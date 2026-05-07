@@ -1,6 +1,11 @@
 //! LoRa radio control via RNode firmware's extended-KISS protocol.
 //! Shared constants + transport-agnostic response handler. Serial:
 //! [`spawn_rnode_interface`] (feature `serial`); BLE: [`crate::ble_rnode`].
+//!
+//! Transport selection is driven by the `port` string in [`RNodeConfig`]:
+//!   - `/dev/ttyUSB0`, `COM3`, etc.  → serial (feature `serial` required)
+//!   - `tcp://192.168.1.1`           → TCP, default port 4242
+//!   - `tcp://192.168.1.1:9000`      → TCP, explicit port
 
 use bytes::Bytes;
 
@@ -101,12 +106,137 @@ pub const MAX_RECONNECT_TRIES: usize = 3;
 pub const RADIO_STATE_ON: u8 = 0x01;
 pub const RADIO_STATE_OFF: u8 = 0x00;
 
+/// Default TCP port for RNode-over-IP.
+pub const DEFAULT_TCP_PORT: u16 = 7633;
+
 #[cfg(feature = "serial")]
 const RNODE_READ_TIMEOUT_MS: u64 = 100;
+
+// Transport abstraction
+
+/// Parsed representation of the `port` config field.
+#[cfg(feature = "serial")]
+#[derive(Debug, Clone)]
+pub enum PortConfig {
+    /// A local serial device path, e.g. `/dev/ttyUSB0` or `COM3`.
+    Serial { path: String, baud: u32 },
+    /// A TCP endpoint, e.g. `tcp://192.168.1.1` or `tcp://192.168.1.1:9000`.
+    Tcp { addr: String },
+}
+
+#[cfg(feature = "serial")]
+impl PortConfig {
+    pub fn parse(port: &str, baud: u32) -> Result<Self, String> {
+        if let Some(rest) = port.strip_prefix("tcp://") {
+            // Already has a port number?
+            let addr = if rest.contains(':') {
+                rest.to_string()
+            } else {
+                format!("{}:{}", rest, DEFAULT_TCP_PORT)
+            };
+            Ok(Self::Tcp { addr })
+        } else {
+            Ok(Self::Serial {
+                path: port.to_string(),
+                baud,
+            })
+        }
+    }
+}
+
+/// A unified sync I/O stream for either a serial port or a TCP socket.
+///
+/// Both variants support `Read + Write + Send + 'static` so the existing
+/// `spawn_blocking` read/write loops require minimal changes.
+#[cfg(feature = "serial")]
+pub enum RNodeStream {
+    Serial(Box<dyn serialport::SerialPort>),
+    Tcp(std::net::TcpStream),
+}
+
+#[cfg(feature = "serial")]
+impl RNodeStream {
+    /// Open a serial port.
+    pub fn open_serial(path: &str, baud: u32) -> std::io::Result<Self> {
+        let port = serialport::new(path, baud)
+            .timeout(Duration::from_millis(RNODE_READ_TIMEOUT_MS))
+            .open()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(Self::Serial(port))
+    }
+
+    /// Connect to a TCP socket (blocking).
+    pub fn connect_tcp(addr: &str) -> std::io::Result<Self> {
+        let stream = std::net::TcpStream::connect(addr)?;
+        // Mirror the serial timeout so the read loop doesn't block forever.
+        stream.set_read_timeout(Some(Duration::from_millis(RNODE_READ_TIMEOUT_MS)))?;
+        Ok(Self::Tcp(stream))
+    }
+
+    /// Shallow-clone the stream for the write half.
+    ///
+    /// - Serial: uses `SerialPort::try_clone`.
+    /// - TCP: uses `TcpStream::try_clone` (both halves share the same fd).
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        match self {
+            Self::Serial(p) => Ok(Self::Serial(
+                p.try_clone()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+            )),
+            Self::Tcp(s) => Ok(Self::Tcp(s.try_clone()?)),
+        }
+    }
+
+    /// Human-readable description for log messages.
+    pub fn description(&self) -> String {
+        match self {
+            Self::Serial(p) => p
+                .name()
+                .unwrap_or_else(|| "<unknown serial>".to_string()),
+            Self::Tcp(s) => s
+                .peer_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "<unknown tcp>".to_string()),
+        }
+    }
+}
+
+#[cfg(feature = "serial")]
+impl std::io::Read for RNodeStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Serial(p) => p.read(buf),
+            Self::Tcp(s) => s.read(buf),
+        }
+    }
+}
+
+#[cfg(feature = "serial")]
+impl std::io::Write for RNodeStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Serial(p) => p.write(buf),
+            Self::Tcp(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Serial(p) => p.flush(),
+            Self::Tcp(s) => s.flush(),
+        }
+    }
+}
+
+// Safety: TcpStream is Send; serialport's Box<dyn SerialPort> is Send on all
+// platforms the crate targets.
+#[cfg(feature = "serial")]
+unsafe impl Send for RNodeStream {}
 
 #[derive(Debug, Clone)]
 pub struct RNodeConfig {
     pub name: String,
+    /// Serial device path (`/dev/ttyUSB0`) **or** TCP URL (`tcp://host[:port]`).
     pub port: String,
     pub baud_rate: u32,
     /// Hz.
@@ -354,14 +484,44 @@ pub async fn spawn_rnode_interface(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-    let port = serialport::new(&config.port, config.baud_rate)
-        .timeout(Duration::from_millis(RNODE_READ_TIMEOUT_MS))
-        .open()
-        .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("rnode open: {}", e)))?;
+    let port_cfg = PortConfig::parse(&config.port, config.baud_rate)
+        .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("rnode port parse: {}", e)))?;
+
+    let port = match &port_cfg {
+        PortConfig::Serial { path, baud } => {
+            tracing::info!(
+                name = %config.name,
+                port = %path,
+                baud = baud,
+                freq = config.frequency,
+                bw = config.bandwidth,
+                sf = config.spreading_factor,
+                "RNode serial interface opening"
+            );
+            RNodeStream::open_serial(path, *baud)
+                .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("rnode serial open: {}", e)))?
+        }
+        PortConfig::Tcp { addr } => {
+            tracing::info!(
+                name = %config.name,
+                addr = %addr,
+                freq = config.frequency,
+                bw = config.bandwidth,
+                sf = config.spreading_factor,
+                "RNode TCP interface connecting"
+            );
+            // TcpStream::connect is blocking; run it off the async executor.
+            let addr = addr.clone();
+            tokio::task::spawn_blocking(move || RNodeStream::connect_tcp(&addr))
+                .await
+                .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("rnode tcp spawn: {}", e)))?
+                .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("rnode tcp connect: {}", e)))?
+        }
+    };
 
     tracing::info!(
         name = %config.name,
-        port = %config.port,
+        endpoint = %port.description(),
         freq = config.frequency,
         bw = config.bandwidth,
         sf = config.spreading_factor,
@@ -482,7 +642,14 @@ pub async fn spawn_rnode_interface(
                 use std::io::Read;
                 match port_r.read(&mut buf) {
                     Ok(n) => Ok((port_r, buf, n)),
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok((port_r, buf, 0)),
+                    // Serial returns TimedOut; TCP returns WouldBlock on non-blocking
+                    // or TimedOut on a read-timeout — treat both as "no data yet".
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::TimedOut
+                            || e.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        Ok((port_r, buf, 0))
+                    }
                     Err(e) => Err((port_r, e)),
                 }
             })
@@ -638,5 +805,42 @@ mod tests {
         assert_eq!(CMD_DISP_ADR, 0x63);
         assert_eq!(CMD_WIFI_IP, 0x84);
         assert_eq!(CMD_WIFI_NM, 0x85);
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_port_config_serial() {
+        let cfg = PortConfig::parse("/dev/ttyUSB0", 115200).unwrap();
+        assert!(matches!(cfg, PortConfig::Serial { path, .. } if path == "/dev/ttyUSB0"));
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_port_config_tcp_default_port() {
+        let cfg = PortConfig::parse("tcp://192.168.1.1", 115200).unwrap();
+        match cfg {
+            PortConfig::Tcp { addr } => assert_eq!(addr, "192.168.1.1:7633"),
+            _ => panic!("expected Tcp variant"),
+        }
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_port_config_tcp_explicit_port() {
+        let cfg = PortConfig::parse("tcp://192.168.1.1:9000", 115200).unwrap();
+        match cfg {
+            PortConfig::Tcp { addr } => assert_eq!(addr, "192.168.1.1:9000"),
+            _ => panic!("expected Tcp variant"),
+        }
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_port_config_tcp_hostname() {
+        let cfg = PortConfig::parse("tcp://rnode.local", 115200).unwrap();
+        match cfg {
+            PortConfig::Tcp { addr } => assert_eq!(addr, "rnode.local:7633"),
+            _ => panic!("expected Tcp variant"),
+        }
     }
 }
