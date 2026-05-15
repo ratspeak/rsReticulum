@@ -4,7 +4,7 @@
 //!
 //! Transport selection is driven by the `port` string in [`RNodeConfig`]:
 //!   - `/dev/ttyUSB0`, `COM3`, etc.  → serial (feature `serial` required)
-//!   - `tcp://192.168.1.1`           → TCP, default port 4242
+//!   - `tcp://192.168.1.1`           → TCP, default port 7633
 //!   - `tcp://192.168.1.1:9000`      → TCP, explicit port
 
 use bytes::Bytes;
@@ -493,9 +493,6 @@ pub async fn spawn_rnode_interface(
                 name = %config.name,
                 port = %path,
                 baud = baud,
-                freq = config.frequency,
-                bw = config.bandwidth,
-                sf = config.spreading_factor,
                 "RNode serial interface opening"
             );
             RNodeStream::open_serial(path, *baud)
@@ -505,9 +502,6 @@ pub async fn spawn_rnode_interface(
             tracing::info!(
                 name = %config.name,
                 addr = %addr,
-                freq = config.frequency,
-                bw = config.bandwidth,
-                sf = config.spreading_factor,
                 "RNode TCP interface connecting"
             );
             // TcpStream::connect is blocking; run it off the async executor.
