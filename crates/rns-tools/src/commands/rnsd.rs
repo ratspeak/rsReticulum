@@ -171,6 +171,7 @@ pub(crate) async fn main() {
         tracing_subscriber::fmt()
             .with_max_level(level)
             .with_writer(LogFileWriter { path: log_path })
+            .with_ansi(false)
             .init();
     } else {
         tracing_subscriber::fmt().with_max_level(level).init();
