@@ -1020,6 +1020,7 @@ pub async fn init(
                 {
                     Ok(client_handle) => {
                         let client_iface_id = client_handle.id;
+                        let client_online = client_handle.online.clone();
                         register_interface_handle_with_role(
                             &transport_tx,
                             client_handle,
@@ -1027,11 +1028,12 @@ pub async fn init(
                             &interface_controls,
                         )
                         .await;
-                        let _ = transport_tx
-                            .send(TransportMessage::SharedConnectionRestored {
-                                interface_id: client_iface_id,
-                            })
-                            .await;
+                        spawn_shared_peer_monitor(
+                            transport_tx.clone(),
+                            client_iface_id,
+                            client_online,
+                            shutdown.clone(),
+                        );
                         InstanceMode::Client
                     }
                     Err(_) => InstanceMode::Standalone,
@@ -1076,6 +1078,7 @@ pub async fn init(
                             {
                                 Ok(client_handle) => {
                                     let client_iface_id = client_handle.id;
+                                    let client_online = client_handle.online.clone();
                                     register_interface_handle_with_role(
                                         &transport_tx,
                                         client_handle,
@@ -1083,11 +1086,12 @@ pub async fn init(
                                         &interface_controls,
                                     )
                                     .await;
-                                    let _ = transport_tx
-                                        .send(TransportMessage::SharedConnectionRestored {
-                                            interface_id: client_iface_id,
-                                        })
-                                        .await;
+                                    spawn_shared_peer_monitor(
+                                        transport_tx.clone(),
+                                        client_iface_id,
+                                        client_online,
+                                        shutdown.clone(),
+                                    );
                                     InstanceMode::Client
                                 }
                                 Err(_) => InstanceMode::Standalone,
@@ -1143,6 +1147,7 @@ pub async fn init(
                 {
                     Ok(client_handle) => {
                         let client_iface_id = client_handle.id;
+                        let client_online = client_handle.online.clone();
                         register_interface_handle_with_role(
                             &transport_tx,
                             client_handle,
@@ -1150,11 +1155,12 @@ pub async fn init(
                             &interface_controls,
                         )
                         .await;
-                        let _ = transport_tx
-                            .send(TransportMessage::SharedConnectionRestored {
-                                interface_id: client_iface_id,
-                            })
-                            .await;
+                        spawn_shared_peer_monitor(
+                            transport_tx.clone(),
+                            client_iface_id,
+                            client_online,
+                            shutdown.clone(),
+                        );
                         InstanceMode::Client
                     }
                     Err(_) => InstanceMode::Standalone,
@@ -1197,6 +1203,7 @@ pub async fn init(
                         {
                             Ok(client_handle) => {
                                 let client_iface_id = client_handle.id;
+                                let client_online = client_handle.online.clone();
                                 register_interface_handle_with_role(
                                     &transport_tx,
                                     client_handle,
@@ -1204,11 +1211,12 @@ pub async fn init(
                                     &interface_controls,
                                 )
                                 .await;
-                                let _ = transport_tx
-                                    .send(TransportMessage::SharedConnectionRestored {
-                                        interface_id: client_iface_id,
-                                    })
-                                    .await;
+                                spawn_shared_peer_monitor(
+                                    transport_tx.clone(),
+                                    client_iface_id,
+                                    client_online,
+                                    shutdown.clone(),
+                                );
                                 InstanceMode::Client
                             }
                             Err(_) => InstanceMode::Standalone,
@@ -1550,6 +1558,38 @@ fn discovered_backbone_client_mode(
 
 fn next_id(id_gen: &Arc<AtomicU64>) -> u64 {
     id_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn spawn_shared_peer_monitor(
+    transport_tx: mpsc::Sender<TransportMessage>,
+    interface_id: u64,
+    online: Arc<AtomicBool>,
+    shutdown: ShutdownSignal,
+) {
+    tokio::spawn(async move {
+        let mut was_online = false;
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                _ = shutdown.wait() => break,
+                _ = interval.tick() => {
+                    let is_online = online.load(std::sync::atomic::Ordering::SeqCst);
+                    if is_online == was_online {
+                        continue;
+                    }
+                    was_online = is_online;
+                    let message = if is_online {
+                        TransportMessage::SharedConnectionRestored { interface_id }
+                    } else {
+                        TransportMessage::SharedConnectionLost
+                    };
+                    if transport_tx.send(message).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn ingress_for_role(
@@ -3468,6 +3508,44 @@ mod tests {
         bytes::Bytes::from(raw)
     }
 
+    #[tokio::test]
+    async fn shared_peer_monitor_emits_connection_lifecycle_events() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let online = Arc::new(AtomicBool::new(false));
+        let shutdown = ShutdownSignal::new();
+
+        spawn_shared_peer_monitor(tx, 7, online.clone(), shutdown.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "offline initial state should not emit a lost event"
+        );
+
+        online.store(true, std::sync::atomic::Ordering::SeqCst);
+        let restored = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
+            .await
+            .expect("restored event timed out")
+            .expect("monitor channel closed");
+        match restored {
+            TransportMessage::SharedConnectionRestored { interface_id } => {
+                assert_eq!(interface_id, 7)
+            }
+            other => panic!("expected SharedConnectionRestored, got {other:?}"),
+        }
+
+        online.store(false, std::sync::atomic::Ordering::SeqCst);
+        let lost = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
+            .await
+            .expect("lost event timed out")
+            .expect("monitor channel closed");
+        match lost {
+            TransportMessage::SharedConnectionLost => {}
+            other => panic!("expected SharedConnectionLost, got {other:?}"),
+        }
+
+        shutdown.trigger();
+    }
+
     fn write_stale_python_destination_table(storage_dir: &Path, entries: usize) {
         std::fs::create_dir_all(storage_dir).unwrap();
 
@@ -4314,31 +4392,66 @@ enabled = yes
         .unwrap();
         assert_eq!(handle_c.instance_mode, InstanceMode::Client);
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let (stats_tx, stats_rx) = tokio::sync::oneshot::channel();
-        handle_a
-            .transport_tx
-            .send(TransportMessage::Rpc {
-                query: rns_transport::messages::TransportQuery::GetInterfaceStats,
-                response_tx: stats_tx,
-            })
-            .await
-            .unwrap();
-        let server_stats = stats_rx.await.unwrap();
-        let roles: Vec<String> = match server_stats {
-            rns_transport::messages::TransportQueryResponse::InterfaceStats(entries) => {
-                entries.into_iter().map(|entry| entry.role).collect()
+        let server_entries = {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let (stats_tx, stats_rx) = tokio::sync::oneshot::channel();
+                handle_a
+                    .transport_tx
+                    .send(TransportMessage::Rpc {
+                        query: rns_transport::messages::TransportQuery::GetInterfaceStats,
+                        response_tx: stats_tx,
+                    })
+                    .await
+                    .unwrap();
+                let server_stats = stats_rx.await.unwrap();
+                let entries = match server_stats {
+                    rns_transport::messages::TransportQueryResponse::InterfaceStats(entries) => {
+                        entries
+                    }
+                    other => panic!("unexpected stats response: {other:?}"),
+                };
+                let local_clients: Vec<_> = entries
+                    .iter()
+                    .filter(|entry| entry.role == "local_client")
+                    .collect();
+                if entries.iter().any(|entry| entry.role == "shared_server")
+                    && local_clients.len() == 2
+                    && local_clients.iter().all(|entry| entry.online)
+                    && local_clients.iter().all(|entry| entry.tx_drops == 0)
+                {
+                    break entries;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break entries;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            other => panic!("unexpected stats response: {other:?}"),
         };
+        let roles: Vec<String> = server_entries
+            .iter()
+            .map(|entry| entry.role.clone())
+            .collect();
         assert!(
             roles.iter().any(|role| role == "shared_server"),
             "shared instance must mark the listener"
         );
+        let local_clients: Vec<_> = server_entries
+            .iter()
+            .filter(|entry| entry.role == "local_client")
+            .collect();
+        assert_eq!(
+            local_clients.len(),
+            2,
+            "transient shared-instance detection sockets must not remain registered"
+        );
         assert!(
-            roles.iter().filter(|role| *role == "local_client").count() >= 2,
-            "accepted shared clients must be marked for transport policy"
+            local_clients.iter().all(|entry| entry.online),
+            "accepted shared clients must be online"
+        );
+        assert!(
+            local_clients.iter().all(|entry| entry.tx_drops == 0),
+            "accepted shared clients must not accumulate TX drops"
         );
 
         let shared_control_stats = handle_b
@@ -4426,6 +4539,30 @@ enabled = yes
         .await
         .expect("shared instance did not forward local-client plain packet");
         assert_eq!(received.as_ref(), raw.as_ref());
+
+        let post_forward_stats = handle_b
+            .query_control(rns_transport::messages::TransportQuery::GetInterfaceStats)
+            .await
+            .expect("post-forward control query should reach shared instance");
+        let post_forward_entries = match post_forward_stats {
+            rns_transport::messages::TransportQueryResponse::InterfaceStats(entries) => entries,
+            other => panic!("unexpected post-forward stats response: {other:?}"),
+        };
+        let post_forward_local_clients: Vec<_> = post_forward_entries
+            .iter()
+            .filter(|entry| entry.role == "local_client")
+            .collect();
+        assert_eq!(
+            post_forward_local_clients.len(),
+            2,
+            "forwarding through shared instance must not retain stale local clients"
+        );
+        assert!(
+            post_forward_local_clients
+                .iter()
+                .all(|entry| entry.tx_drops == 0),
+            "forwarding through shared instance must not report TX drops"
+        );
 
         shutdown_c.trigger();
         shutdown_b.trigger();

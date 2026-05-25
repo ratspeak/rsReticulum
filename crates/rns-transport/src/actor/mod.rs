@@ -493,6 +493,15 @@ impl TransportActor {
                 let is_outbound = entry.direction.outbound;
                 let iface_name = entry.name.clone();
                 let role = entry.role;
+                if role == InterfaceRole::LocalClient && interface_marked_offline(&entry) {
+                    tracing::info!(
+                        id,
+                        name = %iface_name,
+                        role = role.as_str(),
+                        "skipping registration for interface already marked offline"
+                    );
+                    return;
+                }
                 debug!(id, name = %iface_name, outbound = is_outbound, role = role.as_str(), "registering interface");
                 self.interfaces.insert(id, entry);
                 if !self.startup_complete && self.startup_time == 0.0 {
@@ -983,6 +992,18 @@ impl TransportActor {
         let Some(entry) = self.interfaces.get(&id) else {
             return;
         };
+        if entry.role == InterfaceRole::LocalClient && interface_marked_offline(entry) {
+            tracing::info!(
+                interface_id = id,
+                interface_name = %entry.name,
+                "interface marked offline; auto-deregistering"
+            );
+            self.deregister_interface(id);
+            return;
+        }
+        let Some(entry) = self.interfaces.get(&id) else {
+            return;
+        };
         if !entry.direction.outbound {
             return;
         }
@@ -1260,6 +1281,14 @@ impl TransportActor {
             }
         }
     }
+}
+
+fn interface_marked_offline(entry: &InterfaceEntry) -> bool {
+    entry
+        .online
+        .as_ref()
+        .map(|online| !online.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false)
 }
 
 fn now_f64() -> f64 {
@@ -1657,6 +1686,73 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(&[0x01]));
         assert_eq!(tx_drops.load(std::sync::atomic::Ordering::Relaxed), 2);
         assert!(actor.interfaces.contains_key(&1));
+    }
+
+    #[test]
+    fn test_register_interface_skips_already_offline_child() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (raw, dest_hash) = make_valid_announce("test.offline.local_client", 0);
+        actor.recent_announces.insert(
+            dest_hash,
+            RecentAnnounce {
+                dest_hash,
+                hops: 0,
+                app_data: None,
+                timestamp: now_f64(),
+                public_key: None,
+                ratchet: None,
+                raw_packet: raw.to_vec(),
+                retained: false,
+                name_hash: [0u8; 10],
+            },
+        );
+
+        let (mut entry, mut rx) = make_test_interface("SharedInstanceServer/client_4");
+        entry.role = InterfaceRole::LocalClient;
+        entry.online = Some(Arc::new(AtomicBool::new(false)));
+        let tx_drops = entry.tx_drops.clone();
+
+        actor.handle_message(TransportMessage::RegisterInterface { id: 4, entry });
+
+        assert!(
+            !actor.interfaces.contains_key(&4),
+            "offline child handles must not be registered after disconnect"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "offline child must not receive cached announce replay"
+        );
+        assert_eq!(
+            tx_drops.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "offline registration should not count as TX pressure"
+        );
+    }
+
+    #[test]
+    fn test_send_to_interface_auto_deregisters_offline_entry_before_queueing() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut entry, mut rx) = make_test_interface("SharedInstanceServer/client_5");
+        entry.role = InterfaceRole::LocalClient;
+        entry.online = Some(Arc::new(AtomicBool::new(false)));
+        let tx_drops = entry.tx_drops.clone();
+        actor.interfaces.insert(5, entry);
+
+        actor.send_to_interface(5, &[0x01, 0x02, 0x03]);
+
+        assert!(
+            !actor.interfaces.contains_key(&5),
+            "offline interface should be reaped before enqueue"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "offline interface should not receive outbound bytes"
+        );
+        assert_eq!(
+            tx_drops.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "offline interface should not report queue drops"
+        );
     }
 
     #[test]
