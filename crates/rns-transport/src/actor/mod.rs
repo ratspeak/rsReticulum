@@ -1730,6 +1730,31 @@ mod tests {
     }
 
     #[test]
+    fn test_register_interface_allows_offline_shared_instance_peer() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut entry, mut rx) = make_test_interface("SharedInstanceClient");
+        entry.role = InterfaceRole::SharedInstancePeer;
+        entry.online = Some(Arc::new(AtomicBool::new(false)));
+
+        actor.handle_message(TransportMessage::RegisterInterface { id: 44, entry });
+
+        assert!(
+            actor.interfaces.contains_key(&44),
+            "shared-instance peers must remain registered while reconnecting"
+        );
+        actor.send_to_interface(44, &[0xA5, 0x5A]);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from_static(&[0xA5, 0x5A]),
+            "offline shared peer should not use local-client stale-handle reaping"
+        );
+        assert!(
+            actor.interfaces.contains_key(&44),
+            "offline shared peer should not be auto-deregistered"
+        );
+    }
+
+    #[test]
     fn test_send_to_interface_auto_deregisters_offline_entry_before_queueing() {
         let (mut actor, _tx) = TransportActor::new();
         let (mut entry, mut rx) = make_test_interface("SharedInstanceServer/client_5");
@@ -7551,6 +7576,35 @@ mod tests {
             rns_wire::flags::HeaderType::Header2
         );
         assert_eq!(header.transport_id, Some([0x66; 16]));
+    }
+
+    #[test]
+    fn shared_connection_lost_clears_state_without_deregistering_peer() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_shared_instance = true;
+
+        let (mut shared_peer, _rx) = make_test_interface("SharedInstanceClient");
+        shared_peer.role = InterfaceRole::SharedInstancePeer;
+        shared_peer.online = Some(Arc::new(AtomicBool::new(false)));
+        actor.interfaces.insert(1, shared_peer);
+        actor.path_table.insert(
+            [0x11; 16],
+            crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Gateway),
+        );
+        actor.reverse_table.insert([0x22; 16], 1, 1);
+        actor.pending_local_path_requests.insert([0x33; 16], 1);
+
+        actor.handle_message(TransportMessage::SharedConnectionLost);
+
+        assert!(!actor.is_shared_instance);
+        assert!(actor.shared_instance_client_mode);
+        assert!(
+            actor.interfaces.contains_key(&1),
+            "connection-loss events should suspend shared routing without deleting the peer"
+        );
+        assert!(actor.path_table.is_empty());
+        assert!(actor.reverse_table.is_empty());
+        assert!(actor.pending_local_path_requests.is_empty());
     }
 
     #[test]
