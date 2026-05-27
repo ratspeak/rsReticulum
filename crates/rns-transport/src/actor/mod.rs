@@ -512,12 +512,11 @@ impl TransportActor {
                 // queries from other code (e.g. announce replay below) see
                 // the restored paths.
                 self.drain_pending_for_interface(id, &iface_name);
-                // Replay cached announces so a freshly connected peer learns
-                // the known destinations immediately. Important for relay
-                // topologies where announces arrived before any clients did.
-                if role == InterfaceRole::LocalClient && is_outbound {
-                    self.replay_recent_announces_to_local_client(id);
-                } else if self.is_transport_enabled && is_outbound {
+                // Python registers local shared clients without replaying the
+                // cached announce store. Cached announces are retained for
+                // path/cache request flows, and live announces are forwarded
+                // as they arrive.
+                if role != InterfaceRole::LocalClient && self.is_transport_enabled && is_outbound {
                     let announces: Vec<Vec<u8>> = self
                         .announce_table
                         .iter()
@@ -729,33 +728,6 @@ impl TransportActor {
                 warn!(dest = hex::encode(hash), drops = self.channel_drops, err = %e,
                     "failed to send AnnounceRequested after shared instance reconnect");
             }
-        }
-    }
-
-    fn replay_recent_announces_to_local_client(&mut self, interface_id: InterfaceId) {
-        let announces: Vec<Vec<u8>> = self
-            .recent_announces
-            .values()
-            .filter(|announce| !announce.raw_packet.is_empty())
-            .map(|announce| {
-                self.transport_announce_from_raw(
-                    &announce.raw_packet,
-                    announce.dest_hash,
-                    announce.hops,
-                    rns_wire::context::PacketContext::None,
-                )
-            })
-            .collect();
-
-        if !announces.is_empty() {
-            debug!(
-                interface_id,
-                count = announces.len(),
-                "replaying recent announces to local shared client"
-            );
-        }
-        for raw in announces {
-            self.send_to_interface(interface_id, &raw);
         }
     }
 
@@ -1752,6 +1724,55 @@ mod tests {
             actor.interfaces.contains_key(&44),
             "offline shared peer should not be auto-deregistered"
         );
+    }
+
+    #[test]
+    fn test_register_local_client_does_not_replay_cached_announces() {
+        let (mut actor, _tx) = TransportActor::new();
+
+        let cached_announces = 1_200;
+        for i in 0..cached_announces {
+            let mut dest_hash = [0; 16];
+            dest_hash[8..].copy_from_slice(&(i as u64).to_be_bytes());
+            let mut raw_packet = vec![0x51];
+            raw_packet.extend_from_slice(&dest_hash);
+            actor.recent_announces.insert(
+                dest_hash,
+                RecentAnnounce {
+                    dest_hash,
+                    hops: 1,
+                    app_data: None,
+                    timestamp: i as f64,
+                    public_key: None,
+                    ratchet: None,
+                    raw_packet,
+                    retained: false,
+                    name_hash: [0; 10],
+                },
+            );
+        }
+        assert!(
+            actor.recent_announces.len() > 1_000,
+            "fixture must model the large cache seen in contributor reports"
+        );
+
+        let (mut entry, mut rx) = make_test_interface("SharedInstanceServer/client_9");
+        entry.role = InterfaceRole::LocalClient;
+        let tx_drops = entry.tx_drops.clone();
+
+        actor.handle_message(TransportMessage::RegisterInterface { id: 9, entry });
+
+        assert_eq!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "registering a local shared client must not dump cached announces"
+        );
+        assert_eq!(
+            tx_drops.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "registering a local shared client must not create TX pressure"
+        );
+        assert!(actor.interfaces.contains_key(&9));
     }
 
     #[test]
