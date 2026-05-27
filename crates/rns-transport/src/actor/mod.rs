@@ -512,27 +512,10 @@ impl TransportActor {
                 // queries from other code (e.g. announce replay below) see
                 // the restored paths.
                 self.drain_pending_for_interface(id, &iface_name);
-                // Python registers local shared clients without replaying the
-                // cached announce store. Cached announces are retained for
-                // path/cache request flows, and live announces are forwarded
-                // as they arrive.
-                if role != InterfaceRole::LocalClient && self.is_transport_enabled && is_outbound {
-                    let announces: Vec<Vec<u8>> = self
-                        .announce_table
-                        .iter()
-                        .map(|(_, entry)| entry.packet_raw.clone())
-                        .collect();
-                    if !announces.is_empty() {
-                        debug!(
-                            id,
-                            count = announces.len(),
-                            "replaying cached announces to new interface"
-                        );
-                        for raw in &announces {
-                            self.send_to_interface(id, raw);
-                        }
-                    }
-                }
+                // Python interface registration does not trigger announce
+                // retransmission. Cached/path-response announces stay queued
+                // for the announce job, and local shared clients only receive
+                // live announces or request-driven responses after connect.
             }
             TransportMessage::DeregisterInterface { id } => {
                 debug!(id, "deregistering interface");
@@ -1773,6 +1756,125 @@ mod tests {
             "registering a local shared client must not create TX pressure"
         );
         assert!(actor.interfaces.contains_key(&9));
+    }
+
+    #[test]
+    fn test_register_interface_does_not_replay_announce_table() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let dest_hash = [0xA7; 16];
+        actor.announce_table.insert(
+            dest_hash,
+            crate::announce::AnnounceEntry {
+                timestamp: now_f64(),
+                retransmit_timeout: now_f64(),
+                retries: 0,
+                received_from: [0x22; 16],
+                hops: 2,
+                packet_raw: vec![0x51, 0x01, 0x02],
+                local_rebroadcasts: 0,
+                block_rebroadcast: false,
+                attached_interface: None,
+                source_interface: None,
+            },
+        );
+
+        let (entry, mut rx) = make_test_interface("tcp_backbone");
+        actor.handle_message(TransportMessage::RegisterInterface { id: 10, entry });
+
+        assert_eq!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "interface registration must not replay queued announces"
+        );
+        assert!(
+            actor.announce_table.get(&dest_hash).is_some(),
+            "announce job, not registration, owns queued announce processing"
+        );
+    }
+
+    #[test]
+    fn local_client_path_request_uses_cached_announce_without_startup_dump() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        actor.transport_identity_hash = Some([0x77; 16]);
+
+        let cached_announces = 1_200;
+        for i in 0..cached_announces {
+            let mut dest_hash = [0; 16];
+            dest_hash[8..].copy_from_slice(&(i as u64).to_be_bytes());
+            actor.recent_announces.insert(
+                dest_hash,
+                RecentAnnounce {
+                    dest_hash,
+                    hops: 1,
+                    app_data: None,
+                    timestamp: i as f64,
+                    public_key: None,
+                    ratchet: None,
+                    raw_packet: vec![0x51, i as u8],
+                    retained: false,
+                    name_hash: [0; 10],
+                },
+            );
+        }
+        let (target_raw, target_dest) = make_valid_announce("test.shared.cached_path_response", 2);
+        actor.recent_announces.insert(
+            target_dest,
+            RecentAnnounce {
+                dest_hash: target_dest,
+                hops: 3,
+                app_data: None,
+                timestamp: cached_announces as f64,
+                public_key: None,
+                ratchet: None,
+                raw_packet: target_raw.to_vec(),
+                retained: false,
+                name_hash: [0; 10],
+            },
+        );
+        actor.path_table.insert(
+            target_dest,
+            crate::path_table::PathEntry::new(Some([0x22; 16]), 3, 2, InterfaceMode::Gateway),
+        );
+        assert!(
+            actor.recent_announces.len() > 1_000,
+            "fixture must keep a large cache while proving request-driven use"
+        );
+
+        let (mut local_client, mut local_rx) =
+            make_test_interface("SharedInstanceServer/client_10");
+        local_client.role = InterfaceRole::LocalClient;
+        actor.handle_message(TransportMessage::RegisterInterface {
+            id: 1,
+            entry: local_client,
+        });
+        assert_eq!(
+            local_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "local shared client must not receive cached announces on connect"
+        );
+
+        actor.handle_inbound_path_request(&make_path_request_payload(target_dest, None), 1);
+        assert_eq!(
+            local_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "path request should queue the cached response for the announce job"
+        );
+
+        actor.flush_pending_announces();
+        let response = local_rx
+            .try_recv()
+            .expect("cached announce should be returned after a local path request");
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&response).unwrap();
+        assert_eq!(header.destination_hash, target_dest);
+        assert_eq!(header.hops, 3);
+        assert_eq!(header.transport_id, Some([0x77; 16]));
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::PathResponse
+        );
     }
 
     #[test]
