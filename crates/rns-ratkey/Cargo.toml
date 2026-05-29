@@ -17,10 +17,23 @@ zeroize = { workspace = true }
 aes = { workspace = true }
 toml = "0.8"
 
+# X.509 attestation-chain verification (always compiled, not behind `hardware`).
+x509-cert = { version = "0.2", features = ["pem"] }
+rsa = "0.9"
+# `oid` feature: lets RSA PKCS#1 v1.5 VerifyingKey<Sha256/Sha512> build the DigestInfo prefix.
+sha2 = { workspace = true, features = ["oid"] }
+der = "0.7"
+const-oid = "0.9"
+
 [dev-dependencies]
 rns-crypto = { workspace = true, features = ["std"] }
 rns-identity = { workspace = true }
 rns-link = { path = "../rns-link" }
+# Synthetic-chain test fixtures.
+x509-cert = { version = "0.2", features = ["pem", "builder"] }
+# `sha2` feature provides RsaSignatureAssociatedOid for the cert builder's signer.
+rsa = { version = "0.9", features = ["sha2"] }
+rand = { workspace = true }
 
 [features]
 default = []

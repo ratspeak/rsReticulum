@@ -37,9 +37,12 @@ Ed25519 (9A) / X25519 (9D):
 - **TDES management keys** are not supported (only AES-128/192/256). Pre-5.7
   YubiKeys default to a TDES management key; provisioning those needs a `des`
   block cipher added to `mgmt.rs`.
-- Cryptographic attestation certificate chain verification against the bundled
-  Yubico roots (`attestation.rs` is metadata/OID extraction only; `chain_verified`
-  is always false).
+- Validate attestation-chain verification against a real device. `attestation.rs`
+  now does full RSA PKCS#1 v1.5 chain verification (per-key → device F9 → bundled,
+  fingerprint-pinned Yubico roots; legacy + new-PKI A/B/B2 intermediates bundled;
+  notBefore/notAfter checks; no CRL/OCSP/name-constraints). Exercised against
+  synthetic chains and the real published CA certs — not yet a physical YubiKey's
+  ATTEST output.
 - Edge cases on a real device: disconnect mid-operation, wrong PIN / lockout,
   touch timeout (if touch is ever enabled), and the `from_hwid` key-mismatch guard.
 - Decide and document the ratchet policy for hardware identities. PIV cannot hold
