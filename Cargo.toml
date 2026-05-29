@@ -46,7 +46,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 
 # Compression
-bzip2 = "0.5"
+bzip2 = "0.6"
 
 # Serial
 serialport = { version = "4", default-features = false }
