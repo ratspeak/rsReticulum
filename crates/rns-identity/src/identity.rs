@@ -43,6 +43,9 @@ pub trait LocalKeyBackend: Send + Sync {
     fn sign_ed25519(&self, message: &[u8]) -> Option<[u8; 64]>;
     /// X25519 ECDH shared secret with `peer_pub`, or `None` if unavailable.
     fn ecdh(&self, peer_pub: &[u8; 32]) -> Option<[u8; 32]>;
+    /// Drop any cached authentication so the next operation must re-authenticate
+    /// (e.g. a hardware token re-locks its PIN). No-op for software backends.
+    fn lock(&self) {}
 }
 
 /// A Reticulum identity: X25519 keypair for encryption + Ed25519 keypair for signing.
@@ -220,6 +223,14 @@ impl Identity {
     /// True if private operations are served by a hardware backend.
     pub fn has_backend(&self) -> bool {
         self.backend.is_some()
+    }
+
+    /// Re-lock the hardware backend (drop its cached authentication). No-op for
+    /// software identities. The next private operation will fail until re-auth.
+    pub fn lock(&self) {
+        if let Some(b) = self.backend.as_ref() {
+            b.lock();
+        }
     }
 
     pub fn get_signing_key(&self) -> Option<Ed25519PrivateKey> {

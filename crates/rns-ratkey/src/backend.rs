@@ -24,6 +24,11 @@ enum Cmd {
         peer_pub: [u8; 32],
         reply: Sender<Option<[u8; 32]>>,
     },
+    /// Re-select the PIV applet to drop the on-card PIN cache. Acknowledged so
+    /// callers (lock-on-quit / timeout) can block until the card is re-locked.
+    Lock {
+        reply: Sender<()>,
+    },
 }
 
 /// `LocalKeyBackend` over a PIV token. Each call round-trips a request to the
@@ -57,6 +62,15 @@ impl LocalKeyBackend for HardwareBackend {
             })
             .ok()?;
         rx.recv().ok().flatten()
+    }
+
+    fn lock(&self) {
+        let (reply, rx) = mpsc::channel();
+        if let Ok(tx) = self.cmd_tx.lock()
+            && tx.send(Cmd::Lock { reply }).is_ok()
+        {
+            let _ = rx.recv();
+        }
     }
 }
 
@@ -111,6 +125,11 @@ pub fn load_hardware_identity(hwid: &HwidConfig, pin: &str) -> Result<Identity, 
                     }
                     Cmd::Ecdh { peer_pub, reply } => {
                         let _ = reply.send(session.ecdh_x25519(SLOT_KEY_MANAGEMENT, &peer_pub).ok());
+                    }
+                    Cmd::Lock { reply } => {
+                        let locked = session.lock().is_ok();
+                        tracing::debug!(locked, "PIV applet re-selected (PIN cache dropped)");
+                        let _ = reply.send(());
                     }
                 }
             }
