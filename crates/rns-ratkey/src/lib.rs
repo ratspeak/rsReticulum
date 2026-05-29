@@ -9,6 +9,8 @@
 
 pub mod apdu;
 pub mod attestation;
+#[cfg(feature = "hardware")]
+pub mod backend;
 pub mod detect;
 pub mod error;
 pub mod hardware;
@@ -29,6 +31,8 @@ pub use provision::{ProvisionConfig, ProvisionResult};
 pub use session::{DeviceMeta, PivSession};
 pub use transport::PivTransport;
 
+#[cfg(feature = "hardware")]
+pub use backend::{HardwareBackend, load_hardware_identity};
 #[cfg(feature = "hardware")]
 pub use session::PcscPivSession;
 #[cfg(feature = "hardware")]

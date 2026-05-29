@@ -9,6 +9,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::persistence;
 use std::path::Path;
+use std::sync::Arc;
 
 /// HKDF-derived key length: 32 bytes AES key || 32 bytes HMAC key.
 pub const DERIVED_KEY_LENGTH: usize = 64;
@@ -33,6 +34,17 @@ pub enum IdentityError {
     Io(#[from] std::io::Error),
 }
 
+/// Delegate for an `Identity` whose private key is not in memory (e.g. a PIV
+/// hardware token). Implemented outside this crate (see `rns-ratkey`). Both
+/// operations must produce standard output — RFC 8032 Ed25519 / RFC 7748 X25519
+/// — so the resulting identity is wire-identical to a software one.
+pub trait LocalKeyBackend: Send + Sync {
+    /// Ed25519 signature over `message`, or `None` if currently unavailable.
+    fn sign_ed25519(&self, message: &[u8]) -> Option<[u8; 64]>;
+    /// X25519 ECDH shared secret with `peer_pub`, or `None` if unavailable.
+    fn ecdh(&self, peer_pub: &[u8; 32]) -> Option<[u8; 32]>;
+}
+
 /// A Reticulum identity: X25519 keypair for encryption + Ed25519 keypair for signing.
 ///
 /// Wire representation:
@@ -45,6 +57,29 @@ pub struct Identity {
     pub_key: X25519PublicKey,
     sig_pub: Ed25519PublicKey,
     pub hash: [u8; 16],
+    /// Set only for hardware-backed identities; `None` for all software ones.
+    backend: Option<Arc<dyn LocalKeyBackend>>,
+}
+
+impl Clone for Identity {
+    /// Software identities clone their key material; hardware-backed identities
+    /// share the same `LocalKeyBackend` (Arc) — there is no extractable key to copy.
+    fn clone(&self) -> Self {
+        Self {
+            prv: self
+                .prv
+                .as_ref()
+                .map(|k| X25519PrivateKey::from_bytes(&k.to_bytes())),
+            sig_prv: self
+                .sig_prv
+                .as_ref()
+                .map(|k| Ed25519PrivateKey::from_bytes(&k.to_bytes())),
+            pub_key: self.pub_key.clone(),
+            sig_pub: self.sig_pub.clone(),
+            hash: self.hash,
+            backend: self.backend.clone(),
+        }
+    }
 }
 
 impl Default for Identity {
@@ -67,6 +102,7 @@ impl Identity {
             pub_key,
             sig_pub,
             hash,
+            backend: None,
         }
     }
 
@@ -91,6 +127,7 @@ impl Identity {
             pub_key,
             sig_pub,
             hash,
+            backend: None,
         })
     }
 
@@ -114,7 +151,20 @@ impl Identity {
             pub_key,
             sig_pub,
             hash,
+            backend: None,
         })
+    }
+
+    /// Construct an identity whose private operations are served by `backend`
+    /// (e.g. a hardware token). Public-key-only in memory; `sign` and `decrypt`
+    /// delegate to the backend. Wire-identical to a software identity.
+    pub fn from_backend(
+        public_key: &[u8],
+        backend: Arc<dyn LocalKeyBackend>,
+    ) -> Result<Self, IdentityError> {
+        let mut id = Self::from_public_key(public_key)?;
+        id.backend = Some(backend);
+        Ok(id)
     }
 
     /// Load an identity from file, accepting either the current msgpack envelope
@@ -167,15 +217,24 @@ impl Identity {
         self.prv.is_some() && self.sig_prv.is_some()
     }
 
+    /// True if private operations are served by a hardware backend.
+    pub fn has_backend(&self) -> bool {
+        self.backend.is_some()
+    }
+
     pub fn get_signing_key(&self) -> Option<Ed25519PrivateKey> {
         self.sig_prv
             .as_ref()
             .map(|k| Ed25519PrivateKey::from_bytes(&k.to_bytes()))
     }
 
-    /// Sign `message` with the Ed25519 key; `None` if this is a public-only identity.
+    /// Sign `message` with the Ed25519 key, delegating to the hardware backend
+    /// when the in-memory key is absent; `None` if neither is available.
     pub fn sign(&self, message: &[u8]) -> Option<[u8; 64]> {
-        self.sig_prv.as_ref().map(|key| key.sign(message))
+        match self.sig_prv.as_ref() {
+            Some(key) => Some(key.sign(message)),
+            None => self.backend.as_ref().and_then(|b| b.sign_ed25519(message)),
+        }
     }
 
     pub fn verify(&self, message: &[u8], signature: &[u8; 64]) -> bool {
@@ -251,8 +310,16 @@ impl Identity {
             return Err(IdentityError::DecryptionFailed);
         }
 
-        let prv = self.prv.as_ref().ok_or(IdentityError::DecryptionFailed)?;
-        let mut shared = prv.exchange(&peer_pub);
+        // Identity-key ECDH: in-memory key if present, else the hardware backend.
+        let mut shared: [u8; 32] = if let Some(prv) = self.prv.as_ref() {
+            prv.exchange(&peer_pub)
+        } else if let Some(backend) = self.backend.as_ref() {
+            backend
+                .ecdh(&peer_pub_bytes)
+                .ok_or(IdentityError::DecryptionFailed)?
+        } else {
+            return Err(IdentityError::DecryptionFailed);
+        };
         let derived_result =
             derive_key_64(&shared, &self.hash).map_err(|_| IdentityError::DecryptionFailed);
         shared.zeroize();
@@ -482,5 +549,56 @@ mod tests {
         let id = Identity::new();
         let pub_id = Identity::from_public_key(&id.get_public_key()).unwrap();
         assert!(pub_id.prove(b"test", true).is_err());
+    }
+
+    // A software-keyed backend, standing in for a hardware token in tests.
+    struct SoftwareBackend {
+        sig: rns_crypto::ed25519::Ed25519PrivateKey,
+        x: rns_crypto::x25519::X25519PrivateKey,
+    }
+    impl LocalKeyBackend for SoftwareBackend {
+        fn sign_ed25519(&self, message: &[u8]) -> Option<[u8; 64]> {
+            Some(self.sig.sign(message))
+        }
+        fn ecdh(&self, peer_pub: &[u8; 32]) -> Option<[u8; 32]> {
+            let peer = rns_crypto::x25519::X25519PublicKey::from_bytes(peer_pub);
+            Some(self.x.exchange(&peer))
+        }
+    }
+
+    #[test]
+    fn test_backend_identity_is_wire_identical() {
+        use std::sync::Arc;
+
+        // Build a backend from a software identity's keys, then a separate
+        // backend-driven identity over the same public key.
+        let sw = Identity::new();
+        let prv = sw.get_private_key().unwrap();
+        let mut x_bytes = [0u8; 32];
+        x_bytes.copy_from_slice(&prv[..32]);
+        let mut ed_bytes = [0u8; 32];
+        ed_bytes.copy_from_slice(&prv[32..]);
+        let backend = Arc::new(SoftwareBackend {
+            sig: rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(&ed_bytes),
+            x: rns_crypto::x25519::X25519PrivateKey::from_bytes(&x_bytes),
+        });
+
+        let hw = Identity::from_backend(&sw.get_public_key(), backend).unwrap();
+
+        // Same identity, but no extractable in-memory key.
+        assert_eq!(hw.hash, sw.hash);
+        assert!(!hw.has_private_key());
+        assert!(hw.get_private_key().is_none());
+
+        // sign() delegates and is byte-identical (Ed25519 is deterministic).
+        let msg = b"hardware parity";
+        assert_eq!(hw.sign(msg), sw.sign(msg));
+        assert!(hw.verify(msg, &hw.sign(msg).unwrap()));
+
+        // decrypt() delegates the ECDH to the backend; round-trips, and the
+        // software identity decrypts the same ciphertext (identical key material).
+        let ct = hw.encrypt(b"secret payload", None).unwrap();
+        assert_eq!(hw.decrypt(&ct, None, false).unwrap(), b"secret payload");
+        assert_eq!(sw.decrypt(&ct, None, false).unwrap(), b"secret payload");
     }
 }

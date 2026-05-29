@@ -2537,8 +2537,13 @@ impl LinkManager {
 }
 
 fn clone_identity(identity: &Identity) -> Option<Identity> {
-    let private_key = identity.get_private_key()?;
-    Identity::from_private_key(&*private_key).ok()
+    // Clone preserves a hardware backend (shared Arc) — there is no extractable
+    // private key to copy; software identities clone their key material.
+    if identity.has_private_key() || identity.has_backend() {
+        Some(identity.clone())
+    } else {
+        None
+    }
 }
 
 fn unix_now() -> f64 {

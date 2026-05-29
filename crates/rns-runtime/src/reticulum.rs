@@ -2553,8 +2553,12 @@ async fn start_blackhole_subscriber(handle: ReticulumHandle) {
 }
 
 fn clone_identity(identity: &Identity) -> Option<Identity> {
-    let private_key = identity.get_private_key()?;
-    Identity::from_private_key(&*private_key).ok()
+    // Preserve a hardware backend (shared Arc); software identities copy key material.
+    if identity.has_private_key() || identity.has_backend() {
+        Some(identity.clone())
+    } else {
+        None
+    }
 }
 
 fn send_announce_try(
