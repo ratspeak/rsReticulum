@@ -36,6 +36,9 @@ pub enum RatkeyError {
     #[error("key mismatch: hardware public key does not match .hwid file")]
     KeyMismatch,
 
+    #[error("management key authentication failed")]
+    ManagementAuthFailed,
+
     #[cfg(feature = "hardware")]
     #[error("PC/SC error: {0}")]
     Pcsc(#[from] pcsc::Error),

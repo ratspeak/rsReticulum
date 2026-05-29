@@ -1544,6 +1544,7 @@ dependencies = [
 name = "rns-ratkey"
 version = "0.9.4"
 dependencies = [
+ "aes",
  "hex",
  "pcsc",
  "rns-crypto",

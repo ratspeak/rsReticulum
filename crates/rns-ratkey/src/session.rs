@@ -145,6 +145,39 @@ impl<T: PivTransport> PivSession<T> {
         let metadata = self.read_metadata(slot)?;
         apdu::parse_metadata_public_key(&metadata)
     }
+
+    /// Authenticate the PIV management key (slot 9B) via witness/challenge mutual
+    /// auth — required before on-device key generation. The algorithm is read
+    /// from the card (YubiKey 5.7 default: AES-192). AES management keys only.
+    pub fn authenticate_management_key(&mut self, key: &[u8]) -> Result<(), RatkeyError> {
+        let meta = self.read_metadata(apdu::SLOT_CARD_MANAGEMENT)?;
+        let alg = apdu::parse_metadata_algorithm(&meta)?;
+        let block = crate::mgmt::block_len(alg).ok_or_else(|| {
+            RatkeyError::UnsupportedDevice(format!(
+                "unsupported management-key algorithm 0x{alg:02X} (TDES not implemented)"
+            ))
+        })?;
+
+        // Step 1: get the card's encrypted witness, decrypt it with the key.
+        let resp = self.transport.transmit(&apdu::auth_witness_request(alg))?;
+        let witness = apdu::parse_auth_witness(apdu::check_response(&resp)?)?;
+        let decrypted = crate::mgmt::ecb_decrypt(alg, key, &witness)?;
+
+        // Step 2: prove the witness + send our own challenge. A wrong key is
+        // rejected here with an APDU status (not the mutual check below).
+        let challenge = rns_crypto::random::random_bytes(block);
+        let resp = self
+            .transport
+            .transmit(&apdu::auth_witness_response(alg, &decrypted, &challenge))?;
+        let data = apdu::check_response(&resp).map_err(|_| RatkeyError::ManagementAuthFailed)?;
+        let encrypted = apdu::parse_auth_response(data)?;
+
+        // Step 3: mutual check — the card must have encrypted our challenge.
+        if crate::mgmt::ecb_encrypt(alg, key, &challenge)? != encrypted {
+            return Err(RatkeyError::ManagementAuthFailed);
+        }
+        Ok(())
+    }
 }
 
 /// PC/SC convenience alias; `connect()` lives on this monomorphization.

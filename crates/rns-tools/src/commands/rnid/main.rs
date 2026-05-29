@@ -187,6 +187,9 @@ enum HwCommands {
         nickname: Option<String>,
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// PIV management key (hex). Defaults to the factory key.
+        #[arg(long)]
+        mgmt_key: Option<String>,
     },
     List {
         #[arg(short, long)]

@@ -30,6 +30,13 @@ pub const SLOT_SIGNATURE: u8 = 0x9C;
 pub const SLOT_KEY_MANAGEMENT: u8 = 0x9D;
 pub const SLOT_CARD_AUTH: u8 = 0x9E;
 pub const SLOT_ATTESTATION: u8 = 0xF9;
+pub const SLOT_CARD_MANAGEMENT: u8 = 0x9B;
+
+// Management-key algorithm (key reference 9B). AES-192 is the YubiKey 5.7 default.
+pub const MGMT_ALG_TDES: u8 = 0x03;
+pub const MGMT_ALG_AES128: u8 = 0x08;
+pub const MGMT_ALG_AES192: u8 = 0x0A;
+pub const MGMT_ALG_AES256: u8 = 0x0C;
 
 pub const PIN_POLICY_NEVER: u8 = 0x01;
 pub const PIN_POLICY_ONCE: u8 = 0x02;
@@ -42,6 +49,8 @@ pub const TOUCH_POLICY_CACHED: u8 = 0x03;
 const TAG_DYNAMIC_AUTH: u8 = 0x7C;
 const TAG_AUTH_RESPONSE: u8 = 0x82;
 const TAG_AUTH_CHALLENGE: u8 = 0x81;
+/// Management-key auth witness (same byte as `TAG_GEN_ALGORITHM`, different context).
+const TAG_AUTH_WITNESS: u8 = 0x80;
 const TAG_AUTH_EXPONENTIATION: u8 = 0x85;
 const TAG_GEN_ALGORITHM: u8 = 0x80;
 const TAG_PIN_POLICY: u8 = 0xAA;
@@ -194,6 +203,45 @@ pub fn get_serial() -> Vec<u8> {
 
 pub fn attest_key(slot: u8) -> Vec<u8> {
     build_apdu(INS_ATTEST, slot, 0x00, &[])
+}
+
+// --- Management-key authentication (slot 9B, witness/challenge mutual auth) ---
+
+/// Step 1: request an encrypted witness from the card. `mgmt_alg` is the
+/// management-key algorithm (P1).
+pub fn auth_witness_request(mgmt_alg: u8) -> Vec<u8> {
+    let inner = tlv(TAG_AUTH_WITNESS, &[]);
+    let data = tlv(TAG_DYNAMIC_AUTH, &inner);
+    build_apdu(INS_GENERAL_AUTHENTICATE, mgmt_alg, SLOT_CARD_MANAGEMENT, &data)
+}
+
+/// Step 3: return the decrypted witness plus our own challenge.
+pub fn auth_witness_response(mgmt_alg: u8, decrypted_witness: &[u8], challenge: &[u8]) -> Vec<u8> {
+    let mut inner = tlv(TAG_AUTH_WITNESS, decrypted_witness);
+    inner.extend_from_slice(&tlv(TAG_AUTH_CHALLENGE, challenge));
+    let data = tlv(TAG_DYNAMIC_AUTH, &inner);
+    build_apdu(INS_GENERAL_AUTHENTICATE, mgmt_alg, SLOT_CARD_MANAGEMENT, &data)
+}
+
+/// Extract the witness (tag 0x80) from a witness-request response.
+pub fn parse_auth_witness(data: &[u8]) -> Result<Vec<u8>, RatkeyError> {
+    find_tlv_value(data, TAG_AUTH_WITNESS)
+        .map(<[u8]>::to_vec)
+        .ok_or(RatkeyError::Apdu { sw1: 0x6A, sw2: 0x80 })
+}
+
+/// Extract the card's encrypted challenge (tag 0x82) from a witness-response reply.
+pub fn parse_auth_response(data: &[u8]) -> Result<Vec<u8>, RatkeyError> {
+    find_tlv_value(data, TAG_AUTH_RESPONSE)
+        .map(<[u8]>::to_vec)
+        .ok_or(RatkeyError::Apdu { sw1: 0x6A, sw2: 0x80 })
+}
+
+/// Algorithm byte (tag 0x01) from a GET METADATA response (e.g. slot 9B mgmt key).
+pub fn parse_metadata_algorithm(metadata: &[u8]) -> Result<u8, RatkeyError> {
+    find_tlv_value(metadata, 0x01)
+        .and_then(|v| v.first().copied())
+        .ok_or(RatkeyError::Apdu { sw1: 0x6A, sw2: 0x80 })
 }
 
 pub fn check_response(response: &[u8]) -> Result<&[u8], RatkeyError> {
@@ -657,6 +705,47 @@ mod tests {
         response.extend_from_slice(&[0xCC; 32]);
         let secret = parse_ecdh_response(&response).unwrap();
         assert_eq!(secret, [0xCC; 32]);
+    }
+
+    #[test]
+    fn test_auth_witness_request() {
+        let apdu = auth_witness_request(MGMT_ALG_AES192);
+        assert_eq!(
+            apdu,
+            vec![0x00, 0x87, 0x0A, 0x9B, 0x04, 0x7C, 0x02, 0x80, 0x00]
+        );
+    }
+
+    #[test]
+    fn test_auth_witness_response_carries_witness() {
+        let witness = [0xAA; 16];
+        let challenge = [0xBB; 16];
+        let apdu = auth_witness_response(MGMT_ALG_AES192, &witness, &challenge);
+        assert_eq!(apdu[1], 0x87); // INS GENERAL AUTHENTICATE
+        assert_eq!(apdu[2], 0x0A); // P1 = AES-192
+        assert_eq!(apdu[3], 0x9B); // P2 = mgmt slot
+        assert_eq!(apdu[5], 0x7C); // dynamic auth template
+        assert_eq!(parse_auth_witness(&apdu[5..]).unwrap(), witness.to_vec());
+    }
+
+    #[test]
+    fn test_parse_auth_witness() {
+        let mut resp = vec![0x7C, 0x12, 0x80, 0x10];
+        resp.extend_from_slice(&[0xCC; 16]);
+        assert_eq!(parse_auth_witness(&resp).unwrap(), vec![0xCC; 16]);
+    }
+
+    #[test]
+    fn test_parse_auth_response() {
+        let mut resp = vec![0x7C, 0x12, 0x82, 0x10];
+        resp.extend_from_slice(&[0xDD; 16]);
+        assert_eq!(parse_auth_response(&resp).unwrap(), vec![0xDD; 16]);
+    }
+
+    #[test]
+    fn test_parse_metadata_algorithm() {
+        let meta = vec![0x01, 0x01, MGMT_ALG_AES192];
+        assert_eq!(parse_metadata_algorithm(&meta).unwrap(), MGMT_ALG_AES192);
     }
 
     #[test]

@@ -19,23 +19,24 @@ on-device and attestation-chain verification are not yet implemented.
 
 ## Validated on hardware (YubiKey 5, firmware 5.7.4)
 
-Via `rnid-rs hw verify` / `hw test` against PIN-once + touch-never Ed25519 (9A)
-and X25519 (9D) keys:
+Full provision → verify → test loop with our own code, PIN-once + touch-never
+Ed25519 (9A) / X25519 (9D):
 
+- **Management-key authentication** (witness/challenge, AES-192) — `hw provision`
+  authenticates slot 9B and generates both keys on-device. Successful generate
+  is proof of auth.
 - `parse_metadata_public_key` reads the correct pubkey from GET METADATA
   (confirmed against ykman-exported ground truth — the layout assumption held).
 - Ed25519 signing on slot 9A; signature verifies against the slot pubkey.
 - X25519 ECDH on slot 9D; shared secret symmetric with a software peer.
 - `HardwareIdentity` decrypt end-to-end (on-device ECDH → HKDF → AES token).
+- The pubkey our provision records matches ykman's independent export byte-for-byte.
 
 ## Still required before hardware RatKey is documented as supported
 
-- **Implement PIV management-key authentication.** `hw provision` only does
-  `verify_pin`, but PIV key *generation* (GENERATE ASYMMETRIC) requires admin
-  auth via GENERAL AUTHENTICATE on slot 9B. Hardware validation above used
-  ykman-generated keys; our own provisioning cannot create keys on-device yet.
-  YubiKey 5.7 defaults the management key to AES-192. Required for in-app
-  provisioning in Ratspeak.
+- **TDES management keys** are not supported (only AES-128/192/256). Pre-5.7
+  YubiKeys default to a TDES management key; provisioning those needs a `des`
+  block cipher added to `mgmt.rs`.
 - Cryptographic attestation certificate chain verification against the bundled
   Yubico roots (`attestation.rs` is metadata/OID extraction only; `chain_verified`
   is always false).

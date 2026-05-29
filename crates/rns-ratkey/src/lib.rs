@@ -13,6 +13,7 @@ pub mod detect;
 pub mod error;
 pub mod hardware;
 pub mod hwid;
+pub mod mgmt;
 pub mod mock;
 pub mod pin;
 pub mod provision;

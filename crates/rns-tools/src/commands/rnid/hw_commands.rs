@@ -8,8 +8,9 @@ pub fn run(cmd: HwCommands) {
             pin,
             nickname,
             output,
+            mgmt_key,
         } => {
-            cmd_provision(pin, nickname, output);
+            cmd_provision(pin, nickname, output, mgmt_key);
         }
         HwCommands::List { dir } => cmd_list(dir),
         HwCommands::Info { hwid } => cmd_info(hwid),
@@ -66,7 +67,15 @@ fn cmd_detect() {
     }
 }
 
-fn cmd_provision(pin: Option<String>, nickname: Option<String>, output: Option<PathBuf>) {
+/// Factory-default PIV management key (24 bytes; AES-192 on YubiKey 5.7+).
+const DEFAULT_MGMT_KEY: &str = "010203040506070801020304050607080102030405060708";
+
+fn cmd_provision(
+    pin: Option<String>,
+    nickname: Option<String>,
+    output: Option<PathBuf>,
+    mgmt_key: Option<String>,
+) {
     let pin = match pin {
         Some(p) => p,
         None => {
@@ -92,6 +101,21 @@ fn cmd_provision(pin: Option<String>, nickname: Option<String>, output: Option<P
 
     if let Err(e) = session.verify_pin(&pin) {
         eprintln!("PIN verification failed: {e}");
+        std::process::exit(1);
+    }
+
+    // Key generation is an administrative op gated by the management key, not the PIN.
+    let mgmt_key_hex = mgmt_key.unwrap_or_else(|| DEFAULT_MGMT_KEY.to_string());
+    let mgmt_key_bytes = match hex::decode(mgmt_key_hex.trim()) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Error: invalid --mgmt-key hex: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = session.authenticate_management_key(&mgmt_key_bytes) {
+        eprintln!("Management key authentication failed: {e}");
+        eprintln!("Pass --mgmt-key <hex> if the device uses a non-default management key.");
         std::process::exit(1);
     }
 

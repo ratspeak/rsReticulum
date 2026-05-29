@@ -580,4 +580,79 @@ mod tests {
         let mut hw = HardwareIdentity::from_hwid(config, Box::new(session)).unwrap();
         assert_eq!(hw.sign(b"announce").unwrap(), sig);
     }
+
+    // --- Management-key auth over a card-simulating transport ----------------
+    // Plays the card side of witness/challenge so the protocol direction (host
+    // must DECRYPT the witness, not encrypt it) is exercised without hardware.
+    struct MgmtFakeTransport {
+        alg: u8,
+        key: Vec<u8>,
+        witness: [u8; 16],
+    }
+
+    fn wrap_7c(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x7C, (payload.len() + 2) as u8, tag, payload.len() as u8];
+        v.extend_from_slice(payload);
+        v.extend_from_slice(&[0x90, 0x00]); // SW OK
+        v
+    }
+
+    impl PivTransport for MgmtFakeTransport {
+        fn transmit(&mut self, apdu: &[u8]) -> Result<Vec<u8>, RatkeyError> {
+            let (ins, p2) = (apdu[1], apdu[3]);
+            match (ins, p2) {
+                (0xF7, 0x9B) => Ok(vec![0x01, 0x01, self.alg, 0x90, 0x00]), // metadata: alg
+                (0x87, 0x9B) => {
+                    let data = &apdu[5..];
+                    let witness_field = crate::apdu::parse_auth_witness(data).unwrap();
+                    if witness_field.is_empty() {
+                        // witness request → return the witness encrypted with the key
+                        let enc =
+                            crate::mgmt::ecb_encrypt(self.alg, &self.key, &self.witness).unwrap();
+                        Ok(wrap_7c(0x80, &enc))
+                    } else if witness_field.as_slice() == self.witness {
+                        // correct decrypted witness → encrypt the host's challenge
+                        let challenge = &data[data.len() - 16..];
+                        let enc = crate::mgmt::ecb_encrypt(self.alg, &self.key, challenge).unwrap();
+                        Ok(wrap_7c(0x82, &enc))
+                    } else {
+                        // wrong witness → card rejects (security status not satisfied)
+                        Ok(vec![0x69, 0x82])
+                    }
+                }
+                _ => panic!("unexpected mgmt apdu ins=0x{ins:02X} p2=0x{p2:02X}"),
+            }
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_authenticate_management_key_success() {
+        let key = vec![0x5Au8; 24]; // AES-192
+        let fake = MgmtFakeTransport {
+            alg: crate::apdu::MGMT_ALG_AES192,
+            key: key.clone(),
+            witness: [0x77; 16],
+        };
+        let mut session = PivSession::new(fake, fake_meta());
+        session.authenticate_management_key(&key).unwrap();
+    }
+
+    #[test]
+    fn test_authenticate_management_key_wrong_key() {
+        // Host's wrong key → decrypted witness mismatches → card rejects → mapped error.
+        let fake = MgmtFakeTransport {
+            alg: crate::apdu::MGMT_ALG_AES192,
+            key: vec![0x5Au8; 24],
+            witness: [0x77; 16],
+        };
+        let mut session = PivSession::new(fake, fake_meta());
+        let wrong = vec![0x00u8; 24];
+        assert!(matches!(
+            session.authenticate_management_key(&wrong),
+            Err(RatkeyError::ManagementAuthFailed)
+        ));
+    }
 }
