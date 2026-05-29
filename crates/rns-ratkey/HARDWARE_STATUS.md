@@ -1,8 +1,47 @@
 # RatKey Hardware Status
 
-RatKey hardware identity support is experimental. The runtime path (sign, ECDH,
-decrypt, metadata pubkey read) is now validated on a real device; provisioning
-on-device and attestation-chain verification are not yet implemented.
+RatKey hardware identity support is **desktop only** and experimental. The full
+desktop path is validated on a real YubiKey (5.7.4): provision (recoverable /
+hardware-only / import / restore), on-card sign + ECDH, in-app load into LXMF/RNS,
+PIN-prompt unlock, auto-lock timeout, and lock-on-quit. Attestation-chain
+hardware-validation and pre-5.7 TDES management keys remain open.
+
+## Release scope: desktop only
+
+Mobile is intentionally excluded from release. The `hardware` feature is off on
+iOS/Android (pcsc is desktop-only), the `hw_*` commands are
+`#[cfg(not(any(target_os = "android", target_os = "ios")))]`, and the frontend
+hides every hardware entry point on mobile (`isMobile()` gate in setup.js +
+identity.js).
+
+## Mobile (deferred — needs a different model)
+
+Desktop keeps the token plugged in and does every sign/ECDH on-card. That can't
+work over transient NFC (iOS CoreNFC is modal ~60s; Android IsoDep only while the
+tag is in-field; neither runs in the background). A messaging app used all day
+needs a **wrapped software session**: tap the key to unlock (on-card ECDH unwraps
+a software identity stored encrypted at rest, ideally in the Secure Enclave /
+StrongBox), operate in software for a configurable window (mirrors the desktop
+auto-lock setting), re-tap to refresh. This is a different security model than
+"key never leaves the token" and should be an explicit mode alongside
+hardware-only. The `PivTransport` seam is ready (`PivSession::new` takes any
+transport); a mobile loader belongs in `ratspeak-runtime`. Android NFC (IsoDep)
+is the tractable first transport.
+
+### Software seed-restore (hardware-independent; cross-platform; not yet built)
+
+Separate from the above and far simpler: a *recoverable* identity's 24-word
+phrase can be restored as a plain **software** identity on any platform (incl.
+mobile) — pure BIP-39 derivation (`seed::derive_identity`), no pcsc/NFC/USB. This
+is the practical mobile recovery path ("I backed my YubiKey identity up on
+desktop; restore it on my phone") **and** closes a gap on desktop today: the
+existing "Restore from seed" only writes keys onto a *new YubiKey* (hardware
+restore) — there is no restore-to-software path, so a lost key with no spare = no
+recovery. Prerequisite: decouple the derivation from the `hardware`/pcsc feature
+(`bip39`/`hkdf` are already non-optional in rns-ratkey; add a `seed` feature to
+ratspeak-runtime that pulls `dep:rns-ratkey` *without* `rns-ratkey/hardware`, and
+enable it on all platforms). Then a `restore_software_identity(phrase)` command
+derives → builds a software `Identity` → saves it like import/create.
 
 ## Architecture (done)
 
