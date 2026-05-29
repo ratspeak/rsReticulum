@@ -19,6 +19,7 @@ pub mod mgmt;
 pub mod mock;
 pub mod pin;
 pub mod provision;
+pub mod seed;
 pub mod session;
 pub mod transport;
 
