@@ -169,7 +169,7 @@ async fn run_rnsh_listener_inner(
         event_rx,
         &cfg.identity,
         RNSH_APP_NAME,
-        signing_key,
+        Some(signing_key),
     );
 
     let announce_tx = transport_tx.clone();

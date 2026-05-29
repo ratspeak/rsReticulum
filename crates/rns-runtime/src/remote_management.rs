@@ -45,7 +45,7 @@ pub async fn start_remote_management(
         event_rx,
         identity,
         app_name,
-        signing_key,
+        Some(signing_key),
     );
 
     let status_hash: [u8; 16] = truncated_hash(STATUS_PATH.as_bytes());

@@ -235,7 +235,7 @@ pub async fn spawn_rncp_listener(
         dest_rx,
         &cfg.identity,
         &cfg.app_name,
-        signing_key,
+        Some(signing_key),
     );
 
     let (completion_tx, mut completion_rx) = mpsc::channel::<ResourceCompletion>(64);

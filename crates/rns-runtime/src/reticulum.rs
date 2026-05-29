@@ -2427,7 +2427,7 @@ async fn start_blackhole_publisher(handle: &ReticulumHandle) -> Result<[u8; 16],
         event_rx,
         &identity,
         app_name,
-        signing_key,
+        Some(signing_key),
     );
 
     let list_hash = rns_crypto::sha::truncated_hash(b"/list");

@@ -280,7 +280,9 @@ impl LinkManager {
         event_rx: mpsc::Receiver<DestinationEvent>,
         identity: &Identity,
         app_name: &str,
-        identity_key: Ed25519PrivateKey,
+        // `None` for hardware-backed identities (no extractable signing key);
+        // link-mode packet proofs are skipped until routed through the backend.
+        identity_key: Option<Ed25519PrivateKey>,
     ) -> Self {
         let dest = match Destination::new(Some(identity), Direction::In, DestType::Single, app_name)
         {
@@ -298,7 +300,7 @@ impl LinkManager {
             transport_tx,
             event_rx,
             active_links: HashMap::new(),
-            identity_key: Some(identity_key),
+            identity_key,
             destination_hash,
             destination: dest,
             identity: manager_identity,
@@ -1719,6 +1721,8 @@ impl LinkManager {
                         );
 
                         // Link proofs are unencrypted (Packet.py:198-200).
+                        // TODO(ratkey): hardware identities carry no `identity_key`; route
+                        // link-mode packet proofs through `self.identity` (backend sign).
                         if let Some(ref signing_key) = self.identity_key {
                             let pkt_hash =
                                 rns_wire::hash::packet_hash(raw, header.flags.header_type);
@@ -2809,7 +2813,7 @@ mod tests {
         let identity = Identity::new();
         let signing_key = identity.get_signing_key().unwrap();
 
-        let lm = LinkManager::with_destination(tx, event_rx, &identity, "test.app", signing_key);
+        let lm = LinkManager::with_destination(tx, event_rx, &identity, "test.app", Some(signing_key));
 
         assert!(lm.destination.is_some());
         assert_eq!(lm.active_link_count(), 0);
@@ -2823,7 +2827,7 @@ mod tests {
         let identity = Identity::new();
         let signing_key = identity.get_signing_key().unwrap();
         let mut lm =
-            LinkManager::with_destination(tx, event_rx, &identity, "test.app", signing_key);
+            LinkManager::with_destination(tx, event_rx, &identity, "test.app", Some(signing_key));
 
         let tag = vec![0xA5; 16];
         lm.handle_event(DestinationEvent::AnnounceRequested(AnnounceRequest {
@@ -3011,7 +3015,7 @@ mod tests {
         let signing_key = identity.get_signing_key().unwrap();
 
         let mut lm =
-            LinkManager::with_destination(tx, event_rx, &identity, "test.gate", signing_key);
+            LinkManager::with_destination(tx, event_rx, &identity, "test.gate", Some(signing_key));
 
         if let Some(ref mut dest) = lm.destination {
             dest.set_accepts_links(false);
