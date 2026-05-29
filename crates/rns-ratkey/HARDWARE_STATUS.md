@@ -28,20 +28,32 @@ hardware-only. The `PivTransport` seam is ready (`PivSession::new` takes any
 transport); a mobile loader belongs in `ratspeak-runtime`. Android NFC (IsoDep)
 is the tractable first transport.
 
-### Software seed-restore (hardware-independent; cross-platform; not yet built)
+### Recoverable software identities — DONE (2026-05-29, cross-platform)
 
-Separate from the above and far simpler: a *recoverable* identity's 24-word
-phrase can be restored as a plain **software** identity on any platform (incl.
-mobile) — pure BIP-39 derivation (`seed::derive_identity`), no pcsc/NFC/USB. This
-is the practical mobile recovery path ("I backed my YubiKey identity up on
-desktop; restore it on my phone") **and** closes a gap on desktop today: the
-existing "Restore from seed" only writes keys onto a *new YubiKey* (hardware
-restore) — there is no restore-to-software path, so a lost key with no spare = no
-recovery. Prerequisite: decouple the derivation from the `hardware`/pcsc feature
-(`bip39`/`hkdf` are already non-optional in rns-ratkey; add a `seed` feature to
-ratspeak-runtime that pulls `dep:rns-ratkey` *without* `rns-ratkey/hardware`, and
-enable it on all platforms). Then a `restore_software_identity(phrase)` command
-derives → builds a software `Identity` → saves it like import/create.
+The recoverable model generalized "hardware identity" → "recoverable identity,"
+with the YubiKey as one optional backing. All on every platform (the derivation
++ vault are pure-Rust, gated behind a default `seed` feature in ratspeak-runtime
+that pulls `rns-ratkey` without pcsc):
+
+- **Software seed-restore** (`ratspeak_runtime::derive_identity_key_from_phrase`,
+  `restore_seed_identity` command): a 24-word phrase restores a software identity
+  on any platform — the practical mobile recovery path. Folded into the app's
+  **Import** flow (key *or* phrase), not a separate button.
+- **Mnemonic-derived-by-default** (`generate_recoverable_key`): new software
+  identities are derived from a fresh BIP-39 mnemonic shown once for backup
+  (wallet-style, never stored). Both `api_create_identity` (settings) and
+  `api_setup_complete` (first-setup) produce them; legacy random identities keep
+  raw-key export. `LxmfManager::create_identity` (random) stays for internal/tests.
+- **Passcode at-rest encryption** (`vault.rs`): software identities can be sealed
+  with a passcode — Argon2id(passcode,salt) → HKDF(info=params‖salt) binds the KDF
+  params → 64-byte KEK → `rns_crypto::token` (AES-256-CBC + HMAC). Stored as
+  `identity.enc`; param-tamper/wrong-passcode → auth failure (unit-tested). The
+  launch unlock + auto-lock + lock-on-quit machinery is shared with the hardware
+  PIN path (one "protected identity" state, a `kind` discriminator selects PIN vs
+  passcode; the `hw_unlock`/`hardware_locked`/`hw_locked` wire names are retained).
+
+Caveat documented to users: restore recovers the *identity*, not past message
+history (forward secrecy).
 
 ## Architecture (done)
 
