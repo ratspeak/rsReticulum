@@ -200,6 +200,8 @@ enum HwCommands {
     },
     Test {
         hwid: PathBuf,
+        #[arg(long)]
+        pin: Option<String>,
     },
 }
 

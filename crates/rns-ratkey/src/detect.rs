@@ -1,9 +1,4 @@
-//! PC/SC reader enumeration; filters to YubiKey 5 / Nitrokey 3 by reader name.
-
-use pcsc::{Card, Context, Protocols, Scope, ShareMode};
-use tracing::{debug, info, warn};
-
-use crate::error::RatkeyError;
+//! Device classification (always available) + PC/SC reader enumeration (behind `hardware`).
 
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -47,6 +42,14 @@ pub fn detect_device_type(reader_name: &str) -> DeviceType {
     }
 }
 
+#[cfg(feature = "hardware")]
+use pcsc::{Card, Context, Protocols, Scope, ShareMode};
+#[cfg(feature = "hardware")]
+use tracing::{debug, info, warn};
+#[cfg(feature = "hardware")]
+use crate::error::RatkeyError;
+
+#[cfg(feature = "hardware")]
 pub fn list_readers() -> Result<Vec<String>, RatkeyError> {
     let ctx = Context::establish(Scope::User)?;
 
@@ -64,6 +67,7 @@ pub fn list_readers() -> Result<Vec<String>, RatkeyError> {
     Ok(names)
 }
 
+#[cfg(feature = "hardware")]
 pub fn detect_devices() -> Result<Vec<DeviceInfo>, RatkeyError> {
     let readers = list_readers()?;
     let mut devices = Vec::new();
@@ -101,6 +105,7 @@ pub fn detect_devices() -> Result<Vec<DeviceInfo>, RatkeyError> {
     Ok(devices)
 }
 
+#[cfg(feature = "hardware")]
 fn try_connect_piv(reader_name: &str) -> Result<DeviceInfo, RatkeyError> {
     use crate::apdu;
 
@@ -150,6 +155,7 @@ fn try_connect_piv(reader_name: &str) -> Result<DeviceInfo, RatkeyError> {
 
 /// Best-effort serial/firmware read. Yubico proprietary INS — Nitrokey 3 returns (None, None).
 /// APDU errors are tolerated; never fails a connection.
+#[cfg(feature = "hardware")]
 pub(crate) fn read_identity(card: &Card, device_type: DeviceType) -> (Option<u32>, Option<String>) {
     use crate::apdu;
 

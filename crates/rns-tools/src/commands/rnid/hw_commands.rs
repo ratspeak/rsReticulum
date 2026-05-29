@@ -14,7 +14,7 @@ pub fn run(cmd: HwCommands) {
         HwCommands::List { dir } => cmd_list(dir),
         HwCommands::Info { hwid } => cmd_info(hwid),
         HwCommands::Verify { hwid } => cmd_verify(hwid),
-        HwCommands::Test { hwid } => cmd_test(hwid),
+        HwCommands::Test { hwid, pin } => cmd_test(hwid, pin),
     }
 }
 
@@ -81,7 +81,7 @@ fn cmd_provision(pin: Option<String>, nickname: Option<String>, output: Option<P
         std::process::exit(1);
     }
 
-    let mut session = match rns_ratkey::session::PivSession::connect() {
+    let mut session = match rns_ratkey::PcscPivSession::connect() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error connecting to hardware token: {e}");
@@ -95,12 +95,14 @@ fn cmd_provision(pin: Option<String>, nickname: Option<String>, output: Option<P
         std::process::exit(1);
     }
 
-    // Slot 9A (PIV authentication), touch-always: prevents silent sign while PIN cache valid.
+    // Slot 9A (PIV authentication). PIN-once + touch-never: the PIN is the
+    // session unlock; the app re-locks on timeout / quit. (Policies are burned
+    // in permanently for a hardware-only identity.)
     println!("Generating Ed25519 key in slot 9A...");
     let ed_pub = match session.generate_ed25519(
         rns_ratkey::apdu::SLOT_AUTHENTICATION,
         Some(rns_ratkey::apdu::PIN_POLICY_ONCE),
-        Some(rns_ratkey::apdu::TOUCH_POLICY_ALWAYS),
+        Some(rns_ratkey::apdu::TOUCH_POLICY_NEVER),
     ) {
         Ok(pub_key) => pub_key,
         Err(e) => {
@@ -109,12 +111,13 @@ fn cmd_provision(pin: Option<String>, nickname: Option<String>, output: Option<P
         }
     };
 
-    // Slot 9D (PIV key management), touch-cached: one tap unlocks ECDH for a window (else every packet prompts).
+    // Slot 9D (PIV key management). PIN-once + touch-never: ECDH runs on every
+    // inbound packet, so per-op touch is impractical; the PIN gates the session.
     println!("Generating X25519 key in slot 9D...");
     let x_pub = match session.generate_x25519(
         rns_ratkey::apdu::SLOT_KEY_MANAGEMENT,
         Some(rns_ratkey::apdu::PIN_POLICY_ONCE),
-        Some(rns_ratkey::apdu::TOUCH_POLICY_CACHED),
+        Some(rns_ratkey::apdu::TOUCH_POLICY_NEVER),
     ) {
         Ok(pub_key) => pub_key,
         Err(e) => {
@@ -164,8 +167,8 @@ fn cmd_provision(pin: Option<String>, nickname: Option<String>, output: Option<P
             },
             policy: rns_ratkey::hwid::HwidPolicy {
                 pin_cache_timeout: 300,
-                touch_signing: "always".to_string(),
-                touch_encryption: "cached".to_string(),
+                touch_signing: "never".to_string(),
+                touch_encryption: "never".to_string(),
             },
             attestation: Default::default(),
             app: Default::default(),
@@ -292,7 +295,22 @@ fn cmd_verify(hwid_path: PathBuf) {
 
     println!("Verifying hardware identity {}...", config.identity.hash);
 
-    let session = match rns_ratkey::session::PivSession::connect() {
+    let expected_ed = match config.ed25519_pub_bytes() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Error: .hwid has invalid Ed25519 key: {e}");
+            std::process::exit(1);
+        }
+    };
+    let expected_x = match config.x25519_pub_bytes() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Error: .hwid has invalid X25519 key: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut session = match rns_ratkey::PcscPivSession::connect() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error: cannot connect to hardware token: {e}");
@@ -300,20 +318,42 @@ fn cmd_verify(hwid_path: PathBuf) {
         }
     };
 
-    let metadata = match session.read_metadata(rns_ratkey::apdu::SLOT_AUTHENTICATION) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Error reading slot 9A: {e}");
-            std::process::exit(1);
+    // Reads the slot public keys from GET METADATA and compares against the .hwid.
+    // This is the on-device confirmation of the metadata parser before it gates
+    // HardwareIdentity construction.
+    let mut ok = true;
+    match session.read_public_key(rns_ratkey::apdu::SLOT_AUTHENTICATION) {
+        Ok(dev_ed) if dev_ed == expected_ed => println!("  Slot 9A (Ed25519): MATCH"),
+        Ok(_) => {
+            println!("  Slot 9A (Ed25519): MISMATCH");
+            ok = false;
         }
-    };
+        Err(e) => {
+            println!("  Slot 9A (Ed25519): error reading key: {e}");
+            ok = false;
+        }
+    }
+    match session.read_public_key(rns_ratkey::apdu::SLOT_KEY_MANAGEMENT) {
+        Ok(dev_x) if dev_x == expected_x => println!("  Slot 9D (X25519): MATCH"),
+        Ok(_) => {
+            println!("  Slot 9D (X25519): MISMATCH");
+            ok = false;
+        }
+        Err(e) => {
+            println!("  Slot 9D (X25519): error reading key: {e}");
+            ok = false;
+        }
+    }
 
-    println!("  Slot 9A metadata: {} bytes", metadata.len());
-    println!("  Verification requires comparing public keys from device with .hwid file.");
-    println!("  (Full verification implemented when hardware is available for testing)");
+    if ok {
+        println!("\nVerified: connected token matches this .hwid.");
+    } else {
+        println!("\nVerification FAILED: token does not match this .hwid.");
+        std::process::exit(1);
+    }
 }
 
-fn cmd_test(hwid_path: PathBuf) {
+fn cmd_test(hwid_path: PathBuf, pin: Option<String>) {
     let config = match rns_ratkey::hwid::HwidConfig::from_file(&hwid_path) {
         Ok(c) => c,
         Err(e) => {
@@ -322,15 +362,30 @@ fn cmd_test(hwid_path: PathBuf) {
         }
     };
 
+    let pin = match pin {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: --pin is required (PIN-once keys need one verification per session)");
+            eprintln!("Usage: rnid-rs hw test <hwid> --pin <PIN>");
+            std::process::exit(1);
+        }
+    };
+
     println!("Testing hardware identity {}...\n", config.identity.hash);
 
-    let session = match rns_ratkey::session::PivSession::connect() {
+    let mut session = match rns_ratkey::PcscPivSession::connect() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error: cannot connect to hardware token: {e}");
             std::process::exit(1);
         }
     };
+
+    // PIN_POLICY_ONCE: a fresh session must verify the PIN before any private-key op.
+    if let Err(e) = session.verify_pin(&pin) {
+        eprintln!("PIN verification failed: {e}");
+        std::process::exit(1);
+    }
 
     println!("1. Testing Ed25519 signing in slot 9A...");
     let test_msg = b"RATKEY hardware identity test message";
@@ -366,6 +421,34 @@ fn cmd_test(hwid_path: PathBuf) {
                 println!("   FAIL: ECDH shared secrets do not match");
                 std::process::exit(1);
             }
+        }
+        Err(e) => {
+            println!("   FAIL: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    println!("3. Testing HardwareIdentity decrypt (on-device ECDH + HKDF + AES) end-to-end...");
+    let mut hw = match rns_ratkey::HardwareIdentity::from_hwid(config.clone(), Box::new(session)) {
+        Ok(h) => h,
+        Err(e) => {
+            println!("   FAIL: cannot build HardwareIdentity: {e}");
+            std::process::exit(1);
+        }
+    };
+    let plaintext = b"RATKEY end-to-end decrypt test";
+    let ciphertext = match hw.as_identity().encrypt(plaintext, None) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("   FAIL: encrypt to hardware identity failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    match hw.decrypt(&ciphertext, None, false) {
+        Ok(pt) if pt == plaintext => println!("   PASS: round-trip decrypt via on-device ECDH"),
+        Ok(_) => {
+            println!("   FAIL: decrypted plaintext mismatch");
+            std::process::exit(1);
         }
         Err(e) => {
             println!("   FAIL: {e}");

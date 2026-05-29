@@ -218,7 +218,7 @@ mod tests {
         let result = provision_mock(&mut session, &config).unwrap();
 
         let path = result.hwid_path.as_ref().unwrap();
-        let mut hw = crate::HardwareIdentity::from_file_mock(path, session).unwrap();
+        let mut hw = crate::HardwareIdentity::from_file(path, Box::new(session)).unwrap();
 
         let message = b"provisioned and loaded";
         let sig = hw.sign(message).unwrap();

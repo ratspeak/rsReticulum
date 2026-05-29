@@ -145,6 +145,12 @@ impl MockPivSession {
         self.pin_verified = false;
     }
 
+    /// Re-lock: clears PIN verification so the next op needs `verify_pin` again.
+    /// Mirrors `PivSession::lock` (which re-selects the applet on real hardware).
+    pub fn lock(&mut self) {
+        self.pin_verified = false;
+    }
+
     pub fn simulate_touch(&mut self) {
         self.touch_required = false;
     }

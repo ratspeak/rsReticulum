@@ -48,6 +48,8 @@ const TAG_PIN_POLICY: u8 = 0xAA;
 const TAG_TOUCH_POLICY: u8 = 0xAB;
 const TAG_OBJECT_ID: u8 = 0x5C;
 const TAG_ECC_POINT: u8 = 0x86;
+/// GET METADATA public-key field (Yubico).
+const TAG_METADATA_PUBLIC_KEY: u8 = 0x04;
 
 /// Cert object ID for slot 9A (Authentication).
 pub const OBJ_ID_9A: &[u8] = &[0x5F, 0xC1, 0x05];
@@ -290,6 +292,31 @@ pub fn parse_ecdh_response(data: &[u8]) -> Result<[u8; 32], RatkeyError> {
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(secret_bytes);
+    Ok(out)
+}
+
+/// GET METADATA public key: field tag 0x04, then EC point tag 0x86 → 32 bytes.
+/// `find_tlv_value` recurses into a `7F49` wrapper if present, so both the
+/// bare (`86 20 ..`) and wrapped (`7F49 .. 86 20 ..`) encodings resolve.
+/// Yubico 5.3+ extension; Nitrokey 3 does not implement GET METADATA.
+pub fn parse_metadata_public_key(metadata: &[u8]) -> Result<[u8; 32], RatkeyError> {
+    let pubkey_field =
+        find_tlv_value(metadata, TAG_METADATA_PUBLIC_KEY).ok_or(RatkeyError::Apdu {
+            sw1: 0x6A,
+            sw2: 0x80,
+        })?;
+    let point = find_tlv_value(pubkey_field, TAG_ECC_POINT).ok_or(RatkeyError::Apdu {
+        sw1: 0x6A,
+        sw2: 0x80,
+    })?;
+    if point.len() != 32 {
+        return Err(RatkeyError::InvalidHwid(format!(
+            "expected 32-byte public key in metadata, got {} bytes",
+            point.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(point);
     Ok(out)
 }
 
@@ -630,6 +657,47 @@ mod tests {
         response.extend_from_slice(&[0xCC; 32]);
         let secret = parse_ecdh_response(&response).unwrap();
         assert_eq!(secret, [0xCC; 32]);
+    }
+
+    #[test]
+    fn test_parse_metadata_public_key_bare() {
+        // Slot metadata: 01(algo) 02(policy) 03(origin) 04(pubkey = 86 20 <32>).
+        // Layout pending confirmation against a real YubiKey GET METADATA response.
+        let mut meta = vec![
+            0x01,
+            0x01,
+            ALG_ED25519,
+            0x02,
+            0x02,
+            PIN_POLICY_ONCE,
+            TOUCH_POLICY_ALWAYS,
+            0x03,
+            0x01,
+            0x01,
+            0x04,
+            0x22,
+            0x86,
+            0x20,
+        ];
+        meta.extend_from_slice(&[0xAB; 32]);
+        assert_eq!(parse_metadata_public_key(&meta).unwrap(), [0xAB; 32]);
+    }
+
+    #[test]
+    fn test_parse_metadata_public_key_7f49_wrapped() {
+        // Same, but the point is wrapped in a 7F49 template (04 25 7F49 22 86 20 <32>).
+        let mut meta = vec![
+            0x01, 0x01, ALG_X25519, 0x04, 0x25, 0x7F, 0x49, 0x22, 0x86, 0x20,
+        ];
+        meta.extend_from_slice(&[0xCD; 32]);
+        assert_eq!(parse_metadata_public_key(&meta).unwrap(), [0xCD; 32]);
+    }
+
+    #[test]
+    fn test_parse_metadata_public_key_missing_field() {
+        // No 0x04 field present.
+        let meta = vec![0x01, 0x01, ALG_ED25519, 0x03, 0x01, 0x01];
+        assert!(parse_metadata_public_key(&meta).is_err());
     }
 
     #[test]
