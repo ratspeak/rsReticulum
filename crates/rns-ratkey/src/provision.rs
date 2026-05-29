@@ -176,7 +176,50 @@ pub fn import_recoverable_identity<T: PivTransport>(
         Some(touch_byte(config.touch_encryption)),
     )?;
 
-    let identity_hash = compute_identity_hash(&derived.ed25519_pub, &derived.x25519_pub);
+    finalize_provision(session, config, derived.ed25519_pub, derived.x25519_pub)
+}
+
+/// On-device provisioning (no seed backup): authenticate, generate both keys on
+/// the token, and write the `.hwid`. Requires the management key.
+pub fn provision_hardware_only<T: PivTransport>(
+    session: &mut PivSession<T>,
+    mgmt_key: &[u8],
+    config: &ProvisionConfig,
+) -> Result<ProvisionResult, RatkeyError> {
+    session.authenticate_management_key(mgmt_key)?;
+    let ed_pub = session.generate_ed25519(
+        SLOT_9A,
+        Some(apdu::PIN_POLICY_ONCE),
+        Some(touch_byte(config.touch_signing)),
+    )?;
+    let x_pub = session.generate_x25519(
+        SLOT_9D,
+        Some(apdu::PIN_POLICY_ONCE),
+        Some(touch_byte(config.touch_encryption)),
+    )?;
+    finalize_provision(session, config, ed_pub, x_pub)
+}
+
+/// Register an already-provisioned token: read its slot public keys and write a
+/// `.hwid` for it (import-existing). No key material is created; no mgmt key needed.
+pub fn read_existing<T: PivTransport>(
+    session: &mut PivSession<T>,
+    config: &ProvisionConfig,
+) -> Result<ProvisionResult, RatkeyError> {
+    let ed_pub = session.read_public_key(SLOT_9A)?;
+    let x_pub = session.read_public_key(SLOT_9D)?;
+    finalize_provision(session, config, ed_pub, x_pub)
+}
+
+/// Build the `.hwid` from the provisioned public keys + device metadata, writing
+/// it under `config.identities_dir` if set. Shared by all real-hardware flows.
+fn finalize_provision<T: PivTransport>(
+    session: &PivSession<T>,
+    config: &ProvisionConfig,
+    ed25519_pub: [u8; 32],
+    x25519_pub: [u8; 32],
+) -> Result<ProvisionResult, RatkeyError> {
+    let identity_hash = compute_identity_hash(&ed25519_pub, &x25519_pub);
     let identity_hash_hex = hex::encode(identity_hash);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -195,8 +238,8 @@ pub fn import_recoverable_identity<T: PivTransport>(
             firmware: session.firmware().unwrap_or("unknown").to_string(),
         },
         keys: HwidKeys {
-            ed25519_pub: hex::encode(derived.ed25519_pub),
-            x25519_pub: hex::encode(derived.x25519_pub),
+            ed25519_pub: hex::encode(ed25519_pub),
+            x25519_pub: hex::encode(x25519_pub),
         },
         slots: HwidSlots {
             signing: "9A".to_string(),
@@ -224,8 +267,8 @@ pub fn import_recoverable_identity<T: PivTransport>(
 
     Ok(ProvisionResult {
         config: hwid,
-        ed25519_pub: derived.ed25519_pub,
-        x25519_pub: derived.x25519_pub,
+        ed25519_pub,
+        x25519_pub,
         identity_hash,
         identity_hash_hex,
         hwid_path,
