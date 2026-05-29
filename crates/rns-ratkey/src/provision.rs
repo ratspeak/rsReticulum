@@ -5,9 +5,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rns_crypto::sha::truncated_hash;
 
+use crate::apdu;
 use crate::error::RatkeyError;
 use crate::hwid::*;
 use crate::mock::{MockPivSession, SLOT_9A, SLOT_9D, TouchPolicy};
+use crate::seed;
+use crate::session::PivSession;
+use crate::transport::PivTransport;
 
 #[derive(Debug, Clone)]
 pub struct ProvisionResult {
@@ -130,6 +134,124 @@ pub fn compute_identity_hash(ed25519_pub: &[u8; 32], x25519_pub: &[u8; 32]) -> [
     pub_key_bytes[..32].copy_from_slice(x25519_pub);
     pub_key_bytes[32..].copy_from_slice(ed25519_pub);
     truncated_hash(&pub_key_bytes)
+}
+
+fn touch_byte(tp: TouchPolicy) -> u8 {
+    match tp {
+        TouchPolicy::Never => apdu::TOUCH_POLICY_NEVER,
+        TouchPolicy::Always => apdu::TOUCH_POLICY_ALWAYS,
+        TouchPolicy::Cached => apdu::TOUCH_POLICY_CACHED,
+    }
+}
+
+fn touch_str(tp: TouchPolicy) -> &'static str {
+    match tp {
+        TouchPolicy::Never => "never",
+        TouchPolicy::Always => "always",
+        TouchPolicy::Cached => "cached",
+    }
+}
+
+/// Recoverable provision / restore: derive the identity from `mnemonic`, import
+/// both keys into the token (PIN-once + configured touch policy), and write the
+/// `.hwid`. Requires the management key. The session must already be connected.
+pub fn import_recoverable_identity<T: PivTransport>(
+    session: &mut PivSession<T>,
+    mgmt_key: &[u8],
+    config: &ProvisionConfig,
+    mnemonic: &str,
+) -> Result<ProvisionResult, RatkeyError> {
+    let derived = seed::derive_identity(mnemonic)?;
+    session.authenticate_management_key(mgmt_key)?;
+    session.import_ed25519(
+        SLOT_9A,
+        &derived.ed25519_seed,
+        Some(apdu::PIN_POLICY_ONCE),
+        Some(touch_byte(config.touch_signing)),
+    )?;
+    session.import_x25519(
+        SLOT_9D,
+        &derived.x25519_secret,
+        Some(apdu::PIN_POLICY_ONCE),
+        Some(touch_byte(config.touch_encryption)),
+    )?;
+
+    let identity_hash = compute_identity_hash(&derived.ed25519_pub, &derived.x25519_pub);
+    let identity_hash_hex = hex::encode(identity_hash);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let hwid = HwidConfig {
+        identity: HwidIdentity {
+            hash: identity_hash_hex.clone(),
+            nickname: config.nickname.clone(),
+            created_at: now,
+        },
+        device: HwidDevice {
+            device_type: session.device_type().as_str().to_string(),
+            serial: session.serial().unwrap_or(0),
+            firmware: session.firmware().unwrap_or("unknown").to_string(),
+        },
+        keys: HwidKeys {
+            ed25519_pub: hex::encode(derived.ed25519_pub),
+            x25519_pub: hex::encode(derived.x25519_pub),
+        },
+        slots: HwidSlots {
+            signing: "9A".to_string(),
+            encryption: "9D".to_string(),
+        },
+        policy: HwidPolicy {
+            pin_cache_timeout: 300,
+            touch_signing: touch_str(config.touch_signing).to_string(),
+            touch_encryption: touch_str(config.touch_encryption).to_string(),
+        },
+        attestation: HwidAttestation::default(),
+        app: HwidApp::default(),
+        backup: HwidBackup::default(),
+    };
+
+    let hwid_path = if let Some(ref dir) = config.identities_dir {
+        let identity_dir = dir.join(&identity_hash_hex);
+        std::fs::create_dir_all(&identity_dir)?;
+        let path = identity_dir.join("identity.hwid");
+        hwid.to_file(&path)?;
+        Some(path)
+    } else {
+        None
+    };
+
+    Ok(ProvisionResult {
+        config: hwid,
+        ed25519_pub: derived.ed25519_pub,
+        x25519_pub: derived.x25519_pub,
+        identity_hash,
+        identity_hash_hex,
+        hwid_path,
+    })
+}
+
+/// Recoverable provisioning: generate a fresh 24-word mnemonic, import the
+/// derived identity, and return both the result and the mnemonic to show once.
+pub fn provision_recoverable<T: PivTransport>(
+    session: &mut PivSession<T>,
+    mgmt_key: &[u8],
+    config: &ProvisionConfig,
+) -> Result<(ProvisionResult, String), RatkeyError> {
+    let mnemonic = seed::generate_mnemonic()?;
+    let result = import_recoverable_identity(session, mgmt_key, config, &mnemonic)?;
+    Ok((result, mnemonic))
+}
+
+/// Restore a recoverable identity from an existing 24-word mnemonic onto a token.
+pub fn restore<T: PivTransport>(
+    session: &mut PivSession<T>,
+    mgmt_key: &[u8],
+    config: &ProvisionConfig,
+    mnemonic: &str,
+) -> Result<ProvisionResult, RatkeyError> {
+    import_recoverable_identity(session, mgmt_key, config, mnemonic)
 }
 
 #[cfg(test)]

@@ -158,6 +158,49 @@ pub fn generate_key(
     build_apdu(INS_GENERATE_ASYMMETRIC, 0x00, slot, &data)
 }
 
+// Yubico private-key import elements: Ed25519 = 0x07, X25519 = 0x08.
+const TAG_IMPORT_ED25519: u8 = 0x07;
+const TAG_IMPORT_X25519: u8 = 0x08;
+
+/// IMPORT ASYMMETRIC KEY (Ed25519, slot). Requires management-key auth. For
+/// recoverable provisioning — the key was derived off-device from a seed phrase.
+pub fn import_ed25519(
+    slot: u8,
+    private_key: &[u8; 32],
+    pin_policy: Option<u8>,
+    touch_policy: Option<u8>,
+) -> Vec<u8> {
+    import_key(slot, ALG_ED25519, TAG_IMPORT_ED25519, private_key, pin_policy, touch_policy)
+}
+
+/// IMPORT ASYMMETRIC KEY (X25519, slot). Requires management-key auth.
+pub fn import_x25519(
+    slot: u8,
+    private_key: &[u8; 32],
+    pin_policy: Option<u8>,
+    touch_policy: Option<u8>,
+) -> Vec<u8> {
+    import_key(slot, ALG_X25519, TAG_IMPORT_X25519, private_key, pin_policy, touch_policy)
+}
+
+fn import_key(
+    slot: u8,
+    alg: u8,
+    key_tag: u8,
+    private_key: &[u8; 32],
+    pin_policy: Option<u8>,
+    touch_policy: Option<u8>,
+) -> Vec<u8> {
+    let mut data = tlv(key_tag, private_key);
+    if let Some(pp) = pin_policy {
+        data.extend_from_slice(&tlv(TAG_PIN_POLICY, &[pp]));
+    }
+    if let Some(tp) = touch_policy {
+        data.extend_from_slice(&tlv(TAG_TOUCH_POLICY, &[tp]));
+    }
+    build_apdu(INS_IMPORT_KEY, alg, slot, &data)
+}
+
 /// GENERAL AUTHENTICATE Ed25519 sign. Send raw message — device does SHA-512 internally; no pre-hash.
 pub fn sign_ed25519(slot: u8, message: &[u8]) -> Vec<u8> {
     let challenge = tlv(TAG_AUTH_CHALLENGE, message);
@@ -746,6 +789,37 @@ mod tests {
     fn test_parse_metadata_algorithm() {
         let meta = vec![0x01, 0x01, MGMT_ALG_AES192];
         assert_eq!(parse_metadata_algorithm(&meta).unwrap(), MGMT_ALG_AES192);
+    }
+
+    #[test]
+    fn test_import_ed25519() {
+        let key = [0x11; 32];
+        let apdu = import_ed25519(
+            SLOT_AUTHENTICATION,
+            &key,
+            Some(PIN_POLICY_ONCE),
+            Some(TOUCH_POLICY_NEVER),
+        );
+        assert_eq!(apdu[1], 0xFE); // INS IMPORT KEY
+        assert_eq!(apdu[2], 0xE0); // P1 = Ed25519
+        assert_eq!(apdu[3], 0x9A); // P2 = slot
+        assert_eq!(apdu[5], 0x07); // Ed25519 private-key element tag
+        assert_eq!(apdu[6], 0x20); // 32-byte length
+        assert_eq!(&apdu[7..39], &key);
+        assert_eq!(
+            &apdu[39..45],
+            &[0xAA, 0x01, PIN_POLICY_ONCE, 0xAB, 0x01, TOUCH_POLICY_NEVER]
+        );
+    }
+
+    #[test]
+    fn test_import_x25519_tag() {
+        let apdu = import_x25519(SLOT_KEY_MANAGEMENT, &[0x22; 32], None, None);
+        assert_eq!(apdu[1], 0xFE);
+        assert_eq!(apdu[2], 0xE1); // X25519
+        assert_eq!(apdu[3], 0x9D);
+        assert_eq!(apdu[5], 0x08); // X25519 private-key element tag
+        assert_eq!(apdu[6], 0x20);
     }
 
     #[test]

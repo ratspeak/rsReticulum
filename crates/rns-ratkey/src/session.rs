@@ -107,6 +107,43 @@ impl<T: PivTransport> PivSession<T> {
         apdu::parse_generate_response(data)
     }
 
+    /// Import an off-device Ed25519 key (recoverable provisioning / restore).
+    /// Requires prior `authenticate_management_key`.
+    pub fn import_ed25519(
+        &mut self,
+        slot: u8,
+        private_key: &[u8; 32],
+        pin_policy: Option<u8>,
+        touch_policy: Option<u8>,
+    ) -> Result<(), RatkeyError> {
+        let resp = self.transport.transmit(&apdu::import_ed25519(
+            slot,
+            private_key,
+            pin_policy,
+            touch_policy,
+        ))?;
+        apdu::check_response(&resp)?;
+        Ok(())
+    }
+
+    /// Import an off-device X25519 key. Requires prior `authenticate_management_key`.
+    pub fn import_x25519(
+        &mut self,
+        slot: u8,
+        private_key: &[u8; 32],
+        pin_policy: Option<u8>,
+        touch_policy: Option<u8>,
+    ) -> Result<(), RatkeyError> {
+        let resp = self.transport.transmit(&apdu::import_x25519(
+            slot,
+            private_key,
+            pin_policy,
+            touch_policy,
+        ))?;
+        apdu::check_response(&resp)?;
+        Ok(())
+    }
+
     pub fn sign_ed25519(&mut self, slot: u8, message: &[u8]) -> Result<[u8; 64], RatkeyError> {
         let resp = self.transport.transmit(&apdu::sign_ed25519(slot, message))?;
         let data = apdu::check_response(&resp)?;
