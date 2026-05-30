@@ -197,13 +197,13 @@ impl<T: PivTransport> PivSession<T> {
 
     /// Authenticate the PIV management key (slot 9B) via witness/challenge mutual
     /// auth — required before on-device key generation. The algorithm is read
-    /// from the card (YubiKey 5.7 default: AES-192). AES management keys only.
+    /// from the card (YubiKey 5.7 default: AES-192).
     pub fn authenticate_management_key(&mut self, key: &[u8]) -> Result<(), RatkeyError> {
         let meta = self.read_metadata(apdu::SLOT_CARD_MANAGEMENT)?;
         let alg = apdu::parse_metadata_algorithm(&meta)?;
         let block = crate::mgmt::block_len(alg).ok_or_else(|| {
             RatkeyError::UnsupportedDevice(format!(
-                "unsupported management-key algorithm 0x{alg:02X} (TDES not implemented)"
+                "unsupported management-key algorithm 0x{alg:02X}"
             ))
         })?;
 

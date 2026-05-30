@@ -198,7 +198,8 @@ pub struct LinkManager {
     transport_tx: mpsc::Sender<TransportMessage>,
     event_rx: mpsc::Receiver<DestinationEvent>,
     active_links: HashMap<[u8; 16], ActiveLink>,
-    /// `None` rejects all links.
+    /// Raw software signing key, when available. Hardware-backed identities sign
+    /// through `identity` instead.
     identity_key: Option<Ed25519PrivateKey>,
     pub destination_hash: [u8; 16],
     destination: Option<Destination>,
@@ -281,7 +282,7 @@ impl LinkManager {
         identity: &Identity,
         app_name: &str,
         // `None` for hardware-backed identities (no extractable signing key);
-        // link-mode packet proofs are skipped until routed through the backend.
+        // link proofs are routed through the backend-aware `Identity`.
         identity_key: Option<Ed25519PrivateKey>,
     ) -> Self {
         let dest = match Destination::new(Some(identity), Direction::In, DestType::Single, app_name)
@@ -561,14 +562,6 @@ impl LinkManager {
     }
 
     fn handle_link_request(&mut self, raw: &[u8], interface_id: u64) {
-        let identity_key = match &self.identity_key {
-            Some(k) => k,
-            None => {
-                tracing::warn!("link request received but no identity key configured");
-                return;
-            }
-        };
-
         let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(raw) {
             Ok(h) => h,
             Err(_) => return,
@@ -589,14 +582,32 @@ impl LinkManager {
             }
         }
 
-        let (link, proof_data) =
-            match Link::new_responder(request_data, identity_key, self.destination_hash, hops) {
-                Ok(result) => result,
-                Err(e) => {
-                    tracing::warn!(error = %e, "link handshake failed");
-                    return;
-                }
-            };
+        let responder = match (&self.identity_key, &self.identity) {
+            (Some(identity_key), _) => {
+                Link::new_responder(request_data, identity_key, self.destination_hash, hops)
+            }
+            (None, Some(identity)) => {
+                let identity_ed25519_pub = identity_ed25519_public_key(identity);
+                Link::new_responder_with(
+                    request_data,
+                    &identity_ed25519_pub,
+                    self.destination_hash,
+                    hops,
+                    |signed_data| identity.sign(signed_data),
+                )
+            }
+            (None, None) => {
+                tracing::warn!("link request received but no identity signer configured");
+                return;
+            }
+        };
+        let (link, proof_data) = match responder {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(error = %e, "link handshake failed");
+                return;
+            }
+        };
 
         let link_id = link.link_id;
 
@@ -1705,6 +1716,12 @@ impl LinkManager {
             }
             _ => {
                 // Application data on a link (LXMF DIRECT).
+                let identity_key_bytes = self.identity_key.as_ref().map(|key| key.to_bytes());
+                let identity_for_signing = if identity_key_bytes.is_none() {
+                    self.identity.clone()
+                } else {
+                    None
+                };
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
@@ -1721,13 +1738,19 @@ impl LinkManager {
                         );
 
                         // Link proofs are unencrypted (Packet.py:198-200).
-                        // TODO(ratkey): hardware identities carry no `identity_key`; route
-                        // link-mode packet proofs through `self.identity` (backend sign).
-                        if let Some(ref signing_key) = self.identity_key {
-                            let pkt_hash =
-                                rns_wire::hash::packet_hash(raw, header.flags.header_type);
-                            if let Ok(proof_data) = active.link.prove_packet(&pkt_hash, signing_key)
-                            {
+                        let pkt_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
+                        let proof = if let Some(key_bytes) = identity_key_bytes {
+                            let signing_key = Ed25519PrivateKey::from_bytes(&key_bytes);
+                            active.link.prove_packet(&pkt_hash, &signing_key)
+                        } else if let Some(identity) = identity_for_signing.as_ref() {
+                            active
+                                .link
+                                .prove_packet_with_fallible(&pkt_hash, |hash| identity.sign(hash))
+                        } else {
+                            Err(rns_link::encryption::LinkCryptoError::EncryptionFailed)
+                        };
+                        match proof {
+                            Ok(proof_data) => {
                                 let proof_header = rns_wire::header::PacketHeader {
                                     flags: rns_wire::flags::PacketFlags {
                                         header_type: rns_wire::flags::HeaderType::Header1,
@@ -1753,6 +1776,12 @@ impl LinkManager {
                                     link_id = hex::encode(link_id),
                                     proof_len = proof_data.len(),
                                     "delivery proof sent for link data packet (unencrypted)"
+                                );
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    link_id = hex::encode(link_id),
+                                    "could not sign delivery proof for link data packet"
                                 );
                             }
                         }
@@ -2550,6 +2579,13 @@ fn clone_identity(identity: &Identity) -> Option<Identity> {
     }
 }
 
+fn identity_ed25519_public_key(identity: &Identity) -> [u8; 32] {
+    let public_key = identity.get_public_key();
+    let mut ed25519_pub = [0u8; 32];
+    ed25519_pub.copy_from_slice(&public_key[32..64]);
+    ed25519_pub
+}
+
 fn unix_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2577,8 +2613,30 @@ pub fn register_destination(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rns_identity::identity::LocalKeyBackend;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     const TEST_CHANNEL_MSG_TYPE: u16 = 0x1234;
+
+    struct TestSigningBackend {
+        signing_key: Ed25519PrivateKey,
+        available: AtomicBool,
+    }
+
+    impl LocalKeyBackend for TestSigningBackend {
+        fn sign_ed25519(&self, message: &[u8]) -> Option<[u8; 64]> {
+            self.available
+                .load(Ordering::SeqCst)
+                .then(|| self.signing_key.sign(message))
+        }
+
+        fn ecdh(&self, _peer_pub: &[u8; 32]) -> Option<[u8; 32]> {
+            None
+        }
+    }
 
     struct TestChannelNoop;
 
@@ -2597,6 +2655,39 @@ mod tests {
         ) -> Result<(), rns_protocol::channel_message::ChannelMessageError> {
             Ok(())
         }
+    }
+
+    fn link_request_raw(dest_hash: [u8; 16], request_data: &[u8]) -> Vec<u8> {
+        let flags = rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header1,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            destination_type: rns_wire::flags::DestinationType::Single,
+            packet_type: rns_wire::flags::PacketType::LinkRequest,
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags,
+            hops: 0,
+            transport_id: None,
+            destination_hash: dest_hash,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(request_data);
+        raw
+    }
+
+    fn backend_identity(available: bool) -> (Identity, [u8; 32], [u8; 32]) {
+        let software = Identity::new();
+        let public_key = software.get_public_key();
+        let identity_ed25519_pub = identity_ed25519_public_key(&software);
+        let signing_seed = software.get_signing_key().unwrap().to_bytes();
+        let backend: Arc<dyn LocalKeyBackend> = Arc::new(TestSigningBackend {
+            signing_key: Ed25519PrivateKey::from_bytes(&signing_seed),
+            available: AtomicBool::new(available),
+        });
+        let backend_identity = Identity::from_backend(&public_key, backend).unwrap();
+        (backend_identity, identity_ed25519_pub, signing_seed)
     }
 
     #[test]
@@ -2806,6 +2897,59 @@ mod tests {
     }
 
     #[test]
+    fn backend_identity_accepts_link_request_without_raw_signing_key() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let (identity, identity_ed25519_pub, _signing_seed) = backend_identity(true);
+        let mut lm = LinkManager::with_destination(tx, event_rx, &identity, "test.hw", None);
+
+        let dest_hash = lm.destination_hash;
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let raw = link_request_raw(dest_hash, &request_data);
+
+        lm.handle_link_request(&raw, 1);
+
+        assert_eq!(lm.active_link_count(), 1);
+        let outbound = rx.try_recv().expect("link proof should be queued");
+        let TransportMessage::Outbound(request) = outbound else {
+            panic!("expected outbound link proof");
+        };
+        let (proof_header, proof_offset) =
+            rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(
+            proof_header.context,
+            rns_wire::context::PacketContext::Lrproof
+        );
+        let identity_pub =
+            rns_crypto::ed25519::Ed25519PublicKey::from_bytes(&identity_ed25519_pub).unwrap();
+        let rtt = initiator
+            .validate_proof(
+                &request.raw[proof_offset..],
+                &identity_pub,
+                &identity_ed25519_pub,
+            )
+            .expect("backend-signed proof validates");
+        assert!(!rtt.is_empty());
+    }
+
+    #[test]
+    fn backend_identity_link_request_fails_closed_when_signer_unavailable() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let (identity, _identity_ed25519_pub, _signing_seed) = backend_identity(false);
+        let mut lm = LinkManager::with_destination(tx, event_rx, &identity, "test.hw", None);
+
+        let dest_hash = lm.destination_hash;
+        let (_initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let raw = link_request_raw(dest_hash, &request_data);
+
+        lm.handle_link_request(&raw, 1);
+
+        assert_eq!(lm.active_link_count(), 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn test_with_destination_constructor() {
         let (tx, _rx) = mpsc::channel(16);
         let (_event_tx, event_rx) = mpsc::channel(16);
@@ -2813,7 +2957,8 @@ mod tests {
         let identity = Identity::new();
         let signing_key = identity.get_signing_key().unwrap();
 
-        let lm = LinkManager::with_destination(tx, event_rx, &identity, "test.app", Some(signing_key));
+        let lm =
+            LinkManager::with_destination(tx, event_rx, &identity, "test.app", Some(signing_key));
 
         assert!(lm.destination.is_some());
         assert_eq!(lm.active_link_count(), 0);
@@ -3144,6 +3289,83 @@ mod tests {
             rns_wire::flags::PacketType::Proof
         );
         assert_eq!(proof_header.context, rns_wire::context::PacketContext::None);
+        let proof_data = &request.raw[proof_offset..];
+        assert_eq!(&proof_data[..32], &packet_hash);
+        assert!(sender_link.validate_packet_proof(&packet_hash, proof_data));
+    }
+
+    #[test]
+    fn backend_identity_signs_link_packet_delivery_proof() {
+        let (identity, identity_ed25519_pub, signing_seed) = backend_identity(true);
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm =
+            LinkManager::with_destination(transport_tx, event_rx, &identity, "test.hw", None);
+
+        let dest_hash = lm.destination_hash;
+        let identity_pub =
+            rns_crypto::ed25519::Ed25519PublicKey::from_bytes(&identity_ed25519_pub).unwrap();
+        let signing_key = Ed25519PrivateKey::from_bytes(&signing_seed);
+        let (mut sender_link, request_data) = Link::new_initiator(dest_hash, 1);
+        let (mut receiver_link, proof_data) =
+            Link::new_responder(&request_data, &signing_key, dest_hash, 1).unwrap();
+        let rtt_data = sender_link
+            .validate_proof(&proof_data, &identity_pub, &identity_ed25519_pub)
+            .unwrap();
+        receiver_link.receive_rtt_packet(&rtt_data).unwrap();
+        let link_id = receiver_link.link_id;
+
+        let encrypted = sender_link.encrypt(b"link payload").unwrap();
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&encrypted);
+        let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
+
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        lm.handle_inbound_packet(&raw, 1);
+
+        let outbound = transport_rx
+            .try_recv()
+            .expect("backend-signed delivery proof queued");
+        let TransportMessage::Outbound(request) = outbound else {
+            panic!("expected outbound proof");
+        };
+        let (proof_header, proof_offset) =
+            rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(proof_header.destination_hash, link_id);
+        assert_eq!(
+            proof_header.flags.packet_type,
+            rns_wire::flags::PacketType::Proof
+        );
+        assert_eq!(
+            proof_header.context,
+            rns_wire::context::PacketContext::LinkProof
+        );
         let proof_data = &request.raw[proof_offset..];
         assert_eq!(&proof_data[..32], &packet_hash);
         assert!(sender_link.validate_packet_proof(&packet_hash, proof_data));

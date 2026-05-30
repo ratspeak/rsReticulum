@@ -385,6 +385,49 @@ impl Link {
         destination_hash: [u8; 16],
         hops: u8,
     ) -> Result<(Self, Vec<u8>), HandshakeError> {
+        let identity_ed25519_pub = identity_signing_key.public_key().to_bytes();
+        Self::new_responder_inner(
+            request_data,
+            &identity_ed25519_pub,
+            destination_hash,
+            hops,
+            Some(identity_signing_key),
+            |signed_data| Some(identity_signing_key.sign(signed_data)),
+        )
+    }
+
+    /// Create an inbound link proof using an external signer (e.g. YubiKey/PIV).
+    pub fn new_responder_with<F>(
+        request_data: &[u8],
+        identity_ed25519_pub: &[u8; 32],
+        destination_hash: [u8; 16],
+        hops: u8,
+        sign_fn: F,
+    ) -> Result<(Self, Vec<u8>), HandshakeError>
+    where
+        F: FnOnce(&[u8]) -> Option<[u8; 64]>,
+    {
+        Self::new_responder_inner(
+            request_data,
+            identity_ed25519_pub,
+            destination_hash,
+            hops,
+            None,
+            sign_fn,
+        )
+    }
+
+    fn new_responder_inner<F>(
+        request_data: &[u8],
+        identity_ed25519_pub: &[u8; 32],
+        destination_hash: [u8; 16],
+        hops: u8,
+        identity_signing_key: Option<&Ed25519PrivateKey>,
+        sign_fn: F,
+    ) -> Result<(Self, Vec<u8>), HandshakeError>
+    where
+        F: FnOnce(&[u8]) -> Option<[u8; 64]>,
+    {
         let request = LinkRequestData::unpack(request_data)?;
         let link_id = compute_link_id(&destination_hash, request_data);
 
@@ -404,16 +447,21 @@ impl Link {
 
         // The proof binds the link to the responder's long-term identity key, not
         // its ephemeral one — that's what lets the initiator authenticate us.
-        let identity_ed25519_pub = identity_signing_key.public_key().to_bytes();
         let signalling =
             SignallingData::new(request.signalling.mode, rns_wire::constants::MTU as u32);
-        let proof = LinkProofData::create(
-            identity_signing_key,
-            &responder_keys.x25519_pub.to_bytes(),
-            &identity_ed25519_pub,
-            &link_id,
+        let responder_x25519_pub = responder_keys.x25519_pub.to_bytes();
+        let sig_bytes = signalling.pack();
+        let mut signed_data = Vec::with_capacity(16 + 32 + 32 + 3);
+        signed_data.extend_from_slice(&link_id);
+        signed_data.extend_from_slice(&responder_x25519_pub);
+        signed_data.extend_from_slice(identity_ed25519_pub);
+        signed_data.extend_from_slice(&sig_bytes);
+        let signature = sign_fn(&signed_data).ok_or(HandshakeError::InvalidSignature)?;
+        let proof = LinkProofData {
+            signature,
+            responder_x25519_pub,
             signalling,
-        );
+        };
         let proof_data = proof.pack();
 
         let timeout_secs = ESTABLISHMENT_TIMEOUT_PER_HOP * (hops.max(1) as f64) + KEEPALIVE_DEFAULT;
@@ -429,9 +477,7 @@ impl Link {
             ephemeral_keys: Some(responder_keys),
             peer_x25519_pub: Some(request.peer_x25519_pub),
             peer_ed25519_pub: Some(request.peer_ed25519_pub),
-            sig_prv: Some(Ed25519PrivateKey::from_bytes(
-                &identity_signing_key.to_bytes(),
-            )),
+            sig_prv: identity_signing_key.map(|key| Ed25519PrivateKey::from_bytes(&key.to_bytes())),
             session_keys: Some(session_keys),
             request_time: now,
             rtt: None,
@@ -566,6 +612,18 @@ impl Link {
     where
         F: FnOnce(&[u8]) -> [u8; 64],
     {
+        self.identify_with_fallible(identity_pub_key, |message| Some(sign_fn(message)))
+    }
+
+    /// Identify with an external signer that can be unavailable.
+    pub fn identify_with_fallible<F>(
+        &self,
+        identity_pub_key: &[u8; 64],
+        sign_fn: F,
+    ) -> Result<Vec<u8>, LinkCryptoError>
+    where
+        F: FnOnce(&[u8]) -> Option<[u8; 64]>,
+    {
         if !self.is_initiator || self.state != LinkState::Active {
             return Err(LinkCryptoError::EncryptionFailed);
         }
@@ -574,7 +632,7 @@ impl Link {
         signed_data.extend_from_slice(&self.link_id);
         signed_data.extend_from_slice(identity_pub_key);
 
-        let signature = sign_fn(&signed_data);
+        let signature = sign_fn(&signed_data).ok_or(LinkCryptoError::EncryptionFailed)?;
 
         let mut proof_data = Vec::with_capacity(128);
         proof_data.extend_from_slice(identity_pub_key);
@@ -927,11 +985,23 @@ impl Link {
     where
         F: FnOnce(&[u8]) -> [u8; 64],
     {
+        self.prove_packet_with_fallible(packet_hash, |hash| Some(sign_fn(hash)))
+    }
+
+    /// Variant of [`Link::prove_packet_with`] for signers that can be unavailable.
+    pub fn prove_packet_with_fallible<F>(
+        &self,
+        packet_hash: &[u8; 32],
+        sign_fn: F,
+    ) -> Result<Vec<u8>, LinkCryptoError>
+    where
+        F: FnOnce(&[u8]) -> Option<[u8; 64]>,
+    {
         if self.state != LinkState::Active && self.state != LinkState::Stale {
             return Err(LinkCryptoError::EncryptionFailed);
         }
 
-        let signature = sign_fn(packet_hash);
+        let signature = sign_fn(packet_hash).ok_or(LinkCryptoError::EncryptionFailed)?;
 
         let mut proof = Vec::with_capacity(96);
         proof.extend_from_slice(packet_hash);

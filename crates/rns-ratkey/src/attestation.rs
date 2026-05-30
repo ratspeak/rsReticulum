@@ -136,7 +136,7 @@ pub fn verify_attestation(
 
     let metadata_extracted = info.firmware_version.is_some();
     let root_ca = if let Some((major, minor, patch)) = info.firmware_version {
-        if major > 5 || (major == 5 && minor >= 7 && patch >= 4) {
+        if major > 5 || (major == 5 && (minor > 7 || (minor == 7 && patch >= 4))) {
             "new".to_string()
         } else {
             "legacy".to_string()
@@ -725,6 +725,25 @@ mod tests {
         assert!(!result.verified);
         assert!(!result.chain_verified);
         assert_eq!(result.root_ca, "new"); // 5.7.4 → new root CA
+    }
+
+    #[test]
+    fn test_verify_attestation_future_firmware_uses_new_root_label() {
+        let mut attest_der = Vec::new();
+        let mut inner = Vec::new();
+        inner.push(0x06);
+        inner.push(OID_FIRMWARE_VERSION.len() as u8);
+        inner.extend_from_slice(OID_FIRMWARE_VERSION);
+        inner.push(0x04);
+        inner.push(0x03);
+        inner.extend_from_slice(&[0x05, 0x08, 0x00]); // 5.8.0
+
+        attest_der.push(0x30);
+        attest_der.push(inner.len() as u8);
+        attest_der.extend_from_slice(&inner);
+
+        let result = verify_attestation(&attest_der, &[0x30, 0x00]).unwrap();
+        assert_eq!(result.root_ca, "new");
     }
 
     #[test]
