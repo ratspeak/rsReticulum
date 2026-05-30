@@ -10,9 +10,11 @@ pub const PIV_AID: &[u8] = &[0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x0
 pub const INS_SELECT: u8 = 0xA4;
 pub const INS_VERIFY: u8 = 0x20;
 pub const INS_CHANGE_REFERENCE: u8 = 0x24;
+pub const INS_RESET_RETRY: u8 = 0x2C;
 pub const INS_GENERAL_AUTHENTICATE: u8 = 0x87;
 pub const INS_GENERATE_ASYMMETRIC: u8 = 0x47;
 pub const INS_GET_DATA: u8 = 0xCB;
+pub const INS_RESET_PIV: u8 = 0xFB;
 pub const INS_GET_METADATA: u8 = 0xF7;
 pub const INS_ATTEST: u8 = 0xF9;
 pub const INS_IMPORT_KEY: u8 = 0xFE;
@@ -188,6 +190,25 @@ pub fn change_pin(old_pin: &str, new_pin: &str) -> Vec<u8> {
     data[..old_len].copy_from_slice(&old_bytes[..old_len]);
     data[8..8 + new_len].copy_from_slice(&new_bytes[..new_len]);
     build_apdu(INS_CHANGE_REFERENCE, 0x00, 0x80, &data)
+}
+
+/// RESET RETRY COUNTER: unblock a locked PIN with the PUK and set a new PIN.
+pub fn reset_retry(puk: &str, new_pin: &str) -> Vec<u8> {
+    let mut data = [0xFFu8; 16];
+    let puk_bytes = puk.as_bytes();
+    let new_bytes = new_pin.as_bytes();
+    let puk_len = puk_bytes.len().min(8);
+    let new_len = new_bytes.len().min(8);
+    data[..puk_len].copy_from_slice(&puk_bytes[..puk_len]);
+    data[8..8 + new_len].copy_from_slice(&new_bytes[..new_len]);
+    build_apdu(INS_RESET_RETRY, 0x00, 0x80, &data)
+}
+
+/// RESET PIV: erase all PIV data and restore factory PIV secrets.
+///
+/// YubiKey only accepts this command after both the PIN and PUK are blocked.
+pub fn reset_piv() -> Vec<u8> {
+    build_apdu(INS_RESET_PIV, 0x00, 0x00, &[])
 }
 
 // GENERATE ASYMMETRIC KEY PAIR (Ed25519/X25519).
@@ -762,6 +783,29 @@ mod tests {
             &apdu[13..21],
             &[0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0xFF, 0xFF]
         );
+    }
+
+    #[test]
+    fn test_reset_retry() {
+        let apdu = reset_retry("12345678", "654321");
+        assert_eq!(apdu[0], 0x00); // CLA
+        assert_eq!(apdu[1], 0x2C); // INS = RESET RETRY
+        assert_eq!(apdu[2], 0x00); // P1
+        assert_eq!(apdu[3], 0x80); // P2 = PIN
+        assert_eq!(apdu[4], 0x10); // Lc = 16
+        assert_eq!(
+            &apdu[5..13],
+            &[0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38]
+        );
+        assert_eq!(
+            &apdu[13..21],
+            &[0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0xFF, 0xFF]
+        );
+    }
+
+    #[test]
+    fn test_reset_piv() {
+        assert_eq!(reset_piv(), vec![0x00, 0xFB, 0x00, 0x00]);
     }
 
     #[test]

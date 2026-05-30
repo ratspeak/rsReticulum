@@ -46,6 +46,8 @@ impl SlotState {
 #[derive(Debug, Clone)]
 pub enum MockOperation {
     PinVerify { success: bool },
+    PinUnblock { success: bool },
+    ResetPiv { success: bool },
     GenerateEd25519 { slot: u8 },
     GenerateX25519 { slot: u8 },
     SignEd25519 { slot: u8, data_len: usize },
@@ -56,8 +58,10 @@ pub enum MockOperation {
 pub struct MockPivSession {
     slots: HashMap<u8, SlotState>,
     pin: String,
+    puk: String,
     pin_verified: bool,
     pin_retries: u8,
+    puk_retries: u8,
     max_retries: u8,
     connected: bool,
     /// True: `TouchPolicy::Always` slots reject ops. `simulate_touch()` clears.
@@ -77,8 +81,10 @@ impl MockPivSession {
         Self {
             slots,
             pin: "123456".to_string(),
+            puk: "12345678".to_string(),
             pin_verified: false,
             pin_retries: 3,
+            puk_retries: 3,
             max_retries: 3,
             connected: true,
             touch_required: true,
@@ -134,6 +140,10 @@ impl MockPivSession {
     pub fn set_pin(&mut self, pin: &str) {
         self.pin = pin.to_string();
         self.pin_verified = false;
+    }
+
+    pub fn set_puk(&mut self, puk: &str) {
+        self.puk = puk.to_string();
     }
 
     pub fn disconnect(&mut self) {
@@ -215,6 +225,58 @@ impl MockPivSession {
                 })
             }
         }
+    }
+
+    pub fn unblock_pin(&mut self, puk: &str, new_pin: &str) -> Result<(), RatkeyError> {
+        self.check_connected()?;
+
+        if self.puk_retries == 0 {
+            self.operations
+                .push(MockOperation::PinUnblock { success: false });
+            return Err(RatkeyError::PukLocked);
+        }
+
+        if puk == self.puk {
+            self.pin = new_pin.to_string();
+            self.pin_verified = true;
+            self.pin_retries = self.max_retries;
+            self.puk_retries = self.max_retries;
+            self.operations
+                .push(MockOperation::PinUnblock { success: true });
+            Ok(())
+        } else {
+            self.puk_retries -= 1;
+            self.operations
+                .push(MockOperation::PinUnblock { success: false });
+            if self.puk_retries == 0 {
+                Err(RatkeyError::PukLocked)
+            } else {
+                Err(RatkeyError::PukFailed {
+                    remaining: self.puk_retries,
+                })
+            }
+        }
+    }
+
+    pub fn reset_piv(&mut self) -> Result<(), RatkeyError> {
+        self.check_connected()?;
+        if self.pin_retries != 0 || self.puk_retries != 0 {
+            self.operations
+                .push(MockOperation::ResetPiv { success: false });
+            return Err(RatkeyError::ResetRequiresBlockedPinAndPuk);
+        }
+
+        self.slots.insert(SLOT_9A, SlotState::empty());
+        self.slots.insert(SLOT_9D, SlotState::empty());
+        self.pin = "123456".to_string();
+        self.puk = "12345678".to_string();
+        self.pin_verified = false;
+        self.pin_retries = self.max_retries;
+        self.puk_retries = self.max_retries;
+        self.touch_required = true;
+        self.operations
+            .push(MockOperation::ResetPiv { success: true });
+        Ok(())
     }
 
     pub fn generate_ed25519(
@@ -380,6 +442,7 @@ impl Default for MockPivSession {
 impl Drop for MockPivSession {
     fn drop(&mut self) {
         self.pin.zeroize();
+        self.puk.zeroize();
     }
 }
 
@@ -416,6 +479,70 @@ mod tests {
         // Locked state survives correct PIN until PUK unlock.
         let err = session.verify_pin("123456").unwrap_err();
         assert!(matches!(err, RatkeyError::PinLocked));
+    }
+
+    #[test]
+    fn test_pin_unblock_with_puk() {
+        let mut session = MockPivSession::new();
+        let _ = session.verify_pin("wrong");
+        let _ = session.verify_pin("wrong");
+        let _ = session.verify_pin("wrong");
+        assert!(matches!(
+            session.verify_pin("123456"),
+            Err(RatkeyError::PinLocked)
+        ));
+
+        session.unblock_pin("12345678", "654321").unwrap();
+        assert!(session.verify_pin("654321").is_ok());
+        assert!(matches!(
+            session.verify_pin("123456"),
+            Err(RatkeyError::PinFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_pin_unblock_wrong_puk_locks_puk() {
+        let mut session = MockPivSession::new();
+        let _ = session.verify_pin("wrong");
+        let _ = session.verify_pin("wrong");
+        let _ = session.verify_pin("wrong");
+
+        let err = session.unblock_pin("bad", "654321").unwrap_err();
+        assert!(matches!(err, RatkeyError::PukFailed { remaining: 2 }));
+        let _ = session.unblock_pin("bad", "654321");
+        let err = session.unblock_pin("bad", "654321").unwrap_err();
+        assert!(matches!(err, RatkeyError::PukLocked));
+        assert!(matches!(
+            session.unblock_pin("12345678", "654321"),
+            Err(RatkeyError::PukLocked)
+        ));
+    }
+
+    #[test]
+    fn test_reset_piv_requires_blocked_pin_and_puk() {
+        let mut session = MockPivSession::with_keys();
+        assert!(matches!(
+            session.reset_piv(),
+            Err(RatkeyError::ResetRequiresBlockedPinAndPuk)
+        ));
+    }
+
+    #[test]
+    fn test_reset_piv_clears_keys_and_restores_defaults() {
+        let mut session = MockPivSession::with_keys();
+        let _ = session.verify_pin("badpin");
+        let _ = session.verify_pin("badpin");
+        let _ = session.verify_pin("badpin");
+        let _ = session.unblock_pin("badpuk", "654321");
+        let _ = session.unblock_pin("badpuk", "654321");
+        let _ = session.unblock_pin("badpuk", "654321");
+
+        session.reset_piv().unwrap();
+        session.verify_pin("123456").unwrap();
+        assert!(matches!(
+            session.sign_ed25519(SLOT_9A, b"test"),
+            Err(RatkeyError::EmptySlot { slot: SLOT_9A })
+        ));
     }
 
     #[test]

@@ -11,9 +11,19 @@ pub enum RatkeyError {
     #[error("PIN verification failed ({remaining} attempts remaining)")]
     PinFailed { remaining: u8 },
 
-    /// PIN locked (retry counter exhausted); PUK required to unlock.
-    #[error("PIN locked — device requires PUK to unlock")]
+    /// PIN locked (retry counter exhausted); PIV reset or recovery-code unlock required.
+    #[error("PIN locked — reset the PIV application to recover")]
     PinLocked,
+
+    #[error("PIV recovery code failed ({remaining} attempts remaining)")]
+    PukFailed { remaining: u8 },
+
+    /// Recovery counter exhausted; PIV reset is required.
+    #[error("PIV recovery counter locked — reset the PIV application to recover")]
+    PukLocked,
+
+    #[error("PIV reset requires both retry counters to be blocked")]
+    ResetRequiresBlockedPinAndPuk,
 
     #[error("PIN required — call verify_pin() first")]
     PinRequired,

@@ -75,6 +75,34 @@ impl<T: PivTransport> PivSession<T> {
         Ok(())
     }
 
+    pub fn unblock_pin(&mut self, puk: &str, new_pin: &str) -> Result<(), RatkeyError> {
+        let resp = self.transport.transmit(&apdu::reset_retry(puk, new_pin))?;
+        match apdu::check_response(&resp) {
+            Ok(_) => {
+                self.pin_cache.cache(new_pin);
+                Ok(())
+            }
+            Err(RatkeyError::PinFailed { remaining }) => Err(RatkeyError::PukFailed { remaining }),
+            Err(RatkeyError::PinLocked) => Err(RatkeyError::PukLocked),
+            Err(other) => Err(other),
+        }
+    }
+
+    pub fn reset_piv(&mut self) -> Result<(), RatkeyError> {
+        let resp = self.transport.transmit(&apdu::reset_piv())?;
+        match apdu::check_response(&resp) {
+            Ok(_) => {
+                self.pin_cache.clear();
+                Ok(())
+            }
+            Err(RatkeyError::Apdu {
+                sw1: 0x69,
+                sw2: 0x85,
+            }) => Err(RatkeyError::ResetRequiresBlockedPinAndPuk),
+            Err(other) => Err(other),
+        }
+    }
+
     pub fn generate_ed25519(
         &mut self,
         slot: u8,
