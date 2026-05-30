@@ -4,7 +4,8 @@ RatKey hardware identity support is **desktop only** and experimental. The full
 desktop path is validated on a real YubiKey (5.7.4): provision (recoverable /
 hardware-only / import / restore), on-card sign + ECDH, in-app load into LXMF/RNS,
 PIN-prompt unlock, auto-lock timeout, and lock-on-quit. Attestation-chain
-hardware-validation and pre-5.7 TDES management keys remain open.
+verification and pre-5.7 (TDES) management keys are implemented and unit-tested,
+but await validation on physical devices.
 
 ## Release scope: desktop only
 
@@ -85,9 +86,12 @@ Ed25519 (9A) / X25519 (9D):
 
 ## Still required before hardware RatKey is documented as supported
 
-- **TDES management keys** are not supported (only AES-128/192/256). Pre-5.7
-  YubiKeys default to a TDES management key; provisioning those needs a `des`
-  block cipher added to `mgmt.rs`.
+- **TDES management keys** are implemented (3DES EDE3 via the `des` crate, 8-byte
+  block; `mgmt.rs` dispatches on the algorithm byte). A FIPS-81 known-answer test
+  and a distinct-subkey round-trip cover the cipher. Pre-5.7 YubiKeys default to a
+  TDES management key; the witness/challenge auth flow already drives its block
+  size from `mgmt::block_len`, so it is ready — but not yet exercised against a
+  physical pre-5.7 device.
 - Validate attestation-chain verification against a real device. `attestation.rs`
   now does full RSA PKCS#1 v1.5 chain verification (per-key → device F9 → bundled,
   fingerprint-pinned Yubico roots; legacy + new-PKI A/B/B2 intermediates bundled;

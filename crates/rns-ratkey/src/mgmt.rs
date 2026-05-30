@@ -1,47 +1,56 @@
-//! PIV management-key crypto: AES-ECB single/multi-block for the witness/challenge
+//! PIV management-key crypto: ECB single/multi-block for the witness/challenge
 //! mutual authentication. Dispatch is on the management-key *algorithm* byte, not
-//! the key length — AES-192 and TDES both use 24-byte keys. TDES is not supported.
+//! the key length — AES-192 and TDES both use 24-byte keys, but differ in block
+//! size (AES 16, TDES 8). TDES (3DES EDE3) is the pre-5.7 YubiKey factory default.
 
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
 use aes::{Aes128, Aes192, Aes256};
+use des::TdesEde3;
 
 use crate::apdu;
 use crate::error::RatkeyError;
 
 const AES_BLOCK: usize = 16;
+const DES_BLOCK: usize = 8;
 
 /// Required key length for a management-key algorithm, or `None` if unsupported.
 pub fn key_len(alg: u8) -> Option<usize> {
     match alg {
+        apdu::MGMT_ALG_TDES => Some(24), // 3DES EDE3: three 8-byte DES subkeys
         apdu::MGMT_ALG_AES128 => Some(16),
         apdu::MGMT_ALG_AES192 => Some(24),
         apdu::MGMT_ALG_AES256 => Some(32),
-        // TODO(tdes): pre-5.7 YubiKeys default the management key to 3DES.
-        // Supporting them needs a DES block cipher (`des` crate) + an 8-byte
-        // block path here and in `process`/`block_len`. Deferred.
-        _ => None, // TDES (0x03) and unknown: unsupported
+        _ => None,
     }
 }
 
 /// ECB block size (challenge length) for a supported algorithm.
 pub fn block_len(alg: u8) -> Option<usize> {
-    key_len(alg).map(|_| AES_BLOCK)
+    match alg {
+        apdu::MGMT_ALG_TDES => Some(DES_BLOCK),
+        apdu::MGMT_ALG_AES128 | apdu::MGMT_ALG_AES192 | apdu::MGMT_ALG_AES256 => Some(AES_BLOCK),
+        _ => None,
+    }
 }
 
 fn check(alg: u8, key: &[u8], data: &[u8]) -> Result<(), RatkeyError> {
-    match key_len(alg) {
-        None => Err(RatkeyError::UnsupportedDevice(format!(
-            "unsupported management-key algorithm 0x{alg:02X} (TDES not implemented)"
-        ))),
-        Some(n) if key.len() != n => Err(RatkeyError::InvalidHwid(format!(
+    let n = key_len(alg).ok_or_else(|| {
+        RatkeyError::UnsupportedDevice(format!("unsupported management-key algorithm 0x{alg:02X}"))
+    })?;
+    if key.len() != n {
+        return Err(RatkeyError::InvalidHwid(format!(
             "management key length {} does not match algorithm 0x{alg:02X} (expected {n})",
             key.len()
-        ))),
-        Some(_) if data.is_empty() || data.len() % AES_BLOCK != 0 => Err(RatkeyError::InvalidHwid(
-            format!("management-key ECB input not block-aligned: {} bytes", data.len()),
-        )),
-        Some(_) => Ok(()),
+        )));
     }
+    let block = block_len(alg).expect("supported alg has a block size");
+    if data.is_empty() || data.len() % block != 0 {
+        return Err(RatkeyError::InvalidHwid(format!(
+            "management-key ECB input not block-aligned: {} bytes (block {block})",
+            data.len()
+        )));
+    }
+    Ok(())
 }
 
 pub fn ecb_encrypt(alg: u8, key: &[u8], data: &[u8]) -> Result<Vec<u8>, RatkeyError> {
@@ -60,10 +69,10 @@ pub fn ecb_decrypt(alg: u8, key: &[u8], data: &[u8]) -> Result<Vec<u8>, RatkeyEr
 
 fn process(alg: u8, key: &[u8], buf: &mut [u8], decrypt: bool) -> Result<(), RatkeyError> {
     macro_rules! run {
-        ($cipher:ty) => {{
+        ($cipher:ty, $block:expr) => {{
             let cipher = <$cipher>::new_from_slice(key)
                 .map_err(|_| RatkeyError::InvalidHwid("invalid management key".to_string()))?;
-            for chunk in buf.chunks_mut(AES_BLOCK) {
+            for chunk in buf.chunks_mut($block) {
                 let block = GenericArray::from_mut_slice(chunk);
                 if decrypt {
                     cipher.decrypt_block(block);
@@ -74,9 +83,10 @@ fn process(alg: u8, key: &[u8], buf: &mut [u8], decrypt: bool) -> Result<(), Rat
         }};
     }
     match alg {
-        apdu::MGMT_ALG_AES128 => run!(Aes128),
-        apdu::MGMT_ALG_AES192 => run!(Aes192),
-        apdu::MGMT_ALG_AES256 => run!(Aes256),
+        apdu::MGMT_ALG_TDES => run!(TdesEde3, DES_BLOCK),
+        apdu::MGMT_ALG_AES128 => run!(Aes128, AES_BLOCK),
+        apdu::MGMT_ALG_AES192 => run!(Aes192, AES_BLOCK),
+        apdu::MGMT_ALG_AES256 => run!(Aes256, AES_BLOCK),
         _ => {
             return Err(RatkeyError::UnsupportedDevice(format!(
                 "unsupported management-key algorithm 0x{alg:02X}"
@@ -120,6 +130,16 @@ mod tests {
         );
     }
 
+    // 3DES EDE3 with three identical 8-byte subkeys reduces to single-DES, so the
+    // canonical FIPS-81 single-DES ECB vector is a known-answer for our EDE3 path:
+    //   DES(0x0123456789ABCDEF, "Now is t") = 0x3FA40E8A984D4815.
+    const TDES_KAT_KEY: [u8; 24] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD,
+        0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+    ];
+    const TDES_KAT_PT: [u8; 8] = [0x4E, 0x6F, 0x77, 0x20, 0x69, 0x73, 0x20, 0x74];
+    const TDES_KAT_CT: [u8; 8] = [0x3F, 0xA4, 0x0E, 0x8A, 0x98, 0x4D, 0x48, 0x15];
+
     #[test]
     fn test_round_trip_all_aes() {
         for (alg, klen) in [
@@ -142,14 +162,39 @@ mod tests {
     }
 
     #[test]
-    fn test_tdes_unsupported() {
-        assert!(ecb_encrypt(apdu::MGMT_ALG_TDES, &[0u8; 24], &[0u8; 8]).is_err());
-        assert!(key_len(apdu::MGMT_ALG_TDES).is_none());
+    fn test_tdes_kat() {
+        assert_eq!(key_len(apdu::MGMT_ALG_TDES), Some(24));
+        assert_eq!(block_len(apdu::MGMT_ALG_TDES), Some(8));
+        assert_eq!(
+            ecb_encrypt(apdu::MGMT_ALG_TDES, &TDES_KAT_KEY, &TDES_KAT_PT).unwrap(),
+            TDES_KAT_CT.to_vec()
+        );
+        assert_eq!(
+            ecb_decrypt(apdu::MGMT_ALG_TDES, &TDES_KAT_KEY, &TDES_KAT_CT).unwrap(),
+            TDES_KAT_PT.to_vec()
+        );
+    }
+
+    #[test]
+    fn test_tdes_round_trip_distinct_keys() {
+        // Three distinct subkeys exercise the real EDE3 / DED3 inverse, not the
+        // degenerate single-DES reduction.
+        let mut key = [0u8; 24];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(1);
+        }
+        let pt = [0x42u8; 8];
+        let ct = ecb_encrypt(apdu::MGMT_ALG_TDES, &key, &pt).unwrap();
+        assert_ne!(ct, pt.to_vec());
+        assert_eq!(ecb_decrypt(apdu::MGMT_ALG_TDES, &key, &ct).unwrap(), pt.to_vec());
     }
 
     #[test]
     fn test_non_block_aligned_rejected() {
         assert!(ecb_encrypt(apdu::MGMT_ALG_AES192, &KAT_KEY, &[0u8; 15]).is_err());
         assert!(ecb_encrypt(apdu::MGMT_ALG_AES192, &KAT_KEY, &[]).is_err());
+        // TDES uses an 8-byte block: 8 is valid, 7 is not.
+        assert!(ecb_encrypt(apdu::MGMT_ALG_TDES, &TDES_KAT_KEY, &[0u8; 8]).is_ok());
+        assert!(ecb_encrypt(apdu::MGMT_ALG_TDES, &TDES_KAT_KEY, &[0u8; 7]).is_err());
     }
 }
