@@ -168,6 +168,18 @@ impl<T: PivTransport> PivSession<T> {
         Ok(apdu::check_response(&resp)?.to_vec())
     }
 
+    /// Device attestation (slot F9) intermediate certificate, unwrapped to raw DER.
+    /// This is the issuer of the per-slot certs returned by [`Self::attest_key`].
+    pub fn read_attestation_cert(&mut self) -> Result<Vec<u8>, RatkeyError> {
+        let cmd = apdu::get_data(apdu::SLOT_ATTESTATION)
+            .ok_or(RatkeyError::EmptySlot { slot: apdu::SLOT_ATTESTATION })?;
+        let resp = self.transport.transmit(&cmd)?;
+        let data = apdu::check_response(&resp)?;
+        apdu::parse_certificate_object(data).ok_or_else(|| {
+            RatkeyError::InvalidHwid("device attestation cert (F9) not found in response".into())
+        })
+    }
+
     /// Returns raw GET METADATA TLV bytes.
     pub fn read_metadata(&mut self, slot: u8) -> Result<Vec<u8>, RatkeyError> {
         let resp = self.transport.transmit(&apdu::get_metadata(slot))?;

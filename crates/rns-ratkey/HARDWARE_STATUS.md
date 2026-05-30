@@ -3,9 +3,9 @@
 RatKey hardware identity support is **desktop only** and experimental. The full
 desktop path is validated on a real YubiKey (5.7.4): provision (recoverable /
 hardware-only / import / restore), on-card sign + ECDH, in-app load into LXMF/RNS,
-PIN-prompt unlock, auto-lock timeout, and lock-on-quit. Attestation-chain
-verification and pre-5.7 (TDES) management keys are implemented and unit-tested,
-but await validation on physical devices.
+PIN-prompt unlock, auto-lock timeout, lock-on-quit, and **attestation-chain
+verification against the device's real ATTEST output**. Pre-5.7 (TDES) management
+keys are implemented and unit-tested but await validation on a pre-5.7 device.
 
 ## Release scope: desktop only
 
@@ -91,8 +91,15 @@ Ed25519 (9A) / X25519 (9D):
   (confirmed against ykman-exported ground truth — the layout assumption held).
 - Ed25519 signing on slot 9A; signature verifies against the slot pubkey.
 - X25519 ECDH on slot 9D; shared secret symmetric with a software peer.
-- `HardwareIdentity` decrypt end-to-end (on-device ECDH → HKDF → AES token).
+- `HardwareIdentity` decrypt end-to-end (on-device ECDH → HKDF → AES token) — the
+  same Ed25519-sign + X25519-ECDH + token-AES primitives LXMF uses, so live LXMF
+  send/receive on a hardware identity routes through the card (serial 35284666).
 - The pubkey our provision records matches ykman's independent export byte-for-byte.
+- **Attestation chain verified against the device's real ATTEST output** (`hw
+  attest`): both slot-9A/9D per-key certs chain through the slot-F9 device
+  intermediate to a bundled, fingerprint-pinned new-PKI Yubico root. `hw provision`
+  now captures + verifies the chain into the `.hwid`. The captured 5.7.4 certs are
+  committed as a CI regression vector (`tests/fixtures/{9a_attest,f9_device}.der`).
 
 ## Still required before hardware RatKey is documented as supported
 
@@ -102,12 +109,10 @@ Ed25519 (9A) / X25519 (9D):
   TDES management key; the witness/challenge auth flow already drives its block
   size from `mgmt::block_len`, so it is ready — but not yet exercised against a
   physical pre-5.7 device.
-- Validate attestation-chain verification against a real device. `attestation.rs`
-  now does full RSA PKCS#1 v1.5 chain verification (per-key → device F9 → bundled,
-  fingerprint-pinned Yubico roots; legacy + new-PKI A/B/B2 intermediates bundled;
-  notBefore/notAfter checks; no CRL/OCSP/name-constraints). Exercised against
-  synthetic chains and the real published CA certs — not yet a physical YubiKey's
-  ATTEST output.
+- A two-node **live LXMF message exchange** in the app on a hardware identity. The
+  on-card crypto primitives are validated (above) and the runtime delegates
+  sign/ECDH to the backend, but an end-to-end app round-trip between two peers is
+  still a manual check.
 - Edge cases on a real device: disconnect mid-operation, wrong PIN / lockout,
   touch timeout (if touch is ever enabled), and the `from_hwid` key-mismatch guard.
 - Decide and document the ratchet policy for hardware identities. PIV cannot hold

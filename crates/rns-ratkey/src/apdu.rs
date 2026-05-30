@@ -64,13 +64,63 @@ const TAG_METADATA_PUBLIC_KEY: u8 = 0x04;
 pub const OBJ_ID_9A: &[u8] = &[0x5F, 0xC1, 0x05];
 /// Cert object ID for slot 9D (Key Management).
 pub const OBJ_ID_9D: &[u8] = &[0x5F, 0xC1, 0x0B];
+/// Object ID for the device attestation (slot F9) intermediate certificate.
+pub const OBJ_ID_F9: &[u8] = &[0x5F, 0xFF, 0x01];
 
 pub fn slot_to_object_id(slot: u8) -> Option<&'static [u8]> {
     match slot {
         0x9A => Some(OBJ_ID_9A),
         0x9D => Some(OBJ_ID_9D),
+        SLOT_ATTESTATION => Some(OBJ_ID_F9),
         _ => None,
     }
+}
+
+/// Extract the certificate DER from a PIV GET DATA cert object response, which
+/// wraps the cert as `53 L { 70 L <certDER> 71 .. FE .. }`. Falls back to the raw
+/// buffer if it already looks like a bare certificate (`30` SEQUENCE).
+pub fn parse_certificate_object(resp: &[u8]) -> Option<Vec<u8>> {
+    let content = read_ber_tlv(resp, 0x53).unwrap_or(resp);
+    if let Some(cert) = read_ber_tlv(content, 0x70) {
+        return Some(cert.to_vec());
+    }
+    match resp.first() {
+        Some(0x30) => Some(resp.to_vec()),
+        _ => None,
+    }
+}
+
+/// First top-level BER-TLV with `tag` in `buf`, returning its value. Handles
+/// short-form and 1-/2-byte long-form lengths; single-byte tags only.
+fn read_ber_tlv(buf: &[u8], tag: u8) -> Option<&[u8]> {
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        let t = buf[i];
+        let len_byte = buf[i + 1];
+        i += 2;
+        let len = if len_byte < 0x80 {
+            len_byte as usize
+        } else {
+            let n = (len_byte & 0x7f) as usize;
+            if n == 0 || n > 2 || i + n > buf.len() {
+                return None;
+            }
+            let mut l = 0usize;
+            for _ in 0..n {
+                l = (l << 8) | buf[i] as usize;
+                i += 1;
+            }
+            l
+        };
+        if i + len > buf.len() {
+            return None;
+        }
+        if t == tag {
+            return Some(&buf[i..i + len]);
+        }
+        i += len;
+    }
+    None
 }
 
 // ISO 7816-4 APDU: CLA INS P1 P2 [Lc] [Data]. CLA=0x00 (no chaining, no secure messaging).
@@ -623,6 +673,31 @@ mod tests {
     fn test_attest_slot_9a() {
         let apdu = attest_key(SLOT_AUTHENTICATION);
         assert_eq!(apdu, vec![0x00, 0xF9, 0x9A, 0x00]);
+    }
+
+    #[test]
+    fn test_get_data_slot_f9_attestation() {
+        let apdu = get_data(SLOT_ATTESTATION).unwrap();
+        assert_eq!(apdu, vec![0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xFF, 0x01]);
+    }
+
+    #[test]
+    fn test_parse_certificate_object() {
+        // A 200-byte "cert" (DER SEQUENCE header) forces long-form lengths, wrapped
+        // as the PIV cert object: 53 L { 70 L <cert> 71 01 00 FE 00 }.
+        let mut cert = vec![0x30, 0x81, 0xC5];
+        cert.extend(std::iter::repeat(0xAB).take(197));
+        let mut inner = vec![0x70, 0x81, cert.len() as u8];
+        inner.extend_from_slice(&cert);
+        inner.extend_from_slice(&[0x71, 0x01, 0x00, 0xFE, 0x00]);
+        let mut obj = vec![0x53, 0x81, inner.len() as u8];
+        obj.extend_from_slice(&inner);
+
+        assert_eq!(parse_certificate_object(&obj).unwrap(), cert);
+        // Bare DER (no PIV wrapper) is returned as-is.
+        assert_eq!(parse_certificate_object(&cert).unwrap(), cert);
+        // Non-cert payload yields nothing.
+        assert!(parse_certificate_object(&[0x00, 0x01, 0x02]).is_none());
     }
 
     #[test]

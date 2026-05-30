@@ -206,6 +206,9 @@ enum HwCommands {
         #[arg(long)]
         pin: Option<String>,
     },
+    /// Fetch the on-card attestation (slots 9A/9D + device F9) and verify the
+    /// certificate chain to a bundled Yubico root. No PIN required.
+    Attest,
 }
 
 #[cfg(feature = "hardware")]

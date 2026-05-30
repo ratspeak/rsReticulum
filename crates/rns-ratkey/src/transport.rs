@@ -87,6 +87,34 @@ mod pcsc_transport {
     }
 
     fn transmit_card(card: &pcsc::Card, command: &[u8]) -> Result<Vec<u8>, RatkeyError> {
+        let mut data = transmit_once(card, command)?;
+        // ISO 7816-4 response chaining. Large reads (e.g. GET DATA on a ~1 KB cert)
+        // come back as `61 xx` — more data, fetch it with GET RESPONSE — and `6C xx`
+        // means resend with the card's expected Le. Accumulate into one response.
+        let mut guard = 0;
+        while data.len() >= 2 {
+            guard += 1;
+            if guard > 64 {
+                warn!("APDU response chaining exceeded bound");
+                break;
+            }
+            let (sw1, sw2) = (data[data.len() - 2], data[data.len() - 1]);
+            if sw1 == 0x61 {
+                data.truncate(data.len() - 2); // drop interim SW; keep the data
+                let get_response = [0x00, 0xC0, 0x00, 0x00, sw2]; // sw2 = bytes left (0 = 256)
+                data.extend_from_slice(&transmit_once(card, &get_response)?);
+            } else if sw1 == 0x6C {
+                let mut retry = command.to_vec(); // wrong Le: resend with the exact Le
+                retry.push(sw2);
+                data = transmit_once(card, &retry)?;
+            } else {
+                break;
+            }
+        }
+        Ok(data)
+    }
+
+    fn transmit_once(card: &pcsc::Card, command: &[u8]) -> Result<Vec<u8>, RatkeyError> {
         let mut response_buf = vec![0u8; MAX_RESPONSE];
         let response = card.transmit(command, &mut response_buf).map_err(|e| {
             warn!("PC/SC transmit failed: {}", e);

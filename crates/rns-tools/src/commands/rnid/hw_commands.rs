@@ -16,6 +16,69 @@ pub fn run(cmd: HwCommands) {
         HwCommands::Info { hwid } => cmd_info(hwid),
         HwCommands::Verify { hwid } => cmd_verify(hwid),
         HwCommands::Test { hwid, pin } => cmd_test(hwid, pin),
+        HwCommands::Attest => cmd_attest(),
+    }
+}
+
+/// Fetch on-card attestation certs and verify the chain to a bundled Yubico root.
+/// ATTEST + reading the F9 device cert are unauthenticated (no PIN).
+fn cmd_attest() {
+    let mut session = match rns_ratkey::PcscPivSession::connect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error connecting to hardware token: {e}");
+            eprintln!("\nRun `rnid-rs hw detect` to check for connected devices.");
+            std::process::exit(1);
+        }
+    };
+
+    let device_cert = match session.read_attestation_cert() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error reading device attestation cert (slot F9): {e}");
+            std::process::exit(1);
+        }
+    };
+
+    println!(
+        "Attesting {} (serial {}, firmware {})...\n",
+        session.device_type().as_str(),
+        session.serial().unwrap_or(0),
+        session.firmware().unwrap_or("unknown"),
+    );
+
+    let mut all_ok = true;
+    for (label, slot) in [
+        ("9A (signing)", rns_ratkey::apdu::SLOT_AUTHENTICATION),
+        ("9D (encryption)", rns_ratkey::apdu::SLOT_KEY_MANAGEMENT),
+    ] {
+        match session.attest_key(slot) {
+            Ok(cert) => match rns_ratkey::attestation::verify_attestation(&cert, &device_cert) {
+                Ok(v) => {
+                    println!("Slot {label}:");
+                    println!("  chain_verified: {}", v.chain_verified);
+                    println!("  root CA:        {}", v.root_ca);
+                    println!("  {}", v.description);
+                    all_ok &= v.chain_verified;
+                }
+                Err(e) => {
+                    eprintln!("Slot {label}: verification error: {e}");
+                    all_ok = false;
+                }
+            },
+            Err(e) => {
+                eprintln!("Slot {label}: attest error: {e}");
+                all_ok = false;
+            }
+        }
+        println!();
+    }
+
+    if all_ok {
+        println!("✓ Attestation chain cryptographically verified to a bundled Yubico root.");
+    } else {
+        eprintln!("✗ Attestation could not be fully verified.");
+        std::process::exit(1);
     }
 }
 
@@ -64,6 +127,29 @@ fn cmd_detect() {
             eprintln!("Error detecting devices: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Best-effort on-card attestation capture for the `.hwid`: the per-slot certs +
+/// the chain-verified flag. Empty on devices without PIV attestation (e.g. Nitrokey).
+fn capture_attestation(
+    session: &mut rns_ratkey::PcscPivSession,
+) -> rns_ratkey::hwid::HwidAttestation {
+    let device = match session.read_attestation_cert() {
+        Ok(c) => c,
+        Err(_) => return Default::default(),
+    };
+    let ed = session.attest_key(rns_ratkey::apdu::SLOT_AUTHENTICATION).ok();
+    let x = session.attest_key(rns_ratkey::apdu::SLOT_KEY_MANAGEMENT).ok();
+    let verified = ed
+        .as_ref()
+        .and_then(|c| rns_ratkey::attestation::verify_attestation(c, &device).ok())
+        .map(|v| v.chain_verified)
+        .unwrap_or(false);
+    rns_ratkey::hwid::HwidAttestation {
+        ed25519_cert: ed.map(hex::encode).unwrap_or_default(),
+        x25519_cert: x.map(hex::encode).unwrap_or_default(),
+        verified,
     }
 }
 
@@ -153,11 +239,15 @@ fn cmd_provision(
     let identity_hash = rns_ratkey::provision::compute_identity_hash(&ed_pub, &x_pub);
     let hash_hex = hex::encode(identity_hash);
 
+    // Capture + verify the on-card attestation chain so the .hwid records it.
+    let attestation = capture_attestation(&mut session);
+
     println!("\nHardware identity provisioned:");
     println!("  Identity hash:  {hash_hex}");
     println!("  Ed25519 public: {}", hex::encode(ed_pub));
     println!("  X25519 public:  {}", hex::encode(x_pub));
     println!("  Device:         {}", session.device_type().as_str());
+    println!("  Attestation:    chain_verified={}", attestation.verified);
 
     if let Some(dir) = output {
         let identity_dir = dir.join(&hash_hex);
@@ -194,7 +284,7 @@ fn cmd_provision(
                 touch_signing: "never".to_string(),
                 touch_encryption: "never".to_string(),
             },
-            attestation: Default::default(),
+            attestation: attestation.clone(),
             app: Default::default(),
             backup: Default::default(),
         };

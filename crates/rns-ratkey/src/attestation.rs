@@ -736,6 +736,23 @@ mod tests {
         assert_eq!(result.root_ca, "unknown");
     }
 
+    // Real on-device vectors captured from a YubiKey 5.7.4 (serial 35284666) via
+    // `rnid-rs hw attest`: the slot-9A per-key attestation cert + the slot-F9
+    // device intermediate. Proves the verifier chains a real device's ATTEST
+    // output to a bundled, fingerprint-pinned Yubico root — the regression guard
+    // for the hardware validation, runnable in CI without a device.
+    #[test]
+    fn test_real_yubikey_attestation_chain_verifies() {
+        let attest = include_bytes!("../tests/fixtures/9a_attest.der");
+        let device = include_bytes!("../tests/fixtures/f9_device.der");
+        let v = verify_attestation(attest, device).unwrap();
+        assert!(v.chain_verified, "real-device chain must verify: {}", v.description);
+        assert!(v.verified);
+        assert_eq!(v.root_ca, "new");
+        assert_eq!(v.info.firmware_version, Some((5, 7, 4)));
+        assert_eq!(v.info.serial_number, Some(35284666));
+    }
+
     // ---------------------------------------------------------------------
     // Pinned-fingerprint guards: compute the SHA-256 with our own code path
     // (pem_to_der + sha2) and assert it equals the pinned constant. Catches a
