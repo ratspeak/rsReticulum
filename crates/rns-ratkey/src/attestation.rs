@@ -741,6 +741,8 @@ mod tests {
     // device intermediate. Proves the verifier chains a real device's ATTEST
     // output to a bundled, fingerprint-pinned Yubico root — the regression guard
     // for the hardware validation, runnable in CI without a device.
+    // Both certs are notAfter=9999-12-31 (Yubico attestation certs do not expire),
+    // so the validity-window check in `verify_chain` will not rot this vector.
     #[test]
     fn test_real_yubikey_attestation_chain_verifies() {
         let attest = include_bytes!("../tests/fixtures/9a_attest.der");
