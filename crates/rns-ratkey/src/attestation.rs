@@ -965,7 +965,7 @@ mod tests {
             &leaf.der,
             &sub.der,
             &[anchor_of(&root)],
-            &[sub.cert.clone()],
+            std::slice::from_ref(&sub.cert),
             now(),
         );
         assert!(res.is_ok(), "valid synthetic chain must verify: {res:?}");
@@ -985,7 +985,7 @@ mod tests {
             &tampered_der,
             &sub.der,
             &[anchor_of(&root)],
-            &[sub.cert.clone()],
+            std::slice::from_ref(&sub.cert),
             now(),
         );
         assert!(
@@ -1051,7 +1051,7 @@ mod tests {
             &leaf.der,
             &sub.der,
             &[anchor_of(&root)],
-            &[sub.cert.clone()],
+            std::slice::from_ref(&sub.cert),
             now(),
         );
         assert!(matches!(res, Err(ChainError::Expired)), "got {res:?}");

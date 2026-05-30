@@ -743,7 +743,7 @@ mod tests {
         // A 200-byte "cert" (DER SEQUENCE header) forces long-form lengths, wrapped
         // as the PIV cert object: 53 L { 70 L <cert> 71 01 00 FE 00 }.
         let mut cert = vec![0x30, 0x81, 0xC5];
-        cert.extend(std::iter::repeat(0xAB).take(197));
+        cert.extend(std::iter::repeat_n(0xAB, 197));
         let mut inner = vec![0x70, 0x81, cert.len() as u8];
         inner.extend_from_slice(&cert);
         inner.extend_from_slice(&[0x71, 0x01, 0x00, 0xFE, 0x00]);

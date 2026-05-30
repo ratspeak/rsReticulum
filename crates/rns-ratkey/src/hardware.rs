@@ -58,11 +58,10 @@ impl IdentityBackend for MockPivSession {
         self.ecdh_x25519(slot, peer_pub)
     }
     fn read_ed25519_public(&mut self, slot: u8) -> Result<[u8; 32], RatkeyError> {
-        // Shared borrow so only the inherent `&self` method applies (not this trait method).
-        (&*self).read_ed25519_public(slot)
+        MockPivSession::read_ed25519_public(self, slot)
     }
     fn read_x25519_public(&mut self, slot: u8) -> Result<[u8; 32], RatkeyError> {
-        (&*self).read_x25519_public(slot)
+        MockPivSession::read_x25519_public(self, slot)
     }
     fn is_connected(&self) -> bool {
         self.is_connected()
