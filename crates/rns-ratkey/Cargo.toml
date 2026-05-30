@@ -26,7 +26,7 @@ sha2 = { workspace = true, features = ["oid"] }
 der = "0.7"
 const-oid = "0.9"
 
-# BIP-39 recoverable backup: 24-word mnemonic -> deterministic Reticulum identity.
+# BIP-39 recoverable backup: 12-word mnemonic -> deterministic Reticulum identity.
 bip39 = "2"
 hkdf = "0.12"
 

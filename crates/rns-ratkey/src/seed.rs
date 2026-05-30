@@ -1,8 +1,8 @@
 //! BIP-39 recoverable backup: a deterministic Reticulum identity derived from a
-//! 24-word mnemonic. Interop-compatible with ratkey-py (derivation scheme v1):
+//! 12-word mnemonic. Interop-compatible with ratkey-py (derivation scheme v1):
 //!
 //! ```text
-//! mnemonic (24 words)
+//! mnemonic (12 words)
 //!   -> PBKDF2-SHA512 (BIP-39, passphrase="")          -> 64-byte seed
 //!   -> HKDF-SHA256(seed, salt="ratkey-ed25519-v1", info) -> 32-byte Ed25519 seed
 //!   -> HKDF-SHA256(seed, salt="ratkey-x25519-v1",  info) -> 32-byte X25519 secret
@@ -24,6 +24,8 @@ use crate::error::RatkeyError;
 const ED25519_SALT: &[u8] = b"ratkey-ed25519-v1";
 const X25519_SALT: &[u8] = b"ratkey-x25519-v1";
 const HKDF_INFO: &[u8] = b"ratkey identity key derivation";
+const MNEMONIC_WORDS: usize = 12;
+const MNEMONIC_ENTROPY_BYTES: usize = 16;
 
 /// Key material derived from a mnemonic. The two secret fields are zeroized on drop.
 pub struct DerivedIdentity {
@@ -40,10 +42,10 @@ impl Drop for DerivedIdentity {
     }
 }
 
-/// Generate a fresh 24-word (256-bit) BIP-39 English mnemonic.
+/// Generate a fresh 12-word (128-bit) BIP-39 English mnemonic.
 pub fn generate_mnemonic() -> Result<String, RatkeyError> {
-    let mut entropy = [0u8; 32];
-    entropy.copy_from_slice(&rns_crypto::random::random_bytes(32));
+    let mut entropy = [0u8; MNEMONIC_ENTROPY_BYTES];
+    entropy.copy_from_slice(&rns_crypto::random::random_bytes(MNEMONIC_ENTROPY_BYTES));
     let result = Mnemonic::from_entropy_in(Language::English, &entropy)
         .map(|m| m.to_string())
         .map_err(|e| RatkeyError::InvalidHwid(format!("mnemonic generation failed: {e}")));
@@ -51,18 +53,18 @@ pub fn generate_mnemonic() -> Result<String, RatkeyError> {
     result
 }
 
-/// True for a valid 24-word BIP-39 English mnemonic (wordlist + checksum).
+/// True for a valid 12-word BIP-39 English mnemonic (wordlist + checksum).
 pub fn validate_mnemonic(words: &str) -> bool {
     let w = words.trim();
-    w.split_whitespace().count() == 24
+    w.split_whitespace().count() == MNEMONIC_WORDS
         && Mnemonic::parse_in_normalized(Language::English, w).is_ok()
 }
 
-/// Derive the Reticulum identity keys from a 24-word mnemonic (scheme v1).
+/// Derive the Reticulum identity keys from a 12-word mnemonic (scheme v1).
 pub fn derive_identity(words: &str) -> Result<DerivedIdentity, RatkeyError> {
     if !validate_mnemonic(words) {
         return Err(RatkeyError::InvalidHwid(
-            "invalid seed phrase: expected 24 valid BIP-39 English words".to_string(),
+            "invalid seed phrase: expected 12 valid BIP-39 English words".to_string(),
         ));
     }
     let mnemonic = Mnemonic::parse_in_normalized(Language::English, words.trim())
@@ -101,8 +103,8 @@ mod tests {
     use super::*;
 
     fn test_mnemonic() -> String {
-        // Standard BIP-39 all-zero-entropy vector (checksum word "art").
-        "abandon ".repeat(23) + "art"
+        // Standard BIP-39 all-zero-entropy vector (checksum word "about").
+        "abandon ".repeat(11) + "about"
     }
 
     #[test]
@@ -111,11 +113,11 @@ mod tests {
         let d = derive_identity(&test_mnemonic()).unwrap();
         assert_eq!(
             hex::encode(d.ed25519_seed),
-            "7263e9dd6caad2ac3e1466898709dbf512bacab7dfcde21faf59b26607802648"
+            "dfbf047515deef875db5884b7d1ec625f57641adb7265153a2c3b775ed04386f"
         );
         assert_eq!(
             hex::encode(d.x25519_secret),
-            "2d9f476de3ab7a9fda148957c09a3c68e23cca2db4656033cce86766d4383aae"
+            "20c92deea11650882a353b4e9928602d247b4ee689c1e0e10dc77637dbe3b33f"
         );
     }
 
@@ -130,14 +132,14 @@ mod tests {
     #[test]
     fn test_validate_rejects_bad_input() {
         assert!(!validate_mnemonic("not a real phrase"));
-        assert!(!validate_mnemonic(&"abandon ".repeat(24))); // 24 abandon = bad checksum
+        assert!(!validate_mnemonic(&"abandon ".repeat(12))); // 12 abandon = bad checksum
         assert!(validate_mnemonic(&test_mnemonic()));
     }
 
     #[test]
     fn test_generate_roundtrips() {
         let m = generate_mnemonic().unwrap();
-        assert_eq!(m.split_whitespace().count(), 24);
+        assert_eq!(m.split_whitespace().count(), MNEMONIC_WORDS);
         assert!(validate_mnemonic(&m));
         // A generated phrase derives a stable identity.
         let d = derive_identity(&m).unwrap();

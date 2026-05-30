@@ -37,7 +37,7 @@ with the YubiKey as one optional backing. All on every platform (the derivation
 that pulls `rns-ratkey` without pcsc):
 
 - **Software seed-restore** (`ratspeak_runtime::derive_identity_key_from_phrase`,
-  `restore_seed_identity` command): a 24-word phrase restores a software identity
+  `restore_seed_identity` command): a 12-word phrase restores a software identity
   on any platform — the practical mobile recovery path. Folded into the app's
   **Import** flow (key *or* phrase), not a separate button.
 - **Mnemonic-derived-by-default** (`generate_recoverable_key`): new software

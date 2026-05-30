@@ -275,7 +275,7 @@ fn finalize_provision<T: PivTransport>(
     })
 }
 
-/// Recoverable provisioning: generate a fresh 24-word mnemonic, import the
+/// Recoverable provisioning: generate a fresh 12-word mnemonic, import the
 /// derived identity, and return both the result and the mnemonic to show once.
 pub fn provision_recoverable<T: PivTransport>(
     session: &mut PivSession<T>,
@@ -287,7 +287,7 @@ pub fn provision_recoverable<T: PivTransport>(
     Ok((result, mnemonic))
 }
 
-/// Restore a recoverable identity from an existing 24-word mnemonic onto a token.
+/// Restore a recoverable identity from an existing 12-word mnemonic onto a token.
 pub fn restore<T: PivTransport>(
     session: &mut PivSession<T>,
     mgmt_key: &[u8],
