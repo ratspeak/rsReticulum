@@ -6,4 +6,6 @@ __pycache__/
 /interop_artifacts/
 /rust_artifacts/
 proptest-regressions/
-/tools/
+/tools/*
+!/tools/
+!/tools/interop_flow.py
