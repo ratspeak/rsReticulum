@@ -26,9 +26,7 @@ enum Cmd {
     },
     /// Re-select the PIV applet to drop the on-card PIN cache. Acknowledged so
     /// callers (lock-on-quit / timeout) can block until the card is re-locked.
-    Lock {
-        reply: Sender<()>,
-    },
+    Lock { reply: Sender<()> },
 }
 
 /// `LocalKeyBackend` over a PIV token. Each call round-trips a request to the
@@ -121,10 +119,12 @@ pub fn load_hardware_identity(hwid: &HwidConfig, pin: &str) -> Result<Identity, 
             while let Ok(cmd) = cmd_rx.recv() {
                 match cmd {
                     Cmd::Sign { message, reply } => {
-                        let _ = reply.send(session.sign_ed25519(SLOT_AUTHENTICATION, &message).ok());
+                        let _ =
+                            reply.send(session.sign_ed25519(SLOT_AUTHENTICATION, &message).ok());
                     }
                     Cmd::Ecdh { peer_pub, reply } => {
-                        let _ = reply.send(session.ecdh_x25519(SLOT_KEY_MANAGEMENT, &peer_pub).ok());
+                        let _ =
+                            reply.send(session.ecdh_x25519(SLOT_KEY_MANAGEMENT, &peer_pub).ok());
                     }
                     Cmd::Lock { reply } => {
                         let locked = session.lock().is_ok();
@@ -142,6 +142,11 @@ pub fn load_hardware_identity(hwid: &HwidConfig, pin: &str) -> Result<Identity, 
     let mut pub64 = [0u8; 64];
     pub64[..32].copy_from_slice(&x_pub);
     pub64[32..].copy_from_slice(&ed_pub);
-    Identity::from_backend(&pub64, Arc::new(HardwareBackend { cmd_tx: Mutex::new(cmd_tx) }))
-        .map_err(|e| RatkeyError::InvalidHwid(format!("cannot build identity: {e}")))
+    Identity::from_backend(
+        &pub64,
+        Arc::new(HardwareBackend {
+            cmd_tx: Mutex::new(cmd_tx),
+        }),
+    )
+    .map_err(|e| RatkeyError::InvalidHwid(format!("cannot build identity: {e}")))
 }

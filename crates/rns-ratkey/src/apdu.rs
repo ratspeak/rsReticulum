@@ -241,7 +241,14 @@ pub fn import_ed25519(
     pin_policy: Option<u8>,
     touch_policy: Option<u8>,
 ) -> Vec<u8> {
-    import_key(slot, ALG_ED25519, TAG_IMPORT_ED25519, private_key, pin_policy, touch_policy)
+    import_key(
+        slot,
+        ALG_ED25519,
+        TAG_IMPORT_ED25519,
+        private_key,
+        pin_policy,
+        touch_policy,
+    )
 }
 
 /// IMPORT ASYMMETRIC KEY (X25519, slot). Requires management-key auth.
@@ -251,7 +258,14 @@ pub fn import_x25519(
     pin_policy: Option<u8>,
     touch_policy: Option<u8>,
 ) -> Vec<u8> {
-    import_key(slot, ALG_X25519, TAG_IMPORT_X25519, private_key, pin_policy, touch_policy)
+    import_key(
+        slot,
+        ALG_X25519,
+        TAG_IMPORT_X25519,
+        private_key,
+        pin_policy,
+        touch_policy,
+    )
 }
 
 fn import_key(
@@ -326,7 +340,12 @@ pub fn attest_key(slot: u8) -> Vec<u8> {
 pub fn auth_witness_request(mgmt_alg: u8) -> Vec<u8> {
     let inner = tlv(TAG_AUTH_WITNESS, &[]);
     let data = tlv(TAG_DYNAMIC_AUTH, &inner);
-    build_apdu(INS_GENERAL_AUTHENTICATE, mgmt_alg, SLOT_CARD_MANAGEMENT, &data)
+    build_apdu(
+        INS_GENERAL_AUTHENTICATE,
+        mgmt_alg,
+        SLOT_CARD_MANAGEMENT,
+        &data,
+    )
 }
 
 /// Step 3: return the decrypted witness plus our own challenge.
@@ -334,28 +353,42 @@ pub fn auth_witness_response(mgmt_alg: u8, decrypted_witness: &[u8], challenge: 
     let mut inner = tlv(TAG_AUTH_WITNESS, decrypted_witness);
     inner.extend_from_slice(&tlv(TAG_AUTH_CHALLENGE, challenge));
     let data = tlv(TAG_DYNAMIC_AUTH, &inner);
-    build_apdu(INS_GENERAL_AUTHENTICATE, mgmt_alg, SLOT_CARD_MANAGEMENT, &data)
+    build_apdu(
+        INS_GENERAL_AUTHENTICATE,
+        mgmt_alg,
+        SLOT_CARD_MANAGEMENT,
+        &data,
+    )
 }
 
 /// Extract the witness (tag 0x80) from a witness-request response.
 pub fn parse_auth_witness(data: &[u8]) -> Result<Vec<u8>, RatkeyError> {
     find_tlv_value(data, TAG_AUTH_WITNESS)
         .map(<[u8]>::to_vec)
-        .ok_or(RatkeyError::Apdu { sw1: 0x6A, sw2: 0x80 })
+        .ok_or(RatkeyError::Apdu {
+            sw1: 0x6A,
+            sw2: 0x80,
+        })
 }
 
 /// Extract the card's encrypted challenge (tag 0x82) from a witness-response reply.
 pub fn parse_auth_response(data: &[u8]) -> Result<Vec<u8>, RatkeyError> {
     find_tlv_value(data, TAG_AUTH_RESPONSE)
         .map(<[u8]>::to_vec)
-        .ok_or(RatkeyError::Apdu { sw1: 0x6A, sw2: 0x80 })
+        .ok_or(RatkeyError::Apdu {
+            sw1: 0x6A,
+            sw2: 0x80,
+        })
 }
 
 /// Algorithm byte (tag 0x01) from a GET METADATA response (e.g. slot 9B mgmt key).
 pub fn parse_metadata_algorithm(metadata: &[u8]) -> Result<u8, RatkeyError> {
     find_tlv_value(metadata, 0x01)
         .and_then(|v| v.first().copied())
-        .ok_or(RatkeyError::Apdu { sw1: 0x6A, sw2: 0x80 })
+        .ok_or(RatkeyError::Apdu {
+            sw1: 0x6A,
+            sw2: 0x80,
+        })
 }
 
 pub fn check_response(response: &[u8]) -> Result<&[u8], RatkeyError> {
@@ -699,7 +732,10 @@ mod tests {
     #[test]
     fn test_get_data_slot_f9_attestation() {
         let apdu = get_data(SLOT_ATTESTATION).unwrap();
-        assert_eq!(apdu, vec![0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xFF, 0x01]);
+        assert_eq!(
+            apdu,
+            vec![0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xFF, 0x01]
+        );
     }
 
     #[test]

@@ -43,11 +43,11 @@ pub fn detect_device_type(reader_name: &str) -> DeviceType {
 }
 
 #[cfg(feature = "hardware")]
+use crate::error::RatkeyError;
+#[cfg(feature = "hardware")]
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
 #[cfg(feature = "hardware")]
 use tracing::{debug, info, warn};
-#[cfg(feature = "hardware")]
-use crate::error::RatkeyError;
 
 #[cfg(feature = "hardware")]
 pub fn list_readers() -> Result<Vec<String>, RatkeyError> {

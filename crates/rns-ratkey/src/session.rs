@@ -69,7 +69,9 @@ impl<T: PivTransport> PivSession<T> {
     }
 
     pub fn change_pin(&mut self, old_pin: &str, new_pin: &str) -> Result<(), RatkeyError> {
-        let resp = self.transport.transmit(&apdu::change_pin(old_pin, new_pin))?;
+        let resp = self
+            .transport
+            .transmit(&apdu::change_pin(old_pin, new_pin))?;
         apdu::check_response(&resp)?;
         self.pin_cache.cache(new_pin);
         Ok(())
@@ -173,13 +175,17 @@ impl<T: PivTransport> PivSession<T> {
     }
 
     pub fn sign_ed25519(&mut self, slot: u8, message: &[u8]) -> Result<[u8; 64], RatkeyError> {
-        let resp = self.transport.transmit(&apdu::sign_ed25519(slot, message))?;
+        let resp = self
+            .transport
+            .transmit(&apdu::sign_ed25519(slot, message))?;
         let data = apdu::check_response(&resp)?;
         apdu::parse_sign_response(data)
     }
 
     pub fn ecdh_x25519(&mut self, slot: u8, peer_pub: &[u8; 32]) -> Result<[u8; 32], RatkeyError> {
-        let resp = self.transport.transmit(&apdu::ecdh_x25519(slot, peer_pub))?;
+        let resp = self
+            .transport
+            .transmit(&apdu::ecdh_x25519(slot, peer_pub))?;
         let data = apdu::check_response(&resp)?;
         apdu::parse_ecdh_response(data)
     }
@@ -199,8 +205,9 @@ impl<T: PivTransport> PivSession<T> {
     /// Device attestation (slot F9) intermediate certificate, unwrapped to raw DER.
     /// This is the issuer of the per-slot certs returned by [`Self::attest_key`].
     pub fn read_attestation_cert(&mut self) -> Result<Vec<u8>, RatkeyError> {
-        let cmd = apdu::get_data(apdu::SLOT_ATTESTATION)
-            .ok_or(RatkeyError::EmptySlot { slot: apdu::SLOT_ATTESTATION })?;
+        let cmd = apdu::get_data(apdu::SLOT_ATTESTATION).ok_or(RatkeyError::EmptySlot {
+            slot: apdu::SLOT_ATTESTATION,
+        })?;
         let resp = self.transport.transmit(&cmd)?;
         let data = apdu::check_response(&resp)?;
         apdu::parse_certificate_object(data).ok_or_else(|| {

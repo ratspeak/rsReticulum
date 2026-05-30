@@ -186,7 +186,10 @@ mod tests {
         let pt = [0x42u8; 8];
         let ct = ecb_encrypt(apdu::MGMT_ALG_TDES, &key, &pt).unwrap();
         assert_ne!(ct, pt.to_vec());
-        assert_eq!(ecb_decrypt(apdu::MGMT_ALG_TDES, &key, &ct).unwrap(), pt.to_vec());
+        assert_eq!(
+            ecb_decrypt(apdu::MGMT_ALG_TDES, &key, &ct).unwrap(),
+            pt.to_vec()
+        );
     }
 
     #[test]

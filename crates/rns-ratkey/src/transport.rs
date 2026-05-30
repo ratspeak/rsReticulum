@@ -156,11 +156,15 @@ mod tests {
     #[test]
     fn appends_get_response_on_61() {
         let mut calls = 0;
-        let out = chain_response(&[0x00, 0xCB, 0x3F, 0xFF], vec![0xAA, 0xBB, 0x61, 0x02], |apdu| {
-            calls += 1;
-            assert_eq!(apdu, &[0x00, 0xC0, 0x00, 0x00, 0x02]); // GET RESPONSE, Le=2
-            Ok(vec![0xCC, 0xDD, 0x90, 0x00])
-        })
+        let out = chain_response(
+            &[0x00, 0xCB, 0x3F, 0xFF],
+            vec![0xAA, 0xBB, 0x61, 0x02],
+            |apdu| {
+                calls += 1;
+                assert_eq!(apdu, &[0x00, 0xC0, 0x00, 0x00, 0x02]); // GET RESPONSE, Le=2
+                Ok(vec![0xCC, 0xDD, 0x90, 0x00])
+            },
+        )
         .unwrap();
         assert_eq!(calls, 1);
         assert_eq!(out, vec![0xAA, 0xBB, 0xCC, 0xDD, 0x90, 0x00]);

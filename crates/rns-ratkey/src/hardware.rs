@@ -107,10 +107,7 @@ impl HardwareIdentity {
         })
     }
 
-    pub fn from_file(
-        path: &Path,
-        backend: Box<dyn IdentityBackend>,
-    ) -> Result<Self, RatkeyError> {
+    pub fn from_file(path: &Path, backend: Box<dyn IdentityBackend>) -> Result<Self, RatkeyError> {
         let config = HwidConfig::from_file(path)?;
         Self::from_hwid(config, backend)
     }
@@ -310,7 +307,10 @@ mod tests {
         let hw_sig = hw.sign(message).unwrap();
         let sw_sig = sw_identity.sign(message).unwrap();
 
-        assert_eq!(hw_sig, sw_sig, "hardware and software signatures must match");
+        assert_eq!(
+            hw_sig, sw_sig,
+            "hardware and software signatures must match"
+        );
         assert_eq!(hw.identity.hash, sw_identity.hash);
         assert_eq!(hw.get_public_key(), sw_identity.get_public_key());
     }

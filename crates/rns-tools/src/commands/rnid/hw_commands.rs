@@ -139,8 +139,12 @@ fn capture_attestation(
         Ok(c) => c,
         Err(_) => return Default::default(),
     };
-    let ed = session.attest_key(rns_ratkey::apdu::SLOT_AUTHENTICATION).ok();
-    let x = session.attest_key(rns_ratkey::apdu::SLOT_KEY_MANAGEMENT).ok();
+    let ed = session
+        .attest_key(rns_ratkey::apdu::SLOT_AUTHENTICATION)
+        .ok();
+    let x = session
+        .attest_key(rns_ratkey::apdu::SLOT_KEY_MANAGEMENT)
+        .ok();
     let verified = ed
         .as_ref()
         .and_then(|c| rns_ratkey::attestation::verify_attestation(c, &device).ok())

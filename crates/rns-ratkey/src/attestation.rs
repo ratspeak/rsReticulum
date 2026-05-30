@@ -40,8 +40,8 @@ use der::Encode;
 use rsa::RsaPublicKey;
 use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::pkcs1v15::{Signature as RsaSignature, VerifyingKey};
-use sha2::{Digest, Sha256, Sha512};
 use rsa::signature::Verifier;
+use sha2::{Digest, Sha256, Sha512};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use x509_cert::Certificate;
 use x509_cert::der::Decode;
@@ -60,8 +60,10 @@ const YUBICO_ATTESTATION_INTERMEDIATE_A_1_PEM: &str =
     include_str!("../certs/yubico-attestation-intermediate-a-1.pem");
 const YUBICO_ATTESTATION_INTERMEDIATE_B_1_PEM: &str =
     include_str!("../certs/yubico-attestation-intermediate-b-1.pem");
-const YUBICO_PIV_ATTESTATION_A_1_PEM: &str = include_str!("../certs/yubico-piv-attestation-a-1.pem");
-const YUBICO_PIV_ATTESTATION_B_1_PEM: &str = include_str!("../certs/yubico-piv-attestation-b-1.pem");
+const YUBICO_PIV_ATTESTATION_A_1_PEM: &str =
+    include_str!("../certs/yubico-piv-attestation-a-1.pem");
+const YUBICO_PIV_ATTESTATION_B_1_PEM: &str =
+    include_str!("../certs/yubico-piv-attestation-b-1.pem");
 const YUBICO_PIV_ATTESTATION_B2_1_PEM: &str =
     include_str!("../certs/yubico-piv-attestation-b2-1.pem");
 
@@ -151,13 +153,7 @@ pub fn verify_attestation(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
 
-    let chain_result = verify_chain(
-        attestation_cert_der,
-        device_cert_der,
-        &anchors,
-        &pool,
-        now,
-    );
+    let chain_result = verify_chain(attestation_cert_der, device_cert_der, &anchors, &pool, now);
 
     let chain_verified = chain_result.is_ok();
 
@@ -191,7 +187,9 @@ fn build_description(
     };
 
     match chain_result {
-        Ok(()) => format!("{prefix}; attestation chain cryptographically verified to bundled Yubico root"),
+        Ok(()) => {
+            format!("{prefix}; attestation chain cryptographically verified to bundled Yubico root")
+        }
         Err(e) => format!("{prefix}; attestation chain not verified: {e}"),
     }
 }
@@ -229,9 +227,14 @@ impl std::fmt::Display for ChainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ChainError::ParseLeaf => write!(f, "attestation certificate did not parse as X.509"),
-            ChainError::ParseDevice => write!(f, "device (slot F9) certificate did not parse as X.509"),
+            ChainError::ParseDevice => {
+                write!(f, "device (slot F9) certificate did not parse as X.509")
+            }
             ChainError::IssuerNotFound => {
-                write!(f, "no bundled/known issuer found for a certificate in the chain")
+                write!(
+                    f,
+                    "no bundled/known issuer found for a certificate in the chain"
+                )
             }
             ChainError::SignatureInvalid => write!(f, "a certificate signature failed to verify"),
             ChainError::Expired => write!(f, "a certificate is outside its validity window"),
@@ -306,8 +309,10 @@ fn verify_chain(
         for anchor in anchors {
             // `anchor` is trusted only because its DER SHA-256 matched a pinned
             // constant in bundled_trust_anchors(); its self-signature is not checked.
-            if names_match(&anchor.cert.tbs_certificate.subject, &current.tbs_certificate.issuer)
-                && verify_signature(&current, &anchor.cert).is_ok()
+            if names_match(
+                &anchor.cert.tbs_certificate.subject,
+                &current.tbs_certificate.issuer,
+            ) && verify_signature(&current, &anchor.cert).is_ok()
             {
                 check_validity(&anchor.cert, now)?;
                 return Ok(());
@@ -317,20 +322,27 @@ fn verify_chain(
         // A self-issued cert that is not a pinned anchor is an untrusted root:
         // the chain terminates here without reaching a trust anchor. (Anchors are
         // checked above, so reaching this point means it is not pinned.)
-        if names_match(&current.tbs_certificate.subject, &current.tbs_certificate.issuer) {
+        if names_match(
+            &current.tbs_certificate.subject,
+            &current.tbs_certificate.issuer,
+        ) {
             return Err(ChainError::IssuerNotFound);
         }
 
         // Otherwise advance one link via a searchable (non-anchor) issuer.
         let issuer = searchable.iter().copied().find(|cand| {
-            names_match(&cand.tbs_certificate.subject, &current.tbs_certificate.issuer)
-                && verify_signature(&current, cand).is_ok()
+            names_match(
+                &cand.tbs_certificate.subject,
+                &current.tbs_certificate.issuer,
+            ) && verify_signature(&current, cand).is_ok()
         });
 
         match issuer {
             Some(issuer_cert) => {
                 check_validity(issuer_cert, now)?;
-                let issuer_der = issuer_cert.to_der().map_err(|_| ChainError::IssuerNotFound)?;
+                let issuer_der = issuer_cert
+                    .to_der()
+                    .map_err(|_| ChainError::IssuerNotFound)?;
                 // Cycle guard: a non-self-issued cert pointing back at itself.
                 if issuer_der == current_der {
                     return Err(ChainError::IssuerNotFound);
@@ -341,12 +353,14 @@ fn verify_chain(
             None => {
                 // No pinned anchor and no searchable issuer signs `current`.
                 // Distinguish "issuer present but bad signature" for diagnostics.
-                let issuer_present = anchors
-                    .iter()
-                    .any(|a| names_match(&a.cert.tbs_certificate.subject, &current.tbs_certificate.issuer))
-                    || searchable.iter().any(|c| {
-                        names_match(&c.tbs_certificate.subject, &current.tbs_certificate.issuer)
-                    });
+                let issuer_present = anchors.iter().any(|a| {
+                    names_match(
+                        &a.cert.tbs_certificate.subject,
+                        &current.tbs_certificate.issuer,
+                    )
+                }) || searchable.iter().any(|c| {
+                    names_match(&c.tbs_certificate.subject, &current.tbs_certificate.issuer)
+                });
                 return Err(if issuer_present {
                     ChainError::SignatureInvalid
                 } else {
@@ -767,7 +781,11 @@ mod tests {
         let attest = include_bytes!("../tests/fixtures/9a_attest.der");
         let device = include_bytes!("../tests/fixtures/f9_device.der");
         let v = verify_attestation(attest, device).unwrap();
-        assert!(v.chain_verified, "real-device chain must verify: {}", v.description);
+        assert!(
+            v.chain_verified,
+            "real-device chain must verify: {}",
+            v.description
+        );
         assert!(v.verified);
         assert_eq!(v.root_ca, "new");
         assert_eq!(v.info.firmware_version, Some((5, 7, 4)));
@@ -813,7 +831,10 @@ mod tests {
         let int_a = pem_to_der(YUBICO_ATTESTATION_INTERMEDIATE_A_1_PEM).unwrap();
         let now = Duration::from_secs(1_900_000_000); // ~2030, inside all windows
         let res = verify_chain(&int_a, &int_a, &anchors, &pool, now);
-        assert!(res.is_ok(), "real intermediate must chain to pinned root: {res:?}");
+        assert!(
+            res.is_ok(),
+            "real intermediate must chain to pinned root: {res:?}"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -823,12 +844,12 @@ mod tests {
 
     use rsa::RsaPrivateKey;
     use rsa::pkcs1v15::SigningKey;
+    use std::str::FromStr;
     use x509_cert::builder::{Builder, CertificateBuilder, Profile};
     use x509_cert::name::Name;
     use x509_cert::serial_number::SerialNumber;
     use x509_cert::spki::SubjectPublicKeyInfoOwned;
     use x509_cert::time::{Time, Validity};
-    use std::str::FromStr;
 
     struct Node {
         cert: Certificate,
@@ -967,7 +988,10 @@ mod tests {
             &[sub.cert.clone()],
             now(),
         );
-        assert!(matches!(res, Err(ChainError::SignatureInvalid)), "got {res:?}");
+        assert!(
+            matches!(res, Err(ChainError::SignatureInvalid)),
+            "got {res:?}"
+        );
     }
 
     #[test]
@@ -998,12 +1022,16 @@ mod tests {
         // Leaf already expired: notBefore..notAfter both in the past.
         let expired = Validity {
             not_before: Time::UtcTime(
-                x509_cert::der::asn1::UtcTime::from_unix_duration(Duration::from_secs(1_000_000_000))
-                    .unwrap(),
+                x509_cert::der::asn1::UtcTime::from_unix_duration(Duration::from_secs(
+                    1_000_000_000,
+                ))
+                .unwrap(),
             ),
             not_after: Time::UtcTime(
-                x509_cert::der::asn1::UtcTime::from_unix_duration(Duration::from_secs(1_100_000_000))
-                    .unwrap(),
+                x509_cert::der::asn1::UtcTime::from_unix_duration(Duration::from_secs(
+                    1_100_000_000,
+                ))
+                .unwrap(),
             ),
         };
         let leaf = build_cert(
@@ -1053,7 +1081,7 @@ mod tests {
         let res = verify_chain(
             &leaf.der,
             &sub.der,
-            &[anchor_of(&other_root)],           // pinned set: unrelated root only
+            &[anchor_of(&other_root)], // pinned set: unrelated root only
             &[sub.cert.clone(), bogus_root.cert.clone()], // searchable: real signer present
             now(),
         );
@@ -1070,6 +1098,9 @@ mod tests {
         let (leaf, _sub, root) = synthetic_chain();
         // No sub-CA in the pool: leaf's issuer is unfindable.
         let res = verify_chain(&leaf.der, &leaf.der, &[anchor_of(&root)], &[], now());
-        assert!(matches!(res, Err(ChainError::IssuerNotFound)), "got {res:?}");
+        assert!(
+            matches!(res, Err(ChainError::IssuerNotFound)),
+            "got {res:?}"
+        );
     }
 }
