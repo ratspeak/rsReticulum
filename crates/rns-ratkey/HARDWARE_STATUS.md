@@ -41,10 +41,20 @@ that pulls `rns-ratkey` without pcsc):
   on any platform — the practical mobile recovery path. Folded into the app's
   **Import** flow (key *or* phrase), not a separate button.
 - **Mnemonic-derived-by-default** (`generate_recoverable_key`): new software
-  identities are derived from a fresh BIP-39 mnemonic shown once for backup
-  (wallet-style, never stored). Both `api_create_identity` (settings) and
-  `api_setup_complete` (first-setup) produce them; legacy random identities keep
-  raw-key export. `LxmfManager::create_identity` (random) stays for internal/tests.
+  identities are derived from a fresh BIP-39 mnemonic shown for backup at creation.
+  Both `api_create_identity` (settings) and `api_setup_complete` (first-setup)
+  produce them; legacy random identities keep raw-key export.
+  `LxmfManager::create_identity` (random) stays for internal/tests.
+- **Recovery-phrase re-display** (`vault::store_plaintext_seed` /
+  `has_stored_mnemonic` / `reveal_mnemonic`, `reveal_identity_mnemonic` command,
+  software only): the phrase is persisted so it can be shown again. Its at-rest
+  protection tracks the key's — a plaintext `identity.seed` sidecar when the
+  identity is unprotected (crypto-equivalent to the already-plaintext `identity`
+  key file), folded into the vault as a `mnemonic_token` (same KEK) once a passcode
+  is set. The vault is authoritative when present, so reveal honors the passcode
+  even if a stale sidecar survives the verify-before-delete window. Captured at
+  create/import (both `api_create_identity`, `api_setup_complete`, and
+  `restore_seed_identity`); hardware identities never store a phrase.
 - **Passcode at-rest encryption** (`vault.rs`): software identities can be sealed
   with a passcode — Argon2id(passcode,salt) → HKDF(info=params‖salt) binds the KDF
   params → 64-byte KEK → `rns_crypto::token` (AES-256-CBC + HMAC). Stored as
