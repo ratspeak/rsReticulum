@@ -2,8 +2,9 @@
 //!
 //! Python Reticulum uses `multiprocessing.connection.Listener/Client` for the
 //! local control port. Keep the Rust control socket wire-compatible with that:
-//! framed auth challenge (`#CHALLENGE#` + `{sha256}` payload), framed pickle
-//! request dictionaries, and framed pickle responses.
+//! framed auth challenge (`#CHALLENGE#`), framed pickle request dictionaries,
+//! and framed pickle responses. Python 3.12+ uses tagged SHA-256 auth
+//! challenges, while Python 3.11 and older use raw MD5 HMAC responses.
 
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +13,22 @@ pub(crate) const MP_WELCOME: &[u8] = b"#WELCOME#";
 pub(crate) const MP_FAILURE: &[u8] = b"#FAILURE#";
 const MP_DIGEST_PREFIX: &[u8] = b"{sha256}";
 const MP_CHALLENGE_RANDOM_LEN: usize = 40;
+const MP_LEGACY_CHALLENGE_RANDOM_LEN: usize = 20;
 const MAX_MP_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PythonAuthProtocol {
+    LegacyMd5,
+    Sha256,
+}
+
+pub(crate) fn detect_python_auth_protocol(challenge: &[u8]) -> PythonAuthProtocol {
+    if challenge.starts_with(MP_DIGEST_PREFIX) {
+        PythonAuthProtocol::Sha256
+    } else {
+        PythonAuthProtocol::LegacyMd5
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum PyValue {
@@ -209,6 +225,18 @@ pub fn compute_auth_hmac(key: &[u8], challenge: &[u8]) -> [u8; 32] {
     mac.update(challenge);
     let result = mac.finalize();
     let mut out = [0u8; 32];
+    out.copy_from_slice(&result.into_bytes());
+    out
+}
+
+pub fn compute_legacy_auth_hmac(key: &[u8], challenge: &[u8]) -> [u8; 16] {
+    use hmac::{Hmac, Mac};
+    use md5::Md5;
+
+    let mut mac = Hmac::<Md5>::new_from_slice(key).expect("HMAC key can be any length");
+    mac.update(challenge);
+    let result = mac.finalize();
+    let mut out = [0u8; 16];
     out.copy_from_slice(&result.into_bytes());
     out
 }
@@ -1399,6 +1427,18 @@ fn read_u64_le(data: &[u8], index: &mut usize) -> Result<u64, RpcError> {
 }
 
 pub fn compute_python_auth_response(key: &[u8], message: &[u8]) -> Vec<u8> {
+    compute_python_auth_response_for(detect_python_auth_protocol(message), key, message)
+}
+
+pub(crate) fn compute_python_auth_response_for(
+    protocol: PythonAuthProtocol,
+    key: &[u8],
+    message: &[u8],
+) -> Vec<u8> {
+    if protocol == PythonAuthProtocol::LegacyMd5 {
+        return compute_legacy_auth_hmac(key, message).to_vec();
+    }
+
     let mut response = Vec::with_capacity(MP_DIGEST_PREFIX.len() + 32);
     response.extend_from_slice(MP_DIGEST_PREFIX);
     response.extend_from_slice(&compute_auth_hmac(key, message));
@@ -1406,7 +1446,26 @@ pub fn compute_python_auth_response(key: &[u8], message: &[u8]) -> Vec<u8> {
 }
 
 pub fn verify_python_auth_response(key: &[u8], message: &[u8], response: &[u8]) -> bool {
+    let protocol = if response.starts_with(MP_DIGEST_PREFIX) {
+        PythonAuthProtocol::Sha256
+    } else {
+        PythonAuthProtocol::LegacyMd5
+    };
+    verify_python_auth_response_for(protocol, key, message, response)
+}
+
+pub(crate) fn verify_python_auth_response_for(
+    protocol: PythonAuthProtocol,
+    key: &[u8],
+    message: &[u8],
+    response: &[u8],
+) -> bool {
     use subtle::ConstantTimeEq;
+    if protocol == PythonAuthProtocol::LegacyMd5 {
+        let expected = compute_legacy_auth_hmac(key, message);
+        return expected.as_slice().ct_eq(response).into();
+    }
+
     if !response.starts_with(MP_DIGEST_PREFIX) {
         return false;
     }
@@ -1416,6 +1475,14 @@ pub fn verify_python_auth_response(key: &[u8], message: &[u8], response: &[u8]) 
 }
 
 pub fn new_python_challenge() -> Vec<u8> {
+    new_python_challenge_for(PythonAuthProtocol::Sha256)
+}
+
+pub(crate) fn new_python_challenge_for(protocol: PythonAuthProtocol) -> Vec<u8> {
+    if protocol == PythonAuthProtocol::LegacyMd5 {
+        return rns_crypto::random::random_bytes(MP_LEGACY_CHALLENGE_RANDOM_LEN);
+    }
+
     let mut message = Vec::with_capacity(MP_DIGEST_PREFIX.len() + MP_CHALLENGE_RANDOM_LEN);
     message.extend_from_slice(MP_DIGEST_PREFIX);
     message.extend_from_slice(&rns_crypto::random::random_bytes(MP_CHALLENGE_RANDOM_LEN));
@@ -1580,8 +1647,9 @@ where
         return Err(RpcError::AuthFailed);
     }
     let challenge = &challenge_frame[MP_CHALLENGE.len()..];
+    let protocol = detect_python_auth_protocol(challenge);
 
-    let response = compute_python_auth_response(rpc_key, challenge);
+    let response = compute_python_auth_response_for(protocol, rpc_key, challenge);
     tokio::time::timeout(timeout, write_mp_frame(&mut stream, &response))
         .await
         .map_err(|_| {
@@ -1603,7 +1671,7 @@ where
         return Err(RpcError::AuthFailed);
     }
 
-    let client_challenge = new_python_challenge();
+    let client_challenge = new_python_challenge_for(protocol);
     let mut client_challenge_frame =
         Vec::with_capacity(MP_CHALLENGE.len() + client_challenge.len());
     client_challenge_frame.extend_from_slice(MP_CHALLENGE);
@@ -1628,7 +1696,7 @@ where
                 "server auth response read timeout",
             ))
         })??;
-    if verify_python_auth_response(rpc_key, &client_challenge, &server_response) {
+    if verify_python_auth_response_for(protocol, rpc_key, &client_challenge, &server_response) {
         tokio::time::timeout(timeout, write_mp_frame(&mut stream, MP_WELCOME))
             .await
             .map_err(|_| {
@@ -1848,6 +1916,34 @@ mod tests {
         let challenge = b"random_challenge_bytes_32_bytes!";
         let hmac = compute_auth_hmac(key, challenge);
         assert!(!verify_auth_hmac(wrong_key, challenge, &hmac));
+    }
+
+    #[test]
+    fn test_python_legacy_md5_auth_response() {
+        let key = b"test_rpc_key";
+        let challenge = b"python311challenge";
+        let response = compute_python_auth_response(key, challenge);
+        assert_eq!(response.len(), 16);
+        assert!(verify_python_auth_response(key, challenge, &response));
+        assert!(!verify_python_auth_response(
+            b"wrong_key",
+            challenge,
+            &response
+        ));
+    }
+
+    #[test]
+    fn test_python_sha256_auth_response() {
+        let key = b"test_rpc_key";
+        let challenge = b"{sha256}python312pluschallenge";
+        let response = compute_python_auth_response(key, challenge);
+        assert!(response.starts_with(MP_DIGEST_PREFIX));
+        assert!(verify_python_auth_response(key, challenge, &response));
+        assert!(!verify_python_auth_response(
+            b"wrong_key",
+            challenge,
+            &response
+        ));
     }
 
     #[test]

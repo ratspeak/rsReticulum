@@ -198,7 +198,11 @@ async fn handle_rpc_client(
         return Err(RpcError::AuthFailed);
     }
     let client_challenge = &client_challenge_frame[rpc::MP_CHALLENGE.len()..];
-    let client_response = rpc::compute_python_auth_response(rpc_key, client_challenge);
+    let client_response = rpc::compute_python_auth_response_for(
+        rpc::detect_python_auth_protocol(client_challenge),
+        rpc_key,
+        client_challenge,
+    );
     rpc::write_mp_frame(&mut stream, &client_response).await?;
     let client_welcome = rpc::read_mp_frame(&mut stream, 256).await?;
     if client_welcome != rpc::MP_WELCOME {

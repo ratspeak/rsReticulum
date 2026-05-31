@@ -28,6 +28,7 @@ des = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 hkdf = "0.12"
 hmac = "0.12"
+md-5 = "0.10"
 sha2 = "0.10"
 subtle = "2"
 zeroize = { version = "1", features = ["derive"] }
