@@ -450,6 +450,18 @@ pub(crate) fn dispatch_event(event: BlePeerEvent) {
     }
 }
 
+fn peer_state_for_count(peer_count: usize) -> PeerState {
+    if peer_count > 0 {
+        PeerState::On
+    } else {
+        PeerState::Starting
+    }
+}
+
+fn dispatch_status_changed(state: PeerState, peer_count: usize) {
+    dispatch_event(BlePeerEvent::StatusChanged { state, peer_count });
+}
+
 /// `false` means the radio truly stops, not just the TX channel dropping.
 static BLE_PEER_RUNNING: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
 
@@ -524,6 +536,7 @@ pub async fn stop_ble_peer_interface() {
     } else {
         tracing::info!("stop_ble_peer_interface: peripheral stopped");
     }
+    dispatch_status_changed(PeerState::Off, 0);
     clear_event_dispatcher();
     tracing::info!(generation, "stop_ble_peer_interface: done");
 }
@@ -4874,6 +4887,10 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
     // either we reconnect or the entry expires. Identity-keyed
     // tracking is gone because the BLE link no longer exchanges identity.
     record_disconnect(&recently_disconnected, &peer_address);
+    dispatch_event(BlePeerEvent::Disconnected {
+        address: peer_address,
+        reason: "central disconnect".into(),
+    });
 }
 
 /// Per-peer write loop: fragment and write outbound data to peer's RX
@@ -4984,6 +5001,7 @@ pub async fn spawn_ble_peer_interface(
     // Reset the process-wide running flag and advance the session generation
     // so callbacks/tasks from a previous enable cannot outlive this interface.
     let generation = begin_ble_peer_session();
+    dispatch_status_changed(PeerState::Starting, 0);
 
     // Start peripheral (GATT server + advertising)
     if let Err(e) = start_peripheral(&config.identity_hash).await {
@@ -5442,6 +5460,7 @@ pub async fn spawn_ble_peer_interface(
                 }
 
                 // Clean up disconnected peers
+                let previous_peer_count = connected_addrs.len();
                 connected_addrs.retain(|addr, online| {
                     let alive = online.load(Ordering::SeqCst);
                     if !alive {
@@ -5454,6 +5473,12 @@ pub async fn spawn_ble_peer_interface(
                     }
                     alive
                 });
+                if connected_addrs.len() != previous_peer_count {
+                    dispatch_status_changed(
+                        peer_state_for_count(connected_addrs.len()),
+                        connected_addrs.len(),
+                    );
+                }
 
                 // Drop "recently disconnected" entries that have aged out.
                 prune_recently_disconnected(&recently_disc);
@@ -5491,8 +5516,17 @@ pub async fn spawn_ble_peer_interface(
                         scan_interval = next_interval;
 
                         for peer in &peers {
+                            dispatch_event(BlePeerEvent::Discovered {
+                                address: peer.ble_address.clone(),
+                                rssi: peer.rssi,
+                                protocol: peer.protocol,
+                            });
                             // Skip if already connected
                             if connected_addrs.contains_key(&peer.ble_address) {
+                                dispatch_event(BlePeerEvent::RssiUpdate {
+                                    address: peer.ble_address.clone(),
+                                    rssi: peer.rssi,
+                                });
                                 continue;
                             }
 
@@ -5606,6 +5640,10 @@ pub async fn spawn_ble_peer_interface(
                                         identity_hash: String::new(),
                                         protocol: proto_evt,
                                     });
+                                    dispatch_status_changed(
+                                        peer_state_for_count(connected_addrs.len()),
+                                        connected_addrs.len(),
+                                    );
                                     // Kick-announce: now that we're subscribed
                                     // to the peer's TX, ask the embedding UI to
                                     // fire an immediate Reticulum announce so
@@ -5681,6 +5719,7 @@ pub async fn spawn_ble_peer_interface(
                 // between rotation-aware reconnect (zero-out backoff so the
                 // peer comes back fast on next scan) and genuine-failure
                 // accumulation (existing 3-strike path).
+                let previous_peer_count = connected_addrs.len();
                 connected_addrs.retain(|addr, online| {
                     let alive = online.load(Ordering::SeqCst);
                     if !alive {
@@ -5710,6 +5749,12 @@ pub async fn spawn_ble_peer_interface(
                     }
                     alive
                 });
+                if connected_addrs.len() != previous_peer_count {
+                    dispatch_status_changed(
+                        peer_state_for_count(connected_addrs.len()),
+                        connected_addrs.len(),
+                    );
+                }
 
                 prune_recently_disconnected(&recently_disc);
                 anti_loop_prune(&anti_loop);
@@ -5738,7 +5783,16 @@ pub async fn spawn_ble_peer_interface(
                         scan_interval = next_interval;
 
                         for peer in &peers {
+                            dispatch_event(BlePeerEvent::Discovered {
+                                address: peer.ble_address.clone(),
+                                rssi: peer.rssi,
+                                protocol: peer.protocol,
+                            });
                             if connected_addrs.contains_key(&peer.ble_address) {
+                                dispatch_event(BlePeerEvent::RssiUpdate {
+                                    address: peer.ble_address.clone(),
+                                    rssi: peer.rssi,
+                                });
                                 continue;
                             }
                             if connected_addrs.len() >= MAX_PEERS {
@@ -5880,6 +5934,10 @@ pub async fn spawn_ble_peer_interface(
                                         identity_hash: String::new(),
                                         protocol: peer.protocol,
                                     });
+                                    dispatch_status_changed(
+                                        peer_state_for_count(connected_addrs.len()),
+                                        connected_addrs.len(),
+                                    );
                                     dispatch_event(BlePeerEvent::SubscribeReady {
                                         address: peer.ble_address.clone(),
                                     });
@@ -5976,6 +6034,7 @@ pub async fn spawn_ble_peer_interface(
 
                 // Drop peers whose JNI disconnect callback flipped their flag.
                 // unregister cleans the static registry that backs that callback.
+                let previous_peer_count = connected_addrs.len();
                 connected_addrs.retain(|addr, online| {
                     let alive = online.load(Ordering::SeqCst);
                     if !alive {
@@ -5989,6 +6048,12 @@ pub async fn spawn_ble_peer_interface(
                     }
                     alive
                 });
+                if connected_addrs.len() != previous_peer_count {
+                    dispatch_status_changed(
+                        peer_state_for_count(connected_addrs.len()),
+                        connected_addrs.len(),
+                    );
+                }
 
                 // Native scan via BluetoothLeScanner with a service-UUID
                 // filter (battery-efficient — radio firmware filters
@@ -6007,7 +6072,16 @@ pub async fn spawn_ble_peer_interface(
                     };
 
                 for (addr, rssi, protocol) in &scan_results {
+                    dispatch_event(BlePeerEvent::Discovered {
+                        address: addr.clone(),
+                        rssi: *rssi,
+                        protocol: *protocol,
+                    });
                     if connected_addrs.contains_key(addr) {
+                        dispatch_event(BlePeerEvent::RssiUpdate {
+                            address: addr.clone(),
+                            rssi: *rssi,
+                        });
                         continue;
                     }
                     if connected_addrs.len() >= MAX_PEERS {
@@ -6151,6 +6225,10 @@ pub async fn spawn_ble_peer_interface(
                                 identity_hash: String::new(),
                                 protocol: *protocol,
                             });
+                            dispatch_status_changed(
+                                peer_state_for_count(connected_addrs.len()),
+                                connected_addrs.len(),
+                            );
                             // Kick-announce — see iOS Central path.
                             dispatch_event(BlePeerEvent::SubscribeReady {
                                 address: addr.clone(),
@@ -6617,6 +6695,13 @@ mod tests {
 
         record_reconnect_success(&map, "peer-address");
         assert!(!reconnect_in_backoff(&map, "peer-address"));
+    }
+
+    #[test]
+    fn peer_status_state_reflects_peer_count() {
+        assert_eq!(peer_state_for_count(0), PeerState::Starting);
+        assert_eq!(peer_state_for_count(1), PeerState::On);
+        assert_eq!(peer_state_for_count(7), PeerState::On);
     }
 
     // ── Constants ──
