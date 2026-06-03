@@ -4638,6 +4638,12 @@ async fn connect_mesh_peer(
 /// to transport. Linux + Windows only — Apple's notify delegate pushes
 /// directly into `apple_peripheral::INBOUND_TX` so the global per-peer
 /// reassembler handles inbound without a per-connection task.
+type PeerWriterRegistry = Arc<tokio::sync::RwLock<HashMap<String, mpsc::Sender<Bytes>>>>;
+
+fn central_writer_key(address: &str) -> String {
+    format!("central:{address}")
+}
+
 #[cfg(all(
     feature = "ble",
     not(any(target_os = "android", target_os = "ios", target_os = "macos"))
@@ -4647,8 +4653,8 @@ struct PeerReadLoopCtx {
     transport_tx: mpsc::Sender<TransportMessage>,
     peer_online: Arc<AtomicBool>,
     rxb: Arc<AtomicU64>,
-    peer_writers: Arc<tokio::sync::RwLock<Vec<mpsc::Sender<Bytes>>>>,
-    peer_write_tx: mpsc::Sender<Bytes>,
+    peer_writers: PeerWriterRegistry,
+    peer_writer_key: String,
     recently_disconnected: RecentlyDisconnected,
     anti_loop: AntiLoopMap,
 }
@@ -4664,7 +4670,7 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
         peer_online,
         rxb,
         peer_writers,
-        peer_write_tx,
+        peer_writer_key,
         recently_disconnected,
         anti_loop,
     } = ctx;
@@ -4788,7 +4794,7 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
     // Cleanup: disconnect and remove writer
     let _ = conn.peripheral.disconnect().await;
     let mut writers = peer_writers.write().await;
-    writers.retain(|w| !w.same_channel(&peer_write_tx));
+    writers.remove(&peer_writer_key);
     tracing::info!(address = %peer_address, "BLE mesh peer disconnected and cleaned up");
 
     // Mark this peer as a wanted-reconnect target keyed by BLE address.
@@ -5071,10 +5077,10 @@ pub async fn spawn_ble_peer_interface(
     // Outbound channel (transport → interface → BLE peers)
     let (tx, mut app_rx) = mpsc::channel::<Bytes>(64);
 
-    // Shared peer write channels — populated as peers connect.
-    // Each connected peer gets a write channel; outbound data is broadcast to all.
-    let peer_writers: Arc<tokio::sync::RwLock<Vec<mpsc::Sender<Bytes>>>> =
-        Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    // Shared peer write channels keyed by role/address. Each connected
+    // central-side peer gets a write channel; disconnect paths remove the key
+    // explicitly so reconnect churn does not grow stale fan-out targets.
+    let peer_writers: PeerWriterRegistry = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
     // Write task: forward outbound packets to (a) every peer we connected to as
     // Central via the per-peer write channels, AND (b) every peer that
@@ -5107,11 +5113,25 @@ pub async fn spawn_ble_peer_interface(
 
                 // (a) Centrals we initiated to — peer_write_loop fragments inside
                 //     and runs its own per-peer anti-loop check before writing.
-                let readers = writers_w.read().await;
-                for peer_tx in readers.iter() {
-                    let _ = peer_tx.send(payload.clone()).await;
+                let writer_snapshot = {
+                    let readers = writers_w.read().await;
+                    readers
+                        .iter()
+                        .map(|(key, tx)| (key.clone(), tx.clone()))
+                        .collect::<Vec<_>>()
+                };
+                let mut closed_writers = Vec::new();
+                for (key, peer_tx) in writer_snapshot {
+                    if peer_tx.send(payload.clone()).await.is_err() {
+                        closed_writers.push(key);
+                    }
                 }
-                drop(readers);
+                if !closed_writers.is_empty() {
+                    let mut writers = writers_w.write().await;
+                    for key in closed_writers {
+                        writers.remove(&key);
+                    }
+                }
 
                 // (b) Subscribers on our peripheral TX. Fragment here so each
                 //     NOTIFY frame fits the per-peer (Android) or conservative
@@ -5408,7 +5428,11 @@ pub async fn spawn_ble_peer_interface(
 
                                     // Per-peer write channel
                                     let (peer_write_tx, peer_write_rx) = mpsc::channel::<Bytes>(64);
-                                    writers.write().await.push(peer_write_tx.clone());
+                                    let peer_writer_key = central_writer_key(&peer.ble_address);
+                                    writers
+                                        .write()
+                                        .await
+                                        .insert(peer_writer_key.clone(), peer_write_tx.clone());
 
                                     // Track this peer
                                     connected_addrs
@@ -5457,7 +5481,7 @@ pub async fn spawn_ble_peer_interface(
                                                     peer_online: online_r,
                                                     rxb: rxb_r,
                                                     peer_writers: writers_r,
-                                                    peer_write_tx,
+                                                    peer_writer_key,
                                                     recently_disconnected: recently_r,
                                                     anti_loop: anti_loop_r,
                                                 },
@@ -5642,7 +5666,11 @@ pub async fn spawn_ble_peer_interface(
 
                                     let (peer_write_tx, mut peer_write_rx) =
                                         mpsc::channel::<Bytes>(64);
-                                    writers.write().await.push(peer_write_tx.clone());
+                                    let peer_writer_key = central_writer_key(&peer.ble_address);
+                                    writers
+                                        .write()
+                                        .await
+                                        .insert(peer_writer_key.clone(), peer_write_tx.clone());
                                     connected_addrs
                                         .insert(peer.ble_address.clone(), online.clone());
 
@@ -5654,6 +5682,8 @@ pub async fn spawn_ble_peer_interface(
                                     let online_w = online.clone();
                                     let addr_w = peer.ble_address.clone();
                                     let anti_loop_w = anti_loop.clone();
+                                    let writers_cleanup = writers.clone();
+                                    let writer_key_cleanup = peer_writer_key.clone();
                                     let mtu = cp.write_mtu;
                                     track_child_task(
                                         generation,
@@ -5726,6 +5756,10 @@ pub async fn spawn_ble_peer_interface(
                                                     );
                                                 }
                                             }
+                                            writers_cleanup
+                                                .write()
+                                                .await
+                                                .remove(&writer_key_cleanup);
                                         }),
                                     );
 
@@ -5907,7 +5941,11 @@ pub async fn spawn_ble_peer_interface(
                             );
 
                             let (peer_write_tx, mut peer_write_rx) = mpsc::channel::<Bytes>(64);
-                            writers.write().await.push(peer_write_tx.clone());
+                            let peer_writer_key = central_writer_key(addr);
+                            writers
+                                .write()
+                                .await
+                                .insert(peer_writer_key.clone(), peer_write_tx.clone());
                             connected_addrs.insert(addr.clone(), peer_online.clone());
 
                             // Per-peer write loop: bytes from the fan-out task
@@ -5916,6 +5954,8 @@ pub async fn spawn_ble_peer_interface(
                             let online_w = peer_online.clone();
                             let addr_w = addr.clone();
                             let anti_loop_w = anti_loop.clone();
+                            let writers_cleanup = writers.clone();
+                            let writer_key_cleanup = peer_writer_key.clone();
                             track_child_task(
                                 generation,
                                 tokio::spawn(async move {
@@ -5983,6 +6023,7 @@ pub async fn spawn_ble_peer_interface(
                                             break;
                                         }
                                     }
+                                    writers_cleanup.write().await.remove(&writer_key_cleanup);
                                 }),
                             );
 
