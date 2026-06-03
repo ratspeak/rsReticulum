@@ -2685,6 +2685,11 @@ pub fn disconnect_android_peer(address: &str) {
 }
 
 #[cfg(target_os = "android")]
+pub fn android_ble_peer_availability_json() -> Result<String, String> {
+    android_peripheral::ble_peer_availability_json()
+}
+
+#[cfg(target_os = "android")]
 mod android_peripheral {
     use super::*;
     use jni::JavaVM;
@@ -2954,6 +2959,32 @@ mod android_peripheral {
             .l()
             .map_err(|e| format!("Class cast: {e}"))?;
         Ok(jni::objects::JClass::from(cls))
+    }
+
+    pub fn ble_peer_availability_json() -> Result<String, String> {
+        with_env(|env| {
+            let context = get_app_context(env)?;
+            let cls = find_app_class(env, "org.ratspeak.android.RatspeakBleAvailability")
+                .map_err(|e| format!("RatspeakBleAvailability class: {e}"))?;
+            let result = env
+                .call_static_method(
+                    cls,
+                    "check",
+                    "(Landroid/content/Context;)Ljava/lang/String;",
+                    &[JValue::Object(context)],
+                )
+                .map_err(|e| format!("RatspeakBleAvailability.check: {e}"))?
+                .l()
+                .map_err(|e| format!("{e}"))?;
+            if result.is_null() {
+                return Err("RatspeakBleAvailability returned null".into());
+            }
+            let jstr: jni::objects::JString = result.into();
+            Ok(env
+                .get_string(jstr)
+                .map(|s| s.to_string_lossy().into_owned())
+                .map_err(|e| format!("availability string: {e}"))?)
+        })
     }
 
     pub async fn start_advertising(identity_hash: &[u8]) -> Result<(), String> {
