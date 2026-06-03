@@ -144,6 +144,49 @@ pub fn anti_loop_prune(map: &AntiLoopMap) {
     }
 }
 
+#[derive(Debug, Default)]
+struct BlePeerLinkRegistry {
+    identity_by_address: HashMap<String, String>,
+}
+
+impl BlePeerLinkRegistry {
+    fn set_identity(&mut self, address: String, identity_hash: String) {
+        if !address.is_empty() && !identity_hash.is_empty() {
+            self.identity_by_address.insert(address, identity_hash);
+        }
+    }
+
+    fn address_for_writer_key<'a>(&self, writer_key: &'a str) -> &'a str {
+        writer_key.strip_prefix("central:").unwrap_or(writer_key)
+    }
+
+    fn should_send_peripheral_subscriber(
+        &self,
+        subscriber_address: &str,
+        central_writer_keys: &[String],
+    ) -> bool {
+        if central_writer_keys
+            .iter()
+            .any(|key| self.address_for_writer_key(key) == subscriber_address)
+        {
+            return false;
+        }
+
+        let Some(subscriber_identity) = self.identity_by_address.get(subscriber_address) else {
+            return true;
+        };
+
+        !central_writer_keys.iter().any(|key| {
+            let writer_address = self.address_for_writer_key(key);
+            self.identity_by_address
+                .get(writer_address)
+                .is_some_and(|writer_identity| writer_identity == subscriber_identity)
+        })
+    }
+}
+
+type LinkRegistry = Arc<tokio::sync::RwLock<BlePeerLinkRegistry>>;
+
 fn reconnect_in_backoff(map: &RecentlyDisconnected, identity_hex: &str) -> bool {
     if let Ok(guard) = map.lock() {
         if let Some((when, fails)) = guard.get(identity_hex) {
@@ -4657,6 +4700,7 @@ struct PeerReadLoopCtx {
     peer_writer_key: String,
     recently_disconnected: RecentlyDisconnected,
     anti_loop: AntiLoopMap,
+    link_registry: LinkRegistry,
 }
 
 #[cfg(all(
@@ -4673,6 +4717,7 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
         peer_writer_key,
         recently_disconnected,
         anti_loop,
+        link_registry,
     } = ctx;
     let peer_address: String = conn.ble_address.clone();
     use btleplug::api::Peripheral as _;
@@ -4689,6 +4734,7 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
 
     // Fragment reassembly buffer: maps total_count to per-sequence payload slots.
     let mut reassembly: FragmentReassembly = HashMap::new();
+    let mut identity_announced = false;
     let mut missed_keepalives: u32 = 0;
 
     loop {
@@ -4762,6 +4808,24 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
                 // Forward complete packet to transport
                 if let Some(raw) = complete_packet {
                     rxb.fetch_add(raw.len() as u64, Ordering::Relaxed);
+                    if !identity_announced {
+                        if let Ok(parsed) = rns_wire::packet::Packet::from_raw(&raw) {
+                            if parsed.header.flags.packet_type
+                                == rns_wire::flags::PacketType::Announce
+                            {
+                                let id_hex = hex::encode(parsed.header.destination_hash);
+                                link_registry
+                                    .write()
+                                    .await
+                                    .set_identity(conn.ble_address.clone(), id_hex.clone());
+                                dispatch_event(BlePeerEvent::IdentityResolved {
+                                    address: conn.ble_address.clone(),
+                                    identity_hash: id_hex,
+                                });
+                                identity_announced = true;
+                            }
+                        }
+                    }
                     // Register the source so the fan-out anti-loop filter
                     // doesn't echo this exact payload back to the peer it
                     // came from.
@@ -4923,6 +4987,8 @@ pub async fn spawn_ble_peer_interface(
     // peripheral inbound consumer, the Central read loops, and the fan-out
     // task on every platform.
     let anti_loop = new_anti_loop_map();
+    let link_registry: LinkRegistry =
+        Arc::new(tokio::sync::RwLock::new(BlePeerLinkRegistry::default()));
 
     // TX/RX byte counters. Declared up here so the peripheral inbound
     // reassembly task spawned next can clone shared_rxb into its closure.
@@ -4935,6 +5001,7 @@ pub async fn spawn_ble_peer_interface(
     {
         let transport_periph = transport_tx.clone();
         let anti_loop_p = anti_loop.clone();
+        let link_registry_p = link_registry.clone();
         // Apple (iOS+macOS) and Android peripheral modules expose a per-process
         // inbound channel populated by their delegate / GATT-server callback.
         // All platform peripheral modules surface a `(peer_id, data)`
@@ -5040,6 +5107,10 @@ pub async fn spawn_ble_peer_interface(
                                     {
                                         let id_hex = hex::encode(parsed.header.destination_hash);
                                         identity_announced.insert(peer.clone());
+                                        link_registry_p
+                                            .write()
+                                            .await
+                                            .set_identity(peer.clone(), id_hex.clone());
                                         dispatch_event(BlePeerEvent::IdentityResolved {
                                             address: peer.clone(),
                                             identity_hash: id_hex,
@@ -5095,6 +5166,7 @@ pub async fn spawn_ble_peer_interface(
     let txb_w = shared_txb.clone();
     let writers_w = peer_writers.clone();
     let anti_loop_fan = anti_loop.clone();
+    let link_registry_fan = link_registry.clone();
     track_child_task(
         generation,
         tokio::spawn(async move {
@@ -5120,6 +5192,10 @@ pub async fn spawn_ble_peer_interface(
                         .map(|(key, tx)| (key.clone(), tx.clone()))
                         .collect::<Vec<_>>()
                 };
+                let central_writer_keys = writer_snapshot
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
                 let mut closed_writers = Vec::new();
                 for (key, peer_tx) in writer_snapshot {
                     if peer_tx.send(payload.clone()).await.is_err() {
@@ -5156,6 +5232,18 @@ pub async fn spawn_ble_peer_interface(
                         (COLUMBA_TX_UUID, &col_subs, "columba"),
                     ] {
                         for addr in subs {
+                            let send_on_peripheral = {
+                                let links = link_registry_fan.read().await;
+                                links.should_send_peripheral_subscriber(addr, &central_writer_keys)
+                            };
+                            if !send_on_peripheral {
+                                tracing::debug!(
+                                    peer = %addr,
+                                    char = label,
+                                    "Apple BLE fan-out: central path preferred"
+                                );
+                                continue;
+                            }
                             if !anti_loop_should_send(&anti_loop_fan, addr, &payload) {
                                 tracing::info!(peer = %addr, char = label, "Apple BLE fan-out: anti-loop skip");
                                 continue;
@@ -5230,6 +5318,13 @@ pub async fn spawn_ble_peer_interface(
                         .unwrap_or((182, 182, Vec::new(), Vec::new()));
                     let rats_frags = fragment_packet(&payload, rats_mtu);
                     for addr in &rats_subs {
+                        let send_on_peripheral = {
+                            let links = link_registry_fan.read().await;
+                            links.should_send_peripheral_subscriber(addr, &central_writer_keys)
+                        };
+                        if !send_on_peripheral {
+                            continue;
+                        }
                         if !anti_loop_should_send(&anti_loop_fan, addr, &payload) {
                             continue;
                         }
@@ -5248,6 +5343,13 @@ pub async fn spawn_ble_peer_interface(
                     }
                     let col_frags = fragment_packet(&payload, col_mtu);
                     for addr in &col_subs {
+                        let send_on_peripheral = {
+                            let links = link_registry_fan.read().await;
+                            links.should_send_peripheral_subscriber(addr, &central_writer_keys)
+                        };
+                        if !send_on_peripheral {
+                            continue;
+                        }
                         if !anti_loop_should_send(&anti_loop_fan, addr, &payload) {
                             continue;
                         }
@@ -5468,6 +5570,7 @@ pub async fn spawn_ble_peer_interface(
                                     let writers_r = writers.clone();
                                     let recently_r = recently_disc.clone();
                                     let anti_loop_r = anti_loop.clone();
+                                    let link_registry_r = link_registry.clone();
                                     let proto_evt = peer.protocol;
                                     let addr_evt = peer.ble_address.clone();
                                     track_child_task(
@@ -5484,6 +5587,7 @@ pub async fn spawn_ble_peer_interface(
                                                     peer_writer_key,
                                                     recently_disconnected: recently_r,
                                                     anti_loop: anti_loop_r,
+                                                    link_registry: link_registry_r,
                                                 },
                                             )
                                             .await;
@@ -6454,6 +6558,36 @@ mod tests {
         assert_eq!(r, "\"Ratspeak\"");
         let c = serde_json::to_string(&PeerProtocol::Columba).unwrap();
         assert_eq!(c, "\"Columba\"");
+    }
+
+    #[test]
+    fn link_registry_prefers_central_same_address() {
+        let registry = BlePeerLinkRegistry::default();
+        assert!(!registry.should_send_peripheral_subscriber(
+            "AA:BB:CC:DD:EE:FF",
+            &[central_writer_key("AA:BB:CC:DD:EE:FF")]
+        ));
+        assert!(registry.should_send_peripheral_subscriber(
+            "11:22:33:44:55:66",
+            &[central_writer_key("AA:BB:CC:DD:EE:FF")]
+        ));
+    }
+
+    #[test]
+    fn link_registry_prefers_central_same_identity() {
+        let mut registry = BlePeerLinkRegistry::default();
+        registry.set_identity("central-addr".into(), "identity-a".into());
+        registry.set_identity("peripheral-addr".into(), "identity-a".into());
+        registry.set_identity("other-addr".into(), "identity-b".into());
+
+        assert!(!registry.should_send_peripheral_subscriber(
+            "peripheral-addr",
+            &[central_writer_key("central-addr")]
+        ));
+        assert!(registry.should_send_peripheral_subscriber(
+            "other-addr",
+            &[central_writer_key("central-addr")]
+        ));
     }
 
     // ── Constants ──
