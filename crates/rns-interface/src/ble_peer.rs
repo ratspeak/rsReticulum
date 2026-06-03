@@ -408,23 +408,73 @@ pub(crate) fn running_flag() -> Arc<AtomicBool> {
         .clone()
 }
 
-/// Called from the spawn path so a previous teardown doesn't poison boot.
-pub(crate) fn mark_running() {
+static BLE_PEER_GENERATION: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+static BLE_PEER_CHILD_TASKS: std::sync::OnceLock<
+    std::sync::Mutex<Vec<(u64, tokio::task::JoinHandle<()>)>>,
+> = std::sync::OnceLock::new();
+
+fn generation_counter() -> &'static AtomicU64 {
+    BLE_PEER_GENERATION.get_or_init(|| AtomicU64::new(0))
+}
+
+fn child_tasks() -> &'static std::sync::Mutex<Vec<(u64, tokio::task::JoinHandle<()>)>> {
+    BLE_PEER_CHILD_TASKS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn begin_ble_peer_session() -> u64 {
+    let generation = generation_counter().fetch_add(1, Ordering::SeqCst) + 1;
     running_flag().store(true, Ordering::SeqCst);
+    generation
+}
+
+fn invalidate_ble_peer_session() -> u64 {
+    running_flag().store(false, Ordering::SeqCst);
+    generation_counter().fetch_add(1, Ordering::SeqCst) + 1
+}
+
+fn generation_is_current(generation: u64) -> bool {
+    running_flag().load(Ordering::SeqCst)
+        && generation_counter().load(Ordering::SeqCst) == generation
+}
+
+fn track_child_task(generation: u64, handle: tokio::task::JoinHandle<()>) {
+    if let Ok(mut tasks) = child_tasks().lock() {
+        tasks.push((generation, handle));
+    } else {
+        handle.abort();
+    }
+}
+
+fn abort_ble_peer_child_tasks() {
+    if let Ok(mut tasks) = child_tasks().lock() {
+        for (_, task) in tasks.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+fn stop_central_connections() {
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    crate::ble_central_apple_connect::disconnect_all();
+
+    #[cfg(target_os = "android")]
+    android_peripheral::peer_client_disconnect_all();
 }
 
 /// Caller must still `DeregisterInterface` on the transport actor to drop
 /// paths + remove the interface entry.
 pub async fn stop_ble_peer_interface() {
     tracing::info!("stop_ble_peer_interface: signalling shutdown + stopping peripheral");
-    running_flag().store(false, Ordering::SeqCst);
+    let generation = invalidate_ble_peer_session();
+    stop_central_connections();
+    abort_ble_peer_child_tasks();
     if let Err(e) = stop_peripheral().await {
         tracing::warn!(error = %e, "BLE peer: stop_peripheral failed during teardown");
     } else {
         tracing::info!("stop_ble_peer_interface: peripheral stopped");
     }
     clear_event_dispatcher();
-    tracing::info!("stop_ble_peer_interface: done");
+    tracing::info!(generation, "stop_ble_peer_interface: done");
 }
 
 #[derive(Debug, Clone)]
@@ -1189,24 +1239,54 @@ mod apple_peripheral {
     /// 256 × ~200B ≈ 50KB — absorbs an LXMF burst (~40 frags) without OOM.
     const INBOUND_CAPACITY: usize = 256;
 
-    /// `peer_id` is `CBCentral.identifier.UUIDString` (or empty if unknown).
-    static INBOUND_TX: OnceLock<tokio::sync::mpsc::Sender<(String, Vec<u8>)>> = OnceLock::new();
-    type InboundReceiver = tokio::sync::mpsc::Receiver<(String, Vec<u8>)>;
+    type InboundFrame = (String, Vec<u8>);
+    type InboundSender = tokio::sync::mpsc::Sender<InboundFrame>;
+    type InboundReceiver = tokio::sync::mpsc::Receiver<InboundFrame>;
 
+    /// `peer_id` is `CBCentral.identifier.UUIDString` (or empty if unknown).
+    static INBOUND_TX: OnceLock<std::sync::Mutex<Option<InboundSender>>> = OnceLock::new();
     static INBOUND_RX: OnceLock<std::sync::Mutex<Option<InboundReceiver>>> = OnceLock::new();
 
+    fn inbound_tx_slot() -> &'static std::sync::Mutex<Option<InboundSender>> {
+        INBOUND_TX.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    fn inbound_rx_slot() -> &'static std::sync::Mutex<Option<InboundReceiver>> {
+        INBOUND_RX.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    fn reset_inbound_channel() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<InboundFrame>(INBOUND_CAPACITY);
+        if let Ok(mut slot) = inbound_tx_slot().lock() {
+            *slot = Some(tx);
+        }
+        if let Ok(mut slot) = inbound_rx_slot().lock() {
+            *slot = Some(rx);
+        }
+    }
+
+    fn clear_inbound_channel() {
+        if let Ok(mut slot) = inbound_tx_slot().lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = inbound_rx_slot().lock() {
+            *slot = None;
+        }
+    }
+
+    fn inbound_sender() -> Option<InboundSender> {
+        inbound_tx_slot()
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().cloned())
+    }
+
     pub fn take_inbound_rx() -> Option<tokio::sync::mpsc::Receiver<(String, Vec<u8>)>> {
-        INBOUND_RX
-            .get()
-            .and_then(|m| m.lock().ok())
-            .and_then(|mut opt| opt.take())
+        inbound_rx_slot().lock().ok().and_then(|mut opt| opt.take())
     }
 
     pub(super) fn try_push_inbound(peer: String, data: Vec<u8>) -> bool {
-        match INBOUND_TX.get() {
-            Some(tx) => tx.try_send((peer, data)).is_ok(),
-            None => false,
-        }
+        inbound_sender().is_some_and(|tx| tx.try_send((peer, data)).is_ok())
     }
 
     struct SendPtr(*mut AnyObject);
@@ -1692,7 +1772,7 @@ mod apple_peripheral {
                                 len = data.len(),
                                 "Apple BLE peripheral: write received"
                             );
-                            if let Some(tx) = INBOUND_TX.get() {
+                            if let Some(tx) = inbound_sender() {
                                 // CB dispatch queue is synchronous, so try_send +
                                 // drop-on-full instead of blocking the callback.
                                 if let Err(e) = tx.try_send((peer_id, data)) {
@@ -2156,9 +2236,7 @@ mod apple_peripheral {
         if let Ok(mut g) = last_identity_hash().lock() {
             *g = Some(id_hash.clone());
         }
-        let (tx, rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(INBOUND_CAPACITY);
-        let _ = INBOUND_TX.set(tx);
-        let _ = INBOUND_RX.set(std::sync::Mutex::new(Some(rx)));
+        reset_inbound_channel();
 
         // Stash pending + signal sender BEFORE creating the manager —
         // `peripheralManagerDidUpdateState:` fires on the main queue and
@@ -2366,6 +2444,7 @@ mod apple_peripheral {
     /// returning leaves CB in a dirty state that breaks subsequent enables.
     pub async fn stop_advertising() -> Result<(), String> {
         apply_event(crate::ble_peer_lifecycle::LifecycleEvent::StopRequested);
+        clear_inbound_channel();
 
         if let Ok(mut g) = pending_advertise().lock() {
             *g = None;
@@ -2549,8 +2628,16 @@ mod android_peripheral {
     use std::sync::OnceLock;
 
     static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
-    static ADVERTISER_REF: OnceLock<GlobalRef> = OnceLock::new();
-    static CALLBACK_REF: OnceLock<GlobalRef> = OnceLock::new();
+    static ADVERTISER_REF: OnceLock<std::sync::Mutex<Option<GlobalRef>>> = OnceLock::new();
+    static CALLBACK_REF: OnceLock<std::sync::Mutex<Option<GlobalRef>>> = OnceLock::new();
+
+    fn advertiser_slot() -> &'static std::sync::Mutex<Option<GlobalRef>> {
+        ADVERTISER_REF.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    fn callback_slot() -> &'static std::sync::Mutex<Option<GlobalRef>> {
+        CALLBACK_REF.get_or_init(|| std::sync::Mutex::new(None))
+    }
 
     /// Registry of per-peer `online` flags so the JNI disconnect callback can
     /// flip them without holding a direct handle to the Tokio task that owns
@@ -2594,23 +2681,53 @@ mod android_peripheral {
     /// is the source BluetoothDevice MAC string passed from RatspeakGattCallback.kt.
     /// See apple_peripheral::INBOUND_TX for the same shape on Apple platforms —
     /// the consumer in spawn_ble_peer_interface keys per-peer reassembly off this.
-    static INBOUND_TX: OnceLock<tokio::sync::mpsc::Sender<(String, Vec<u8>)>> = OnceLock::new();
-    static INBOUND_RX: OnceLock<
-        std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<(String, Vec<u8>)>>>,
-    > = OnceLock::new();
+    type InboundFrame = (String, Vec<u8>);
+    type InboundSender = tokio::sync::mpsc::Sender<InboundFrame>;
+    type InboundReceiver = tokio::sync::mpsc::Receiver<InboundFrame>;
+
+    static INBOUND_TX: OnceLock<std::sync::Mutex<Option<InboundSender>>> = OnceLock::new();
+    static INBOUND_RX: OnceLock<std::sync::Mutex<Option<InboundReceiver>>> = OnceLock::new();
+
+    fn inbound_tx_slot() -> &'static std::sync::Mutex<Option<InboundSender>> {
+        INBOUND_TX.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    fn inbound_rx_slot() -> &'static std::sync::Mutex<Option<InboundReceiver>> {
+        INBOUND_RX.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    fn reset_inbound_channel() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<InboundFrame>(INBOUND_CAPACITY);
+        if let Ok(mut slot) = inbound_tx_slot().lock() {
+            *slot = Some(tx);
+        }
+        if let Ok(mut slot) = inbound_rx_slot().lock() {
+            *slot = Some(rx);
+        }
+    }
+
+    fn clear_inbound_channel() {
+        if let Ok(mut slot) = inbound_tx_slot().lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = inbound_rx_slot().lock() {
+            *slot = None;
+        }
+    }
 
     /// Take the inbound receiver (call once from spawn_ble_peer_interface).
     pub fn take_inbound_rx() -> Option<tokio::sync::mpsc::Receiver<(String, Vec<u8>)>> {
-        INBOUND_RX
-            .get()
-            .and_then(|m| m.lock().ok())
-            .and_then(|mut opt| opt.take())
+        inbound_rx_slot().lock().ok().and_then(|mut opt| opt.take())
     }
 
     /// Called from JNI native method when the GATT server receives data from a peer.
     /// `peer_address` is the source BluetoothDevice MAC (or random rotating addr).
     pub fn on_gatt_data_received(peer_address: String, data: Vec<u8>) {
-        if let Some(tx) = INBOUND_TX.get() {
+        let tx = inbound_tx_slot()
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().cloned());
+        if let Some(tx) = tx {
             // JNI callback is synchronous on the binder thread; try_send + drop-on-full
             // is preferred over blocking the Android GATT stack when the reassembler stalls.
             if let Err(e) = tx.try_send((peer_address, data)) {
@@ -2777,9 +2894,7 @@ mod android_peripheral {
 
     pub async fn start_advertising(identity_hash: &[u8]) -> Result<(), String> {
         // Set up inbound channel for GATT server write callbacks (see INBOUND_TX docs)
-        let (tx, rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(INBOUND_CAPACITY);
-        let _ = INBOUND_TX.set(tx);
-        let _ = INBOUND_RX.set(std::sync::Mutex::new(Some(rx)));
+        reset_inbound_channel();
 
         let id_hash = identity_hash.to_vec();
         tokio::task::spawn_blocking(move || {
@@ -2883,8 +2998,12 @@ mod android_peripheral {
                     &[JValue::Object(settings), JValue::Object(ad_data), JValue::Object(callback_ref.as_obj())])
                     .map_err(|e| { jni_clear(env); format!("startAdvertising: {e}") })?;
 
-                let _ = ADVERTISER_REF.set(env.new_global_ref(advertiser).map_err(|e| format!("{e}"))?);
-                let _ = CALLBACK_REF.set(callback_ref);
+                if let Ok(mut slot) = advertiser_slot().lock() {
+                    *slot = Some(env.new_global_ref(advertiser).map_err(|e| format!("{e}"))?);
+                }
+                if let Ok(mut slot) = callback_slot().lock() {
+                    *slot = Some(callback_ref);
+                }
                 tracing::info!("Android BLE Peripheral: advertising started");
                 Ok(())
             })
@@ -2892,6 +3011,8 @@ mod android_peripheral {
     }
 
     pub async fn stop_advertising() -> Result<(), String> {
+        clear_inbound_channel();
+        peer_client_disconnect_all();
         tokio::task::spawn_blocking(|| {
             // Close GATT server
             with_env(|env| {
@@ -2904,10 +3025,15 @@ mod android_peripheral {
             .ok();
 
             // Stop advertising
-            if let Some(adv) = ADVERTISER_REF.get() {
+            let adv_ref = advertiser_slot()
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take());
+            let callback_ref = callback_slot().lock().ok().and_then(|mut slot| slot.take());
+            if let Some(adv) = adv_ref {
                 with_env(|env| {
-                    let cb = CALLBACK_REF
-                        .get()
+                    let cb = callback_ref
+                        .as_ref()
                         .map(|r| r.as_obj())
                         .unwrap_or(JObject::null());
                     env.call_method(
@@ -3305,6 +3431,25 @@ mod android_peripheral {
         });
     }
 
+    /// Tear down every Android central-side peer client known to the current
+    /// BLE Peer runtime. Used during interface stop so disabling the mesh
+    /// releases native GATT connections immediately instead of waiting for
+    /// later callbacks or scan-loop cleanup.
+    pub fn peer_client_disconnect_all() {
+        let addrs = peer_online_map()
+            .lock()
+            .ok()
+            .map(|g| g.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for addr in &addrs {
+            signal_peer_offline(addr);
+            peer_client_disconnect(addr);
+        }
+        if let Ok(mut g) = peer_online_map().lock() {
+            g.clear();
+        }
+    }
+
     /// Scan for nearby BLE mesh peers using a service-UUID filter at the
     /// radio firmware level (battery-efficient). Returns
     /// `(address, rssi, protocol)` tuples. Blocking — runs on `spawn_blocking`.
@@ -3393,10 +3538,12 @@ mod linux_peripheral {
     /// Per-process inbound channel — write callbacks push (peer_address, data)
     /// pairs that the spawn function's per-peer reassembler consumes.
     type InboundFrame = (String, Vec<u8>);
+    type InboundSender = mpsc::Sender<InboundFrame>;
     type InboundReceiver = mpsc::Receiver<InboundFrame>;
+    type InboundSenderSlot = std::sync::Mutex<Option<InboundSender>>;
     type InboundReceiverSlot = std::sync::Mutex<Option<InboundReceiver>>;
 
-    static INBOUND_TX: OnceLock<mpsc::Sender<InboundFrame>> = OnceLock::new();
+    static INBOUND_TX: OnceLock<InboundSenderSlot> = OnceLock::new();
     static INBOUND_RX: OnceLock<InboundReceiverSlot> = OnceLock::new();
 
     /// Per-characteristic notifier registry keyed by TX char UUID. Each value
@@ -3421,19 +3568,45 @@ mod linux_peripheral {
         HANDLES.get_or_init(|| std::sync::Mutex::new(None))
     }
 
+    fn inbound_tx_slot() -> &'static InboundSenderSlot {
+        INBOUND_TX.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    fn inbound_rx_slot() -> &'static InboundReceiverSlot {
+        INBOUND_RX.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    fn reset_inbound_channel() {
+        let (tx, rx) = mpsc::channel::<InboundFrame>(256);
+        if let Ok(mut slot) = inbound_tx_slot().lock() {
+            *slot = Some(tx);
+        }
+        if let Ok(mut slot) = inbound_rx_slot().lock() {
+            *slot = Some(rx);
+        }
+    }
+
+    fn clear_inbound_channel() {
+        if let Ok(mut slot) = inbound_tx_slot().lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = inbound_rx_slot().lock() {
+            *slot = None;
+        }
+    }
+
+    fn inbound_sender() -> Option<InboundSender> {
+        inbound_tx_slot()
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().cloned())
+    }
+
     /// Drain the inbound channel receiver. The spawn function calls this once
     /// at startup and pumps the resulting receiver into the per-peer
-    /// reassembler. Subsequent calls return `None` so the consumer can't be
-    /// double-spawned.
+    /// reassembler.
     pub fn take_inbound_rx() -> Option<InboundReceiver> {
-        let slot = INBOUND_RX.get_or_init(|| {
-            let (tx, rx) = mpsc::channel::<InboundFrame>(256);
-            // Stash the sender so write callbacks can push into the channel
-            // even though the receiver is owned by the consumer task.
-            let _ = INBOUND_TX.set(tx);
-            std::sync::Mutex::new(Some(rx))
-        });
-        slot.lock().ok().and_then(|mut g| g.take())
+        inbound_rx_slot().lock().ok().and_then(|mut g| g.take())
     }
 
     /// Push a notification on the named TX characteristic. Returns true if
@@ -3524,7 +3697,7 @@ mod linux_peripheral {
     /// runtime context (bluer needs the current dispatcher).
     pub async fn start_advertising(identity_hash: &[u8]) -> Result<(), String> {
         // Ensure inbound channel exists before any write callback fires.
-        take_inbound_rx_init();
+        reset_inbound_channel();
 
         let session = bluer::Session::new()
             .await
@@ -3620,11 +3793,9 @@ mod linux_peripheral {
     fn take_inbound_rx_init() {
         // Cheap idempotent init so write callbacks always have a sender even
         // before the consumer takes the receiver.
-        let _ = INBOUND_RX.get_or_init(|| {
-            let (tx, rx) = mpsc::channel::<InboundFrame>(256);
-            let _ = INBOUND_TX.set(tx);
-            std::sync::Mutex::new(Some(rx))
-        });
+        if inbound_sender().is_none() {
+            reset_inbound_channel();
+        }
     }
 
     async fn build_service(
@@ -3647,7 +3818,7 @@ mod linux_peripheral {
                     let char_uuid = rx_uuid_for_trace;
                     let byte_len = new_value.len();
                     Box::pin(async move {
-                        if let Some(tx) = INBOUND_TX.get() {
+                        if let Some(tx) = inbound_sender() {
                             if let Err(e) = tx.try_send((addr.clone(), new_value)) {
                                 // Channel full — log so operators see the
                                 // backpressure signal instead of finding
@@ -3724,6 +3895,7 @@ mod linux_peripheral {
     }
 
     pub async fn stop_advertising() -> Result<(), String> {
+        clear_inbound_channel();
         let dropped_handles = {
             if let Ok(mut slot) = handles_slot().lock() {
                 // Dropping the handles unregisters the GATT app + advertising.
@@ -3785,7 +3957,10 @@ mod windows_peripheral {
     /// Per-process inbound channel. `GattLocalCharacteristic` write events
     /// push `(session_id_string, data)` pairs on the sender; the spawn
     /// function's reassembler consumes them via `take_inbound_rx`.
-    static INBOUND_TX: OnceLock<mpsc::Sender<(String, Vec<u8>)>> = OnceLock::new();
+    type InboundFrame = (String, Vec<u8>);
+    type InboundSender = mpsc::Sender<InboundFrame>;
+    type InboundReceiver = mpsc::Receiver<InboundFrame>;
+    static INBOUND_TX: OnceLock<Mutex<Option<InboundSender>>> = OnceLock::new();
     static INBOUND_RX: OnceLock<Mutex<Option<mpsc::Receiver<(String, Vec<u8>)>>>> = OnceLock::new();
 
     /// Held state across a single start/stop cycle. `_provider` keeps the
@@ -3808,20 +3983,42 @@ mod windows_peripheral {
         INNER.get_or_init(|| Mutex::new(None))
     }
 
-    fn ensure_inbound_channel() {
-        let _ = INBOUND_RX.get_or_init(|| {
-            let (tx, rx) = mpsc::channel::<(String, Vec<u8>)>(256);
-            let _ = INBOUND_TX.set(tx);
-            Mutex::new(Some(rx))
-        });
+    fn inbound_tx_slot() -> &'static Mutex<Option<InboundSender>> {
+        INBOUND_TX.get_or_init(|| Mutex::new(None))
+    }
+
+    fn inbound_rx_slot() -> &'static Mutex<Option<InboundReceiver>> {
+        INBOUND_RX.get_or_init(|| Mutex::new(None))
+    }
+
+    fn reset_inbound_channel() {
+        let (tx, rx) = mpsc::channel::<InboundFrame>(256);
+        if let Ok(mut slot) = inbound_tx_slot().lock() {
+            *slot = Some(tx);
+        }
+        if let Ok(mut slot) = inbound_rx_slot().lock() {
+            *slot = Some(rx);
+        }
+    }
+
+    fn clear_inbound_channel() {
+        if let Ok(mut slot) = inbound_tx_slot().lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = inbound_rx_slot().lock() {
+            *slot = None;
+        }
+    }
+
+    fn inbound_sender() -> Option<InboundSender> {
+        inbound_tx_slot()
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().cloned())
     }
 
     pub fn take_inbound_rx() -> Option<mpsc::Receiver<(String, Vec<u8>)>> {
-        ensure_inbound_channel();
-        INBOUND_RX
-            .get()
-            .and_then(|m| m.lock().ok())
-            .and_then(|mut opt| opt.take())
+        inbound_rx_slot().lock().ok().and_then(|mut opt| opt.take())
     }
 
     fn uuid_to_guid(u: uuid::Uuid) -> GUID {
@@ -3919,7 +4116,7 @@ mod windows_peripheral {
             let len = reader.UnconsumedBufferLength()? as usize;
             let mut bytes = vec![0u8; len];
             reader.ReadBytes(&mut bytes)?;
-            if let Some(tx) = INBOUND_TX.get() {
+            if let Some(tx) = inbound_sender() {
                 if let Err(e) = tx.try_send((device_id.clone(), bytes)) {
                     tracing::warn!(
                         target: "ble_trace",
@@ -4025,7 +4222,7 @@ mod windows_peripheral {
     }
 
     pub async fn start_advertising(identity_hash: &[u8]) -> Result<(), String> {
-        ensure_inbound_channel();
+        reset_inbound_channel();
 
         // WinRT GATT setup uses `.get()` internally (see
         // build_and_start_service) because windows 0.58 `IAsyncOperation`
@@ -4094,6 +4291,7 @@ mod windows_peripheral {
     }
 
     pub async fn stop_advertising() -> Result<(), String> {
+        clear_inbound_channel();
         let inner = {
             if let Ok(mut slot) = inner_slot().lock() {
                 slot.take()
@@ -4705,9 +4903,9 @@ pub async fn spawn_ble_peer_interface(
 ) -> Result<InterfaceHandle, InterfaceError> {
     let name = config.name.clone();
 
-    // Reset the process-wide running flag so a previous teardown doesn't
-    // make this fresh boot exit immediately.
-    mark_running();
+    // Reset the process-wide running flag and advance the session generation
+    // so callbacks/tasks from a previous enable cannot outlive this interface.
+    let generation = begin_ble_peer_session();
 
     // Start peripheral (GATT server + advertising)
     if let Err(e) = start_peripheral(&config.identity_hash).await {
@@ -4769,101 +4967,104 @@ pub async fn spawn_ble_peer_interface(
         };
         if let Some(mut rx) = periph_rx {
             let rxb = shared_rxb.clone();
-            tokio::spawn(async move {
-                // Per-peer reassembly: outer key is the source peer identifier
-                // (BluetoothDevice MAC on Android; CBCentral.identifier UUID
-                // string on Apple). Two peers writing fragments concurrently
-                // can no longer corrupt each other's reassembly buffers.
-                type PeerReassembly = FragmentReassembly;
-                let mut reassembly: HashMap<String, PeerReassembly> = HashMap::new();
-                // Identity is learned from the first signed Reticulum announce.
-                // Emit once per peer address so callers can dedupe
-                // central/peripheral views of the same device.
-                let mut identity_announced: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                while let Some((peer, data)) = rx.recv().await {
-                    if !running_flag().load(Ordering::SeqCst) {
-                        break;
-                    }
-                    tracing::debug!(
-                        target: "ble_trace",
-                        step = "reassembly.frame",
-                        peer = %peer,
-                        len = data.len(),
-                        first_byte = data.first().copied().unwrap_or(0),
-                        "BLE Peer reassembly: frame received"
-                    );
-                    if data.is_empty() || (data.len() == 1 && data[0] == 0x00) {
-                        continue; // Empty or keepalive
-                    }
-                    let per_peer = reassembly.entry(peer.clone()).or_default();
-                    let complete = consume_ble_frame(data, per_peer);
-
-                    if let Some(raw) = complete {
-                        rxb.fetch_add(raw.len() as u64, Ordering::Relaxed);
-                        let parse_result = rns_wire::packet::Packet::from_raw(&raw);
-                        match &parse_result {
-                            Ok(parsed) => tracing::debug!(
-                                target: "ble_trace",
-                                step = "reassembly.complete",
-                                peer = %peer,
-                                len = raw.len(),
-                                packet_type = ?parsed.header.flags.packet_type,
-                                "BLE Peer reassembly: complete packet"
-                            ),
-                            Err(e) => tracing::debug!(
-                                target: "ble_trace",
-                                step = "reassembly.complete",
-                                peer = %peer,
-                                len = raw.len(),
-                                parse_err = %e,
-                                "BLE Peer reassembly: complete packet (parse failed)"
-                            ),
-                        }
-                        // Identity learning: peek at the packet header
-                        // before we hand off to transport. If this is an
-                        // announce and we haven't yet associated this peer
-                        // address with an identity, emit IdentityResolved for
-                        // caller-side deduplication. Cheap: parses header only,
-                        // doesn't validate the announce
-                        // signature (transport will do that).
-                        if !identity_announced.contains(&peer) {
-                            if let Ok(parsed) = &parse_result {
-                                if parsed.header.flags.packet_type
-                                    == rns_wire::flags::PacketType::Announce
-                                {
-                                    let id_hex = hex::encode(parsed.header.destination_hash);
-                                    identity_announced.insert(peer.clone());
-                                    dispatch_event(BlePeerEvent::IdentityResolved {
-                                        address: peer.clone(),
-                                        identity_hash: id_hex,
-                                    });
-                                }
-                            }
-                        }
-                        // Record this packet's source so the outbound
-                        // fan-out can skip echoing it back to the same peer.
-                        anti_loop_record(&anti_loop_p, peer.clone(), &raw);
-                        let msg =
-                            TransportMessage::Inbound(rns_transport::messages::InboundPacket {
-                                raw: Bytes::from(raw),
-                                interface_id: id,
-                                rssi: None,
-                                snr: None,
-                                q: None,
-                            });
-                        if transport_periph.send(msg).await.is_err() {
+            track_child_task(
+                generation,
+                tokio::spawn(async move {
+                    // Per-peer reassembly: outer key is the source peer identifier
+                    // (BluetoothDevice MAC on Android; CBCentral.identifier UUID
+                    // string on Apple). Two peers writing fragments concurrently
+                    // can no longer corrupt each other's reassembly buffers.
+                    type PeerReassembly = FragmentReassembly;
+                    let mut reassembly: HashMap<String, PeerReassembly> = HashMap::new();
+                    // Identity is learned from the first signed Reticulum announce.
+                    // Emit once per peer address so callers can dedupe
+                    // central/peripheral views of the same device.
+                    let mut identity_announced: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    while let Some((peer, data)) = rx.recv().await {
+                        if !generation_is_current(generation) {
                             break;
                         }
-                    }
+                        tracing::debug!(
+                            target: "ble_trace",
+                            step = "reassembly.frame",
+                            peer = %peer,
+                            len = data.len(),
+                            first_byte = data.first().copied().unwrap_or(0),
+                            "BLE Peer reassembly: frame received"
+                        );
+                        if data.is_empty() || (data.len() == 1 && data[0] == 0x00) {
+                            continue; // Empty or keepalive
+                        }
+                        let per_peer = reassembly.entry(peer.clone()).or_default();
+                        let complete = consume_ble_frame(data, per_peer);
 
-                    // Drop expired reassembly buffers (per peer, then per fragment-set).
-                    for buf in reassembly.values_mut() {
-                        prune_reassembly(buf);
+                        if let Some(raw) = complete {
+                            rxb.fetch_add(raw.len() as u64, Ordering::Relaxed);
+                            let parse_result = rns_wire::packet::Packet::from_raw(&raw);
+                            match &parse_result {
+                                Ok(parsed) => tracing::debug!(
+                                    target: "ble_trace",
+                                    step = "reassembly.complete",
+                                    peer = %peer,
+                                    len = raw.len(),
+                                    packet_type = ?parsed.header.flags.packet_type,
+                                    "BLE Peer reassembly: complete packet"
+                                ),
+                                Err(e) => tracing::debug!(
+                                    target: "ble_trace",
+                                    step = "reassembly.complete",
+                                    peer = %peer,
+                                    len = raw.len(),
+                                    parse_err = %e,
+                                    "BLE Peer reassembly: complete packet (parse failed)"
+                                ),
+                            }
+                            // Identity learning: peek at the packet header
+                            // before we hand off to transport. If this is an
+                            // announce and we haven't yet associated this peer
+                            // address with an identity, emit IdentityResolved for
+                            // caller-side deduplication. Cheap: parses header only,
+                            // doesn't validate the announce
+                            // signature (transport will do that).
+                            if !identity_announced.contains(&peer) {
+                                if let Ok(parsed) = &parse_result {
+                                    if parsed.header.flags.packet_type
+                                        == rns_wire::flags::PacketType::Announce
+                                    {
+                                        let id_hex = hex::encode(parsed.header.destination_hash);
+                                        identity_announced.insert(peer.clone());
+                                        dispatch_event(BlePeerEvent::IdentityResolved {
+                                            address: peer.clone(),
+                                            identity_hash: id_hex,
+                                        });
+                                    }
+                                }
+                            }
+                            // Record this packet's source so the outbound
+                            // fan-out can skip echoing it back to the same peer.
+                            anti_loop_record(&anti_loop_p, peer.clone(), &raw);
+                            let msg =
+                                TransportMessage::Inbound(rns_transport::messages::InboundPacket {
+                                    raw: Bytes::from(raw),
+                                    interface_id: id,
+                                    rssi: None,
+                                    snr: None,
+                                    q: None,
+                                });
+                            if transport_periph.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+
+                        // Drop expired reassembly buffers (per peer, then per fragment-set).
+                        for buf in reassembly.values_mut() {
+                            prune_reassembly(buf);
+                        }
+                        reassembly.retain(|_, m| !m.is_empty());
                     }
-                    reassembly.retain(|_, m| !m.is_empty());
-                }
-            });
+                }),
+            );
         }
     }
 
@@ -4888,154 +5089,165 @@ pub async fn spawn_ble_peer_interface(
     let txb_w = shared_txb.clone();
     let writers_w = peer_writers.clone();
     let anti_loop_fan = anti_loop.clone();
-    tokio::spawn(async move {
-        // Apple-side fallback (no per-central API exposed up to us yet).
-        // Gated to Apple because the only consumer is the Apple-cfg
-        // fragmentation block below — on Linux/Windows the const would
-        // be dead.
-        #[cfg(any(target_os = "ios", target_os = "macos"))]
-        const APPLE_NOTIFY_MTU: usize = 182;
-
-        while let Some(payload) = app_rx.recv().await {
-            if !running_flag().load(Ordering::SeqCst) {
-                break;
-            }
-            txb_w.fetch_add(payload.len() as u64, Ordering::Relaxed);
-
-            // (a) Centrals we initiated to — peer_write_loop fragments inside
-            //     and runs its own per-peer anti-loop check before writing.
-            let readers = writers_w.read().await;
-            for peer_tx in readers.iter() {
-                let _ = peer_tx.send(payload.clone()).await;
-            }
-            drop(readers);
-
-            // (b) Subscribers on our peripheral TX. Fragment here so each
-            //     NOTIFY frame fits the per-peer (Android) or conservative
-            //     (Apple) ATT MTU. Enumerate subscribed centrals and skip
-            //     any whose address is recorded as the source of this exact
-            //     payload (anti-loop).
+    track_child_task(
+        generation,
+        tokio::spawn(async move {
+            // Apple-side fallback (no per-central API exposed up to us yet).
+            // Gated to Apple because the only consumer is the Apple-cfg
+            // fragmentation block below — on Linux/Windows the const would
+            // be dead.
             #[cfg(any(target_os = "ios", target_os = "macos"))]
-            {
-                let rats_subs = apple_peripheral::subscribed_centrals_for_char(RATSPEAK_TX_UUID);
-                let col_subs = apple_peripheral::subscribed_centrals_for_char(COLUMBA_TX_UUID);
-                let frags = fragment_packet(&payload, APPLE_NOTIFY_MTU);
-                tracing::info!(
-                    rats_subs = rats_subs.len(),
-                    col_subs = col_subs.len(),
-                    payload_bytes = payload.len(),
-                    frags = frags.len(),
-                    "Apple BLE peripheral fan-out: writing outbound"
-                );
-                for (char_uuid, subs, label) in [
-                    (RATSPEAK_TX_UUID, &rats_subs, "ratspeak"),
-                    (COLUMBA_TX_UUID, &col_subs, "columba"),
-                ] {
-                    for addr in subs {
+            const APPLE_NOTIFY_MTU: usize = 182;
+
+            while let Some(payload) = app_rx.recv().await {
+                if !generation_is_current(generation) {
+                    break;
+                }
+                txb_w.fetch_add(payload.len() as u64, Ordering::Relaxed);
+
+                // (a) Centrals we initiated to — peer_write_loop fragments inside
+                //     and runs its own per-peer anti-loop check before writing.
+                let readers = writers_w.read().await;
+                for peer_tx in readers.iter() {
+                    let _ = peer_tx.send(payload.clone()).await;
+                }
+                drop(readers);
+
+                // (b) Subscribers on our peripheral TX. Fragment here so each
+                //     NOTIFY frame fits the per-peer (Android) or conservative
+                //     (Apple) ATT MTU. Enumerate subscribed centrals and skip
+                //     any whose address is recorded as the source of this exact
+                //     payload (anti-loop).
+                #[cfg(any(target_os = "ios", target_os = "macos"))]
+                {
+                    let rats_subs =
+                        apple_peripheral::subscribed_centrals_for_char(RATSPEAK_TX_UUID);
+                    let col_subs = apple_peripheral::subscribed_centrals_for_char(COLUMBA_TX_UUID);
+                    let frags = fragment_packet(&payload, APPLE_NOTIFY_MTU);
+                    tracing::info!(
+                        rats_subs = rats_subs.len(),
+                        col_subs = col_subs.len(),
+                        payload_bytes = payload.len(),
+                        frags = frags.len(),
+                        "Apple BLE peripheral fan-out: writing outbound"
+                    );
+                    for (char_uuid, subs, label) in [
+                        (RATSPEAK_TX_UUID, &rats_subs, "ratspeak"),
+                        (COLUMBA_TX_UUID, &col_subs, "columba"),
+                    ] {
+                        for addr in subs {
+                            if !anti_loop_should_send(&anti_loop_fan, addr, &payload) {
+                                tracing::info!(peer = %addr, char = label, "Apple BLE fan-out: anti-loop skip");
+                                continue;
+                            }
+                            let mut ok_frags = 0usize;
+                            for frag in &frags {
+                                if apple_peripheral::notify_tx(Some(addr), char_uuid, frag) {
+                                    ok_frags += 1;
+                                }
+                            }
+                            tracing::info!(
+                                peer = %addr,
+                                total_frags = frags.len(),
+                                ok_frags,
+                                char = label,
+                                "Apple BLE fan-out: notify_tx results"
+                            );
+                        }
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    // Linux bluer notifier doesn't expose per-central addresses up
+                    // to us yet — the Notifier is keyed by char only. Apply the
+                    // anti-loop filter against a synthetic broadcast key so a
+                    // packet recently received from any peripheral subscriber is
+                    // skipped on the same characteristic. This is a coarser
+                    // filter than apple/android but still prevents the
+                    // most-common 2-node echo loop. A linux-specific per-device
+                    // notifier table can refine this later.
+                    const LINUX_NOTIFY_MTU: usize = 244;
+                    let frags = fragment_packet(&payload, LINUX_NOTIFY_MTU);
+                    for frag in &frags {
+                        let _ = linux_peripheral::notify_tx(RATSPEAK_TX_UUID, frag);
+                        let _ = linux_peripheral::notify_tx(COLUMBA_TX_UUID, frag);
+                    }
+                    let _ = &anti_loop_fan; // silence unused-warning on linux-only path
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    // WinRT GattLocalCharacteristic.NotifyValueAsync broadcasts to
+                    // every subscribed client on the characteristic — Windows
+                    // doesn't expose a per-subscriber addressable notify. Same
+                    // coarse anti-loop story as Linux: filter against a
+                    // per-characteristic "broadcast" key. Per-client routing can
+                    // be added later by keying on the GattSubscribedClient's
+                    // device id seen during SubscribedClientsChanged.
+                    const WINDOWS_NOTIFY_MTU: usize = 244;
+                    let frags = fragment_packet(&payload, WINDOWS_NOTIFY_MTU);
+                    for frag in &frags {
+                        let _ = windows_peripheral::notify_tx(RATSPEAK_TX_UUID, frag);
+                        let _ = windows_peripheral::notify_tx(COLUMBA_TX_UUID, frag);
+                    }
+                    let _ = &anti_loop_fan;
+                }
+                #[cfg(target_os = "android")]
+                {
+                    // Query the min subscribed payload per characteristic so the
+                    // chunk size adapts to the lowest-capacity central, alongside
+                    // the per-characteristic subscriber list for anti-loop
+                    // addressing.
+                    let (rats_mtu, col_mtu, rats_subs, col_subs) =
+                        tokio::task::spawn_blocking(|| {
+                            (
+                                android_peripheral::min_subscribed_payload(RATSPEAK_TX_UUID),
+                                android_peripheral::min_subscribed_payload(COLUMBA_TX_UUID),
+                                android_peripheral::subscribed_addresses_for(RATSPEAK_TX_UUID),
+                                android_peripheral::subscribed_addresses_for(COLUMBA_TX_UUID),
+                            )
+                        })
+                        .await
+                        .unwrap_or((182, 182, Vec::new(), Vec::new()));
+                    let rats_frags = fragment_packet(&payload, rats_mtu);
+                    for addr in &rats_subs {
                         if !anti_loop_should_send(&anti_loop_fan, addr, &payload) {
-                            tracing::info!(peer = %addr, char = label, "Apple BLE fan-out: anti-loop skip");
                             continue;
                         }
-                        let mut ok_frags = 0usize;
-                        for frag in &frags {
-                            if apple_peripheral::notify_tx(Some(addr), char_uuid, frag) {
-                                ok_frags += 1;
+                        let addr_owned = addr.clone();
+                        let frags_owned = rats_frags.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            for frag in &frags_owned {
+                                let _ = android_peripheral::notify_tx(
+                                    &addr_owned,
+                                    RATSPEAK_TX_UUID,
+                                    frag,
+                                );
                             }
+                        })
+                        .await;
+                    }
+                    let col_frags = fragment_packet(&payload, col_mtu);
+                    for addr in &col_subs {
+                        if !anti_loop_should_send(&anti_loop_fan, addr, &payload) {
+                            continue;
                         }
-                        tracing::info!(
-                            peer = %addr,
-                            total_frags = frags.len(),
-                            ok_frags,
-                            char = label,
-                            "Apple BLE fan-out: notify_tx results"
-                        );
+                        let addr_owned = addr.clone();
+                        let frags_owned = col_frags.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            for frag in &frags_owned {
+                                let _ = android_peripheral::notify_tx(
+                                    &addr_owned,
+                                    COLUMBA_TX_UUID,
+                                    frag,
+                                );
+                            }
+                        })
+                        .await;
                     }
                 }
             }
-            #[cfg(target_os = "linux")]
-            {
-                // Linux bluer notifier doesn't expose per-central addresses up
-                // to us yet — the Notifier is keyed by char only. Apply the
-                // anti-loop filter against a synthetic broadcast key so a
-                // packet recently received from any peripheral subscriber is
-                // skipped on the same characteristic. This is a coarser
-                // filter than apple/android but still prevents the
-                // most-common 2-node echo loop. A linux-specific per-device
-                // notifier table can refine this later.
-                const LINUX_NOTIFY_MTU: usize = 244;
-                let frags = fragment_packet(&payload, LINUX_NOTIFY_MTU);
-                for frag in &frags {
-                    let _ = linux_peripheral::notify_tx(RATSPEAK_TX_UUID, frag);
-                    let _ = linux_peripheral::notify_tx(COLUMBA_TX_UUID, frag);
-                }
-                let _ = &anti_loop_fan; // silence unused-warning on linux-only path
-            }
-            #[cfg(target_os = "windows")]
-            {
-                // WinRT GattLocalCharacteristic.NotifyValueAsync broadcasts to
-                // every subscribed client on the characteristic — Windows
-                // doesn't expose a per-subscriber addressable notify. Same
-                // coarse anti-loop story as Linux: filter against a
-                // per-characteristic "broadcast" key. Per-client routing can
-                // be added later by keying on the GattSubscribedClient's
-                // device id seen during SubscribedClientsChanged.
-                const WINDOWS_NOTIFY_MTU: usize = 244;
-                let frags = fragment_packet(&payload, WINDOWS_NOTIFY_MTU);
-                for frag in &frags {
-                    let _ = windows_peripheral::notify_tx(RATSPEAK_TX_UUID, frag);
-                    let _ = windows_peripheral::notify_tx(COLUMBA_TX_UUID, frag);
-                }
-                let _ = &anti_loop_fan;
-            }
-            #[cfg(target_os = "android")]
-            {
-                // Query the min subscribed payload per characteristic so the
-                // chunk size adapts to the lowest-capacity central, alongside
-                // the per-characteristic subscriber list for anti-loop
-                // addressing.
-                let (rats_mtu, col_mtu, rats_subs, col_subs) = tokio::task::spawn_blocking(|| {
-                    (
-                        android_peripheral::min_subscribed_payload(RATSPEAK_TX_UUID),
-                        android_peripheral::min_subscribed_payload(COLUMBA_TX_UUID),
-                        android_peripheral::subscribed_addresses_for(RATSPEAK_TX_UUID),
-                        android_peripheral::subscribed_addresses_for(COLUMBA_TX_UUID),
-                    )
-                })
-                .await
-                .unwrap_or((182, 182, Vec::new(), Vec::new()));
-                let rats_frags = fragment_packet(&payload, rats_mtu);
-                for addr in &rats_subs {
-                    if !anti_loop_should_send(&anti_loop_fan, addr, &payload) {
-                        continue;
-                    }
-                    let addr_owned = addr.clone();
-                    let frags_owned = rats_frags.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        for frag in &frags_owned {
-                            let _ =
-                                android_peripheral::notify_tx(&addr_owned, RATSPEAK_TX_UUID, frag);
-                        }
-                    })
-                    .await;
-                }
-                let col_frags = fragment_packet(&payload, col_mtu);
-                for addr in &col_subs {
-                    if !anti_loop_should_send(&anti_loop_fan, addr, &payload) {
-                        continue;
-                    }
-                    let addr_owned = addr.clone();
-                    let frags_owned = col_frags.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        for frag in &frags_owned {
-                            let _ =
-                                android_peripheral::notify_tx(&addr_owned, COLUMBA_TX_UUID, frag);
-                        }
-                    })
-                    .await;
-                }
-            }
-        }
-    });
+        }),
+    );
 
     // Shared "recently disconnected" registry. Lets the scan loop
     // prioritize reconnecting to peers we know about, and applies an
@@ -5094,7 +5306,7 @@ pub async fn spawn_ble_peer_interface(
             };
 
             loop {
-                if !running_flag().load(Ordering::SeqCst) {
+                if !generation_is_current(generation) {
                     tracing::info!("BLE mesh Central scan loop: shutdown signal, exiting");
                     break;
                 }
@@ -5209,18 +5421,21 @@ pub async fn spawn_ble_peer_interface(
                                     let online_w = peer_online.clone();
                                     let addr_w = peer.ble_address.clone();
                                     let anti_loop_w = anti_loop.clone();
-                                    tokio::spawn(async move {
-                                        peer_write_loop(
-                                            p_write,
-                                            rx_c,
-                                            mtu,
-                                            peer_write_rx,
-                                            online_w,
-                                            addr_w,
-                                            anti_loop_w,
-                                        )
-                                        .await;
-                                    });
+                                    track_child_task(
+                                        generation,
+                                        tokio::spawn(async move {
+                                            peer_write_loop(
+                                                p_write,
+                                                rx_c,
+                                                mtu,
+                                                peer_write_rx,
+                                                online_w,
+                                                addr_w,
+                                                anti_loop_w,
+                                            )
+                                            .await;
+                                        }),
+                                    );
 
                                     // Spawn per-peer read loop
                                     let transport_r = transport.clone();
@@ -5231,22 +5446,25 @@ pub async fn spawn_ble_peer_interface(
                                     let anti_loop_r = anti_loop.clone();
                                     let proto_evt = peer.protocol;
                                     let addr_evt = peer.ble_address.clone();
-                                    tokio::spawn(async move {
-                                        peer_read_loop(
-                                            conn,
-                                            PeerReadLoopCtx {
-                                                interface_id: id,
-                                                transport_tx: transport_r,
-                                                peer_online: online_r,
-                                                rxb: rxb_r,
-                                                peer_writers: writers_r,
-                                                peer_write_tx,
-                                                recently_disconnected: recently_r,
-                                                anti_loop: anti_loop_r,
-                                            },
-                                        )
-                                        .await;
-                                    });
+                                    track_child_task(
+                                        generation,
+                                        tokio::spawn(async move {
+                                            peer_read_loop(
+                                                conn,
+                                                PeerReadLoopCtx {
+                                                    interface_id: id,
+                                                    transport_tx: transport_r,
+                                                    peer_online: online_r,
+                                                    rxb: rxb_r,
+                                                    peer_writers: writers_r,
+                                                    peer_write_tx,
+                                                    recently_disconnected: recently_r,
+                                                    anti_loop: anti_loop_r,
+                                                },
+                                            )
+                                            .await;
+                                        }),
+                                    );
                                     dispatch_event(BlePeerEvent::Connected {
                                         address: addr_evt.clone(),
                                         identity_hash: String::new(),
@@ -5315,7 +5533,7 @@ pub async fn spawn_ble_peer_interface(
             let mut connected_addrs: HashMap<String, Arc<AtomicBool>> = HashMap::new();
             let mut scan_interval = SCAN_ACTIVE_INTERVAL;
             loop {
-                if !running_flag().load(Ordering::SeqCst) {
+                if !generation_is_current(generation) {
                     tracing::info!("Apple BLE mesh Central scan loop: shutdown signal, exiting");
                     crate::ble_central_apple_connect::disconnect_all();
                     break;
@@ -5437,73 +5655,79 @@ pub async fn spawn_ble_peer_interface(
                                     let addr_w = peer.ble_address.clone();
                                     let anti_loop_w = anti_loop.clone();
                                     let mtu = cp.write_mtu;
-                                    tokio::spawn(async move {
-                                        const SHUTDOWN_POLL: Duration = Duration::from_secs(1);
-                                        let mut tx_count: u64 = 0;
-                                        loop {
-                                            let data = tokio::select! {
-                                                v = peer_write_rx.recv() => match v {
-                                                    Some(d) => d,
-                                                    None => break,
-                                                },
-                                                _ = tokio::time::sleep(SHUTDOWN_POLL) => {
-                                                    if !online_w.load(Ordering::SeqCst)
-                                                        || !running_flag().load(Ordering::SeqCst)
-                                                    {
-                                                        online_w.store(false, Ordering::SeqCst);
-                                                        break;
+                                    track_child_task(
+                                        generation,
+                                        tokio::spawn(async move {
+                                            const SHUTDOWN_POLL: Duration = Duration::from_secs(1);
+                                            let mut tx_count: u64 = 0;
+                                            loop {
+                                                let data = tokio::select! {
+                                                    v = peer_write_rx.recv() => match v {
+                                                        Some(d) => d,
+                                                        None => break,
+                                                    },
+                                                    _ = tokio::time::sleep(SHUTDOWN_POLL) => {
+                                                        if !online_w.load(Ordering::SeqCst)
+                                                            || !generation_is_current(generation)
+                                                        {
+                                                            online_w.store(false, Ordering::SeqCst);
+                                                            break;
+                                                        }
+                                                        continue;
                                                     }
-                                                    continue;
-                                                }
-                                            };
-                                            if !online_w.load(Ordering::SeqCst)
-                                                || !running_flag().load(Ordering::SeqCst)
-                                            {
-                                                online_w.store(false, Ordering::SeqCst);
-                                                break;
-                                            }
-                                            if !anti_loop_should_send(&anti_loop_w, &addr_w, &data)
-                                            {
-                                                continue;
-                                            }
-                                            let frags = fragment_packet(&data, mtu);
-                                            let mut all_ok = true;
-                                            for frag in &frags {
-                                                if let Err(e) =
-                                                    crate::ble_central_apple_connect::write_peer(
-                                                        &addr_w, frag,
-                                                    )
+                                                };
+                                                if !online_w.load(Ordering::SeqCst)
+                                                    || !generation_is_current(generation)
                                                 {
-                                                    tracing::warn!(
-                                                        target: "ble_trace",
-                                                        step = "peer.write_fail",
-                                                        peer = %addr_w,
-                                                        tx_count = tx_count,
-                                                        frag_len = frag.len(),
-                                                        err = %e,
-                                                        "Apple BLE mesh peer write failed"
-                                                    );
                                                     online_w.store(false, Ordering::SeqCst);
-                                                    all_ok = false;
                                                     break;
                                                 }
+                                                if !anti_loop_should_send(
+                                                    &anti_loop_w,
+                                                    &addr_w,
+                                                    &data,
+                                                ) {
+                                                    continue;
+                                                }
+                                                let frags = fragment_packet(&data, mtu);
+                                                let mut all_ok = true;
+                                                for frag in &frags {
+                                                    if let Err(e) =
+                                                        crate::ble_central_apple_connect::write_peer(
+                                                            &addr_w, frag,
+                                                        )
+                                                    {
+                                                        tracing::warn!(
+                                                            target: "ble_trace",
+                                                            step = "peer.write_fail",
+                                                            peer = %addr_w,
+                                                            tx_count = tx_count,
+                                                            frag_len = frag.len(),
+                                                            err = %e,
+                                                            "Apple BLE mesh peer write failed"
+                                                        );
+                                                        online_w.store(false, Ordering::SeqCst);
+                                                        all_ok = false;
+                                                        break;
+                                                    }
+                                                }
+                                                if !all_ok {
+                                                    break;
+                                                }
+                                                tx_count += 1;
+                                                if tx_count % 5 == 0 {
+                                                    tracing::info!(
+                                                        target: "ble_trace",
+                                                        step = "peer.tx_progress",
+                                                        peer = %addr_w,
+                                                        tx_count = tx_count,
+                                                        last_len = data.len(),
+                                                        "Apple BLE mesh outbound frames (rolling count)"
+                                                    );
+                                                }
                                             }
-                                            if !all_ok {
-                                                break;
-                                            }
-                                            tx_count += 1;
-                                            if tx_count % 5 == 0 {
-                                                tracing::info!(
-                                                    target: "ble_trace",
-                                                    step = "peer.tx_progress",
-                                                    peer = %addr_w,
-                                                    tx_count = tx_count,
-                                                    last_len = data.len(),
-                                                    "Apple BLE mesh outbound frames (rolling count)"
-                                                );
-                                            }
-                                        }
-                                    });
+                                        }),
+                                    );
 
                                     dispatch_event(BlePeerEvent::Connected {
                                         address: peer.ble_address.clone(),
@@ -5593,7 +5817,7 @@ pub async fn spawn_ble_peer_interface(
             let mut connected_addrs: HashMap<String, Arc<AtomicBool>> = HashMap::new();
 
             loop {
-                if !running_flag().load(Ordering::SeqCst) {
+                if !generation_is_current(generation) {
                     tracing::info!(
                         "BLE mesh (Android) Central scan loop: shutdown signal, exiting"
                     );
@@ -5692,72 +5916,75 @@ pub async fn spawn_ble_peer_interface(
                             let online_w = peer_online.clone();
                             let addr_w = addr.clone();
                             let anti_loop_w = anti_loop.clone();
-                            tokio::spawn(async move {
-                                // Bounded recv wake so global shutdown
-                                // tears this task down within ~1s even when
-                                // there's no outbound traffic. Without it the
-                                // task would live until the scan loop's
-                                // cleanup-on-next-tick dropped the write_tx.
-                                const SHUTDOWN_POLL: Duration = Duration::from_secs(1);
-                                loop {
-                                    let data = tokio::select! {
-                                        v = peer_write_rx.recv() => match v {
-                                            Some(d) => d,
-                                            None => break,
-                                        },
-                                        _ = tokio::time::sleep(SHUTDOWN_POLL) => {
-                                            if !online_w.load(Ordering::SeqCst)
-                                                || !running_flag().load(Ordering::SeqCst)
-                                            {
-                                                online_w.store(false, Ordering::SeqCst);
-                                                break;
+                            track_child_task(
+                                generation,
+                                tokio::spawn(async move {
+                                    // Bounded recv wake so global shutdown
+                                    // tears this task down within ~1s even when
+                                    // there's no outbound traffic. Without it the
+                                    // task would live until the scan loop's
+                                    // cleanup-on-next-tick dropped the write_tx.
+                                    const SHUTDOWN_POLL: Duration = Duration::from_secs(1);
+                                    loop {
+                                        let data = tokio::select! {
+                                            v = peer_write_rx.recv() => match v {
+                                                Some(d) => d,
+                                                None => break,
+                                            },
+                                            _ = tokio::time::sleep(SHUTDOWN_POLL) => {
+                                                if !online_w.load(Ordering::SeqCst)
+                                                    || !generation_is_current(generation)
+                                                {
+                                                    online_w.store(false, Ordering::SeqCst);
+                                                    break;
+                                                }
+                                                continue;
                                             }
+                                        };
+                                        if !online_w.load(Ordering::SeqCst)
+                                            || !generation_is_current(generation)
+                                        {
+                                            online_w.store(false, Ordering::SeqCst);
+                                            break;
+                                        }
+                                        // Don't echo a packet back to its source.
+                                        if !anti_loop_should_send(&anti_loop_w, &addr_w, &data) {
                                             continue;
                                         }
-                                    };
-                                    if !online_w.load(Ordering::SeqCst)
-                                        || !running_flag().load(Ordering::SeqCst)
-                                    {
-                                        online_w.store(false, Ordering::SeqCst);
-                                        break;
-                                    }
-                                    // Don't echo a packet back to its source.
-                                    if !anti_loop_should_send(&anti_loop_w, &addr_w, &data) {
-                                        continue;
-                                    }
-                                    // Query the per-peer negotiated MTU each
-                                    // iteration so we pick up post-connect MTU
-                                    // exchange results.
-                                    let addr_mtu = addr_w.clone();
-                                    let mtu = tokio::task::spawn_blocking(move || {
-                                        android_peripheral::peer_client_mtu(&addr_mtu)
-                                    })
-                                    .await
-                                    .unwrap_or(244);
-                                    let frags = fragment_packet(&data, mtu);
-                                    let addr_w2 = addr_w.clone();
-                                    let send_ok = tokio::task::spawn_blocking(move || {
-                                        for frag in &frags {
-                                            if !android_peripheral::peer_client_write(
-                                                &addr_w2, frag,
-                                            ) {
-                                                return false;
+                                        // Query the per-peer negotiated MTU each
+                                        // iteration so we pick up post-connect MTU
+                                        // exchange results.
+                                        let addr_mtu = addr_w.clone();
+                                        let mtu = tokio::task::spawn_blocking(move || {
+                                            android_peripheral::peer_client_mtu(&addr_mtu)
+                                        })
+                                        .await
+                                        .unwrap_or(244);
+                                        let frags = fragment_packet(&data, mtu);
+                                        let addr_w2 = addr_w.clone();
+                                        let send_ok = tokio::task::spawn_blocking(move || {
+                                            for frag in &frags {
+                                                if !android_peripheral::peer_client_write(
+                                                    &addr_w2, frag,
+                                                ) {
+                                                    return false;
+                                                }
                                             }
+                                            true
+                                        })
+                                        .await
+                                        .unwrap_or(false);
+                                        if !send_ok {
+                                            tracing::warn!(
+                                                peer = %addr_w,
+                                                "Android peer client write failed, marking offline"
+                                            );
+                                            online_w.store(false, Ordering::SeqCst);
+                                            break;
                                         }
-                                        true
-                                    })
-                                    .await
-                                    .unwrap_or(false);
-                                    if !send_ok {
-                                        tracing::warn!(
-                                            peer = %addr_w,
-                                            "Android peer client write failed, marking offline"
-                                        );
-                                        online_w.store(false, Ordering::SeqCst);
-                                        break;
                                     }
-                                }
-                            });
+                                }),
+                            );
 
                             // Drop any wanted-reconnect entry for this peer.
                             record_reconnect_success(&recently_disc, addr);
