@@ -2952,7 +2952,7 @@ pub async fn spawn_ble_peer_runtime(
     identity_hash: Vec<u8>,
     event_tx: Option<tokio::sync::mpsc::Sender<rns_interface::ble_peer::BlePeerEvent>>,
     foreground_wake: std::sync::Arc<tokio::sync::Notify>,
-    seed_identities: Vec<String>,
+    seed_addresses: Vec<String>,
 ) -> Result<u64, String> {
     let id = handle
         .id_gen
@@ -2970,7 +2970,7 @@ pub async fn spawn_ble_peer_runtime(
         handle.transport_tx.clone(),
         handle.is_foreground.clone(),
         foreground_wake,
-        seed_identities,
+        seed_addresses,
     )
     .await
     .map_err(|e| {

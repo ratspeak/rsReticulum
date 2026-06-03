@@ -67,7 +67,7 @@ pub const RECONNECT_BACKOFF_FAILURES: u32 = 3;
 pub const RECONNECT_BACKOFF_DURATION: Duration = Duration::from_secs(300);
 pub const RECONNECT_PRUNE_AFTER: Duration = Duration::from_secs(600);
 
-/// `(disconnect_time, consecutive_failure_count)` keyed by identity hex.
+/// `(disconnect_time, consecutive_failure_count)` keyed by BLE scan address.
 pub type RecentlyDisconnected = Arc<std::sync::Mutex<HashMap<String, (Instant, u32)>>>;
 
 pub fn new_recently_disconnected() -> RecentlyDisconnected {
@@ -75,14 +75,16 @@ pub fn new_recently_disconnected() -> RecentlyDisconnected {
 }
 
 /// Seeded entries start at `(now, 0)` — candidate, not in backoff.
-pub fn seed_recently_disconnected(map: &RecentlyDisconnected, identities: Vec<String>) {
-    if identities.is_empty() {
+pub fn seed_recently_disconnected(map: &RecentlyDisconnected, addresses: Vec<String>) {
+    if addresses.is_empty() {
         return;
     }
     if let Ok(mut guard) = map.lock() {
         let now = Instant::now();
-        for id in identities {
-            guard.entry(id).or_insert((now, 0));
+        for address in addresses {
+            if !address.is_empty() {
+                guard.entry(address).or_insert((now, 0));
+            }
         }
     }
 }
@@ -187,9 +189,9 @@ impl BlePeerLinkRegistry {
 
 type LinkRegistry = Arc<tokio::sync::RwLock<BlePeerLinkRegistry>>;
 
-fn reconnect_in_backoff(map: &RecentlyDisconnected, identity_hex: &str) -> bool {
+fn reconnect_in_backoff(map: &RecentlyDisconnected, address: &str) -> bool {
     if let Ok(guard) = map.lock() {
-        if let Some((when, fails)) = guard.get(identity_hex) {
+        if let Some((when, fails)) = guard.get(address) {
             return *fails >= RECONNECT_BACKOFF_FAILURES
                 && when.elapsed() < RECONNECT_BACKOFF_DURATION;
         }
@@ -197,19 +199,25 @@ fn reconnect_in_backoff(map: &RecentlyDisconnected, identity_hex: &str) -> bool 
     false
 }
 
-fn record_disconnect(map: &RecentlyDisconnected, identity_hex: &str) {
+fn record_disconnect(map: &RecentlyDisconnected, address: &str) {
+    if address.is_empty() {
+        return;
+    }
     if let Ok(mut guard) = map.lock() {
         guard
-            .entry(identity_hex.to_string())
+            .entry(address.to_string())
             .and_modify(|(when, _)| *when = Instant::now())
             .or_insert((Instant::now(), 0));
     }
 }
 
-fn record_reconnect_failure(map: &RecentlyDisconnected, identity_hex: &str) {
+fn record_reconnect_failure(map: &RecentlyDisconnected, address: &str) {
+    if address.is_empty() {
+        return;
+    }
     if let Ok(mut guard) = map.lock() {
         guard
-            .entry(identity_hex.to_string())
+            .entry(address.to_string())
             .and_modify(|(when, fails)| {
                 *when = Instant::now();
                 *fails = fails.saturating_add(1);
@@ -218,9 +226,9 @@ fn record_reconnect_failure(map: &RecentlyDisconnected, identity_hex: &str) {
     }
 }
 
-fn record_reconnect_success(map: &RecentlyDisconnected, identity_hex: &str) {
+fn record_reconnect_success(map: &RecentlyDisconnected, address: &str) {
     if let Ok(mut guard) = map.lock() {
-        guard.remove(identity_hex);
+        guard.remove(address);
     }
 }
 
@@ -4969,7 +4977,7 @@ pub async fn spawn_ble_peer_interface(
     transport_tx: mpsc::Sender<TransportMessage>,
     is_foreground: Arc<AtomicBool>,
     foreground_wake: Arc<tokio::sync::Notify>,
-    seed_identities: Vec<String>,
+    seed_addresses: Vec<String>,
 ) -> Result<InterfaceHandle, InterfaceError> {
     let name = config.name.clone();
 
@@ -5375,11 +5383,11 @@ pub async fn spawn_ble_peer_interface(
     // prioritize reconnecting to peers we know about, and applies an
     // exponential-backoff window after repeated failures.
     //
-    // Seeded from persisted recently-disconnected identities so a fresh process
+    // Seeded from persisted recently-disconnected addresses so a fresh process
     // launch immediately prefers peers from the previous session, instead of
     // waiting to observe a disconnect first.
     let recently_disconnected = new_recently_disconnected();
-    seed_recently_disconnected(&recently_disconnected, seed_identities);
+    seed_recently_disconnected(&recently_disconnected, seed_addresses);
 
     // Main mesh management task — scan, discover, connect, manage peers.
     //
@@ -6588,6 +6596,27 @@ mod tests {
             "other-addr",
             &[central_writer_key("central-addr")]
         ));
+    }
+
+    #[test]
+    fn recently_disconnected_reconnects_are_address_keyed() {
+        let map = new_recently_disconnected();
+        seed_recently_disconnected(&map, vec![String::new(), "peer-address".into()]);
+
+        {
+            let guard = map.lock().unwrap();
+            assert!(!guard.contains_key(""));
+            assert!(guard.contains_key("peer-address"));
+        }
+
+        assert!(!reconnect_in_backoff(&map, "peer-address"));
+        record_reconnect_failure(&map, "peer-address");
+        record_reconnect_failure(&map, "peer-address");
+        record_reconnect_failure(&map, "peer-address");
+        assert!(reconnect_in_backoff(&map, "peer-address"));
+
+        record_reconnect_success(&map, "peer-address");
+        assert!(!reconnect_in_backoff(&map, "peer-address"));
     }
 
     // ── Constants ──
