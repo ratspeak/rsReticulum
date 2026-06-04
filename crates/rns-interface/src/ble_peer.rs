@@ -186,10 +186,12 @@ impl BlePeerLinkRegistry {
         }
     }
 
+    #[cfg(any(test, target_os = "android", target_os = "ios", target_os = "macos"))]
     fn address_for_writer_key<'a>(&self, writer_key: &'a str) -> &'a str {
         writer_key.strip_prefix("central:").unwrap_or(writer_key)
     }
 
+    #[cfg(any(test, target_os = "android", target_os = "ios", target_os = "macos"))]
     fn should_send_peripheral_subscriber(
         &self,
         subscriber_address: &str,
@@ -217,11 +219,13 @@ impl BlePeerLinkRegistry {
 
 type LinkRegistry = Arc<tokio::sync::RwLock<BlePeerLinkRegistry>>;
 
+#[cfg(any(test, target_os = "android", target_os = "ios", target_os = "macos"))]
 fn payload_needs_redundant_role_fanout(payload: &[u8]) -> bool {
     rns_wire::header::PacketHeader::unpack(payload)
         .is_ok_and(|(header, _)| header.flags.packet_type == rns_wire::flags::PacketType::Proof)
 }
 
+#[cfg(any(test, target_os = "android", target_os = "ios", target_os = "macos"))]
 fn should_send_peripheral_payload(
     registry: &BlePeerLinkRegistry,
     subscriber_address: &str,
@@ -515,15 +519,15 @@ pub(crate) fn running_flag() -> Arc<AtomicBool> {
 }
 
 static BLE_PEER_GENERATION: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
-static BLE_PEER_CHILD_TASKS: std::sync::OnceLock<
-    std::sync::Mutex<Vec<(u64, tokio::task::JoinHandle<()>)>>,
-> = std::sync::OnceLock::new();
+type BlePeerChildTask = (u64, tokio::task::JoinHandle<()>);
+type BlePeerChildTasks = std::sync::Mutex<Vec<BlePeerChildTask>>;
+static BLE_PEER_CHILD_TASKS: std::sync::OnceLock<BlePeerChildTasks> = std::sync::OnceLock::new();
 
 fn generation_counter() -> &'static AtomicU64 {
     BLE_PEER_GENERATION.get_or_init(|| AtomicU64::new(0))
 }
 
-fn child_tasks() -> &'static std::sync::Mutex<Vec<(u64, tokio::task::JoinHandle<()>)>> {
+fn child_tasks() -> &'static BlePeerChildTasks {
     BLE_PEER_CHILD_TASKS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
@@ -3953,14 +3957,6 @@ mod linux_peripheral {
         Ok(())
     }
 
-    fn take_inbound_rx_init() {
-        // Cheap idempotent init so write callbacks always have a sender even
-        // before the consumer takes the receiver.
-        if inbound_sender().is_none() {
-            reset_inbound_channel();
-        }
-    }
-
     async fn build_service(
         service_uuid: Uuid,
         rx_uuid: Uuid,
@@ -5292,6 +5288,7 @@ pub async fn spawn_ble_peer_interface(
     let txb_w = shared_txb.clone();
     let writers_w = peer_writers.clone();
     let anti_loop_fan = anti_loop.clone();
+    #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
     let link_registry_fan = link_registry.clone();
     track_child_task(
         generation,
@@ -5318,6 +5315,7 @@ pub async fn spawn_ble_peer_interface(
                         .map(|(key, tx)| (key.clone(), tx.clone()))
                         .collect::<Vec<_>>()
                 };
+                #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
                 let central_writer_keys = writer_snapshot
                     .iter()
                     .map(|(key, _)| key.clone())
