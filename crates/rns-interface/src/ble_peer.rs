@@ -217,6 +217,21 @@ impl BlePeerLinkRegistry {
 
 type LinkRegistry = Arc<tokio::sync::RwLock<BlePeerLinkRegistry>>;
 
+fn payload_needs_redundant_role_fanout(payload: &[u8]) -> bool {
+    rns_wire::header::PacketHeader::unpack(payload)
+        .is_ok_and(|(header, _)| header.flags.packet_type == rns_wire::flags::PacketType::Proof)
+}
+
+fn should_send_peripheral_payload(
+    registry: &BlePeerLinkRegistry,
+    subscriber_address: &str,
+    central_writer_keys: &[String],
+    payload: &[u8],
+) -> bool {
+    payload_needs_redundant_role_fanout(payload)
+        || registry.should_send_peripheral_subscriber(subscriber_address, central_writer_keys)
+}
+
 fn reconnect_in_backoff(map: &RecentlyDisconnected, address: &str) -> bool {
     if let Ok(guard) = map.lock() {
         if let Some((when, fails)) = guard.get(address) {
@@ -5345,7 +5360,12 @@ pub async fn spawn_ble_peer_interface(
                         for addr in subs {
                             let send_on_peripheral = {
                                 let links = link_registry_fan.read().await;
-                                links.should_send_peripheral_subscriber(addr, &central_writer_keys)
+                                should_send_peripheral_payload(
+                                    &links,
+                                    addr,
+                                    &central_writer_keys,
+                                    &payload,
+                                )
                             };
                             if !send_on_peripheral {
                                 tracing::debug!(
@@ -5434,7 +5454,12 @@ pub async fn spawn_ble_peer_interface(
                     for addr in &rats_subs {
                         let send_on_peripheral = {
                             let links = link_registry_fan.read().await;
-                            links.should_send_peripheral_subscriber(addr, &central_writer_keys)
+                            should_send_peripheral_payload(
+                                &links,
+                                addr,
+                                &central_writer_keys,
+                                &payload,
+                            )
                         };
                         if !send_on_peripheral {
                             continue;
@@ -5461,7 +5486,12 @@ pub async fn spawn_ble_peer_interface(
                     for addr in &col_subs {
                         let send_on_peripheral = {
                             let links = link_registry_fan.read().await;
-                            links.should_send_peripheral_subscriber(addr, &central_writer_keys)
+                            should_send_peripheral_payload(
+                                &links,
+                                addr,
+                                &central_writer_keys,
+                                &payload,
+                            )
                         };
                         if !send_on_peripheral {
                             continue;
@@ -6833,6 +6863,73 @@ mod tests {
         assert!(registry.should_send_peripheral_subscriber(
             "other-addr",
             &[central_writer_key("central-addr")]
+        ));
+    }
+
+    fn raw_test_packet(
+        packet_type: rns_wire::flags::PacketType,
+        context: rns_wire::context::PacketContext,
+    ) -> Vec<u8> {
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: [0x44; 16],
+            context,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&[0xAA; 96]);
+        raw
+    }
+
+    #[test]
+    fn proof_payload_bypasses_role_preference() {
+        let registry = BlePeerLinkRegistry::default();
+        let writer_keys = [central_writer_key("AA:BB:CC:DD:EE:FF")];
+        let proof = raw_test_packet(
+            rns_wire::flags::PacketType::Proof,
+            rns_wire::context::PacketContext::LinkProof,
+        );
+        let data = raw_test_packet(
+            rns_wire::flags::PacketType::Data,
+            rns_wire::context::PacketContext::None,
+        );
+
+        assert!(payload_needs_redundant_role_fanout(&proof));
+        assert!(should_send_peripheral_payload(
+            &registry,
+            "AA:BB:CC:DD:EE:FF",
+            &writer_keys,
+            &proof,
+        ));
+        assert!(!payload_needs_redundant_role_fanout(&data));
+        assert!(!should_send_peripheral_payload(
+            &registry,
+            "AA:BB:CC:DD:EE:FF",
+            &writer_keys,
+            &data,
+        ));
+    }
+
+    #[test]
+    fn malformed_payload_uses_normal_role_preference() {
+        let registry = BlePeerLinkRegistry::default();
+        let writer_keys = [central_writer_key("AA:BB:CC:DD:EE:FF")];
+
+        assert!(!payload_needs_redundant_role_fanout(
+            b"not-a-reticulum-packet"
+        ));
+        assert!(!should_send_peripheral_payload(
+            &registry,
+            "AA:BB:CC:DD:EE:FF",
+            &writer_keys,
+            b"not-a-reticulum-packet",
         ));
     }
 
