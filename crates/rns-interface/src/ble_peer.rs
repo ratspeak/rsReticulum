@@ -60,6 +60,7 @@ pub const FRAGMENT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MIN_RSSI: i16 = -85;
 pub const SCAN_ACTIVE_INTERVAL: Duration = Duration::from_secs(5);
 pub const SCAN_IDLE_INTERVAL: Duration = Duration::from_secs(30);
+pub const BLE_FRAGMENT_PACING: Duration = Duration::from_millis(8);
 
 /// Recently-disconnected peers stay "wanted" — scan loop uses the active
 /// interval for them until they reconnect or the entry expires.
@@ -113,6 +114,33 @@ fn payload_hash(data: &[u8]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     data.hash(&mut h);
     h.finish()
+}
+
+#[cfg(any(test, target_os = "android"))]
+fn parse_newline_addresses(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn should_pace_after_fragment(index: usize, total: usize) -> bool {
+    index < total.saturating_sub(1)
+}
+
+#[cfg(any(test, not(target_os = "android")))]
+async fn pace_after_ble_fragment(index: usize, total: usize) {
+    if should_pace_after_fragment(index, total) {
+        tokio::time::sleep(BLE_FRAGMENT_PACING).await;
+    }
+}
+
+#[cfg(target_os = "android")]
+fn sleep_after_ble_fragment_blocking(index: usize, total: usize) {
+    if should_pace_after_fragment(index, total) {
+        std::thread::sleep(BLE_FRAGMENT_PACING);
+    }
 }
 
 /// A second call from the same source within `ANTI_LOOP_TTL` refreshes the timestamp.
@@ -3294,11 +3322,36 @@ mod android_peripheral {
                 .get_string(jstr)
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if owned.is_empty() {
-                Ok(Vec::new())
-            } else {
-                Ok(owned.split('\n').map(|s| s.to_string()).collect())
-            }
+            Ok(super::parse_newline_addresses(&owned))
+        })
+        .unwrap_or_default()
+    }
+
+    /// Snapshot of remote centrals currently connected to our local GATT
+    /// server, whether or not they have completed CCCD subscription yet. The
+    /// Android central scan loop uses this to avoid initiating a second,
+    /// opposite-direction GATT connection to the same phone while its inbound
+    /// peripheral-side connection is already live.
+    pub fn connected_or_subscribed_addresses() -> Vec<String> {
+        with_env(|env| {
+            let server_cls = find_app_class(env, "org.ratspeak.android.RatspeakBleServer")
+                .map_err(|e| format!("RatspeakBleServer class: {e}"))?;
+            let result = env
+                .call_static_method(
+                    server_cls,
+                    "connectedOrSubscribedAddresses",
+                    "()Ljava/lang/String;",
+                    &[],
+                )
+                .map_err(|e| format!("connectedOrSubscribedAddresses call: {e}"))?
+                .l()
+                .map_err(|e| format!("connectedOrSubscribedAddresses result: {e}"))?;
+            let jstr: jni::objects::JString = result.into();
+            let owned = env
+                .get_string(jstr)
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Ok(super::parse_newline_addresses(&owned))
         })
         .unwrap_or_default()
     }
@@ -4977,7 +5030,7 @@ async fn peer_write_loop(
         }
 
         let fragments = fragment_packet(&data, write_mtu);
-        for frag in &fragments {
+        for (idx, frag) in fragments.iter().enumerate() {
             if let Err(e) =
                 crate::ble_rnode::ble_write(&peripheral, &rx_char, frag, write_mtu).await
             {
@@ -4993,6 +5046,7 @@ async fn peer_write_loop(
                 peer_online.store(false, Ordering::SeqCst);
                 return;
             }
+            pace_after_ble_fragment(idx, fragments.len()).await;
         }
         tx_count += 1;
         if tx_count % 5 == 0 {
@@ -5306,10 +5360,11 @@ pub async fn spawn_ble_peer_interface(
                                 continue;
                             }
                             let mut ok_frags = 0usize;
-                            for frag in &frags {
+                            for (idx, frag) in frags.iter().enumerate() {
                                 if apple_peripheral::notify_tx(Some(addr), char_uuid, frag) {
                                     ok_frags += 1;
                                 }
+                                pace_after_ble_fragment(idx, frags.len()).await;
                             }
                             tracing::info!(
                                 peer = %addr,
@@ -5333,9 +5388,10 @@ pub async fn spawn_ble_peer_interface(
                     // notifier table can refine this later.
                     const LINUX_NOTIFY_MTU: usize = 244;
                     let frags = fragment_packet(&payload, LINUX_NOTIFY_MTU);
-                    for frag in &frags {
+                    for (idx, frag) in frags.iter().enumerate() {
                         let _ = linux_peripheral::notify_tx(RATSPEAK_TX_UUID, frag);
                         let _ = linux_peripheral::notify_tx(COLUMBA_TX_UUID, frag);
+                        pace_after_ble_fragment(idx, frags.len()).await;
                     }
                     let _ = &anti_loop_fan; // silence unused-warning on linux-only path
                 }
@@ -5350,9 +5406,10 @@ pub async fn spawn_ble_peer_interface(
                     // device id seen during SubscribedClientsChanged.
                     const WINDOWS_NOTIFY_MTU: usize = 244;
                     let frags = fragment_packet(&payload, WINDOWS_NOTIFY_MTU);
-                    for frag in &frags {
+                    for (idx, frag) in frags.iter().enumerate() {
                         let _ = windows_peripheral::notify_tx(RATSPEAK_TX_UUID, frag);
                         let _ = windows_peripheral::notify_tx(COLUMBA_TX_UUID, frag);
+                        pace_after_ble_fragment(idx, frags.len()).await;
                     }
                     let _ = &anti_loop_fan;
                 }
@@ -5388,12 +5445,14 @@ pub async fn spawn_ble_peer_interface(
                         let addr_owned = addr.clone();
                         let frags_owned = rats_frags.clone();
                         let _ = tokio::task::spawn_blocking(move || {
-                            for frag in &frags_owned {
+                            let total = frags_owned.len();
+                            for (idx, frag) in frags_owned.iter().enumerate() {
                                 let _ = android_peripheral::notify_tx(
                                     &addr_owned,
                                     RATSPEAK_TX_UUID,
                                     frag,
                                 );
+                                sleep_after_ble_fragment_blocking(idx, total);
                             }
                         })
                         .await;
@@ -5413,12 +5472,14 @@ pub async fn spawn_ble_peer_interface(
                         let addr_owned = addr.clone();
                         let frags_owned = col_frags.clone();
                         let _ = tokio::task::spawn_blocking(move || {
-                            for frag in &frags_owned {
+                            let total = frags_owned.len();
+                            for (idx, frag) in frags_owned.iter().enumerate() {
                                 let _ = android_peripheral::notify_tx(
                                     &addr_owned,
                                     COLUMBA_TX_UUID,
                                     frag,
                                 );
+                                sleep_after_ble_fragment_blocking(idx, total);
                             }
                         })
                         .await;
@@ -5813,6 +5874,9 @@ pub async fn spawn_ble_peer_interface(
                         }
                         scan_interval = next_interval;
 
+                        let peripheral_peer_addresses =
+                            apple_peripheral::subscribed_central_addresses();
+
                         for peer in &peers {
                             dispatch_event(BlePeerEvent::Discovered {
                                 address: peer.ble_address.clone(),
@@ -5824,6 +5888,23 @@ pub async fn spawn_ble_peer_interface(
                                     address: peer.ble_address.clone(),
                                     rssi: peer.rssi,
                                 });
+                                continue;
+                            }
+                            if peripheral_peer_addresses
+                                .iter()
+                                .any(|addr| addr == &peer.ble_address)
+                            {
+                                dispatch_event(BlePeerEvent::RssiUpdate {
+                                    address: peer.ble_address.clone(),
+                                    rssi: peer.rssi,
+                                });
+                                record_reconnect_success(&recently_disc, &peer.ble_address);
+                                tracing::debug!(
+                                    target: "ble_trace",
+                                    step = "peer.connect_suppressed",
+                                    address = %peer.ble_address,
+                                    "Apple BLE mesh: peer already subscribed to local peripheral, skipping central connect"
+                                );
                                 continue;
                             }
                             if connected_addrs.len() >= MAX_PEERS {
@@ -5918,7 +5999,7 @@ pub async fn spawn_ble_peer_interface(
                                                 }
                                                 let frags = fragment_packet(&data, mtu);
                                                 let mut all_ok = true;
-                                                for frag in &frags {
+                                                for (idx, frag) in frags.iter().enumerate() {
                                                     if let Err(e) =
                                                         crate::ble_central_apple_connect::write_peer(
                                                             &addr_w, frag,
@@ -5937,6 +6018,7 @@ pub async fn spawn_ble_peer_interface(
                                                         all_ok = false;
                                                         break;
                                                     }
+                                                    pace_after_ble_fragment(idx, frags.len()).await;
                                                 }
                                                 if !all_ok {
                                                     break;
@@ -6102,6 +6184,16 @@ pub async fn spawn_ble_peer_interface(
                         SCAN_IDLE_INTERVAL
                     };
 
+                let peripheral_peer_addresses = if scan_results.is_empty() {
+                    Vec::new()
+                } else {
+                    tokio::task::spawn_blocking(
+                        android_peripheral::connected_or_subscribed_addresses,
+                    )
+                    .await
+                    .unwrap_or_default()
+                };
+
                 for (addr, rssi, protocol) in &scan_results {
                     dispatch_event(BlePeerEvent::Discovered {
                         address: addr.clone(),
@@ -6113,6 +6205,20 @@ pub async fn spawn_ble_peer_interface(
                             address: addr.clone(),
                             rssi: *rssi,
                         });
+                        continue;
+                    }
+                    if peripheral_peer_addresses.iter().any(|peer| peer == addr) {
+                        dispatch_event(BlePeerEvent::RssiUpdate {
+                            address: addr.clone(),
+                            rssi: *rssi,
+                        });
+                        record_reconnect_success(&recently_disc, addr);
+                        tracing::debug!(
+                            target: "ble_trace",
+                            step = "peer.connect_suppressed",
+                            address = %addr,
+                            "BLE mesh (Android): peer already connected to local GATT server, skipping central connect"
+                        );
                         continue;
                     }
                     if connected_addrs.len() >= MAX_PEERS {
@@ -6220,12 +6326,14 @@ pub async fn spawn_ble_peer_interface(
                                         let frags = fragment_packet(&data, mtu);
                                         let addr_w2 = addr_w.clone();
                                         let send_ok = tokio::task::spawn_blocking(move || {
-                                            for frag in &frags {
+                                            let total = frags.len();
+                                            for (idx, frag) in frags.iter().enumerate() {
                                                 if !android_peripheral::peer_client_write(
                                                     &addr_w2, frag,
                                                 ) {
                                                     return false;
                                                 }
+                                                sleep_after_ble_fragment_blocking(idx, total);
                                             }
                                             true
                                         })
@@ -6675,6 +6783,27 @@ mod tests {
         assert_eq!(r, "\"Ratspeak\"");
         let c = serde_json::to_string(&PeerProtocol::Columba).unwrap();
         assert_eq!(c, "\"Columba\"");
+    }
+
+    #[test]
+    fn newline_address_parser_filters_blank_entries() {
+        let parsed = parse_newline_addresses("\nAA:BB:CC:DD:EE:FF\n\n  11:22:33:44:55:66  \n");
+        assert_eq!(
+            parsed,
+            vec![
+                "AA:BB:CC:DD:EE:FF".to_string(),
+                "11:22:33:44:55:66".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn fragment_pacing_skips_final_fragment() {
+        assert!(!should_pace_after_fragment(0, 0));
+        assert!(!should_pace_after_fragment(0, 1));
+        assert!(should_pace_after_fragment(0, 2));
+        assert!(!should_pace_after_fragment(1, 2));
+        assert!(!should_pace_after_fragment(2, 2));
     }
 
     #[test]
