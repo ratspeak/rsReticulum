@@ -233,6 +233,7 @@ impl Default for RatchetRing {
 
 /// Ratchet public key learned from a remote destination's announce, with
 /// the local receive time used for expiry.
+#[derive(Clone, Copy)]
 pub struct ReceivedRatchet {
     pub ratchet_pub: [u8; 32],
     pub received_at: f64,
