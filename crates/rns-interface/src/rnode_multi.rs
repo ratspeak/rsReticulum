@@ -176,6 +176,10 @@ pub struct RNodeMultiConfig {
     pub flow_control: bool,
     /// Up to `MAX_SUBINTERFACES` radios on this device.
     pub subinterfaces: Vec<SubInterfaceConfig>,
+    /// Station-ID beacon, parent-level: when due, the callsign is sent on
+    /// all subinterfaces (Python RNodeMultiInterface.py:849-859).
+    pub id_interval: Option<u64>,
+    pub id_callsign: Option<Vec<u8>>,
 }
 
 impl RNodeMultiConfig {
@@ -186,6 +190,8 @@ impl RNodeMultiConfig {
             baud_rate: 115200,
             flow_control: false,
             subinterfaces: Vec::new(),
+            id_interval: None,
+            id_callsign: None,
         }
     }
 }
@@ -452,11 +458,83 @@ pub async fn spawn_rnode_multi_interface(
     let ready = Arc::new(AtomicBool::new(true));
     let ready_w = ready.clone();
 
+    // Python RNodeMultiInterface.py:281-291 — oversized callsigns disable
+    // beaconing; when due, the callsign goes out on all subinterfaces.
+    let beacon: Option<(Duration, Bytes)> = config
+        .id_interval
+        .zip(config.id_callsign.clone())
+        .filter(|(_, callsign)| {
+            let ok = callsign.len() <= rnode::CALLSIGN_MAX_LEN;
+            if !ok {
+                tracing::error!(
+                    name = %config.name,
+                    len = callsign.len(),
+                    "id_callsign exceeds {} bytes, beaconing disabled",
+                    rnode::CALLSIGN_MAX_LEN
+                );
+            }
+            ok
+        })
+        .map(|(interval, callsign)| (Duration::from_secs(interval), Bytes::from(callsign)));
+    let beacon_vports: Vec<u8> = config.subinterfaces.iter().map(|s| s.vport).collect();
+
     tokio::spawn(async move {
         let mut port_w = port_write;
-        while let Some(req) = write_rx.recv().await {
+        let mut first_tx: Option<tokio::time::Instant> = None;
+        loop {
+            let req = if let Some((interval, ref callsign)) = beacon {
+                match tokio::time::timeout(Duration::from_secs(1), write_rx.recv()).await {
+                    Ok(Some(req)) => req,
+                    Ok(None) => break,
+                    Err(_) => {
+                        if !first_tx.is_some_and(|t| t.elapsed() >= interval)
+                            || !online_w.load(Ordering::SeqCst)
+                        {
+                            continue;
+                        }
+                        tracing::debug!("RNodeMulti transmitting station-ID beacon on all subinterfaces");
+                        first_tx = None;
+                        let mut frames = Vec::new();
+                        for &vport in &beacon_vports {
+                            frames.extend_from_slice(&build_subinterface_data_frame(
+                                vport, callsign,
+                            ));
+                        }
+                        let online_ref = online_w.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            use std::io::Write;
+                            port_w.write_all(&frames)?;
+                            port_w.flush()?;
+                            Ok::<_, std::io::Error>(port_w)
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok(p)) => {
+                                port_w = p;
+                                continue;
+                            }
+                            _ => {
+                                online_ref.store(false, Ordering::SeqCst);
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                match write_rx.recv().await {
+                    Some(req) => req,
+                    None => break,
+                }
+            };
             if !online_w.load(Ordering::SeqCst) {
                 break;
+            }
+            if let Some((_, ref callsign)) = beacon {
+                if req.data == *callsign {
+                    first_tx = None;
+                } else if first_tx.is_none() {
+                    first_tx = Some(tokio::time::Instant::now());
+                }
             }
 
             if req.flow_control {

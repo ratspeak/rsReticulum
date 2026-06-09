@@ -62,7 +62,20 @@ pub struct KissSerialConfig {
     pub name: String,
     pub port: String,
     pub baud_rate: u32,
+    pub data_bits: u8,
+    pub parity: String,
+    pub stop_bits: u8,
     pub mode: InterfaceMode,
+    /// TNC timing, config units are milliseconds (Python defaults 350/20/64/20;
+    /// persistence is a raw 0-255 CSMA p-value, not ms).
+    pub preamble_ms: u32,
+    pub txtail_ms: u32,
+    pub persistence: u8,
+    pub slottime_ms: u32,
+    pub flow_control: bool,
+    /// Station-ID beacon: seconds between IDs, sent only after data TX.
+    pub id_interval: Option<u64>,
+    pub id_callsign: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +103,15 @@ pub struct RNodeInterfaceConfig {
     pub coding_rate: u8,
     pub tx_power: i8,
     pub mode: InterfaceMode,
+    /// Gate each TX on the radio's CMD_READY. Python default: off.
+    pub flow_control: bool,
+    /// Short-term airtime cap, percent (0.0..=100.0). `None` = unlimited.
+    pub st_alock: Option<f32>,
+    /// Long-term airtime cap, percent (0.0..=100.0). `None` = unlimited.
+    pub lt_alock: Option<f32>,
+    /// Station-ID beacon: seconds between IDs, sent only after data TX.
+    pub id_interval: Option<u64>,
+    pub id_callsign: Option<String>,
 }
 
 /// LoRa RNode reached over Bluetooth LE.
@@ -105,6 +127,15 @@ pub struct BleRNodeInterfaceConfig {
     pub coding_rate: u8,
     pub tx_power: i8,
     pub mode: InterfaceMode,
+    /// Gate each TX on the radio's CMD_READY. Python default: off.
+    pub flow_control: bool,
+    /// Short-term airtime cap, percent (0.0..=100.0). `None` = unlimited.
+    pub st_alock: Option<f32>,
+    /// Long-term airtime cap, percent (0.0..=100.0). `None` = unlimited.
+    pub lt_alock: Option<f32>,
+    /// Station-ID beacon: seconds between IDs, sent only after data TX.
+    pub id_interval: Option<u64>,
+    pub id_callsign: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +176,9 @@ pub struct RNodeMultiInterfaceConfig {
     pub flow_control: bool,
     pub subinterfaces: Vec<RNodeSubInterfaceConfig>,
     pub mode: InterfaceMode,
+    /// Parent-level station-ID beacon (sent on all subinterfaces when due).
+    pub id_interval: Option<u64>,
+    pub id_callsign: Option<String>,
 }
 
 #[cfg(feature = "serial")]
@@ -173,6 +207,9 @@ pub struct AX25KISSInterfaceConfig {
     pub name: String,
     pub port: String,
     pub baud_rate: u32,
+    pub data_bits: u8,
+    pub parity: String,
+    pub stop_bits: u8,
     pub callsign: String,
     pub ssid: u8,
     pub preamble: u32,
@@ -340,6 +377,16 @@ fn synthesize_tcp_client(
     if let Some(timeout) = section.get_uint("connect_timeout") {
         config.connect_timeout_secs = timeout;
     }
+    if let Some(mtu) = section.get_uint("fixed_mtu") {
+        // Python TCPInterface.py:112 — fixed MTU below protocol MTU is invalid.
+        if (mtu as usize) < rns_wire::constants::MTU {
+            return Err(InterfaceFactoryError::InvalidValue {
+                field: format!("{name}.fixed_mtu"),
+                message: format!("{mtu} is below the protocol MTU of 500"),
+            });
+        }
+        config.fixed_mtu = Some(mtu as u32);
+    }
     if let Some(retries) = section.get_uint("max_reconnect_tries") {
         config.max_reconnect_tries = Some(retries as usize);
     }
@@ -370,6 +417,9 @@ fn synthesize_tcp_server(
     }
     if let Some(ipv6) = section.get_bool("prefer_ipv6") {
         config.prefer_ipv6 = ipv6;
+    }
+    if let Some(device) = section.get("device") {
+        config.device = Some(device.to_string());
     }
 
     Ok(InterfaceConfig::TcpServer(config))
@@ -463,11 +513,23 @@ fn synthesize_kiss_serial(
         .or_else(|| section.get_uint("baud_rate"))
         .unwrap_or(9600) as u32;
 
+    // Python KISSInterface.py:86-97 — TNC timing defaults 350/20/64/20,
+    // serial 8N1, flow_control off, optional station-ID beacon.
     Ok(InterfaceConfig::KissSerial(KissSerialConfig {
         name: name.to_string(),
         port,
         baud_rate,
+        data_bits: section.get_uint("databits").unwrap_or(8) as u8,
+        parity: section.get("parity").unwrap_or("N").to_string(),
+        stop_bits: section.get_uint("stopbits").unwrap_or(1) as u8,
         mode,
+        preamble_ms: section.get_uint("preamble").unwrap_or(350) as u32,
+        txtail_ms: section.get_uint("txtail").unwrap_or(20) as u32,
+        persistence: section.get_uint("persistence").unwrap_or(64) as u8,
+        slottime_ms: section.get_uint("slottime").unwrap_or(20) as u32,
+        flow_control: section.get_bool("flow_control").unwrap_or(false),
+        id_interval: section.get_uint("id_interval"),
+        id_callsign: section.get("id_callsign").map(|s| s.to_string()),
     }))
 }
 
@@ -552,30 +614,10 @@ fn synthesize_rnode(
         })?
         .to_string();
 
-    let frequency =
-        section
-            .get_uint("frequency")
-            .ok_or_else(|| InterfaceFactoryError::MissingField {
-                name: name.to_string(),
-                field: "frequency".to_string(),
-            })? as u32;
+    let (frequency, bandwidth, spreading_factor, coding_rate, tx_power) =
+        require_rnode_radio_params(name, section)?;
 
-    let bandwidth = section.get_uint("bandwidth").unwrap_or(125000) as u32;
-
-    let spreading_factor = section
-        .get_uint("spreadingfactor")
-        .or_else(|| section.get_uint("spreading_factor"))
-        .unwrap_or(7) as u8;
-
-    let coding_rate = section
-        .get_uint("codingrate")
-        .or_else(|| section.get_uint("coding_rate"))
-        .unwrap_or(5) as u8;
-
-    let tx_power = section
-        .get_int("txpower")
-        .or_else(|| section.get_int("tx_power"))
-        .unwrap_or(17) as i8;
+    let (flow_control, st_alock, lt_alock) = parse_rnode_airtime(name, section)?;
 
     Ok(InterfaceConfig::RNode(RNodeInterfaceConfig {
         name: name.to_string(),
@@ -586,7 +628,82 @@ fn synthesize_rnode(
         coding_rate,
         tx_power,
         mode,
+        flow_control,
+        st_alock,
+        lt_alock,
+        id_interval: section.get_uint("id_interval"),
+        id_callsign: section.get("id_callsign").map(|s| s.to_string()),
     }))
+}
+
+/// Radio parameters are deliberately required: Python errors when they are
+/// absent (RNodeInterface validation fails on the 0 fallbacks), and silently
+/// inventing RF parameters — especially TX power — risks misconfigured
+/// transmissions. Documented in fix-registry (final sweep decision items).
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+fn require_rnode_radio_params(
+    name: &str,
+    section: &ConfigSection,
+) -> Result<(u32, u32, u8, u8, i8), InterfaceFactoryError> {
+    let missing = |field: &str| InterfaceFactoryError::MissingField {
+        name: name.to_string(),
+        field: field.to_string(),
+    };
+    let frequency = section
+        .get_uint("frequency")
+        .ok_or_else(|| missing("frequency"))? as u32;
+    let bandwidth = section
+        .get_uint("bandwidth")
+        .ok_or_else(|| missing("bandwidth"))? as u32;
+    let spreading_factor = section
+        .get_uint("spreadingfactor")
+        .or_else(|| section.get_uint("spreading_factor"))
+        .ok_or_else(|| missing("spreadingfactor"))? as u8;
+    let coding_rate = section
+        .get_uint("codingrate")
+        .or_else(|| section.get_uint("coding_rate"))
+        .ok_or_else(|| missing("codingrate"))? as u8;
+    let tx_power = section
+        .get_int("txpower")
+        .or_else(|| section.get_int("tx_power"))
+        .ok_or_else(|| missing("txpower"))? as i8;
+    Ok((frequency, bandwidth, spreading_factor, coding_rate, tx_power))
+}
+
+/// Shared RNode airtime/flow-control parsing. Python `RNodeInterface.py:156-160`:
+/// `flow_control` defaults off, `airtime_limit_short`/`airtime_limit_long` are
+/// duty-cycle percentages validated to 0..=100.
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+fn parse_rnode_airtime(
+    name: &str,
+    section: &ConfigSection,
+) -> Result<(bool, Option<f32>, Option<f32>), InterfaceFactoryError> {
+    let flow_control = section.get_bool("flow_control").unwrap_or(false);
+    let st_alock = section
+        .get_float("airtime_limit_short")
+        .or_else(|| section.get_float("st_alock"))
+        .map(|v| v as f32);
+    let lt_alock = section
+        .get_float("airtime_limit_long")
+        .or_else(|| section.get_float("lt_alock"))
+        .map(|v| v as f32);
+    if let Some(v) = st_alock
+        && !(0.0..=100.0).contains(&v)
+    {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.airtime_limit_short"),
+            message: format!("{v} is outside 0..=100 percent"),
+        });
+    }
+    if let Some(v) = lt_alock
+        && !(0.0..=100.0).contains(&v)
+    {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.airtime_limit_long"),
+            message: format!("{v} is outside 0..=100 percent"),
+        });
+    }
+    Ok((flow_control, st_alock, lt_alock))
 }
 
 #[cfg(feature = "ble")]
@@ -603,30 +720,10 @@ fn synthesize_ble_rnode(
         })?
         .to_string();
 
-    let frequency =
-        section
-            .get_uint("frequency")
-            .ok_or_else(|| InterfaceFactoryError::MissingField {
-                name: name.to_string(),
-                field: "frequency".to_string(),
-            })? as u32;
+    let (frequency, bandwidth, spreading_factor, coding_rate, tx_power) =
+        require_rnode_radio_params(name, section)?;
 
-    let bandwidth = section.get_uint("bandwidth").unwrap_or(125000) as u32;
-
-    let spreading_factor = section
-        .get_uint("spreadingfactor")
-        .or_else(|| section.get_uint("spreading_factor"))
-        .unwrap_or(7) as u8;
-
-    let coding_rate = section
-        .get_uint("codingrate")
-        .or_else(|| section.get_uint("coding_rate"))
-        .unwrap_or(5) as u8;
-
-    let tx_power = section
-        .get_int("txpower")
-        .or_else(|| section.get_int("tx_power"))
-        .unwrap_or(17) as i8;
+    let (flow_control, st_alock, lt_alock) = parse_rnode_airtime(name, section)?;
 
     Ok(InterfaceConfig::BleRNode(BleRNodeInterfaceConfig {
         name: name.to_string(),
@@ -637,6 +734,11 @@ fn synthesize_ble_rnode(
         coding_rate,
         tx_power,
         mode,
+        flow_control,
+        st_alock,
+        lt_alock,
+        id_interval: section.get_uint("id_interval"),
+        id_callsign: section.get("id_callsign").map(|s| s.to_string()),
     }))
 }
 
@@ -765,25 +867,10 @@ fn synthesize_rnode_multi(
             });
         }
 
-        let frequency = sub_section.get_uint("frequency").ok_or_else(|| {
-            InterfaceFactoryError::MissingField {
-                name: format!("{name}/{sub_name}"),
-                field: "frequency".to_string(),
-            }
-        })? as u32;
-        let bandwidth = sub_section.get_uint("bandwidth").unwrap_or(125000) as u32;
-        let spreading_factor = sub_section
-            .get_uint("spreadingfactor")
-            .or_else(|| sub_section.get_uint("spreading_factor"))
-            .unwrap_or(7) as u8;
-        let coding_rate = sub_section
-            .get_uint("codingrate")
-            .or_else(|| sub_section.get_uint("coding_rate"))
-            .unwrap_or(5) as u8;
-        let tx_power = sub_section
-            .get_uint("txpower")
-            .or_else(|| sub_section.get_uint("tx_power"))
-            .unwrap_or(14) as u8;
+        let sub_full_name = format!("{name}/{sub_name}");
+        let (frequency, bandwidth, spreading_factor, coding_rate, tx_power) =
+            require_rnode_radio_params(&sub_full_name, sub_section)?;
+        let tx_power = tx_power as u8;
         let flow_control = sub_section
             .get_bool("flow_control")
             .unwrap_or(parent_flow_control);
@@ -847,6 +934,8 @@ fn synthesize_rnode_multi(
         flow_control: parent_flow_control,
         subinterfaces,
         mode,
+        id_interval: section.get_uint("id_interval"),
+        id_callsign: section.get("id_callsign").map(|s| s.to_string()),
     }))
 }
 
@@ -933,10 +1022,26 @@ fn synthesize_ax25kiss(
         .or_else(|| section.get_uint("baud_rate"))
         .unwrap_or(9600) as u32;
 
-    let ssid = section.get_uint("ssid").unwrap_or(0) as u8;
-    let preamble = section.get_uint("preamble").unwrap_or(150) as u32;
-    let txtail = section.get_uint("txtail").unwrap_or(10) as u32;
-    let persistence = section.get_uint("persistence").unwrap_or(200) as u32;
+    // Python AX25KISSInterface requires an explicit 0..=15 SSID
+    // (default -1 fails validation, AX25KISSInterface.py:138-139).
+    let ssid_raw = section
+        .get_int("ssid")
+        .ok_or_else(|| InterfaceFactoryError::MissingField {
+            name: name.to_string(),
+            field: "ssid".to_string(),
+        })?;
+    if !(0..=15).contains(&ssid_raw) {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.ssid"),
+            message: format!("{ssid_raw} is outside 0..=15"),
+        });
+    }
+    let ssid = ssid_raw as u8;
+
+    // Python defaults: 350/20/64/20 (AX25KISSInterface.py:141-144).
+    let preamble = section.get_uint("preamble").unwrap_or(350) as u32;
+    let txtail = section.get_uint("txtail").unwrap_or(20) as u32;
+    let persistence = section.get_uint("persistence").unwrap_or(64) as u32;
     let slottime = section.get_uint("slottime").unwrap_or(20) as u32;
     let flow_control = section.get_bool("flow_control").unwrap_or(false);
 
@@ -944,6 +1049,9 @@ fn synthesize_ax25kiss(
         name: name.to_string(),
         port,
         baud_rate,
+        data_bits: section.get_uint("databits").unwrap_or(8) as u8,
+        parity: section.get("parity").unwrap_or("N").to_string(),
+        stop_bits: section.get_uint("stopbits").unwrap_or(1) as u8,
         callsign,
         ssid,
         preamble,
@@ -966,11 +1074,15 @@ fn synthesize_backbone(
         .get("target_host")
         .or_else(|| section.get("remote"))
         .map(|s| s.to_string());
+    // Python BackboneInterface.py:133-134 errors without an explicit port.
     let port = section
         .get_uint("port")
         .or_else(|| section.get_uint("listen_port"))
         .or_else(|| section.get_uint("target_port"))
-        .unwrap_or(4242) as u16;
+        .ok_or_else(|| InterfaceFactoryError::MissingField {
+            name: name.to_string(),
+            field: "port".to_string(),
+        })? as u16;
     let device = section.get("device").map(|s| s.to_string());
     let prefer_ipv6 = section.get_bool("prefer_ipv6").unwrap_or(false);
     let connect_timeout = section.get_uint("connect_timeout").unwrap_or(5);
@@ -1265,6 +1377,202 @@ mod tests {
         assert_eq!(pi.announce_rate_penalty, Some(0));
     }
 
+    /// Python KISSInterface.py:86-97 defaults: 350/20/64/20, 8N1, no beacon.
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_synthesize_kiss_defaults_match_python() {
+        let mut section = ConfigSection::new();
+        section.set("type", "KISSInterface");
+        section.set("port", "/dev/ttyUSB1");
+
+        match synthesize_interface("kiss_defaults", &section).unwrap() {
+            InterfaceConfig::KissSerial(c) => {
+                assert_eq!(c.preamble_ms, 350);
+                assert_eq!(c.txtail_ms, 20);
+                assert_eq!(c.persistence, 64);
+                assert_eq!(c.slottime_ms, 20);
+                assert_eq!((c.data_bits, c.parity.as_str(), c.stop_bits), (8, "N", 1));
+                assert!(!c.flow_control);
+                assert!(c.id_interval.is_none() && c.id_callsign.is_none());
+            }
+            _ => panic!("expected KissSerial"),
+        }
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_synthesize_kiss_full_params_and_beacon() {
+        let mut section = ConfigSection::new();
+        section.set("type", "KISSInterface");
+        section.set("port", "/dev/ttyUSB1");
+        section.set("preamble", "150");
+        section.set("txtail", "10");
+        section.set("persistence", "200");
+        section.set("slottime", "30");
+        section.set("flow_control", "true");
+        section.set("id_interval", "600");
+        section.set("id_callsign", "MYCALL-0");
+
+        match synthesize_interface("kiss_full", &section).unwrap() {
+            InterfaceConfig::KissSerial(c) => {
+                assert_eq!(c.preamble_ms, 150);
+                assert_eq!(c.txtail_ms, 10);
+                assert_eq!(c.persistence, 200);
+                assert_eq!(c.slottime_ms, 30);
+                assert!(c.flow_control);
+                assert_eq!(c.id_interval, Some(600));
+                assert_eq!(c.id_callsign.as_deref(), Some("MYCALL-0"));
+            }
+            _ => panic!("expected KissSerial"),
+        }
+    }
+
+    /// Python AX25KISSInterface.py:141-144 defaults + 0..=15 SSID requirement.
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_synthesize_ax25kiss_defaults_and_ssid() {
+        let mut section = ConfigSection::new();
+        section.set("type", "AX25KISSInterface");
+        section.set("port", "/dev/ttyUSB2");
+        section.set("callsign", "NO1CLL");
+        section.set("ssid", "0");
+
+        match synthesize_interface("ax25_defaults", &section).unwrap() {
+            InterfaceConfig::AX25KISS(c) => {
+                assert_eq!(c.preamble, 350);
+                assert_eq!(c.txtail, 20);
+                assert_eq!(c.persistence, 64);
+                assert_eq!(c.slottime, 20);
+            }
+            _ => panic!("expected AX25KISS"),
+        }
+
+        let mut no_ssid = ConfigSection::new();
+        no_ssid.set("type", "AX25KISSInterface");
+        no_ssid.set("port", "/dev/ttyUSB2");
+        no_ssid.set("callsign", "NO1CLL");
+        assert!(matches!(
+            synthesize_interface("ax25_no_ssid", &no_ssid),
+            Err(InterfaceFactoryError::MissingField { field, .. }) if field == "ssid"
+        ));
+
+        section.set("ssid", "16");
+        assert!(matches!(
+            synthesize_interface("ax25_bad_ssid", &section),
+            Err(InterfaceFactoryError::InvalidValue { field, .. }) if field.ends_with("ssid")
+        ));
+    }
+
+    #[test]
+    fn test_synthesize_tcp_fixed_mtu_and_device() {
+        let mut client = ConfigSection::new();
+        client.set("type", "TCPClientInterface");
+        client.set("target_host", "example.com");
+        client.set("target_port", "4242");
+        client.set("fixed_mtu", "1064");
+        match synthesize_interface("tcp_fixed", &client).unwrap() {
+            InterfaceConfig::TcpClient(c) => assert_eq!(c.fixed_mtu, Some(1064)),
+            _ => panic!("expected TcpClient"),
+        }
+
+        client.set("fixed_mtu", "400");
+        assert!(matches!(
+            synthesize_interface("tcp_small_mtu", &client),
+            Err(InterfaceFactoryError::InvalidValue { field, .. }) if field.ends_with("fixed_mtu")
+        ));
+
+        let mut server = ConfigSection::new();
+        server.set("type", "TCPServerInterface");
+        server.set("listen_port", "4242");
+        server.set("device", "eth0");
+        match synthesize_interface("tcp_dev", &server).unwrap() {
+            InterfaceConfig::TcpServer(c) => assert_eq!(c.device.as_deref(), Some("eth0")),
+            _ => panic!("expected TcpServer"),
+        }
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_synthesize_rnode_beacon_keys() {
+        let mut section = ConfigSection::new();
+        section.set("type", "RNodeInterface");
+        section.set("port", "/dev/ttyACM0");
+        section.set("frequency", "868000000");
+        set_rnode_radio_params(&mut section);
+        section.set("id_interval", "600");
+        section.set("id_callsign", "MYCALL-0");
+
+        match synthesize_interface("rnode_beacon", &section).unwrap() {
+            InterfaceConfig::RNode(c) => {
+                assert_eq!(c.id_interval, Some(600));
+                assert_eq!(c.id_callsign.as_deref(), Some("MYCALL-0"));
+            }
+            _ => panic!("expected RNode"),
+        }
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_synthesize_rnode_airtime_and_flow_control() {
+        let mut section = ConfigSection::new();
+        section.set("type", "RNodeInterface");
+        section.set("port", "/dev/ttyACM0");
+        section.set("frequency", "868000000");
+        set_rnode_radio_params(&mut section);
+        section.set("flow_control", "true");
+        section.set("airtime_limit_short", "33");
+        section.set("airtime_limit_long", "3.3");
+
+        let config = synthesize_interface("rnode_airtime", &section).unwrap();
+        match config {
+            InterfaceConfig::RNode(c) => {
+                assert!(c.flow_control);
+                assert_eq!(c.st_alock, Some(33.0));
+                assert_eq!(c.lt_alock, Some(3.3));
+            }
+            _ => panic!("expected RNode"),
+        }
+    }
+
+    /// Python parity: flow_control defaults off, airtime limits unset.
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_synthesize_rnode_airtime_defaults() {
+        let mut section = ConfigSection::new();
+        section.set("type", "RNodeInterface");
+        section.set("port", "/dev/ttyACM0");
+        section.set("frequency", "868000000");
+        set_rnode_radio_params(&mut section);
+
+        let config = synthesize_interface("rnode_defaults", &section).unwrap();
+        match config {
+            InterfaceConfig::RNode(c) => {
+                assert!(!c.flow_control);
+                assert!(c.st_alock.is_none());
+                assert!(c.lt_alock.is_none());
+            }
+            _ => panic!("expected RNode"),
+        }
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_synthesize_rnode_airtime_out_of_range() {
+        let mut section = ConfigSection::new();
+        section.set("type", "RNodeInterface");
+        section.set("port", "/dev/ttyACM0");
+        section.set("frequency", "868000000");
+        set_rnode_radio_params(&mut section);
+        section.set("airtime_limit_long", "101");
+
+        match synthesize_interface("rnode_bad_alock", &section) {
+            Err(InterfaceFactoryError::InvalidValue { field, .. }) => {
+                assert!(field.ends_with("airtime_limit_long"));
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_serial() {
@@ -1438,6 +1746,7 @@ mod tests {
         section.set("type", "RNodeInterface");
         section.set("port", "/dev/ttyACM0");
         section.set("frequency", "868000000");
+        set_rnode_radio_params(&mut section);
         section.set("bandwidth", "125000");
         section.set("spreadingfactor", "7");
         section.set("codingrate", "5");
@@ -1460,15 +1769,30 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn set_rnode_radio_params(section: &mut ConfigSection) {
+        section.set("bandwidth", "125000");
+        section.set("spreadingfactor", "7");
+        section.set("codingrate", "5");
+        section.set("txpower", "17");
+    }
+
+    /// Python parity: all radio params required — no invented defaults.
     #[cfg(feature = "serial")]
     #[test]
-    fn test_synthesize_rnode_defaults() {
+    fn test_synthesize_rnode_requires_radio_params() {
         let mut section = ConfigSection::new();
         section.set("type", "RNodeInterface");
         section.set("port", "/dev/ttyACM0");
         section.set("frequency", "915000000");
 
-        let config = synthesize_interface("rnode_defaults", &section).unwrap();
+        assert!(matches!(
+            synthesize_interface("rnode_missing", &section),
+            Err(InterfaceFactoryError::MissingField { field, .. }) if field == "bandwidth"
+        ));
+
+        set_rnode_radio_params(&mut section);
+        let config = synthesize_interface("rnode_full", &section).unwrap();
         match config {
             InterfaceConfig::RNode(c) => {
                 assert_eq!(c.bandwidth, 125000);
@@ -1487,6 +1811,7 @@ mod tests {
         section.set("type", "RNodeInterface");
         section.set("port", "tcp://rnode.local");
         section.set("frequency", "915000000");
+        set_rnode_radio_params(&mut section);
 
         let config = synthesize_interface("rnode_tcp", &section).unwrap();
         match config {
@@ -1579,7 +1904,17 @@ mod tests {
             name: "k".to_string(),
             port: "/dev/ttyS0".to_string(),
             baud_rate: 9600,
+            data_bits: 8,
+            parity: "N".to_string(),
+            stop_bits: 1,
             mode: InterfaceMode::Full,
+            preamble_ms: 350,
+            txtail_ms: 20,
+            persistence: 64,
+            slottime_ms: 20,
+            flow_control: false,
+            id_interval: None,
+            id_callsign: None,
         });
         let _auto = InterfaceConfig::Auto(AutoInterfaceConfig {
             name: "a".to_string(),
@@ -1602,6 +1937,11 @@ mod tests {
             coding_rate: 5,
             tx_power: 17,
             mode: InterfaceMode::Full,
+            flow_control: false,
+            st_alock: None,
+            lt_alock: None,
+            id_interval: None,
+            id_callsign: None,
         });
         let _local = InterfaceConfig::Local(LocalInterfaceConfig {
             name: "l".to_string(),
@@ -1809,6 +2149,13 @@ mod tests {
         let mut section = ConfigSection::new();
         section.set("type", "BackboneInterface");
 
+        // Python BackboneInterface errors without an explicit port.
+        assert!(matches!(
+            synthesize_interface("backbone_no_port", &section),
+            Err(InterfaceFactoryError::MissingField { field, .. }) if field == "port"
+        ));
+
+        section.set("port", "4242");
         let config = synthesize_interface("backbone_defaults", &section).unwrap();
         match config {
             InterfaceConfig::Backbone(c) => {
@@ -1830,6 +2177,7 @@ mod tests {
         let mut section = ConfigSection::new();
         section.set("type", "BackboneInterface");
         section.set("target_host", "host.example");
+        section.set("target_port", "4242");
         section.set("connect_timeout", "12");
 
         let config = synthesize_interface("bb_to", &section).unwrap();
@@ -1844,6 +2192,7 @@ mod tests {
         let mut section = ConfigSection::new();
         section.set("type", "BackboneInterface");
         section.set("target_host", "host.example");
+        section.set("target_port", "4242");
         section.set("max_reconnect_tries", "7");
 
         let config = synthesize_interface("bb_retries", &section).unwrap();
@@ -1858,6 +2207,7 @@ mod tests {
         let mut section = ConfigSection::new();
         section.set("type", "BackboneInterface");
         section.set("target_host", "host.example");
+        section.set("target_port", "4242");
         section.set("i2p_tunneled", "yes");
 
         let config = synthesize_interface("bb_i2p", &section).unwrap();
@@ -2035,6 +2385,10 @@ mod tests {
             let mut sub = ConfigSection::new();
             sub.set("vport", "0");
             sub.set("frequency", "865600000");
+            sub.set("bandwidth", "125000");
+            sub.set("spreadingfactor", "7");
+            sub.set("codingrate", "5");
+            sub.set("txpower", "14");
             section.subsections.insert(name.to_string(), sub);
         }
 

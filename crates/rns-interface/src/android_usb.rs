@@ -103,6 +103,12 @@ pub struct AndroidUsbConfig {
     pub coding_rate: u8,
     pub tx_power: u8,
     pub mode: InterfaceMode,
+    /// Gate each TX on the radio's CMD_READY. Python default: off.
+    pub flow_control: bool,
+    /// Short-term airtime cap, percent (0.0..=100.0). `None` = unlimited.
+    pub st_alock: Option<f32>,
+    /// Long-term airtime cap, percent (0.0..=100.0). `None` = unlimited.
+    pub lt_alock: Option<f32>,
 }
 
 impl AndroidUsbConfig {
@@ -117,6 +123,9 @@ impl AndroidUsbConfig {
             coding_rate: 6,
             tx_power: 17,
             mode: InterfaceMode::Full,
+            flow_control: false,
+            st_alock: None,
+            lt_alock: None,
         }
     }
 }
@@ -615,6 +624,9 @@ pub async fn spawn_android_usb_rnode_interface(
     rnode_cfg.coding_rate = config.coding_rate;
     rnode_cfg.tx_power = config.tx_power;
     rnode_cfg.mode = config.mode;
+    rnode_cfg.flow_control = config.flow_control;
+    rnode_cfg.st_alock = config.st_alock;
+    rnode_cfg.lt_alock = config.lt_alock;
     let init_bytes = rnode::build_init_sequence(&rnode_cfg);
     if raw_write_tx.send(init_bytes).await.is_err() {
         return Err(InterfaceError::SendFailed(

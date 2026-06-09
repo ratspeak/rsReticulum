@@ -33,6 +33,8 @@ pub struct TcpClientConfig {
     pub connect_timeout_secs: u64,
     pub max_reconnect_tries: Option<usize>,
     pub mode: InterfaceMode,
+    /// Override HW MTU for link MTU discovery (Python `fixed_mtu`, >= 500).
+    pub fixed_mtu: Option<u32>,
 }
 
 impl TcpClientConfig {
@@ -45,6 +47,7 @@ impl TcpClientConfig {
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT,
             max_reconnect_tries: None,
             mode: InterfaceMode::Full,
+            fixed_mtu: None,
         }
     }
 }
@@ -57,6 +60,9 @@ pub struct TcpServerConfig {
     pub kiss_framing: bool,
     pub prefer_ipv6: bool,
     pub mode: InterfaceMode,
+    /// Bind to this network device's address instead of `listen_ip`
+    /// (Python `device =` option).
+    pub device: Option<String>,
 }
 
 impl TcpServerConfig {
@@ -68,8 +74,30 @@ impl TcpServerConfig {
             kiss_framing: false,
             prefer_ipv6: false,
             mode: InterfaceMode::Full,
+            device: None,
         }
     }
+}
+
+/// First usable address on `device`, honouring `prefer_ipv6`. Python
+/// `TCPServerInterface.get_address_for_if` equivalent.
+fn address_for_device(device: &str, prefer_ipv6: bool) -> Option<std::net::IpAddr> {
+    let addrs = if_addrs::get_if_addrs().ok()?;
+    let on_dev: Vec<std::net::IpAddr> = addrs
+        .iter()
+        .filter(|a| a.name == device)
+        .map(|a| a.ip())
+        .collect();
+    if prefer_ipv6
+        && let Some(v6) = on_dev.iter().find(|ip| ip.is_ipv6())
+    {
+        return Some(*v6);
+    }
+    on_dev
+        .iter()
+        .find(|ip| ip.is_ipv4())
+        .or_else(|| on_dev.first())
+        .copied()
 }
 
 pub struct TcpInterfaceState {
@@ -274,6 +302,7 @@ pub async fn spawn_tcp_client(
     let name = config.name.clone();
     let mode = config.mode;
     let kiss_framing = config.kiss_framing;
+    let fixed_mtu = config.fixed_mtu;
 
     // Wrap rx so it survives reconnects; forwarder task feeds per-connection channel.
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
@@ -401,7 +430,9 @@ pub async fn spawn_tcp_client(
             repeat: false,
         },
         bitrate,
-        mtu: crate::traits::optimise_mtu(bitrate).unwrap_or(TCP_HW_MTU),
+        mtu: fixed_mtu.unwrap_or_else(|| {
+            crate::traits::optimise_mtu(bitrate).unwrap_or(TCP_HW_MTU)
+        }),
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
@@ -489,7 +520,17 @@ pub async fn spawn_tcp_server(
     transport_tx: mpsc::Sender<TransportMessage>,
     handle_tx: mpsc::Sender<InterfaceHandle>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-    let addr = format!("{}:{}", config.listen_ip, config.listen_port);
+    let addr = match config.device.as_deref() {
+        Some(device) => {
+            let ip = address_for_device(device, config.prefer_ipv6).ok_or_else(|| {
+                crate::traits::InterfaceError::SendFailed(format!(
+                    "no usable address on device '{device}'"
+                ))
+            })?;
+            std::net::SocketAddr::new(ip, config.listen_port).to_string()
+        }
+        None => format!("{}:{}", config.listen_ip, config.listen_port),
+    };
     let listener = TcpListener::bind(&addr).await?;
     let local_addr = listener.local_addr()?;
     tracing::info!(name = %config.name, addr = %local_addr, "TCP server listening");
@@ -634,6 +675,7 @@ mod tests {
             connect_timeout_secs: 5,
             max_reconnect_tries: Some(1),
             mode: InterfaceMode::Full,
+            fixed_mtu: None,
         };
         let client_handle = spawn_tcp_client(client_cfg, 1, transport_tx.clone(), None)
             .await
@@ -718,6 +760,7 @@ mod tests {
             connect_timeout_secs: 1,
             max_reconnect_tries: Some(2),
             mode: InterfaceMode::Full,
+            fixed_mtu: None,
         };
 
         let handle = spawn_tcp_client(config, 99, transport_tx, None)
@@ -761,6 +804,7 @@ mod tests {
             connect_timeout_secs: 5,
             max_reconnect_tries: Some(1),
             mode: InterfaceMode::Full,
+            fixed_mtu: None,
         };
         let client_handle = spawn_tcp_client(client_cfg, 321, transport_tx.clone(), None)
             .await

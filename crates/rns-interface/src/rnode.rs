@@ -513,8 +513,7 @@ async fn open_configured_rnode_stream(
         let mut init_port = port.try_clone().map_err(|e| {
             crate::traits::InterfaceError::SendFailed(format!("rnode clone: {}", e))
         })?;
-        let mut init_seq = build_init_sequence(config);
-        init_seq.extend_from_slice(&build_airtime_sequence(config));
+        let init_seq = build_init_sequence(config);
         use std::io::Write;
         init_port.write_all(&init_seq).map_err(|e| {
             crate::traits::InterfaceError::SendFailed(format!("rnode init write: {}", e))
@@ -559,7 +558,14 @@ pub struct RNodeConfig {
     pub st_alock: Option<f32>,
     /// Long-term airtime cap, percent (0.0..100.0). `None` = unlimited.
     pub lt_alock: Option<f32>,
+    /// Station-ID beacon: seconds between IDs, armed by data TX
+    /// (Python `id_interval`/`id_callsign`, callsign max 32 bytes).
+    pub id_interval: Option<u64>,
+    pub id_callsign: Option<Vec<u8>>,
 }
+
+/// Python `RNodeInterface.CALLSIGN_MAX_LEN`.
+pub const CALLSIGN_MAX_LEN: usize = 32;
 
 impl RNodeConfig {
     pub fn new(name: &str, port: &str) -> Self {
@@ -573,9 +579,12 @@ impl RNodeConfig {
             coding_rate: 5,
             tx_power: 14,
             mode: InterfaceMode::Full,
-            flow_control: true,
+            // Python RNodeInterface defaults flow_control off.
+            flow_control: false,
             st_alock: None,
             lt_alock: None,
+            id_interval: None,
+            id_callsign: None,
         }
     }
 }
@@ -631,14 +640,16 @@ fn u32_to_bytes(val: u32) -> [u8; 4] {
     val.to_be_bytes()
 }
 
-/// KISS init sequence. Order matters: RADIO_STATE=ON must be last.
+/// KISS init sequence. Order matters: airtime locks precede RADIO_STATE=ON,
+/// which must be last (Python `initRadio`, RNodeInterface.py:470-478).
 pub fn build_init_sequence(config: &RNodeConfig) -> Vec<u8> {
-    let mut out = Vec::with_capacity(48);
+    let mut out = Vec::with_capacity(64);
     kiss::frame_with_command_into(CMD_FREQUENCY, &u32_to_bytes(config.frequency), &mut out);
     kiss::frame_with_command_into(CMD_BANDWIDTH, &u32_to_bytes(config.bandwidth), &mut out);
     kiss::frame_with_command_into(CMD_SF, &[config.spreading_factor], &mut out);
     kiss::frame_with_command_into(CMD_CR, &[config.coding_rate], &mut out);
     kiss::frame_with_command_into(CMD_TXPOWER, &[config.tx_power], &mut out);
+    out.extend_from_slice(&build_airtime_sequence(config));
     kiss::frame_with_command_into(CMD_RADIO_STATE, &[RADIO_STATE_ON], &mut out);
     out
 }
@@ -833,6 +844,22 @@ pub async fn spawn_rnode_interface(
     let name = config.name.clone();
     let mode = config.mode;
     let flow_control = config.flow_control;
+    // Python RNodeInterface.py:333-343: oversized callsigns disable beaconing.
+    let beacon: Option<(Duration, Bytes)> = config
+        .id_interval
+        .zip(config.id_callsign.clone())
+        .filter(|(_, callsign)| {
+            let ok = callsign.len() <= CALLSIGN_MAX_LEN;
+            if !ok {
+                tracing::error!(
+                    name = %config.name,
+                    len = callsign.len(),
+                    "id_callsign exceeds {CALLSIGN_MAX_LEN} bytes, beaconing disabled"
+                );
+            }
+            ok
+        })
+        .map(|(interval, callsign)| (Duration::from_secs(interval), Bytes::from(callsign)));
 
     let online_r = online.clone();
     let rxb_r = shared_rxb.clone();
@@ -896,11 +923,40 @@ pub async fn spawn_rnode_interface(
             let online_w = online_r.clone();
             let ready_w = ready.clone();
             let txb_w = txb_r.clone();
+            let beacon_w = beacon.clone();
             let write_handle = tokio::spawn(async move {
                 let mut port_w = port_write;
-                while let Some(request) = conn_rx.recv().await {
+                // Python first_tx semantics: armed by data TX, cleared when
+                // the callsign beacon goes out (RNodeInterface.py:712-718, 1142-1146).
+                let mut first_tx: Option<tokio::time::Instant> = None;
+                loop {
+                    let request = if let Some((interval, ref callsign)) = beacon_w {
+                        match tokio::time::timeout(Duration::from_secs(1), conn_rx.recv()).await {
+                            Ok(Some(request)) => request,
+                            Ok(None) => break,
+                            Err(_) => {
+                                if !first_tx.is_some_and(|t| t.elapsed() >= interval) {
+                                    continue;
+                                }
+                                tracing::debug!("RNode transmitting station-ID beacon");
+                                RNodeWriteRequest::Packet(callsign.clone())
+                            }
+                        }
+                    } else {
+                        match conn_rx.recv().await {
+                            Some(request) => request,
+                            None => break,
+                        }
+                    };
                     let (framed, is_packet, done_tx) = match request {
                         RNodeWriteRequest::Packet(data) => {
+                            if let Some((_, ref callsign)) = beacon_w {
+                                if data == *callsign {
+                                    first_tx = None;
+                                } else if first_tx.is_none() {
+                                    first_tx = Some(tokio::time::Instant::now());
+                                }
+                            }
                             txb_w
                                 .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
                             (kiss::frame(&data), true, None)
@@ -1072,7 +1128,7 @@ mod tests {
         assert_eq!(cfg.baud_rate, 115200);
         assert_eq!(cfg.frequency, 868_000_000);
         assert_eq!(cfg.spreading_factor, 7);
-        assert!(cfg.flow_control);
+        assert!(!cfg.flow_control, "flow_control defaults off (Python parity)");
         assert!(cfg.st_alock.is_none());
         assert!(cfg.lt_alock.is_none());
     }
@@ -1087,6 +1143,42 @@ mod tests {
         let mut deframer = kiss::RawKissDeframer::new();
         let frames = deframer.feed(&seq);
         assert_eq!(frames.len(), 6);
+    }
+
+    /// Byte-exact vs Python `setSTALock`/`setLTALock` (RNodeInterface.py:612-630):
+    /// `at = int(pct * 100)` big-endian u16, KISS-escaped, framed per command.
+    #[test]
+    fn test_airtime_sequence_matches_python_encoding() {
+        let mut cfg = RNodeConfig::new("rnode0", "/dev/ttyACM0");
+        cfg.st_alock = Some(33.0);
+        cfg.lt_alock = Some(3.3);
+        let seq = build_airtime_sequence(&cfg);
+
+        // st: 3300 = 0x0CE4, lt: 330 = 0x014A — no KISS-special bytes, framed verbatim.
+        let expected = [
+            kiss::FEND, CMD_ST_ALOCK, 0x0C, 0xE4, kiss::FEND,
+            kiss::FEND, CMD_LT_ALOCK, 0x01, 0x4A, kiss::FEND,
+        ];
+        assert_eq!(seq, expected);
+
+        cfg.st_alock = None;
+        cfg.lt_alock = None;
+        assert!(build_airtime_sequence(&cfg).is_empty());
+    }
+
+    /// Airtime frames are part of the radio init sequence when configured.
+    #[test]
+    fn test_init_sequence_includes_airtime_commands() {
+        let mut cfg = RNodeConfig::new("rnode0", "/dev/ttyACM0");
+        cfg.st_alock = Some(10.0);
+        cfg.lt_alock = Some(1.0);
+        let seq = build_init_sequence(&cfg);
+
+        let mut deframer = kiss::RawKissDeframer::new();
+        let frames = deframer.feed(&seq);
+        let cmds: Vec<u8> = frames.iter().map(|(c, _)| *c).collect();
+        assert!(cmds.contains(&CMD_ST_ALOCK), "init must send CMD_ST_ALOCK");
+        assert!(cmds.contains(&CMD_LT_ALOCK), "init must send CMD_LT_ALOCK");
     }
 
     #[test]

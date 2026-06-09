@@ -1259,7 +1259,7 @@ pub async fn init(
         tracing::info!("transport node mode enabled");
     }
 
-    let interfaces = match synthesize_interfaces(&config, rc.panic_on_interface_error) {
+    let mut interfaces = match synthesize_interfaces(&config, rc.panic_on_interface_error) {
         Ok(interfaces) => interfaces,
         Err(e) => {
             let _ = transport_tx.send(TransportMessage::Shutdown).await;
@@ -1269,6 +1269,10 @@ pub async fn init(
     if !interfaces.is_empty() {
         tracing::info!("synthesized {} interfaces from config", interfaces.len());
     }
+    for iface_config in &mut interfaces {
+        apply_discovery_mode_autocorrect(&config, iface_config);
+    }
+    let interfaces = interfaces;
 
     let discovery_runtime = Arc::new(DiscoveryRuntime::default());
     if let Ok(store) = DiscoveryStore::open(&paths.storage_dir) {
@@ -1893,6 +1897,88 @@ fn interface_section<'a>(
 ) -> Option<&'a ConfigSection> {
     let name = interface_config_name(iface_config);
     config.subsection("interfaces", name)
+}
+
+fn interface_config_mode_mut(
+    iface_config: &mut interface_factory::InterfaceConfig,
+) -> &mut rns_interface::traits::InterfaceMode {
+    match iface_config {
+        interface_factory::InterfaceConfig::TcpClient(c) => &mut c.mode,
+        interface_factory::InterfaceConfig::TcpServer(c) => &mut c.mode,
+        interface_factory::InterfaceConfig::Udp(c) => &mut c.mode,
+        #[cfg(feature = "serial")]
+        interface_factory::InterfaceConfig::Serial(c) => &mut c.mode,
+        #[cfg(feature = "serial")]
+        interface_factory::InterfaceConfig::KissSerial(c) => &mut c.mode,
+        interface_factory::InterfaceConfig::Auto(c) => &mut c.mode,
+        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        interface_factory::InterfaceConfig::RNode(c) => &mut c.mode,
+        interface_factory::InterfaceConfig::Local(c) => &mut c.mode,
+        interface_factory::InterfaceConfig::I2P(c) => &mut c.mode,
+        interface_factory::InterfaceConfig::Pipe(c) => &mut c.mode,
+        #[cfg(feature = "serial")]
+        interface_factory::InterfaceConfig::RNodeMulti(c) => &mut c.mode,
+        #[cfg(feature = "serial")]
+        interface_factory::InterfaceConfig::AX25KISS(c) => &mut c.mode,
+        interface_factory::InterfaceConfig::Backbone(c) => &mut c.mode,
+        #[cfg(feature = "ble")]
+        interface_factory::InterfaceConfig::BleRNode(c) => &mut c.mode,
+    }
+}
+
+/// Python Reticulum.py:841-848: a `discoverable` interface must run in
+/// Gateway or Access Point mode for discovery to be useful, so the mode is
+/// auto-corrected (AP for RNode radios, Gateway otherwise) with a notice.
+/// `ignore_config_warnings = yes` opts out and keeps the configured mode.
+fn apply_discovery_mode_autocorrect(
+    config: &Config,
+    iface_config: &mut interface_factory::InterfaceConfig,
+) {
+    use rns_interface::traits::InterfaceMode;
+
+    let Some(section) = interface_section(config, iface_config) else {
+        return;
+    };
+    if !section.get_bool("discoverable").unwrap_or(false)
+        || section.get_bool("ignore_config_warnings").unwrap_or(false)
+    {
+        return;
+    }
+
+    let is_rnode = {
+        #[allow(unused_mut)]
+        let mut rnode = false;
+        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        {
+            rnode |= matches!(iface_config, interface_factory::InterfaceConfig::RNode(_));
+        }
+        #[cfg(feature = "serial")]
+        {
+            rnode |= matches!(iface_config, interface_factory::InterfaceConfig::RNodeMulti(_));
+        }
+        #[cfg(feature = "ble")]
+        {
+            rnode |= matches!(iface_config, interface_factory::InterfaceConfig::BleRNode(_));
+        }
+        rnode
+    };
+
+    let name = interface_config_name(iface_config).to_string();
+    let mode = interface_config_mode_mut(iface_config);
+    if matches!(*mode, InterfaceMode::Gateway | InterfaceMode::AccessPoint) {
+        return;
+    }
+    *mode = if is_rnode {
+        InterfaceMode::AccessPoint
+    } else {
+        InterfaceMode::Gateway
+    };
+    tracing::warn!(
+        interface = %name,
+        mode = ?*mode,
+        "discovery enabled without gateway or AP mode — auto-configured; \
+         set ignore_config_warnings to keep the configured mode"
+    );
 }
 
 fn interface_bootstrap_only(
@@ -2744,6 +2830,12 @@ pub struct BleRnodeRuntimeArgs<'a> {
     pub tx_power: i8,
     /// Reticulum interface routing/announce propagation mode.
     pub mode: rns_interface::traits::InterfaceMode,
+    /// Short-term airtime limit in percent (0.0..=100.0), None = no limit.
+    pub st_alock: Option<f32>,
+    /// Long-term airtime limit in percent (0.0..=100.0), None = no limit.
+    pub lt_alock: Option<f32>,
+    /// Enable KISS flow control.
+    pub flow_control: bool,
 }
 
 /// Returns `(interface_id, online_flag)`; `online_flag` flips to `true`
@@ -2762,6 +2854,9 @@ pub async fn spawn_ble_rnode_runtime(
         coding_rate,
         tx_power,
         mode,
+        st_alock,
+        lt_alock,
+        flow_control,
     } = args;
 
     let id = handle
@@ -2774,6 +2869,9 @@ pub async fn spawn_ble_rnode_runtime(
     config.coding_rate = coding_rate;
     config.tx_power = tx_power as u8;
     config.mode = mode;
+    config.st_alock = st_alock;
+    config.lt_alock = lt_alock;
+    config.flow_control = flow_control;
 
     let iface_handle = rns_interface::ble_rnode::spawn_ble_rnode_interface(
         config,
@@ -2813,6 +2911,12 @@ pub struct RnodeRuntimeArgs<'a> {
     pub tx_power: i8,
     /// Reticulum interface routing/announce propagation mode.
     pub mode: rns_interface::traits::InterfaceMode,
+    /// Short-term airtime limit in percent (0.0..=100.0), None = no limit.
+    pub st_alock: Option<f32>,
+    /// Long-term airtime limit in percent (0.0..=100.0), None = no limit.
+    pub lt_alock: Option<f32>,
+    /// Enable KISS flow control.
+    pub flow_control: bool,
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -2829,6 +2933,9 @@ pub async fn spawn_rnode_runtime(
         coding_rate,
         tx_power,
         mode,
+        st_alock,
+        lt_alock,
+        flow_control,
     } = args;
 
     let id = handle
@@ -2841,6 +2948,9 @@ pub async fn spawn_rnode_runtime(
     config.coding_rate = coding_rate;
     config.tx_power = tx_power as u8;
     config.mode = mode;
+    config.st_alock = st_alock;
+    config.lt_alock = lt_alock;
+    config.flow_control = flow_control;
 
     let iface_handle =
         rns_interface::rnode::spawn_rnode_interface(config, id, handle.transport_tx.clone())
@@ -2874,6 +2984,9 @@ pub async fn spawn_ble_rnode_runtime_native(
         coding_rate,
         tx_power,
         mode,
+        st_alock,
+        lt_alock,
+        flow_control,
     } = args;
 
     let id = handle
@@ -2886,6 +2999,9 @@ pub async fn spawn_ble_rnode_runtime_native(
     config.coding_rate = coding_rate;
     config.tx_power = tx_power as u8;
     config.mode = mode;
+    config.st_alock = st_alock;
+    config.lt_alock = lt_alock;
+    config.flow_control = flow_control;
 
     let iface_handle = rns_interface::ble_rnode::spawn_ble_rnode_interface_native(
         config,
@@ -3040,6 +3156,9 @@ pub async fn spawn_android_usb_rnode_runtime(
     coding_rate: u8,
     tx_power: i8,
     mode: rns_interface::traits::InterfaceMode,
+    st_alock: Option<f32>,
+    lt_alock: Option<f32>,
+    flow_control: bool,
 ) -> Result<u64, String> {
     let id = handle
         .id_gen
@@ -3051,6 +3170,9 @@ pub async fn spawn_android_usb_rnode_runtime(
     config.coding_rate = coding_rate;
     config.tx_power = tx_power as u8;
     config.mode = mode;
+    config.st_alock = st_alock;
+    config.lt_alock = lt_alock;
+    config.flow_control = flow_control;
 
     let iface_handle = rns_interface::android_usb::spawn_android_usb_rnode_interface(
         config,
@@ -3135,6 +3257,11 @@ async fn spawn_interface(
             let mut serial_config = rns_interface::serial::SerialConfig::new(&c.name, &c.port);
             serial_config.baud_rate = c.baud_rate;
             serial_config.mode = c.mode;
+            let (data, parity, stop) =
+                rns_interface::serial::serial_params_from(c.data_bits, &c.parity, c.stop_bits);
+            serial_config.data_bits = data;
+            serial_config.parity = parity;
+            serial_config.stop_bits = stop;
             rns_interface::serial::spawn_serial_interface(serial_config, id, transport_tx)
                 .await
                 .map(|h| vec![h])
@@ -3145,6 +3272,21 @@ async fn spawn_interface(
             let mut kiss_config =
                 rns_interface::kiss_iface::KissInterfaceConfig::new(&c.name, &c.port, c.baud_rate);
             kiss_config.mode = c.mode;
+            let (data, parity, stop) =
+                rns_interface::serial::serial_params_from(c.data_bits, &c.parity, c.stop_bits);
+            kiss_config.data_bits = data;
+            kiss_config.parity = parity;
+            kiss_config.stop_bits = stop;
+            // Wire units are 10 ms steps for the timing commands; persistence
+            // is the raw 0-255 CSMA p-value (Python setPreamble etc.).
+            let to_wire = |ms: u32| ((ms / 10).min(255)) as u8;
+            kiss_config.txdelay = Some(to_wire(c.preamble_ms));
+            kiss_config.txtail = Some(to_wire(c.txtail_ms));
+            kiss_config.slottime = Some(to_wire(c.slottime_ms));
+            kiss_config.persistence = Some(c.persistence);
+            kiss_config.flow_control = c.flow_control;
+            kiss_config.id_interval = c.id_interval;
+            kiss_config.id_callsign = c.id_callsign.as_ref().map(|s| s.as_bytes().to_vec());
             rns_interface::kiss_iface::spawn_kiss_interface(kiss_config, id, transport_tx)
                 .await
                 .map(|h| vec![h])
@@ -3177,6 +3319,11 @@ async fn spawn_interface(
             rnode_config.coding_rate = c.coding_rate;
             rnode_config.tx_power = c.tx_power as u8;
             rnode_config.mode = c.mode;
+            rnode_config.flow_control = c.flow_control;
+            rnode_config.st_alock = c.st_alock;
+            rnode_config.lt_alock = c.lt_alock;
+            rnode_config.id_interval = c.id_interval;
+            rnode_config.id_callsign = c.id_callsign.as_ref().map(|s| s.as_bytes().to_vec());
             rns_interface::rnode::spawn_rnode_interface(rnode_config, id, transport_tx)
                 .await
                 .map(|h| vec![h])
@@ -3239,6 +3386,8 @@ async fn spawn_interface(
                 rns_interface::rnode_multi::RNodeMultiConfig::new(&c.name, &c.port);
             multi_config.baud_rate = c.baud_rate;
             multi_config.flow_control = c.flow_control;
+            multi_config.id_interval = c.id_interval;
+            multi_config.id_callsign = c.id_callsign.as_ref().map(|s| s.as_bytes().to_vec());
             for sub in &c.subinterfaces {
                 let mut sub_config = rns_interface::rnode_multi::SubInterfaceConfig::new(
                     &sub.name,
@@ -3281,6 +3430,9 @@ async fn spawn_interface(
                 rns_interface::ax25kiss::AX25KISSConfig::new(&c.name, &c.port, &c.callsign, c.ssid);
             let mut ax25_config = ax25_config;
             ax25_config.baud_rate = c.baud_rate;
+            ax25_config.data_bits = c.data_bits;
+            ax25_config.parity = c.parity.clone();
+            ax25_config.stop_bits = c.stop_bits;
             ax25_config.preamble = c.preamble as u16;
             ax25_config.txtail = c.txtail as u16;
             ax25_config.persistence = c.persistence as u8;
@@ -3301,6 +3453,11 @@ async fn spawn_interface(
             config.coding_rate = c.coding_rate;
             config.tx_power = c.tx_power as u8;
             config.mode = c.mode;
+            config.flow_control = c.flow_control;
+            config.st_alock = c.st_alock;
+            config.lt_alock = c.lt_alock;
+            config.id_interval = c.id_interval;
+            config.id_callsign = c.id_callsign.as_ref().map(|s| s.as_bytes().to_vec());
             rns_interface::ble_rnode::spawn_ble_rnode_interface(config, id, transport_tx)
                 .await
                 .map(|h| vec![h])
@@ -3897,6 +4054,46 @@ loglevel = 7
         assert_eq!(rc.ingress_overrides.new_time, Some(1234.0));
         assert_eq!(rc.ingress_overrides.burst_penalty, Some(17.5));
         assert_eq!(rc.ingress_overrides.held_release_interval, Some(3.5));
+    }
+
+    /// Python Reticulum.py:841-848 parity: discoverable interfaces are
+    /// auto-corrected to Gateway/AP mode unless ignore_config_warnings.
+    #[test]
+    fn discovery_mode_autocorrect_matches_python() {
+        use rns_interface::traits::InterfaceMode;
+
+        let input = "[interfaces]\n\
+                     [[upstream]]\n\
+                     type = TCPServerInterface\n\
+                     listen_ip = 0.0.0.0\n\
+                     listen_port = 4242\n\
+                     discoverable = yes\n";
+        let config = Config::parse(input).unwrap();
+        let mut interfaces = synthesize_interfaces(&config, false).unwrap();
+        apply_discovery_mode_autocorrect(&config, &mut interfaces[0]);
+        match &interfaces[0] {
+            interface_factory::InterfaceConfig::TcpServer(c) => {
+                assert_eq!(c.mode, InterfaceMode::Gateway);
+            }
+            _ => panic!("expected TcpServer"),
+        }
+
+        let opted_out = "[interfaces]\n\
+                         [[upstream]]\n\
+                         type = TCPServerInterface\n\
+                         listen_ip = 0.0.0.0\n\
+                         listen_port = 4242\n\
+                         discoverable = yes\n\
+                         ignore_config_warnings = yes\n";
+        let config = Config::parse(opted_out).unwrap();
+        let mut interfaces = synthesize_interfaces(&config, false).unwrap();
+        apply_discovery_mode_autocorrect(&config, &mut interfaces[0]);
+        match &interfaces[0] {
+            interface_factory::InterfaceConfig::TcpServer(c) => {
+                assert_eq!(c.mode, InterfaceMode::Full, "opt-out keeps configured mode");
+            }
+            _ => panic!("expected TcpServer"),
+        }
     }
 
     #[test]
@@ -4744,6 +4941,9 @@ type = RNodeInterface
 port = /dev/ttyACM0
 frequency = 868000000
 bandwidth = 125000
+spreadingfactor = 7
+codingrate = 5
+txpower = 17
 
 [[OpenCom XL]]
 type = RNodeMultiInterface

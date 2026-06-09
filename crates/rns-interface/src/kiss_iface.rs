@@ -28,6 +28,10 @@ pub struct KissInterfaceConfig {
     pub txtail: Option<u8>,
     /// Honour CMD_READY from TNC.
     pub flow_control: bool,
+    /// Station-ID beacon: seconds between IDs, counted from the first data
+    /// TX after the previous beacon (Python `id_interval`/`id_callsign`).
+    pub id_interval: Option<u64>,
+    pub id_callsign: Option<Vec<u8>>,
 }
 
 impl KissInterfaceConfig {
@@ -45,8 +49,20 @@ impl KissInterfaceConfig {
             txdelay: None,
             txtail: None,
             flow_control: false,
+            id_interval: None,
+            id_callsign: None,
         }
     }
+}
+
+/// Beacon frame payload: callsign zero-padded to the 15-byte minimum
+/// (Python KISSInterface.py:350-353).
+pub fn beacon_frame_payload(id_callsign: &[u8]) -> Vec<u8> {
+    let mut frame = id_callsign.to_vec();
+    while frame.len() < 15 {
+        frame.push(0x00);
+    }
+    frame
 }
 
 pub async fn spawn_kiss_interface(
@@ -113,9 +129,47 @@ pub async fn spawn_kiss_interface(
     let online_w = online.clone();
     let ready_w = ready.clone();
     let txb_w = shared_txb.clone();
+    let beacon = config
+        .id_interval
+        .zip(config.id_callsign.clone())
+        .map(|(interval, callsign)| (Duration::from_secs(interval), Bytes::from(callsign)));
     tokio::spawn(async move {
         let mut port_w = port_write;
-        while let Some(data) = rx.recv().await {
+        // Python first_tx semantics: armed by the first data TX after a
+        // beacon; cleared when the beacon goes out.
+        let mut first_tx: Option<tokio::time::Instant> = None;
+        loop {
+            let data = if let Some((interval, ref callsign)) = beacon {
+                match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+                    Ok(Some(data)) => data,
+                    Ok(None) => break,
+                    Err(_) => {
+                        let due = first_tx.is_some_and(|t| t.elapsed() >= interval);
+                        if !due {
+                            continue;
+                        }
+                        tracing::debug!("KISS transmitting station-ID beacon");
+                        Bytes::from(beacon_frame_payload(callsign))
+                    }
+                }
+            } else {
+                match rx.recv().await {
+                    Some(data) => data,
+                    None => break,
+                }
+            };
+
+            // Python KISSInterface.py:267-271 compares the unpadded callsign,
+            // so a padded (<15 byte) beacon re-arms the timer and beacons
+            // repeat every id_interval once anything has been sent. Kept
+            // bug-for-bug for parity.
+            let is_beacon = beacon.as_ref().is_some_and(|(_, callsign)| data == *callsign);
+            if is_beacon {
+                first_tx = None;
+            } else if first_tx.is_none() {
+                first_tx = Some(tokio::time::Instant::now());
+            }
+
             txb_w.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
             // Flow control: bounded wait so a stuck TNC can't hang transmit.
             if flow_control {
@@ -262,6 +316,20 @@ mod tests {
         assert_eq!(cfg.baud_rate, 9600);
         assert!(!cfg.flow_control);
         assert_eq!(cfg.mode, InterfaceMode::Full);
+        assert!(cfg.id_interval.is_none() && cfg.id_callsign.is_none());
+    }
+
+    /// Python KISSInterface.py:350-353 — beacon payload is the callsign
+    /// zero-padded to 15 bytes; longer callsigns pass through unchanged.
+    #[test]
+    fn test_beacon_frame_payload_padding() {
+        let short = beacon_frame_payload(b"MYCALL-0");
+        assert_eq!(short.len(), 15);
+        assert_eq!(&short[..8], b"MYCALL-0");
+        assert!(short[8..].iter().all(|&b| b == 0));
+
+        let long = beacon_frame_payload(b"AVERYLONGCALLSIGN");
+        assert_eq!(long, b"AVERYLONGCALLSIGN");
     }
 
     #[test]

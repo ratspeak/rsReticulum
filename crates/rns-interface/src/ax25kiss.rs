@@ -56,6 +56,10 @@ pub struct AX25KISSConfig {
     /// Honour CMD_READY from TNC.
     pub flow_control: bool,
     pub mode: InterfaceMode,
+    /// Serial line params in Python config form (converted at open).
+    pub data_bits: u8,
+    pub parity: String,
+    pub stop_bits: u8,
 }
 
 impl AX25KISSConfig {
@@ -74,6 +78,9 @@ impl AX25KISSConfig {
             slottime: 20,
             flow_control: false,
             mode: InterfaceMode::Full,
+            data_bits: 8,
+            parity: "N".to_string(),
+            stop_bits: 1,
         }
     }
 
@@ -232,10 +239,12 @@ pub async fn spawn_ax25kiss_interface(
         crate::traits::InterfaceError::SendFailed(format!("ax25kiss config: {}", e))
     })?;
 
+    let (data_bits, parity, stop_bits) =
+        crate::serial::serial_params_from(config.data_bits, &config.parity, config.stop_bits);
     let port = serialport::new(&config.port, config.baud_rate)
-        .data_bits(serialport::DataBits::Eight)
-        .parity(serialport::Parity::None)
-        .stop_bits(serialport::StopBits::One)
+        .data_bits(data_bits)
+        .parity(parity)
+        .stop_bits(stop_bits)
         .timeout(Duration::from_millis(AX25_READ_TIMEOUT_MS))
         .open()
         .map_err(|e| {

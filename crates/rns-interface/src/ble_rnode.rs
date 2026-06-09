@@ -379,6 +379,10 @@ pub struct BleRNodeConfig {
     pub flow_control: bool,
     pub st_alock: Option<f32>,
     pub lt_alock: Option<f32>,
+    /// Station-ID beacon: seconds between IDs, armed by data TX
+    /// (Python `id_interval`/`id_callsign`, callsign max 32 bytes).
+    pub id_interval: Option<u64>,
+    pub id_callsign: Option<Vec<u8>>,
 }
 
 impl BleRNodeConfig {
@@ -392,11 +396,35 @@ impl BleRNodeConfig {
             coding_rate: 5,
             tx_power: 14,
             mode: InterfaceMode::Full,
-            flow_control: true,
+            // Python RNodeInterface defaults flow_control off.
+            flow_control: false,
             st_alock: None,
             lt_alock: None,
+            id_interval: None,
+            id_callsign: None,
         }
     }
+}
+
+/// Station-ID beacon parameters, disabled for oversized callsigns
+/// (Python RNodeInterface.py:333-343).
+fn beacon_from_config(config: &BleRNodeConfig) -> Option<(Duration, Bytes)> {
+    config
+        .id_interval
+        .zip(config.id_callsign.clone())
+        .filter(|(_, callsign)| {
+            let ok = callsign.len() <= rnode::CALLSIGN_MAX_LEN;
+            if !ok {
+                tracing::error!(
+                    name = %config.name,
+                    len = callsign.len(),
+                    "id_callsign exceeds {} bytes, beaconing disabled",
+                    rnode::CALLSIGN_MAX_LEN
+                );
+            }
+            ok
+        })
+        .map(|(interval, callsign)| (Duration::from_secs(interval), Bytes::from(callsign)))
 }
 
 pub(crate) async fn get_adapter() -> Result<Adapter, InterfaceError> {
@@ -1164,11 +1192,14 @@ pub async fn spawn_ble_rnode_interface(
         flow_control: config.flow_control,
         st_alock: config.st_alock,
         lt_alock: config.lt_alock,
+        id_interval: config.id_interval,
+        id_callsign: config.id_callsign.clone(),
     };
 
     let name = config.name.clone();
     let mode = config.mode;
     let flow_control = config.flow_control;
+    let beacon = beacon_from_config(&config);
     let ble_uri = config.ble_uri.clone();
     let log_name = name.clone();
     let running_task = running.clone();
@@ -1293,8 +1324,37 @@ pub async fn spawn_ble_rnode_interface(
             let online_w = online_handle.clone();
             let ready_w = ready.clone();
             let txb_w = task_txb.clone();
+            let beacon_w = beacon.clone();
             let write_handle = tokio::spawn(async move {
-                while let Some(data) = conn_rx.recv().await {
+                // Python first_tx semantics: armed by data TX, cleared when
+                // the callsign beacon goes out (RNodeInterface.py:712-718).
+                let mut first_tx: Option<tokio::time::Instant> = None;
+                loop {
+                    let data = if let Some((interval, ref callsign)) = beacon_w {
+                        match tokio::time::timeout(Duration::from_secs(1), conn_rx.recv()).await {
+                            Ok(Some(data)) => data,
+                            Ok(None) => break,
+                            Err(_) => {
+                                if !first_tx.is_some_and(|t| t.elapsed() >= interval) {
+                                    continue;
+                                }
+                                tracing::debug!("BLE RNode transmitting station-ID beacon");
+                                callsign.clone()
+                            }
+                        }
+                    } else {
+                        match conn_rx.recv().await {
+                            Some(data) => data,
+                            None => break,
+                        }
+                    };
+                    if let Some((_, ref callsign)) = beacon_w {
+                        if data == *callsign {
+                            first_tx = None;
+                        } else if first_tx.is_none() {
+                            first_tx = Some(tokio::time::Instant::now());
+                        }
+                    }
                     txb_w.fetch_add(data.len() as u64, Ordering::Relaxed);
                     if flow_control {
                         while !ready_w.load(Ordering::SeqCst) {
@@ -1496,11 +1556,14 @@ pub async fn spawn_ble_rnode_interface_native(
         flow_control: config.flow_control,
         st_alock: config.st_alock,
         lt_alock: config.lt_alock,
+        id_interval: config.id_interval,
+        id_callsign: config.id_callsign.clone(),
     };
 
     let name = config.name.clone();
     let mode = config.mode;
     let flow_control = config.flow_control;
+    let beacon = beacon_from_config(&config);
     let ble_uri = config.ble_uri.clone();
     let log_name = name.clone();
     let running = register_running(id);
@@ -1595,10 +1658,37 @@ pub async fn spawn_ble_rnode_interface_native(
             let online_w = online_handle.clone();
             let ready_w = ready.clone();
             let txb_w = task_txb.clone();
+            let beacon_w = beacon.clone();
             let write_handle = tokio::spawn(async move {
-                while let Some(msg) = conn_rx.recv().await {
+                let mut first_tx: Option<tokio::time::Instant> = None;
+                loop {
+                    let msg = if let Some((interval, ref callsign)) = beacon_w {
+                        match tokio::time::timeout(Duration::from_secs(1), conn_rx.recv()).await {
+                            Ok(Some(msg)) => msg,
+                            Ok(None) => break,
+                            Err(_) => {
+                                if !first_tx.is_some_and(|t| t.elapsed() >= interval) {
+                                    continue;
+                                }
+                                tracing::debug!("BLE RNode (native) transmitting station-ID beacon");
+                                NativeBridgeWrite::Packet(callsign.clone())
+                            }
+                        }
+                    } else {
+                        match conn_rx.recv().await {
+                            Some(msg) => msg,
+                            None => break,
+                        }
+                    };
                     match msg {
                         NativeBridgeWrite::Packet(data) => {
+                            if let Some((_, ref callsign)) = beacon_w {
+                                if data == *callsign {
+                                    first_tx = None;
+                                } else if first_tx.is_none() {
+                                    first_tx = Some(tokio::time::Instant::now());
+                                }
+                            }
                             txb_w.fetch_add(data.len() as u64, Ordering::Relaxed);
                             if flow_control {
                                 while !ready_w.load(Ordering::SeqCst) {

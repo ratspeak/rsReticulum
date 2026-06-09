@@ -46,6 +46,32 @@ impl SerialConfig {
     }
 }
 
+/// Map Python-style serial config values (`databits`/`parity`/`stopbits`)
+/// to serialport enums. Parity accepts `e`/`even` and `o`/`odd`
+/// (case-insensitive); anything else is none, matching the reference.
+pub fn serial_params_from(
+    data_bits: u8,
+    parity: &str,
+    stop_bits: u8,
+) -> (serialport::DataBits, serialport::Parity, serialport::StopBits) {
+    let data = match data_bits {
+        5 => serialport::DataBits::Five,
+        6 => serialport::DataBits::Six,
+        7 => serialport::DataBits::Seven,
+        _ => serialport::DataBits::Eight,
+    };
+    let parity = match parity.to_ascii_lowercase().as_str() {
+        "e" | "even" => serialport::Parity::Even,
+        "o" | "odd" => serialport::Parity::Odd,
+        _ => serialport::Parity::None,
+    };
+    let stop = match stop_bits {
+        2 => serialport::StopBits::Two,
+        _ => serialport::StopBits::One,
+    };
+    (data, parity, stop)
+}
+
 pub async fn spawn_serial_interface(
     config: SerialConfig,
     id: InterfaceId,
