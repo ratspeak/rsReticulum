@@ -2742,6 +2742,8 @@ pub struct BleRnodeRuntimeArgs<'a> {
     pub coding_rate: u8,
     /// Transmit power in dBm.
     pub tx_power: i8,
+    /// Reticulum interface routing/announce propagation mode.
+    pub mode: rns_interface::traits::InterfaceMode,
 }
 
 /// Returns `(interface_id, online_flag)`; `online_flag` flips to `true`
@@ -2759,6 +2761,7 @@ pub async fn spawn_ble_rnode_runtime(
         spreading_factor,
         coding_rate,
         tx_power,
+        mode,
     } = args;
 
     let id = handle
@@ -2770,6 +2773,7 @@ pub async fn spawn_ble_rnode_runtime(
     config.spreading_factor = spreading_factor;
     config.coding_rate = coding_rate;
     config.tx_power = tx_power as u8;
+    config.mode = mode;
 
     let iface_handle = rns_interface::ble_rnode::spawn_ble_rnode_interface(
         config,
@@ -2807,6 +2811,8 @@ pub struct RnodeRuntimeArgs<'a> {
     pub coding_rate: u8,
     /// Transmit power in dBm.
     pub tx_power: i8,
+    /// Reticulum interface routing/announce propagation mode.
+    pub mode: rns_interface::traits::InterfaceMode,
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -2822,6 +2828,7 @@ pub async fn spawn_rnode_runtime(
         spreading_factor,
         coding_rate,
         tx_power,
+        mode,
     } = args;
 
     let id = handle
@@ -2833,6 +2840,7 @@ pub async fn spawn_rnode_runtime(
     config.spreading_factor = spreading_factor;
     config.coding_rate = coding_rate;
     config.tx_power = tx_power as u8;
+    config.mode = mode;
 
     let iface_handle =
         rns_interface::rnode::spawn_rnode_interface(config, id, handle.transport_tx.clone())
@@ -2865,6 +2873,7 @@ pub async fn spawn_ble_rnode_runtime_native(
         spreading_factor,
         coding_rate,
         tx_power,
+        mode,
     } = args;
 
     let id = handle
@@ -2876,6 +2885,7 @@ pub async fn spawn_ble_rnode_runtime_native(
     config.spreading_factor = spreading_factor;
     config.coding_rate = coding_rate;
     config.tx_power = tx_power as u8;
+    config.mode = mode;
 
     let iface_handle = rns_interface::ble_rnode::spawn_ble_rnode_interface_native(
         config,
@@ -3029,6 +3039,7 @@ pub async fn spawn_android_usb_rnode_runtime(
     spreading_factor: u8,
     coding_rate: u8,
     tx_power: i8,
+    mode: rns_interface::traits::InterfaceMode,
 ) -> Result<u64, String> {
     let id = handle
         .id_gen
@@ -3039,6 +3050,7 @@ pub async fn spawn_android_usb_rnode_runtime(
     config.spreading_factor = spreading_factor;
     config.coding_rate = coding_rate;
     config.tx_power = tx_power as u8;
+    config.mode = mode;
 
     let iface_handle = rns_interface::android_usb::spawn_android_usb_rnode_interface(
         config,

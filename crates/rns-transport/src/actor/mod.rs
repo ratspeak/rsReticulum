@@ -6572,6 +6572,28 @@ mod tests {
     }
 
     #[test]
+    fn gateway_mode_without_transport_does_not_relay_unknown_path_requests() {
+        let (mut actor, _tx) = TransportActor::new();
+
+        let (mut gateway, _gateway_rx) = make_test_interface("gateway");
+        gateway.mode = InterfaceMode::Gateway;
+        actor.interfaces.insert(1, gateway);
+        let (boundary, mut boundary_rx) = make_test_interface("boundary");
+        actor.interfaces.insert(2, boundary);
+
+        actor.handle_inbound_path_request(&make_path_request_payload([0x33; 16], None), 1);
+
+        assert!(
+            boundary_rx.try_recv().is_err(),
+            "gateway mode must not relay unknown path discovery unless transport is enabled"
+        );
+        assert!(
+            actor.discovery_path_requests.is_empty(),
+            "non-transport nodes must not track recursive discovery state"
+        );
+    }
+
+    #[test]
     fn inbound_tagless_path_request_is_ignored() {
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
