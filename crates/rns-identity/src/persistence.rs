@@ -5,7 +5,8 @@ use std::path::Path;
 /// Write `data` to `path` via `<path>.tmp` + `rename`, fsyncing first.
 ///
 /// On Unix the temp file is created with mode `0600` so that key material is
-/// not world-readable even during the write.
+/// not world-readable even during the write. After the rename the parent
+/// directory is fsynced best-effort so the rename itself survives power loss.
 pub fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp_path = path.with_extension("tmp");
 
@@ -28,6 +29,14 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     }
 
     fs::rename(&tmp_path, path)?;
+
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+
     Ok(())
 }
 

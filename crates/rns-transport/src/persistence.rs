@@ -1,5 +1,6 @@
 //! Atomic msgpack persistence for transport tables. `atomic_write` is
-//! write-to-tmp + rename so a crash leaves either the old or new file.
+//! write-to-tmp + fsync + rename (via the shared rns-identity helper) so a
+//! crash or power loss leaves either the old or the new file, never a torn one.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -602,11 +603,9 @@ fn atomic_write<T: Serialize>(path: &Path, data: &T) -> Result<(), PersistenceEr
 }
 
 fn atomic_write_bytes(path: &Path, serialized: &[u8]) -> Result<(), PersistenceError> {
-    let tmp_path = path.with_extension("tmp");
-    std::fs::write(&tmp_path, serialized).map_err(PersistenceError::Io)?;
-    std::fs::rename(&tmp_path, path).map_err(PersistenceError::Io)?;
-
-    Ok(())
+    // Single canonical atomic-write implementation (fsync + rename + dir
+    // sync) lives in rns-identity; transport tables share it (AF-2026-04.2).
+    rns_identity::persistence::atomic_write(path, serialized).map_err(PersistenceError::Io)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1048,6 +1047,32 @@ mod tests {
         assert_eq!(loaded[0].hops, 3);
         assert_eq!(loaded[0].interface_id, 1);
         assert_eq!(loaded[0].interface_name.as_deref(), Some("test_iface"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_bytes_uses_shared_fsync_helper() {
+        // AF-2026-04.2: transport tables must go through the rns-identity
+        // atomic_write (fsync before rename). The shared helper creates the
+        // temp file with mode 0600 — observable proof of delegation, unlike
+        // the old fs::write path (umask default).
+        let dir = std::env::temp_dir().join("reticulum_rs_test_atomic_bytes");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("snapshot.msgpack");
+
+        atomic_write_bytes(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        // Overwrite must replace cleanly (rename on top).
+        atomic_write_bytes(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
