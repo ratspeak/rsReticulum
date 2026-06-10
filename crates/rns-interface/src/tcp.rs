@@ -15,14 +15,26 @@ pub const RECONNECT_WAIT_INITIAL: u64 = 5;
 pub const RECONNECT_WAIT_MAX: u64 = 300;
 pub const DEFAULT_CONNECT_TIMEOUT: u64 = 5;
 pub const DEFAULT_TCP_USER_TIMEOUT: u32 = 24;
-/// I2P tunnels need a longer `TCP_USER_TIMEOUT` to absorb latency spikes.
-pub const I2P_TCP_USER_TIMEOUT: u32 = 45;
 
 pub const TCP_HW_MTU: u32 = 262144;
 
+// Python TCPClientInterface: TCP_PROBE_AFTER / TCP_PROBE_INTERVAL / TCP_PROBES.
+// Dead-peer detection: 5s idle + 12 probes × 2s ≈ 29s.
 pub const TCP_KEEPIDLE: u32 = 5;
 pub const TCP_KEEPINTVL: u32 = 2;
 pub const TCP_KEEPCNT: u32 = 12;
+
+/// Tuned keepalive (idle/interval/count + Linux `TCP_USER_TIMEOUT`) for plain
+/// TCP client and accepted sockets, matching Python `set_timeouts_linux`.
+pub(crate) fn set_tcp_keepalive_tuned(stream: &TcpStream) {
+    crate::socket_tuning::set_keepalive_tuned(
+        stream,
+        std::time::Duration::from_secs(TCP_KEEPIDLE as u64),
+        std::time::Duration::from_secs(TCP_KEEPINTVL as u64),
+        TCP_KEEPCNT,
+        std::time::Duration::from_secs(DEFAULT_TCP_USER_TIMEOUT as u64),
+    );
+}
 
 #[derive(Debug, Clone)]
 pub struct TcpClientConfig {
@@ -177,7 +189,7 @@ pub fn frame_for_tcp(data: &[u8], kiss_framing: bool) -> Vec<u8> {
     }
 }
 
-use crate::socket_tuning::{set_keepalive, set_socket_buffers};
+use crate::socket_tuning::set_socket_buffers;
 
 async fn tcp_read_loop(
     mut reader: tokio::net::tcp::OwnedReadHalf,
@@ -352,9 +364,7 @@ pub async fn spawn_tcp_client(
                 }
             };
 
-            if let Err(e) = set_keepalive(&stream) {
-                tracing::debug!(error = %e, "failed to set TCP keepalive");
-            }
+            set_tcp_keepalive_tuned(&stream);
 
             // Nagle off for low-latency packets; larger buffers for bulk transfers.
             let _ = stream.set_nodelay(true);
@@ -463,9 +473,7 @@ async fn spawn_tcp_accepted(
     let state = TcpInterfaceState::with_shared_counters(shared_rxb.clone(), shared_txb.clone());
     state.online.store(true, Ordering::SeqCst);
 
-    if let Err(e) = set_keepalive(&stream) {
-        tracing::debug!(error = %e, "failed to set keepalive on accepted socket");
-    }
+    set_tcp_keepalive_tuned(&stream);
     let _ = stream.set_nodelay(true);
     set_socket_buffers(&stream, 131072);
 
@@ -611,6 +619,66 @@ mod tests {
         let config = TcpServerConfig::new("server", "0.0.0.0", 4242);
         assert_eq!(config.listen_port, 4242);
         assert!(!config.prefer_ipv6);
+    }
+
+    /// T1-2 regression: the client/accept paths must apply the TUNED keepalive
+    /// (idle 5s + 12 probes × 2s ≈ 29s dead-peer parity with Python), not just
+    /// SO_KEEPALIVE. Reads the options back via getsockopt.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tuned_keepalive_applies_python_probe_values() {
+        use std::os::fd::AsRawFd;
+
+        fn get_opt(fd: i32, level: i32, name: i32) -> i32 {
+            let mut val: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let rc = unsafe {
+                libc::getsockopt(
+                    fd,
+                    level,
+                    name,
+                    &mut val as *mut _ as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, 0, "getsockopt({level},{name}) failed");
+            val
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted, client) = tokio::join!(listener.accept(), TcpStream::connect(addr));
+        let client = client.unwrap();
+        let (server, _) = accepted.unwrap();
+
+        for stream in [&client, &server] {
+            set_tcp_keepalive_tuned(stream);
+            let fd = stream.as_ref().as_raw_fd();
+            // BSD getsockopt returns the option bit, not 1 — assert enabled.
+            assert_ne!(get_opt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 0);
+
+            #[cfg(target_os = "linux")]
+            let idle = get_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE);
+            #[cfg(target_os = "macos")]
+            let idle = get_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPALIVE);
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                assert_eq!(idle, TCP_KEEPIDLE as i32);
+                assert_eq!(
+                    get_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL),
+                    TCP_KEEPINTVL as i32
+                );
+                assert_eq!(
+                    get_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT),
+                    TCP_KEEPCNT as i32
+                );
+            }
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                get_opt(fd, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT),
+                (DEFAULT_TCP_USER_TIMEOUT * 1000) as i32
+            );
+        }
     }
 
     #[test]

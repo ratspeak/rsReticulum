@@ -262,6 +262,14 @@ async fn connect_to_sam(sam_host: &str, sam_port: u16) -> Result<TcpStream, SamE
     let addr = format!("{}:{}", sam_host, sam_port);
     let stream = TcpStream::connect(&addr).await.map_err(SamError::Io)?;
     let _ = stream.set_nodelay(true);
+    // Python i2p_tunneled tuning: longer probes/timeout to absorb I2P latency.
+    crate::socket_tuning::set_keepalive_tuned(
+        &stream,
+        std::time::Duration::from_secs(I2P_PROBE_AFTER),
+        std::time::Duration::from_secs(I2P_PROBE_INTERVAL),
+        I2P_PROBES as u32,
+        std::time::Duration::from_secs(I2P_TCP_USER_TIMEOUT as u64),
+    );
     Ok(stream)
 }
 
