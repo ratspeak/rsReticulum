@@ -121,87 +121,31 @@ pub fn frame_with_command(cmd: u8, data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Classic KISS deframer: high nibble of the command byte is a TNC port, so
+/// frames are returned as `(command & CMD_MASK, data)`. Thin wrapper over
+/// [`RawKissDeframer`], which owns the framing state machine.
 pub struct KissDeframer {
-    buffer: Vec<u8>,
-    in_frame: bool,
-    command: u8,
-    /// Reusable scratch for unescape output.
-    unescape_scratch: Vec<u8>,
+    inner: RawKissDeframer,
 }
 
 impl KissDeframer {
     pub fn new() -> Self {
         Self {
-            buffer: Vec::with_capacity(DEFRAME_BUF_CAPACITY),
-            in_frame: false,
-            command: CMD_UNKNOWN,
-            unescape_scratch: Vec::with_capacity(DEFRAME_BUF_CAPACITY),
+            inner: RawKissDeframer::new(),
         }
     }
 
     /// Returns complete frames as (command, data) pairs.
     pub fn feed(&mut self, data: &[u8]) -> Vec<(u8, Vec<u8>)> {
-        let mut frames = Vec::new();
-        let mut i = 0;
-        while i < data.len() {
-            match data[i..].iter().position(|&b| b == FEND) {
-                Some(rel) => {
-                    let hit = i + rel;
-                    if self.in_frame {
-                        self.append_in_frame(&data[i..hit]);
-                        if !self.buffer.is_empty() {
-                            self.unescape_scratch.clear();
-                            unescape_into(&self.buffer, &mut self.unescape_scratch);
-                            let frame_data = std::mem::replace(
-                                &mut self.unescape_scratch,
-                                Vec::with_capacity(DEFRAME_BUF_CAPACITY),
-                            );
-                            frames.push((self.command & CMD_MASK, frame_data));
-                        }
-                        self.buffer.clear();
-                    }
-                    self.in_frame = true;
-                    self.command = CMD_UNKNOWN;
-                    i = hit + 1;
-                }
-                None => {
-                    if self.in_frame {
-                        self.append_in_frame(&data[i..]);
-                    }
-                    return frames;
-                }
-            }
+        let mut frames = self.inner.feed(data);
+        for frame in &mut frames {
+            frame.0 &= CMD_MASK;
         }
         frames
     }
 
-    /// Append `chunk` to the in-frame buffer. The first byte after a FEND is
-    /// the command byte (consumed separately); subsequent bytes are payload
-    /// up to `MAX_FRAME_SIZE`. Overflow drops the in-progress frame and waits
-    /// for the next FEND to resync — matching the previous byte-loop.
-    fn append_in_frame(&mut self, chunk: &[u8]) {
-        let mut chunk = chunk;
-        if self.command == CMD_UNKNOWN {
-            if let Some((&first, rest)) = chunk.split_first() {
-                self.command = first;
-                chunk = rest;
-            } else {
-                return;
-            }
-        }
-        if self.buffer.len() + chunk.len() > MAX_FRAME_SIZE {
-            self.buffer.clear();
-            self.in_frame = false;
-            self.command = CMD_UNKNOWN;
-            return;
-        }
-        self.buffer.extend_from_slice(chunk);
-    }
-
     pub fn reset(&mut self) {
-        self.buffer.clear();
-        self.in_frame = false;
-        self.command = CMD_UNKNOWN;
+        self.inner.reset();
     }
 }
 
@@ -221,6 +165,7 @@ pub struct RawKissDeframer {
     buffer: Vec<u8>,
     in_frame: bool,
     command: u8,
+    /// Reusable scratch for unescape output.
     unescape_scratch: Vec<u8>,
 }
 
@@ -270,6 +215,10 @@ impl RawKissDeframer {
         frames
     }
 
+    /// Append `chunk` to the in-frame buffer. The first byte after a FEND is
+    /// the command byte (consumed separately); subsequent bytes are payload
+    /// up to `MAX_FRAME_SIZE`. Overflow drops the in-progress frame and waits
+    /// for the next FEND to resync — matching the previous byte-loop.
     fn append_in_frame(&mut self, chunk: &[u8]) {
         let mut chunk = chunk;
         if self.command == CMD_UNKNOWN {
