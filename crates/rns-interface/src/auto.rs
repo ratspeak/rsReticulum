@@ -1199,12 +1199,17 @@ pub async fn spawn_auto_interface(
     let disc_sock_recv = disc_sock.clone();
     tokio::spawn(async move {
         let mut buf = [0u8; 256];
+        // Python's read loops swallow exceptions and keep serving; Linux
+        // surfaces transient async errors (ICMP unreachable) via recv_from,
+        // so only sustained failure may kill the loop.
+        let mut consecutive_errors = 0u32;
         loop {
             if !online_d.load(Ordering::SeqCst) {
                 break;
             }
             match disc_sock_recv.recv_from(&mut buf).await {
                 Ok((n, src)) => {
+                    consecutive_errors = 0;
                     if n < 32 {
                         tracing::debug!(src = %src, n, "auto-instr mcast RX too short");
                         continue;
@@ -1267,8 +1272,12 @@ pub async fn spawn_auto_interface(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "auto discovery recv error");
-                    break;
+                    consecutive_errors += 1;
+                    tracing::warn!(error = %e, consecutive_errors, "auto discovery recv error");
+                    if consecutive_errors >= 50 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
         }
@@ -1300,12 +1309,14 @@ pub async fn spawn_auto_interface(
         let urecv_link_locals = unicast_link_locals.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 256];
+            let mut consecutive_errors = 0u32;
             loop {
                 if !urecv_online.load(Ordering::SeqCst) {
                     break;
                 }
                 match urecv_sock.recv_from(&mut buf).await {
                     Ok((n, src)) => {
+                        consecutive_errors = 0;
                         if n < 32 {
                             continue;
                         }
@@ -1341,8 +1352,16 @@ pub async fn spawn_auto_interface(
                         }
                     }
                     Err(e) => {
-                        tracing::debug!(error = %e, "auto unicast discovery recv error");
-                        break;
+                        consecutive_errors += 1;
+                        tracing::debug!(
+                            error = %e,
+                            consecutive_errors,
+                            "auto unicast discovery recv error"
+                        );
+                        if consecutive_errors >= 50 {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
             }
@@ -1625,9 +1644,11 @@ pub async fn spawn_auto_interface(
     let dedup = Arc::new(Mutex::new(MultiIfDedup::new()));
     let read_task = tokio::spawn(async move {
         let mut buf = [0u8; 2048];
+        let mut consecutive_errors = 0u32;
         loop {
             match data_sock.recv_from(&mut buf).await {
                 Ok((n, _src)) => {
+                    consecutive_errors = 0;
                     if n == 0 {
                         continue;
                     }
@@ -1658,8 +1679,12 @@ pub async fn spawn_auto_interface(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "auto data recv error");
-                    break;
+                    consecutive_errors += 1;
+                    tracing::warn!(error = %e, consecutive_errors, "auto data recv error");
+                    if consecutive_errors >= 50 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
         }
