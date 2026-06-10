@@ -148,6 +148,94 @@ async fn local_write_loop<W: AsyncWriteExt + Unpin>(
     online.store(false, Ordering::SeqCst);
 }
 
+/// Per-stream wiring shared by both platform variants: write loop, read task,
+/// and the connection's `InterfaceHandle`. `dereg_on_disconnect` is set for
+/// accepted server-side clients so transport drops them immediately on EOF.
+fn wire_local_stream<R, W>(
+    id: InterfaceId,
+    name: String,
+    parent_id: Option<InterfaceId>,
+    reader: R,
+    writer: W,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    dereg_on_disconnect: bool,
+) -> InterfaceHandle
+where
+    R: AsyncReadExt + Unpin + Send + 'static,
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
+    let online = Arc::new(AtomicBool::new(true));
+    let rxb = Arc::new(AtomicU64::new(0));
+    let txb = Arc::new(AtomicU64::new(0));
+    let (tx, rx) = mpsc::channel::<Bytes>(256);
+
+    tokio::spawn(local_write_loop(writer, rx, online.clone(), txb.clone()));
+
+    let online_r = online.clone();
+    let rxb_r = rxb.clone();
+    let task_name = name.clone();
+    let dereg_tx = transport_tx.clone();
+    let read_task = tokio::spawn(async move {
+        local_read_loop(reader, id, transport_tx, online_r, rxb_r).await;
+        if dereg_on_disconnect {
+            tracing::info!(name = %task_name, "local client disconnected");
+            // Proactively notify so transport drops immediately.
+            let _ = dereg_tx
+                .send(TransportMessage::DeregisterInterface { id })
+                .await;
+        }
+    });
+
+    InterfaceHandle {
+        id,
+        parent_id,
+        name,
+        mode: InterfaceMode::Full,
+        direction: InterfaceDirection {
+            inbound: true,
+            outbound: true,
+            forward: false,
+            repeat: false,
+        },
+        bitrate: 1_000_000_000,
+        mtu: crate::traits::optimise_mtu(1_000_000_000).unwrap_or(LOCAL_MTU),
+        online,
+        rxb: Some(rxb),
+        txb: Some(txb),
+        tx,
+        read_task,
+    }
+}
+
+/// Handle for the listener pseudo-interface (id 0): inbound-only, no
+/// per-byte counters of its own.
+fn server_listener_handle(
+    name: String,
+    online: Arc<AtomicBool>,
+    tx: mpsc::Sender<Bytes>,
+    read_task: tokio::task::JoinHandle<()>,
+) -> InterfaceHandle {
+    InterfaceHandle {
+        id: 0,
+        parent_id: None,
+        name,
+        mode: InterfaceMode::Full,
+        direction: InterfaceDirection {
+            inbound: true,
+            outbound: false,
+            forward: false,
+            repeat: false,
+        },
+        bitrate: 1_000_000_000,
+        mtu: crate::traits::optimise_mtu(1_000_000_000).unwrap_or(LOCAL_MTU),
+        online,
+        rxb: Some(Arc::new(AtomicU64::new(0))),
+        txb: Some(Arc::new(AtomicU64::new(0))),
+        tx,
+        read_task,
+    }
+}
+
 #[cfg(unix)]
 mod platform {
     use super::*;
@@ -238,50 +326,16 @@ mod platform {
                         let client_name = format!("{}/client_{}", config.name, client_id);
                         tracing::info!(name = %client_name, "local client connected");
 
-                        let c_online = Arc::new(AtomicBool::new(true));
-                        let c_rxb = Arc::new(AtomicU64::new(0));
-                        let c_txb = Arc::new(AtomicU64::new(0));
-                        let (c_tx, c_rx) = mpsc::channel::<Bytes>(256);
                         let (reader, writer) = stream.into_split();
-
-                        let c_online2 = c_online.clone();
-                        let c_txb2 = c_txb.clone();
-                        tokio::spawn(local_write_loop(writer, c_rx, c_online2, c_txb2));
-
-                        let c_online3 = c_online.clone();
-                        let c_rxb2 = c_rxb.clone();
-                        let transport_tx2 = transport_tx.clone();
-                        let dereg_tx = transport_tx.clone();
-                        let cname = client_name.clone();
-                        let read_handle = tokio::spawn(async move {
-                            local_read_loop(reader, client_id, transport_tx2, c_online3, c_rxb2)
-                                .await;
-                            tracing::info!(name = %cname, "local client disconnected");
-                            // Proactively notify so transport drops immediately.
-                            let _ = dereg_tx
-                                .send(TransportMessage::DeregisterInterface { id: client_id })
-                                .await;
-                        });
-
-                        let handle = InterfaceHandle {
-                            id: client_id,
-                            parent_id: Some(0),
-                            name: client_name,
-                            mode: InterfaceMode::Full,
-                            direction: InterfaceDirection {
-                                inbound: true,
-                                outbound: true,
-                                forward: false,
-                                repeat: false,
-                            },
-                            bitrate: 1_000_000_000,
-                            mtu: crate::traits::optimise_mtu(1_000_000_000).unwrap_or(LOCAL_MTU),
-                            online: c_online,
-                            rxb: Some(c_rxb),
-                            txb: Some(c_txb),
-                            tx: c_tx,
-                            read_task: read_handle,
-                        };
+                        let handle = wire_local_stream(
+                            client_id,
+                            client_name,
+                            Some(0),
+                            reader,
+                            writer,
+                            transport_tx.clone(),
+                            true,
+                        );
                         if handle_tx.send(handle).await.is_err() {
                             tracing::warn!("local handle registry closed");
                             break;
@@ -296,28 +350,7 @@ mod platform {
             online2.store(false, Ordering::SeqCst);
         });
 
-        let server_rxb = Arc::new(AtomicU64::new(0));
-        let server_txb = Arc::new(AtomicU64::new(0));
-
-        Ok(InterfaceHandle {
-            id: 0,
-            parent_id: None,
-            name,
-            mode: InterfaceMode::Full,
-            direction: InterfaceDirection {
-                inbound: true,
-                outbound: false,
-                forward: false,
-                repeat: false,
-            },
-            bitrate: 1_000_000_000,
-            mtu: crate::traits::optimise_mtu(1_000_000_000).unwrap_or(LOCAL_MTU),
-            online,
-            rxb: Some(server_rxb),
-            txb: Some(server_txb),
-            tx,
-            read_task,
-        })
+        Ok(server_listener_handle(name, online, tx, read_task))
     }
 
     pub async fn spawn_local_client_impl(
@@ -328,42 +361,16 @@ mod platform {
         let stream = connect_unix_stream(&config.socket_path).await?;
         tracing::info!(name = %config.name, path = %display_socket_path(&config.socket_path), "local client connected");
 
-        let online = Arc::new(AtomicBool::new(true));
-        let shared_rxb = Arc::new(AtomicU64::new(0));
-        let shared_txb = Arc::new(AtomicU64::new(0));
-        let (tx, rx) = mpsc::channel::<Bytes>(256);
         let (reader, writer) = stream.into_split();
-
-        let online_w = online.clone();
-        let task_txb = shared_txb.clone();
-        tokio::spawn(local_write_loop(writer, rx, online_w, task_txb));
-
-        let online_r = online.clone();
-        let task_rxb = shared_rxb.clone();
-        let name = config.name.clone();
-        let read_task = tokio::spawn(async move {
-            local_read_loop(reader, id, transport_tx, online_r, task_rxb).await;
-        });
-
-        Ok(InterfaceHandle {
+        Ok(wire_local_stream(
             id,
-            parent_id: None,
-            name,
-            mode: InterfaceMode::Full,
-            direction: InterfaceDirection {
-                inbound: true,
-                outbound: true,
-                forward: false,
-                repeat: false,
-            },
-            bitrate: 1_000_000_000,
-            mtu: crate::traits::optimise_mtu(1_000_000_000).unwrap_or(LOCAL_MTU),
-            online,
-            rxb: Some(shared_rxb),
-            txb: Some(shared_txb),
-            tx,
-            read_task,
-        })
+            config.name.clone(),
+            None,
+            reader,
+            writer,
+            transport_tx,
+            false,
+        ))
     }
 }
 
@@ -407,50 +414,16 @@ mod platform {
                         let client_name = format!("{}/client_{}", config.name, client_id);
                         tracing::info!(name = %client_name, peer = %peer, "local client connected (TCP)");
 
-                        let c_online = Arc::new(AtomicBool::new(true));
-                        let c_rxb = Arc::new(AtomicU64::new(0));
-                        let c_txb = Arc::new(AtomicU64::new(0));
-                        let (c_tx, c_rx) = mpsc::channel::<Bytes>(256);
                         let (reader, writer) = stream.into_split();
-
-                        let c_online2 = c_online.clone();
-                        let c_txb2 = c_txb.clone();
-                        tokio::spawn(local_write_loop(writer, c_rx, c_online2, c_txb2));
-
-                        let c_online3 = c_online.clone();
-                        let c_rxb2 = c_rxb.clone();
-                        let transport_tx2 = transport_tx.clone();
-                        let dereg_tx = transport_tx.clone();
-                        let cname = client_name.clone();
-                        let read_handle = tokio::spawn(async move {
-                            local_read_loop(reader, client_id, transport_tx2, c_online3, c_rxb2)
-                                .await;
-                            tracing::info!(name = %cname, "local client disconnected");
-                            // See unix variant — notify proactively to avoid zombies.
-                            let _ = dereg_tx
-                                .send(TransportMessage::DeregisterInterface { id: client_id })
-                                .await;
-                        });
-
-                        let handle = InterfaceHandle {
-                            id: client_id,
-                            parent_id: Some(0),
-                            name: client_name,
-                            mode: InterfaceMode::Full,
-                            direction: InterfaceDirection {
-                                inbound: true,
-                                outbound: true,
-                                forward: false,
-                                repeat: false,
-                            },
-                            bitrate: 1_000_000_000,
-                            mtu: crate::traits::optimise_mtu(1_000_000_000).unwrap_or(LOCAL_MTU),
-                            online: c_online,
-                            rxb: Some(c_rxb),
-                            txb: Some(c_txb),
-                            tx: c_tx,
-                            read_task: read_handle,
-                        };
+                        let handle = wire_local_stream(
+                            client_id,
+                            client_name,
+                            Some(0),
+                            reader,
+                            writer,
+                            transport_tx.clone(),
+                            true,
+                        );
                         if handle_tx.send(handle).await.is_err() {
                             tracing::warn!("local handle registry closed");
                             break;
@@ -465,28 +438,7 @@ mod platform {
             online2.store(false, Ordering::SeqCst);
         });
 
-        let server_rxb = Arc::new(AtomicU64::new(0));
-        let server_txb = Arc::new(AtomicU64::new(0));
-
-        Ok(InterfaceHandle {
-            id: 0,
-            parent_id: None,
-            name,
-            mode: InterfaceMode::Full,
-            direction: InterfaceDirection {
-                inbound: true,
-                outbound: false,
-                forward: false,
-                repeat: false,
-            },
-            bitrate: 1_000_000_000,
-            mtu: crate::traits::optimise_mtu(1_000_000_000).unwrap_or(LOCAL_MTU),
-            online,
-            rxb: Some(server_rxb),
-            txb: Some(server_txb),
-            tx,
-            read_task,
-        })
+        Ok(server_listener_handle(name, online, tx, read_task))
     }
 
     pub async fn spawn_local_client_impl(
@@ -498,42 +450,16 @@ mod platform {
         let stream = TcpStream::connect(&addr).await?;
         tracing::info!(name = %config.name, addr = %addr, "local client connected (TCP fallback)");
 
-        let online = Arc::new(AtomicBool::new(true));
-        let shared_rxb = Arc::new(AtomicU64::new(0));
-        let shared_txb = Arc::new(AtomicU64::new(0));
-        let (tx, rx) = mpsc::channel::<Bytes>(256);
         let (reader, writer) = stream.into_split();
-
-        let online_w = online.clone();
-        let task_txb = shared_txb.clone();
-        tokio::spawn(local_write_loop(writer, rx, online_w, task_txb));
-
-        let online_r = online.clone();
-        let task_rxb = shared_rxb.clone();
-        let name = config.name.clone();
-        let read_task = tokio::spawn(async move {
-            local_read_loop(reader, id, transport_tx, online_r, task_rxb).await;
-        });
-
-        Ok(InterfaceHandle {
+        Ok(wire_local_stream(
             id,
-            parent_id: None,
-            name,
-            mode: InterfaceMode::Full,
-            direction: InterfaceDirection {
-                inbound: true,
-                outbound: true,
-                forward: false,
-                repeat: false,
-            },
-            bitrate: 1_000_000_000,
-            mtu: crate::traits::optimise_mtu(1_000_000_000).unwrap_or(LOCAL_MTU),
-            online,
-            rxb: Some(shared_rxb),
-            txb: Some(shared_txb),
-            tx,
-            read_task,
-        })
+            config.name.clone(),
+            None,
+            reader,
+            writer,
+            transport_tx,
+            false,
+        ))
     }
 }
 
