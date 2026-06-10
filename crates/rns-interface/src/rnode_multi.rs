@@ -271,13 +271,38 @@ struct SubInterfaceSignal {
     last_snr: Option<f32>,
 }
 
+/// Device-level + per-sub online state shared by the writer and reader tasks.
+#[derive(Clone)]
+struct OnlineFlags {
+    device: Arc<AtomicBool>,
+    subs: Arc<Vec<Arc<AtomicBool>>>,
+}
+
+impl OnlineFlags {
+    /// Device failure takes every sub-interface down with it.
+    fn trip_device(&self) {
+        self.device.store(false, Ordering::SeqCst);
+        for sub in self.subs.iter() {
+            sub.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// True while the device is up and at least one sub remains registered —
+    /// once false the shared reader exits and releases the serial port.
+    fn device_running(&self) -> bool {
+        self.device.load(Ordering::SeqCst) && self.subs.iter().any(|sub| sub.load(Ordering::SeqCst))
+    }
+}
+
 const RNODE_READ_TIMEOUT_MS: u64 = 100;
 
 /// Spawn one RNodeMulti over a single serial port.
 ///
 /// Returns one `InterfaceHandle` per configured sub-interface. Each handle has
-/// its own tx channel and `InterfaceId`; all of them share one serial
-/// connection and one online flag, so the whole device goes up or down atomically.
+/// its own tx channel, `InterfaceId`, and online flag; all of them share one
+/// serial connection. Tearing down one sub leaves the others running; the
+/// shared reader exits (releasing the port) when the device fails or every
+/// sub has been deregistered.
 ///
 /// `ids.len()` must equal `config.subinterfaces.len()`.
 pub async fn spawn_rnode_multi_interface(
@@ -357,6 +382,19 @@ pub async fn spawn_rnode_multi_interface(
 
     let num_subs = config.subinterfaces.len();
 
+    // Per-sub online flags: deregistering one sub must not kill the shared
+    // device, but the reader must release the serial port once ALL subs are
+    // gone; device-level failure trips every sub flag.
+    let sub_onlines: Arc<Vec<Arc<AtomicBool>>> = Arc::new(
+        (0..num_subs)
+            .map(|_| Arc::new(AtomicBool::new(true)))
+            .collect(),
+    );
+    let flags = OnlineFlags {
+        device: online.clone(),
+        subs: sub_onlines.clone(),
+    };
+
     // All sub-interface handles funnel into one writer so CMD_SEL_INT framing
     // stays ordered relative to each data frame.
     let (write_tx, mut write_rx) = mpsc::channel::<WriteRequest>(256);
@@ -416,11 +454,12 @@ pub async fn spawn_rnode_multi_interface(
         );
 
         // The real read loop is shared by all sub-interfaces; each handle just
-        // needs a JoinHandle that exits when the device goes offline.
-        let online_sub = online.clone();
+        // needs a JoinHandle that exits when its sub or the device goes offline.
+        let online_sub = sub_onlines[i].clone();
+        let device_sub = online.clone();
         let sub_read_task = tokio::spawn(async move {
             loop {
-                if !online_sub.load(Ordering::SeqCst) {
+                if !online_sub.load(Ordering::SeqCst) || !device_sub.load(Ordering::SeqCst) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -440,7 +479,7 @@ pub async fn spawn_rnode_multi_interface(
             },
             bitrate,
             mtu: rns_wire::constants::MTU as u32,
-            online: online.clone(),
+            online: sub_onlines[i].clone(),
             rxb: Some(rxb),
             txb: Some(txb),
             tx: sub_tx,
@@ -455,6 +494,7 @@ pub async fn spawn_rnode_multi_interface(
         .try_clone()
         .map_err(|e| InterfaceError::SendFailed(format!("RNodeMulti clone: {}", e)))?;
     let online_w = online.clone();
+    let flags_w = flags.clone();
     let ready = Arc::new(AtomicBool::new(true));
     let ready_w = ready.clone();
 
@@ -501,7 +541,6 @@ pub async fn spawn_rnode_multi_interface(
                             frames
                                 .extend_from_slice(&build_subinterface_data_frame(vport, callsign));
                         }
-                        let online_ref = online_w.clone();
                         let result = tokio::task::spawn_blocking(move || {
                             use std::io::Write;
                             port_w.write_all(&frames)?;
@@ -515,7 +554,7 @@ pub async fn spawn_rnode_multi_interface(
                                 continue;
                             }
                             _ => {
-                                online_ref.store(false, Ordering::SeqCst);
+                                flags_w.trip_device();
                                 break;
                             }
                         }
@@ -551,7 +590,6 @@ pub async fn spawn_rnode_multi_interface(
             }
 
             let frame = build_subinterface_data_frame(req.index, &req.data);
-            let online_ref = online_w.clone();
             let result = tokio::task::spawn_blocking(move || {
                 use std::io::Write;
                 port_w.write_all(&frame)?;
@@ -565,18 +603,19 @@ pub async fn spawn_rnode_multi_interface(
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(error = %e, "RNodeMulti write error");
-                    online_ref.store(false, Ordering::SeqCst);
+                    flags_w.trip_device();
                     break;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "RNodeMulti write task panicked");
+                    flags_w.trip_device();
                     break;
                 }
             }
         }
     });
 
-    let online_r = online.clone();
+    let flags_r = flags;
     let ready_r = ready;
     let parent_name = config.name.clone();
 
@@ -607,7 +646,7 @@ pub async fn spawn_rnode_multi_interface(
         let mut interfaces_buf: Vec<u8> = Vec::new();
 
         loop {
-            if !online_r.load(Ordering::SeqCst) {
+            if !flags_r.device_running() {
                 break;
             }
 
@@ -652,7 +691,7 @@ pub async fn spawn_rnode_multi_interface(
                                         parent = %parent_name,
                                         "transport channel closed"
                                     );
-                                    online_r.store(false, Ordering::SeqCst);
+                                    flags_r.trip_device();
                                     return;
                                 }
                             } else {
@@ -913,7 +952,7 @@ pub async fn spawn_rnode_multi_interface(
                                         parent = %parent_name,
                                         "RNodeMulti device reset detected"
                                     );
-                                    online_r.store(false, Ordering::SeqCst);
+                                    flags_r.trip_device();
                                     return;
                                 }
                             }
@@ -934,7 +973,7 @@ pub async fn spawn_rnode_multi_interface(
                         error = %e,
                         "RNodeMulti read error"
                     );
-                    online_r.store(false, Ordering::SeqCst);
+                    flags_r.trip_device();
                     return;
                 }
                 Err(e) => {
@@ -943,7 +982,7 @@ pub async fn spawn_rnode_multi_interface(
                         error = %e,
                         "RNodeMulti read task panicked"
                     );
-                    online_r.store(false, Ordering::SeqCst);
+                    flags_r.trip_device();
                     return;
                 }
             }
@@ -971,6 +1010,40 @@ mod tests {
         assert_eq!(cfg.subinterfaces.len(), 2);
         assert!(cfg.subinterfaces.iter().all(|sub| sub.outgoing));
         assert!(cfg.subinterfaces.iter().all(|sub| !sub.flow_control));
+    }
+
+    /// T1-3: the shared serial reader runs while the device is up and at
+    /// least one sub-interface remains registered. Deregistering one sub
+    /// must NOT stop the device; deregistering all must (port release);
+    /// device failure trips every sub flag.
+    #[test]
+    fn test_online_flags_reader_exit_semantics() {
+        let flags = OnlineFlags {
+            device: Arc::new(AtomicBool::new(true)),
+            subs: Arc::new(vec![
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+            ]),
+        };
+        assert!(flags.device_running());
+
+        // One sub deregistered (actor flips its flag): device keeps serving.
+        flags.subs[0].store(false, Ordering::SeqCst);
+        assert!(flags.device_running());
+
+        // Last sub deregistered: reader must exit and release the port.
+        flags.subs[1].store(false, Ordering::SeqCst);
+        assert!(!flags.device_running());
+
+        // Device failure path: every sub flag goes down with the device.
+        let flags2 = OnlineFlags {
+            device: Arc::new(AtomicBool::new(true)),
+            subs: Arc::new(vec![Arc::new(AtomicBool::new(true))]),
+        };
+        flags2.trip_device();
+        assert!(!flags2.device.load(Ordering::SeqCst));
+        assert!(!flags2.subs[0].load(Ordering::SeqCst));
+        assert!(!flags2.device_running());
     }
 
     /// The multi reader decodes STAT_RSSI/STAT_SNR via the shared rnode

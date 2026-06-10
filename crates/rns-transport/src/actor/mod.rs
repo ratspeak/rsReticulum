@@ -867,6 +867,12 @@ impl TransportActor {
     /// to it. Shared by `DeregisterInterface` and the `Closed`-tx auto-drop.
     fn deregister_interface(&mut self, id: InterfaceId) {
         let role = self.interfaces.get(&id).map(|entry| entry.role);
+        // Flip the driver-shared online flag before dropping the entry:
+        // driver tasks gated on it (Auto beacons/discovery, BLE loops) hold
+        // their own Arc clones and would otherwise spin forever.
+        if let Some(online) = self.interfaces.get(&id).and_then(|e| e.online.as_ref()) {
+            online.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         self.void_tunnel_interface(id);
         let dropped = self.path_table.drop_all_via(id);
         if dropped > 0 {
@@ -1592,6 +1598,26 @@ mod tests {
         actor.interfaces.insert(1, entry);
         actor.handle_message(TransportMessage::DeregisterInterface { id: 1 });
         assert!(!actor.interfaces.contains_key(&1));
+    }
+
+    /// T1-3 regression: deregistering must flip the driver-shared `online`
+    /// flag so flag-gated driver tasks (Auto beacons/discovery, BLE loops,
+    /// RNodeMulti subs) exit instead of spinning on an orphaned Arc.
+    #[test]
+    fn test_deregister_interface_flips_shared_online_flag() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut entry, _rx) = make_test_interface("test_iface");
+        let online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        entry.online = Some(online.clone());
+        actor.interfaces.insert(1, entry);
+
+        actor.handle_message(TransportMessage::DeregisterInterface { id: 1 });
+
+        assert!(!actor.interfaces.contains_key(&1));
+        assert!(
+            !online.load(std::sync::atomic::Ordering::SeqCst),
+            "driver-shared online flag must be false after deregister"
+        );
     }
 
     #[test]
