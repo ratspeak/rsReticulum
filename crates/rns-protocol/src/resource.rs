@@ -2125,10 +2125,19 @@ impl InboundTransfer {
         let hashmap_max_len =
             crate::resource_adv::hashmap_max_len(rns_wire::constants::ENCRYPTED_MDU);
 
-        // Parse hashes from the hashmap data and insert into our map_hashes
+        // Parse hashes from the hashmap data and insert into our map_hashes.
+        // `segment` is wire-supplied: indices are bounded by total_parts
+        // (Python preallocates hashmap to total_parts, so out-of-range
+        // writes are impossible there) — anything beyond is hostile.
         let hashes_count = hashmap_data.len() / MAPHASH_LEN;
         for i in 0..hashes_count {
-            let idx = i + segment * hashmap_max_len;
+            let idx = match segment
+                .checked_mul(hashmap_max_len)
+                .and_then(|base| base.checked_add(i))
+            {
+                Some(idx) if idx < self.resource.total_parts => idx,
+                _ => break,
+            };
             let start = i * MAPHASH_LEN;
             let end = start + MAPHASH_LEN;
             if end <= hashmap_data.len() {
@@ -4139,6 +4148,80 @@ mod tests {
         assert!(!inbound.waiting_for_hmu);
         // Should have triggered a request_next
         assert!(matches!(action, TransferAction::SendRequest(_)));
+    }
+
+    #[test]
+    fn test_hashmap_update_rejects_out_of_range_segment() {
+        // Wire-supplied `segment` must not grow map_hashes past total_parts.
+        let data = vec![0u8; 2000];
+        let outbound = OutboundResource::new(data.clone(), false, None).unwrap();
+        let total_parts = outbound.num_parts();
+
+        let mut inbound = InboundTransfer::from_advertisement(
+            total_parts,
+            outbound.total_size,
+            data.len(),
+            outbound.random_hash,
+            outbound.resource_hash,
+            ResourceFlags {
+                compressed: false,
+                ..Default::default()
+            },
+            outbound.map_hashes[..2].to_vec(),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        // Hostile segment index: would previously push ~segment*74 zero
+        // entries into map_hashes. Must be ignored without growth or panic.
+        inbound.hashmap_update(1_000_000, &outbound.map_hashes[0]);
+        assert_eq!(inbound.resource.map_hashes.len(), 2);
+
+        // Overflowing segment*hashmap_max_len must not panic either.
+        inbound.hashmap_update(usize::MAX, &outbound.map_hashes[0]);
+        assert_eq!(inbound.resource.map_hashes.len(), 2);
+    }
+
+    #[test]
+    fn test_hashmap_update_second_segment_bounded_by_total_parts() {
+        // Resource large enough that its hashmap spans >1 segment: segment 1
+        // writes land, but never past total_parts even if overfull.
+        let hashmap_max_len =
+            crate::resource_adv::hashmap_max_len(rns_wire::constants::ENCRYPTED_MDU);
+        let data = vec![0xCD; (hashmap_max_len + 12) * SDU];
+        let outbound = OutboundResource::new(data.clone(), false, None).unwrap();
+        let total_parts = outbound.num_parts();
+        assert!(total_parts > hashmap_max_len);
+
+        let mut inbound = InboundTransfer::from_advertisement(
+            total_parts,
+            outbound.total_size,
+            data.len(),
+            outbound.random_hash,
+            outbound.resource_hash,
+            ResourceFlags {
+                compressed: false,
+                ..Default::default()
+            },
+            outbound.map_hashes[..hashmap_max_len].to_vec(),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        // Segment 1 carrying a deliberately overfull hash list: valid tail
+        // entries land, writes stop exactly at total_parts.
+        let mut overfull = Vec::new();
+        for i in hashmap_max_len..total_parts {
+            overfull.extend_from_slice(&outbound.map_hashes[i]);
+        }
+        overfull.extend_from_slice(&[0xEE; MAPHASH_LEN * 8]);
+        inbound.hashmap_update(1, &overfull);
+
+        assert_eq!(inbound.resource.map_hashes.len(), total_parts);
+        assert_eq!(
+            inbound.resource.map_hashes[total_parts - 1],
+            outbound.map_hashes[total_parts - 1]
+        );
     }
 
     #[test]
