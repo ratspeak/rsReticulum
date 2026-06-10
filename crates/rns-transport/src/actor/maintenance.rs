@@ -135,17 +135,20 @@ impl TransportActor {
             // ones (Delivered/Failed/Culled) were already signalled out.
             self.receipt_table
                 .retain(|_, r| r.status == ReceiptStatus::Sent);
-            while self.receipt_table.len() > MAX_RECEIPTS {
-                if let Some(oldest_key) = self
+            let excess = self.receipt_table.len().saturating_sub(MAX_RECEIPTS);
+            if excess > 0 {
+                // Cull the oldest in one sorted pass — a min-scan per
+                // eviction is O(n·k) on burst overflow.
+                let mut by_age: Vec<([u8; 16], std::time::Instant)> = self
                     .receipt_table
                     .iter()
-                    .min_by_key(|(_, r)| r.sent_at)
-                    .map(|(k, _)| *k)
-                {
-                    if let Some(r) = self.receipt_table.get_mut(&oldest_key) {
-                        r.cull();
+                    .map(|(k, r)| (*k, r.sent_at))
+                    .collect();
+                by_age.sort_unstable_by_key(|(_, sent_at)| *sent_at);
+                for (key, _) in by_age.into_iter().take(excess) {
+                    if let Some(mut receipt) = self.receipt_table.remove(&key) {
+                        receipt.cull();
                     }
-                    self.receipt_table.remove(&oldest_key);
                 }
             }
             self.last_receipts_check = now;

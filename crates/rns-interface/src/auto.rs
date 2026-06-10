@@ -1225,20 +1225,21 @@ pub async fn spawn_auto_interface(
                                 .map(|(name, _, _)| name.clone())
                         };
                         let is_self = self_iface.is_some();
-                        let received_hash = hex32(&buf[..32]);
                         let expected = make_beacon(&auth_group_id, &peer_ip);
-                        let expected_hex = hex32(&expected);
                         let match_ok = expected[..] == buf[..32];
-                        tracing::debug!(
-                            src = %src_v6,
-                            scope_id = src_v6.scope_id(),
-                            n,
-                            is_self,
-                            recv_hash = %received_hash,
-                            expected_hash = %expected_hex,
-                            match_ok,
-                            "auto-instr mcast RX"
-                        );
+                        // Hash hex strings only materialize when debug is on.
+                        if tracing::enabled!(tracing::Level::DEBUG) {
+                            tracing::debug!(
+                                src = %src_v6,
+                                scope_id = src_v6.scope_id(),
+                                n,
+                                is_self,
+                                recv_hash = %hex32(&buf[..32]),
+                                expected_hash = %hex32(&expected),
+                                match_ok,
+                                "auto-instr mcast RX"
+                            );
+                        }
                         if let Some(ifname) = self_iface {
                             // Self-echo: carrier confirmed; record for jobs task.
                             let mut echoes = disc_echoes.lock().await;
@@ -1400,39 +1401,52 @@ pub async fn spawn_auto_interface(
                 }
                 let snapshot = { rev_link_locals.lock().await.clone() };
                 let now = Instant::now();
-                let mut table = rev_peers.lock().await;
-                for (_key, peer) in table.iter_mut() {
-                    if now.duration_since(peer.last_reverse).as_secs_f64()
-                        >= REVERSE_PEERING_INTERVAL
-                    {
-                        let mut targets: Vec<_> = snapshot
-                            .iter()
-                            .filter(|(_, _, scope_id)| {
-                                peer.scope_id == 0 || *scope_id == peer.scope_id
-                            })
-                            .collect();
-                        if targets.is_empty() {
-                            targets = snapshot.iter().collect();
+                // Snapshot due peers under a short lock; sends happen lock-free
+                // so discovery/data tasks aren't stalled by the fan-out.
+                let due: Vec<(PeerKey, Peer)> = {
+                    let table = rev_peers.lock().await;
+                    table
+                        .iter()
+                        .filter(|(_, peer)| {
+                            now.duration_since(peer.last_reverse).as_secs_f64()
+                                >= REVERSE_PEERING_INTERVAL
+                        })
+                        .map(|(key, peer)| (*key, peer.clone()))
+                        .collect()
+                };
+                for (_, peer) in &due {
+                    let mut targets: Vec<_> = snapshot
+                        .iter()
+                        .filter(|(_, _, scope_id)| peer.scope_id == 0 || *scope_id == peer.scope_id)
+                        .collect();
+                    if targets.is_empty() {
+                        targets = snapshot.iter().collect();
+                    }
+                    for (_name, ll_addr, scope_id) in targets {
+                        let beacon = make_beacon(&rev_group_id, ll_addr);
+                        let dest =
+                            SocketAddrV6::new(*peer.addr.ip(), unicast_disc_port, 0, *scope_id);
+                        if let Err(e) = unicast_sock.send_to(&beacon, dest).await {
+                            tracing::debug!(
+                                peer = %peer.ip,
+                                peer_ifname = %peer.ifname,
+                                peer_scope_id = peer.scope_id,
+                                local_iface = %_name,
+                                local_scope_id = scope_id,
+                                dst = %dest,
+                                error = %e,
+                                raw_os_error = ?e.raw_os_error(),
+                                "auto: reverse peering TX failed"
+                            );
                         }
-                        for (_name, ll_addr, scope_id) in targets {
-                            let beacon = make_beacon(&rev_group_id, ll_addr);
-                            let dest =
-                                SocketAddrV6::new(*peer.addr.ip(), unicast_disc_port, 0, *scope_id);
-                            if let Err(e) = unicast_sock.send_to(&beacon, dest).await {
-                                tracing::debug!(
-                                    peer = %peer.ip,
-                                    peer_ifname = %peer.ifname,
-                                    peer_scope_id = peer.scope_id,
-                                    local_iface = %_name,
-                                    local_scope_id = scope_id,
-                                    dst = %dest,
-                                    error = %e,
-                                    raw_os_error = ?e.raw_os_error(),
-                                    "auto: reverse peering TX failed"
-                                );
-                            }
+                    }
+                }
+                if !due.is_empty() {
+                    let mut table = rev_peers.lock().await;
+                    for (key, _) in &due {
+                        if let Some(peer) = table.get_mut(key) {
+                            peer.last_reverse = now;
                         }
-                        peer.last_reverse = now;
                     }
                 }
             }
@@ -1591,32 +1605,46 @@ pub async fn spawn_auto_interface(
     tokio::spawn(async move {
         while let Some(data) = rx.recv().await {
             let len = data.len();
-            let prefix = hex_prefix(&data, 16);
-            let table = peers_write.lock().await;
-            let peer_count = table.len();
-            if peer_count == 0 {
+            // Hex prefix only materializes when debug logging is active; the
+            // error path below recomputes it (errors are rare).
+            let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
+            let prefix = if debug_enabled {
+                hex_prefix(&data, 16)
+            } else {
+                String::new()
+            };
+            // Snapshot under a short lock so the discovery/jobs tasks are not
+            // blocked while we await per-peer sends.
+            let targets: Vec<Peer> = {
+                let table = peers_write.lock().await;
+                table.values().cloned().collect()
+            };
+            let peer_count = targets.len();
+            if peer_count == 0 && debug_enabled {
                 tracing::debug!(
                     len,
                     prefix = %prefix,
                     "auto-instr data TX skipped: no discovered peers"
                 );
             }
-            for (_key, peer) in table.iter() {
+            for peer in &targets {
                 let res = data_sock_w.send_to(&data, peer.addr).await;
                 match res {
                     Ok(n) => {
-                        tracing::debug!(
-                            peer = %peer.ip,
-                            ifname = %peer.ifname,
-                            scope_id = peer.scope_id,
-                            scope_source = ?peer.scope_source,
-                            dst = %peer.addr,
-                            len,
-                            sent_bytes = n,
-                            prefix = %prefix,
-                            peer_count,
-                            "auto-instr data TX"
-                        );
+                        if debug_enabled {
+                            tracing::debug!(
+                                peer = %peer.ip,
+                                ifname = %peer.ifname,
+                                scope_id = peer.scope_id,
+                                scope_source = ?peer.scope_source,
+                                dst = %peer.addr,
+                                len,
+                                sent_bytes = n,
+                                prefix = %prefix,
+                                peer_count,
+                                "auto-instr data TX"
+                            );
+                        }
                         task_txb.fetch_add(len as u64, Ordering::Relaxed);
                     }
                     Err(e) => {
@@ -1627,7 +1655,7 @@ pub async fn spawn_auto_interface(
                             scope_source = ?peer.scope_source,
                             dst = %peer.addr,
                             len,
-                            prefix = %prefix,
+                            prefix = %hex_prefix(&data, 16),
                             peer_count,
                             error = %e,
                             raw_os_error = ?e.raw_os_error(),

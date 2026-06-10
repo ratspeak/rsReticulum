@@ -170,7 +170,7 @@ pub(crate) async fn main() {
         }
         tracing_subscriber::fmt()
             .with_max_level(level)
-            .with_writer(LogFileWriter { path: log_path })
+            .with_writer(LogFileWriter::new(log_path))
             .with_ansi(false)
             .init();
     } else {
@@ -388,23 +388,50 @@ fn rotate_log_if_needed(path: &Path) -> std::io::Result<()> {
 
 #[derive(Clone)]
 struct LogFileWriter {
-    path: PathBuf,
+    /// One persistent file handle + in-memory size counter shared across
+    /// `make_writer` calls — tracing calls it per event, so per-event opens
+    /// and per-write stats would dominate logging cost.
+    shared: std::sync::Arc<std::sync::Mutex<RotatingLogFile>>,
+}
+
+impl LogFileWriter {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            shared: std::sync::Arc::new(std::sync::Mutex::new(RotatingLogFile {
+                path,
+                file: None,
+                size: 0,
+            })),
+        }
+    }
 }
 
 impl<'a> MakeWriter<'a> for LogFileWriter {
-    type Writer = Box<dyn Write + Send + 'a>;
+    type Writer = SharedLogWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
-            Ok(file) => Box::new(RotatingLogFile {
-                path: self.path.clone(),
-                file: Some(file),
-            }),
-            Err(_) => Box::new(std::io::stderr()),
+        SharedLogWriter(self.shared.clone())
+    }
+}
+
+/// Per-event writer handle; locks the shared rotating file for each write
+/// and falls back to stderr if the logfile cannot be opened.
+struct SharedLogWriter(std::sync::Arc<std::sync::Mutex<RotatingLogFile>>);
+
+impl Write for SharedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut inner = self.0.lock().expect("log writer mutex poisoned");
+        match inner.write(buf) {
+            Ok(n) => Ok(n),
+            Err(_) => std::io::stderr().write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut inner = self.0.lock().expect("log writer mutex poisoned");
+        match inner.flush() {
+            Ok(()) => Ok(()),
+            Err(_) => std::io::stderr().flush(),
         }
     }
 }
@@ -412,23 +439,25 @@ impl<'a> MakeWriter<'a> for LogFileWriter {
 struct RotatingLogFile {
     path: PathBuf,
     file: Option<File>,
+    /// Current logfile size, maintained in memory; stat only happens at open.
+    size: u64,
 }
 
 impl RotatingLogFile {
     fn file_mut(&mut self) -> io::Result<&mut File> {
         if self.file.is_none() {
-            self.file = Some(
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.path)?,
-            );
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?;
+            self.size = file.metadata().map(|m| m.len()).unwrap_or(0);
+            self.file = Some(file);
         }
         Ok(self.file.as_mut().expect("log file was just opened"))
     }
 
     fn rotate_if_needed(&mut self) -> io::Result<()> {
-        if self.path.metadata().map(|m| m.len()).unwrap_or(0) <= LOG_ROTATE_BYTES {
+        if self.size <= LOG_ROTATE_BYTES {
             return Ok(());
         }
 
@@ -450,6 +479,7 @@ impl RotatingLogFile {
                 .append(true)
                 .open(&self.path)?,
         );
+        self.size = 0;
         Ok(())
     }
 }
@@ -457,6 +487,7 @@ impl RotatingLogFile {
 impl Write for RotatingLogFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let written = self.file_mut()?.write(buf)?;
+        self.size += written as u64;
         self.rotate_if_needed()?;
         Ok(written)
     }
