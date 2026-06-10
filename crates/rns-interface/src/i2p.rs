@@ -352,8 +352,7 @@ pub async fn spawn_i2p_client(
     let task_txb = shared_txb.clone();
 
     let read_task = tokio::spawn(async move {
-        let mut tries: usize = 0;
-        let mut backoff = config.reconnect_delay;
+        let mut pacer = ReconnectPacer::new(config.reconnect_delay, config.max_reconnect_tries);
 
         loop {
             let session_id = generate_session_id();
@@ -366,12 +365,14 @@ pub async fn spawn_i2p_client(
                         error = %e,
                         "I2P client: failed to connect to SAM bridge"
                     );
-                    if check_max_tries(&config.max_reconnect_tries, &mut tries) {
+                    if pacer.give_up() {
                         tracing::warn!(name = %config.name, "I2P client: max reconnect tries reached");
+                        let _ = transport_tx
+                            .send(TransportMessage::DeregisterInterface { id })
+                            .await;
                         return;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    pacer.wait().await;
                     continue;
                 }
             };
@@ -385,11 +386,14 @@ pub async fn spawn_i2p_client(
                     error = %e,
                     "I2P client: SAM HELLO failed"
                 );
-                if check_max_tries(&config.max_reconnect_tries, &mut tries) {
+                if pacer.give_up() {
+                    tracing::warn!(name = %config.name, "I2P client: max reconnect tries reached");
+                    let _ = transport_tx
+                        .send(TransportMessage::DeregisterInterface { id })
+                        .await;
                     return;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                pacer.wait().await;
                 continue;
             }
 
@@ -415,11 +419,14 @@ pub async fn spawn_i2p_client(
                         error = %e,
                         "I2P client: SESSION CREATE failed"
                     );
-                    if check_max_tries(&config.max_reconnect_tries, &mut tries) {
+                    if pacer.give_up() {
+                        tracing::warn!(name = %config.name, "I2P client: max reconnect tries reached");
+                        let _ = transport_tx
+                            .send(TransportMessage::DeregisterInterface { id })
+                            .await;
                         return;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    pacer.wait().await;
                     continue;
                 }
             };
@@ -433,11 +440,14 @@ pub async fn spawn_i2p_client(
                         error = %e,
                         "I2P client: failed to open stream connection to SAM"
                     );
-                    if check_max_tries(&config.max_reconnect_tries, &mut tries) {
+                    if pacer.give_up() {
+                        tracing::warn!(name = %config.name, "I2P client: max reconnect tries reached");
+                        let _ = transport_tx
+                            .send(TransportMessage::DeregisterInterface { id })
+                            .await;
                         return;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    pacer.wait().await;
                     continue;
                 }
             };
@@ -451,11 +461,14 @@ pub async fn spawn_i2p_client(
                     error = %e,
                     "I2P client: SAM HELLO on stream socket failed"
                 );
-                if check_max_tries(&config.max_reconnect_tries, &mut tries) {
+                if pacer.give_up() {
+                    tracing::warn!(name = %config.name, "I2P client: max reconnect tries reached");
+                    let _ = transport_tx
+                        .send(TransportMessage::DeregisterInterface { id })
+                        .await;
                     return;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                pacer.wait().await;
                 continue;
             }
 
@@ -473,11 +486,14 @@ pub async fn spawn_i2p_client(
                     error = %e,
                     "I2P client: STREAM CONNECT failed"
                 );
-                if check_max_tries(&config.max_reconnect_tries, &mut tries) {
+                if pacer.give_up() {
+                    tracing::warn!(name = %config.name, "I2P client: max reconnect tries reached");
+                    let _ = transport_tx
+                        .send(TransportMessage::DeregisterInterface { id })
+                        .await;
                     return;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                pacer.wait().await;
                 continue;
             }
 
@@ -488,8 +504,7 @@ pub async fn spawn_i2p_client(
             );
 
             online_task.store(true, Ordering::SeqCst);
-            tries = 0;
-            backoff = config.reconnect_delay;
+            pacer.reset();
 
             // BufReader may have prefetched past the handshake; flush its tail first.
             let buffered = stream_buf_reader.buffer().to_vec();
@@ -534,20 +549,19 @@ pub async fn spawn_i2p_client(
             write_handle.abort();
             let _ = write_handle.await;
 
-            if let Some(max) = config.max_reconnect_tries {
-                tries += 1;
-                if tries >= max {
-                    tracing::warn!(name = %config.name, "I2P client: max reconnect tries reached");
-                    return;
-                }
+            if pacer.give_up() {
+                tracing::warn!(name = %config.name, "I2P client: max reconnect tries reached");
+                let _ = transport_tx
+                    .send(TransportMessage::DeregisterInterface { id })
+                    .await;
+                return;
             }
             tracing::info!(
                 name = %config.name,
-                delay = backoff,
+                delay = pacer.backoff,
                 "I2P client: reconnecting"
             );
-            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-            backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+            pacer.wait().await;
         }
     });
 
@@ -874,13 +888,51 @@ async fn i2p_read_loop(
     online.store(false, Ordering::SeqCst);
 }
 
-/// Increments `tries` (when bounded) and returns `true` if the cap was hit.
-fn check_max_tries(max: &Option<usize>, tries: &mut usize) -> bool {
-    if let Some(limit) = max {
-        *tries += 1;
-        *tries >= *limit
-    } else {
-        false
+/// Reconnect pacing for the SAM client loop: bounded tries + exponential
+/// backoff, reset on every successful connect.
+struct ReconnectPacer {
+    tries: usize,
+    backoff: u64,
+    initial: u64,
+    max_tries: Option<usize>,
+}
+
+impl ReconnectPacer {
+    fn new(initial: u64, max_tries: Option<usize>) -> Self {
+        Self {
+            tries: 0,
+            backoff: initial,
+            initial,
+            max_tries,
+        }
+    }
+
+    /// Count a failure; `true` means the bounded try cap was hit.
+    fn give_up(&mut self) -> bool {
+        if let Some(limit) = self.max_tries {
+            self.tries += 1;
+            self.tries >= limit
+        } else {
+            false
+        }
+    }
+
+    /// Current delay, advancing the doubling (capped) for the next failure.
+    fn next_backoff(&mut self) -> u64 {
+        let current = self.backoff;
+        self.backoff = (self.backoff * 2).min(RECONNECT_WAIT_MAX);
+        current
+    }
+
+    /// Sleep the current backoff, then double it (capped).
+    async fn wait(&mut self) {
+        let delay = self.next_backoff();
+        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+    }
+
+    fn reset(&mut self) {
+        self.tries = 0;
+        self.backoff = self.initial;
     }
 }
 
@@ -1008,24 +1060,37 @@ mod tests {
     }
 
     #[test]
-    fn test_check_max_tries_unlimited() {
-        let max = None;
-        let mut tries = 0;
-        assert!(!check_max_tries(&max, &mut tries));
-        assert_eq!(tries, 0);
+    fn test_pacer_unlimited_never_gives_up() {
+        let mut pacer = ReconnectPacer::new(15, None);
+        for _ in 0..100 {
+            assert!(!pacer.give_up());
+        }
+        assert_eq!(pacer.tries, 0);
     }
 
     #[test]
-    fn test_check_max_tries_limited() {
-        let max = Some(3);
-        let mut tries = 0;
+    fn test_pacer_bounded_gives_up_at_cap() {
+        let mut pacer = ReconnectPacer::new(15, Some(3));
+        assert!(!pacer.give_up());
+        assert!(!pacer.give_up());
+        assert!(pacer.give_up());
+        assert_eq!(pacer.tries, 3);
+    }
 
-        assert!(!check_max_tries(&max, &mut tries));
-        assert_eq!(tries, 1);
-        assert!(!check_max_tries(&max, &mut tries));
-        assert_eq!(tries, 2);
-        assert!(check_max_tries(&max, &mut tries));
-        assert_eq!(tries, 3);
+    #[test]
+    fn test_pacer_backoff_doubles_capped_and_resets() {
+        let mut pacer = ReconnectPacer::new(15, Some(10));
+        assert_eq!(pacer.next_backoff(), 15);
+        assert_eq!(pacer.backoff, 30);
+        for _ in 0..10 {
+            pacer.next_backoff();
+        }
+        assert_eq!(pacer.backoff, RECONNECT_WAIT_MAX);
+
+        let _ = pacer.give_up();
+        pacer.reset();
+        assert_eq!(pacer.tries, 0);
+        assert_eq!(pacer.backoff, 15);
     }
 
     #[test]
