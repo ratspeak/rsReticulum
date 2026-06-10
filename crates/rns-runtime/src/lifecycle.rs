@@ -75,21 +75,48 @@ impl Default for ExitHandler {
     }
 }
 
-/// Install Ctrl-C / SIGTERM handlers that trip `shutdown`. Returned receiver
+/// Install a Ctrl-C (SIGINT) handler that trips `shutdown`. Returned receiver
 /// yields once on signal for await-based callers.
+///
+/// On unix the OS-level registration happens synchronously in this call — a
+/// handler registered inside a spawned task only takes effect once that task
+/// is first polled, leaving a window where SIGINT kills the process via the
+/// default disposition.
 pub fn install_signal_handlers(shutdown: ShutdownSignal) -> mpsc::Receiver<()> {
     let (tx, rx) = mpsc::channel(1);
-
     let shutdown_clone = shutdown.clone();
-    tokio::spawn(async move {
-        let ctrl_c = tokio::signal::ctrl_c();
-        ctrl_c.await.ok();
-        tracing::info!("received shutdown signal");
-        shutdown_clone.trigger();
-        let _ = tx.send(()).await;
-    });
+
+    #[cfg(unix)]
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+        Ok(mut sigint) => {
+            tokio::spawn(async move {
+                sigint.recv().await;
+                signal_shutdown(shutdown_clone, tx).await;
+            });
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "SIGINT registration failed; falling back to ctrl_c");
+            spawn_ctrl_c_handler(shutdown_clone, tx);
+        }
+    }
+
+    #[cfg(not(unix))]
+    spawn_ctrl_c_handler(shutdown_clone, tx);
 
     rx
+}
+
+fn spawn_ctrl_c_handler(shutdown: ShutdownSignal, tx: mpsc::Sender<()>) {
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        signal_shutdown(shutdown, tx).await;
+    });
+}
+
+async fn signal_shutdown(shutdown: ShutdownSignal, tx: mpsc::Sender<()>) {
+    tracing::info!("received shutdown signal");
+    shutdown.trigger();
+    let _ = tx.send(()).await;
 }
 
 #[cfg(test)]
