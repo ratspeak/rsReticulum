@@ -22,7 +22,10 @@ impl TransportActor {
             && self.state_dirty
             && now - self.last_state_save >= STATE_SAVE_INTERVAL_SECS
         {
-            self.save_routing_state();
+            // Async: the fsync chain (F_FULLFSYNC per file on macOS) stalls
+            // the actor for seconds if run inline, starving control queries
+            // and inbound routing.
+            self.save_routing_state_async();
         }
 
         if now - self.last_tables_cull >= TABLES_CULL_INTERVAL {

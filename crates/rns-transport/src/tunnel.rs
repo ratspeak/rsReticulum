@@ -23,6 +23,7 @@ pub struct TunnelPath {
     pub packet_hash: Option<[u8; 32]>,
 }
 
+#[derive(Clone)]
 pub struct TunnelTable {
     entries: HashMap<[u8; 32], TunnelEntry>,
 }

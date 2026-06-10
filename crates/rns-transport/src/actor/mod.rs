@@ -117,6 +117,10 @@ pub struct TransportActor {
     /// Set when persisted-state mutates; cleared after each `save_state`.
     /// Gates the periodic tick so idle devices don't spin disk uselessly.
     pub state_dirty: bool,
+    /// Guards the blocking-pool routing-state writer; concurrent writers
+    /// would race on the shared `<file>.tmp` paths.
+    pub routing_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub hashlist_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     /// Persisted path entries waiting on their interface to re-register.
     /// Drained by `drain_pending_for_interface` on `RegisterInterface`.
@@ -243,6 +247,8 @@ impl TransportActor {
             storage_dir: None,
             last_state_save: 0.0,
             state_dirty: false,
+            routing_save_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hashlist_save_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_path_entries: Vec::new(),
             pending_tunnel_entries: Vec::new(),
             recent_announces: HashMap::new(),
@@ -292,8 +298,9 @@ impl TransportActor {
                             self.on_resume();
                         } else {
                             // Background: flush state so an OS kill (force-quit,
-                            // OOM) cannot lose this session's learnings.
-                            self.save_state();
+                            // OOM) cannot lose this session's learnings. Async —
+                            // on desktop this edge fires on every focus loss.
+                            self.save_state_async();
                         }
                         #[cfg(feature = "mobile-throttle")]
                         {

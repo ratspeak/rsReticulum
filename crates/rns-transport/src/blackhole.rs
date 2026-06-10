@@ -63,6 +63,7 @@ impl BlackholeEntry {
     }
 }
 
+#[derive(Clone)]
 pub struct BlackholeTable {
     entries: HashMap<IdentityHash, BlackholeEntry>,
 }

@@ -139,6 +139,8 @@ impl ReticulumHandle {
 
     /// Query this process' transport actor directly.
     pub async fn query_transport(&self, query: TransportQuery) -> Option<TransportQueryResponse> {
+        let variant = format!("{query:?}");
+        let started = std::time::Instant::now();
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
             .transport_tx
@@ -149,12 +151,25 @@ impl ReticulumHandle {
             .await
             .is_err()
         {
+            tracing::warn!(query = %variant, "transport query channel closed");
             return None;
         }
-        tokio::time::timeout(Duration::from_secs(5), rx)
+        let send_elapsed = started.elapsed();
+        let result = tokio::time::timeout(Duration::from_secs(5), rx)
             .await
             .ok()
-            .and_then(|r| r.ok())
+            .and_then(|r| r.ok());
+        let total = started.elapsed();
+        if result.is_none() || total > Duration::from_millis(1000) {
+            tracing::warn!(
+                query = %variant,
+                send_ms = send_elapsed.as_millis() as u64,
+                total_ms = total.as_millis() as u64,
+                timed_out = result.is_none(),
+                "transport query slow or failed"
+            );
+        }
+        result
     }
 
     /// Query the authoritative control plane.

@@ -82,15 +82,199 @@ fn load_indexed_python_cached_announce(
     crate::persistence::load_python_cached_announce(announce_cache_dir, packet_hash)
 }
 
+/// Owned copy of everything `write_routing_snapshot` persists, so the disk
+/// I/O (fsync-heavy on macOS: F_FULLFSYNC per file + dir) can run on the
+/// blocking pool without borrowing the actor.
+pub(super) struct RoutingSnapshot {
+    pub path_table: crate::path_table::PathTable,
+    pub tunnel_table: crate::tunnel::TunnelTable,
+    pub blackhole_table: crate::blackhole::BlackholeTable,
+    pub recent_announces: Vec<RecentAnnounce>,
+    pub interface_names: std::collections::HashMap<u64, String>,
+    pub transport_identity_hash: Option<[u8; 16]>,
+}
+
+/// Persist a routing snapshot. Runs on the blocking pool for periodic saves
+/// and inline for shutdown; must not touch the actor.
+pub(super) fn write_routing_snapshot(dir: &std::path::Path, snapshot: &RoutingSnapshot) {
+    let interface_names = &snapshot.interface_names;
+
+    let path_table_path = dir.join("path_table.msgpack");
+    if let Err(e) =
+        crate::persistence::save_path_table(&snapshot.path_table, interface_names, &path_table_path)
+    {
+        trace!("failed to save path table: {}", e);
+    } else {
+        debug!("saved path table ({} entries)", snapshot.path_table.len());
+    }
+
+    let destination_table_path = dir.join("destination_table");
+    if let Err(e) = crate::persistence::save_python_destination_table(
+        &snapshot.path_table,
+        interface_names,
+        &destination_table_path,
+    ) {
+        trace!("failed to save Python destination_table: {}", e);
+    }
+
+    let blackhole_path = dir.join("blackhole_table.msgpack");
+    if let Err(e) =
+        crate::persistence::save_blackhole_table(&snapshot.blackhole_table, &blackhole_path)
+    {
+        trace!("failed to save blackhole table: {}", e);
+    } else {
+        debug!(
+            "saved blackhole table ({} entries)",
+            snapshot.blackhole_table.len()
+        );
+    }
+
+    if let Some(local_identity_hash) = snapshot.transport_identity_hash {
+        let blackhole_dir = dir.join("blackhole");
+        if let Err(e) = crate::persistence::save_python_blackhole_files(
+            &snapshot.blackhole_table,
+            local_identity_hash,
+            &blackhole_dir,
+        ) {
+            trace!("failed to save Python blackhole files: {}", e);
+        }
+    }
+
+    let announce_path = dir.join("announce_cache.msgpack");
+    if let Err(e) =
+        crate::persistence::save_announce_cache(snapshot.recent_announces.iter(), &announce_path)
+    {
+        trace!("failed to save announce cache: {}", e);
+    } else {
+        debug!(
+            "saved announce cache ({} entries)",
+            snapshot.recent_announces.len()
+        );
+    }
+
+    let announce_cache_dir = dir.join("cache").join("announces");
+    if let Err(e) = crate::persistence::save_python_announce_cache_for_paths_and_tunnels(
+        &snapshot.path_table,
+        Some(&snapshot.tunnel_table),
+        snapshot.recent_announces.iter(),
+        interface_names,
+        &announce_cache_dir,
+    ) {
+        trace!("failed to save Python announce cache files: {}", e);
+    }
+
+    let tunnel_path = dir.join("tunnel_table.msgpack");
+    if let Err(e) =
+        crate::persistence::save_tunnel_table(&snapshot.tunnel_table, interface_names, &tunnel_path)
+    {
+        trace!("failed to save tunnel table: {}", e);
+    } else {
+        debug!(
+            "saved tunnel table ({} entries)",
+            snapshot.tunnel_table.len()
+        );
+    }
+
+    let python_tunnels_path = dir.join("tunnels");
+    if let Err(e) = crate::persistence::save_python_tunnel_table(
+        &snapshot.tunnel_table,
+        interface_names,
+        &python_tunnels_path,
+    ) {
+        trace!("failed to save Python tunnels table: {}", e);
+    }
+
+    debug!(
+        paths = snapshot.path_table.len(),
+        announces = snapshot.recent_announces.len(),
+        tunnels = snapshot.tunnel_table.len(),
+        blackhole = snapshot.blackhole_table.len(),
+        "flushed routing state"
+    );
+}
+
 impl TransportActor {
+    fn routing_snapshot(&self) -> RoutingSnapshot {
+        RoutingSnapshot {
+            path_table: self.path_table.clone(),
+            tunnel_table: self.tunnel_table.clone(),
+            blackhole_table: self.blackhole_table.clone(),
+            recent_announces: self.recent_announces.values().cloned().collect(),
+            interface_names: self
+                .interfaces
+                .iter()
+                .map(|(&id, entry)| (id, entry.name.clone()))
+                .collect(),
+            transport_identity_hash: self.transport_identity_hash,
+        }
+    }
+
+    /// Periodic flush used by `on_tick`: snapshot on the actor (cheap clones)
+    /// and push the fsync-heavy writes to the blocking pool. A save already
+    /// in flight keeps `state_dirty` set so the next tick retries — two
+    /// writers would race on the shared `<file>.tmp` names.
+    pub(super) fn save_routing_state_async(&mut self) {
+        if self.shared_instance_client_mode {
+            trace!("skipping routing-state save in shared-instance client mode");
+            self.state_dirty = false;
+            self.last_state_save = now();
+            return;
+        }
+        let Some(dir) = self.storage_dir.clone() else {
+            self.state_dirty = false;
+            self.last_state_save = now();
+            return;
+        };
+        if self
+            .routing_save_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            trace!("routing-state save already in flight; retry next interval");
+            return;
+        }
+        self.routing_save_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+        let snapshot = self.routing_snapshot();
+        let in_flight = self.routing_save_in_flight.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || {
+                    write_routing_snapshot(&dir, &snapshot);
+                    in_flight.store(false, std::sync::atomic::Ordering::Release);
+                });
+            }
+            Err(_) => {
+                // No runtime (tests, exotic embedders): write inline.
+                write_routing_snapshot(&dir, &snapshot);
+                in_flight.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        self.state_dirty = false;
+        self.last_state_save = now();
+    }
+
+    /// Wait (bounded) for an in-flight async save so a synchronous save
+    /// can't race it on the shared `<file>.tmp` paths.
+    pub(super) fn wait_for_routing_save(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while self
+            .routing_save_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!("in-flight routing-state save did not finish before sync save");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     /// Flush the small/critical routing-state files: path_table,
     /// announce_cache, blackhole_table, tunnel_table. Hashlist is excluded —
     /// it can be multiple MB and is rebuildable from in-flight traffic, so
     /// we save it only on shutdown / falling-edge via `save_state`.
-    /// Called from the periodic `on_tick` save (every
-    /// `STATE_SAVE_INTERVAL_SECS`, gated on `state_dirty`). Clears
-    /// `state_dirty` and bumps `last_state_save` so the periodic trigger
-    /// doesn't double-fire.
+    /// Synchronous: used by shutdown / falling-edge / RPC-forced saves where
+    /// completion must be guaranteed before proceeding.
     pub(super) fn save_routing_state(&mut self) {
         if self.shared_instance_client_mode {
             trace!("skipping routing-state save in shared-instance client mode");
@@ -99,117 +283,18 @@ impl TransportActor {
             return;
         }
 
-        if let Some(ref dir) = self.storage_dir {
-            let interface_names: std::collections::HashMap<u64, String> = self
-                .interfaces
-                .iter()
-                .map(|(&id, entry)| (id, entry.name.clone()))
-                .collect();
-
-            let path_table_path = dir.join("path_table.msgpack");
-            if let Err(e) = crate::persistence::save_path_table(
-                &self.path_table,
-                &interface_names,
-                &path_table_path,
-            ) {
-                trace!("failed to save path table: {}", e);
-            } else {
-                debug!("saved path table ({} entries)", self.path_table.len());
-            }
-
-            let destination_table_path = dir.join("destination_table");
-            if let Err(e) = crate::persistence::save_python_destination_table(
-                &self.path_table,
-                &interface_names,
-                &destination_table_path,
-            ) {
-                trace!("failed to save Python destination_table: {}", e);
-            }
-
-            let blackhole_path = dir.join("blackhole_table.msgpack");
-            if let Err(e) =
-                crate::persistence::save_blackhole_table(&self.blackhole_table, &blackhole_path)
-            {
-                trace!("failed to save blackhole table: {}", e);
-            } else {
-                debug!(
-                    "saved blackhole table ({} entries)",
-                    self.blackhole_table.len()
-                );
-            }
-
-            if let Some(local_identity_hash) = self.transport_identity_hash {
-                let blackhole_dir = dir.join("blackhole");
-                if let Err(e) = crate::persistence::save_python_blackhole_files(
-                    &self.blackhole_table,
-                    local_identity_hash,
-                    &blackhole_dir,
-                ) {
-                    trace!("failed to save Python blackhole files: {}", e);
-                }
-            }
-
-            let announce_path = dir.join("announce_cache.msgpack");
-            if let Err(e) = crate::persistence::save_announce_cache(
-                self.recent_announces.values(),
-                &announce_path,
-            ) {
-                trace!("failed to save announce cache: {}", e);
-            } else {
-                debug!(
-                    "saved announce cache ({} entries)",
-                    self.recent_announces.len()
-                );
-            }
-
-            let announce_cache_dir = dir.join("cache").join("announces");
-            if let Err(e) = crate::persistence::save_python_announce_cache_for_paths_and_tunnels(
-                &self.path_table,
-                Some(&self.tunnel_table),
-                self.recent_announces.values(),
-                &interface_names,
-                &announce_cache_dir,
-            ) {
-                trace!("failed to save Python announce cache files: {}", e);
-            }
-
-            let tunnel_path = dir.join("tunnel_table.msgpack");
-            if let Err(e) = crate::persistence::save_tunnel_table(
-                &self.tunnel_table,
-                &interface_names,
-                &tunnel_path,
-            ) {
-                trace!("failed to save tunnel table: {}", e);
-            } else {
-                debug!("saved tunnel table ({} entries)", self.tunnel_table.len());
-            }
-
-            let python_tunnels_path = dir.join("tunnels");
-            if let Err(e) = crate::persistence::save_python_tunnel_table(
-                &self.tunnel_table,
-                &interface_names,
-                &python_tunnels_path,
-            ) {
-                trace!("failed to save Python tunnels table: {}", e);
-            }
-
-            // Single-line summary for diagnosing periodic routing-state saves
-            // without surfacing normal flushes at default log levels.
-            debug!(
-                paths = self.path_table.len(),
-                announces = self.recent_announces.len(),
-                tunnels = self.tunnel_table.len(),
-                blackhole = self.blackhole_table.len(),
-                "flushed routing state"
-            );
+        self.wait_for_routing_save();
+        if let Some(dir) = self.storage_dir.clone() {
+            let snapshot = self.routing_snapshot();
+            write_routing_snapshot(&dir, &snapshot);
         }
         self.state_dirty = false;
         self.last_state_save = now();
     }
 
     /// Flush every persisted table including the (potentially large) packet
-    /// hashlist. Called on `on_shutdown` and the foreground→background
-    /// falling edge — both are infrequent and worth the full snapshot.
+    /// hashlist, synchronously. Shutdown-only: the process is exiting, so
+    /// blocking the actor is fine and completion must be guaranteed.
     pub(super) fn save_state(&mut self) {
         // Routing state first so the order matches the periodic-save shape.
         self.save_routing_state();
@@ -225,6 +310,47 @@ impl TransportActor {
             } else {
                 info!(entries = self.packet_hashlist.len(), "flushed hashlist");
             }
+        }
+    }
+
+    /// Falling-edge (foreground→background) flush. Same coverage as
+    /// `save_state` but entirely off-actor: on desktop the edge fires on
+    /// every window focus loss, and the inline fsync chain (F_FULLFSYNC per
+    /// file on macOS) stalls routing + control queries for seconds.
+    pub(super) fn save_state_async(&mut self) {
+        self.save_routing_state_async();
+        if self.shared_instance_client_mode {
+            return;
+        }
+        let Some(dir) = self.storage_dir.clone() else {
+            return;
+        };
+        if self
+            .hashlist_save_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            trace!("hashlist save already in flight; skipping");
+            return;
+        }
+        self.hashlist_save_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+        let hashlist = self.packet_hashlist.clone();
+        let in_flight = self.hashlist_save_in_flight.clone();
+        let entries = hashlist.len();
+        let write = move || {
+            let hashlist_path = dir.join("packet_hashlist");
+            if let Err(e) = crate::persistence::save_hashlist(&hashlist, &hashlist_path) {
+                trace!("failed to save hashlist: {}", e);
+            } else {
+                info!(entries, "flushed hashlist");
+            }
+            in_flight.store(false, std::sync::atomic::Ordering::Release);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(write);
+            }
+            Err(_) => write(),
         }
     }
 
@@ -837,5 +963,112 @@ impl TransportActor {
         for dest in loaded_dests {
             self.fire_path_waiters(&dest);
         }
+    }
+}
+
+#[cfg(test)]
+mod async_save_tests {
+    use super::*;
+
+    fn temp_storage() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rns-async-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn dirty_actor(dir: &std::path::Path) -> TransportActor {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.storage_dir = Some(dir.to_path_buf());
+        actor.path_table.insert(
+            [0x11; 16],
+            crate::path_table::PathEntry {
+                timestamp: crate::now_f64(),
+                next_hop: Some([0x22; 16]),
+                hops: 1,
+                expires: crate::now_f64() + 600.0,
+                random_blobs: std::collections::VecDeque::new(),
+                interface_id: 7,
+                packet_hash: Some([0x33; 32]),
+            },
+        );
+        actor.state_dirty = true;
+        actor
+    }
+
+    /// The periodic save must never run the fsync chain on the actor: the
+    /// tick path schedules to the blocking pool and returns immediately,
+    /// clearing the dirty flag; the files appear once the pool task runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn periodic_save_writes_off_actor_and_clears_dirty() {
+        let dir = temp_storage();
+        let mut actor = dirty_actor(&dir);
+
+        actor.save_routing_state_async();
+        assert!(!actor.state_dirty, "dirty clears at scheduling time");
+
+        let path = dir.join("path_table.msgpack");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(path.exists(), "blocking-pool save must land on disk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A save already in flight must NOT be raced by a second scheduling —
+    /// the tmp-file names are shared. The skipped attempt keeps state_dirty
+    /// set so the next interval retries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_flight_save_skips_and_keeps_dirty() {
+        let dir = temp_storage();
+        let mut actor = dirty_actor(&dir);
+        actor
+            .routing_save_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        actor.save_routing_state_async();
+        assert!(
+            actor.state_dirty,
+            "skipped save must leave state_dirty for retry"
+        );
+        assert!(!dir.join("path_table.msgpack").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The synchronous path (shutdown / falling edge) waits for an in-flight
+    /// async save before writing, then completes inline.
+    #[test]
+    fn sync_save_waits_for_in_flight_then_writes() {
+        let dir = temp_storage();
+        let mut actor = dirty_actor(&dir);
+
+        let flag = actor.routing_save_in_flight.clone();
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        let release = std::thread::spawn({
+            let flag = flag.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                flag.store(false, std::sync::atomic::Ordering::Release);
+            }
+        });
+
+        let started = std::time::Instant::now();
+        actor.save_routing_state();
+        release.join().unwrap();
+
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(140),
+            "sync save must wait out the in-flight writer"
+        );
+        assert!(dir.join("path_table.msgpack").exists());
+        assert!(!actor.state_dirty);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

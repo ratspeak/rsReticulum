@@ -7,6 +7,7 @@ use crate::constants::HASHLIST_MAXSIZE;
 /// When the `current` set fills to `max_size / 2`, it is promoted to
 /// `previous` and a new empty `current` begins — giving a bounded, amortised
 /// O(1) membership structure with a window of up to `max_size` entries.
+#[derive(Clone)]
 pub struct PacketHashlist {
     current: HashSet<[u8; 32]>,
     previous: HashSet<[u8; 32]>,

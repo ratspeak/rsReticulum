@@ -88,6 +88,7 @@ impl PathEntry {
 
 /// Destination-hash → path mapping plus a parallel liveness state map so we
 /// can probe unresponsive paths without rewriting the entries.
+#[derive(Clone)]
 pub struct PathTable {
     entries: HashMap<DestHash, PathEntry>,
     states: HashMap<DestHash, PathState>,
