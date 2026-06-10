@@ -584,21 +584,9 @@ impl Link {
         identity_pub_key: &[u8; 64],
         identity_signing_key: &Ed25519PrivateKey,
     ) -> Result<Vec<u8>, LinkCryptoError> {
-        if !self.is_initiator || self.state != LinkState::Active {
-            return Err(LinkCryptoError::EncryptionFailed);
-        }
-
-        let mut signed_data = Vec::with_capacity(16 + 64);
-        signed_data.extend_from_slice(&self.link_id);
-        signed_data.extend_from_slice(identity_pub_key);
-
-        let signature = identity_signing_key.sign(&signed_data);
-
-        let mut proof_data = Vec::with_capacity(128);
-        proof_data.extend_from_slice(identity_pub_key);
-        proof_data.extend_from_slice(&signature);
-
-        self.encrypt(&proof_data)
+        self.identify_with_fallible(identity_pub_key, |message| {
+            Some(identity_signing_key.sign(message))
+        })
     }
 
     /// Identify with an external signer (e.g. hardware identity).
@@ -936,17 +924,7 @@ impl Link {
         packet_hash: &[u8; 32],
         identity_signing_key: &Ed25519PrivateKey,
     ) -> Result<Vec<u8>, LinkCryptoError> {
-        if self.state != LinkState::Active && self.state != LinkState::Stale {
-            return Err(LinkCryptoError::EncryptionFailed);
-        }
-
-        let signature = identity_signing_key.sign(packet_hash);
-
-        let mut proof = Vec::with_capacity(96);
-        proof.extend_from_slice(packet_hash);
-        proof.extend_from_slice(&signature);
-
-        Ok(proof)
+        self.prove_packet_with_fallible(packet_hash, |hash| Some(identity_signing_key.sign(hash)))
     }
 
     /// Sign a received link packet with this link's ephemeral signing key.
@@ -957,23 +935,13 @@ impl Link {
         &self,
         packet_hash: &[u8; 32],
     ) -> Result<Vec<u8>, LinkCryptoError> {
-        if self.state != LinkState::Active && self.state != LinkState::Stale {
-            return Err(LinkCryptoError::EncryptionFailed);
-        }
-
-        let signature = if let Some(signature) = self.sign(packet_hash) {
-            signature
-        } else if let Some(ephemeral_keys) = self.ephemeral_keys.as_ref() {
-            ephemeral_keys.ed25519_prv.sign(packet_hash)
-        } else {
-            return Err(LinkCryptoError::EncryptionFailed);
-        };
-
-        let mut proof = Vec::with_capacity(96);
-        proof.extend_from_slice(packet_hash);
-        proof.extend_from_slice(&signature);
-
-        Ok(proof)
+        self.prove_packet_with_fallible(packet_hash, |hash| {
+            self.sign(hash).or_else(|| {
+                self.ephemeral_keys
+                    .as_ref()
+                    .map(|keys| keys.ed25519_prv.sign(hash))
+            })
+        })
     }
 
     /// Variant of [`Link::prove_packet`] for external signers.
