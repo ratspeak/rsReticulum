@@ -53,7 +53,11 @@ pub fn serial_params_from(
     data_bits: u8,
     parity: &str,
     stop_bits: u8,
-) -> (serialport::DataBits, serialport::Parity, serialport::StopBits) {
+) -> (
+    serialport::DataBits,
+    serialport::Parity,
+    serialport::StopBits,
+) {
     let data = match data_bits {
         5 => serialport::DataBits::Five,
         6 => serialport::DataBits::Six,

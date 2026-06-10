@@ -163,7 +163,9 @@ pub async fn spawn_kiss_interface(
             // so a padded (<15 byte) beacon re-arms the timer and beacons
             // repeat every id_interval once anything has been sent. Kept
             // bug-for-bug for parity.
-            let is_beacon = beacon.as_ref().is_some_and(|(_, callsign)| data == *callsign);
+            let is_beacon = beacon
+                .as_ref()
+                .is_some_and(|(_, callsign)| data == *callsign);
             if is_beacon {
                 first_tx = None;
             } else if first_tx.is_none() {

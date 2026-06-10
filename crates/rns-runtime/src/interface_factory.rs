@@ -667,7 +667,13 @@ fn require_rnode_radio_params(
         .get_int("txpower")
         .or_else(|| section.get_int("tx_power"))
         .ok_or_else(|| missing("txpower"))? as i8;
-    Ok((frequency, bandwidth, spreading_factor, coding_rate, tx_power))
+    Ok((
+        frequency,
+        bandwidth,
+        spreading_factor,
+        coding_rate,
+        tx_power,
+    ))
 }
 
 /// Shared RNode airtime/flow-control parsing. Python `RNodeInterface.py:156-160`:

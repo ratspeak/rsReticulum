@@ -487,18 +487,19 @@ pub async fn spawn_rnode_multi_interface(
                     Ok(Some(req)) => req,
                     Ok(None) => break,
                     Err(_) => {
-                        if !first_tx.is_some_and(|t| t.elapsed() >= interval)
+                        if first_tx.is_none_or(|t| t.elapsed() < interval)
                             || !online_w.load(Ordering::SeqCst)
                         {
                             continue;
                         }
-                        tracing::debug!("RNodeMulti transmitting station-ID beacon on all subinterfaces");
+                        tracing::debug!(
+                            "RNodeMulti transmitting station-ID beacon on all subinterfaces"
+                        );
                         first_tx = None;
                         let mut frames = Vec::new();
                         for &vport in &beacon_vports {
-                            frames.extend_from_slice(&build_subinterface_data_frame(
-                                vport, callsign,
-                            ));
+                            frames
+                                .extend_from_slice(&build_subinterface_data_frame(vport, callsign));
                         }
                         let online_ref = online_w.clone();
                         let result = tokio::task::spawn_blocking(move || {

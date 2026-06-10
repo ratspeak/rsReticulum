@@ -935,7 +935,7 @@ pub async fn spawn_rnode_interface(
                             Ok(Some(request)) => request,
                             Ok(None) => break,
                             Err(_) => {
-                                if !first_tx.is_some_and(|t| t.elapsed() >= interval) {
+                                if first_tx.is_none_or(|t| t.elapsed() < interval) {
                                     continue;
                                 }
                                 tracing::debug!("RNode transmitting station-ID beacon");
@@ -1128,7 +1128,10 @@ mod tests {
         assert_eq!(cfg.baud_rate, 115200);
         assert_eq!(cfg.frequency, 868_000_000);
         assert_eq!(cfg.spreading_factor, 7);
-        assert!(!cfg.flow_control, "flow_control defaults off (Python parity)");
+        assert!(
+            !cfg.flow_control,
+            "flow_control defaults off (Python parity)"
+        );
         assert!(cfg.st_alock.is_none());
         assert!(cfg.lt_alock.is_none());
     }
@@ -1156,8 +1159,16 @@ mod tests {
 
         // st: 3300 = 0x0CE4, lt: 330 = 0x014A — no KISS-special bytes, framed verbatim.
         let expected = [
-            kiss::FEND, CMD_ST_ALOCK, 0x0C, 0xE4, kiss::FEND,
-            kiss::FEND, CMD_LT_ALOCK, 0x01, 0x4A, kiss::FEND,
+            kiss::FEND,
+            CMD_ST_ALOCK,
+            0x0C,
+            0xE4,
+            kiss::FEND,
+            kiss::FEND,
+            CMD_LT_ALOCK,
+            0x01,
+            0x4A,
+            kiss::FEND,
         ];
         assert_eq!(seq, expected);
 

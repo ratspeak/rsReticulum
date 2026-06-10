@@ -1335,7 +1335,7 @@ pub async fn spawn_ble_rnode_interface(
                             Ok(Some(data)) => data,
                             Ok(None) => break,
                             Err(_) => {
-                                if !first_tx.is_some_and(|t| t.elapsed() >= interval) {
+                                if first_tx.is_none_or(|t| t.elapsed() < interval) {
                                     continue;
                                 }
                                 tracing::debug!("BLE RNode transmitting station-ID beacon");
@@ -1667,10 +1667,12 @@ pub async fn spawn_ble_rnode_interface_native(
                             Ok(Some(msg)) => msg,
                             Ok(None) => break,
                             Err(_) => {
-                                if !first_tx.is_some_and(|t| t.elapsed() >= interval) {
+                                if first_tx.is_none_or(|t| t.elapsed() < interval) {
                                     continue;
                                 }
-                                tracing::debug!("BLE RNode (native) transmitting station-ID beacon");
+                                tracing::debug!(
+                                    "BLE RNode (native) transmitting station-ID beacon"
+                                );
                                 NativeBridgeWrite::Packet(callsign.clone())
                             }
                         }
@@ -2168,6 +2170,8 @@ mod tests {
             flow_control: ble_cfg.flow_control,
             st_alock: ble_cfg.st_alock,
             lt_alock: ble_cfg.lt_alock,
+            id_interval: ble_cfg.id_interval,
+            id_callsign: ble_cfg.id_callsign.clone(),
         };
         let seq = rnode::build_init_sequence(&rnode_cfg);
         assert!(!seq.is_empty());

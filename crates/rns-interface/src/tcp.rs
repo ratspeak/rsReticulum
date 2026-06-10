@@ -88,9 +88,7 @@ fn address_for_device(device: &str, prefer_ipv6: bool) -> Option<std::net::IpAdd
         .filter(|a| a.name == device)
         .map(|a| a.ip())
         .collect();
-    if prefer_ipv6
-        && let Some(v6) = on_dev.iter().find(|ip| ip.is_ipv6())
-    {
+    if prefer_ipv6 && let Some(v6) = on_dev.iter().find(|ip| ip.is_ipv6()) {
         return Some(*v6);
     }
     on_dev
@@ -430,9 +428,8 @@ pub async fn spawn_tcp_client(
             repeat: false,
         },
         bitrate,
-        mtu: fixed_mtu.unwrap_or_else(|| {
-            crate::traits::optimise_mtu(bitrate).unwrap_or(TCP_HW_MTU)
-        }),
+        mtu: fixed_mtu
+            .unwrap_or_else(|| crate::traits::optimise_mtu(bitrate).unwrap_or(TCP_HW_MTU)),
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),

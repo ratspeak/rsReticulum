@@ -1954,11 +1954,17 @@ fn apply_discovery_mode_autocorrect(
         }
         #[cfg(feature = "serial")]
         {
-            rnode |= matches!(iface_config, interface_factory::InterfaceConfig::RNodeMulti(_));
+            rnode |= matches!(
+                iface_config,
+                interface_factory::InterfaceConfig::RNodeMulti(_)
+            );
         }
         #[cfg(feature = "ble")]
         {
-            rnode |= matches!(iface_config, interface_factory::InterfaceConfig::BleRNode(_));
+            rnode |= matches!(
+                iface_config,
+                interface_factory::InterfaceConfig::BleRNode(_)
+            );
         }
         rnode
     };
