@@ -679,6 +679,16 @@ pub enum RNodeResponse {
     None,
 }
 
+/// Python: raw unsigned RSSI byte minus `RSSI_OFFSET` (157) → dBm.
+pub fn decode_rssi_byte(byte: u8) -> f32 {
+    byte as f32 - RSSI_OFFSET as f32
+}
+
+/// Python: signed SNR byte × 0.25 → dB.
+pub fn decode_snr_byte(byte: u8) -> f32 {
+    byte as i8 as f32 / 4.0
+}
+
 /// Dispatch decoded KISS frame; shared by serial and BLE transports.
 pub fn process_rnode_response(
     cmd: u8,
@@ -706,13 +716,13 @@ pub fn process_rnode_response(
         }
         CMD_STAT_RSSI => {
             if !frame.is_empty() {
-                *last_rssi = Some(frame[0] as i8 as f32);
+                *last_rssi = Some(decode_rssi_byte(frame[0]));
             }
             RNodeResponse::None
         }
         CMD_STAT_SNR => {
             if !frame.is_empty() {
-                *last_snr = Some(frame[0] as i8 as f32 / 4.0);
+                *last_snr = Some(decode_snr_byte(frame[0]));
             }
             RNodeResponse::None
         }
@@ -1134,6 +1144,23 @@ mod tests {
         );
         assert!(cfg.st_alock.is_none());
         assert!(cfg.lt_alock.is_none());
+    }
+
+    /// Python parity (RNodeInterface.py:878,880): RSSI = raw byte − 157,
+    /// SNR = signed byte × 0.25.
+    #[test]
+    fn test_rssi_snr_decode_matches_python() {
+        assert_eq!(decode_rssi_byte(67), -90.0);
+        assert_eq!(decode_rssi_byte(157), 0.0);
+        assert_eq!(decode_rssi_byte(0), -157.0);
+        assert_eq!(decode_snr_byte(20), 5.0);
+        assert_eq!(decode_snr_byte(0xF6), -2.5); // -10 as i8
+
+        let mut rssi = None;
+        let mut snr = None;
+        let resp = process_rnode_response(CMD_STAT_RSSI, &[67], 0, &mut rssi, &mut snr);
+        assert!(matches!(resp, RNodeResponse::None));
+        assert_eq!(rssi, Some(-90.0));
     }
 
     #[test]

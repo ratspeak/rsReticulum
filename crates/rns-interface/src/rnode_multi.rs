@@ -676,7 +676,7 @@ pub async fn spawn_rnode_multi_interface(
 
                             rnode::CMD_STAT_RSSI => {
                                 if !frame.is_empty() {
-                                    let rssi = frame[0] as i8 as f32;
+                                    let rssi = rnode::decode_rssi_byte(frame[0]);
                                     if let Some(local_idx) =
                                         vport_map.get(selected_index).copied().flatten()
                                     {
@@ -686,7 +686,7 @@ pub async fn spawn_rnode_multi_interface(
                             }
                             rnode::CMD_STAT_SNR => {
                                 if !frame.is_empty() {
-                                    let snr = frame[0] as i8 as f32 / 4.0;
+                                    let snr = rnode::decode_snr_byte(frame[0]);
                                     if let Some(local_idx) =
                                         vport_map.get(selected_index).copied().flatten()
                                     {
@@ -971,6 +971,14 @@ mod tests {
         assert_eq!(cfg.subinterfaces.len(), 2);
         assert!(cfg.subinterfaces.iter().all(|sub| sub.outgoing));
         assert!(cfg.subinterfaces.iter().all(|sub| !sub.flow_control));
+    }
+
+    /// The multi reader decodes STAT_RSSI/STAT_SNR via the shared rnode
+    /// helpers — Python formula: RSSI = raw byte − 157, SNR = signed × 0.25.
+    #[test]
+    fn test_multi_rssi_snr_decode_matches_python() {
+        assert_eq!(rnode::decode_rssi_byte(67), -90.0);
+        assert_eq!(rnode::decode_snr_byte(0xF6), -2.5);
     }
 
     #[test]
