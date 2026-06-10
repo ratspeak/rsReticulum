@@ -1864,7 +1864,10 @@ mod tests {
         assert_eq!(cfg.spreading_factor, 7);
         assert_eq!(cfg.coding_rate, 5);
         assert_eq!(cfg.tx_power, 14);
-        assert!(cfg.flow_control);
+        assert!(
+            !cfg.flow_control,
+            "flow_control defaults off (Python parity)"
+        );
         assert!(cfg.st_alock.is_none());
         assert!(cfg.lt_alock.is_none());
     }
@@ -2193,12 +2196,13 @@ mod tests {
         let mut rnode_cfg = rnode::RNodeConfig::new("test", "ble://");
         rnode_cfg.st_alock = Some(25.0);
         rnode_cfg.lt_alock = Some(50.0);
-        let mut seq = rnode::build_init_sequence(&rnode_cfg);
-        seq.extend_from_slice(&rnode::build_airtime_sequence(&rnode_cfg));
+        // Airtime locks are part of the init sequence, before RADIO_STATE_ON.
+        let seq = rnode::build_init_sequence(&rnode_cfg);
 
         let mut deframer = kiss::RawKissDeframer::new();
         let frames = deframer.feed(&seq);
-        assert_eq!(frames.len(), 8); // 6 init + 2 airtime
+        assert_eq!(frames.len(), 8); // 5 params + 2 airtime + radio on
+        assert_eq!(frames.last().unwrap().0, rnode::CMD_RADIO_STATE);
     }
 
     // ── process_rnode_response tests ──
