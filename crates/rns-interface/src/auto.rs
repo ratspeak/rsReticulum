@@ -1081,10 +1081,10 @@ pub async fn spawn_auto_interface(
             );
         }
         if let Err(e) = disc_sock.join_multicast_v6(&mcast_group, *scope_id) {
-            // EPERM/EACCES on Apple is the canonical signal that the
-            // multicast networking entitlement isn't provisioned (e.g. iOS
-            // PermissionDenied covers EPERM/EACCES/Windows ERROR_ACCESS_DENIED.
-            // Surfaced as an event so UIs can show pending Apple approval.
+            // PermissionDenied (EPERM/EACCES, Windows ERROR_ACCESS_DENIED) on
+            // Apple platforms is the canonical signal that the multicast
+            // networking entitlement isn't provisioned. Surfaced as an event
+            // so UIs can show pending Apple approval.
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 tracing::warn!(
                     iface = %iface_name,

@@ -103,7 +103,6 @@ pub const REQUIRED_FW_VER_MIN: u8 = 52;
 pub const RSSI_OFFSET: i32 = 157;
 
 pub const RECONNECT_WAIT: u64 = 5;
-pub const MAX_RECONNECT_TRIES: usize = 3;
 
 pub const RADIO_STATE_ON: u8 = 0x01;
 pub const RADIO_STATE_OFF: u8 = 0x00;

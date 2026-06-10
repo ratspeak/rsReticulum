@@ -173,15 +173,19 @@ pub fn select_piv() -> Vec<u8> {
 
 /// PIN is ASCII, 0xFF-padded to 8 bytes (NIST SP 800-73-4 §2.4.3).
 pub fn verify_pin(pin: &str) -> Vec<u8> {
+    use zeroize::Zeroize;
     let mut pin_data = [0xFFu8; 8];
     let pin_bytes = pin.as_bytes();
     let copy_len = pin_bytes.len().min(8);
     pin_data[..copy_len].copy_from_slice(&pin_bytes[..copy_len]);
-    build_apdu(INS_VERIFY, 0x00, 0x80, &pin_data)
+    let cmd = build_apdu(INS_VERIFY, 0x00, 0x80, &pin_data);
+    pin_data.zeroize();
+    cmd
 }
 
 // CHANGE REFERENCE DATA.
 pub fn change_pin(old_pin: &str, new_pin: &str) -> Vec<u8> {
+    use zeroize::Zeroize;
     let mut data = [0xFFu8; 16];
     let old_bytes = old_pin.as_bytes();
     let new_bytes = new_pin.as_bytes();
@@ -189,11 +193,14 @@ pub fn change_pin(old_pin: &str, new_pin: &str) -> Vec<u8> {
     let new_len = new_bytes.len().min(8);
     data[..old_len].copy_from_slice(&old_bytes[..old_len]);
     data[8..8 + new_len].copy_from_slice(&new_bytes[..new_len]);
-    build_apdu(INS_CHANGE_REFERENCE, 0x00, 0x80, &data)
+    let cmd = build_apdu(INS_CHANGE_REFERENCE, 0x00, 0x80, &data);
+    data.zeroize();
+    cmd
 }
 
 /// RESET RETRY COUNTER: unblock a locked PIN with the PUK and set a new PIN.
 pub fn reset_retry(puk: &str, new_pin: &str) -> Vec<u8> {
+    use zeroize::Zeroize;
     let mut data = [0xFFu8; 16];
     let puk_bytes = puk.as_bytes();
     let new_bytes = new_pin.as_bytes();
@@ -201,7 +208,9 @@ pub fn reset_retry(puk: &str, new_pin: &str) -> Vec<u8> {
     let new_len = new_bytes.len().min(8);
     data[..puk_len].copy_from_slice(&puk_bytes[..puk_len]);
     data[8..8 + new_len].copy_from_slice(&new_bytes[..new_len]);
-    build_apdu(INS_RESET_RETRY, 0x00, 0x80, &data)
+    let cmd = build_apdu(INS_RESET_RETRY, 0x00, 0x80, &data);
+    data.zeroize();
+    cmd
 }
 
 /// RESET PIV: erase all PIV data and restore factory PIV secrets.

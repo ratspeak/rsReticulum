@@ -1,6 +1,7 @@
 //! Network interface implementations for Reticulum.
 //! Each module provides a spawn function returning a Tokio task driving a
-//! concrete transport; [`traits::Interface`] is the common abstraction.
+//! concrete transport; [`traits::InterfaceHandle`] is the common handle the
+//! runtime registers with the transport actor.
 
 #[cfg(target_os = "android")]
 pub mod android_usb;

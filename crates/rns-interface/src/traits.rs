@@ -82,50 +82,6 @@ pub struct InterfaceDirection {
     pub repeat: bool,
 }
 
-/// Interface statistics.
-#[derive(Debug, Clone, Default)]
-pub struct InterfaceStats {
-    pub rx_bytes: u64,
-    pub tx_bytes: u64,
-    pub rx_packets: u64,
-    pub tx_packets: u64,
-    pub online: bool,
-    pub bitrate: u64,
-    pub mtu: u32,
-}
-
-/// Base trait for all network interfaces.
-pub trait Interface: Send + Sync {
-    fn process_incoming(&self, data: &[u8]);
-
-    fn process_outgoing(&self, data: &[u8]) -> Result<(), InterfaceError>;
-
-    fn get_stats(&self) -> InterfaceStats;
-
-    fn detach(&mut self);
-
-    fn name(&self) -> &str;
-
-    fn mode(&self) -> InterfaceMode;
-
-    /// Interface bitrate in bits/sec.
-    fn bitrate(&self) -> u64;
-
-    fn mtu(&self) -> u32 {
-        rns_wire::constants::MTU as u32
-    }
-
-    fn online(&self) -> bool;
-
-    /// 16-byte interface identifier: truncated SHA-256 of the interface name.
-    fn get_hash(&self) -> [u8; 16] {
-        let full = rns_crypto::sha::full_hash(self.name().as_bytes());
-        let mut h = [0u8; 16];
-        h.copy_from_slice(&full[..16]);
-        h
-    }
-}
-
 /// Select an MTU for the given bitrate; `None` below 62.5 kbps minimum.
 pub fn optimise_mtu(bitrate: u64) -> Option<u32> {
     if bitrate >= 1_000_000_000 {

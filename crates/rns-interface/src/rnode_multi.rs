@@ -891,32 +891,9 @@ pub async fn spawn_rnode_multi_interface(
                                 }
                             }
 
-                            CMD_ERROR => {
-                                if !frame.is_empty() {
-                                    match frame[0] {
-                                        ERROR_INITRADIO => {
-                                            tracing::error!(
-                                                parent = %parent_name,
-                                                "RNodeMulti hardware initialisation error"
-                                            );
-                                        }
-                                        ERROR_TXFAILED => {
-                                            tracing::error!(
-                                                parent = %parent_name,
-                                                "RNodeMulti hardware TX error"
-                                            );
-                                        }
-                                        code => {
-                                            tracing::error!(
-                                                parent = %parent_name,
-                                                code = format!("0x{:02X}", code),
-                                                "RNodeMulti hardware error"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-
+                            // No CMD_ERROR arm: 0x90 collides with CMD_INT5_DATA
+                            // and is consumed by the vport demux above — same
+                            // collision as Python RNodeMultiInterface.
                             rnode::CMD_RESET => {
                                 if frame.first().copied() == Some(0xF8) {
                                     tracing::error!(

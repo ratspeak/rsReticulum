@@ -62,23 +62,25 @@ impl<T: PivTransport> PivSession<T> {
     }
 
     pub fn verify_pin(&mut self, pin: &str) -> Result<(), RatkeyError> {
-        let resp = self.transport.transmit(&apdu::verify_pin(pin))?;
+        // PIN-bearing APDU buffers are wiped once transmitted.
+        let cmd = zeroize::Zeroizing::new(apdu::verify_pin(pin));
+        let resp = self.transport.transmit(&cmd)?;
         apdu::check_response(&resp)?;
         self.pin_cache.cache(pin);
         Ok(())
     }
 
     pub fn change_pin(&mut self, old_pin: &str, new_pin: &str) -> Result<(), RatkeyError> {
-        let resp = self
-            .transport
-            .transmit(&apdu::change_pin(old_pin, new_pin))?;
+        let cmd = zeroize::Zeroizing::new(apdu::change_pin(old_pin, new_pin));
+        let resp = self.transport.transmit(&cmd)?;
         apdu::check_response(&resp)?;
         self.pin_cache.cache(new_pin);
         Ok(())
     }
 
     pub fn unblock_pin(&mut self, puk: &str, new_pin: &str) -> Result<(), RatkeyError> {
-        let resp = self.transport.transmit(&apdu::reset_retry(puk, new_pin))?;
+        let cmd = zeroize::Zeroizing::new(apdu::reset_retry(puk, new_pin));
+        let resp = self.transport.transmit(&cmd)?;
         match apdu::check_response(&resp) {
             Ok(_) => {
                 self.pin_cache.cache(new_pin);
@@ -174,20 +176,42 @@ impl<T: PivTransport> PivSession<T> {
         Ok(())
     }
 
+    /// Transmit a PIN-gated command, retrying once through the cached PIN
+    /// when the card answers 0x6982 (security status not satisfied) — e.g.
+    /// pin_policy=ALWAYS slots, or the applet was re-selected since the last
+    /// VERIFY. The cache expires on its own timeout and is cleared by `lock`.
+    fn transmit_pin_gated(&mut self, cmd: &[u8]) -> Result<Vec<u8>, RatkeyError> {
+        let resp = self.transport.transmit(cmd)?;
+        match apdu::check_response(&resp) {
+            Err(RatkeyError::Apdu {
+                sw1: 0x69,
+                sw2: 0x82,
+            }) => {
+                let pin = match self.pin_cache.get() {
+                    Some(pin) => zeroize::Zeroizing::new(pin.to_string()),
+                    None => {
+                        return Err(RatkeyError::Apdu {
+                            sw1: 0x69,
+                            sw2: 0x82,
+                        });
+                    }
+                };
+                self.verify_pin(&pin)?;
+                let resp = self.transport.transmit(cmd)?;
+                Ok(apdu::check_response(&resp)?.to_vec())
+            }
+            other => Ok(other?.to_vec()),
+        }
+    }
+
     pub fn sign_ed25519(&mut self, slot: u8, message: &[u8]) -> Result<[u8; 64], RatkeyError> {
-        let resp = self
-            .transport
-            .transmit(&apdu::sign_ed25519(slot, message))?;
-        let data = apdu::check_response(&resp)?;
-        apdu::parse_sign_response(data)
+        let data = self.transmit_pin_gated(&apdu::sign_ed25519(slot, message))?;
+        apdu::parse_sign_response(&data)
     }
 
     pub fn ecdh_x25519(&mut self, slot: u8, peer_pub: &[u8; 32]) -> Result<[u8; 32], RatkeyError> {
-        let resp = self
-            .transport
-            .transmit(&apdu::ecdh_x25519(slot, peer_pub))?;
-        let data = apdu::check_response(&resp)?;
-        apdu::parse_ecdh_response(data)
+        let data = self.transmit_pin_gated(&apdu::ecdh_x25519(slot, peer_pub))?;
+        apdu::parse_ecdh_response(&data)
     }
 
     /// Returns DER-encoded X.509 attestation certificate.
@@ -280,5 +304,116 @@ impl PivSession<crate::transport::PcscTransport> {
     pub fn connect_reader(reader_name: &str) -> Result<Self, RatkeyError> {
         let (transport, meta) = crate::transport::PcscTransport::connect_reader(reader_name)?;
         Ok(Self::new(transport, meta))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /// Card that loses PIN verification whenever `verified` is flipped off
+    /// (pin_policy=ALWAYS / applet reselect shape): SIGN answers 0x6982
+    /// until a VERIFY lands.
+    struct PinGatedTransport {
+        verified: Arc<AtomicBool>,
+        verify_calls: Arc<AtomicU32>,
+    }
+
+    impl PivTransport for PinGatedTransport {
+        fn transmit(&mut self, apdu: &[u8]) -> Result<Vec<u8>, RatkeyError> {
+            match apdu[1] {
+                0xA4 => {
+                    self.verified.store(false, Ordering::SeqCst);
+                    Ok(vec![0x90, 0x00])
+                }
+                0x20 => {
+                    self.verify_calls.fetch_add(1, Ordering::SeqCst);
+                    self.verified.store(true, Ordering::SeqCst);
+                    Ok(vec![0x90, 0x00])
+                }
+                0x87 => {
+                    if !self.verified.load(Ordering::SeqCst) {
+                        return Ok(vec![0x69, 0x82]);
+                    }
+                    let mut v = vec![0x7C, 0x42, 0x82, 0x40];
+                    v.extend_from_slice(&[0xAB; 64]);
+                    v.extend_from_slice(&[0x90, 0x00]);
+                    Ok(v)
+                }
+                _ => Ok(vec![0x90, 0x00]),
+            }
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
+    fn session_with_flags() -> (
+        PivSession<PinGatedTransport>,
+        Arc<AtomicBool>,
+        Arc<AtomicU32>,
+    ) {
+        let verified = Arc::new(AtomicBool::new(false));
+        let verify_calls = Arc::new(AtomicU32::new(0));
+        let transport = PinGatedTransport {
+            verified: verified.clone(),
+            verify_calls: verify_calls.clone(),
+        };
+        let session = PivSession::new(
+            transport,
+            DeviceMeta {
+                device_type: DeviceType::Unknown,
+                serial: None,
+                firmware: None,
+            },
+        );
+        (session, verified, verify_calls)
+    }
+
+    /// T2-6a: the PIN cache is no longer write-only — a 0x6982 on a key op
+    /// re-verifies through the cached PIN and retries once.
+    #[test]
+    fn sign_retries_through_cached_pin() {
+        let (mut session, verified, verify_calls) = session_with_flags();
+
+        session.verify_pin("123456").unwrap();
+        assert_eq!(verify_calls.load(Ordering::SeqCst), 1);
+
+        // Card drops auth state (pin_policy=ALWAYS consumes the VERIFY).
+        verified.store(false, Ordering::SeqCst);
+
+        let sig = session.sign_ed25519(0x9A, b"message").unwrap();
+        assert_eq!(sig, [0xAB; 64]);
+        assert_eq!(
+            verify_calls.load(Ordering::SeqCst),
+            2,
+            "sign must have re-verified via the cached PIN"
+        );
+    }
+
+    /// After `lock()` the cache is cleared: no silent re-verify is possible.
+    #[test]
+    fn sign_after_lock_fails_without_fresh_pin() {
+        let (mut session, _verified, verify_calls) = session_with_flags();
+
+        session.verify_pin("123456").unwrap();
+        session.lock().unwrap();
+
+        let err = session.sign_ed25519(0x9A, b"message").unwrap_err();
+        assert!(matches!(
+            err,
+            RatkeyError::Apdu {
+                sw1: 0x69,
+                sw2: 0x82
+            }
+        ));
+        assert_eq!(
+            verify_calls.load(Ordering::SeqCst),
+            1,
+            "locked session must not re-verify on its own"
+        );
     }
 }

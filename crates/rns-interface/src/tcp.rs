@@ -124,28 +124,14 @@ pub struct TcpInterfaceState {
 
 impl TcpInterfaceState {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            online: AtomicBool::new(false),
-            detached: AtomicBool::new(false),
-            rx_bytes: AtomicU64::new(0),
-            tx_bytes: AtomicU64::new(0),
-            rx_packets: AtomicU64::new(0),
-            tx_packets: AtomicU64::new(0),
-            shared_rxb: None,
-            shared_txb: None,
-        })
+        Arc::new(Self::default())
     }
 
     pub fn with_shared_counters(rxb: Arc<AtomicU64>, txb: Arc<AtomicU64>) -> Arc<Self> {
         Arc::new(Self {
-            online: AtomicBool::new(false),
-            detached: AtomicBool::new(false),
-            rx_bytes: AtomicU64::new(0),
-            tx_bytes: AtomicU64::new(0),
-            rx_packets: AtomicU64::new(0),
-            tx_packets: AtomicU64::new(0),
             shared_rxb: Some(rxb),
             shared_txb: Some(txb),
+            ..Self::default()
         })
     }
 
