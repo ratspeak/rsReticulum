@@ -571,6 +571,16 @@ impl InboundResource {
             return Err(ResourceError::TooLarge);
         }
 
+        // `total_parts` is attacker-controlled wire input; unchecked it sizes the
+        // parts Vec directly (24 B per slot — a remote multi-GB alloc bomb). Real
+        // transfers satisfy total_parts == ceil(total_size / sdu); MIN_PART_SIZE
+        // is a generous lower bound on any negotiated SDU (real MDU ≈ 475).
+        const MIN_PART_SIZE: usize = 32;
+        let max_parts = total_size.div_ceil(MIN_PART_SIZE).saturating_add(16);
+        if total_parts > max_parts {
+            return Err(ResourceError::TooLarge);
+        }
+
         Ok(Self {
             state: ResourceState::Transferring,
             parts: vec![None; total_parts],
@@ -2759,6 +2769,54 @@ mod tests {
         let (assembled, proof) = inbound.complete(None).unwrap();
         assert_eq!(assembled, data);
         assert_eq!(proof.len(), 64); // resource_hash(32) + expected_proof(32)
+    }
+
+    #[test]
+    fn test_inbound_rejects_part_count_inconsistent_with_size() {
+        // AF-2026-04.1: wire-controlled num_parts must not size the parts Vec
+        // unchecked — total_size=1024 with 10M parts is a ~240 MB alloc bomb.
+        let result = InboundTransfer::from_advertisement(
+            10_000_000,
+            1024,
+            1000,
+            [0xAA; RANDOM_HASH_SIZE],
+            [0xBB; 32],
+            ResourceFlags::default(),
+            Vec::new(),
+            Duration::from_millis(100),
+        );
+        assert!(matches!(result, Err(ResourceError::TooLarge)));
+
+        // Same bound at the InboundResource layer directly.
+        let result = InboundResource::new(
+            usize::MAX,
+            1024,
+            1000,
+            [0xAA; RANDOM_HASH_SIZE],
+            [0xBB; 32],
+            ResourceFlags::default(),
+            Vec::new(),
+        );
+        assert!(matches!(result, Err(ResourceError::TooLarge)));
+    }
+
+    #[test]
+    fn test_inbound_accepts_max_legitimate_part_count() {
+        // Worst legitimate case: max-size transfer split at the real SDU.
+        let max_total_size =
+            MAX_EFFICIENT_SIZE + RANDOM_HASH_SIZE + rns_crypto::TOKEN_OVERHEAD + 16;
+        let parts = max_total_size.div_ceil(SDU);
+        let result = InboundResource::new(
+            parts,
+            max_total_size,
+            MAX_EFFICIENT_SIZE,
+            [0xAA; RANDOM_HASH_SIZE],
+            [0xBB; 32],
+            ResourceFlags::default(),
+            Vec::new(),
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().total_parts, parts);
     }
 
     #[test]
