@@ -114,25 +114,13 @@ pub async fn spawn_serial_interface(
         while let Some(data) = rx.recv().await {
             txb_w.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let framed = hdlc::frame(&data);
-            let online_ref = online_w.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                use std::io::Write;
-                port_w.write_all(&framed)?;
-                port_w.flush()?;
-                Ok::<_, std::io::Error>(port_w)
-            })
-            .await;
-            match result {
-                Ok(Ok(p)) => {
+            match crate::serial_io::blocking_write_all(port_w, framed).await {
+                Ok(p) => {
                     port_w = p;
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "serial write error");
-                    online_ref.store(false, Ordering::SeqCst);
-                    break;
-                }
                 Err(e) => {
-                    tracing::warn!(error = %e, "serial write task panicked");
+                    tracing::warn!(error = %e, "serial write error");
+                    online_w.store(false, Ordering::SeqCst);
                     break;
                 }
             }
@@ -150,18 +138,8 @@ pub async fn spawn_serial_interface(
             if !online_r.load(Ordering::SeqCst) {
                 break;
             }
-            let result = tokio::task::spawn_blocking(move || {
-                use std::io::Read;
-                match port_r.read(&mut buf) {
-                    Ok(n) => Ok((port_r, buf, n)),
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok((port_r, buf, 0)),
-                    Err(e) => Err((port_r, e)),
-                }
-            })
-            .await;
-
-            match result {
-                Ok(Ok((p, b, n))) => {
+            match crate::serial_io::poll_read(port_r, buf).await {
+                Ok((p, b, n)) => {
                     port_r = p;
                     buf = b;
                     if n > 0 {
@@ -185,13 +163,8 @@ pub async fn spawn_serial_interface(
                         }
                     }
                 }
-                Ok(Err((_p, e))) => {
-                    tracing::warn!(error = %e, "serial read error");
-                    online_r.store(false, Ordering::SeqCst);
-                    return;
-                }
                 Err(e) => {
-                    tracing::warn!(error = %e, "serial read task panicked");
+                    tracing::warn!(error = %e, "serial read error");
                     online_r.store(false, Ordering::SeqCst);
                     return;
                 }

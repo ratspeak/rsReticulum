@@ -188,25 +188,13 @@ pub async fn spawn_kiss_interface(
                 }
             }
             let framed = kiss::frame(&data);
-            let online_ref = online_w.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                use std::io::Write;
-                port_w.write_all(&framed)?;
-                port_w.flush()?;
-                Ok::<_, std::io::Error>(port_w)
-            })
-            .await;
-            match result {
-                Ok(Ok(p)) => {
+            match crate::serial_io::blocking_write_all(port_w, framed).await {
+                Ok(p) => {
                     port_w = p;
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "KISS write error");
-                    online_ref.store(false, Ordering::SeqCst);
-                    break;
-                }
                 Err(e) => {
-                    tracing::warn!(error = %e, "KISS write task panicked");
+                    tracing::warn!(error = %e, "KISS write error");
+                    online_w.store(false, Ordering::SeqCst);
                     break;
                 }
             }
@@ -225,18 +213,8 @@ pub async fn spawn_kiss_interface(
             if !online_r.load(Ordering::SeqCst) {
                 break;
             }
-            let result = tokio::task::spawn_blocking(move || {
-                use std::io::Read;
-                match port_r.read(&mut buf) {
-                    Ok(n) => Ok((port_r, buf, n)),
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok((port_r, buf, 0)),
-                    Err(e) => Err((port_r, e)),
-                }
-            })
-            .await;
-
-            match result {
-                Ok(Ok((p, b, n))) => {
+            match crate::serial_io::poll_read(port_r, buf).await {
+                Ok((p, b, n)) => {
                     port_r = p;
                     buf = b;
                     if n > 0 {
@@ -273,13 +251,8 @@ pub async fn spawn_kiss_interface(
                         }
                     }
                 }
-                Ok(Err((_p, e))) => {
-                    tracing::warn!(error = %e, "KISS read error");
-                    online_r.store(false, Ordering::SeqCst);
-                    return;
-                }
                 Err(e) => {
-                    tracing::warn!(error = %e, "KISS read task panicked");
+                    tracing::warn!(error = %e, "KISS read error");
                     online_r.store(false, Ordering::SeqCst);
                     return;
                 }

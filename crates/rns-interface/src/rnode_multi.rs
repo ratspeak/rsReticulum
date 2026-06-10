@@ -541,19 +541,12 @@ pub async fn spawn_rnode_multi_interface(
                             frames
                                 .extend_from_slice(&build_subinterface_data_frame(vport, callsign));
                         }
-                        let result = tokio::task::spawn_blocking(move || {
-                            use std::io::Write;
-                            port_w.write_all(&frames)?;
-                            port_w.flush()?;
-                            Ok::<_, std::io::Error>(port_w)
-                        })
-                        .await;
-                        match result {
-                            Ok(Ok(p)) => {
+                        match crate::serial_io::blocking_write_all(port_w, frames).await {
+                            Ok(p) => {
                                 port_w = p;
                                 continue;
                             }
-                            _ => {
+                            Err(_) => {
                                 flags_w.trip_device();
                                 break;
                             }
@@ -590,24 +583,12 @@ pub async fn spawn_rnode_multi_interface(
             }
 
             let frame = build_subinterface_data_frame(req.index, &req.data);
-            let result = tokio::task::spawn_blocking(move || {
-                use std::io::Write;
-                port_w.write_all(&frame)?;
-                port_w.flush()?;
-                Ok::<_, std::io::Error>(port_w)
-            })
-            .await;
-            match result {
-                Ok(Ok(p)) => {
+            match crate::serial_io::blocking_write_all(port_w, frame).await {
+                Ok(p) => {
                     port_w = p;
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "RNodeMulti write error");
-                    flags_w.trip_device();
-                    break;
-                }
                 Err(e) => {
-                    tracing::warn!(error = %e, "RNodeMulti write task panicked");
+                    tracing::warn!(error = %e, "RNodeMulti write error");
                     flags_w.trip_device();
                     break;
                 }
@@ -650,18 +631,8 @@ pub async fn spawn_rnode_multi_interface(
                 break;
             }
 
-            let result = tokio::task::spawn_blocking(move || {
-                use std::io::Read;
-                match port_r.read(&mut buf) {
-                    Ok(n) => Ok((port_r, buf, n)),
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok((port_r, buf, 0)),
-                    Err(e) => Err((port_r, e)),
-                }
-            })
-            .await;
-
-            match result {
-                Ok(Ok((p, b, n))) => {
+            match crate::serial_io::poll_read(port_r, buf).await {
+                Ok((p, b, n)) => {
                     port_r = p;
                     buf = b;
                     if n == 0 {
@@ -967,20 +938,11 @@ pub async fn spawn_rnode_multi_interface(
                         }
                     }
                 }
-                Ok(Err((_p, e))) => {
-                    tracing::warn!(
-                        parent = %parent_name,
-                        error = %e,
-                        "RNodeMulti read error"
-                    );
-                    flags_r.trip_device();
-                    return;
-                }
                 Err(e) => {
                     tracing::warn!(
                         parent = %parent_name,
                         error = %e,
-                        "RNodeMulti read task panicked"
+                        "RNodeMulti read error"
                     );
                     flags_r.trip_device();
                     return;

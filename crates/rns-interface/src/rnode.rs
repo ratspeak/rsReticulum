@@ -981,29 +981,17 @@ pub async fn spawn_rnode_interface(
                             }
                         }
                     }
-                    let online_ref = online_w.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        use std::io::Write;
-                        port_w.write_all(&framed)?;
-                        port_w.flush()?;
-                        Ok::<_, std::io::Error>(port_w)
-                    })
-                    .await;
+                    let result = crate::serial_io::blocking_write_all(port_w, framed).await;
                     if let Some(done_tx) = done_tx {
                         let _ = done_tx.send(());
                     }
                     match result {
-                        Ok(Ok(p)) => {
+                        Ok(p) => {
                             port_w = p;
                         }
-                        Ok(Err(e)) => {
-                            tracing::warn!(error = %e, "RNode write error");
-                            online_ref.store(false, Ordering::SeqCst);
-                            break;
-                        }
                         Err(e) => {
-                            tracing::warn!(error = %e, "RNode write task panicked");
-                            online_ref.store(false, Ordering::SeqCst);
+                            tracing::warn!(error = %e, "RNode write error");
+                            online_w.store(false, Ordering::SeqCst);
                             break;
                         }
                     }
