@@ -1,109 +1,77 @@
-//! Shared TCP socket tuning for [`crate::tcp`] and [`crate::backbone`].
+//! Shared TCP socket tuning for [`crate::tcp`], [`crate::backbone`],
+//! [`crate::i2p`], and [`crate::rnode`] (TCP transport).
 //! `set_keepalive`: portable SO_KEEPALIVE. `set_keepalive_tuned`: adds Linux
-//! TCP_KEEPIDLE/INTVL/CNT + TCP_USER_TIMEOUT.
+//! TCP_KEEPIDLE/INTVL/CNT + TCP_USER_TIMEOUT. All helpers are generic over
+//! the raw-fd/raw-socket borrow, so they accept tokio and std streams alike.
 //! `iface_addr_for`: kernel iface name → IpAddr for Backbone `device =` key.
 
 use std::net::IpAddr;
 use std::time::Duration;
 
-use tokio::net::TcpStream;
-
-/// Enable portable `SO_KEEPALIVE`; for tuned, use [`set_keepalive_tuned`].
+/// Borrow the raw fd/socket as a `socket2::Socket` without taking ownership
+/// (`ManuallyDrop` keeps the destructor from closing it).
 #[cfg(unix)]
-pub fn set_keepalive(stream: &TcpStream) -> std::io::Result<()> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let raw_fd = stream.as_ref().as_raw_fd();
+fn with_socket2<S: std::os::fd::AsRawFd, R>(
+    stream: &S,
+    f: impl FnOnce(&socket2::Socket) -> R,
+) -> R {
+    use std::os::fd::FromRawFd;
     // SAFETY: we borrow the fd without taking ownership (ManuallyDrop ensures
     // the socket2::Socket destructor does not close the fd).
-    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(raw_fd) });
-    sock.set_keepalive(true)?;
-    Ok(())
+    let sock =
+        std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(stream.as_raw_fd()) });
+    f(&sock)
 }
 
 #[cfg(windows)]
-pub fn set_keepalive(stream: &TcpStream) -> std::io::Result<()> {
-    use std::os::windows::io::{AsRawSocket, FromRawSocket};
-    let raw = stream.as_ref().as_raw_socket();
-    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_socket(raw) });
-    sock.set_keepalive(true)?;
-    Ok(())
+fn with_socket2<S: std::os::windows::io::AsRawSocket, R>(
+    stream: &S,
+    f: impl FnOnce(&socket2::Socket) -> R,
+) -> R {
+    use std::os::windows::io::FromRawSocket;
+    // SAFETY: same borrow-without-ownership contract as the unix variant.
+    let sock = std::mem::ManuallyDrop::new(unsafe {
+        socket2::Socket::from_raw_socket(stream.as_raw_socket())
+    });
+    f(&sock)
 }
 
-/// Enable portable `SO_KEEPALIVE` on a blocking std TCP stream.
+/// Platform bound for streams the tuning helpers accept: anything exposing
+/// the raw socket handle (tokio `TcpStream`, std `TcpStream`, …).
 #[cfg(unix)]
-pub fn set_keepalive_std(stream: &std::net::TcpStream) -> std::io::Result<()> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let raw_fd = stream.as_raw_fd();
-    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(raw_fd) });
-    sock.set_keepalive(true)?;
-    Ok(())
-}
+pub trait RawStream: std::os::fd::AsRawFd {}
+#[cfg(unix)]
+impl<T: std::os::fd::AsRawFd> RawStream for T {}
 
 #[cfg(windows)]
-pub fn set_keepalive_std(stream: &std::net::TcpStream) -> std::io::Result<()> {
-    use std::os::windows::io::{AsRawSocket, FromRawSocket};
-    let raw = stream.as_raw_socket();
-    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_socket(raw) });
-    sock.set_keepalive(true)?;
-    Ok(())
+pub trait RawStream: std::os::windows::io::AsRawSocket {}
+#[cfg(windows)]
+impl<T: std::os::windows::io::AsRawSocket> RawStream for T {}
+
+/// Enable portable `SO_KEEPALIVE`; for tuned, use [`set_keepalive_tuned`].
+pub fn set_keepalive<S: RawStream>(stream: &S) -> std::io::Result<()> {
+    with_socket2(stream, |sock| sock.set_keepalive(true))
 }
 
 /// Tuned keepalive: idle/interval/retries + Linux TCP_USER_TIMEOUT. Best-effort.
-#[cfg(unix)]
-pub fn set_keepalive_tuned(
-    stream: &TcpStream,
+pub fn set_keepalive_tuned<S: RawStream>(
+    stream: &S,
     idle: Duration,
     intvl: Duration,
     retries: u32,
     user_timeout: Duration,
 ) {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let raw_fd = stream.as_ref().as_raw_fd();
-    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(raw_fd) });
-    apply_tuned_keepalive(&sock, idle, intvl, retries, user_timeout);
+    with_socket2(stream, |sock| {
+        apply_tuned_keepalive(sock, idle, intvl, retries, user_timeout)
+    });
 }
 
-#[cfg(windows)]
-pub fn set_keepalive_tuned(
-    stream: &TcpStream,
-    idle: Duration,
-    intvl: Duration,
-    retries: u32,
-    user_timeout: Duration,
-) {
-    use std::os::windows::io::{AsRawSocket, FromRawSocket};
-    let raw = stream.as_ref().as_raw_socket();
-    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_socket(raw) });
-    apply_tuned_keepalive(&sock, idle, intvl, retries, user_timeout);
-}
-
-/// Tuned keepalive for blocking std TCP streams. Best-effort.
-#[cfg(unix)]
-pub fn set_keepalive_tuned_std(
-    stream: &std::net::TcpStream,
-    idle: Duration,
-    intvl: Duration,
-    retries: u32,
-    user_timeout: Duration,
-) {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let raw_fd = stream.as_raw_fd();
-    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(raw_fd) });
-    apply_tuned_keepalive(&sock, idle, intvl, retries, user_timeout);
-}
-
-#[cfg(windows)]
-pub fn set_keepalive_tuned_std(
-    stream: &std::net::TcpStream,
-    idle: Duration,
-    intvl: Duration,
-    retries: u32,
-    user_timeout: Duration,
-) {
-    use std::os::windows::io::{AsRawSocket, FromRawSocket};
-    let raw = stream.as_raw_socket();
-    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_socket(raw) });
-    apply_tuned_keepalive(&sock, idle, intvl, retries, user_timeout);
+/// Raise TCP send/recv buffers; best-effort.
+pub fn set_socket_buffers<S: RawStream>(stream: &S, size: usize) {
+    with_socket2(stream, |sock| {
+        let _ = sock.set_recv_buffer_size(size);
+        let _ = sock.set_send_buffer_size(size);
+    });
 }
 
 fn apply_tuned_keepalive(
@@ -134,44 +102,6 @@ fn apply_tuned_keepalive(
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "fuchsia")))]
     let _ = user_timeout;
-}
-
-/// Raise TCP send/recv buffers; best-effort.
-#[cfg(unix)]
-pub fn set_socket_buffers(stream: &TcpStream, size: usize) {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let raw_fd = stream.as_ref().as_raw_fd();
-    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(raw_fd) });
-    let _ = sock.set_recv_buffer_size(size);
-    let _ = sock.set_send_buffer_size(size);
-}
-
-#[cfg(windows)]
-pub fn set_socket_buffers(stream: &TcpStream, size: usize) {
-    use std::os::windows::io::{AsRawSocket, FromRawSocket};
-    let raw = stream.as_ref().as_raw_socket();
-    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_socket(raw) });
-    let _ = sock.set_recv_buffer_size(size);
-    let _ = sock.set_send_buffer_size(size);
-}
-
-/// Raise TCP send/recv buffers on a blocking std TCP stream; best-effort.
-#[cfg(unix)]
-pub fn set_socket_buffers_std(stream: &std::net::TcpStream, size: usize) {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let raw_fd = stream.as_raw_fd();
-    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(raw_fd) });
-    let _ = sock.set_recv_buffer_size(size);
-    let _ = sock.set_send_buffer_size(size);
-}
-
-#[cfg(windows)]
-pub fn set_socket_buffers_std(stream: &std::net::TcpStream, size: usize) {
-    use std::os::windows::io::{AsRawSocket, FromRawSocket};
-    let raw = stream.as_raw_socket();
-    let sock = std::mem::ManuallyDrop::new(unsafe { socket2::Socket::from_raw_socket(raw) });
-    let _ = sock.set_recv_buffer_size(size);
-    let _ = sock.set_send_buffer_size(size);
 }
 
 /// Resolve interface name to its IPv4 broadcast address; `None` if the
@@ -230,7 +160,7 @@ pub fn iface_addr_for(name: &str, prefer_ipv6: bool) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     #[tokio::test]
     async fn keepalive_and_buffers_apply_without_panic() {
@@ -264,6 +194,7 @@ mod tests {
         set_socket_buffers(&client, 131_072);
     }
 
+    /// The same generic helpers must accept blocking std streams.
     #[test]
     fn std_keepalive_and_buffers_apply_without_panic() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -272,17 +203,17 @@ mod tests {
         let client = std::net::TcpStream::connect(addr).unwrap();
         let server = accept.join().unwrap();
 
-        set_keepalive_std(&server).expect("server set_keepalive_std");
-        set_keepalive_std(&client).expect("client set_keepalive_std");
+        set_keepalive(&server).expect("server set_keepalive");
+        set_keepalive(&client).expect("client set_keepalive");
 
-        set_keepalive_tuned_std(
+        set_keepalive_tuned(
             &server,
             Duration::from_secs(5),
             Duration::from_secs(2),
             12,
             Duration::from_secs(24),
         );
-        set_keepalive_tuned_std(
+        set_keepalive_tuned(
             &client,
             Duration::from_secs(5),
             Duration::from_secs(2),
@@ -290,8 +221,8 @@ mod tests {
             Duration::from_secs(24),
         );
 
-        set_socket_buffers_std(&server, 131_072);
-        set_socket_buffers_std(&client, 131_072);
+        set_socket_buffers(&server, 131_072);
+        set_socket_buffers(&client, 131_072);
     }
 
     #[test]

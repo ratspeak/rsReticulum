@@ -355,14 +355,14 @@ impl RNodeStream {
         // Mirror the serial timeout so the read loop doesn't block forever.
         stream.set_read_timeout(Some(Duration::from_millis(RNODE_READ_TIMEOUT_MS)))?;
         stream.set_nodelay(true)?;
-        crate::socket_tuning::set_keepalive_tuned_std(
+        crate::socket_tuning::set_keepalive_tuned(
             &stream,
             Duration::from_secs(RNODE_TCP_KEEPIDLE_SECS),
             Duration::from_secs(RNODE_TCP_KEEPINTVL_SECS),
             RNODE_TCP_KEEPCNT,
             Duration::from_secs(RNODE_TCP_USER_TIMEOUT_SECS),
         );
-        crate::socket_tuning::set_socket_buffers_std(&stream, RNODE_TCP_BUFFER_BYTES);
+        crate::socket_tuning::set_socket_buffers(&stream, RNODE_TCP_BUFFER_BYTES);
         Ok(Self::Tcp(stream))
     }
 
