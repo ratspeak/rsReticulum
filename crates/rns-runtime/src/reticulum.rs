@@ -1019,22 +1019,13 @@ pub async fn init(
                 .await
                 {
                     Ok(client_handle) => {
-                        let client_iface_id = client_handle.id;
-                        let client_online = client_handle.online.clone();
-                        register_interface_handle_with_role(
-                            &transport_tx,
+                        adopt_shared_instance_client(
                             client_handle,
-                            rns_transport::messages::InterfaceRole::SharedInstancePeer,
+                            &transport_tx,
                             &interface_controls,
+                            &shutdown,
                         )
-                        .await;
-                        spawn_shared_peer_monitor(
-                            transport_tx.clone(),
-                            client_iface_id,
-                            client_online,
-                            shutdown.clone(),
-                        );
-                        InstanceMode::Client
+                        .await
                     }
                     Err(_) => InstanceMode::Standalone,
                 }
@@ -1077,22 +1068,13 @@ pub async fn init(
                             .await
                             {
                                 Ok(client_handle) => {
-                                    let client_iface_id = client_handle.id;
-                                    let client_online = client_handle.online.clone();
-                                    register_interface_handle_with_role(
-                                        &transport_tx,
+                                    adopt_shared_instance_client(
                                         client_handle,
-                                        rns_transport::messages::InterfaceRole::SharedInstancePeer,
+                                        &transport_tx,
                                         &interface_controls,
+                                        &shutdown,
                                     )
-                                    .await;
-                                    spawn_shared_peer_monitor(
-                                        transport_tx.clone(),
-                                        client_iface_id,
-                                        client_online,
-                                        shutdown.clone(),
-                                    );
-                                    InstanceMode::Client
+                                    .await
                                 }
                                 Err(_) => InstanceMode::Standalone,
                             }
@@ -1146,22 +1128,13 @@ pub async fn init(
                 .await
                 {
                     Ok(client_handle) => {
-                        let client_iface_id = client_handle.id;
-                        let client_online = client_handle.online.clone();
-                        register_interface_handle_with_role(
-                            &transport_tx,
+                        adopt_shared_instance_client(
                             client_handle,
-                            rns_transport::messages::InterfaceRole::SharedInstancePeer,
+                            &transport_tx,
                             &interface_controls,
+                            &shutdown,
                         )
-                        .await;
-                        spawn_shared_peer_monitor(
-                            transport_tx.clone(),
-                            client_iface_id,
-                            client_online,
-                            shutdown.clone(),
-                        );
-                        InstanceMode::Client
+                        .await
                     }
                     Err(_) => InstanceMode::Standalone,
                 }
@@ -1202,22 +1175,13 @@ pub async fn init(
                         .await
                         {
                             Ok(client_handle) => {
-                                let client_iface_id = client_handle.id;
-                                let client_online = client_handle.online.clone();
-                                register_interface_handle_with_role(
-                                    &transport_tx,
+                                adopt_shared_instance_client(
                                     client_handle,
-                                    rns_transport::messages::InterfaceRole::SharedInstancePeer,
+                                    &transport_tx,
                                     &interface_controls,
+                                    &shutdown,
                                 )
-                                .await;
-                                spawn_shared_peer_monitor(
-                                    transport_tx.clone(),
-                                    client_iface_id,
-                                    client_online,
-                                    shutdown.clone(),
-                                );
-                                InstanceMode::Client
+                                .await
                             }
                             Err(_) => InstanceMode::Standalone,
                         }
@@ -1562,6 +1526,32 @@ fn discovered_backbone_client_mode(
 
 fn next_id(id_gen: &Arc<AtomicU64>) -> u64 {
     id_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Register a freshly connected shared-instance client (TCP or local socket)
+/// as the SharedInstancePeer and start its reconnect monitor.
+async fn adopt_shared_instance_client(
+    client_handle: rns_interface::traits::InterfaceHandle,
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    interface_controls: &InterfaceControlMap,
+    shutdown: &ShutdownSignal,
+) -> InstanceMode {
+    let client_iface_id = client_handle.id;
+    let client_online = client_handle.online.clone();
+    register_interface_handle_with_role(
+        transport_tx,
+        client_handle,
+        rns_transport::messages::InterfaceRole::SharedInstancePeer,
+        interface_controls,
+    )
+    .await;
+    spawn_shared_peer_monitor(
+        transport_tx.clone(),
+        client_iface_id,
+        client_online,
+        shutdown.clone(),
+    );
+    InstanceMode::Client
 }
 
 fn spawn_shared_peer_monitor(
