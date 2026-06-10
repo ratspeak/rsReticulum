@@ -251,6 +251,27 @@ fn parse_interface_mode(s: &str) -> Option<InterfaceMode> {
     }
 }
 
+/// Config ports arrive as u64; values over 65535 are config errors, not
+/// silent `as u16` wraps (70000 would otherwise become 4464).
+fn parse_port(name: &str, field: &str, value: u64) -> Result<u16, InterfaceFactoryError> {
+    u16::try_from(value).map_err(|_| InterfaceFactoryError::InvalidValue {
+        field: format!("{name}.{field}"),
+        message: format!("{value} is not a valid port (0-65535)"),
+    })
+}
+
+/// Optional port field: validate only when present.
+fn parse_port_opt(
+    name: &str,
+    field: &str,
+    section: &ConfigSection,
+) -> Result<Option<u16>, InterfaceFactoryError> {
+    section
+        .get_uint(field)
+        .map(|v| parse_port(name, field, v))
+        .transpose()
+}
+
 pub fn synthesize_interface(
     name: &str,
     section: &ConfigSection,
@@ -263,6 +284,17 @@ pub fn synthesize_interface(
     if !enabled {
         debug!(interface = %name, "interface disabled in config, skipping");
         return Err(InterfaceFactoryError::Disabled(name.to_string()));
+    }
+
+    // IFAC sizes outside 1..=64 would panic deep in the transport actor on
+    // first egress (`ifac_sign` asserts); reject at config parse instead.
+    if let Some(size) = section.get_uint("ifac_size") {
+        if !(1..=64).contains(&size) {
+            return Err(InterfaceFactoryError::InvalidValue {
+                field: format!("{name}.ifac_size"),
+                message: format!("{size} is out of range (1-64 bytes)"),
+            });
+        }
     }
 
     let iface_type = section.get("type").ok_or_else(|| {
@@ -360,13 +392,16 @@ fn synthesize_tcp_client(
             field: "target_host".to_string(),
         })?;
 
-    let port =
+    let port = parse_port(
+        name,
+        "target_port",
         section
             .get_uint("target_port")
             .ok_or_else(|| InterfaceFactoryError::MissingField {
                 name: name.to_string(),
                 field: "target_port".to_string(),
-            })? as u16;
+            })?,
+    )?;
 
     let mut config = TcpClientConfig::new(name, host, port);
     config.mode = mode;
@@ -401,13 +436,16 @@ fn synthesize_tcp_server(
 ) -> Result<InterfaceConfig, InterfaceFactoryError> {
     let ip = section.get("listen_ip").unwrap_or("0.0.0.0");
 
-    let port =
+    let port = parse_port(
+        name,
+        "listen_port",
         section
             .get_uint("listen_port")
             .ok_or_else(|| InterfaceFactoryError::MissingField {
                 name: name.to_string(),
                 field: "listen_port".to_string(),
-            })? as u16;
+            })?,
+    )?;
 
     let mut config = TcpServerConfig::new(name, ip, port);
     config.mode = mode;
@@ -436,15 +474,11 @@ fn synthesize_udp(
     if let Some(ip) = section.get("listen_ip") {
         config.listen_ip = Some(ip.to_string());
     }
-    if let Some(port) = section.get_uint("listen_port") {
-        config.listen_port = Some(port as u16);
-    }
+    config.listen_port = parse_port_opt(name, "listen_port", section)?;
     if let Some(ip) = section.get("forward_ip") {
         config.forward_ip = Some(ip.to_string());
     }
-    if let Some(port) = section.get_uint("forward_port") {
-        config.forward_port = Some(port as u16);
-    }
+    config.forward_port = parse_port_opt(name, "forward_port", section)?;
     if let Some(device) = section.get("device") {
         config.device = Some(device.to_string());
     }
@@ -552,8 +586,8 @@ fn synthesize_auto(
         None => rns_interface::auto::DiscoveryScope::Link,
     };
 
-    let discovery_port = section.get_uint("discovery_port").unwrap_or(29716) as u16;
-    let data_port = section.get_uint("data_port").unwrap_or(42671) as u16;
+    let discovery_port = parse_port_opt(name, "discovery_port", section)?.unwrap_or(29716);
+    let data_port = parse_port_opt(name, "data_port", section)?.unwrap_or(42671);
 
     let multicast_address_type = match section.get("multicast_address_type") {
         Some(s) => rns_interface::auto::McastAddrType::from_str(s).map_err(|message| {
@@ -753,9 +787,8 @@ fn synthesize_local(
     section: &ConfigSection,
     mode: InterfaceMode,
 ) -> Result<InterfaceConfig, InterfaceFactoryError> {
-    let port = section
-        .get_uint("port")
-        .unwrap_or(crate::constants::LOCAL_INTERFACE_PORT as u64) as u16;
+    let port =
+        parse_port_opt(name, "port", section)?.unwrap_or(crate::constants::LOCAL_INTERFACE_PORT);
 
     Ok(InterfaceConfig::Local(LocalInterfaceConfig {
         name: name.to_string(),
@@ -783,7 +816,7 @@ fn synthesize_i2p(
         .get("i2p_sam_host")
         .unwrap_or("127.0.0.1")
         .to_string();
-    let i2p_sam_port = section.get_uint("i2p_sam_port").unwrap_or(7656) as u16;
+    let i2p_sam_port = parse_port_opt(name, "i2p_sam_port", section)?.unwrap_or(7656);
 
     Ok(InterfaceConfig::I2P(I2PInterfaceConfig {
         name: name.to_string(),
@@ -1081,14 +1114,18 @@ fn synthesize_backbone(
         .or_else(|| section.get("remote"))
         .map(|s| s.to_string());
     // Python BackboneInterface.py:133-134 errors without an explicit port.
-    let port = section
-        .get_uint("port")
-        .or_else(|| section.get_uint("listen_port"))
-        .or_else(|| section.get_uint("target_port"))
-        .ok_or_else(|| InterfaceFactoryError::MissingField {
-            name: name.to_string(),
-            field: "port".to_string(),
-        })? as u16;
+    let port = parse_port(
+        name,
+        "port",
+        section
+            .get_uint("port")
+            .or_else(|| section.get_uint("listen_port"))
+            .or_else(|| section.get_uint("target_port"))
+            .ok_or_else(|| InterfaceFactoryError::MissingField {
+                name: name.to_string(),
+                field: "port".to_string(),
+            })?,
+    )?;
     let device = section.get("device").map(|s| s.to_string());
     let prefer_ipv6 = section.get_bool("prefer_ipv6").unwrap_or(false);
     let connect_timeout = section.get_uint("connect_timeout").unwrap_or(5);
@@ -1293,6 +1330,70 @@ mod tests {
             Err(InterfaceFactoryError::UnknownType(t)) => assert_eq!(t, "FooInterface"),
             other => panic!("expected UnknownType, got {other:?}"),
         }
+    }
+
+    /// T1-11: ports over 65535 are config errors, never silent u16 wraps.
+    #[test]
+    fn test_out_of_range_port_rejected() {
+        let mut section = ConfigSection::new();
+        section.set("type", "TCPClientInterface");
+        section.set("target_host", "127.0.0.1");
+        section.set("target_port", "70000");
+        match synthesize_interface("tcp_badport", &section) {
+            Err(InterfaceFactoryError::InvalidValue { field, message }) => {
+                assert_eq!(field, "tcp_badport.target_port");
+                assert!(message.contains("70000"));
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        let mut section = ConfigSection::new();
+        section.set("type", "UDPInterface");
+        section.set("listen_ip", "0.0.0.0");
+        section.set("listen_port", "65536");
+        match synthesize_interface("udp_badport", &section) {
+            Err(InterfaceFactoryError::InvalidValue { field, .. }) => {
+                assert_eq!(field, "udp_badport.listen_port");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        let mut section = ConfigSection::new();
+        section.set("type", "AutoInterface");
+        section.set("discovery_port", "99999");
+        match synthesize_interface("auto_badport", &section) {
+            Err(InterfaceFactoryError::InvalidValue { field, .. }) => {
+                assert_eq!(field, "auto_badport.discovery_port");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    /// T1-11: ifac_size outside 1..=64 used to panic the transport actor on
+    /// first egress; it must be a parse-time config error.
+    #[test]
+    fn test_ifac_size_out_of_range_rejected() {
+        for bad in ["0", "65", "4096"] {
+            let mut section = ConfigSection::new();
+            section.set("type", "TCPClientInterface");
+            section.set("target_host", "127.0.0.1");
+            section.set("target_port", "4242");
+            section.set("ifac_size", bad);
+            match synthesize_interface("tcp_ifac", &section) {
+                Err(InterfaceFactoryError::InvalidValue { field, .. }) => {
+                    assert_eq!(field, "tcp_ifac.ifac_size");
+                }
+                other => panic!("expected InvalidValue for ifac_size={bad}, got {other:?}"),
+            }
+        }
+
+        // In-range sizes still parse.
+        let mut section = ConfigSection::new();
+        section.set("type", "TCPClientInterface");
+        section.set("target_host", "127.0.0.1");
+        section.set("target_port", "4242");
+        section.set("ifac_size", "64");
+        assert!(synthesize_interface("tcp_ifac_ok", &section).is_ok());
     }
 
     #[test]

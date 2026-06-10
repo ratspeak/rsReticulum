@@ -342,6 +342,11 @@ pub async fn spawn_tcp_client(
                         tries += 1;
                         if tries >= max {
                             tracing::warn!(name = %config.name, "max reconnect tries reached");
+                            // Same dereg as the post-connect give-up below —
+                            // otherwise the actor keeps a zombie entry.
+                            let _ = transport_tx
+                                .send(TransportMessage::DeregisterInterface { id })
+                                .await;
                             return;
                         }
                     }
@@ -355,6 +360,9 @@ pub async fn spawn_tcp_client(
                         tries += 1;
                         if tries >= max {
                             tracing::warn!(name = %config.name, "max reconnect tries reached");
+                            let _ = transport_tx
+                                .send(TransportMessage::DeregisterInterface { id })
+                                .await;
                             return;
                         }
                     }
@@ -679,6 +687,37 @@ mod tests {
                 (DEFAULT_TCP_USER_TIMEOUT * 1000) as i32
             );
         }
+    }
+
+    /// T1-11: exhausting max_reconnect_tries before the FIRST successful
+    /// connect must send DeregisterInterface, same as the post-connect path —
+    /// otherwise the actor keeps a zombie entry forever.
+    #[tokio::test]
+    async fn test_initial_connect_give_up_sends_deregister() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
+
+        // Bind-then-drop: the port refuses connections immediately.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let mut config = TcpClientConfig::new("tcp-giveup", &addr.ip().to_string(), addr.port());
+        config.max_reconnect_tries = Some(1);
+        config.connect_timeout_secs = 2;
+
+        let handle = spawn_tcp_client(config, 77, transport_tx, None)
+            .await
+            .unwrap();
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), transport_rx.recv())
+            .await
+            .expect("expected DeregisterInterface before timeout")
+            .expect("transport channel closed");
+        match msg {
+            TransportMessage::DeregisterInterface { id } => assert_eq!(id, 77),
+            other => panic!("expected DeregisterInterface, got {other:?}"),
+        }
+        handle.read_task.abort();
     }
 
     #[test]

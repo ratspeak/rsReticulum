@@ -54,7 +54,28 @@ pub async fn spawn_udp_interface(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-    let listen_ip = config.listen_ip.as_deref().unwrap_or("0.0.0.0");
+    // Python UDPInterface `device =`: fill unset listen/forward IPs with the
+    // NIC's IPv4 broadcast address; a device that can't be resolved is a
+    // config error, not a silent fallback to wildcard.
+    let mut listen_ip_cfg = config.listen_ip.clone();
+    let mut forward_ip_cfg = config.forward_ip.clone();
+    if let Some(device) = config.device.as_deref() {
+        if listen_ip_cfg.is_none() || forward_ip_cfg.is_none() {
+            let bcast = crate::socket_tuning::iface_broadcast_for(device).ok_or_else(|| {
+                crate::traits::InterfaceError::SendFailed(format!(
+                    "UDP device '{device}' not found or has no IPv4 broadcast address"
+                ))
+            })?;
+            if listen_ip_cfg.is_none() {
+                listen_ip_cfg = Some(bcast.to_string());
+            }
+            if forward_ip_cfg.is_none() {
+                forward_ip_cfg = Some(bcast.to_string());
+            }
+        }
+    }
+
+    let listen_ip = listen_ip_cfg.as_deref().unwrap_or("0.0.0.0");
     let listen_port = config.listen_port.unwrap_or(0);
     let bind_addr = format!("{}:{}", listen_ip, listen_port);
     let socket = Arc::new(UdpSocket::bind(&bind_addr).await?);
@@ -73,7 +94,7 @@ pub async fn spawn_udp_interface(
     let task_rxb = shared_rxb.clone();
     let task_txb = shared_txb.clone();
 
-    let forward_addr: Option<SocketAddr> = match (&config.forward_ip, config.forward_port) {
+    let forward_addr: Option<SocketAddr> = match (&forward_ip_cfg, config.forward_port) {
         (Some(ip), Some(port)) => {
             let addr_str = format!("{}:{}", ip, port);
             match addr_str.parse() {
@@ -183,6 +204,38 @@ mod tests {
     #[test]
     fn test_hw_mtu() {
         assert_eq!(HW_MTU, 1064);
+    }
+
+    /// T1-11: `device =` was parsed then silently ignored. A device that
+    /// cannot be resolved must now fail the spawn with a clear error.
+    #[tokio::test]
+    async fn test_udp_device_unresolvable_errors() {
+        let (transport_tx, _rx) = mpsc::channel::<TransportMessage>(8);
+        let mut cfg = UdpInterfaceConfig::new("udp-dev");
+        cfg.device = Some("definitely-not-a-real-interface-zzz".to_string());
+        let err = match spawn_udp_interface(cfg, 1, transport_tx).await {
+            Err(e) => e,
+            Ok(_) => panic!("unresolvable device must error"),
+        };
+        assert!(
+            err.to_string()
+                .contains("definitely-not-a-real-interface-zzz")
+        );
+    }
+
+    /// Explicit listen/forward IPs take precedence — the device is not
+    /// resolved at all, so the spawn succeeds regardless of the NIC name.
+    #[tokio::test]
+    async fn test_udp_device_ignored_when_ips_explicit() {
+        let (transport_tx, _rx) = mpsc::channel::<TransportMessage>(8);
+        let mut cfg = UdpInterfaceConfig::new("udp-dev-explicit")
+            .listen("127.0.0.1", 0)
+            .forward("127.0.0.1", 19999);
+        cfg.device = Some("definitely-not-a-real-interface-zzz".to_string());
+        let handle = spawn_udp_interface(cfg, 2, transport_tx)
+            .await
+            .expect("explicit IPs bypass device resolution");
+        handle.read_task.abort();
     }
 
     #[test]

@@ -174,6 +174,26 @@ pub fn set_socket_buffers_std(stream: &std::net::TcpStream, size: usize) {
     let _ = sock.set_send_buffer_size(size);
 }
 
+/// Resolve interface name to its IPv4 broadcast address; `None` if the
+/// interface is missing or has no broadcast-capable IPv4. Python UDP
+/// `device =` semantics (`get_broadcast_for_if`).
+pub fn iface_broadcast_for(name: &str) -> Option<std::net::Ipv4Addr> {
+    let ifaces = match if_addrs::get_if_addrs() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "if_addrs::get_if_addrs() failed");
+            return None;
+        }
+    };
+    ifaces.into_iter().filter(|i| i.name == name).find_map(|i| {
+        if let if_addrs::IfAddr::V4(v4) = i.addr {
+            v4.broadcast
+        } else {
+            None
+        }
+    })
+}
+
 /// Resolve interface name to `IpAddr`; `None` if missing. Caller falls back
 /// to wildcard bind.
 pub fn iface_addr_for(name: &str, prefer_ipv6: bool) -> Option<IpAddr> {
