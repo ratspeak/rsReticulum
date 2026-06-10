@@ -228,6 +228,9 @@ pub(crate) async fn main() {
 }
 
 async fn run_fetch(args: Args) -> ! {
+    // Register before any slow init so an early SIGINT exits cleanly.
+    let shutdown = ShutdownSignal::new();
+    let _signal_rx = install_signal_handlers(shutdown.clone());
     // In fetch mode the positionals are `<destination_hash> <remote_path>`.
     let (Some(dest_arg), Some(path_arg)) = (args.file.as_ref(), args.destination.as_ref()) else {
         eprintln!("rncp-rs: fetch mode requires <destination_hash> <remote_path>");
@@ -264,7 +267,7 @@ async fn run_fetch(args: Args) -> ! {
         None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
 
-    let handle = start_reticulum(args.config.as_deref()).await;
+    let handle = start_reticulum(args.config.as_deref(), shutdown.clone()).await;
     let paths = StoragePaths::from_config_dir(&handle.config_dir);
     let identity = match load_or_create_identity(args.identity_path.as_deref(), &paths.identity_dir)
     {
@@ -371,6 +374,9 @@ fn print_fetch_summary(outcome: &RncpFetchOutcome) {
 }
 
 async fn run_send(args: Args) -> ! {
+    // Register before any slow init so an early SIGINT exits cleanly.
+    let shutdown = ShutdownSignal::new();
+    let _signal_rx = install_signal_handlers(shutdown.clone());
     let (Some(file_arg), Some(dest_arg)) = (args.file.as_ref(), args.destination.as_ref()) else {
         // Bare `rncp` prints help and exits 0.
         let mut cmd = <Args as clap::CommandFactory>::command();
@@ -407,7 +413,7 @@ async fn run_send(args: Args) -> ! {
         }
     };
 
-    let handle = start_reticulum(args.config.as_deref()).await;
+    let handle = start_reticulum(args.config.as_deref(), shutdown.clone()).await;
 
     let paths = StoragePaths::from_config_dir(&handle.config_dir);
     let identity = match load_or_create_identity(args.identity_path.as_deref(), &paths.identity_dir)
@@ -525,6 +531,9 @@ fn human_rate(bps: f64) -> (f64, &'static str) {
 }
 
 async fn run_listen(args: Args) -> ! {
+    // Register before any slow init so an early SIGINT exits cleanly.
+    let shutdown = ShutdownSignal::new();
+    let _signal_rx = install_signal_handlers(shutdown.clone());
     let save_dir = match args.save.as_deref() {
         Some(p) => {
             let path = expand_tilde(p);
@@ -571,7 +580,7 @@ async fn run_listen(args: Args) -> ! {
         eprintln!("Warning: No allowed identities configured, rncp will not accept any files!");
     }
 
-    let handle = start_reticulum(args.config.as_deref()).await;
+    let handle = start_reticulum(args.config.as_deref(), shutdown.clone()).await;
     let paths = StoragePaths::from_config_dir(&handle.config_dir);
     let identity = match load_or_create_identity(args.identity_path.as_deref(), &paths.identity_dir)
     {
@@ -806,9 +815,10 @@ fn rncp_allowed_identity_file_candidates() -> Vec<PathBuf> {
     paths
 }
 
-async fn start_reticulum(config_dir: Option<&str>) -> rns_runtime::reticulum::ReticulumHandle {
-    let shutdown = ShutdownSignal::new();
-    let _signal_rx = install_signal_handlers(shutdown.clone());
+async fn start_reticulum(
+    config_dir: Option<&str>,
+    shutdown: ShutdownSignal,
+) -> rns_runtime::reticulum::ReticulumHandle {
     let is_foreground = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     match rns_runtime::reticulum::init(config_dir, None, shutdown.clone(), is_foreground).await {
         Ok(h) => h,

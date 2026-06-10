@@ -120,9 +120,12 @@ async fn run(mut args: Args) -> ExitCode {
 }
 
 async fn run_listener(args: Args) -> ExitCode {
+    // Register before any slow init so an early SIGINT exits cleanly.
+    let shutdown = ShutdownSignal::new();
+    let _signal_rx = install_signal_handlers(shutdown.clone());
     init_logging(args.verbose, args.quiet);
 
-    let handle = match start_reticulum(args.config.as_deref()).await {
+    let handle = match start_reticulum(args.config.as_deref(), shutdown.clone()).await {
         Ok(handle) => handle,
         Err(e) => {
             eprintln!("rnsh-rs: failed to start reticulum: {e}");
@@ -172,6 +175,9 @@ async fn run_listener(args: Args) -> ExitCode {
 }
 
 async fn run_initiator(args: Args) -> ExitCode {
+    // Register before any slow init so an early SIGINT exits cleanly.
+    let shutdown = ShutdownSignal::new();
+    let _signal_rx = install_signal_handlers(shutdown.clone());
     init_logging(args.verbose, args.quiet);
 
     let destination = match args.destination.as_deref().and_then(parse_hash16) {
@@ -182,7 +188,7 @@ async fn run_initiator(args: Args) -> ExitCode {
         }
     };
 
-    let handle = match start_reticulum(args.config.as_deref()).await {
+    let handle = match start_reticulum(args.config.as_deref(), shutdown.clone()).await {
         Ok(handle) => handle,
         Err(e) => {
             eprintln!("rnsh-rs: failed to start reticulum: {e}");
@@ -253,9 +259,8 @@ async fn run_initiator(args: Args) -> ExitCode {
 
 async fn start_reticulum(
     config_dir: Option<&Path>,
+    shutdown: ShutdownSignal,
 ) -> Result<rns_runtime::reticulum::ReticulumHandle, rns_runtime::reticulum::ReticulumError> {
-    let shutdown = ShutdownSignal::new();
-    let _signal_rx = install_signal_handlers(shutdown.clone());
     let is_foreground = Arc::new(AtomicBool::new(true));
     let config = config_dir.and_then(|path| path.to_str());
     rns_runtime::reticulum::init(config, None, shutdown, is_foreground).await
