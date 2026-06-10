@@ -26,7 +26,7 @@ use rns_transport::messages::{
 #[cfg(feature = "hardware")]
 mod hw_commands;
 
-const RETICULUM_COMPAT_VERSION: &str = "1.2.5";
+use rns_tools::RETICULUM_COMPAT_VERSION;
 const DEFAULT_ASPECTS: &str = "rns.id";
 const PUB_EXT: &str = "pub";
 const SIG_EXT: &str = "rsg";

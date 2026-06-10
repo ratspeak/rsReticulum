@@ -27,7 +27,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 5;
 const REMOTE_TIMEOUT_SECS: u64 = 30;
 const REMOTE_HOPS: u8 = 8;
 const MGMT_APP: &str = "rnstransport.remote.management";
-const RETICULUM_COMPAT_VERSION: &str = "1.2.5";
+use rns_tools::RETICULUM_COMPAT_VERSION;
 
 #[derive(Parser)]
 #[command(

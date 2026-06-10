@@ -4,6 +4,15 @@
 //! [`actor::TransportActor`] owns all mutable state; other crates send typed
 //! [`messages::TransportMessage`]s over a Tokio mpsc channel.
 
+/// Unix time as f64 seconds — Python `time.time()` equivalent, the timebase
+/// used across path/reverse/rate/blackhole/tunnel tables.
+pub fn now_f64() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
 pub mod actor;
 pub mod announce;
 pub mod await_path;

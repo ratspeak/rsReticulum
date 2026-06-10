@@ -488,9 +488,6 @@ mod tests {
     }
 
     fn now_seconds() -> f64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64()
+        crate::now_f64()
     }
 }

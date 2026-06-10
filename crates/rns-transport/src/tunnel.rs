@@ -79,10 +79,7 @@ impl TunnelTable {
     }
 
     pub fn cull_expired(&mut self) -> usize {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = crate::now_f64();
 
         let before = self.entries.len();
         self.entries.retain(|_, entry| entry.expires > now);
@@ -91,10 +88,7 @@ impl TunnelTable {
 
     /// Batched cull — bounds per-tick work on large tables.
     pub fn cull_expired_batch(&mut self, limit: usize) -> usize {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = crate::now_f64();
 
         let to_remove: Vec<[u8; 32]> = self
             .entries
@@ -182,10 +176,7 @@ pub fn handle_tunnel(
     interface_id: crate::messages::InterfaceId,
     destination_timeout: f64,
 ) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
+    let now = crate::now_f64();
     let expires = now + destination_timeout;
 
     if let Some(existing) = tunnel_table.get_mut(&tunnel_id) {

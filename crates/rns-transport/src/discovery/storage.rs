@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmpv::Value;
 use thiserror::Error;
@@ -231,10 +230,7 @@ pub fn classify(heard_delta_secs: u64) -> DiscoveryStatus {
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::now_f64() as u64
 }
 
 // On-disk msgpack format mirrors Python's key schema for interop.

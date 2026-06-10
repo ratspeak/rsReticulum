@@ -1,3 +1,4 @@
+use crate::now_f64;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1250,13 +1251,6 @@ fn interface_marked_offline(entry: &InterfaceEntry) -> bool {
         .as_ref()
         .map(|online| !online.load(std::sync::atomic::Ordering::SeqCst))
         .unwrap_or(false)
-}
-
-fn now_f64() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
 }
 
 fn announce_timebase(random_blob: &[u8; 10]) -> u64 {
@@ -5870,10 +5864,7 @@ mod tests {
 
         // Pre-populate with a fresh + an expired entry, both bound to the
         // same logical interface name.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
+        let now = crate::now_f64();
         let mut table = crate::path_table::PathTable::new();
         table.insert(
             [0xAA; 16],
@@ -5920,10 +5911,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
+        let now = crate::now_f64();
         let cached_dest = [0xCA; 16];
         let missing_dest = [0xDB; 16];
         let mut cached_entry =

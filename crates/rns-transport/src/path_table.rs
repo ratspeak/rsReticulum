@@ -1,5 +1,5 @@
+use crate::now_f64;
 use std::collections::{HashMap, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::constants::{
     AP_PATH_TIME, DESTINATION_TIMEOUT, InterfaceMode, MAX_RANDOM_BLOBS, PERSIST_RANDOM_BLOBS,
@@ -260,13 +260,6 @@ fn path_expiry(mode: InterfaceMode) -> u64 {
         InterfaceMode::Roaming => ROAMING_PATH_TIME,
         _ => DESTINATION_TIMEOUT,
     }
-}
-
-fn now_f64() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
 }
 
 #[cfg(test)]

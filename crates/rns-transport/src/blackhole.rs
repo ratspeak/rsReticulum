@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rns_wire::types::IdentityHash;
 use serde::{Deserialize, Serialize};
@@ -87,10 +86,7 @@ impl BlackholeTable {
         ttl: Option<f64>,
         reason: BlackholeReason,
     ) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = crate::now_f64();
 
         self.entries.insert(
             identity_hash.into(),
@@ -111,10 +107,7 @@ impl BlackholeTable {
         reason: BlackholeReason,
         reason_label: Option<String>,
     ) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = crate::now_f64();
 
         self.entries.insert(
             identity_hash.into(),
@@ -163,10 +156,7 @@ impl BlackholeTable {
         match self.entries.get(identity_hash) {
             Some(entry) => {
                 if let Some(ttl) = entry.ttl {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs_f64();
+                    let now = crate::now_f64();
                     now - entry.created < ttl
                 } else {
                     true
@@ -183,10 +173,7 @@ impl BlackholeTable {
 
     /// Drop entries whose TTL has elapsed; returns the number removed.
     pub fn cull_expired(&mut self) -> usize {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = crate::now_f64();
 
         let before = self.entries.len();
         self.entries

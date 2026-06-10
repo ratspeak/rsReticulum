@@ -13,7 +13,7 @@ use rns_runtime::probe::{
 
 const DEFAULT_PROBE_SIZE: usize = 16;
 const DEFAULT_TIMEOUT_SECS: f64 = 12.0;
-const RETICULUM_COMPAT_VERSION: &str = "1.2.5";
+use rns_tools::RETICULUM_COMPAT_VERSION;
 
 #[derive(Parser)]
 #[command(

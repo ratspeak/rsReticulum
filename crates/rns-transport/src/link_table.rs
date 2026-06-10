@@ -100,10 +100,7 @@ impl LinkTable {
     /// Returns `(total_culled, expired_unvalidated_links)` — the caller can
     /// apply failed-link rediscovery rules using the retained route metadata.
     pub fn cull_stale(&mut self, timeout: f64) -> (usize, Vec<ExpiredLink>) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = crate::now_f64();
         let cutoff = now - timeout;
 
         let mut unvalidated_expired = Vec::new();
@@ -228,10 +225,7 @@ mod tests {
 
     #[test]
     fn test_link_table_cull_validated_vs_unvalidated() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = crate::now_f64();
 
         let mut table = LinkTable::new();
 
@@ -314,10 +308,7 @@ mod tests {
         active.insert(1u64);
         active.insert(2u64);
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = crate::now_f64();
 
         table.insert(
             [0x01; 16],

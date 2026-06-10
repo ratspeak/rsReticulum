@@ -42,7 +42,7 @@ use rns_runtime::rncp::{
 };
 
 const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
-const RETICULUM_COMPAT_VERSION: &str = "1.2.5";
+use rns_tools::RETICULUM_COMPAT_VERSION;
 
 #[derive(Parser)]
 #[command(

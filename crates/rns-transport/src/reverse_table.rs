@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::constants::REVERSE_TIMEOUT;
 use crate::messages::InterfaceId;
@@ -48,10 +47,7 @@ impl ReverseTable {
         remaining_hops: u8,
         outbound_interface: Option<InterfaceId>,
     ) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = crate::now_f64();
 
         self.entries.insert(
             packet_hash.into(),
@@ -73,10 +69,7 @@ impl ReverseTable {
     }
 
     pub fn cull_expired(&mut self) -> usize {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = crate::now_f64();
         let cutoff = now - REVERSE_TIMEOUT as f64;
 
         let before = self.entries.len();
@@ -86,10 +79,7 @@ impl ReverseTable {
 
     /// Batched cull — bounds per-tick work on large tables.
     pub fn cull_expired_batch(&mut self, limit: usize) -> usize {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = crate::now_f64();
         let cutoff = now - REVERSE_TIMEOUT as f64;
 
         let to_remove: Vec<TruncatedHash> = self

@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
 use crate::constants::MAX_RATE_TIMESTAMPS;
@@ -42,10 +41,7 @@ impl RateTable {
     /// and "blocked" as a single numeric comparison.
     pub fn record(&mut self, dest_hash: impl Into<DestHash>) -> f64 {
         let dest_hash = dest_hash.into();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = crate::now_f64();
 
         let entry = self.entries.entry(dest_hash).or_insert_with(|| RateEntry {
             timestamps: Vec::new(),
@@ -101,10 +97,7 @@ impl RateTable {
     }
 
     pub fn is_blocked(&self, dest_hash: &[u8; 16]) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = crate::now_f64();
         self.entries
             .get(dest_hash)
             .is_some_and(|e| e.blocked_until > now)
@@ -151,10 +144,7 @@ impl RateTable {
         rate_penalty: f64,
     ) -> bool {
         let dest_hash = dest_hash.into();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = crate::now_f64();
 
         let entry = match self.entries.entry(dest_hash) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
