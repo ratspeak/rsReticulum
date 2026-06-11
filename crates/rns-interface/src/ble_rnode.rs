@@ -741,12 +741,17 @@ async fn connect_rnode(
         rx_char.properties, tx_char.properties
     ));
 
-    // SMP must run BEFORE subscribe on desktop / Apple platforms — reading
-    // the encrypted TX char kicks off SMP and drops L2CAP, which kills any
-    // pending subscribe. iOS/macOS share CoreBluetooth; Windows uses WinRT
-    // GATT (auto-prompt on encrypted-char reads). Linux used explicit BlueZ
-    // pairing before `connect()`, above.
-    #[cfg(any(target_os = "ios", target_os = "macos", target_os = "windows"))]
+    // SMP must run BEFORE subscribe on desktop / Apple / Android platforms —
+    // reading the encrypted TX char kicks off SMP and drops L2CAP, which
+    // kills any pending subscribe. iOS/macOS share CoreBluetooth; Windows
+    // (WinRT) and Android auto-prompt and retry on encrypted-char reads.
+    // Linux used explicit BlueZ pairing before `connect()`, above.
+    #[cfg(any(
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    ))]
     desktop_trigger_pairing(&peripheral, &tx_char).await?;
 
     ble_diag("[ble] subscribe TX start");
@@ -786,7 +791,21 @@ async fn connect_rnode(
 /// pairing flow when the characteristic requires authentication). Linux
 /// uses `linux_trigger_pairing` instead — BlueZ requires an explicit
 /// `Device::pair()` plus a registered Agent for the passkey callback.
-#[cfg(any(target_os = "ios", target_os = "macos", target_os = "windows"))]
+///
+/// Android behaves like Windows: a GATT op on an auth-required char makes
+/// the platform start bonding (system passkey dialog) and retry the op
+/// internally once bonded. Without this read-first step the subscribe()
+/// CCCD write fails instantly with insufficient-auth while the bond is
+/// still running — first add fails, second connect works. If the stack
+/// errors instead of blocking, the error maps to "BLE pairing in
+/// progress" and the reconnect loop retries on a 1s cadence until the
+/// bond lands.
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "android"
+))]
 async fn desktop_trigger_pairing(
     peripheral: &Peripheral,
     tx_char: &btleplug::api::Characteristic,
