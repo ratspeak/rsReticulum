@@ -131,12 +131,7 @@ impl TransportActor {
                     .recent_announces
                     .values()
                     .map(|a| {
-                        let is_path_response =
-                            rns_wire::header::PacketHeader::unpack(&a.raw_packet)
-                                .ok()
-                                .is_some_and(|(header, _)| {
-                                    header.context == rns_wire::context::PacketContext::PathResponse
-                                });
+                        let is_path_response = a.is_path_response;
                         AnnounceRpcEntry {
                             dest_hash: a.dest_hash,
                             hops: a.hops,

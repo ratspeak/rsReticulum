@@ -478,11 +478,16 @@ impl TransportActor {
             return;
         }
 
-        // Diagnostics + identity cache. `retained` pins survive re-announce so
-        // a fresh announce never silently un-pins an RPC-retained destination.
-        // Bounded by `cleanup_known_destinations` (7-day eviction); no count cap.
+        // Diagnostics + identity cache (metadata only — raw bytes go to the
+        // disk announce cache below, Python `Transport.cache` parity).
+        // `retained` pins survive re-announce so a fresh announce never
+        // silently un-pins an RPC-retained destination. Swept by
+        // `cleanup_known_destinations` (linger + 7-day eviction).
         let now_ts = now_f64();
-        let raw_vec = raw.to_vec();
+        let announce_packet_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
+        let is_path_response =
+            header.context == rns_wire::context::PacketContext::PathResponse;
+        self.cache_announce_to_disk(&announce_packet_hash, raw, interface_id);
         let app_data_for_handlers = announce_app_data.clone();
         match self.recent_announces.entry(header.destination_hash) {
             std::collections::hash_map::Entry::Occupied(mut o) => {
@@ -492,7 +497,8 @@ impl TransportActor {
                 e.timestamp = now_ts;
                 e.public_key = announce_public_key;
                 e.ratchet = announce_ratchet;
-                e.raw_packet = raw_vec;
+                e.packet_hash = Some(announce_packet_hash);
+                e.is_path_response = is_path_response;
                 e.name_hash = announce_name_hash;
             }
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -503,8 +509,10 @@ impl TransportActor {
                     timestamp: now_ts,
                     public_key: announce_public_key,
                     ratchet: announce_ratchet,
-                    raw_packet: raw_vec,
+                    packet_hash: Some(announce_packet_hash),
+                    is_path_response,
                     retained: false,
+                    last_used: None,
                     name_hash: announce_name_hash,
                 });
                 self.state_dirty = true;

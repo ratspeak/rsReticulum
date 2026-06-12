@@ -256,106 +256,36 @@ pub fn load_python_destination_table(
     Ok(out)
 }
 
-pub fn save_python_announce_cache_for_paths<'a, I>(
-    path_entries: &PathTable,
-    announces: I,
-    interface_names: &HashMap<u64, String>,
-    announce_cache_dir: &Path,
-) -> Result<(), PersistenceError>
-where
-    I: IntoIterator<Item = &'a crate::actor::RecentAnnounce>,
-{
-    save_python_announce_cache_for_paths_and_tunnels(
-        path_entries,
-        None,
-        announces,
-        interface_names,
-        announce_cache_dir,
-    )
-}
-
-pub fn save_python_announce_cache_for_paths_and_tunnels<'a, I>(
-    path_entries: &PathTable,
-    tunnel_table: Option<&crate::tunnel::TunnelTable>,
-    announces: I,
-    interface_names: &HashMap<u64, String>,
-    announce_cache_dir: &Path,
-) -> Result<(), PersistenceError>
-where
-    I: IntoIterator<Item = &'a crate::actor::RecentAnnounce>,
-{
-    std::fs::create_dir_all(announce_cache_dir).map_err(PersistenceError::Io)?;
-    let announces_by_dest: HashMap<[u8; 16], &crate::actor::RecentAnnounce> =
-        announces.into_iter().map(|a| (a.dest_hash, a)).collect();
-    let mut written = std::collections::HashSet::new();
-
-    for (dest_hash, path_entry) in path_entries.iter() {
-        let Some(packet_hash) = path_entry.packet_hash else {
-            continue;
-        };
-        let Some(announce) = announces_by_dest.get(dest_hash.as_bytes()) else {
-            continue;
-        };
-        if announce.raw_packet.is_empty() {
-            continue;
-        }
-        let interface_reference = interface_names
-            .get(&path_entry.interface_id)
-            .map(|name| Value::String(name.as_str().into()))
-            .unwrap_or(Value::Nil);
-        write_python_cached_announce(
-            announce_cache_dir,
-            &packet_hash,
-            announce.raw_packet.clone(),
-            interface_reference,
-        )?;
-        written.insert(packet_hash);
-    }
-
-    if let Some(tunnel_table) = tunnel_table {
-        for tunnel in tunnel_table.iter().map(|(_, tunnel)| tunnel) {
-            let interface_reference = interface_names
-                .get(&tunnel.interface_id)
-                .map(|name| Value::String(name.as_str().into()))
-                .unwrap_or(Value::Nil);
-            for (dest_hash, tunnel_path) in &tunnel.tunnel_paths {
-                let Some(packet_hash) = tunnel_path.packet_hash else {
-                    continue;
-                };
-                if written.contains(&packet_hash) {
-                    continue;
-                }
-                let Some(announce) = announces_by_dest.get(dest_hash) else {
-                    continue;
-                };
-                if announce.raw_packet.is_empty() {
-                    continue;
-                }
-                write_python_cached_announce(
-                    announce_cache_dir,
-                    &packet_hash,
-                    announce.raw_packet.clone(),
-                    interface_reference.clone(),
-                )?;
-                written.insert(packet_hash);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn write_python_cached_announce(
+/// Write one announce's raw bytes into the Python-compatible per-packet
+/// announce cache, skipping when the file already exists (cache files are
+/// content-addressed by packet hash, and SINGLE announces retransmit
+/// byte-identical). Plain tmp+rename without fsync — matches Python
+/// `Transport.cache`'s plain write; the cache is best-effort and rebuilt
+/// from live traffic, and this runs on the actor for every fresh announce.
+pub fn write_python_cached_announce_if_absent(
     announce_cache_dir: &Path,
     packet_hash: &[u8; 32],
-    raw_packet: Vec<u8>,
-    interface_reference: Value,
+    raw_packet: &[u8],
+    interface_name: Option<&str>,
 ) -> Result<(), PersistenceError> {
-    let value = Value::Array(vec![Value::Binary(raw_packet), interface_reference]);
+    let path = announce_cache_dir.join(hex::encode(packet_hash));
+    if path.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(announce_cache_dir).map_err(PersistenceError::Io)?;
+    let interface_reference = interface_name
+        .map(|name| Value::String(name.into()))
+        .unwrap_or(Value::Nil);
+    let value = Value::Array(vec![
+        Value::Binary(raw_packet.to_vec()),
+        interface_reference,
+    ]);
     let mut serialized = Vec::new();
     rmpv::encode::write_value(&mut serialized, &value)
         .map_err(|e| PersistenceError::Serialize(e.to_string()))?;
-    let path = announce_cache_dir.join(hex::encode(packet_hash));
-    atomic_write_bytes(&path, &serialized)
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &serialized).map_err(PersistenceError::Io)?;
+    std::fs::rename(&tmp, &path).map_err(PersistenceError::Io)
 }
 
 pub fn load_python_cached_announce(
@@ -838,15 +768,42 @@ pub struct PersistedAnnounceEntry {
     pub timestamp: f64,
     pub public_key: Option<Vec<u8>>,
     pub ratchet: Option<Vec<u8>>,
-    /// Raw announce bytes so CacheRequest replays hit a byte-identical packet
-    /// instead of re-serialising (which would disturb signatures).
-    pub raw_packet: Vec<u8>,
+    /// Disk announce-cache key (`cache/announces/<hex>`). Raw announce bytes
+    /// are not persisted inline since v6 — CacheRequest replays read the
+    /// byte-identical packet from the per-announce cache file.
+    #[serde(default)]
+    pub packet_hash: Option<Vec<u8>>,
     /// Pinned via `RetainDestination`; the maintenance sweep skips the
     /// entry regardless of age while this is `true`.
     pub retained: bool,
     /// `SHA-256(app_name)[:10]` of the announced aspect. Lets cache consumers
-    /// retro-filter without re-parsing `raw_packet`.
+    /// retro-filter without re-parsing the announce.
     pub name_hash: Vec<u8>,
+    #[serde(default)]
+    pub is_path_response: bool,
+    #[serde(default)]
+    pub last_used: Option<f64>,
+}
+
+/// Exact v5 on-disk entry shape (raw announce bytes inline), kept for
+/// one-shot migration to the disk-backed v6 cache.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LegacyPersistedAnnounceEntryV5 {
+    pub destination_hash: Vec<u8>,
+    pub hops: u8,
+    pub app_data: Option<Vec<u8>>,
+    pub timestamp: f64,
+    pub public_key: Option<Vec<u8>>,
+    pub ratchet: Option<Vec<u8>>,
+    pub raw_packet: Vec<u8>,
+    pub retained: bool,
+    pub name_hash: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyPersistedAnnounceCacheV5 {
+    entries: Vec<LegacyPersistedAnnounceEntryV5>,
+    version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -856,7 +813,8 @@ pub struct PersistedAnnounceCache {
 }
 
 impl PersistedAnnounceCache {
-    pub const CURRENT_VERSION: u32 = 5;
+    pub const CURRENT_VERSION: u32 = 6;
+    pub const LEGACY_RAW_VERSION: u32 = 5;
 }
 
 pub fn save_announce_cache<'a, I>(announces: I, path: &Path) -> Result<(), PersistenceError>
@@ -872,9 +830,11 @@ where
             timestamp: a.timestamp,
             public_key: a.public_key.map(|k| k.to_vec()),
             ratchet: a.ratchet.map(|r| r.to_vec()),
-            raw_packet: a.raw_packet.clone(),
+            packet_hash: a.packet_hash.map(|h| h.to_vec()),
             retained: a.retained,
             name_hash: a.name_hash.to_vec(),
+            is_path_response: a.is_path_response,
+            last_used: a.last_used,
         })
         .collect();
 
@@ -899,6 +859,71 @@ pub fn load_announce_cache(path: &Path) -> Result<Vec<PersistedAnnounceEntry>, P
     }
 
     Ok(persisted.entries)
+}
+
+/// Decode a v5 announce cache (raw bytes inline). Used only as the fallback
+/// path when `load_announce_cache` rejects the file.
+pub fn load_announce_cache_legacy_v5(
+    path: &Path,
+) -> Result<Vec<LegacyPersistedAnnounceEntryV5>, PersistenceError> {
+    let data = std::fs::read(path).map_err(PersistenceError::Io)?;
+    let persisted: LegacyPersistedAnnounceCacheV5 =
+        rmp_serde::from_slice(&data).map_err(|e| PersistenceError::Deserialize(e.to_string()))?;
+    if persisted.version != PersistedAnnounceCache::LEGACY_RAW_VERSION {
+        return Err(PersistenceError::VersionMismatch {
+            expected: PersistedAnnounceCache::LEGACY_RAW_VERSION,
+            found: persisted.version,
+        });
+    }
+    Ok(persisted.entries)
+}
+
+/// One-shot v5 → v6 migration: write each entry's raw announce into the
+/// per-packet disk cache, derive `packet_hash`/`is_path_response` from the
+/// raw bytes, and return the slim v6 shape. Entries whose raw bytes fail to
+/// parse keep `packet_hash = None` (replay treats that as a cache miss).
+pub fn migrate_legacy_announce_entries(
+    legacy: Vec<LegacyPersistedAnnounceEntryV5>,
+    announce_cache_dir: &Path,
+) -> Vec<PersistedAnnounceEntry> {
+    legacy
+        .into_iter()
+        .map(|e| {
+            let mut packet_hash = None;
+            let mut is_path_response = false;
+            if !e.raw_packet.is_empty() {
+                if let Ok((header, _)) = rns_wire::header::PacketHeader::unpack(&e.raw_packet) {
+                    let hash =
+                        rns_wire::hash::packet_hash(&e.raw_packet, header.flags.header_type);
+                    is_path_response =
+                        header.context == rns_wire::context::PacketContext::PathResponse;
+                    if write_python_cached_announce_if_absent(
+                        announce_cache_dir,
+                        &hash,
+                        &e.raw_packet,
+                        None,
+                    )
+                    .is_ok()
+                    {
+                        packet_hash = Some(hash.to_vec());
+                    }
+                }
+            }
+            PersistedAnnounceEntry {
+                destination_hash: e.destination_hash,
+                hops: e.hops,
+                app_data: e.app_data,
+                timestamp: e.timestamp,
+                public_key: e.public_key,
+                ratchet: e.ratchet,
+                packet_hash,
+                retained: e.retained,
+                name_hash: e.name_hash,
+                is_path_response,
+                last_used: None,
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1179,19 +1204,14 @@ mod tests {
         );
         assert_eq!(loaded[0].packet_hash, packet_hash);
 
-        let announces = [crate::actor::RecentAnnounce {
-            dest_hash: destination_hash,
-            hops: 2,
-            app_data: None,
-            timestamp: 1234.5,
-            public_key: None,
-            ratchet: None,
-            raw_packet: vec![0xFE; 42],
-            retained: false,
-            name_hash: [0xAB; 10],
-        }];
         let cache_dir = dir.join("cache").join("announces");
-        save_python_announce_cache_for_paths(&table, announces.iter(), &names, &cache_dir).unwrap();
+        write_python_cached_announce_if_absent(
+            &cache_dir,
+            &packet_hash,
+            &[0xFE; 42],
+            Some("Interface[Test]"),
+        )
+        .unwrap();
         let cached = load_python_cached_announce(&cache_dir, &packet_hash)
             .unwrap()
             .unwrap();
@@ -1199,6 +1219,41 @@ mod tests {
         assert_eq!(
             cached.interface_reference.as_deref(),
             Some("Interface[Test]")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cached_announce_write_if_absent_does_not_overwrite() {
+        let dir = std::env::temp_dir().join("reticulum_rs_test_announce_if_absent");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache_dir = dir.join("cache").join("announces");
+        let packet_hash = [0xCC; 32];
+
+        write_python_cached_announce_if_absent(
+            &cache_dir,
+            &packet_hash,
+            &[0xFE; 42],
+            Some("Interface[First]"),
+        )
+        .unwrap();
+        // Second write for the same packet hash is a no-op.
+        write_python_cached_announce_if_absent(
+            &cache_dir,
+            &packet_hash,
+            &[0x00; 8],
+            Some("Interface[Second]"),
+        )
+        .unwrap();
+
+        let cached = load_python_cached_announce(&cache_dir, &packet_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.raw_packet, vec![0xFE; 42]);
+        assert_eq!(
+            cached.interface_reference.as_deref(),
+            Some("Interface[First]")
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1253,25 +1308,12 @@ mod tests {
         assert_eq!(loaded[0].paths[0].hops, 3);
         assert_eq!(loaded[0].paths[0].packet_hash, packet_hash);
 
-        let announces = [crate::actor::RecentAnnounce {
-            dest_hash: destination_hash,
-            hops: 3,
-            app_data: None,
-            timestamp: 1234.5,
-            public_key: None,
-            ratchet: None,
-            raw_packet: vec![0xFE; 42],
-            retained: false,
-            name_hash: [0xAB; 10],
-        }];
-        let empty_paths = PathTable::new();
         let cache_dir = dir.join("cache").join("announces");
-        save_python_announce_cache_for_paths_and_tunnels(
-            &empty_paths,
-            Some(&tunnels),
-            announces.iter(),
-            &names,
+        write_python_cached_announce_if_absent(
             &cache_dir,
+            &packet_hash,
+            &[0xFE; 42],
+            Some("Interface[Tunnel]"),
         )
         .unwrap();
         let cached = load_python_cached_announce(&cache_dir, &packet_hash)
@@ -1554,8 +1596,10 @@ mod tests {
             timestamp: 1000.0,
             public_key: None,
             ratchet: Some([0xDD; 32]),
-            raw_packet: vec![0xEE; 64],
+            packet_hash: Some([0xEE; 32]),
+            is_path_response: true,
             retained: false,
+            last_used: Some(1234.0),
             name_hash: [0xAB; 10],
         }];
 
@@ -1570,6 +1614,117 @@ mod tests {
         assert_eq!(loaded[0].destination_hash, [0xCC; 16].to_vec());
         assert_eq!(loaded[0].hops, 3);
         assert_eq!(loaded[0].ratchet, Some(vec![0xDD; 32]));
+        assert_eq!(loaded[0].packet_hash, Some([0xEE; 32].to_vec()));
+        assert!(loaded[0].is_path_response);
+        assert_eq!(loaded[0].last_used, Some(1234.0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn packed_test_announce(context: rns_wire::context::PacketContext, fill: u8) -> Vec<u8> {
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Single,
+                packet_type: rns_wire::flags::PacketType::Announce,
+            },
+            hops: 1,
+            transport_id: None,
+            destination_hash: [fill; 16],
+            context,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&[fill; 32]);
+        raw
+    }
+
+    #[test]
+    fn legacy_v5_announce_cache_migrates_raw_to_disk_cache() {
+        // Exact v5 on-disk shape: raw announce bytes inline, no packet_hash /
+        // is_path_response / last_used.
+        #[derive(Serialize)]
+        struct V5Entry {
+            destination_hash: Vec<u8>,
+            hops: u8,
+            app_data: Option<Vec<u8>>,
+            timestamp: f64,
+            public_key: Option<Vec<u8>>,
+            ratchet: Option<Vec<u8>>,
+            raw_packet: Vec<u8>,
+            retained: bool,
+            name_hash: Vec<u8>,
+        }
+        #[derive(Serialize)]
+        struct V5Cache {
+            entries: Vec<V5Entry>,
+            version: u32,
+        }
+
+        let plain_raw = packed_test_announce(rns_wire::context::PacketContext::None, 0xA1);
+        let plain_hash =
+            rns_wire::hash::packet_hash(&plain_raw, rns_wire::flags::HeaderType::Header1);
+        let pr_raw = packed_test_announce(rns_wire::context::PacketContext::PathResponse, 0xB2);
+        let pr_hash = rns_wire::hash::packet_hash(&pr_raw, rns_wire::flags::HeaderType::Header1);
+
+        let entry = |dest: u8, raw: Vec<u8>, retained: bool| V5Entry {
+            destination_hash: vec![dest; 16],
+            hops: 1,
+            app_data: None,
+            timestamp: 1000.0,
+            public_key: None,
+            ratchet: None,
+            raw_packet: raw,
+            retained,
+            name_hash: vec![0xAB; 10],
+        };
+        let v5 = V5Cache {
+            entries: vec![
+                entry(0xA1, plain_raw.clone(), true),
+                entry(0xB2, pr_raw.clone(), false),
+                // Too short for PacketHeader::unpack — must migrate as a miss.
+                entry(0xC3, vec![0x01], false),
+            ],
+            version: 5,
+        };
+        let bytes = rmp_serde::to_vec(&v5).unwrap();
+
+        let dir = std::env::temp_dir().join("reticulum_rs_test_announce_v5_migration");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("announce_cache.msgpack");
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(
+            load_announce_cache(&path).is_err(),
+            "v6 loader must reject a v5 snapshot"
+        );
+
+        let legacy = load_announce_cache_legacy_v5(&path).unwrap();
+        assert_eq!(legacy.len(), 3);
+        let cache_dir = dir.join("cache").join("announces");
+        let migrated = migrate_legacy_announce_entries(legacy, &cache_dir);
+
+        assert_eq!(migrated.len(), 3);
+        assert_eq!(migrated[0].destination_hash, vec![0xA1; 16]);
+        assert_eq!(migrated[0].packet_hash, Some(plain_hash.to_vec()));
+        assert!(!migrated[0].is_path_response);
+        assert!(migrated[0].retained);
+        assert_eq!(migrated[0].last_used, None);
+        assert_eq!(migrated[1].packet_hash, Some(pr_hash.to_vec()));
+        assert!(migrated[1].is_path_response);
+        assert_eq!(migrated[2].packet_hash, None);
+
+        // Raw bytes landed in the per-packet disk cache, byte-identical.
+        let on_disk = load_python_cached_announce(&cache_dir, &plain_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(on_disk.raw_packet, plain_raw);
+        let on_disk_pr = load_python_cached_announce(&cache_dir, &pr_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(on_disk_pr.raw_packet, pr_raw);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

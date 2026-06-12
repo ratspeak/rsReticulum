@@ -82,7 +82,20 @@ pub const JOB_INTERVAL_BG_MS: u64 = 2000;
 /// Cadence at which `on_tick` flushes routing-state files (path_table,
 /// announce_cache, blackhole, tunnel_table) when dirty. Hashlist is excluded
 /// (multi-MB on busy hubs); it saves on shutdown + foreground→background.
-pub const STATE_SAVE_INTERVAL_SECS: f64 = 10.0;
+/// Matches Python `Reticulum.GRACIOUS_PERSIST_INTERVAL` (5 min). On a live
+/// announce feed the dirty bit is effectively always set, so this interval
+/// IS the flush rate — at 10s the full-state clone+serialize+fsync cycle
+/// dominated daemon RSS via allocator churn. Abrupt-exit safety comes from
+/// the falling-edge save and `on_shutdown`, not from this cadence.
+pub const STATE_SAVE_INTERVAL_SECS: f64 = 300.0;
+
+/// Python `Transport.UNUSED_DESTINATION_LINGER`: never-used destinations
+/// without a path are dropped from the announce cache after this idle time.
+pub const UNUSED_DESTINATION_LINGER: f64 = 360.0;
+
+/// Python `Transport.max_pr_tags`: hard count cap on the discovery
+/// path-request tag gate, on top of the time-based retain.
+pub const MAX_DISCOVERY_PR_TAGS: usize = 32_000;
 
 /// Link table check interval.
 pub const LINKS_CHECK_INTERVAL: f64 = 1.0;

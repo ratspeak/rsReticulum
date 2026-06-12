@@ -20,24 +20,33 @@ fn recent_announce_from_cached_packet(
         timestamp,
         public_key: None,
         ratchet: None,
-        raw_packet,
+        packet_hash: None,
+        is_path_response: false,
         retained: false,
+        last_used: None,
         name_hash: [0u8; 10],
     };
 
-    if let Ok((header, offset)) = rns_wire::header::PacketHeader::unpack(&recent.raw_packet)
+    if let Ok((header, offset)) = rns_wire::header::PacketHeader::unpack(&raw_packet)
         && header.flags.packet_type == rns_wire::flags::PacketType::Announce
         && header.destination_hash == dest_hash
-        && recent.raw_packet.len() >= offset
-        && let Ok(announce) = rns_identity::announce::AnnounceData::unpack(
-            &recent.raw_packet[offset..],
-            header.flags.context_flag,
-        )
+        && raw_packet.len() >= offset
     {
-        recent.app_data = announce.app_data;
-        recent.public_key = Some(announce.public_key);
-        recent.ratchet = announce.ratchet;
-        recent.name_hash = announce.name_hash;
+        recent.packet_hash = Some(rns_wire::hash::packet_hash(
+            &raw_packet,
+            header.flags.header_type,
+        ));
+        recent.is_path_response =
+            header.context == rns_wire::context::PacketContext::PathResponse;
+        if let Ok(announce) = rns_identity::announce::AnnounceData::unpack(
+            &raw_packet[offset..],
+            header.flags.context_flag,
+        ) {
+            recent.app_data = announce.app_data;
+            recent.public_key = Some(announce.public_key);
+            recent.ratchet = announce.ratchet;
+            recent.name_hash = announce.name_hash;
+        }
     }
 
     recent
@@ -152,16 +161,8 @@ pub(super) fn write_routing_snapshot(dir: &std::path::Path, snapshot: &RoutingSn
         );
     }
 
-    let announce_cache_dir = dir.join("cache").join("announces");
-    if let Err(e) = crate::persistence::save_python_announce_cache_for_paths_and_tunnels(
-        &snapshot.path_table,
-        Some(&snapshot.tunnel_table),
-        snapshot.recent_announces.iter(),
-        interface_names,
-        &announce_cache_dir,
-    ) {
-        trace!("failed to save Python announce cache files: {}", e);
-    }
+    // Per-announce Python cache files are written event-driven at receive
+    // (`cache_announce_to_disk`), not re-serialized here every cycle.
 
     let tunnel_path = dir.join("tunnel_table.msgpack");
     if let Err(e) =
@@ -194,6 +195,55 @@ pub(super) fn write_routing_snapshot(dir: &std::path::Path, snapshot: &RoutingSn
 }
 
 impl TransportActor {
+    /// Fetch raw announce bytes from the disk announce cache
+    /// (`cache/announces/<packet_hash>`). Misses are normal: legacy entries,
+    /// cleaned cache files, or shared-instance client mode.
+    pub(super) fn cached_announce_raw(&self, packet_hash: &[u8; 32]) -> Option<Vec<u8>> {
+        let dir = self.storage_dir.as_ref()?;
+        let announce_cache_dir = dir.join("cache").join("announces");
+        match crate::persistence::load_python_cached_announce(&announce_cache_dir, packet_hash) {
+            Ok(Some(cached)) => Some(cached.raw_packet),
+            Ok(None) => None,
+            Err(e) => {
+                trace!("failed to load cached announce: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Event-driven announce cache write at receive (Python parity:
+    /// `Transport.cache(packet, force_cache=True)` on announce ingest).
+    /// One file per announce packet; skipped when the file already exists
+    /// (SINGLE announces are retransmitted byte-identical). No fsync — the
+    /// cache is best-effort and rebuilt from live traffic, and an fsync
+    /// chain here would stall the actor on every announce.
+    pub(super) fn cache_announce_to_disk(
+        &self,
+        packet_hash: &[u8; 32],
+        raw: &[u8],
+        interface_id: InterfaceId,
+    ) {
+        if self.shared_instance_client_mode {
+            return;
+        }
+        let Some(dir) = self.storage_dir.as_ref() else {
+            return;
+        };
+        let announce_cache_dir = dir.join("cache").join("announces");
+        let interface_name = self
+            .interfaces
+            .get(&interface_id)
+            .map(|entry| entry.name.clone());
+        if let Err(e) = crate::persistence::write_python_cached_announce_if_absent(
+            &announce_cache_dir,
+            packet_hash,
+            raw,
+            interface_name.as_deref(),
+        ) {
+            trace!("failed to write announce cache file: {}", e);
+        }
+    }
+
     fn routing_snapshot(&self) -> RoutingSnapshot {
         RoutingSnapshot {
             path_table: self.path_table.clone(),
@@ -690,8 +740,34 @@ impl TransportActor {
         // announce_cache — no interface dependency, bind directly.
         let announce_path = dir.join("announce_cache.msgpack");
         if announce_path.exists() {
-            match crate::persistence::load_announce_cache(&announce_path) {
-                Ok(entries) => {
+            let loaded = match crate::persistence::load_announce_cache(&announce_path) {
+                Ok(entries) => Some(entries),
+                Err(v6_err) => {
+                    // Pre-v6 caches carried raw announce bytes inline. Migrate
+                    // them into per-packet disk cache files once, then proceed
+                    // with the slim v6 metadata shape.
+                    match crate::persistence::load_announce_cache_legacy_v5(&announce_path) {
+                        Ok(legacy) => {
+                            let announce_cache_dir = dir.join("cache").join("announces");
+                            let migrated = crate::persistence::migrate_legacy_announce_entries(
+                                legacy,
+                                &announce_cache_dir,
+                            );
+                            debug!(
+                                count = migrated.len(),
+                                "migrated legacy announce cache to disk-backed v6"
+                            );
+                            Some(migrated)
+                        }
+                        Err(_) => {
+                            trace!("failed to load announce cache: {}", v6_err);
+                            None
+                        }
+                    }
+                }
+            };
+            match loaded {
+                Some(entries) => {
                     let count = entries.len();
                     let mut expired = 0usize;
                     for ae in entries {
@@ -730,6 +806,15 @@ impl TransportActor {
                             } else {
                                 [0u8; 10]
                             };
+                            let packet_hash = ae.packet_hash.and_then(|h| {
+                                if h.len() == 32 {
+                                    let mut arr = [0u8; 32];
+                                    arr.copy_from_slice(&h);
+                                    Some(arr)
+                                } else {
+                                    None
+                                }
+                            });
                             self.recent_announces
                                 .entry(hash)
                                 .or_insert_with(|| RecentAnnounce {
@@ -739,17 +824,17 @@ impl TransportActor {
                                     timestamp: ae.timestamp,
                                     public_key,
                                     ratchet,
-                                    raw_packet: ae.raw_packet,
+                                    packet_hash,
+                                    is_path_response: ae.is_path_response,
                                     retained: ae.retained,
+                                    last_used: ae.last_used,
                                     name_hash,
                                 });
                         }
                     }
                     debug!(count, expired, "loaded announce cache entries from disk");
                 }
-                Err(e) => {
-                    trace!("failed to load announce cache: {}", e);
-                }
+                None => {}
             }
         }
     }
@@ -1014,7 +1099,9 @@ mod async_save_tests {
         assert!(!actor.state_dirty, "dirty clears at scheduling time");
 
         let path = dir.join("path_table.msgpack");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Generous: the blocking pool competes with the whole suite's fsync
+        // traffic on first run; the loop exits as soon as the file lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !path.exists() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }

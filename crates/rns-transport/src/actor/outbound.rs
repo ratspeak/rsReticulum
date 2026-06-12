@@ -184,13 +184,13 @@ impl TransportActor {
         let mut requested_hash = [0u8; 32];
         requested_hash.copy_from_slice(payload);
 
-        let dest_hash: Option<[u8; 16]> = self
+        let dest_and_hops: Option<([u8; 16], u8)> = self
             .path_table
             .iter()
             .find(|(_, entry)| entry.packet_hash == Some(requested_hash))
-            .map(|(dest, _)| *dest.as_bytes());
+            .map(|(dest, entry)| (*dest.as_bytes(), entry.hops));
 
-        let Some(dest) = dest_hash else {
+        let Some((dest, cached_hops)) = dest_and_hops else {
             trace!(
                 hash = %hex::encode(requested_hash),
                 "cache request miss — no path entry with matching packet hash"
@@ -198,24 +198,13 @@ impl TransportActor {
             return;
         };
 
-        let (cached_raw, cached_hops) = match self.recent_announces.get(&dest) {
-            Some(cached) => (cached.raw_packet.clone(), cached.hops),
-            None => {
-                trace!(
-                    dest = %hex::encode(dest),
-                    "cache request: path entry found but no cached announce for destination"
-                );
-                return;
-            }
-        };
-
-        if cached_raw.is_empty() {
+        let Some(cached_raw) = self.cached_announce_raw(&requested_hash) else {
             trace!(
                 dest = %hex::encode(dest),
-                "cache request: announce cached but no raw packet (v1 persistence), ignoring"
+                "cache request: path entry found but no cached announce on disk"
             );
             return;
-        }
+        };
 
         debug!(
             dest = %hex::encode(dest),
@@ -364,14 +353,10 @@ impl TransportActor {
                 return;
             }
 
-            let cached_raw: Option<(u8, Vec<u8>)> =
-                self.recent_announces.get(&requested_dest).and_then(|a| {
-                    if a.raw_packet.is_empty() {
-                        None
-                    } else {
-                        Some((path.hops, a.raw_packet.clone()))
-                    }
-                });
+            let cached_raw: Option<(u8, Vec<u8>)> = path
+                .packet_hash
+                .and_then(|hash| self.cached_announce_raw(&hash))
+                .map(|raw| (path.hops, raw));
             if let Some((hops, raw)) = cached_raw {
                 debug!(
                     dest = %hex::encode(requested_dest),

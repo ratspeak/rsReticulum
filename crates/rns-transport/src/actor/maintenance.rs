@@ -65,7 +65,7 @@ impl TransportActor {
             // Cull may have removed path/tunnel entries — flag for save so
             // the on-disk file reflects the current routing state. False
             // positives (cull found nothing) cost one no-op file rewrite at
-            // the next 10 s tick.
+            // the next periodic flush.
             self.state_dirty = true;
             self.last_tables_cull = now;
         }
@@ -172,6 +172,20 @@ impl TransportActor {
             .retain(|_, request| now < request.timeout);
         self.discovery_pr_tags
             .retain(|_, last| now - *last < PATH_REQUEST_GATE_TIMEOUT);
+        // Python `max_pr_tags` hard cap on top of the time gate: a tag storm
+        // inside the gate window must not grow the map without bound.
+        if self.discovery_pr_tags.len() > MAX_DISCOVERY_PR_TAGS {
+            let mut by_age: Vec<(Vec<u8>, f64)> = self
+                .discovery_pr_tags
+                .iter()
+                .map(|(tag, last)| (tag.clone(), *last))
+                .collect();
+            by_age.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+            let excess = self.discovery_pr_tags.len() - MAX_DISCOVERY_PR_TAGS;
+            for (tag, _) in by_age.into_iter().take(excess) {
+                self.discovery_pr_tags.remove(&tag);
+            }
+        }
 
         self.process_pending_discovery_path_requests(now);
         self.process_announce_queues(now);
@@ -474,10 +488,13 @@ impl TransportActor {
         }
     }
 
-    /// Sweep `recent_announces`. Keep retained + pathed entries; reap the
-    /// rest past `DESTINATION_TIMEOUT` (7 days). No count cap.
+    /// Sweep `recent_announces`, mirroring Python
+    /// `Identity.clean_known_destinations`: retained + pathed entries are
+    /// kept; pathless never-used entries die after `UNUSED_DESTINATION_LINGER`
+    /// (6 min); pathless used entries die after `DESTINATION_TIMEOUT * 1.25`
+    /// idle since last use.
     pub(super) fn cleanup_known_destinations(&mut self, now: f64) {
-        let threshold = DESTINATION_TIMEOUT as f64;
+        let used_threshold = DESTINATION_TIMEOUT as f64 * 1.25;
 
         let before = self.recent_announces.len();
         // Collect into a Vec; the has-path borrow on path_table fights an
@@ -492,12 +509,11 @@ impl TransportActor {
                 if self.path_table.has_path(&a.dest_hash) {
                     return None;
                 }
-                let idle = now - a.timestamp;
-                if idle > threshold {
-                    Some(a.dest_hash)
-                } else {
-                    None
-                }
+                let stale = match a.last_used {
+                    None => now - a.timestamp > UNUSED_DESTINATION_LINGER,
+                    Some(last_used) => now - last_used.max(a.timestamp) > used_threshold,
+                };
+                if stale { Some(a.dest_hash) } else { None }
             })
             .collect();
 
@@ -584,7 +600,13 @@ mod cleanup_tests {
     use crate::actor::RecentAnnounce;
     use crate::path_table::PathEntry;
 
-    fn insert_entry(actor: &mut TransportActor, hash: u8, timestamp: f64, retained: bool) {
+    fn insert_entry_with_last_used(
+        actor: &mut TransportActor,
+        hash: u8,
+        timestamp: f64,
+        retained: bool,
+        last_used: Option<f64>,
+    ) {
         let entry = RecentAnnounce {
             dest_hash: [hash; 16],
             hops: 0,
@@ -592,11 +614,21 @@ mod cleanup_tests {
             timestamp,
             public_key: None,
             ratchet: None,
-            raw_packet: Vec::new(),
+            packet_hash: None,
+            is_path_response: false,
             retained,
+            last_used,
             name_hash: [0u8; 10],
         };
         actor.recent_announces.insert(entry.dest_hash, entry);
+    }
+
+    fn insert_entry(actor: &mut TransportActor, hash: u8, timestamp: f64, retained: bool) {
+        insert_entry_with_last_used(actor, hash, timestamp, retained, None);
+    }
+
+    fn insert_used_entry(actor: &mut TransportActor, hash: u8, timestamp: f64, last_used: f64) {
+        insert_entry_with_last_used(actor, hash, timestamp, false, Some(last_used));
     }
 
     #[test]
@@ -621,28 +653,29 @@ mod cleanup_tests {
         assert_eq!(actor.recent_announces.len(), 1);
     }
 
-    // Pre-collapse, a never-used pathless entry was reaped after 6 min.
-    // Under the uniform 7-d policy, an entry only ten minutes old survives.
     #[test]
-    fn pathless_kept_well_below_destination_timeout() {
+    fn pathless_never_used_kept_inside_linger() {
         let (mut actor, _tx) = TransportActor::new();
         let now = 10_000.0;
-        let ten_minutes_old = now - 10.0 * 60.0;
-        insert_entry(&mut actor, 0x03, ten_minutes_old, /*retained=*/ false);
+        insert_entry(
+            &mut actor,
+            0x03,
+            now - UNUSED_DESTINATION_LINGER + 1.0,
+            /*retained=*/ false,
+        );
 
         actor.cleanup_known_destinations(now);
         assert_eq!(actor.recent_announces.len(), 1);
     }
 
     #[test]
-    fn pathless_reaped_past_destination_timeout() {
+    fn pathless_never_used_reaped_after_linger() {
         let (mut actor, _tx) = TransportActor::new();
-        let now = 10_000_000.0;
-        let timeout = DESTINATION_TIMEOUT as f64;
+        let now = 10_000.0;
         insert_entry(
             &mut actor,
             0x05,
-            now - timeout - 1.0,
+            now - UNUSED_DESTINATION_LINGER - 1.0,
             /*retained=*/ false,
         );
 
@@ -651,18 +684,49 @@ mod cleanup_tests {
     }
 
     #[test]
-    fn pathless_kept_just_inside_destination_timeout() {
+    fn pathless_used_survives_destination_timeout_idle() {
         let (mut actor, _tx) = TransportActor::new();
         let now = 10_000_000.0;
         let timeout = DESTINATION_TIMEOUT as f64;
-        insert_entry(
-            &mut actor,
-            0x07,
-            now - timeout + 1.0,
-            /*retained=*/ false,
-        );
+        // Announce far past linger; 7 d idle since use is inside the
+        // 7 d * 1.25 window, so the use pin keeps it alive.
+        insert_used_entry(&mut actor, 0x07, now - timeout * 2.0, now - timeout);
 
         actor.cleanup_known_destinations(now);
         assert_eq!(actor.recent_announces.len(), 1);
+    }
+
+    #[test]
+    fn pathless_used_reaped_past_destination_timeout_x125() {
+        let (mut actor, _tx) = TransportActor::new();
+        let now = 10_000_000.0;
+        let threshold = DESTINATION_TIMEOUT as f64 * 1.25;
+        insert_used_entry(&mut actor, 0x09, now - threshold - 2.0, now - threshold - 1.0);
+
+        actor.cleanup_known_destinations(now);
+        assert!(actor.recent_announces.is_empty());
+    }
+
+    #[test]
+    fn discovery_pr_tags_capped_at_max() {
+        let (mut actor, _tx) = TransportActor::new();
+        let now = crate::now_f64();
+        // All inside PATH_REQUEST_GATE_TIMEOUT, so only the count cap trims.
+        for i in 0..=MAX_DISCOVERY_PR_TAGS {
+            let tag = (i as u64).to_be_bytes().to_vec();
+            actor.discovery_pr_tags.insert(tag, now - (i as f64) * 1e-4);
+        }
+        assert_eq!(actor.discovery_pr_tags.len(), MAX_DISCOVERY_PR_TAGS + 1);
+
+        actor.on_tick();
+
+        assert_eq!(actor.discovery_pr_tags.len(), MAX_DISCOVERY_PR_TAGS);
+        let oldest = (MAX_DISCOVERY_PR_TAGS as u64).to_be_bytes().to_vec();
+        assert!(!actor.discovery_pr_tags.contains_key(&oldest));
+        assert!(
+            actor
+                .discovery_pr_tags
+                .contains_key(&0u64.to_be_bytes().to_vec())
+        );
     }
 }

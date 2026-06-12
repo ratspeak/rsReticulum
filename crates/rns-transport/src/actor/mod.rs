@@ -147,21 +147,33 @@ pub struct TransportActor {
     pub is_foreground: Arc<AtomicBool>,
 }
 
-/// Cached announce for diagnostics + CacheRequest replay. `raw_packet` keeps
-/// byte-identical replay; `retained` pins the entry against the cull sweep
-/// (toggled via `RetainDestination` / `UnretainDestination`).
+/// Cached announce metadata for diagnostics + CacheRequest replay. Raw
+/// announce bytes live on disk (`cache/announces/<packet_hash>`, written
+/// event-driven at receive — Python `Transport.cache` parity) and are fetched
+/// via `packet_hash`; keeping them in RAM doubled per-destination retention
+/// and dominated the periodic state snapshot. `retained` pins the entry
+/// against the cull sweep (`RetainDestination` / `UnretainDestination`).
 #[derive(Debug, Clone)]
 pub struct RecentAnnounce {
     pub dest_hash: [u8; 16],
     pub hops: u8,
     pub app_data: Option<Vec<u8>>,
+    /// Announce receive time (Python `known_destinations[0]`). Not bumped on
+    /// use — see `last_used`.
     pub timestamp: f64,
     pub public_key: Option<[u8; 64]>,
     pub ratchet: Option<[u8; 32]>,
-    pub raw_packet: Vec<u8>,
+    /// Disk-cache key for the raw announce. `None` for legacy entries whose
+    /// cache file could not be recovered; replay paths treat that as a miss.
+    pub packet_hash: Option<[u8; 32]>,
+    /// Captured at receive so RPC consumers don't re-parse the raw packet.
+    pub is_path_response: bool,
     pub retained: bool,
+    /// Last `UseDestination` touch (Python `known_destinations[4]`). Drives
+    /// the `UNUSED_DESTINATION_LINGER` sweep for pathless entries.
+    pub last_used: Option<f64>,
     /// `SHA-256(app_name)[:10]` so cache consumers can filter by aspect
-    /// without re-parsing `raw_packet`. Zeroed if the announce had no payload.
+    /// without re-parsing the announce. Zeroed if the announce had no payload.
     pub name_hash: [u8; 10],
 }
 
@@ -373,31 +385,21 @@ impl TransportActor {
                 packet_hash,
                 destination_hash,
             } => {
-                // Walk the path table by packet_hash to find the destination
-                // that announced this packet, then replay the cached announce
+                // Serve straight from the disk announce cache (Python parity:
+                // cache_request_packet reads the cache file), then replay
                 // through our own inbound path (interface_id=0 marks it as
                 // locally injected, not from the wire).
-                let local_hit = self
-                    .path_table
-                    .iter()
-                    .find(|(_, entry)| entry.packet_hash == Some(packet_hash))
-                    .map(|(dest, _)| *dest.as_bytes());
-
-                if let Some(dest) = local_hit {
-                    if let Some(cached) = self.recent_announces.get(&dest) {
-                        if !cached.raw_packet.is_empty() {
-                            debug!(hash = %hex::encode(&packet_hash[..8]), "cache request: local hit, replaying");
-                            let inbound = crate::messages::InboundPacket {
-                                raw: Bytes::copy_from_slice(&cached.raw_packet),
-                                interface_id: 0,
-                                rssi: None,
-                                snr: None,
-                                q: None,
-                            };
-                            self.on_inbound(inbound);
-                            return;
-                        }
-                    }
+                if let Some(raw) = self.cached_announce_raw(&packet_hash) {
+                    debug!(hash = %hex::encode(&packet_hash[..8]), "cache request: local hit, replaying");
+                    let inbound = crate::messages::InboundPacket {
+                        raw: Bytes::from(raw),
+                        interface_id: 0,
+                        rssi: None,
+                        snr: None,
+                        q: None,
+                    };
+                    self.on_inbound(inbound);
+                    return;
                 }
 
                 // Local miss: only transport nodes forward the request
@@ -823,9 +825,11 @@ impl TransportActor {
 
     /// Mark a destination's cached metadata as used, matching Python's
     /// `_used_destination_data` refresh semantics for shared clients.
+    /// `timestamp` stays the announce time (Python keeps announce time and
+    /// use time as separate fields); the linger sweep reads `last_used`.
     pub(super) fn use_destination(&mut self, dest_hash: &[u8; 16]) -> bool {
         if let Some(entry) = self.recent_announces.get_mut(dest_hash) {
-            entry.timestamp = now_f64();
+            entry.last_used = Some(now_f64());
             self.state_dirty = true;
             true
         } else {
@@ -1673,7 +1677,7 @@ mod tests {
     #[test]
     fn test_register_interface_skips_already_offline_child() {
         let (mut actor, _tx) = TransportActor::new();
-        let (raw, dest_hash) = make_valid_announce("test.offline.local_client", 0);
+        let (_raw, dest_hash) = make_valid_announce("test.offline.local_client", 0);
         actor.recent_announces.insert(
             dest_hash,
             RecentAnnounce {
@@ -1683,8 +1687,10 @@ mod tests {
                 timestamp: now_f64(),
                 public_key: None,
                 ratchet: None,
-                raw_packet: raw.to_vec(),
+                packet_hash: Some([0xAB; 32]),
+                is_path_response: false,
                 retained: false,
+                last_used: None,
                 name_hash: [0u8; 10],
             },
         );
@@ -1744,8 +1750,6 @@ mod tests {
         for i in 0..cached_announces {
             let mut dest_hash = [0; 16];
             dest_hash[8..].copy_from_slice(&(i as u64).to_be_bytes());
-            let mut raw_packet = vec![0x51];
-            raw_packet.extend_from_slice(&dest_hash);
             actor.recent_announces.insert(
                 dest_hash,
                 RecentAnnounce {
@@ -1755,8 +1759,10 @@ mod tests {
                     timestamp: i as f64,
                     public_key: None,
                     ratchet: None,
-                    raw_packet,
+                    packet_hash: None,
+                    is_path_response: false,
                     retained: false,
+                    last_used: None,
                     name_hash: [0; 10],
                 },
             );
@@ -1823,9 +1829,14 @@ mod tests {
 
     #[test]
     fn local_client_path_request_uses_cached_announce_without_startup_dump() {
+        let dir = std::env::temp_dir().join("rns_local_client_cached_path_response");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
         actor.transport_identity_hash = Some([0x77; 16]);
+        actor.storage_dir = Some(dir.clone());
 
         let cached_announces = 1_200;
         for i in 0..cached_announces {
@@ -1840,13 +1851,24 @@ mod tests {
                     timestamp: i as f64,
                     public_key: None,
                     ratchet: None,
-                    raw_packet: vec![0x51, i as u8],
+                    packet_hash: None,
+                    is_path_response: false,
                     retained: false,
+                    last_used: None,
                     name_hash: [0; 10],
                 },
             );
         }
         let (target_raw, target_dest) = make_valid_announce("test.shared.cached_path_response", 2);
+        let target_ph =
+            rns_wire::hash::packet_hash(&target_raw, rns_wire::flags::HeaderType::Header1);
+        crate::persistence::write_python_cached_announce_if_absent(
+            &dir.join("cache").join("announces"),
+            &target_ph,
+            &target_raw,
+            None,
+        )
+        .unwrap();
         actor.recent_announces.insert(
             target_dest,
             RecentAnnounce {
@@ -1856,15 +1878,17 @@ mod tests {
                 timestamp: cached_announces as f64,
                 public_key: None,
                 ratchet: None,
-                raw_packet: target_raw.to_vec(),
+                packet_hash: Some(target_ph),
+                is_path_response: false,
                 retained: false,
+                last_used: None,
                 name_hash: [0; 10],
             },
         );
-        actor.path_table.insert(
-            target_dest,
-            crate::path_table::PathEntry::new(Some([0x22; 16]), 3, 2, InterfaceMode::Gateway),
-        );
+        let mut target_path =
+            crate::path_table::PathEntry::new(Some([0x22; 16]), 3, 2, InterfaceMode::Gateway);
+        target_path.packet_hash = Some(target_ph);
+        actor.path_table.insert(target_dest, target_path);
         assert!(
             actor.recent_announces.len() > 1_000,
             "fixture must keep a large cache while proving request-driven use"
@@ -1902,6 +1926,8 @@ mod tests {
             header.context,
             rns_wire::context::PacketContext::PathResponse
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3525,8 +3551,10 @@ mod tests {
                 timestamp: 1.0,
                 public_key: Some(other_public_key),
                 ratchet: None,
-                raw_packet: vec![0xAA, 0xBB],
+                packet_hash: Some([0xAB; 32]),
+                is_path_response: false,
                 retained: false,
+                last_used: None,
                 name_hash: [0xCC; 10],
             },
         );
@@ -3545,7 +3573,7 @@ mod tests {
             .get(&dest_hash)
             .expect("existing entry must not be removed");
         assert_eq!(cached.public_key, Some(other_public_key));
-        assert_eq!(cached.raw_packet, vec![0xAA, 0xBB]);
+        assert_eq!(cached.packet_hash, Some([0xAB; 32]));
         assert_eq!(cached.name_hash, [0xCC; 10]);
     }
 
@@ -3573,8 +3601,10 @@ mod tests {
                     timestamp: 1.0,
                     public_key,
                     ratchet: None,
-                    raw_packet: Vec::new(),
+                    packet_hash: None,
+                    is_path_response: false,
                     retained: false,
+                    last_used: None,
                     name_hash: [0; 10],
                 },
             );
@@ -5619,8 +5649,10 @@ mod tests {
                 timestamp: 1.0,
                 public_key: Some(manual_public_key),
                 ratchet: None,
-                raw_packet: Vec::new(),
+                packet_hash: None,
+                is_path_response: false,
                 retained: false,
+                last_used: None,
                 name_hash: [0; 10],
             },
         );
@@ -5682,8 +5714,10 @@ mod tests {
             timestamp: 1234567890.0,
             public_key: Some([0x42; 64]),
             ratchet: None,
-            raw_packet: vec![0x55; 48],
+            packet_hash: Some([0x55; 32]),
+            is_path_response: true,
             retained: false,
+            last_used: Some(1234567999.0),
             name_hash: [0x77; 10],
         }];
 
@@ -5698,6 +5732,9 @@ mod tests {
         assert_eq!(loaded[0].destination_hash, [0xAA; 16].to_vec());
         assert_eq!(loaded[0].hops, 2);
         assert_eq!(loaded[0].app_data, Some(vec![1, 2, 3]));
+        assert_eq!(loaded[0].packet_hash, Some([0x55; 32].to_vec()));
+        assert!(loaded[0].is_path_response);
+        assert_eq!(loaded[0].last_used, Some(1234567999.0));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5747,8 +5784,13 @@ mod tests {
 
     #[test]
     fn test_cache_request_handler() {
+        let dir = std::env::temp_dir().join("rns_cache_request_handler");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true; // cache request broadcast requires transport
+        actor.storage_dir = Some(dir.clone()); // announce receive writes the disk cache
 
         // Register an outbound interface to receive the replayed announce
         let (iface, mut rx) = make_test_interface("out1");
@@ -5771,13 +5813,20 @@ mod tests {
         };
         actor.on_inbound(inbound);
 
-        // Verify announce was cached with raw bytes
+        // Verify metadata cached and raw bytes written to the disk announce cache
         assert_eq!(actor.recent_announces.len(), 1);
         let cached = actor
             .recent_announces
             .get(&dest_hash)
             .expect("announce should be cached under its dest_hash");
-        assert!(!cached.raw_packet.is_empty());
+        assert_eq!(cached.packet_hash, Some(packet_hash));
+        let on_disk = crate::persistence::load_python_cached_announce(
+            &dir.join("cache").join("announces"),
+            &packet_hash,
+        )
+        .unwrap()
+        .expect("announce receive should write the disk cache file");
+        assert_eq!(on_disk.raw_packet, announce_raw.to_vec());
 
         // Verify path_table has the packet_hash
         let path_entry = actor.path_table.get(&dest_hash);
@@ -5813,6 +5862,8 @@ mod tests {
             "expected replayed announce on output interface"
         );
         assert_eq!(replayed.unwrap(), announce_raw);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5945,22 +5996,12 @@ mod tests {
         )
         .unwrap();
 
-        let announces = [RecentAnnounce {
-            dest_hash: cached_dest,
-            hops: 1,
-            app_data: None,
-            timestamp: now,
-            public_key: None,
-            ratchet: None,
-            raw_packet: vec![0xFE; 42],
-            retained: false,
-            name_hash: [0u8; 10],
-        }];
-        crate::persistence::save_python_announce_cache_for_paths(
-            &table,
-            announces.iter(),
-            &names,
+        // Disk cache file exists only for cached_dest's announce packet hash.
+        crate::persistence::write_python_cached_announce_if_absent(
             &dir.join("cache").join("announces"),
+            &[0x11; 32],
+            &[0xFE; 42],
+            Some("Border_TCP"),
         )
         .unwrap();
 
@@ -6048,8 +6089,10 @@ mod tests {
                 timestamp: 1.0,
                 public_key: Some([0x11; 64]),
                 ratchet: None,
-                raw_packet: Vec::new(),
+                packet_hash: None,
+                is_path_response: false,
                 retained: false,
+                last_used: None,
                 name_hash: [0; 10],
             },
         );
@@ -6195,7 +6238,7 @@ mod tests {
     #[test]
     fn periodic_save_skipped_when_clean() {
         // Dirty gate: an idle device with no mutations since last save
-        // shouldn't spin disk every 10 s.
+        // shouldn't spin disk on every flush interval.
         let dir = std::env::temp_dir().join("rns_periodic_save_clean");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -6295,8 +6338,10 @@ mod tests {
                 timestamp: 1.0,
                 public_key: Some([0x22; 64]),
                 ratchet: None,
-                raw_packet: Vec::new(),
+                packet_hash: None,
+                is_path_response: false,
                 retained: false,
+                last_used: None,
                 name_hash: [0; 10],
             },
         );
@@ -6784,9 +6829,14 @@ mod tests {
 
     #[test]
     fn pr_ingress_burst_does_not_block_known_path_response() {
+        let dir = std::env::temp_dir().join("rns_pr_burst_known_path");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
         actor.transport_identity_hash = Some([0x44; 16]);
+        actor.storage_dir = Some(dir.clone());
 
         let (mut gateway, _gateway_rx) = make_test_interface("gateway");
         gateway.mode = InterfaceMode::Gateway;
@@ -6796,12 +6846,17 @@ mod tests {
         prime_ingress_pr_burst(&mut actor, 1);
 
         let (raw, dest) = make_valid_announce("test.pr_burst.known_path", 1);
+        let ph = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+        crate::persistence::write_python_cached_announce_if_absent(
+            &dir.join("cache").join("announces"),
+            &ph,
+            &raw,
+            None,
+        )
+        .unwrap();
         let mut path_entry =
             crate::path_table::PathEntry::new(Some([0xAB; 16]), 2, 2, InterfaceMode::Gateway);
-        path_entry.packet_hash = Some(rns_wire::hash::packet_hash(
-            &raw,
-            rns_wire::flags::HeaderType::Header1,
-        ));
+        path_entry.packet_hash = Some(ph);
         actor.path_table.insert(dest, path_entry);
         actor.recent_announces.insert(
             dest,
@@ -6812,8 +6867,10 @@ mod tests {
                 timestamp: now_f64(),
                 public_key: None,
                 ratchet: None,
-                raw_packet: raw.to_vec(),
+                packet_hash: Some(ph),
+                is_path_response: false,
                 retained: false,
+                last_used: None,
                 name_hash: [0u8; 10],
             },
         );
@@ -6826,6 +6883,8 @@ mod tests {
             .expect("known path response should still be queued during PR burst");
         assert!(queued.block_rebroadcast);
         assert_eq!(queued.attached_interface, Some(1));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -7410,9 +7469,14 @@ mod tests {
 
     #[test]
     fn known_path_request_does_not_answer_requestor_next_hop() {
+        let dir = std::env::temp_dir().join("rns_path_request_next_hop");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
         actor.transport_identity_hash = Some([0x44; 16]);
+        actor.storage_dir = Some(dir.clone());
 
         let (requestor, mut requestor_rx) = make_test_interface("requestor");
         actor.interfaces.insert(1, requestor);
@@ -7421,12 +7485,17 @@ mod tests {
 
         let next_hop = [0xAB; 16];
         let (raw, dest) = make_valid_announce("test.path.request.next_hop", 1);
+        let ph = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+        crate::persistence::write_python_cached_announce_if_absent(
+            &dir.join("cache").join("announces"),
+            &ph,
+            &raw,
+            None,
+        )
+        .unwrap();
         let mut path_entry =
             crate::path_table::PathEntry::new(Some(next_hop), 2, 2, InterfaceMode::Gateway);
-        path_entry.packet_hash = Some(rns_wire::hash::packet_hash(
-            &raw,
-            rns_wire::flags::HeaderType::Header1,
-        ));
+        path_entry.packet_hash = Some(ph);
         actor.path_table.insert(dest, path_entry);
         actor.recent_announces.insert(
             dest,
@@ -7437,8 +7506,10 @@ mod tests {
                 timestamp: now_f64(),
                 public_key: None,
                 ratchet: None,
-                raw_packet: raw.to_vec(),
+                packet_hash: Some(ph),
+                is_path_response: false,
                 retained: false,
+                last_used: None,
                 name_hash: [0u8; 10],
             },
         );
@@ -7479,13 +7550,20 @@ mod tests {
             rns_wire::flags::HeaderType::Header2
         );
         assert_eq!(header.transport_id, Some([0x44; 16]));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn known_path_response_restores_displaced_announce() {
+        let dir = std::env::temp_dir().join("rns_path_request_held");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
         actor.transport_identity_hash = Some([0x44; 16]);
+        actor.storage_dir = Some(dir.clone());
 
         let (requestor, mut requestor_rx) = make_test_interface("requestor");
         actor.interfaces.insert(1, requestor);
@@ -7493,12 +7571,17 @@ mod tests {
         actor.interfaces.insert(2, next_hop_iface);
 
         let (raw, dest) = make_valid_announce("test.path.request.held", 1);
+        let ph = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+        crate::persistence::write_python_cached_announce_if_absent(
+            &dir.join("cache").join("announces"),
+            &ph,
+            &raw,
+            None,
+        )
+        .unwrap();
         let mut path_entry =
             crate::path_table::PathEntry::new(Some([0xAB; 16]), 2, 2, InterfaceMode::Gateway);
-        path_entry.packet_hash = Some(rns_wire::hash::packet_hash(
-            &raw,
-            rns_wire::flags::HeaderType::Header1,
-        ));
+        path_entry.packet_hash = Some(ph);
         actor.path_table.insert(dest, path_entry);
         actor.recent_announces.insert(
             dest,
@@ -7509,8 +7592,10 @@ mod tests {
                 timestamp: now_f64(),
                 public_key: None,
                 ratchet: None,
-                raw_packet: raw.to_vec(),
+                packet_hash: Some(ph),
+                is_path_response: false,
                 retained: false,
+                last_used: None,
                 name_hash: [0u8; 10],
             },
         );
@@ -7557,22 +7642,37 @@ mod tests {
         assert!(!restored.block_rebroadcast);
         assert_eq!(restored.packet_raw, held_raw);
         assert!(!actor.held_announces.contains_key(&dest));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn known_path_request_not_answered_on_same_roaming_interface() {
+        let dir = std::env::temp_dir().join("rns_path_request_roaming");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
+        // Cached announce is fully available — only the roaming rule may block.
+        actor.storage_dir = Some(dir.clone());
 
         let (mut roaming, mut roaming_rx) = make_test_interface("roaming");
         roaming.mode = InterfaceMode::Roaming;
         actor.interfaces.insert(1, roaming);
 
         let (raw, dest) = make_valid_announce("test.path.request.roaming", 1);
-        actor.path_table.insert(
-            dest,
-            crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Roaming),
-        );
+        let ph = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+        crate::persistence::write_python_cached_announce_if_absent(
+            &dir.join("cache").join("announces"),
+            &ph,
+            &raw,
+            None,
+        )
+        .unwrap();
+        let mut path_entry = crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Roaming);
+        path_entry.packet_hash = Some(ph);
+        actor.path_table.insert(dest, path_entry);
         actor.recent_announces.insert(
             dest,
             RecentAnnounce {
@@ -7582,8 +7682,10 @@ mod tests {
                 timestamp: now_f64(),
                 public_key: None,
                 ratchet: None,
-                raw_packet: raw.to_vec(),
+                packet_hash: Some(ph),
+                is_path_response: false,
                 retained: false,
+                last_used: None,
                 name_hash: [0u8; 10],
             },
         );
@@ -7593,6 +7695,12 @@ mod tests {
             roaming_rx.try_recv().is_err(),
             "roaming interface should not answer with a path learned on itself"
         );
+        assert!(
+            actor.announce_table.get(&dest).is_none(),
+            "roaming rule must block the queued path response, not just the send"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -8243,8 +8351,10 @@ mod tests {
                 timestamp: 1.0,
                 public_key: Some(identity.get_public_key()),
                 ratchet: None,
-                raw_packet: Vec::new(),
+                packet_hash: None,
+                is_path_response: false,
                 retained: false,
+                last_used: None,
                 name_hash: [0; 10],
             },
         );
