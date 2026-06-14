@@ -728,10 +728,7 @@ mod cleanup_tests {
         assert_eq!(actor.discovery_pr_tags.len(), MAX_DISCOVERY_PR_TAGS);
         let oldest = (MAX_DISCOVERY_PR_TAGS as u64).to_be_bytes().to_vec();
         assert!(!actor.discovery_pr_tags.contains_key(&oldest));
-        assert!(
-            actor
-                .discovery_pr_tags
-                .contains_key(&0u64.to_be_bytes().to_vec())
-        );
+        let newest = 0u64.to_be_bytes();
+        assert!(actor.discovery_pr_tags.contains_key(newest.as_slice()));
     }
 }

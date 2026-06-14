@@ -765,75 +765,72 @@ impl TransportActor {
                     }
                 }
             };
-            match loaded {
-                Some(entries) => {
-                    let count = entries.len();
-                    let mut expired = 0usize;
-                    for ae in entries {
-                        if ae.destination_hash.len() == 16 {
-                            let mut hash = [0u8; 16];
-                            hash.copy_from_slice(&ae.destination_hash);
-                            let stale_pathless = !ae.retained
-                                && !self.recent_announces.contains_key(&hash)
-                                && now_ts - ae.timestamp > DESTINATION_TIMEOUT as f64;
-                            if stale_pathless {
-                                expired += 1;
-                                continue;
-                            }
-                            let public_key = ae.public_key.and_then(|k| {
-                                if k.len() == 64 {
-                                    let mut arr = [0u8; 64];
-                                    arr.copy_from_slice(&k);
-                                    Some(arr)
-                                } else {
-                                    None
-                                }
-                            });
-                            let ratchet = ae.ratchet.and_then(|r| {
-                                if r.len() == 32 {
-                                    let mut arr = [0u8; 32];
-                                    arr.copy_from_slice(&r);
-                                    Some(arr)
-                                } else {
-                                    None
-                                }
-                            });
-                            let name_hash = if ae.name_hash.len() == 10 {
-                                let mut nh = [0u8; 10];
-                                nh.copy_from_slice(&ae.name_hash);
-                                nh
-                            } else {
-                                [0u8; 10]
-                            };
-                            let packet_hash = ae.packet_hash.and_then(|h| {
-                                if h.len() == 32 {
-                                    let mut arr = [0u8; 32];
-                                    arr.copy_from_slice(&h);
-                                    Some(arr)
-                                } else {
-                                    None
-                                }
-                            });
-                            self.recent_announces
-                                .entry(hash)
-                                .or_insert_with(|| RecentAnnounce {
-                                    dest_hash: hash,
-                                    hops: ae.hops,
-                                    app_data: ae.app_data,
-                                    timestamp: ae.timestamp,
-                                    public_key,
-                                    ratchet,
-                                    packet_hash,
-                                    is_path_response: ae.is_path_response,
-                                    retained: ae.retained,
-                                    last_used: ae.last_used,
-                                    name_hash,
-                                });
+            if let Some(entries) = loaded {
+                let count = entries.len();
+                let mut expired = 0usize;
+                for ae in entries {
+                    if ae.destination_hash.len() == 16 {
+                        let mut hash = [0u8; 16];
+                        hash.copy_from_slice(&ae.destination_hash);
+                        let stale_pathless = !ae.retained
+                            && !self.recent_announces.contains_key(&hash)
+                            && now_ts - ae.timestamp > DESTINATION_TIMEOUT as f64;
+                        if stale_pathless {
+                            expired += 1;
+                            continue;
                         }
+                        let public_key = ae.public_key.and_then(|k| {
+                            if k.len() == 64 {
+                                let mut arr = [0u8; 64];
+                                arr.copy_from_slice(&k);
+                                Some(arr)
+                            } else {
+                                None
+                            }
+                        });
+                        let ratchet = ae.ratchet.and_then(|r| {
+                            if r.len() == 32 {
+                                let mut arr = [0u8; 32];
+                                arr.copy_from_slice(&r);
+                                Some(arr)
+                            } else {
+                                None
+                            }
+                        });
+                        let name_hash = if ae.name_hash.len() == 10 {
+                            let mut nh = [0u8; 10];
+                            nh.copy_from_slice(&ae.name_hash);
+                            nh
+                        } else {
+                            [0u8; 10]
+                        };
+                        let packet_hash = ae.packet_hash.and_then(|h| {
+                            if h.len() == 32 {
+                                let mut arr = [0u8; 32];
+                                arr.copy_from_slice(&h);
+                                Some(arr)
+                            } else {
+                                None
+                            }
+                        });
+                        self.recent_announces
+                            .entry(hash)
+                            .or_insert_with(|| RecentAnnounce {
+                                dest_hash: hash,
+                                hops: ae.hops,
+                                app_data: ae.app_data,
+                                timestamp: ae.timestamp,
+                                public_key,
+                                ratchet,
+                                packet_hash,
+                                is_path_response: ae.is_path_response,
+                                retained: ae.retained,
+                                last_used: ae.last_used,
+                                name_hash,
+                            });
                     }
-                    debug!(count, expired, "loaded announce cache entries from disk");
                 }
-                None => {}
+                debug!(count, expired, "loaded announce cache entries from disk");
             }
         }
     }

@@ -2262,7 +2262,7 @@ mod tests {
     fn test_response_rssi_updates() {
         let mut rssi = None;
         let mut snr = None;
-        rnode::process_rnode_response(rnode::CMD_STAT_RSSI, &[0xBF], 1, &mut rssi, &mut snr);
+        rnode::process_rnode_response(rnode::CMD_STAT_RSSI, &[92], 1, &mut rssi, &mut snr);
         assert_eq!(rssi, Some(-65.0));
     }
 
