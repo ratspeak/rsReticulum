@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.4"
+version = "1.0.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 rust-version = "1.85"
@@ -79,12 +79,12 @@ nix = { version = "0.29", features = ["term", "fs"] }
 proptest = "1"
 
 # Workspace crates
-rns-crypto = { path = "crates/rns-crypto", default-features = false }
-rns-wire = { path = "crates/rns-wire", default-features = false }
-rns-identity = { path = "crates/rns-identity" }
-rns-transport = { path = "crates/rns-transport" }
-rns-link = { path = "crates/rns-link" }
-rns-protocol = { path = "crates/rns-protocol" }
-rns-interface = { path = "crates/rns-interface" }
-rns-runtime = { path = "crates/rns-runtime" }
-rns-ratkey = { path = "crates/rns-ratkey" }
+rns-crypto = { path = "crates/rns-crypto", version = "1.0.0", default-features = false }
+rns-wire = { path = "crates/rns-wire", version = "1.0.0", default-features = false }
+rns-identity = { path = "crates/rns-identity", version = "1.0.0" }
+rns-transport = { path = "crates/rns-transport", version = "1.0.0" }
+rns-link = { path = "crates/rns-link", version = "1.0.0" }
+rns-protocol = { path = "crates/rns-protocol", version = "1.0.0" }
+rns-interface = { path = "crates/rns-interface", version = "1.0.0" }
+rns-runtime = { path = "crates/rns-runtime", version = "1.0.0" }
+rns-ratkey = { path = "crates/rns-ratkey", version = "1.0.0" }

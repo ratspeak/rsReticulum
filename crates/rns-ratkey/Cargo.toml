@@ -33,7 +33,7 @@ hkdf = "0.12"
 [dev-dependencies]
 rns-crypto = { workspace = true, features = ["std"] }
 rns-identity = { workspace = true }
-rns-link = { path = "../rns-link" }
+rns-link = { workspace = true }
 # Synthetic-chain test fixtures.
 x509-cert = { version = "0.2", features = ["pem", "builder"] }
 # `sha2` feature provides RsaSignatureAssociatedOid for the cert builder's signer.

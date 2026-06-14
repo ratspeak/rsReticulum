@@ -1582,7 +1582,7 @@ dependencies = [
 
 [[package]]
 name = "rns-crypto"
-version = "0.9.4"
+version = "1.0.0"
 dependencies = [
  "aes",
  "cbc",
@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "rns-identity"
-version = "0.9.4"
+version = "1.0.0"
 dependencies = [
  "hex",
  "proptest",
@@ -1620,7 +1620,7 @@ dependencies = [
 
 [[package]]
 name = "rns-interface"
-version = "0.9.4"
+version = "1.0.0"
 dependencies = [
  "bluer",
  "btleplug",
@@ -1650,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "rns-link"
-version = "0.9.4"
+version = "1.0.0"
 dependencies = [
  "hex",
  "proptest",
@@ -1666,7 +1666,7 @@ dependencies = [
 
 [[package]]
 name = "rns-protocol"
-version = "0.9.4"
+version = "1.0.0"
 dependencies = [
  "bzip2",
  "hex",
@@ -1683,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "rns-ratkey"
-version = "0.9.4"
+version = "1.0.0"
 dependencies = [
  "aes",
  "bip39",
@@ -1709,7 +1709,7 @@ dependencies = [
 
 [[package]]
 name = "rns-runtime"
-version = "0.9.4"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "hex",
@@ -1735,7 +1735,7 @@ dependencies = [
 
 [[package]]
 name = "rns-tools"
-version = "0.9.4"
+version = "1.0.0"
 dependencies = [
  "base64",
  "bytes",
@@ -1762,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "rns-transport"
-version = "0.9.4"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "hex",
@@ -1782,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "rns-wire"
-version = "0.9.4"
+version = "1.0.0"
 dependencies = [
  "proptest",
  "rns-crypto",
