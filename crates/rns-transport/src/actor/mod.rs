@@ -3047,6 +3047,28 @@ mod tests {
         assert!(rx2.try_recv().is_ok());
     }
 
+    #[test]
+    fn outbound_no_path_proof_does_not_request_path() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (entry, mut rx) = make_test_interface("iface1");
+        actor.interfaces.insert(1, entry);
+
+        let dest_hash = [0x42; 16];
+        let raw = make_proof_packet(dest_hash, 0);
+        actor.on_outbound(OutboundRequest {
+            raw: raw.clone(),
+            destination_hash: dest_hash,
+        });
+
+        let sent = rx.try_recv().expect("proof should broadcast");
+        assert_eq!(sent, raw);
+        assert!(
+            rx.try_recv().is_err(),
+            "proof should not be followed by a path request"
+        );
+        assert!(!actor.path_requests.contains_key(&dest_hash));
+    }
+
     fn assert_link_request_pins_to_path_owner(
         owner_name: &str,
         owner_mode: InterfaceMode,

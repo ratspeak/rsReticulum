@@ -129,7 +129,9 @@ impl TransportActor {
                         "outbound: no path, broadcasting"
                     );
                     self.broadcast_on_interfaces(&request.raw, None);
-                    self.on_automatic_path_request(request.destination_hash);
+                    if parsed.flags.packet_type != rns_wire::flags::PacketType::Proof {
+                        self.on_automatic_path_request(request.destination_hash);
+                    }
                 }
             }
         }
