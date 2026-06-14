@@ -1818,6 +1818,17 @@ pub struct RuntimeInterfaceIfacConfig {
     pub ifac_size: Option<usize>,
 }
 
+#[derive(Clone, Debug)]
+pub struct RuntimeBackboneClientConfig<'a> {
+    pub name: &'a str,
+    pub host: &'a str,
+    pub port: u16,
+    pub prefer_ipv6: bool,
+    pub connect_timeout: Option<u64>,
+    pub max_reconnect_tries: Option<usize>,
+    pub ifac: Option<RuntimeInterfaceIfacConfig>,
+}
+
 fn runtime_ifac_post_init(
     ifac: Option<RuntimeInterfaceIfacConfig>,
     default_ifac_size: usize,
@@ -2824,13 +2835,15 @@ pub async fn spawn_backbone_client_runtime(
 ) -> Result<u64, String> {
     spawn_backbone_client_runtime_with_ifac(
         handle,
-        name,
-        host,
-        port,
-        prefer_ipv6,
-        connect_timeout,
-        max_reconnect_tries,
-        None,
+        RuntimeBackboneClientConfig {
+            name,
+            host,
+            port,
+            prefer_ipv6,
+            connect_timeout,
+            max_reconnect_tries,
+            ifac: None,
+        },
     )
     .await
 }
@@ -2838,24 +2851,22 @@ pub async fn spawn_backbone_client_runtime(
 /// Spawn a Backbone (HDLC-over-TCP) client interface at runtime with optional IFAC settings.
 pub async fn spawn_backbone_client_runtime_with_ifac(
     handle: &ReticulumHandle,
-    name: &str,
-    host: &str,
-    port: u16,
-    prefer_ipv6: bool,
-    connect_timeout: Option<u64>,
-    max_reconnect_tries: Option<usize>,
-    ifac: Option<RuntimeInterfaceIfacConfig>,
+    runtime_config: RuntimeBackboneClientConfig<'_>,
 ) -> Result<u64, String> {
     let id = handle
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let post_init = runtime_ifac_post_init(ifac, 16)?;
-    let mut config = rns_interface::backbone::BackboneClientConfig::new(name, host, port);
-    config.prefer_ipv6 = prefer_ipv6;
-    if let Some(t) = connect_timeout {
+    let post_init = runtime_ifac_post_init(runtime_config.ifac, 16)?;
+    let mut config = rns_interface::backbone::BackboneClientConfig::new(
+        runtime_config.name,
+        runtime_config.host,
+        runtime_config.port,
+    );
+    config.prefer_ipv6 = runtime_config.prefer_ipv6;
+    if let Some(t) = runtime_config.connect_timeout {
         config.connect_timeout_secs = t;
     }
-    config.max_reconnect_tries = max_reconnect_tries;
+    config.max_reconnect_tries = runtime_config.max_reconnect_tries;
 
     let iface_handle =
         rns_interface::backbone::spawn_backbone_client(config, id, handle.transport_tx.clone())
@@ -2880,7 +2891,7 @@ pub async fn spawn_backbone_client_runtime_with_ifac(
         )
         .await;
     }
-    tracing::info!(name = %name, id, "runtime Backbone client interface spawned");
+    tracing::info!(name = %runtime_config.name, id, "runtime Backbone client interface spawned");
     Ok(id)
 }
 
