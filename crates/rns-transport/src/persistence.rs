@@ -893,8 +893,7 @@ pub fn migrate_legacy_announce_entries(
             let mut is_path_response = false;
             if !e.raw_packet.is_empty() {
                 if let Ok((header, _)) = rns_wire::header::PacketHeader::unpack(&e.raw_packet) {
-                    let hash =
-                        rns_wire::hash::packet_hash(&e.raw_packet, header.flags.header_type);
+                    let hash = rns_wire::hash::packet_hash(&e.raw_packet, header.flags.header_type);
                     is_path_response =
                         header.context == rns_wire::context::PacketContext::PathResponse;
                     if write_python_cached_announce_if_absent(

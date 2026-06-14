@@ -485,8 +485,7 @@ impl TransportActor {
         // `cleanup_known_destinations` (linger + 7-day eviction).
         let now_ts = now_f64();
         let announce_packet_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
-        let is_path_response =
-            header.context == rns_wire::context::PacketContext::PathResponse;
+        let is_path_response = header.context == rns_wire::context::PacketContext::PathResponse;
         self.cache_announce_to_disk(&announce_packet_hash, raw, interface_id);
         let app_data_for_handlers = announce_app_data.clone();
         match self.recent_announces.entry(header.destination_hash) {

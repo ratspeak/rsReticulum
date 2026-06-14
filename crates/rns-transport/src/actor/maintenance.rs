@@ -701,7 +701,12 @@ mod cleanup_tests {
         let (mut actor, _tx) = TransportActor::new();
         let now = 10_000_000.0;
         let threshold = DESTINATION_TIMEOUT as f64 * 1.25;
-        insert_used_entry(&mut actor, 0x09, now - threshold - 2.0, now - threshold - 1.0);
+        insert_used_entry(
+            &mut actor,
+            0x09,
+            now - threshold - 2.0,
+            now - threshold - 1.0,
+        );
 
         actor.cleanup_known_destinations(now);
         assert!(actor.recent_announces.is_empty());

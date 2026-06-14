@@ -36,8 +36,7 @@ fn recent_announce_from_cached_packet(
             &raw_packet,
             header.flags.header_type,
         ));
-        recent.is_path_response =
-            header.context == rns_wire::context::PacketContext::PathResponse;
+        recent.is_path_response = header.context == rns_wire::context::PacketContext::PathResponse;
         if let Ok(announce) = rns_identity::announce::AnnounceData::unpack(
             &raw_packet[offset..],
             header.flags.context_flag,
