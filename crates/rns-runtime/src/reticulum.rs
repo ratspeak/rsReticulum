@@ -1811,6 +1811,41 @@ fn derive_ifac_key_from_post_init(
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeInterfaceIfacConfig {
+    pub network_name: Option<String>,
+    pub passphrase: Option<String>,
+    pub ifac_size: Option<usize>,
+}
+
+fn runtime_ifac_post_init(
+    ifac: Option<RuntimeInterfaceIfacConfig>,
+    default_ifac_size: usize,
+) -> Result<Option<interface_factory::InterfacePostInit>, String> {
+    let Some(ifac) = ifac else {
+        return Ok(None);
+    };
+
+    if let Some(size) = ifac.ifac_size
+        && !(1..=64).contains(&size)
+    {
+        return Err(format!("Invalid IFAC size {size}; expected 1..=64 bytes"));
+    }
+
+    let network_name = ifac.network_name.filter(|s| !s.is_empty());
+    let passphrase = ifac.passphrase.filter(|s| !s.is_empty());
+    if network_name.is_none() && passphrase.is_none() {
+        return Ok(None);
+    }
+
+    let mut post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new())
+        .with_default_ifac_size(default_ifac_size);
+    post_init.ifac_network_name = network_name;
+    post_init.ifac_passphrase = passphrase;
+    post_init.ifac_size = ifac.ifac_size;
+    Ok(Some(post_init))
+}
+
 fn get_post_init_for_config(
     config: &Config,
     iface_config: &interface_factory::InterfaceConfig,
@@ -2705,21 +2740,45 @@ pub async fn spawn_tcp_client_runtime(
     host: &str,
     port: u16,
 ) -> Result<u64, String> {
+    spawn_tcp_client_runtime_with_ifac(handle, name, host, port, None).await
+}
+
+/// Spawn a TCP client interface at runtime with optional IFAC settings.
+pub async fn spawn_tcp_client_runtime_with_ifac(
+    handle: &ReticulumHandle,
+    name: &str,
+    host: &str,
+    port: u16,
+    ifac: Option<RuntimeInterfaceIfacConfig>,
+) -> Result<u64, String> {
     let id = handle
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let post_init = runtime_ifac_post_init(ifac, 16)?;
     let config = rns_interface::tcp::TcpClientConfig::new(name, host, port);
     let iface_handle =
         rns_interface::tcp::spawn_tcp_client(config, id, handle.transport_tx.clone(), None)
             .await
             .map_err(|e| format!("TCP client spawn failed: {e}"))?;
 
-    register_interface_handle(
-        &handle.transport_tx,
-        iface_handle,
-        &handle.interface_controls,
-    )
-    .await;
+    if let Some(post_init) = post_init {
+        let ifac_key = derive_ifac_key_from_post_init(&post_init);
+        register_interface_with_post_init(
+            &handle.transport_tx,
+            iface_handle,
+            &post_init,
+            ifac_key,
+            &handle.interface_controls,
+        )
+        .await;
+    } else {
+        register_interface_handle(
+            &handle.transport_tx,
+            iface_handle,
+            &handle.interface_controls,
+        )
+        .await;
+    }
     tracing::info!(name = %name, id, "runtime TCP client interface spawned");
     Ok(id)
 }
@@ -2763,9 +2822,34 @@ pub async fn spawn_backbone_client_runtime(
     connect_timeout: Option<u64>,
     max_reconnect_tries: Option<usize>,
 ) -> Result<u64, String> {
+    spawn_backbone_client_runtime_with_ifac(
+        handle,
+        name,
+        host,
+        port,
+        prefer_ipv6,
+        connect_timeout,
+        max_reconnect_tries,
+        None,
+    )
+    .await
+}
+
+/// Spawn a Backbone (HDLC-over-TCP) client interface at runtime with optional IFAC settings.
+pub async fn spawn_backbone_client_runtime_with_ifac(
+    handle: &ReticulumHandle,
+    name: &str,
+    host: &str,
+    port: u16,
+    prefer_ipv6: bool,
+    connect_timeout: Option<u64>,
+    max_reconnect_tries: Option<usize>,
+    ifac: Option<RuntimeInterfaceIfacConfig>,
+) -> Result<u64, String> {
     let id = handle
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let post_init = runtime_ifac_post_init(ifac, 16)?;
     let mut config = rns_interface::backbone::BackboneClientConfig::new(name, host, port);
     config.prefer_ipv6 = prefer_ipv6;
     if let Some(t) = connect_timeout {
@@ -2778,12 +2862,24 @@ pub async fn spawn_backbone_client_runtime(
             .await
             .map_err(|e| format!("Backbone client spawn failed: {e}"))?;
 
-    register_interface_handle(
-        &handle.transport_tx,
-        iface_handle,
-        &handle.interface_controls,
-    )
-    .await;
+    if let Some(post_init) = post_init {
+        let ifac_key = derive_ifac_key_from_post_init(&post_init);
+        register_interface_with_post_init(
+            &handle.transport_tx,
+            iface_handle,
+            &post_init,
+            ifac_key,
+            &handle.interface_controls,
+        )
+        .await;
+    } else {
+        register_interface_handle(
+            &handle.transport_tx,
+            iface_handle,
+            &handle.interface_controls,
+        )
+        .await;
+    }
     tracing::info!(name = %name, id, "runtime Backbone client interface spawned");
     Ok(id)
 }
@@ -3690,6 +3786,57 @@ mod tests {
         let mut raw = header.pack();
         raw.extend_from_slice(body);
         bytes::Bytes::from(raw)
+    }
+
+    #[test]
+    fn runtime_ifac_post_init_ignores_blank_fields() {
+        let post_init = runtime_ifac_post_init(
+            Some(RuntimeInterfaceIfacConfig {
+                network_name: Some(String::new()),
+                passphrase: Some(String::new()),
+                ifac_size: None,
+            }),
+            16,
+        )
+        .unwrap();
+
+        assert!(post_init.is_none());
+    }
+
+    #[test]
+    fn runtime_ifac_post_init_uses_tcp_default_size() {
+        let post_init = runtime_ifac_post_init(
+            Some(RuntimeInterfaceIfacConfig {
+                network_name: Some("testnet".to_string()),
+                passphrase: Some("secret".to_string()),
+                ifac_size: None,
+            }),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(post_init.ifac_network_name.as_deref(), Some("testnet"));
+        assert_eq!(post_init.ifac_passphrase.as_deref(), Some("secret"));
+        assert_eq!(post_init.ifac_size, None);
+        assert_eq!(post_init.default_ifac_size, 16);
+    }
+
+    #[test]
+    fn runtime_ifac_post_init_rejects_invalid_size() {
+        let result = runtime_ifac_post_init(
+            Some(RuntimeInterfaceIfacConfig {
+                network_name: Some("testnet".to_string()),
+                passphrase: None,
+                ifac_size: Some(0),
+            }),
+            16,
+        );
+
+        match result {
+            Ok(_) => panic!("expected invalid IFAC size to be rejected"),
+            Err(err) => assert!(err.contains("Invalid IFAC size")),
+        }
     }
 
     #[tokio::test]
