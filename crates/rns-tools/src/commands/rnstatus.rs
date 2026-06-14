@@ -27,7 +27,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 5;
 const REMOTE_TIMEOUT_SECS: u64 = 30;
 const REMOTE_HOPS: u8 = 8;
 const MGMT_APP: &str = "rnstransport.remote.management";
-use rns_tools::RETICULUM_COMPAT_VERSION;
+use rns_tools::RS_RETICULUM_VERSION;
 
 #[derive(Parser)]
 #[command(
@@ -125,7 +125,7 @@ pub(crate) async fn main() -> ExitCode {
     let args = Args::parse();
 
     if args.version {
-        println!("rnstatus-rs {RETICULUM_COMPAT_VERSION}");
+        println!("rnstatus-rs {RS_RETICULUM_VERSION}");
         return ExitCode::SUCCESS;
     }
     if let Err(e) = validate_args(&args) {

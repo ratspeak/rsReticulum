@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use tracing_subscriber::fmt::MakeWriter;
 
-use rns_tools::RETICULUM_COMPAT_VERSION;
+use rns_tools::{RETICULUM_COMPAT_VERSION, RS_RETICULUM_VERSION};
 const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 const RNSD_EXAMPLE_CONFIG: &str = r#"# This is an example Reticulum config file.
 
@@ -134,7 +134,7 @@ pub(crate) async fn main() {
     let args = Args::parse();
 
     if args.version {
-        println!("rnsd-rs {RETICULUM_COMPAT_VERSION}");
+        println!("rnsd-rs {RS_RETICULUM_VERSION}");
         return;
     }
 
@@ -177,7 +177,7 @@ pub(crate) async fn main() {
         tracing_subscriber::fmt().with_max_level(level).init();
     }
 
-    tracing::info!("rnsd-rs {RETICULUM_COMPAT_VERSION} starting");
+    tracing::info!("rnsd-rs {RS_RETICULUM_VERSION} starting");
 
     let shutdown = rns_runtime::lifecycle::ShutdownSignal::new();
     let _signal_rx = rns_runtime::lifecycle::install_signal_handlers(shutdown.clone());
@@ -215,7 +215,7 @@ async fn run_interactive_shell(handle: rns_runtime::reticulum::ReticulumHandle) 
         let mut stdout = io::stdout();
         let _ = writeln!(
             stdout,
-            "rnsd-rs {RETICULUM_COMPAT_VERSION} interactive console"
+            "rnsd-rs {RS_RETICULUM_VERSION} interactive console"
         );
         let _ = writeln!(
             stdout,

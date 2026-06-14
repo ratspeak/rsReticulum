@@ -42,7 +42,7 @@ use rns_runtime::rncp::{
 };
 
 const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
-use rns_tools::RETICULUM_COMPAT_VERSION;
+use rns_tools::RS_RETICULUM_VERSION;
 
 #[derive(Parser)]
 #[command(
@@ -197,7 +197,7 @@ fn load_or_create_identity(
 pub(crate) async fn main() {
     let args = Args::parse();
     if args.version {
-        println!("rncp-rs {RETICULUM_COMPAT_VERSION}");
+        println!("rncp-rs {RS_RETICULUM_VERSION}");
         return;
     }
     if args.phy_rates {

@@ -23,7 +23,8 @@ use rns_runtime::rnsh::{
 };
 use tokio::sync::mpsc;
 
-const RNS_VERSION: &str = "1.2.5";
+use rns_tools::RS_RETICULUM_VERSION;
+
 const RNSH_PROTOCOL_VERSION: &str = "0.2.0";
 const APP_NAME: &str = "rnsh";
 const DEFAULT_SERVICE_NAME: &str = "default";
@@ -86,7 +87,7 @@ pub(crate) async fn main() -> ExitCode {
 
 async fn run(mut args: Args) -> ExitCode {
     if args.version {
-        println!("rnsh-rs {RNS_VERSION} (protocol {RNSH_PROTOCOL_VERSION})");
+        println!("rnsh-rs {RS_RETICULUM_VERSION} (protocol {RNSH_PROTOCOL_VERSION})");
         return ExitCode::SUCCESS;
     }
 
@@ -878,8 +879,8 @@ mod tests {
     #[test]
     fn version_string_uses_rust_command_name() {
         assert_eq!(
-            format!("rnsh-rs {RNS_VERSION} (protocol {RNSH_PROTOCOL_VERSION})"),
-            "rnsh-rs 1.2.5 (protocol 0.2.0)"
+            format!("rnsh-rs {RS_RETICULUM_VERSION} (protocol {RNSH_PROTOCOL_VERSION})"),
+            format!("rnsh-rs {} (protocol 0.2.0)", env!("CARGO_PKG_VERSION"))
         );
     }
 

@@ -13,7 +13,7 @@ use rns_runtime::probe::{
 
 const DEFAULT_PROBE_SIZE: usize = 16;
 const DEFAULT_TIMEOUT_SECS: f64 = 12.0;
-use rns_tools::RETICULUM_COMPAT_VERSION;
+use rns_tools::RS_RETICULUM_VERSION;
 
 #[derive(Parser)]
 #[command(
@@ -65,7 +65,7 @@ struct Args {
 pub(crate) async fn main() {
     let args = Args::parse();
     if args.version {
-        println!("rnprobe-rs {RETICULUM_COMPAT_VERSION}");
+        println!("rnprobe-rs {RS_RETICULUM_VERSION}");
         return;
     }
 

@@ -26,7 +26,7 @@ use rns_transport::messages::{
 #[cfg(feature = "hardware")]
 mod hw_commands;
 
-use rns_tools::RETICULUM_COMPAT_VERSION;
+use rns_tools::RS_RETICULUM_VERSION;
 const DEFAULT_ASPECTS: &str = "rns.id";
 const PUB_EXT: &str = "pub";
 const SIG_EXT: &str = "rsg";
@@ -238,7 +238,7 @@ pub(crate) async fn main() -> ExitCode {
 
 async fn run(mut args: Args) -> ExitCode {
     if args.version {
-        println!("rnid-rs {RETICULUM_COMPAT_VERSION}");
+        println!("rnid-rs {RS_RETICULUM_VERSION}");
         return ExitCode::SUCCESS;
     }
 

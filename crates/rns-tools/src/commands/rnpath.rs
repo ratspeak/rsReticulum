@@ -27,7 +27,7 @@ const REMOTE_TIMEOUT_SECS: u64 = 30;
 const REMOTE_HOPS: u8 = 8;
 const MGMT_APP: &str = "rnstransport.remote.management";
 const BLACKHOLE_APP: &str = "rnstransport.info.blackhole";
-use rns_tools::RETICULUM_COMPAT_VERSION;
+use rns_tools::RS_RETICULUM_VERSION;
 
 #[derive(Parser)]
 #[command(
@@ -130,7 +130,7 @@ pub(crate) async fn main() -> ExitCode {
     let args = Args::parse();
 
     if args.version {
-        println!("rnpath-rs {RETICULUM_COMPAT_VERSION}");
+        println!("rnpath-rs {RS_RETICULUM_VERSION}");
         return ExitCode::SUCCESS;
     }
 

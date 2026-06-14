@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{CommandFactory, Parser};
 use rns_interface::{kiss, rnode, rnode_admin};
+use rns_tools::RS_RETICULUM_VERSION;
 
 // rnodeconf support is staged: safe inspection/config modules are compiled now,
 // while hardware-gated flashing/signing paths are wired in behind explicit CLI flows.
@@ -31,8 +32,6 @@ mod model;
 #[allow(dead_code)]
 #[path = "rnodeconf/trust.rs"]
 mod trust;
-
-const RNODECONF_VERSION: &str = "2.5.0";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -166,7 +165,7 @@ struct Args {
 pub(crate) fn main() -> ExitCode {
     let args = Args::parse();
     if args.version {
-        println!("rnodeconf-rs {RNODECONF_VERSION}");
+        println!("rnodeconf-rs {RS_RETICULUM_VERSION}");
         return ExitCode::SUCCESS;
     }
     if let Some(trust_key) = args.trust_key.as_deref() {
