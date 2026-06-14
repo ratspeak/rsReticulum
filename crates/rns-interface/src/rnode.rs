@@ -966,6 +966,18 @@ pub async fn spawn_rnode_interface(
                                     first_tx = Some(tokio::time::Instant::now());
                                 }
                             }
+                            if let Ok((header, _)) = rns_wire::header::PacketHeader::unpack(&data) {
+                                tracing::debug!(
+                                    id,
+                                    raw_len = data.len(),
+                                    packet_type = ?header.flags.packet_type,
+                                    context = ?header.context,
+                                    dest = %hex::encode(header.destination_hash),
+                                    "RNode queued packet"
+                                );
+                            } else {
+                                tracing::debug!(id, raw_len = data.len(), "RNode queued packet");
+                            }
                             txb_w
                                 .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
                             (kiss::frame(&data), true, None)
@@ -980,12 +992,16 @@ pub async fn spawn_rnode_interface(
                             }
                         }
                     }
+                    let framed_len = framed.len();
                     let result = crate::serial_io::blocking_write_all(port_w, framed).await;
                     if let Some(done_tx) = done_tx {
                         let _ = done_tx.send(());
                     }
                     match result {
                         Ok(p) => {
+                            if is_packet {
+                                tracing::debug!(id, framed_len, "RNode packet write complete");
+                            }
                             port_w = p;
                         }
                         Err(e) => {
