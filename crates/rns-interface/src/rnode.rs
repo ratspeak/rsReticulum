@@ -639,10 +639,12 @@ fn u32_to_bytes(val: u32) -> [u8; 4] {
     val.to_be_bytes()
 }
 
-/// KISS init sequence. Order matters: airtime locks precede RADIO_STATE=ON,
-/// which must be last (Python `initRadio`, RNodeInterface.py:470-478).
+/// KISS init sequence. Order matters: turn the radio off first so persisted
+/// TNC startup profiles cannot keep old parameters active, airtime locks
+/// precede RADIO_STATE=ON, and RADIO_STATE=ON must be last.
 pub fn build_init_sequence(config: &RNodeConfig) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
+    kiss::frame_with_command_into(CMD_RADIO_STATE, &[RADIO_STATE_OFF], &mut out);
     kiss::frame_with_command_into(CMD_FREQUENCY, &u32_to_bytes(config.frequency), &mut out);
     kiss::frame_with_command_into(CMD_BANDWIDTH, &u32_to_bytes(config.bandwidth), &mut out);
     kiss::frame_with_command_into(CMD_SF, &[config.spreading_factor], &mut out);
@@ -1175,7 +1177,9 @@ mod tests {
 
         let mut deframer = kiss::RawKissDeframer::new();
         let frames = deframer.feed(&seq);
-        assert_eq!(frames.len(), 6);
+        assert_eq!(frames.len(), 7);
+        assert_eq!(frames[0], (CMD_RADIO_STATE, vec![RADIO_STATE_OFF]));
+        assert_eq!(frames[6], (CMD_RADIO_STATE, vec![RADIO_STATE_ON]));
     }
 
     /// Byte-exact vs Python `setSTALock`/`setLTALock` (RNodeInterface.py:612-630):
