@@ -608,6 +608,11 @@ pub struct ReticulumConfig {
 
     /// Bootstrap config files loaded on startup. Python `bootstrap_configs`.
     pub bootstrap_configs: Vec<PathBuf>,
+
+    /// Optional REST API listen address, e.g. `127.0.0.1:8080`.
+    /// Enabled only when compiled with `--features api`.
+    /// Set `api_listen` in `[reticulum]` config section to activate.
+    pub api_listen: Option<std::net::SocketAddr>,
 }
 
 impl Default for ReticulumConfig {
@@ -640,6 +645,7 @@ impl Default for ReticulumConfig {
             blackhole_sources: Vec::new(),
             publish_blackhole: false,
             bootstrap_configs: Vec::new(),
+            api_listen: None,
         }
     }
 }
@@ -922,6 +928,18 @@ impl ReticulumConfig {
             }
             if let Some(list) = sec.get_list("bootstrap_configs") {
                 rc.bootstrap_configs = list.iter().map(|s| PathBuf::from(s.trim())).collect();
+            }
+            if let Some(addr_str) = sec.get("api_listen") {
+                match addr_str.trim().parse::<std::net::SocketAddr>() {
+                    Ok(addr) => rc.api_listen = Some(addr),
+                    Err(e) => {
+                        return Err(ConfigError::InvalidValue {
+                            section: "reticulum".to_string(),
+                            key: "api_listen".to_string(),
+                            message: e.to_string(),
+                        });
+                    }
+                }
             }
         }
 
@@ -1414,6 +1432,18 @@ pub async fn init(
                     }
                 });
             }
+        }
+    }
+
+    // REST API server — compiled only with --features api, activated by api_listen in config.
+    #[cfg(feature = "api")]
+    if instance_mode == InstanceMode::Shared {
+        if let Some(listen) = rc.api_listen {
+            let api_tx = transport_tx.clone();
+            let api_shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                crate::api_server::run_api_server(listen, api_tx, api_shutdown).await;
+            });
         }
     }
 

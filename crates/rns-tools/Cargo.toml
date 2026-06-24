@@ -9,6 +9,7 @@ autobins = false
 [features]
 default = []
 hardware = ["dep:rns-ratkey"]
+api = ["rns-runtime/api"]
 
 [dependencies]
 rns-runtime = { workspace = true, features = ["serial"] }
@@ -36,6 +37,7 @@ sha2 = { workspace = true }
 [[bin]]
 name = "rnsd-rs"
 path = "src/bin/rnsd-rs.rs"
+required-features = []
 
 [[bin]]
 name = "rnstatus-rs"

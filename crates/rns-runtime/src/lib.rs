@@ -17,3 +17,6 @@ pub mod rncp;
 pub mod rnsh;
 pub mod rpc;
 pub mod rpc_server;
+
+#[cfg(feature = "api")]
+pub mod api_server;
