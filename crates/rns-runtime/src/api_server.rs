@@ -104,7 +104,8 @@ impl AppState {
             .await
             .map_err(|_| ApiError::transport("transport actor is gone"))?;
 
-        rx.await.map_err(|_| ApiError::transport("transport actor dropped response channel"))
+        rx.await
+            .map_err(|_| ApiError::transport("transport actor dropped response channel"))
     }
 }
 
@@ -167,7 +168,7 @@ async fn status(State(s): State<AppState>) -> ApiResult<Json<Value>> {
 #[derive(Deserialize)]
 struct InterfacesQuery {
     filter: Option<String>,
-    all:    Option<bool>,
+    all: Option<bool>,
 }
 
 async fn interfaces(
@@ -191,10 +192,7 @@ async fn interfaces(
     Ok(Json(json!({ "interfaces": entries })))
 }
 
-async fn interface_by_id(
-    State(s): State<AppState>,
-    Path(id): Path<u64>,
-) -> ApiResult<Json<Value>> {
+async fn interface_by_id(State(s): State<AppState>, Path(id): Path<u64>) -> ApiResult<Json<Value>> {
     let ifaces = fetch_interfaces(&s).await?;
     ifaces
         .iter()
@@ -208,16 +206,17 @@ struct PathsQuery {
     max_hops: Option<u8>,
 }
 
-async fn paths(
-    State(s): State<AppState>,
-    Query(q): Query<PathsQuery>,
-) -> ApiResult<Json<Value>> {
+async fn paths(State(s): State<AppState>, Query(q): Query<PathsQuery>) -> ApiResult<Json<Value>> {
     // TransportQuery::GetPathTable doesn't accept max_hops directly —
     // We filter on the API side, like rnpath-rs does.
     let entries = match s.query(TransportQuery::GetPathTable).await? {
         TransportQueryResponse::PathTable(v) => v,
         TransportQueryResponse::Error(e) => return Err(ApiError::internal(e)),
-        other => return Err(ApiError::internal(format!("unexpected response: {other:?}"))),
+        other => {
+            return Err(ApiError::internal(format!(
+                "unexpected response: {other:?}"
+            )));
+        }
     };
 
     let rows: Vec<_> = entries
@@ -233,7 +232,9 @@ async fn links(State(s): State<AppState>) -> ApiResult<Json<Value>> {
     match s.query(TransportQuery::GetLinkCount).await? {
         TransportQueryResponse::IntResult(n) => Ok(Json(json!({ "link_count": n }))),
         TransportQueryResponse::Error(e) => Err(ApiError::internal(e)),
-        other => Err(ApiError::internal(format!("unexpected response: {other:?}"))),
+        other => Err(ApiError::internal(format!(
+            "unexpected response: {other:?}"
+        ))),
     }
 }
 
@@ -245,7 +246,9 @@ async fn fetch_interfaces(s: &AppState) -> ApiResult<Vec<InterfaceStatRpcEntry>>
     match s.query(TransportQuery::GetInterfaceStats).await? {
         TransportQueryResponse::InterfaceStats(v) => Ok(v),
         TransportQueryResponse::Error(e) => Err(ApiError::internal(e)),
-        other => Err(ApiError::internal(format!("unexpected response: {other:?}"))),
+        other => Err(ApiError::internal(format!(
+            "unexpected response: {other:?}"
+        ))),
     }
 }
 
