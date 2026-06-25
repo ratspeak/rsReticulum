@@ -1440,9 +1440,10 @@ pub async fn init(
     if instance_mode == InstanceMode::Shared {
         if let Some(listen) = rc.api_listen {
             let api_tx = transport_tx.clone();
+            let api_handle = handle.clone();
             let api_shutdown = shutdown.clone();
             tokio::spawn(async move {
-                crate::api_server::run_api_server(listen, api_tx, api_shutdown).await;
+                crate::api_server::run_api_server(listen, api_tx, api_handle, api_shutdown).await;
             });
         }
     }
@@ -3370,6 +3371,56 @@ pub async fn teardown_interface(handle: &ReticulumHandle, id: u64) {
         .send(TransportMessage::DeregisterInterface { id })
         .await;
     tracing::info!(id, "interface deregistered");
+}
+
+/// Spawn any [`InterfaceConfig`] at runtime using the full config pipeline
+/// (post_init, announce rates, ingress defaults).
+///
+/// This is the public entry point used by the REST API — it accepts a
+/// complete `InterfaceConfig` (produced by `synthesize_interface`) and
+/// mirrors exactly what happens during rnsd startup.
+pub async fn spawn_interface_from_config(
+    handle: &ReticulumHandle,
+    iface_config: &interface_factory::InterfaceConfig,
+) -> Result<u64, String> {
+    let id = next_id(&handle.id_gen);
+
+    // Load post_init from the on-disk config so IFAC, announce-rate, etc.
+    // are honoured for newly added interfaces too.
+    let disk_config =
+        crate::config::Config::from_file(&handle.config_dir.join("config")).unwrap_or_default();
+    let mut post_init = get_post_init_for_config(&disk_config, iface_config);
+    finalize_post_init(&mut post_init, &handle.config);
+
+    let iface_handles = spawn_interface(
+        iface_config,
+        id,
+        handle.transport_tx.clone(),
+        handle.id_gen.clone(),
+        handle.handle_tx.clone(),
+        &handle.socket_base,
+        handle.is_foreground.clone(),
+    )
+    .await?;
+
+    for iface_handle in iface_handles {
+        let ifac_key = derive_ifac_key_from_post_init(&post_init);
+        register_interface_with_post_init(
+            &handle.transport_tx,
+            iface_handle,
+            &post_init,
+            ifac_key,
+            &handle.interface_controls,
+        )
+        .await;
+    }
+
+    tracing::info!(
+        name = %interface_config_name(iface_config),
+        id,
+        "interface spawned via REST API"
+    );
+    Ok(id)
 }
 
 async fn spawn_interface(

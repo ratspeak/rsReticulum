@@ -147,6 +147,79 @@ impl ConfigSection {
         self.subsections.insert(name.clone(), ConfigSection::new());
         Ok(self.subsections.get_mut(&name).unwrap())
     }
+
+    /// Add a subsection under this section, returning a mutable reference to it.
+    /// If a subsection with this name already exists, returns a reference to the existing one.
+    pub fn add_subsection(&mut self, name: String) -> &mut ConfigSection {
+        if !self.subsections.contains_key(&name) {
+            self.subsection_order.push(name.clone());
+            self.subsections.insert(name.clone(), ConfigSection::new());
+        }
+        self.subsections.get_mut(&name).unwrap()
+    }
+
+    /// Remove a subsection by name. Returns `true` if it existed.
+    pub fn remove_subsection(&mut self, name: &str) -> bool {
+        if self.subsections.remove(name).is_some() {
+            self.subsection_order.retain(|n| n != name);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Serialize this section at `depth` bracket-levels into `out`.
+    /// `depth=2` → `[[name]]`, `depth=3` → `[[[name]]]`, etc.
+    pub(crate) fn write_ini(&self, name: &str, depth: usize, out: &mut String) {
+        let brackets = "[".repeat(depth);
+        let close = "]".repeat(depth);
+        let needs_quote = name.contains(|c: char| c == '#' || c == '[' || c == ']');
+        if needs_quote {
+            out.push_str(&format!("{}\"{}\"{}\n", brackets, name, close));
+        } else {
+            out.push_str(&format!("{}{}{}\n", brackets, name, close));
+        }
+        for key in &self.value_order {
+            if let Some(value) = self.values.get(key) {
+                match value {
+                    ConfigValue::Scalar(s) => {
+                        let needs_q = s.contains(',')
+                            || s.contains('#')
+                            || s.starts_with('"')
+                            || s.starts_with('\'');
+                        if needs_q {
+                            out.push_str(&format!("{} = \"{}\"\n", key, s.replace('"', "\\\"")));
+                        } else {
+                            out.push_str(&format!("{} = {}\n", key, s));
+                        }
+                    }
+                    ConfigValue::List(items) => {
+                        if items.is_empty() {
+                            out.push_str(&format!("{} = ,\n", key));
+                        } else {
+                            let parts: Vec<String> = items
+                                .iter()
+                                .map(|s| {
+                                    if s.contains(',') || s.contains('#') {
+                                        format!("\"{}\"", s.replace('"', "\\\""))
+                                    } else {
+                                        s.clone()
+                                    }
+                                })
+                                .collect();
+                            out.push_str(&format!("{} = {}\n", key, parts.join(", ")));
+                        }
+                    }
+                }
+            }
+        }
+        for sub_name in &self.subsection_order {
+            if let Some(sub) = self.subsections.get(sub_name) {
+                out.push('\n');
+                sub.write_ini(sub_name, depth + 1, out);
+            }
+        }
+    }
 }
 
 /// Keys before any `[section]` header land under the empty-string section.
@@ -324,6 +397,75 @@ impl Config {
 
     pub fn write_default(path: &Path) -> Result<(), ConfigError> {
         std::fs::write(path, DEFAULT_CONFIG)?;
+        Ok(())
+    }
+
+    /// Ensure a top-level section exists, creating it if absent.
+    /// Returns a mutable reference to the section.
+    pub fn ensure_section(&mut self, name: &str) -> &mut ConfigSection {
+        if !self.sections.contains_key(name) {
+            self.section_order.push(name.to_string());
+            self.sections.insert(name.to_string(), ConfigSection::new());
+        }
+        self.sections.get_mut(name).unwrap()
+    }
+
+    /// Serialize the entire config back to INI text.
+    /// Preserves insertion order of sections, keys, and subsections.
+    pub fn to_ini(&self) -> String {
+        let mut out = String::new();
+        for section_name in &self.section_order {
+            let Some(section) = self.sections.get(section_name) else {
+                continue;
+            };
+            if section_name.is_empty() {
+                // Root keys (before any section header).
+                for key in &section.value_order {
+                    if let Some(ConfigValue::Scalar(s)) = section.values.get(key) {
+                        out.push_str(&format!("{} = {}\n", key, s));
+                    }
+                }
+            } else {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                let needs_quote = section_name.contains(|c: char| c == '#' || c == '[' || c == ']');
+                if needs_quote {
+                    out.push_str(&format!("[\"{}\"]\n", section_name));
+                } else {
+                    out.push_str(&format!("[{}]\n", section_name));
+                }
+                for key in &section.value_order {
+                    if let Some(value) = section.values.get(key) {
+                        match value {
+                            ConfigValue::Scalar(s) => {
+                                out.push_str(&format!("{} = {}\n", key, s));
+                            }
+                            ConfigValue::List(items) => {
+                                if items.is_empty() {
+                                    out.push_str(&format!("{} = ,\n", key));
+                                } else {
+                                    out.push_str(&format!("{} = {}\n", key, items.join(", ")));
+                                }
+                            }
+                        }
+                    }
+                }
+                for sub_name in &section.subsection_order {
+                    if let Some(sub) = section.subsections.get(sub_name) {
+                        out.push('\n');
+                        sub.write_ini(sub_name, 2, &mut out);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Write the config back to a file.
+    pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
+        let content = self.to_ini();
+        std::fs::write(path, content)?;
         Ok(())
     }
 
@@ -925,6 +1067,70 @@ type = UDPInterface
     fn test_strip_comment_in_quotes() {
         let result = strip_comment(r#"key = "value # with hash""#);
         assert_eq!(result, r#"key = "value # with hash""#);
+    }
+
+    #[test]
+    fn test_to_ini_round_trip() {
+        let input = "[reticulum]
+enable_transport = False
+
+[interfaces]
+
+[[My Hub]]
+type = TCPClientInterface
+enabled = Yes
+target_host = hub.example.com
+target_port = 4242
+";
+        let config = Config::parse(input).unwrap();
+        let output = config.to_ini();
+        let reparsed = Config::parse(&output).unwrap();
+
+        assert_eq!(
+            reparsed
+                .section("reticulum")
+                .and_then(|s| s.get_bool("enable_transport")),
+            Some(false)
+        );
+        let hub = reparsed.subsection("interfaces", "My Hub").unwrap();
+        assert_eq!(hub.get("type"), Some("TCPClientInterface"));
+        assert_eq!(hub.get("target_host"), Some("hub.example.com"));
+        assert_eq!(hub.get_uint("target_port"), Some(4242));
+    }
+
+    #[test]
+    fn test_ensure_section_and_add_remove_subsection() {
+        let mut config = Config::new();
+        let sec = config.ensure_section("interfaces");
+        let sub = sec.add_subsection("My Iface".to_string());
+        sub.set("type", "TCPClientInterface");
+        sub.set("target_host", "example.com");
+
+        assert_eq!(
+            config
+                .subsection("interfaces", "My Iface")
+                .and_then(|s| s.get("type")),
+            Some("TCPClientInterface")
+        );
+
+        // Calling ensure_section again does not remove the existing section.
+        config.ensure_section("interfaces");
+        assert!(config.subsection("interfaces", "My Iface").is_some());
+
+        // remove_subsection removes and returns true.
+        let removed = config
+            .section_mut("interfaces")
+            .unwrap()
+            .remove_subsection("My Iface");
+        assert!(removed);
+        assert!(config.subsection("interfaces", "My Iface").is_none());
+
+        // Re-deleting returns false
+        let removed_again = config
+            .section_mut("interfaces")
+            .unwrap()
+            .remove_subsection("My Iface");
+        assert!(!removed_again);
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {

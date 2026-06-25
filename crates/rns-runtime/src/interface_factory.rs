@@ -1249,6 +1249,70 @@ pub fn default_ifac_size_for(config: &InterfaceConfig) -> usize {
     }
 }
 
+/// Serialize an [`InterfaceMode`] back to the canonical config string.
+fn mode_to_str(mode: InterfaceMode) -> &'static str {
+    match mode {
+        InterfaceMode::Full => "Full",
+        InterfaceMode::PointToPoint => "PointToPoint",
+        InterfaceMode::AccessPoint => "AccessPoint",
+        InterfaceMode::Roaming => "Roaming",
+        InterfaceMode::Boundary => "Boundary",
+        InterfaceMode::Gateway => "Gateway",
+    }
+}
+
+/// Convert a [`TcpClientConfig`] back into a [`ConfigSection`] suitable for
+/// writing into the `[interfaces]` block of the Reticulum config file.
+pub fn tcp_client_to_section(
+    c: &rns_interface::tcp::TcpClientConfig,
+) -> crate::config::ConfigSection {
+    let mut s = crate::config::ConfigSection::new();
+    s.set("type", "TCPClientInterface");
+    s.set("enabled", "Yes");
+    s.set("target_host", &c.target_host);
+    s.set("target_port", &c.target_port.to_string());
+    if c.mode != InterfaceMode::Full {
+        s.set("interface_mode", mode_to_str(c.mode));
+    }
+    if c.kiss_framing {
+        s.set("kiss_framing", "Yes");
+    }
+    if c.connect_timeout_secs != rns_interface::tcp::DEFAULT_CONNECT_TIMEOUT {
+        s.set("connect_timeout", &c.connect_timeout_secs.to_string());
+    }
+    if let Some(tries) = c.max_reconnect_tries {
+        s.set("max_reconnect_tries", &tries.to_string());
+    }
+    if let Some(mtu) = c.fixed_mtu {
+        s.set("fixed_mtu", &mtu.to_string());
+    }
+    s
+}
+
+/// Convert a [`TcpServerConfig`] back into a [`ConfigSection`].
+pub fn tcp_server_to_section(
+    c: &rns_interface::tcp::TcpServerConfig,
+) -> crate::config::ConfigSection {
+    let mut s = crate::config::ConfigSection::new();
+    s.set("type", "TCPServerInterface");
+    s.set("enabled", "Yes");
+    s.set("listen_ip", &c.listen_ip);
+    s.set("listen_port", &c.listen_port.to_string());
+    if c.mode != InterfaceMode::Full {
+        s.set("interface_mode", mode_to_str(c.mode));
+    }
+    if c.kiss_framing {
+        s.set("kiss_framing", "Yes");
+    }
+    if c.prefer_ipv6 {
+        s.set("prefer_ipv6", "Yes");
+    }
+    if let Some(ref dev) = c.device {
+        s.set("device", dev);
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
