@@ -427,6 +427,29 @@ fn beacon_from_config(config: &BleRNodeConfig) -> Option<(Duration, Bytes)> {
         .map(|(interval, callsign)| (Duration::from_secs(interval), Bytes::from(callsign)))
 }
 
+fn rnode_config_from_ble_config(config: &BleRNodeConfig) -> rnode::RNodeConfig {
+    rnode::RNodeConfig {
+        name: config.name.clone(),
+        port: config.ble_uri.clone(),
+        baud_rate: 0,
+        frequency: config.frequency,
+        bandwidth: config.bandwidth,
+        spreading_factor: config.spreading_factor,
+        coding_rate: config.coding_rate,
+        tx_power: config.tx_power,
+        mode: config.mode,
+        flow_control: config.flow_control,
+        st_alock: config.st_alock,
+        lt_alock: config.lt_alock,
+        id_interval: config.id_interval,
+        id_callsign: config.id_callsign.clone(),
+    }
+}
+
+fn build_ble_rnode_init_sequence(config: &BleRNodeConfig) -> Vec<u8> {
+    rnode::build_init_sequence(&rnode_config_from_ble_config(config))
+}
+
 pub(crate) async fn get_adapter() -> Result<Adapter, InterfaceError> {
     // btleplug's Android global_adapter() panics without init; under
     // panic=abort that kills the app. Fail loudly so the UI can prompt.
@@ -1198,22 +1221,7 @@ pub async fn spawn_ble_rnode_interface(
         config.bandwidth,
     );
 
-    let rnode_cfg = rnode::RNodeConfig {
-        name: config.name.clone(),
-        port: config.ble_uri.clone(),
-        baud_rate: 0,
-        frequency: config.frequency,
-        bandwidth: config.bandwidth,
-        spreading_factor: config.spreading_factor,
-        coding_rate: config.coding_rate,
-        tx_power: config.tx_power,
-        mode: config.mode,
-        flow_control: config.flow_control,
-        st_alock: config.st_alock,
-        lt_alock: config.lt_alock,
-        id_interval: config.id_interval,
-        id_callsign: config.id_callsign.clone(),
-    };
+    let init_seq_template = build_ble_rnode_init_sequence(&config);
 
     let name = config.name.clone();
     let mode = config.mode;
@@ -1304,9 +1312,8 @@ pub async fn spawn_ble_rnode_interface(
             }
             ble_diag("[ble] detect sent ok");
 
-            ble_diag("[ble] sending init + airtime sequence");
-            let mut init_seq = rnode::build_init_sequence(&rnode_cfg);
-            init_seq.extend_from_slice(&rnode::build_airtime_sequence(&rnode_cfg));
+            ble_diag("[ble] sending init sequence");
+            let init_seq = init_seq_template.clone();
             if let Err(e) =
                 ble_write(&conn.peripheral, &conn.rx_char, &init_seq, conn.write_mtu).await
             {
@@ -1562,22 +1569,7 @@ pub async fn spawn_ble_rnode_interface_native(
         config.bandwidth,
     );
 
-    let rnode_cfg = rnode::RNodeConfig {
-        name: config.name.clone(),
-        port: config.ble_uri.clone(),
-        baud_rate: 0,
-        frequency: config.frequency,
-        bandwidth: config.bandwidth,
-        spreading_factor: config.spreading_factor,
-        coding_rate: config.coding_rate,
-        tx_power: config.tx_power,
-        mode: config.mode,
-        flow_control: config.flow_control,
-        st_alock: config.st_alock,
-        lt_alock: config.lt_alock,
-        id_interval: config.id_interval,
-        id_callsign: config.id_callsign.clone(),
-    };
+    let init_seq_template = build_ble_rnode_init_sequence(&config);
 
     let name = config.name.clone();
     let mode = config.mode;
@@ -1647,8 +1639,7 @@ pub async fn spawn_ble_rnode_interface_native(
                 continue;
             }
 
-            let mut init_seq = rnode::build_init_sequence(&rnode_cfg);
-            init_seq.extend_from_slice(&rnode::build_airtime_sequence(&rnode_cfg));
+            let init_seq = init_seq_template.clone();
             if let Err(e) = tcp_write.write_all(&init_seq).await {
                 tracing::warn!(error = %e, "BLE RNode native init write failed");
                 if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
@@ -2176,30 +2167,29 @@ mod tests {
 
     // ── Init sequence tests ──
 
+    fn frame_command_count(frames: &[(u8, Vec<u8>)], command: u8) -> usize {
+        frames.iter().filter(|(cmd, _)| *cmd == command).count()
+    }
+
     #[test]
     fn test_ble_init_sequence_uses_rnode_helpers() {
         let ble_cfg = BleRNodeConfig::new("ble0", "ble://RNode 1234");
-        let rnode_cfg = rnode::RNodeConfig {
-            name: ble_cfg.name.clone(),
-            port: ble_cfg.ble_uri.clone(),
-            baud_rate: 0,
-            frequency: ble_cfg.frequency,
-            bandwidth: ble_cfg.bandwidth,
-            spreading_factor: ble_cfg.spreading_factor,
-            coding_rate: ble_cfg.coding_rate,
-            tx_power: ble_cfg.tx_power,
-            mode: ble_cfg.mode,
-            flow_control: ble_cfg.flow_control,
-            st_alock: ble_cfg.st_alock,
-            lt_alock: ble_cfg.lt_alock,
-            id_interval: ble_cfg.id_interval,
-            id_callsign: ble_cfg.id_callsign.clone(),
-        };
-        let seq = rnode::build_init_sequence(&rnode_cfg);
+        let rnode_cfg = rnode_config_from_ble_config(&ble_cfg);
+        let seq = build_ble_rnode_init_sequence(&ble_cfg);
         assert!(!seq.is_empty());
+        assert_eq!(seq, rnode::build_init_sequence(&rnode_cfg));
+
         let mut deframer = kiss::RawKissDeframer::new();
         let frames = deframer.feed(&seq);
-        assert_eq!(frames.len(), 6);
+        assert_eq!(frames.len(), 7);
+        assert_eq!(
+            frames[0],
+            (rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_OFF])
+        );
+        assert_eq!(
+            frames.last().unwrap(),
+            &(rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_ON])
+        );
     }
 
     #[test]
@@ -2212,16 +2202,36 @@ mod tests {
 
     #[test]
     fn test_ble_full_init_with_airtime() {
-        let mut rnode_cfg = rnode::RNodeConfig::new("test", "ble://");
-        rnode_cfg.st_alock = Some(25.0);
-        rnode_cfg.lt_alock = Some(50.0);
+        let mut cfg = BleRNodeConfig::new("test", "ble://");
+        cfg.st_alock = Some(25.0);
+        cfg.lt_alock = Some(50.0);
         // Airtime locks are part of the init sequence, before RADIO_STATE_ON.
-        let seq = rnode::build_init_sequence(&rnode_cfg);
+        let seq = build_ble_rnode_init_sequence(&cfg);
 
         let mut deframer = kiss::RawKissDeframer::new();
         let frames = deframer.feed(&seq);
-        assert_eq!(frames.len(), 8); // 5 params + 2 airtime + radio on
-        assert_eq!(frames.last().unwrap().0, rnode::CMD_RADIO_STATE);
+        assert_eq!(frames.len(), 9);
+        assert_eq!(
+            frames[0],
+            (rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_OFF])
+        );
+        assert_eq!(
+            frames.last().unwrap(),
+            &(rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_ON])
+        );
+        assert_eq!(frame_command_count(&frames, rnode::CMD_ST_ALOCK), 1);
+        assert_eq!(frame_command_count(&frames, rnode::CMD_LT_ALOCK), 1);
+        let radio_on = frames.len() - 1;
+        let st = frames
+            .iter()
+            .position(|(cmd, _)| *cmd == rnode::CMD_ST_ALOCK)
+            .expect("CMD_ST_ALOCK present");
+        let lt = frames
+            .iter()
+            .position(|(cmd, _)| *cmd == rnode::CMD_LT_ALOCK)
+            .expect("CMD_LT_ALOCK present");
+        assert!(st < radio_on);
+        assert!(lt < radio_on);
     }
 
     // ── process_rnode_response tests ──

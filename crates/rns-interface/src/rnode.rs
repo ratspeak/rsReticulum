@@ -1222,8 +1222,32 @@ mod tests {
         let mut deframer = kiss::RawKissDeframer::new();
         let frames = deframer.feed(&seq);
         let cmds: Vec<u8> = frames.iter().map(|(c, _)| *c).collect();
-        assert!(cmds.contains(&CMD_ST_ALOCK), "init must send CMD_ST_ALOCK");
-        assert!(cmds.contains(&CMD_LT_ALOCK), "init must send CMD_LT_ALOCK");
+        assert_eq!(frames[0], (CMD_RADIO_STATE, vec![RADIO_STATE_OFF]));
+        assert_eq!(
+            frames.last().unwrap(),
+            &(CMD_RADIO_STATE, vec![RADIO_STATE_ON])
+        );
+        assert_eq!(
+            cmds.iter().filter(|&&cmd| cmd == CMD_ST_ALOCK).count(),
+            1,
+            "init must send CMD_ST_ALOCK exactly once"
+        );
+        assert_eq!(
+            cmds.iter().filter(|&&cmd| cmd == CMD_LT_ALOCK).count(),
+            1,
+            "init must send CMD_LT_ALOCK exactly once"
+        );
+        let radio_on = cmds.len() - 1;
+        let st = cmds
+            .iter()
+            .position(|&cmd| cmd == CMD_ST_ALOCK)
+            .expect("CMD_ST_ALOCK present");
+        let lt = cmds
+            .iter()
+            .position(|&cmd| cmd == CMD_LT_ALOCK)
+            .expect("CMD_LT_ALOCK present");
+        assert!(st < radio_on, "CMD_ST_ALOCK must precede RADIO_STATE_ON");
+        assert!(lt < radio_on, "CMD_LT_ALOCK must precede RADIO_STATE_ON");
     }
 
     #[test]
