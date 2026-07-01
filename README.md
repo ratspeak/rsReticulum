@@ -145,7 +145,7 @@ intentional.
 `rnodeconf-rs` in the current build only covers safe inspection/device setting paths, EEPROM
 dump/backup, and trusted-key storage.
 
-`rnid-rs` tracks the Reticulum 1.2.4 identity utility surface for normal
+`rnid-rs` tracks the Reticulum 1.2.5 identity utility surface for normal
 software identities: public/private import and export, destination hashing,
 `.pub` public identity files, and signed `.rsg` signature files. The
 hardware-backed `rnid-rs hw` path is a Rust extension behind the `hardware`
@@ -169,7 +169,7 @@ rnid-rs -i ~/.rsReticulum/identities/mgmt -X -w mgmt.rid
 rnid-rs -m <public_identity_data> -w peer.pub
 rnid-rs -M <private_identity_data> -X -w restored_identity
 
-# Sign and validate. New signatures are Reticulum 1.2.4 .rsg envelopes.
+# Sign and validate. New signatures are Reticulum 1.2.5 .rsg envelopes.
 rnid-rs -i ~/.rsReticulum/identities/mgmt -s message.txt
 rnid-rs -V message.txt.rsg
 rnid-rs -i <signer_hash> -N -V message.txt.rsg
@@ -181,7 +181,7 @@ rnid-rs -i ~/.rsReticulum/identities/mgmt -d message.txt.rfe
 
 Use `--raw -s <file>` only when a workflow intentionally needs the legacy raw
 64-byte signature form. Normal `rnid-rs -s <file>` produces a `.rsg` file that
-embeds the signer metadata needed for 1.2.4 validation.
+embeds the signer metadata needed for 1.2.5 validation.
 
 ## Configuration
 
@@ -256,8 +256,8 @@ Most daemon and utility flows are implemented for the public `*-rs` tools:
 `rnsd-rs`, `rnstatus-rs`, `rnpath-rs`, `rnid-rs`, `rnprobe-rs`, `rncp-rs`,
 `rnsh-rs`, and `rnodeconf-rs`.
 
-The current compatibility target is Reticulum 1.2.4 where the matching Rust
-surface is implemented and tested. `rnid-rs` has explicit 1.2.4 coverage for
+The current compatibility target is Reticulum 1.2.5 where the matching Rust
+surface is implemented and tested. `rnid-rs` has explicit 1.2.5 coverage for
 the normal identity utility flow.
 
 Known gaps and intentional limits:
