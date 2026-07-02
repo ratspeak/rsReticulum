@@ -4043,10 +4043,13 @@ mod linux_peripheral {
         // after connect via primary service discovery.
         let mut service_uuids = std::collections::BTreeSet::new();
         service_uuids.insert(super::RATSPEAK_SERVICE_UUID);
+        // No local_name: broadcasting the plaintext app name fingerprints the
+        // device to any passive scanner. Discovery is by service UUID, and
+        // dropping the name also frees space in the 31-byte adv PDU. Matches
+        // the Apple/Android advertised sets (service UUID only).
         let adv = Advertisement {
             service_uuids,
             discoverable: Some(true),
-            local_name: Some("Ratspeak".into()),
             ..Default::default()
         };
         let adv_handle = match adapter.advertise(adv).await {
