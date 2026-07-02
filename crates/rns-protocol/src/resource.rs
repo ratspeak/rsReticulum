@@ -198,7 +198,9 @@ impl WindowState {
     pub fn grow(&mut self, rate: usize) {
         if self.window < self.window_max {
             self.window += 1;
-            if (self.window - self.window_min) > (WINDOW_FLEXIBILITY - 1) {
+            // saturating: a very-slow demotion can clamp `window` below `window_min` (Python's
+            // signed comparison is false there; a plain sub underflows).
+            if self.window.saturating_sub(self.window_min) > (WINDOW_FLEXIBILITY - 1) {
                 self.window_min += 1;
             }
         }
@@ -236,7 +238,7 @@ impl WindowState {
         if self.window_max > self.window_min {
             self.window_max -= 1;
         }
-        if self.window_max - self.window > WINDOW_FLEXIBILITY - 1 {
+        if self.window_max.saturating_sub(self.window) > WINDOW_FLEXIBILITY - 1 {
             self.window_max -= 1;
         }
     }
@@ -2595,6 +2597,31 @@ mod tests {
 
         // Once the window outgrows its flexibility band, `window_min` slides up.
         assert!(ws.window_min > initial_min);
+    }
+
+    // Regression: a very-slow demotion can clamp `window` below an already-raised `window_min`;
+    // the next promoted grow must not underflow `window - window_min` (Python's signed comparison
+    // is simply false there).
+    #[test]
+    fn window_grow_survives_demote_then_promote() {
+        let mut w = WindowState::new();
+        for _ in 0..6 {
+            w.grow(1000);
+        }
+        assert_eq!((w.window, w.window_min, w.window_max), (10, 7, 10));
+        for _ in 0..VERY_SLOW_RATE_THRESHOLD {
+            w.grow(RATE_VERY_SLOW - 1);
+        }
+        assert_eq!(
+            (w.window, w.window_min, w.window_max),
+            (WINDOW_MAX_VERY_SLOW, 7, WINDOW_MAX_VERY_SLOW)
+        );
+        for _ in 0..FAST_RATE_THRESHOLD + 1 {
+            w.grow(RATE_FAST + 1);
+        }
+        assert_eq!(w.window_max, WINDOW_MAX_FAST);
+        assert_eq!(w.window, 5);
+        assert_eq!(w.window_min, 7); // unchanged: window has not outgrown the band
     }
 
     #[test]
