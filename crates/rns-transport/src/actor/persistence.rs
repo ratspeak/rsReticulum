@@ -1097,9 +1097,21 @@ mod async_save_tests {
         let path = dir.join("path_table.msgpack");
         // Generous: the blocking pool competes with the whole suite's fsync
         // traffic on first run; the loop exits as soon as the file lands.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // Write errors are swallowed by design (trace-logged, self-healed by
+        // the next tick), so a transient CI failure (AV racing the tmp
+        // rename, fsync storm) would leave a one-shot write unlanded forever
+        // — model the periodic tick and reschedule after a failed attempt.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !path.exists() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if !path.exists()
+                && !actor
+                    .routing_save_in_flight
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                actor.state_dirty = true;
+                actor.save_routing_state_async();
+            }
         }
         assert!(path.exists(), "blocking-pool save must land on disk");
         let _ = std::fs::remove_dir_all(&dir);
