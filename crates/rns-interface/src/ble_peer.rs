@@ -697,6 +697,40 @@ async fn stop_central_connections() {
     disconnect_central_peripherals().await;
 }
 
+/// Force-disconnect a single central-role mesh peer by BLE address on every
+/// platform (previously only Android). The per-peer read loop then runs its
+/// own disconnect cleanup / reconnect bookkeeping.
+pub async fn disconnect_mesh_peer(address: &str) {
+    #[cfg(target_os = "android")]
+    {
+        let addr = address.to_string();
+        let _ = tokio::task::spawn_blocking(move || disconnect_android_peer(&addr)).await;
+    }
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    crate::ble_central_apple_connect::disconnect_peer(address);
+    #[cfg(all(
+        feature = "ble",
+        not(any(target_os = "android", target_os = "ios", target_os = "macos"))
+    ))]
+    {
+        use btleplug::api::Peripheral as _;
+        let peripheral = central_peripherals()
+            .lock()
+            .ok()
+            .and_then(|mut reg| reg.remove(address));
+        if let Some(p) = peripheral {
+            let _ = p.disconnect().await;
+        }
+    }
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "macos",
+        feature = "ble"
+    )))]
+    let _ = address;
+}
+
 /// Caller must still `DeregisterInterface` on the transport actor to drop
 /// paths + remove the interface entry.
 pub async fn stop_ble_peer_interface() {
