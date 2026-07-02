@@ -1409,6 +1409,34 @@ mod apple_peripheral {
     unsafe impl Send for SendPtr {}
     unsafe impl Sync for SendPtr {}
     static MANAGER_PTR: OnceLock<std::sync::Mutex<SendPtr>> = OnceLock::new();
+
+    /// The `OnceLock` can only be initialized once, so hold the manager pointer
+    /// behind interior mutability — otherwise `set()` on a second enable cycle
+    /// is a silent no-op, stranding notify_tx on the old (torn-down) manager
+    /// and leaving the new one advertising unstoppably.
+    fn manager_ptr_slot() -> &'static std::sync::Mutex<SendPtr> {
+        MANAGER_PTR.get_or_init(|| std::sync::Mutex::new(SendPtr(std::ptr::null_mut())))
+    }
+
+    /// Installs a freshly-constructed manager, tearing down any predecessor
+    /// that was never stopped (an enable without an intervening disable) so it
+    /// can't keep advertising after we've replaced it.
+    fn set_manager_ptr(mgr_raw: *mut AnyObject) {
+        let mut guard = manager_ptr_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = guard.0;
+        *guard = SendPtr(mgr_raw);
+        drop(guard);
+        if !prev.is_null() {
+            tracing::warn!("iOS BLE Peripheral: replacing a live manager ptr without teardown");
+            unsafe {
+                let _: () = msg_send![prev, stopAdvertising];
+                let _: () = msg_send![prev, setDelegate: std::ptr::null::<AnyObject>()];
+                let _: () = msg_send![prev, release];
+            }
+        }
+    }
     static DELEGATE_CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
 
     static LIFECYCLE: OnceLock<crate::ble_peer_lifecycle::PeripheralLifecycle> = OnceLock::new();
@@ -1735,12 +1763,7 @@ mod apple_peripheral {
                             );
                             return;
                         };
-                        let Some(mgr_lock) = MANAGER_PTR.get() else {
-                            tracing::warn!(
-                                "iOS BLE Peripheral: recovery-ready but MANAGER_PTR unset"
-                            );
-                            return;
-                        };
+                        let mgr_lock = manager_ptr_slot();
                         let mgr_ptr = match mgr_lock.lock() {
                             Ok(g) if !g.0.is_null() => g.0,
                             _ => {
@@ -2241,13 +2264,7 @@ mod apple_peripheral {
     /// Returns the raw `updateValue:` result without touching the retry
     /// queue, so it's safe to call from the is-ready-to-update flush loop.
     fn notify_tx_inner(to_peer: Option<&str>, char_uuid: Uuid, data: &[u8]) -> bool {
-        let mgr_lock = match MANAGER_PTR.get() {
-            Some(m) => m,
-            None => {
-                tracing::warn!("Apple BLE notify_tx: no manager ptr");
-                return false;
-            }
-        };
+        let mgr_lock = manager_ptr_slot();
         let mgr = match mgr_lock.lock() {
             Ok(g) if !g.0.is_null() => g.0,
             _ => {
@@ -2407,7 +2424,7 @@ mod apple_peripheral {
             // like `NSKVONotifying_CBPeripheralManager`.
             let _: *mut AnyObject = msg_send![mgr_raw, retain];
 
-            let _ = MANAGER_PTR.set(std::sync::Mutex::new(SendPtr(mgr_raw)));
+            set_manager_ptr(mgr_raw);
             tracing::info!("iOS BLE Peripheral: manager created, waiting for PoweredOn");
 
             // 10s safety net; CB normally reports state within ~100ms.
@@ -2596,15 +2613,7 @@ mod apple_peripheral {
         // Holding the lock across `await` would deadlock with concurrent
         // notify_tx; take the raw ptr out and drop the guard.
         let mgr_ptr: *mut AnyObject = {
-            let Some(lock) = MANAGER_PTR.get() else {
-                tracing::warn!("iOS BLE Peripheral: stop requested but MANAGER_PTR unset");
-                if needs_stop_ad {
-                    apply_event(crate::ble_peer_lifecycle::LifecycleEvent::AdvertiseStopped);
-                }
-                apply_event(crate::ble_peer_lifecycle::LifecycleEvent::ServicesRemoved);
-                apply_event(crate::ble_peer_lifecycle::LifecycleEvent::Reset);
-                return Ok(());
-            };
+            let lock = manager_ptr_slot();
             match lock.lock() {
                 Ok(g) if !g.0.is_null() => g.0,
                 _ => {
@@ -2705,10 +2714,8 @@ mod apple_peripheral {
 
         // OnceLock can't be cleared, but the inner Mutex<SendPtr> lets us
         // null the pointer so notify_tx + the next start cycle see no manager.
-        if let Some(lock) = MANAGER_PTR.get() {
-            if let Ok(mut guard) = lock.lock() {
-                *guard = SendPtr(std::ptr::null_mut());
-            }
+        if let Ok(mut guard) = manager_ptr_slot().lock() {
+            *guard = SendPtr(std::ptr::null_mut());
         }
 
         // Any queued retries reference characteristics we just released;
