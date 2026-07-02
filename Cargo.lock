@@ -1635,6 +1635,7 @@ dependencies = [
  "objc2-foundation",
  "rand 0.8.5",
  "rns-crypto",
+ "rns-identity",
  "rns-transport",
  "rns-wire",
  "serde",
