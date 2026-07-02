@@ -5465,14 +5465,16 @@ pub async fn spawn_ble_peer_interface(
                 }
                 #[cfg(target_os = "linux")]
                 {
-                    // Linux bluer notifier doesn't expose per-central addresses up
-                    // to us yet — the Notifier is keyed by char only. Apply the
-                    // anti-loop filter against a synthetic broadcast key so a
-                    // packet recently received from any peripheral subscriber is
-                    // skipped on the same characteristic. This is a coarser
-                    // filter than apple/android but still prevents the
-                    // most-common 2-node echo loop. A linux-specific per-device
-                    // notifier table can refine this later.
+                    // bluer's Notifier is keyed by characteristic only — it does
+                    // not surface which central subscribed, so there is NO
+                    // per-subscriber anti-loop or dual-role dedupe on this leg
+                    // (unlike apple/android). A packet is broadcast to every
+                    // subscriber, which means a peer we are ALSO connected to as
+                    // Central receives it twice (once here, once on the central
+                    // write leg). Transport's packet hashlist dedups the copy so
+                    // this is wasted airtime, not misdelivery. Per-subscriber
+                    // notify routing (needed to suppress the echo) rides with the
+                    // deferred per-peer child-interface work.
                     const LINUX_NOTIFY_MTU: usize = 244;
                     let frags = fragment_packet(&payload, LINUX_NOTIFY_MTU);
                     for (idx, frag) in frags.iter().enumerate() {
@@ -5480,17 +5482,18 @@ pub async fn spawn_ble_peer_interface(
                         let _ = linux_peripheral::notify_tx(COLUMBA_TX_UUID, frag);
                         pace_after_ble_fragment(idx, frags.len()).await;
                     }
-                    let _ = &anti_loop_fan; // silence unused-warning on linux-only path
+                    let _ = &anti_loop_fan; // per-subscriber filtering not available here
                 }
                 #[cfg(target_os = "windows")]
                 {
                     // WinRT GattLocalCharacteristic.NotifyValueAsync broadcasts to
-                    // every subscribed client on the characteristic — Windows
-                    // doesn't expose a per-subscriber addressable notify. Same
-                    // coarse anti-loop story as Linux: filter against a
-                    // per-characteristic "broadcast" key. Per-client routing can
-                    // be added later by keying on the GattSubscribedClient's
-                    // device id seen during SubscribedClientsChanged.
+                    // every subscribed client; we do not yet track per-client
+                    // device ids (NotifyValueForSubscribedClientAsync +
+                    // SubscribedClientsChanged), so as on Linux there is NO
+                    // per-subscriber anti-loop or dual-role dedupe here. A
+                    // dual-role peer receives each packet twice; transport dedups
+                    // it, so the cost is airtime only. Per-client routing rides
+                    // with the deferred per-peer child-interface work.
                     const WINDOWS_NOTIFY_MTU: usize = 244;
                     let frags = fragment_packet(&payload, WINDOWS_NOTIFY_MTU);
                     for (idx, frag) in frags.iter().enumerate() {
@@ -5498,7 +5501,7 @@ pub async fn spawn_ble_peer_interface(
                         let _ = windows_peripheral::notify_tx(COLUMBA_TX_UUID, frag);
                         pace_after_ble_fragment(idx, frags.len()).await;
                     }
-                    let _ = &anti_loop_fan;
+                    let _ = &anti_loop_fan; // per-subscriber filtering not available here
                 }
                 #[cfg(target_os = "android")]
                 {
