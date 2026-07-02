@@ -2599,7 +2599,6 @@ mod apple_peripheral {
                 .ok_or("CBMutableCharacteristic not found")?;
             let svc_cls = AnyClass::get("CBMutableService").ok_or("CBMutableService not found")?;
             let arr_cls = AnyClass::get("NSArray").ok_or("NSArray not found")?;
-            let data_cls = AnyClass::get("NSData").ok_or("NSData not found")?;
             let dict_cls = AnyClass::get("NSDictionary").ok_or("NSDictionary not found")?;
 
             // RX (write + writeNoResponse)
@@ -2615,14 +2614,10 @@ mod apple_peripheral {
             // Keep the registry pointer valid for notify_tx.
             let _: *mut AnyObject = msg_send![tx_raw, retain];
             register_characteristic(RATSPEAK_TX_UUID, tx_raw);
-            // ID (read, static value)
-            let id_data: *mut AnyObject = msg_send![data_cls,
-                dataWithBytes: id_hash.as_ptr() as *const std::ffi::c_void,
-                length: id_hash.len()];
-            let id_raw: *mut AnyObject = msg_send![char_cls, alloc];
-            let id_raw: *mut AnyObject = msg_send![id_raw,
-                initWithType: cbuuid(&RATSPEAK_ID_UUID), properties: 0x02u64,
-                value: id_data, permissions: 0x01u64];
+            // No static ID characteristic: it exposed a MAC-rotation-stable
+            // identity read to any connecting scanner (a tracking vector) and
+            // was never read by this stack — identity is learned from signed
+            // announces instead.
 
             // Ratspeak service (primary)
             let svc_raw: *mut AnyObject = msg_send![svc_cls, alloc];
@@ -2631,10 +2626,9 @@ mod apple_peripheral {
             let char_ptrs = [
                 rx_raw as *const AnyObject,
                 tx_raw as *const AnyObject,
-                id_raw as *const AnyObject,
             ];
             let chars: *mut AnyObject = msg_send![arr_cls,
-                arrayWithObjects: char_ptrs.as_ptr(), count: 3usize];
+                arrayWithObjects: char_ptrs.as_ptr(), count: 2usize];
             let _: () = msg_send![svc_raw, setCharacteristics: chars];
             let _: () = msg_send![mgr_raw, addService: svc_raw];
 
@@ -2649,23 +2643,15 @@ mod apple_peripheral {
                 value: std::ptr::null::<AnyObject>(), permissions: 0x01u64];
             let _: *mut AnyObject = msg_send![c_tx_raw, retain];
             register_characteristic(COLUMBA_TX_UUID, c_tx_raw);
-            let c_id_data: *mut AnyObject = msg_send![data_cls,
-                dataWithBytes: id_hash.as_ptr() as *const std::ffi::c_void,
-                length: id_hash.len()];
-            let c_id_raw: *mut AnyObject = msg_send![char_cls, alloc];
-            let c_id_raw: *mut AnyObject = msg_send![c_id_raw,
-                initWithType: cbuuid(&COLUMBA_ID_UUID), properties: 0x02u64,
-                value: c_id_data, permissions: 0x01u64];
             let c_svc_raw: *mut AnyObject = msg_send![svc_cls, alloc];
             let c_svc_raw: *mut AnyObject = msg_send![c_svc_raw,
                 initWithType: cbuuid(&COLUMBA_SERVICE_UUID), primary: false];
             let c_char_ptrs = [
                 c_rx_raw as *const AnyObject,
                 c_tx_raw as *const AnyObject,
-                c_id_raw as *const AnyObject,
             ];
             let c_chars: *mut AnyObject = msg_send![arr_cls,
-                arrayWithObjects: c_char_ptrs.as_ptr(), count: 3usize];
+                arrayWithObjects: c_char_ptrs.as_ptr(), count: 2usize];
             let _: () = msg_send![c_svc_raw, setCharacteristics: c_chars];
             let _: () = msg_send![mgr_raw, addService: c_svc_raw];
 
@@ -3995,8 +3981,10 @@ mod linux_peripheral {
 
     /// Start GATT server + LE advertising. Must be called from a tokio
     /// runtime context (bluer needs the current dispatcher).
-    pub async fn start_advertising(identity_hash: &[u8]) -> Result<(), String> {
+    pub async fn start_advertising(_identity_hash: &[u8]) -> Result<(), String> {
         // Ensure inbound channel exists before any write callback fires.
+        // identity_hash is unused: the static ID characteristic was removed as
+        // a tracking vector; identity is exchanged via signed announces.
         reset_inbound_channel();
 
         let session = bluer::Session::new()
@@ -4011,23 +3999,18 @@ mod linux_peripheral {
             .await
             .map_err(|e| format!("adapter power on: {e}"))?;
 
-        let id_bytes = identity_hash.to_vec();
         let app = Application {
             services: vec![
                 build_service(
                     super::RATSPEAK_SERVICE_UUID,
                     super::RATSPEAK_RX_UUID,
                     super::RATSPEAK_TX_UUID,
-                    super::RATSPEAK_ID_UUID,
-                    id_bytes.clone(),
                 )
                 .await,
                 build_service(
                     super::COLUMBA_SERVICE_UUID,
                     super::COLUMBA_RX_UUID,
                     super::COLUMBA_TX_UUID,
-                    super::COLUMBA_ID_UUID,
-                    id_bytes,
                 )
                 .await,
             ],
@@ -4090,13 +4073,7 @@ mod linux_peripheral {
         Ok(())
     }
 
-    async fn build_service(
-        service_uuid: Uuid,
-        rx_uuid: Uuid,
-        tx_uuid: Uuid,
-        id_uuid: Uuid,
-        identity_hash: Vec<u8>,
-    ) -> Service {
+    async fn build_service(service_uuid: Uuid, rx_uuid: Uuid, tx_uuid: Uuid) -> Service {
         // Inbound RX: peer writes here, we push (peer_addr, data) on the
         // shared channel for the spawn function's reassembler.
         let rx_uuid_for_trace = rx_uuid;
@@ -4163,25 +4140,13 @@ mod linux_peripheral {
             ..Default::default()
         };
 
-        // ID: static 16-byte Reticulum identity hash, read-only.
-        let id_bytes = identity_hash;
-        let id_char = Characteristic {
-            uuid: id_uuid,
-            read: Some(CharacteristicRead {
-                read: true,
-                fun: Box::new(move |_| {
-                    let bytes = id_bytes.clone();
-                    Box::pin(async move { Ok(bytes) })
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
+        // No static ID characteristic: it exposed a MAC-rotation-stable
+        // identity read to any connecting scanner (a tracking vector) and was
+        // never read by this stack — identity is learned from signed announces.
         Service {
             uuid: service_uuid,
             primary: true,
-            characteristics: vec![rx_char, tx_char, id_char],
+            characteristics: vec![rx_char, tx_char],
             ..Default::default()
         }
     }
@@ -4332,8 +4297,6 @@ mod windows_peripheral {
         service_uuid: uuid::Uuid,
         rx_uuid: uuid::Uuid,
         tx_uuid: uuid::Uuid,
-        id_uuid: uuid::Uuid,
-        identity_hash: &[u8],
     ) -> Result<(GattServiceProvider, GattLocalCharacteristic), String> {
         let svc_guid = uuid_to_guid(service_uuid);
         let create_result = GattServiceProvider::CreateAsync(svc_guid)
@@ -4472,30 +4435,9 @@ mod windows_peripheral {
             .SubscribedClientsChanged(&sub_handler)
             .map_err(|e| format!("tx SubscribedClientsChanged subscribe: {e}"))?;
 
-        // ID characteristic — static read-only identity hash.
-        let id_params =
-            GattLocalCharacteristicParameters::new().map_err(|e| format!("id params: {e}"))?;
-        id_params
-            .SetCharacteristicProperties(GattCharacteristicProperties::Read)
-            .map_err(|e| format!("id props: {e}"))?;
-        id_params
-            .SetReadProtectionLevel(GattProtectionLevel::Plain)
-            .map_err(|e| format!("id read protection: {e}"))?;
-        let writer = DataWriter::new().map_err(|e| format!("id DataWriter::new: {e}"))?;
-        writer
-            .WriteBytes(identity_hash)
-            .map_err(|e| format!("id WriteBytes: {e}"))?;
-        let id_buf = writer
-            .DetachBuffer()
-            .map_err(|e| format!("id DetachBuffer: {e}"))?;
-        id_params
-            .SetStaticValue(&id_buf)
-            .map_err(|e| format!("id SetStaticValue: {e}"))?;
-        let _id_create = service
-            .CreateCharacteristicAsync(uuid_to_guid(id_uuid), &id_params)
-            .map_err(|e| format!("id create call: {e}"))?
-            .get()
-            .map_err(|e| format!("id create get: {e}"))?;
+        // No static ID characteristic: it exposed a MAC-rotation-stable
+        // identity read to any connecting scanner (a tracking vector) and was
+        // never read by this stack — identity is learned from signed announces.
 
         // Advertise the service.
         let adv_params = GattServiceProviderAdvertisingParameters::new()
@@ -4513,7 +4455,7 @@ mod windows_peripheral {
         Ok((provider, tx_char))
     }
 
-    pub async fn start_advertising(identity_hash: &[u8]) -> Result<(), String> {
+    pub async fn start_advertising(_identity_hash: &[u8]) -> Result<(), String> {
         reset_inbound_channel();
 
         // WinRT GATT setup uses `.get()` internally (see
@@ -4521,8 +4463,6 @@ mod windows_peripheral {
         // doesn't play well with `.await`. Hop to spawn_blocking so the
         // tokio executor isn't parked for the ~tens of ms each service
         // registration takes.
-        let id_hash_rs = identity_hash.to_vec();
-        let id_hash_cb = id_hash_rs.clone();
 
         // Attempt Ratspeak service first. If CreateAsync fails because the
         // app is unpackaged (AccessDenied), surface a user-friendly error
@@ -4532,8 +4472,6 @@ mod windows_peripheral {
                 super::RATSPEAK_SERVICE_UUID,
                 super::RATSPEAK_RX_UUID,
                 super::RATSPEAK_TX_UUID,
-                super::RATSPEAK_ID_UUID,
-                &id_hash_rs,
             )
         })
         .await
@@ -4554,8 +4492,6 @@ mod windows_peripheral {
                 super::COLUMBA_SERVICE_UUID,
                 super::COLUMBA_RX_UUID,
                 super::COLUMBA_TX_UUID,
-                super::COLUMBA_ID_UUID,
-                &id_hash_cb,
             )
         })
         .await
