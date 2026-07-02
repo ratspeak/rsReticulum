@@ -54,6 +54,11 @@ pub const COLUMBA_RX_UUID: Uuid = Uuid::from_u128(0x37145b00_442d_4a94_917f_8f42
 pub const COLUMBA_ID_UUID: Uuid = Uuid::from_u128(0x37145b00_442d_4a94_917f_8f42c5da28e6);
 
 pub const MAX_PEERS: usize = 7;
+/// Upper bound on a fragment set's `total`. A Reticulum packet is <=500 bytes,
+/// so even at a pathologically small ATT MTU the count stays well under this;
+/// the cap stops an unauthenticated writer from sizing a reassembly buffer off
+/// an attacker-controlled 16-bit field (multi-MB allocation per START frame).
+pub const MAX_FRAGMENTS: u16 = 64;
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 pub const KEEPALIVE_MAX_MISSES: u32 = 3;
 pub const FRAGMENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -651,7 +656,7 @@ fn parse_fragment_header(data: &[u8]) -> Option<FragmentHeader> {
 
     let seq = u16::from_be_bytes([data[1], data[2]]);
     let total = u16::from_be_bytes([data[3], data[4]]);
-    if total == 0 || seq >= total {
+    if total == 0 || total > MAX_FRAGMENTS || seq >= total {
         return None;
     }
 
@@ -6634,6 +6639,22 @@ mod tests {
     #[test]
     fn test_reassemble_empty() {
         assert!(reassemble_fragments(&[]).is_none());
+    }
+
+    #[test]
+    fn test_reassembly_rejects_oversized_total() {
+        // A START claiming more fragments than MAX_FRAGMENTS must be rejected at
+        // header parse, so an unauthenticated writer can't size a reassembly
+        // buffer off the attacker-controlled 16-bit `total` field.
+        let start = make_fragment(FragmentType::Start, 0, MAX_FRAGMENTS + 1, &[0xAA; 4]);
+        assert!(parse_fragment_header(&start).is_none());
+
+        // consume_ble_frame therefore forwards it as a raw passthrough frame
+        // (no allocation) rather than opening a reassembly entry.
+        let mut reassembly: FragmentReassembly = HashMap::new();
+        let out = consume_ble_frame(start.clone(), &mut reassembly);
+        assert_eq!(out, Some(start));
+        assert!(reassembly.is_empty());
     }
 
     #[test]
