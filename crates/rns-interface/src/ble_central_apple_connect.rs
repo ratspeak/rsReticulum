@@ -421,39 +421,33 @@ pub fn write_peer(address: &str, data: &[u8]) -> Result<(), String> {
         return Err(format!("peer {address} marked offline"));
     }
 
-    // The flag can flip back to false at any time after returning true
-    // (per Apple's docs); the ready-to-send delegate drains the queue.
-    let ready: bool = unsafe { msg_send![peer.peripheral.0, canSendWriteWithoutResponse] };
-    if ready {
-        unsafe { issue_write(&peer, data) };
-        return Ok(());
+    // Always enqueue, then drain, so every fragment leaves through the single
+    // FIFO path. Issuing directly on a "ready" radio would let a later
+    // fragment jump ahead of ones already queued from when it was busy, and
+    // the receiver would misparse the out-of-order envelope as a raw packet.
+    {
+        let mut g = pending_write().lock().expect("pending_write lock");
+        let q = g.entry(address.to_owned()).or_default();
+        if q.len() >= PENDING_WRITE_CAP {
+            q.pop_front();
+            tracing::warn!(
+                target: "ble_trace",
+                step = "central.write_overflow_drop",
+                peer = %address,
+                cap = PENDING_WRITE_CAP,
+                "Apple BLE central: pending-write ring overflowed, dropping oldest"
+            );
+        }
+        q.push_back(data.to_vec());
     }
-
-    let mut g = pending_write().lock().expect("pending_write lock");
-    let q = g.entry(address.to_owned()).or_default();
-    if q.len() >= PENDING_WRITE_CAP {
-        q.pop_front();
-        tracing::warn!(
-            target: "ble_trace",
-            step = "central.write_overflow_drop",
-            peer = %address,
-            cap = PENDING_WRITE_CAP,
-            "Apple BLE central: pending-write ring overflowed, dropping oldest"
-        );
-    }
-    q.push_back(data.to_vec());
-    tracing::debug!(
-        target: "ble_trace",
-        step = "central.write_queued",
-        peer = %address,
-        bytes = data.len(),
-        depth = q.len(),
-        "Apple BLE central: write queued (radio queue full)"
-    );
+    unsafe { drain_pending_writes(address) };
     Ok(())
 }
 
-/// Requeues at front if canSend flips false mid-drain.
+/// Drains queued writes in FIFO order while the radio can accept them. Holds
+/// the pending-write lock across the whole loop so a concurrent drain (or a
+/// [`write_peer`] enqueue) can't interleave and reorder fragments — an
+/// out-of-order envelope makes the receiver misparse the frame as a raw packet.
 unsafe fn drain_pending_writes(address: &str) {
     let peer = {
         let g = connected_peers().lock().expect("connected_peers lock");
@@ -466,23 +460,27 @@ unsafe fn drain_pending_writes(address: &str) {
         return;
     }
     let mut drained = 0usize;
+    let mut g = pending_write().lock().expect("pending_write lock");
+    let Some(q) = g.get_mut(address) else {
+        return;
+    };
     loop {
-        let entry = {
-            let mut g = pending_write().lock().expect("pending_write lock");
-            g.get_mut(address).and_then(|q| q.pop_front())
-        };
-        let Some(data) = entry else {
-            break;
-        };
-        let ready: bool = unsafe { msg_send![peer.peripheral.0, canSendWriteWithoutResponse] };
-        if !ready {
-            let mut g = pending_write().lock().expect("pending_write lock");
-            g.entry(address.to_owned()).or_default().push_front(data);
+        // Peek before popping: leave the fragment queued if the radio can't
+        // take it, so ordering is preserved for the next drain.
+        if q.front().is_none() {
             break;
         }
+        let ready: bool = unsafe { msg_send![peer.peripheral.0, canSendWriteWithoutResponse] };
+        if !ready {
+            break;
+        }
+        let Some(data) = q.pop_front() else {
+            break;
+        };
         unsafe { issue_write(&peer, &data) };
         drained += 1;
     }
+    drop(g);
     if drained > 0 {
         tracing::debug!(
             target: "ble_trace",
