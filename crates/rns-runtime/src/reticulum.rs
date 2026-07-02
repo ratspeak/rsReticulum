@@ -1477,6 +1477,17 @@ impl ReticulumHandle {
         result
     }
 
+    /// Register a wire packet tap on the local transport actor (sniffer/debug).
+    pub async fn register_packet_tap(
+        &self,
+        tap_tx: tokio::sync::broadcast::Sender<rns_transport::messages::PacketTapEvent>,
+    ) {
+        let _ = self
+            .transport_tx
+            .send(TransportMessage::SetPacketTap { tap_tx })
+            .await;
+    }
+
     /// Recall the identity and latest announce metadata for `destination_hash`.
     ///
     /// This reads this process' live, validated replicated announce cache in
