@@ -29,8 +29,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config
       - name: Test (default features)
         run: cargo test --workspace
-      - name: Test BLE interface features (Linux)
-        if: runner.os == 'Linux'
+      - name: Test BLE interface features (Linux/macOS)
+        if: runner.os != 'Windows'
         run: cargo test -p rns-interface --features ble,ble_peer
 
   lint:
