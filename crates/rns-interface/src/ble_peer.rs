@@ -66,6 +66,10 @@ pub const MIN_RSSI: i16 = -85;
 pub const SCAN_ACTIVE_INTERVAL: Duration = Duration::from_secs(5);
 pub const SCAN_IDLE_INTERVAL: Duration = Duration::from_secs(30);
 pub const BLE_FRAGMENT_PACING: Duration = Duration::from_millis(8);
+/// Upper bound on a single btleplug fragment write; a wedged BlueZ/WinRT stack
+/// would otherwise hang the per-peer write loop (and everything queued behind
+/// it) forever. Generous — a healthy write completes in milliseconds.
+pub const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Recently-disconnected peers stay "wanted" — scan loop uses the active
 /// interval for them until they reconnect or the entry expires.
@@ -658,6 +662,10 @@ fn generation_is_current(generation: u64) -> bool {
 
 fn track_child_task(generation: u64, handle: tokio::task::JoinHandle<()>) {
     if let Ok(mut tasks) = child_tasks().lock() {
+        // Drop handles for per-peer tasks that already finished (reconnect
+        // churn spawns a fresh read/write pair per connect); otherwise the
+        // vec grows unbounded for the life of the session.
+        tasks.retain(|(_, h)| !h.is_finished());
         tasks.push((generation, handle));
     } else {
         handle.abort();
@@ -677,7 +685,10 @@ async fn stop_central_connections() {
     crate::ble_central_apple_connect::disconnect_all();
 
     #[cfg(target_os = "android")]
-    android_peripheral::peer_client_disconnect_all();
+    {
+        // JNI disconnect-all can block; keep it off the async runtime thread.
+        let _ = tokio::task::spawn_blocking(android_peripheral::peer_client_disconnect_all).await;
+    }
 
     #[cfg(all(
         feature = "ble",
@@ -5152,9 +5163,16 @@ async fn peer_write_loop(
 
         let fragments = fragment_packet(&data, write_mtu);
         for (idx, frag) in fragments.iter().enumerate() {
-            if let Err(e) =
-                crate::ble_rnode::ble_write(&peripheral, &rx_char, frag, write_mtu).await
-            {
+            // Bound the write: a wedged BlueZ/WinRT stack can otherwise leave
+            // this task (and every packet queued behind it) hung indefinitely.
+            let write =
+                crate::ble_rnode::ble_write(&peripheral, &rx_char, frag, write_mtu);
+            let result: Result<(), String> =
+                match tokio::time::timeout(PEER_WRITE_TIMEOUT, write).await {
+                    Ok(r) => r.map_err(|e| e.to_string()),
+                    Err(_) => Err("write timed out".to_string()),
+                };
+            if let Err(e) = result {
                 tracing::warn!(
                     target: "ble_trace",
                     step = "peer.write_fail",
@@ -5426,8 +5444,17 @@ pub async fn spawn_ble_peer_interface(
                     .collect::<Vec<_>>();
                 let mut closed_writers = Vec::new();
                 for (key, peer_tx) in writer_snapshot {
-                    if peer_tx.send(payload.clone()).await.is_err() {
-                        closed_writers.push(key);
+                    // try_send, not send().await: a full per-peer channel means
+                    // that peer's radio is backed up, and awaiting it would
+                    // head-of-line-block the broadcast to every other peer.
+                    // Drop for the slow peer (transport retransmits) and keep
+                    // fanning out; only a closed channel retires the writer.
+                    match peer_tx.try_send(payload.clone()) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => closed_writers.push(key),
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(peer = %key, "BLE fan-out: peer write queue full, dropping");
+                        }
                     }
                 }
                 if !closed_writers.is_empty() {
@@ -5719,11 +5746,24 @@ pub async fn spawn_ble_peer_interface(
                 // the connect attempt. Same root cause class as the macOS
                 // bypass at the central scan loop above.
                 match scan_mesh_peers_shared(&adapter, 3).await {
-                    Ok(peers) => {
-                        // Active scan if we either saw new peers OR have a
-                        // wanted-reconnect entry that's not in backoff.
+                    Ok(mut peers) => {
+                        // Connect strongest-RSSI first so a crowded room fills
+                        // the MAX_PEERS slots with the nearest peers instead of
+                        // whatever scan order returned.
+                        peers.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+                        // Active scan only when there is something to act on: an
+                        // unconnected, non-backoff candidate with a free slot, or
+                        // a wanted-reconnect. A stable mesh keeps seeing its
+                        // already-connected peers every scan, so gating on "new
+                        // peers seen" alone pinned the radio at the active duty
+                        // cycle forever.
+                        let have_candidate = connected_addrs.len() < MAX_PEERS
+                            && peers.iter().any(|p| {
+                                !connected_addrs.contains_key(&p.ble_address)
+                                    && !reconnect_in_backoff(&recently_disc, &p.ble_address)
+                            });
                         let next_interval =
-                            if !peers.is_empty() || has_wanted_reconnects(&recently_disc) {
+                            if have_candidate || has_wanted_reconnects(&recently_disc) {
                                 SCAN_ACTIVE_INTERVAL
                             } else {
                                 SCAN_IDLE_INTERVAL
@@ -5988,9 +6028,19 @@ pub async fn spawn_ble_peer_interface(
                 crate::ble_central_apple_connect::prune_discovered();
 
                 match scan_mesh_peers(3).await {
-                    Ok(peers) => {
+                    Ok(mut peers) => {
+                        // Connect strongest-RSSI first so a crowded room fills
+                        // the MAX_PEERS slots with the nearest peers.
+                        peers.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+                        // Idle down when there is no actionable peer — a stable
+                        // mesh keeps seeing its connected peers every scan.
+                        let have_candidate = connected_addrs.len() < MAX_PEERS
+                            && peers.iter().any(|p| {
+                                !connected_addrs.contains_key(&p.ble_address)
+                                    && !reconnect_in_backoff(&recently_disc, &p.ble_address)
+                            });
                         let next_interval =
-                            if !peers.is_empty() || has_wanted_reconnects(&recently_disc) {
+                            if have_candidate || has_wanted_reconnects(&recently_disc) {
                                 SCAN_ACTIVE_INTERVAL
                             } else {
                                 SCAN_IDLE_INTERVAL
@@ -6283,6 +6333,7 @@ pub async fn spawn_ble_peer_interface(
                 // Drop peers whose JNI disconnect callback flipped their flag.
                 // unregister cleans the static registry that backs that callback.
                 let previous_peer_count = connected_addrs.len();
+                let mut dropped_addrs: Vec<String> = Vec::new();
                 connected_addrs.retain(|addr, online| {
                     let alive = online.load(Ordering::SeqCst);
                     if !alive {
@@ -6292,10 +6343,20 @@ pub async fn spawn_ble_peer_interface(
                         // no longer exchanges identity.
                         record_disconnect(&recently_disc, addr);
                         android_peripheral::unregister_peer_online(addr);
-                        android_peripheral::peer_client_disconnect(addr);
+                        dropped_addrs.push(addr.clone());
                     }
                     alive
                 });
+                if !dropped_addrs.is_empty() {
+                    // peer_client_disconnect crosses into the JVM and can block;
+                    // run it off the async runtime rather than stalling the loop.
+                    let _ = tokio::task::spawn_blocking(move || {
+                        for addr in dropped_addrs {
+                            android_peripheral::peer_client_disconnect(&addr);
+                        }
+                    })
+                    .await;
+                }
                 if connected_addrs.len() != previous_peer_count {
                     dispatch_status_changed(
                         peer_state_for_count(connected_addrs.len()),
@@ -6306,14 +6367,24 @@ pub async fn spawn_ble_peer_interface(
                 // Native scan via BluetoothLeScanner with a service-UUID
                 // filter (battery-efficient — radio firmware filters
                 // adverts before waking the host).
-                let scan_results = tokio::task::spawn_blocking(move || {
+                let mut scan_results = tokio::task::spawn_blocking(move || {
                     android_peripheral::peer_scan_mesh(SCAN_TIMEOUT_MS)
                 })
                 .await
                 .unwrap_or_default();
+                // Connect strongest-RSSI first so a crowded room fills the
+                // MAX_PEERS slots with the nearest peers.
+                scan_results.sort_by(|a, b| b.1.cmp(&a.1));
 
+                // Idle down when there is no actionable peer — a stable mesh
+                // keeps seeing its connected peers every scan.
+                let have_candidate = connected_addrs.len() < MAX_PEERS
+                    && scan_results.iter().any(|(addr, _, _)| {
+                        !connected_addrs.contains_key(addr)
+                            && !reconnect_in_backoff(&recently_disc, addr)
+                    });
                 let scan_interval =
-                    if !scan_results.is_empty() || has_wanted_reconnects(&recently_disc) {
+                    if have_candidate || has_wanted_reconnects(&recently_disc) {
                         SCAN_ACTIVE_INTERVAL
                     } else {
                         SCAN_IDLE_INTERVAL
