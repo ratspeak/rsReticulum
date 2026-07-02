@@ -511,6 +511,12 @@ fn peer_state_for_count(peer_count: usize) -> PeerState {
 }
 
 fn dispatch_status_changed(state: PeerState, peer_count: usize) {
+    // Keep the transport-shared online flag in step with real interface state
+    // so a dead/Off/BluetoothOff radio stops being handed outbound packets.
+    interface_online_flag().store(
+        matches!(state, PeerState::On | PeerState::Starting),
+        Ordering::SeqCst,
+    );
     dispatch_event(BlePeerEvent::StatusChanged { state, peer_count });
 }
 
@@ -519,6 +525,18 @@ static BLE_PEER_RUNNING: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceL
 
 pub(crate) fn running_flag() -> Arc<AtomicBool> {
     BLE_PEER_RUNNING
+        .get_or_init(|| Arc::new(AtomicBool::new(false)))
+        .clone()
+}
+
+/// Shared with the transport actor as the interface's `online` flag. Tracks
+/// real operational state (via [`dispatch_status_changed`]) rather than
+/// staying `true` forever, and is what Halt/Resume toggles. Distinct from
+/// `running_flag` (session lifecycle) so a Halt doesn't tear down the loops.
+static BLE_PEER_ONLINE: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
+
+fn interface_online_flag() -> Arc<AtomicBool> {
+    BLE_PEER_ONLINE
         .get_or_init(|| Arc::new(AtomicBool::new(false)))
         .clone()
 }
@@ -6521,7 +6539,7 @@ pub async fn spawn_ble_peer_interface(
         },
         bitrate: 250_000, // BLE 1M PHY effective throughput
         mtu: 500,
-        online: Arc::new(AtomicBool::new(true)),
+        online: interface_online_flag(),
         txb: Some(shared_txb),
         rxb: Some(shared_rxb),
         tx,
