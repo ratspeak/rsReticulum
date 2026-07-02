@@ -374,12 +374,27 @@ pub async fn connect_peer(
         let mut g = online_flags().lock().expect("online_flags lock");
         g.insert(address.clone(), online.clone());
     }
+    // CB auto-negotiates the ATT MTU during connection setup and exposes the
+    // usable per-write payload via maximumWriteValueLengthForType:. Reading it
+    // (rather than assuming 244) both prevents silent truncation on a link that
+    // negotiated a smaller MTU and unlocks larger writes (iOS commonly 512).
+    // Clamp: floor at the ATT-23 minimum, ceil at our fragment TARGET_MTU.
+    const WRITE_WITHOUT_RESPONSE: usize = 1; // CBCharacteristicWriteWithoutResponse
+    let negotiated: usize =
+        unsafe { msg_send![peripheral.0, maximumWriteValueLengthForType: WRITE_WITHOUT_RESPONSE] };
+    let write_mtu = negotiated.clamp(20, crate::ble_peer::TARGET_MTU as usize);
+    tracing::info!(
+        target: "ble_trace",
+        step = "apple_connect.mtu",
+        address = %address,
+        negotiated,
+        write_mtu,
+        "Apple BLE central: negotiated write MTU"
+    );
     let peer = Arc::new(ConnectedPeer {
         address: address.clone(),
         protocol,
-        // CB auto-negotiates ATT MTU with no public read-back API.
-        // 244 = ATT MTU 247 - 3-byte header (BLE 4.2+ baseline).
-        write_mtu: 244,
+        write_mtu,
         online: online.clone(),
         peripheral,
         delegate,

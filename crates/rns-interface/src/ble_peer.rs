@@ -4847,12 +4847,15 @@ async fn connect_mesh_peer(
         "BLE mesh: subscribed to peer TX notifications"
     );
 
-    // btleplug doesn't expose negotiated MTU on the public Peripheral trait —
-    // CoreBluetooth/BlueZ both auto-negotiate. 244 is the safe ATT MTU 247
-    // payload (247 - 3 ATT header) that essentially every BLE 4.2+ stack
-    // supports out of the box. Going higher risks btleplug truncating writes
-    // on platforms where the negotiated MTU is below 512.
-    let write_mtu = 244;
+    // btleplug 0.11 exposes no negotiated-MTU getter, and there is no length
+    // field to detect a stack-side truncation, so we must not assume more than
+    // the lowest MTU any real peer negotiates. 182 = the iOS default ATT MTU
+    // 185 minus the 3-byte ATT header; every modern BLE stack negotiates at
+    // least this, so writes of this size are never silently truncated (the
+    // 244 assumption corrupted multi-fragment packets sent to a <247-MTU peer,
+    // e.g. an iOS peripheral). Per-peer negotiated sizing here waits on a
+    // btleplug MTU API.
+    let write_mtu = 182;
 
     tracing::info!(
         target: "ble_trace",
