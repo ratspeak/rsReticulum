@@ -568,12 +568,18 @@ fn abort_ble_peer_child_tasks() {
     }
 }
 
-fn stop_central_connections() {
+async fn stop_central_connections() {
     #[cfg(any(target_os = "ios", target_os = "macos"))]
     crate::ble_central_apple_connect::disconnect_all();
 
     #[cfg(target_os = "android")]
     android_peripheral::peer_client_disconnect_all();
+
+    #[cfg(all(
+        feature = "ble",
+        not(any(target_os = "android", target_os = "ios", target_os = "macos"))
+    ))]
+    disconnect_central_peripherals().await;
 }
 
 /// Caller must still `DeregisterInterface` on the transport actor to drop
@@ -581,8 +587,19 @@ fn stop_central_connections() {
 pub async fn stop_ble_peer_interface() {
     tracing::info!("stop_ble_peer_interface: signalling shutdown + stopping peripheral");
     let generation = invalidate_ble_peer_session();
-    stop_central_connections();
+    stop_central_connections().await;
     abort_ble_peer_child_tasks();
+
+    // A scan aborted mid-cycle leaves the Apple central lifecycle stuck in
+    // Scanning, so the next enable's start_scan is rejected and the central
+    // role stays dead until process restart. Reset it here — stop_scan is a
+    // no-op when already idle and keeps the manager alive for reuse (releasing
+    // it per-toggle trips the macOS alloc-cycle Unsupported bug).
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    if let Err(e) = crate::ble_central_apple::stop_scan().await {
+        tracing::warn!(error = %e, "BLE peer: apple central stop_scan during teardown");
+    }
+
     if let Err(e) = stop_peripheral().await {
         tracing::warn!(error = %e, "BLE peer: stop_peripheral failed during teardown");
     } else {
@@ -4650,6 +4667,37 @@ struct MeshPeerConnection {
     ble_address: String,
 }
 
+/// Connected btleplug peripherals keyed by BLE address. `peer_read_loop`
+/// disconnects on graceful exit, but interface teardown aborts that task
+/// before its cleanup runs, so hold clones here to disconnect explicitly —
+/// mirrors the Apple/Android `disconnect_all` paths.
+#[cfg(all(
+    feature = "ble",
+    not(any(target_os = "android", target_os = "ios", target_os = "macos"))
+))]
+fn central_peripherals()
+-> &'static std::sync::Mutex<HashMap<String, btleplug::platform::Peripheral>> {
+    static REG: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, btleplug::platform::Peripheral>>,
+    > = std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(all(
+    feature = "ble",
+    not(any(target_os = "android", target_os = "ios", target_os = "macos"))
+))]
+async fn disconnect_central_peripherals() {
+    use btleplug::api::Peripheral as _;
+    let peripherals: Vec<btleplug::platform::Peripheral> = match central_peripherals().lock() {
+        Ok(mut m) => m.drain().map(|(_, p)| p).collect(),
+        Err(_) => return,
+    };
+    for p in peripherals {
+        let _ = p.disconnect().await;
+    }
+}
+
 /// Connect to a discovered mesh peer and subscribe to TX notifications.
 ///
 /// No BLE-level identity exchange. Identity is learned later from the first
@@ -4795,6 +4843,12 @@ async fn connect_mesh_peer(
         protocol = ?protocol,
         "BLE mesh peer connected"
     );
+
+    // Register for explicit disconnect on interface teardown (the read loop's
+    // own disconnect is skipped when its task is aborted).
+    if let Ok(mut reg) = central_peripherals().lock() {
+        reg.insert(peer.ble_address.clone(), peripheral.clone());
+    }
 
     Ok(MeshPeerConnection {
         peripheral,
@@ -4985,6 +5039,9 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
 
     // Cleanup: disconnect and remove writer
     let _ = conn.peripheral.disconnect().await;
+    if let Ok(mut reg) = central_peripherals().lock() {
+        reg.remove(&peer_address);
+    }
     let mut writers = peer_writers.write().await;
     writers.remove(&peer_writer_key);
     tracing::info!(address = %peer_address, "BLE mesh peer disconnected and cleaned up");
