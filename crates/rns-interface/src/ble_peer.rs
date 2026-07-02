@@ -242,6 +242,9 @@ fn should_send_peripheral_payload(
 }
 
 fn reconnect_in_backoff(map: &RecentlyDisconnected, address: &str) -> bool {
+    if in_churn_backoff(address) {
+        return true;
+    }
     if let Ok(guard) = map.lock() {
         if let Some((when, fails)) = guard.get(address) {
             return *fails >= RECONNECT_BACKOFF_FAILURES
@@ -255,6 +258,7 @@ fn record_disconnect(map: &RecentlyDisconnected, address: &str) {
     if address.is_empty() {
         return;
     }
+    note_peer_disconnected(address);
     if let Ok(mut guard) = map.lock() {
         guard
             .entry(address.to_string())
@@ -279,6 +283,7 @@ fn record_reconnect_failure(map: &RecentlyDisconnected, address: &str) {
 }
 
 fn record_reconnect_success(map: &RecentlyDisconnected, address: &str) {
+    note_peer_connected(address);
     if let Ok(mut guard) = map.lock() {
         guard.remove(address);
     }
@@ -309,8 +314,72 @@ fn record_rotation_disconnect(map: &RecentlyDisconnected, address: &str) {
 }
 
 fn prune_recently_disconnected(map: &RecentlyDisconnected) {
+    prune_churn_track();
     if let Ok(mut guard) = map.lock() {
         guard.retain(|_, (when, _)| when.elapsed() < RECONNECT_PRUNE_AFTER);
+    }
+}
+
+/// A connect that survives at least this long is a healthy session and resets
+/// the churn counter; a drop sooner is counted as a flap. Longer than
+/// `KEEPALIVE_INTERVAL` so at least one keepalive must have succeeded.
+const CHURN_MIN_STABLE: Duration = Duration::from_secs(20);
+
+/// `(connected_at, flap_count, last_update)` keyed by BLE address. Separate
+/// from `RecentlyDisconnected` because a successful connect clears that map's
+/// failure count — so connect-then-drop flapping never accumulated backoff
+/// there. This counter survives connects and only resets on a stable session.
+type ChurnEntry = (Option<Instant>, u32, Instant);
+
+fn churn_track() -> &'static std::sync::Mutex<HashMap<String, ChurnEntry>> {
+    static CHURN: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ChurnEntry>>> =
+        std::sync::OnceLock::new();
+    CHURN.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn note_peer_connected(address: &str) {
+    if address.is_empty() {
+        return;
+    }
+    if let Ok(mut g) = churn_track().lock() {
+        let e = g
+            .entry(address.to_string())
+            .or_insert((None, 0, Instant::now()));
+        e.0 = Some(Instant::now());
+        e.2 = Instant::now();
+    }
+}
+
+fn note_peer_disconnected(address: &str) {
+    if address.is_empty() {
+        return;
+    }
+    if let Ok(mut g) = churn_track().lock() {
+        if let Some(e) = g.get_mut(address) {
+            // Only count as a flap when we know it connected recently; a
+            // missing connect stamp defaults to "stable" so a missed
+            // note_peer_connected can never manufacture wrongful backoff.
+            let flapped = e.0.is_some_and(|t| t.elapsed() < CHURN_MIN_STABLE);
+            e.1 = if flapped { e.1.saturating_add(1) } else { 0 };
+            e.0 = None;
+            e.2 = Instant::now();
+        }
+    }
+}
+
+fn in_churn_backoff(address: &str) -> bool {
+    if let Ok(g) = churn_track().lock() {
+        if let Some((_, count, last)) = g.get(address) {
+            return *count >= RECONNECT_BACKOFF_FAILURES
+                && last.elapsed() < RECONNECT_BACKOFF_DURATION;
+        }
+    }
+    false
+}
+
+fn prune_churn_track() {
+    if let Ok(mut g) = churn_track().lock() {
+        g.retain(|_, (_, _, last)| last.elapsed() < RECONNECT_PRUNE_AFTER);
     }
 }
 
@@ -7066,6 +7135,34 @@ mod tests {
         assert_eq!(peer_state_for_count(0), PeerState::Starting);
         assert_eq!(peer_state_for_count(1), PeerState::On);
         assert_eq!(peer_state_for_count(7), PeerState::On);
+    }
+
+    #[test]
+    fn churn_backoff_engages_on_rapid_connect_drop() {
+        // Unique address: churn_track is a process-global shared across tests.
+        let addr = "churn-flap-aa:01";
+        assert!(!in_churn_backoff(addr));
+        // Connect + immediate drop is well under CHURN_MIN_STABLE, so each
+        // cycle counts as a flap; the backoff must engage at the threshold.
+        for _ in 0..RECONNECT_BACKOFF_FAILURES {
+            note_peer_connected(addr);
+            note_peer_disconnected(addr);
+        }
+        assert!(
+            in_churn_backoff(addr),
+            "rapid connect/drop flapping must engage churn backoff"
+        );
+    }
+
+    #[test]
+    fn churn_missing_connect_stamp_never_backs_off() {
+        // A disconnect with no recorded connect stamp defaults to "stable" so a
+        // missed note_peer_connected can never manufacture wrongful backoff.
+        let addr = "churn-nostamp-bb:02";
+        for _ in 0..(RECONNECT_BACKOFF_FAILURES + 2) {
+            note_peer_disconnected(addr);
+        }
+        assert!(!in_churn_backoff(addr));
     }
 
     // ── Constants ──

@@ -817,9 +817,14 @@ fn resolve_pending(address: &str, kind: CallbackKind, result: Result<(), String>
     }
 }
 
-/// English-locale, case-insensitive substring match against rotation
+/// English-locale, case-insensitive substring match against RPA-rotation
 /// signatures: `CBErrorPeripheralConnectionTimeout` (constant or localized
-/// "timed out unexpectedly") and "specified device has disconnected".
+/// "timed out unexpectedly"), which is how a rotated-address peer presents.
+///
+/// "The specified device has disconnected" (CBErrorPeripheralDisconnected) is
+/// deliberately NOT treated as rotation: it is the generic remote-initiated
+/// disconnect, and mapping it to Rotation cleared the reconnect backoff on
+/// every ordinary drop, letting a flapping peer churn without ever backing off.
 fn classify_disconnect_reason(err: Option<&str>) -> DisconnectReason {
     let Some(s) = err else {
         return DisconnectReason::OtherError;
@@ -827,7 +832,6 @@ fn classify_disconnect_reason(err: Option<&str>) -> DisconnectReason {
     let lower = s.to_ascii_lowercase();
     if lower.contains("timed out unexpectedly")
         || lower.contains("cberrorperipheralconnectiontimeout")
-        || lower.contains("specified device has disconnected")
     {
         DisconnectReason::Rotation
     } else {
@@ -1278,9 +1282,10 @@ mod tests {
     }
 
     #[test]
-    fn classify_rotation_via_specified_device_disconnected() {
+    fn classify_specified_device_disconnected_is_not_rotation() {
+        // Generic remote-initiated disconnect must NOT clear reconnect backoff.
         let r = classify_disconnect_reason(Some("The specified device has disconnected from us."));
-        assert_eq!(r, DisconnectReason::Rotation);
+        assert_eq!(r, DisconnectReason::OtherError);
     }
 
     #[test]
