@@ -19,6 +19,7 @@ mobile-throttle = ["rns-transport/mobile-throttle"]
 [dependencies]
 rns-crypto = { workspace = true, features = ["std"] }
 rns-wire = { workspace = true, features = ["std"] }
+rns-identity = { workspace = true }
 rns-transport = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

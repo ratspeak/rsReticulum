@@ -224,6 +224,23 @@ impl BlePeerLinkRegistry {
 
 type LinkRegistry = Arc<tokio::sync::RwLock<BlePeerLinkRegistry>>;
 
+/// Returns the destination-hash hex of `raw` ONLY if it is a signed announce
+/// whose Ed25519 signature verifies. Binding a peer's identity from an
+/// unverified announce let an in-range attacker claim a known contact's
+/// identity (mislabelling the peer and poisoning the dual-role dedup registry);
+/// the signature check means a claim can't be forged without the private key.
+fn verified_announce_identity_hex(raw: &[u8]) -> Option<String> {
+    let (header, payload_offset) = rns_wire::header::PacketHeader::unpack(raw).ok()?;
+    if header.flags.packet_type != rns_wire::flags::PacketType::Announce {
+        return None;
+    }
+    let payload = raw.get(payload_offset..)?;
+    let announce =
+        rns_identity::announce::AnnounceData::unpack(payload, header.flags.context_flag).ok()?;
+    announce.verify_signature(&header.destination_hash).ok()?;
+    Some(hex::encode(header.destination_hash))
+}
+
 #[cfg(any(test, target_os = "android", target_os = "ios", target_os = "macos"))]
 fn payload_needs_redundant_role_fanout(payload: &[u8]) -> bool {
     rns_wire::header::PacketHeader::unpack(payload)
@@ -5081,21 +5098,16 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
                 if let Some(raw) = complete_packet {
                     rxb.fetch_add(raw.len() as u64, Ordering::Relaxed);
                     if !identity_announced {
-                        if let Ok(parsed) = rns_wire::packet::Packet::from_raw(&raw) {
-                            if parsed.header.flags.packet_type
-                                == rns_wire::flags::PacketType::Announce
-                            {
-                                let id_hex = hex::encode(parsed.header.destination_hash);
-                                link_registry
-                                    .write()
-                                    .await
-                                    .set_identity(conn.ble_address.clone(), id_hex.clone());
-                                dispatch_event(BlePeerEvent::IdentityResolved {
-                                    address: conn.ble_address.clone(),
-                                    identity_hash: id_hex,
-                                });
-                                identity_announced = true;
-                            }
+                        if let Some(id_hex) = verified_announce_identity_hex(&raw) {
+                            link_registry
+                                .write()
+                                .await
+                                .set_identity(conn.ble_address.clone(), id_hex.clone());
+                            dispatch_event(BlePeerEvent::IdentityResolved {
+                                address: conn.ble_address.clone(),
+                                identity_hash: id_hex,
+                            });
+                            identity_announced = true;
                         }
                     }
                     // Register the source so the fan-out anti-loop filter
@@ -5374,29 +5386,23 @@ pub async fn spawn_ble_peer_interface(
                                     "BLE Peer reassembly: complete packet (parse failed)"
                                 ),
                             }
-                            // Identity learning: peek at the packet header
-                            // before we hand off to transport. If this is an
-                            // announce and we haven't yet associated this peer
-                            // address with an identity, emit IdentityResolved for
-                            // caller-side deduplication. Cheap: parses header only,
-                            // doesn't validate the announce
-                            // signature (transport will do that).
+                            // Identity learning: associate this peer address
+                            // with an identity for caller-side dedup, but only
+                            // from a signature-verified announce. Binding from
+                            // an unverified announce let an in-range attacker
+                            // claim a known contact's identity and poison the
+                            // dual-role dedup registry.
                             if !identity_announced.contains(&peer) {
-                                if let Ok(parsed) = &parse_result {
-                                    if parsed.header.flags.packet_type
-                                        == rns_wire::flags::PacketType::Announce
-                                    {
-                                        let id_hex = hex::encode(parsed.header.destination_hash);
-                                        identity_announced.insert(peer.clone());
-                                        link_registry_p
-                                            .write()
-                                            .await
-                                            .set_identity(peer.clone(), id_hex.clone());
-                                        dispatch_event(BlePeerEvent::IdentityResolved {
-                                            address: peer.clone(),
-                                            identity_hash: id_hex,
-                                        });
-                                    }
+                                if let Some(id_hex) = verified_announce_identity_hex(&raw) {
+                                    identity_announced.insert(peer.clone());
+                                    link_registry_p
+                                        .write()
+                                        .await
+                                        .set_identity(peer.clone(), id_hex.clone());
+                                    dispatch_event(BlePeerEvent::IdentityResolved {
+                                        address: peer.clone(),
+                                        identity_hash: id_hex,
+                                    });
                                 }
                             }
                             // Record this packet's source so the outbound
