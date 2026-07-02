@@ -1588,9 +1588,7 @@ mod apple_peripheral {
     /// that was never stopped (an enable without an intervening disable) so it
     /// can't keep advertising after we've replaced it.
     fn set_manager_ptr(mgr_raw: *mut AnyObject) {
-        let mut guard = manager_ptr_slot()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = manager_ptr_slot().lock().unwrap_or_else(|e| e.into_inner());
         let prev = guard.0;
         *guard = SendPtr(mgr_raw);
         drop(guard);
@@ -2668,10 +2666,7 @@ mod apple_peripheral {
             let svc_raw: *mut AnyObject = msg_send![svc_cls, alloc];
             let svc_raw: *mut AnyObject = msg_send![svc_raw,
                 initWithType: cbuuid(&RATSPEAK_SERVICE_UUID), primary: true];
-            let char_ptrs = [
-                rx_raw as *const AnyObject,
-                tx_raw as *const AnyObject,
-            ];
+            let char_ptrs = [rx_raw as *const AnyObject, tx_raw as *const AnyObject];
             let chars: *mut AnyObject = msg_send![arr_cls,
                 arrayWithObjects: char_ptrs.as_ptr(), count: 2usize];
             let _: () = msg_send![svc_raw, setCharacteristics: chars];
@@ -2691,10 +2686,7 @@ mod apple_peripheral {
             let c_svc_raw: *mut AnyObject = msg_send![svc_cls, alloc];
             let c_svc_raw: *mut AnyObject = msg_send![c_svc_raw,
                 initWithType: cbuuid(&COLUMBA_SERVICE_UUID), primary: false];
-            let c_char_ptrs = [
-                c_rx_raw as *const AnyObject,
-                c_tx_raw as *const AnyObject,
-            ];
+            let c_char_ptrs = [c_rx_raw as *const AnyObject, c_tx_raw as *const AnyObject];
             let c_chars: *mut AnyObject = msg_send![arr_cls,
                 arrayWithObjects: c_char_ptrs.as_ptr(), count: 2usize];
             let _: () = msg_send![c_svc_raw, setCharacteristics: c_chars];
@@ -5199,8 +5191,7 @@ async fn peer_write_loop(
         for (idx, frag) in fragments.iter().enumerate() {
             // Bound the write: a wedged BlueZ/WinRT stack can otherwise leave
             // this task (and every packet queued behind it) hung indefinitely.
-            let write =
-                crate::ble_rnode::ble_write(&peripheral, &rx_char, frag, write_mtu);
+            let write = crate::ble_rnode::ble_write(&peripheral, &rx_char, frag, write_mtu);
             let result: Result<(), String> =
                 match tokio::time::timeout(PEER_WRITE_TIMEOUT, write).await {
                     Ok(r) => r.map_err(|e| e.to_string()),
@@ -6417,12 +6408,11 @@ pub async fn spawn_ble_peer_interface(
                         !connected_addrs.contains_key(addr)
                             && !reconnect_in_backoff(&recently_disc, addr)
                     });
-                let scan_interval =
-                    if have_candidate || has_wanted_reconnects(&recently_disc) {
-                        SCAN_ACTIVE_INTERVAL
-                    } else {
-                        SCAN_IDLE_INTERVAL
-                    };
+                let scan_interval = if have_candidate || has_wanted_reconnects(&recently_disc) {
+                    SCAN_ACTIVE_INTERVAL
+                } else {
+                    SCAN_IDLE_INTERVAL
+                };
 
                 let peripheral_peer_addresses = if scan_results.is_empty() {
                     Vec::new()
