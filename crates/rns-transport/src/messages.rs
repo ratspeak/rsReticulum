@@ -96,6 +96,13 @@ pub struct InterfaceEntry {
     /// Announces awaiting bandwidth-capped retransmission. Drained in
     /// hop-priority order (lowest hops first, oldest among ties).
     pub announce_queue: Vec<QueuedAnnounce>,
+    /// Multipoint medium whose peers cannot hear each other (e.g. BLE Peer:
+    /// each peer is a separate point-to-point GATT link presented as one
+    /// interface). Unlike a shared broadcast medium, an announce arriving on
+    /// such an interface must be relayed back out the SAME interface to reach
+    /// its other peers. Loop safety comes from the announce-table dedup + hop
+    /// cap and the driver's own per-peer anti-loop filter.
+    pub multipoint: bool,
 }
 
 impl InterfaceEntry {
@@ -131,7 +138,13 @@ impl InterfaceEntry {
             tx_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ingress: IngressController::new(),
             announce_queue: Vec::new(),
+            multipoint: false,
         }
+    }
+
+    pub fn with_multipoint(mut self, multipoint: bool) -> Self {
+        self.multipoint = multipoint;
+        self
     }
 
     pub fn with_ifac(mut self, key: [u8; 64], size: usize) -> Self {

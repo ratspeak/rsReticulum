@@ -1337,6 +1337,7 @@ pub async fn init(
                     role,
                     ingress_overrides,
                     &reg_controls,
+                    false,
                 )
                 .await;
             }
@@ -1671,6 +1672,7 @@ async fn register_interface_handle_with_role(
         role,
         rns_transport::ingress::IngressOverrides::default(),
         interface_controls,
+        false,
     )
     .await;
 }
@@ -1681,6 +1683,7 @@ async fn register_interface_handle_with_role_and_overrides(
     role: rns_transport::messages::InterfaceRole,
     ingress_overrides: rns_transport::ingress::IngressOverrides,
     interface_controls: &InterfaceControlMap,
+    multipoint: bool,
 ) {
     let name = handle.name.clone();
     let id = handle.id;
@@ -1724,6 +1727,7 @@ async fn register_interface_handle_with_role_and_overrides(
         tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ingress,
         announce_queue: Vec::new(),
+        multipoint,
     };
     if let Err(e) = transport_tx
         .send(TransportMessage::RegisterInterface { id, entry })
@@ -1788,6 +1792,7 @@ async fn register_interface_with_post_init(
         tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ingress,
         announce_queue: Vec::new(),
+        multipoint: false,
     };
     if let Err(e) = transport_tx
         .send(TransportMessage::RegisterInterface { id, entry })
@@ -3223,10 +3228,15 @@ pub async fn spawn_ble_peer_runtime(
         format!("BLE Peer spawn failed: {e}")
     })?;
 
-    register_interface_handle(
+    // multipoint = true: BLE peers can't hear each other, so the transport must
+    // relay announces back out this interface to reach its other peers.
+    register_interface_handle_with_role_and_overrides(
         &handle.transport_tx,
         iface_handle,
+        rns_transport::messages::InterfaceRole::Normal,
+        rns_transport::ingress::IngressOverrides::default(),
         &handle.interface_controls,
+        true,
     )
     .await;
     tracing::info!(name = %name, id, "runtime BLE Peer mesh interface spawned");

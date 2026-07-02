@@ -1048,7 +1048,16 @@ impl TransportActor {
         let Some(entry) = self.interfaces.get(&id) else {
             return false;
         };
-        if except == Some(id) || !entry.direction.outbound {
+        if !entry.direction.outbound {
+            return false;
+        }
+        // Normally an announce is never sent back out its source interface
+        // (loopback / dedup churn on a shared medium). A multipoint interface
+        // (e.g. BLE Peer) is the exception: its peers can't hear each other, so
+        // relaying back out reaches the ones the source peer couldn't. The
+        // driver's per-peer anti-loop filter keeps it off the source peer, and
+        // the announce-table dedup + hop cap bound propagation.
+        if except == Some(id) && !entry.multipoint {
             return false;
         }
 
@@ -1544,6 +1553,7 @@ mod tests {
             rxb: None,
             txb: None,
             tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            multipoint: false,
             ingress: crate::ingress::IngressController::new(),
             announce_queue: Vec::new(),
         };
@@ -1594,6 +1604,30 @@ mod tests {
         actor.handle_message(TransportMessage::RegisterInterface { id: 1, entry });
         assert!(actor.interfaces.contains_key(&1));
         assert_eq!(actor.interfaces.get(&1).unwrap().name, "test_iface");
+    }
+
+    #[test]
+    fn test_multipoint_interface_relays_announce_to_source() {
+        let (mut actor, _tx) = TransportActor::new();
+        let dest = [0xAB; 16];
+
+        // Point-to-multipoint medium whose peers can't hear each other:
+        // an announce arriving here must be allowed back out the same
+        // interface. A normal interface must still exclude its source.
+        let (normal, _rx) = make_test_interface("normal");
+        actor.interfaces.insert(1, normal);
+        let (mut mp, _rx2) = make_test_interface("ble");
+        mp.multipoint = true;
+        actor.interfaces.insert(2, mp);
+
+        assert!(
+            !actor.interface_allows_announce(1, &dest, Some(1)),
+            "normal interface must not relay an announce back to its source"
+        );
+        assert!(
+            actor.interface_allows_announce(2, &dest, Some(2)),
+            "multipoint interface must relay an announce back to its other peers"
+        );
     }
 
     #[test]
