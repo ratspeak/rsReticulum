@@ -4434,6 +4434,7 @@ egress_control = Yes
             role,
             inherited,
             &interface_controls,
+            false,
         )
         .await;
 
@@ -4481,6 +4482,7 @@ egress_control = Yes
                 role,
                 overrides.clone(),
                 &interface_controls,
+                false,
             )
             .await;
 
