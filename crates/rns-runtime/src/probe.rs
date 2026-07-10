@@ -20,6 +20,9 @@ use rns_wire::flags::{DestinationType, HeaderType, PacketFlags, PacketType, Tran
 use rns_wire::hash::packet_hash_pair;
 use rns_wire::header::PacketHeader;
 
+/// Python rnprobe `DEFAULT_TIMEOUT`.
+const DEFAULT_TIMEOUT_SECS: f64 = 12.0;
+
 #[derive(Debug, Error)]
 pub enum ProbeError {
     #[error("timed out waiting for path to destination")]
@@ -239,13 +242,15 @@ impl Drop for DeliveryProofWaiter {
     }
 }
 
+/// `None` waits mirror Python rnprobe: `DEFAULT_TIMEOUT +
+/// get_first_hop_timeout(dest)`, resolved fresh at each wait.
 pub async fn probe_once(
     transport_tx: mpsc::Sender<TransportMessage>,
     dest_hash: [u8; 16],
     app_name: &str,
     size: usize,
-    proof_wait: Duration,
-    path_wait: Duration,
+    proof_wait: Option<Duration>,
+    path_wait: Option<Duration>,
     use_implicit_proof: bool,
 ) -> Result<ProbeOutcome, ProbeError> {
     if size > MTU {
@@ -276,6 +281,11 @@ pub async fn probe_once(
             })
             .await
             .map_err(|_| ProbeError::TransportClosed)?;
+
+        let path_wait = match path_wait {
+            Some(d) => d,
+            None => default_probe_wait(&transport_tx, dest_hash).await?,
+        };
 
         let (await_tx, await_rx) = oneshot::channel();
         transport_tx
@@ -340,6 +350,12 @@ pub async fn probe_once(
 
     let (full_hash, trunc_hash) = packet_hash_pair(&raw, HeaderType::Header1);
 
+    // Per probe, like Python's per-packet `timeout or DEFAULT_TIMEOUT + fht`.
+    let proof_wait = match proof_wait {
+        Some(d) => d,
+        None => default_probe_wait(&transport_tx, dest_hash).await?,
+    };
+
     // trunc_hash keys `receipt_table`; unique msg_id filters fan-out.
     let msg_id = format!(
         "probe.{}.{:x}",
@@ -402,6 +418,17 @@ pub async fn probe_once(
         interface: path_meta.interface,
         destination_hash: dest_hash,
     })
+}
+
+async fn default_probe_wait(
+    tx: &mpsc::Sender<TransportMessage>,
+    dest: [u8; 16],
+) -> Result<Duration, ProbeError> {
+    let first_hop = match query(tx, TransportQuery::FirstHopTimeout { dest }).await? {
+        TransportQueryResponse::FloatResult(Some(t)) => t,
+        _ => rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT,
+    };
+    Ok(Duration::from_secs_f64(DEFAULT_TIMEOUT_SECS + first_hop))
 }
 
 pub fn parse_dest_hash(hex_str: &str) -> Result<[u8; 16], ProbeError> {

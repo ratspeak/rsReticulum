@@ -1,45 +1,35 @@
 //! Python ref: `RNS/__init__.py` (`prettyspeed`, `prettysize`, `prettytime`).
 
 pub fn pretty_size(num: u64) -> String {
-    if num == 0 {
-        return "0 B".to_string();
-    }
-    let units = ["B", "KB", "MB", "GB", "TB"];
+    let units = ["", "K", "M", "G", "T", "P", "E", "Z"];
     let mut val = num as f64;
     for unit in &units {
-        if val < 1024.0 {
-            return if val < 10.0 {
-                format!("{val:.2} {unit}")
-            } else if val < 100.0 {
-                format!("{val:.1} {unit}")
+        if val.abs() < 1000.0 {
+            return if unit.is_empty() {
+                format!("{val:.0} B")
             } else {
-                format!("{val:.0} {unit}")
-            };
-        }
-        val /= 1024.0;
-    }
-    format!("{val:.1} PB")
-}
-
-pub fn pretty_speed(bps: u64) -> String {
-    if bps == 0 {
-        return "0 bps".to_string();
-    }
-    let units = ["bps", "Kbps", "Mbps", "Gbps"];
-    let mut val = bps as f64;
-    for unit in &units {
-        if val < 1000.0 {
-            return if val < 10.0 {
-                format!("{val:.2} {unit}")
-            } else if val < 100.0 {
-                format!("{val:.1} {unit}")
-            } else {
-                format!("{val:.0} {unit}")
+                format!("{val:.2} {unit}B")
             };
         }
         val /= 1000.0;
     }
-    format!("{val:.1} Tbps")
+    format!("{val:.2}YB")
+}
+
+pub fn pretty_speed(bps: u64) -> String {
+    let units = ["", "K", "M", "G", "T", "P", "E", "Z"];
+    let mut val = bps as f64;
+    for unit in &units {
+        if val.abs() < 1000.0 {
+            return if unit.is_empty() {
+                format!("{val:.0} bps")
+            } else {
+                format!("{val:.2} {unit}bps")
+            };
+        }
+        val /= 1000.0;
+    }
+    format!("{val:.2}Ybps")
 }
 
 pub fn pretty_time(seconds: f64) -> String {
@@ -89,16 +79,18 @@ mod tests {
     fn test_pretty_size() {
         assert_eq!(pretty_size(0), "0 B");
         assert_eq!(pretty_size(100), "100 B");
-        assert_eq!(pretty_size(1024), "1.00 KB");
-        assert_eq!(pretty_size(1536), "1.50 KB");
-        assert_eq!(pretty_size(1048576), "1.00 MB");
-        assert_eq!(pretty_size(1073741824), "1.00 GB");
+        assert_eq!(pretty_size(999), "999 B");
+        assert_eq!(pretty_size(1000), "1.00 KB");
+        assert_eq!(pretty_size(1024), "1.02 KB");
+        assert_eq!(pretty_size(1536), "1.54 KB");
+        assert_eq!(pretty_size(1048576), "1.05 MB");
+        assert_eq!(pretty_size(1073741824), "1.07 GB");
     }
 
     #[test]
     fn test_pretty_speed() {
         assert_eq!(pretty_speed(0), "0 bps");
-        assert_eq!(pretty_speed(115200), "115 Kbps");
+        assert_eq!(pretty_speed(115200), "115.20 Kbps");
         assert_eq!(pretty_speed(1000000), "1.00 Mbps");
         assert_eq!(pretty_speed(1000000000), "1.00 Gbps");
     }

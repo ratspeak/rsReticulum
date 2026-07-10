@@ -188,6 +188,7 @@ pub(crate) async fn main() -> ExitCode {
         config_dir,
         rpc_key,
         timeout: std::time::Duration::from_secs(args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS)),
+        explicit_timeout: args.timeout.map(std::time::Duration::from_secs),
     };
 
     // First matching branch wins when multiple action flags are passed.
@@ -267,6 +268,8 @@ struct ClientCtx {
     config_dir: PathBuf,
     rpc_key: Vec<u8>,
     timeout: std::time::Duration,
+    /// `-w` as given; `None` means path requests wait `PATH_REQUEST_TIMEOUT`.
+    explicit_timeout: Option<std::time::Duration>,
 }
 
 async fn request(ctx: &ClientCtx, req: &RpcRequest) -> Result<RpcResponse, LocalRpcFailure> {
@@ -772,12 +775,17 @@ async fn query_path(ctx: &ClientCtx, dest_hex: &str) -> ExitCode {
     let mut next_hop = next_hop;
     let mut iface = iface;
     if next_hop.is_none() && path_entry.is_none() {
-        let timeout_secs = ctx.timeout.as_secs_f64().max(0.1);
+        // Python rnpath defaults -w to Transport.PATH_REQUEST_TIMEOUT.
+        let timeout_secs = ctx
+            .explicit_timeout
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(rns_transport::constants::PATH_REQUEST_TIMEOUT)
+            .max(0.1);
         let req = RpcRequest::RequestPath {
             destination_hash: dest.to_vec(),
             timeout_secs: Some(timeout_secs),
         };
-        let rpc_timeout = ctx.timeout + std::time::Duration::from_secs(1);
+        let rpc_timeout = std::time::Duration::from_secs_f64(timeout_secs + 1.0);
         let found = match request_with_timeout(ctx, &req, rpc_timeout).await {
             Ok(RpcResponse::BoolResult(found)) => found,
             Ok(other) => {

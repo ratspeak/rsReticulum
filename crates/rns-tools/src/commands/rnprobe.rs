@@ -12,7 +12,6 @@ use rns_runtime::probe::{
 };
 
 const DEFAULT_PROBE_SIZE: usize = 16;
-const DEFAULT_TIMEOUT_SECS: f64 = 12.0;
 use rns_tools::RS_RETICULUM_VERSION;
 
 #[derive(Parser)]
@@ -103,9 +102,9 @@ pub(crate) async fn main() {
     };
 
     let size = args.size.unwrap_or(DEFAULT_PROBE_SIZE);
-    let timeout = Duration::from_secs_f64(args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
+    // None = Python default: 12 s + first-hop timeout, resolved per wait.
+    let timeout = args.timeout.map(Duration::from_secs_f64);
     let wait = Duration::from_secs_f64(args.wait.max(0.0));
-    let path_wait = timeout;
 
     let shutdown = rns_runtime::lifecycle::ShutdownSignal::new();
     let _signal_rx = rns_runtime::lifecycle::install_signal_handlers(shutdown.clone());
@@ -143,7 +142,7 @@ pub(crate) async fn main() {
             &full_name,
             size,
             timeout,
-            path_wait,
+            timeout,
             handle.should_use_implicit_proof(),
         )
         .await;

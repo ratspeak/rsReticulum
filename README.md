@@ -116,14 +116,14 @@ The `rns-tools` crate builds Rust-namespaced Reticulum utilities:
 #### Commands:
 
 ```text
-rnsd-rs     [-c CONFIG_DIR] [-v|-q]... [--service] [--exampleconfig] [--version]
-rnstatus-rs [--all] [--sort rate|traffic|rx|tx|rxs|txs|announces|arx|atx|held]
+rnsd-rs     [-c CONFIG_DIR] [-v|-q]... [-i] [--service] [--exampleconfig] [--version]
+rnstatus-rs [--all] [--sort rate|traffic|rx|tx|rxs|txs|announces|arx|atx|prx|ptx|held]
          [--reverse] [--announce-stats] [--link-stats] [--totals] [--json]
-         [--discovered|-D] [-m [-I SECONDS]] [FILTER]
+         [-d|--discovered] [-D] [-m [-I SECONDS]] [FILTER]
          [-R <transport_hash> -i <identity_file>]
 rnpath-rs   [--table|--rates] [destination_hash] [--max HOPS]
 rnpath-rs   <destination_hash>
-rnprobe-rs  [-s SIZE] [-n COUNT] [-t TIMEOUT] [-w WAIT] [--json] <destination_hash>
+rnprobe-rs  [-s SIZE] [-n COUNT] [-t TIMEOUT] [-w WAIT] [--json] <full_name> <destination_hash>
 rnid-rs     [-i IDENTITY|-g FILE|-m PUB|-M PRV] [-p|-P] [-x|-X] [-H ASPECT]
             [-a [ASPECT]] [-e FILE|-d FILE|-s FILE|-V FILE] [-w FILE] [-f]
             [-R|-N] [-t SECONDS] [-b|-B] [--raw] [--version]
@@ -131,6 +131,11 @@ rncp-rs     <file> <destination_hash>
 rncp-rs     -l [-b SECONDS] [-s DEST_DIR] [-a <allowed_hash>]...
 rncp-rs     -l -F [-j <jail_dir>] [-a <allowed_hash>|-n]...
 rncp-rs     -f <destination_hash> <remote_path> [-s DEST_DIR]
+rnodeconf-rs [-i] [-N|-T] [-b|-B|-p] [-w MODE] [-D N] [-t N] [-R N] [--freq HZ]
+            [--bw HZ] [--txp DBM] [--sf SF] [--cr CR] [-x|-X]
+            [--eeprom-backup|--eeprom-dump] [--trust-key HASH] [--version] [PORT]
+rnsh-rs     -l [-i FILE] [-s NAME] [-b PERIOD] [-a HASH]... [-n] [-A|-C] [-- CMD...]
+rnsh-rs     [-i FILE] [-s NAME] [-N] [-m] [-w SECONDS] <destination_hash> [-- CMD...]
 ```
 
 Add the release `bin/` directory or `target/release` to `PATH` if
