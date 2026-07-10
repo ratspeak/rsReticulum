@@ -5,6 +5,7 @@
 /// One bounded blocking read. Serial idle timeouts surface as `n == 0` so
 /// the caller's loop can re-check its exit flag. A panicked blocking task
 /// folds into an `io::Error`.
+#[cfg(feature = "serial")]
 pub(crate) async fn poll_read<P>(
     mut port: P,
     mut buf: [u8; 1024],
