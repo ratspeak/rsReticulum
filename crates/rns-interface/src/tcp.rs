@@ -285,12 +285,12 @@ async fn tcp_write_loop(
     state.online.store(false, Ordering::SeqCst);
 }
 
-/// Spawn an auto-reconnecting TCP client interface.
+/// Spawn an auto-reconnecting TCP client interface. IFAC masking, when
+/// configured, is applied by the transport actor, not the driver.
 pub async fn spawn_tcp_client(
     config: TcpClientConfig,
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
-    _ifac: Option<crate::traits::IfacConfig>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
     let online = Arc::new(AtomicBool::new(false));
     let online2 = online.clone();
@@ -691,9 +691,7 @@ mod tests {
         config.max_reconnect_tries = Some(1);
         config.connect_timeout_secs = 2;
 
-        let handle = spawn_tcp_client(config, 77, transport_tx, None)
-            .await
-            .unwrap();
+        let handle = spawn_tcp_client(config, 77, transport_tx).await.unwrap();
 
         let msg = tokio::time::timeout(std::time::Duration::from_secs(10), transport_rx.recv())
             .await
@@ -767,7 +765,7 @@ mod tests {
             mode: InterfaceMode::Full,
             fixed_mtu: None,
         };
-        let client_handle = spawn_tcp_client(client_cfg, 1, transport_tx.clone(), None)
+        let client_handle = spawn_tcp_client(client_cfg, 1, transport_tx.clone())
             .await
             .unwrap();
 
@@ -853,9 +851,7 @@ mod tests {
             fixed_mtu: None,
         };
 
-        let handle = spawn_tcp_client(config, 99, transport_tx, None)
-            .await
-            .unwrap();
+        let handle = spawn_tcp_client(config, 99, transport_tx).await.unwrap();
 
         // Two failed tries with 5s waits each; 20s headroom.
         let result =
@@ -896,7 +892,7 @@ mod tests {
             mode: InterfaceMode::Full,
             fixed_mtu: None,
         };
-        let client_handle = spawn_tcp_client(client_cfg, 321, transport_tx.clone(), None)
+        let client_handle = spawn_tcp_client(client_cfg, 321, transport_tx.clone())
             .await
             .unwrap();
 

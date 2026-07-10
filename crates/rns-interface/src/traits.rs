@@ -24,12 +24,6 @@ pub struct InterfaceHandle {
     pub read_task: tokio::task::JoinHandle<()>,
 }
 
-/// Optional per-interface IFAC (Interface Authentication Code) configuration.
-pub struct IfacConfig {
-    pub ifac_key: [u8; 64],
-    pub ifac_size: usize,
-}
-
 /// Interface operating mode. Byte values are on-wire constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
