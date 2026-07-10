@@ -3850,7 +3850,7 @@ mod linux_peripheral {
     use bluer::adv::Advertisement;
     use bluer::gatt::local::{
         Application, ApplicationHandle, Characteristic, CharacteristicNotifier,
-        CharacteristicNotify, CharacteristicNotifyMethod, CharacteristicRead, CharacteristicWrite,
+        CharacteristicNotify, CharacteristicNotifyMethod, CharacteristicWrite,
         CharacteristicWriteMethod, Service,
     };
     use std::sync::OnceLock;
@@ -5775,7 +5775,7 @@ pub async fn spawn_ble_peer_interface(
                         // Connect strongest-RSSI first so a crowded room fills
                         // the MAX_PEERS slots with the nearest peers instead of
                         // whatever scan order returned.
-                        peers.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+                        peers.sort_by_key(|p| std::cmp::Reverse(p.rssi));
                         // Active scan only when there is something to act on: an
                         // unconnected, non-backoff candidate with a free slot, or
                         // a wanted-reconnect. A stable mesh keeps seeing its
@@ -6056,7 +6056,7 @@ pub async fn spawn_ble_peer_interface(
                     Ok(mut peers) => {
                         // Connect strongest-RSSI first so a crowded room fills
                         // the MAX_PEERS slots with the nearest peers.
-                        peers.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+                        peers.sort_by_key(|p| std::cmp::Reverse(p.rssi));
                         // Idle down when there is no actionable peer — a stable
                         // mesh keeps seeing its connected peers every scan.
                         let have_candidate = connected_addrs.len() < MAX_PEERS
@@ -6399,7 +6399,7 @@ pub async fn spawn_ble_peer_interface(
                 .unwrap_or_default();
                 // Connect strongest-RSSI first so a crowded room fills the
                 // MAX_PEERS slots with the nearest peers.
-                scan_results.sort_by(|a, b| b.1.cmp(&a.1));
+                scan_results.sort_by_key(|r| std::cmp::Reverse(r.1));
 
                 // Idle down when there is no actionable peer — a stable mesh
                 // keeps seeing its connected peers every scan.
