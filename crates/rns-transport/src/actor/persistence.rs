@@ -302,6 +302,85 @@ impl TransportActor {
         self.last_state_save = now();
     }
 
+    /// Reference-counted prune of the on-disk announce cache — Python
+    /// `Transport.clean_announce_cache` parity. The keep-set is every packet
+    /// hash a path response could still be served from: live paths, tunnel
+    /// paths, RPC-retained announces (Rust pin extension), and persisted
+    /// entries still waiting for their interface to re-register. The walk
+    /// and unlinks run on the blocking pool; the actor only snapshots.
+    /// Returns true when a sweep was scheduled (or ran inline).
+    pub(super) fn maybe_sweep_announce_cache(&mut self) -> bool {
+        if self.shared_instance_client_mode {
+            // Python parity: shared-instance clients never clean the cache —
+            // an empty client routing table must not wipe files the owning
+            // instance still references.
+            return false;
+        }
+        let Some(dir) = self.storage_dir.clone() else {
+            return false;
+        };
+        if self
+            .announce_sweep_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            trace!("announce-cache sweep already in flight; retry next pass");
+            return false;
+        }
+
+        let mut keep: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        keep.extend(self.path_table.iter().filter_map(|(_, e)| e.packet_hash));
+        keep.extend(
+            self.tunnel_table
+                .tunnel_paths()
+                .filter_map(|(_, p)| p.packet_hash),
+        );
+        keep.extend(
+            self.recent_announces
+                .values()
+                .filter(|a| a.retained)
+                .filter_map(|a| a.packet_hash),
+        );
+        keep.extend(
+            self.pending_path_entries
+                .iter()
+                .filter_map(|e| e.packet_hash.as_deref())
+                .filter_map(|h| <[u8; 32]>::try_from(h).ok()),
+        );
+        keep.extend(
+            self.pending_tunnel_entries
+                .iter()
+                .flat_map(|e| e.paths.iter())
+                .filter_map(|p| p.packet_hash.as_deref())
+                .filter_map(|h| <[u8; 32]>::try_from(h).ok()),
+        );
+
+        self.announce_sweep_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+        let in_flight = self.announce_sweep_in_flight.clone();
+        let grace =
+            std::time::Duration::from_secs(crate::constants::ANNOUNCE_CACHE_SWEEP_GRACE_SECS);
+        let sweep = move || {
+            let started = std::time::Instant::now();
+            let (removed, total) = crate::persistence::sweep_announce_cache(&dir, &keep, grace);
+            if removed > 0 {
+                debug!(
+                    removed,
+                    total,
+                    elapsed = ?started.elapsed(),
+                    "cleaned cached announces"
+                );
+            }
+            in_flight.store(false, std::sync::atomic::Ordering::Release);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(sweep);
+            }
+            Err(_) => sweep(),
+        }
+        true
+    }
+
     /// Wait (bounded) for an in-flight async save so a synchronous save
     /// can't race it on the shared `<file>.tmp` paths.
     pub(super) fn wait_for_routing_save(&self) {
@@ -1044,6 +1123,209 @@ impl TransportActor {
         for dest in loaded_dests {
             self.fire_path_waiters(&dest);
         }
+    }
+}
+
+#[cfg(test)]
+mod announce_sweep_actor_tests {
+    use super::*;
+
+    fn temp_storage(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rns-sweep-actor-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("cache").join("announces")).unwrap();
+        dir
+    }
+
+    /// Write an announce-cache file whose mtime is one hour in the past so
+    /// the sweep's grace window never protects it.
+    fn write_aged(storage: &std::path::Path, hash: [u8; 32]) -> std::path::PathBuf {
+        let p = storage
+            .join("cache")
+            .join("announces")
+            .join(hex::encode(hash));
+        std::fs::write(&p, b"announce").unwrap();
+        let aged = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let file = std::fs::File::options().write(true).open(&p).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(aged))
+            .unwrap();
+        p
+    }
+
+    fn sweep_actor(storage: &std::path::Path) -> TransportActor {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.storage_dir = Some(storage.to_path_buf());
+        actor
+    }
+
+    fn retained_announce(hash: [u8; 32]) -> super::super::RecentAnnounce {
+        super::super::RecentAnnounce {
+            dest_hash: [0x01; 16],
+            hops: 1,
+            app_data: None,
+            timestamp: crate::now_f64(),
+            public_key: None,
+            ratchet: None,
+            packet_hash: Some(hash),
+            is_path_response: false,
+            retained: true,
+            last_used: None,
+            name_hash: [0u8; 10],
+        }
+    }
+
+    /// Keep-set covers every source a path response can be served from:
+    /// live paths, tunnel paths, retained pins, and persisted entries still
+    /// waiting for interface re-registration. Everything else, aged past the
+    /// grace window, is removed. No tokio runtime → the sweep runs inline,
+    /// making the test fully deterministic.
+    #[test]
+    fn sweep_keeps_all_reference_sources_and_removes_orphans() {
+        let storage = temp_storage("keepset");
+        let path_hash = [0x33; 32];
+        let tunnel_hash = [0x44; 32];
+        let pin_hash = [0x55; 32];
+        let pending_path_hash = [0x66; 32];
+        let pending_tunnel_hash = [0x77; 32];
+        let orphan_hash = [0x88; 32];
+        for h in [
+            path_hash,
+            tunnel_hash,
+            pin_hash,
+            pending_path_hash,
+            pending_tunnel_hash,
+            orphan_hash,
+        ] {
+            write_aged(&storage, h);
+        }
+
+        let mut actor = sweep_actor(&storage);
+        actor.path_table.insert(
+            [0x11; 16],
+            crate::path_table::PathEntry {
+                timestamp: crate::now_f64(),
+                next_hop: Some([0x22; 16]),
+                hops: 1,
+                expires: crate::now_f64() + 600.0,
+                random_blobs: std::collections::VecDeque::new(),
+                interface_id: 7,
+                packet_hash: Some(path_hash),
+            },
+        );
+        actor.tunnel_table.insert(crate::tunnel::TunnelEntry {
+            tunnel_id: [0xAB; 32],
+            interface_id: 7,
+            tunnel_paths: std::collections::HashMap::from([(
+                [0x12; 16],
+                crate::tunnel::TunnelPath {
+                    timestamp: crate::now_f64(),
+                    next_hop: None,
+                    hops: 2,
+                    expires: crate::now_f64() + 600.0,
+                    random_blobs: Vec::new(),
+                    packet_hash: Some(tunnel_hash),
+                },
+            )]),
+            expires: crate::now_f64() + 600.0,
+        });
+        actor
+            .recent_announces
+            .insert([0x01; 16], retained_announce(pin_hash));
+        actor
+            .pending_path_entries
+            .push(crate::persistence::PersistedPathEntry {
+                destination_hash: vec![0x13; 16],
+                timestamp: crate::now_f64(),
+                next_hop: None,
+                hops: 1,
+                expires: crate::now_f64() + 600.0,
+                random_blobs: Vec::new(),
+                interface_id: 9,
+                interface_name: None,
+                interface_hash: None,
+                packet_hash: Some(pending_path_hash.to_vec()),
+            });
+        actor
+            .pending_tunnel_entries
+            .push(crate::persistence::PersistedTunnelEntry {
+                tunnel_id: vec![0xCD; 32],
+                interface_id: 9,
+                expires: crate::now_f64() + 600.0,
+                paths: vec![crate::persistence::PersistedTunnelPath {
+                    destination_hash: vec![0x14; 16],
+                    next_hop: None,
+                    hops: 3,
+                    expires: crate::now_f64() + 600.0,
+                    timestamp: crate::now_f64(),
+                    random_blobs: Vec::new(),
+                    packet_hash: Some(pending_tunnel_hash.to_vec()),
+                }],
+                interface_name: None,
+                interface_hash: None,
+            });
+
+        actor.maybe_sweep_announce_cache();
+
+        let dir = storage.join("cache").join("announces");
+        for (h, why) in [
+            (path_hash, "live path"),
+            (tunnel_hash, "tunnel path"),
+            (pin_hash, "retained pin"),
+            (pending_path_hash, "pending path entry"),
+            (pending_tunnel_hash, "pending tunnel entry"),
+        ] {
+            assert!(
+                dir.join(hex::encode(h)).exists(),
+                "{why} announce must survive the sweep"
+            );
+        }
+        assert!(
+            !dir.join(hex::encode(orphan_hash)).exists(),
+            "orphan must be removed"
+        );
+        assert!(
+            !actor
+                .announce_sweep_in_flight
+                .load(std::sync::atomic::Ordering::Acquire),
+            "inline sweep must clear the in-flight flag"
+        );
+
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    #[test]
+    fn sweep_skips_when_in_flight_or_shared_client() {
+        let storage = temp_storage("guards");
+        let orphan = write_aged(&storage, [0x99; 32]);
+        let mut actor = sweep_actor(&storage);
+
+        actor
+            .announce_sweep_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+        actor.maybe_sweep_announce_cache();
+        assert!(orphan.exists(), "in-flight guard must skip the sweep");
+        actor
+            .announce_sweep_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        actor.shared_instance_client_mode = true;
+        actor.maybe_sweep_announce_cache();
+        assert!(
+            orphan.exists(),
+            "shared-instance clients must never clean the cache"
+        );
+
+        actor.shared_instance_client_mode = false;
+        actor.maybe_sweep_announce_cache();
+        assert!(!orphan.exists(), "unguarded sweep collects the orphan");
+
+        let _ = std::fs::remove_dir_all(&storage);
     }
 }
 

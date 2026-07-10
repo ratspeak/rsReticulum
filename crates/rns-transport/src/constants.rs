@@ -112,6 +112,18 @@ pub const PENDING_PRS_CHECK_INTERVAL: f64 = 30.0;
 /// Cache cleanup interval (5 minutes).
 pub const CACHE_CLEAN_INTERVAL: f64 = 300.0;
 
+/// On-disk announce cache sweep cadence — Python's 15-minute
+/// `clean_announce_cache` interval. Independent of the RAM-cache clean
+/// gate: Python's jobs thread cleans regardless of interface presence, so a
+/// node that boots with no interfaces still collects backlog.
+pub const ANNOUNCE_CACHE_SWEEP_INTERVAL: f64 = 900.0;
+
+/// Never delete announce-cache files younger than this. The keep-set is
+/// snapshotted on the actor while the cache writer keeps running on the
+/// blocking pool, so a fresh announce can exist on disk before its path
+/// entry does. Python accepts that race; we close it.
+pub const ANNOUNCE_CACHE_SWEEP_GRACE_SECS: u64 = 300;
+
 /// Table culling interval.
 pub const TABLES_CULL_INTERVAL: f64 = 5.0;
 

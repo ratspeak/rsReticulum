@@ -1044,6 +1044,158 @@ pub enum PersistenceError {
     VersionMismatch { expected: u32, found: u32 },
 }
 
+/// Reference-counted prune of `storage/cache/announces` — Python
+/// `Transport.clean_announce_cache` parity (Transport.py: keep only files
+/// whose hex name is a packet hash referenced by an active path or tunnel
+/// path; non-hex names are removed). Files younger than `grace` are always
+/// kept: the keep-set is snapshotted on the actor while announces keep
+/// arriving, so a fresh cache file can precede its path-table entry.
+/// Returns (removed, total_seen). Missing dir and per-entry IO errors are
+/// tolerated — the sweep is idempotent and re-runs on the next pass.
+pub fn sweep_announce_cache(
+    storage_dir: &Path,
+    keep: &std::collections::HashSet<[u8; 32]>,
+    grace: std::time::Duration,
+) -> (usize, usize) {
+    let dir = storage_dir.join("cache").join("announces");
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+    let mut total = 0usize;
+    // Unlinking during a lazy `read_dir` walk skips entries on common
+    // filesystems (directory compaction moves them behind the cursor), so a
+    // single pass leaves stragglers on large backlogs. Python avoids this by
+    // materialising `os.listdir` up front; re-passing keeps memory constant
+    // instead and terminates because entries only ever shrink — a pass that
+    // removes nothing means every survivor is referenced or in-grace.
+    loop {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return (removed, total);
+        };
+        let mut seen = 0usize;
+        let mut removed_this_pass = 0usize;
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            seen += 1;
+            let name = entry.file_name();
+            let referenced = name
+                .to_str()
+                .and_then(|s| {
+                    let mut hash = [0u8; 32];
+                    hex::decode_to_slice(s, &mut hash).ok()?;
+                    Some(hash)
+                })
+                .is_some_and(|hash| keep.contains(&hash));
+            if referenced {
+                continue;
+            }
+            // Unparseable mtime (or mtime in the future) counts as fresh:
+            // err on the side of keeping; a later sweep collects it.
+            let fresh = meta
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_none_or(|age| age < grace);
+            if fresh {
+                continue;
+            }
+            if std::fs::remove_file(entry.path()).is_ok() {
+                removed_this_pass += 1;
+            }
+        }
+        total = total.max(seen);
+        removed += removed_this_pass;
+        if removed_this_pass == 0 {
+            return (removed, total);
+        }
+    }
+}
+
+#[cfg(test)]
+mod announce_sweep_tests {
+    use super::sweep_announce_cache;
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    fn setup(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rns-announce-sweep-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("cache").join("announces")).unwrap();
+        dir
+    }
+
+    fn write_entry(storage: &std::path::Path, hash: [u8; 32]) -> std::path::PathBuf {
+        let p = storage
+            .join("cache")
+            .join("announces")
+            .join(hex::encode(hash));
+        std::fs::write(&p, b"announce").unwrap();
+        p
+    }
+
+    /// Decision-table parity with Python `Transport.clean_announce_cache`
+    /// (upstream Transport.py:2521): referenced → keep, unreferenced → remove,
+    /// non-hex name → remove. Grace column is the deliberate Rust extension.
+    #[test]
+    fn sweep_matrix_matches_python_semantics() {
+        let storage = setup("matrix");
+        let kept_hash = [0xAA; 32];
+        let orphan_hash = [0xBB; 32];
+        let kept = write_entry(&storage, kept_hash);
+        let orphan = write_entry(&storage, orphan_hash);
+        let non_hex = storage.join("cache").join("announces").join("not-a-hash");
+        std::fs::write(&non_hex, b"junk").unwrap();
+
+        let mut keep = HashSet::new();
+        keep.insert(kept_hash);
+
+        // Zero grace: age checks never protect anything.
+        let (removed, total) = sweep_announce_cache(&storage, &keep, Duration::ZERO);
+        assert_eq!(total, 3);
+        assert_eq!(removed, 2);
+        assert!(kept.exists(), "referenced announce must survive");
+        assert!(!orphan.exists(), "unreferenced announce must be removed");
+        assert!(!non_hex.exists(), "non-hex file must be removed");
+
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    #[test]
+    fn grace_window_protects_fresh_orphans() {
+        let storage = setup("grace");
+        let orphan = write_entry(&storage, [0xCC; 32]);
+
+        let (removed, total) =
+            sweep_announce_cache(&storage, &HashSet::new(), Duration::from_secs(3600));
+        assert_eq!((removed, total), (0, 1));
+        assert!(orphan.exists(), "fresh orphan inside grace must survive");
+
+        // Same file, grace elapsed → collected.
+        let (removed, _) = sweep_announce_cache(&storage, &HashSet::new(), Duration::ZERO);
+        assert_eq!(removed, 1);
+        assert!(!orphan.exists());
+
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    #[test]
+    fn missing_dir_is_a_noop() {
+        let storage = std::env::temp_dir().join("rns-announce-sweep-missing-nonexistent");
+        assert_eq!(
+            sweep_announce_cache(&storage, &HashSet::new(), Duration::ZERO),
+            (0, 0)
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

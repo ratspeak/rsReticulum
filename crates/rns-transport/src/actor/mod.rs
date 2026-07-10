@@ -91,6 +91,10 @@ pub struct TransportActor {
     last_receipts_check: f64,
     last_announces_check: f64,
     last_cache_clean: f64,
+    /// Last on-disk announce-cache sweep. 0.0 until the first sweep is
+    /// actually scheduled, so a tick that fires before storage init doesn't
+    /// consume the boot slot.
+    last_announce_cache_sweep: f64,
     last_blackhole_check: f64,
     last_rate_cull: f64,
     last_held_announce_check: f64,
@@ -121,6 +125,9 @@ pub struct TransportActor {
     /// would race on the shared `<file>.tmp` paths.
     pub routing_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub hashlist_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Guards the blocking-pool announce-cache sweep (Python parity with the
+    /// non-blocking `cache_clean_lock`: an in-flight sweep skips the pass).
+    pub announce_sweep_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     /// Persisted path entries waiting on their interface to re-register.
     /// Drained by `drain_pending_for_interface` on `RegisterInterface`.
@@ -248,6 +255,7 @@ impl TransportActor {
             last_receipts_check: 0.0,
             last_announces_check: 0.0,
             last_cache_clean: 0.0,
+            last_announce_cache_sweep: 0.0,
             last_blackhole_check: 0.0,
             last_rate_cull: 0.0,
             last_held_announce_check: 0.0,
@@ -261,6 +269,9 @@ impl TransportActor {
             state_dirty: false,
             routing_save_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hashlist_save_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            announce_sweep_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             pending_path_entries: Vec::new(),
             pending_tunnel_entries: Vec::new(),
             recent_announces: HashMap::new(),

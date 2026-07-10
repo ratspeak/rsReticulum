@@ -163,6 +163,19 @@ impl TransportActor {
             self.last_cache_clean = now;
         }
 
+        // On-disk announce-cache prune. Deliberately outside the
+        // startup_complete gate: that gate is stamped on first interface
+        // registration, and a node with no interfaces must still collect
+        // backlog (Python's jobs thread cleans unconditionally). Safe before
+        // interfaces exist — pending re-registration entries are in the
+        // keep-set and the mtime grace covers fresh writes. First sweep runs
+        // on the first tick after storage init, then every 15 minutes.
+        if now - self.last_announce_cache_sweep >= ANNOUNCE_CACHE_SWEEP_INTERVAL
+            && self.maybe_sweep_announce_cache()
+        {
+            self.last_announce_cache_sweep = now;
+        }
+
         self.expire_path_waiters(now);
 
         // Drop pending path-request markers after the upstream gate timeout.
@@ -352,6 +365,7 @@ impl TransportActor {
         self.last_receipts_check = 0.0;
         self.last_announces_check = 0.0;
         self.last_cache_clean = 0.0;
+        self.last_announce_cache_sweep = 0.0;
         self.last_blackhole_check = 0.0;
         self.last_rate_cull = 0.0;
         self.last_held_announce_check = 0.0;
