@@ -528,6 +528,13 @@ pub enum TransportQuery {
     /// `recent_announces`. Returns `IntResult(count_purged)`. Use sparingly —
     /// this can drop legit-but-unseen entries.
     PurgeUnverifiedBlackholes,
+    /// Recall the 64-byte identity public key for a destination previously
+    /// learned from a validated announce (`recent_announces`). Used by
+    /// `LinkClient` so Nomad/page browsers skip a fresh path-response wait when
+    /// the key is already cached. Response: `PublicKeyResult`.
+    RecallDestinationPublicKey {
+        dest: [u8; 16],
+    },
 }
 
 #[derive(Debug)]
@@ -540,6 +547,8 @@ pub enum TransportQueryResponse {
     FloatResult(Option<f64>),
     StringResult(Option<String>),
     HashResult(Option<[u8; 16]>),
+    /// 64-byte `X25519_pub || Ed25519_pub` for `RecallDestinationPublicKey`.
+    PublicKeyResult(Option<[u8; 64]>),
     BoolResult(bool),
     PathStateResult(crate::constants::PathState),
     BlackholeList(Vec<BlackholeRpcEntry>),

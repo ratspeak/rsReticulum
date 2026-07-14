@@ -545,6 +545,13 @@ impl TransportActor {
                 }
                 TransportQueryResponse::HashResult(None)
             }
+            TransportQuery::RecallDestinationPublicKey { dest } => {
+                let public_key = self
+                    .recent_announces
+                    .get(&dest)
+                    .and_then(|entry| entry.public_key);
+                TransportQueryResponse::PublicKeyResult(public_key)
+            }
             TransportQuery::FilterBlackholedDests { dests } => {
                 let mut hits = Vec::new();
                 for dest in &dests {

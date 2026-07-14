@@ -16,8 +16,15 @@ use rns_identity::identity::Identity;
 use rns_link::link::{CloseReason, Link};
 use rns_protocol::resource::{InboundTransfer, TransferAction};
 use rns_protocol::resource_adv::ResourceAdvertisement;
+use rns_transport::await_path::{AwaitPathError, await_path};
 use rns_transport::link_messages::DestinationEvent;
-use rns_transport::messages::{AnnounceHandlerEvent, OutboundRequest, TransportMessage};
+use rns_transport::messages::{
+    AnnounceHandlerEvent, OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
+};
+use tokio::sync::oneshot;
+
+/// MeshChat `NomadnetDownloader` path_lookup_timeout default (seconds).
+const PATH_LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error)]
 pub enum LinkClientError {
@@ -70,27 +77,9 @@ impl LinkClient {
         let dest_hash =
             Destination::hash_from_name_and_identity(app_name, Some(&remote_transport_hash));
 
-        // Register the handler before the path request so the answering
-        // announce (carrying the pubkey) is observed.
-        let (ann_tx, mut ann_rx) = mpsc::channel::<AnnounceHandlerEvent>(64);
-        self.send_msg(TransportMessage::RegisterAnnounceHandler {
-            aspect_filter: Some(app_name.to_string()),
-            receive_path_responses: true,
-            callback_tx: ann_tx,
-        })
-        .await?;
-
-        self.send_msg(TransportMessage::RequestPath {
-            destination_hash: dest_hash,
-        })
-        .await?;
-
-        let pubkey = wait_for_pubkey(&mut ann_rx, dest_hash, time_remaining(deadline)?).await?;
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::DeregisterAnnounceHandler {
-                aspect_filter: Some(app_name.to_string()),
-            });
+        let pubkey = self
+            .discover_remote_public_key(dest_hash, app_name, deadline)
+            .await?;
 
         let (mut link, request_data) = Link::new_initiator(dest_hash, hops);
         let link_id = link.link_id;
@@ -188,6 +177,90 @@ impl LinkClient {
             .try_send(TransportMessage::DeregisterDestination { hash: link_id });
 
         response
+    }
+
+    /// Resolve remote identity public key + path before link establishment.
+    ///
+    /// Prefer recalling a key already cached from a prior announce (Nomad nodes
+    /// that appear in the directory almost always have one). Fall back to the
+    /// historical RequestPath + announce wait only when the cache misses.
+    /// Temporary announce handlers are always GC'd without wiping other
+    /// `aspect_filter` registrations (e.g. a long-lived Nomad discoverer).
+    async fn discover_remote_public_key(
+        &self,
+        dest_hash: [u8; 16],
+        app_name: &str,
+        deadline: Instant,
+    ) -> Result<[u8; 64], LinkClientError> {
+        let path_budget = PATH_LOOKUP_TIMEOUT.min(time_remaining(deadline)?);
+
+        if let Some(pubkey) = self.recall_destination_public_key(dest_hash).await? {
+            self.await_path_or_timeout(dest_hash, path_budget).await?;
+            return Ok(pubkey);
+        }
+
+        let (ann_tx, mut ann_rx) = mpsc::channel::<AnnounceHandlerEvent>(64);
+        self.send_msg(TransportMessage::RegisterAnnounceHandler {
+            aspect_filter: Some(app_name.to_string()),
+            receive_path_responses: true,
+            callback_tx: ann_tx,
+        })
+        .await?;
+
+        // Failure point: path/announce discovery times out or transport dies.
+        // Fallback: always drop `ann_rx` then GC closed handlers only — never
+        // Deregister by aspect (that would remove the app's permanent listener).
+        let discovery = async {
+            self.send_msg(TransportMessage::RequestPath {
+                destination_hash: dest_hash,
+            })
+            .await?;
+            wait_for_pubkey(&mut ann_rx, dest_hash, time_remaining(deadline)?).await
+        }
+        .await;
+
+        drop(ann_rx);
+        self.gc_closed_announce_handlers();
+        discovery
+    }
+
+    async fn recall_destination_public_key(
+        &self,
+        dest_hash: [u8; 16],
+    ) -> Result<Option<[u8; 64]>, LinkClientError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send_msg(TransportMessage::Rpc {
+            query: TransportQuery::RecallDestinationPublicKey { dest: dest_hash },
+            response_tx,
+        })
+        .await?;
+        match timeout(Duration::from_secs(5), response_rx).await {
+            Ok(Ok(TransportQueryResponse::PublicKeyResult(pk))) => Ok(pk),
+            Ok(Ok(_)) => Ok(None),
+            Ok(Err(_)) => Err(LinkClientError::TransportUnavailable),
+            Err(_) => Err(LinkClientError::Timeout("pubkey recall")),
+        }
+    }
+
+    async fn await_path_or_timeout(
+        &self,
+        dest_hash: [u8; 16],
+        budget: Duration,
+    ) -> Result<(), LinkClientError> {
+        match await_path(&self.transport_tx, dest_hash, budget).await {
+            Ok(()) => Ok(()),
+            Err(AwaitPathError::Timeout) => Err(LinkClientError::Timeout("path lookup")),
+            Err(AwaitPathError::TransportDown) => Err(LinkClientError::TransportUnavailable),
+        }
+    }
+
+    /// Sweep closed announce-handler channels without removing live ones.
+    fn gc_closed_announce_handlers(&self) {
+        let _ = self
+            .transport_tx
+            .try_send(TransportMessage::DeregisterAnnounceHandler {
+                aspect_filter: None,
+            });
     }
 
     async fn send_msg(&self, msg: TransportMessage) -> Result<(), LinkClientError> {
@@ -676,5 +749,43 @@ mod tests {
         let (header, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
         assert_eq!(header.context, rns_wire::context::PacketContext::LinkClose);
         assert!(responder.receive_teardown(&request.raw[offset..]));
+    }
+
+    #[tokio::test]
+    async fn recall_destination_public_key_reads_rpc_result() {
+        let dest = [0xAB; 16];
+        let expected = [0x42u8; 64];
+        let (transport_tx, mut transport_rx) = mpsc::channel(4);
+        let client = LinkClient::new(transport_tx, Identity::new());
+
+        let recall = tokio::spawn(async move { client.recall_destination_public_key(dest).await });
+
+        let msg = transport_rx.recv().await.expect("rpc message");
+        let TransportMessage::Rpc {
+            query: TransportQuery::RecallDestinationPublicKey { dest: got_dest },
+            response_tx,
+        } = msg
+        else {
+            panic!("expected RecallDestinationPublicKey rpc, got {msg:?}");
+        };
+        assert_eq!(got_dest, dest);
+        response_tx
+            .send(TransportQueryResponse::PublicKeyResult(Some(expected)))
+            .unwrap();
+
+        let recalled = recall.await.unwrap().unwrap();
+        assert_eq!(recalled, Some(expected));
+    }
+
+    #[test]
+    fn gc_closed_announce_handlers_sends_aspect_filter_none() {
+        let (transport_tx, mut transport_rx) = mpsc::channel(4);
+        let client = LinkClient::new(transport_tx, Identity::new());
+        client.gc_closed_announce_handlers();
+        let msg = transport_rx.try_recv().unwrap();
+        match msg {
+            TransportMessage::DeregisterAnnounceHandler { aspect_filter: None } => {}
+            other => panic!("expected GC deregister, got {other:?}"),
+        }
     }
 }

@@ -8476,6 +8476,60 @@ mod tests {
     }
 
     #[test]
+    fn recall_destination_public_key_hit_and_miss() {
+        let (mut actor, _tx) = TransportActor::new();
+        let identity = rns_identity::identity::Identity::new();
+        let dest_hash = [0xD1; 16];
+        insert_announce_for(&mut actor, dest_hash, &identity);
+
+        let hit = actor.handle_query(crate::messages::TransportQuery::RecallDestinationPublicKey {
+            dest: dest_hash,
+        });
+        match hit {
+            crate::messages::TransportQueryResponse::PublicKeyResult(Some(pk)) => {
+                assert_eq!(pk, identity.get_public_key());
+            }
+            other => panic!("expected PublicKeyResult(Some(_)), got {other:?}"),
+        }
+
+        let miss =
+            actor.handle_query(crate::messages::TransportQuery::RecallDestinationPublicKey {
+                dest: [0xEE; 16],
+            });
+        assert!(matches!(
+            miss,
+            crate::messages::TransportQueryResponse::PublicKeyResult(None)
+        ));
+    }
+
+    #[test]
+    fn deregister_announce_handler_none_only_sweeps_closed() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (live_tx, _live_rx) = tokio::sync::mpsc::channel(4);
+        let (dead_tx, dead_rx) = tokio::sync::mpsc::channel(4);
+        drop(dead_rx);
+
+        actor.announce_handlers.push(AnnounceHandlerRegistration {
+            aspect_filter: Some("nomadnetwork.node".into()),
+            receive_path_responses: false,
+            tx: live_tx,
+        });
+        actor.announce_handlers.push(AnnounceHandlerRegistration {
+            aspect_filter: Some("nomadnetwork.node".into()),
+            receive_path_responses: true,
+            tx: dead_tx,
+        });
+
+        actor.handle_message(TransportMessage::DeregisterAnnounceHandler { aspect_filter: None });
+        assert_eq!(actor.announce_handlers.len(), 1);
+        assert_eq!(
+            actor.announce_handlers[0].aspect_filter.as_deref(),
+            Some("nomadnetwork.node")
+        );
+        assert!(!actor.announce_handlers[0].tx.is_closed());
+    }
+
+    #[test]
     fn filter_blackholed_dests_returns_only_blackholed() {
         let (mut actor, _tx) = TransportActor::new();
         let blocked = rns_identity::identity::Identity::new();
