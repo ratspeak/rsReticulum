@@ -152,19 +152,36 @@ pub(crate) async fn main() -> ExitCode {
 }
 
 async fn run_monitor(args: Args) -> ExitCode {
-    let interval = Duration::from_secs_f64(args.monitor_interval.max(0.1));
+    // Python 1.3.8 rnstatus.py:714-744 (commit 32389002): one RNS instance and
+    // one remote destination live across refreshes; only the request repeats.
+    let session = if args.remote.is_some() {
+        match RemoteSession::open(&args).await {
+            Ok(s) => Some(s),
+            Err(code) => return code,
+        }
+    } else {
+        None
+    };
     loop {
+        let started = std::time::Instant::now();
         print!("\x1b[2J\x1b[H");
-        let exit = if args.remote.is_some() {
-            run_remote_once(&args).await
-        } else {
-            run_local_once(&args).await
+        let exit = match &session {
+            Some(session) => session.query_and_print(&args).await,
+            None => run_local_once(&args).await,
         };
         if exit != ExitCode::SUCCESS {
+            if let Some(session) = &session {
+                session.shutdown.trigger();
+            }
             return exit;
         }
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep(monitor_sleep(args.monitor_interval, started.elapsed())).await;
     }
+}
+
+/// Python 1.3.8 rnstatus.py:742-744: sleep `max(interval - render time, 0.2)`.
+fn monitor_sleep(interval_secs: f64, elapsed: Duration) -> Duration {
+    Duration::from_secs_f64((interval_secs - elapsed.as_secs_f64()).max(0.2))
 }
 
 async fn run_local(args: Args) -> ExitCode {
@@ -342,8 +359,8 @@ enum SortKey {
 
 fn validate_args(args: &Args) -> Result<(), String> {
     parse_sort_key(args.sort.as_deref()).map(|_| ())?;
-    if args.monitor_interval <= 0.0 {
-        return Err("--monitor-interval must be greater than 0".to_string());
+    if !(args.monitor_interval > 0.0 && args.monitor_interval.is_finite()) {
+        return Err("--monitor-interval must be a finite number greater than 0".to_string());
     }
     if (args.discovered || args.discovered_details) && args.remote.is_some() {
         return Err(
@@ -393,6 +410,32 @@ fn local_stat_sort_value(e: &rpc::InterfaceStatEntry, key: SortKey) -> f64 {
         SortKey::PathRequestRx => e.incoming_pr_frequency,
         SortKey::PathRequestTx => e.outgoing_pr_frequency,
         SortKey::Held => e.held_announces as f64,
+    }
+}
+
+/// Python 1.3.8 rnstatus.py:421-427 mode string table (unknown modes render "Full").
+fn mode_display_name(mode: &str) -> &'static str {
+    match mode {
+        "AccessPoint" | "Access Point" => "Access Point",
+        "PointToPoint" | "Point-to-Point" => "Point-to-Point",
+        "Roaming" => "Roaming",
+        "Boundary" => "Boundary",
+        "Gateway" => "Gateway",
+        "Internal" => "Internal",
+        _ => "Full",
+    }
+}
+
+/// Same table keyed on the numeric mode carried by remote /status responses.
+fn remote_mode_display_name(mode: u64) -> &'static str {
+    match mode {
+        0x02 => "Point-to-Point",
+        0x03 => "Access Point",
+        0x04 => "Roaming",
+        0x05 => "Boundary",
+        0x06 => "Gateway",
+        0x07 => "Internal",
+        _ => "Full",
     }
 }
 
@@ -472,7 +515,7 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
             let status = if entry.online { "Up" } else { "Down" };
             println!("  {}", entry.name);
             println!("    Status   : {status}");
-            println!("    Mode     : {}", entry.mode);
+            println!("    Mode     : {}", mode_display_name(&entry.mode));
             println!("    Role     : {}", entry.role);
             println!("    Bitrate  : {}", format::pretty_speed(entry.bitrate));
             println!("    MTU      : {} B", entry.mtu);
@@ -866,85 +909,105 @@ fn unix_now_secs() -> u64 {
 }
 
 async fn run_remote(args: Args) -> ExitCode {
-    run_remote_once(&args).await
+    let session = match RemoteSession::open(&args).await {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let exit = session.query_and_print(&args).await;
+    session.shutdown.trigger();
+    exit
 }
 
-async fn run_remote_once(args: &Args) -> ExitCode {
-    let remote_hex = args.remote.as_deref().expect("checked in main");
-    let remote_hash = match hash::parse_dest_hash(remote_hex) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("rnstatus-rs: --remote: {e}");
-            return ExitCode::from(2);
-        }
-    };
+/// Remote-management state reused across monitor refreshes: one runtime,
+/// one identity, one client — only the /status request repeats.
+struct RemoteSession {
+    remote_hash: [u8; 16],
+    client: LinkClient,
+    shutdown: ShutdownSignal,
+    timeout: Duration,
+}
 
-    let identity_path = match args.identity.as_ref() {
-        Some(p) => p.clone(),
-        None => {
-            eprintln!("rnstatus-rs: --remote requires --identity <path>.");
-            return ExitCode::from(2);
-        }
-    };
-    let identity = match rns_identity::identity::Identity::from_file(&identity_path) {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!(
-                "rnstatus-rs: could not load identity from {}: {e:?}",
-                identity_path.display()
-            );
-            return ExitCode::from(1);
-        }
-    };
+impl RemoteSession {
+    async fn open(args: &Args) -> Result<Self, ExitCode> {
+        let remote_hex = args.remote.as_deref().expect("checked in main");
+        let remote_hash = match hash::parse_dest_hash(remote_hex) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("rnstatus-rs: --remote: {e}");
+                return Err(ExitCode::from(2));
+            }
+        };
 
-    let shutdown = ShutdownSignal::new();
-    let foreground = Arc::new(AtomicBool::new(true));
-    let handle = match init(args.config.as_deref(), None, shutdown.clone(), foreground).await {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("rnstatus-rs: failed to initialize Reticulum runtime: {e:?}");
-            return ExitCode::from(1);
-        }
-    };
+        let identity_path = match args.identity.as_ref() {
+            Some(p) => p.clone(),
+            None => {
+                eprintln!("rnstatus-rs: --remote requires --identity <path>.");
+                return Err(ExitCode::from(2));
+            }
+        };
+        let identity = match rns_identity::identity::Identity::from_file(&identity_path) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!(
+                    "rnstatus-rs: could not load identity from {}: {e:?}",
+                    identity_path.display()
+                );
+                return Err(ExitCode::from(1));
+            }
+        };
 
-    let timeout = Duration::from_secs(args.timeout.unwrap_or(REMOTE_TIMEOUT_SECS));
+        let shutdown = ShutdownSignal::new();
+        let foreground = Arc::new(AtomicBool::new(true));
+        let handle = match init(args.config.as_deref(), None, shutdown.clone(), foreground).await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("rnstatus-rs: failed to initialize Reticulum runtime: {e:?}");
+                return Err(ExitCode::from(1));
+            }
+        };
 
-    // Wire format: msgpack 1-tuple `(include_link_count,)`.
-    let payload = match rmp_serde::to_vec(&(args.link_stats,)) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("rnstatus-rs: msgpack encode failed: {e}");
-            shutdown.trigger();
-            return ExitCode::from(1);
-        }
-    };
-
-    let client = LinkClient::new(handle.transport_tx.clone(), identity);
-    let response_bytes = match client
-        .query(
+        Ok(Self {
             remote_hash,
-            MGMT_APP,
-            "/status",
-            payload,
-            REMOTE_HOPS,
-            timeout,
-        )
-        .await
-    {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("rnstatus-rs: remote query failed: {}", remote_err(&e));
-            shutdown.trigger();
-            return match e {
-                LinkClientError::Timeout(_) => ExitCode::from(124),
-                _ => ExitCode::from(1),
-            };
-        }
-    };
+            client: LinkClient::new(handle.transport_tx.clone(), identity),
+            shutdown,
+            timeout: Duration::from_secs(args.timeout.unwrap_or(REMOTE_TIMEOUT_SECS)),
+        })
+    }
 
-    let exit = print_remote_status(&response_bytes, args);
-    shutdown.trigger();
-    exit
+    async fn query_and_print(&self, args: &Args) -> ExitCode {
+        // Wire format: msgpack 1-tuple `(include_link_count,)`.
+        let payload = match rmp_serde::to_vec(&(args.link_stats,)) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("rnstatus-rs: msgpack encode failed: {e}");
+                return ExitCode::from(1);
+            }
+        };
+
+        let response_bytes = match self
+            .client
+            .query(
+                self.remote_hash,
+                MGMT_APP,
+                "/status",
+                payload,
+                REMOTE_HOPS,
+                self.timeout,
+            )
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("rnstatus-rs: remote query failed: {}", remote_err(&e));
+                return match e {
+                    LinkClientError::Timeout(_) => ExitCode::from(124),
+                    _ => ExitCode::from(1),
+                };
+            }
+        };
+
+        print_remote_status(&response_bytes, args)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1115,7 +1178,7 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
             let status = if iface.online { "Up" } else { "Down" };
             println!("  {}", iface.name);
             println!("    Status   : {status}");
-            println!("    Mode     : 0x{:02x}", iface.mode);
+            println!("    Mode     : {}", remote_mode_display_name(iface.mode));
             println!("    Bitrate  : {}", format::pretty_speed(iface.bitrate));
             if let Some(clients) = iface.clients {
                 println!("    Clients  : {clients}");
@@ -1497,6 +1560,58 @@ mod tests {
         assert_eq!(iface.burst_activated, 0.0);
         assert!(!iface.pr_burst_active);
         assert_eq!(iface.pr_burst_activated, 0.0);
+    }
+
+    #[test]
+    fn mode_display_names_match_python_138_table() {
+        assert_eq!(mode_display_name("Full"), "Full");
+        assert_eq!(mode_display_name("PointToPoint"), "Point-to-Point");
+        assert_eq!(mode_display_name("AccessPoint"), "Access Point");
+        assert_eq!(mode_display_name("Roaming"), "Roaming");
+        assert_eq!(mode_display_name("Boundary"), "Boundary");
+        assert_eq!(mode_display_name("Gateway"), "Gateway");
+        assert_eq!(mode_display_name("Internal"), "Internal");
+        // Python rnstatus.py:427 falls back to "Full" for unknown modes.
+        assert_eq!(mode_display_name("Bogus"), "Full");
+
+        assert_eq!(remote_mode_display_name(0x01), "Full");
+        assert_eq!(remote_mode_display_name(0x02), "Point-to-Point");
+        assert_eq!(remote_mode_display_name(0x03), "Access Point");
+        assert_eq!(remote_mode_display_name(0x04), "Roaming");
+        assert_eq!(remote_mode_display_name(0x05), "Boundary");
+        assert_eq!(remote_mode_display_name(0x06), "Gateway");
+        assert_eq!(remote_mode_display_name(0x07), "Internal");
+        assert_eq!(remote_mode_display_name(0x08), "Full");
+    }
+
+    #[test]
+    fn monitor_sleep_compensates_render_time_with_floor() {
+        // Python rnstatus.py:742-744: max(interval - elapsed, 0.2).
+        assert_eq!(
+            monitor_sleep(1.0, Duration::from_millis(250)),
+            Duration::from_secs_f64(0.75)
+        );
+        assert_eq!(
+            monitor_sleep(1.0, Duration::from_secs(5)),
+            Duration::from_secs_f64(0.2)
+        );
+        assert_eq!(
+            monitor_sleep(0.05, Duration::ZERO),
+            Duration::from_secs_f64(0.2)
+        );
+    }
+
+    #[test]
+    fn monitor_interval_must_be_finite_positive() {
+        let mut args = test_args();
+        args.monitor_interval = 0.0;
+        assert!(validate_args(&args).is_err());
+        args.monitor_interval = f64::INFINITY;
+        assert!(validate_args(&args).is_err());
+        args.monitor_interval = f64::NAN;
+        assert!(validate_args(&args).is_err());
+        args.monitor_interval = 0.5;
+        assert!(validate_args(&args).is_ok());
     }
 
     #[test]

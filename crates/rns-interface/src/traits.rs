@@ -36,6 +36,8 @@ pub enum InterfaceMode {
     Roaming = 0x04,
     Boundary = 0x05,
     Gateway = 0x06,
+    /// Python 1.3.8 `MODE_INTERNAL` (Interface.py:51) — local/shared-instance interfaces.
+    Internal = 0x07,
 }
 
 pub const MODE_FULL: InterfaceMode = InterfaceMode::Full;
@@ -51,6 +53,7 @@ pub const DISCOVER_PATHS_FOR: &[InterfaceMode] = &[
     InterfaceMode::AccessPoint,
     InterfaceMode::Gateway,
     InterfaceMode::Roaming,
+    InterfaceMode::Internal,
 ];
 
 impl InterfaceMode {
@@ -62,6 +65,7 @@ impl InterfaceMode {
             0x04 => Some(Self::Roaming),
             0x05 => Some(Self::Boundary),
             0x06 => Some(Self::Gateway),
+            0x07 => Some(Self::Internal),
             _ => None,
         }
     }
@@ -174,6 +178,7 @@ mod tests {
         assert_eq!(InterfaceMode::Roaming as u8, 0x04);
         assert_eq!(InterfaceMode::Boundary as u8, 0x05);
         assert_eq!(InterfaceMode::Gateway as u8, 0x06);
+        assert_eq!(InterfaceMode::Internal as u8, 0x07);
     }
 
     #[test]
@@ -184,7 +189,9 @@ mod tests {
             Some(InterfaceMode::PointToPoint)
         );
         assert_eq!(InterfaceMode::from_u8(0x06), Some(InterfaceMode::Gateway));
+        assert_eq!(InterfaceMode::from_u8(0x07), Some(InterfaceMode::Internal));
         assert_eq!(InterfaceMode::from_u8(0x00), None);
+        assert_eq!(InterfaceMode::from_u8(0x08), None);
         assert_eq!(InterfaceMode::from_u8(0xFF), None);
     }
 
@@ -199,6 +206,7 @@ mod tests {
         assert!(DISCOVER_PATHS_FOR.contains(&InterfaceMode::AccessPoint));
         assert!(DISCOVER_PATHS_FOR.contains(&InterfaceMode::Gateway));
         assert!(DISCOVER_PATHS_FOR.contains(&InterfaceMode::Roaming));
+        assert!(DISCOVER_PATHS_FOR.contains(&InterfaceMode::Internal));
         assert!(!DISCOVER_PATHS_FOR.contains(&InterfaceMode::Full));
     }
 

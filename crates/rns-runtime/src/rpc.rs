@@ -2,9 +2,11 @@
 //!
 //! Python Reticulum uses `multiprocessing.connection.Listener/Client` for the
 //! local control port. Keep the Rust control socket wire-compatible with that:
-//! framed auth challenge (`#CHALLENGE#`), framed pickle request dictionaries,
-//! and framed pickle responses. Python 3.12+ uses tagged SHA-256 auth
-//! challenges, while Python 3.11 and older use raw MD5 HMAC responses.
+//! framed auth challenge (`#CHALLENGE#`), then framed msgpack request
+//! dictionaries and responses, byte-exact with the vendored umsgpack
+//! (Python >=1.3.4, commit a2ef9782 — hard cutover from pickle, no fallback).
+//! Python 3.12+ uses tagged SHA-256 auth challenges, while Python 3.11 and
+//! older use raw MD5 HMAC responses.
 
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +81,10 @@ pub enum RpcRequest {
         packet_hash: Vec<u8>,
     },
     GetBlackholedIdentities,
+    /// Python 1.3.8 `is_blackholed()` RPC verb (Reticulum.py:1649-1661).
+    IsBlackholed {
+        identity_hash: Vec<u8>,
+    },
     DropPath {
         destination_hash: Vec<u8>,
     },
@@ -192,20 +198,20 @@ pub struct BlackholeEntry {
 }
 
 pub fn encode_request(req: &RpcRequest) -> Result<Vec<u8>, RpcError> {
-    encode_python_pickle(&request_to_py_value(req))
+    encode_umsgpack(&request_to_py_value(req))
 }
 
 pub fn decode_request(data: &[u8]) -> Result<RpcRequest, RpcError> {
-    let value = decode_python_pickle(data)?;
+    let value = decode_umsgpack(data)?;
     py_value_to_request(&value)
 }
 
 pub fn encode_response(resp: &RpcResponse) -> Result<Vec<u8>, RpcError> {
-    encode_python_pickle(&response_to_py_value(resp))
+    encode_umsgpack(&response_to_py_value(resp))
 }
 
 pub fn decode_response(data: &[u8]) -> Result<RpcResponse, RpcError> {
-    let value = decode_python_pickle(data)?;
+    let value = decode_umsgpack(data)?;
     py_value_to_response(&value)
 }
 
@@ -213,7 +219,7 @@ pub fn decode_response_for_request(
     data: &[u8],
     request: &RpcRequest,
 ) -> Result<RpcResponse, RpcError> {
-    let value = decode_python_pickle(data)?;
+    let value = decode_umsgpack(data)?;
     py_value_to_response_for_request(&value, request)
 }
 
@@ -304,6 +310,10 @@ fn request_to_py_value(req: &RpcRequest) -> PyValue {
             ("packet_hash", PyValue::Bytes(packet_hash.clone())),
         ]),
         RpcRequest::GetBlackholedIdentities => py_get("blackholed_identities"),
+        RpcRequest::IsBlackholed { identity_hash } => py_dict(vec![
+            ("get", PyValue::String("is_blackholed".to_string())),
+            ("identity_hash", PyValue::Bytes(identity_hash.clone())),
+        ]),
         RpcRequest::DropPath { destination_hash } => py_dict(vec![
             ("drop", PyValue::String("path".to_string())),
             ("destination_hash", PyValue::Bytes(destination_hash.clone())),
@@ -400,6 +410,9 @@ fn py_value_to_request(value: &PyValue) -> Result<RpcRequest, RpcError> {
                 packet_hash: dict_bytes(entries, "packet_hash")?,
             }),
             "blackholed_identities" => Ok(RpcRequest::GetBlackholedIdentities),
+            "is_blackholed" => Ok(RpcRequest::IsBlackholed {
+                identity_hash: dict_bytes(entries, "identity_hash")?,
+            }),
             other => Err(RpcError::Deserialize(format!(
                 "unknown Python RPC get path: {other}"
             ))),
@@ -687,7 +700,8 @@ fn py_value_to_response_for_request(
         | RpcRequest::DropAnnounceQueues
         | RpcRequest::BlackholeIdentity { .. }
         | RpcRequest::UnblackholeIdentity { .. } => Ok(RpcResponse::Ok),
-        RpcRequest::UseDestination { .. }
+        RpcRequest::IsBlackholed { .. }
+        | RpcRequest::UseDestination { .. }
         | RpcRequest::RetainDestination { .. }
         | RpcRequest::RetainIdentity { .. }
         | RpcRequest::UnretainDestination { .. } => Ok(RpcResponse::BoolResult(match value {
@@ -1012,6 +1026,8 @@ fn mode_to_python_int(mode: &str) -> u8 {
         "Roaming" => 0x04,
         "Boundary" => 0x05,
         "Gateway" => 0x06,
+        // Python 1.3.8 MODE_INTERNAL (Interface.py:51).
+        "Internal" => 0x07,
         _ => 0x01,
     }
 }
@@ -1024,346 +1040,283 @@ fn mode_from_py_value(value: &PyValue) -> String {
         PyValue::Int(4) => "Roaming",
         PyValue::Int(5) => "Boundary",
         PyValue::Int(6) => "Gateway",
+        PyValue::Int(7) => "Internal",
         PyValue::String(s) => s.as_str(),
         _ => "Full",
     }
     .to_string()
 }
 
-fn encode_python_pickle(value: &PyValue) -> Result<Vec<u8>, RpcError> {
-    let mut out = vec![0x80, 0x04]; // PROTO 4, no FRAME needed for small control messages.
-    encode_pickle_value(value, &mut out)?;
-    out.push(b'.'); // STOP
+/// Nesting cap for inbound payloads; the recursive decoder must not let a
+/// hostile local client blow the stack (umsgpack relies on Python's ~1000
+/// recursion limit for the same purpose).
+const MAX_MSGPACK_DEPTH: usize = 128;
+
+/// Byte-exact with `RNS.vendor.umsgpack.packb` (1.3.8) for the value tree the
+/// RPC vocabulary uses: nil/bool/int/float64/str/bin/array/map.
+fn encode_umsgpack(value: &PyValue) -> Result<Vec<u8>, RpcError> {
+    let mut out = Vec::new();
+    encode_msgpack_value(value, &mut out)?;
     Ok(out)
 }
 
-fn encode_pickle_value(value: &PyValue, out: &mut Vec<u8>) -> Result<(), RpcError> {
+fn encode_msgpack_value(value: &PyValue, out: &mut Vec<u8>) -> Result<(), RpcError> {
     match value {
-        PyValue::None => out.push(b'N'),
-        PyValue::Bool(true) => out.push(0x88),
-        PyValue::Bool(false) => out.push(0x89),
-        PyValue::Int(v) => encode_pickle_int(*v, out)?,
+        PyValue::None => out.push(0xc0),
+        PyValue::Bool(true) => out.push(0xc3),
+        PyValue::Bool(false) => out.push(0xc2),
+        PyValue::Int(v) => encode_msgpack_int(*v, out)?,
+        // umsgpack packs Python floats as float64 (`_float_precision = "double"`).
         PyValue::Float(v) => {
-            out.push(b'G');
+            out.push(0xcb);
             out.extend_from_slice(&v.to_be_bytes());
         }
-        PyValue::Bytes(bytes) => encode_pickle_bytes(bytes, out)?,
-        PyValue::String(s) => encode_pickle_string(s, out)?,
+        PyValue::Bytes(bytes) => encode_msgpack_bytes(bytes, out)?,
+        PyValue::String(s) => encode_msgpack_string(s, out)?,
         PyValue::List(values) => {
-            out.push(b']');
-            if !values.is_empty() {
-                out.push(b'(');
-                for value in values {
-                    encode_pickle_value(value, out)?;
-                }
-                out.push(b'e'); // APPENDS
+            encode_msgpack_seq_header(values.len(), 0x90, 0xdc, "array", out)?;
+            for value in values {
+                encode_msgpack_value(value, out)?;
             }
         }
         PyValue::Dict(entries) => {
-            out.push(b'}');
-            if !entries.is_empty() {
-                out.push(b'(');
-                for (key, value) in entries {
-                    encode_pickle_key(key, out)?;
-                    encode_pickle_value(value, out)?;
+            encode_msgpack_seq_header(entries.len(), 0x80, 0xde, "map", out)?;
+            for (key, value) in entries {
+                match key {
+                    PyDictKey::String(s) => encode_msgpack_string(s, out)?,
+                    PyDictKey::Bytes(bytes) => encode_msgpack_bytes(bytes, out)?,
                 }
-                out.push(b'u'); // SETITEMS
+                encode_msgpack_value(value, out)?;
             }
         }
     }
     Ok(())
 }
 
-fn encode_pickle_key(key: &PyDictKey, out: &mut Vec<u8>) -> Result<(), RpcError> {
-    match key {
-        PyDictKey::String(s) => encode_pickle_string(s, out),
-        PyDictKey::Bytes(bytes) => encode_pickle_bytes(bytes, out),
+/// Shared fixarray/fixmap + 16/32-bit header layout (`_pack_array`/`_pack_map`).
+fn encode_msgpack_seq_header(
+    len: usize,
+    fix_base: u8,
+    len16_code: u8,
+    kind: &str,
+    out: &mut Vec<u8>,
+) -> Result<(), RpcError> {
+    if len < 16 {
+        out.push(fix_base | len as u8);
+    } else if let Ok(v) = u16::try_from(len) {
+        out.push(len16_code);
+        out.extend_from_slice(&v.to_be_bytes());
+    } else if let Ok(v) = u32::try_from(len) {
+        out.push(len16_code + 1);
+        out.extend_from_slice(&v.to_be_bytes());
+    } else {
+        return Err(RpcError::Serialize(format!("huge {kind}")));
     }
+    Ok(())
 }
 
-fn encode_pickle_string(s: &str, out: &mut Vec<u8>) -> Result<(), RpcError> {
+/// umsgpack `_pack_integer`: values outside i64::MIN..=u64::MAX raise
+/// UnsupportedTypeException — mirror the rejection exactly.
+fn encode_msgpack_int(value: i128, out: &mut Vec<u8>) -> Result<(), RpcError> {
+    if value < 0 {
+        if value >= -32 {
+            out.push(value as i8 as u8);
+        } else if value >= i128::from(i8::MIN) {
+            out.push(0xd0);
+            out.push(value as i8 as u8);
+        } else if value >= i128::from(i16::MIN) {
+            out.push(0xd1);
+            out.extend_from_slice(&(value as i16).to_be_bytes());
+        } else if value >= i128::from(i32::MIN) {
+            out.push(0xd2);
+            out.extend_from_slice(&(value as i32).to_be_bytes());
+        } else if value >= i128::from(i64::MIN) {
+            out.push(0xd3);
+            out.extend_from_slice(&(value as i64).to_be_bytes());
+        } else {
+            return Err(RpcError::Serialize("huge signed int".to_string()));
+        }
+    } else if value < 128 {
+        out.push(value as u8);
+    } else if value < 1 << 8 {
+        out.push(0xcc);
+        out.push(value as u8);
+    } else if value < 1 << 16 {
+        out.push(0xcd);
+        out.extend_from_slice(&(value as u16).to_be_bytes());
+    } else if value < 1 << 32 {
+        out.push(0xce);
+        out.extend_from_slice(&(value as u32).to_be_bytes());
+    } else if value <= i128::from(u64::MAX) {
+        out.push(0xcf);
+        out.extend_from_slice(&(value as u64).to_be_bytes());
+    } else {
+        return Err(RpcError::Serialize("huge unsigned int".to_string()));
+    }
+    Ok(())
+}
+
+fn encode_msgpack_string(s: &str, out: &mut Vec<u8>) -> Result<(), RpcError> {
     let bytes = s.as_bytes();
-    if let Ok(len) = u8::try_from(bytes.len()) {
-        out.push(0x8c); // SHORT_BINUNICODE
-        out.push(len);
-    } else {
-        let len = u32::try_from(bytes.len())
-            .map_err(|_| RpcError::Serialize("string too large for pickle".to_string()))?;
-        out.push(b'X'); // BINUNICODE
-        out.extend_from_slice(&len.to_le_bytes());
-    }
-    out.extend_from_slice(bytes);
-    Ok(())
-}
-
-fn encode_pickle_bytes(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), RpcError> {
-    if let Ok(len) = u8::try_from(bytes.len()) {
-        out.push(b'C'); // SHORT_BINBYTES
-        out.push(len);
-    } else {
-        let len = u32::try_from(bytes.len())
-            .map_err(|_| RpcError::Serialize("bytes too large for pickle".to_string()))?;
-        out.push(b'B'); // BINBYTES
-        out.extend_from_slice(&len.to_le_bytes());
-    }
-    out.extend_from_slice(bytes);
-    Ok(())
-}
-
-fn encode_pickle_int(value: i128, out: &mut Vec<u8>) -> Result<(), RpcError> {
-    if let Ok(v) = u8::try_from(value) {
-        out.push(b'K'); // BININT1
+    let len = bytes.len();
+    if len < 32 {
+        out.push(0xa0 | len as u8);
+    } else if let Ok(v) = u8::try_from(len) {
+        out.push(0xd9);
         out.push(v);
-    } else if let Ok(v) = u16::try_from(value) {
-        out.push(b'M'); // BININT2
-        out.extend_from_slice(&v.to_le_bytes());
-    } else if let Ok(v) = i32::try_from(value) {
-        out.push(b'J'); // BININT
-        out.extend_from_slice(&v.to_le_bytes());
-    } else if value >= 0 {
-        let mut n = u128::try_from(value)
-            .map_err(|_| RpcError::Serialize("negative big integers unsupported".to_string()))?;
-        let mut bytes = Vec::new();
-        while n > 0 {
-            bytes.push((n & 0xff) as u8);
-            n >>= 8;
-        }
-        if bytes.last().is_some_and(|b| b & 0x80 != 0) {
-            bytes.push(0);
-        }
-        let len = u8::try_from(bytes.len())
-            .map_err(|_| RpcError::Serialize("integer too large for pickle".to_string()))?;
-        out.push(0x8a); // LONG1
-        out.push(len);
-        out.extend_from_slice(&bytes);
+    } else if let Ok(v) = u16::try_from(len) {
+        out.push(0xda);
+        out.extend_from_slice(&v.to_be_bytes());
+    } else if let Ok(v) = u32::try_from(len) {
+        out.push(0xdb);
+        out.extend_from_slice(&v.to_be_bytes());
     } else {
-        return Err(RpcError::Serialize(
-            "negative big integers unsupported".to_string(),
-        ));
+        return Err(RpcError::Serialize("huge string".to_string()));
     }
+    out.extend_from_slice(bytes);
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-enum StackItem {
-    Mark,
-    Value(PyValue),
+fn encode_msgpack_bytes(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), RpcError> {
+    let len = bytes.len();
+    if let Ok(v) = u8::try_from(len) {
+        out.push(0xc4);
+        out.push(v);
+    } else if let Ok(v) = u16::try_from(len) {
+        out.push(0xc5);
+        out.extend_from_slice(&v.to_be_bytes());
+    } else if let Ok(v) = u32::try_from(len) {
+        out.push(0xc6);
+        out.extend_from_slice(&v.to_be_bytes());
+    } else {
+        return Err(RpcError::Serialize("huge binary string".to_string()));
+    }
+    out.extend_from_slice(bytes);
+    Ok(())
 }
 
-fn decode_python_pickle(data: &[u8]) -> Result<PyValue, RpcError> {
+/// Like `umsgpack.unpackb`: decodes one object, ignores trailing bytes.
+fn decode_umsgpack(data: &[u8]) -> Result<PyValue, RpcError> {
     let mut i = 0usize;
-    let mut stack: Vec<StackItem> = Vec::new();
-    let mut memo: Vec<PyValue> = Vec::new();
+    decode_msgpack_value(data, &mut i, 0)
+}
 
-    while i < data.len() {
-        let op = data[i];
-        i += 1;
-        match op {
-            0x80 => {
-                read_exact(data, &mut i, 1)?;
-            }
-            0x95 => {
-                read_exact(data, &mut i, 8)?;
-            }
-            0x94 => {
-                let value = stack_value(stack.last())?.clone();
-                memo.push(value);
-            }
-            b'h' => {
-                let idx = read_u8(data, &mut i)? as usize;
-                let value = memo.get(idx).cloned().ok_or_else(|| {
-                    RpcError::Deserialize(format!("pickle memo index out of range: {idx}"))
-                })?;
-                stack.push(StackItem::Value(value));
-            }
-            b'j' => {
-                let idx = read_u32_le(data, &mut i)? as usize;
-                let value = memo.get(idx).cloned().ok_or_else(|| {
-                    RpcError::Deserialize(format!("pickle memo index out of range: {idx}"))
-                })?;
-                stack.push(StackItem::Value(value));
-            }
-            b'}' => stack.push(StackItem::Value(PyValue::Dict(Vec::new()))),
-            b']' => stack.push(StackItem::Value(PyValue::List(Vec::new()))),
-            b'(' => stack.push(StackItem::Mark),
-            0x8c => {
-                let len = read_u8(data, &mut i)? as usize;
-                let bytes = read_exact(data, &mut i, len)?;
-                let s = std::str::from_utf8(bytes)
-                    .map_err(|e| RpcError::Deserialize(e.to_string()))?
-                    .to_string();
-                stack.push(StackItem::Value(PyValue::String(s)));
-            }
-            b'X' => {
-                let len = read_u32_le(data, &mut i)? as usize;
-                let bytes = read_exact(data, &mut i, len)?;
-                let s = std::str::from_utf8(bytes)
-                    .map_err(|e| RpcError::Deserialize(e.to_string()))?
-                    .to_string();
-                stack.push(StackItem::Value(PyValue::String(s)));
-            }
-            0x8d => {
-                let len = read_u64_le(data, &mut i)? as usize;
-                let bytes = read_exact(data, &mut i, len)?;
-                let s = std::str::from_utf8(bytes)
-                    .map_err(|e| RpcError::Deserialize(e.to_string()))?
-                    .to_string();
-                stack.push(StackItem::Value(PyValue::String(s)));
-            }
-            b'C' => {
-                let len = read_u8(data, &mut i)? as usize;
-                let bytes = read_exact(data, &mut i, len)?.to_vec();
-                stack.push(StackItem::Value(PyValue::Bytes(bytes)));
-            }
-            b'B' => {
-                let len = read_u32_le(data, &mut i)? as usize;
-                let bytes = read_exact(data, &mut i, len)?.to_vec();
-                stack.push(StackItem::Value(PyValue::Bytes(bytes)));
-            }
-            0x8e => {
-                let len = read_u64_le(data, &mut i)? as usize;
-                let bytes = read_exact(data, &mut i, len)?.to_vec();
-                stack.push(StackItem::Value(PyValue::Bytes(bytes)));
-            }
-            b'N' => stack.push(StackItem::Value(PyValue::None)),
-            0x88 => stack.push(StackItem::Value(PyValue::Bool(true))),
-            0x89 => stack.push(StackItem::Value(PyValue::Bool(false))),
-            b'K' => {
-                let v = read_u8(data, &mut i)?;
-                stack.push(StackItem::Value(PyValue::Int(i128::from(v))));
-            }
-            b'M' => {
-                let v = read_u16_le(data, &mut i)?;
-                stack.push(StackItem::Value(PyValue::Int(i128::from(v))));
-            }
-            b'J' => {
-                let bytes = read_exact(data, &mut i, 4)?;
-                let v = i32::from_le_bytes(bytes.try_into().unwrap());
-                stack.push(StackItem::Value(PyValue::Int(i128::from(v))));
-            }
-            0x8a => {
-                let len = read_u8(data, &mut i)? as usize;
-                let bytes = read_exact(data, &mut i, len)?;
-                stack.push(StackItem::Value(PyValue::Int(decode_pickle_long(bytes)?)));
-            }
-            0x8b => {
-                let len = read_u32_le(data, &mut i)? as usize;
-                let bytes = read_exact(data, &mut i, len)?;
-                stack.push(StackItem::Value(PyValue::Int(decode_pickle_long(bytes)?)));
-            }
-            b'G' => {
-                let bytes = read_exact(data, &mut i, 8)?;
-                let v = f64::from_be_bytes(bytes.try_into().unwrap());
-                stack.push(StackItem::Value(PyValue::Float(v)));
-            }
-            b's' => apply_setitem(&mut stack)?,
-            b'u' => apply_setitems(&mut stack)?,
-            b'a' => apply_append(&mut stack)?,
-            b'e' => apply_appends(&mut stack)?,
-            b'.' => {
-                return match stack.pop() {
-                    Some(StackItem::Value(value)) => Ok(value),
-                    _ => Err(RpcError::Deserialize(
-                        "pickle ended without value".to_string(),
-                    )),
-                };
-            }
-            other => {
-                return Err(RpcError::Deserialize(format!(
-                    "unsupported pickle opcode 0x{other:02x}"
-                )));
-            }
+fn decode_msgpack_value(data: &[u8], i: &mut usize, depth: usize) -> Result<PyValue, RpcError> {
+    if depth > MAX_MSGPACK_DEPTH {
+        return Err(RpcError::Deserialize(
+            "msgpack nesting too deep".to_string(),
+        ));
+    }
+    let code = read_u8(data, i)?;
+    match code {
+        0x00..=0x7f => Ok(PyValue::Int(i128::from(code))),
+        0xe0..=0xff => Ok(PyValue::Int(i128::from(code as i8))),
+        0x80..=0x8f => decode_msgpack_map(data, i, usize::from(code & 0x0f), depth),
+        0x90..=0x9f => decode_msgpack_array(data, i, usize::from(code & 0x0f), depth),
+        0xa0..=0xbf => decode_msgpack_str(data, i, usize::from(code & 0x1f)),
+        0xc0 => Ok(PyValue::None),
+        0xc2 => Ok(PyValue::Bool(false)),
+        0xc3 => Ok(PyValue::Bool(true)),
+        0xc4 => {
+            let len = read_u8(data, i)? as usize;
+            Ok(PyValue::Bytes(read_exact(data, i, len)?.to_vec()))
         }
-    }
-
-    Err(RpcError::Deserialize("pickle missing STOP".to_string()))
-}
-
-fn stack_value(item: Option<&StackItem>) -> Result<&PyValue, RpcError> {
-    match item {
-        Some(StackItem::Value(value)) => Ok(value),
-        _ => Err(RpcError::Deserialize("expected pickle value".to_string())),
-    }
-}
-
-fn pop_value(stack: &mut Vec<StackItem>) -> Result<PyValue, RpcError> {
-    match stack.pop() {
-        Some(StackItem::Value(value)) => Ok(value),
-        _ => Err(RpcError::Deserialize("expected pickle value".to_string())),
-    }
-}
-
-fn apply_setitem(stack: &mut Vec<StackItem>) -> Result<(), RpcError> {
-    let value = pop_value(stack)?;
-    let key = pop_value(stack)?;
-    let Some(StackItem::Value(PyValue::Dict(entries))) = stack.last_mut() else {
-        return Err(RpcError::Deserialize(
-            "SETITEM target is not a dictionary".to_string(),
-        ));
-    };
-    entries.push((py_key(key)?, value));
-    Ok(())
-}
-
-fn apply_setitems(stack: &mut Vec<StackItem>) -> Result<(), RpcError> {
-    let mark = find_mark(stack)?;
-    let items = stack.split_off(mark + 1);
-    stack.pop();
-    let Some(StackItem::Value(PyValue::Dict(entries))) = stack.last_mut() else {
-        return Err(RpcError::Deserialize(
-            "SETITEMS target is not a dictionary".to_string(),
-        ));
-    };
-    let mut values = items.into_iter().map(|item| match item {
-        StackItem::Value(value) => Ok(value),
-        StackItem::Mark => Err(RpcError::Deserialize("nested mark in SETITEMS".to_string())),
-    });
-    while let Some(key) = values.next() {
-        let key = key?;
-        let value = values
-            .next()
-            .ok_or_else(|| RpcError::Deserialize("odd SETITEMS count".to_string()))??;
-        entries.push((py_key(key)?, value));
-    }
-    Ok(())
-}
-
-fn apply_append(stack: &mut Vec<StackItem>) -> Result<(), RpcError> {
-    let value = pop_value(stack)?;
-    let Some(StackItem::Value(PyValue::List(values))) = stack.last_mut() else {
-        return Err(RpcError::Deserialize(
-            "APPEND target is not a list".to_string(),
-        ));
-    };
-    values.push(value);
-    Ok(())
-}
-
-fn apply_appends(stack: &mut Vec<StackItem>) -> Result<(), RpcError> {
-    let mark = find_mark(stack)?;
-    let items = stack.split_off(mark + 1);
-    stack.pop();
-    let Some(StackItem::Value(PyValue::List(values))) = stack.last_mut() else {
-        return Err(RpcError::Deserialize(
-            "APPENDS target is not a list".to_string(),
-        ));
-    };
-    for item in items {
-        match item {
-            StackItem::Value(value) => values.push(value),
-            StackItem::Mark => {
-                return Err(RpcError::Deserialize("nested mark in APPENDS".to_string()));
-            }
+        0xc5 => {
+            let len = read_u16_be(data, i)? as usize;
+            Ok(PyValue::Bytes(read_exact(data, i, len)?.to_vec()))
         }
+        0xc6 => {
+            let len = read_u32_be(data, i)? as usize;
+            Ok(PyValue::Bytes(read_exact(data, i, len)?.to_vec()))
+        }
+        0xca => {
+            let bytes = read_exact(data, i, 4)?;
+            let v = f32::from_be_bytes(bytes.try_into().unwrap());
+            Ok(PyValue::Float(f64::from(v)))
+        }
+        0xcb => {
+            let bytes = read_exact(data, i, 8)?;
+            let v = f64::from_be_bytes(bytes.try_into().unwrap());
+            Ok(PyValue::Float(v))
+        }
+        0xcc => Ok(PyValue::Int(i128::from(read_u8(data, i)?))),
+        0xcd => Ok(PyValue::Int(i128::from(read_u16_be(data, i)?))),
+        0xce => Ok(PyValue::Int(i128::from(read_u32_be(data, i)?))),
+        0xcf => Ok(PyValue::Int(i128::from(read_u64_be(data, i)?))),
+        0xd0 => Ok(PyValue::Int(i128::from(read_u8(data, i)? as i8))),
+        0xd1 => Ok(PyValue::Int(i128::from(read_u16_be(data, i)? as i16))),
+        0xd2 => Ok(PyValue::Int(i128::from(read_u32_be(data, i)? as i32))),
+        0xd3 => Ok(PyValue::Int(i128::from(read_u64_be(data, i)? as i64))),
+        0xd9 => {
+            let len = read_u8(data, i)? as usize;
+            decode_msgpack_str(data, i, len)
+        }
+        0xda => {
+            let len = read_u16_be(data, i)? as usize;
+            decode_msgpack_str(data, i, len)
+        }
+        0xdb => {
+            let len = read_u32_be(data, i)? as usize;
+            decode_msgpack_str(data, i, len)
+        }
+        0xdc => {
+            let len = read_u16_be(data, i)? as usize;
+            decode_msgpack_array(data, i, len, depth)
+        }
+        0xdd => {
+            let len = read_u32_be(data, i)? as usize;
+            decode_msgpack_array(data, i, len, depth)
+        }
+        0xde => {
+            let len = read_u16_be(data, i)? as usize;
+            decode_msgpack_map(data, i, len, depth)
+        }
+        0xdf => {
+            let len = read_u32_be(data, i)? as usize;
+            decode_msgpack_map(data, i, len, depth)
+        }
+        // Ext/timestamp families (0xc1 reserved, 0xc7-0xc9, 0xd4-0xd8) never
+        // appear in the RPC vocabulary.
+        other => Err(RpcError::Deserialize(format!(
+            "unsupported msgpack type code 0x{other:02x}"
+        ))),
     }
-    Ok(())
 }
 
-fn find_mark(stack: &[StackItem]) -> Result<usize, RpcError> {
-    stack
-        .iter()
-        .rposition(|item| matches!(item, StackItem::Mark))
-        .ok_or_else(|| RpcError::Deserialize("pickle mark not found".to_string()))
+fn decode_msgpack_str(data: &[u8], i: &mut usize, len: usize) -> Result<PyValue, RpcError> {
+    let bytes = read_exact(data, i, len)?;
+    // umsgpack default: invalid UTF-8 raises InvalidStringException.
+    let s = std::str::from_utf8(bytes)
+        .map_err(|_| RpcError::Deserialize("unpacked string is invalid utf-8".to_string()))?;
+    Ok(PyValue::String(s.to_string()))
+}
+
+fn decode_msgpack_array(
+    data: &[u8],
+    i: &mut usize,
+    len: usize,
+    depth: usize,
+) -> Result<PyValue, RpcError> {
+    let mut values = Vec::with_capacity(len.min(1024));
+    for _ in 0..len {
+        values.push(decode_msgpack_value(data, i, depth + 1)?);
+    }
+    Ok(PyValue::List(values))
+}
+
+fn decode_msgpack_map(
+    data: &[u8],
+    i: &mut usize,
+    len: usize,
+    depth: usize,
+) -> Result<PyValue, RpcError> {
+    let mut entries = Vec::with_capacity(len.min(1024));
+    for _ in 0..len {
+        let key = py_key(decode_msgpack_value(data, i, depth + 1)?)?;
+        let value = decode_msgpack_value(data, i, depth + 1)?;
+        entries.push((key, value));
+    }
+    Ok(PyValue::Dict(entries))
 }
 
 fn py_key(value: PyValue) -> Result<PyDictKey, RpcError> {
@@ -1376,31 +1329,12 @@ fn py_key(value: PyValue) -> Result<PyDictKey, RpcError> {
     }
 }
 
-fn decode_pickle_long(bytes: &[u8]) -> Result<i128, RpcError> {
-    if bytes.is_empty() {
-        return Ok(0);
-    }
-    if bytes.len() > 16 {
-        return Err(RpcError::Deserialize(
-            "pickle LONG exceeds i128 range".to_string(),
-        ));
-    }
-    let mut value = 0i128;
-    for (shift, byte) in bytes.iter().enumerate() {
-        value |= i128::from(*byte) << (shift * 8);
-    }
-    if bytes.last().is_some_and(|b| b & 0x80 != 0) {
-        value -= 1i128 << (bytes.len() * 8);
-    }
-    Ok(value)
-}
-
 fn read_exact<'a>(data: &'a [u8], index: &mut usize, len: usize) -> Result<&'a [u8], RpcError> {
     let end = index
         .checked_add(len)
-        .ok_or_else(|| RpcError::Deserialize("pickle length overflow".to_string()))?;
+        .ok_or_else(|| RpcError::Deserialize("msgpack length overflow".to_string()))?;
     if end > data.len() {
-        return Err(RpcError::Deserialize("truncated pickle".to_string()));
+        return Err(RpcError::Deserialize("truncated msgpack".to_string()));
     }
     let out = &data[*index..end];
     *index = end;
@@ -1411,19 +1345,19 @@ fn read_u8(data: &[u8], index: &mut usize) -> Result<u8, RpcError> {
     Ok(read_exact(data, index, 1)?[0])
 }
 
-fn read_u16_le(data: &[u8], index: &mut usize) -> Result<u16, RpcError> {
+fn read_u16_be(data: &[u8], index: &mut usize) -> Result<u16, RpcError> {
     let bytes = read_exact(data, index, 2)?;
-    Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+    Ok(u16::from_be_bytes(bytes.try_into().unwrap()))
 }
 
-fn read_u32_le(data: &[u8], index: &mut usize) -> Result<u32, RpcError> {
+fn read_u32_be(data: &[u8], index: &mut usize) -> Result<u32, RpcError> {
     let bytes = read_exact(data, index, 4)?;
-    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+    Ok(u32::from_be_bytes(bytes.try_into().unwrap()))
 }
 
-fn read_u64_le(data: &[u8], index: &mut usize) -> Result<u64, RpcError> {
+fn read_u64_be(data: &[u8], index: &mut usize) -> Result<u64, RpcError> {
     let bytes = read_exact(data, index, 8)?;
-    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+    Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
 }
 
 pub fn compute_python_auth_response(key: &[u8], message: &[u8]) -> Vec<u8> {
@@ -1859,7 +1793,7 @@ mod tests {
                 ("status", PyValue::Bool(true)),
             ])]),
         )]);
-        let encoded = encode_python_pickle(&legacy).unwrap();
+        let encoded = encode_umsgpack(&legacy).unwrap();
         let decoded =
             decode_response_for_request(&encoded, &RpcRequest::GetInterfaceStats).unwrap();
         match decoded {
@@ -1888,7 +1822,7 @@ mod tests {
                 ("source", PyValue::Bytes(vec![0xAA; 16])),
             ]),
         )]);
-        let encoded = encode_python_pickle(&value).unwrap();
+        let encoded = encode_umsgpack(&value).unwrap();
         match decode_response_for_request(&encoded, &RpcRequest::GetBlackholedIdentities).unwrap() {
             RpcResponse::BlackholeList(entries) => {
                 assert_eq!(entries.len(), 1);
@@ -1995,11 +1929,251 @@ mod tests {
             RpcRequest::UnretainDestination {
                 destination_hash: vec![0; 16],
             },
+            RpcRequest::IsBlackholed {
+                identity_hash: vec![0; 16],
+            },
         ];
 
         for req in &requests {
             let encoded = encode_request(req).unwrap();
             let _ = decode_request(&encoded).unwrap();
         }
+    }
+
+    // Fixtures generated by running the VERBATIM 1.3.8 vendored umsgpack
+    // (git show 1.3.8:RNS/vendor/umsgpack.py, packb) over the RPC dict shapes
+    // Python 1.3.8 Reticulum.py packs on the shared-instance control socket.
+    const FX_REQ_PATH_TABLE_NONE: &str = "82a3676574aa706174685f7461626c65a86d61785f686f7073c0";
+    const FX_REQ_PATH_TABLE_8: &str = "82a3676574aa706174685f7461626c65a86d61785f686f707308";
+    const FX_REQ_INTERFACE_STATS: &str = "81a3676574af696e746572666163655f7374617473";
+    const FX_REQ_IS_BLACKHOLED: &str = "82a3676574ad69735f626c61636b686f6c6564ad6964656e746974795f68617368c410000102030405060708090a0b0c0d0e0f";
+    const FX_REQ_NEXT_HOP: &str = "82a3676574a86e6578745f686f70b064657374696e6174696f6e5f68617368c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const FX_REQ_DROP_PATH: &str = "82a464726f70a470617468b064657374696e6174696f6e5f68617368c410bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const FX_REQ_BLACKHOLE_IDENTITY: &str = "83b2626c61636b686f6c655f6964656e74697479c41042424242424242424242424242424242a5756e74696ccb41d26580b4a00000a6726561736f6ea474657374";
+    const FX_REQ_BLACKHOLE_IDENTITY_NONE: &str = "83b2626c61636b686f6c655f6964656e74697479c41042424242424242424242424242424242a5756e74696cc0a6726561736f6ec0";
+    const FX_REQ_DESTINATION_DATA_USED: &str = "82b064657374696e6174696f6e5f64617461a475736564b064657374696e6174696f6e5f68617368c410cccccccccccccccccccccccccccccccc";
+    const FX_REQ_IDENTITY_DATA_RETAIN: &str = "82ad6964656e746974795f64617461a672657461696ead6964656e746974795f68617368c410dddddddddddddddddddddddddddddddd";
+    const FX_RESP_PATH_TABLE: &str = "9186a468617368c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa974696d657374616d70cb41d26580b4800000a3766961c410bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba4686f707303a765787069726573cb41d267cf54800000a9696e74657266616365b2544350496e746572666163655b746573745d";
+    const FX_RESP_BLACKHOLE_DICT: &str = "81c4104242424242424242424242424242424283a6736f75726365c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5756e74696ccb4093480000000000a6726561736f6ea6706172697479";
+    const FX_INT_EDGES: &str = "dc0014007fcc80ccffcd0100cdffffce00010000ceffffffffcf0000000100000000cfffffffffffffffffffe0d0dfd080d1ff7fd18000d2ffff7fffd280000000d3ffffffff7fffffffd38000000000000000";
+    const FX_STR_EDGES: &str = "93a0bf61616161616161616161616161616161616161616161616161616161616161d9206161616161616161616161616161616161616161616161616161616161616161";
+    const FX_ARRAY_16: &str = "dc0010000102030405060708090a0b0c0d0e0f";
+
+    fn assert_fixture(value: &PyValue, fixture_hex: &str) {
+        let encoded = encode_umsgpack(value).unwrap();
+        assert_eq!(hex::encode(&encoded), fixture_hex);
+        let decoded = decode_umsgpack(&hex::decode(fixture_hex).unwrap()).unwrap();
+        assert_eq!(&decoded, value);
+    }
+
+    #[test]
+    fn requests_are_byte_exact_with_python_138_umsgpack() {
+        for (req, fixture) in [
+            (
+                RpcRequest::GetPathTable { max_hops: None },
+                FX_REQ_PATH_TABLE_NONE,
+            ),
+            (
+                RpcRequest::GetPathTable { max_hops: Some(8) },
+                FX_REQ_PATH_TABLE_8,
+            ),
+            (RpcRequest::GetInterfaceStats, FX_REQ_INTERFACE_STATS),
+            (
+                RpcRequest::IsBlackholed {
+                    identity_hash: (0u8..16).collect(),
+                },
+                FX_REQ_IS_BLACKHOLED,
+            ),
+            (
+                RpcRequest::GetNextHop {
+                    destination_hash: vec![0xAA; 16],
+                },
+                FX_REQ_NEXT_HOP,
+            ),
+            (
+                RpcRequest::DropPath {
+                    destination_hash: vec![0xBB; 16],
+                },
+                FX_REQ_DROP_PATH,
+            ),
+            (
+                RpcRequest::BlackholeIdentity {
+                    identity_hash: vec![0x42; 16],
+                    until: Some(1234567890.5),
+                    reason: Some("test".to_string()),
+                },
+                FX_REQ_BLACKHOLE_IDENTITY,
+            ),
+            (
+                RpcRequest::BlackholeIdentity {
+                    identity_hash: vec![0x42; 16],
+                    until: None,
+                    reason: None,
+                },
+                FX_REQ_BLACKHOLE_IDENTITY_NONE,
+            ),
+            (
+                RpcRequest::UseDestination {
+                    destination_hash: vec![0xCC; 16],
+                },
+                FX_REQ_DESTINATION_DATA_USED,
+            ),
+            (
+                RpcRequest::RetainIdentity {
+                    identity_hash: vec![0xDD; 16],
+                },
+                FX_REQ_IDENTITY_DATA_RETAIN,
+            ),
+        ] {
+            let encoded = encode_request(&req).unwrap();
+            assert_eq!(hex::encode(&encoded), fixture, "request {req:?}");
+            let _ = decode_request(&hex::decode(fixture).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn scalar_responses_are_byte_exact_with_python_138_umsgpack() {
+        assert_fixture(&PyValue::Bool(true), "c3");
+        assert_fixture(&PyValue::Bool(false), "c2");
+        assert_fixture(&PyValue::None, "c0");
+        assert_fixture(&PyValue::Int(42), "2a");
+        assert_fixture(&PyValue::Float(12.5), "cb4029000000000000");
+    }
+
+    #[test]
+    fn path_table_response_is_byte_exact_with_python_138_umsgpack() {
+        let resp = RpcResponse::PathTable(vec![PathTableEntry {
+            hash: vec![0xAA; 16],
+            timestamp: 1234567890.0,
+            via: Some(vec![0xBB; 16]),
+            hops: 3,
+            expires: 1235172690.0,
+            interface: "TCPInterface[test]".to_string(),
+        }]);
+        assert_eq!(
+            hex::encode(encode_response(&resp).unwrap()),
+            FX_RESP_PATH_TABLE
+        );
+        match decode_response_for_request(
+            &hex::decode(FX_RESP_PATH_TABLE).unwrap(),
+            &RpcRequest::GetPathTable { max_hops: None },
+        )
+        .unwrap()
+        {
+            RpcResponse::PathTable(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].hops, 3);
+                assert_eq!(entries[0].interface, "TCPInterface[test]");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blackhole_dict_response_is_byte_exact_with_python_138_umsgpack() {
+        let resp = RpcResponse::BlackholeList(vec![BlackholeEntry {
+            identity_hash: vec![0x42; 16],
+            source: Some(vec![0xAA; 16]),
+            until: Some(1234.0),
+            reason: Some("parity".to_string()),
+        }]);
+        assert_eq!(
+            hex::encode(encode_response(&resp).unwrap()),
+            FX_RESP_BLACKHOLE_DICT
+        );
+        match decode_response_for_request(
+            &hex::decode(FX_RESP_BLACKHOLE_DICT).unwrap(),
+            &RpcRequest::GetBlackholedIdentities,
+        )
+        .unwrap()
+        {
+            RpcResponse::BlackholeList(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].identity_hash, vec![0x42; 16]);
+                assert_eq!(entries[0].until, Some(1234.0));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn integer_width_boundaries_match_umsgpack() {
+        let edges: Vec<i128> = vec![
+            0,
+            127,
+            128,
+            255,
+            256,
+            65535,
+            65536,
+            4294967295,
+            4294967296,
+            18446744073709551615,
+            -1,
+            -32,
+            -33,
+            -128,
+            -129,
+            -32768,
+            -32769,
+            -2147483648,
+            -2147483649,
+            -9223372036854775808,
+        ];
+        let value = PyValue::List(edges.into_iter().map(PyValue::Int).collect());
+        assert_fixture(&value, FX_INT_EDGES);
+    }
+
+    #[test]
+    fn string_and_array_length_boundaries_match_umsgpack() {
+        let value = PyValue::List(vec![
+            PyValue::String(String::new()),
+            PyValue::String("a".repeat(31)),
+            PyValue::String("a".repeat(32)),
+        ]);
+        assert_fixture(&value, FX_STR_EDGES);
+
+        let value = PyValue::List((0..16).map(PyValue::Int).collect());
+        assert_fixture(&value, FX_ARRAY_16);
+
+        // bin8 → bin16 boundary (c4 ff / c5 0100), matching umsgpack _pack_binary.
+        let mut expected = String::from("93c400c4ff");
+        expected.push_str(&"01".repeat(255));
+        expected.push_str("c50100");
+        expected.push_str(&"02".repeat(256));
+        let value = PyValue::List(vec![
+            PyValue::Bytes(Vec::new()),
+            PyValue::Bytes(vec![0x01; 255]),
+            PyValue::Bytes(vec![0x02; 256]),
+        ]);
+        assert_fixture(&value, &expected);
+    }
+
+    #[test]
+    fn huge_ints_are_rejected_like_umsgpack() {
+        assert!(encode_umsgpack(&PyValue::Int(i128::from(u64::MAX) + 1)).is_err());
+        assert!(encode_umsgpack(&PyValue::Int(i128::from(i64::MIN) - 1)).is_err());
+        // Boundary values still encode.
+        assert!(encode_umsgpack(&PyValue::Int(i128::from(u64::MAX))).is_ok());
+        assert!(encode_umsgpack(&PyValue::Int(i128::from(i64::MIN))).is_ok());
+    }
+
+    #[test]
+    fn pickle_frames_no_longer_decode() {
+        // Python <=1.3.3 pickle frame for {"get": "link_count"} — the hard
+        // cutover (a2ef9782) must reject it rather than fall back.
+        let pickle = [
+            0x80u8, 0x04, b'}', b'(', 0x8c, 0x03, b'g', b'e', b't', 0x8c, 0x0a, b'l', b'i', b'n',
+            b'k', b'_', b'c', b'o', b'u', b'n', b't', b'u', b'.',
+        ];
+        assert!(decode_request(&pickle).is_err());
+    }
+
+    #[test]
+    fn msgpack_depth_limit_rejects_hostile_nesting() {
+        // 200 nested single-element arrays around a nil.
+        let mut data = vec![0x91u8; 200];
+        data.push(0xc0);
+        assert!(decode_umsgpack(&data).is_err());
     }
 }

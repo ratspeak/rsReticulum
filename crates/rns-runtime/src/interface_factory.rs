@@ -247,6 +247,8 @@ fn parse_interface_mode(s: &str) -> Option<InterfaceMode> {
         "roaming" => Some(InterfaceMode::Roaming),
         "boundary" => Some(InterfaceMode::Boundary),
         "gateway" | "gw" => Some(InterfaceMode::Gateway),
+        // Python 1.3.8 MODE_INTERNAL (Reticulum.py:721,737-738).
+        "internal" => Some(InterfaceMode::Internal),
         _ => None,
     }
 }
@@ -1162,6 +1164,12 @@ pub struct InterfacePostInit {
     pub ingress_control: bool,
     /// Per-interface overrides for Python `ic_*` ingress knobs.
     pub ingress_overrides: rns_transport::ingress::IngressOverrides,
+    /// Python 1.3.8 `recursive_prs` (Reticulum.py:808-809, default false):
+    /// force unknown-path discovery on path requests regardless of mode.
+    pub recursive_prs: bool,
+    /// Python 1.3.8 `announces_from_internal` (Reticulum.py:811-812, default
+    /// true): rebroadcast announces learned via MODE_INTERNAL interfaces.
+    pub announces_from_internal: bool,
 }
 
 impl InterfacePostInit {
@@ -1210,6 +1218,8 @@ impl InterfacePostInit {
             default_ifac_size: 8,
             ingress_control,
             ingress_overrides,
+            recursive_prs: section.get_bool("recursive_prs").unwrap_or(false),
+            announces_from_internal: section.get_bool("announces_from_internal").unwrap_or(true),
         }
     }
 

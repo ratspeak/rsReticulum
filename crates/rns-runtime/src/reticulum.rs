@@ -72,6 +72,10 @@ pub struct ReticulumHandle {
     /// Mobile builds throttle tick rates when the app is backgrounded.
     pub is_foreground: Arc<AtomicBool>,
     pub shutdown: ShutdownSignal,
+    /// Wire-facing transport identity (Python `Transport.identity`): on
+    /// non-transport nodes this is a fresh per-boot identity unless
+    /// `static_transport_identity` is set (Transport.py:234-238); RPC-key
+    /// derivation stays on the persisted identity.
     pub transport_identity: Arc<Identity>,
     pub network_identity: Option<Arc<Identity>>,
     /// Present even when `discover_interfaces = No` so a downstream can
@@ -296,6 +300,11 @@ fn transport_query_to_rpc_request(query: &TransportQuery) -> Option<crate::rpc::
             packet_hash: packet_hash.to_vec(),
         },
         TransportQuery::GetBlackholedIdentities => RpcRequest::GetBlackholedIdentities,
+        // Python 1.3.8 is_blackholed() proxies to the shared instance
+        // (Reticulum.py:1655-1659).
+        TransportQuery::IsBlackholed { hash } => RpcRequest::IsBlackholed {
+            identity_hash: hash.to_vec(),
+        },
         TransportQuery::DropPath { dest } => RpcRequest::DropPath {
             destination_hash: dest.to_vec(),
         },
@@ -571,6 +580,10 @@ pub struct ReticulumConfig {
     pub shared_instance_port: u16,
     pub control_port: u16,
     pub enable_transport: bool,
+    /// Python 1.3.8 `static_transport_identity` (Reticulum.py:255,502-504,
+    /// default false): opts a non-transport node out of the per-boot
+    /// ephemeral wire-facing transport identity.
+    pub static_transport_identity: bool,
     pub respond_to_probes: bool,
     pub use_implicit_proof: bool,
     pub panic_on_interface_error: bool,
@@ -609,6 +622,13 @@ pub struct ReticulumConfig {
     /// Publish this node's local blackhole table on
     /// `rnstransport.info.blackhole`. Python `publish_blackhole`.
     pub publish_blackhole: bool,
+    /// Seconds between blackhole-source pulls. Python 1.3.8
+    /// `blackhole_update_interval` (Reticulum.py:266,593-596): parsed as
+    /// float minutes, clamped to min 2, stored as seconds; default 3600.
+    pub blackhole_update_interval: f64,
+    /// Python 1.3.8 `[logging] logtimestamps` (Reticulum.py:459-461,
+    /// RNS/__init__.py:85 default True): log lines carry a timestamp prefix.
+    pub log_timestamps: bool,
 
     /// Bootstrap config files loaded on startup. Python `bootstrap_configs`.
     pub bootstrap_configs: Vec<PathBuf>,
@@ -623,6 +643,7 @@ impl Default for ReticulumConfig {
             shared_instance_port: LOCAL_INTERFACE_PORT,
             control_port: LOCAL_CONTROL_PORT,
             enable_transport: false,
+            static_transport_identity: false,
             respond_to_probes: false,
             use_implicit_proof: true,
             panic_on_interface_error: false,
@@ -643,6 +664,9 @@ impl Default for ReticulumConfig {
             interface_discovery_sources: Vec::new(),
             blackhole_sources: Vec::new(),
             publish_blackhole: false,
+            blackhole_update_interval:
+                rns_transport::discovery::blackhole_subscriber::UPDATE_INTERVAL.as_secs_f64(),
+            log_timestamps: true,
             bootstrap_configs: Vec::new(),
         }
     }
@@ -858,6 +882,9 @@ impl ReticulumConfig {
             if let Some(value) = config_bool("reticulum", sec, "enable_transport")? {
                 rc.enable_transport = value;
             }
+            if let Some(value) = config_bool("reticulum", sec, "static_transport_identity")? {
+                rc.static_transport_identity = value;
+            }
             if let Some(value) = config_bool("reticulum", sec, "respond_to_probes")? {
                 rc.respond_to_probes = value;
             }
@@ -924,6 +951,10 @@ impl ReticulumConfig {
             if let Some(list) = sec.get_list("blackhole_sources") {
                 rc.blackhole_sources = parse_hash16_list("blackhole_sources", Some(list))?;
             }
+            // Reticulum.py:593-596: float minutes, clamped to min 2, stored ×60.
+            if let Some(v) = config_float("reticulum", sec, "blackhole_update_interval")? {
+                rc.blackhole_update_interval = v.max(2.0) * 60.0;
+            }
             if let Some(list) = sec.get_list("bootstrap_configs") {
                 rc.bootstrap_configs = list.iter().map(|s| PathBuf::from(s.trim())).collect();
             }
@@ -933,6 +964,9 @@ impl ReticulumConfig {
             if let Some(level) = config_int("logging", sec, "loglevel")? {
                 rc.loglevel = (level as i32).clamp(0, 7);
             }
+            if let Some(value) = config_bool("logging", sec, "logtimestamps")? {
+                rc.log_timestamps = value;
+            }
         }
 
         Ok(rc)
@@ -941,6 +975,13 @@ impl ReticulumConfig {
     pub fn from_config(config: &Config) -> Self {
         Self::try_from_config(config).expect("valid Reticulum configuration")
     }
+}
+
+/// Python 1.3.8 Transport.py:234-238: the wire-facing transport identity is
+/// ephemeral per boot exactly when transport is disabled and
+/// `static_transport_identity` is unset.
+fn uses_ephemeral_transport_identity(rc: &ReticulumConfig) -> bool {
+    !rc.enable_transport && !rc.static_transport_identity
 }
 
 /// Bring up the Reticulum runtime: config dir, transport actor, interfaces,
@@ -969,6 +1010,16 @@ pub async fn init(
     let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new();
     actor.is_foreground = is_foreground.clone();
     actor.initialize_storage(paths.storage_dir.clone());
+    // Python 1.3.8 Transport.py:234-238: non-transport nodes get a fresh
+    // per-boot wire-facing transport identity unless static_transport_identity
+    // is set. Pre-seed the actor's hash so runtime-side wire consumers
+    // (discovery announcer, blackhole publisher/subscriber) share the value.
+    actor.static_transport_identity = rc.static_transport_identity;
+    let ephemeral_transport_identity =
+        uses_ephemeral_transport_identity(&rc).then(rns_identity::identity::Identity::new);
+    if let Some(ephemeral) = &ephemeral_transport_identity {
+        actor.ephemeral_identity_hash = Some(ephemeral.hash);
+    }
 
     let shutdown_tx = transport_tx.clone();
     let shutdown_clone = shutdown.clone();
@@ -976,8 +1027,9 @@ pub async fn init(
         actor.run().await;
     });
 
-    // Python Reticulum has a persistent transport identity. The actor needs
-    // its hash for transport-node path requests and Header2 path responses.
+    // Persistent transport identity (Python 1.3.8 Transport._identity /
+    // internal_identity()): the actor keeps it for RPC-key parity and swaps
+    // in the ephemeral hash itself when the policy applies.
     let transport_identity_path = paths.storage_dir.join("transport_identity");
     let transport_identity = match rns_identity::identity::Identity::from_file(
         &transport_identity_path,
@@ -1000,14 +1052,20 @@ pub async fn init(
     });
 
     // Python defaults the local shared-instance RPC key to a hash of the
-    // persistent transport identity, so CLI/control clients work without an
-    // explicit config key as long as they share the same config directory.
+    // PERSISTENT transport identity (internal_identity(), Reticulum.py:352),
+    // so RPC auth stays stable across the per-boot ephemeral rotation.
     if rc.rpc_key.is_none() {
         if let Some(private_key) = transport_identity.get_private_key() {
             rc.rpc_key = Some(crate::rpc::derive_rpc_key(&*private_key).to_vec());
         }
     }
     let transport_identity = Arc::new(transport_identity);
+    // Wire-facing identity for runtime consumers (Python Transport.identity):
+    // ephemeral when the non-transport default policy is active.
+    let wire_transport_identity = match ephemeral_transport_identity {
+        Some(ephemeral) => Arc::new(ephemeral),
+        None => transport_identity.clone(),
+    };
 
     let network_identity = rc
         .network_identity_path
@@ -1360,7 +1418,7 @@ pub async fn init(
         config: rc.clone(),
         is_foreground,
         shutdown: shutdown.clone(),
-        transport_identity: transport_identity.clone(),
+        transport_identity: wire_transport_identity,
         network_identity: network_identity.clone(),
         discovery: discovery_runtime,
     };
@@ -1628,7 +1686,7 @@ fn ingress_for_role(
     }
 }
 
-/// Preserve Python Reticulum's six interface modes in the transport actor.
+/// Preserve Python Reticulum's interface modes in the transport actor.
 /// Full and point-to-point currently share gateway's forwarding policy, but
 /// retaining the variants keeps stats/RPC and future policy changes honest.
 fn convert_mode(
@@ -1650,6 +1708,9 @@ fn convert_mode(
         rns_interface::traits::InterfaceMode::Full => rns_transport::constants::InterfaceMode::Full,
         rns_interface::traits::InterfaceMode::PointToPoint => {
             rns_transport::constants::InterfaceMode::PointToPoint
+        }
+        rns_interface::traits::InterfaceMode::Internal => {
+            rns_transport::constants::InterfaceMode::Internal
         }
     }
 }
@@ -1747,6 +1808,8 @@ async fn register_interface_handle_with_role_and_overrides(
         ingress,
         announce_queue: Vec::new(),
         multipoint,
+        // Interface.py class defaults; Python spawned sub-interfaces do not
+        // inherit recursive_prs/announces_from_internal (TCPInterface.py:579+).
         recursive_prs: false,
         announces_from_internal: true,
     };
@@ -1816,8 +1879,8 @@ async fn register_interface_with_post_init(
         ingress,
         announce_queue: Vec::new(),
         multipoint: false,
-        recursive_prs: false,
-        announces_from_internal: true,
+        recursive_prs: post_init.recursive_prs,
+        announces_from_internal: post_init.announces_from_internal,
     };
     if let Err(e) = transport_tx
         .send(TransportMessage::RegisterInterface { id, entry })
@@ -2660,7 +2723,9 @@ async fn start_blackhole_subscriber(handle: ReticulumHandle) {
             _ = tokio::time::sleep(BLACKHOLE_INITIAL_WAIT) => {}
         }
 
-        let mut state = BlackholeSubscriberState::new();
+        let mut state = BlackholeSubscriberState::new().with_update_interval(
+            Duration::from_secs_f64(handle.config.blackhole_update_interval),
+        );
         loop {
             let sources: Vec<rns_wire::types::IdentityHash> = handle
                 .config
@@ -4415,6 +4480,158 @@ egress_control = Yes
     }
 
     #[test]
+    fn static_transport_identity_key_parses_with_python_default() {
+        let rc = ReticulumConfig::from_config(&Config::parse("[reticulum]\n").unwrap());
+        assert!(!rc.static_transport_identity);
+        assert!(uses_ephemeral_transport_identity(&rc));
+
+        let rc = ReticulumConfig::from_config(
+            &Config::parse("[reticulum]\nstatic_transport_identity = yes\n").unwrap(),
+        );
+        assert!(rc.static_transport_identity);
+        assert!(!uses_ephemeral_transport_identity(&rc));
+
+        // Python Transport.py:234-238: transport nodes never rotate.
+        let rc = ReticulumConfig::from_config(
+            &Config::parse("[reticulum]\nenable_transport = yes\n").unwrap(),
+        );
+        assert!(!uses_ephemeral_transport_identity(&rc));
+
+        let rc = ReticulumConfig::from_config(
+            &Config::parse(
+                "[reticulum]\nenable_transport = yes\nstatic_transport_identity = yes\n",
+            )
+            .unwrap(),
+        );
+        assert!(!uses_ephemeral_transport_identity(&rc));
+    }
+
+    #[test]
+    fn blackhole_update_interval_parses_minutes_with_two_minute_clamp() {
+        let rc = ReticulumConfig::from_config(&Config::parse("[reticulum]\n").unwrap());
+        assert_eq!(rc.blackhole_update_interval, 3600.0);
+
+        // Reticulum.py:593-596: minutes ×60 into seconds.
+        let rc = ReticulumConfig::from_config(
+            &Config::parse("[reticulum]\nblackhole_update_interval = 30\n").unwrap(),
+        );
+        assert_eq!(rc.blackhole_update_interval, 1800.0);
+
+        let rc = ReticulumConfig::from_config(
+            &Config::parse("[reticulum]\nblackhole_update_interval = 2.5\n").unwrap(),
+        );
+        assert_eq!(rc.blackhole_update_interval, 150.0);
+
+        // Sub-2-minute values clamp to the 2-minute floor.
+        let rc = ReticulumConfig::from_config(
+            &Config::parse("[reticulum]\nblackhole_update_interval = 1\n").unwrap(),
+        );
+        assert_eq!(rc.blackhole_update_interval, 120.0);
+    }
+
+    #[test]
+    fn logtimestamps_key_parses_with_python_default() {
+        let rc = ReticulumConfig::from_config(&Config::parse("[logging]\n").unwrap());
+        assert!(rc.log_timestamps);
+
+        let rc = ReticulumConfig::from_config(
+            &Config::parse("[logging]\nlogtimestamps = no\n").unwrap(),
+        );
+        assert!(!rc.log_timestamps);
+
+        let rc = ReticulumConfig::from_config(
+            &Config::parse("[logging]\nlogtimestamps = yes\n").unwrap(),
+        );
+        assert!(rc.log_timestamps);
+    }
+
+    #[test]
+    fn post_init_parses_recursive_prs_and_announces_from_internal() {
+        let post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
+        assert!(!post_init.recursive_prs);
+        assert!(post_init.announces_from_internal);
+
+        let mut section = ConfigSection::new();
+        section.set("recursive_prs", "yes");
+        section.set("announces_from_internal", "no");
+        let post_init = interface_factory::InterfacePostInit::from_section(&section);
+        assert!(post_init.recursive_prs);
+        assert!(!post_init.announces_from_internal);
+    }
+
+    #[test]
+    fn internal_interface_mode_parses_and_discovery_autocorrects() {
+        // Python 1.3.8 Reticulum.py:721,737-738: mode = internal → MODE_INTERNAL.
+        let base = "[interfaces]\n\n[[Test TCP]]\ntype = TCPClientInterface\n\
+                    target_host = 127.0.0.1\ntarget_port = 4242\nmode = internal\n";
+        let config = Config::parse(base).unwrap();
+        let mut interfaces = synthesize_interfaces(&config, false).unwrap();
+        assert_eq!(
+            *interface_config_mode_mut(&mut interfaces[0]),
+            rns_interface::traits::InterfaceMode::Internal
+        );
+
+        // Reticulum.py:856-863: discoverable autocorrects internal away
+        // unless ignore_config_warnings is set.
+        let config = Config::parse(&format!("{base}discoverable = yes\n")).unwrap();
+        let mut interfaces = synthesize_interfaces(&config, false).unwrap();
+        apply_discovery_mode_autocorrect(&config, &mut interfaces[0]);
+        assert_eq!(
+            *interface_config_mode_mut(&mut interfaces[0]),
+            rns_interface::traits::InterfaceMode::Gateway
+        );
+
+        let config = Config::parse(&format!(
+            "{base}discoverable = yes\nignore_config_warnings = yes\n"
+        ))
+        .unwrap();
+        let mut interfaces = synthesize_interfaces(&config, false).unwrap();
+        apply_discovery_mode_autocorrect(&config, &mut interfaces[0]);
+        assert_eq!(
+            *interface_config_mode_mut(&mut interfaces[0]),
+            rns_interface::traits::InterfaceMode::Internal
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_applies_parsed_interface_flags_and_internal_mode() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let mut section = ConfigSection::new();
+        section.set("recursive_prs", "yes");
+        section.set("announces_from_internal", "no");
+        let post_init = interface_factory::InterfacePostInit::from_section(&section);
+        let mut handle = test_interface_handle(920_101, None, "internal-mode");
+        handle.mode = rns_interface::traits::InterfaceMode::Internal;
+        register_interface_with_post_init(
+            &transport_tx,
+            handle,
+            &post_init,
+            None,
+            &interface_controls,
+        )
+        .await;
+        let TransportMessage::RegisterInterface { entry, .. } =
+            transport_rx.recv().await.expect("registration")
+        else {
+            panic!("expected RegisterInterface");
+        };
+        assert_eq!(
+            entry.mode,
+            rns_transport::constants::InterfaceMode::Internal
+        );
+        assert!(entry.recursive_prs);
+        assert!(!entry.announces_from_internal);
+
+        interface_tasks()
+            .lock()
+            .expect("interface_tasks mutex poisoned")
+            .remove(&920_101);
+    }
+
+    #[test]
     fn default_announce_rate_applies_only_when_transport_enabled() {
         let mut post_init =
             interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
@@ -4810,6 +5027,7 @@ egress_control = Yes
         assert_eq!(convert_mode(IM::Gateway), TM::Gateway);
         assert_eq!(convert_mode(IM::Full), TM::Full);
         assert_eq!(convert_mode(IM::PointToPoint), TM::PointToPoint);
+        assert_eq!(convert_mode(IM::Internal), TM::Internal);
     }
 
     #[test]

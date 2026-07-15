@@ -468,6 +468,16 @@ async fn process_rpc_request(
                 _ => RpcResponse::BlackholeList(Vec::new()),
             }
         }
+        RpcRequest::IsBlackholed { identity_hash } => {
+            if let Some(hash) = hash_to_array(&identity_hash) {
+                if let Some(TransportQueryResponse::BoolResult(v)) =
+                    query_transport(transport_tx, TransportQuery::IsBlackholed { hash }).await
+                {
+                    return RpcResponse::BoolResult(v);
+                }
+            }
+            RpcResponse::BoolResult(false)
+        }
         RpcRequest::BlackholeIdentity {
             identity_hash,
             until,
@@ -763,6 +773,8 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        // Python >=1.3.4 clients speak umsgpack over send_bytes/recv_bytes
+        // (commit a2ef9782); frames hardcoded so the test needs no msgpack module.
         let script = r#"
 import multiprocessing.connection
 import sys
@@ -770,17 +782,17 @@ import sys
 port = int(sys.argv[1])
 authkey = bytes.fromhex(sys.argv[2])
 conn = multiprocessing.connection.Client(("127.0.0.1", port), authkey=authkey)
-conn.send({"get": "link_count"})
-resp = conn.recv()
+conn.send_bytes(bytes.fromhex("81a3676574aa6c696e6b5f636f756e74"))  # {"get": "link_count"}
+resp = conn.recv_bytes()
 conn.close()
-if resp != 0:
-    raise SystemExit(f"unexpected response: {resp!r}")
+if resp != b"\x00":
+    raise SystemExit(f"unexpected response: {resp.hex()}")
 conn = multiprocessing.connection.Client(("127.0.0.1", port), authkey=authkey)
-conn.send({"get": "interface_stats"})
-resp = conn.recv()
+conn.send_bytes(bytes.fromhex("81a3676574af696e746572666163655f7374617473"))  # {"get": "interface_stats"}
+resp = conn.recv_bytes()
 conn.close()
-if not isinstance(resp, dict) or "interfaces" not in resp:
-    raise SystemExit(f"unexpected interface_stats response: {resp!r}")
+if b"\xaainterfaces" not in resp:
+    raise SystemExit(f"unexpected interface_stats response: {resp.hex()}")
 "#;
         let output = std::process::Command::new("python3")
             .arg("-c")
@@ -813,6 +825,9 @@ if not isinstance(resp, dict) or "interfaces" not in resp:
 
         let port = portpicker_ephemeral();
         let rpc_key = b"python_listener_key".to_vec();
+        // umsgpack frames over send_bytes/recv_bytes, matching a >=1.3.4
+        // Python rpc_loop (commit a2ef9782); hardcoded so no msgpack module
+        // is needed.
         let script = r#"
 import multiprocessing.connection
 import sys
@@ -822,10 +837,10 @@ authkey = bytes.fromhex(sys.argv[2])
 listener = multiprocessing.connection.Listener(("127.0.0.1", port), authkey=authkey)
 print("READY", flush=True)
 conn = listener.accept()
-call = conn.recv()
-if call != {"get": "link_count"}:
-    raise SystemExit(f"unexpected call: {call!r}")
-conn.send(7)
+call = conn.recv_bytes()
+if call != bytes.fromhex("81a3676574aa6c696e6b5f636f756e74"):  # {"get": "link_count"}
+    raise SystemExit(f"unexpected call: {call.hex()}")
+conn.send_bytes(b"\x07")  # 7
 conn.close()
 listener.close()
 "#;
@@ -920,6 +935,9 @@ listener.close()
                 packet_hash: vec![0; 32],
             },
             RpcRequest::GetBlackholedIdentities,
+            RpcRequest::IsBlackholed {
+                identity_hash: vec![0; 16],
+            },
             RpcRequest::DropPath {
                 destination_hash: vec![0; 16],
             },

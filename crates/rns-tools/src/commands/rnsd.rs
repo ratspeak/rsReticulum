@@ -12,18 +12,31 @@ const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 const RNSD_EXAMPLE_CONFIG: &str = r#"# This is an example Reticulum config file.
 
 [reticulum]
-enable_transport = No
-share_instance = Yes
+enable_transport = no
+share_instance = yes
 instance_name = default
+
+# Interval in minutes at which remote blackhole sources
+# are updated. Defaults to one hour.
+# blackhole_update_interval = 60
+
+# When not running as a transport node, force the same,
+# static transport identity at every instance start.
+# Defaults to a new identity per start if transport is
+# disabled.
+# static_transport_identity = no
 
 [logging]
 loglevel = 4
+
+# You can disable timestamp inclusion in logs.
+# logtimestamps = no
 
 [interfaces]
 
 [[Default Interface]]
 type = AutoInterface
-enabled = Yes
+enabled = yes
 
 [[UDP Interface]]
 type = UDPInterface
@@ -60,7 +73,7 @@ bandwidth = 125000
 txpower = 7
 spreadingfactor = 8
 codingrate = 5
-flow_control = False
+flow_control = false
 
 [[Packet Radio KISS Interface]]
 type = KISSInterface
