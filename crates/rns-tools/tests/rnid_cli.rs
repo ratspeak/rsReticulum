@@ -138,7 +138,7 @@ fn rnid_flag_conflicts_are_rejected() {
     assert_failure(
         &output,
         Some(1),
-        "-b, -B and --hex",
+        "-b, -B, --hex and --base256",
         "base64/base32 conflict",
     );
 

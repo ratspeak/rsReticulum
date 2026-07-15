@@ -145,6 +145,9 @@ pub struct Link {
     pub establishment_rate: Option<f64>,
     /// Expected in-flight data rate (bits/sec), refreshed after each resource transfer.
     pub expected_rate: Option<f64>,
+    /// Path length in hops: initiator sets it at creation (Link.py:282), the
+    /// destination side from the LRRTT packet at activation (Link.py:525).
+    pub expected_hops: Option<u8>,
 
     pub destination_hash: [u8; 16],
 
@@ -238,6 +241,7 @@ impl Link {
             establishment_cost,
             establishment_rate: None,
             expected_rate: None,
+            expected_hops: Some(hops),
             destination_hash,
             remote_identity_pub: None,
             identified: false,
@@ -496,6 +500,8 @@ impl Link {
             establishment_cost,
             establishment_rate: None,
             expected_rate: None,
+            // Populated by the runtime from the LRRTT packet hops (Link.py:525).
+            expected_hops: None,
             destination_hash,
             remote_identity_pub: None,
             identified: false,
@@ -1038,12 +1044,22 @@ impl Link {
         self.outgoing_resources.retain(|h| h != resource_hash);
     }
 
+    /// `bytes` is the link payload after the context byte (ciphertext), the
+    /// same unit as `record_rx` — Packet.py:291 txbytes += len(ciphertext).
     pub fn record_tx(&mut self, bytes: usize) {
         self.tx_bytes += bytes as u64;
         self.tx_count += 1;
         self.keepalive.record_outbound();
     }
 
+    /// Count an outbound keepalive beat (Python counts them too, Packet.py:291)
+    /// without touching `last_outbound` — that would defer `is_stale` forever.
+    pub fn record_tx_keepalive(&mut self, bytes: usize) {
+        self.tx_bytes += bytes as u64;
+        self.tx_count += 1;
+    }
+
+    /// `bytes` is the link payload after the context byte (Link.py:929).
     pub fn record_rx(&mut self, bytes: usize) {
         self.rx_bytes += bytes as u64;
         self.rx_count += 1;
@@ -2196,6 +2212,36 @@ mod tests {
         assert_eq!(rx_b, 50);
         assert_eq!(tx_c, 2);
         assert_eq!(rx_c, 1);
+    }
+
+    /// Keepalive beats count into traffic stats (Packet.py:291) but must not
+    /// refresh `last_outbound`, or an initiator pinging a dead peer would
+    /// never go stale.
+    #[test]
+    fn test_record_tx_keepalive_counts_without_outbound_refresh() {
+        let (mut link, _, _) = make_active_link();
+        assert!(link.keepalive.last_outbound.is_none());
+
+        link.record_tx_keepalive(1);
+
+        let (tx_b, _, tx_c, _) = link.traffic_stats();
+        assert_eq!(tx_b, 1);
+        assert_eq!(tx_c, 1);
+        assert!(link.keepalive.last_outbound.is_none());
+    }
+
+    /// Initiator knows expected_hops at creation (Link.py:282); the responder
+    /// side stays unset until the runtime observes the LRRTT hops (Link.py:525).
+    #[test]
+    fn test_expected_hops_initiator_only_at_creation() {
+        let dest_hash = [0xAB; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let (initiator, request_data) = Link::new_initiator(dest_hash, 3);
+        let (responder, _proof) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 3).unwrap();
+
+        assert_eq!(initiator.expected_hops, Some(3));
+        assert_eq!(responder.expected_hops, None);
     }
 
     #[test]

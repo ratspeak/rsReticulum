@@ -49,6 +49,19 @@ impl TransportActor {
             }
         };
 
+        // Python 1.3.8 Packet.py:247-248: unpack() rejects on-wire hop counts
+        // >= PATHFINDER_M for every packet type. Checked on the RAW hops byte,
+        // before the inbound hop adjustment; kept at the inbound boundary so
+        // locally built packets and vector tooling are unaffected.
+        if parsed.hops >= PATHFINDER_M {
+            debug!(
+                hops = parsed.hops,
+                interface_id = packet.interface_id,
+                "inbound packet dropped: invalid hop count"
+            );
+            return;
+        }
+
         // Dedup via the packet hashlist. A handful of contexts legitimately
         // repeat (keepalives, resource transfer frames, channel traffic) and
         // must bypass the check.
@@ -126,7 +139,7 @@ impl TransportActor {
     ) {
         let is_from_local_client = self.is_local_client_interface(interface_id);
 
-        if header.hops > PATHFINDER_M {
+        if header.hops >= PATHFINDER_M {
             debug!(hops = header.hops, "announce exceeded hop limit");
             return;
         }
@@ -452,12 +465,13 @@ impl TransportActor {
                 .get(&header.destination_hash)
                 .copied()
             {
-                let response = self.path_response_from_cached_announce(
+                if let Some(response) = self.path_response_from_cached_announce(
                     raw,
                     header.destination_hash,
                     header.hops,
-                );
-                self.send_to_interface(request.requesting_interface, &response);
+                ) {
+                    self.send_to_interface(request.requesting_interface, &response);
+                }
             }
 
             debug!(
@@ -524,12 +538,13 @@ impl TransportActor {
                 .pending_local_path_requests
                 .remove(&header.destination_hash)
             {
-                let response = self.path_response_from_cached_announce(
+                if let Some(response) = self.path_response_from_cached_announce(
                     raw,
                     header.destination_hash,
                     header.hops,
-                );
-                self.send_to_interface(waiting_interface, &response);
+                ) {
+                    self.send_to_interface(waiting_interface, &response);
+                }
             }
         }
 

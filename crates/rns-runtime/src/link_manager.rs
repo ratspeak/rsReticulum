@@ -738,9 +738,14 @@ impl LinkManager {
         match header.context {
             rns_wire::context::PacketContext::Lrrtt => {
                 if let Some(active) = self.active_links.get_mut(&link_id) {
+                    active.link.record_rx(data.len());
                     if active.link.state == LinkState::Handshake {
                         match active.link.receive_rtt_packet(data) {
                             Ok(()) => {
+                                // +1 mirrors Python's increment-on-receive
+                                // (Transport.py:1491) before Link.py:525 reads
+                                // packet.hops; the delivered raw is unadjusted.
+                                active.link.expected_hops = Some(header.hops.saturating_add(1));
                                 tracing::info!(
                                     link_id = hex::encode(link_id),
                                     rtt_ms = active.link.rtt.map(|r| r.as_millis()).unwrap_or(0),
@@ -771,6 +776,7 @@ impl LinkManager {
             rns_wire::context::PacketContext::LinkIdentify => {
                 let mut close_rejected_link = false;
                 if let Some(active) = self.active_links.get_mut(&link_id) {
+                    active.link.record_rx(data.len());
                     match active.link.handle_identification(data) {
                         Ok(remote_pub) => {
                             let identity_hash = rns_crypto::sha::truncated_hash(&remote_pub);
@@ -815,6 +821,7 @@ impl LinkManager {
             rns_wire::context::PacketContext::Keepalive => {
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
+                    active.link.record_rx(data.len());
 
                     // Keepalives are NOT encrypted (Packet.py:205-208).
                     if data.first() == Some(&rns_link::constants::KEEPALIVE_REQUEST) {
@@ -840,6 +847,7 @@ impl LinkManager {
                             };
                             let mut resp_raw = resp_header.pack();
                             resp_raw.push(rns_link::constants::KEEPALIVE_RESPONSE);
+                            active.link.record_tx_keepalive(1);
                             let _ = self.transport_tx.try_send(TransportMessage::Outbound(
                                 OutboundRequest {
                                     raw: Bytes::from(resp_raw),
@@ -851,10 +859,10 @@ impl LinkManager {
                 }
             }
             rns_wire::context::PacketContext::LinkClose => {
-                let verified = self
-                    .active_links
-                    .get_mut(&link_id)
-                    .is_some_and(|active| active.link.receive_teardown(data));
+                let verified = self.active_links.get_mut(&link_id).is_some_and(|active| {
+                    active.link.record_rx(data.len());
+                    active.link.receive_teardown(data)
+                });
                 if verified {
                     tracing::info!(link_id = hex::encode(link_id), "link torn down by remote");
                     self.close_active_link(link_id, CloseReason::DestinationClosed, false);
@@ -892,6 +900,8 @@ impl LinkManager {
                             &proof_data,
                             rns_wire::context::PacketContext::None,
                         );
+                        // Proofs to a link count into txbytes (Link.py:388, Packet.py:291).
+                        active.link.record_tx(proof_data.len());
                         tracing::debug!(
                             link_id = hex::encode(link_id),
                             proof_len = proof_data.len(),
@@ -926,6 +936,7 @@ impl LinkManager {
             rns_wire::context::PacketContext::ResourceAdv => {
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
+                    active.link.record_rx(data.len());
 
                     if let Ok(plaintext) = active.link.decrypt(data) {
                         match ResourceAdvertisement::unpack(&plaintext) {
@@ -1119,7 +1130,7 @@ impl LinkManager {
                                 };
                                 let mut hmu_raw = hmu_header.pack();
                                 hmu_raw.extend_from_slice(&encrypted);
-                                active.link.record_tx(hmu_raw.len());
+                                active.link.record_tx(encrypted.len());
                                 let _ = self.transport_tx.try_send(TransportMessage::Outbound(
                                     OutboundRequest {
                                         raw: Bytes::from(hmu_raw),
@@ -1164,7 +1175,7 @@ impl LinkManager {
                                     };
                                     let mut prf_raw = prf_header.pack();
                                     prf_raw.extend_from_slice(&proof);
-                                    active.link.record_tx(prf_raw.len());
+                                    active.link.record_tx(proof.len());
                                     let _ = self.transport_tx.try_send(TransportMessage::Outbound(
                                         OutboundRequest {
                                             raw: Bytes::from(prf_raw),
@@ -1307,6 +1318,7 @@ impl LinkManager {
                 // Receiver's HMU for outbound transfer (Link.py:1104-1124).
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
+                    active.link.record_rx(data.len());
                     if let Ok(plaintext) = active.link.decrypt(data) {
                         if plaintext.len() > 32 {
                             // Exhaustion flag shifts the resource hash by MAPHASH_LEN.
@@ -1395,7 +1407,7 @@ impl LinkManager {
                                     };
                                     let mut raw = part_header.pack();
                                     raw.extend_from_slice(&body);
-                                    active.link.record_tx(raw.len());
+                                    active.link.record_tx(body.len());
                                     let _ = self.transport_tx.try_send(TransportMessage::Outbound(
                                         OutboundRequest {
                                             raw: Bytes::from(raw),
@@ -1412,6 +1424,7 @@ impl LinkManager {
                 // Sender-initiated cancel of an inbound transfer (Link.py:1135-1142).
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
+                    active.link.record_rx(data.len());
                     if let Ok(plaintext) = active.link.decrypt(data) {
                         if plaintext.len() >= 32 {
                             let mut rh = [0u8; 32];
@@ -1461,6 +1474,7 @@ impl LinkManager {
                 // Receiver-initiated reject of an outbound transfer (Link.py:1144-1151).
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
+                    active.link.record_rx(data.len());
                     if let Ok(plaintext) = active.link.decrypt(data) {
                         if plaintext.len() >= 32 {
                             let mut rh = [0u8; 32];
@@ -1480,6 +1494,7 @@ impl LinkManager {
             rns_wire::context::PacketContext::ResourceHmu => {
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
+                    active.link.record_rx(data.len());
                     if let Ok(plaintext) = active.link.decrypt(data) {
                         if let Ok((rh, segment, hashmap)) =
                             rns_protocol::resource::parse_hashmap_update(&plaintext)
@@ -1505,7 +1520,7 @@ impl LinkManager {
                                         };
                                         let mut req_raw = req_header.pack();
                                         req_raw.extend_from_slice(&encrypted);
-                                        active.link.record_tx(req_raw.len());
+                                        active.link.record_tx(encrypted.len());
                                         let _ = self.transport_tx.try_send(
                                             TransportMessage::Outbound(OutboundRequest {
                                                 raw: Bytes::from(req_raw),
@@ -1522,6 +1537,8 @@ impl LinkManager {
             rns_wire::context::PacketContext::ResourcePrf => {
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
+                    // RESOURCE_PRF proofs route through Link.receive (Transport.py:2268).
+                    active.link.record_rx(data.len());
                     if data.len() >= 64 {
                         let mut rh = [0u8; 32];
                         rh.copy_from_slice(&data[..32]);
@@ -1574,6 +1591,7 @@ impl LinkManager {
             rns_wire::context::PacketContext::Request => {
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
+                    active.link.record_rx(data.len());
 
                     if let Ok((_request_id, path_hash, _timestamp, data)) =
                         active.link.handle_request(data)
@@ -1632,6 +1650,7 @@ impl LinkManager {
                                         };
                                         let mut resp_raw = resp_header.pack();
                                         resp_raw.extend_from_slice(&encrypted);
+                                        active.link.record_tx(encrypted.len());
                                         let _ = self.transport_tx.try_send(
                                             TransportMessage::Outbound(OutboundRequest {
                                                 raw: Bytes::from(resp_raw),
@@ -1695,6 +1714,7 @@ impl LinkManager {
             rns_wire::context::PacketContext::Response => {
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
+                    active.link.record_rx(data.len());
 
                     if let Ok((request_id, response_data)) = active.link.handle_response(data) {
                         tracing::debug!(
@@ -1766,6 +1786,8 @@ impl LinkManager {
                                 };
                                 let mut proof_raw = proof_header.pack();
                                 proof_raw.extend_from_slice(&proof_data);
+                                // Proofs to a link count into txbytes (Link.py:388, Packet.py:291).
+                                active.link.record_tx(proof_data.len());
                                 let _ = self.transport_tx.try_send(TransportMessage::Outbound(
                                     OutboundRequest {
                                         raw: Bytes::from(proof_raw),
@@ -1830,12 +1852,12 @@ impl LinkManager {
                     continue;
                 };
 
-                let (packet_hash, raw_len) =
+                let packet_hash =
                     Self::resend_channel_data(&self.transport_tx, link_id, sequence, &data);
                 if let Some(channel) = active.channel.as_mut() {
                     channel.track_outbound_packet_hash(packet_hash, sequence);
                 }
-                active.link.record_tx(raw_len);
+                active.link.record_tx(data.len());
             }
 
             if !active.inbound_resources.is_empty() || !active.outbound_resources.is_empty() {
@@ -1845,11 +1867,13 @@ impl LinkManager {
             match action {
                 LinkAction::SendKeepalive => {
                     Self::send_keepalive_packet(&self.transport_tx, link_id);
+                    active.link.record_tx_keepalive(1);
                 }
                 LinkAction::TransitionedToStale => {
                     // Python double-sends on stale transition (Link.py:797-802, initiator only).
                     if active.link.is_initiator {
                         Self::send_keepalive_packet(&self.transport_tx, link_id);
+                        active.link.record_tx_keepalive(1);
                     }
                     tracing::debug!(link_id = hex::encode(link_id), "link transitioned to stale");
                 }
@@ -2013,7 +2037,7 @@ impl LinkManager {
         link_id: &[u8; 16],
         sequence: u16,
         data: &[u8],
-    ) -> ([u8; 32], usize) {
+    ) -> [u8; 32] {
         let channel_header = rns_wire::header::PacketHeader {
             flags: rns_wire::flags::PacketFlags {
                 header_type: rns_wire::flags::HeaderType::Header1,
@@ -2030,7 +2054,6 @@ impl LinkManager {
         let mut raw = channel_header.pack();
         raw.extend_from_slice(data);
         let packet_hash = rns_wire::hash::packet_hash(&raw, channel_header.flags.header_type);
-        let raw_len = raw.len();
         let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
             raw: Bytes::from(raw),
             destination_hash: *link_id,
@@ -2041,7 +2064,7 @@ impl LinkManager {
             packet_hash = hex::encode(&packet_hash[..8]),
             "channel packet retransmitted"
         );
-        (packet_hash, raw_len)
+        packet_hash
     }
 
     fn ensure_link_channel(active: &mut ActiveLink, link_id: [u8; 16]) -> Option<&mut LinkChannel> {
@@ -2242,7 +2265,7 @@ impl LinkManager {
         if let Some(channel) = active.channel.as_mut() {
             channel.track_outbound_packet_hash(packet_hash, prepared.sequence);
         }
-        active.link.record_tx(raw.len());
+        active.link.record_tx(prepared.data.len());
 
         permit.send(TransportMessage::Outbound(OutboundRequest {
             raw: Bytes::from(raw),
@@ -2299,7 +2322,7 @@ impl LinkManager {
             .active_links
             .get_mut(link_id)
             .ok_or(LinkSendError::LinkNotFound)?;
-        active.link.record_tx(raw.len());
+        active.link.record_tx(encrypted.len());
         permit.send(TransportMessage::Outbound(OutboundRequest {
             raw: Bytes::from(raw),
             destination_hash: *link_id,
@@ -2536,7 +2559,7 @@ impl LinkManager {
         };
         let mut raw = adv_header.pack();
         raw.extend_from_slice(&encrypted);
-        active.link.record_tx(raw.len());
+        active.link.record_tx(encrypted.len());
         let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
             raw: Bytes::from(raw),
             destination_hash: *link_id,
@@ -3083,6 +3106,64 @@ mod tests {
         assert_eq!(lm.get_link(&link_id).unwrap().state, LinkState::Active);
     }
 
+    /// Destination side learns expected_hops from the LRRTT packet at
+    /// activation (Link.py:525); +1 mirrors Python's increment-on-receive.
+    /// The initiator keeps its construction-time value (Link.py:282).
+    #[test]
+    fn lrrtt_activation_sets_expected_hops_on_destination_side() {
+        let dest_hash = [0x37; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 2);
+        let (responder, proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 2).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .unwrap();
+        let link_id = responder.link_id;
+        assert_eq!(responder.expected_hops, None);
+
+        let (transport_tx, _transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 3,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Lrrtt,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&rtt_data);
+
+        lm.handle_inbound_packet(&raw, 1);
+
+        let link = lm.get_link(&link_id).unwrap();
+        assert_eq!(link.state, LinkState::Active);
+        assert_eq!(link.expected_hops, Some(4));
+        assert_eq!(initiator.expected_hops, Some(2));
+    }
+
     #[test]
     fn request_resource_transfer_can_start_before_responder_lrrtt_activation() {
         let dest_hash = [0x36; 16];
@@ -3292,6 +3373,81 @@ mod tests {
         let proof_data = &request.raw[proof_offset..];
         assert_eq!(&proof_data[..32], &packet_hash);
         assert!(sender_link.validate_packet_proof(&packet_hash, proof_data));
+    }
+
+    /// 1.3.8 stats parity (Packet.py:291): tx counts the link payload after
+    /// the context byte — the same unit rx counts (Link.py:929) — so a channel
+    /// echo round-trip yields matching data counters on both peers.
+    #[test]
+    fn channel_echo_round_trip_counts_matching_tx_rx_bytes() {
+        fn payload_len(raw: &[u8]) -> u64 {
+            let (_, offset) = rns_wire::header::PacketHeader::unpack(raw).unwrap();
+            (raw.len() - offset) as u64
+        }
+        fn next_outbound(rx: &mut mpsc::Receiver<TransportMessage>) -> Bytes {
+            match rx.try_recv().expect("outbound packet queued") {
+                TransportMessage::Outbound(request) => request.raw,
+                _ => panic!("expected outbound packet"),
+            }
+        }
+        fn active_link_entry(link: Link) -> ActiveLink {
+            ActiveLink {
+                link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            }
+        }
+
+        let (initiator, responder, _identity_key) = handshaken_link_pair_with_identity();
+        let link_id = responder.link_id;
+
+        let (tx_a, mut rx_a) = mpsc::channel(16);
+        let (_event_tx_a, event_rx_a) = mpsc::channel(16);
+        let mut lm_a = LinkManager::new(tx_a, event_rx_a, [0xA1; 16], None);
+        lm_a.active_links
+            .insert(link_id, active_link_entry(initiator));
+
+        let (tx_b, mut rx_b) = mpsc::channel(16);
+        let (_event_tx_b, event_rx_b) = mpsc::channel(16);
+        let mut lm_b = LinkManager::new(tx_b, event_rx_b, [0xB1; 16], None);
+        lm_b.active_links
+            .insert(link_id, active_link_entry(responder));
+
+        // A -> B channel data; B proves it back.
+        lm_a.send_channel_message(&link_id, &TestChannelNoop)
+            .unwrap();
+        let data_ab = next_outbound(&mut rx_a);
+        lm_b.handle_inbound_packet(&data_ab, 1);
+        let proof_b = next_outbound(&mut rx_b);
+        lm_a.handle_inbound_packet(&proof_b, 1);
+
+        // B -> A echo; A proves it back.
+        lm_b.send_channel_message(&link_id, &TestChannelNoop)
+            .unwrap();
+        let data_ba = next_outbound(&mut rx_b);
+        lm_a.handle_inbound_packet(&data_ba, 1);
+        let proof_a = next_outbound(&mut rx_a);
+        lm_b.handle_inbound_packet(&proof_a, 1);
+
+        let (a_tx, a_rx, a_txc, a_rxc) = lm_a.get_link(&link_id).unwrap().traffic_stats();
+        let (b_tx, b_rx, b_txc, b_rxc) = lm_b.get_link(&link_id).unwrap().traffic_stats();
+
+        // tx counts data + delivery proofs; proofs never route through
+        // Link.receive, so rx counts data payloads only (Python parity).
+        assert_eq!(a_tx, payload_len(&data_ab) + payload_len(&proof_a));
+        assert_eq!(b_tx, payload_len(&data_ba) + payload_len(&proof_b));
+        assert_eq!(a_rx, payload_len(&data_ba));
+        assert_eq!(b_rx, payload_len(&data_ab));
+        // Data components match across peers — the 1.3.8 unit consistency.
+        assert_eq!(a_tx - payload_len(&proof_a), b_rx);
+        assert_eq!(b_tx - payload_len(&proof_b), a_rx);
+        assert_eq!((a_txc, a_rxc), (2, 1));
+        assert_eq!((b_txc, b_rxc), (2, 1));
     }
 
     #[test]

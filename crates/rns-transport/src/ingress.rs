@@ -18,7 +18,7 @@ use crate::constants::{
     AR_FREQ_DECAY, EC_PR_FREQ, EGRESS_CONTROL, IA_FREQ_SAMPLES, IC_BURST_FREQ, IC_BURST_FREQ_NEW,
     IC_BURST_HOLD, IC_BURST_MIN_SAMPLES, IC_BURST_PENALTY, IC_DEQUE_MIN_SAMPLE,
     IC_HELD_RELEASE_INTERVAL, IC_NEW_TIME, IC_PR_BURST_FREQ, IC_PR_BURST_FREQ_NEW, IP_FREQ_SAMPLES,
-    MAX_HELD_ANNOUNCES, OA_FREQ_SAMPLES, OP_FREQ_SAMPLES, PR_FREQ_DECAY,
+    MAX_HELD_ANNOUNCES, OA_FREQ_SAMPLES, OP_FREQ_SAMPLES, PATHFINDER_M, PR_FREQ_DECAY,
 };
 
 /// Per-interface ingress overrides parsed from `[interface.<name>] ic_*` keys.
@@ -367,6 +367,11 @@ impl IngressController {
     }
 
     pub fn hold_announce(&mut self, announce: HeldAnnounce) {
+        // Python 1.3.8 Interface.py:221-222: announces already at the hop cap
+        // would be dropped by every receiver on release — don't hold them.
+        if announce.hops >= PATHFINDER_M - 1 {
+            return;
+        }
         if self.held_announces.contains_key(&announce.destination_hash)
             || self.held_announces.len() < self.max_held
         {
@@ -768,6 +773,27 @@ mod tests {
         };
         ctrl.hold_announce(a3);
         assert_eq!(ctrl.held_count(), 2);
+    }
+
+    #[test]
+    fn hold_announce_ignores_max_hop_announces() {
+        // Python 1.3.8 Interface.py:221-222: hops >= PATHFINDER_M-1 not held.
+        let mut ctrl = IngressController::new();
+        ctrl.hold_announce(HeldAnnounce {
+            raw: Bytes::from_static(&[1, 2, 3]),
+            destination_hash: [0xA1; 16],
+            hops: PATHFINDER_M - 1,
+            receiving_interface_id: 1,
+        });
+        assert_eq!(ctrl.held_count(), 0);
+
+        ctrl.hold_announce(HeldAnnounce {
+            raw: Bytes::from_static(&[4, 5, 6]),
+            destination_hash: [0xA2; 16],
+            hops: PATHFINDER_M - 2,
+            receiving_interface_id: 1,
+        });
+        assert_eq!(ctrl.held_count(), 1);
     }
 
     #[test]

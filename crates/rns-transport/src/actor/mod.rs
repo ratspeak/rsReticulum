@@ -100,8 +100,33 @@ pub struct TransportActor {
     last_held_announce_check: f64,
 
     pub is_transport_enabled: bool,
+    /// Wire-facing transport identity (Python `Transport.identity`): HEADER_2
+    /// path responses, link-request transport_id matching, local next-hop
+    /// answers. On non-transport nodes this rotates per boot by default —
+    /// see `apply_transport_identity_policy`.
     pub transport_identity_hash: Option<[u8; 16]>,
+    /// Persisted transport identity (Python 1.3.8 `Transport._identity`,
+    /// Transport.py:211-215). RPC-key derivation and operator identification
+    /// stay bound to this; never emitted on the wire when the ephemeral
+    /// policy is active.
+    pub internal_identity_hash: Option<[u8; 16]>,
+    /// Per-boot ephemeral identity hash substituted for the persisted one
+    /// when transport is disabled and `static_transport_identity` is unset
+    /// (Python 1.3.8 Transport.py:234-238). Generated lazily once per boot;
+    /// the runtime may pre-seed it with the hash of a full ephemeral
+    /// `Identity` so runtime-side consumers (discovery announcer, blackhole
+    /// publisher) share the same value.
+    pub ephemeral_identity_hash: Option<[u8; 16]>,
+    /// Python 1.3.8 `static_transport_identity` config key (Reticulum.py:502-504,
+    /// default false): opts a non-transport node out of the per-boot ephemeral
+    /// transport identity. Set by the runtime before spawn.
+    pub static_transport_identity: bool,
     pub blackhole_sources: Vec<[u8; 16]>,
+    /// Live snapshot of currently blackholed identity hashes, shared with the
+    /// runtime's link layer so the LINKIDENTIFY handler can tear down links
+    /// from blackholed identities (Python 1.3.8 Link.py:966-968) without an
+    /// actor round-trip. Rebuilt on every blackhole-table mutation.
+    pub blackholed_snapshot: Arc<std::sync::RwLock<HashSet<[u8; 16]>>>,
 
     /// True when connected to a shared Reticulum instance — the transport
     /// defers to the shared instance for routing decisions rather than
@@ -261,7 +286,11 @@ impl TransportActor {
             last_held_announce_check: 0.0,
             is_transport_enabled: false,
             transport_identity_hash: None,
+            internal_identity_hash: None,
+            ephemeral_identity_hash: None,
+            static_transport_identity: false,
             blackhole_sources: Vec::new(),
+            blackholed_snapshot: Arc::new(std::sync::RwLock::new(HashSet::new())),
             is_shared_instance: false,
             shared_instance_client_mode: false,
             storage_dir: None,
@@ -472,13 +501,17 @@ impl TransportActor {
             TransportMessage::SetTransportEnabled { enabled } => {
                 debug!(enabled, "setting transport enabled");
                 self.is_transport_enabled = enabled;
+                // The runtime sends the identity before the enable flag, so
+                // the swap decision must be re-evaluated here.
+                self.apply_transport_identity_policy();
             }
             TransportMessage::SetTransportIdentity { identity_hash } => {
                 debug!(
                     hash = hex::encode(identity_hash),
                     "setting transport identity"
                 );
-                self.transport_identity_hash = Some(identity_hash);
+                self.internal_identity_hash = Some(identity_hash);
+                self.apply_transport_identity_policy();
                 self.load_python_blackhole_if_ready();
             }
             TransportMessage::SetBlackholeSources { sources } => {
@@ -698,6 +731,49 @@ impl TransportActor {
         self.pending_discovery_prs.clear();
         self.last_discovery_pr_tx = 0.0;
         self.state_dirty = true;
+    }
+
+    /// Python 1.3.8 Transport.py:234-238: when transport is disabled and
+    /// `static_transport_identity` is unset (the default), the wire-facing
+    /// transport identity becomes a fresh per-boot identity while the
+    /// persisted one is retained as `internal_identity_hash`
+    /// (`Transport._identity`). Re-evaluated on both SetTransportIdentity and
+    /// SetTransportEnabled so the runtime's message order doesn't matter.
+    fn apply_transport_identity_policy(&mut self) {
+        let Some(internal) = self.internal_identity_hash else {
+            return;
+        };
+        if !self.is_transport_enabled && !self.static_transport_identity {
+            let ephemeral = *self
+                .ephemeral_identity_hash
+                .get_or_insert_with(|| rns_identity::identity::Identity::new().hash);
+            if self.transport_identity_hash != Some(ephemeral) {
+                debug!(
+                    hash = hex::encode(ephemeral),
+                    "initialized ephemeral transport identity"
+                );
+                self.transport_identity_hash = Some(ephemeral);
+            }
+        } else {
+            self.transport_identity_hash = Some(internal);
+        }
+    }
+
+    /// Rebuild the shared blackhole snapshot from the authoritative table.
+    /// Called after every blackhole-table mutation; TTL-expired entries drop
+    /// out here and on the periodic cull (Python parity: the 60s expiry job,
+    /// Transport.py:986-1002).
+    fn publish_blackhole_snapshot(&self) {
+        let now = now_f64();
+        let set: HashSet<[u8; 16]> = self
+            .blackhole_table
+            .iter_entries()
+            .filter(|(_, entry)| entry.ttl.is_none_or(|ttl| now - entry.created < ttl))
+            .map(|(hash, _)| hash.into_bytes())
+            .collect();
+        if let Ok(mut guard) = self.blackholed_snapshot.write() {
+            *guard = set;
+        }
     }
 
     fn record_packet_metrics(&mut self, packet_hash: [u8; 32], metrics: PacketMetrics) {
@@ -1072,35 +1148,66 @@ impl TransportActor {
             return false;
         }
 
+        // Python 1.3.8 Transport.py:1210-1240 hoists the instance-local check
+        // and the announce's next-hop (learned-from) interface.
+        // `from_iface_mode`: None = no live path; Some(None) = path via an
+        // unregistered interface (Python's mode-less hasattr case);
+        // Some(Some(mode)) otherwise. Never consulted for local destinations.
+        let local = self.local_destinations.contains(destination_hash);
+        let from_iface_mode = self
+            .path_table
+            .get_live(destination_hash)
+            .map(|path| self.interfaces.get(&path.interface_id).map(|i| i.mode));
+
+        // Mode-independent gate: a non-local announce whose next-hop interface
+        // doesn't exist is never rebroadcast (Transport.py:1216-1218).
+        if !local && from_iface_mode.is_none() {
+            trace!(
+                dest = hex::encode(destination_hash),
+                interface = id,
+                "blocking announce broadcast: next hop interface doesn't exist"
+            );
+            return false;
+        }
+
+        // Per-interface announces_from_internal opt-out for internal-origin
+        // announces; checked before the egress-mode gates (Transport.py:1220).
+        if !local
+            && !entry.announces_from_internal
+            && from_iface_mode == Some(Some(InterfaceMode::Internal))
+        {
+            trace!(
+                dest = hex::encode(destination_hash),
+                interface = id,
+                "blocking announce broadcast: internal-mode next hop interface"
+            );
+            return false;
+        }
+
         match entry.mode {
             InterfaceMode::AccessPoint => false,
+            InterfaceMode::Internal => {
+                // Internal egress relays everything except boundary-origin and
+                // mode-less-origin announces (Transport.py:1228-1236).
+                local
+                    || !matches!(
+                        from_iface_mode,
+                        Some(None) | Some(Some(InterfaceMode::Boundary))
+                    )
+            }
             InterfaceMode::Roaming => {
-                if self.local_destinations.contains(destination_hash) {
-                    return true;
-                }
-                let Some(path) = self.path_table.get_live(destination_hash) else {
-                    return false;
-                };
-                !matches!(
-                    self.interfaces
-                        .get(&path.interface_id)
-                        .map(|iface| iface.mode),
-                    Some(InterfaceMode::Roaming | InterfaceMode::Boundary) | None
-                )
+                local
+                    || !matches!(
+                        from_iface_mode,
+                        Some(None) | Some(Some(InterfaceMode::Roaming | InterfaceMode::Boundary))
+                    )
             }
             InterfaceMode::Boundary => {
-                if self.local_destinations.contains(destination_hash) {
-                    return true;
-                }
-                let Some(path) = self.path_table.get_live(destination_hash) else {
-                    return false;
-                };
-                !matches!(
-                    self.interfaces
-                        .get(&path.interface_id)
-                        .map(|iface| iface.mode),
-                    Some(InterfaceMode::Roaming) | None
-                )
+                local
+                    || !matches!(
+                        from_iface_mode,
+                        Some(None) | Some(Some(InterfaceMode::Roaming))
+                    )
             }
             InterfaceMode::Full | InterfaceMode::PointToPoint | InterfaceMode::Gateway => true,
         }
@@ -1164,17 +1271,23 @@ impl TransportActor {
         }
     }
 
+    /// `None` when the cached announce fails to parse — Python 1.3.8
+    /// Transport.py:2984 treats that as a cache miss and never emits the raw
+    /// bytes (unpack also rejects hops >= PATHFINDER_M, Packet.py:247-248).
     fn path_response_from_cached_announce(
         &self,
         cached_raw: &[u8],
         destination_hash: [u8; 16],
         hops: u8,
-    ) -> Vec<u8> {
+    ) -> Option<Vec<u8>> {
         let Ok((cached_header, payload_offset)) =
             rns_wire::header::PacketHeader::unpack(cached_raw)
         else {
-            return cached_raw.to_vec();
+            return None;
         };
+        if cached_header.hops >= PATHFINDER_M {
+            return None;
+        }
 
         let (header_type, transport_type, transport_id) =
             if let Some(transport_id) = self.transport_identity_hash {
@@ -1207,7 +1320,7 @@ impl TransportActor {
         };
         let mut raw = header.pack();
         raw.extend_from_slice(&cached_raw[payload_offset..]);
-        raw
+        Some(raw)
     }
 
     pub fn has_path(&self, dest_hash: &[u8; 16]) -> bool {
@@ -1305,9 +1418,13 @@ fn rand_window() -> f64 {
 }
 
 fn mode_discovers_unknown_paths(mode: InterfaceMode) -> bool {
+    // Python 1.3.8 Interface.py:55 DISCOVER_PATHS_FOR.
     matches!(
         mode,
-        InterfaceMode::AccessPoint | InterfaceMode::Gateway | InterfaceMode::Roaming
+        InterfaceMode::AccessPoint
+            | InterfaceMode::Gateway
+            | InterfaceMode::Roaming
+            | InterfaceMode::Internal
     )
 }
 
@@ -1565,6 +1682,8 @@ mod tests {
             txb: None,
             tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             multipoint: false,
+            recursive_prs: false,
+            announces_from_internal: true,
             ingress: crate::ingress::IngressController::new(),
             announce_queue: Vec::new(),
         };
@@ -1630,6 +1749,10 @@ mod tests {
         let (mut mp, _rx2) = make_test_interface("ble");
         mp.multipoint = true;
         actor.interfaces.insert(2, mp);
+        // The relayed announce has installed a path (next-hop gate parity).
+        actor
+            .path_table
+            .insert(dest, PathEntry::new(None, 1, 2, InterfaceMode::Gateway));
 
         assert!(
             !actor.interface_allows_announce(1, &dest, Some(1)),
@@ -2241,7 +2364,10 @@ mod tests {
         actor.interfaces.insert(2, entry2);
         actor.interfaces.insert(3, entry3);
 
-        let data = vec![0xAA, 0xBB];
+        let (data, dest) = make_valid_announce("test.ap.skip", 1);
+        actor
+            .path_table
+            .insert(dest, PathEntry::new(None, 1, 1, InterfaceMode::Gateway));
         actor.broadcast_announce_on_interfaces(&data, None);
         actor.flush_announce_queues();
 
@@ -3413,6 +3539,12 @@ mod tests {
         actor.interfaces.insert(1, entry1);
 
         let (raw, dest_hash) = make_valid_announce("test.retransmit", 0);
+        // Processing the announce installs the path before any retransmit
+        // (next-hop gate parity).
+        actor.path_table.insert(
+            dest_hash,
+            PathEntry::new(None, 1, 1, InterfaceMode::Gateway),
+        );
 
         // Insert an announce entry that is due for retransmit
         let announce_entry = crate::announce::AnnounceEntry {
@@ -5600,13 +5732,16 @@ mod tests {
         let (entry, mut rx) = make_test_interface("spaced_iface");
         actor.interfaces.insert(1, entry);
 
-        let (raw, _dest) = make_valid_announce("test.cap", 0);
+        let (raw, dest) = make_valid_announce("test.cap", 0);
         let raw_len = raw.len();
 
         // Two distinct announces back-to-back. The first call must just
-        // enqueue (nothing on the wire yet).
+        // enqueue (nothing on the wire yet). Both destinations are local so
+        // the next-hop gate does not apply.
+        actor.local_destinations.insert(dest);
         actor.broadcast_announce_on_interfaces(&raw, None);
-        let (raw2, _dest2) = make_valid_announce("test.cap.b", 0);
+        let (raw2, dest2) = make_valid_announce("test.cap.b", 0);
+        actor.local_destinations.insert(dest2);
         actor.broadcast_announce_on_interfaces(&raw2, None);
         assert!(
             rx.try_recv().is_err(),
@@ -5768,6 +5903,148 @@ mod tests {
                 .blackhole_table
                 .is_blackholed(&manual_identity.hash)
         );
+    }
+
+    // Python 1.3.8 Transport.py:234-238: transport disabled + default config
+    // swaps the wire-facing identity to a per-boot ephemeral one, keeping the
+    // persisted hash as the internal identity.
+    #[test]
+    fn ephemeral_transport_identity_swap_when_transport_disabled() {
+        let (mut actor, _tx) = TransportActor::new();
+        let persistent = [0x11; 16];
+
+        actor.handle_message(TransportMessage::SetTransportIdentity {
+            identity_hash: persistent,
+        });
+
+        assert_eq!(actor.internal_identity_hash, Some(persistent));
+        let ephemeral = actor
+            .transport_identity_hash
+            .expect("wire identity must be set");
+        assert_ne!(
+            ephemeral, persistent,
+            "wire identity must not expose the persisted hash"
+        );
+
+        // Per-boot stable: a repeated identity set keeps the same ephemeral.
+        actor.handle_message(TransportMessage::SetTransportIdentity {
+            identity_hash: persistent,
+        });
+        assert_eq!(actor.transport_identity_hash, Some(ephemeral));
+
+        // Enabling transport restores the persistent identity (the runtime
+        // sends SetTransportIdentity before SetTransportEnabled).
+        actor.handle_message(TransportMessage::SetTransportEnabled { enabled: true });
+        assert_eq!(actor.transport_identity_hash, Some(persistent));
+    }
+
+    #[test]
+    fn static_transport_identity_flag_keeps_persistent_identity() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.static_transport_identity = true;
+        let persistent = [0x22; 16];
+
+        actor.handle_message(TransportMessage::SetTransportIdentity {
+            identity_hash: persistent,
+        });
+
+        assert_eq!(actor.transport_identity_hash, Some(persistent));
+        assert_eq!(actor.internal_identity_hash, Some(persistent));
+        assert_eq!(actor.ephemeral_identity_hash, None);
+    }
+
+    #[test]
+    fn preseeded_ephemeral_identity_hash_is_used() {
+        // The runtime may generate the full ephemeral Identity itself (its
+        // discovery/blackhole destinations need the keys) and pre-seed the
+        // hash so both layers agree on the wire value.
+        let (mut actor, _tx) = TransportActor::new();
+        actor.ephemeral_identity_hash = Some([0xEE; 16]);
+
+        actor.handle_message(TransportMessage::SetTransportIdentity {
+            identity_hash: [0x33; 16],
+        });
+
+        assert_eq!(actor.transport_identity_hash, Some([0xEE; 16]));
+        assert_eq!(actor.internal_identity_hash, Some([0x33; 16]));
+    }
+
+    #[test]
+    fn transport_enabled_before_identity_keeps_persistent_identity() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.handle_message(TransportMessage::SetTransportEnabled { enabled: true });
+        actor.handle_message(TransportMessage::SetTransportIdentity {
+            identity_hash: [0x44; 16],
+        });
+        assert_eq!(actor.transport_identity_hash, Some([0x44; 16]));
+        assert_eq!(actor.ephemeral_identity_hash, None);
+    }
+
+    // Shared snapshot consumed by the runtime link layer for the Python 1.3.8
+    // Link.py:966-968 blackholed-identity link teardown.
+    #[test]
+    fn blackhole_snapshot_tracks_rpc_mutations() {
+        let (mut actor, _tx) = TransportActor::new();
+        let snapshot = actor.blackholed_snapshot.clone();
+        assert!(snapshot.read().unwrap().is_empty());
+
+        actor.handle_query(crate::messages::TransportQuery::BlackholeIdentity {
+            hash: [0xAB; 16],
+            ttl: None,
+            reason: crate::blackhole::BlackholeReason::Manual,
+            reason_label: None,
+        });
+        assert!(snapshot.read().unwrap().contains(&[0xAB; 16]));
+
+        actor.handle_query(crate::messages::TransportQuery::UnblackholeIdentity {
+            hash: [0xAB; 16],
+        });
+        assert!(!snapshot.read().unwrap().contains(&[0xAB; 16]));
+
+        // System entries surface too, and ClearSystemBlackholes removes them.
+        actor.handle_query(crate::messages::TransportQuery::BlackholeIdentity {
+            hash: [0xAC; 16],
+            ttl: None,
+            reason: crate::blackhole::BlackholeReason::RateLimit,
+            reason_label: None,
+        });
+        assert!(snapshot.read().unwrap().contains(&[0xAC; 16]));
+        actor.handle_query(crate::messages::TransportQuery::ClearSystemBlackholes);
+        assert!(!snapshot.read().unwrap().contains(&[0xAC; 16]));
+    }
+
+    #[test]
+    fn blackhole_snapshot_filters_expired_entries() {
+        let (mut actor, _tx) = TransportActor::new();
+        let now = crate::now_f64();
+        actor.blackhole_table.insert_entry(
+            [0xE1; 16],
+            crate::blackhole::BlackholeEntry {
+                created: now - 100.0,
+                ttl: Some(50.0),
+                reason: crate::blackhole::BlackholeReason::Manual,
+                reason_label: None,
+                source: None,
+            },
+        );
+        actor.blackhole_table.insert_entry(
+            [0xE2; 16],
+            crate::blackhole::BlackholeEntry {
+                created: now,
+                ttl: Some(500.0),
+                reason: crate::blackhole::BlackholeReason::Manual,
+                reason_label: None,
+                source: None,
+            },
+        );
+        actor.publish_blackhole_snapshot();
+
+        let snapshot = actor.blackholed_snapshot.read().unwrap();
+        assert!(
+            !snapshot.contains(&[0xE1; 16]),
+            "expired TTL must not surface"
+        );
+        assert!(snapshot.contains(&[0xE2; 16]));
     }
 
     #[test]
@@ -6435,6 +6712,8 @@ mod tests {
         actor.interfaces.insert(2, gw);
 
         let (raw, dest) = make_valid_announce("test.outbound.ap", 0);
+        // Own announces are always for registered (instance-local) destinations.
+        actor.local_destinations.insert(dest);
         actor.handle_message(TransportMessage::Outbound(OutboundRequest {
             raw,
             destination_hash: dest,
@@ -6508,6 +6787,404 @@ mod tests {
             actor.interfaces.get(&4).unwrap().announce_queue.len(),
             1,
             "boundary may rebroadcast paths learned from gateway/full-style interfaces"
+        );
+    }
+
+    /// Python 1.3.8 Packet.py:247-248: raw hops byte >= PATHFINDER_M is
+    /// malformed for every packet type; 127 is the maximum valid value.
+    #[test]
+    fn inbound_hop_count_at_or_above_max_is_dropped_for_all_packet_types() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (dest_tx, mut dest_rx) = mpsc::channel(8);
+        let dest = [0xE1; 16];
+        actor.local_destinations.insert(dest);
+        actor.destination_channels.insert(dest, dest_tx);
+
+        // Data: 128 dropped at parse, 127 delivered.
+        actor.on_inbound(InboundPacket {
+            raw: make_data_packet(dest, PATHFINDER_M),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(dest_rx.try_recv().is_err(), "hops=128 data must be dropped");
+        actor.on_inbound(InboundPacket {
+            raw: make_data_packet(dest, PATHFINDER_M - 1),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(
+            dest_rx.try_recv().is_ok(),
+            "hops=127 data must be processed"
+        );
+
+        // LinkRequest: 128 dropped at parse, 127 delivered.
+        let lr_dest = [0xE2; 16];
+        let (lr_tx, mut lr_rx) = mpsc::channel(8);
+        actor.local_destinations.insert(lr_dest);
+        actor.destination_channels.insert(lr_dest, lr_tx);
+        actor.on_inbound(InboundPacket {
+            raw: make_link_request_packet(lr_dest, PATHFINDER_M),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(
+            lr_rx.try_recv().is_err(),
+            "hops=128 link request must be dropped"
+        );
+        actor.on_inbound(InboundPacket {
+            raw: make_link_request_packet(lr_dest, PATHFINDER_M - 1),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(
+            lr_rx.try_recv().is_ok(),
+            "hops=127 link request must be processed"
+        );
+
+        // Proof: 128 leaves the receipt pending, 127 delivers it.
+        let proof_dest = [0xE3; 16];
+        actor.receipt_table.insert(
+            proof_dest,
+            PacketReceipt::new([0u8; 32], proof_dest, Some(Duration::from_secs(180))),
+        );
+        actor.on_inbound(InboundPacket {
+            raw: make_proof_packet(proof_dest, PATHFINDER_M),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(
+            actor.receipt_table.contains_key(&proof_dest),
+            "hops=128 proof must be dropped"
+        );
+        actor.on_inbound(InboundPacket {
+            raw: make_proof_packet(proof_dest, PATHFINDER_M - 1),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(
+            !actor.receipt_table.contains_key(&proof_dest),
+            "hops=127 proof must be processed"
+        );
+
+        // Announce: 128 dropped at parse, no path learned.
+        let (announce_raw, announce_dest) = make_valid_announce("test.hops.parse", PATHFINDER_M);
+        actor.on_inbound(InboundPacket {
+            raw: announce_raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(
+            actor.path_table.get(&announce_dest).is_none(),
+            "hops=128 announce must be dropped"
+        );
+    }
+
+    /// The announce hop cap is checked post-adjustment with `>=`: a raw
+    /// 127-hop announce (128 after increment) is not path-learned, while a
+    /// raw 126-hop announce is.
+    #[test]
+    fn announce_hop_cap_boundary_after_inbound_adjustment() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (iface, _rx) = make_test_interface("wire");
+        actor.interfaces.insert(1, iface);
+
+        let (raw_127, dest_127) = make_valid_announce("test.hops.cap.a", PATHFINDER_M - 1);
+        actor.on_inbound(InboundPacket {
+            raw: raw_127,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(
+            actor.path_table.get(&dest_127).is_none(),
+            "raw 127-hop announce adjusts to 128 and must not be path-learned"
+        );
+
+        let (raw_126, dest_126) = make_valid_announce("test.hops.cap.b", PATHFINDER_M - 2);
+        actor.on_inbound(InboundPacket {
+            raw: raw_126,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert_eq!(
+            actor.path_table.get(&dest_126).map(|e| e.hops),
+            Some(PATHFINDER_M - 1),
+            "raw 126-hop announce must still be path-learned"
+        );
+    }
+
+    /// Python 1.3.8 Transport.py:1216-1218: mode-independent block when the
+    /// destination is not instance-local and no next-hop interface exists.
+    #[test]
+    fn announce_broadcast_blocked_without_next_hop_interface_unless_local() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        let (mut full, _rx) = make_test_interface("full");
+        full.mode = InterfaceMode::Full;
+        actor.interfaces.insert(1, full);
+
+        let (raw, dest) = make_valid_announce("test.nexthop.gate", 1);
+        actor.broadcast_announce_on_interfaces(&raw, None);
+        assert_eq!(
+            actor.interfaces.get(&1).unwrap().announce_queue.len(),
+            0,
+            "non-local announce without a known path must not be rebroadcast"
+        );
+
+        actor.local_destinations.insert(dest);
+        actor.broadcast_announce_on_interfaces(&raw, None);
+        assert_eq!(
+            actor.interfaces.get(&1).unwrap().announce_queue.len(),
+            1,
+            "instance-local destinations are exempt from the next-hop gate"
+        );
+    }
+
+    /// Python 1.3.8 Transport.py:1220-1236: internal-mode egress and
+    /// announces_from_internal origin gating.
+    #[test]
+    fn internal_mode_announce_gating_matches_python_138() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (mut boundary, _rx1) = make_test_interface("boundary");
+        boundary.mode = InterfaceMode::Boundary;
+        actor.interfaces.insert(1, boundary);
+        let (mut internal_egress, _rx2) = make_test_interface("internal_egress");
+        internal_egress.mode = InterfaceMode::Internal;
+        actor.interfaces.insert(2, internal_egress);
+        let (mut full, _rx3) = make_test_interface("full");
+        full.mode = InterfaceMode::Full;
+        actor.interfaces.insert(3, full);
+
+        // Boundary-origin announce: blocked on internal egress, allowed on full.
+        let (raw_b, dest_b) = make_valid_announce("test.internal.from_boundary", 1);
+        actor.path_table.insert(
+            dest_b,
+            crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Boundary),
+        );
+        actor.broadcast_announce_on_interfaces(&raw_b, None);
+        assert_eq!(
+            actor.interfaces.get(&2).unwrap().announce_queue.len(),
+            0,
+            "internal egress must block boundary-origin announces"
+        );
+        assert_eq!(
+            actor.interfaces.get(&3).unwrap().announce_queue.len(),
+            1,
+            "full egress relays boundary-origin announces"
+        );
+
+        // Full-origin announce: allowed on internal egress.
+        let (raw_f, dest_f) = make_valid_announce("test.internal.from_full", 1);
+        actor.path_table.insert(
+            dest_f,
+            crate::path_table::PathEntry::new(None, 1, 3, InterfaceMode::Full),
+        );
+        actor.broadcast_announce_on_interfaces(&raw_f, None);
+        assert_eq!(
+            actor.interfaces.get(&2).unwrap().announce_queue.len(),
+            1,
+            "internal egress relays full-origin announces"
+        );
+
+        // Mode-less origin (unregistered interface): blocked on internal
+        // egress, allowed on full egress.
+        let (raw_m, dest_m) = make_valid_announce("test.internal.modeless", 1);
+        actor.path_table.insert(
+            dest_m,
+            crate::path_table::PathEntry::new(None, 1, 99, InterfaceMode::Full),
+        );
+        actor.broadcast_announce_on_interfaces(&raw_m, None);
+        assert_eq!(
+            actor.interfaces.get(&2).unwrap().announce_queue.len(),
+            1,
+            "internal egress must block announces from mode-less interfaces"
+        );
+        assert_eq!(
+            actor.interfaces.get(&3).unwrap().announce_queue.len(),
+            3,
+            "full egress relays announces from mode-less interfaces"
+        );
+
+        // Local destination is exempt on internal egress even without a path.
+        let (raw_l, dest_l) = make_valid_announce("test.internal.local", 0);
+        actor.local_destinations.insert(dest_l);
+        actor.broadcast_announce_on_interfaces(&raw_l, None);
+        assert_eq!(
+            actor.interfaces.get(&2).unwrap().announce_queue.len(),
+            2,
+            "instance-local announces pass internal egress gating"
+        );
+    }
+
+    /// Python 1.3.8 Transport.py:1219-1221: announces_from_internal=False on
+    /// the egress interface blocks internal-origin announces, ordered before
+    /// the egress-mode gates.
+    #[test]
+    fn announces_from_internal_false_blocks_internal_origin_rebroadcast() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (mut internal_origin, _rx1) = make_test_interface("internal_origin");
+        internal_origin.mode = InterfaceMode::Internal;
+        actor.interfaces.insert(1, internal_origin);
+        let (mut opted_out, _rx2) = make_test_interface("opted_out");
+        opted_out.mode = InterfaceMode::Full;
+        opted_out.announces_from_internal = false;
+        actor.interfaces.insert(2, opted_out);
+        let (mut default_full, _rx3) = make_test_interface("default_full");
+        default_full.mode = InterfaceMode::Full;
+        actor.interfaces.insert(3, default_full);
+
+        let (raw, dest) = make_valid_announce("test.afi.origin", 1);
+        actor.path_table.insert(
+            dest,
+            crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Internal),
+        );
+        actor.broadcast_announce_on_interfaces(&raw, None);
+        assert_eq!(
+            actor.interfaces.get(&2).unwrap().announce_queue.len(),
+            0,
+            "announces_from_internal=false must block internal-origin announces"
+        );
+        assert_eq!(
+            actor.interfaces.get(&3).unwrap().announce_queue.len(),
+            1,
+            "default announces_from_internal=true relays internal-origin announces"
+        );
+
+        // Instance-local destinations are exempt from the opt-out.
+        let (raw_l, dest_l) = make_valid_announce("test.afi.local", 0);
+        actor.local_destinations.insert(dest_l);
+        actor.broadcast_announce_on_interfaces(&raw_l, None);
+        assert_eq!(
+            actor.interfaces.get(&2).unwrap().announce_queue.len(),
+            1,
+            "local announces bypass the announces_from_internal opt-out"
+        );
+    }
+
+    /// Python 1.3.8 Transport.py:2946-2947 (commit 03ddb082): recursive_prs
+    /// forces unknown-path discovery independent of interface mode; Internal
+    /// joins DISCOVER_PATHS_FOR (Interface.py:55).
+    #[test]
+    fn recursive_prs_option_forces_unknown_path_discovery() {
+        assert!(mode_discovers_unknown_paths(InterfaceMode::Internal));
+
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (mut full, _full_rx) = make_test_interface("full");
+        full.mode = InterfaceMode::Full;
+        actor.interfaces.insert(1, full);
+        let (mut boundary, mut boundary_rx) = make_test_interface("boundary");
+        boundary.mode = InterfaceMode::Boundary;
+        actor.interfaces.insert(2, boundary);
+
+        actor.handle_inbound_path_request(&make_path_request_payload([0x61; 16], None), 1);
+        assert!(
+            boundary_rx.try_recv().is_err(),
+            "full mode without recursive_prs must not discover unknown paths"
+        );
+
+        actor.interfaces.get_mut(&1).unwrap().recursive_prs = true;
+        actor.handle_inbound_path_request(&make_path_request_payload([0x62; 16], None), 1);
+        assert!(
+            boundary_rx.try_recv().is_ok(),
+            "recursive_prs must force unknown-path discovery regardless of mode"
+        );
+    }
+
+    /// Python 1.3.8 Transport.py:2685-2697: next_hop/next_hop_interface fall
+    /// back to the transport identity / shared-instance interface for
+    /// instance-local destinations.
+    #[test]
+    fn next_hop_rpc_falls_back_to_local_destinations() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.transport_identity_hash = Some([0x77; 16]);
+        let dest = [0x71; 16];
+        actor.local_destinations.insert(dest);
+
+        match actor.handle_query(TransportQuery::GetNextHop { dest }) {
+            TransportQueryResponse::HashResult(h) => assert_eq!(h, Some([0x77; 16])),
+            other => panic!("unexpected response: {other:?}"),
+        }
+        // No shared-instance interface: interface queries stay empty.
+        match actor.handle_query(TransportQuery::GetNextHopIfName { dest }) {
+            TransportQueryResponse::StringResult(name) => assert_eq!(name, None),
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let (mut shared, _rx) = make_test_interface("shared_server");
+        shared.role = InterfaceRole::SharedServer;
+        actor.interfaces.insert(5, shared);
+        match actor.handle_query(TransportQuery::GetNextHopIfName { dest }) {
+            TransportQueryResponse::StringResult(name) => {
+                assert_eq!(name.as_deref(), Some("shared_server"))
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match actor.handle_query(TransportQuery::GetNextHopInterfaceId { dest }) {
+            TransportQueryResponse::IntResult(id) => assert_eq!(id, 5),
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // Unknown non-local destinations still resolve to nothing.
+        let unknown = [0x72; 16];
+        match actor.handle_query(TransportQuery::GetNextHop { dest: unknown }) {
+            TransportQueryResponse::HashResult(h) => assert_eq!(h, None),
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match actor.handle_query(TransportQuery::GetNextHopInterfaceId { dest: unknown }) {
+            TransportQueryResponse::IntResult(id) => assert_eq!(id, -1),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// Python 1.3.8 Transport.py:2984: a cached announce that fails to unpack
+    /// is a miss — no path response is synthesized from raw bytes.
+    #[test]
+    fn path_response_from_unparseable_cached_announce_is_a_miss() {
+        let (actor, _tx) = TransportActor::new();
+
+        assert!(
+            actor
+                .path_response_from_cached_announce(&[0x01, 0x02], [0xAA; 16], 1)
+                .is_none(),
+            "garbage cached bytes must not produce a path response"
+        );
+
+        let (raw_bad_hops, dest) = make_valid_announce("test.cache.badhops", PATHFINDER_M);
+        assert!(
+            actor
+                .path_response_from_cached_announce(&raw_bad_hops, dest, 1)
+                .is_none(),
+            "cached announce with hops >= PATHFINDER_M must be treated as a miss"
+        );
+
+        let (raw_ok, dest_ok) = make_valid_announce("test.cache.ok", 1);
+        assert!(
+            actor
+                .path_response_from_cached_announce(&raw_ok, dest_ok, 1)
+                .is_some()
         );
     }
 

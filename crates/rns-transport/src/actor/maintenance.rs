@@ -111,7 +111,9 @@ impl TransportActor {
         self.cull_announce_queues(now);
 
         if now - self.last_blackhole_check >= BLACKHOLE_CHECK_INTERVAL {
-            self.blackhole_table.cull_expired();
+            if self.blackhole_table.cull_expired() > 0 {
+                self.publish_blackhole_snapshot();
+            }
             self.state_dirty = true;
             self.last_blackhole_check = now;
         }

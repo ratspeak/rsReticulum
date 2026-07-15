@@ -21,8 +21,11 @@ pub const INITIAL_WAIT: Duration = Duration::from_secs(20);
 /// Python `BlackholeUpdater.JOB_INTERVAL` — time between scheduling sweeps.
 pub const JOB_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Python `BlackholeUpdater.UPDATE_INTERVAL` — minimum gap between
-/// successful pulls from the same source (1 hour).
+/// Python `BlackholeUpdater.UPDATE_INTERVAL` — default minimum gap between
+/// successful pulls from the same source (1 hour). Python 1.3.8 makes this
+/// configurable via `blackhole_update_interval` (Reticulum.py:593-596,
+/// consumed at Discovery.py:749); the config-side minutes→seconds conversion
+/// and 2-minute clamp live at the parse site, this module takes seconds.
 pub const UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Python `BlackholeUpdater.SOURCE_TIMEOUT` — kept here for parity but
@@ -33,16 +36,40 @@ pub const SOURCE_TIMEOUT: Duration = Duration::from_secs(25);
 /// Per-process subscriber state. Cheap to clone-on-snapshot via the
 /// [`SubscriberState::snapshot`] helper; the runtime owner holds the
 /// authoritative copy.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct SubscriberState {
     /// Unix-seconds timestamp of the most recent successful pull, keyed by
     /// source identity hash. Missing key ⇒ "never pulled".
     last_updates: HashMap<IdentityHash, f64>,
+    /// Minimum gap between pulls from the same source. Defaults to
+    /// [`UPDATE_INTERVAL`]; overridden by the `blackhole_update_interval`
+    /// config key (Python 1.3.8 RNS.Reticulum.blackhole_update_interval()).
+    update_interval: Duration,
+}
+
+impl Default for SubscriberState {
+    fn default() -> Self {
+        Self {
+            last_updates: HashMap::new(),
+            update_interval: UPDATE_INTERVAL,
+        }
+    }
 }
 
 impl SubscriberState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Override the per-source pull interval. The caller passes seconds
+    /// already clamped at config parse (min 2 minutes, Reticulum.py:593-596).
+    pub fn with_update_interval(mut self, interval: Duration) -> Self {
+        self.update_interval = interval;
+        self
+    }
+
+    pub fn update_interval(&self) -> Duration {
+        self.update_interval
     }
 
     /// Record a successful pull from `source` at `now` (Unix seconds).
@@ -70,7 +97,7 @@ impl SubscriberState {
             .copied()
             .filter(|src| {
                 let last = self.last_updates.get(src).copied().unwrap_or(0.0);
-                now - last >= UPDATE_INTERVAL.as_secs_f64()
+                now - last >= self.update_interval.as_secs_f64()
             })
             .collect();
         due.sort();
@@ -185,5 +212,25 @@ mod tests {
         s.prune(&[h(0x11), h(0x22)]);
 
         assert_eq!(s.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn default_update_interval_matches_python_constant() {
+        let s = SubscriberState::new();
+        assert_eq!(s.update_interval(), UPDATE_INTERVAL);
+    }
+
+    #[test]
+    fn configured_update_interval_overrides_default() {
+        // 2 minutes — the Python config minimum after the parse-side clamp.
+        let mut s = SubscriberState::new().with_update_interval(Duration::from_secs(120));
+        s.mark_updated(h(0x11), 10_000.0);
+
+        // Inside the configured window — not due, even though the default
+        // 1h interval would also say not due; check the boundary instead.
+        assert!(s.due_sources(&[h(0x11)], 10_000.0 + 119.0).is_empty());
+
+        // At the configured boundary — due again, far before the 1h default.
+        assert_eq!(s.due_sources(&[h(0x11)], 10_000.0 + 120.0), vec![h(0x11)]);
     }
 }

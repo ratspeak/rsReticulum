@@ -103,6 +103,14 @@ pub struct InterfaceEntry {
     /// its other peers. Loop safety comes from the announce-table dedup + hop
     /// cap and the driver's own per-peer anti-loop filter.
     pub multipoint: bool,
+    /// Python 1.3.8 `Interface.recursive_prs` (Interface.py:110): force
+    /// unknown-path discovery for path requests arriving on this interface,
+    /// independent of interface mode.
+    pub recursive_prs: bool,
+    /// Python 1.3.8 `Interface.announces_from_internal` (Interface.py:111):
+    /// when false, this interface does not rebroadcast announces whose
+    /// next-hop interface is `InterfaceMode::Internal`.
+    pub announces_from_internal: bool,
 }
 
 impl InterfaceEntry {
@@ -139,6 +147,8 @@ impl InterfaceEntry {
             ingress: IngressController::new(),
             announce_queue: Vec::new(),
             multipoint: false,
+            recursive_prs: false,
+            announces_from_internal: true,
         }
     }
 

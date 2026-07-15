@@ -58,6 +58,8 @@ pub const CMD_REMOTE_INPUT: u16 = 0x0A01;
 pub const EVT_MSG: u16 = 0x0000;
 pub const EVT_SYSTEM_BOOT: u16 = 0x0001;
 pub const EVT_CORE_INIT: u16 = 0x0002;
+// "Board hardware initialization" (1.3.8 WeaveInterface.py:342, newer firmware boot event)
+pub const EVT_BOARD_INIT: u16 = 0x0003;
 
 // Driver events (0x1xxx)
 pub const EVT_DRV_UART_INIT: u16 = 0x1000;
@@ -112,6 +114,7 @@ pub const EVT_STAT_UPTIME: u16 = 0xE001;
 pub const EVT_STAT_TIMEBASE: u16 = 0xE002;
 pub const EVT_STAT_CPU: u16 = 0xE003;
 pub const EVT_STAT_TASK_CPU: u16 = 0xE004;
+// EVT_STAT_MEMORY data = [free u32 BE][total u32 BE] (1.3.8 WeaveInterface.py:760-761)
 pub const EVT_STAT_MEMORY: u16 = 0xE005;
 pub const EVT_STAT_STORAGE: u16 = 0xE006;
 
@@ -440,6 +443,24 @@ mod tests {
         assert_eq!(frame.level, 5);
         assert_eq!(frame.event, EVT_SYSTEM_BOOT);
         assert_eq!(frame.data, b"ok");
+    }
+
+    #[test]
+    fn test_boot_event_codes() {
+        assert_eq!(EVT_MSG, 0x0000);
+        assert_eq!(EVT_SYSTEM_BOOT, 0x0001);
+        assert_eq!(EVT_CORE_INIT, 0x0002);
+        assert_eq!(EVT_BOARD_INIT, 0x0003);
+    }
+
+    #[test]
+    fn test_parse_log_frame_board_init() {
+        // flags=0, ts=42ms, level=NOTICE, event=EVT_BOARD_INIT, no data
+        let payload = [0x00, 0x00, 0x00, 0x00, 0x2A, 0x04, 0x00, 0x03];
+        let frame = parse_log_frame(&payload).unwrap();
+        assert_eq!(frame.timestamp_ms, 42);
+        assert_eq!(frame.event, EVT_BOARD_INIT);
+        assert!(frame.data.is_empty());
     }
 
     #[test]

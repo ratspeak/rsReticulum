@@ -156,14 +156,29 @@ impl TransportActor {
                 TransportQueryResponse::Announces(entries)
             }
             TransportQuery::GetNextHop { dest } => {
-                let next_hop = self.path_table.get_live(&dest).and_then(|e| e.next_hop);
+                // Python 1.3.8 Transport.py:2685-2688: local destinations
+                // resolve to Transport.identity.hash.
+                let next_hop = self
+                    .path_table
+                    .get_live(&dest)
+                    .and_then(|e| e.next_hop)
+                    .or_else(|| {
+                        self.local_destinations
+                            .contains(&dest)
+                            .then_some(self.transport_identity_hash)
+                            .flatten()
+                    });
                 TransportQueryResponse::HashResult(next_hop)
             }
             TransportQuery::GetNextHopIfName { dest } => {
+                // Python 1.3.8 Transport.py:2691-2697: local destinations
+                // resolve to the shared-instance interface (None off shared hosts).
                 let name = self
                     .path_table
                     .get_live(&dest)
-                    .and_then(|e| self.interfaces.get(&e.interface_id).map(|i| i.name.clone()));
+                    .map(|e| e.interface_id)
+                    .or_else(|| self.local_destination_interface_id(&dest))
+                    .and_then(|id| self.interfaces.get(&id).map(|i| i.name.clone()));
                 TransportQueryResponse::StringResult(name)
             }
             TransportQuery::GetPacketRssi { packet_hash } => TransportQueryResponse::FloatResult(
@@ -294,12 +309,14 @@ impl TransportActor {
                     self.path_table.remove(&dest);
                 }
                 self.state_dirty = true;
+                self.publish_blackhole_snapshot();
                 TransportQueryResponse::Ok
             }
             TransportQuery::UnblackholeIdentity { hash } => {
                 let removed = self.blackhole_table.remove(&hash);
                 if removed {
                     self.state_dirty = true;
+                    self.publish_blackhole_snapshot();
                 }
                 TransportQueryResponse::BoolResult(removed)
             }
@@ -310,6 +327,7 @@ impl TransportActor {
                 let cleared = self.blackhole_table.clear_system_entries();
                 if cleared > 0 {
                     self.state_dirty = true;
+                    self.publish_blackhole_snapshot();
                 }
                 TransportQueryResponse::IntResult(cleared as i64)
             }
@@ -342,6 +360,7 @@ impl TransportActor {
                         );
                         if applied > 0 {
                             self.state_dirty = true;
+                            self.publish_blackhole_snapshot();
                         }
                         TransportQueryResponse::IntResult(applied as i64)
                     }
@@ -457,7 +476,9 @@ impl TransportActor {
                 let bitrate = self
                     .path_table
                     .get_live(&dest)
-                    .and_then(|e| self.interfaces.get(&e.interface_id))
+                    .map(|e| e.interface_id)
+                    .or_else(|| self.local_destination_interface_id(&dest))
+                    .and_then(|id| self.interfaces.get(&id))
                     .map(|iface| iface.bitrate as f64);
                 TransportQueryResponse::FloatResult(bitrate)
             }
@@ -465,7 +486,9 @@ impl TransportActor {
                 let id = self
                     .path_table
                     .get_live(&dest)
-                    .map(|e| e.interface_id as i64);
+                    .map(|e| e.interface_id)
+                    .or_else(|| self.local_destination_interface_id(&dest))
+                    .map(|id| id as i64);
                 TransportQueryResponse::IntResult(id.unwrap_or(-1))
             }
             TransportQuery::FirstHopTimeout { dest } => {
@@ -588,10 +611,27 @@ impl TransportActor {
                 }
                 if purged > 0 {
                     self.state_dirty = true;
+                    self.publish_blackhole_snapshot();
                 }
                 TransportQueryResponse::IntResult(purged as i64)
             }
         }
+    }
+
+    /// Next-hop interface for a local destination: the shared-instance server
+    /// interface, mirroring Python 1.3.8 Transport.next_hop_interface's
+    /// destinations_map fallback (Transport.py:2695-2696).
+    fn local_destination_interface_id(
+        &self,
+        dest: &[u8; 16],
+    ) -> Option<crate::messages::InterfaceId> {
+        if !self.local_destinations.contains(dest) {
+            return None;
+        }
+        self.interfaces
+            .iter()
+            .find(|(_, e)| e.role == crate::messages::InterfaceRole::SharedServer)
+            .map(|(&id, _)| id)
     }
 }
 

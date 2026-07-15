@@ -1500,7 +1500,7 @@ async fn send_client_channel_data(
     raw.extend_from_slice(data);
     let packet_hash = rns_wire::hash::packet_hash(&raw, channel_header.flags.header_type);
     channel.track_outbound_packet_hash(packet_hash, sequence);
-    link.record_tx(raw.len());
+    link.record_tx(data.len());
     transport_tx
         .send(TransportMessage::Outbound(OutboundRequest {
             raw: Bytes::from(raw),

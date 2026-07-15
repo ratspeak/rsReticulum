@@ -281,6 +281,10 @@ pub enum InterfaceMode {
     AccessPoint,
     Roaming,
     Boundary,
+    /// Python 1.3.8 `MODE_INTERNAL` (Interface.py:51) — local/shared-instance
+    /// interfaces. Default path expiry (`path_expiry` wildcard arm) and a
+    /// discovery mode (`mode_discovers_unknown_paths`), like upstream.
+    Internal,
 }
 
 /// Which directions an interface carries traffic in.

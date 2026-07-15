@@ -659,6 +659,7 @@ impl TransportActor {
                             );
                         }
                     }
+                    self.publish_blackhole_snapshot();
                     debug!("loaded {} blackhole entries from disk", count);
                 }
                 Err(e) => {
@@ -947,6 +948,7 @@ impl TransportActor {
                     );
                 }
                 if count > 0 {
+                    self.publish_blackhole_snapshot();
                     debug!(count, "loaded Python blackhole files");
                 }
             }

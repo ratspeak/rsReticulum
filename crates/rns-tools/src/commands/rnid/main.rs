@@ -1,7 +1,9 @@
 //! rnid-rs - identity create/inspect/sign/verify/encrypt/decrypt.
 //!
-//! Python reference: `RNS/Utilities/rnid.py` from Reticulum 1.2.5.
+//! Python reference: `RNS/Utilities/rnid.py` from Reticulum 1.3.8.
 
+mod b256;
+mod meta;
 mod rsg;
 
 use std::io::{Read, Write};
@@ -30,6 +32,7 @@ use rns_tools::RS_RETICULUM_VERSION;
 const DEFAULT_ASPECTS: &str = "rns.id";
 const PUB_EXT: &str = "pub";
 const SIG_EXT: &str = "rsg";
+const MSG_EXT: &str = "rsm";
 const ENCRYPT_EXT: &str = "rfe";
 const ENC_CHUNK: usize = 16 * 1024 * 1024;
 const DEC_CHUNK: usize = ENC_CHUNK + rns_crypto::TOKEN_OVERHEAD * 2;
@@ -100,27 +103,39 @@ struct Args {
     hash: Option<String>,
 
     /// Encrypt file.
-    #[arg(short = 'e', long)]
-    encrypt: Option<PathBuf>,
+    #[arg(short = 'e', long, num_args = 0.., value_name = "file")]
+    encrypt: Option<Vec<PathBuf>>,
 
     /// Decrypt file.
-    #[arg(short = 'd', long)]
-    decrypt: Option<PathBuf>,
+    #[arg(short = 'd', long, num_args = 0.., value_name = "file")]
+    decrypt: Option<Vec<PathBuf>>,
 
     /// Sign file.
-    #[arg(short = 's', long)]
-    sign: Option<PathBuf>,
+    #[arg(short = 's', long, num_args = 0.., value_name = "path")]
+    sign: Option<Vec<PathBuf>>,
 
     /// Validate signature.
-    #[arg(short = 'V', long = "validate")]
-    validate: Option<PathBuf>,
+    #[arg(short = 'V', long = "validate", num_args = 0.., value_name = "path")]
+    validate: Option<Vec<PathBuf>>,
+
+    /// Create embedded signed message.
+    #[arg(short = 'S', long = "sign-message", num_args = 0..=1, value_name = "text")]
+    sign_message: Option<Option<String>>,
+
+    /// Embed metadata structure from file.
+    #[arg(short = 'E', long = "embed-meta", value_name = "path")]
+    embed_meta: Option<PathBuf>,
+
+    /// Validate metadata for embedding with spec from file.
+    #[arg(long = "meta-spec", num_args = 0..=1, value_name = "path")]
+    meta_spec: Option<Option<PathBuf>>,
 
     /// Sign raw input data instead of hashing first.
     #[arg(long)]
     raw: bool,
 
-    /// Legacy input file path override.
-    #[arg(short = 'r', long, hide = true)]
+    /// Input file path for operations with optional file input.
+    #[arg(short = 'r', long, value_name = "path")]
     read: Option<PathBuf>,
 
     /// Output file path.
@@ -159,9 +174,17 @@ struct Args {
     #[arg(short = 'B', long)]
     base32: bool,
 
+    /// Use base256-encoded input and output.
+    #[arg(short = 'U', long)]
+    base256: bool,
+
     /// Use hex-encoded input and output.
-    #[arg(long)]
+    #[arg(short = 'F', long)]
     hex: bool,
+
+    /// Display RSM metadata if available.
+    #[arg(long)]
+    meta: bool,
 
     /// Print version and exit.
     #[arg(long)]
@@ -236,7 +259,7 @@ pub(crate) async fn main() -> ExitCode {
     run(args).await
 }
 
-async fn run(mut args: Args) -> ExitCode {
+async fn run(args: Args) -> ExitCode {
     if args.version {
         println!("rnid-rs {RS_RETICULUM_VERSION}");
         return ExitCode::SUCCESS;
@@ -255,11 +278,19 @@ async fn run(mut args: Args) -> ExitCode {
         .with_writer(std::io::stderr)
         .try_init();
 
+    // Python truthiness: empty path lists (`-s` with no values) and an empty
+    // `-S ""` message do not activate their operation.
+    let sign_message_active = match &args.sign_message {
+        Some(None) => true,
+        Some(Some(text)) => !text.is_empty(),
+        None => false,
+    };
     let op_count = [
-        args.encrypt.is_some(),
-        args.decrypt.is_some(),
-        args.validate.is_some(),
-        args.sign.is_some(),
+        paths_active(&args.encrypt),
+        paths_active(&args.decrypt),
+        paths_active(&args.validate),
+        paths_active(&args.sign),
+        sign_message_active,
     ]
     .into_iter()
     .filter(|op| *op)
@@ -283,26 +314,19 @@ async fn run(mut args: Args) -> ExitCode {
         eprintln!("The -i, -g, -m and -M args are mutually exclusive");
         return ExitCode::from(1);
     }
-    let encoding_count = [args.base64, args.base32, args.hex]
+    let encoding_count = [args.base64, args.base32, args.base256, args.hex]
         .into_iter()
         .filter(|flag| *flag)
         .count();
     if encoding_count > 1 {
-        eprintln!("The -b, -B and --hex args are mutually exclusive");
+        eprintln!("The -b, -B, --hex and --base256 args are mutually exclusive");
         return ExitCode::from(1);
     }
 
-    if args.read.is_none() {
-        args.read = args
-            .encrypt
-            .clone()
-            .or_else(|| args.decrypt.clone())
-            .or_else(|| args.sign.clone());
-    }
-
-    let op_requires_identity = args.sign.is_some()
-        || args.encrypt.is_some()
-        || args.decrypt.is_some()
+    let op_requires_identity = paths_active(&args.sign)
+        || sign_message_active
+        || paths_active(&args.encrypt)
+        || paths_active(&args.decrypt)
         || args.announce.is_some()
         || args.write.is_some()
         || args.print_identity
@@ -353,17 +377,47 @@ async fn run(mut args: Args) -> ExitCode {
         return announce_destination(identity.as_ref().expect("identity checked"), aspects, &args)
             .await;
     }
-    if args.validate.is_some() {
-        return validate_signature(identity.as_ref(), args.identity.as_deref(), &args);
+    // Multi-path ops iterate like Python 1.3.8's recursive list dispatch
+    // (rnid.py:606-617 etc.): first failing path terminates with its own code.
+    if paths_active(&args.validate) {
+        for path in args.validate.clone().expect("validate active") {
+            let code =
+                validate_signature(identity.as_ref(), args.identity.as_deref(), &path, &args);
+            if code != ExitCode::SUCCESS {
+                return code;
+            }
+        }
+        return ExitCode::SUCCESS;
     }
-    if args.sign.is_some() {
-        return sign_file(identity.as_ref().expect("identity checked"), &args);
+    if paths_active(&args.sign) {
+        for path in args.sign.clone().expect("sign active") {
+            let code = sign_file(identity.as_ref().expect("identity checked"), &path, &args);
+            if code != ExitCode::SUCCESS {
+                return code;
+            }
+        }
+        return ExitCode::SUCCESS;
     }
-    if args.encrypt.is_some() {
-        return encrypt_file(identity.as_ref().expect("identity checked"), &args);
+    if sign_message_active {
+        return sign_message(identity.as_ref().expect("identity checked"), &args);
     }
-    if args.decrypt.is_some() {
-        return decrypt_file(identity.as_ref().expect("identity checked"), &args);
+    if paths_active(&args.encrypt) {
+        for path in args.encrypt.clone().expect("encrypt active") {
+            let code = encrypt_file(identity.as_ref().expect("identity checked"), &path, &args);
+            if code != ExitCode::SUCCESS {
+                return code;
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    if paths_active(&args.decrypt) {
+        for path in args.decrypt.clone().expect("decrypt active") {
+            let code = decrypt_file(identity.as_ref().expect("identity checked"), &path, &args);
+            if code != ExitCode::SUCCESS {
+                return code;
+            }
+        }
+        return ExitCode::SUCCESS;
     }
     if args.write.is_some() {
         let code = write_identity(identity.as_ref().expect("identity checked"), &args);
@@ -858,15 +912,11 @@ fn export_private_identity(identity: &Identity, args: &Args) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn sign_file(identity: &Identity, args: &Args) -> ExitCode {
+fn sign_file(identity: &Identity, input_path: &Path, args: &Args) -> ExitCode {
     if !identity.has_private_key() {
         eprintln!("Specified Identity does not hold a private key. Cannot sign.");
         return ExitCode::from(4);
     }
-    let Some(input_path) = args.read.as_ref() else {
-        eprintln!("Signing requested, but no input data specified");
-        return ExitCode::from(6);
-    };
     let input = match std::fs::File::open(input_path) {
         Ok(file) => file,
         Err(e) => {
@@ -883,7 +933,7 @@ fn sign_file(identity: &Identity, args: &Args) -> ExitCode {
             }
         }
     } else {
-        match rsg::create_rsg(identity, input) {
+        match rsg::create_rsg(identity, input, false, None) {
             Ok(rsg) => rsg,
             Err(e) => {
                 eprintln!("Could not sign {}: {e}", input_path.display());
@@ -892,15 +942,17 @@ fn sign_file(identity: &Identity, args: &Args) -> ExitCode {
         }
     };
 
-    if !args.raw && (args.base64 || args.base32 || args.hex) {
-        let encoded = if args.base64 {
-            URL_SAFE.encode(&signature)
+    if !args.raw && (args.base64 || args.base32 || args.base256 || args.hex) {
+        let wrapped = if args.base256 {
+            wrap_rsg_str(&b256::b256rep(&signature))
+        } else if args.base64 {
+            wrap_rsg(URL_SAFE.encode(&signature).as_bytes())
         } else if args.base32 {
-            encode_base32(&signature)
+            wrap_rsg(encode_base32(&signature).as_bytes())
         } else {
-            hex::encode(&signature)
+            wrap_rsg(hex::encode(&signature).as_bytes())
         };
-        println!("\n{}\n", wrap_rsg(encoded.as_bytes()));
+        println!("\n{wrapped}\n");
         println!(
             "Signed file {} with {}",
             input_path.display(),
@@ -938,29 +990,156 @@ fn sign_file(identity: &Identity, args: &Args) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Python ref: 1.3.8 rnid.py:788-841 sign_message (-S): message from CLI arg,
+/// `-r` file, or $EDITOR; optional `-E` metadata embedding; writes `<name>.rsm`
+/// for binary output, armored print otherwise.
+fn sign_message(identity: &Identity, args: &Args) -> ExitCode {
+    let binary_output = !(args.base32 || args.base64 || args.base256 || args.hex);
+    if binary_output && args.write.is_none() {
+        eprintln!("No write path specified");
+        return ExitCode::from(250);
+    }
+    if !identity.has_private_key() {
+        eprintln!("Cannot sign, the identity does not hold a private key");
+        return ExitCode::from(4);
+    }
+
+    let message_arg = args.sign_message.as_ref().expect("sign_message active");
+    let message: Vec<u8> = if let Some(read_path) = args.read.as_ref() {
+        if message_arg.is_some() {
+            eprintln!(
+                "Both an input file and command-line provided message was specified, aborting"
+            );
+            return ExitCode::from(250);
+        }
+        if !read_path.is_file() {
+            eprintln!("The file {} does not exist", read_path.display());
+            return ExitCode::from(6);
+        }
+        // Python opens the file as utf-8 text (rnid.py:806).
+        match std::fs::read_to_string(read_path) {
+            Ok(text) => text.into_bytes(),
+            Err(e) => {
+                eprintln!("Could not read message from {}: {e}", read_path.display());
+                return ExitCode::from(252);
+            }
+        }
+    } else if let Some(text) = message_arg {
+        text.clone().into_bytes()
+    } else {
+        match get_editor_content() {
+            Ok(content) => content,
+            Err(code) => return code,
+        }
+    };
+    if message.is_empty() {
+        eprintln!("No message specified");
+        return ExitCode::from(250);
+    }
+
+    let mut meta_values: Option<Vec<(String, rmpv::Value)>> = None;
+    if let Some(meta_path) = args.embed_meta.as_ref() {
+        // Default spec path is `<meta path>.spec` unless --meta-spec is given;
+        // a missing spec file disables validation (rnid.py:812-815).
+        let spec_path = args
+            .meta_spec
+            .clone()
+            .flatten()
+            .unwrap_or_else(|| PathBuf::from(format!("{}.spec", meta_path.to_string_lossy())));
+        if !meta_path.is_file() {
+            eprintln!("Metadata file {} does not exist", meta_path.display());
+            return ExitCode::from(6);
+        }
+        let spec_path = spec_path.is_file().then_some(spec_path);
+        let spec_info = spec_path
+            .as_ref()
+            .map(|p| format!(" using spec from {}", p.display()))
+            .unwrap_or_default();
+        println!("Embedding metadata from {}{spec_info}", meta_path.display());
+
+        match meta::rsg_meta_from_file(meta_path, spec_path.as_deref()) {
+            Ok(values) => meta_values = Some(values),
+            Err(e) => {
+                eprintln!("Could not load metadata from {}: {e}", meta_path.display());
+                return ExitCode::from(254);
+            }
+        }
+    }
+
+    let rsg = match rsg::create_rsg(identity, &message[..], true, meta_values.as_deref()) {
+        Ok(rsg) => rsg,
+        Err(e) => {
+            eprintln!("Could not sign message: {e}");
+            return ExitCode::from(254);
+        }
+    };
+
+    if binary_output {
+        let write_path = args.write.as_ref().expect("write path checked");
+        let write_str = write_path.to_string_lossy();
+        let rsg_path = if write_str.ends_with(&format!(".{MSG_EXT}")) {
+            write_path.clone()
+        } else {
+            append_extension(write_path, MSG_EXT)
+        };
+        if rsg_path.is_file() && !args.force {
+            eprintln!(
+                "The signature file \"{}\" already exists, not overwriting",
+                rsg_path.display()
+            );
+            return ExitCode::from(11);
+        }
+        if let Err(e) = std::fs::write(&rsg_path, &rsg) {
+            eprintln!("Could not sign message: {e}");
+            return ExitCode::from(254);
+        }
+        println!(
+            "Message signed with {} saved to {}",
+            pretty_hash(&identity.hash),
+            rsg_path.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let wrapped = if args.base256 {
+        wrap_rsg_str(&b256::b256rep(&rsg))
+    } else if args.base32 {
+        wrap_rsg(encode_base32(&rsg).as_bytes())
+    } else if args.base64 {
+        wrap_rsg(URL_SAFE.encode(&rsg).as_bytes())
+    } else {
+        wrap_rsg(hex::encode(&rsg).as_bytes())
+    };
+    println!("\n{wrapped}\n");
+    println!("Message signed with {}", pretty_hash(&identity.hash));
+    ExitCode::SUCCESS
+}
+
 fn validate_signature(
     identity: Option<&Identity>,
     identity_arg: Option<&str>,
+    validate_path: &Path,
     args: &Args,
 ) -> ExitCode {
-    let Some(validate_path) = args.validate.as_ref() else {
-        return ExitCode::from(20);
-    };
-
     let validate_str = validate_path.to_string_lossy();
+    if validate_str
+        .to_lowercase()
+        .ends_with(&format!(".{MSG_EXT}"))
+    {
+        return validate_message_file(identity, identity_arg, validate_path, args);
+    }
     let path_is_sigfile = validate_str
         .to_lowercase()
         .ends_with(&format!(".{SIG_EXT}"));
-    let (sig_path, inferred_input_path) = if path_is_sigfile {
+    let (sig_path, input_path) = if path_is_sigfile {
         let stripped = &validate_str[..validate_str.len() - SIG_EXT.len() - 1];
-        (validate_path.clone(), PathBuf::from(stripped))
+        (validate_path.to_path_buf(), PathBuf::from(stripped))
     } else {
         (
             append_extension(validate_path, SIG_EXT),
-            validate_path.clone(),
+            validate_path.to_path_buf(),
         )
     };
-    let input_path = args.read.clone().unwrap_or(inferred_input_path);
 
     let sig_bytes = match std::fs::read(&sig_path) {
         Ok(data) => data,
@@ -1052,11 +1231,120 @@ fn validate_signature(
     }
 }
 
-fn encrypt_file(identity: &Identity, args: &Args) -> ExitCode {
-    let Some(input_path) = args.read.as_ref() else {
-        eprintln!("Encryption requested, but no input data specified");
+/// Python ref: 1.3.8 rnid.py:673-737 validate_message: verifies an .rsm's
+/// embedded message, prints it, and with --meta renders the typed recursive
+/// metadata dump.
+fn validate_message_file(
+    identity: Option<&Identity>,
+    identity_arg: Option<&str>,
+    path: &Path,
+    args: &Args,
+) -> ExitCode {
+    if !path.is_file() {
+        eprintln!("The signature file \"{}\" does not exist", path.display());
         return ExitCode::from(6);
+    }
+    let rsg_bytes = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Could not read rsg: {e}");
+            return ExitCode::from(252);
+        }
     };
+
+    let required = if let Some(identity) = identity {
+        Some(rsg::RequiredSigner::Identity(identity))
+    } else if let Some(identity_arg) = identity_arg {
+        match parse_hash16(identity_arg) {
+            Some(hash) => Some(rsg::RequiredSigner::Hash(hash)),
+            None => {
+                eprintln!("Invalid identity hash length");
+                return ExitCode::from(8);
+            }
+        }
+    } else {
+        None
+    };
+
+    let Some(rmpv::Value::Map(envelope)) = rsg::extract_signed_rsg_data(&rsg_bytes) else {
+        // Python hits a TypeError on the None envelope -> R_UNKNOWN_ERROR.
+        eprintln!(
+            "Error while validating {}: could not decode rsm envelope",
+            path.display()
+        );
+        return ExitCode::from(254);
+    };
+    let message_entry = envelope
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("message"))
+        .map(|(_, v)| v);
+    let Some(message_entry) = message_entry else {
+        eprintln!("No embedded message in {}", path.display());
+        return ExitCode::from(10);
+    };
+    let message: Vec<u8> = match message_entry {
+        rmpv::Value::Binary(bytes) => bytes.clone(),
+        rmpv::Value::String(s) => s.as_bytes().to_vec(),
+        _ => {
+            eprintln!(
+                "Error while validating {}: invalid embedded message type",
+                path.display()
+            );
+            return ExitCode::from(254);
+        }
+    };
+
+    let validated = match rsg::validate_rsg(&rsg_bytes, &message[..], required) {
+        Ok(validated) => validated,
+        Err(e) => {
+            let signer_description = required
+                .map(|required| match required {
+                    rsg::RequiredSigner::Identity(identity) => pretty_hash(&identity.hash),
+                    rsg::RequiredSigner::Hash(hash) => pretty_hash(&hash),
+                })
+                .map(|s| format!("\nThe message was NOT signed by {s}"))
+                .unwrap_or_default();
+            eprintln!(
+                "Invalid signature in {}{signer_description}: {e}",
+                path.display()
+            );
+            return ExitCode::from(10);
+        }
+    };
+
+    if args.meta {
+        println!("RSM Metadata\n============\n");
+        let mut dump = String::new();
+        for (key, entry) in &validated.meta {
+            let key = key
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{key}"));
+            format_meta_entry(&mut dump, entry, &key, 1);
+        }
+        print!("{dump}");
+        println!("\nValidation\n==========");
+    }
+    let c = if args.meta { "" } else { ":" };
+    let f = if args.meta { "" } else { " following" };
+    println!(
+        "\nSignature is valid, the{f} message was signed by {}{c}\n",
+        pretty_hash(&validated.signer_hash)
+    );
+    if args.meta {
+        println!("Message\n=======\n");
+    }
+    match String::from_utf8(message) {
+        Ok(text) => println!("{text}"),
+        Err(e) => {
+            eprintln!("Error while validating {}: {e}", path.display());
+            return ExitCode::from(254);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn encrypt_file(identity: &Identity, input_path: &Path, args: &Args) -> ExitCode {
     let mut input: Box<dyn Read> = match std::fs::File::open(input_path) {
         Ok(file) => Box::new(file),
         Err(e) => {
@@ -1120,15 +1408,11 @@ fn encrypt_file(identity: &Identity, args: &Args) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn decrypt_file(identity: &Identity, args: &Args) -> ExitCode {
+fn decrypt_file(identity: &Identity, input_path: &Path, args: &Args) -> ExitCode {
     if !identity.has_private_key() {
         eprintln!("Specified Identity does not hold a private key. Cannot decrypt.");
         return ExitCode::from(4);
     }
-    let Some(input_path) = args.read.as_ref() else {
-        eprintln!("Decryption requested, but no input data specified");
-        return ExitCode::from(6);
-    };
     if !input_path
         .to_string_lossy()
         .to_lowercase()
@@ -1365,6 +1649,193 @@ fn wrap_rsg(rsg: &[u8]) -> String {
     wrapped
 }
 
+/// Python nargs="*" truthiness: `-s` with no values yields an empty list,
+/// which does not activate the operation.
+fn paths_active(paths: &Option<Vec<PathBuf>>) -> bool {
+    paths.as_ref().is_some_and(|paths| !paths.is_empty())
+}
+
+/// Python ref: 1.3.8 rnid.py:522-536 wrap_rsg_str — like wrap_rsg but chunks
+/// by characters (base256 armor is multi-byte UTF-8).
+fn wrap_rsg_str(rsg: &str) -> String {
+    const HEADER: &str = "#### Start of rsg data ";
+    const FOOTER: &str = " End of rsg data ####";
+    const ROW_WIDTH: usize = 64;
+
+    let mut header = HEADER.to_string();
+    while header.chars().count() < ROW_WIDTH {
+        header.push('#');
+    }
+    let mut footer = String::new();
+    while footer.chars().count() + FOOTER.chars().count() < ROW_WIDTH {
+        footer.push('#');
+    }
+    footer.push_str(FOOTER);
+
+    let mut wrapped = String::new();
+    wrapped.push_str(&header);
+    wrapped.push('\n');
+    let chars: Vec<char> = rsg.chars().collect();
+    for chunk in chars.chunks(ROW_WIDTH) {
+        wrapped.extend(chunk);
+        for _ in chunk.len()..ROW_WIDTH {
+            wrapped.push('=');
+        }
+        wrapped.push('\n');
+    }
+    wrapped.push_str(&footer);
+    wrapped
+}
+
+/// Python ref: 1.3.8 rnid.py:1034-1059 get_editor_content. Errors are printed
+/// here; the returned code is R_READ_ERROR (252).
+fn get_editor_content() -> Result<Vec<u8>, ExitCode> {
+    let mut editor = std::env::var("EDITOR").unwrap_or_default();
+    if editor.is_empty() {
+        for fallback in ["nano", "vim", "vi"] {
+            let found = std::process::Command::new("which")
+                .arg(fallback)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if found {
+                editor = fallback.to_string();
+                break;
+            }
+        }
+    }
+    if editor.is_empty() {
+        eprintln!("Could not launch editor");
+        return Err(ExitCode::from(252));
+    }
+
+    let tmp_path = std::env::temp_dir().join(format!(
+        "rnid-message-{}-{}.tmp",
+        std::process::id(),
+        now_epoch() as u64
+    ));
+    let run = || -> Result<Vec<u8>, String> {
+        std::fs::write(&tmp_path, "").map_err(|e| e.to_string())?;
+        let status = std::process::Command::new(&editor)
+            .arg(&tmp_path)
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err(format!(
+                "Editor exited with error code {}",
+                status.code().unwrap_or(-1)
+            ));
+        }
+        std::fs::read_to_string(&tmp_path)
+            .map(String::into_bytes)
+            .map_err(|e| e.to_string())
+    };
+    let result = run();
+    let _ = std::fs::remove_file(&tmp_path);
+    result.map_err(|e| {
+        eprintln!("Could not get content from editor: {e}");
+        ExitCode::from(252)
+    })
+}
+
+/// Python ref: 1.3.8 rnid.py:700-727 --meta recursive typed dump. Type chars:
+/// s str, b bytes (hex), l list, i int, f float, N nil, u unknown (incl.
+/// bool, matching Python where type(True) != int); values wrap at 64 chars
+/// with continuation lines indented to the lead-in width.
+fn format_meta_entry(out: &mut String, entry: &rmpv::Value, key: &str, level: usize) {
+    const MAX_WIDTH: usize = 64;
+    let indent = "  ".repeat(level);
+    if let rmpv::Value::Map(entries) = entry {
+        out.push_str(&format!("d{indent}{key}:\n"));
+        for (sub_key, sub_entry) in entries {
+            let sub_key = sub_key
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{sub_key}"));
+            format_meta_entry(out, sub_entry, &sub_key, level + 1);
+        }
+        return;
+    }
+
+    let etype = match entry {
+        rmpv::Value::String(_) => 's',
+        rmpv::Value::Binary(_) => 'b',
+        rmpv::Value::Array(_) => 'l',
+        rmpv::Value::Integer(_) => 'i',
+        rmpv::Value::F32(_) | rmpv::Value::F64(_) => 'f',
+        rmpv::Value::Nil => 'N',
+        _ => 'u',
+    };
+    // Python 1.3.8 rnid.py:717 skips note=None entries (pre-1.3.2 shim).
+    if key == "note" && entry.is_nil() {
+        return;
+    }
+    let text = match entry {
+        rmpv::Value::Binary(bytes) => hex::encode(bytes),
+        _ => py_str_value(entry),
+    };
+    let leadin = format!("{etype}{indent}{key}=");
+    let leadln = leadin.chars().count();
+    let chars: Vec<char> = text.chars().collect();
+    let mut first = true;
+    let mut chunks = chars.chunks(MAX_WIDTH);
+    loop {
+        let Some(chunk) = chunks.next() else {
+            if first {
+                out.push_str(&leadin);
+                out.push('\n');
+            }
+            break;
+        };
+        if first {
+            out.push_str(&leadin);
+            first = false;
+        } else {
+            out.push_str(&" ".repeat(leadln));
+        }
+        out.extend(chunk);
+        out.push('\n');
+    }
+}
+
+/// Python str() rendering of msgpack values for the --meta dump.
+fn py_str_value(value: &rmpv::Value) -> String {
+    match value {
+        rmpv::Value::String(s) => s.as_str().map(str::to_string).unwrap_or_default(),
+        rmpv::Value::Integer(i) => format!("{i}"),
+        rmpv::Value::F32(f) => py_float(*f as f64),
+        rmpv::Value::F64(f) => py_float(*f),
+        rmpv::Value::Boolean(b) => if *b { "True" } else { "False" }.to_string(),
+        rmpv::Value::Nil => "None".to_string(),
+        rmpv::Value::Array(items) => {
+            let rendered: Vec<String> = items.iter().map(py_repr_value).collect();
+            format!("[{}]", rendered.join(", "))
+        }
+        other => format!("{other}"),
+    }
+}
+
+/// Python repr() rendering for list members.
+fn py_repr_value(value: &rmpv::Value) -> String {
+    match value {
+        rmpv::Value::String(s) => {
+            let s = s.as_str().unwrap_or_default();
+            format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+        }
+        _ => py_str_value(value),
+    }
+}
+
+/// Python str() float formatting: whole floats keep one decimal ("2.0").
+fn py_float(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 && value.abs() < 1e16 {
+        format!("{value:.1}")
+    } else {
+        format!("{value}")
+    }
+}
+
 fn encode_base32(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let mut out = String::new();
@@ -1428,6 +1899,264 @@ fn now_epoch() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmpv::Value;
+
+    // Shared with the fixtures in rsg.rs: generated by running the verbatim
+    // Python 1.3.8 rnid.py create_rsg/rsg_meta code with vendored
+    // umsgpack/configobj and the 1.3.8 vendor/validate.py.
+    const FIXTURE_PRV_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
+    const FIXTURE_MESSAGE: &str = "Hello Reticulum 1.3.8 signed message test.\nSecond line æø.";
+    const FIXTURE_META_INI: &str = concat!(
+        "title = Test Release\n",
+        "tags = alpha, beta, gamma\n",
+        "quoted = \"hello # world\"\n",
+        "inline = value # trailing comment\n",
+        "[origin]\n",
+        "name = Origins\n",
+        "path = pkg/data\n",
+        "[[nested]]\n",
+        "deep = yes\n",
+    );
+    const FIXTURE_META_RSM_HEX: &str = "270dbe3b2ea3d7c96adca079a25521e938fe9c9d6b617644fa3088af6f254bf2afa70e867fafd411a79834f3d10d80c7f95b782fbf0ebec74a8b91f797bf390484a86861736874797065a6736861323536a468617368c420322779176317ebc50102a216a56a68d41c8e9aa1c849f4d4eded5c31ba542795a46d65746187a67369676e6572c410aca31af0441d81dbec71e82da0b4b5f5a67075626b6579c4408f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7a57469746c65ac546573742052656c65617365a47461677393a5616c706861a462657461a567616d6d61a671756f746564ad68656c6c6f202320776f726c64a6696e6c696e65a576616c7565a66f726967696e83a46e616d65a74f726967696e73a470617468a8706b672f64617461a66e657374656481a464656570a3796573a76d657373616765c43c48656c6c6f205265746963756c756d20312e332e38207369676e6564206d65737361676520746573742e0a5365636f6e64206c696e6520c3a6c3b82e";
+    const FIXTURE_SPEC_META_INI: &str = "name = pkg\nversion = 7\nweight = 2.5\nactive = yes\n";
+    const FIXTURE_SPEC: &str = concat!(
+        "name = string(max=64)\n",
+        "version = integer(max=100)\n",
+        "weight = float(min=0)\n",
+        "active = boolean\n",
+        "extra = string(default=filled)\n",
+    );
+    const FIXTURE_SPEC_RSM_HEX: &str = "f53a7788db14455a9f489bf742082c1f8e3dbd330e832511522073f7af422ef4055a04f093f34c06c1c4364c64de25dd00d63f720dde22f43ae223bc24fcf90184a86861736874797065a6736861323536a468617368c420322779176317ebc50102a216a56a68d41c8e9aa1c849f4d4eded5c31ba542795a46d65746187a67369676e6572c410aca31af0441d81dbec71e82da0b4b5f5a67075626b6579c4408f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7a46e616d65a3706b67a776657273696f6e07a6776569676874cb4004000000000000a6616374697665c3a56578747261a666696c6c6564a76d657373616765c43c48656c6c6f205265746963756c756d20312e332e38207369676e6564206d65737361676520746573742e0a5365636f6e64206c696e6520c3a6c3b82e";
+
+    fn fixture_identity() -> Identity {
+        Identity::from_private_key(&hex::decode(FIXTURE_PRV_HEX).unwrap()).unwrap()
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rnid-rs-test-{label}-{}-{}",
+            std::process::id(),
+            now_epoch().to_bits()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn ini_meta_rsm_is_byte_exact_with_python_138() {
+        let dir = unique_temp_dir("meta");
+        let meta_path = dir.join("meta.ini");
+        std::fs::write(&meta_path, FIXTURE_META_INI).unwrap();
+
+        let values = meta::rsg_meta_from_file(&meta_path, None).unwrap();
+        let rsm = rsg::create_rsg(
+            &fixture_identity(),
+            FIXTURE_MESSAGE.as_bytes(),
+            true,
+            Some(&values),
+        )
+        .unwrap();
+        assert_eq!(hex::encode(&rsm), FIXTURE_META_RSM_HEX);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spec_validated_meta_rsm_is_byte_exact_with_python_138() {
+        let dir = unique_temp_dir("spec");
+        let meta_path = dir.join("meta.ini");
+        let spec_path = dir.join("meta.ini.spec");
+        std::fs::write(&meta_path, FIXTURE_SPEC_META_INI).unwrap();
+        std::fs::write(&spec_path, FIXTURE_SPEC).unwrap();
+
+        let values = meta::rsg_meta_from_file(&meta_path, Some(&spec_path)).unwrap();
+        let rsm = rsg::create_rsg(
+            &fixture_identity(),
+            FIXTURE_MESSAGE.as_bytes(),
+            true,
+            Some(&values),
+        )
+        .unwrap();
+        assert_eq!(hex::encode(&rsm), FIXTURE_SPEC_RSM_HEX);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn meta_dump_matches_python_138_output() {
+        // Golden output captured from the verbatim 1.3.8 rnid.py recurse fn
+        // (:700-727) over this meta map; note=None entries are skipped.
+        let identity = fixture_identity();
+        let entries: Vec<(Value, Value)> = vec![
+            (Value::from("signer"), Value::Binary(identity.hash.to_vec())),
+            (
+                Value::from("pubkey"),
+                Value::Binary(identity.get_public_key().to_vec()),
+            ),
+            (Value::from("title"), Value::from("Test Release")),
+            (
+                Value::from("tags"),
+                Value::Array(vec![
+                    Value::from("alpha"),
+                    Value::from("beta"),
+                    Value::from("gamma"),
+                ]),
+            ),
+            (Value::from("version"), Value::from(7)),
+            (Value::from("weight"), Value::F64(2.5)),
+            (Value::from("active"), Value::Boolean(true)),
+            (Value::from("note"), Value::Nil),
+            (
+                Value::from("origin"),
+                Value::Map(vec![
+                    (Value::from("name"), Value::from("Origins")),
+                    (
+                        Value::from("nested"),
+                        Value::Map(vec![(Value::from("deep"), Value::from("yes"))]),
+                    ),
+                ]),
+            ),
+        ];
+
+        let mut dump = String::new();
+        for (key, entry) in &entries {
+            format_meta_entry(&mut dump, entry, key.as_str().unwrap(), 1);
+        }
+        let expected = concat!(
+            "b  signer=aca31af0441d81dbec71e82da0b4b5f5\n",
+            "b  pubkey=8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f\n",
+            "          29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7\n",
+            "s  title=Test Release\n",
+            "l  tags=['alpha', 'beta', 'gamma']\n",
+            "i  version=7\n",
+            "f  weight=2.5\n",
+            "u  active=True\n",
+            "d  origin:\n",
+            "s    name=Origins\n",
+            "d    nested:\n",
+            "s      deep=yes\n",
+        );
+        assert_eq!(dump, expected);
+    }
+
+    #[test]
+    fn wrap_rsg_str_matches_python_138_output() {
+        let sample = format!("αβγ{}{}", "a".repeat(63), "Ω".repeat(4));
+        let expected = concat!(
+            "#### Start of rsg data #########################################\n",
+            "αβγaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+            "aaΩΩΩΩ==========================================================\n",
+            "########################################### End of rsg data ####",
+        );
+        assert_eq!(wrap_rsg_str(&sample), expected);
+    }
+
+    #[test]
+    fn multifile_sign_validate_and_rsm_round_trip() {
+        let dir = unique_temp_dir("multi");
+        let identity_path = dir.join("identity");
+        fixture_identity().to_file(&identity_path).unwrap();
+        let file_a = dir.join("a.txt");
+        let file_b = dir.join("b.txt");
+        std::fs::write(&file_a, b"first payload").unwrap();
+        std::fs::write(&file_b, b"second payload").unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let identity_arg = identity_path.to_string_lossy().to_string();
+        let run_args = |argv: Vec<String>| {
+            let args = Args::parse_from(argv);
+            rt.block_on(run(args))
+        };
+
+        // Multi-path sign creates one .rsg per input.
+        let code = run_args(vec![
+            "rnid-rs".into(),
+            "-i".into(),
+            identity_arg.clone(),
+            "-s".into(),
+            file_a.to_string_lossy().into(),
+            file_b.to_string_lossy().into(),
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(dir.join("a.txt.rsg").is_file());
+        assert!(dir.join("b.txt.rsg").is_file());
+
+        // Multi-path validate succeeds across both.
+        let code = run_args(vec![
+            "rnid-rs".into(),
+            "-V".into(),
+            file_a.to_string_lossy().into(),
+            file_b.to_string_lossy().into(),
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS);
+
+        // First failing path terminates with its own code (missing file -> 6).
+        let code = run_args(vec![
+            "rnid-rs".into(),
+            "-V".into(),
+            dir.join("missing.txt").to_string_lossy().into(),
+            file_a.to_string_lossy().into(),
+        ]);
+        assert_eq!(code, ExitCode::from(6));
+
+        // -S message to .rsm, then validate through the -V dispatch.
+        let rsm_path = dir.join("message");
+        let code = run_args(vec![
+            "rnid-rs".into(),
+            "-i".into(),
+            identity_arg.clone(),
+            "-S".into(),
+            "signed message body".into(),
+            "-w".into(),
+            rsm_path.to_string_lossy().into(),
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS);
+        let rsm_file = dir.join("message.rsm");
+        assert!(rsm_file.is_file());
+        let code = run_args(vec![
+            "rnid-rs".into(),
+            "-V".into(),
+            rsm_file.to_string_lossy().into(),
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS);
+
+        // Wrong required signer on an .rsm is an invalid signature (10).
+        let other_identity_path = dir.join("other-identity");
+        Identity::new().to_file(&other_identity_path).unwrap();
+        let code = run_args(vec![
+            "rnid-rs".into(),
+            "-i".into(),
+            other_identity_path.to_string_lossy().into(),
+            "-V".into(),
+            rsm_file.to_string_lossy().into(),
+        ]);
+        assert_eq!(code, ExitCode::from(10));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sign_message_requires_write_path_for_binary_output() {
+        let dir = unique_temp_dir("nowrite");
+        let identity_path = dir.join("identity");
+        fixture_identity().to_file(&identity_path).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let args = Args::parse_from([
+            "rnid-rs",
+            "-i",
+            identity_path.to_string_lossy().as_ref(),
+            "-S",
+            "some message",
+        ]);
+        let code = rt.block_on(run(args));
+        assert_eq!(code, ExitCode::from(250));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn decrypt_accepts_pre_1_2_4_rnid_rs_chunking() {

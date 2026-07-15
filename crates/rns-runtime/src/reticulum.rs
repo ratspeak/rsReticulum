@@ -1747,6 +1747,8 @@ async fn register_interface_handle_with_role_and_overrides(
         ingress,
         announce_queue: Vec::new(),
         multipoint,
+        recursive_prs: false,
+        announces_from_internal: true,
     };
     if let Err(e) = transport_tx
         .send(TransportMessage::RegisterInterface { id, entry })
@@ -1814,6 +1816,8 @@ async fn register_interface_with_post_init(
         ingress,
         announce_queue: Vec::new(),
         multipoint: false,
+        recursive_prs: false,
+        announces_from_internal: true,
     };
     if let Err(e) = transport_tx
         .send(TransportMessage::RegisterInterface { id, entry })
