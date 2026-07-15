@@ -88,6 +88,10 @@ impl TransportActor {
                         "outbound: routed via path"
                     );
 
+                    // Python 1.3.8 Transport.py:1153/1186: local_hops_delta
+                    // replaces the zero hops byte on the way out.
+                    let apply_delta = self.should_apply_delta(&parsed, target_interface);
+
                     // Transport nodes only forward Header2 packets whose transport_id
                     // matches their identity — Python hubs silently drop Header1 —
                     // so every directed send through a relay must be wrapped.
@@ -100,7 +104,11 @@ impl TransportActor {
                             };
                             let new_header = rns_wire::header::PacketHeader {
                                 flags: new_flags,
-                                hops: parsed.hops,
+                                hops: if apply_delta {
+                                    self.local_hops_delta
+                                } else {
+                                    parsed.hops
+                                },
                                 transport_id: Some(next_hop),
                                 destination_hash: parsed.destination_hash,
                                 context: parsed.context,
@@ -116,9 +124,15 @@ impl TransportActor {
                                 "outbound: wrapped Header1 -> Header2 for transport"
                             );
                             self.send_to_interface(target_interface, &new_raw);
+                        } else if apply_delta {
+                            let mangled = self.mangle_hops(&request.raw, &parsed, false);
+                            self.send_to_interface(target_interface, &mangled);
                         } else {
                             self.send_to_interface(target_interface, &request.raw);
                         }
+                    } else if apply_delta {
+                        let mangled = self.mangle_hops(&request.raw, &parsed, false);
+                        self.send_to_interface(target_interface, &mangled);
                     } else {
                         self.send_to_interface(target_interface, &request.raw);
                     }
@@ -159,7 +173,17 @@ impl TransportActor {
         if let Ok((parsed, _)) = rns_wire::header::PacketHeader::unpack(&request.raw) {
             let pkt_hash = rns_wire::hash::packet_hash(&request.raw, parsed.flags.header_type);
             self.packet_hashlist.insert(pkt_hash);
-            self.send_to_interface(interface_id, &request.raw);
+            // Python's outbound applies should_apply_delta on attached-
+            // interface sends too (Transport.py:1342-1345).
+            if self.should_apply_delta(&parsed, interface_id) {
+                let transport_insert = parsed.flags.packet_type
+                    == rns_wire::flags::PacketType::Announce
+                    && parsed.flags.header_type == rns_wire::flags::HeaderType::Header1;
+                let mangled = self.mangle_hops(&request.raw, &parsed, transport_insert);
+                self.send_to_interface(interface_id, &mangled);
+            } else {
+                self.send_to_interface(interface_id, &request.raw);
+            }
             if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce {
                 if let Some(entry) = self.interfaces.get_mut(&interface_id) {
                     entry.ingress.sent_announce();

@@ -140,7 +140,13 @@ pub(crate) async fn main() -> ExitCode {
         1 => tracing::Level::INFO,
         _ => tracing::Level::DEBUG,
     };
-    tracing_subscriber::fmt().with_max_level(level).init();
+    let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
+    rns_tools::init_tracing(
+        level,
+        rns_tools::config_log_timestamps(&config_dir),
+        true,
+        std::io::stdout,
+    );
 
     if args.monitor {
         run_monitor(args).await

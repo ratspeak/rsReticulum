@@ -213,10 +213,13 @@ pub(crate) async fn main() {
         0 => tracing::Level::WARN,
         _ => tracing::Level::ERROR,
     };
-    tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_writer(std::io::stderr)
-        .init();
+    let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
+    rns_tools::init_tracing(
+        level,
+        rns_tools::config_log_timestamps(&config_dir),
+        true,
+        std::io::stderr,
+    );
 
     if args.fetch {
         run_fetch(args).await;

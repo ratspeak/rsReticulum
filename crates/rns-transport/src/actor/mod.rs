@@ -121,6 +121,12 @@ pub struct TransportActor {
     /// default false): opts a non-transport node out of the per-boot ephemeral
     /// transport identity. Set by the runtime before spawn.
     pub static_transport_identity: bool,
+    /// Python 1.3.8 `Transport.local_hops_delta` (Transport.py:167,240): when
+    /// the `local_hops_delta` config key is set, a per-boot random 2..=7
+    /// replaces the hops byte of locally-originated packets at egress
+    /// (`should_apply_delta`/`mangle_hops`). 0 = disabled (the default). Set
+    /// by the runtime before spawn.
+    pub local_hops_delta: u8,
     pub blackhole_sources: Vec<[u8; 16]>,
     /// Live snapshot of currently blackholed identity hashes, shared with the
     /// runtime's link layer so the LINKIDENTIFY handler can tear down links
@@ -289,6 +295,7 @@ impl TransportActor {
             internal_identity_hash: None,
             ephemeral_identity_hash: None,
             static_transport_identity: false,
+            local_hops_delta: 0,
             blackhole_sources: Vec::new(),
             blackholed_snapshot: Arc::new(std::sync::RwLock::new(HashSet::new())),
             is_shared_instance: false,
@@ -674,6 +681,54 @@ impl TransportActor {
         self.interfaces
             .get(&id)
             .is_some_and(|entry| entry.role == InterfaceRole::SharedInstancePeer)
+    }
+
+    /// Python 1.3.8 Transport.should_apply_delta (Transport.py:1356-1359):
+    /// mangle only locally-originated (hops==0) non-PLAIN/GROUP packets, never
+    /// when this node is itself a shared-instance client, and never on
+    /// local-client / shared-instance edges.
+    fn should_apply_delta(
+        &self,
+        header: &rns_wire::header::PacketHeader,
+        interface_id: InterfaceId,
+    ) -> bool {
+        self.local_hops_delta != 0
+            && !self.is_shared_instance
+            && header.hops == 0
+            && header.flags.destination_type != rns_wire::flags::DestinationType::Plain
+            && header.flags.destination_type != rns_wire::flags::DestinationType::Group
+            && !self.is_local_client_interface(interface_id)
+            && !self.is_shared_instance_peer_interface(interface_id)
+    }
+
+    /// Python 1.3.8 Transport.mangle_hops (Transport.py:1362-1365): rewrite
+    /// the hops byte to the per-boot delta. `transport_insert` additionally
+    /// re-frames a HEADER_1 announce as HEADER_2|TRANSPORT carrying this
+    /// node's transport identity hash (packet grows by 17 bytes).
+    fn mangle_hops(
+        &self,
+        raw: &[u8],
+        header: &rns_wire::header::PacketHeader,
+        transport_insert: bool,
+    ) -> Vec<u8> {
+        if transport_insert && let Some(transport_id) = self.transport_identity_hash {
+            let mut flags = header.flags;
+            flags.header_type = rns_wire::flags::HeaderType::Header2;
+            flags.transport_type = rns_wire::flags::TransportType::Transport;
+            let new_header = rns_wire::header::PacketHeader {
+                flags,
+                hops: self.local_hops_delta,
+                transport_id: Some(transport_id),
+                destination_hash: header.destination_hash,
+                context: header.context,
+            };
+            let mut out = new_header.pack();
+            out.extend_from_slice(&raw[header.size()..]);
+            return out;
+        }
+        let mut out = raw.to_vec();
+        out[1] = self.local_hops_delta;
+        out
     }
 
     fn adjusted_inbound_hops(&self, raw_hops: u8, interface_id: InterfaceId) -> u8 {
@@ -1121,8 +1176,20 @@ impl TransportActor {
                 }
             })
             .collect();
+        // Python 1.3.8 Transport.py:1342-1344: locally-originated non-announce
+        // packets get the per-boot hops delta, decided per egress interface.
+        let delta_header = (self.local_hops_delta != 0)
+            .then(|| rns_wire::header::PacketHeader::unpack(raw).ok())
+            .flatten()
+            .map(|(header, _)| header);
         for id in ids {
-            self.send_to_interface(id, raw);
+            match &delta_header {
+                Some(header) if self.should_apply_delta(header, id) => {
+                    let mangled = self.mangle_hops(raw, header, false);
+                    self.send_to_interface(id, &mangled);
+                }
+                _ => self.send_to_interface(id, raw),
+            }
         }
     }
 
@@ -1214,9 +1281,12 @@ impl TransportActor {
     }
 
     fn broadcast_local_announce_on_interfaces(&mut self, raw: &[u8], except: Option<InterfaceId>) {
-        let destination_hash = rns_wire::header::PacketHeader::unpack(raw)
+        let header = rns_wire::header::PacketHeader::unpack(raw)
             .ok()
-            .map(|(h, _)| h.destination_hash)
+            .map(|(h, _)| h);
+        let destination_hash = header
+            .as_ref()
+            .map(|h| h.destination_hash)
             .unwrap_or([0u8; 16]);
         let ids: Vec<InterfaceId> = self
             .interfaces
@@ -1225,7 +1295,17 @@ impl TransportActor {
             .filter(|id| self.interface_allows_announce(*id, &destination_hash, except))
             .collect();
         for id in ids {
-            self.send_to_interface(id, raw);
+            // Python 1.3.8 Transport.py:1345: delta-mangled HEADER_1 announces
+            // are re-framed as HEADER_2|TRANSPORT with our transport identity.
+            match &header {
+                Some(h) if self.should_apply_delta(h, id) => {
+                    let transport_insert =
+                        h.flags.header_type == rns_wire::flags::HeaderType::Header1;
+                    let mangled = self.mangle_hops(raw, h, transport_insert);
+                    self.send_to_interface(id, &mangled);
+                }
+                _ => self.send_to_interface(id, raw),
+            }
             if let Some(entry) = self.interfaces.get_mut(&id) {
                 entry.ingress.sent_announce();
             }
@@ -5978,6 +6058,481 @@ mod tests {
         });
         assert_eq!(actor.transport_identity_hash, Some([0x44; 16]));
         assert_eq!(actor.ephemeral_identity_hash, None);
+    }
+
+    // ---- local_hops_delta (Python 1.3.8 Transport.py:1356-1365, 1.3.7
+    // eacff56f instance-local exclusions) ----
+
+    fn make_data_packet_with_dest_type(
+        dest_hash: [u8; 16],
+        destination_type: rns_wire::flags::DestinationType,
+    ) -> Bytes {
+        let flags = rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header1,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            destination_type,
+            packet_type: rns_wire::flags::PacketType::Data,
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags,
+            hops: 0,
+            transport_id: None,
+            destination_hash: dest_hash,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&[0xDD; 32]);
+        Bytes::from(raw)
+    }
+
+    #[test]
+    fn local_hops_delta_disabled_by_default_is_noop() {
+        let (mut actor, _tx) = TransportActor::new();
+        assert_eq!(actor.local_hops_delta, 0);
+        let (entry, mut rx) = make_test_interface("iface1");
+        actor.interfaces.insert(1, entry);
+
+        let raw = make_data_packet([0x21; 16], 0);
+        actor.on_outbound(OutboundRequest {
+            raw: raw.clone(),
+            destination_hash: [0x21; 16],
+        });
+        let sent = rx.try_recv().unwrap();
+        assert_eq!(&sent[..], &raw[..], "disabled delta must not touch bytes");
+    }
+
+    #[test]
+    fn local_hops_delta_mangles_outbound_by_destination_type() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.local_hops_delta = 5;
+        let (entry, mut rx) = make_test_interface("iface1");
+        actor.interfaces.insert(1, entry);
+
+        // SINGLE data: hops byte rewritten to the delta, rest untouched.
+        let raw = make_data_packet_with_dest_type([0x21; 16], rns_wire::flags::DestinationType::Single);
+        actor.on_outbound(OutboundRequest {
+            raw: raw.clone(),
+            destination_hash: [0x21; 16],
+        });
+        let sent = rx.try_recv().unwrap();
+        assert_eq!(sent[1], 5);
+        assert_eq!(sent[0], raw[0]);
+        assert_eq!(&sent[2..], &raw[2..]);
+        while rx.try_recv().is_ok() {} // drain the automatic path request
+
+        // PLAIN and GROUP destinations are excluded (Transport.py:1358).
+        for dest_type in [
+            rns_wire::flags::DestinationType::Plain,
+            rns_wire::flags::DestinationType::Group,
+        ] {
+            let raw = make_data_packet_with_dest_type([0x22; 16], dest_type);
+            actor.on_outbound(OutboundRequest {
+                raw: raw.clone(),
+                destination_hash: [0x22; 16],
+            });
+            let sent = rx.try_recv().unwrap();
+            assert_eq!(&sent[..], &raw[..], "{dest_type:?} must not be mangled");
+        }
+    }
+
+    #[test]
+    fn local_hops_delta_announce_transport_insert() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.local_hops_delta = 4;
+        let transport_id = [0x77; 16];
+        actor.transport_identity_hash = Some(transport_id);
+        let (entry, mut rx) = make_test_interface("iface1");
+        actor.interfaces.insert(1, entry);
+
+        let (raw, dest_hash) = make_valid_announce("delta.announce", 0);
+        actor.local_destinations.insert(dest_hash);
+        actor.on_outbound(OutboundRequest {
+            raw: raw.clone(),
+            destination_hash: dest_hash,
+        });
+
+        let sent = rx.try_recv().unwrap();
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&sent).unwrap();
+        assert_eq!(
+            header.flags.header_type,
+            rns_wire::flags::HeaderType::Header2
+        );
+        assert_eq!(
+            header.flags.transport_type,
+            rns_wire::flags::TransportType::Transport
+        );
+        assert_eq!(header.flags.packet_type, rns_wire::flags::PacketType::Announce);
+        assert_eq!(header.transport_id, Some(transport_id));
+        assert_eq!(header.destination_hash, dest_hash);
+        assert_eq!(header.hops, 4);
+        assert_eq!(
+            sent.len(),
+            raw.len() + 16,
+            "HEADER_2 insert adds the 16-byte transport_id"
+        );
+        assert_eq!(
+            &sent[offset..],
+            &raw[rns_wire::constants::HEADER_MINSIZE..],
+            "announce payload must be preserved"
+        );
+        // The hashable part skips hops/transport bits, so the packet hash is
+        // stable across the mangle (Python Packet.get_hashable_part).
+        assert_eq!(
+            rns_wire::hash::packet_hash(&sent, rns_wire::flags::HeaderType::Header2),
+            rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1),
+        );
+    }
+
+    #[test]
+    fn local_hops_delta_applies_on_known_path_sends() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.local_hops_delta = 3;
+        let (entry, mut rx) = make_test_interface("iface1");
+        actor.interfaces.insert(1, entry);
+
+        // Transport-wrapped send (Transport.py:1153): hops byte = delta.
+        let dest_a = [0x31; 16];
+        actor.path_table.insert(
+            dest_a,
+            crate::path_table::PathEntry::new(Some([0xBB; 16]), 2, 1, InterfaceMode::Gateway),
+        );
+        actor.on_outbound(OutboundRequest {
+            raw: make_data_packet(dest_a, 0),
+            destination_hash: dest_a,
+        });
+        let sent = rx.try_recv().unwrap();
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&sent).unwrap();
+        assert_eq!(
+            header.flags.header_type,
+            rns_wire::flags::HeaderType::Header2
+        );
+        assert_eq!(header.transport_id, Some([0xBB; 16]));
+        assert_eq!(header.hops, 3, "wrapped send must carry the delta");
+
+        // Direct send (Transport.py:1186-1187): mangle_hops.
+        let dest_b = [0x32; 16];
+        actor.path_table.insert(
+            dest_b,
+            crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Gateway),
+        );
+        actor.on_outbound(OutboundRequest {
+            raw: make_data_packet(dest_b, 0),
+            destination_hash: dest_b,
+        });
+        let sent = rx.try_recv().unwrap();
+        assert_eq!(sent[1], 3, "direct send must carry the delta");
+    }
+
+    #[test]
+    fn local_hops_delta_skips_local_client_and_shared_peer_interfaces() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.local_hops_delta = 6;
+
+        let (mut client, mut client_rx) = make_test_interface("local_client");
+        client.role = InterfaceRole::LocalClient;
+        let (mut peer, mut peer_rx) = make_test_interface("shared_peer");
+        peer.role = InterfaceRole::SharedInstancePeer;
+        let (normal, mut normal_rx) = make_test_interface("external");
+        actor.interfaces.insert(1, client);
+        actor.interfaces.insert(2, peer);
+        actor.interfaces.insert(3, normal);
+
+        actor.on_outbound(OutboundRequest {
+            raw: make_data_packet([0x41; 16], 0),
+            destination_hash: [0x41; 16],
+        });
+
+        assert_eq!(client_rx.try_recv().unwrap()[1], 0, "local client exempt");
+        assert_eq!(peer_rx.try_recv().unwrap()[1], 0, "shared peer exempt");
+        assert_eq!(normal_rx.try_recv().unwrap()[1], 6, "external mangled");
+    }
+
+    #[test]
+    fn local_hops_delta_suppressed_when_connected_to_shared_instance() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.local_hops_delta = 6;
+        actor.is_shared_instance = true;
+        let (entry, mut rx) = make_test_interface("iface1");
+        actor.interfaces.insert(1, entry);
+
+        actor.on_outbound(OutboundRequest {
+            raw: make_data_packet([0x42; 16], 0),
+            destination_hash: [0x42; 16],
+        });
+        assert_eq!(
+            rx.try_recv().unwrap()[1],
+            0,
+            "shared-instance clients never apply the delta themselves"
+        );
+    }
+
+    #[test]
+    fn local_hops_delta_link_table_substitution_and_instance_local_exemption() {
+        // Shared-instance host forwarding link traffic for a local client
+        // (Transport.py:1731).
+        let (mut actor, _tx) = TransportActor::new();
+        actor.local_hops_delta = 6;
+
+        let (mut client, _client_rx) = make_test_interface("local_client");
+        client.role = InterfaceRole::LocalClient;
+        let (external, mut external_rx) = make_test_interface("external");
+        actor.interfaces.insert(1, client);
+        actor.interfaces.insert(2, external);
+
+        let link_id = [0x51; 16];
+        actor.link_table.insert(
+            link_id,
+            crate::link_table::LinkEntry {
+                timestamp: now_f64(),
+                next_hop: None,
+                interface_id: 2,
+                remaining_hops: 1,
+                destination_hash: [0xC1; 16],
+                established: true,
+                validated: true,
+                proof_timeout: now_f64() + 120.0,
+                receiving_interface: 1,
+                taken_hops: 0,
+            },
+        );
+        actor.on_inbound(InboundPacket {
+            raw: make_link_data_packet(link_id, 0),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        let forwarded = external_rx.try_recv().unwrap();
+        assert_eq!(forwarded[1], 6, "local-client link traffic gets the delta");
+
+        // Instance-local link (both sides local clients): exempt — this is
+        // the 1.3.6 regression fixed in 1.3.7 (eacff56f).
+        let (mut actor, _tx) = TransportActor::new();
+        actor.local_hops_delta = 6;
+        let (mut client_a, _rx_a) = make_test_interface("client_a");
+        client_a.role = InterfaceRole::LocalClient;
+        let (mut client_b, mut rx_b) = make_test_interface("client_b");
+        client_b.role = InterfaceRole::LocalClient;
+        actor.interfaces.insert(1, client_a);
+        actor.interfaces.insert(2, client_b);
+
+        let link_id = [0x52; 16];
+        actor.link_table.insert(
+            link_id,
+            crate::link_table::LinkEntry {
+                timestamp: now_f64(),
+                next_hop: None,
+                interface_id: 2,
+                remaining_hops: 0,
+                destination_hash: [0xC2; 16],
+                established: true,
+                validated: true,
+                proof_timeout: now_f64() + 120.0,
+                receiving_interface: 1,
+                taken_hops: 0,
+            },
+        );
+        actor.on_inbound(InboundPacket {
+            raw: make_link_data_packet(link_id, 0),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        let forwarded = rx_b.try_recv().unwrap();
+        assert_eq!(
+            forwarded[1], 0,
+            "instance-local link traffic must keep its true hop count"
+        );
+    }
+
+    #[test]
+    fn local_hops_delta_lrproof_transit_exclusions() {
+        // Destination is a local client, initiator is external: the proof
+        // leaving the instance gets the delta (Transport.py:2222).
+        let (mut actor, _tx) = TransportActor::new();
+        actor.local_hops_delta = 6;
+        actor.is_transport_enabled = true;
+
+        let (external, mut external_rx) = make_test_interface("to_initiator");
+        let (mut client, _client_rx) = make_test_interface("local_client");
+        client.role = InterfaceRole::LocalClient;
+        actor.interfaces.insert(1, external);
+        actor.interfaces.insert(2, client);
+
+        let link_id = [0x61; 16];
+        let destination_hash = [0xC3; 16];
+        let destination_identity = rns_identity::identity::Identity::new();
+        insert_announce_for(&mut actor, destination_hash, &destination_identity);
+        actor.link_table.insert(
+            link_id,
+            crate::link_table::LinkEntry {
+                timestamp: now_f64(),
+                next_hop: None,
+                interface_id: 2,
+                remaining_hops: 0,
+                destination_hash,
+                established: false,
+                validated: false,
+                proof_timeout: now_f64() + 120.0,
+                receiving_interface: 1,
+                taken_hops: 1,
+            },
+        );
+        let proof = make_lrproof_packet(link_id, 0, &destination_identity, None);
+        actor.on_inbound(InboundPacket {
+            raw: proof,
+            interface_id: 2,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        let routed = external_rx.try_recv().unwrap();
+        assert_eq!(routed[1], 6, "proof leaving the instance gets the delta");
+
+        // Instance-local link: proof between two local clients is exempt.
+        let (mut actor, _tx) = TransportActor::new();
+        actor.local_hops_delta = 6;
+        let (mut client_a, mut rx_a) = make_test_interface("client_a");
+        client_a.role = InterfaceRole::LocalClient;
+        let (mut client_b, _rx_b) = make_test_interface("client_b");
+        client_b.role = InterfaceRole::LocalClient;
+        actor.interfaces.insert(1, client_a);
+        actor.interfaces.insert(2, client_b);
+
+        let link_id = [0x62; 16];
+        let destination_hash = [0xC4; 16];
+        let destination_identity = rns_identity::identity::Identity::new();
+        insert_announce_for(&mut actor, destination_hash, &destination_identity);
+        actor.link_table.insert(
+            link_id,
+            crate::link_table::LinkEntry {
+                timestamp: now_f64(),
+                next_hop: None,
+                interface_id: 2,
+                remaining_hops: 0,
+                destination_hash,
+                established: false,
+                validated: false,
+                proof_timeout: now_f64() + 120.0,
+                receiving_interface: 1,
+                taken_hops: 0,
+            },
+        );
+        let proof = make_lrproof_packet(link_id, 0, &destination_identity, None);
+        actor.on_inbound(InboundPacket {
+            raw: proof,
+            interface_id: 2,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        let routed = rx_a.try_recv().unwrap();
+        assert_eq!(
+            routed[1], 0,
+            "instance-local link proof must keep its true hop count"
+        );
+    }
+
+    #[test]
+    fn local_hops_delta_reverse_proof_exclusions() {
+        // Proof originated by a local client heading to an external requester
+        // gets the delta (Transport.py:2287).
+        let (mut actor, _tx) = TransportActor::new();
+        actor.local_hops_delta = 6;
+        actor.is_transport_enabled = true;
+
+        let (external, mut external_rx) = make_test_interface("external");
+        let (mut client, _client_rx) = make_test_interface("local_client");
+        client.role = InterfaceRole::LocalClient;
+        actor.interfaces.insert(1, external);
+        actor.interfaces.insert(2, client);
+
+        let proof_hash = [0x71; 16];
+        actor.reverse_table.insert(proof_hash, 1, 1);
+        actor.on_inbound(InboundPacket {
+            raw: make_proof_packet(proof_hash, 0),
+            interface_id: 2,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        let routed = external_rx.try_recv().unwrap();
+        assert_eq!(routed[1], 6, "local-client proof gets the delta");
+
+        // Proof heading back to a local client is exempt (1.3.7 eacff56f).
+        let (mut actor, _tx) = TransportActor::new();
+        actor.local_hops_delta = 6;
+        actor.is_transport_enabled = true;
+        let (mut client_a, mut rx_a) = make_test_interface("client_a");
+        client_a.role = InterfaceRole::LocalClient;
+        let (mut client_b, _rx_b) = make_test_interface("client_b");
+        client_b.role = InterfaceRole::LocalClient;
+        actor.interfaces.insert(1, client_a);
+        actor.interfaces.insert(2, client_b);
+
+        let proof_hash = [0x72; 16];
+        actor.reverse_table.insert(proof_hash, 1, 0);
+        actor.on_inbound(InboundPacket {
+            raw: make_proof_packet(proof_hash, 0),
+            interface_id: 2,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        let routed = rx_a.try_recv().unwrap();
+        assert_eq!(
+            routed[1], 0,
+            "proof to a local client must keep its true hop count"
+        );
+    }
+
+    #[test]
+    fn local_hops_delta_strips_transport_header_on_local_client_delivery() {
+        // Transport.py:1613-1619: with the delta active, HEADER_2 frames
+        // delivered to a local shared client lose their transport headers.
+        let (mut actor, _tx) = TransportActor::new();
+        actor.local_hops_delta = 6;
+        actor.is_transport_enabled = true;
+        let transport_id = [0x88; 16];
+        actor.transport_identity_hash = Some(transport_id);
+
+        let (external, _external_rx) = make_test_interface("external");
+        let (mut client, mut client_rx) = make_test_interface("local_client");
+        client.role = InterfaceRole::LocalClient;
+        actor.interfaces.insert(1, external);
+        actor.interfaces.insert(2, client);
+
+        let dest_hash = [0x81; 16];
+        actor.path_table.insert(
+            dest_hash,
+            crate::path_table::PathEntry::new(None, 0, 2, InterfaceMode::Gateway),
+        );
+
+        let raw = make_header2_data_packet(transport_id, dest_hash, 1, b"to_local_client");
+        actor.on_inbound(InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+
+        let delivered = client_rx.try_recv().unwrap();
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&delivered).unwrap();
+        assert_eq!(
+            header.flags.header_type,
+            rns_wire::flags::HeaderType::Header1,
+            "transport headers must be stripped for local-client delivery"
+        );
+        assert_eq!(
+            header.flags.transport_type,
+            rns_wire::flags::TransportType::Broadcast
+        );
+        assert_eq!(header.transport_id, None);
+        assert_eq!(header.hops, 2, "raw 1 -> inbound-adjusted 2");
+        assert_eq!(&delivered[offset..], b"to_local_client");
     }
 
     // Shared snapshot consumed by the runtime link layer for the Python 1.3.8

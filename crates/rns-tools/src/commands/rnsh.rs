@@ -124,7 +124,7 @@ async fn run_listener(args: Args) -> ExitCode {
     // Register before any slow init so an early SIGINT exits cleanly.
     let shutdown = ShutdownSignal::new();
     let _signal_rx = install_signal_handlers(shutdown.clone());
-    init_logging(args.verbose, args.quiet);
+    init_logging(args.verbose, args.quiet, args.config.as_deref());
 
     let handle = match start_reticulum(args.config.as_deref(), shutdown.clone()).await {
         Ok(handle) => handle,
@@ -179,7 +179,7 @@ async fn run_initiator(args: Args) -> ExitCode {
     // Register before any slow init so an early SIGINT exits cleanly.
     let shutdown = ShutdownSignal::new();
     let _signal_rx = install_signal_handlers(shutdown.clone());
-    init_logging(args.verbose, args.quiet);
+    init_logging(args.verbose, args.quiet, args.config.as_deref());
 
     let destination = match args.destination.as_deref().and_then(parse_hash16) {
         Some(hash) => hash,
@@ -267,17 +267,20 @@ async fn start_reticulum(
     rns_runtime::reticulum::init(config, None, shutdown, is_foreground).await
 }
 
-fn init_logging(verbose: u8, quiet: u8) {
+fn init_logging(verbose: u8, quiet: u8, config_dir: Option<&Path>) {
     let level = match (verbose as i32) - (quiet as i32) {
         n if n >= 2 => tracing::Level::DEBUG,
         1 => tracing::Level::INFO,
         0 => tracing::Level::WARN,
         _ => tracing::Level::ERROR,
     };
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_writer(std::io::stderr)
-        .try_init();
+    let resolved = resolve_config_dir(config_dir.and_then(|path| path.to_str()));
+    rns_tools::init_tracing(
+        level,
+        rns_tools::config_log_timestamps(&resolved),
+        true,
+        std::io::stderr,
+    );
 }
 
 fn terminal_window_size() -> (Option<u32>, Option<u32>, Option<u32>, Option<u32>) {

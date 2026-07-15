@@ -164,6 +164,7 @@ pub(crate) async fn main() {
         config_loglevel + args.verbose as i32 - args.quiet as i32
     };
     let level = tracing_level(verbosity);
+    let log_timestamps = rns_tools::config_log_timestamps(&config_dir);
 
     if args.service {
         if let Err(e) = fs::create_dir_all(&config_dir) {
@@ -181,13 +182,9 @@ pub(crate) async fn main() {
             );
             std::process::exit(1);
         }
-        tracing_subscriber::fmt()
-            .with_max_level(level)
-            .with_writer(LogFileWriter::new(log_path))
-            .with_ansi(false)
-            .init();
+        rns_tools::init_tracing(level, log_timestamps, false, LogFileWriter::new(log_path));
     } else {
-        tracing_subscriber::fmt().with_max_level(level).init();
+        rns_tools::init_tracing(level, log_timestamps, true, std::io::stdout);
     }
 
     tracing::info!("rnsd-rs {RS_RETICULUM_VERSION} starting");

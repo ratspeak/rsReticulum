@@ -584,6 +584,10 @@ pub struct ReticulumConfig {
     /// default false): opts a non-transport node out of the per-boot
     /// ephemeral wire-facing transport identity.
     pub static_transport_identity: bool,
+    /// Python 1.3.8 `local_hops_delta` (Reticulum.py:256,506-508, default
+    /// false): apply a per-boot random 2..=7 hop offset to locally-originated
+    /// packets (Transport.py:240,1356-1365).
+    pub local_hops_delta: bool,
     pub respond_to_probes: bool,
     pub use_implicit_proof: bool,
     pub panic_on_interface_error: bool,
@@ -644,6 +648,7 @@ impl Default for ReticulumConfig {
             control_port: LOCAL_CONTROL_PORT,
             enable_transport: false,
             static_transport_identity: false,
+            local_hops_delta: false,
             respond_to_probes: false,
             use_implicit_proof: true,
             panic_on_interface_error: false,
@@ -885,6 +890,9 @@ impl ReticulumConfig {
             if let Some(value) = config_bool("reticulum", sec, "static_transport_identity")? {
                 rc.static_transport_identity = value;
             }
+            if let Some(value) = config_bool("reticulum", sec, "local_hops_delta")? {
+                rc.local_hops_delta = value;
+            }
             if let Some(value) = config_bool("reticulum", sec, "respond_to_probes")? {
                 rc.respond_to_probes = value;
             }
@@ -984,6 +992,12 @@ fn uses_ephemeral_transport_identity(rc: &ReticulumConfig) -> bool {
     !rc.enable_transport && !rc.static_transport_identity
 }
 
+/// Python 1.3.8 Transport.py:240: per-boot random hop delta,
+/// `(ord(os.urandom(1)) % 6) + 2` = 2..=7.
+fn generate_local_hops_delta() -> u8 {
+    (rns_crypto::random::random_bytes(1)[0] % 6) + 2
+}
+
 /// Bring up the Reticulum runtime: config dir, transport actor, interfaces,
 /// instance mode, jobs runner, and optional RPC / remote-management / probe.
 pub async fn init(
@@ -1015,6 +1029,11 @@ pub async fn init(
     // is set. Pre-seed the actor's hash so runtime-side wire consumers
     // (discovery announcer, blackhole publisher/subscriber) share the value.
     actor.static_transport_identity = rc.static_transport_identity;
+    // Python 1.3.8 Transport.py:240: one random 2..=7 delta per boot;
+    // should_apply_delta gates actual application.
+    if rc.local_hops_delta {
+        actor.local_hops_delta = generate_local_hops_delta();
+    }
     let ephemeral_transport_identity =
         uses_ephemeral_transport_identity(&rc).then(rns_identity::identity::Identity::new);
     if let Some(ephemeral) = &ephemeral_transport_identity {
@@ -4504,6 +4523,26 @@ egress_control = Yes
             .unwrap(),
         );
         assert!(!uses_ephemeral_transport_identity(&rc));
+    }
+
+    #[test]
+    fn local_hops_delta_key_parses_with_python_default() {
+        let rc = ReticulumConfig::from_config(&Config::parse("[reticulum]\n").unwrap());
+        assert!(!rc.local_hops_delta);
+
+        let rc = ReticulumConfig::from_config(
+            &Config::parse("[reticulum]\nlocal_hops_delta = yes\n").unwrap(),
+        );
+        assert!(rc.local_hops_delta);
+    }
+
+    #[test]
+    fn local_hops_delta_value_stays_in_python_range() {
+        // Python Transport.py:240: (rand_byte % 6) + 2 = 2..=7.
+        for _ in 0..256 {
+            let delta = generate_local_hops_delta();
+            assert!((2..=7).contains(&delta), "delta {delta} out of range");
+        }
     }
 
     #[test]

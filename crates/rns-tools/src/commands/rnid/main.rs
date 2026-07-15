@@ -273,10 +273,13 @@ async fn run(args: Args) -> ExitCode {
         5 => tracing::Level::DEBUG,
         _ => tracing::Level::TRACE,
     };
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_writer(std::io::stderr)
-        .try_init();
+    let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
+    rns_tools::init_tracing(
+        level,
+        rns_tools::config_log_timestamps(&config_dir),
+        true,
+        std::io::stderr,
+    );
 
     // Python truthiness: empty path lists (`-s` with no values) and an empty
     // `-S ""` message do not activate their operation.

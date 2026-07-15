@@ -625,6 +625,13 @@ impl TransportActor {
             .path_table
             .get_live(&header.destination_hash)
             .is_some_and(|path| self.is_local_client_interface(path.interface_id));
+        // Python 1.3.8 Transport.py:1550-1551: to_local_client also covers
+        // proofs whose reverse entry came in from a local client.
+        let proof_for_local_client = self
+            .reverse_table
+            .get(&header.destination_hash)
+            .is_some_and(|entry| self.is_local_client_interface(entry.receiving_interface));
+        let to_local_client = for_local_client || proof_for_local_client;
 
         let path_request_dest = Self::path_request_dest_hash();
         let tunnel_synth_dest = Self::tunnel_synthesize_dest_hash();
@@ -747,6 +754,7 @@ impl TransportActor {
             interface_id,
             from_local_client,
             for_local_client,
+            to_local_client,
         ) {
             let pkt_hash = rns_wire::hash::truncated_packet_hash(raw, header.flags.header_type);
             self.reverse_table.insert_with_outbound(
@@ -778,6 +786,11 @@ impl TransportActor {
             .path_table
             .get_live(&header.destination_hash)
             .is_some_and(|path| self.is_local_client_interface(path.interface_id));
+        let proof_for_local_client = self
+            .reverse_table
+            .get(&header.destination_hash)
+            .is_some_and(|entry| self.is_local_client_interface(entry.receiving_interface));
+        let to_local_client = for_local_client || proof_for_local_client;
 
         let link_request_for_this_instance = header.transport_id.is_none()
             || header
@@ -809,6 +822,7 @@ impl TransportActor {
             interface_id,
             from_local_client,
             for_local_client,
+            to_local_client,
         ) {
             let Some(path) = self.path_table.get_live(&header.destination_hash) else {
                 return;
@@ -872,6 +886,7 @@ impl TransportActor {
         interface_id: InterfaceId,
         from_local_client: bool,
         for_local_client: bool,
+        to_local_client: bool,
     ) -> Option<(InterfaceId, Vec<u8>)> {
         let path = self.path_table.get_live(&header.destination_hash)?;
         if path.interface_id == interface_id && !for_local_client {
@@ -898,7 +913,13 @@ impl TransportActor {
             return None;
         }
 
-        let forwarded = self.rewrite_forwarded_transport_packet(raw, header, path)?;
+        let mut forwarded =
+            self.rewrite_forwarded_transport_packet(raw, header, path, to_local_client)?;
+        // Python 1.3.8 Transport.py:1687: substitute the delta for
+        // local-client-originated packets leaving the shared instance.
+        if self.local_hops_delta != 0 && from_local_client && !to_local_client {
+            forwarded[1] = self.local_hops_delta;
+        }
         Some((path.interface_id, forwarded))
     }
 
@@ -907,6 +928,7 @@ impl TransportActor {
         raw: &[u8],
         header: &rns_wire::header::PacketHeader,
         path: &crate::path_table::PathEntry,
+        to_local_client: bool,
     ) -> Option<Vec<u8>> {
         let payload_offset = header.size();
         if raw.len() < payload_offset {
@@ -928,7 +950,14 @@ impl TransportActor {
             let mut forwarded = new_header.pack();
             forwarded.extend_from_slice(&raw[payload_offset..]);
             Some(forwarded)
-        } else if path.hops == 1 {
+        } else if path.hops == 1
+            || (to_local_client
+                && self.local_hops_delta != 0
+                && header.flags.header_type == rns_wire::flags::HeaderType::Header2)
+        {
+            // Python 1.3.8 Transport.py:1613-1619: with the delta active,
+            // HEADER_2 frames delivered to local shared clients get their
+            // transport headers stripped, same as the one-hop case.
             let mut flags = header.flags;
             flags.header_type = rns_wire::flags::HeaderType::Header1;
             flags.transport_type = rns_wire::flags::TransportType::Broadcast;
@@ -1018,6 +1047,11 @@ impl TransportActor {
                     let outbound_interface = link_entry.interface_id;
                     let target_interface = link_entry.receiving_interface;
                     let destination_hash = link_entry.destination_hash;
+                    // Python 1.3.8 Transport.py:1552/2222: instance-local
+                    // links are exempt from delta mangling (1.3.7 eacff56f).
+                    let instance_local_link = self
+                        .is_local_client_interface(link_entry.interface_id)
+                        && self.is_local_client_interface(link_entry.receiving_interface);
 
                     // Require that the proof arrived on the same interface we
                     // forwarded the request to; a mismatch is either a routing
@@ -1037,7 +1071,14 @@ impl TransportActor {
                         }
                         let mut forwarded = raw.to_vec();
                         if forwarded.len() >= 2 {
-                            forwarded[1] = header.hops;
+                            forwarded[1] = if !from_local_client
+                                || instance_local_link
+                                || self.local_hops_delta == 0
+                            {
+                                header.hops
+                            } else {
+                                self.local_hops_delta
+                            };
                         }
                         if let Some(entry) = self.link_table.get_mut(&header.destination_hash) {
                             entry.validated = true;
@@ -1100,6 +1141,14 @@ impl TransportActor {
         // match — a proof on the wrong interface means a routing change or
         // a spoof. Older entries without that field route unconditionally.
         if self.is_transport_enabled || from_local_client || proof_for_local_client {
+            // Python 1.3.8 Transport.py:2287: delta for local-client-origin
+            // proofs; proofs headed to local clients exempt (1.3.7 eacff56f).
+            let proof_hops =
+                if !from_local_client || proof_for_local_client || self.local_hops_delta == 0 {
+                    header.hops
+                } else {
+                    self.local_hops_delta
+                };
             if let Some(reverse_entry) = self.reverse_table.remove(&header.destination_hash) {
                 if let Some(expected_outbound) = reverse_entry.outbound_interface {
                     if _interface_id != expected_outbound {
@@ -1113,7 +1162,7 @@ impl TransportActor {
                         let target_interface = reverse_entry.receiving_interface;
                         let mut forwarded = raw.to_vec();
                         if forwarded.len() >= 2 {
-                            forwarded[1] = header.hops;
+                            forwarded[1] = proof_hops;
                         }
                         self.send_to_interface(target_interface, &forwarded);
                         trace!(
@@ -1127,7 +1176,7 @@ impl TransportActor {
                     let target_interface = reverse_entry.receiving_interface;
                     let mut forwarded = raw.to_vec();
                     if forwarded.len() >= 2 {
-                        forwarded[1] = header.hops;
+                        forwarded[1] = proof_hops;
                     }
                     self.send_to_interface(target_interface, &forwarded);
                     trace!(
@@ -1169,7 +1218,13 @@ impl TransportActor {
             return false;
         };
 
-        let shared_client_path = self.is_local_client_interface(interface_id)
+        let from_local_client = self.is_local_client_interface(interface_id);
+        // Python 1.3.8 Transport.py:1548-1553 (the 1.3.7 eacff56f fix): links
+        // between two local clients of this shared instance are exempt from
+        // delta mangling.
+        let instance_local_link = self.is_local_client_interface(entry.interface_id)
+            && self.is_local_client_interface(entry.receiving_interface);
+        let shared_client_path = from_local_client
             || self.is_local_client_interface(entry.receiving_interface)
             || self.is_local_client_interface(entry.interface_id);
         if !self.is_transport_enabled && !shared_client_path {
@@ -1226,7 +1281,14 @@ impl TransportActor {
 
         let mut forwarded = raw.to_vec();
         if forwarded.len() >= 2 {
-            forwarded[1] = header.hops;
+            // Python 1.3.8 Transport.py:1731: delta for local-client link
+            // traffic leaving the instance; instance-local links exempt.
+            forwarded[1] = if !from_local_client || instance_local_link || self.local_hops_delta == 0
+            {
+                header.hops
+            } else {
+                self.local_hops_delta
+            };
         }
         let skip_hashlist = matches!(
             header.context,
