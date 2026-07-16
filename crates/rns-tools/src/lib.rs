@@ -7,7 +7,7 @@ pub mod hash;
 pub const RS_RETICULUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Python Reticulum version these tools track for CLI/protocol parity.
-pub const RETICULUM_COMPAT_VERSION: &str = "1.2.5";
+pub const RETICULUM_COMPAT_VERSION: &str = "1.3.8";
 
 /// Python 1.3.2 `[logging] logtimestamps` (Reticulum.py:459-461,
 /// RNS/__init__.py:85 default True): whether log lines carry a timestamp
