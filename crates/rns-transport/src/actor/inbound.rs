@@ -1283,12 +1283,12 @@ impl TransportActor {
         if forwarded.len() >= 2 {
             // Python 1.3.8 Transport.py:1731: delta for local-client link
             // traffic leaving the instance; instance-local links exempt.
-            forwarded[1] = if !from_local_client || instance_local_link || self.local_hops_delta == 0
-            {
-                header.hops
-            } else {
-                self.local_hops_delta
-            };
+            forwarded[1] =
+                if !from_local_client || instance_local_link || self.local_hops_delta == 0 {
+                    header.hops
+                } else {
+                    self.local_hops_delta
+                };
         }
         let skip_hashlist = matches!(
             header.context,

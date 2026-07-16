@@ -6110,7 +6110,8 @@ mod tests {
         actor.interfaces.insert(1, entry);
 
         // SINGLE data: hops byte rewritten to the delta, rest untouched.
-        let raw = make_data_packet_with_dest_type([0x21; 16], rns_wire::flags::DestinationType::Single);
+        let raw =
+            make_data_packet_with_dest_type([0x21; 16], rns_wire::flags::DestinationType::Single);
         actor.on_outbound(OutboundRequest {
             raw: raw.clone(),
             destination_hash: [0x21; 16],
@@ -6162,7 +6163,10 @@ mod tests {
             header.flags.transport_type,
             rns_wire::flags::TransportType::Transport
         );
-        assert_eq!(header.flags.packet_type, rns_wire::flags::PacketType::Announce);
+        assert_eq!(
+            header.flags.packet_type,
+            rns_wire::flags::PacketType::Announce
+        );
         assert_eq!(header.transport_id, Some(transport_id));
         assert_eq!(header.destination_hash, dest_hash);
         assert_eq!(header.hops, 4);
