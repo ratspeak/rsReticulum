@@ -10,7 +10,6 @@ default = []
 serial = ["dep:serialport"]
 rnode-tcp = []
 ble = ["dep:btleplug", "dep:futures", "dep:uuid", "dep:bluer"]
-ble_peer = ["ble"]
 # See rns-transport's mobile-throttle. When enabled, auto-interface beacons
 # and reverse-peering probes slow down in the background; BLE peer scan
 # cadence adjusts to `is_foreground`. Disabled on desktop builds.

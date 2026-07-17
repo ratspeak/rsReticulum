@@ -31,7 +31,7 @@ jobs:
         run: cargo test --workspace
       - name: Test BLE interface features (Linux/macOS)
         if: runner.os != 'Windows'
-        run: cargo test -p rns-interface --features ble,ble_peer
+        run: cargo test -p rns-interface --features ble
 
   lint:
     name: Lint
@@ -46,4 +46,4 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy -p rns-interface --features ble,ble_peer --all-targets -- -D warnings
+      - run: cargo clippy -p rns-interface --features ble --all-targets -- -D warnings
