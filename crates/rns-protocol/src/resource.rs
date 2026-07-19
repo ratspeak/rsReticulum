@@ -1623,6 +1623,17 @@ impl OutboundTransfer {
                     }
                 }
 
+                // An empty hashmap means there is nothing to answer the receiver's
+                // request with — cancel rather than emit a useless empty HMU (1.3.9).
+                if hashmap_bytes.is_empty() {
+                    self.resource.state = ResourceState::Failed;
+                    actions.push(TransferAction::SendCancel(
+                        CancelType::Icl,
+                        self.resource.resource_hash,
+                    ));
+                    return actions;
+                }
+
                 // HMU wire layout: resource_hash(32) || msgpack([segment, hashmap]).
                 let hmu_payload = {
                     use rmpv::Value;
@@ -2118,6 +2129,19 @@ impl InboundTransfer {
     pub fn hashmap_update(&mut self, segment: usize, hashmap_data: &[u8]) -> TransferAction {
         if self.resource.state == ResourceState::Failed {
             return TransferAction::None;
+        }
+
+        // Only process a hashmap update we actually solicited (1.3.9). An
+        // unsolicited HMU is dropped rather than resetting the retry/activity
+        // counters or injecting hashmap entries outside the request cycle.
+        if !self.waiting_for_hmu {
+            return TransferAction::None;
+        }
+
+        // An empty/degenerate HMU carries no hashes and is invalid — cancel the
+        // transfer rather than spinning on an unsatisfiable request (1.3.9).
+        if hashmap_data.len() < MAPHASH_LEN {
+            return self.cancel();
         }
 
         self.resource.state = ResourceState::Transferring;
@@ -4167,6 +4191,7 @@ mod tests {
             hashmap_bytes.extend_from_slice(&outbound.map_hashes[i]);
         }
 
+        inbound.waiting_for_hmu = true;
         let action = inbound.hashmap_update(0, &hashmap_bytes);
 
         // Should have extended map_hashes
@@ -4175,6 +4200,65 @@ mod tests {
         assert!(!inbound.waiting_for_hmu);
         // Should have triggered a request_next
         assert!(matches!(action, TransferAction::SendRequest(_)));
+    }
+
+    #[test]
+    fn test_hashmap_update_ignores_unsolicited() {
+        // 1.3.9: an HMU that was not solicited (waiting_for_hmu == false) is
+        // dropped without touching transfer state.
+        let data = vec![0u8; 2000];
+        let outbound = OutboundResource::new(data.clone(), false, None).unwrap();
+        let mut inbound = InboundTransfer::from_advertisement(
+            outbound.num_parts(),
+            outbound.total_size,
+            data.len(),
+            outbound.random_hash,
+            outbound.resource_hash,
+            ResourceFlags {
+                compressed: false,
+                ..Default::default()
+            },
+            outbound.map_hashes[..2].to_vec(),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        assert!(!inbound.waiting_for_hmu);
+        let before = inbound.resource.map_hashes.len();
+        let action = inbound.hashmap_update(0, &outbound.map_hashes[0]);
+        assert!(matches!(action, TransferAction::None));
+        assert_eq!(inbound.resource.map_hashes.len(), before);
+        assert_ne!(inbound.resource.state, ResourceState::Failed);
+    }
+
+    #[test]
+    fn test_hashmap_update_empty_cancels() {
+        // 1.3.9: a solicited but empty/degenerate HMU cancels the transfer and
+        // emits a receiver cancel (RESOURCE_RCL).
+        let data = vec![0u8; 2000];
+        let outbound = OutboundResource::new(data.clone(), false, None).unwrap();
+        let mut inbound = InboundTransfer::from_advertisement(
+            outbound.num_parts(),
+            outbound.total_size,
+            data.len(),
+            outbound.random_hash,
+            outbound.resource_hash,
+            ResourceFlags {
+                compressed: false,
+                ..Default::default()
+            },
+            outbound.map_hashes[..2].to_vec(),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        inbound.waiting_for_hmu = true;
+        let action = inbound.hashmap_update(0, &[]);
+        assert!(matches!(
+            action,
+            TransferAction::SendCancel(CancelType::Rcl, _)
+        ));
+        assert_eq!(inbound.resource.state, ResourceState::Failed);
     }
 
     #[test]
@@ -4201,10 +4285,12 @@ mod tests {
 
         // Hostile segment index: would previously push ~segment*74 zero
         // entries into map_hashes. Must be ignored without growth or panic.
+        inbound.waiting_for_hmu = true;
         inbound.hashmap_update(1_000_000, &outbound.map_hashes[0]);
         assert_eq!(inbound.resource.map_hashes.len(), 2);
 
         // Overflowing segment*hashmap_max_len must not panic either.
+        inbound.waiting_for_hmu = true;
         inbound.hashmap_update(usize::MAX, &outbound.map_hashes[0]);
         assert_eq!(inbound.resource.map_hashes.len(), 2);
     }
@@ -4242,6 +4328,7 @@ mod tests {
             overfull.extend_from_slice(&outbound.map_hashes[i]);
         }
         overfull.extend_from_slice(&[0xEE; MAPHASH_LEN * 8]);
+        inbound.waiting_for_hmu = true;
         inbound.hashmap_update(1, &overfull);
 
         assert_eq!(inbound.resource.map_hashes.len(), total_parts);
