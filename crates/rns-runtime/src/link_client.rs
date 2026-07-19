@@ -479,17 +479,37 @@ async fn wait_for_response(
                             let Some(transfer) = inbound_resources.get_mut(&rh) else {
                                 continue;
                             };
-                            if let TransferAction::SendRequest(req) =
-                                transfer.hashmap_update(segment, &hashmap)
-                            {
-                                send_link_data(
-                                    transport_tx,
-                                    link,
-                                    link_id,
-                                    rns_wire::context::PacketContext::ResourceReq,
-                                    &req,
-                                    true,
-                                )?;
+                            match transfer.hashmap_update(segment, &hashmap) {
+                                TransferAction::SendRequest(req) => {
+                                    send_link_data(
+                                        transport_tx,
+                                        link,
+                                        link_id,
+                                        rns_wire::context::PacketContext::ResourceReq,
+                                        &req,
+                                        true,
+                                    )?;
+                                }
+                                // Empty/invalid HMU cancels the transfer (RESOURCE_RCL, 1.3.9).
+                                TransferAction::SendCancel(cancel_type, resource_hash) => {
+                                    let context = match cancel_type {
+                                        rns_protocol::resource::CancelType::Icl => {
+                                            rns_wire::context::PacketContext::ResourceIcl
+                                        }
+                                        rns_protocol::resource::CancelType::Rcl => {
+                                            rns_wire::context::PacketContext::ResourceRcl
+                                        }
+                                    };
+                                    send_link_data(
+                                        transport_tx,
+                                        link,
+                                        link_id,
+                                        context,
+                                        &resource_hash,
+                                        true,
+                                    )?;
+                                }
+                                _ => {}
                             }
                         }
                         rns_wire::context::PacketContext::LinkClose

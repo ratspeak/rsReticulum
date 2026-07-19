@@ -777,7 +777,17 @@ impl LinkManager {
                 let mut close_rejected_link = false;
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_rx(data.len());
+                    // First-identity-wins (1.3.9): capture prior state so a repeat
+                    // identification is treated as a no-op rather than re-tracking
+                    // the peer and re-firing identity side effects.
+                    let was_identified = active.link.identified;
                     match active.link.handle_identification(data) {
+                        Ok(_) if was_identified => {
+                            tracing::debug!(
+                                link_id = hex::encode(link_id),
+                                "ignoring repeat link identification (first-identity-wins)"
+                            );
+                        }
                         Ok(remote_pub) => {
                             let identity_hash = rns_crypto::sha::truncated_hash(&remote_pub);
                             let accepted = self
@@ -934,135 +944,160 @@ impl LinkManager {
                 }
             }
             rns_wire::context::PacketContext::ResourceAdv => {
+                // A successfully-decrypted but unparseable advertisement means the
+                // peer is misbehaving, so tear the link down (1.3.9's dispatch-
+                // exception teardown). Decrypt failures stay a silent drop, and the
+                // Rust-specific segment-metadata guards below stay a silent reject so
+                // a peer cannot kill an established link by racing bad split metadata.
+                let mut teardown_link = false;
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
 
                     if let Ok(plaintext) = active.link.decrypt(data) {
-                        match ResourceAdvertisement::unpack(&plaintext) {
-                            Ok(adv) => {
-                                // Split-resource routing set up before the per-segment
-                                // transfer. The MAX_SEGMENTS cap is load-bearing: a peer
-                                // could otherwise advertise u32::MAX and OOM
-                                // `MultiSegmentInbound::new`.
-                                if adv.total_segments > 1 {
-                                    if adv.total_segments > MAX_SEGMENTS
-                                        || adv.segment_index == 0
-                                        || adv.segment_index > adv.total_segments
-                                    {
-                                        tracing::warn!(
-                                            link_id = hex::encode(link_id),
-                                            total_segments = adv.total_segments,
-                                            segment_index = adv.segment_index,
-                                            max_segments = MAX_SEGMENTS,
-                                            "rejecting split-resource ADV with out-of-range segment metadata"
-                                        );
-                                        return;
-                                    }
-                                    // Mid-stream changes to `total_segments` are rejected.
-                                    let entry = active
-                                        .inbound_split_resources
-                                        .entry(adv.original_hash)
-                                        .or_insert_with(|| {
-                                            MultiSegmentInbound::new(
-                                                adv.total_segments,
-                                                adv.original_hash,
-                                            )
-                                        });
-                                    if entry.total_segments != adv.total_segments {
-                                        tracing::warn!(
-                                            link_id = hex::encode(link_id),
-                                            original = hex::encode(&adv.original_hash[..8]),
-                                            coord_total = entry.total_segments,
-                                            adv_total = adv.total_segments,
-                                            "split-resource ADV total_segments mismatched coordinator; ignoring"
-                                        );
-                                        return;
-                                    }
-                                    active.segment_routing.insert(
-                                        adv.resource_hash,
-                                        SegmentRoute {
-                                            original_hash: adv.original_hash,
-                                            segment_index: adv.segment_index,
-                                        },
-                                    );
-                                }
-
-                                let map_hashes = adv.get_map_hashes();
-                                let mut transfer_flags = adv.flags;
-                                if adv.total_segments > 1 && adv.segment_index > 1 {
-                                    transfer_flags.has_metadata = false;
-                                }
-                                let rtt = active
-                                    .link
-                                    .rtt
-                                    .unwrap_or(std::time::Duration::from_millis(500));
-                                let mut rh = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
-                                let copy_len = adv.random_hash.len().min(rh.len());
-                                rh[..copy_len].copy_from_slice(&adv.random_hash[..copy_len]);
-
-                                if let Ok(mut transfer) = InboundTransfer::from_advertisement(
-                                    adv.num_parts,
-                                    adv.transfer_size,
-                                    adv.data_size,
-                                    rh,
-                                    adv.resource_hash,
-                                    transfer_flags,
-                                    map_hashes,
-                                    rtt,
-                                ) {
-                                    // Python Resource.accept → request_next: initial request
-                                    // accepts the ADV and names the parts.
-                                    let action = transfer.request_next();
-                                    if let TransferAction::SendRequest(req_data) = action {
-                                        if let Ok(encrypted) = active.link.encrypt(&req_data) {
-                                            let req_header = rns_wire::header::PacketHeader {
-                                                flags: rns_wire::flags::PacketFlags {
-                                                    header_type:
-                                                        rns_wire::flags::HeaderType::Header1,
-                                                    context_flag: false,
-                                                    transport_type:
-                                                        rns_wire::flags::TransportType::Broadcast,
-                                                    destination_type:
-                                                        rns_wire::flags::DestinationType::Link,
-                                                    packet_type: rns_wire::flags::PacketType::Data,
-                                                },
-                                                hops: 0,
-                                                transport_id: None,
-                                                destination_hash: link_id,
-                                                context:
-                                                    rns_wire::context::PacketContext::ResourceReq,
-                                            };
-                                            let mut req_raw = req_header.pack();
-                                            req_raw.extend_from_slice(&encrypted);
-                                            let _ = self.transport_tx.try_send(
-                                                TransportMessage::Outbound(OutboundRequest {
-                                                    raw: Bytes::from(req_raw),
-                                                    destination_hash: link_id,
-                                                }),
-                                            );
-                                        }
-                                    }
-
-                                    active.link.track_incoming_resource(adv.resource_hash);
-                                    active.inbound_resources.insert(adv.resource_hash, transfer);
-                                    tracing::info!(
+                        'adv: {
+                            let adv = match ResourceAdvertisement::unpack(&plaintext) {
+                                Ok(adv) => adv,
+                                Err(e) => {
+                                    tracing::warn!(
                                         link_id = hex::encode(link_id),
-                                        resource = hex::encode(&adv.resource_hash[..8]),
-                                        parts = adv.num_parts,
-                                        "inbound resource accepted — initial request sent"
+                                        error = %e,
+                                        "tearing down link: unparseable resource advertisement"
                                     );
+                                    teardown_link = true;
+                                    break 'adv;
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
+                            };
+
+                            // Request-resources (a REQUEST carried as a resource) are
+                            // accepted only when this destination has request handlers
+                            // registered (1.3.9); otherwise ignore without teardown.
+                            if adv.flags.is_request
+                                && self.request_handler.is_none()
+                                && self.request_handler_ex.is_none()
+                            {
+                                tracing::debug!(
                                     link_id = hex::encode(link_id),
-                                    error = %e,
-                                    "failed to parse resource advertisement"
+                                    "ignoring inbound request-resource: no request handlers registered"
+                                );
+                                break 'adv;
+                            }
+
+                            // Split-resource routing set up before the per-segment
+                            // transfer. The MAX_SEGMENTS cap is load-bearing: a peer
+                            // could otherwise advertise u32::MAX and OOM
+                            // `MultiSegmentInbound::new`.
+                            if adv.total_segments > 1 {
+                                if adv.total_segments > MAX_SEGMENTS
+                                    || adv.segment_index == 0
+                                    || adv.segment_index > adv.total_segments
+                                {
+                                    tracing::warn!(
+                                        link_id = hex::encode(link_id),
+                                        total_segments = adv.total_segments,
+                                        segment_index = adv.segment_index,
+                                        max_segments = MAX_SEGMENTS,
+                                        "rejecting split-resource ADV with out-of-range segment metadata"
+                                    );
+                                    break 'adv;
+                                }
+                                // Mid-stream changes to `total_segments` are rejected.
+                                let entry = active
+                                    .inbound_split_resources
+                                    .entry(adv.original_hash)
+                                    .or_insert_with(|| {
+                                        MultiSegmentInbound::new(
+                                            adv.total_segments,
+                                            adv.original_hash,
+                                        )
+                                    });
+                                if entry.total_segments != adv.total_segments {
+                                    tracing::warn!(
+                                        link_id = hex::encode(link_id),
+                                        original = hex::encode(&adv.original_hash[..8]),
+                                        coord_total = entry.total_segments,
+                                        adv_total = adv.total_segments,
+                                        "split-resource ADV total_segments mismatched coordinator; ignoring"
+                                    );
+                                    break 'adv;
+                                }
+                                active.segment_routing.insert(
+                                    adv.resource_hash,
+                                    SegmentRoute {
+                                        original_hash: adv.original_hash,
+                                        segment_index: adv.segment_index,
+                                    },
+                                );
+                            }
+
+                            let map_hashes = adv.get_map_hashes();
+                            let mut transfer_flags = adv.flags;
+                            if adv.total_segments > 1 && adv.segment_index > 1 {
+                                transfer_flags.has_metadata = false;
+                            }
+                            let rtt = active
+                                .link
+                                .rtt
+                                .unwrap_or(std::time::Duration::from_millis(500));
+                            let mut rh = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
+                            let copy_len = adv.random_hash.len().min(rh.len());
+                            rh[..copy_len].copy_from_slice(&adv.random_hash[..copy_len]);
+
+                            if let Ok(mut transfer) = InboundTransfer::from_advertisement(
+                                adv.num_parts,
+                                adv.transfer_size,
+                                adv.data_size,
+                                rh,
+                                adv.resource_hash,
+                                transfer_flags,
+                                map_hashes,
+                                rtt,
+                            ) {
+                                // Python Resource.accept → request_next: initial request
+                                // accepts the ADV and names the parts.
+                                let action = transfer.request_next();
+                                if let TransferAction::SendRequest(req_data) = action {
+                                    if let Ok(encrypted) = active.link.encrypt(&req_data) {
+                                        let req_header = rns_wire::header::PacketHeader {
+                                            flags: rns_wire::flags::PacketFlags {
+                                                header_type: rns_wire::flags::HeaderType::Header1,
+                                                context_flag: false,
+                                                transport_type:
+                                                    rns_wire::flags::TransportType::Broadcast,
+                                                destination_type:
+                                                    rns_wire::flags::DestinationType::Link,
+                                                packet_type: rns_wire::flags::PacketType::Data,
+                                            },
+                                            hops: 0,
+                                            transport_id: None,
+                                            destination_hash: link_id,
+                                            context: rns_wire::context::PacketContext::ResourceReq,
+                                        };
+                                        let mut req_raw = req_header.pack();
+                                        req_raw.extend_from_slice(&encrypted);
+                                        let _ = self.transport_tx.try_send(
+                                            TransportMessage::Outbound(OutboundRequest {
+                                                raw: Bytes::from(req_raw),
+                                                destination_hash: link_id,
+                                            }),
+                                        );
+                                    }
+                                }
+
+                                active.link.track_incoming_resource(adv.resource_hash);
+                                active.inbound_resources.insert(adv.resource_hash, transfer);
+                                tracing::info!(
+                                    link_id = hex::encode(link_id),
+                                    resource = hex::encode(&adv.resource_hash[..8]),
+                                    parts = adv.num_parts,
+                                    "inbound resource accepted — initial request sent"
                                 );
                             }
                         }
                     }
+                }
+                if teardown_link {
+                    let _ = self.close_active_link(link_id, CloseReason::DestinationClosed, true);
                 }
             }
             rns_wire::context::PacketContext::Resource => {
@@ -1501,33 +1536,55 @@ impl LinkManager {
                         {
                             if let Some(transfer) = active.inbound_resources.get_mut(&rh) {
                                 let action = transfer.hashmap_update(segment, &hashmap);
-                                if let TransferAction::SendRequest(req) = action {
-                                    if let Ok(encrypted) = active.link.encrypt(&req) {
-                                        let req_header = rns_wire::header::PacketHeader {
-                                            flags: rns_wire::flags::PacketFlags {
-                                                header_type: rns_wire::flags::HeaderType::Header1,
-                                                context_flag: false,
-                                                transport_type:
-                                                    rns_wire::flags::TransportType::Broadcast,
-                                                destination_type:
-                                                    rns_wire::flags::DestinationType::Link,
-                                                packet_type: rns_wire::flags::PacketType::Data,
-                                            },
-                                            hops: 0,
-                                            transport_id: None,
-                                            destination_hash: link_id,
-                                            context: rns_wire::context::PacketContext::ResourceReq,
-                                        };
-                                        let mut req_raw = req_header.pack();
-                                        req_raw.extend_from_slice(&encrypted);
-                                        active.link.record_tx(encrypted.len());
-                                        let _ = self.transport_tx.try_send(
-                                            TransportMessage::Outbound(OutboundRequest {
-                                                raw: Bytes::from(req_raw),
-                                                destination_hash: link_id,
-                                            }),
-                                        );
+                                // A solicited HMU may either request the next parts or
+                                // cancel the transfer (RESOURCE_RCL) on an empty/invalid
+                                // update (1.3.9).
+                                let outbound = match action {
+                                    TransferAction::SendRequest(req) => {
+                                        active.link.encrypt(&req).ok().map(|enc| {
+                                            (rns_wire::context::PacketContext::ResourceReq, enc)
+                                        })
                                     }
+                                    TransferAction::SendCancel(cancel_type, resource_hash) => {
+                                        active.link.encrypt(&resource_hash).ok().map(|enc| {
+                                            let context = match cancel_type {
+                                                rns_protocol::resource::CancelType::Icl => {
+                                                    rns_wire::context::PacketContext::ResourceIcl
+                                                }
+                                                rns_protocol::resource::CancelType::Rcl => {
+                                                    rns_wire::context::PacketContext::ResourceRcl
+                                                }
+                                            };
+                                            (context, enc)
+                                        })
+                                    }
+                                    _ => None,
+                                };
+                                if let Some((context, encrypted)) = outbound {
+                                    let req_header = rns_wire::header::PacketHeader {
+                                        flags: rns_wire::flags::PacketFlags {
+                                            header_type: rns_wire::flags::HeaderType::Header1,
+                                            context_flag: false,
+                                            transport_type:
+                                                rns_wire::flags::TransportType::Broadcast,
+                                            destination_type:
+                                                rns_wire::flags::DestinationType::Link,
+                                            packet_type: rns_wire::flags::PacketType::Data,
+                                        },
+                                        hops: 0,
+                                        transport_id: None,
+                                        destination_hash: link_id,
+                                        context,
+                                    };
+                                    let mut req_raw = req_header.pack();
+                                    req_raw.extend_from_slice(&encrypted);
+                                    active.link.record_tx(encrypted.len());
+                                    let _ = self.transport_tx.try_send(TransportMessage::Outbound(
+                                        OutboundRequest {
+                                            raw: Bytes::from(req_raw),
+                                            destination_hash: link_id,
+                                        },
+                                    ));
                                 }
                             }
                         }
@@ -4169,6 +4226,124 @@ mod tests {
         assert!(
             active.inbound_resources.is_empty(),
             "no per-segment transfer must be opened for a rejected ADV"
+        );
+    }
+
+    // 1.3.9: an inbound request-resource is ignored (no transfer opened, link
+    // kept) when the destination has no request handlers registered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_inbound_request_resource_ignored_without_handlers() {
+        use rns_protocol::resource::ResourceFlags;
+        use rns_protocol::resource_adv::ResourceAdvertisement;
+
+        let (sender_link, receiver_link) = handshaken_link_pair();
+        let link_id = receiver_link.link_id;
+
+        let (transport_tx, mut _transport_rx) = mpsc::channel(64);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xCC; 16], None);
+        assert!(lm.request_handler.is_none() && lm.request_handler_ex.is_none());
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let adv = ResourceAdvertisement::with_metadata_size(
+            64,
+            32,
+            1,
+            [0x42; 32],
+            vec![0x11; 4],
+            ResourceFlags {
+                is_request: true,
+                ..Default::default()
+            },
+            &[],
+            rns_wire::constants::ENCRYPTED_MDU,
+            0,
+        );
+        let encrypted = sender_link.encrypt(&adv.pack()).expect("encrypt");
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::ResourceAdv,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&encrypted);
+        lm.handle_inbound_packet(&raw, 1);
+
+        let active = lm.active_links.get(&link_id).expect("link still present");
+        assert!(
+            active.inbound_resources.is_empty(),
+            "request-resource must not open a transfer without handlers"
+        );
+    }
+
+    // 1.3.9: a successfully-decrypted but unparseable advertisement tears down
+    // the link (the dispatch-exception teardown).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_unparseable_advertisement_tears_down_link() {
+        let (sender_link, receiver_link) = handshaken_link_pair();
+        let link_id = receiver_link.link_id;
+
+        let (transport_tx, mut _transport_rx) = mpsc::channel(64);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xCC; 16], None);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        // A payload that decrypts fine but is not a msgpack map fails unpack.
+        let encrypted = sender_link
+            .encrypt(b"\xff not a resource advertisement")
+            .expect("encrypt");
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::ResourceAdv,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&encrypted);
+        lm.handle_inbound_packet(&raw, 1);
+
+        assert!(
+            lm.active_links.get(&link_id).is_none(),
+            "unparseable advertisement must tear the link down"
         );
     }
 
