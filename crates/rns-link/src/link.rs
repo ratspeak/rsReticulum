@@ -671,6 +671,14 @@ impl Link {
             return Err(LinkCryptoError::DecryptionFailed);
         }
 
+        // First-identity-wins (Reticulum 1.3.9): once a verified identity is
+        // recorded it is immutable — a later, even validly-signed, identification
+        // is ignored rather than overwriting the peer. Callers detect the repeat
+        // via `self.identified` being already set and skip re-tracking/callbacks.
+        if let Some(existing) = self.remote_identity_pub {
+            return Ok(existing);
+        }
+
         self.remote_identity_pub = Some(public_key);
         self.identified = true;
 
@@ -2020,6 +2028,37 @@ mod tests {
         assert_eq!(remote_pub, identity_pub);
         assert!(responder.identified);
         assert_eq!(responder.remote_identity().unwrap(), &identity_pub);
+    }
+
+    #[test]
+    fn test_identify_first_wins_ignores_later_identity() {
+        // First-identity-wins (Reticulum 1.3.9): once a verified identity is
+        // recorded, a second validly-signed LinkIdentify for a DIFFERENT identity
+        // must not overwrite the first.
+        let (initiator, mut responder, _dest_identity) = make_active_link();
+
+        let first_identity = Ed25519PrivateKey::generate();
+        let mut first_pub = [0u8; 64];
+        first_pub[..32].copy_from_slice(&[0x11; 32]);
+        first_pub[32..].copy_from_slice(&first_identity.public_key().to_bytes());
+        let first_data = initiator.identify(&first_pub, &first_identity).unwrap();
+
+        let recorded = responder.handle_identification(&first_data).unwrap();
+        assert_eq!(recorded, first_pub);
+        assert_eq!(responder.remote_identity().unwrap(), &first_pub);
+
+        // A second, independently valid identification for a different identity.
+        let second_identity = Ed25519PrivateKey::generate();
+        let mut second_pub = [0u8; 64];
+        second_pub[..32].copy_from_slice(&[0x22; 32]);
+        second_pub[32..].copy_from_slice(&second_identity.public_key().to_bytes());
+        let second_data = initiator.identify(&second_pub, &second_identity).unwrap();
+        assert_ne!(first_pub, second_pub);
+
+        // The recorded identity stays the first one; the repeat is ignored.
+        let returned = responder.handle_identification(&second_data).unwrap();
+        assert_eq!(returned, first_pub);
+        assert_eq!(responder.remote_identity().unwrap(), &first_pub);
     }
 
     #[test]
