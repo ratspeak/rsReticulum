@@ -8,13 +8,15 @@
 //! - Service: `a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d`
 //! - RX:      `…4c5e` (WRITE, WRITE_NO_RESPONSE)
 //! - TX:      `…4c5f` (READ, NOTIFY)
-//! - ID:      `…4c60` (READ) — 16-byte identity hash
 //!
 //! ### Columba (cross-app compat)
 //! - Service: `37145b00-442d-4a94-917f-8f42c5da28e3`
 //! - RX:      `…28e5` (WRITE, WRITE_NO_RESPONSE)
 //! - TX:      `…28e4` (READ, NOTIFY, INDICATE)
-//! - ID:      `…28e6` (READ)
+//!
+//! Peer identity binds only from signature-verified announces. There is no ID
+//! characteristic: a statically readable identity hash was a tracking vector
+//! that defeated BLE MAC rotation.
 //!
 //! ## Fragmentation
 //!
@@ -41,7 +43,7 @@ use crate::traits::{
 };
 use rns_transport::messages::TransportMessage;
 
-// Peer writes RX, we notify TX, ID is hash.
+// Peer writes RX, we notify TX. ID chars are legacy — no longer registered.
 pub const RATSPEAK_SERVICE_UUID: Uuid = Uuid::from_u128(0xa1b2c3d4_e5f6_4a5b_8c9d_0e1f2a3b4c5d);
 pub const RATSPEAK_RX_UUID: Uuid = Uuid::from_u128(0xa1b2c3d4_e5f6_4a5b_8c9d_0e1f2a3b4c5e);
 pub const RATSPEAK_TX_UUID: Uuid = Uuid::from_u128(0xa1b2c3d4_e5f6_4a5b_8c9d_0e1f2a3b4c5f);
