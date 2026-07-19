@@ -191,6 +191,17 @@ async fn run_rnsh_listener_inner(
     link_mgr.set_link_identified_channel(identified_tx);
     link_mgr.set_link_closed_channel(closed_tx);
 
+    // Defense in depth: in authenticated mode, reject unallowed identities
+    // synchronously at the link layer (as rncp does), so the manager tears the
+    // link down at identify time in addition to the handler-level allow-check
+    // below. allow_all installs no gate.
+    if !cfg.allow_all {
+        let allowed = listener_allowed_identities(&cfg);
+        link_mgr.set_link_identity_gate(move |_link_id, identity_hash| {
+            allowed.contains(&identity_hash)
+        });
+    }
+
     let manager_task = tokio::spawn(async move {
         link_mgr.run_with_commands(command_rx).await;
     });
@@ -209,17 +220,40 @@ async fn run_rnsh_listener_inner(
         tokio::select! {
             maybe_link = established_rx.recv() => {
                 let Some(link_id) = maybe_link else { break };
-                sessions.insert(link_id, ListenerSession::new(cfg.allow_all));
+                // or_insert (not insert) so a rare identification processed ahead
+                // of this establishment event is never clobbered.
+                sessions.entry(link_id).or_insert_with(|| ListenerSession::new(cfg.allow_all));
             }
             maybe_identified = identified_rx.recv() => {
                 let Some((link_id, identity_hash)) = maybe_identified else { break };
                 let allowed = listener_allowed_identities(&cfg);
                 if cfg.allow_all || allowed.contains(&identity_hash) {
-                    let session = sessions.entry(link_id).or_insert_with(|| ListenerSession::new(cfg.allow_all));
-                    session.authorized = true;
-                    session.remote_identity_hash = Some(identity_hash);
-                    session.state = ListenerState::WaitVersion;
+                    // Identification is a legitimate session creator (it may race
+                    // ahead of the establishment event), so create-or-get here.
+                    let session = sessions
+                        .entry(link_id)
+                        .or_insert_with(|| ListenerSession::new(cfg.allow_all));
+                    // First-identification-wins: only a freshly-established
+                    // (WaitIdent) authenticated session may be authorized and
+                    // advanced — a repeat identification cannot regress a session
+                    // that has already moved on.
+                    if session.state == ListenerState::WaitIdent {
+                        session.authorized = true;
+                        session.remote_identity_hash = Some(identity_hash);
+                        session.state = ListenerState::WaitVersion;
+                    } else if cfg.allow_all && session.remote_identity_hash.is_none() {
+                        // allow_all sessions start authorized in WaitVersion;
+                        // record the first identity without regressing state.
+                        session.remote_identity_hash = Some(identity_hash);
+                    }
                 } else {
+                    // Denial is terminal: mark the session Closed so a message that
+                    // lands before CloseLink completes cannot resurrect it.
+                    let session = sessions
+                        .entry(link_id)
+                        .or_insert_with(|| ListenerSession::new(cfg.allow_all));
+                    session.authorized = false;
+                    session.state = ListenerState::Closed;
                     send_manager_message(
                         &command_tx,
                         link_id,
@@ -727,6 +761,8 @@ enum ListenerState {
     WaitVersion,
     WaitCommand,
     Running,
+    /// Terminal: the session was denied or torn down. No message can advance it.
+    Closed,
 }
 
 struct ListenerSession {
@@ -991,11 +1027,14 @@ async fn handle_listener_channel_message(
     sessions: &mut HashMap<[u8; 16], ListenerSession>,
     msg: LinkChannelMessage,
 ) -> Result<(), RnshError> {
-    let session = sessions
-        .entry(msg.link_id)
-        .or_insert_with(|| ListenerSession::new(cfg.allow_all));
+    // Sessions are created only on link establishment or on an allowed
+    // identification — a stray channel message must never fabricate one.
+    let Some(session) = sessions.get_mut(&msg.link_id) else {
+        return Ok(());
+    };
 
-    if !session.authorized {
+    // Drop everything on an unauthorized or terminally-closed session.
+    if !session.authorized || session.state == ListenerState::Closed {
         return Ok(());
     }
 
@@ -1003,6 +1042,7 @@ async fn handle_listener_channel_message(
         .map_err(|e| RnshError::Channel(e.to_string()))?;
 
     match session.state {
+        ListenerState::Closed => Ok(()),
         ListenerState::WaitIdent => Ok(()),
         ListenerState::WaitVersion => match decoded {
             RnshMessage::VersionInfo(version) => {
@@ -2168,5 +2208,199 @@ mod tests {
         }
         let _ = std::fs::remove_file(&pid_path);
         assert!(!process_exists(pid), "child process survived session drop");
+    }
+
+    fn unique_marker(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "rnsh-adv-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    // Authenticated listener whose default command creates `marker` if it ever
+    // reaches process spawn. The attacker identity is absent from the allow-list.
+    fn marker_listener_config(marker: &std::path::Path) -> RnshListenerConfig {
+        RnshListenerConfig {
+            identity: Identity::new(),
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("touch '{}'", marker.display()),
+            ],
+            allow_all: false,
+            allowed: Vec::new(),
+            allowed_identity_files: Vec::new(),
+            allow_remote_command: false,
+            remote_command_as_args: false,
+            announce_period: None,
+        }
+    }
+
+    fn version_channel_msg(link_id: [u8; 16]) -> LinkChannelMessage {
+        let msg = VersionInfoMessage::new(RNSH_SOFTWARE_VERSION);
+        LinkChannelMessage {
+            link_id,
+            msg_type: msg.msg_type(),
+            payload: msg.pack(),
+        }
+    }
+
+    fn execute_command_channel_msg(link_id: [u8; 16]) -> LinkChannelMessage {
+        // Empty cmdline + headless pipes: selects the listener's default command.
+        let msg =
+            ExecuteCommandMessage::new(None, true, true, true, None, None, None, None, None, None);
+        LinkChannelMessage {
+            link_id,
+            msg_type: msg.msg_type(),
+            payload: msg.pack(),
+        }
+    }
+
+    // The 1.3.9 rnsh flaw: a rejected identity ignores the fatal error, then
+    // sends VersionInfo + ExecuteCommand and reaches command execution. A denied
+    // (terminal Closed) session must drop both and never spawn the command.
+    #[tokio::test]
+    async fn adversarial_denied_session_never_runs_command() {
+        let marker = unique_marker("denied");
+        let _ = std::fs::remove_file(&marker);
+        let cfg = marker_listener_config(&marker);
+        let (command_tx, command_rx) = mpsc::channel(64);
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        spawn_ack_manager(command_rx, messages.clone());
+
+        let link_id = [0x55; 16];
+        let mut sessions = HashMap::new();
+        let mut denied = ListenerSession::new(false);
+        denied.state = ListenerState::Closed; // denial marks the session terminal
+        sessions.insert(link_id, denied);
+
+        handle_listener_channel_message(
+            &command_tx,
+            &cfg,
+            &mut sessions,
+            version_channel_msg(link_id),
+        )
+        .await
+        .expect("handler ok");
+        handle_listener_channel_message(
+            &command_tx,
+            &cfg,
+            &mut sessions,
+            execute_command_channel_msg(link_id),
+        )
+        .await
+        .expect("handler ok");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            !marker.exists(),
+            "denied session must never run the listener command"
+        );
+        assert_eq!(sessions.get(&link_id).unwrap().state, ListenerState::Closed);
+        assert!(
+            !messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, RnshMessage::VersionInfo(_))),
+            "denied session must not answer VersionInfo"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    // Same attack against a session that identified with an unallowed identity but
+    // was never authorized (still WaitIdent). Every message is dropped at the gate.
+    #[tokio::test]
+    async fn adversarial_unauthorized_session_never_runs_command() {
+        let marker = unique_marker("unauth");
+        let _ = std::fs::remove_file(&marker);
+        let cfg = marker_listener_config(&marker);
+        let (command_tx, command_rx) = mpsc::channel(64);
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        spawn_ack_manager(command_rx, messages.clone());
+
+        let link_id = [0x56; 16];
+        let mut sessions = HashMap::new();
+        // Unauthorized authenticated session: authorized=false, WaitIdent.
+        sessions.insert(link_id, ListenerSession::new(false));
+
+        handle_listener_channel_message(
+            &command_tx,
+            &cfg,
+            &mut sessions,
+            version_channel_msg(link_id),
+        )
+        .await
+        .expect("handler ok");
+        handle_listener_channel_message(
+            &command_tx,
+            &cfg,
+            &mut sessions,
+            execute_command_channel_msg(link_id),
+        )
+        .await
+        .expect("handler ok");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            !marker.exists(),
+            "unauthorized session must never run the listener command"
+        );
+        let session = sessions.get(&link_id).unwrap();
+        assert!(!session.authorized);
+        assert_eq!(session.state, ListenerState::WaitIdent);
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    // Positive control: an authorized session in WaitCommand DOES run the command,
+    // proving the harness can reach process spawn — so the negative results above
+    // are due to authorization, not an impotent test setup.
+    #[tokio::test]
+    async fn positive_control_authorized_session_runs_command() {
+        let marker = unique_marker("authed");
+        let _ = std::fs::remove_file(&marker);
+        let cfg = marker_listener_config(&marker);
+        let (command_tx, command_rx) = mpsc::channel(64);
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        spawn_ack_manager(command_rx, messages.clone());
+
+        let link_id = [0x57; 16];
+        let mut sessions = HashMap::new();
+        let mut authed = ListenerSession::new(false);
+        authed.authorized = true;
+        authed.remote_identity_hash = Some([0xAB; 16]);
+        authed.state = ListenerState::WaitCommand;
+        sessions.insert(link_id, authed);
+
+        handle_listener_channel_message(
+            &command_tx,
+            &cfg,
+            &mut sessions,
+            execute_command_channel_msg(link_id),
+        )
+        .await
+        .expect("handler ok");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            marker.exists(),
+            "authorized session must run the listener command (positive control)"
+        );
+        assert_eq!(
+            sessions.get(&link_id).unwrap().state,
+            ListenerState::Running
+        );
+
+        drop(sessions); // reap the spawned child
+        let _ = std::fs::remove_file(&marker);
     }
 }
