@@ -1613,6 +1613,7 @@ dependencies = [
  "rns-crypto",
  "rns-wire",
  "serde",
+ "serde_bytes",
  "thiserror 2.0.18",
  "tracing",
  "zeroize",

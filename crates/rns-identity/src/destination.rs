@@ -37,6 +37,23 @@ struct PathResponseCache {
 // Path-response dedup window (seconds). Matches upstream default.
 const PR_TAG_WINDOW: f64 = 30.0;
 
+/// Separate clocks used while constructing an announce: a persisted 40-bit
+/// ordering value for the wire and a local elapsed-time value for cache expiry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnnounceTime {
+    pub wire: u64,
+    pub cache: f64,
+}
+
+impl AnnounceTime {
+    pub fn new(wire: u64, cache: f64) -> Result<Self, DestinationError> {
+        if wire > crate::announce::ANNOUNCE_TIME_MAX || !cache.is_finite() || cache < 0.0 {
+            return Err(DestinationError::InvalidAnnounceTime(cache));
+        }
+        Ok(Self { wire, cache })
+    }
+}
+
 /// Destination type (matches wire format `DestinationType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -89,6 +106,8 @@ pub enum DestinationError {
     ProveNotSingle,
     #[error("identity error: {0}")]
     Identity(#[from] crate::identity::IdentityError),
+    #[error("invalid announce clock value: {0}")]
+    InvalidAnnounceTime(f64),
 }
 
 pub struct Destination {
@@ -572,6 +591,28 @@ impl Destination {
         tag: Option<&[u8]>,
         now: f64,
     ) -> Result<(Vec<u8>, bool), DestinationError> {
+        if !now.is_finite() || now < 0.0 || now > crate::announce::ANNOUNCE_TIME_MAX as f64 {
+            return Err(DestinationError::InvalidAnnounceTime(now));
+        }
+        self.create_announce_at(
+            identity,
+            app_data,
+            ratchet,
+            tag,
+            AnnounceTime::new(now as u64, now)?,
+        )
+    }
+
+    /// Build announce data with independent wire-ordering and cache clocks.
+    pub fn create_announce_at(
+        &mut self,
+        identity: &Identity,
+        app_data: Option<&[u8]>,
+        ratchet: Option<&[u8; 32]>,
+        tag: Option<&[u8]>,
+        time: AnnounceTime,
+    ) -> Result<(Vec<u8>, bool), DestinationError> {
+        let time = AnnounceTime::new(time.wire, time.cache)?;
         if self.dest_type != DestType::Single {
             return Err(DestinationError::EncryptionUnavailable);
         }
@@ -580,7 +621,7 @@ impl Destination {
         }
 
         self.path_responses
-            .retain(|_, v| now <= v.timestamp + PR_TAG_WINDOW);
+            .retain(|_, v| time.cache <= v.timestamp + PR_TAG_WINDOW);
 
         if let Some(tag_bytes) = tag {
             if let Some(cached) = self.path_responses.get(tag_bytes) {
@@ -595,9 +636,7 @@ impl Destination {
         let public_key = identity.get_public_key();
 
         let random_bytes: [u8; 5] = rns_crypto::random::random_bytes(5).try_into().unwrap();
-        let ts_int = now as u64;
-        // Low 5 bytes of the u64 timestamp; wraps ~every 34 000 years.
-        let ts_bytes = &ts_int.to_be_bytes()[3..8];
+        let ts_bytes = &time.wire.to_be_bytes()[3..8];
         let mut random_hash = [0u8; 10];
         random_hash[..5].copy_from_slice(&random_bytes);
         random_hash[5..].copy_from_slice(ts_bytes);
@@ -637,7 +676,7 @@ impl Destination {
             self.path_responses.insert(
                 tag_bytes.to_vec(),
                 PathResponseCache {
-                    timestamp: now,
+                    timestamp: time.cache,
                     announce_data: announce_data.clone(),
                     has_ratchet,
                 },
@@ -656,8 +695,30 @@ impl Destination {
         tag: Option<&[u8]>,
         now: f64,
     ) -> Result<Vec<u8>, DestinationError> {
+        if !now.is_finite() || now < 0.0 || now > crate::announce::ANNOUNCE_TIME_MAX as f64 {
+            return Err(DestinationError::InvalidAnnounceTime(now));
+        }
+        self.announce_packet_at(
+            identity,
+            app_data,
+            ratchet,
+            path_response,
+            tag,
+            AnnounceTime::new(now as u64, now)?,
+        )
+    }
+
+    pub fn announce_packet_at(
+        &mut self,
+        identity: &Identity,
+        app_data: Option<&[u8]>,
+        ratchet: Option<&[u8; 32]>,
+        path_response: bool,
+        tag: Option<&[u8]>,
+        time: AnnounceTime,
+    ) -> Result<Vec<u8>, DestinationError> {
         let (announce_data, has_ratchet) =
-            self.create_announce(identity, app_data, ratchet, tag, now)?;
+            self.create_announce_at(identity, app_data, ratchet, tag, time)?;
 
         let context = if path_response {
             rns_wire::context::PacketContext::PathResponse
@@ -926,5 +987,46 @@ mod tests {
             !header.flags.context_flag,
             "the cached payload's ratchet flag must not depend on current caller state"
         );
+    }
+
+    #[test]
+    fn announce_wire_time_is_independent_from_path_cache_time() {
+        let identity = Identity::new();
+        let mut dest = Destination::new(
+            Some(&identity),
+            Direction::In,
+            DestType::Single,
+            "test.time",
+        )
+        .unwrap();
+        let wire_time = 0x01_0203_0405;
+        let raw = dest
+            .announce_packet_at(
+                &identity,
+                None,
+                None,
+                false,
+                None,
+                AnnounceTime::new(wire_time, 9_999_999.0).unwrap(),
+            )
+            .unwrap();
+        let (_, header_len) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        let announce = crate::announce::AnnounceData::unpack(&raw[header_len..], false).unwrap();
+        assert_eq!(&announce.random_hash[5..], &wire_time.to_be_bytes()[3..]);
+
+        assert!(matches!(
+            dest.announce_packet_at(
+                &identity,
+                None,
+                None,
+                false,
+                None,
+                AnnounceTime {
+                    wire: crate::announce::ANNOUNCE_TIME_MAX + 1,
+                    cache: 1.0,
+                },
+            ),
+            Err(DestinationError::InvalidAnnounceTime(_))
+        ));
     }
 }
