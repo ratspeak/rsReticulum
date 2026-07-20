@@ -31,6 +31,7 @@ pub enum DefaultAppData {
 struct PathResponseCache {
     timestamp: f64,
     announce_data: Vec<u8>,
+    has_ratchet: bool,
 }
 
 // Path-response dedup window (seconds). Matches upstream default.
@@ -583,7 +584,7 @@ impl Destination {
 
         if let Some(tag_bytes) = tag {
             if let Some(cached) = self.path_responses.get(tag_bytes) {
-                return Ok((cached.announce_data.clone(), ratchet.is_some()));
+                return Ok((cached.announce_data.clone(), cached.has_ratchet));
             }
         }
 
@@ -638,6 +639,7 @@ impl Destination {
                 PathResponseCache {
                     timestamp: now,
                     announce_data: announce_data.clone(),
+                    has_ratchet,
                 },
             );
         }
@@ -855,5 +857,74 @@ mod tests {
         assert!(taken.is_some());
         assert!(taken.unwrap().has_private_key());
         assert!(dest.auto_identity().is_none());
+    }
+
+    #[test]
+    fn cached_path_response_preserves_ratcheted_announce_context() {
+        let identity = Identity::new();
+        let mut dest = Destination::new(
+            Some(&identity),
+            Direction::In,
+            DestType::Single,
+            "test.path",
+        )
+        .unwrap();
+        let ratchet = [0xA5; 32];
+        let tag = b"request-tag";
+
+        let first = dest
+            .announce_packet(
+                &identity,
+                Some(b"app-data"),
+                Some(&ratchet),
+                true,
+                Some(tag),
+                100.0,
+            )
+            .unwrap();
+        let replay = dest
+            .announce_packet(&identity, Some(b"changed"), None, true, Some(tag), 101.0)
+            .unwrap();
+
+        assert_eq!(
+            replay, first,
+            "a matching tag must replay exact signed bytes"
+        );
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&replay).unwrap();
+        assert!(
+            header.flags.context_flag,
+            "the cached payload's ratchet flag must not depend on current caller state"
+        );
+    }
+
+    #[test]
+    fn cached_path_response_preserves_unratcheted_announce_context() {
+        let identity = Identity::new();
+        let mut dest = Destination::new(
+            Some(&identity),
+            Direction::In,
+            DestType::Single,
+            "test.path",
+        )
+        .unwrap();
+        let ratchet = [0x5A; 32];
+        let tag = b"request-tag";
+
+        let first = dest
+            .announce_packet(&identity, None, None, true, Some(tag), 100.0)
+            .unwrap();
+        let replay = dest
+            .announce_packet(&identity, None, Some(&ratchet), true, Some(tag), 101.0)
+            .unwrap();
+
+        assert_eq!(
+            replay, first,
+            "a matching tag must replay exact signed bytes"
+        );
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&replay).unwrap();
+        assert!(
+            !header.flags.context_flag,
+            "the cached payload's ratchet flag must not depend on current caller state"
+        );
     }
 }
