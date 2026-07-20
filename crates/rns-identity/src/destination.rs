@@ -720,6 +720,37 @@ impl Destination {
         let (announce_data, has_ratchet) =
             self.create_announce_at(identity, app_data, ratchet, tag, time)?;
 
+        Ok(self.pack_announce_packet(&announce_data, has_ratchet, path_response))
+    }
+
+    /// Return an exact cached path-response packet for `tag`, if it is still
+    /// inside the local deduplication window.
+    ///
+    /// This lookup does not create a new announce or consume a new wire-order
+    /// value. Durable announce planners can therefore service a repeated path
+    /// request before deciding whether a fresh announce may be emitted.
+    pub fn cached_path_response_packet(
+        &mut self,
+        tag: &[u8],
+        cache_now: f64,
+    ) -> Result<Option<Vec<u8>>, DestinationError> {
+        if !cache_now.is_finite() || cache_now < 0.0 {
+            return Err(DestinationError::InvalidAnnounceTime(cache_now));
+        }
+
+        self.path_responses
+            .retain(|_, cached| cache_now <= cached.timestamp + PR_TAG_WINDOW);
+        Ok(self.path_responses.get(tag).map(|cached| {
+            self.pack_announce_packet(&cached.announce_data, cached.has_ratchet, true)
+        }))
+    }
+
+    fn pack_announce_packet(
+        &self,
+        announce_data: &[u8],
+        has_ratchet: bool,
+        path_response: bool,
+    ) -> Vec<u8> {
         let context = if path_response {
             rns_wire::context::PacketContext::PathResponse
         } else {
@@ -742,8 +773,8 @@ impl Destination {
         };
 
         let mut raw = header.pack();
-        raw.extend_from_slice(&announce_data);
-        Ok(raw)
+        raw.extend_from_slice(announce_data);
+        raw
     }
 
     pub fn remove_link(&mut self, link_id: &[u8; 16]) {
@@ -987,6 +1018,34 @@ mod tests {
             !header.flags.context_flag,
             "the cached payload's ratchet flag must not depend on current caller state"
         );
+    }
+
+    #[test]
+    fn cached_path_response_can_be_retrieved_without_creating_an_announce() {
+        let identity = Identity::new();
+        let mut dest = Destination::new(
+            Some(&identity),
+            Direction::In,
+            DestType::Single,
+            "test.path",
+        )
+        .unwrap();
+        let tag = b"request-tag";
+        let first = dest
+            .announce_packet(&identity, Some(b"app-data"), None, true, Some(tag), 100.0)
+            .unwrap();
+
+        assert_eq!(
+            dest.cached_path_response_packet(tag, 101.0).unwrap(),
+            Some(first),
+            "a durable planner must be able to replay the signed packet without advancing time"
+        );
+        assert_eq!(
+            dest.cached_path_response_packet(tag, 131.0).unwrap(),
+            None,
+            "changing the expiry comparison must not leave stale path responses replayable"
+        );
+        assert!(dest.cached_path_response_packet(tag, f64::NAN).is_err());
     }
 
     #[test]
