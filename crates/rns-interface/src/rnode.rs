@@ -983,13 +983,16 @@ pub async fn spawn_rnode_interface(
                                     } else if tcp_activity
                                         && last_write.elapsed() >= activity_keepalive
                                     {
-                                        tracing::debug!("RNode TCP activity keepalive (detect)");
+                                        tracing::debug!(
+                                            "RNode TCP activity keepalive (detect)"
+                                        );
                                         let (done_tx, _done_rx) = oneshot::channel();
                                         RNodeWriteRequest::Raw(build_detect_sequence(), done_tx)
                                     } else {
                                         continue;
                                     }
-                                } else if tcp_activity && last_write.elapsed() >= activity_keepalive
+                                } else if tcp_activity
+                                    && last_write.elapsed() >= activity_keepalive
                                 {
                                     tracing::debug!("RNode TCP activity keepalive (detect)");
                                     let (done_tx, _done_rx) = oneshot::channel();
@@ -1656,9 +1659,8 @@ mod tests {
                             return;
                         }
                     }
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
                     {
                         continue;
                     }
