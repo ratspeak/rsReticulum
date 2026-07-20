@@ -25,6 +25,41 @@ fn unique_temp_path(path: &Path) -> std::io::Result<PathBuf> {
     Ok(parent.join(temp_name))
 }
 
+#[cfg(not(windows))]
+fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // Same-directory temporary files keep this on one volume. MoveFileExW is
+    // the Windows replacement primitive; std::fs::rename rejects an existing
+    // destination on Windows instead of replacing it.
+    let replaced = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum InjectedFailure {
@@ -105,7 +140,7 @@ fn atomic_write_inner(
         }
 
         fail_if(InjectedFailure::Rename, injected)?;
-        fs::rename(&tmp_path, path)?;
+        atomic_replace(&tmp_path, path)?;
 
         fail_if(InjectedFailure::VerifyFinal, injected)?;
         let final_data = read_file_bounded(path, data.len())?
@@ -177,6 +212,13 @@ mod tests {
         atomic_write(&path, b"hello world").unwrap();
         let data = read_file(&path).unwrap().unwrap();
         assert_eq!(data, b"hello world");
+
+        atomic_write(&path, b"replacement").unwrap();
+        let data = read_file(&path).unwrap().unwrap();
+        assert_eq!(
+            data, b"replacement",
+            "Windows must replace an existing state file instead of failing after the first write"
+        );
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
