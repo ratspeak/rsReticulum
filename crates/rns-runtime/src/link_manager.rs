@@ -4342,7 +4342,7 @@ mod tests {
         lm.handle_inbound_packet(&raw, 1);
 
         assert!(
-            lm.active_links.get(&link_id).is_none(),
+            !lm.active_links.contains_key(&link_id),
             "unparseable advertisement must tear the link down"
         );
     }
