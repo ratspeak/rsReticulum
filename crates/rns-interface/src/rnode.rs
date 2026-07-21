@@ -690,6 +690,19 @@ pub fn decode_snr_byte(byte: u8) -> f32 {
     byte as i8 as f32 / 4.0
 }
 
+/// Official RNode battery telemetry is `[state, percent]`, not millivolts.
+pub fn decode_battery_status(frame: &[u8]) -> Option<(u8, u8)> {
+    (frame.len() >= 2).then(|| (frame[0], frame[1].min(100)))
+}
+
+/// Official RNode temperature telemetry stores Celsius with a +120 offset.
+pub fn decode_temperature_byte(byte: u8) -> Option<i8> {
+    let temperature_c = i16::from(byte) - 120;
+    (-30..=90)
+        .contains(&temperature_c)
+        .then_some(temperature_c as i8)
+}
+
 /// Dispatch decoded KISS frame; shared by serial and BLE transports.
 pub fn process_rnode_response(
     cmd: u8,
@@ -789,16 +802,22 @@ pub fn process_rnode_response(
             RNodeResponse::None
         }
         CMD_STAT_BAT => {
-            if frame.len() >= 2 {
-                let batt = ((frame[0] as u16) << 8) | frame[1] as u16;
-                tracing::debug!(id, battery_mv = batt, "RNode battery status");
+            if let Some((state, percent)) = decode_battery_status(frame) {
+                tracing::debug!(
+                    id,
+                    battery_state = state,
+                    battery_percent = percent,
+                    "RNode battery status"
+                );
             }
             RNodeResponse::None
         }
         CMD_STAT_TEMP => {
-            if !frame.is_empty() {
-                let temp = frame[0] as i8;
-                tracing::debug!(id, temp_c = temp, "RNode temperature");
+            if let Some(temperature_c) = frame
+                .first()
+                .and_then(|byte| decode_temperature_byte(*byte))
+            {
+                tracing::debug!(id, temperature_c, "RNode temperature");
             }
             RNodeResponse::None
         }
@@ -1166,6 +1185,19 @@ mod tests {
         let resp = process_rnode_response(CMD_STAT_RSSI, &[67], 0, &mut rssi, &mut snr);
         assert!(matches!(resp, RNodeResponse::None));
         assert_eq!(rssi, Some(-90.0));
+    }
+
+    #[test]
+    fn test_battery_and_temperature_decode_match_official_rnode_wire_format() {
+        assert_eq!(decode_battery_status(&[0x02, 73]), Some((0x02, 73)));
+        assert_eq!(decode_battery_status(&[0x01, 140]), Some((0x01, 100)));
+        assert_eq!(decode_battery_status(&[0x01]), None);
+
+        assert_eq!(decode_temperature_byte(90), Some(-30));
+        assert_eq!(decode_temperature_byte(120), Some(0));
+        assert_eq!(decode_temperature_byte(210), Some(90));
+        assert_eq!(decode_temperature_byte(89), None);
+        assert_eq!(decode_temperature_byte(211), None);
     }
 
     #[test]
