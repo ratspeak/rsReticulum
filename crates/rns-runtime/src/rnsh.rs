@@ -191,17 +191,6 @@ async fn run_rnsh_listener_inner(
     link_mgr.set_link_identified_channel(identified_tx);
     link_mgr.set_link_closed_channel(closed_tx);
 
-    // Defense in depth: in authenticated mode, reject unallowed identities
-    // synchronously at the link layer (as rncp does), so the manager tears the
-    // link down at identify time in addition to the handler-level allow-check
-    // below. allow_all installs no gate.
-    if !cfg.allow_all {
-        let allowed = listener_allowed_identities(&cfg);
-        link_mgr.set_link_identity_gate(move |_link_id, identity_hash| {
-            allowed.contains(&identity_hash)
-        });
-    }
-
     let manager_task = tokio::spawn(async move {
         link_mgr.run_with_commands(command_rx).await;
     });
@@ -259,11 +248,11 @@ async fn run_rnsh_listener_inner(
                         link_id,
                         ErrorMessage::new(Some("Identity is not allowed.".into()), true, None),
                     ).await?;
-                    let _ = command_tx.send(LinkManagerCommand::CloseLink {
-                        link_id,
-                        reason: CloseReason::DestinationClosed,
-                        send_teardown: true,
-                    }).await;
+                    // Keep the already-closed session around just long enough
+                    // for the peer to receive the protocol-level denial. The
+                    // channel-message gate drops every subsequent message, so
+                    // this grace period cannot advance or run the session.
+                    close_link_after_error(command_tx.clone(), link_id);
                 }
             }
             maybe_closed = closed_rx.recv() => {
