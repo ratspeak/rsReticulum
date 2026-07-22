@@ -102,28 +102,13 @@ pub const REQUIRED_FW_VER_MIN: u8 = 52;
 
 pub const RSSI_OFFSET: i32 = 157;
 
-pub const RECONNECT_WAIT: u64 = 5;
+pub const RECONNECT_WAIT: u64 = crate::serial_tcp_stream::RECONNECT_WAIT_SECS;
 
 pub const RADIO_STATE_ON: u8 = 0x01;
 pub const RADIO_STATE_OFF: u8 = 0x00;
 
 /// Default TCP port for RNode-over-IP.
-pub const DEFAULT_TCP_PORT: u16 = 7633;
-
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-const RNODE_READ_TIMEOUT_MS: u64 = 100;
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-const RNODE_TCP_CONNECT_TIMEOUT_SECS: u64 = 5;
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-const RNODE_TCP_KEEPIDLE_SECS: u64 = 5;
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-const RNODE_TCP_KEEPINTVL_SECS: u64 = 2;
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-const RNODE_TCP_KEEPCNT: u32 = 12;
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-const RNODE_TCP_USER_TIMEOUT_SECS: u64 = 24;
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-const RNODE_TCP_BUFFER_BYTES: usize = 131_072;
+pub use crate::serial_tcp_stream::DEFAULT_TCP_PORT;
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 type RNodeStopRegistry = Mutex<HashMap<InterfaceId, mpsc::Sender<()>>>;
@@ -207,247 +192,13 @@ async fn send_detach_request(conn_tx: &mpsc::Sender<RNodeWriteRequest>, id: Inte
     }
 }
 
-// Transport abstraction
-
-/// Parsed representation of the `port` config field.
+// Transport abstraction — shared with kiss_iface via `serial_tcp_stream`.
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-#[derive(Debug, Clone)]
-pub enum PortConfig {
-    /// A local serial device path, e.g. `/dev/ttyUSB0` or `COM3`.
-    #[cfg(feature = "serial")]
-    Serial { path: String, baud: u32 },
-    /// A TCP endpoint, e.g. `tcp://192.168.1.1` or `tcp://192.168.1.1:9000`.
-    Tcp { addr: String },
-}
-
+use crate::serial_tcp_stream::PortConfig;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-impl PortConfig {
-    pub fn parse(port: &str, baud: u32) -> Result<Self, String> {
-        #[cfg(not(feature = "serial"))]
-        let _ = baud;
-
-        if let Some(rest) = strip_tcp_scheme(port) {
-            let addr = parse_tcp_endpoint(rest)?;
-            Ok(Self::Tcp { addr })
-        } else {
-            #[cfg(feature = "serial")]
-            {
-                Ok(Self::Serial {
-                    path: port.to_string(),
-                    baud,
-                })
-            }
-            #[cfg(not(feature = "serial"))]
-            Err("RNode serial ports require the 'serial' feature; use tcp://host[:port] for TCP RNodes".to_string())
-        }
-    }
-}
-
+use crate::serial_tcp_stream::SerialTcpStream as RNodeStream;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-fn strip_tcp_scheme(port: &str) -> Option<&str> {
-    const TCP_SCHEME: &str = "tcp://";
-    port.get(..TCP_SCHEME.len())
-        .filter(|prefix| prefix.eq_ignore_ascii_case(TCP_SCHEME))
-        .and_then(|_| port.get(TCP_SCHEME.len()..))
-}
-
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-fn parse_tcp_endpoint(endpoint: &str) -> Result<String, String> {
-    if endpoint.is_empty() {
-        return Err("missing TCP host".to_string());
-    }
-
-    if let Some(rest) = endpoint.strip_prefix('[') {
-        let Some(closing) = rest.find(']') else {
-            return Err("missing closing ']' in IPv6 TCP host".to_string());
-        };
-        let host = &rest[..closing];
-        if host.is_empty() {
-            return Err("missing TCP host".to_string());
-        }
-
-        let tail = &rest[closing + 1..];
-        let port = if tail.is_empty() {
-            DEFAULT_TCP_PORT
-        } else if let Some(port) = tail.strip_prefix(':') {
-            parse_tcp_port(port)?
-        } else {
-            return Err("unexpected text after bracketed TCP host".to_string());
-        };
-
-        return Ok(format!("[{host}]:{port}"));
-    }
-
-    let colon_count = endpoint.matches(':').count();
-    match colon_count {
-        0 => Ok(format!("{endpoint}:{DEFAULT_TCP_PORT}")),
-        1 => {
-            let (host, port) = endpoint
-                .rsplit_once(':')
-                .expect("colon_count guarantees a separator");
-            if host.is_empty() {
-                return Err("missing TCP host".to_string());
-            }
-            Ok(format!("{host}:{}", parse_tcp_port(port)?))
-        }
-        _ => Ok(format!("[{endpoint}]:{DEFAULT_TCP_PORT}")),
-    }
-}
-
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-fn parse_tcp_port(port: &str) -> Result<u16, String> {
-    if port.is_empty() {
-        return Err("missing TCP port".to_string());
-    }
-    port.parse::<u16>()
-        .map_err(|_| format!("invalid TCP port: {port}"))
-}
-
-/// A unified sync I/O stream for either a serial port or a TCP socket.
-///
-/// Both variants support `Read + Write + Send + 'static` so the existing
-/// `spawn_blocking` read/write loops require minimal changes.
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-pub enum RNodeStream {
-    #[cfg(feature = "serial")]
-    Serial(Box<dyn serialport::SerialPort>),
-    Tcp(std::net::TcpStream),
-}
-
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-impl RNodeStream {
-    /// Open a serial port.
-    #[cfg(feature = "serial")]
-    pub fn open_serial(path: &str, baud: u32) -> std::io::Result<Self> {
-        let port = serialport::new(path, baud)
-            .timeout(Duration::from_millis(RNODE_READ_TIMEOUT_MS))
-            .open()
-            .map_err(std::io::Error::other)?;
-        Ok(Self::Serial(port))
-    }
-
-    /// Connect to a TCP socket (blocking).
-    pub fn connect_tcp(addr: &str) -> std::io::Result<Self> {
-        Self::connect_tcp_with_timeout(addr, Duration::from_secs(RNODE_TCP_CONNECT_TIMEOUT_SECS))
-    }
-
-    fn connect_tcp_with_timeout(addr: &str, timeout: Duration) -> std::io::Result<Self> {
-        use std::net::ToSocketAddrs;
-
-        let mut last_error = None;
-        for socket_addr in addr.to_socket_addrs()? {
-            match std::net::TcpStream::connect_timeout(&socket_addr, timeout) {
-                Ok(stream) => return Self::from_tcp_stream(stream),
-                Err(e) => last_error = Some(e),
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::AddrNotAvailable,
-                format!("no socket addresses resolved for {addr}"),
-            )
-        }))
-    }
-
-    fn from_tcp_stream(stream: std::net::TcpStream) -> std::io::Result<Self> {
-        // Mirror the serial timeout so the read loop doesn't block forever.
-        stream.set_read_timeout(Some(Duration::from_millis(RNODE_READ_TIMEOUT_MS)))?;
-        stream.set_nodelay(true)?;
-        crate::socket_tuning::set_keepalive_tuned(
-            &stream,
-            Duration::from_secs(RNODE_TCP_KEEPIDLE_SECS),
-            Duration::from_secs(RNODE_TCP_KEEPINTVL_SECS),
-            RNODE_TCP_KEEPCNT,
-            Duration::from_secs(RNODE_TCP_USER_TIMEOUT_SECS),
-        );
-        crate::socket_tuning::set_socket_buffers(&stream, RNODE_TCP_BUFFER_BYTES);
-        Ok(Self::Tcp(stream))
-    }
-
-    /// Shallow-clone the stream for the write half.
-    ///
-    /// - Serial: uses `SerialPort::try_clone`.
-    /// - TCP: uses `TcpStream::try_clone` (both halves share the same fd).
-    pub fn try_clone(&self) -> std::io::Result<Self> {
-        match self {
-            #[cfg(feature = "serial")]
-            Self::Serial(p) => Ok(Self::Serial(p.try_clone().map_err(std::io::Error::other)?)),
-            Self::Tcp(s) => Ok(Self::Tcp(s.try_clone()?)),
-        }
-    }
-
-    /// Human-readable description for log messages.
-    pub fn description(&self) -> String {
-        match self {
-            #[cfg(feature = "serial")]
-            Self::Serial(p) => p.name().unwrap_or_else(|| "<unknown serial>".to_string()),
-            Self::Tcp(s) => s
-                .peer_addr()
-                .map(|a| a.to_string())
-                .unwrap_or_else(|_| "<unknown tcp>".to_string()),
-        }
-    }
-
-    fn is_tcp(&self) -> bool {
-        matches!(self, Self::Tcp(_))
-    }
-}
-
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-impl std::io::Read for RNodeStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            #[cfg(feature = "serial")]
-            Self::Serial(p) => p.read(buf),
-            Self::Tcp(s) => s.read(buf),
-        }
-    }
-}
-
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-impl std::io::Write for RNodeStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            #[cfg(feature = "serial")]
-            Self::Serial(p) => p.write(buf),
-            Self::Tcp(s) => s.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            #[cfg(feature = "serial")]
-            Self::Serial(p) => p.flush(),
-            Self::Tcp(s) => s.flush(),
-        }
-    }
-}
-
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-fn read_rnode_stream(
-    mut stream: RNodeStream,
-    mut buf: [u8; 1024],
-) -> Result<(RNodeStream, [u8; 1024], usize), (RNodeStream, std::io::Error)> {
-    use std::io::Read;
-
-    match stream.read(&mut buf) {
-        Ok(0) if stream.is_tcp() => Err((
-            stream,
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "RNode TCP socket closed"),
-        )),
-        Ok(n) => Ok((stream, buf, n)),
-        // Serial returns TimedOut; TCP returns WouldBlock on non-blocking
-        // or TimedOut on a read-timeout. Treat both as "no data yet".
-        Err(e)
-            if e.kind() == std::io::ErrorKind::TimedOut
-                || e.kind() == std::io::ErrorKind::WouldBlock =>
-        {
-            Ok((stream, buf, 0))
-        }
-        Err(e) => Err((stream, e)),
-    }
-}
+use crate::serial_tcp_stream::read_stream as read_rnode_stream;
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 async fn open_configured_rnode_stream(
@@ -526,16 +277,7 @@ async fn open_configured_rnode_stream(
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-fn reconnect_delay() -> Duration {
-    #[cfg(test)]
-    {
-        Duration::from_millis(100)
-    }
-    #[cfg(not(test))]
-    {
-        Duration::from_secs(RECONNECT_WAIT)
-    }
-}
+use crate::serial_tcp_stream::reconnect_delay;
 
 #[derive(Debug, Clone)]
 pub struct RNodeConfig {
