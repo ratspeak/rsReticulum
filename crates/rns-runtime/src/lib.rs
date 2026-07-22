@@ -8,6 +8,7 @@ pub mod jobs;
 pub mod lifecycle;
 pub mod link_client;
 pub mod link_manager;
+pub mod link_session;
 pub mod platform;
 pub mod probe;
 pub mod remote_management;
