@@ -859,6 +859,26 @@ async fn announce_destination(identity: &Identity, aspects: &str, args: &Args) -
     println!("Created destination {aspects}");
     println!("Announcing destination {}", pretty_hash(&destination.hash));
 
+    // Destination construction is intentionally side-effect free in the Rust
+    // implementation. Register this short-lived destination explicitly so
+    // the transport recognises its announce as locally originated and allows
+    // it through the announce egress gates.
+    let dest_hash = destination.hash;
+    if handle
+        .transport_tx
+        .send(TransportMessage::RegisterDestination {
+            hash: dest_hash,
+            app_name: aspects.to_string(),
+            delivery_tx: None,
+        })
+        .await
+        .is_err()
+    {
+        eprintln!("An error occurred while attempting to register the announce destination");
+        shutdown.trigger();
+        return ExitCode::from(1);
+    }
+
     let raw = match destination.announce_packet(identity, None, None, false, None, now_epoch()) {
         Ok(raw) => raw,
         Err(e) => {
@@ -867,14 +887,19 @@ async fn announce_destination(identity: &Identity, aspects: &str, args: &Args) -
             return ExitCode::from(1);
         }
     };
-    let dest_hash = destination.hash;
-    let _ = handle
+    if handle
         .transport_tx
         .send(TransportMessage::Outbound(OutboundRequest {
             raw: raw.into(),
             destination_hash: dest_hash,
         }))
-        .await;
+        .await
+        .is_err()
+    {
+        eprintln!("An error occurred while attempting to queue the announce");
+        shutdown.trigger();
+        return ExitCode::from(1);
+    }
     tokio::time::sleep(Duration::from_millis(250)).await;
     shutdown.trigger();
     ExitCode::SUCCESS
