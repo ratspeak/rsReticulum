@@ -13,7 +13,8 @@ use rns_identity::identity::Identity;
 use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
-    AnnounceRpcEntry, OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
+    AnnounceRpcEntry, InterfaceId, OutboundRequest, TransportMessage, TransportQuery,
+    TransportQueryResponse,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -227,7 +228,7 @@ impl LinkSession {
             Ok(result) => result,
             Err(_) => Err(LinkSessionError::Timeout("link proof")),
         };
-        let proof = match proof {
+        let (proof, attached_interface) = match proof {
             Ok(proof) => proof,
             Err(error) => return Err(error),
         };
@@ -243,6 +244,7 @@ impl LinkSession {
 
         send_raw(
             &transport_tx,
+            attached_interface,
             link_id,
             build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data),
         )
@@ -260,6 +262,7 @@ impl LinkSession {
                 .map_err(|_| LinkSessionError::IdentificationUnavailable)?;
             send_raw(
                 &transport_tx,
+                attached_interface,
                 link_id,
                 build_data_packet(
                     link_id,
@@ -284,6 +287,7 @@ impl LinkSession {
             transport_tx,
             identity,
             link,
+            attached_interface,
             delivery_rx,
             command_rx,
             event_tx,
@@ -344,6 +348,7 @@ async fn run_session_actor(
     transport_tx: mpsc::Sender<TransportMessage>,
     identity: Identity,
     mut link: Link,
+    attached_interface: InterfaceId,
     mut delivery_rx: mpsc::Receiver<DestinationEvent>,
     mut command_rx: mpsc::Receiver<LinkSessionCommand>,
     event_tx: mpsc::Sender<LinkSessionEvent>,
@@ -358,6 +363,7 @@ async fn run_session_actor(
                     Some(LinkSessionCommand::SendPacket { payload, result_tx }) => {
                         let result = send_application_packet(
                             &transport_tx,
+                            attached_interface,
                             &mut link,
                             &mut pending_packets,
                             payload,
@@ -369,7 +375,7 @@ async fn run_session_actor(
                         }
                     }
                     Some(LinkSessionCommand::Close) | None => {
-                        send_local_teardown(&transport_tx, &mut link).await;
+                        send_local_teardown(&transport_tx, attached_interface, &mut link).await;
                         break LinkSessionCloseReason::Local;
                     }
                 }
@@ -380,6 +386,7 @@ async fn run_session_actor(
                 };
                 match process_destination_event(
                     &transport_tx,
+                    attached_interface,
                     &identity,
                     &mut link,
                     &mut pending_packets,
@@ -394,19 +401,26 @@ async fn run_session_actor(
             _ = ticker.tick() => {
                 match link.tick() {
                     LinkAction::SendKeepalive => {
-                        if send_keepalive(&transport_tx, &mut link).await.is_err() {
+                        if send_keepalive(&transport_tx, attached_interface, &mut link)
+                            .await
+                            .is_err()
+                        {
                             break LinkSessionCloseReason::TransportUnavailable;
                         }
                     }
                     LinkAction::TransitionedToStale => {
                         let _ = event_tx.send(LinkSessionEvent::Stale).await;
-                        if send_keepalive(&transport_tx, &mut link).await.is_err() {
+                        if send_keepalive(&transport_tx, attached_interface, &mut link)
+                            .await
+                            .is_err()
+                        {
                             break LinkSessionCloseReason::TransportUnavailable;
                         }
                     }
                     LinkAction::SendTeardownAndClose(data) => {
                         let _ = send_raw(
                             &transport_tx,
+                            attached_interface,
                             link_id,
                             build_data_packet(link_id, rns_wire::context::PacketContext::LinkClose, &data),
                         ).await;
@@ -429,6 +443,7 @@ async fn run_session_actor(
 
 async fn send_application_packet(
     transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
     link: &mut Link,
     pending_packets: &mut HashSet<[u8; 32]>,
     payload: Vec<u8>,
@@ -454,7 +469,7 @@ async fn send_application_packet(
         &encrypted,
     );
     let packet_hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
-    send_raw(transport_tx, link.link_id, raw).await?;
+    send_raw(transport_tx, attached_interface, link.link_id, raw).await?;
     link.record_tx(encrypted.len());
     pending_packets.insert(packet_hash);
     Ok(LinkSessionPacketReceipt {
@@ -465,6 +480,7 @@ async fn send_application_packet(
 
 async fn process_destination_event(
     transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
     identity: &Identity,
     link: &mut Link,
     pending_packets: &mut HashSet<[u8; 32]>,
@@ -475,7 +491,13 @@ async fn process_destination_event(
         DestinationEvent::LinkClosed { link_id } if link_id == link.link_id => {
             return Ok(Some(LinkSessionCloseReason::Remote));
         }
-        DestinationEvent::InboundPacket { raw, .. } => {
+        DestinationEvent::InboundPacket { raw, interface_id } => {
+            // Python pins an established Link to the interface that delivered
+            // its proof. Accepting Link traffic from another interface would
+            // both break route affinity and permit cross-interface injection.
+            if interface_id != attached_interface {
+                return Ok(None);
+            }
             let Ok((header, data_offset)) = rns_wire::header::PacketHeader::unpack(&raw) else {
                 return Ok(None);
             };
@@ -542,7 +564,7 @@ async fn process_destination_event(
                             rns_wire::context::PacketContext::LinkProof,
                             &proof,
                         );
-                        send_raw(transport_tx, link.link_id, proof_raw).await?;
+                        send_raw(transport_tx, attached_interface, link.link_id, proof_raw).await?;
                         link.record_tx(proof.len());
                     }
                     event_tx
@@ -567,13 +589,13 @@ async fn process_destination_event(
 async fn wait_for_link_proof(
     delivery_rx: &mut mpsc::Receiver<DestinationEvent>,
     link_id: [u8; 16],
-) -> Result<Vec<u8>, LinkSessionError> {
+) -> Result<(Vec<u8>, InterfaceId), LinkSessionError> {
     while let Some(event) = delivery_rx.recv().await {
         match event {
             DestinationEvent::LinkClosed { link_id: closed } if closed == link_id => {
                 return Err(LinkSessionError::HandshakeFailed("Link closed".into()));
             }
-            DestinationEvent::InboundPacket { raw, .. } => {
+            DestinationEvent::InboundPacket { raw, interface_id } => {
                 let Ok((header, data_offset)) = rns_wire::header::PacketHeader::unpack(&raw) else {
                     continue;
                 };
@@ -581,7 +603,7 @@ async fn wait_for_link_proof(
                     && header.flags.packet_type == rns_wire::flags::PacketType::Proof
                     && raw.len() > data_offset
                 {
-                    return Ok(raw[data_offset..].to_vec());
+                    return Ok((raw[data_offset..].to_vec(), interface_id));
                 }
             }
             _ => {}
@@ -594,6 +616,7 @@ async fn wait_for_link_proof(
 
 async fn send_keepalive(
     transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
     link: &mut Link,
 ) -> Result<(), LinkSessionError> {
     let raw = build_data_packet(
@@ -601,18 +624,23 @@ async fn send_keepalive(
         rns_wire::context::PacketContext::Keepalive,
         &[rns_link::constants::KEEPALIVE_REQUEST],
     );
-    send_raw(transport_tx, link.link_id, raw).await?;
+    send_raw(transport_tx, attached_interface, link.link_id, raw).await?;
     link.record_tx_keepalive(1);
     Ok(())
 }
 
-async fn send_local_teardown(transport_tx: &mpsc::Sender<TransportMessage>, link: &mut Link) {
+async fn send_local_teardown(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &mut Link,
+) {
     let link_id = link.link_id;
     let Some(data) = link.teardown(CloseReason::InitiatorClosed) else {
         return;
     };
     let _ = send_raw(
         transport_tx,
+        attached_interface,
         link_id,
         build_data_packet(link_id, rns_wire::context::PacketContext::LinkClose, &data),
     )
@@ -621,14 +649,18 @@ async fn send_local_teardown(transport_tx: &mpsc::Sender<TransportMessage>, link
 
 async fn send_raw(
     transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
     destination_hash: [u8; 16],
     raw: Bytes,
 ) -> Result<(), LinkSessionError> {
     transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw,
-            destination_hash,
-        }))
+        .send(TransportMessage::OutboundAttached {
+            request: OutboundRequest {
+                raw,
+                destination_hash,
+            },
+            interface_id: attached_interface,
+        })
         .await
         .map_err(|_| LinkSessionError::TransportUnavailable)
 }
@@ -748,6 +780,7 @@ mod tests {
         let mut pending_packets = HashSet::new();
         let receipt = send_application_packet(
             &transport_tx,
+            7,
             &mut initiator,
             &mut pending_packets,
             b"pong".to_vec(),
@@ -756,7 +789,10 @@ mod tests {
         .expect("a stale Link must still be able to answer its peer");
 
         let sent = match transport_rx.recv().await.unwrap() {
-            TransportMessage::Outbound(request) => request,
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 7,
+            } => request,
             other => panic!("unexpected transport message: {other:?}"),
         };
         let (header, offset) = rns_wire::header::PacketHeader::unpack(&sent.raw).unwrap();
@@ -873,7 +909,10 @@ mod tests {
             .unwrap();
 
         let rtt = match transport_rx.recv().await.unwrap() {
-            TransportMessage::Outbound(request) => request,
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
             other => panic!("unexpected transport message: {other:?}"),
         };
         let (rtt_header, rtt_offset) = rns_wire::header::PacketHeader::unpack(&rtt.raw).unwrap();
@@ -883,7 +922,10 @@ mod tests {
             .unwrap();
 
         let identify = match transport_rx.recv().await.unwrap() {
-            TransportMessage::Outbound(request) => request,
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
             other => panic!("unexpected transport message: {other:?}"),
         };
         let (identify_header, identify_offset) =
@@ -904,7 +946,10 @@ mod tests {
             .await
             .unwrap();
         let sent = match transport_rx.recv().await.unwrap() {
-            TransportMessage::Outbound(request) => request,
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
             other => panic!("unexpected transport message: {other:?}"),
         };
         let (sent_header, sent_offset) = rns_wire::header::PacketHeader::unpack(&sent.raw).unwrap();
@@ -926,6 +971,23 @@ mod tests {
         );
         delivery_tx
             .send(DestinationEvent::InboundPacket {
+                raw: inbound.clone(),
+                interface_id: 9,
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), session.events.recv())
+                .await
+                .is_err(),
+            "Link traffic from a different interface must be ignored"
+        );
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "off-interface Link traffic must not be proved"
+        );
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
                 raw: inbound,
                 interface_id: 1,
             })
@@ -937,7 +999,10 @@ mod tests {
             LinkSessionEvent::Packet { ref data, .. } if data == b"hello client"
         ));
         let proof = match transport_rx.recv().await.unwrap() {
-            TransportMessage::Outbound(request) => request,
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
             other => panic!("unexpected transport message: {other:?}"),
         };
         let (proof_header, _) = rns_wire::header::PacketHeader::unpack(&proof.raw).unwrap();
@@ -952,7 +1017,10 @@ mod tests {
 
         session.handle.close().await;
         let close = match transport_rx.recv().await.unwrap() {
-            TransportMessage::Outbound(request) => request,
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
             other => panic!("unexpected transport message: {other:?}"),
         };
         let (close_header, close_offset) =
