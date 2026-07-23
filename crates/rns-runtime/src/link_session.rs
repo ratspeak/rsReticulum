@@ -805,6 +805,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_actor_recovers_and_answers_data_received_after_stale() {
+        let destination_hash = [0xBD; 16];
+        let server_signing = Ed25519PrivateKey::generate();
+        let server_public = server_signing.public_key();
+        let client_identity = Identity::new();
+        let (mut initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &server_signing, destination_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &server_public, &server_public.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+
+        // Make the actor enter STALE on its first tick. The subsequent inbound
+        // application packet models a peer heartbeat arriving during the
+        // recoverable stale grace period.
+        initiator.keepalive.stale_time = Duration::ZERO;
+        initiator.keepalive.keepalive_interval = Duration::from_secs(60);
+
+        let link_id = initiator.link_id;
+        let mdu = initiator.mdu;
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(16);
+        let (delivery_tx, delivery_rx) = mpsc::channel::<DestinationEvent>(16);
+        let (command_tx, command_rx) = mpsc::channel::<LinkSessionCommand>(16);
+        let (event_tx, mut event_rx) = mpsc::channel::<LinkSessionEvent>(16);
+        let handle = LinkSessionHandle {
+            link_id,
+            mdu,
+            command_tx,
+        };
+
+        tokio::spawn(run_session_actor(
+            transport_tx,
+            client_identity,
+            initiator,
+            7,
+            delivery_rx,
+            command_rx,
+            event_tx,
+        ));
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap(),
+            Some(LinkSessionEvent::Stale)
+        );
+        let stale_keepalive = transport_rx.recv().await.unwrap();
+        assert!(matches!(
+            stale_keepalive,
+            TransportMessage::OutboundAttached {
+                interface_id: 7,
+                ..
+            }
+        ));
+
+        let inbound_ciphertext = responder.encrypt(b"ping").unwrap();
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: build_data_packet(
+                    responder.link_id,
+                    rns_wire::context::PacketContext::None,
+                    &inbound_ciphertext,
+                ),
+                interface_id: 7,
+            })
+            .await
+            .unwrap();
+
+        let inbound_proof = transport_rx.recv().await.unwrap();
+        assert!(matches!(
+            inbound_proof,
+            TransportMessage::OutboundAttached {
+                interface_id: 7,
+                ..
+            }
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(LinkSessionEvent::Packet { ref data, .. }) if data == b"ping"
+        ));
+        assert_eq!(event_rx.recv().await, Some(LinkSessionEvent::Recovered));
+
+        handle
+            .send_packet(b"pong".to_vec())
+            .await
+            .expect("the recovered actor must accept the heartbeat response");
+        let response = match transport_rx.recv().await.unwrap() {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 7,
+            } => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&response.raw).unwrap();
+        assert_eq!(responder.decrypt(&response.raw[offset..]).unwrap(), b"pong");
+
+        handle.close().await;
+    }
+
+    #[tokio::test]
     async fn cancelled_handshake_deregisters_temporary_link_destination() {
         let destination_hash = [0x33; 16];
         let remote_identity = Identity::new();
