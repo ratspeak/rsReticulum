@@ -433,7 +433,10 @@ async fn send_application_packet(
     pending_packets: &mut HashSet<[u8; 32]>,
     payload: Vec<u8>,
 ) -> Result<LinkSessionPacketReceipt, LinkSessionError> {
-    if link.state != LinkState::Active {
+    // STALE is a recoverable Link state, not a closed transport. Application
+    // traffic such as a peer heartbeat reply must still be allowed through:
+    // the reply may be the packet that lets the remote side recover the Link.
+    if !matches!(link.state, LinkState::Active | LinkState::Stale) {
         return Err(LinkSessionError::LinkNotActive);
     }
     if payload.len() > link.mdu {
@@ -710,6 +713,7 @@ fn build_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rns_crypto::ed25519::Ed25519PrivateKey;
 
     #[test]
     fn application_packets_use_link_destination_and_none_context() {
@@ -724,6 +728,44 @@ mod tests {
         assert_eq!(header.flags.packet_type, rns_wire::flags::PacketType::Data);
         assert_eq!(header.context, rns_wire::context::PacketContext::None);
         assert_eq!(&packet[offset..], &[1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn application_packets_can_answer_while_link_is_stale() {
+        let destination_hash = [0xBC; 16];
+        let server_signing = Ed25519PrivateKey::generate();
+        let server_public = server_signing.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &server_signing, destination_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &server_public, &server_public.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+        initiator.state = LinkState::Stale;
+
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let mut pending_packets = HashSet::new();
+        let receipt = send_application_packet(
+            &transport_tx,
+            &mut initiator,
+            &mut pending_packets,
+            b"pong".to_vec(),
+        )
+        .await
+        .expect("a stale Link must still be able to answer its peer");
+
+        let sent = match transport_rx.recv().await.unwrap() {
+            TransportMessage::Outbound(request) => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&sent.raw).unwrap();
+        assert_eq!(header.destination_hash, initiator.link_id);
+        assert_eq!(responder.decrypt(&sent.raw[offset..]).unwrap(), b"pong");
+        assert_eq!(
+            receipt.packet_hash,
+            rns_wire::hash::packet_hash(&sent.raw, header.flags.header_type)
+        );
     }
 
     #[tokio::test]
