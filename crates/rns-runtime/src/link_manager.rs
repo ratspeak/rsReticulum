@@ -4506,7 +4506,7 @@ mod tests {
                 ..Default::default()
             },
             &[],
-            rns_wire::constants::ENCRYPTED_MDU,
+            rns_wire::constants::LINK_MDU,
             0,
         );
         adv.original_hash = [0x99; 32];
@@ -4586,7 +4586,7 @@ mod tests {
                 ..Default::default()
             },
             &[],
-            rns_wire::constants::ENCRYPTED_MDU,
+            rns_wire::constants::LINK_MDU,
             0,
         );
         let encrypted = sender_link.encrypt(&adv.pack()).expect("encrypt");

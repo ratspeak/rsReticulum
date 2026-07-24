@@ -1579,8 +1579,7 @@ impl OutboundTransfer {
         // The collision guard widens the search window so out-of-order
         // part requests don't fall outside the scanned range when the
         // receiver's consecutive height lags ours.
-        let guard_size =
-            crate::resource_adv::collision_guard_size(rns_wire::constants::ENCRYPTED_MDU);
+        let guard_size = crate::resource_adv::collision_guard_size(rns_wire::constants::LINK_MDU);
         let search_start = self.receiver_min_consecutive_height;
         let search_end = (search_start + guard_size).min(self.resource.num_parts());
 
@@ -1627,7 +1626,7 @@ impl OutboundTransfer {
             };
 
             let hashmap_max_len =
-                crate::resource_adv::hashmap_max_len(rns_wire::constants::ENCRYPTED_MDU);
+                crate::resource_adv::hashmap_max_len(rns_wire::constants::LINK_MDU);
 
             // Python cancels if an exhausted request cursor is not aligned to
             // a hashmap segment boundary.
@@ -1723,7 +1722,7 @@ impl OutboundTransfer {
             self.resource.random_hash.to_vec(),
             self.resource.flags,
             &self.resource.map_hashes,
-            rns_wire::constants::ENCRYPTED_MDU,
+            rns_wire::constants::LINK_MDU,
         );
         // `ResourceAdvertisement::new` defaults to single-segment metadata
         // (`segment_index = 1`, `total_segments = 1`, `original_hash =
@@ -2176,8 +2175,7 @@ impl InboundTransfer {
         self.last_activity = Instant::now();
         self.retries_left = MAX_RETRIES;
 
-        let hashmap_max_len =
-            crate::resource_adv::hashmap_max_len(rns_wire::constants::ENCRYPTED_MDU);
+        let hashmap_max_len = crate::resource_adv::hashmap_max_len(rns_wire::constants::LINK_MDU);
 
         // Parse hashes from the hashmap data and insert into our map_hashes.
         // `segment` is wire-supplied: indices are bounded by total_parts
@@ -4023,7 +4021,7 @@ mod tests {
         let mut sender =
             OutboundTransfer::new(data.clone(), false, Duration::from_millis(100)).unwrap();
         assert!(
-            crate::resource_adv::hashmap_max_len(rns_wire::constants::ENCRYPTED_MDU) > 1,
+            crate::resource_adv::hashmap_max_len(rns_wire::constants::LINK_MDU) > 1,
             "test requires a multi-entry hashmap segment"
         );
 
@@ -4252,8 +4250,7 @@ mod tests {
         assert_eq!(inbound.hashmap_height, initial_height);
 
         // Build hashmap data for segment 0 with additional hashes
-        let hashmap_max_len =
-            crate::resource_adv::hashmap_max_len(rns_wire::constants::ENCRYPTED_MDU);
+        let hashmap_max_len = crate::resource_adv::hashmap_max_len(rns_wire::constants::LINK_MDU);
         let mut hashmap_bytes = Vec::new();
         let end = outbound.map_hashes.len().min(hashmap_max_len);
         for i in 0..end {
@@ -4368,8 +4365,7 @@ mod tests {
     fn test_hashmap_update_second_segment_bounded_by_total_parts() {
         // Resource large enough that its hashmap spans >1 segment: segment 1
         // writes land, but never past total_parts even if overfull.
-        let hashmap_max_len =
-            crate::resource_adv::hashmap_max_len(rns_wire::constants::ENCRYPTED_MDU);
+        let hashmap_max_len = crate::resource_adv::hashmap_max_len(rns_wire::constants::LINK_MDU);
         let data = vec![0xCD; (hashmap_max_len + 12) * SDU];
         let outbound = OutboundResource::new(data.clone(), false, None).unwrap();
         let total_parts = outbound.num_parts();
@@ -4577,8 +4573,7 @@ mod tests {
         let mut request_data = Vec::new();
         request_data.push(HASHMAP_IS_EXHAUSTED);
         // last_map_hash -- use the hash at hashmap_max_len boundary
-        let hashmap_max_len =
-            crate::resource_adv::hashmap_max_len(rns_wire::constants::ENCRYPTED_MDU);
+        let hashmap_max_len = crate::resource_adv::hashmap_max_len(rns_wire::constants::LINK_MDU);
         let boundary_idx = hashmap_max_len.min(sender.resource.num_parts()) - 1;
         request_data.extend_from_slice(&sender.resource.map_hashes[boundary_idx]);
         request_data.extend_from_slice(&sender.resource.resource_hash);

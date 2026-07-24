@@ -33,8 +33,22 @@ pub const MDU: usize = MTU - HEADER_MAXSIZE - 1;
 /// Encrypted link MDU, matching Python `RNS.Link.MDU`:
 /// floor((MTU - IFAC_MIN - HEADER_MIN - TOKEN_OVERHEAD) / AES128_BLOCKSIZE)
 /// * AES128_BLOCKSIZE - 1 = 431.
-pub const ENCRYPTED_MDU: usize =
+pub const LINK_MDU: usize =
     ((MTU - 1 - HEADER_MINSIZE - TOKEN_OVERHEAD) / AES128_BLOCKSIZE) * AES128_BLOCKSIZE - 1;
+
+/// Maximum plaintext payload for one encrypted packet to a SINGLE destination.
+///
+/// This is Python `RNS.Packet.ENCRYPTED_MDU`: the general MDU minus identity
+/// encryption's ephemeral key and token overhead, rounded to an AES block.
+pub const SINGLE_PACKET_ENCRYPTED_MDU: usize =
+    ((MDU - TOKEN_OVERHEAD - KEYSIZE / 16) / AES128_BLOCKSIZE) * AES128_BLOCKSIZE - 1;
+
+/// Former name for [`LINK_MDU`].
+///
+/// Kept as a compatibility alias while downstream users migrate to the
+/// unambiguous name.
+#[deprecated(since = "1.0.2", note = "use LINK_MDU")]
+pub const ENCRYPTED_MDU: usize = LINK_MDU;
 
 /// MDU available to plaintext (unencrypted) payloads.
 pub const PLAIN_MDU: usize = MDU;
@@ -72,7 +86,8 @@ mod tests {
         assert_eq!(HEADER_MINSIZE, 19);
         assert_eq!(HEADER_MAXSIZE, 35);
         assert_eq!(MDU, 464);
-        assert_eq!(ENCRYPTED_MDU, 431);
+        assert_eq!(LINK_MDU, 431);
+        assert_eq!(SINGLE_PACKET_ENCRYPTED_MDU, 383);
         assert_eq!(TRUNCATED_HASHLENGTH / 8, 16);
         assert_eq!(HASHLENGTH / 8, 32);
         assert_eq!(KEYSIZE / 8, 64);
