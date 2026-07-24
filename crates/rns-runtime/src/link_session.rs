@@ -17,8 +17,11 @@ use rns_protocol::channel::{
 };
 use rns_protocol::channel_message::{ChannelMessageError, MessageBase};
 use rns_protocol::resource::{
-    CancelType, HASHMAP_IS_EXHAUSTED, MAPHASH_LEN, OutboundTransfer, TransferAction,
+    CancelType, HASHMAP_IS_EXHAUSTED, InboundTransfer, MAPHASH_LEN, MAX_SEGMENTS,
+    MultiSegmentInbound, OutboundTransfer, RANDOM_HASH_SIZE, TransferAction, get_map_hash,
+    parse_hashmap_update,
 };
+use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
     AnnounceRpcEntry, InterfaceId, OutboundRequest, TransportMessage, TransportQuery,
@@ -35,6 +38,9 @@ const COMMAND_BUFFER: usize = 64;
 const EVENT_BUFFER: usize = 256;
 const MAX_PENDING_REQUESTS: usize = 64;
 const MAX_QUEUED_RESOURCES: usize = 8;
+const MAX_PENDING_RESOURCE_OFFERS: usize = 8;
+const RESOURCE_OFFER_TIMEOUT: Duration = Duration::from_secs(30);
+const RESOURCE_REJECTION_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct LinkSessionConfig {
@@ -201,6 +207,171 @@ impl LinkSessionResourceHandle {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSessionReceivedResource {
+    pub link_id: [u8; 16],
+    pub resource_id: [u8; 32],
+    pub data: Vec<u8>,
+    pub metadata: Option<Vec<u8>>,
+    pub total_segments: usize,
+    pub request_id: Option<Vec<u8>>,
+    pub is_request: bool,
+    pub is_response: bool,
+}
+
+/// A bounded inbound Resource advertisement awaiting an application decision.
+///
+/// Offers are rejected after 30 seconds if the application does not decide.
+/// Accepting creates a lifecycle handle; dropping an offer leaves that timeout
+/// in force rather than accepting data implicitly.
+pub struct LinkSessionResourceOffer {
+    link_id: [u8; 16],
+    resource_id: [u8; 32],
+    segment_hash: [u8; 32],
+    data_size: usize,
+    transfer_size: usize,
+    total_segments: usize,
+    request_id: Option<Vec<u8>>,
+    is_request: bool,
+    is_response: bool,
+    command_tx: mpsc::Sender<LinkSessionCommand>,
+}
+
+impl LinkSessionResourceOffer {
+    pub fn link_id(&self) -> [u8; 16] {
+        self.link_id
+    }
+
+    pub fn resource_id(&self) -> [u8; 32] {
+        self.resource_id
+    }
+
+    pub fn data_size(&self) -> usize {
+        self.data_size
+    }
+
+    pub fn transfer_size(&self) -> usize {
+        self.transfer_size
+    }
+
+    pub fn total_segments(&self) -> usize {
+        self.total_segments
+    }
+
+    pub fn request_id(&self) -> Option<&[u8]> {
+        self.request_id.as_deref()
+    }
+
+    pub fn is_request(&self) -> bool {
+        self.is_request
+    }
+
+    pub fn is_response(&self) -> bool {
+        self.is_response
+    }
+
+    pub async fn accept(
+        self,
+    ) -> Result<LinkSessionInboundResourceHandle, LinkSessionResourceError> {
+        let (progress_tx, progress_rx) = watch::channel(0.0);
+        let (conclusion_tx, conclusion_rx) = oneshot::channel();
+        let (result_tx, result_rx) = oneshot::channel();
+        self.command_tx
+            .send(LinkSessionCommand::Resource(
+                LinkSessionResourceCommand::AcceptInbound {
+                    segment_hash: self.segment_hash,
+                    progress_tx,
+                    conclusion_tx,
+                    result_tx,
+                },
+            ))
+            .await
+            .map_err(|_| LinkSessionResourceError::SessionClosed)?;
+        result_rx
+            .await
+            .map_err(|_| LinkSessionResourceError::SessionClosed)??;
+        Ok(LinkSessionInboundResourceHandle {
+            link_id: self.link_id,
+            resource_id: self.resource_id,
+            data_size: self.data_size,
+            total_segments: self.total_segments,
+            progress_rx,
+            conclusion_rx,
+            command_tx: self.command_tx,
+        })
+    }
+
+    pub async fn reject(self) -> Result<bool, LinkSessionResourceError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.command_tx
+            .send(LinkSessionCommand::Resource(
+                LinkSessionResourceCommand::RejectInbound {
+                    segment_hash: self.segment_hash,
+                    result_tx,
+                },
+            ))
+            .await
+            .map_err(|_| LinkSessionResourceError::SessionClosed)?;
+        result_rx
+            .await
+            .map_err(|_| LinkSessionResourceError::SessionClosed)?
+    }
+}
+
+pub struct LinkSessionInboundResourceHandle {
+    link_id: [u8; 16],
+    resource_id: [u8; 32],
+    data_size: usize,
+    total_segments: usize,
+    progress_rx: watch::Receiver<f64>,
+    conclusion_rx: oneshot::Receiver<Result<LinkSessionReceivedResource, LinkSessionResourceError>>,
+    command_tx: mpsc::Sender<LinkSessionCommand>,
+}
+
+impl LinkSessionInboundResourceHandle {
+    pub fn link_id(&self) -> [u8; 16] {
+        self.link_id
+    }
+
+    pub fn resource_id(&self) -> [u8; 32] {
+        self.resource_id
+    }
+
+    pub fn data_size(&self) -> usize {
+        self.data_size
+    }
+
+    pub fn total_segments(&self) -> usize {
+        self.total_segments
+    }
+
+    pub fn progress(&self) -> watch::Receiver<f64> {
+        self.progress_rx.clone()
+    }
+
+    pub async fn cancel(&self) -> Result<bool, LinkSessionResourceError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.command_tx
+            .send(LinkSessionCommand::Resource(
+                LinkSessionResourceCommand::CancelInbound {
+                    resource_id: self.resource_id,
+                    result_tx,
+                },
+            ))
+            .await
+            .map_err(|_| LinkSessionResourceError::SessionClosed)?;
+        result_rx
+            .await
+            .map_err(|_| LinkSessionResourceError::SessionClosed)?
+    }
+
+    pub async fn concluded(self) -> Result<LinkSessionReceivedResource, LinkSessionResourceError> {
+        self.conclusion_rx
+            .await
+            .map_err(|_| LinkSessionResourceError::SessionClosed)?
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LinkSessionResourceError {
     #[error("link is not active")]
@@ -217,6 +388,10 @@ pub enum LinkSessionResourceError {
     Cancelled,
     #[error("resource transfer was rejected by the peer")]
     Rejected,
+    #[error("inbound resource offer is no longer available")]
+    OfferExpired,
+    #[error("inbound resource advertisement is invalid: {0}")]
+    InvalidAdvertisement(String),
     #[error("resource transfer failed: {0}")]
     Failed(String),
     #[error(transparent)]
@@ -326,6 +501,21 @@ enum LinkSessionResourceCommand {
         resource_id: [u8; 32],
         result_tx: oneshot::Sender<Result<bool, LinkSessionResourceError>>,
     },
+    AcceptInbound {
+        segment_hash: [u8; 32],
+        progress_tx: watch::Sender<f64>,
+        conclusion_tx:
+            oneshot::Sender<Result<LinkSessionReceivedResource, LinkSessionResourceError>>,
+        result_tx: oneshot::Sender<Result<(), LinkSessionResourceError>>,
+    },
+    RejectInbound {
+        segment_hash: [u8; 32],
+        result_tx: oneshot::Sender<Result<bool, LinkSessionResourceError>>,
+    },
+    CancelInbound {
+        resource_id: [u8; 32],
+        result_tx: oneshot::Sender<Result<bool, LinkSessionResourceError>>,
+    },
 }
 
 struct ResourceStartInfo {
@@ -355,10 +545,64 @@ struct SessionOutboundResource {
     conclusion_tx: oneshot::Sender<Result<LinkSessionResourceReceipt, LinkSessionResourceError>>,
 }
 
+struct PendingInboundResourceOffer {
+    advertisement: ResourceAdvertisement,
+    offered_at: Instant,
+}
+
+struct SessionInboundResource {
+    transfer: InboundTransfer,
+    resource_id: [u8; 32],
+    segment_index: usize,
+}
+
+struct SessionInboundLogical {
+    data_size: usize,
+    total_segments: usize,
+    request_id: Option<Vec<u8>>,
+    is_request: bool,
+    is_response: bool,
+    progress_tx: watch::Sender<f64>,
+    conclusion_tx: oneshot::Sender<Result<LinkSessionReceivedResource, LinkSessionResourceError>>,
+    coordinator: Option<MultiSegmentInbound>,
+    current_segment: Option<[u8; 32]>,
+    reported_bytes: usize,
+    reported_progress: f64,
+}
+
+struct InboundResourceLifecycle {
+    progress_tx: watch::Sender<f64>,
+    conclusion_tx: oneshot::Sender<Result<LinkSessionReceivedResource, LinkSessionResourceError>>,
+}
+
+struct InboundResourceSinks<'a> {
+    event_tx: &'a mpsc::Sender<LinkSessionEvent>,
+    command_tx: &'a mpsc::Sender<LinkSessionCommand>,
+    offer_tx: &'a mpsc::Sender<LinkSessionResourceOffer>,
+}
+
+struct SessionActorChannels {
+    transport_tx: mpsc::Sender<TransportMessage>,
+    command_tx: mpsc::Sender<LinkSessionCommand>,
+    event_tx: mpsc::Sender<LinkSessionEvent>,
+    resource_offer_tx: mpsc::Sender<LinkSessionResourceOffer>,
+}
+
+struct DestinationEventContext<'a> {
+    transport_tx: &'a mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    identity: &'a Identity,
+    sinks: InboundResourceSinks<'a>,
+}
+
 #[derive(Default)]
 struct SessionResources {
     outbound: Option<SessionOutboundResource>,
     queued: VecDeque<SessionOutboundResource>,
+    pending_inbound: HashMap<[u8; 32], PendingInboundResourceOffer>,
+    inbound: HashMap<[u8; 32], SessionInboundResource>,
+    inbound_logicals: HashMap<[u8; 32], SessionInboundLogical>,
+    rejected_inbound: HashMap<[u8; 32], Instant>,
 }
 
 struct SessionActorState {
@@ -633,6 +877,7 @@ impl LinkSessionHandle {
 pub struct LinkSession {
     pub handle: LinkSessionHandle,
     pub events: mpsc::Receiver<LinkSessionEvent>,
+    pub resource_offers: mpsc::Receiver<LinkSessionResourceOffer>,
 }
 
 /// Ensures a cancelled or failed handshake cannot leave its temporary Link
@@ -760,23 +1005,32 @@ impl LinkSession {
             LinkChannel::new_encrypted_with_mdu(link_id, link.rtt_secs(), link.mdu, channel_keys);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_BUFFER);
         let (event_tx, events) = mpsc::channel(EVENT_BUFFER);
+        let (resource_offer_tx, resource_offers) = mpsc::channel(MAX_PENDING_RESOURCE_OFFERS);
         let handle = LinkSessionHandle {
             link_id,
             mdu: link.mdu,
-            command_tx,
+            command_tx: command_tx.clone(),
         };
         tokio::spawn(run_session_actor(
-            transport_tx,
             identity,
             (link, channel),
             attached_interface,
             delivery_rx,
             command_rx,
-            event_tx,
+            SessionActorChannels {
+                transport_tx,
+                command_tx,
+                event_tx,
+                resource_offer_tx,
+            },
         ));
         registration.disarm();
 
-        Ok(Self { handle, events })
+        Ok(Self {
+            handle,
+            events,
+            resource_offers,
+        })
     }
 }
 
@@ -827,14 +1081,19 @@ pub async fn lookup_destination(
 }
 
 async fn run_session_actor(
-    transport_tx: mpsc::Sender<TransportMessage>,
     identity: Identity,
     link_and_channel: (Link, LinkChannel),
     attached_interface: InterfaceId,
     mut delivery_rx: mpsc::Receiver<DestinationEvent>,
     mut command_rx: mpsc::Receiver<LinkSessionCommand>,
-    event_tx: mpsc::Sender<LinkSessionEvent>,
+    channels: SessionActorChannels,
 ) {
+    let SessionActorChannels {
+        transport_tx,
+        command_tx,
+        event_tx,
+        resource_offer_tx,
+    } = channels;
     let (mut link, channel) = link_and_channel;
     let link_id = link.link_id;
     let mut state = SessionActorState {
@@ -935,12 +1194,18 @@ async fn run_session_actor(
                     break LinkSessionCloseReason::TransportUnavailable;
                 };
                 match process_destination_event(
-                    &transport_tx,
-                    attached_interface,
-                    &identity,
+                    DestinationEventContext {
+                        transport_tx: &transport_tx,
+                        attached_interface,
+                        identity: &identity,
+                        sinks: InboundResourceSinks {
+                            event_tx: &event_tx,
+                            command_tx: &command_tx,
+                            offer_tx: &resource_offer_tx,
+                        },
+                    },
                     &mut link,
                     &mut state,
-                    &event_tx,
                     event,
                 ).await {
                     Ok(Some(reason)) => break reason,
@@ -973,7 +1238,16 @@ async fn run_session_actor(
                 ).await {
                     break LinkSessionCloseReason::TransportUnavailable;
                 }
-                if state.resources.outbound.is_some() {
+                if poll_inbound_resources(
+                    &transport_tx,
+                    attached_interface,
+                    &mut link,
+                    &mut state.resources,
+                    &event_tx,
+                ).await {
+                    break LinkSessionCloseReason::TransportUnavailable;
+                }
+                if state.resources.outbound.is_some() || !state.resources.inbound.is_empty() {
                     // Resource watchdogs own liveness while a transfer is in
                     // flight, matching the responder Link manager.
                     link.record_inbound();
@@ -1017,6 +1291,7 @@ async fn run_session_actor(
     state.channel.shutdown();
     fail_pending_requests(&mut state.requests, &event_tx);
     fail_outbound_resources(&mut link, &mut state.resources, &event_tx);
+    fail_inbound_resources(&mut link, &mut state.resources, &event_tx);
     deregister_destination(&transport_tx, link_id);
     let _ = event_tx
         .send(LinkSessionEvent::Closed {
@@ -1231,6 +1506,65 @@ async fn handle_resource_command(
                 let _ = result_tx.send(Ok(false));
                 false
             }
+        }
+        LinkSessionResourceCommand::AcceptInbound {
+            segment_hash,
+            progress_tx,
+            conclusion_tx,
+            result_tx,
+        } => {
+            let result = accept_inbound_offer(
+                transport_tx,
+                attached_interface,
+                link,
+                resources,
+                event_tx,
+                segment_hash,
+                InboundResourceLifecycle {
+                    progress_tx,
+                    conclusion_tx,
+                },
+            )
+            .await;
+            let transport_failed =
+                matches!(result, Err(LinkSessionResourceError::TransportUnavailable));
+            let _ = result_tx.send(result);
+            transport_failed
+        }
+        LinkSessionResourceCommand::RejectInbound {
+            segment_hash,
+            result_tx,
+        } => {
+            let result = reject_inbound_offer(
+                transport_tx,
+                attached_interface,
+                link,
+                resources,
+                segment_hash,
+            )
+            .await;
+            let transport_failed =
+                matches!(result, Err(LinkSessionResourceError::TransportUnavailable));
+            let _ = result_tx.send(result);
+            transport_failed
+        }
+        LinkSessionResourceCommand::CancelInbound {
+            resource_id,
+            result_tx,
+        } => {
+            let result = cancel_inbound_resource(
+                transport_tx,
+                attached_interface,
+                link,
+                resources,
+                event_tx,
+                resource_id,
+            )
+            .await;
+            let transport_failed =
+                matches!(result, Err(LinkSessionResourceError::TransportUnavailable));
+            let _ = result_tx.send(result);
+            transport_failed
         }
     }
 }
@@ -1742,6 +2076,932 @@ async fn handle_outbound_resource_rejection(
     activate_next_queued(transport_tx, attached_interface, link, resources, event_tx).await
 }
 
+fn resource_logical_id(advertisement: &ResourceAdvertisement) -> [u8; 32] {
+    if advertisement.total_segments > 1 {
+        advertisement.original_hash
+    } else {
+        advertisement.resource_hash
+    }
+}
+
+fn validate_inbound_advertisement(
+    advertisement: &ResourceAdvertisement,
+) -> Result<(), LinkSessionResourceError> {
+    if advertisement.total_segments == 0
+        || advertisement.total_segments > MAX_SEGMENTS
+        || advertisement.segment_index == 0
+        || advertisement.segment_index > advertisement.total_segments
+    {
+        return Err(LinkSessionResourceError::InvalidAdvertisement(
+            "segment metadata is out of range".into(),
+        ));
+    }
+    if advertisement.total_segments == 1 && advertisement.segment_index != 1 {
+        return Err(LinkSessionResourceError::InvalidAdvertisement(
+            "single-segment resource has a non-first segment index".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn inbound_transfer_from_advertisement(
+    advertisement: &ResourceAdvertisement,
+    rtt: Duration,
+) -> Result<InboundTransfer, LinkSessionResourceError> {
+    validate_inbound_advertisement(advertisement)?;
+    let mut random_hash = [0u8; RANDOM_HASH_SIZE];
+    let random = advertisement
+        .random_hash
+        .get(..RANDOM_HASH_SIZE)
+        .ok_or_else(|| {
+            LinkSessionResourceError::InvalidAdvertisement(
+                "resource random hash is truncated".into(),
+            )
+        })?;
+    random_hash.copy_from_slice(random);
+    let mut flags = advertisement.flags;
+    if advertisement.total_segments > 1 && advertisement.segment_index > 1 {
+        flags.has_metadata = false;
+    }
+    InboundTransfer::from_advertisement(
+        advertisement.num_parts,
+        advertisement.transfer_size,
+        advertisement.data_size,
+        random_hash,
+        advertisement.resource_hash,
+        flags,
+        advertisement.get_map_hashes(),
+        rtt,
+    )
+    .map_err(|error| LinkSessionResourceError::InvalidAdvertisement(error.to_string()))
+}
+
+async fn accept_inbound_offer(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &mut Link,
+    resources: &mut SessionResources,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+    segment_hash: [u8; 32],
+    lifecycle: InboundResourceLifecycle,
+) -> Result<(), LinkSessionResourceError> {
+    let pending = resources
+        .pending_inbound
+        .remove(&segment_hash)
+        .ok_or(LinkSessionResourceError::OfferExpired)?;
+    let advertisement = pending.advertisement;
+    let resource_id = resource_logical_id(&advertisement);
+    if advertisement.segment_index != 1 || resources.inbound_logicals.contains_key(&resource_id) {
+        return Err(LinkSessionResourceError::OfferExpired);
+    }
+
+    let rtt = Duration::from_secs_f64(link.rtt_secs().max(0.001));
+    let mut transfer = inbound_transfer_from_advertisement(&advertisement, rtt)?;
+    let request = match transfer.request_next() {
+        TransferAction::SendRequest(request) => request,
+        _ => {
+            return Err(LinkSessionResourceError::InvalidAdvertisement(
+                "resource did not produce an initial request".into(),
+            ));
+        }
+    };
+    send_resource_action(
+        transport_tx,
+        attached_interface,
+        link,
+        TransferAction::SendRequest(request),
+    )
+    .await?;
+
+    let coordinator = (advertisement.total_segments > 1).then(|| {
+        MultiSegmentInbound::new(advertisement.total_segments, advertisement.original_hash)
+    });
+    resources.inbound_logicals.insert(
+        resource_id,
+        SessionInboundLogical {
+            data_size: advertisement.data_size,
+            total_segments: advertisement.total_segments,
+            request_id: advertisement.request_id.clone(),
+            is_request: advertisement.flags.is_request,
+            is_response: advertisement.flags.is_response,
+            progress_tx: lifecycle.progress_tx,
+            conclusion_tx: lifecycle.conclusion_tx,
+            coordinator,
+            current_segment: Some(segment_hash),
+            reported_bytes: 0,
+            reported_progress: 0.0,
+        },
+    );
+    resources.inbound.insert(
+        segment_hash,
+        SessionInboundResource {
+            transfer,
+            resource_id,
+            segment_index: advertisement.segment_index,
+        },
+    );
+    link.track_incoming_resource(segment_hash);
+    let _ = event_tx.try_send(LinkSessionEvent::ResourceStarted {
+        resource_id,
+        direction: LinkSessionResourceDirection::Inbound,
+        data_size: advertisement.data_size,
+        total_segments: advertisement.total_segments,
+    });
+    Ok(())
+}
+
+async fn reject_inbound_offer(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &mut Link,
+    resources: &mut SessionResources,
+    segment_hash: [u8; 32],
+) -> Result<bool, LinkSessionResourceError> {
+    let Some(pending) = resources.pending_inbound.remove(&segment_hash) else {
+        return Ok(false);
+    };
+    let resource_id = resource_logical_id(&pending.advertisement);
+    send_resource_action(
+        transport_tx,
+        attached_interface,
+        link,
+        TransferAction::SendCancel(CancelType::Rcl, segment_hash),
+    )
+    .await?;
+    resources
+        .rejected_inbound
+        .insert(resource_id, Instant::now());
+    Ok(true)
+}
+
+fn remove_inbound_segments(
+    link: &mut Link,
+    resources: &mut SessionResources,
+    resource_id: [u8; 32],
+) {
+    let segment_hashes: Vec<[u8; 32]> = resources
+        .inbound
+        .iter()
+        .filter_map(|(segment_hash, inbound)| {
+            (inbound.resource_id == resource_id).then_some(*segment_hash)
+        })
+        .collect();
+    for segment_hash in segment_hashes {
+        resources.inbound.remove(&segment_hash);
+        link.untrack_resource(&segment_hash);
+    }
+}
+
+fn conclude_inbound_resource(
+    resources: &mut SessionResources,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+    resource_id: [u8; 32],
+    result: Result<LinkSessionReceivedResource, LinkSessionResourceError>,
+) {
+    let Some(logical) = resources.inbound_logicals.remove(&resource_id) else {
+        return;
+    };
+    let succeeded = result.is_ok();
+    let _ = logical.conclusion_tx.send(result);
+    let _ = event_tx.try_send(LinkSessionEvent::ResourceConcluded {
+        resource_id,
+        direction: LinkSessionResourceDirection::Inbound,
+        succeeded,
+    });
+}
+
+async fn cancel_inbound_resource(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &mut Link,
+    resources: &mut SessionResources,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+    resource_id: [u8; 32],
+) -> Result<bool, LinkSessionResourceError> {
+    let Some(current_segment) = resources
+        .inbound_logicals
+        .get(&resource_id)
+        .map(|logical| logical.current_segment)
+    else {
+        return Ok(false);
+    };
+    if let Some(segment_hash) = current_segment {
+        send_resource_action(
+            transport_tx,
+            attached_interface,
+            link,
+            TransferAction::SendCancel(CancelType::Rcl, segment_hash),
+        )
+        .await?;
+    }
+    remove_inbound_segments(link, resources, resource_id);
+    resources
+        .rejected_inbound
+        .insert(resource_id, Instant::now());
+    conclude_inbound_resource(
+        resources,
+        event_tx,
+        resource_id,
+        Err(LinkSessionResourceError::Cancelled),
+    );
+    Ok(true)
+}
+
+async fn accept_followup_inbound_segment(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &mut Link,
+    resources: &mut SessionResources,
+    advertisement: ResourceAdvertisement,
+) -> Result<(), LinkSessionResourceError> {
+    let resource_id = resource_logical_id(&advertisement);
+    let Some(logical) = resources.inbound_logicals.get(&resource_id) else {
+        return Err(LinkSessionResourceError::OfferExpired);
+    };
+    if logical.total_segments != advertisement.total_segments || logical.current_segment.is_some() {
+        return Err(LinkSessionResourceError::InvalidAdvertisement(
+            "split-resource sequence does not match the active transfer".into(),
+        ));
+    }
+    let expected_segment = logical
+        .coordinator
+        .as_ref()
+        .map(|coordinator| coordinator.assembled_count() + 1)
+        .unwrap_or(1);
+    if advertisement.segment_index != expected_segment {
+        return Err(LinkSessionResourceError::InvalidAdvertisement(format!(
+            "expected segment {expected_segment}, received {}",
+            advertisement.segment_index
+        )));
+    }
+
+    let rtt = Duration::from_secs_f64(link.rtt_secs().max(0.001));
+    let mut transfer = inbound_transfer_from_advertisement(&advertisement, rtt)?;
+    let request = match transfer.request_next() {
+        TransferAction::SendRequest(request) => request,
+        _ => {
+            return Err(LinkSessionResourceError::InvalidAdvertisement(
+                "resource did not produce an initial request".into(),
+            ));
+        }
+    };
+    send_resource_action(
+        transport_tx,
+        attached_interface,
+        link,
+        TransferAction::SendRequest(request),
+    )
+    .await?;
+
+    let segment_hash = advertisement.resource_hash;
+    resources.inbound.insert(
+        segment_hash,
+        SessionInboundResource {
+            transfer,
+            resource_id,
+            segment_index: advertisement.segment_index,
+        },
+    );
+    if let Some(logical) = resources.inbound_logicals.get_mut(&resource_id) {
+        logical.current_segment = Some(segment_hash);
+    }
+    link.track_incoming_resource(segment_hash);
+    Ok(())
+}
+
+async fn process_inbound_resource_advertisement(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &mut Link,
+    resources: &mut SessionResources,
+    sinks: InboundResourceSinks<'_>,
+    encrypted_advertisement: &[u8],
+) -> bool {
+    let Ok(plaintext) = link.decrypt(encrypted_advertisement) else {
+        return false;
+    };
+    let Ok(advertisement) = ResourceAdvertisement::unpack(&plaintext) else {
+        return false;
+    };
+    let segment_hash = advertisement.resource_hash;
+    let resource_id = resource_logical_id(&advertisement);
+    if validate_inbound_advertisement(&advertisement).is_err() {
+        return matches!(
+            send_resource_action(
+                transport_tx,
+                attached_interface,
+                link,
+                TransferAction::SendCancel(CancelType::Rcl, segment_hash),
+            )
+            .await,
+            Err(LinkSessionResourceError::TransportUnavailable)
+        );
+    }
+    let rtt = Duration::from_secs_f64(link.rtt_secs().max(0.001));
+    if inbound_transfer_from_advertisement(&advertisement, rtt).is_err() {
+        return matches!(
+            send_resource_action(
+                transport_tx,
+                attached_interface,
+                link,
+                TransferAction::SendCancel(CancelType::Rcl, segment_hash),
+            )
+            .await,
+            Err(LinkSessionResourceError::TransportUnavailable)
+        );
+    }
+
+    if resources
+        .rejected_inbound
+        .get(&resource_id)
+        .is_some_and(|rejected_at| rejected_at.elapsed() < RESOURCE_REJECTION_TTL)
+    {
+        return matches!(
+            send_resource_action(
+                transport_tx,
+                attached_interface,
+                link,
+                TransferAction::SendCancel(CancelType::Rcl, segment_hash),
+            )
+            .await,
+            Err(LinkSessionResourceError::TransportUnavailable)
+        );
+    }
+    if resources.inbound.contains_key(&segment_hash)
+        || resources.pending_inbound.contains_key(&segment_hash)
+    {
+        return false;
+    }
+
+    if resources.inbound_logicals.contains_key(&resource_id) {
+        return match accept_followup_inbound_segment(
+            transport_tx,
+            attached_interface,
+            link,
+            resources,
+            advertisement,
+        )
+        .await
+        {
+            Ok(()) => false,
+            Err(error) => {
+                tracing::debug!(%error, "rejecting invalid follow-up Resource advertisement");
+                let transport_failed = matches!(
+                    send_resource_action(
+                        transport_tx,
+                        attached_interface,
+                        link,
+                        TransferAction::SendCancel(CancelType::Rcl, segment_hash),
+                    )
+                    .await,
+                    Err(LinkSessionResourceError::TransportUnavailable)
+                );
+                fail_inbound_logical(
+                    link,
+                    resources,
+                    sinks.event_tx,
+                    resource_id,
+                    LinkSessionResourceError::Failed(error.to_string()),
+                );
+                transport_failed
+            }
+        };
+    }
+
+    let has_pending_logical = resources
+        .pending_inbound
+        .values()
+        .any(|pending| resource_logical_id(&pending.advertisement) == resource_id);
+    if advertisement.segment_index != 1
+        || has_pending_logical
+        || resources.pending_inbound.len() >= MAX_PENDING_RESOURCE_OFFERS
+    {
+        return matches!(
+            send_resource_action(
+                transport_tx,
+                attached_interface,
+                link,
+                TransferAction::SendCancel(CancelType::Rcl, segment_hash),
+            )
+            .await,
+            Err(LinkSessionResourceError::TransportUnavailable)
+        );
+    }
+
+    let offer = LinkSessionResourceOffer {
+        link_id: link.link_id,
+        resource_id,
+        segment_hash,
+        data_size: advertisement.data_size,
+        transfer_size: advertisement.transfer_size,
+        total_segments: advertisement.total_segments,
+        request_id: advertisement.request_id.clone(),
+        is_request: advertisement.flags.is_request,
+        is_response: advertisement.flags.is_response,
+        command_tx: sinks.command_tx.clone(),
+    };
+    resources.pending_inbound.insert(
+        segment_hash,
+        PendingInboundResourceOffer {
+            advertisement,
+            offered_at: Instant::now(),
+        },
+    );
+    if sinks.offer_tx.try_send(offer).is_err() {
+        resources.pending_inbound.remove(&segment_hash);
+        resources
+            .rejected_inbound
+            .insert(resource_id, Instant::now());
+        return matches!(
+            send_resource_action(
+                transport_tx,
+                attached_interface,
+                link,
+                TransferAction::SendCancel(CancelType::Rcl, segment_hash),
+            )
+            .await,
+            Err(LinkSessionResourceError::TransportUnavailable)
+        );
+    }
+    false
+}
+
+fn report_inbound_progress(
+    resources: &mut SessionResources,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+    segment_hash: [u8; 32],
+) {
+    let Some(inbound) = resources.inbound.get(&segment_hash) else {
+        return;
+    };
+    let resource_id = inbound.resource_id;
+    let segment_index = inbound.segment_index;
+    let segment_progress = inbound.transfer.progress();
+    let Some(logical) = resources.inbound_logicals.get_mut(&resource_id) else {
+        return;
+    };
+    let progress = if logical.total_segments == 0 {
+        0.0
+    } else {
+        ((segment_index.saturating_sub(1) as f64 + segment_progress)
+            / logical.total_segments as f64)
+            .clamp(0.0, 1.0)
+    };
+    let transferred = (progress * logical.data_size as f64).floor() as usize;
+    if transferred == logical.reported_bytes && progress == logical.reported_progress {
+        return;
+    }
+    logical.reported_bytes = transferred;
+    logical.reported_progress = progress;
+    logical.progress_tx.send_replace(progress);
+    let _ = event_tx.try_send(LinkSessionEvent::ResourceProgress {
+        resource_id,
+        direction: LinkSessionResourceDirection::Inbound,
+        transferred,
+        total: logical.data_size,
+    });
+}
+
+fn fail_inbound_logical(
+    link: &mut Link,
+    resources: &mut SessionResources,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+    resource_id: [u8; 32],
+    error: LinkSessionResourceError,
+) {
+    remove_inbound_segments(link, resources, resource_id);
+    conclude_inbound_resource(resources, event_tx, resource_id, Err(error));
+}
+
+async fn complete_inbound_segment(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &mut Link,
+    resources: &mut SessionResources,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+    segment_hash: [u8; 32],
+) -> bool {
+    let Some(mut inbound) = resources.inbound.remove(&segment_hash) else {
+        return false;
+    };
+    link.untrack_resource(&segment_hash);
+    let resource_id = inbound.resource_id;
+    let segment_index = inbound.segment_index;
+    let Some(keys) = link.session_keys() else {
+        fail_inbound_logical(
+            link,
+            resources,
+            event_tx,
+            resource_id,
+            LinkSessionResourceError::LinkCrypto,
+        );
+        return false;
+    };
+    let decrypt = |ciphertext: &[u8]| {
+        rns_link::encryption::link_decrypt(&keys, ciphertext)
+            .map_err(|_| rns_protocol::resource::ResourceError::DecryptFailed)
+    };
+    let (data, proof) = match inbound.transfer.complete(Some(&decrypt)) {
+        Ok(completed) => completed,
+        Err(error) => {
+            let transport_failed = matches!(
+                send_resource_action(
+                    transport_tx,
+                    attached_interface,
+                    link,
+                    TransferAction::SendCancel(CancelType::Rcl, segment_hash),
+                )
+                .await,
+                Err(LinkSessionResourceError::TransportUnavailable)
+            );
+            fail_inbound_logical(
+                link,
+                resources,
+                event_tx,
+                resource_id,
+                LinkSessionResourceError::Failed(error.to_string()),
+            );
+            return transport_failed;
+        }
+    };
+    let metadata = inbound.transfer.resource.metadata.clone();
+    if let Err(error) = send_resource_action(
+        transport_tx,
+        attached_interface,
+        link,
+        TransferAction::SendProof(proof),
+    )
+    .await
+    {
+        let transport_failed = matches!(error, LinkSessionResourceError::TransportUnavailable);
+        fail_inbound_logical(
+            link,
+            resources,
+            event_tx,
+            resource_id,
+            LinkSessionResourceError::Failed(error.to_string()),
+        );
+        return transport_failed;
+    }
+
+    let mut complete_data = None;
+    let mut complete_metadata = metadata.clone();
+    let mut coordinator_error = None;
+    if let Some(logical) = resources.inbound_logicals.get_mut(&resource_id) {
+        logical.current_segment = None;
+        if let Some(coordinator) = logical.coordinator.as_mut() {
+            if let Err(error) = coordinator.set_segment_data(segment_index, data) {
+                coordinator_error = Some(error.to_string());
+            } else {
+                if let Some(metadata) = metadata {
+                    coordinator.set_metadata(metadata);
+                }
+                if coordinator.is_complete() {
+                    match coordinator.reassemble() {
+                        Ok(data) => {
+                            complete_data = Some(data);
+                            complete_metadata = coordinator.metadata.take();
+                        }
+                        Err(error) => coordinator_error = Some(error.to_string()),
+                    }
+                }
+            }
+        } else {
+            complete_data = Some(data);
+        }
+    }
+    if let Some(error) = coordinator_error {
+        fail_inbound_logical(
+            link,
+            resources,
+            event_tx,
+            resource_id,
+            LinkSessionResourceError::Failed(error),
+        );
+        return false;
+    }
+
+    let Some(data) = complete_data else {
+        return false;
+    };
+    let Some(logical) = resources.inbound_logicals.get(&resource_id) else {
+        return false;
+    };
+    let received = LinkSessionReceivedResource {
+        link_id: link.link_id,
+        resource_id,
+        data,
+        metadata: complete_metadata,
+        total_segments: logical.total_segments,
+        request_id: logical.request_id.clone(),
+        is_request: logical.is_request,
+        is_response: logical.is_response,
+    };
+    conclude_inbound_resource(resources, event_tx, resource_id, Ok(received));
+    false
+}
+
+async fn handle_inbound_resource_part(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &mut Link,
+    resources: &mut SessionResources,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+    part: &[u8],
+) -> bool {
+    let segment_hash = resources
+        .inbound
+        .iter()
+        .find_map(|(segment_hash, inbound)| {
+            let map_hash = get_map_hash(part, &inbound.transfer.resource.random_hash);
+            inbound
+                .transfer
+                .resource
+                .map_hashes
+                .contains(&map_hash)
+                .then_some(*segment_hash)
+        });
+    let Some(segment_hash) = segment_hash else {
+        return false;
+    };
+    let (resource_id, action, complete) = {
+        let inbound = resources
+            .inbound
+            .get_mut(&segment_hash)
+            .expect("selected inbound resource exists");
+        let action = inbound.transfer.receive_part(part.to_vec());
+        (
+            inbound.resource_id,
+            action,
+            inbound.transfer.resource.is_complete(),
+        )
+    };
+    report_inbound_progress(resources, event_tx, segment_hash);
+
+    match action {
+        TransferAction::Complete => {
+            return complete_inbound_segment(
+                transport_tx,
+                attached_interface,
+                link,
+                resources,
+                event_tx,
+                segment_hash,
+            )
+            .await;
+        }
+        TransferAction::Failed(reason) => {
+            fail_inbound_logical(
+                link,
+                resources,
+                event_tx,
+                resource_id,
+                LinkSessionResourceError::Failed(reason),
+            );
+            return false;
+        }
+        TransferAction::SendRequest(_)
+        | TransferAction::SendHmu(_)
+        | TransferAction::SendCancel(_, _) => {
+            let cancel = matches!(action, TransferAction::SendCancel(_, _));
+            if let Err(error) =
+                send_resource_action(transport_tx, attached_interface, link, action).await
+            {
+                let transport_failed =
+                    matches!(error, LinkSessionResourceError::TransportUnavailable);
+                fail_inbound_logical(
+                    link,
+                    resources,
+                    event_tx,
+                    resource_id,
+                    LinkSessionResourceError::Failed(error.to_string()),
+                );
+                return transport_failed;
+            }
+            if cancel {
+                fail_inbound_logical(
+                    link,
+                    resources,
+                    event_tx,
+                    resource_id,
+                    LinkSessionResourceError::Failed(
+                        "receiver cancelled an invalid Resource transfer".into(),
+                    ),
+                );
+            }
+        }
+        TransferAction::None
+        | TransferAction::SendAdvertisement(_)
+        | TransferAction::SendPart(_, _)
+        | TransferAction::SendProof(_) => {}
+    }
+    if complete {
+        complete_inbound_segment(
+            transport_tx,
+            attached_interface,
+            link,
+            resources,
+            event_tx,
+            segment_hash,
+        )
+        .await
+    } else {
+        false
+    }
+}
+
+async fn handle_inbound_resource_hmu(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &mut Link,
+    resources: &mut SessionResources,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+    encrypted_hmu: &[u8],
+) -> bool {
+    let Ok(plaintext) = link.decrypt(encrypted_hmu) else {
+        return false;
+    };
+    let Ok((segment_hash, segment, hashmap)) = parse_hashmap_update(&plaintext) else {
+        return false;
+    };
+    let Some(inbound) = resources.inbound.get_mut(&segment_hash) else {
+        return false;
+    };
+    let resource_id = inbound.resource_id;
+    let action = inbound.transfer.hashmap_update(segment, &hashmap);
+    let cancel = matches!(action, TransferAction::SendCancel(_, _));
+    if matches!(action, TransferAction::None) {
+        return false;
+    }
+    if let Err(error) = send_resource_action(transport_tx, attached_interface, link, action).await {
+        let transport_failed = matches!(error, LinkSessionResourceError::TransportUnavailable);
+        fail_inbound_logical(
+            link,
+            resources,
+            event_tx,
+            resource_id,
+            LinkSessionResourceError::Failed(error.to_string()),
+        );
+        return transport_failed;
+    }
+    if cancel {
+        fail_inbound_logical(
+            link,
+            resources,
+            event_tx,
+            resource_id,
+            LinkSessionResourceError::Failed(
+                "sender returned an invalid Resource hashmap update".into(),
+            ),
+        );
+    }
+    false
+}
+
+fn handle_inbound_resource_cancel(
+    link: &mut Link,
+    resources: &mut SessionResources,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+    encrypted_cancel: &[u8],
+) {
+    let Ok(cancel) = link.decrypt(encrypted_cancel) else {
+        return;
+    };
+    let Some(segment_hash) = cancel.get(..32) else {
+        return;
+    };
+    let mut segment = [0u8; 32];
+    segment.copy_from_slice(segment_hash);
+    let Some(inbound) = resources.inbound.get_mut(&segment) else {
+        return;
+    };
+    inbound.transfer.handle_cancel();
+    let resource_id = inbound.resource_id;
+    remove_inbound_segments(link, resources, resource_id);
+    conclude_inbound_resource(
+        resources,
+        event_tx,
+        resource_id,
+        Err(LinkSessionResourceError::Cancelled),
+    );
+}
+
+async fn poll_inbound_resources(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &mut Link,
+    resources: &mut SessionResources,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+) -> bool {
+    resources
+        .rejected_inbound
+        .retain(|_, rejected_at| rejected_at.elapsed() < RESOURCE_REJECTION_TTL);
+
+    let expired_offers: Vec<[u8; 32]> = resources
+        .pending_inbound
+        .iter()
+        .filter_map(|(segment_hash, pending)| {
+            (pending.offered_at.elapsed() >= RESOURCE_OFFER_TIMEOUT).then_some(*segment_hash)
+        })
+        .collect();
+    for segment_hash in expired_offers {
+        let Some(pending) = resources.pending_inbound.remove(&segment_hash) else {
+            continue;
+        };
+        resources
+            .rejected_inbound
+            .insert(resource_logical_id(&pending.advertisement), Instant::now());
+        if let Err(error) = send_resource_action(
+            transport_tx,
+            attached_interface,
+            link,
+            TransferAction::SendCancel(CancelType::Rcl, segment_hash),
+        )
+        .await
+            && matches!(error, LinkSessionResourceError::TransportUnavailable)
+        {
+            return true;
+        }
+    }
+
+    let watchdog_actions: Vec<([u8; 32], [u8; 32], TransferAction)> = resources
+        .inbound
+        .iter_mut()
+        .filter_map(|(segment_hash, inbound)| {
+            let action = inbound.transfer.check_timeout();
+            (!matches!(action, TransferAction::None)).then_some((
+                *segment_hash,
+                inbound.resource_id,
+                action,
+            ))
+        })
+        .collect();
+    for (segment_hash, resource_id, action) in watchdog_actions {
+        match action {
+            TransferAction::Failed(reason) => {
+                fail_inbound_logical(
+                    link,
+                    resources,
+                    event_tx,
+                    resource_id,
+                    LinkSessionResourceError::Failed(reason),
+                );
+            }
+            action => {
+                let cancel = matches!(action, TransferAction::SendCancel(_, _));
+                if let Err(error) =
+                    send_resource_action(transport_tx, attached_interface, link, action).await
+                {
+                    let transport_failed =
+                        matches!(error, LinkSessionResourceError::TransportUnavailable);
+                    fail_inbound_logical(
+                        link,
+                        resources,
+                        event_tx,
+                        resource_id,
+                        LinkSessionResourceError::Failed(error.to_string()),
+                    );
+                    if transport_failed {
+                        return true;
+                    }
+                } else if cancel {
+                    resources.inbound.remove(&segment_hash);
+                    link.untrack_resource(&segment_hash);
+                    fail_inbound_logical(
+                        link,
+                        resources,
+                        event_tx,
+                        resource_id,
+                        LinkSessionResourceError::Failed(
+                            "Resource watchdog cancelled the transfer".into(),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    false
+}
+
+fn fail_inbound_resources(
+    link: &mut Link,
+    resources: &mut SessionResources,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+) {
+    resources.pending_inbound.clear();
+    resources.rejected_inbound.clear();
+    let resource_ids: Vec<[u8; 32]> = resources.inbound_logicals.keys().copied().collect();
+    for resource_id in resource_ids {
+        remove_inbound_segments(link, resources, resource_id);
+        conclude_inbound_resource(
+            resources,
+            event_tx,
+            resource_id,
+            Err(LinkSessionResourceError::SessionClosed),
+        );
+    }
+}
+
 async fn send_channel_message(
     transport_tx: &mpsc::Sender<TransportMessage>,
     attached_interface: InterfaceId,
@@ -1929,14 +3189,22 @@ async fn send_application_packet(
 }
 
 async fn process_destination_event(
-    transport_tx: &mpsc::Sender<TransportMessage>,
-    attached_interface: InterfaceId,
-    identity: &Identity,
+    context: DestinationEventContext<'_>,
     link: &mut Link,
     state: &mut SessionActorState,
-    event_tx: &mpsc::Sender<LinkSessionEvent>,
     event: DestinationEvent,
 ) -> Result<Option<LinkSessionCloseReason>, LinkSessionError> {
+    let DestinationEventContext {
+        transport_tx,
+        attached_interface,
+        identity,
+        sinks,
+    } = context;
+    let InboundResourceSinks {
+        event_tx,
+        command_tx,
+        offer_tx: resource_offer_tx,
+    } = sinks;
     match event {
         DestinationEvent::LinkClosed { link_id } if link_id == link.link_id => {
             return Ok(Some(LinkSessionCloseReason::Remote));
@@ -2106,6 +3374,63 @@ async fn process_destination_event(
                     {
                         return Err(LinkSessionError::TransportUnavailable);
                     }
+                }
+                rns_wire::context::PacketContext::ResourceAdv => {
+                    link.record_inbound();
+                    link.record_rx(body.len());
+                    if process_inbound_resource_advertisement(
+                        transport_tx,
+                        attached_interface,
+                        link,
+                        &mut state.resources,
+                        InboundResourceSinks {
+                            event_tx,
+                            command_tx,
+                            offer_tx: resource_offer_tx,
+                        },
+                        body,
+                    )
+                    .await
+                    {
+                        return Err(LinkSessionError::TransportUnavailable);
+                    }
+                }
+                rns_wire::context::PacketContext::Resource => {
+                    link.record_inbound();
+                    link.record_rx(body.len());
+                    if handle_inbound_resource_part(
+                        transport_tx,
+                        attached_interface,
+                        link,
+                        &mut state.resources,
+                        event_tx,
+                        body,
+                    )
+                    .await
+                    {
+                        return Err(LinkSessionError::TransportUnavailable);
+                    }
+                }
+                rns_wire::context::PacketContext::ResourceHmu => {
+                    link.record_inbound();
+                    link.record_rx(body.len());
+                    if handle_inbound_resource_hmu(
+                        transport_tx,
+                        attached_interface,
+                        link,
+                        &mut state.resources,
+                        event_tx,
+                        body,
+                    )
+                    .await
+                    {
+                        return Err(LinkSessionError::TransportUnavailable);
+                    }
+                }
+                rns_wire::context::PacketContext::ResourceIcl => {
+                    link.record_inbound();
+                    link.record_rx(body.len());
+                    handle_inbound_resource_cancel(link, &mut state.resources, event_tx, body);
                 }
                 rns_wire::context::PacketContext::ResourceRcl => {
                     link.record_inbound();
@@ -2370,6 +3695,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_inbound_resource_offer_is_rejected() {
+        let destination_hash = [0xAD; 16];
+        let server_signing = Ed25519PrivateKey::generate();
+        let server_public = server_signing.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &server_signing, destination_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &server_public, &server_public.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+
+        let mut sender = OutboundTransfer::new_encrypted(
+            b"expire inbound offer".to_vec(),
+            false,
+            Duration::from_secs_f64(responder.rtt_secs().max(0.001)),
+            responder.session_keys().unwrap(),
+        )
+        .unwrap();
+        let advertisement = match sender.tick() {
+            TransferAction::SendAdvertisement(advertisement) => {
+                ResourceAdvertisement::unpack(&advertisement).expect("unpack advertisement")
+            }
+            other => panic!("unexpected Resource action: {other:?}"),
+        };
+        let resource_id = resource_logical_id(&advertisement);
+        let segment_hash = advertisement.resource_hash;
+        let mut resources = SessionResources::default();
+        resources.pending_inbound.insert(
+            segment_hash,
+            PendingInboundResourceOffer {
+                advertisement,
+                offered_at: Instant::now() - RESOURCE_OFFER_TIMEOUT,
+            },
+        );
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let (event_tx, _event_rx) = mpsc::channel::<LinkSessionEvent>(1);
+
+        assert!(
+            !poll_inbound_resources(&transport_tx, 7, &mut initiator, &mut resources, &event_tx,)
+                .await
+        );
+        assert!(resources.pending_inbound.is_empty());
+        assert!(resources.rejected_inbound.contains_key(&resource_id));
+
+        let rejection = match transport_rx.recv().await.unwrap() {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 7,
+            } => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&rejection.raw).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceRcl
+        );
+        assert_eq!(
+            responder.decrypt(&rejection.raw[offset..]).unwrap(),
+            segment_hash
+        );
+    }
+
+    #[tokio::test]
     async fn application_packets_can_answer_while_link_is_stale() {
         let destination_hash = [0xBC; 16];
         let server_signing = Ed25519PrivateKey::generate();
@@ -2476,20 +3865,25 @@ mod tests {
         let (delivery_tx, delivery_rx) = mpsc::channel::<DestinationEvent>(16);
         let (command_tx, command_rx) = mpsc::channel::<LinkSessionCommand>(16);
         let (event_tx, mut event_rx) = mpsc::channel::<LinkSessionEvent>(16);
+        let (resource_offer_tx, _resource_offer_rx) = mpsc::channel::<LinkSessionResourceOffer>(1);
         let handle = LinkSessionHandle {
             link_id,
             mdu,
-            command_tx,
+            command_tx: command_tx.clone(),
         };
 
         tokio::spawn(run_session_actor(
-            transport_tx,
             client_identity,
             (initiator, channel),
             7,
             delivery_rx,
             command_rx,
-            event_tx,
+            SessionActorChannels {
+                transport_tx,
+                command_tx,
+                event_tx,
+                resource_offer_tx,
+            },
         ));
 
         assert_eq!(
@@ -3219,6 +4613,242 @@ mod tests {
             Some(LinkSessionEvent::ResourceConcluded {
                 resource_id: active_resource_id,
                 direction: LinkSessionResourceDirection::Outbound,
+                succeeded: false,
+            })
+        );
+
+        let inbound_payload = b"resource sent from the responder".to_vec();
+        let mut inbound_sender = OutboundTransfer::new_encrypted(
+            inbound_payload.clone(),
+            false,
+            Duration::from_secs_f64(responder.rtt_secs().max(0.001)),
+            responder.session_keys().unwrap(),
+        )
+        .unwrap();
+        let inbound_advertisement = match inbound_sender.tick() {
+            TransferAction::SendAdvertisement(advertisement) => advertisement,
+            other => panic!("unexpected responder Resource action: {other:?}"),
+        };
+        let inbound_resource_id = inbound_sender.resource.resource_hash;
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: build_data_packet(
+                    responder.link_id,
+                    rns_wire::context::PacketContext::ResourceAdv,
+                    &responder.encrypt(&inbound_advertisement).unwrap(),
+                ),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+        let offer = tokio::time::timeout(Duration::from_secs(1), session.resource_offers.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(offer.resource_id(), inbound_resource_id);
+        assert_eq!(offer.data_size(), inbound_payload.len());
+        let inbound_resource = offer.accept().await.unwrap();
+        let inbound_progress = inbound_resource.progress();
+        assert_eq!(
+            session.events.recv().await,
+            Some(LinkSessionEvent::ResourceStarted {
+                resource_id: inbound_resource_id,
+                direction: LinkSessionResourceDirection::Inbound,
+                data_size: inbound_payload.len(),
+                total_segments: 1,
+            })
+        );
+        let inbound_request = match transport_rx.recv().await.unwrap() {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (inbound_request_header, inbound_request_offset) =
+            rns_wire::header::PacketHeader::unpack(&inbound_request.raw).unwrap();
+        assert_eq!(
+            inbound_request_header.context,
+            rns_wire::context::PacketContext::ResourceReq
+        );
+        let inbound_request_plaintext = responder
+            .decrypt(&inbound_request.raw[inbound_request_offset..])
+            .unwrap();
+        let inbound_request_hash = rns_wire::hash::packet_hash(
+            &inbound_request.raw,
+            inbound_request_header.flags.header_type,
+        );
+        let inbound_actions =
+            inbound_sender.handle_request_packet(inbound_request_hash, &inbound_request_plaintext);
+        assert!(!inbound_actions.is_empty());
+        for action in inbound_actions {
+            let TransferAction::SendPart(_, part) = action else {
+                panic!("unexpected responder Resource action: {action:?}");
+            };
+            delivery_tx
+                .send(DestinationEvent::InboundPacket {
+                    raw: build_data_packet(
+                        responder.link_id,
+                        rns_wire::context::PacketContext::Resource,
+                        &part,
+                    ),
+                    interface_id: 1,
+                })
+                .await
+                .unwrap();
+        }
+
+        let inbound_proof = match transport_rx.recv().await.unwrap() {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (inbound_proof_header, inbound_proof_offset) =
+            rns_wire::header::PacketHeader::unpack(&inbound_proof.raw).unwrap();
+        assert_eq!(
+            inbound_proof_header.context,
+            rns_wire::context::PacketContext::ResourcePrf
+        );
+        assert_eq!(
+            inbound_proof_header.flags.packet_type,
+            rns_wire::flags::PacketType::Proof
+        );
+        assert!(inbound_sender.handle_proof(&inbound_proof.raw[inbound_proof_offset..]));
+        let received = inbound_resource.concluded().await.unwrap();
+        assert_eq!(received.resource_id, inbound_resource_id);
+        assert_eq!(received.data, inbound_payload);
+        assert_eq!(*inbound_progress.borrow(), 1.0);
+        assert!(matches!(
+            session.events.recv().await,
+            Some(LinkSessionEvent::ResourceProgress {
+                resource_id,
+                direction: LinkSessionResourceDirection::Inbound,
+                transferred,
+                total,
+            }) if resource_id == inbound_resource_id
+                && transferred == inbound_payload.len()
+                && total == inbound_payload.len()
+        ));
+        assert_eq!(
+            session.events.recv().await,
+            Some(LinkSessionEvent::ResourceConcluded {
+                resource_id: inbound_resource_id,
+                direction: LinkSessionResourceDirection::Inbound,
+                succeeded: true,
+            })
+        );
+
+        let mut rejected_sender = OutboundTransfer::new_encrypted(
+            b"reject inbound".to_vec(),
+            false,
+            Duration::from_secs_f64(responder.rtt_secs().max(0.001)),
+            responder.session_keys().unwrap(),
+        )
+        .unwrap();
+        let rejected_advertisement = match rejected_sender.tick() {
+            TransferAction::SendAdvertisement(advertisement) => advertisement,
+            other => panic!("unexpected responder Resource action: {other:?}"),
+        };
+        let rejected_id = rejected_sender.resource.resource_hash;
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: build_data_packet(
+                    responder.link_id,
+                    rns_wire::context::PacketContext::ResourceAdv,
+                    &responder.encrypt(&rejected_advertisement).unwrap(),
+                ),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+        let rejected_offer = session.resource_offers.recv().await.unwrap();
+        assert!(rejected_offer.reject().await.unwrap());
+        let rejection = match transport_rx.recv().await.unwrap() {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (rejection_header, rejection_offset) =
+            rns_wire::header::PacketHeader::unpack(&rejection.raw).unwrap();
+        assert_eq!(
+            rejection_header.context,
+            rns_wire::context::PacketContext::ResourceRcl
+        );
+        assert_eq!(
+            responder
+                .decrypt(&rejection.raw[rejection_offset..])
+                .unwrap(),
+            rejected_id
+        );
+
+        let mut cancelled_sender = OutboundTransfer::new_encrypted(
+            b"cancel inbound".to_vec(),
+            false,
+            Duration::from_secs_f64(responder.rtt_secs().max(0.001)),
+            responder.session_keys().unwrap(),
+        )
+        .unwrap();
+        let cancelled_advertisement = match cancelled_sender.tick() {
+            TransferAction::SendAdvertisement(advertisement) => advertisement,
+            other => panic!("unexpected responder Resource action: {other:?}"),
+        };
+        let cancelled_id = cancelled_sender.resource.resource_hash;
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: build_data_packet(
+                    responder.link_id,
+                    rns_wire::context::PacketContext::ResourceAdv,
+                    &responder.encrypt(&cancelled_advertisement).unwrap(),
+                ),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+        let cancelled_offer = session.resource_offers.recv().await.unwrap();
+        let cancelled_inbound = cancelled_offer.accept().await.unwrap();
+        assert_eq!(
+            session.events.recv().await,
+            Some(LinkSessionEvent::ResourceStarted {
+                resource_id: cancelled_id,
+                direction: LinkSessionResourceDirection::Inbound,
+                data_size: b"cancel inbound".len(),
+                total_segments: 1,
+            })
+        );
+        let _cancelled_request = transport_rx.recv().await.unwrap();
+        assert!(cancelled_inbound.cancel().await.unwrap());
+        let cancellation = match transport_rx.recv().await.unwrap() {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (cancellation_header, cancellation_offset) =
+            rns_wire::header::PacketHeader::unpack(&cancellation.raw).unwrap();
+        assert_eq!(
+            cancellation_header.context,
+            rns_wire::context::PacketContext::ResourceRcl
+        );
+        assert_eq!(
+            responder
+                .decrypt(&cancellation.raw[cancellation_offset..])
+                .unwrap(),
+            cancelled_id
+        );
+        assert!(matches!(
+            cancelled_inbound.concluded().await,
+            Err(LinkSessionResourceError::Cancelled)
+        ));
+        assert_eq!(
+            session.events.recv().await,
+            Some(LinkSessionEvent::ResourceConcluded {
+                resource_id: cancelled_id,
+                direction: LinkSessionResourceDirection::Inbound,
                 succeeded: false,
             })
         );
