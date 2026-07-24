@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use rns_crypto::ed25519::Ed25519PrivateKey;
 use rns_identity::destination::{DestType, Destination, Direction};
 use rns_identity::identity::Identity;
-use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
+use rns_link::link::{CloseReason, Link, LinkAction, LinkState, ResourceStrategy};
 use rns_protocol::channel::{ChannelError, LinkChannel};
 use rns_protocol::channel_message::MessageBase;
 use rns_protocol::resource::{
@@ -184,6 +184,7 @@ pub enum RequestOutcome {
 type RequestHandler = Box<dyn Fn([u8; 16], [u8; 16], Vec<u8>) -> Option<Vec<u8>> + Send>;
 type RequestHandlerEx = Box<dyn Fn([u8; 16], [u8; 16], Vec<u8>) -> RequestOutcome + Send>;
 type LinkIdentityGate = Box<dyn Fn([u8; 16], [u8; 16]) -> bool + Send>;
+type ResourceAcceptHandler = Box<dyn Fn([u8; 16], &ResourceAdvertisement) -> bool + Send>;
 
 struct ResourceTransferStart {
     data: Vec<u8>,
@@ -215,6 +216,11 @@ pub struct LinkManager {
     resource_completed_tx: Option<mpsc::Sender<(Vec<u8>, [u8; 16])>>,
     /// Resource hash + metadata.
     resource_completion_tx: Option<mpsc::Sender<ResourceCompletion>>,
+    /// Default policy applied to current and future responder Links. AcceptAll
+    /// preserves the established LXMF DIRECT behavior.
+    resource_strategy: ResourceStrategy,
+    /// Application decision hook used only when the strategy is AcceptApp.
+    resource_accept_handler: Option<ResourceAcceptHandler>,
     /// Fires when a link reaches the active state.
     link_established_tx: Option<mpsc::Sender<[u8; 16]>>,
     /// Fires on LinkIdentify before a resource ADV can race it.
@@ -261,6 +267,8 @@ impl LinkManager {
             response_tx: None,
             resource_completed_tx: None,
             resource_completion_tx: None,
+            resource_strategy: ResourceStrategy::AcceptAll,
+            resource_accept_handler: None,
             link_established_tx: None,
             link_identified_tx: None,
             link_identity_gate: None,
@@ -311,6 +319,8 @@ impl LinkManager {
             response_tx: None,
             resource_completed_tx: None,
             resource_completion_tx: None,
+            resource_strategy: ResourceStrategy::AcceptAll,
+            resource_accept_handler: None,
             link_established_tx: None,
             link_identified_tx: None,
             link_identity_gate: None,
@@ -667,9 +677,10 @@ impl LinkManager {
         }
 
         // LXMF DIRECT uses resource transfer past `LINK_PACKET_MAX_CONTENT`;
-        // AcceptAll skips Python's `ACCEPT_APP` hook.
+        // the manager default remains AcceptAll for backwards compatibility,
+        // but applications can explicitly select Python-style policies.
         let mut link = link;
-        link.resource_strategy = rns_link::link::ResourceStrategy::AcceptAll;
+        link.resource_strategy = self.resource_strategy;
 
         self.active_links.insert(
             link_id,
@@ -981,6 +992,47 @@ impl LinkManager {
                                     "ignoring inbound request-resource: no request handlers registered"
                                 );
                                 break 'adv;
+                            }
+
+                            // Python always accepts request/response Resources
+                            // through their dedicated receipt paths. Ordinary
+                            // Resources follow the configured Link policy.
+                            if !adv.flags.is_request && !adv.flags.is_response {
+                                match self.resource_strategy {
+                                    ResourceStrategy::AcceptAll => {}
+                                    ResourceStrategy::AcceptNone => {
+                                        tracing::debug!(
+                                            link_id = hex::encode(link_id),
+                                            resource = hex::encode(&adv.resource_hash[..8]),
+                                            "ignoring inbound Resource advertisement by policy"
+                                        );
+                                        break 'adv;
+                                    }
+                                    ResourceStrategy::AcceptApp => {
+                                        let accepted = self
+                                            .resource_accept_handler
+                                            .as_ref()
+                                            .is_some_and(|handler| handler(link_id, &adv));
+                                        if !accepted {
+                                            let sent = Self::send_resource_action(
+                                                &self.transport_tx,
+                                                active,
+                                                &link_id,
+                                                TransferAction::SendCancel(
+                                                    rns_protocol::resource::CancelType::Rcl,
+                                                    adv.resource_hash,
+                                                ),
+                                            );
+                                            tracing::debug!(
+                                                link_id = hex::encode(link_id),
+                                                resource = hex::encode(&adv.resource_hash[..8]),
+                                                cancel_sent = sent,
+                                                "inbound Resource advertisement rejected by application"
+                                            );
+                                            break 'adv;
+                                        }
+                                    }
+                                }
                             }
 
                             // Split-resource routing set up before the per-segment
@@ -2410,6 +2462,31 @@ impl LinkManager {
         self.resource_completion_tx = Some(tx);
     }
 
+    /// Set the inbound Resource policy for current and future responder Links.
+    ///
+    /// Request and response Resources remain protocol-owned and bypass this
+    /// policy, matching Python Reticulum. The manager defaults to
+    /// [`ResourceStrategy::AcceptAll`] for LXMF compatibility.
+    pub fn set_resource_strategy(&mut self, strategy: ResourceStrategy) {
+        self.resource_strategy = strategy;
+        for active in self.active_links.values_mut() {
+            active.link.set_resource_strategy(strategy);
+        }
+    }
+
+    /// Install the per-advertisement decision hook used by
+    /// [`ResourceStrategy::AcceptApp`].
+    pub fn set_resource_accept_handler<F>(&mut self, handler: F)
+    where
+        F: Fn([u8; 16], &ResourceAdvertisement) -> bool + Send + 'static,
+    {
+        self.resource_accept_handler = Some(Box::new(handler));
+    }
+
+    pub fn clear_resource_accept_handler(&mut self) {
+        self.resource_accept_handler = None;
+    }
+
     /// Fires when a link reaches the active state.
     pub fn set_link_established_channel(&mut self, tx: mpsc::Sender<[u8; 16]>) {
         self.link_established_tx = Some(tx);
@@ -2889,7 +2966,7 @@ mod tests {
     use rns_identity::identity::LocalKeyBackend;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     const TEST_CHANNEL_MSG_TYPE: u16 = 0x1234;
@@ -2969,6 +3046,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(16);
         let lm = LinkManager::new(tx, event_rx, [0xAA; 16], None);
         assert_eq!(lm.active_link_count(), 0);
+        assert_eq!(lm.resource_strategy, ResourceStrategy::AcceptAll);
     }
 
     #[tokio::test]
@@ -3546,6 +3624,28 @@ mod tests {
     fn handshaken_link_pair() -> (Link, Link) {
         let (initiator, responder, _identity_key) = handshaken_link_pair_with_identity();
         (initiator, responder)
+    }
+
+    fn resource_advertisement_packet(sender_link: &Link, advertisement: &[u8]) -> Vec<u8> {
+        let encrypted = sender_link
+            .encrypt(advertisement)
+            .expect("encrypt Resource advertisement");
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: sender_link.link_id,
+            context: rns_wire::context::PacketContext::ResourceAdv,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&encrypted);
+        raw
     }
 
     #[test]
@@ -4616,6 +4716,183 @@ mod tests {
             active.inbound_resources.is_empty(),
             "request-resource must not open a transfer without handlers"
         );
+    }
+
+    #[test]
+    fn resource_application_policy_accepts_rejects_and_ignores() {
+        let (sender_link, receiver_link) = handshaken_link_pair();
+        let link_id = receiver_link.link_id;
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::new(transport_tx, event_rx, [0xCE; 16], None);
+        manager.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+        manager.set_resource_strategy(ResourceStrategy::AcceptApp);
+
+        let decision_calls = Arc::new(AtomicUsize::new(0));
+        let rejected_calls = Arc::clone(&decision_calls);
+        manager.set_resource_accept_handler(move |seen_link, advertisement| {
+            assert_eq!(seen_link, link_id);
+            assert_eq!(advertisement.data_size, b"rejected".len());
+            rejected_calls.fetch_add(1, Ordering::SeqCst);
+            false
+        });
+
+        let mut rejected_sender = OutboundTransfer::new_encrypted(
+            b"rejected".to_vec(),
+            false,
+            std::time::Duration::from_millis(10),
+            sender_link.session_keys().unwrap(),
+        )
+        .unwrap();
+        let rejected_advertisement = match rejected_sender.tick() {
+            TransferAction::SendAdvertisement(advertisement) => advertisement,
+            other => panic!("unexpected Resource action: {other:?}"),
+        };
+        let rejected_hash = rejected_sender.resource.resource_hash;
+        manager.handle_inbound_packet(
+            &resource_advertisement_packet(&sender_link, &rejected_advertisement),
+            1,
+        );
+
+        let TransportMessage::Outbound(rejection) =
+            transport_rx.try_recv().expect("Resource rejection")
+        else {
+            panic!("expected outbound Resource rejection");
+        };
+        let (rejection_header, rejection_offset) =
+            rns_wire::header::PacketHeader::unpack(&rejection.raw).unwrap();
+        assert_eq!(
+            rejection_header.context,
+            rns_wire::context::PacketContext::ResourceRcl
+        );
+        assert_eq!(
+            sender_link
+                .decrypt(&rejection.raw[rejection_offset..])
+                .unwrap(),
+            rejected_hash
+        );
+        assert!(manager.active_links[&link_id].inbound_resources.is_empty());
+
+        let accepted_calls = Arc::clone(&decision_calls);
+        manager.set_resource_accept_handler(move |seen_link, advertisement| {
+            assert_eq!(seen_link, link_id);
+            assert_eq!(advertisement.data_size, b"accepted".len());
+            accepted_calls.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        let mut accepted_sender = OutboundTransfer::new_encrypted(
+            b"accepted".to_vec(),
+            false,
+            std::time::Duration::from_millis(10),
+            sender_link.session_keys().unwrap(),
+        )
+        .unwrap();
+        let accepted_advertisement = match accepted_sender.tick() {
+            TransferAction::SendAdvertisement(advertisement) => advertisement,
+            other => panic!("unexpected Resource action: {other:?}"),
+        };
+        let accepted_hash = accepted_sender.resource.resource_hash;
+        manager.handle_inbound_packet(
+            &resource_advertisement_packet(&sender_link, &accepted_advertisement),
+            1,
+        );
+
+        let TransportMessage::Outbound(request) =
+            transport_rx.try_recv().expect("initial Resource request")
+        else {
+            panic!("expected outbound Resource request");
+        };
+        let (request_header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(
+            request_header.context,
+            rns_wire::context::PacketContext::ResourceReq
+        );
+        assert!(
+            manager.active_links[&link_id]
+                .inbound_resources
+                .contains_key(&accepted_hash)
+        );
+        assert_eq!(decision_calls.load(Ordering::SeqCst), 2);
+
+        manager.set_resource_strategy(ResourceStrategy::AcceptNone);
+        let mut ignored_sender = OutboundTransfer::new_encrypted(
+            b"ignored".to_vec(),
+            false,
+            std::time::Duration::from_millis(10),
+            sender_link.session_keys().unwrap(),
+        )
+        .unwrap();
+        let ignored_advertisement = match ignored_sender.tick() {
+            TransferAction::SendAdvertisement(advertisement) => advertisement,
+            other => panic!("unexpected Resource action: {other:?}"),
+        };
+        let ignored_hash = ignored_sender.resource.resource_hash;
+        manager.handle_inbound_packet(
+            &resource_advertisement_packet(&sender_link, &ignored_advertisement),
+            1,
+        );
+
+        assert!(transport_rx.try_recv().is_err());
+        assert!(
+            !manager.active_links[&link_id]
+                .inbound_resources
+                .contains_key(&ignored_hash)
+        );
+        assert_eq!(
+            decision_calls.load(Ordering::SeqCst),
+            2,
+            "AcceptNone must not invoke the application callback"
+        );
+
+        manager.set_request_handler(|_, _, _| None);
+        let mut request_sender = OutboundTransfer::new_encrypted(
+            b"request resource".to_vec(),
+            false,
+            std::time::Duration::from_millis(10),
+            sender_link.session_keys().unwrap(),
+        )
+        .unwrap();
+        request_sender.resource.flags.is_request = true;
+        let request_advertisement = match request_sender.tick() {
+            TransferAction::SendAdvertisement(advertisement) => advertisement,
+            other => panic!("unexpected Resource action: {other:?}"),
+        };
+        let request_hash = request_sender.resource.resource_hash;
+        manager.handle_inbound_packet(
+            &resource_advertisement_packet(&sender_link, &request_advertisement),
+            1,
+        );
+
+        let TransportMessage::Outbound(request) = transport_rx
+            .try_recv()
+            .expect("request-Resource acceptance")
+        else {
+            panic!("expected outbound Resource request");
+        };
+        let (request_header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(
+            request_header.context,
+            rns_wire::context::PacketContext::ResourceReq
+        );
+        assert!(
+            manager.active_links[&link_id]
+                .inbound_resources
+                .contains_key(&request_hash),
+            "request Resources bypass the ordinary application policy"
+        );
+        assert_eq!(decision_calls.load(Ordering::SeqCst), 2);
     }
 
     // 1.3.9: a successfully-decrypted but unparseable advertisement tears down
