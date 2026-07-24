@@ -484,6 +484,9 @@ enum LinkSessionChannelCommand {
     IsReady {
         result_tx: oneshot::Sender<Result<bool, LinkSessionChannelError>>,
     },
+    IsDrained {
+        result_tx: oneshot::Sender<Result<bool, LinkSessionChannelError>>,
+    },
     Shutdown {
         result_tx: oneshot::Sender<Result<(), LinkSessionChannelError>>,
     },
@@ -736,6 +739,12 @@ impl LinkSessionChannelHandle {
 
     pub async fn is_ready_to_send(&self) -> Result<bool, LinkSessionChannelError> {
         self.invoke(|result_tx| LinkSessionChannelCommand::IsReady { result_tx })
+            .await
+    }
+
+    /// True when all previously-sent channel messages have been acknowledged.
+    pub async fn is_drained(&self) -> Result<bool, LinkSessionChannelError> {
+        self.invoke(|result_tx| LinkSessionChannelCommand::IsDrained { result_tx })
             .await
     }
 
@@ -1357,6 +1366,9 @@ async fn handle_channel_command(
             let ready = matches!(link.state, LinkState::Active | LinkState::Stale)
                 && channel.is_ready_to_send();
             let _ = result_tx.send(Ok(ready));
+        }
+        LinkSessionChannelCommand::IsDrained { result_tx } => {
+            let _ = result_tx.send(Ok(channel.is_drained()));
         }
         LinkSessionChannelCommand::Shutdown { result_tx } => {
             channel.shutdown();

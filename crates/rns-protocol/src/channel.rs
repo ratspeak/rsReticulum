@@ -326,6 +326,11 @@ impl Channel {
         outstanding < self.window.window
     }
 
+    /// True when every outbound envelope has been acknowledged and removed.
+    pub fn is_drained(&self) -> bool {
+        self.tx_ring.is_empty()
+    }
+
     /// Pack `msg`, push it onto the TX ring, and return the raw envelope for
     /// the transport to send. Fails when the channel is closed or its window
     /// is already saturated.
@@ -694,6 +699,10 @@ impl LinkChannel {
         self.channel.is_ready_to_send()
     }
 
+    pub fn is_drained(&self) -> bool {
+        self.channel.is_drained()
+    }
+
     /// Maximum payload bytes available to one channel message.
     pub fn mdu(&self) -> usize {
         Channel::channel_mdu(self.link_mdu)
@@ -879,6 +888,7 @@ mod tests {
     fn test_channel_flow_control() {
         let mut ch = Channel::new(0.1);
         assert!(ch.is_ready_to_send());
+        assert!(ch.is_drained());
 
         let msg = TestMessage::new(b"a");
         // `WINDOW_INITIAL` = 2 slots, so two sends saturate the window.
@@ -886,9 +896,13 @@ mod tests {
         ch.send(&msg).unwrap();
 
         assert!(!ch.is_ready_to_send());
+        assert!(!ch.is_drained());
 
         ch.delivered(0, 0.1);
         assert!(ch.is_ready_to_send());
+        assert!(!ch.is_drained());
+        ch.delivered(1, 0.1);
+        assert!(ch.is_drained());
     }
 
     #[test]
@@ -1240,6 +1254,7 @@ mod tests {
         tx_lc.delivered(0, 0.1);
         tx_lc.delivered(1, 0.1);
         assert_eq!(tx_lc.outstanding_count(), 0);
+        assert!(tx_lc.is_drained());
     }
 
     #[test]
