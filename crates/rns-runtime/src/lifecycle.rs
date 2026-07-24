@@ -32,10 +32,15 @@ impl ShutdownSignal {
     }
 
     pub async fn wait(&self) {
-        if self.is_triggered() {
-            return;
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_triggered() {
+                return;
+            }
+            notified.await;
         }
-        self.notify.notified().await;
     }
 }
 
@@ -75,33 +80,50 @@ impl Default for ExitHandler {
     }
 }
 
-/// Install a Ctrl-C (SIGINT) handler that trips `shutdown`. Returned receiver
-/// yields once on signal for await-based callers.
+/// Install process-signal handlers that trip `shutdown`. On Unix this covers
+/// both SIGINT and SIGTERM; other platforms use the runtime's Ctrl-C handler.
+/// The returned receiver yields once on the first signal for await-based
+/// callers.
 ///
 /// On unix the OS-level registration happens synchronously in this call — a
 /// handler registered inside a spawned task only takes effect once that task
-/// is first polled, leaving a window where SIGINT kills the process via the
+/// is first polled, leaving a window where a signal kills the process via the
 /// default disposition.
 pub fn install_signal_handlers(shutdown: ShutdownSignal) -> mpsc::Receiver<()> {
     let (tx, rx) = mpsc::channel(1);
-    let shutdown_clone = shutdown.clone();
 
     #[cfg(unix)]
-    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-        Ok(mut sigint) => {
-            tokio::spawn(async move {
-                sigint.recv().await;
-                signal_shutdown(shutdown_clone, tx).await;
-            });
+    {
+        let shutdown_clone = shutdown.clone();
+        let tx_clone = tx.clone();
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+            Ok(mut sigint) => {
+                tokio::spawn(async move {
+                    sigint.recv().await;
+                    signal_shutdown(shutdown_clone, tx_clone, "SIGINT");
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGINT registration failed; falling back to ctrl_c");
+                spawn_ctrl_c_handler(shutdown.clone(), tx.clone());
+            }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "SIGINT registration failed; falling back to ctrl_c");
-            spawn_ctrl_c_handler(shutdown_clone, tx);
+
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::spawn(async move {
+                    sigterm.recv().await;
+                    signal_shutdown(shutdown, tx, "SIGTERM");
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGTERM registration failed");
+            }
         }
     }
 
     #[cfg(not(unix))]
-    spawn_ctrl_c_handler(shutdown_clone, tx);
+    spawn_ctrl_c_handler(shutdown, tx);
 
     rx
 }
@@ -109,14 +131,14 @@ pub fn install_signal_handlers(shutdown: ShutdownSignal) -> mpsc::Receiver<()> {
 fn spawn_ctrl_c_handler(shutdown: ShutdownSignal, tx: mpsc::Sender<()>) {
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
-        signal_shutdown(shutdown, tx).await;
+        signal_shutdown(shutdown, tx, "Ctrl-C");
     });
 }
 
-async fn signal_shutdown(shutdown: ShutdownSignal, tx: mpsc::Sender<()>) {
-    tracing::info!("received shutdown signal");
+fn signal_shutdown(shutdown: ShutdownSignal, tx: mpsc::Sender<()>, signal: &'static str) {
+    tracing::info!(signal, "received shutdown signal");
     shutdown.trigger();
-    let _ = tx.send(()).await;
+    let _ = tx.try_send(());
 }
 
 #[cfg(test)]
@@ -170,5 +192,14 @@ mod tests {
 
         signal.wait().await;
         assert!(signal.is_triggered());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_wait_after_trigger() {
+        let signal = ShutdownSignal::new();
+        signal.trigger();
+        tokio::time::timeout(std::time::Duration::from_millis(50), signal.wait())
+            .await
+            .expect("pre-triggered shutdown wait must return");
     }
 }

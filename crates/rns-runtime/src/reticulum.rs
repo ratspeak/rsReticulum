@@ -5,13 +5,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::config::{Config, ConfigError, ConfigSection};
@@ -56,6 +56,31 @@ struct InterfaceControlMetadata {
 
 type InterfaceControlMap = Arc<std::sync::Mutex<HashMap<u64, InterfaceControlMetadata>>>;
 
+#[derive(Default)]
+struct TransportCompletion {
+    stopped: AtomicBool,
+    notify: Notify,
+}
+
+impl TransportCompletion {
+    fn mark_stopped(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.stopped.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ReticulumHandle {
     pub transport_tx: mpsc::Sender<TransportMessage>,
@@ -81,6 +106,7 @@ pub struct ReticulumHandle {
     /// Present even when `discover_interfaces = No` so a downstream can
     /// still install a stamper and start publishing.
     pub discovery: Arc<DiscoveryRuntime>,
+    transport_completion: Arc<TransportCompletion>,
 }
 
 /// Shared discovery state behind one `Arc` so cloning [`ReticulumHandle`]
@@ -133,6 +159,16 @@ impl ReticulumHandle {
 
     pub fn link_mtu_discovery(&self) -> bool {
         self.config.link_mtu_discovery
+    }
+
+    /// Trigger orderly runtime shutdown and wait until the transport actor has
+    /// synchronously flushed its persisted state.
+    pub async fn shutdown_and_wait(&self) {
+        self.shutdown.trigger();
+        if !self.transport_completion.stopped.load(Ordering::Acquire) {
+            let _ = self.transport_tx.send(TransportMessage::Shutdown).await;
+        }
+        self.transport_completion.wait().await;
     }
 
     /// Wait up to `timeout` for the transport actor to resolve a path.
@@ -1042,8 +1078,11 @@ pub async fn init(
 
     let shutdown_tx = transport_tx.clone();
     let shutdown_clone = shutdown.clone();
+    let transport_completion = Arc::new(TransportCompletion::default());
+    let actor_completion = transport_completion.clone();
     tokio::spawn(async move {
         actor.run().await;
+        actor_completion.mark_stopped();
     });
 
     // Persistent transport identity (Python 1.3.8 Transport._identity /
@@ -1440,6 +1479,7 @@ pub async fn init(
         transport_identity: wire_transport_identity,
         network_identity: network_identity.clone(),
         discovery: discovery_runtime,
+        transport_completion,
     };
 
     if instance_mode != InstanceMode::Client && rc.publish_blackhole {
@@ -4270,6 +4310,10 @@ loglevel = 7
             transport_identity: Arc::new(Identity::new()),
             network_identity: None,
             discovery: Arc::new(DiscoveryRuntime::default()),
+            transport_completion: Arc::new(TransportCompletion {
+                stopped: AtomicBool::new(true),
+                notify: Notify::new(),
+            }),
         }
     }
 

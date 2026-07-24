@@ -209,6 +209,7 @@ pub(crate) async fn main() {
             }
 
             shutdown.wait().await;
+            handle.shutdown_and_wait().await;
             tracing::info!("rnsd-rs shutting down");
         }
         Err(e) => {

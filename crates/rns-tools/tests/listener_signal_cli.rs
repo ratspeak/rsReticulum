@@ -62,13 +62,18 @@ fn wait_until_running(child: &mut Child, settle: Duration) -> bool {
     true
 }
 
-/// Sends SIGINT after a settle period and asserts a clean exit. Retries once
+/// Sends a process signal after a settle period and asserts a clean exit. Retries once
 /// with a longer settle if the child died from the raw signal (exit by signal
-/// 2): under full-workspace load the child can still be booting when the
-/// first SIGINT lands, before its handler is registered. A real handler
+/// number): under full-workspace load the child can still be booting when the
+/// first signal lands, before its handler is registered. A real handler
 /// regression fails both attempts.
 #[cfg(unix)]
-fn assert_sigint_exits(spawn: impl Fn() -> Child, name: &str) {
+fn assert_signal_exits(
+    spawn: impl Fn() -> Child,
+    name: &str,
+    signal_name: &str,
+    signal_number: i32,
+) {
     use std::os::unix::process::ExitStatusExt;
 
     let settles = [Duration::from_secs(3), Duration::from_secs(8)];
@@ -78,7 +83,7 @@ fn assert_sigint_exits(spawn: impl Fn() -> Child, name: &str) {
         if !wait_until_running(&mut child, settle) {
             let output = child.wait_with_output().expect("collect child output");
             panic!(
-                "{name} exited before SIGINT\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+                "{name} exited before {signal_name}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
                 output.status,
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
@@ -86,11 +91,11 @@ fn assert_sigint_exits(spawn: impl Fn() -> Child, name: &str) {
         }
 
         let status = Command::new("kill")
-            .arg("-INT")
+            .arg(format!("-{signal_name}"))
             .arg(child.id().to_string())
             .status()
-            .expect("send SIGINT");
-        assert!(status.success(), "kill -INT failed with {status}");
+            .unwrap_or_else(|_| panic!("send {signal_name}"));
+        assert!(status.success(), "kill -{signal_name} failed with {status}");
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let exit_status = loop {
@@ -105,14 +110,14 @@ fn assert_sigint_exits(spawn: impl Fn() -> Child, name: &str) {
 
         match exit_status {
             Some(status) if status.success() => return,
-            Some(status) if attempt < last_attempt && status.signal() == Some(2) => {
+            Some(status) if attempt < last_attempt && status.signal() == Some(signal_number) => {
                 let _ = child.wait_with_output();
                 continue;
             }
             Some(status) => {
                 let output = child.wait_with_output().expect("collect child output");
                 panic!(
-                    "{name} exited unsuccessfully after SIGINT: {status}\nstdout:\n{}\nstderr:\n{}",
+                    "{name} exited unsuccessfully after {signal_name}: {status}\nstdout:\n{}\nstderr:\n{}",
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr)
                 );
@@ -123,7 +128,7 @@ fn assert_sigint_exits(spawn: impl Fn() -> Child, name: &str) {
                     .wait_with_output()
                     .expect("collect killed child output");
                 panic!(
-                    "{name} did not exit after SIGINT\nstdout:\n{}\nstderr:\n{}",
+                    "{name} did not exit after {signal_name}\nstdout:\n{}\nstderr:\n{}",
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr)
                 );
@@ -138,7 +143,7 @@ fn assert_sigint_exits(spawn: impl Fn() -> Child, name: &str) {
 fn rncp_listener_exits_on_sigint() {
     let tmp = TempDir::new("rncp-sigint");
     write_config(&tmp);
-    assert_sigint_exits(
+    assert_signal_exits(
         || {
             Command::new(env!("CARGO_BIN_EXE_rncp-rs"))
                 .arg("--config")
@@ -152,6 +157,8 @@ fn rncp_listener_exits_on_sigint() {
                 .expect("spawn rncp-rs listener")
         },
         "rncp-rs",
+        "INT",
+        2,
     );
 }
 
@@ -160,7 +167,7 @@ fn rncp_listener_exits_on_sigint() {
 fn rnsh_listener_exits_on_sigint() {
     let tmp = TempDir::new("rnsh-sigint");
     write_config(&tmp);
-    assert_sigint_exits(
+    assert_signal_exits(
         || {
             Command::new(env!("CARGO_BIN_EXE_rnsh-rs"))
                 .arg("--config")
@@ -173,5 +180,32 @@ fn rnsh_listener_exits_on_sigint() {
                 .expect("spawn rnsh-rs listener")
         },
         "rnsh-rs",
+        "INT",
+        2,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rnsd_flushes_state_and_exits_on_sigterm() {
+    let tmp = TempDir::new("rnsd-sigterm");
+    write_config(&tmp);
+    assert_signal_exits(
+        || {
+            Command::new(env!("CARGO_BIN_EXE_rnsd-rs"))
+                .arg("--config")
+                .arg(tmp.path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn rnsd-rs")
+        },
+        "rnsd-rs",
+        "TERM",
+        15,
+    );
+    assert!(
+        tmp.path().join("storage/packet_hashlist").is_file(),
+        "orderly SIGTERM shutdown must flush transport state"
     );
 }
