@@ -467,7 +467,12 @@ impl TransportActor {
                     if self.is_shared_instance {
                         if let Err(e) =
                             tx.try_send(crate::link_messages::DestinationEvent::AnnounceRequested(
-                                crate::link_messages::AnnounceRequest::normal(app_name.clone()),
+                                crate::link_messages::AnnounceRequest {
+                                    app_name: app_name.clone(),
+                                    path_response: true,
+                                    tag: None,
+                                    attached_interface: None,
+                                },
                             ))
                         {
                             self.channel_drops += 1;
@@ -1891,6 +1896,30 @@ mod tests {
             delivery_tx: None,
         });
         assert!(actor.local_destinations.contains(&hash));
+    }
+
+    #[test]
+    fn shared_instance_registration_requests_path_response_announce() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_shared_instance = true;
+        let hash = [0xAB; 16];
+        let (delivery_tx, mut delivery_rx) = mpsc::channel(1);
+
+        actor.handle_message(TransportMessage::RegisterDestination {
+            hash,
+            app_name: "test.shared".to_string(),
+            delivery_tx: Some(delivery_tx),
+        });
+
+        let crate::link_messages::DestinationEvent::AnnounceRequested(request) =
+            delivery_rx.try_recv().unwrap()
+        else {
+            panic!("expected announce request");
+        };
+        assert_eq!(request.app_name, "test.shared");
+        assert!(request.path_response);
+        assert!(request.tag.is_none());
+        assert!(request.attached_interface.is_none());
     }
 
     #[test]
