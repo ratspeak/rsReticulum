@@ -194,8 +194,42 @@ pub enum LinkManagerCommand {
         reason: CloseReason,
         send_teardown: bool,
     },
+    /// Broadcast an announce using the manager's owned Destination.
     Announce,
+    /// Broadcast an announce with the same options exposed by Python's
+    /// `Destination.announce`.
+    AnnounceWith {
+        options: DestinationAnnounceOptions,
+        result_tx: Option<oneshot::Sender<Result<(), DestinationControlError>>>,
+    },
+    /// Change whether the owned Destination accepts new inbound Links.
+    SetAcceptsLinks {
+        accepts: bool,
+        result_tx: Option<oneshot::Sender<Result<(), DestinationControlError>>>,
+    },
     Shutdown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DestinationAnnounceOptions {
+    pub app_data: Option<Vec<u8>>,
+    pub path_response: bool,
+    pub attached_interface: Option<rns_transport::messages::InterfaceId>,
+    pub tag: Option<Vec<u8>>,
+    /// Public ratchet key to advertise, when the caller manages a ratchet ring.
+    pub ratchet: Option<[u8; 32]>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DestinationControlError {
+    #[error("link manager does not own a destination")]
+    DestinationUnavailable,
+    #[error("link manager does not own a signing identity")]
+    IdentityUnavailable,
+    #[error("destination operation failed: {0}")]
+    Destination(#[from] rns_identity::destination::DestinationError),
+    #[error("transport channel is full or closed")]
+    TransportUnavailable,
 }
 
 /// Resource hash + sender metadata (e.g. rncp filename).
@@ -550,6 +584,50 @@ impl LinkManager {
             LinkManagerCommand::Announce => {
                 if let Some(handler) = self.announce_handler.as_mut() {
                     handler();
+                } else {
+                    let app_name = self
+                        .destination
+                        .as_ref()
+                        .map(|destination| destination.app_name.clone())
+                        .unwrap_or_default();
+                    let _ = self.send_destination_announce(
+                        AnnounceRequest::normal(app_name),
+                        None,
+                        None,
+                    );
+                }
+                true
+            }
+            LinkManagerCommand::AnnounceWith { options, result_tx } => {
+                let app_name = self
+                    .destination
+                    .as_ref()
+                    .map(|destination| destination.app_name.clone())
+                    .unwrap_or_default();
+                let request = AnnounceRequest {
+                    app_name,
+                    path_response: options.path_response,
+                    tag: options.tag,
+                    attached_interface: options.attached_interface,
+                };
+                let result = self.send_destination_announce(
+                    request,
+                    options.app_data.as_deref(),
+                    options.ratchet.as_ref(),
+                );
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(result);
+                }
+                true
+            }
+            LinkManagerCommand::SetAcceptsLinks { accepts, result_tx } => {
+                let result = self
+                    .destination
+                    .as_mut()
+                    .ok_or(DestinationControlError::DestinationUnavailable)
+                    .map(|destination| destination.set_accepts_links(accepts));
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(result);
                 }
                 true
             }
@@ -581,24 +659,29 @@ impl LinkManager {
             }
             DestinationEvent::AnnounceRequested(request) => {
                 if request.path_response {
-                    self.send_destination_announce(request);
+                    let _ = self.send_destination_announce(request, None, None);
                 } else if let Some(handler) = self.announce_handler.as_mut() {
                     handler();
                 } else {
-                    self.send_destination_announce(request);
+                    let _ = self.send_destination_announce(request, None, None);
                 }
             }
         }
     }
 
-    fn send_destination_announce(&mut self, request: AnnounceRequest) {
+    fn send_destination_announce(
+        &mut self,
+        request: AnnounceRequest,
+        app_data: Option<&[u8]>,
+        ratchet: Option<&[u8; 32]>,
+    ) -> Result<(), DestinationControlError> {
         let Some(destination) = self.destination.as_mut() else {
             tracing::debug!(
                 app_name = %request.app_name,
                 path_response = request.path_response,
                 "announce requested but no destination is configured"
             );
-            return;
+            return Err(DestinationControlError::DestinationUnavailable);
         };
         let Some(identity) = self.identity.as_ref() else {
             tracing::warn!(
@@ -606,28 +689,17 @@ impl LinkManager {
                 path_response = request.path_response,
                 "announce requested but no private identity is available"
             );
-            return;
+            return Err(DestinationControlError::IdentityUnavailable);
         };
 
-        let raw = match destination.announce_packet(
+        let raw = destination.announce_packet(
             identity,
-            None,
-            None,
+            app_data,
+            ratchet,
             request.path_response,
             request.tag.as_deref(),
             unix_now(),
-        ) {
-            Ok(raw) => raw,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    app_name = %request.app_name,
-                    path_response = request.path_response,
-                    "failed to build requested announce"
-                );
-                return;
-            }
-        };
+        )?;
 
         let outbound = OutboundRequest {
             raw: Bytes::from(raw),
@@ -641,14 +713,16 @@ impl LinkManager {
         } else {
             TransportMessage::Outbound(outbound)
         };
-        if let Err(e) = self.transport_tx.try_send(message) {
+        if let Err(error) = self.transport_tx.try_send(message) {
             tracing::warn!(
                 app_name = %request.app_name,
                 path_response = request.path_response,
-                err = %e,
+                err = %error,
                 "failed to queue requested announce"
             );
+            return Err(DestinationControlError::TransportUnavailable);
         }
+        Ok(())
     }
 
     fn handle_link_request(&mut self, raw: &[u8], interface_id: u64) {
@@ -3982,6 +4056,82 @@ mod tests {
             second_request.raw, first_raw,
             "same path-response tag should reuse cached announce bytes"
         );
+    }
+
+    #[test]
+    fn destination_commands_announce_and_change_link_acceptance() {
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let identity = Identity::new();
+        let mut manager = LinkManager::with_destination(
+            transport_tx,
+            event_rx,
+            &identity,
+            "test.commands",
+            identity.get_signing_key(),
+        );
+
+        let (accept_tx, accept_rx) = oneshot::channel();
+        assert!(manager.handle_command(LinkManagerCommand::SetAcceptsLinks {
+            accepts: false,
+            result_tx: Some(accept_tx),
+        }));
+        assert!(matches!(accept_rx.blocking_recv(), Ok(Ok(()))));
+        assert!(
+            !manager.destination().unwrap().accepts_links(),
+            "the live manager must consult the updated destination gate"
+        );
+
+        let ratchet = [0xA5; 32];
+        let (announce_tx, announce_rx) = oneshot::channel();
+        assert!(manager.handle_command(LinkManagerCommand::AnnounceWith {
+            options: DestinationAnnounceOptions {
+                app_data: Some(b"command app data".to_vec()),
+                ratchet: Some(ratchet),
+                ..DestinationAnnounceOptions::default()
+            },
+            result_tx: Some(announce_tx),
+        }));
+        assert!(matches!(announce_rx.blocking_recv(), Ok(Ok(()))));
+
+        let TransportMessage::Outbound(request) = transport_rx.try_recv().unwrap() else {
+            panic!("expected destination announce");
+        };
+        let (header, data_offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(header.destination_hash, manager.destination_hash);
+        assert_eq!(
+            header.flags.packet_type,
+            rns_wire::flags::PacketType::Announce
+        );
+        assert!(header.flags.context_flag);
+        let announce =
+            rns_identity::announce::AnnounceData::unpack(&request.raw[data_offset..], true)
+                .unwrap();
+        assert_eq!(announce.ratchet, Some(ratchet));
+        assert_eq!(
+            announce.app_data.as_deref(),
+            Some(b"command app data".as_slice())
+        );
+    }
+
+    #[test]
+    fn default_announce_command_uses_owned_destination() {
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let identity = Identity::new();
+        let mut manager = LinkManager::with_destination(
+            transport_tx,
+            event_rx,
+            &identity,
+            "test.default.announce",
+            identity.get_signing_key(),
+        );
+
+        assert!(manager.handle_command(LinkManagerCommand::Announce));
+        assert!(matches!(
+            transport_rx.try_recv(),
+            Ok(TransportMessage::Outbound(_))
+        ));
     }
 
     #[test]
