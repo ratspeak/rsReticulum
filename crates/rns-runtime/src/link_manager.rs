@@ -2,7 +2,7 @@
 //! state (session keys, channel, in/outbound transfers), drives keepalives
 //! and teardown. Lives here to break the rns-transport ↔ rns-link cycle.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -88,6 +88,44 @@ pub struct LinkResourceProof {
     pub resource_hash: [u8; 32],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkResourceDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkResourceConclusion {
+    Complete,
+    Cancelled,
+    Rejected,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkResourceEvent {
+    Started {
+        link_id: [u8; 16],
+        resource_id: [u8; 32],
+        direction: LinkResourceDirection,
+        data_size: usize,
+        total_segments: usize,
+    },
+    Progress {
+        link_id: [u8; 16],
+        resource_id: [u8; 32],
+        direction: LinkResourceDirection,
+        transferred: usize,
+        total: usize,
+    },
+    Concluded {
+        link_id: [u8; 16],
+        resource_id: [u8; 32],
+        direction: LinkResourceDirection,
+        conclusion: LinkResourceConclusion,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub enum LinkPayloadSendReceipt {
     Packet(LinkPacketSendReceipt),
@@ -144,6 +182,12 @@ pub enum LinkManagerCommand {
         payload: Vec<u8>,
         auto_compress: bool,
         result_tx: Option<oneshot::Sender<Result<LinkPayloadSendReceipt, LinkSendError>>>,
+    },
+    CancelLinkResource {
+        link_id: [u8; 16],
+        resource_id: [u8; 32],
+        direction: LinkResourceDirection,
+        result_tx: Option<oneshot::Sender<bool>>,
     },
     CloseLink {
         link_id: [u8; 16],
@@ -234,6 +278,8 @@ pub struct LinkManager {
     link_packet_proof_tx: Option<mpsc::Sender<LinkPacketProof>>,
     /// Valid proof for an application resource sent through this manager.
     outbound_resource_proof_tx: Option<mpsc::Sender<LinkResourceProof>>,
+    /// Unified inbound/outbound Resource lifecycle.
+    resource_event_tx: Option<mpsc::Sender<LinkResourceEvent>>,
     /// Decrypted channel envelopes as `(link_id, msg_type, payload)`.
     channel_message_tx: Option<mpsc::Sender<LinkChannelMessage>>,
     /// Fires when an active link is closed or torn down.
@@ -275,6 +321,7 @@ impl LinkManager {
             link_packet_tx: None,
             link_packet_proof_tx: None,
             outbound_resource_proof_tx: None,
+            resource_event_tx: None,
             channel_message_tx: None,
             link_closed_tx: None,
             inbound_raw_tx: None,
@@ -327,6 +374,7 @@ impl LinkManager {
             link_packet_tx: None,
             link_packet_proof_tx: None,
             outbound_resource_proof_tx: None,
+            resource_event_tx: None,
             channel_message_tx: None,
             link_closed_tx: None,
             inbound_raw_tx: None,
@@ -454,6 +502,18 @@ impl LinkManager {
                 result_tx,
             } => {
                 let result = self.send_link_payload(&link_id, payload, auto_compress);
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(result);
+                }
+                true
+            }
+            LinkManagerCommand::CancelLinkResource {
+                link_id,
+                resource_id,
+                direction,
+                result_tx,
+            } => {
+                let result = self.cancel_link_resource(&link_id, &resource_id, direction);
                 if let Some(tx) = result_tx {
                     let _ = tx.send(result);
                 }
@@ -1138,6 +1198,22 @@ impl LinkManager {
 
                                 active.link.track_incoming_resource(adv.resource_hash);
                                 active.inbound_resources.insert(adv.resource_hash, transfer);
+                                if adv.segment_index == 1 {
+                                    Self::emit_resource_event(
+                                        &self.resource_event_tx,
+                                        LinkResourceEvent::Started {
+                                            link_id,
+                                            resource_id: if adv.total_segments > 1 {
+                                                adv.original_hash
+                                            } else {
+                                                adv.resource_hash
+                                            },
+                                            direction: LinkResourceDirection::Inbound,
+                                            data_size: adv.data_size,
+                                            total_segments: adv.total_segments,
+                                        },
+                                    );
+                                }
                                 tracing::info!(
                                     link_id = hex::encode(link_id),
                                     resource = hex::encode(&adv.resource_hash[..8]),
@@ -1163,7 +1239,9 @@ impl LinkManager {
                         let plaintext = data.to_vec();
                         let mut resource_action_to_send = None;
                         let mut completed_rh = None;
+                        let mut progressed_rh = None;
                         for (rh, transfer) in &mut active.inbound_resources {
+                            let progress_before = transfer.progress();
                             let action = transfer.receive_part(plaintext.clone());
                             tracing::info!(
                                 link_id = hex::encode(link_id),
@@ -1186,9 +1264,21 @@ impl LinkManager {
                             if completed_rh.is_none() && transfer.resource.is_complete() {
                                 completed_rh = Some(*rh);
                             }
+                            if transfer.progress() > progress_before {
+                                progressed_rh = Some(*rh);
+                            }
                             if resource_action_to_send.is_some() || completed_rh.is_some() {
                                 break;
                             }
+                        }
+
+                        if let Some(resource_hash) = progressed_rh {
+                            Self::emit_inbound_resource_progress(
+                                &self.resource_event_tx,
+                                active,
+                                link_id,
+                                resource_hash,
+                            );
                         }
 
                         if let Some(action) = resource_action_to_send {
@@ -1334,6 +1424,17 @@ impl LinkManager {
                                                             total_segments,
                                                             "split-resource reassembly complete"
                                                         );
+                                                        Self::emit_resource_event(
+                                                            &self.resource_event_tx,
+                                                            LinkResourceEvent::Concluded {
+                                                                link_id,
+                                                                resource_id: route.original_hash,
+                                                                direction:
+                                                                    LinkResourceDirection::Inbound,
+                                                                conclusion:
+                                                                    LinkResourceConclusion::Complete,
+                                                            },
+                                                        );
                                                     }
                                                     Err(e) => {
                                                         tracing::warn!(
@@ -1343,6 +1444,19 @@ impl LinkManager {
                                                             ),
                                                             error = ?e,
                                                             "split-resource reassembly failed"
+                                                        );
+                                                        Self::emit_resource_event(
+                                                            &self.resource_event_tx,
+                                                            LinkResourceEvent::Concluded {
+                                                                link_id,
+                                                                resource_id: route.original_hash,
+                                                                direction:
+                                                                    LinkResourceDirection::Inbound,
+                                                                conclusion:
+                                                                    LinkResourceConclusion::Failed(
+                                                                        e.to_string(),
+                                                                    ),
+                                                            },
                                                         );
                                                     }
                                                 }
@@ -1392,6 +1506,15 @@ impl LinkManager {
                                             resource = hex::encode(&rh[..8]),
                                             "inbound resource transfer completed — proof sent"
                                         );
+                                        Self::emit_resource_event(
+                                            &self.resource_event_tx,
+                                            LinkResourceEvent::Concluded {
+                                                link_id,
+                                                resource_id: rh,
+                                                direction: LinkResourceDirection::Inbound,
+                                                conclusion: LinkResourceConclusion::Complete,
+                                            },
+                                        );
                                     }
                                 }
                             }
@@ -1422,11 +1545,14 @@ impl LinkManager {
                                 );
                                 let packet_hash =
                                     rns_wire::hash::packet_hash(raw, header.flags.header_type);
-                                let actions = active
+                                let (actions, progressed) = active
                                     .outbound_resources
                                     .get_mut(&rh)
                                     .map(|transfer| {
-                                        transfer.handle_request_packet(packet_hash, &plaintext)
+                                        let before = transfer.progress();
+                                        let actions =
+                                            transfer.handle_request_packet(packet_hash, &plaintext);
+                                        (actions, transfer.progress() > before)
                                     })
                                     .unwrap_or_default();
                                 for action in actions {
@@ -1502,6 +1628,14 @@ impl LinkManager {
                                         },
                                     ));
                                 }
+                                if progressed {
+                                    Self::emit_outbound_resource_progress(
+                                        &self.resource_event_tx,
+                                        active,
+                                        link_id,
+                                        rh,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1516,41 +1650,22 @@ impl LinkManager {
                         if plaintext.len() >= 32 {
                             let mut rh = [0u8; 32];
                             rh.copy_from_slice(&plaintext[..32]);
+                            let resource_id = Self::inbound_resource_identity(active, &rh).0;
                             if let Some(transfer) = active.inbound_resources.get_mut(&rh) {
                                 transfer.handle_cancel();
+                                Self::drop_inbound_resource(active, &rh);
                                 tracing::debug!(
                                     link_id = hex::encode(link_id),
                                     "RESOURCE_ICL — inbound transfer cancelled"
                                 );
-                            }
-                            active.inbound_resources.remove(&rh);
-
-                            // Sender-cancel of a split-segment tears down the whole
-                            // reassembly state (coordinator + sibling segments) so
-                            // the coordinator isn't orphaned forever.
-                            if let Some(route) = active.segment_routing.remove(&rh) {
-                                let oh = route.original_hash;
-                                active.inbound_split_resources.remove(&oh);
-                                let siblings: Vec<[u8; 32]> = active
-                                    .segment_routing
-                                    .iter()
-                                    .filter_map(|(seg_rh, r)| {
-                                        if r.original_hash == oh {
-                                            Some(*seg_rh)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
-                                for sibling_rh in siblings {
-                                    active.segment_routing.remove(&sibling_rh);
-                                    active.inbound_resources.remove(&sibling_rh);
-                                    active.link.untrack_resource(&sibling_rh);
-                                }
-                                tracing::debug!(
-                                    link_id = hex::encode(link_id),
-                                    original = hex::encode(&oh[..8]),
-                                    "split-resource cancelled by sender — coordinator + siblings dropped"
+                                Self::emit_resource_event(
+                                    &self.resource_event_tx,
+                                    LinkResourceEvent::Concluded {
+                                        link_id,
+                                        resource_id,
+                                        direction: LinkResourceDirection::Inbound,
+                                        conclusion: LinkResourceConclusion::Cancelled,
+                                    },
                                 );
                             }
                         }
@@ -1566,14 +1681,32 @@ impl LinkManager {
                         if plaintext.len() >= 32 {
                             let mut rh = [0u8; 32];
                             rh.copy_from_slice(&plaintext[..32]);
-                            if let Some(transfer) = active.outbound_resources.get_mut(&rh) {
-                                transfer.resource.handle_cancel();
+                            let resource_id = active
+                                .outbound_resources
+                                .get(&rh)
+                                .map(Self::outbound_resource_identity)
+                                .map(|identity| identity.0);
+                            if let Some(resource_id) = resource_id {
+                                if let Some(transfer) = active.outbound_resources.get_mut(&rh) {
+                                    transfer.resource.handle_cancel();
+                                }
+                                active.outbound_resources.remove(&rh);
+                                active.outbound_split_queues.remove(&resource_id);
+                                active.link.untrack_resource(&rh);
                                 tracing::debug!(
                                     link_id = hex::encode(link_id),
                                     "RESOURCE_RCL — outbound transfer rejected"
                                 );
+                                Self::emit_resource_event(
+                                    &self.resource_event_tx,
+                                    LinkResourceEvent::Concluded {
+                                        link_id,
+                                        resource_id,
+                                        direction: LinkResourceDirection::Outbound,
+                                        conclusion: LinkResourceConclusion::Rejected,
+                                    },
+                                );
                             }
-                            active.outbound_resources.remove(&rh);
                         }
                     }
                 }
@@ -1685,13 +1818,22 @@ impl LinkManager {
                                     started_next_segment = true;
                                 }
                             }
-                            if !started_next_segment
-                                && let Some(ref tx) = self.outbound_resource_proof_tx
-                            {
-                                let _ = tx.try_send(LinkResourceProof {
-                                    link_id,
-                                    resource_hash: completed_resource_hash,
-                                });
+                            if !started_next_segment {
+                                if let Some(ref tx) = self.outbound_resource_proof_tx {
+                                    let _ = tx.try_send(LinkResourceProof {
+                                        link_id,
+                                        resource_hash: completed_resource_hash,
+                                    });
+                                }
+                                Self::emit_resource_event(
+                                    &self.resource_event_tx,
+                                    LinkResourceEvent::Concluded {
+                                        link_id,
+                                        resource_id: completed_resource_hash,
+                                        direction: LinkResourceDirection::Outbound,
+                                        conclusion: LinkResourceConclusion::Complete,
+                                    },
+                                );
                             }
                         }
                     }
@@ -1990,7 +2132,17 @@ impl LinkManager {
                 }
                 match action {
                     TransferAction::Failed(reason) => {
+                        let resource_id = Self::inbound_resource_identity(active, &resource_hash).0;
                         Self::drop_inbound_resource(active, &resource_hash);
+                        Self::emit_resource_event(
+                            &self.resource_event_tx,
+                            LinkResourceEvent::Concluded {
+                                link_id: *link_id,
+                                resource_id,
+                                direction: LinkResourceDirection::Inbound,
+                                conclusion: LinkResourceConclusion::Failed(reason.clone()),
+                            },
+                        );
                         tracing::warn!(
                             link_id = hex::encode(link_id),
                             resource = hex::encode(&resource_hash[..8]),
@@ -2025,10 +2177,19 @@ impl LinkManager {
             for (resource_hash, action) in outbound_watchdog_actions {
                 match action {
                     TransferAction::Failed(reason) => {
-                        if let Some(transfer) = active.outbound_resources.remove(&resource_hash)
-                            && let Some(original_hash) = transfer.resource.original_hash
-                        {
-                            active.outbound_split_queues.remove(&original_hash);
+                        if let Some(transfer) = active.outbound_resources.remove(&resource_hash) {
+                            let resource_id = Self::outbound_resource_identity(&transfer).0;
+                            active.outbound_split_queues.remove(&resource_id);
+                            active.link.untrack_resource(&resource_hash);
+                            Self::emit_resource_event(
+                                &self.resource_event_tx,
+                                LinkResourceEvent::Concluded {
+                                    link_id: *link_id,
+                                    resource_id,
+                                    direction: LinkResourceDirection::Outbound,
+                                    conclusion: LinkResourceConclusion::Failed(reason.clone()),
+                                },
+                            );
                         }
                         tracing::warn!(
                             link_id = hex::encode(link_id),
@@ -2119,6 +2280,17 @@ impl LinkManager {
         let Some(mut active) = self.active_links.remove(&link_id) else {
             return false;
         };
+        let inbound_resource_ids: HashSet<[u8; 32]> = active
+            .inbound_resources
+            .keys()
+            .map(|resource_hash| Self::inbound_resource_identity(&active, resource_hash).0)
+            .collect();
+        let outbound_resource_ids: HashSet<[u8; 32]> = active
+            .outbound_resources
+            .values()
+            .map(Self::outbound_resource_identity)
+            .map(|identity| identity.0)
+            .collect();
 
         if send_teardown {
             if let Some(teardown_data) = active.link.teardown(reason) {
@@ -2141,6 +2313,29 @@ impl LinkManager {
             .try_send(TransportMessage::DeregisterDestination { hash: link_id });
         if let Some(ref tx) = self.link_closed_tx {
             let _ = tx.try_send(link_id);
+        }
+        let failure = format!("link closed: {reason:?}");
+        for resource_id in inbound_resource_ids {
+            Self::emit_resource_event(
+                &self.resource_event_tx,
+                LinkResourceEvent::Concluded {
+                    link_id,
+                    resource_id,
+                    direction: LinkResourceDirection::Inbound,
+                    conclusion: LinkResourceConclusion::Failed(failure.clone()),
+                },
+            );
+        }
+        for resource_id in outbound_resource_ids {
+            Self::emit_resource_event(
+                &self.resource_event_tx,
+                LinkResourceEvent::Concluded {
+                    link_id,
+                    resource_id,
+                    direction: LinkResourceDirection::Outbound,
+                    conclusion: LinkResourceConclusion::Failed(failure.clone()),
+                },
+            );
         }
 
         true
@@ -2282,6 +2477,98 @@ impl LinkManager {
                 destination_hash: *link_id,
             }))
             .is_ok()
+    }
+
+    fn emit_resource_event(
+        resource_event_tx: &Option<mpsc::Sender<LinkResourceEvent>>,
+        event: LinkResourceEvent,
+    ) {
+        if let Some(tx) = resource_event_tx {
+            let _ = tx.try_send(event);
+        }
+    }
+
+    fn inbound_resource_identity(
+        active: &ActiveLink,
+        resource_hash: &[u8; 32],
+    ) -> ([u8; 32], usize, usize) {
+        active
+            .segment_routing
+            .get(resource_hash)
+            .map(|route| {
+                let total_segments = active
+                    .inbound_split_resources
+                    .get(&route.original_hash)
+                    .map(|coordinator| coordinator.total_segments)
+                    .unwrap_or(1);
+                (route.original_hash, route.segment_index, total_segments)
+            })
+            .unwrap_or((*resource_hash, 1, 1))
+    }
+
+    fn outbound_resource_identity(transfer: &OutboundTransfer) -> ([u8; 32], usize, usize) {
+        (
+            transfer
+                .resource
+                .original_hash
+                .unwrap_or(transfer.resource.resource_hash),
+            transfer.resource.segment_index,
+            transfer.resource.total_segments,
+        )
+    }
+
+    fn emit_inbound_resource_progress(
+        resource_event_tx: &Option<mpsc::Sender<LinkResourceEvent>>,
+        active: &ActiveLink,
+        link_id: [u8; 16],
+        resource_hash: [u8; 32],
+    ) {
+        let Some(transfer) = active.inbound_resources.get(&resource_hash) else {
+            return;
+        };
+        let (resource_id, segment_index, total_segments) =
+            Self::inbound_resource_identity(active, &resource_hash);
+        let total = transfer.resource.data_size;
+        let progress = ((segment_index.saturating_sub(1) as f64 + transfer.progress())
+            / total_segments.max(1) as f64)
+            .clamp(0.0, 1.0);
+        Self::emit_resource_event(
+            resource_event_tx,
+            LinkResourceEvent::Progress {
+                link_id,
+                resource_id,
+                direction: LinkResourceDirection::Inbound,
+                transferred: (progress * total as f64).floor() as usize,
+                total,
+            },
+        );
+    }
+
+    fn emit_outbound_resource_progress(
+        resource_event_tx: &Option<mpsc::Sender<LinkResourceEvent>>,
+        active: &ActiveLink,
+        link_id: [u8; 16],
+        resource_hash: [u8; 32],
+    ) {
+        let Some(transfer) = active.outbound_resources.get(&resource_hash) else {
+            return;
+        };
+        let (resource_id, segment_index, total_segments) =
+            Self::outbound_resource_identity(transfer);
+        let total = transfer.resource.advertisement_data_size;
+        let progress = ((segment_index.saturating_sub(1) as f64 + transfer.progress())
+            / total_segments.max(1) as f64)
+            .clamp(0.0, 1.0);
+        Self::emit_resource_event(
+            resource_event_tx,
+            LinkResourceEvent::Progress {
+                link_id,
+                resource_id,
+                direction: LinkResourceDirection::Outbound,
+                transferred: (progress * total as f64).floor() as usize,
+                total,
+            },
+        );
     }
 
     fn drop_inbound_resource(active: &mut ActiveLink, resource_hash: &[u8; 32]) {
@@ -2516,6 +2803,10 @@ impl LinkManager {
         self.outbound_resource_proof_tx = Some(tx);
     }
 
+    pub fn set_resource_event_channel(&mut self, tx: mpsc::Sender<LinkResourceEvent>) {
+        self.resource_event_tx = Some(tx);
+    }
+
     pub fn set_channel_message_channel(&mut self, tx: mpsc::Sender<LinkChannelMessage>) {
         self.channel_message_tx = Some(tx);
     }
@@ -2711,6 +3002,90 @@ impl LinkManager {
         }
     }
 
+    /// Cancel an active Resource by the logical id returned in lifecycle
+    /// events or [`LinkResourceSendReceipt`].
+    pub fn cancel_link_resource(
+        &mut self,
+        link_id: &[u8; 16],
+        resource_id: &[u8; 32],
+        direction: LinkResourceDirection,
+    ) -> bool {
+        let Some(active) = self.active_links.get_mut(link_id) else {
+            return false;
+        };
+
+        let cancelled_id = match direction {
+            LinkResourceDirection::Outbound => {
+                let segment_hash =
+                    active
+                        .outbound_resources
+                        .iter()
+                        .find_map(|(segment_hash, transfer)| {
+                            let (logical_id, _, _) = Self::outbound_resource_identity(transfer);
+                            (logical_id == *resource_id || *segment_hash == *resource_id)
+                                .then_some(*segment_hash)
+                        });
+                let Some(segment_hash) = segment_hash else {
+                    return false;
+                };
+                let logical_id = active
+                    .outbound_resources
+                    .get(&segment_hash)
+                    .map(Self::outbound_resource_identity)
+                    .map(|identity| identity.0)
+                    .unwrap_or(segment_hash);
+                let _ = Self::send_resource_action(
+                    &self.transport_tx,
+                    active,
+                    link_id,
+                    TransferAction::SendCancel(
+                        rns_protocol::resource::CancelType::Icl,
+                        segment_hash,
+                    ),
+                );
+                if let Some(mut transfer) = active.outbound_resources.remove(&segment_hash) {
+                    transfer.handle_cancel();
+                }
+                active.outbound_split_queues.remove(&logical_id);
+                active.link.untrack_resource(&segment_hash);
+                logical_id
+            }
+            LinkResourceDirection::Inbound => {
+                let segment_hash = active.inbound_resources.keys().find_map(|segment_hash| {
+                    let (logical_id, _, _) = Self::inbound_resource_identity(active, segment_hash);
+                    (logical_id == *resource_id || *segment_hash == *resource_id)
+                        .then_some(*segment_hash)
+                });
+                let Some(segment_hash) = segment_hash else {
+                    return false;
+                };
+                let logical_id = Self::inbound_resource_identity(active, &segment_hash).0;
+                let _ = Self::send_resource_action(
+                    &self.transport_tx,
+                    active,
+                    link_id,
+                    TransferAction::SendCancel(
+                        rns_protocol::resource::CancelType::Rcl,
+                        segment_hash,
+                    ),
+                );
+                Self::drop_inbound_resource(active, &segment_hash);
+                logical_id
+            }
+        };
+
+        Self::emit_resource_event(
+            &self.resource_event_tx,
+            LinkResourceEvent::Concluded {
+                link_id: *link_id,
+                resource_id: cancelled_id,
+                direction,
+                conclusion: LinkResourceConclusion::Cancelled,
+            },
+        );
+        true
+    }
+
     pub fn process_destination_packet(&self, raw: &[u8], identity: &Identity) -> Option<Vec<u8>> {
         let dest = self.destination.as_ref()?;
         let (header, data_offset) = rns_wire::header::PacketHeader::unpack(raw).ok()?;
@@ -2787,6 +3162,7 @@ impl LinkManager {
             is_response,
             allow_handshake,
         } = request;
+        let data_size = data.len();
         let active = self.active_links.get_mut(link_id)?;
         let state_allows_transfer = active.link.state == LinkState::Active
             || (allow_handshake && active.link.state == LinkState::Handshake);
@@ -2843,6 +3219,7 @@ impl LinkManager {
         let resource_key = resources
             .first()
             .map(|r| r.original_hash.unwrap_or(r.resource_hash))?;
+        let total_segments = resources.len();
 
         let mut transfers: VecDeque<OutboundTransfer> = resources
             .into_iter()
@@ -2853,6 +3230,16 @@ impl LinkManager {
         if !transfers.is_empty() {
             active.outbound_split_queues.insert(resource_key, transfers);
         }
+        Self::emit_resource_event(
+            &self.resource_event_tx,
+            LinkResourceEvent::Started {
+                link_id: *link_id,
+                resource_id: resource_key,
+                direction: LinkResourceDirection::Outbound,
+                data_size,
+                total_segments,
+            },
+        );
 
         Some(resource_key)
     }
@@ -4157,6 +4544,8 @@ mod tests {
         let mut lm = LinkManager::new(transport_tx, event_rx, [0xC2; 16], None);
         let (proof_tx, mut proof_rx) = mpsc::channel(4);
         lm.set_outbound_resource_proof_channel(proof_tx);
+        let (resource_event_tx, mut resource_event_rx) = mpsc::channel(4);
+        lm.set_resource_event_channel(resource_event_tx);
         lm.active_links.insert(
             link_id,
             ActiveLink {
@@ -4174,6 +4563,16 @@ mod tests {
         let receipt = lm
             .send_link_resource(&link_id, b"resource payload".to_vec(), false)
             .expect("resource started");
+        assert_eq!(
+            resource_event_rx.try_recv().unwrap(),
+            LinkResourceEvent::Started {
+                link_id,
+                resource_id: receipt.resource_hash,
+                direction: LinkResourceDirection::Outbound,
+                data_size: b"resource payload".len(),
+                total_segments: 1,
+            }
+        );
         let outbound = transport_rx.try_recv().expect("resource ADV outbound");
         let TransportMessage::Outbound(request) = outbound else {
             panic!("expected outbound resource ADV");
@@ -4215,6 +4614,78 @@ mod tests {
         let proof = proof_rx.try_recv().expect("resource proof event");
         assert_eq!(proof.link_id, link_id);
         assert_eq!(proof.resource_hash, receipt.resource_hash);
+        assert_eq!(
+            resource_event_rx.try_recv().unwrap(),
+            LinkResourceEvent::Concluded {
+                link_id,
+                resource_id: receipt.resource_hash,
+                direction: LinkResourceDirection::Outbound,
+                conclusion: LinkResourceConclusion::Complete,
+            }
+        );
+    }
+
+    #[test]
+    fn outbound_resource_can_be_cancelled_through_manager_command() {
+        let (peer_link, local_link, _identity_key) = handshaken_link_pair_with_identity();
+        let link_id = local_link.link_id;
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::new(transport_tx, event_rx, [0xC5; 16], None);
+        let (resource_event_tx, mut resource_event_rx) = mpsc::channel(4);
+        manager.set_resource_event_channel(resource_event_tx);
+        manager.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: local_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let receipt = manager
+            .send_link_resource(&link_id, b"cancel me".to_vec(), false)
+            .unwrap();
+        let _advertisement = transport_rx.try_recv().unwrap();
+        let _started = resource_event_rx.try_recv().unwrap();
+        let (result_tx, mut result_rx) = oneshot::channel();
+        assert!(
+            manager.handle_command(LinkManagerCommand::CancelLinkResource {
+                link_id,
+                resource_id: receipt.resource_hash,
+                direction: LinkResourceDirection::Outbound,
+                result_tx: Some(result_tx),
+            })
+        );
+        assert!(result_rx.try_recv().unwrap());
+
+        let TransportMessage::Outbound(cancellation) = transport_rx.try_recv().unwrap() else {
+            panic!("expected outbound Resource cancellation");
+        };
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&cancellation.raw).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceIcl
+        );
+        assert_eq!(
+            peer_link.decrypt(&cancellation.raw[offset..]).unwrap(),
+            receipt.resource_hash
+        );
+        assert_eq!(
+            resource_event_rx.try_recv().unwrap(),
+            LinkResourceEvent::Concluded {
+                link_id,
+                resource_id: receipt.resource_hash,
+                direction: LinkResourceDirection::Outbound,
+                conclusion: LinkResourceConclusion::Cancelled,
+            }
+        );
+        assert!(manager.active_links[&link_id].outbound_resources.is_empty());
     }
 
     #[test]
@@ -4893,6 +5364,127 @@ mod tests {
             "request Resources bypass the ordinary application policy"
         );
         assert_eq!(decision_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn inbound_resource_lifecycle_reports_progress_and_completion() {
+        let (sender_link, receiver_link) = handshaken_link_pair();
+        let link_id = receiver_link.link_id;
+        let payload = b"inbound lifecycle".to_vec();
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::new(transport_tx, event_rx, [0xCF; 16], None);
+        let (resource_event_tx, mut resource_event_rx) = mpsc::channel(8);
+        manager.set_resource_event_channel(resource_event_tx);
+        manager.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let mut sender = OutboundTransfer::new_encrypted(
+            payload.clone(),
+            false,
+            std::time::Duration::from_millis(10),
+            sender_link.session_keys().unwrap(),
+        )
+        .unwrap();
+        let advertisement = match sender.tick() {
+            TransferAction::SendAdvertisement(advertisement) => advertisement,
+            other => panic!("unexpected Resource action: {other:?}"),
+        };
+        let resource_id = sender.resource.resource_hash;
+        manager.handle_inbound_packet(
+            &resource_advertisement_packet(&sender_link, &advertisement),
+            1,
+        );
+        assert_eq!(
+            resource_event_rx.try_recv().unwrap(),
+            LinkResourceEvent::Started {
+                link_id,
+                resource_id,
+                direction: LinkResourceDirection::Inbound,
+                data_size: payload.len(),
+                total_segments: 1,
+            }
+        );
+
+        let TransportMessage::Outbound(request) =
+            transport_rx.try_recv().expect("initial Resource request")
+        else {
+            panic!("expected outbound Resource request");
+        };
+        let (request_header, request_offset) =
+            rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(
+            request_header.context,
+            rns_wire::context::PacketContext::ResourceReq
+        );
+        let plaintext = sender_link.decrypt(&request.raw[request_offset..]).unwrap();
+        let packet_hash =
+            rns_wire::hash::packet_hash(&request.raw, request_header.flags.header_type);
+        let actions = sender.handle_request_packet(packet_hash, &plaintext);
+        assert_eq!(actions.len(), 1);
+        let TransferAction::SendPart(_, part) = &actions[0] else {
+            panic!("expected one Resource part");
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Resource,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(part);
+        manager.handle_inbound_packet(&raw, 1);
+
+        assert_eq!(
+            resource_event_rx.try_recv().unwrap(),
+            LinkResourceEvent::Progress {
+                link_id,
+                resource_id,
+                direction: LinkResourceDirection::Inbound,
+                transferred: payload.len(),
+                total: payload.len(),
+            }
+        );
+        assert_eq!(
+            resource_event_rx.try_recv().unwrap(),
+            LinkResourceEvent::Concluded {
+                link_id,
+                resource_id,
+                direction: LinkResourceDirection::Inbound,
+                conclusion: LinkResourceConclusion::Complete,
+            }
+        );
+
+        let TransportMessage::Outbound(proof) = transport_rx.try_recv().expect("Resource proof")
+        else {
+            panic!("expected outbound Resource proof");
+        };
+        let (proof_header, proof_offset) =
+            rns_wire::header::PacketHeader::unpack(&proof.raw).unwrap();
+        assert_eq!(
+            proof_header.context,
+            rns_wire::context::PacketContext::ResourcePrf
+        );
+        assert!(sender.handle_proof(&proof.raw[proof_offset..]));
+        assert!(manager.active_links[&link_id].inbound_resources.is_empty());
     }
 
     // 1.3.9: a successfully-decrypted but unparseable advertisement tears down
