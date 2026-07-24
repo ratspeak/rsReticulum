@@ -15,11 +15,19 @@ macro_rules! pr_log {
 
 impl TransportActor {
     pub(super) fn on_outbound(&mut self, request: crate::messages::OutboundRequest) {
+        let _ = self.on_outbound_with_receipt_policy(request, true);
+    }
+
+    pub(super) fn on_outbound_with_receipt_policy(
+        &mut self,
+        request: crate::messages::OutboundRequest,
+        create_receipt: bool,
+    ) -> bool {
         self.traffic.record_tx(0, request.raw.len() as u64); // interface 0 = local
 
         let parsed = match rns_wire::header::PacketHeader::unpack(&request.raw) {
             Ok((header, _)) => header,
-            Err(_) => return,
+            Err(_) => return false,
         };
 
         // Seed the dedup set with our own packet hash so echoes looped back
@@ -30,7 +38,8 @@ impl TransportActor {
         // Generate a general-purpose receipt for every outbound Data packet to a
         // non-Plain destination so callers can observe delivery / timeout.
         // Link- and resource-level contexts manage their own receipts.
-        if parsed.flags.packet_type == rns_wire::flags::PacketType::Data
+        if create_receipt
+            && parsed.flags.packet_type == rns_wire::flags::PacketType::Data
             && parsed.flags.destination_type != rns_wire::flags::DestinationType::Plain
         {
             let trunc_hash =
@@ -77,13 +86,17 @@ impl TransportActor {
         );
 
         if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce {
+            let has_outbound_interface = self
+                .interfaces
+                .values()
+                .any(|interface| interface.direction.outbound);
             self.broadcast_local_announce_on_interfaces(&request.raw, None);
-            return;
+            return has_outbound_interface;
         }
 
         match parsed.flags.destination_type {
             rns_wire::flags::DestinationType::Plain | rns_wire::flags::DestinationType::Group => {
-                self.broadcast_on_interfaces(&request.raw, None);
+                self.broadcast_on_interfaces(&request.raw, None)
             }
             rns_wire::flags::DestinationType::Single | rns_wire::flags::DestinationType::Link => {
                 if let Some(path) = self.path_table.get_live(&request.destination_hash) {
@@ -111,7 +124,7 @@ impl TransportActor {
                     // Transport nodes only forward Header2 packets whose transport_id
                     // matches their identity — Python hubs silently drop Header1 —
                     // so every directed send through a relay must be wrapped.
-                    if let Some(next_hop) = path_next_hop {
+                    let sent = if let Some(next_hop) = path_next_hop {
                         if parsed.flags.header_type == rns_wire::flags::HeaderType::Header1 {
                             let new_flags = rns_wire::flags::PacketFlags {
                                 header_type: rns_wire::flags::HeaderType::Header2,
@@ -139,25 +152,28 @@ impl TransportActor {
                                 transport_id = %hex::encode(next_hop),
                                 "outbound: wrapped Header1 -> Header2 for transport"
                             );
-                            self.send_to_interface(target_interface, &new_raw);
+                            self.send_to_interface(target_interface, &new_raw)
                         } else if apply_delta {
                             let mangled = self.mangle_hops(&request.raw, &parsed, false);
-                            self.send_to_interface(target_interface, &mangled);
+                            self.send_to_interface(target_interface, &mangled)
                         } else {
-                            self.send_to_interface(target_interface, &request.raw);
+                            self.send_to_interface(target_interface, &request.raw)
                         }
                     } else if apply_delta {
                         let mangled = self.mangle_hops(&request.raw, &parsed, false);
-                        self.send_to_interface(target_interface, &mangled);
+                        self.send_to_interface(target_interface, &mangled)
                     } else {
-                        self.send_to_interface(target_interface, &request.raw);
-                    }
+                        self.send_to_interface(target_interface, &request.raw)
+                    };
 
                     // Touch the path so an actively-used route isn't culled
                     // for staleness while traffic is still flowing on it.
-                    if let Some(path) = self.path_table.get_live_mut(&request.destination_hash) {
+                    if sent
+                        && let Some(path) = self.path_table.get_live_mut(&request.destination_hash)
+                    {
                         path.touch();
                     }
+                    sent
                 } else {
                     let iface_names: Vec<&str> = self
                         .interfaces
@@ -170,10 +186,11 @@ impl TransportActor {
                         broadcast_to = ?iface_names,
                         "outbound: no path, broadcasting"
                     );
-                    self.broadcast_on_interfaces(&request.raw, None);
+                    let sent = self.broadcast_on_interfaces(&request.raw, None);
                     if parsed.flags.packet_type != rns_wire::flags::PacketType::Proof {
                         self.on_automatic_path_request(request.destination_hash);
                     }
+                    sent
                 }
             }
         }
@@ -183,7 +200,7 @@ impl TransportActor {
         &mut self,
         request: crate::messages::OutboundRequest,
         interface_id: InterfaceId,
-    ) {
+    ) -> bool {
         self.traffic.record_tx(0, request.raw.len() as u64);
 
         if let Ok((parsed, _)) = rns_wire::header::PacketHeader::unpack(&request.raw) {
@@ -191,20 +208,23 @@ impl TransportActor {
             self.packet_hashlist.insert(pkt_hash);
             // Python's outbound applies should_apply_delta on attached-
             // interface sends too (Transport.py:1342-1345).
-            if self.should_apply_delta(&parsed, interface_id) {
+            let sent = if self.should_apply_delta(&parsed, interface_id) {
                 let transport_insert = parsed.flags.packet_type
                     == rns_wire::flags::PacketType::Announce
                     && parsed.flags.header_type == rns_wire::flags::HeaderType::Header1;
                 let mangled = self.mangle_hops(&request.raw, &parsed, transport_insert);
-                self.send_to_interface(interface_id, &mangled);
+                self.send_to_interface(interface_id, &mangled)
             } else {
-                self.send_to_interface(interface_id, &request.raw);
-            }
-            if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce {
+                self.send_to_interface(interface_id, &request.raw)
+            };
+            if sent && parsed.flags.packet_type == rns_wire::flags::PacketType::Announce {
                 if let Some(entry) = self.interfaces.get_mut(&interface_id) {
                     entry.ingress.sent_announce();
                 }
             }
+            sent
+        } else {
+            false
         }
     }
 

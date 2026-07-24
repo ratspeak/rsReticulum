@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::constants::{InterfaceDirection, InterfaceMode};
 pub use crate::ingress::HeldAnnounce;
@@ -55,6 +55,44 @@ pub struct InboundPacket {
 pub struct OutboundRequest {
     pub raw: Bytes,
     pub destination_hash: [u8; 16],
+}
+
+/// State update for one explicitly tracked outbound packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptUpdate {
+    Sent,
+    Delivered { rtt: std::time::Duration },
+    TimedOut,
+    Failed,
+    Culled,
+}
+
+/// Receipt metadata installed atomically with an outbound packet.
+pub struct TrackedReceiptRegistration {
+    pub truncated_hash: [u8; 16],
+    pub full_hash: [u8; 32],
+    pub destination_hash: [u8; 16],
+    pub destination_public_key: [u8; 64],
+    pub timeout: Option<std::time::Duration>,
+    pub status_tx: watch::Sender<ReceiptUpdate>,
+}
+
+impl std::fmt::Debug for TrackedReceiptRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrackedReceiptRegistration")
+            .field("truncated_hash", &self.truncated_hash)
+            .field("destination_hash", &self.destination_hash)
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Immediate outcome of dispatching a packet to the interface layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundDispatchResult {
+    Sent,
+    NoInterface,
+    ReceiptCollision,
 }
 
 /// Periodic maintenance tick. Drives cache culling, retransmit scheduling,
@@ -248,6 +286,15 @@ pub enum TransportMessage {
         request: OutboundRequest,
         interface_id: InterfaceId,
     },
+    /// Dispatch an application packet and report whether an interface
+    /// accepted it. Optional receipt registration occurs in the same actor
+    /// turn, avoiding registration/send races.
+    SendPacket {
+        request: OutboundRequest,
+        attached_interface: Option<InterfaceId>,
+        receipt: Option<TrackedReceiptRegistration>,
+        result_tx: tokio::sync::oneshot::Sender<OutboundDispatchResult>,
+    },
     Tick(TimerTick),
     /// Read-only query paired with a oneshot reply channel — used for all
     /// RPC and introspection so callers don't need direct state access.
@@ -359,6 +406,7 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::Inbound(_) => "Inbound",
         TransportMessage::Outbound(_) => "Outbound",
         TransportMessage::OutboundAttached { .. } => "OutboundAttached",
+        TransportMessage::SendPacket { .. } => "SendPacket",
         TransportMessage::Tick(_) => "Tick",
         TransportMessage::Rpc { .. } => "Rpc",
         TransportMessage::RegisterDestination { .. } => "RegisterDestination",
@@ -693,6 +741,17 @@ impl std::fmt::Debug for TransportMessage {
                 .debug_struct("OutboundAttached")
                 .field("request", request)
                 .field("interface_id", interface_id)
+                .finish(),
+            Self::SendPacket {
+                request,
+                attached_interface,
+                receipt,
+                ..
+            } => f
+                .debug_struct("SendPacket")
+                .field("request", request)
+                .field("attached_interface", attached_interface)
+                .field("receipt", receipt)
                 .finish(),
             Self::Tick(t) => f.debug_tuple("Tick").field(t).finish(),
             Self::Rpc { query, .. } => f.debug_struct("Rpc").field("query", query).finish(),

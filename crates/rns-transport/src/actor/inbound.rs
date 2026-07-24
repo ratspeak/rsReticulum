@@ -1044,6 +1044,13 @@ impl TransportActor {
                 return;
             }
 
+            if let Some(status_tx) = self.receipt_updates.remove(&header.destination_hash) {
+                let update = rtt.map_or(crate::messages::ReceiptUpdate::Failed, |rtt| {
+                    crate::messages::ReceiptUpdate::Delivered { rtt }
+                });
+                status_tx.send_replace(update);
+            }
+
             if let Some(msg_id) = self.receipt_msg_ids.remove(&header.destination_hash) {
                 debug!(
                     msg_id = %msg_id,

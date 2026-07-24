@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::{Config, ConfigError, ConfigSection};
@@ -22,6 +22,7 @@ use crate::lifecycle::ShutdownSignal;
 use crate::link_client::LinkClient;
 use crate::link_manager::LinkManager;
 use crate::platform::{StoragePaths, resolve_config_dir};
+use rns_identity::destination::{DestType, Destination, DestinationError, Direction};
 use rns_identity::identity::Identity;
 use rns_transport::await_path::{AwaitPathError, await_path};
 use rns_transport::discovery::{
@@ -30,8 +31,8 @@ use rns_transport::discovery::{
     DiscoveryInterfaceConfig, DiscoveryStamper, DiscoveryStore, ReceiverConfig, discovery_hash,
 };
 use rns_transport::messages::{
-    OutboundRequest, RecalledDestinationRpcEntry, TransportMessage, TransportQuery,
-    TransportQueryResponse,
+    OutboundDispatchResult, OutboundRequest, RecalledDestinationRpcEntry, ReceiptUpdate,
+    TrackedReceiptRegistration, TransportMessage, TransportQuery, TransportQueryResponse,
 };
 
 static INSTANCE: OnceLock<ReticulumHandle> = OnceLock::new();
@@ -137,6 +138,120 @@ pub struct InterfaceStats {
     pub rss_bytes: Option<u64>,
 }
 
+/// Options for [`ReticulumHandle::send_to`].
+#[derive(Debug, Clone)]
+pub struct SendOptions {
+    /// Track the packet until a proof arrives or its receipt expires.
+    pub create_receipt: bool,
+    /// Override the route-derived receipt timeout.
+    pub timeout: Option<Duration>,
+    /// Restrict dispatch to one interface.
+    pub attached_interface: Option<rns_transport::messages::InterfaceId>,
+}
+
+impl Default for SendOptions {
+    fn default() -> Self {
+        Self {
+            create_receipt: true,
+            timeout: None,
+            attached_interface: None,
+        }
+    }
+}
+
+/// Immediate result of a successful packet dispatch.
+#[derive(Debug, Clone)]
+pub struct SendResult {
+    pub packet_hash: [u8; 32],
+    pub receipt: Option<PacketReceiptHandle>,
+}
+
+/// Current lifecycle state of a tracked packet.
+pub type PacketReceiptStatus = ReceiptUpdate;
+
+/// Readable, cloneable handle for one non-Link packet receipt.
+#[derive(Clone)]
+pub struct PacketReceiptHandle {
+    pub packet_hash: [u8; 32],
+    pub truncated_hash: [u8; 16],
+    status_rx: watch::Receiver<ReceiptUpdate>,
+}
+
+impl std::fmt::Debug for PacketReceiptHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketReceiptHandle")
+            .field("packet_hash", &hex::encode(self.packet_hash))
+            .field("status", &self.status())
+            .finish()
+    }
+}
+
+impl PacketReceiptHandle {
+    /// Return the latest receipt state without waiting.
+    pub fn status(&self) -> PacketReceiptStatus {
+        *self.status_rx.borrow()
+    }
+
+    /// Subscribe to future receipt state changes.
+    pub fn watch(&self) -> watch::Receiver<PacketReceiptStatus> {
+        self.status_rx.clone()
+    }
+
+    /// Wait until the packet is delivered or reaches another terminal state.
+    pub async fn delivered(mut self) -> Result<Duration, ReceiptError> {
+        loop {
+            match self.status() {
+                ReceiptUpdate::Sent => {
+                    self.status_rx
+                        .changed()
+                        .await
+                        .map_err(|_| ReceiptError::TransportClosed)?;
+                }
+                ReceiptUpdate::Delivered { rtt } => return Ok(rtt),
+                ReceiptUpdate::TimedOut => return Err(ReceiptError::TimedOut),
+                ReceiptUpdate::Failed => return Err(ReceiptError::Failed),
+                ReceiptUpdate::Culled => return Err(ReceiptError::Culled),
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReceiptError {
+    #[error("packet receipt timed out")]
+    TimedOut,
+    #[error("packet receipt failed")]
+    Failed,
+    #[error("packet receipt was culled")]
+    Culled,
+    #[error("transport closed before the receipt concluded")]
+    TransportClosed,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SendError {
+    #[error("destination must be outbound")]
+    InboundDestination,
+    #[error("Link destinations must use LinkSession")]
+    LinkDestination,
+    #[error("no validated identity is known for destination {0}")]
+    IdentityUnavailable(String),
+    #[error("payload is {actual} bytes; encrypted SINGLE-packet MDU is {max}")]
+    PayloadTooLarge { actual: usize, max: usize },
+    #[error("destination encryption failed: {0}")]
+    Encryption(#[from] DestinationError),
+    #[error("packet construction failed: {0}")]
+    Packet(#[from] rns_wire::packet::PacketError),
+    #[error("transport channel is unavailable")]
+    TransportUnavailable,
+    #[error("no outbound interface accepted the packet")]
+    NoInterface,
+    #[error("another in-flight receipt has the same truncated packet hash")]
+    ReceiptCollision,
+    #[error("transport control failed: {0}")]
+    Control(#[from] ControlError),
+}
+
 impl std::fmt::Debug for RecalledDestination {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RecalledDestination")
@@ -238,6 +353,155 @@ impl ReticulumHandle {
         timeout: Duration,
     ) -> Result<(), AwaitPathError> {
         await_path(&self.transport_tx, destination_hash, timeout).await
+    }
+
+    /// Encrypt and dispatch one non-Link application packet.
+    ///
+    /// SINGLE destinations are resolved from the validated announce cache so
+    /// callers do not need to manually compose packet headers, encryption,
+    /// receipt registration, and proof correlation.
+    pub async fn send_to(
+        &self,
+        destination: &Destination,
+        data: &[u8],
+        options: SendOptions,
+    ) -> Result<SendResult, SendError> {
+        if destination.direction != Direction::Out {
+            return Err(SendError::InboundDestination);
+        }
+        if destination.dest_type == DestType::Link {
+            return Err(SendError::LinkDestination);
+        }
+        if destination.dest_type == DestType::Single
+            && data.len() > rns_wire::constants::SINGLE_PACKET_ENCRYPTED_MDU
+        {
+            return Err(SendError::PayloadTooLarge {
+                actual: data.len(),
+                max: rns_wire::constants::SINGLE_PACKET_ENCRYPTED_MDU,
+            });
+        }
+
+        // Python does not create receipts for PLAIN packets.
+        let create_receipt = options.create_receipt && destination.dest_type != DestType::Plain;
+        let recalled = if destination.dest_type == DestType::Single || create_receipt {
+            Some(
+                self.recall(destination.hash)
+                    .await?
+                    .ok_or_else(|| SendError::IdentityUnavailable(hex::encode(destination.hash)))?,
+            )
+        } else {
+            None
+        };
+        let encryption_identity = recalled
+            .as_ref()
+            .map(|entry| &entry.identity)
+            .unwrap_or(self.transport_identity.as_ref());
+        let ratchet = destination
+            .remote_ratchet_pub
+            .as_ref()
+            .or_else(|| recalled.as_ref().and_then(|entry| entry.ratchet.as_ref()));
+        let encrypted = destination.encrypt(data, encryption_identity, ratchet)?;
+
+        let destination_type = match destination.dest_type {
+            DestType::Single => rns_wire::flags::DestinationType::Single,
+            DestType::Group => rns_wire::flags::DestinationType::Group,
+            DestType::Plain => rns_wire::flags::DestinationType::Plain,
+            DestType::Link => unreachable!("Link destinations rejected above"),
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: destination.hash,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let packet = rns_wire::packet::Packet::new(header, encrypted)?;
+        let packet_hash = packet.packet_hash;
+        let truncated_hash = packet.truncated_hash;
+
+        let (receipt, registration) = if create_receipt {
+            let recalled = recalled
+                .as_ref()
+                .expect("tracked destination recall completed above");
+            let timeout = match options.timeout {
+                Some(timeout) => timeout,
+                None => self.default_packet_receipt_timeout(destination.hash).await,
+            };
+            let (status_tx, status_rx) = watch::channel(ReceiptUpdate::Sent);
+            (
+                Some(PacketReceiptHandle {
+                    packet_hash,
+                    truncated_hash,
+                    status_rx,
+                }),
+                Some(TrackedReceiptRegistration {
+                    truncated_hash,
+                    full_hash: packet_hash,
+                    destination_hash: destination.hash,
+                    destination_public_key: recalled.identity.get_public_key(),
+                    timeout: Some(timeout),
+                    status_tx,
+                }),
+            )
+        } else {
+            (None, None)
+        };
+
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.transport_tx
+            .send(TransportMessage::SendPacket {
+                request: OutboundRequest {
+                    raw: Bytes::from(packet.raw),
+                    destination_hash: destination.hash,
+                },
+                attached_interface: options.attached_interface,
+                receipt: registration,
+                result_tx,
+            })
+            .await
+            .map_err(|_| SendError::TransportUnavailable)?;
+
+        match result_rx
+            .await
+            .map_err(|_| SendError::TransportUnavailable)?
+        {
+            OutboundDispatchResult::Sent => Ok(SendResult {
+                packet_hash,
+                receipt,
+            }),
+            OutboundDispatchResult::NoInterface => Err(SendError::NoInterface),
+            OutboundDispatchResult::ReceiptCollision => Err(SendError::ReceiptCollision),
+        }
+    }
+
+    async fn default_packet_receipt_timeout(&self, destination_hash: [u8; 16]) -> Duration {
+        let first_hop = match self
+            .query_control_result(TransportQuery::FirstHopTimeout {
+                dest: destination_hash,
+            })
+            .await
+        {
+            Ok(TransportQueryResponse::FloatResult(Some(seconds)))
+                if seconds.is_finite() && seconds >= 0.0 =>
+            {
+                seconds
+            }
+            _ => return Duration::from_secs(180),
+        };
+        let hops = match self.hops_to(destination_hash).await {
+            Ok(hops) => hops,
+            Err(_) => return Duration::from_secs(180),
+        };
+        Duration::try_from_secs_f64(
+            first_hop + f64::from(hops) * rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT,
+        )
+        .unwrap_or(Duration::from_secs(180))
     }
 
     /// Query this process' transport actor directly.
@@ -4634,6 +4898,179 @@ loglevel = 7
             timestamp
         );
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_to_builds_encrypted_packet_and_resolves_receipt() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(2);
+        let remote_identity = Identity::new();
+        let destination = Destination::new(
+            Some(&remote_identity),
+            Direction::Out,
+            DestType::Single,
+            "send.test",
+        )
+        .unwrap();
+        let destination_hash = destination.hash;
+        let public_key = remote_identity.get_public_key();
+        let decrypt_identity = remote_identity.clone();
+        let responder = tokio::spawn(async move {
+            let TransportMessage::Rpc { query, response_tx } =
+                transport_rx.recv().await.expect("recall query")
+            else {
+                panic!("expected recall query");
+            };
+            assert!(matches!(
+                query,
+                TransportQuery::RecallDestination { dest } if dest == destination_hash
+            ));
+            response_tx
+                .send(TransportQueryResponse::RecalledDestination(Some(
+                    RecalledDestinationRpcEntry {
+                        dest_hash: destination_hash,
+                        public_key,
+                        app_data: None,
+                        ratchet: None,
+                        hops: 1,
+                        timestamp: 1.0,
+                    },
+                )))
+                .unwrap();
+
+            let TransportMessage::SendPacket {
+                request,
+                attached_interface,
+                receipt: Some(receipt),
+                result_tx,
+            } = transport_rx.recv().await.expect("packet send")
+            else {
+                panic!("expected tracked packet send");
+            };
+            assert_eq!(attached_interface, None);
+            assert_eq!(request.destination_hash, destination_hash);
+            assert_eq!(receipt.timeout, Some(Duration::from_secs(9)));
+            let packet = rns_wire::packet::Packet::from_raw(&request.raw).unwrap();
+            assert_eq!(
+                packet.header.flags.destination_type,
+                rns_wire::flags::DestinationType::Single
+            );
+            let inbound = Destination::new(
+                Some(&decrypt_identity),
+                Direction::In,
+                DestType::Single,
+                "send.test",
+            )
+            .unwrap();
+            assert_eq!(
+                inbound.decrypt(packet.data(), &decrypt_identity).unwrap(),
+                b"hello"
+            );
+            result_tx.send(OutboundDispatchResult::Sent).unwrap();
+            receipt.status_tx.send_replace(ReceiptUpdate::Delivered {
+                rtt: Duration::from_millis(42),
+            });
+        });
+
+        let mut handle = dummy_handle();
+        handle.transport_tx = transport_tx;
+        let sent = handle
+            .send_to(
+                &destination,
+                b"hello",
+                SendOptions {
+                    timeout: Some(Duration::from_secs(9)),
+                    ..SendOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let receipt = sent.receipt.expect("receipt requested");
+        assert_eq!(receipt.packet_hash, sent.packet_hash);
+        assert_eq!(
+            receipt.delivered().await.unwrap(),
+            Duration::from_millis(42)
+        );
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_to_reports_no_interface_without_returning_a_receipt() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(2);
+        let remote_identity = Identity::new();
+        let destination = Destination::new(
+            Some(&remote_identity),
+            Direction::Out,
+            DestType::Single,
+            "send.none",
+        )
+        .unwrap();
+        let destination_hash = destination.hash;
+        let public_key = remote_identity.get_public_key();
+        let responder = tokio::spawn(async move {
+            let TransportMessage::Rpc { response_tx, .. } =
+                transport_rx.recv().await.expect("recall query")
+            else {
+                panic!("expected recall query");
+            };
+            response_tx
+                .send(TransportQueryResponse::RecalledDestination(Some(
+                    RecalledDestinationRpcEntry {
+                        dest_hash: destination_hash,
+                        public_key,
+                        app_data: None,
+                        ratchet: None,
+                        hops: 1,
+                        timestamp: 1.0,
+                    },
+                )))
+                .unwrap();
+            let TransportMessage::SendPacket { result_tx, .. } =
+                transport_rx.recv().await.expect("packet send")
+            else {
+                panic!("expected packet send");
+            };
+            result_tx.send(OutboundDispatchResult::NoInterface).unwrap();
+        });
+
+        let mut handle = dummy_handle();
+        handle.transport_tx = transport_tx;
+        assert!(matches!(
+            handle
+                .send_to(
+                    &destination,
+                    b"hello",
+                    SendOptions {
+                        timeout: Some(Duration::from_secs(1)),
+                        ..SendOptions::default()
+                    },
+                )
+                .await,
+            Err(SendError::NoInterface)
+        ));
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_to_rejects_oversized_single_payload_before_transport_work() {
+        let destination_identity = Identity::new();
+        let destination = Destination::new(
+            Some(&destination_identity),
+            Direction::Out,
+            DestType::Single,
+            "send.large",
+        )
+        .unwrap();
+        let handle = dummy_handle();
+        let payload = vec![0u8; rns_wire::constants::SINGLE_PACKET_ENCRYPTED_MDU + 1];
+
+        assert!(matches!(
+            handle
+                .send_to(&destination, &payload, SendOptions::default())
+                .await,
+            Err(SendError::PayloadTooLarge { actual, max })
+                if actual == payload.len()
+                    && max == rns_wire::constants::SINGLE_PACKET_ENCRYPTED_MDU
+        ));
     }
 
     #[tokio::test]

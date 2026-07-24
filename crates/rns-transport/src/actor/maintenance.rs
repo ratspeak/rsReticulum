@@ -133,18 +133,38 @@ impl TransportActor {
         if now - self.last_receipts_check >= RECEIPTS_CHECK_INTERVAL {
             let mut concluded = Vec::new();
             for (key, receipt) in &mut self.receipt_table {
-                if receipt.status == ReceiptStatus::Sent && receipt.is_timed_out() {
+                let timed_out = receipt.status == ReceiptStatus::Sent && receipt.is_timed_out();
+                if timed_out {
                     receipt.fail();
                 }
                 if receipt.status != ReceiptStatus::Sent {
-                    concluded.push(*key);
+                    let update = if timed_out {
+                        crate::messages::ReceiptUpdate::TimedOut
+                    } else {
+                        match receipt.status {
+                            ReceiptStatus::Delivered => receipt
+                                .get_rtt()
+                                .map_or(crate::messages::ReceiptUpdate::Failed, |rtt| {
+                                    crate::messages::ReceiptUpdate::Delivered { rtt }
+                                }),
+                            ReceiptStatus::Culled => crate::messages::ReceiptUpdate::Culled,
+                            ReceiptStatus::Failed | ReceiptStatus::Receiving => {
+                                crate::messages::ReceiptUpdate::Failed
+                            }
+                            ReceiptStatus::Sent => continue,
+                        }
+                    };
+                    concluded.push((*key, update));
                 }
             }
             // Only in-flight (Sent) receipts are worth keeping; concluded
             // ones (Delivered/Failed/Culled) were already signalled out.
-            for key in concluded {
+            for (key, update) in concluded {
                 self.receipt_table.remove(&key);
                 self.receipt_msg_ids.remove(&key);
+                if let Some(status_tx) = self.receipt_updates.remove(&key) {
+                    status_tx.send_replace(update);
+                }
             }
             let excess = self.receipt_table.len().saturating_sub(MAX_RECEIPTS);
             if excess > 0 {
@@ -161,6 +181,9 @@ impl TransportActor {
                         receipt.cull();
                     }
                     self.receipt_msg_ids.remove(&key);
+                    if let Some(status_tx) = self.receipt_updates.remove(&key) {
+                        status_tx.send_replace(crate::messages::ReceiptUpdate::Culled);
+                    }
                 }
             }
             self.last_receipts_check = now;
