@@ -554,7 +554,7 @@ impl TransportActor {
                     if let Some(ref target) = aspect_filter {
                         registration.aspect_filter.as_ref() != Some(target)
                     } else {
-                        true
+                        false
                     }
                 });
             }
@@ -1863,6 +1863,29 @@ mod tests {
         actor.local_destinations.insert(hash);
         actor.handle_message(TransportMessage::DeregisterDestination { hash });
         assert!(!actor.local_destinations.contains(&hash));
+    }
+
+    #[test]
+    fn deregister_announce_handler_without_filter_removes_all() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        actor.handle_message(TransportMessage::RegisterAnnounceHandler {
+            aspect_filter: Some("first.aspect".into()),
+            receive_path_responses: false,
+            callback_tx: first_tx,
+        });
+        actor.handle_message(TransportMessage::RegisterAnnounceHandler {
+            aspect_filter: None,
+            receive_path_responses: true,
+            callback_tx: second_tx,
+        });
+        assert_eq!(actor.announce_handlers.len(), 2);
+
+        actor.handle_message(TransportMessage::DeregisterAnnounceHandler {
+            aspect_filter: None,
+        });
+        assert!(actor.announce_handlers.is_empty());
     }
 
     #[tokio::test]
