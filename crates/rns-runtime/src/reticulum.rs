@@ -108,6 +108,7 @@ pub struct ReticulumHandle {
     /// still install a stamper and start publishing.
     pub discovery: Arc<DiscoveryRuntime>,
     transport_completion: Arc<TransportCompletion>,
+    started_at: std::time::Instant,
 }
 
 /// Identity and announce metadata recalled from the live transport cache.
@@ -119,6 +120,21 @@ pub struct RecalledDestination {
     pub ratchet: Option<[u8; 32]>,
     pub hops: u8,
     pub last_heard: std::time::SystemTime,
+}
+
+/// Typed snapshot of Reticulum interface and aggregate traffic state.
+#[derive(Debug, Clone)]
+pub struct InterfaceStats {
+    pub interfaces: Vec<rns_transport::messages::InterfaceStatRpcEntry>,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_rate: u64,
+    pub tx_rate: u64,
+    pub transport_id: Option<[u8; 16]>,
+    pub network_id: Option<[u8; 16]>,
+    pub transport_uptime: Option<Duration>,
+    pub probe_responder: Option<[u8; 16]>,
+    pub rss_bytes: Option<u64>,
 }
 
 impl std::fmt::Debug for RecalledDestination {
@@ -346,6 +362,50 @@ impl ReticulumHandle {
                 operation: "path table query",
             }),
         }
+    }
+
+    /// Return a normalized interface-stat snapshot.
+    ///
+    /// Aggregate counters are calculated with saturating sums. Metadata that
+    /// the current runtime or a shared-instance RPC cannot supply remains
+    /// `None` rather than being replaced with sentinel values.
+    pub async fn interface_stats(&self) -> Result<InterfaceStats, ControlError> {
+        let interfaces = match self
+            .query_control_result(TransportQuery::GetInterfaceStats)
+            .await?
+        {
+            TransportQueryResponse::InterfaceStats(entries) => entries,
+            _ => {
+                return Err(ControlError::UnexpectedResponse {
+                    operation: "interface stats query",
+                });
+            }
+        };
+        let sum = |select: fn(&rns_transport::messages::InterfaceStatRpcEntry) -> u64| {
+            interfaces
+                .iter()
+                .map(select)
+                .fold(0_u64, u64::saturating_add)
+        };
+        let local_transport =
+            self.instance_mode != InstanceMode::Client && self.config.enable_transport;
+        Ok(InterfaceStats {
+            rx_bytes: sum(|entry| entry.rx_bytes),
+            tx_bytes: sum(|entry| entry.tx_bytes),
+            rx_rate: sum(|entry| entry.rx_rate),
+            tx_rate: sum(|entry| entry.tx_rate),
+            transport_id: local_transport.then_some(self.transport_identity.hash),
+            network_id: local_transport
+                .then(|| self.network_identity.as_ref().map(|identity| identity.hash))
+                .flatten(),
+            transport_uptime: local_transport.then(|| self.started_at.elapsed()),
+            // The responder uses a separate persisted identity that is not
+            // currently retained by ReticulumHandle.
+            probe_responder: None,
+            // std does not expose portable resident-set accounting.
+            rss_bytes: None,
+            interfaces,
+        })
     }
 
     /// Result-returning control-plane query used by the typed facade.
@@ -1241,6 +1301,7 @@ pub async fn init(
     shutdown: ShutdownSignal,
     is_foreground: Arc<AtomicBool>,
 ) -> Result<ReticulumHandle, ReticulumError> {
+    let started_at = std::time::Instant::now();
     let config_dir = resolve_config_dir(configdir);
     let paths = StoragePaths::from_config_dir(&config_dir);
     paths.ensure_dirs().map_err(ReticulumError::Io)?;
@@ -1679,6 +1740,7 @@ pub async fn init(
         network_identity: network_identity.clone(),
         discovery: discovery_runtime,
         transport_completion,
+        started_at,
     };
 
     if instance_mode != InstanceMode::Client && rc.publish_blackhole {
@@ -4513,6 +4575,7 @@ loglevel = 7
                 stopped: AtomicBool::new(true),
                 notify: Notify::new(),
             }),
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -4622,6 +4685,79 @@ loglevel = 7
         let paths = handle.path_table(Some(4)).await.unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].hash, [0x61; 16]);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_interface_stats_normalize_totals_and_optional_metadata() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let first = rns_transport::messages::InterfaceStatRpcEntry {
+            id: 1,
+            name: "one".to_string(),
+            rx_bytes: 10,
+            tx_bytes: 20,
+            rx_rate: 2,
+            tx_rate: 3,
+            online: true,
+            bitrate: 115_200,
+            mtu: 500,
+            mode: "Full".to_string(),
+            role: "normal".to_string(),
+            announce_queue: Some(0),
+            held_announces: 0,
+            incoming_announce_frequency: 0.0,
+            outgoing_announce_frequency: 0.0,
+            incoming_pr_frequency: 0.0,
+            outgoing_pr_frequency: 0.0,
+            burst_active: false,
+            burst_activated: 0.0,
+            pr_burst_active: false,
+            pr_burst_activated: 0.0,
+            clients: None,
+            announce_rate_target: None,
+            announce_rate_grace: None,
+            announce_rate_penalty: None,
+            announce_cap: 0.02,
+            ifac_size: 0,
+            tx_drops: 0,
+        };
+        let mut second = first.clone();
+        second.id = 2;
+        second.name = "two".to_string();
+        second.rx_bytes = 30;
+        second.tx_bytes = 40;
+        second.rx_rate = 4;
+        second.tx_rate = 5;
+        let responder = tokio::spawn(async move {
+            let TransportMessage::Rpc { response_tx, .. } =
+                transport_rx.recv().await.expect("interface stats query")
+            else {
+                panic!("expected transport RPC");
+            };
+            response_tx
+                .send(TransportQueryResponse::InterfaceStats(vec![first, second]))
+                .expect("interface stats receiver");
+        });
+
+        let mut handle = dummy_handle();
+        handle.transport_tx = transport_tx;
+        handle.config.enable_transport = true;
+        handle.network_identity = Some(Arc::new(Identity::new()));
+        handle.started_at = std::time::Instant::now() - Duration::from_secs(2);
+        let expected_transport_id = handle.transport_identity.hash;
+        let expected_network_id = handle.network_identity.as_ref().unwrap().hash;
+
+        let stats = handle.interface_stats().await.unwrap();
+        assert_eq!(stats.interfaces.len(), 2);
+        assert_eq!(stats.rx_bytes, 40);
+        assert_eq!(stats.tx_bytes, 60);
+        assert_eq!(stats.rx_rate, 6);
+        assert_eq!(stats.tx_rate, 8);
+        assert_eq!(stats.transport_id, Some(expected_transport_id));
+        assert_eq!(stats.network_id, Some(expected_network_id));
+        assert!(stats.transport_uptime.unwrap() >= Duration::from_secs(2));
+        assert_eq!(stats.probe_responder, None);
+        assert_eq!(stats.rss_bytes, None);
         responder.await.unwrap();
     }
 
