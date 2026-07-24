@@ -112,6 +112,11 @@ impl Default for Identity {
 }
 
 impl Identity {
+    pub const CURVE: &'static str = CURVE;
+    pub const KEY_SIZE_BITS: usize = KEY_SIZE_BITS;
+    pub const RATCHET_SIZE_BITS: usize = RATCHET_SIZE_BITS;
+    pub const HASH_LENGTH_BITS: usize = HASH_LENGTH_BITS;
+
     pub fn new() -> Self {
         let prv = X25519PrivateKey::generate();
         let sig_prv = Ed25519PrivateKey::generate();

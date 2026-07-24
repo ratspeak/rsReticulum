@@ -2,9 +2,11 @@ use std::collections::HashMap;
 
 use rns_crypto::sha::truncated_hash;
 use rns_crypto::token;
+use std::fmt;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
-use crate::identity::Identity;
+use crate::identity::{DecryptionResult, Identity};
 use crate::name_hash::name_hash;
 
 /// Callback invoked on incoming data packets: `fn(plaintext, raw_packet)`.
@@ -35,7 +37,10 @@ struct PathResponseCache {
 }
 
 // Path-response dedup window (seconds). Matches upstream default.
-const PR_TAG_WINDOW: f64 = 30.0;
+/// Path-response tag deduplication window, in seconds.
+pub const PR_TAG_WINDOW: f64 = 30.0;
+/// Default GROUP destination key size, in bytes.
+pub const GROUP_KEY_LENGTH: usize = token::KEY_LENGTH;
 
 /// Separate clocks used while constructing an announce: a persisted 40-bit
 /// ordering value for the wire and a local elapsed-time value for cache expiry.
@@ -108,6 +113,18 @@ pub enum DestinationError {
     Identity(#[from] crate::identity::IdentityError),
     #[error("invalid announce clock value: {0}")]
     InvalidAnnounceTime(f64),
+    #[error("name component contains a dot: {0}")]
+    InvalidNameComponent(String),
+    #[error("operation requires a GROUP destination")]
+    NotGroup,
+    #[error("invalid GROUP key length: expected 32 or 64, got {0}")]
+    InvalidGroupKeyLength(usize),
+    #[error("operation requires a SINGLE destination")]
+    NotSingle,
+    #[error("identity does not address this destination")]
+    IdentityMismatch,
+    #[error("identity cannot sign")]
+    SigningUnavailable,
 }
 
 pub struct Destination {
@@ -116,10 +133,14 @@ pub struct Destination {
     pub hash: [u8; 16],
     pub name_hash: [u8; 10],
     pub app_name: String,
+    /// Human-readable full destination name, including the identity hash.
+    pub name: String,
+    /// Identity hash bound into this destination address, when applicable.
+    pub identity_hash: Option<[u8; 16]>,
     pub proof_strategy: ProofStrategy,
     /// If set, incoming data is signature-checked but not decrypted.
     pub only_validate_signature: bool,
-    group_key: Option<Vec<u8>>,
+    group_key: Option<Zeroizing<Vec<u8>>>,
 
     // Identity auto-generated for an IN destination when none was supplied;
     // callers retrieve it via [`auto_identity`] or [`take_auto_identity`].
@@ -151,6 +172,57 @@ pub struct Destination {
 }
 
 impl Destination {
+    pub const PR_TAG_WINDOW: f64 = PR_TAG_WINDOW;
+    pub const RATCHET_COUNT: usize = rns_wire::constants::RATCHET_COUNT;
+    pub const RATCHET_INTERVAL: u64 = rns_wire::constants::RATCHET_INTERVAL;
+
+    /// Build a full dotted destination name from an app name and aspects.
+    ///
+    /// App and aspect arguments are individual components and therefore must
+    /// not contain dots. An identity hash is appended when supplied.
+    pub fn expand_name(
+        identity: Option<&Identity>,
+        app_name: &str,
+        aspects: &[&str],
+    ) -> Result<String, DestinationError> {
+        if app_name.contains('.') {
+            return Err(DestinationError::InvalidNameComponent(app_name.to_string()));
+        }
+        if let Some(aspect) = aspects.iter().find(|aspect| aspect.contains('.')) {
+            return Err(DestinationError::InvalidNameComponent(
+                (*aspect).to_string(),
+            ));
+        }
+
+        let identity_component = usize::from(identity.is_some());
+        let mut components = Vec::with_capacity(1 + aspects.len() + identity_component);
+        components.push(app_name.to_string());
+        components.extend(aspects.iter().map(|aspect| (*aspect).to_string()));
+        if let Some(identity) = identity {
+            components.push(identity.hexhash());
+        }
+        Ok(components.join("."))
+    }
+
+    /// Split a full dotted name into its app name and remaining aspects.
+    pub fn app_and_aspects_from_name(full_name: &str) -> (&str, Vec<&str>) {
+        let mut components = full_name.split('.');
+        let app_name = components.next().unwrap_or_default();
+        (app_name, components.collect())
+    }
+
+    /// Create a destination from separate app and aspect components.
+    pub fn new_with_aspects(
+        identity: Option<&Identity>,
+        direction: Direction,
+        dest_type: DestType,
+        app_name: &str,
+        aspects: &[&str],
+    ) -> Result<Self, DestinationError> {
+        let full_name = Self::expand_name(None, app_name, aspects)?;
+        Self::new(identity, direction, dest_type, &full_name)
+    }
+
     /// Create a new destination.
     ///
     /// For SINGLE/GROUP inbound destinations, a new identity is generated
@@ -182,6 +254,7 @@ impl Destination {
 
                 let nh = name_hash(&hash_name);
                 let hash = Self::compute_hash(&nh, Some(&id_ref));
+                let name = format!("{hash_name}.{}", hex::encode(id_ref));
 
                 Ok(Self {
                     dest_type,
@@ -189,6 +262,8 @@ impl Destination {
                     hash,
                     name_hash: nh,
                     app_name: app_name.to_string(),
+                    name,
+                    identity_hash: Some(id_ref),
                     proof_strategy: ProofStrategy::ProveNone,
                     only_validate_signature: false,
                     group_key: None,
@@ -220,6 +295,8 @@ impl Destination {
                     hash,
                     name_hash: nh,
                     app_name: app_name.to_string(),
+                    name: app_name.to_string(),
+                    identity_hash: None,
                     proof_strategy: ProofStrategy::ProveNone,
                     only_validate_signature: false,
                     group_key: None,
@@ -249,6 +326,10 @@ impl Destination {
                     hash,
                     name_hash: nh,
                     app_name: app_name.to_string(),
+                    name: identity
+                        .map(|identity| format!("{app_name}.{}", identity.hexhash()))
+                        .unwrap_or_else(|| app_name.to_string()),
+                    identity_hash: identity.map(|identity| identity.hash),
                     proof_strategy: ProofStrategy::ProveNone,
                     only_validate_signature: false,
                     group_key: None,
@@ -300,7 +381,42 @@ impl Destination {
 
     /// Set the pre-shared key used for GROUP encryption.
     pub fn set_group_key(&mut self, key: Vec<u8>) {
-        self.group_key = Some(key);
+        self.group_key = Some(Zeroizing::new(key));
+    }
+
+    /// Generate and install a fresh AES-256 GROUP destination key.
+    pub fn generate_group_key(&mut self) -> Result<(), DestinationError> {
+        if self.dest_type != DestType::Group {
+            return Err(DestinationError::NotGroup);
+        }
+        self.group_key = Some(token::generate_key());
+        Ok(())
+    }
+
+    /// Validate and install a GROUP destination key.
+    ///
+    /// The 64-byte AES-256 form is generated by default; the 32-byte legacy
+    /// AES-128 form remains accepted for wire compatibility.
+    pub fn load_group_key(&mut self, key: &[u8]) -> Result<(), DestinationError> {
+        if self.dest_type != DestType::Group {
+            return Err(DestinationError::NotGroup);
+        }
+        if key.len() != token::LEGACY_KEY_LENGTH && key.len() != GROUP_KEY_LENGTH {
+            return Err(DestinationError::InvalidGroupKeyLength(key.len()));
+        }
+        self.group_key = Some(Zeroizing::new(key.to_vec()));
+        Ok(())
+    }
+
+    /// Borrow the installed GROUP key.
+    pub fn group_key(&self) -> Result<&[u8], DestinationError> {
+        if self.dest_type != DestType::Group {
+            return Err(DestinationError::NotGroup);
+        }
+        self.group_key
+            .as_ref()
+            .map(|key| key.as_slice())
+            .ok_or(DestinationError::EncryptionUnavailable)
     }
 
     /// Identity auto-generated at construction (IN + SINGLE/GROUP without a caller-provided identity).
@@ -329,9 +445,21 @@ impl Destination {
         if self.dest_type != DestType::Single {
             return Err(DestinationError::ProveNotSingle);
         }
+        self.ensure_identity(identity)?;
         identity
             .prove(packet_hash, implicit_proof)
             .map_err(DestinationError::Identity)
+    }
+
+    /// Sign a message with the identity bound to this SINGLE destination.
+    pub fn sign(&self, message: &[u8], identity: &Identity) -> Result<[u8; 64], DestinationError> {
+        if self.dest_type != DestType::Single {
+            return Err(DestinationError::NotSingle);
+        }
+        self.ensure_identity(identity)?;
+        identity
+            .sign(message)
+            .ok_or(DestinationError::SigningUnavailable)
     }
 
     /// Encrypt data for this destination.
@@ -346,9 +474,12 @@ impl Destination {
     ) -> Result<Vec<u8>, DestinationError> {
         match self.dest_type {
             DestType::Plain => Ok(plaintext.to_vec()),
-            DestType::Single => identity
-                .encrypt(plaintext, remote_ratchet_pub)
-                .map_err(DestinationError::Identity),
+            DestType::Single => {
+                self.ensure_identity(identity)?;
+                identity
+                    .encrypt(plaintext, remote_ratchet_pub)
+                    .map_err(DestinationError::Identity)
+            }
             DestType::Group => {
                 let key = self
                     .group_key
@@ -375,9 +506,24 @@ impl Destination {
         identity: &Identity,
         ratchet_keys: Option<&[[u8; 32]]>,
     ) -> Result<Vec<u8>, DestinationError> {
+        self.decrypt_with_ratchet_id(ciphertext, identity, ratchet_keys)
+            .map(|result| result.plaintext)
+    }
+
+    /// Decrypt data and report which retained ratchet authenticated it.
+    pub fn decrypt_with_ratchet_id(
+        &self,
+        ciphertext: &[u8],
+        identity: &Identity,
+        ratchet_keys: Option<&[[u8; 32]]>,
+    ) -> Result<DecryptionResult, DestinationError> {
         match self.dest_type {
-            DestType::Plain => Ok(ciphertext.to_vec()),
+            DestType::Plain => Ok(DecryptionResult {
+                plaintext: ciphertext.to_vec(),
+                ratchet_id: None,
+            }),
             DestType::Single => {
+                self.ensure_identity(identity)?;
                 let ratchet_refs: Option<Vec<&[u8; 32]>> = if self.ratchets_enabled {
                     ratchet_keys.map(|keys| keys.iter().collect())
                 } else {
@@ -385,7 +531,7 @@ impl Destination {
                 };
                 let enforce = self.ratchets_enforced;
                 identity
-                    .decrypt(ciphertext, ratchet_refs.as_deref(), enforce)
+                    .decrypt_with_ratchet_id(ciphertext, ratchet_refs.as_deref(), enforce)
                     .map_err(DestinationError::Identity)
             }
             DestType::Group => {
@@ -393,7 +539,12 @@ impl Destination {
                     .group_key
                     .as_ref()
                     .ok_or(DestinationError::EncryptionUnavailable)?;
-                token::decrypt(ciphertext, key).map_err(|_| DestinationError::DecryptionFailed)
+                token::decrypt(ciphertext, key)
+                    .map(|plaintext| DecryptionResult {
+                        plaintext,
+                        ratchet_id: None,
+                    })
+                    .map_err(|_| DestinationError::DecryptionFailed)
             }
             DestType::Link => Err(DestinationError::EncryptionUnavailable),
         }
@@ -559,6 +710,10 @@ impl Destination {
 
     pub fn set_accepts_links(&mut self, accept: bool) {
         self.accept_link_requests = accept;
+    }
+
+    pub fn accepts_links(&self) -> bool {
+        self.accept_link_requests
     }
 
     /// Enable ratchet forward secrecy. If `enforce`, non-ratchet inbound ciphertext is rejected.
@@ -804,6 +959,26 @@ impl Destination {
     pub fn hex_hash(&self) -> String {
         hex::encode(self.hash)
     }
+
+    /// Python-compatible spelling for the destination's hexadecimal hash.
+    pub fn hexhash(&self) -> String {
+        self.hex_hash()
+    }
+
+    fn ensure_identity(&self, identity: &Identity) -> Result<(), DestinationError> {
+        if self.identity_hash != Some(identity.hash)
+            || Self::compute_hash(&self.name_hash, Some(&identity.hash)) != self.hash
+        {
+            return Err(DestinationError::IdentityMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Destination {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "<{}:{}>", self.name, self.hex_hash())
+    }
 }
 
 #[cfg(test)]
@@ -817,6 +992,12 @@ mod tests {
             Destination::new(Some(&id), Direction::In, DestType::Single, "test.app").unwrap();
         assert_eq!(dest.dest_type, DestType::Single);
         assert_ne!(dest.hash, [0u8; 16]);
+        assert_eq!(dest.identity_hash, Some(id.hash));
+        assert_eq!(dest.name, format!("test.app.{}", id.hexhash()));
+        assert_eq!(
+            dest.to_string(),
+            format!("<test.app.{}:{}>", id.hexhash(), dest.hexhash())
+        );
     }
 
     #[test]
@@ -901,6 +1082,107 @@ mod tests {
             Destination::new(Some(&id), Direction::In, DestType::Single, "test.app").unwrap();
         let computed = Destination::hash_from_name_and_identity("test.app", Some(&id.hash));
         assert_eq!(dest.hash, computed);
+    }
+
+    #[test]
+    fn name_helpers_match_component_constructor() {
+        let id = Identity::new();
+        let expanded = Destination::expand_name(Some(&id), "test", &["service", "chat"]).unwrap();
+        assert_eq!(expanded, format!("test.service.chat.{}", id.hexhash()));
+        assert!(Destination::expand_name(None, "test.app", &[]).is_err());
+        assert!(Destination::expand_name(None, "test", &["bad.aspect"]).is_err());
+
+        let (app_name, aspects) = Destination::app_and_aspects_from_name("test.service.chat");
+        assert_eq!(app_name, "test");
+        assert_eq!(aspects, vec!["service", "chat"]);
+
+        let from_parts = Destination::new_with_aspects(
+            Some(&id),
+            Direction::Out,
+            DestType::Single,
+            "test",
+            &["service", "chat"],
+        )
+        .unwrap();
+        let from_full = Destination::new(
+            Some(&id),
+            Direction::Out,
+            DestType::Single,
+            "test.service.chat",
+        )
+        .unwrap();
+        assert_eq!(from_parts.hash, from_full.hash);
+        assert_eq!(from_parts.name, expanded);
+    }
+
+    #[test]
+    fn group_key_api_generates_valid_keys() {
+        let identity = Identity::new();
+        let mut group = Destination::new(
+            Some(&identity),
+            Direction::In,
+            DestType::Group,
+            "test.group",
+        )
+        .unwrap();
+        group.generate_group_key().unwrap();
+        assert_eq!(group.group_key().unwrap().len(), GROUP_KEY_LENGTH);
+
+        let ciphertext = group.encrypt(b"group plaintext", &identity, None).unwrap();
+        assert_eq!(
+            group.decrypt(&ciphertext, &identity).unwrap(),
+            b"group plaintext"
+        );
+
+        let legacy = [0xA5; 32];
+        group.load_group_key(&legacy).unwrap();
+        assert_eq!(group.group_key().unwrap(), legacy);
+        assert!(matches!(
+            group.load_group_key(&[0u8; 31]),
+            Err(DestinationError::InvalidGroupKeyLength(31))
+        ));
+
+        let mut plain =
+            Destination::new(None, Direction::In, DestType::Plain, "test.plain").unwrap();
+        assert!(matches!(
+            plain.generate_group_key(),
+            Err(DestinationError::NotGroup)
+        ));
+    }
+
+    #[test]
+    fn destination_sign_rejects_unbound_identity() {
+        let identity = Identity::new();
+        let other = Identity::new();
+        let destination = Destination::new(
+            Some(&identity),
+            Direction::In,
+            DestType::Single,
+            "test.sign",
+        )
+        .unwrap();
+
+        let signature = destination.sign(b"signed", &identity).unwrap();
+        assert!(identity.verify(b"signed", &signature));
+        assert!(matches!(
+            destination.sign(b"signed", &other),
+            Err(DestinationError::IdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn accepts_links_can_be_queried_and_changed() {
+        let identity = Identity::new();
+        let mut destination = Destination::new(
+            Some(&identity),
+            Direction::In,
+            DestType::Single,
+            "test.links",
+        )
+        .unwrap();
+        assert!(destination.accepts_links());
+        destination.set_accepts_links(false);
+        assert!(!destination.accepts_links());
     }
 
     #[test]
@@ -1014,6 +1296,18 @@ mod tests {
         let ratchets: Vec<&[u8; 32]> = vec![&ratchet_prv_bytes];
         let pt = id.decrypt(&ct, Some(&ratchets), false).unwrap();
         assert_eq!(&pt[..], plaintext);
+
+        let mut inbound =
+            Destination::new(Some(&id), Direction::In, DestType::Single, "test.app").unwrap();
+        inbound.enable_ratchets(false);
+        let decrypted = inbound
+            .decrypt_with_ratchet_id(&ct, &id, Some(&[ratchet_prv_bytes]))
+            .unwrap();
+        assert_eq!(decrypted.plaintext, plaintext);
+        assert_eq!(
+            decrypted.ratchet_id,
+            Some(Identity::ratchet_id(&ratchet_pub))
+        );
     }
 
     #[test]
