@@ -13,6 +13,7 @@ pub mod platform;
 pub mod probe;
 pub mod remote_management;
 pub mod remote_management_schema;
+pub mod resource_source;
 pub mod reticulum;
 pub mod rncp;
 pub mod rnsh;

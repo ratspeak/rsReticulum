@@ -807,6 +807,17 @@ pub struct MultiSegmentOutbound {
     pub data_size: usize,
 }
 
+fn required_segment_count(data_size: usize, metadata_wire_size: usize) -> usize {
+    if data_size == 0 {
+        return 1;
+    }
+    let first_payload_size = MAX_EFFICIENT_SIZE.saturating_sub(metadata_wire_size);
+    let first_len = data_size.min(first_payload_size);
+    1 + data_size
+        .saturating_sub(first_len)
+        .div_ceil(MAX_EFFICIENT_SIZE)
+}
+
 impl MultiSegmentOutbound {
     /// Split `data` into `MAX_EFFICIENT_SIZE`-sized chunks, each wrapped in
     /// its own `OutboundResource` with `flags.split = true` and the correct
@@ -854,9 +865,13 @@ impl MultiSegmentOutbound {
         if metadata_wire_size > MAX_EFFICIENT_SIZE {
             return Err(ResourceError::MetadataTooLarge);
         }
+        let planned_segments = required_segment_count(data.len(), metadata_wire_size);
+        if planned_segments > MAX_SEGMENTS {
+            return Err(ResourceError::TooLarge);
+        }
 
         let first_payload_max = MAX_EFFICIENT_SIZE - metadata_wire_size;
-        let mut chunk_specs: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        let mut chunk_specs: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(planned_segments);
 
         if data.is_empty() {
             chunk_specs.push((Vec::new(), metadata.clone()));
@@ -873,6 +888,7 @@ impl MultiSegmentOutbound {
         }
 
         let total_segments = chunk_specs.len();
+        debug_assert_eq!(total_segments, planned_segments);
         let mut segments = Vec::with_capacity(total_segments);
 
         for (i, (chunk, segment_metadata)) in chunk_specs.into_iter().enumerate() {
@@ -3352,6 +3368,17 @@ mod tests {
     fn test_multi_segment_outbound_too_large() {
         let data = vec![0; MAX_RESOURCE_SIZE + 1];
         assert!(MultiSegmentOutbound::new(data, false).is_err());
+    }
+
+    #[test]
+    fn test_multi_segment_plan_caps_metadata_induced_extra_segment() {
+        let bounded_payload = MAX_EFFICIENT_SIZE * MAX_SEGMENTS;
+        assert_eq!(required_segment_count(bounded_payload, 0), MAX_SEGMENTS);
+        assert_eq!(required_segment_count(bounded_payload, 4), MAX_SEGMENTS + 1);
+        assert_eq!(
+            required_segment_count(MAX_RESOURCE_SIZE, 0),
+            MAX_SEGMENTS + 1
+        );
     }
 
     #[test]
