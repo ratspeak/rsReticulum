@@ -873,34 +873,33 @@ impl LinkManager {
             "link proof packet built"
         );
 
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::Outbound(OutboundRequest {
-                raw: Bytes::from(proof_raw),
-                destination_hash: link_id,
-            }));
-
-        // Required: transport drops link-addressed packets (LRRTT, Resource,
-        // Keepalive...) as unroutable without this registration.
-        let _ = self.transport_tx.try_send(TransportMessage::RegisterLink {
-            link_id,
-            destination_hash: self.destination_hash,
-            interface_id,
-            next_hop: None,
-            remaining_hops: 0,
-            initiator: false,
-        });
-
-        tracing::info!(
-            link_id = hex::encode(link_id),
-            dest = hex::encode(self.destination_hash),
-            request_hops = hops,
-            "link request handled — ECDH handshake complete, proof sent, link registered"
-        );
-
-        if let Some(ref mut dest) = self.destination {
-            dest.incoming_link_request(link_id);
-        }
+        // Reserve both transport slots before publishing either half of the
+        // handshake. Registering the Link before its proof is observable is
+        // essential: a fast initiator may answer the proof immediately, and
+        // transport must already know where to dispatch that first Link packet.
+        let transport_tx = self.transport_tx.clone();
+        let register_permit = match transport_tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(error) => {
+                tracing::warn!(
+                    link_id = hex::encode(link_id),
+                    error = %error,
+                    "link request rejected — transport queue cannot register Link"
+                );
+                return;
+            }
+        };
+        let proof_permit = match transport_tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(error) => {
+                tracing::warn!(
+                    link_id = hex::encode(link_id),
+                    error = %error,
+                    "link request rejected — transport queue cannot send proof"
+                );
+                return;
+            }
+        };
 
         // LXMF DIRECT uses resource transfer past `LINK_PACKET_MAX_CONTENT`;
         // the manager default remains AcceptAll for backwards compatibility,
@@ -920,6 +919,36 @@ impl LinkManager {
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
             },
+        );
+
+        if let Some(ref mut dest) = self.destination {
+            dest.incoming_link_request(link_id);
+        }
+
+        // Required: transport drops link-addressed packets (LRRTT, Resource,
+        // Keepalive...) as unroutable without this registration. The proof is
+        // pinned to the ingress interface, matching Python responder Links.
+        register_permit.send(TransportMessage::RegisterLink {
+            link_id,
+            destination_hash: self.destination_hash,
+            interface_id,
+            next_hop: None,
+            remaining_hops: 0,
+            initiator: false,
+        });
+        proof_permit.send(TransportMessage::OutboundAttached {
+            request: OutboundRequest {
+                raw: Bytes::from(proof_raw),
+                destination_hash: link_id,
+            },
+            interface_id,
+        });
+
+        tracing::info!(
+            link_id = hex::encode(link_id),
+            dest = hex::encode(self.destination_hash),
+            request_hops = hops,
+            "link request handled — ECDH handshake complete, link registered, proof sent"
         );
     }
 
@@ -2864,15 +2893,15 @@ impl LinkManager {
         requested_at: f64,
         data: Vec<u8>,
     ) {
-        if !self
-            .active_links
-            .get(&link_id)
-            .is_some_and(|active| active.link.state == LinkState::Active)
-        {
+        let request_ready = self.active_links.get(&link_id).is_some_and(|active| {
+            active.link.state == LinkState::Active
+                || (!active.link.is_initiator && active.link.state == LinkState::Handshake)
+        });
+        if !request_ready {
             tracing::debug!(
                 link_id = hex::encode(link_id),
                 request_id = hex::encode(request_id),
-                "link request ignored before Link activation"
+                "link request ignored outside an established responder session"
             );
             return;
         }
@@ -4128,10 +4157,25 @@ mod tests {
         lm.handle_link_request(&raw, 1);
 
         assert_eq!(lm.active_link_count(), 1);
+        let registration = rx.try_recv().expect("Link registration should be queued");
+        assert!(matches!(
+            registration,
+            TransportMessage::RegisterLink {
+                link_id,
+                interface_id: 1,
+                initiator: false,
+                ..
+            } if link_id == initiator.link_id
+        ));
         let outbound = rx.try_recv().expect("link proof should be queued");
-        let TransportMessage::Outbound(request) = outbound else {
-            panic!("expected outbound link proof");
+        let TransportMessage::OutboundAttached {
+            request,
+            interface_id,
+        } = outbound
+        else {
+            panic!("expected attached outbound link proof");
         };
+        assert_eq!(interface_id, 1);
         let (proof_header, proof_offset) =
             rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
         assert_eq!(
@@ -4622,6 +4666,105 @@ mod tests {
                 .outbound_resources
                 .contains_key(&resource_hash)
         );
+    }
+
+    #[test]
+    fn responder_accepts_packet_request_before_lrrtt_activation() {
+        let dest_hash = [0x37; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (responder, proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        let link_id = responder.link_id;
+
+        let _rtt_data = initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .expect("initiator accepts responder proof");
+        assert_eq!(initiator.state, LinkState::Active);
+        assert_eq!(responder.state, LinkState::Handshake);
+        assert!(!responder.is_initiator);
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+        manager.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        assert!(manager.register_request_handler(
+            "fetch",
+            AllowPolicy::AllowAll,
+            None,
+            false,
+            move |_| {
+                handler_calls.fetch_add(1, Ordering::SeqCst);
+                RequestOutcome::Reply(b"ready".to_vec())
+            },
+        ));
+
+        let (encrypted_request, _) = initiator
+            .request(
+                "fetch",
+                Some(b"file.bin"),
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+        let request_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Request,
+        };
+        let mut raw = request_header.pack();
+        raw.extend_from_slice(&encrypted_request);
+        let packet_request_id =
+            rns_wire::hash::truncated_packet_hash(&raw, request_header.flags.header_type);
+
+        manager.handle_inbound_packet(&raw, 1);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager.active_links.get(&link_id).unwrap().link.state,
+            LinkState::Handshake,
+            "request handling must not synthesize the missing LRRTT"
+        );
+
+        let TransportMessage::Outbound(response) =
+            transport_rx.try_recv().expect("early request response")
+        else {
+            panic!("expected inline response");
+        };
+        let (response_header, response_offset) =
+            rns_wire::header::PacketHeader::unpack(&response.raw).unwrap();
+        assert_eq!(
+            response_header.context,
+            rns_wire::context::PacketContext::Response
+        );
+        let (response_id, response_data) = initiator
+            .handle_response(&response.raw[response_offset..])
+            .unwrap();
+        assert_eq!(response_id, packet_request_id);
+        assert_eq!(response_data, b"ready");
     }
 
     #[test]
