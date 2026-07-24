@@ -43,14 +43,32 @@ pub(crate) struct PreparedResourceSegment {
     pub segment_data_size: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) enum ResourcePurpose {
+    #[default]
+    Ordinary,
+    Request([u8; 16]),
+}
+
+impl ResourcePurpose {
+    fn apply(self, resource: &mut OutboundResource) {
+        if let Self::Request(request_id) = self {
+            resource.flags.is_request = true;
+            resource.request_id = Some(request_id.to_vec());
+        }
+    }
+}
+
 pub(crate) enum PreparedResourceSource {
     Single {
         data: Option<Vec<u8>>,
         options: ResourceOptions,
+        purpose: ResourcePurpose,
     },
     Split {
         source: Box<dyn ResourceSource>,
         options: ResourceOptions,
+        purpose: ResourcePurpose,
         data_size: usize,
         metadata_wire_size: usize,
         original_hash: [u8; 32],
@@ -61,8 +79,33 @@ pub(crate) enum PreparedResourceSource {
 
 impl PreparedResourceSource {
     pub(crate) fn prepare<S>(
+        source: S,
+        options: ResourceOptions,
+    ) -> Result<Self, ResourceSourceError>
+    where
+        S: ResourceSource + 'static,
+    {
+        Self::prepare_with_purpose(source, options, ResourcePurpose::Ordinary)
+    }
+
+    pub(crate) fn prepare_request<S>(
+        source: S,
+        request_id: [u8; 16],
+    ) -> Result<Self, ResourceSourceError>
+    where
+        S: ResourceSource + 'static,
+    {
+        Self::prepare_with_purpose(
+            source,
+            ResourceOptions::default(),
+            ResourcePurpose::Request(request_id),
+        )
+    }
+
+    fn prepare_with_purpose<S>(
         mut source: S,
         options: ResourceOptions,
+        purpose: ResourcePurpose,
     ) -> Result<Self, ResourceSourceError>
     where
         S: ResourceSource + 'static,
@@ -85,6 +128,7 @@ impl PreparedResourceSource {
             return Ok(Self::Single {
                 data: Some(data),
                 options,
+                purpose,
             });
         }
 
@@ -120,6 +164,7 @@ impl PreparedResourceSource {
         Ok(Self::Split {
             source: Box::new(source),
             options,
+            purpose,
             data_size,
             metadata_wire_size,
             original_hash,
@@ -139,7 +184,11 @@ impl PreparedResourceSource {
         };
 
         match self {
-            Self::Single { data, options } => {
+            Self::Single {
+                data,
+                options,
+                purpose,
+            } => {
                 let Some(data) = data.take() else {
                     return Ok(None);
                 };
@@ -151,6 +200,8 @@ impl PreparedResourceSource {
                     None,
                     Some(&encrypt),
                 )?;
+                let mut resource = resource;
+                purpose.apply(&mut resource);
                 let logical_hash = resource.resource_hash;
                 Ok(Some(PreparedResourceSegment {
                     transfer: OutboundTransfer::from_prebuilt(resource, rtt),
@@ -164,6 +215,7 @@ impl PreparedResourceSource {
             Self::Split {
                 source,
                 options,
+                purpose,
                 data_size,
                 metadata_wire_size,
                 original_hash,
@@ -206,6 +258,7 @@ impl PreparedResourceSource {
                     None,
                     Some(&encrypt),
                 )?;
+                purpose.apply(&mut resource);
                 resource.flags.split = true;
                 resource.segment_index = segment_index;
                 resource.total_segments = *total_segments;
@@ -298,5 +351,28 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn request_source_marks_every_segment_with_request_id() {
+        let request_id = [0x42; 16];
+        let data = vec![0xA5; MAX_EFFICIENT_SIZE + 17];
+        let mut prepared =
+            PreparedResourceSource::prepare_request(Cursor::new(data), request_id).unwrap();
+        let keys = test_keys();
+
+        for expected_segment in 1..=2 {
+            let segment = prepared
+                .next_segment(&keys, Duration::from_millis(100))
+                .unwrap()
+                .unwrap();
+            assert_eq!(segment.segment_index, expected_segment);
+            assert!(segment.transfer.resource.flags.is_request);
+            assert!(!segment.transfer.resource.flags.is_response);
+            assert_eq!(
+                segment.transfer.resource.request_id.as_deref(),
+                Some(request_id.as_slice())
+            );
+        }
     }
 }

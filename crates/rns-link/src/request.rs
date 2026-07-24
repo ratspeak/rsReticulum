@@ -4,6 +4,11 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestState {
     Sent,
+    /// The request body itself is still being delivered as a Resource.
+    ///
+    /// Resource transfer watchdogs own the send timeout in this state. The
+    /// response timeout starts only after the Resource proof arrives.
+    SendingResource,
     /// Response is arriving as a resource transfer rather than a single packet.
     Receiving,
     Delivered,
@@ -59,7 +64,10 @@ impl RequestReceipt {
 
     /// Record a response payload, transition to `Delivered`, and fire the response callback.
     pub fn deliver(&mut self, response: Vec<u8>) {
-        if self.state == RequestState::Sent || self.state == RequestState::Receiving {
+        if matches!(
+            self.state,
+            RequestState::Sent | RequestState::SendingResource | RequestState::Receiving
+        ) {
             self.rtt = Some(self.sent_at.elapsed());
             self.response = Some(response);
             self.state = RequestState::Delivered;
@@ -72,7 +80,10 @@ impl RequestReceipt {
 
     /// Transition to `Failed` and fire the failure callback.
     pub fn fail(&mut self) {
-        if self.state == RequestState::Sent || self.state == RequestState::Receiving {
+        if matches!(
+            self.state,
+            RequestState::Sent | RequestState::SendingResource | RequestState::Receiving
+        ) {
             self.state = RequestState::Failed;
             if let Some(cb) = self.callbacks.failed.take() {
                 cb(self);
@@ -86,7 +97,10 @@ impl RequestReceipt {
     }
 
     pub fn is_pending(&self) -> bool {
-        matches!(self.state, RequestState::Sent | RequestState::Receiving)
+        matches!(
+            self.state,
+            RequestState::Sent | RequestState::SendingResource | RequestState::Receiving
+        )
     }
 
     /// Store the response payload and advance to `ResponseReceived`.
@@ -96,7 +110,10 @@ impl RequestReceipt {
     pub fn receive_response(&mut self, data: Vec<u8>) {
         if matches!(
             self.state,
-            RequestState::Sent | RequestState::Receiving | RequestState::Delivered
+            RequestState::Sent
+                | RequestState::SendingResource
+                | RequestState::Receiving
+                | RequestState::Delivered
         ) {
             self.rtt = Some(self.sent_at.elapsed());
             self.response = Some(data);
@@ -117,8 +134,27 @@ impl RequestReceipt {
 
     /// Transition to `Failed` without firing the failure callback.
     pub fn mark_failed(&mut self) {
-        if self.state == RequestState::Sent {
+        if matches!(
+            self.state,
+            RequestState::Sent | RequestState::SendingResource | RequestState::Receiving
+        ) {
             self.state = RequestState::Failed;
+        }
+    }
+
+    /// Suspend the response deadline while the request body is sent as a
+    /// Resource. The Resource transfer has its own watchdog.
+    pub fn mark_resource_sending(&mut self) {
+        if self.state == RequestState::Sent {
+            self.state = RequestState::SendingResource;
+        }
+    }
+
+    /// Start the response deadline after a request Resource is proved.
+    pub fn mark_resource_sent(&mut self) {
+        if self.state == RequestState::SendingResource {
+            self.state = RequestState::Sent;
+            self.sent_at = Instant::now();
         }
     }
 
@@ -239,6 +275,19 @@ mod tests {
         receipt.mark_failed();
         assert_eq!(receipt.state, RequestState::Failed);
         assert!(!receipt.is_pending());
+    }
+
+    #[test]
+    fn resource_send_suspends_and_restarts_response_timeout() {
+        let mut receipt = RequestReceipt::new([0x12; 32], [0x34; 16], Duration::ZERO);
+
+        receipt.mark_resource_sending();
+        assert_eq!(receipt.state, RequestState::SendingResource);
+        assert!(!receipt.is_timed_out());
+
+        receipt.mark_resource_sent();
+        assert_eq!(receipt.state, RequestState::Sent);
+        assert!(receipt.is_timed_out());
     }
 
     #[test]

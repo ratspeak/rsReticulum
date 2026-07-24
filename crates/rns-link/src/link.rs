@@ -12,7 +12,7 @@ use crate::handshake::{
 use crate::keepalive::KeepaliveState;
 use crate::key_derivation::LinkKeys;
 use crate::mtu_discovery::SignallingData;
-use crate::request::{RequestReceipt, RequestState};
+use crate::request::RequestReceipt;
 
 /// Link lifecycle states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -701,10 +701,30 @@ impl Link {
         data: Option<&[u8]>,
         timeout: Duration,
     ) -> Result<(Vec<u8>, [u8; 16]), LinkCryptoError> {
+        let (packed, request_id) = self.prepare_request(path, data, timeout)?;
+        match self.encrypt(&packed) {
+            Ok(encrypted) => Ok((encrypted, request_id)),
+            Err(error) => {
+                self.discard_pending_request(&request_id);
+                Err(error)
+            }
+        }
+    }
+
+    /// Build the plaintext MsgPack request body and register its receipt.
+    ///
+    /// Packet-sized callers encrypt the returned body directly. Bodies larger
+    /// than the Link MDU are passed to Resource with the returned request ID.
+    pub fn prepare_request(
+        &mut self,
+        path: &str,
+        data: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<(Vec<u8>, [u8; 16]), LinkCryptoError> {
         let data_value = data
             .map(msgpack_value_from_bytes_or_binary)
             .unwrap_or(rmpv::Value::Nil);
-        self.request_value(path, data_value, timeout)
+        self.prepare_request_value(path, data_value, timeout)
     }
 
     /// Build a REQUEST payload with a MsgPack string body.
@@ -717,10 +737,18 @@ impl Link {
         data: &str,
         timeout: Duration,
     ) -> Result<(Vec<u8>, [u8; 16]), LinkCryptoError> {
-        self.request_value(path, rmpv::Value::String(data.into()), timeout)
+        let (packed, request_id) =
+            self.prepare_request_value(path, rmpv::Value::String(data.into()), timeout)?;
+        match self.encrypt(&packed) {
+            Ok(encrypted) => Ok((encrypted, request_id)),
+            Err(error) => {
+                self.discard_pending_request(&request_id);
+                Err(error)
+            }
+        }
     }
 
-    fn request_value(
+    fn prepare_request_value(
         &mut self,
         path: &str,
         data_value: rmpv::Value,
@@ -745,8 +773,6 @@ impl Link {
         rmpv::encode::write_value(&mut packed, &array)
             .map_err(|_| LinkCryptoError::EncryptionFailed)?;
 
-        let encrypted = self.encrypt(&packed)?;
-
         // request_id is a truncated SHA-256 of the plaintext, so both sides derive
         // the same ID without exchanging it.
         let request_id = truncated_hash(&packed);
@@ -756,7 +782,53 @@ impl Link {
         let receipt = RequestReceipt::new(receipt_id, self.link_id, timeout);
         self.pending_requests.push(receipt);
 
-        Ok((encrypted, request_id))
+        Ok((packed, request_id))
+    }
+
+    /// Suspend a request's response timeout while its body is sent by Resource.
+    pub fn mark_request_resource_sending(&mut self, request_id: &[u8; 16]) -> bool {
+        let Some(receipt) = self
+            .pending_requests
+            .iter_mut()
+            .find(|receipt| receipt.request_id[..16] == request_id[..])
+        else {
+            return false;
+        };
+        receipt.mark_resource_sending();
+        true
+    }
+
+    /// Start a Resource-backed request's response timeout after send proof.
+    pub fn mark_request_resource_sent(&mut self, request_id: &[u8; 16]) -> bool {
+        let Some(receipt) = self
+            .pending_requests
+            .iter_mut()
+            .find(|receipt| receipt.request_id[..16] == request_id[..])
+        else {
+            return false;
+        };
+        receipt.mark_resource_sent();
+        true
+    }
+
+    /// Fail and remove a pending request by its truncated request ID.
+    pub fn fail_pending_request(&mut self, request_id: &[u8; 16]) -> bool {
+        let Some(receipt) = self
+            .pending_requests
+            .iter_mut()
+            .find(|receipt| receipt.request_id[..16] == request_id[..])
+        else {
+            return false;
+        };
+        receipt.fail();
+        self.pending_requests
+            .retain(|receipt| receipt.request_id[..16] != request_id[..]);
+        true
+    }
+
+    fn discard_pending_request(&mut self, request_id: &[u8; 16]) {
+        self.pending_requests
+            .retain(|receipt| receipt.request_id[..16] != request_id[..]);
     }
 
     /// Replace the initial request id with the packet-hash id used by
@@ -870,6 +942,16 @@ impl Link {
         &mut self,
         plaintext: &[u8],
     ) -> Result<([u8; 16], Vec<u8>), LinkCryptoError> {
+        let (request_id, response_data) = Self::parse_response_plaintext(plaintext)?;
+        self.deliver_response_data(&request_id, response_data.clone());
+        Ok((request_id, response_data))
+    }
+
+    /// Parse plaintext MsgPack `[request_id, response_data]` without mutating
+    /// pending request state.
+    pub fn parse_response_plaintext(
+        plaintext: &[u8],
+    ) -> Result<([u8; 16], Vec<u8>), LinkCryptoError> {
         let value = rmpv::decode::read_value(&mut &plaintext[..])
             .map_err(|_| LinkCryptoError::DecryptionFailed)?;
 
@@ -889,18 +971,23 @@ impl Link {
 
         let response_data = msgpack_value_to_bytes(&array[1])?;
 
-        if let Some(receipt) = self
+        Ok((request_id, response_data))
+    }
+
+    /// Deliver already-decoded response bytes to a pending request.
+    pub fn deliver_response_data(&mut self, request_id: &[u8; 16], response_data: Vec<u8>) -> bool {
+        let Some(receipt) = self
             .pending_requests
             .iter_mut()
             .find(|r| r.request_id[..16] == request_id[..])
-        {
-            receipt.receive_response(response_data.clone());
-        }
+        else {
+            return false;
+        };
+        receipt.receive_response(response_data);
 
         self.pending_requests
-            .retain(|r| r.state == RequestState::Sent);
-
-        Ok((request_id, response_data))
+            .retain(|receipt| receipt.request_id[..16] != request_id[..]);
+        true
     }
 
     /// Update RTT from an LRRTT packet (context 0xFE) received after handshake.

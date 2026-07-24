@@ -124,6 +124,8 @@ pub struct LinkSessionPacketReceipt {
 pub struct LinkSessionResponse {
     pub request_id: [u8; 16],
     pub data: Vec<u8>,
+    /// Metadata attached to a file-style Resource response.
+    pub metadata: Option<Vec<u8>>,
     pub response_time: Duration,
 }
 
@@ -434,6 +436,8 @@ pub enum LinkSessionError {
     PayloadTooLarge { actual: usize, max: usize },
     #[error("request is {actual} bytes; requests above Link MDU {max} require Resource transfer")]
     RequestRequiresResource { actual: usize, max: usize },
+    #[error("request Resource transfer failed: {0}")]
+    RequestResourceFailed(String),
     #[error("too many Link requests are already pending")]
     TooManyPendingRequests,
     #[error("Link session task is no longer running")]
@@ -450,6 +454,14 @@ enum LinkSessionCommand {
         data: Vec<u8>,
         timeout: Option<Duration>,
         result_tx: oneshot::Sender<Result<LinkSessionResponse, LinkSessionError>>,
+    },
+    RequestResourceConcluded {
+        request_id: [u8; 16],
+        result: Result<LinkSessionResourceReceipt, LinkSessionResourceError>,
+    },
+    RequestResourceReceived {
+        request_id: [u8; 16],
+        result: Result<LinkSessionReceivedResource, LinkSessionResourceError>,
     },
     Channel(LinkSessionChannelCommand),
     Resource(LinkSessionResourceCommand),
@@ -596,6 +608,15 @@ struct DestinationEventContext<'a> {
     attached_interface: InterfaceId,
     identity: &'a Identity,
     sinks: InboundResourceSinks<'a>,
+}
+
+struct SessionRequestContext<'a> {
+    transport_tx: &'a mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &'a mut Link,
+    resources: &'a mut SessionResources,
+    event_tx: &'a mpsc::Sender<LinkSessionEvent>,
+    command_tx: &'a mpsc::Sender<LinkSessionCommand>,
 }
 
 #[derive(Default)]
@@ -805,12 +826,10 @@ impl LinkSessionHandle {
             .map_err(|_| LinkSessionError::SessionClosed)?
     }
 
-    /// Send a packet-sized request and wait for its response.
+    /// Send a request and wait for its response.
     ///
-    /// Requests whose encrypted representation exceeds the current Link MDU
-    /// return [`LinkSessionError::RequestRequiresResource`]; Resource-backed
-    /// requests are handled by the Resource API rather than silently changing
-    /// transport semantics.
+    /// Requests and responses larger than the current Link MDU transparently
+    /// use Reticulum Resource transfer, matching Python RNS.
     pub async fn request(
         &self,
         path: &str,
@@ -1148,9 +1167,14 @@ async fn run_session_actor(
                             continue;
                         }
                         match send_link_request(
-                            &transport_tx,
-                            attached_interface,
-                            &mut link,
+                            SessionRequestContext {
+                                transport_tx: &transport_tx,
+                                attached_interface,
+                                link: &mut link,
+                                resources: &mut state.resources,
+                                event_tx: &event_tx,
+                                command_tx: &command_tx,
+                            },
                             &path,
                             &data,
                             timeout,
@@ -1173,6 +1197,34 @@ async fn run_session_actor(
                                 }
                             }
                         }
+                    }
+                    Some(LinkSessionCommand::RequestResourceConcluded {
+                        request_id,
+                        result,
+                    }) => {
+                        if let Err(error) = result {
+                            fail_session_request(
+                                &mut link,
+                                &mut state.requests,
+                                &event_tx,
+                                request_id,
+                                LinkSessionError::RequestResourceFailed(error.to_string()),
+                            );
+                        } else {
+                            let _ = link.mark_request_resource_sent(&request_id);
+                        }
+                    }
+                    Some(LinkSessionCommand::RequestResourceReceived {
+                        request_id,
+                        result,
+                    }) => {
+                        conclude_request_resource_response(
+                            &mut link,
+                            &mut state.requests,
+                            &event_tx,
+                            request_id,
+                            result,
+                        );
                     }
                     Some(LinkSessionCommand::Channel(command)) => {
                         let transport_failed = handle_channel_command(
@@ -2393,6 +2445,7 @@ async fn process_inbound_resource_advertisement(
     attached_interface: InterfaceId,
     link: &mut Link,
     resources: &mut SessionResources,
+    pending_requests: &HashMap<[u8; 16], PendingSessionRequest>,
     sinks: InboundResourceSinks<'_>,
     encrypted_advertisement: &[u8],
 ) -> bool {
@@ -2491,6 +2544,59 @@ async fn process_inbound_resource_advertisement(
         .pending_inbound
         .values()
         .any(|pending| resource_logical_id(&pending.advertisement) == resource_id);
+
+    // Response Resources are protocol-internal request continuations, not
+    // application Resource offers. Match the authenticated advertisement to a
+    // live request and accept it automatically, as Python RNS does.
+    if advertisement.flags.is_response {
+        let Some(request_id_bytes) = advertisement.request_id.as_deref() else {
+            return false;
+        };
+        let Ok(request_id) = <[u8; 16]>::try_from(request_id_bytes) else {
+            return false;
+        };
+        if advertisement.flags.is_request
+            || advertisement.segment_index != 1
+            || has_pending_logical
+            || !pending_requests.contains_key(&request_id)
+        {
+            return false;
+        }
+
+        resources.pending_inbound.insert(
+            segment_hash,
+            PendingInboundResourceOffer {
+                advertisement,
+                offered_at: Instant::now(),
+            },
+        );
+        let (progress_tx, _progress_rx) = watch::channel(0.0);
+        let (conclusion_tx, conclusion_rx) = oneshot::channel();
+        let result = accept_inbound_offer(
+            transport_tx,
+            attached_interface,
+            link,
+            resources,
+            sinks.event_tx,
+            segment_hash,
+            InboundResourceLifecycle {
+                progress_tx,
+                conclusion_tx,
+            },
+        )
+        .await;
+        let completion_tx = sinks.command_tx.clone();
+        tokio::spawn(async move {
+            let result = conclusion_rx
+                .await
+                .unwrap_or(Err(LinkSessionResourceError::SessionClosed));
+            let _ = completion_tx
+                .send(LinkSessionCommand::RequestResourceReceived { request_id, result })
+                .await;
+        });
+        return matches!(result, Err(LinkSessionResourceError::TransportUnavailable));
+    }
+
     if advertisement.segment_index != 1
         || has_pending_logical
         || resources.pending_inbound.len() >= MAX_PENDING_RESOURCE_OFFERS
@@ -3083,29 +3189,105 @@ async fn resend_timed_out_channel_messages(
 }
 
 async fn send_link_request(
-    transport_tx: &mpsc::Sender<TransportMessage>,
-    attached_interface: InterfaceId,
-    link: &mut Link,
+    context: SessionRequestContext<'_>,
     path: &str,
     data: &[u8],
     timeout: Option<Duration>,
 ) -> Result<[u8; 16], LinkSessionError> {
+    let SessionRequestContext {
+        transport_tx,
+        attached_interface,
+        link,
+        resources,
+        event_tx,
+        command_tx,
+    } = context;
     if link.state != LinkState::Active {
         return Err(LinkSessionError::LinkNotActive);
     }
     let timeout = timeout.unwrap_or_else(|| link.default_request_timeout());
-    let (encrypted, initial_request_id) = link
-        .request(path, Some(data), timeout)
+    let (packed, initial_request_id) = link
+        .prepare_request(path, Some(data), timeout)
         .map_err(|_| LinkSessionError::LinkCrypto)?;
-    if encrypted.len() > link.mdu {
-        link.pending_requests
-            .retain(|receipt| receipt.request_id[..16] != initial_request_id);
-        return Err(LinkSessionError::RequestRequiresResource {
-            actual: encrypted.len(),
-            max: link.mdu,
+
+    if packed.len() > link.mdu {
+        if resources.outbound.is_some() && resources.queued.len() >= MAX_QUEUED_RESOURCES {
+            link.fail_pending_request(&initial_request_id);
+            return Err(LinkSessionError::RequestResourceFailed(
+                LinkSessionResourceError::QueueFull.to_string(),
+            ));
+        }
+        let mut source =
+            PreparedResourceSource::prepare_request(Cursor::new(packed), initial_request_id)
+                .map_err(|error| {
+                    link.fail_pending_request(&initial_request_id);
+                    LinkSessionError::RequestResourceFailed(error.to_string())
+                })?;
+        let Some(keys) = link.session_keys() else {
+            link.fail_pending_request(&initial_request_id);
+            return Err(LinkSessionError::LinkCrypto);
+        };
+        let rtt = Duration::from_secs_f64(link.rtt_secs().max(0.001));
+        let segment = source
+            .next_segment(&keys, rtt)
+            .map_err(|error| {
+                link.fail_pending_request(&initial_request_id);
+                LinkSessionError::RequestResourceFailed(error.to_string())
+            })?
+            .ok_or_else(|| {
+                link.fail_pending_request(&initial_request_id);
+                LinkSessionError::RequestResourceFailed(
+                    "request Resource source produced no segment".into(),
+                )
+            })?;
+        let (progress_tx, _progress_rx) = watch::channel(0.0);
+        let (conclusion_tx, conclusion_rx) = oneshot::channel();
+        let mut outbound =
+            SessionOutboundResource::new(source, segment, progress_tx, conclusion_tx);
+
+        if resources.outbound.is_some() {
+            resources.queued.push_back(outbound);
+        } else if let Err(error) = begin_outbound_resource(
+            transport_tx,
+            attached_interface,
+            link,
+            &mut outbound,
+            event_tx,
+        )
+        .await
+        {
+            link.fail_pending_request(&initial_request_id);
+            return Err(LinkSessionError::RequestResourceFailed(error.to_string()));
+        } else {
+            resources.outbound = Some(outbound);
+        }
+
+        if !link.mark_request_resource_sending(&initial_request_id) {
+            link.fail_pending_request(&initial_request_id);
+            return Err(LinkSessionError::LinkCrypto);
+        }
+        let completion_tx = command_tx.clone();
+        tokio::spawn(async move {
+            let result = conclusion_rx
+                .await
+                .unwrap_or(Err(LinkSessionResourceError::SessionClosed));
+            let _ = completion_tx
+                .send(LinkSessionCommand::RequestResourceConcluded {
+                    request_id: initial_request_id,
+                    result,
+                })
+                .await;
         });
+        return Ok(initial_request_id);
     }
 
+    let encrypted = match link.encrypt(&packed) {
+        Ok(encrypted) => encrypted,
+        Err(_) => {
+            link.fail_pending_request(&initial_request_id);
+            return Err(LinkSessionError::LinkCrypto);
+        }
+    };
     let raw = build_data_packet(
         link.link_id,
         rns_wire::context::PacketContext::Request,
@@ -3114,11 +3296,11 @@ async fn send_link_request(
     let request_id =
         rns_wire::hash::truncated_packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
     if !link.update_pending_request_id(&initial_request_id, request_id) {
+        link.fail_pending_request(&initial_request_id);
         return Err(LinkSessionError::LinkCrypto);
     }
     if let Err(error) = send_raw(transport_tx, attached_interface, link.link_id, raw).await {
-        link.pending_requests
-            .retain(|receipt| receipt.request_id[..16] != request_id);
+        link.fail_pending_request(&request_id);
         return Err(error);
     }
     link.record_tx(encrypted.len());
@@ -3155,6 +3337,123 @@ fn reap_concluded_requests(
             });
         }
     }
+}
+
+fn conclude_request_resource_response(
+    link: &mut Link,
+    pending_requests: &mut HashMap<[u8; 16], PendingSessionRequest>,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+    request_id: [u8; 16],
+    result: Result<LinkSessionReceivedResource, LinkSessionResourceError>,
+) {
+    if !pending_requests.contains_key(&request_id) {
+        return;
+    }
+    let received = match result {
+        Ok(received)
+            if received.is_response
+                && !received.is_request
+                && received.request_id.as_deref() == Some(request_id.as_slice()) =>
+        {
+            received
+        }
+        Ok(_) => {
+            fail_session_request(
+                link,
+                pending_requests,
+                event_tx,
+                request_id,
+                LinkSessionError::RequestResourceFailed(
+                    "response Resource metadata did not match the pending request".into(),
+                ),
+            );
+            return;
+        }
+        Err(error) => {
+            fail_session_request(
+                link,
+                pending_requests,
+                event_tx,
+                request_id,
+                LinkSessionError::RequestResourceFailed(error.to_string()),
+            );
+            return;
+        }
+    };
+
+    let (response_data, metadata) = if received.metadata.is_some() {
+        (received.data, received.metadata)
+    } else {
+        let Ok((packed_request_id, response_data)) = Link::parse_response_plaintext(&received.data)
+        else {
+            fail_session_request(
+                link,
+                pending_requests,
+                event_tx,
+                request_id,
+                LinkSessionError::RequestResourceFailed(
+                    "response Resource contained invalid response data".into(),
+                ),
+            );
+            return;
+        };
+        if packed_request_id != request_id {
+            fail_session_request(
+                link,
+                pending_requests,
+                event_tx,
+                request_id,
+                LinkSessionError::RequestResourceFailed(
+                    "response Resource named a different request".into(),
+                ),
+            );
+            return;
+        }
+        (response_data, None)
+    };
+
+    if !link.deliver_response_data(&request_id, response_data.clone()) {
+        fail_session_request(
+            link,
+            pending_requests,
+            event_tx,
+            request_id,
+            LinkSessionError::Timeout("Link request"),
+        );
+        return;
+    }
+    let Some(pending) = pending_requests.remove(&request_id) else {
+        return;
+    };
+    let response = LinkSessionResponse {
+        request_id,
+        data: response_data,
+        metadata,
+        response_time: pending.sent_at.elapsed(),
+    };
+    let _ = pending.result_tx.send(Ok(response));
+    let _ = event_tx.try_send(LinkSessionEvent::RequestConcluded {
+        request_id,
+        succeeded: true,
+    });
+}
+
+fn fail_session_request(
+    link: &mut Link,
+    pending_requests: &mut HashMap<[u8; 16], PendingSessionRequest>,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+    request_id: [u8; 16],
+    error: LinkSessionError,
+) {
+    link.fail_pending_request(&request_id);
+    let Some(pending) = pending_requests.remove(&request_id) else {
+        return;
+    };
+    let _ = pending.result_tx.send(Err(error));
+    let _ = event_tx.try_send(LinkSessionEvent::RequestConcluded {
+        request_id,
+        succeeded: false,
+    });
 }
 
 fn fail_pending_requests(
@@ -3330,6 +3629,7 @@ async fn process_destination_event(
                         let response = LinkSessionResponse {
                             request_id,
                             data,
+                            metadata: None,
                             response_time: request.sent_at.elapsed(),
                         };
                         let _ = request.result_tx.send(Ok(response));
@@ -3402,6 +3702,7 @@ async fn process_destination_event(
                         attached_interface,
                         link,
                         &mut state.resources,
+                        &state.requests,
                         InboundResourceSinks {
                             event_tx,
                             command_tx,
@@ -3823,7 +4124,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_request_requires_resource_without_leaking_a_receipt() {
+    async fn oversized_request_starts_a_request_resource() {
         let destination_hash = [0xBE; 16];
         let server_signing = Ed25519PrivateKey::generate();
         let server_public = server_signing.public_key();
@@ -3837,22 +4138,180 @@ mod tests {
         let mdu = initiator.mdu;
         let payload = vec![0u8; mdu];
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let (event_tx, _event_rx) = mpsc::channel::<LinkSessionEvent>(4);
+        let (command_tx, _command_rx) = mpsc::channel::<LinkSessionCommand>(4);
+        let mut resources = SessionResources::default();
 
-        assert!(matches!(
-            send_link_request(
+        let request_id = send_link_request(
+            SessionRequestContext {
+                transport_tx: &transport_tx,
+                attached_interface: 1,
+                link: &mut initiator,
+                resources: &mut resources,
+                event_tx: &event_tx,
+                command_tx: &command_tx,
+            },
+            "/large",
+            &payload,
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(initiator.pending_requests.len(), 1);
+        assert_eq!(
+            initiator.pending_requests[0].state,
+            rns_link::request::RequestState::SendingResource
+        );
+
+        let advertisement = match transport_rx.recv().await.unwrap() {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&advertisement.raw).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceAdv
+        );
+        let plaintext = responder.decrypt(&advertisement.raw[offset..]).unwrap();
+        let advertisement = ResourceAdvertisement::unpack(&plaintext).unwrap();
+        assert!(advertisement.flags.is_request);
+        assert!(!advertisement.flags.is_response);
+        assert_eq!(
+            advertisement.request_id.as_deref(),
+            Some(request_id.as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn response_resource_is_accepted_and_concludes_matching_request() {
+        let destination_hash = [0xBF; 16];
+        let server_signing = Ed25519PrivateKey::generate();
+        let server_public = server_signing.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &server_signing, destination_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &server_public, &server_public.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+
+        let (_packed_request, request_id) = initiator
+            .prepare_request("/large-response", Some(b""), Duration::from_secs(5))
+            .unwrap();
+        let (result_tx, result_rx) = oneshot::channel();
+        let mut pending_requests = HashMap::from([(
+            request_id,
+            PendingSessionRequest {
+                sent_at: Instant::now(),
+                result_tx,
+            },
+        )]);
+
+        let packed_response = Link::pack_response(&request_id, b"resource response").unwrap();
+        let mut response_sender = OutboundTransfer::new_encrypted(
+            packed_response,
+            false,
+            Duration::from_secs_f64(responder.rtt_secs().max(0.001)),
+            responder.session_keys().unwrap(),
+        )
+        .unwrap();
+        response_sender.resource.flags.is_response = true;
+        response_sender.resource.request_id = Some(request_id.to_vec());
+        let advertisement = match response_sender.tick() {
+            TransferAction::SendAdvertisement(advertisement) => advertisement,
+            other => panic!("unexpected responder Resource action: {other:?}"),
+        };
+
+        let mut resources = SessionResources::default();
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let (command_tx, mut command_rx) = mpsc::channel::<LinkSessionCommand>(8);
+        let (event_tx, _event_rx) = mpsc::channel::<LinkSessionEvent>(8);
+        let (offer_tx, mut offer_rx) = mpsc::channel::<LinkSessionResourceOffer>(1);
+        assert!(
+            !process_inbound_resource_advertisement(
                 &transport_tx,
                 1,
                 &mut initiator,
-                "/large",
-                &payload,
-                Some(Duration::from_secs(1)),
+                &mut resources,
+                &pending_requests,
+                InboundResourceSinks {
+                    event_tx: &event_tx,
+                    command_tx: &command_tx,
+                    offer_tx: &offer_tx,
+                },
+                &responder.encrypt(&advertisement).unwrap(),
             )
-            .await,
-            Err(LinkSessionError::RequestRequiresResource { actual, max })
-                if actual > max && max == mdu
-        ));
+            .await
+        );
+        assert!(
+            offer_rx.try_recv().is_err(),
+            "response Resources must not be surfaced as application offers"
+        );
+
+        let request = match transport_rx.recv().await.unwrap() {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (request_header, request_offset) =
+            rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(
+            request_header.context,
+            rns_wire::context::PacketContext::ResourceReq
+        );
+        let request_plaintext = responder.decrypt(&request.raw[request_offset..]).unwrap();
+        let request_hash =
+            rns_wire::hash::packet_hash(&request.raw, request_header.flags.header_type);
+        let actions = response_sender.handle_request_packet(request_hash, &request_plaintext);
+        assert!(!actions.is_empty());
+        for action in actions {
+            let TransferAction::SendPart(_, part) = action else {
+                continue;
+            };
+            assert!(
+                !handle_inbound_resource_part(
+                    &transport_tx,
+                    1,
+                    &mut initiator,
+                    &mut resources,
+                    &event_tx,
+                    &part,
+                )
+                .await
+            );
+        }
+
+        let command = tokio::time::timeout(Duration::from_secs(1), command_rx.recv())
+            .await
+            .expect("response Resource conclusion timeout")
+            .expect("response Resource command channel closed");
+        let LinkSessionCommand::RequestResourceReceived {
+            request_id: concluded_id,
+            result,
+        } = command
+        else {
+            panic!("unexpected Link session command");
+        };
+        assert_eq!(concluded_id, request_id);
+        conclude_request_resource_response(
+            &mut initiator,
+            &mut pending_requests,
+            &event_tx,
+            concluded_id,
+            result,
+        );
+
+        let response = result_rx.await.unwrap().unwrap();
+        assert_eq!(response.request_id, request_id);
+        assert_eq!(response.data, b"resource response");
+        assert_eq!(response.metadata, None);
+        assert!(pending_requests.is_empty());
         assert!(initiator.pending_requests.is_empty());
-        assert!(transport_rx.try_recv().is_err());
     }
 
     #[tokio::test]
