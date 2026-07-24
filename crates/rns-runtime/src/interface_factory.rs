@@ -729,21 +729,21 @@ fn parse_rnode_airtime(
         .get_float("airtime_limit_long")
         .or_else(|| section.get_float("lt_alock"))
         .map(|v| v as f32);
-    if let Some(v) = st_alock
-        && !(0.0..=100.0).contains(&v)
-    {
-        return Err(InterfaceFactoryError::InvalidValue {
-            field: format!("{name}.airtime_limit_short"),
-            message: format!("{v} is outside 0..=100 percent"),
-        });
+    if let Some(v) = st_alock {
+        if !(0.0..=100.0).contains(&v) {
+            return Err(InterfaceFactoryError::InvalidValue {
+                field: format!("{name}.airtime_limit_short"),
+                message: format!("{v} is outside 0..=100 percent"),
+            });
+        }
     }
-    if let Some(v) = lt_alock
-        && !(0.0..=100.0).contains(&v)
-    {
-        return Err(InterfaceFactoryError::InvalidValue {
-            field: format!("{name}.airtime_limit_long"),
-            message: format!("{v} is outside 0..=100 percent"),
-        });
+    if let Some(v) = lt_alock {
+        if !(0.0..=100.0).contains(&v) {
+            return Err(InterfaceFactoryError::InvalidValue {
+                field: format!("{name}.airtime_limit_long"),
+                message: format!("{v} is outside 0..=100 percent"),
+            });
+        }
     }
     Ok((flow_control, st_alock, lt_alock))
 }

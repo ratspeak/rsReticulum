@@ -168,10 +168,11 @@ impl TransportActor {
 
                     // Touch the path so an actively-used route isn't culled
                     // for staleness while traffic is still flowing on it.
-                    if sent
-                        && let Some(path) = self.path_table.get_live_mut(&request.destination_hash)
-                    {
-                        path.touch();
+                    if sent {
+                        if let Some(path) = self.path_table.get_live_mut(&request.destination_hash)
+                        {
+                            path.touch();
+                        }
                     }
                     sent
                 } else {

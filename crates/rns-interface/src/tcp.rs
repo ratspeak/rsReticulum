@@ -100,8 +100,10 @@ fn address_for_device(device: &str, prefer_ipv6: bool) -> Option<std::net::IpAdd
         .filter(|a| a.name == device)
         .map(|a| a.ip())
         .collect();
-    if prefer_ipv6 && let Some(v6) = on_dev.iter().find(|ip| ip.is_ipv6()) {
-        return Some(*v6);
+    if prefer_ipv6 {
+        if let Some(v6) = on_dev.iter().find(|ip| ip.is_ipv6()) {
+            return Some(*v6);
+        }
     }
     on_dev
         .iter()

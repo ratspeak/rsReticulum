@@ -3,6 +3,7 @@ name = "rns-tools"
 description = "Rust CLI utilities for Reticulum (rnsd-rs, rnstatus-rs, etc.)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 autobins = false
 

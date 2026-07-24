@@ -3,6 +3,7 @@ name = "rns-protocol"
 description = "Resource, Channel, and Buffer protocols for Reticulum"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

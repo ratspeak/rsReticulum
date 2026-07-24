@@ -581,22 +581,23 @@ impl TransportActor {
                         continue;
                     }
                 }
-                if let Err(error) =
-                    registration
-                        .tx
-                        .try_send(crate::messages::AnnounceHandlerEvent {
-                            destination_hash: header.destination_hash,
-                            identity_hash: announce_identity_hash,
-                            announce_packet_hash,
-                            is_path_response,
-                            hops: header.hops,
-                            app_data: handler_app_data.clone(),
-                            public_key: announce_public_key,
-                            ratchet: announce_ratchet,
-                            name_hash: announce_name_hash,
-                        })
-                    && matches!(error, tokio::sync::mpsc::error::TrySendError::Full(_))
-                {
+                let send_result = registration
+                    .tx
+                    .try_send(crate::messages::AnnounceHandlerEvent {
+                        destination_hash: header.destination_hash,
+                        identity_hash: announce_identity_hash,
+                        announce_packet_hash,
+                        is_path_response,
+                        hops: header.hops,
+                        app_data: handler_app_data.clone(),
+                        public_key: announce_public_key,
+                        ratchet: announce_ratchet,
+                        name_hash: announce_name_hash,
+                    });
+                if matches!(
+                    send_result,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+                ) {
                     registration
                         .dropped_events
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1034,10 +1035,10 @@ impl TransportActor {
                     .receipt_table
                     .get_mut(&header.destination_hash)
                     .expect("receipt existence checked above");
-                if receipt.destination_public_key.is_none()
-                    && let Some(destination_hash) = receipt.destination_hash
-                {
-                    receipt.set_destination_identity(destination_hash, recalled_public_key);
+                if receipt.destination_public_key.is_none() {
+                    if let Some(destination_hash) = receipt.destination_hash {
+                        receipt.set_destination_identity(destination_hash, recalled_public_key);
+                    }
                 }
                 let validated = receipt.validate_proof_from_destination(proof);
                 (validated, receipt.get_rtt())

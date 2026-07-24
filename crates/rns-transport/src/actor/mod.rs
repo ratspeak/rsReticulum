@@ -815,20 +815,22 @@ impl TransportActor {
         header: &rns_wire::header::PacketHeader,
         transport_insert: bool,
     ) -> Vec<u8> {
-        if transport_insert && let Some(transport_id) = self.transport_identity_hash {
-            let mut flags = header.flags;
-            flags.header_type = rns_wire::flags::HeaderType::Header2;
-            flags.transport_type = rns_wire::flags::TransportType::Transport;
-            let new_header = rns_wire::header::PacketHeader {
-                flags,
-                hops: self.local_hops_delta,
-                transport_id: Some(transport_id),
-                destination_hash: header.destination_hash,
-                context: header.context,
-            };
-            let mut out = new_header.pack();
-            out.extend_from_slice(&raw[header.size()..]);
-            return out;
+        if transport_insert {
+            if let Some(transport_id) = self.transport_identity_hash {
+                let mut flags = header.flags;
+                flags.header_type = rns_wire::flags::HeaderType::Header2;
+                flags.transport_type = rns_wire::flags::TransportType::Transport;
+                let new_header = rns_wire::header::PacketHeader {
+                    flags,
+                    hops: self.local_hops_delta,
+                    transport_id: Some(transport_id),
+                    destination_hash: header.destination_hash,
+                    context: header.context,
+                };
+                let mut out = new_header.pack();
+                out.extend_from_slice(&raw[header.size()..]);
+                return out;
+            }
         }
         let mut out = raw.to_vec();
         out[1] = self.local_hops_delta;
@@ -1414,8 +1416,10 @@ impl TransportActor {
                 }
                 _ => self.send_to_interface(id, raw),
             };
-            if sent && let Some(entry) = self.interfaces.get_mut(&id) {
-                entry.ingress.sent_announce();
+            if sent {
+                if let Some(entry) = self.interfaces.get_mut(&id) {
+                    entry.ingress.sent_announce();
+                }
             }
         }
     }

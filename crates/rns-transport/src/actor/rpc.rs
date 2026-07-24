@@ -581,11 +581,11 @@ impl TransportActor {
             }
             TransportQuery::ResolveIdentityHash { input } => {
                 // First treat input as a destination hash.
-                if let Some(entry) = self.recent_announces.get(&input)
-                    && let Some(public_key) = entry.public_key
-                {
-                    let id_hash = rns_crypto::sha::truncated_hash(&public_key);
-                    return TransportQueryResponse::HashResult(Some(id_hash));
+                if let Some(entry) = self.recent_announces.get(&input) {
+                    if let Some(public_key) = entry.public_key {
+                        let id_hash = rns_crypto::sha::truncated_hash(&public_key);
+                        return TransportQueryResponse::HashResult(Some(id_hash));
+                    }
                 }
                 // Fall back to treating input as an identity hash already.
                 for entry in self.recent_announces.values() {

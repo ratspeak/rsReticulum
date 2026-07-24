@@ -2846,11 +2846,13 @@ impl LinkManager {
                 );
             }
         }
-        if !matched_channel_sequence && let Some(ref tx) = self.link_packet_proof_tx {
-            let _ = tx.try_send(LinkPacketProof {
-                link_id,
-                packet_hash,
-            });
+        if !matched_channel_sequence {
+            if let Some(ref tx) = self.link_packet_proof_tx {
+                let _ = tx.try_send(LinkPacketProof {
+                    link_id,
+                    packet_hash,
+                });
+            }
         }
     }
 
@@ -2944,37 +2946,37 @@ impl LinkManager {
                         .map(|active| active.link.mdu)
                         .unwrap_or_default();
                     if packed_response.len() <= mdu {
-                        if let Some(active) = self.active_links.get_mut(&link_id)
-                            && let Ok(encrypted) = active.link.encrypt(&packed_response)
-                        {
-                            let response_header = rns_wire::header::PacketHeader {
-                                flags: rns_wire::flags::PacketFlags {
-                                    header_type: rns_wire::flags::HeaderType::Header1,
-                                    context_flag: false,
-                                    transport_type: rns_wire::flags::TransportType::Broadcast,
-                                    destination_type: rns_wire::flags::DestinationType::Link,
-                                    packet_type: rns_wire::flags::PacketType::Data,
-                                },
-                                hops: 0,
-                                transport_id: None,
-                                destination_hash: link_id,
-                                context: rns_wire::context::PacketContext::Response,
-                            };
-                            let mut raw = response_header.pack();
-                            raw.extend_from_slice(&encrypted);
-                            active.link.record_tx(encrypted.len());
-                            let _ = self.transport_tx.try_send(TransportMessage::Outbound(
-                                OutboundRequest {
-                                    raw: Bytes::from(raw),
+                        if let Some(active) = self.active_links.get_mut(&link_id) {
+                            if let Ok(encrypted) = active.link.encrypt(&packed_response) {
+                                let response_header = rns_wire::header::PacketHeader {
+                                    flags: rns_wire::flags::PacketFlags {
+                                        header_type: rns_wire::flags::HeaderType::Header1,
+                                        context_flag: false,
+                                        transport_type: rns_wire::flags::TransportType::Broadcast,
+                                        destination_type: rns_wire::flags::DestinationType::Link,
+                                        packet_type: rns_wire::flags::PacketType::Data,
+                                    },
+                                    hops: 0,
+                                    transport_id: None,
                                     destination_hash: link_id,
-                                },
-                            ));
-                            tracing::debug!(
-                                link_id = hex::encode(link_id),
-                                request_id = hex::encode(request_id),
-                                response_len = response.len(),
-                                "link request handled — response sent"
-                            );
+                                    context: rns_wire::context::PacketContext::Response,
+                                };
+                                let mut raw = response_header.pack();
+                                raw.extend_from_slice(&encrypted);
+                                active.link.record_tx(encrypted.len());
+                                let _ = self.transport_tx.try_send(TransportMessage::Outbound(
+                                    OutboundRequest {
+                                        raw: Bytes::from(raw),
+                                        destination_hash: link_id,
+                                    },
+                                ));
+                                tracing::debug!(
+                                    link_id = hex::encode(link_id),
+                                    request_id = hex::encode(request_id),
+                                    response_len = response.len(),
+                                    "link request handled — response sent"
+                                );
+                            }
                         }
                     } else if self
                         .start_response_resource(
@@ -3016,8 +3018,8 @@ impl LinkManager {
             );
         }
 
-        if let Some((data, metadata, auto_compress)) = fetch_spec
-            && self
+        if let Some((data, metadata, auto_compress)) = fetch_spec {
+            if self
                 .start_resource_transfer_inner(
                     &link_id,
                     ResourceTransferStart {
@@ -3030,11 +3032,12 @@ impl LinkManager {
                     },
                 )
                 .is_none()
-        {
-            tracing::warn!(
-                link_id = hex::encode(link_id),
-                "link request follow-up Resource could not be started"
-            );
+            {
+                tracing::warn!(
+                    link_id = hex::encode(link_id),
+                    "link request follow-up Resource could not be started"
+                );
+            }
         }
     }
 

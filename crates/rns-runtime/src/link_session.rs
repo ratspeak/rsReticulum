@@ -3036,15 +3036,17 @@ async fn poll_inbound_resources(
         resources
             .rejected_inbound
             .insert(resource_logical_id(&pending.advertisement), Instant::now());
-        if let Err(error) = send_resource_action(
+        let send_result = send_resource_action(
             transport_tx,
             attached_interface,
             link,
             TransferAction::SendCancel(CancelType::Rcl, segment_hash),
         )
-        .await
-            && matches!(error, LinkSessionResourceError::TransportUnavailable)
-        {
+        .await;
+        if matches!(
+            send_result,
+            Err(LinkSessionResourceError::TransportUnavailable)
+        ) {
             return true;
         }
     }
@@ -3623,20 +3625,20 @@ async fn process_destination_event(
                 rns_wire::context::PacketContext::Response => {
                     link.record_inbound();
                     link.record_rx(body.len());
-                    if let Ok((request_id, data)) = link.handle_response(body)
-                        && let Some(request) = state.requests.remove(&request_id)
-                    {
-                        let response = LinkSessionResponse {
-                            request_id,
-                            data,
-                            metadata: None,
-                            response_time: request.sent_at.elapsed(),
-                        };
-                        let _ = request.result_tx.send(Ok(response));
-                        let _ = event_tx.try_send(LinkSessionEvent::RequestConcluded {
-                            request_id,
-                            succeeded: true,
-                        });
+                    if let Ok((request_id, data)) = link.handle_response(body) {
+                        if let Some(request) = state.requests.remove(&request_id) {
+                            let response = LinkSessionResponse {
+                                request_id,
+                                data,
+                                metadata: None,
+                                response_time: request.sent_at.elapsed(),
+                            };
+                            let _ = request.result_tx.send(Ok(response));
+                            let _ = event_tx.try_send(LinkSessionEvent::RequestConcluded {
+                                request_id,
+                                succeeded: true,
+                            });
+                        }
                     }
                 }
                 rns_wire::context::PacketContext::None => {

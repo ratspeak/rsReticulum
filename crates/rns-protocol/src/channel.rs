@@ -357,13 +357,13 @@ impl Channel {
 
         let seq = self.next_tx_sequence;
         let mut envelope = Envelope::pack(msg, seq);
-        if let Some(max) = max_envelope_size
-            && envelope.raw.len() > max
-        {
-            return Err(ChannelError::MessageTooLarge {
-                actual: envelope.raw.len(),
-                max,
-            });
+        if let Some(max) = max_envelope_size {
+            if envelope.raw.len() > max {
+                return Err(ChannelError::MessageTooLarge {
+                    actual: envelope.raw.len(),
+                    max,
+                });
+            }
         }
         self.next_tx_sequence = ((self.next_tx_sequence as u32 + 1) % SEQ_MODULUS) as u16;
         envelope.state = MessageState::Sent;

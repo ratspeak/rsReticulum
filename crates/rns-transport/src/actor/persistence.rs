@@ -27,24 +27,26 @@ fn recent_announce_from_cached_packet(
         name_hash: [0u8; 10],
     };
 
-    if let Ok((header, offset)) = rns_wire::header::PacketHeader::unpack(&raw_packet)
-        && header.flags.packet_type == rns_wire::flags::PacketType::Announce
-        && header.destination_hash == dest_hash
-        && raw_packet.len() >= offset
-    {
-        recent.packet_hash = Some(rns_wire::hash::packet_hash(
-            &raw_packet,
-            header.flags.header_type,
-        ));
-        recent.is_path_response = header.context == rns_wire::context::PacketContext::PathResponse;
-        if let Ok(announce) = rns_identity::announce::AnnounceData::unpack(
-            &raw_packet[offset..],
-            header.flags.context_flag,
-        ) {
-            recent.app_data = announce.app_data;
-            recent.public_key = Some(announce.public_key);
-            recent.ratchet = announce.ratchet;
-            recent.name_hash = announce.name_hash;
+    if let Ok((header, offset)) = rns_wire::header::PacketHeader::unpack(&raw_packet) {
+        if header.flags.packet_type == rns_wire::flags::PacketType::Announce
+            && header.destination_hash == dest_hash
+            && raw_packet.len() >= offset
+        {
+            recent.packet_hash = Some(rns_wire::hash::packet_hash(
+                &raw_packet,
+                header.flags.header_type,
+            ));
+            recent.is_path_response =
+                header.context == rns_wire::context::PacketContext::PathResponse;
+            if let Ok(announce) = rns_identity::announce::AnnounceData::unpack(
+                &raw_packet[offset..],
+                header.flags.context_flag,
+            ) {
+                recent.app_data = announce.app_data;
+                recent.public_key = Some(announce.public_key);
+                recent.ratchet = announce.ratchet;
+                recent.name_hash = announce.name_hash;
+            }
         }
     }
 
@@ -58,11 +60,10 @@ fn python_announce_cache_index(
         Ok(entries) => {
             let mut names = std::collections::HashSet::new();
             for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str()
-                    && name.len() == 64
-                    && name.as_bytes().iter().all(u8::is_ascii_hexdigit)
-                {
-                    names.insert(name.to_ascii_lowercase());
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.len() == 64 && name.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+                        names.insert(name.to_ascii_lowercase());
+                    }
                 }
             }
             Some(names)

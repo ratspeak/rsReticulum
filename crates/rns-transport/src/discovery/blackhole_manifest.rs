@@ -92,10 +92,10 @@ pub fn build_local_manifest(
         if entry.source.is_some() {
             continue;
         }
-        if let Some(set) = verified_ids
-            && !set.contains(hash.as_bytes())
-        {
-            continue;
+        if let Some(set) = verified_ids {
+            if !set.contains(hash.as_bytes()) {
+                continue;
+            }
         }
         let until = entry.ttl.map(|ttl| entry.created + ttl);
         let wire_entry = encode_entry_map(until, entry.reason_str(), our_identity_hash);

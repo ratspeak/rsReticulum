@@ -1007,13 +1007,16 @@ impl ReticulumHandle {
     ) -> TransportQueryResponse {
         if self.instance_mode == InstanceMode::Client
             && matches!(query, TransportQuery::FirstHopTimeout { .. })
-            && let Some(bitrate) = self
+        {
+            if let Some(bitrate) = self
                 .config
                 .force_shared_instance_bitrate
                 .filter(|bitrate| *bitrate > 0)
-            && let TransportQueryResponse::FloatResult(Some(seconds)) = &mut response
-        {
-            *seconds += (rns_wire::constants::MTU as f64 * 8.0) / bitrate as f64;
+            {
+                if let TransportQueryResponse::FloatResult(Some(seconds)) = &mut response {
+                    *seconds += (rns_wire::constants::MTU as f64 * 8.0) / bitrate as f64;
+                }
+            }
         }
         response
     }
@@ -2937,10 +2940,10 @@ fn runtime_ifac_post_init(
         return Ok(None);
     };
 
-    if let Some(size) = ifac.ifac_size
-        && !(1..=64).contains(&size)
-    {
-        return Err(format!("Invalid IFAC size {size}; expected 1..=64 bytes"));
+    if let Some(size) = ifac.ifac_size {
+        if !(1..=64).contains(&size) {
+            return Err(format!("Invalid IFAC size {size}; expected 1..=64 bytes"));
+        }
     }
 
     let network_name = ifac.network_name.filter(|s| !s.is_empty());
