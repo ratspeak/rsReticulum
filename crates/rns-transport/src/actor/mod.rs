@@ -9705,6 +9705,53 @@ mod tests {
     }
 
     #[test]
+    fn recall_destination_is_keyed_and_does_not_touch_lifetime() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (entry, _rx) = make_test_interface("test_iface");
+        actor.interfaces.insert(1, entry);
+
+        let identity = rns_identity::identity::Identity::new();
+        let (raw, dest_hash) = make_announce_for(&identity, "lxmf.delivery", 3);
+        actor.on_inbound(crate::messages::InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        let cached = actor.recent_announces.get_mut(&dest_hash).unwrap();
+        cached.app_data = Some(b"display name".to_vec());
+        cached.ratchet = Some([0x5A; 32]);
+        let timestamp = cached.timestamp;
+        let hops = cached.hops;
+        assert_eq!(cached.last_used, None);
+        actor.state_dirty = false;
+
+        match actor
+            .handle_query(crate::messages::TransportQuery::RecallDestination { dest: dest_hash })
+        {
+            crate::messages::TransportQueryResponse::RecalledDestination(Some(entry)) => {
+                assert_eq!(entry.dest_hash, dest_hash);
+                assert_eq!(entry.public_key, identity.get_public_key());
+                assert_eq!(entry.app_data.as_deref(), Some(b"display name".as_slice()));
+                assert_eq!(entry.ratchet, Some([0x5A; 32]));
+                assert_eq!(entry.hops, hops);
+                assert_eq!(entry.timestamp, timestamp);
+            }
+            other => panic!("expected recalled destination, got {other:?}"),
+        }
+
+        assert_eq!(actor.recent_announces[&dest_hash].last_used, None);
+        assert!(!actor.state_dirty, "read-only recall must not dirty state");
+        assert!(matches!(
+            actor.handle_query(crate::messages::TransportQuery::RecallDestination {
+                dest: [0xFF; 16]
+            }),
+            crate::messages::TransportQueryResponse::RecalledDestination(None)
+        ));
+    }
+
+    #[test]
     fn drop_recent_announces_clears_cached_snapshots() {
         let (mut actor, _tx) = TransportActor::new();
         let (entry, _rx) = make_test_interface("test_iface");

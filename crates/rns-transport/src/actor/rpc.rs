@@ -155,6 +155,19 @@ impl TransportActor {
                 });
                 TransportQueryResponse::Announces(entries)
             }
+            TransportQuery::RecallDestination { dest } => {
+                let recalled = self.recent_announces.get(&dest).and_then(|entry| {
+                    Some(RecalledDestinationRpcEntry {
+                        dest_hash: entry.dest_hash,
+                        public_key: entry.public_key?,
+                        app_data: entry.app_data.clone(),
+                        ratchet: entry.ratchet,
+                        hops: entry.hops,
+                        timestamp: entry.timestamp,
+                    })
+                });
+                TransportQueryResponse::RecalledDestination(recalled)
+            }
             TransportQuery::GetNextHop { dest } => {
                 // Python 1.3.8 Transport.py:2685-2688: local destinations
                 // resolve to Transport.identity.hash.

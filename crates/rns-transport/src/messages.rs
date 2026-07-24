@@ -392,6 +392,11 @@ pub enum TransportQuery {
     GetRateTable,
     GetLinkCount,
     GetRecentAnnounces,
+    /// Recall one validated announce-cache entry without mutating its
+    /// `last_used` timestamp. Python: `Identity.recall(..., _no_use=True)`.
+    RecallDestination {
+        dest: [u8; 16],
+    },
     GetNextHop {
         dest: [u8; 16],
     },
@@ -550,6 +555,7 @@ pub enum TransportQueryResponse {
     InterfaceStats(Vec<InterfaceStatRpcEntry>),
     RateTable(Vec<RateTableRpcEntry>),
     Announces(Vec<AnnounceRpcEntry>),
+    RecalledDestination(Option<RecalledDestinationRpcEntry>),
     IntResult(i64),
     FloatResult(Option<f64>),
     StringResult(Option<String>),
@@ -637,6 +643,18 @@ pub struct AnnounceRpcEntry {
     /// Pinned via `RetainDestination`; the maintenance sweep skips the
     /// entry regardless of age while this is `true`.
     pub retained: bool,
+}
+
+/// The identity-bearing subset of a cached announce returned by
+/// [`TransportQuery::RecallDestination`].
+#[derive(Debug, Clone)]
+pub struct RecalledDestinationRpcEntry {
+    pub dest_hash: [u8; 16],
+    pub public_key: [u8; 64],
+    pub app_data: Option<Vec<u8>>,
+    pub ratchet: Option<[u8; 32]>,
+    pub hops: u8,
+    pub timestamp: f64,
 }
 
 #[derive(Debug, Clone)]

@@ -30,7 +30,8 @@ use rns_transport::discovery::{
     DiscoveryInterfaceConfig, DiscoveryStamper, DiscoveryStore, ReceiverConfig, discovery_hash,
 };
 use rns_transport::messages::{
-    OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
+    OutboundRequest, RecalledDestinationRpcEntry, TransportMessage, TransportQuery,
+    TransportQueryResponse,
 };
 
 static INSTANCE: OnceLock<ReticulumHandle> = OnceLock::new();
@@ -109,6 +110,42 @@ pub struct ReticulumHandle {
     transport_completion: Arc<TransportCompletion>,
 }
 
+/// Identity and announce metadata recalled from the live transport cache.
+#[derive(Clone)]
+pub struct RecalledDestination {
+    pub destination_hash: [u8; 16],
+    pub identity: Identity,
+    pub app_data: Option<Vec<u8>>,
+    pub ratchet: Option<[u8; 32]>,
+    pub hops: u8,
+    pub last_heard: std::time::SystemTime,
+}
+
+impl std::fmt::Debug for RecalledDestination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecalledDestination")
+            .field("destination_hash", &hex::encode(self.destination_hash))
+            .field("identity_hash", &hex::encode(self.identity.hash))
+            .field("app_data_len", &self.app_data.as_ref().map(Vec::len))
+            .field("ratchet_present", &self.ratchet.is_some())
+            .field("hops", &self.hops)
+            .field("last_heard", &self.last_heard)
+            .finish()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ControlError {
+    #[error("transport query channel closed")]
+    ChannelClosed,
+    #[error("transport query timed out after {0:?}")]
+    Timeout(Duration),
+    #[error("transport returned an unexpected response to {operation}")]
+    UnexpectedResponse { operation: &'static str },
+    #[error("cached identity is invalid: {0}")]
+    InvalidIdentity(#[from] rns_identity::identity::IdentityError),
+}
+
 /// Shared discovery state behind one `Arc` so cloning [`ReticulumHandle`]
 /// doesn't proliferate state. Holds inputs for the eventual announce tick /
 /// subscriber loop.
@@ -183,6 +220,13 @@ impl ReticulumHandle {
 
     /// Query this process' transport actor directly.
     pub async fn query_transport(&self, query: TransportQuery) -> Option<TransportQueryResponse> {
+        self.query_transport_result(query).await.ok()
+    }
+
+    async fn query_transport_result(
+        &self,
+        query: TransportQuery,
+    ) -> Result<TransportQueryResponse, ControlError> {
         let variant = format!("{query:?}");
         let started = std::time::Instant::now();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -196,24 +240,51 @@ impl ReticulumHandle {
             .is_err()
         {
             tracing::warn!(query = %variant, "transport query channel closed");
-            return None;
+            return Err(ControlError::ChannelClosed);
         }
         let send_elapsed = started.elapsed();
-        let result = tokio::time::timeout(Duration::from_secs(5), rx)
-            .await
-            .ok()
-            .and_then(|r| r.ok());
+        let timeout = Duration::from_secs(5);
+        let result = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => Err(ControlError::ChannelClosed),
+            Err(_) => Err(ControlError::Timeout(timeout)),
+        };
         let total = started.elapsed();
-        if result.is_none() || total > Duration::from_millis(1000) {
+        if result.is_err() || total > Duration::from_millis(1000) {
             tracing::warn!(
                 query = %variant,
                 send_ms = send_elapsed.as_millis() as u64,
                 total_ms = total.as_millis() as u64,
-                timed_out = result.is_none(),
+                timed_out = matches!(&result, Err(ControlError::Timeout(_))),
                 "transport query slow or failed"
             );
         }
         result
+    }
+
+    /// Recall the identity and latest announce metadata for `destination_hash`.
+    ///
+    /// This reads the process' live, validated announce cache in O(1) without
+    /// extending the entry's lifetime. It mirrors
+    /// `Identity.recall(destination_hash, _no_use=True)` and returns `None`
+    /// when no identity-bearing announce is known.
+    pub async fn recall(
+        &self,
+        destination_hash: [u8; 16],
+    ) -> Result<Option<RecalledDestination>, ControlError> {
+        let response = self
+            .query_transport_result(TransportQuery::RecallDestination {
+                dest: destination_hash,
+            })
+            .await?;
+        match response {
+            TransportQueryResponse::RecalledDestination(entry) => {
+                entry.map(recalled_destination_from_rpc).transpose()
+            }
+            _ => Err(ControlError::UnexpectedResponse {
+                operation: "destination recall",
+            }),
+        }
     }
 
     /// Query the authoritative control plane.
@@ -308,6 +379,24 @@ impl ReticulumHandle {
     pub(crate) async fn install_discovery_store_for_tests(&self, store: Arc<DiscoveryStore>) {
         *self.discovery.store.lock().await = Some(store);
     }
+}
+
+fn recalled_destination_from_rpc(
+    entry: RecalledDestinationRpcEntry,
+) -> Result<RecalledDestination, ControlError> {
+    let identity = Identity::from_public_key(&entry.public_key)?;
+    let last_heard = Duration::try_from_secs_f64(entry.timestamp)
+        .ok()
+        .and_then(|elapsed| std::time::UNIX_EPOCH.checked_add(elapsed))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    Ok(RecalledDestination {
+        destination_hash: entry.dest_hash,
+        identity,
+        app_data: entry.app_data,
+        ratchet: entry.ratchet,
+        hops: entry.hops,
+        last_heard,
+    })
 }
 
 fn transport_query_to_rpc_request(query: &TransportQuery) -> Option<crate::rpc::RpcRequest> {
@@ -4315,6 +4404,63 @@ loglevel = 7
                 notify: Notify::new(),
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn recall_returns_typed_identity_and_metadata() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let identity = Identity::new();
+        let public_key = identity.get_public_key();
+        let destination_hash = [0x42; 16];
+        let timestamp = 1_700_000_000.5;
+        let responder = tokio::spawn(async move {
+            let TransportMessage::Rpc { query, response_tx } =
+                transport_rx.recv().await.expect("recall query")
+            else {
+                panic!("expected transport RPC");
+            };
+            assert!(matches!(
+                query,
+                TransportQuery::RecallDestination { dest } if dest == destination_hash
+            ));
+            response_tx
+                .send(TransportQueryResponse::RecalledDestination(Some(
+                    RecalledDestinationRpcEntry {
+                        dest_hash: destination_hash,
+                        public_key,
+                        app_data: Some(b"display name".to_vec()),
+                        ratchet: Some([0xA5; 32]),
+                        hops: 4,
+                        timestamp,
+                    },
+                )))
+                .expect("recall response receiver");
+        });
+
+        let mut handle = dummy_handle();
+        handle.transport_tx = transport_tx;
+        let recalled = handle
+            .recall(destination_hash)
+            .await
+            .expect("recall query succeeds")
+            .expect("destination is known");
+        assert_eq!(recalled.destination_hash, destination_hash);
+        assert_eq!(recalled.identity.hash, identity.hash);
+        assert_eq!(
+            recalled.app_data.as_deref(),
+            Some(b"display name".as_slice())
+        );
+        assert_eq!(recalled.ratchet, Some([0xA5; 32]));
+        assert_eq!(recalled.hops, 4);
+        assert_eq!(
+            recalled
+                .last_heard
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+            timestamp
+        );
+        responder.await.unwrap();
     }
 
     struct StaticStamper;
