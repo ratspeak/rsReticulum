@@ -581,20 +581,29 @@ impl TransportActor {
                         continue;
                     }
                 }
-                let _ = registration
-                    .tx
-                    .try_send(crate::messages::AnnounceHandlerEvent {
-                        destination_hash: header.destination_hash,
-                        identity_hash: announce_identity_hash,
-                        announce_packet_hash,
-                        is_path_response,
-                        hops: header.hops,
-                        app_data: handler_app_data.clone(),
-                        public_key: announce_public_key,
-                        ratchet: announce_ratchet,
-                        name_hash: announce_name_hash,
-                    });
+                if let Err(error) =
+                    registration
+                        .tx
+                        .try_send(crate::messages::AnnounceHandlerEvent {
+                            destination_hash: header.destination_hash,
+                            identity_hash: announce_identity_hash,
+                            announce_packet_hash,
+                            is_path_response,
+                            hops: header.hops,
+                            app_data: handler_app_data.clone(),
+                            public_key: announce_public_key,
+                            ratchet: announce_ratchet,
+                            name_hash: announce_name_hash,
+                        })
+                    && matches!(error, tokio::sync::mpsc::error::TrySendError::Full(_))
+                {
+                    registration
+                        .dropped_events
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
+            self.announce_handlers
+                .retain(|registration| !registration.tx.is_closed());
         }
     }
 

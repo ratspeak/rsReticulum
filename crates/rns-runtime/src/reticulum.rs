@@ -31,11 +31,13 @@ use rns_transport::discovery::{
     DiscoveryInterfaceConfig, DiscoveryStamper, DiscoveryStore, ReceiverConfig, discovery_hash,
 };
 use rns_transport::messages::{
-    OutboundDispatchResult, OutboundRequest, RecalledDestinationRpcEntry, ReceiptUpdate,
-    TrackedReceiptRegistration, TransportMessage, TransportQuery, TransportQueryResponse,
+    AnnounceHandlerEvent, AnnounceHandlerId, OutboundDispatchResult, OutboundRequest,
+    RecalledDestinationRpcEntry, ReceiptUpdate, TrackedReceiptRegistration, TransportMessage,
+    TransportQuery, TransportQueryResponse,
 };
 
 static INSTANCE: OnceLock<ReticulumHandle> = OnceLock::new();
+pub const DEFAULT_ANNOUNCE_SUBSCRIPTION_CAPACITY: usize = 128;
 
 /// Spawned interface driver tasks, keyed by `interface_id`. Stash is required:
 /// dropping the JoinHandle only detaches the task, so `teardown_interface`
@@ -121,6 +123,74 @@ pub struct RecalledDestination {
     pub ratchet: Option<[u8; 32]>,
     pub hops: u8,
     pub last_heard: std::time::SystemTime,
+}
+
+/// Owned, bounded stream of validated announce-handler events.
+///
+/// Dropping the subscription requests exact deregistration. If the transport
+/// command queue is full, the closed event receiver is reaped on the next
+/// announce dispatch.
+pub struct AnnounceSubscription {
+    id: Option<AnnounceHandlerId>,
+    events: mpsc::Receiver<AnnounceHandlerEvent>,
+    dropped_events: Arc<AtomicU64>,
+    transport_tx: mpsc::Sender<TransportMessage>,
+}
+
+impl AnnounceSubscription {
+    pub fn events(&mut self) -> &mut mpsc::Receiver<AnnounceHandlerEvent> {
+        &mut self.events
+    }
+
+    pub async fn recv(&mut self) -> Option<AnnounceHandlerEvent> {
+        self.events.recv().await
+    }
+
+    /// Number of matching announces omitted because this subscription's
+    /// bounded event channel was full.
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped_events.load(Ordering::Relaxed)
+    }
+
+    /// Deterministically deregister this subscription.
+    pub async fn close(&mut self) -> Result<bool, AnnounceSubscriptionError> {
+        let Some(id) = self.id else {
+            return Ok(false);
+        };
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.transport_tx
+            .send(TransportMessage::DeregisterAnnounceSubscription {
+                id,
+                result_tx: Some(result_tx),
+            })
+            .await
+            .map_err(|_| AnnounceSubscriptionError::TransportUnavailable)?;
+        self.id = None;
+        result_rx
+            .await
+            .map_err(|_| AnnounceSubscriptionError::TransportUnavailable)
+    }
+}
+
+impl Drop for AnnounceSubscription {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            let _ = self
+                .transport_tx
+                .try_send(TransportMessage::DeregisterAnnounceSubscription {
+                    id,
+                    result_tx: None,
+                });
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AnnounceSubscriptionError {
+    #[error("announce subscription capacity must be greater than zero")]
+    InvalidCapacity,
+    #[error("transport channel is unavailable")]
+    TransportUnavailable,
 }
 
 /// Typed snapshot of Reticulum interface and aggregate traffic state.
@@ -353,6 +423,52 @@ impl ReticulumHandle {
         timeout: Duration,
     ) -> Result<(), AwaitPathError> {
         await_path(&self.transport_tx, destination_hash, timeout).await
+    }
+
+    pub async fn subscribe_announces(
+        &self,
+        aspect_filter: Option<String>,
+        receive_path_responses: bool,
+    ) -> Result<AnnounceSubscription, AnnounceSubscriptionError> {
+        self.subscribe_announces_with_capacity(
+            aspect_filter,
+            receive_path_responses,
+            DEFAULT_ANNOUNCE_SUBSCRIPTION_CAPACITY,
+        )
+        .await
+    }
+
+    pub async fn subscribe_announces_with_capacity(
+        &self,
+        aspect_filter: Option<String>,
+        receive_path_responses: bool,
+        capacity: usize,
+    ) -> Result<AnnounceSubscription, AnnounceSubscriptionError> {
+        if capacity == 0 {
+            return Err(AnnounceSubscriptionError::InvalidCapacity);
+        }
+        let (callback_tx, events) = mpsc::channel(capacity);
+        let dropped_events = Arc::new(AtomicU64::new(0));
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.transport_tx
+            .send(TransportMessage::RegisterAnnounceSubscription {
+                aspect_filter,
+                receive_path_responses,
+                callback_tx,
+                dropped_events: Arc::clone(&dropped_events),
+                result_tx,
+            })
+            .await
+            .map_err(|_| AnnounceSubscriptionError::TransportUnavailable)?;
+        let id = result_rx
+            .await
+            .map_err(|_| AnnounceSubscriptionError::TransportUnavailable)?;
+        Ok(AnnounceSubscription {
+            id: Some(id),
+            events,
+            dropped_events,
+            transport_tx: self.transport_tx.clone(),
+        })
     }
 
     /// Encrypt and dispatch one non-Link application packet.
@@ -4525,6 +4641,38 @@ pub enum ReticulumError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn announce_subscription_close_is_exact_and_idempotent() {
+        let (actor, transport_tx) = rns_transport::actor::TransportActor::new();
+        let actor_task = tokio::spawn(actor.run());
+        let (callback_tx, events) = mpsc::channel(1);
+        let dropped_events = Arc::new(AtomicU64::new(0));
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        transport_tx
+            .send(TransportMessage::RegisterAnnounceSubscription {
+                aspect_filter: Some("test.subscription".into()),
+                receive_path_responses: false,
+                callback_tx,
+                dropped_events: Arc::clone(&dropped_events),
+                result_tx,
+            })
+            .await
+            .unwrap();
+        let id = result_rx.await.unwrap();
+        let mut subscription = AnnounceSubscription {
+            id: Some(id),
+            events,
+            dropped_events,
+            transport_tx: transport_tx.clone(),
+        };
+
+        assert!(subscription.close().await.unwrap());
+        assert!(!subscription.close().await.unwrap());
+        transport_tx.send(TransportMessage::Shutdown).await.unwrap();
+        actor_task.await.unwrap();
+        assert!(subscription.recv().await.is_none());
+    }
 
     fn make_plain_data_packet(dest_hash: [u8; 16], body: &[u8]) -> bytes::Bytes {
         let flags = rns_wire::flags::PacketFlags {

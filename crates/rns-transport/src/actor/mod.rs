@@ -2,7 +2,7 @@ use crate::now_f64;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -181,6 +181,7 @@ pub struct TransportActor {
     pub channel_drops: u64,
 
     announce_handlers: Vec<AnnounceHandlerRegistration>,
+    next_announce_handler_id: u64,
 
     /// Foreground/background flag shared with the app layer. Flipping to
     /// background switches the maintenance tick to the long interval so the
@@ -231,9 +232,11 @@ pub struct PendingDiscoveryPathRequest {
 }
 
 struct AnnounceHandlerRegistration {
+    id: crate::messages::AnnounceHandlerId,
     aspect_filter: Option<String>,
     receive_path_responses: bool,
     tx: tokio::sync::mpsc::Sender<crate::messages::AnnounceHandlerEvent>,
+    dropped_events: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -319,6 +322,7 @@ impl TransportActor {
             startup_time: 0.0,
             channel_drops: 0,
             announce_handlers: Vec::new(),
+            next_announce_handler_id: 0,
             is_foreground: Arc::new(AtomicBool::new(true)),
         };
 
@@ -537,11 +541,33 @@ impl TransportActor {
                 receive_path_responses,
                 callback_tx,
             } => {
+                let id = crate::messages::AnnounceHandlerId(self.next_announce_handler_id);
+                self.next_announce_handler_id = self.next_announce_handler_id.wrapping_add(1);
                 self.announce_handlers.push(AnnounceHandlerRegistration {
+                    id,
                     aspect_filter,
                     receive_path_responses,
                     tx: callback_tx,
+                    dropped_events: Arc::new(AtomicU64::new(0)),
                 });
+            }
+            TransportMessage::RegisterAnnounceSubscription {
+                aspect_filter,
+                receive_path_responses,
+                callback_tx,
+                dropped_events,
+                result_tx,
+            } => {
+                let id = crate::messages::AnnounceHandlerId(self.next_announce_handler_id);
+                self.next_announce_handler_id = self.next_announce_handler_id.wrapping_add(1);
+                self.announce_handlers.push(AnnounceHandlerRegistration {
+                    id,
+                    aspect_filter,
+                    receive_path_responses,
+                    tx: callback_tx,
+                    dropped_events,
+                });
+                let _ = result_tx.send(id);
             }
             TransportMessage::DeregisterAnnounceHandler { aspect_filter } => {
                 // Also sweep closed channels here so deregister doubles as
@@ -557,6 +583,17 @@ impl TransportActor {
                         false
                     }
                 });
+            }
+            TransportMessage::DeregisterAnnounceSubscription { id, result_tx } => {
+                let removed = self
+                    .announce_handlers
+                    .iter()
+                    .any(|registration| registration.id == id);
+                self.announce_handlers
+                    .retain(|registration| registration.id != id && !registration.tx.is_closed());
+                if let Some(result_tx) = result_tx {
+                    let _ = result_tx.send(removed);
+                }
             }
             TransportMessage::SetTransportEnabled { enabled } => {
                 debug!(enabled, "setting transport enabled");
@@ -1886,6 +1923,41 @@ mod tests {
             aspect_filter: None,
         });
         assert!(actor.announce_handlers.is_empty());
+    }
+
+    #[test]
+    fn deregister_announce_subscription_removes_only_its_token() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        let (first_result_tx, mut first_result_rx) = tokio::sync::oneshot::channel();
+        let (second_result_tx, mut second_result_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::RegisterAnnounceSubscription {
+            aspect_filter: Some("same.aspect".into()),
+            receive_path_responses: false,
+            callback_tx: first_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
+            result_tx: first_result_tx,
+        });
+        actor.handle_message(TransportMessage::RegisterAnnounceSubscription {
+            aspect_filter: Some("same.aspect".into()),
+            receive_path_responses: false,
+            callback_tx: second_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
+            result_tx: second_result_tx,
+        });
+        let first_id = first_result_rx.try_recv().unwrap();
+        let second_id = second_result_rx.try_recv().unwrap();
+        assert_ne!(first_id, second_id);
+
+        let (removed_tx, mut removed_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::DeregisterAnnounceSubscription {
+            id: first_id,
+            result_tx: Some(removed_tx),
+        });
+        assert!(removed_rx.try_recv().unwrap());
+        assert_eq!(actor.announce_handlers.len(), 1);
+        assert_eq!(actor.announce_handlers[0].id, second_id);
     }
 
     #[tokio::test]
@@ -4002,9 +4074,11 @@ mod tests {
             make_announce_for_with_random_blob(&identity, "test.replay.same", 1, blob);
         let (htx, mut hrx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(0),
             aspect_filter: None,
             receive_path_responses: false,
             tx: htx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
 
         actor.on_inbound(InboundPacket {
@@ -9644,9 +9718,11 @@ mod tests {
 
         let (htx, mut hrx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(0),
             aspect_filter: None,
             receive_path_responses: false,
             tx: htx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
 
         let identity = rns_identity::identity::Identity::new();
@@ -9669,6 +9745,52 @@ mod tests {
     }
 
     #[test]
+    fn bounded_announce_subscription_counts_drops_and_reaps_closed_receiver() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut entry, _rx) = make_test_interface("test_iface");
+        entry.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(1, entry);
+
+        let (callback_tx, callback_rx) = mpsc::channel(1);
+        let dropped_events = Arc::new(AtomicU64::new(0));
+        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::RegisterAnnounceSubscription {
+            aspect_filter: Some("test.subscription".into()),
+            receive_path_responses: false,
+            callback_tx,
+            dropped_events: Arc::clone(&dropped_events),
+            result_tx,
+        });
+        let _id = result_rx.try_recv().unwrap();
+
+        for _ in 0..2 {
+            let identity = rns_identity::identity::Identity::new();
+            let (raw, _) = make_announce_for(&identity, "test.subscription", 1);
+            actor.on_inbound(crate::messages::InboundPacket {
+                raw,
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+        }
+        assert_eq!(dropped_events.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(actor.announce_handlers.len(), 1);
+
+        drop(callback_rx);
+        let identity = rns_identity::identity::Identity::new();
+        let (raw, _) = make_announce_for(&identity, "test.subscription", 1);
+        actor.on_inbound(crate::messages::InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(actor.announce_handlers.is_empty());
+    }
+
+    #[test]
     fn dispatch_with_filter_only_matching_aspect() {
         let (mut actor, _tx) = TransportActor::new();
         let (entry, _rx) = make_test_interface("test_iface");
@@ -9676,9 +9798,11 @@ mod tests {
 
         let (htx, mut hrx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(0),
             aspect_filter: Some("lxmf.delivery".to_string()),
             receive_path_responses: false,
             tx: htx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
 
         let identity = rns_identity::identity::Identity::new();
@@ -9721,14 +9845,18 @@ mod tests {
         let (h_del_tx, mut h_del_rx) = mpsc::channel(8);
         let (h_prop_tx, mut h_prop_rx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(0),
             aspect_filter: Some("lxmf.delivery".to_string()),
             receive_path_responses: false,
             tx: h_del_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(1),
             aspect_filter: Some("lxmf.propagation".to_string()),
             receive_path_responses: false,
             tx: h_prop_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
 
         let identity = rns_identity::identity::Identity::new();
@@ -9762,15 +9890,19 @@ mod tests {
 
         let (default_tx, mut default_rx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(0),
             aspect_filter: None,
             receive_path_responses: false,
             tx: default_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
         let (opt_in_tx, mut opt_in_rx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(1),
             aspect_filter: None,
             receive_path_responses: true,
             tx: opt_in_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
 
         let identity = rns_identity::identity::Identity::new();
@@ -9814,9 +9946,11 @@ mod tests {
 
         let (handler_tx, mut handler_rx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(0),
             aspect_filter: None,
             receive_path_responses: true,
             tx: handler_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
 
         let identity = rns_identity::identity::Identity::new();

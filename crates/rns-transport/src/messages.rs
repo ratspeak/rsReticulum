@@ -6,7 +6,7 @@
 //! transport exclusively via `mpsc` senders and `oneshot` reply channels.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
@@ -16,6 +16,10 @@ pub use crate::ingress::HeldAnnounce;
 use crate::ingress::IngressController;
 
 pub type InterfaceId = u64;
+
+/// Opaque identity for one transport announce-handler registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AnnounceHandlerId(pub(crate) u64);
 
 /// Transport-level role of an interface. Python Reticulum distinguishes
 /// ordinary network interfaces, the local shared-instance listener, accepted
@@ -315,10 +319,25 @@ pub enum TransportMessage {
         receive_path_responses: bool,
         callback_tx: mpsc::Sender<AnnounceHandlerEvent>,
     },
+    /// Register one owned announce subscription and acknowledge once the actor
+    /// has installed it. `dropped_events` counts dispatches rejected by the
+    /// bounded callback channel.
+    RegisterAnnounceSubscription {
+        aspect_filter: Option<String>,
+        receive_path_responses: bool,
+        callback_tx: mpsc::Sender<AnnounceHandlerEvent>,
+        dropped_events: Arc<AtomicU64>,
+        result_tx: tokio::sync::oneshot::Sender<AnnounceHandlerId>,
+    },
     /// Remove handler(s) whose `aspect_filter` matches; `None` removes all.
     /// Handlers with closed senders are also reaped on dispatch.
     DeregisterAnnounceHandler {
         aspect_filter: Option<String>,
+    },
+    /// Remove exactly the subscription backed by `callback_tx`.
+    DeregisterAnnounceSubscription {
+        id: AnnounceHandlerId,
+        result_tx: Option<tokio::sync::oneshot::Sender<bool>>,
     },
     /// Ask the actor to satisfy a packet request: replay from its recent-
     /// announce cache when possible, otherwise emit a CacheRequest packet.
@@ -412,7 +431,9 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::RegisterDestination { .. } => "RegisterDestination",
         TransportMessage::DeregisterDestination { .. } => "DeregisterDestination",
         TransportMessage::RegisterAnnounceHandler { .. } => "RegisterAnnounceHandler",
+        TransportMessage::RegisterAnnounceSubscription { .. } => "RegisterAnnounceSubscription",
         TransportMessage::DeregisterAnnounceHandler { .. } => "DeregisterAnnounceHandler",
+        TransportMessage::DeregisterAnnounceSubscription { .. } => "DeregisterAnnounceSubscription",
         TransportMessage::CacheRequest { .. } => "CacheRequest",
         TransportMessage::RequestPath { .. } => "RequestPath",
         TransportMessage::RegisterInterface { .. } => "RegisterInterface",
@@ -768,9 +789,17 @@ impl std::fmt::Debug for TransportMessage {
                 .debug_struct("RegisterAnnounceHandler")
                 .field("aspect_filter", aspect_filter)
                 .finish(),
+            Self::RegisterAnnounceSubscription { aspect_filter, .. } => f
+                .debug_struct("RegisterAnnounceSubscription")
+                .field("aspect_filter", aspect_filter)
+                .finish(),
             Self::DeregisterAnnounceHandler { aspect_filter } => f
                 .debug_struct("DeregisterAnnounceHandler")
                 .field("aspect_filter", aspect_filter)
+                .finish(),
+            Self::DeregisterAnnounceSubscription { id, .. } => f
+                .debug_struct("DeregisterAnnounceSubscription")
+                .field("id", id)
                 .finish(),
             Self::CacheRequest {
                 packet_hash,
