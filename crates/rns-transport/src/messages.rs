@@ -319,6 +319,10 @@ pub enum TransportMessage {
     RegisterReceipt {
         truncated_hash: [u8; 16],
         full_hash: [u8; 32],
+        /// Destination and validated identity used to construct the outbound
+        /// packet. Delivery proofs must verify against this exact identity.
+        destination_hash: [u8; 16],
+        destination_public_key: [u8; 64],
         msg_id: String,
         /// Override default 180s timeout when `Some`.
         timeout: Option<std::time::Duration>,

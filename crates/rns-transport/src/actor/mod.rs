@@ -590,14 +590,17 @@ impl TransportActor {
             TransportMessage::RegisterReceipt {
                 truncated_hash,
                 full_hash,
+                destination_hash,
+                destination_public_key,
                 msg_id,
                 timeout,
             } => {
-                let receipt = PacketReceipt::new(
+                let mut receipt = PacketReceipt::new(
                     full_hash,
                     truncated_hash,
                     Some(timeout.unwrap_or(std::time::Duration::from_secs(180))),
                 );
+                receipt.set_destination_identity(destination_hash, Some(destination_public_key));
                 self.receipt_table.insert(truncated_hash, receipt);
                 self.receipt_msg_ids.insert(truncated_hash, msg_id);
                 debug!(
@@ -1700,7 +1703,7 @@ mod tests {
         Bytes::from(raw)
     }
 
-    fn make_proof_packet(dest_hash: [u8; 16], hops: u8) -> Bytes {
+    fn make_proof_packet_with_payload(dest_hash: [u8; 16], hops: u8, payload: &[u8]) -> Bytes {
         let flags = rns_wire::flags::PacketFlags {
             header_type: rns_wire::flags::HeaderType::Header1,
             context_flag: false,
@@ -1716,8 +1719,12 @@ mod tests {
             context: rns_wire::context::PacketContext::None,
         };
         let mut raw = header.pack();
-        raw.extend_from_slice(&[0xEE; 32]);
+        raw.extend_from_slice(payload);
         Bytes::from(raw)
+    }
+
+    fn make_proof_packet(dest_hash: [u8; 16], hops: u8) -> Bytes {
+        make_proof_packet_with_payload(dest_hash, hops, &[0xEE; 32])
     }
 
     fn make_link_proof_packet(link_id: [u8; 16], hops: u8) -> Bytes {
@@ -7408,14 +7415,18 @@ mod tests {
             "hops=127 link request must be processed"
         );
 
-        // Proof: 128 leaves the receipt pending, 127 delivers it.
+        // Proof: 128 leaves the receipt pending, 127 validates and delivers it.
         let proof_dest = [0xE3; 16];
-        actor.receipt_table.insert(
-            proof_dest,
-            PacketReceipt::new([0u8; 32], proof_dest, Some(Duration::from_secs(180))),
-        );
+        let proof_identity = rns_identity::identity::Identity::new();
+        let mut packet_hash = [0x44; 32];
+        packet_hash[..16].copy_from_slice(&proof_dest);
+        let proof_signature = proof_identity.sign(&packet_hash).unwrap();
+        let mut receipt =
+            PacketReceipt::new(packet_hash, proof_dest, Some(Duration::from_secs(180)));
+        receipt.set_destination_identity([0xA3; 16], Some(proof_identity.get_public_key()));
+        actor.receipt_table.insert(proof_dest, receipt);
         actor.on_inbound(InboundPacket {
-            raw: make_proof_packet(proof_dest, PATHFINDER_M),
+            raw: make_proof_packet_with_payload(proof_dest, PATHFINDER_M, &proof_signature),
             interface_id: 1,
             rssi: None,
             snr: None,
@@ -7426,7 +7437,7 @@ mod tests {
             "hops=128 proof must be dropped"
         );
         actor.on_inbound(InboundPacket {
-            raw: make_proof_packet(proof_dest, PATHFINDER_M - 1),
+            raw: make_proof_packet_with_payload(proof_dest, PATHFINDER_M - 1, &proof_signature),
             interface_id: 1,
             rssi: None,
             snr: None,
@@ -7450,6 +7461,126 @@ mod tests {
             actor.path_table.get(&announce_dest).is_none(),
             "hops=128 announce must be dropped"
         );
+    }
+
+    #[test]
+    fn delivery_proof_requires_destination_signature() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (iface, _rx) = make_test_interface("proof");
+        actor.interfaces.insert(1, iface);
+
+        let destination = rns_identity::identity::Identity::new();
+        let attacker = rns_identity::identity::Identity::new();
+        let destination_hash = [0xD1; 16];
+        let packet_hash = [0x61; 32];
+        let mut proof_hash = [0u8; 16];
+        proof_hash.copy_from_slice(&packet_hash[..16]);
+        let mut receipt =
+            PacketReceipt::new(packet_hash, proof_hash, Some(Duration::from_secs(180)));
+        receipt.set_destination_identity(destination_hash, Some(destination.get_public_key()));
+        actor.receipt_table.insert(proof_hash, receipt);
+        actor
+            .receipt_msg_ids
+            .insert(proof_hash, "message-1".to_string());
+
+        let forged = attacker.sign(&packet_hash).unwrap();
+        actor.on_inbound(InboundPacket {
+            raw: make_proof_packet_with_payload(proof_hash, 0, &forged),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(
+            actor.receipt_table.contains_key(&proof_hash),
+            "forged proof must leave the receipt pending"
+        );
+        assert!(
+            actor.receipt_msg_ids.contains_key(&proof_hash),
+            "forged proof must not conclude application delivery"
+        );
+
+        let valid = destination.sign(&packet_hash).unwrap();
+        actor.on_inbound(InboundPacket {
+            raw: make_proof_packet_with_payload(proof_hash, 0, &valid),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(!actor.receipt_table.contains_key(&proof_hash));
+        assert!(!actor.receipt_msg_ids.contains_key(&proof_hash));
+    }
+
+    #[test]
+    fn outbound_destination_binding_survives_receipt_registration_order() {
+        let destination = rns_identity::identity::Identity::new();
+        let destination_hash = [0xD2; 16];
+        let raw = make_data_packet(destination_hash, 0);
+        let (packet_hash, proof_hash) =
+            rns_wire::hash::packet_hash_pair(&raw, rns_wire::flags::HeaderType::Header1);
+
+        // LXMF registers after enqueueing the outbound packet.
+        let (mut outbound_first, _tx) = TransportActor::new();
+        insert_announce_for(&mut outbound_first, destination_hash, &destination);
+        outbound_first.on_outbound(OutboundRequest {
+            raw: raw.clone(),
+            destination_hash,
+        });
+        outbound_first.handle_message(TransportMessage::RegisterReceipt {
+            truncated_hash: proof_hash,
+            full_hash: packet_hash,
+            destination_hash,
+            destination_public_key: destination.get_public_key(),
+            msg_id: "outbound-first".to_string(),
+            timeout: None,
+        });
+        let receipt = &outbound_first.receipt_table[&proof_hash];
+        assert_eq!(receipt.destination_hash, Some(destination_hash));
+        assert_eq!(
+            receipt.destination_public_key,
+            Some(destination.get_public_key())
+        );
+
+        // rnprobe registers before enqueueing the outbound packet.
+        let (mut registration_first, _tx) = TransportActor::new();
+        insert_announce_for(&mut registration_first, destination_hash, &destination);
+        registration_first.handle_message(TransportMessage::RegisterReceipt {
+            truncated_hash: proof_hash,
+            full_hash: packet_hash,
+            destination_hash,
+            destination_public_key: destination.get_public_key(),
+            msg_id: "registration-first".to_string(),
+            timeout: None,
+        });
+        registration_first.on_outbound(OutboundRequest {
+            raw,
+            destination_hash,
+        });
+        let receipt = &registration_first.receipt_table[&proof_hash];
+        assert_eq!(receipt.destination_hash, Some(destination_hash));
+        assert_eq!(
+            receipt.destination_public_key,
+            Some(destination.get_public_key())
+        );
+    }
+
+    #[test]
+    fn receipt_maintenance_removes_application_message_index() {
+        let (mut actor, _tx) = TransportActor::new();
+        let proof_hash = [0x71; 16];
+        actor.receipt_table.insert(
+            proof_hash,
+            PacketReceipt::new([0x71; 32], proof_hash, Some(Duration::ZERO)),
+        );
+        actor
+            .receipt_msg_ids
+            .insert(proof_hash, "timed-out-message".to_string());
+
+        actor.on_tick();
+
+        assert!(!actor.receipt_table.contains_key(&proof_hash));
+        assert!(!actor.receipt_msg_ids.contains_key(&proof_hash));
     }
 
     /// The announce hop cap is checked post-adjustment with `>=`: a raw

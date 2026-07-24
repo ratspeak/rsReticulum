@@ -366,6 +366,8 @@ pub async fn probe_once(
         .send(TransportMessage::RegisterReceipt {
             truncated_hash: trunc_hash,
             full_hash,
+            destination_hash: dest_hash,
+            destination_public_key: pubkey,
             msg_id: msg_id.clone(),
             timeout: Some(proof_wait + Duration::from_secs(1)),
         })

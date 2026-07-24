@@ -35,20 +35,36 @@ impl TransportActor {
         {
             let trunc_hash =
                 rns_wire::hash::truncated_packet_hash(&request.raw, parsed.flags.header_type);
-            if let std::collections::hash_map::Entry::Vacant(e) =
-                self.receipt_table.entry(trunc_hash)
-            {
-                let full_hash = rns_wire::hash::packet_hash(&request.raw, parsed.flags.header_type);
-                let receipt = PacketReceipt::new(
-                    full_hash,
-                    trunc_hash,
-                    Some(std::time::Duration::from_secs(180)),
-                );
-                e.insert(receipt);
-                trace!(
-                    trunc = hex::encode(trunc_hash),
-                    "generated receipt for outbound packet"
-                );
+            let destination_public_key = self
+                .recent_announces
+                .get(&request.destination_hash)
+                .and_then(|announce| announce.public_key);
+            match self.receipt_table.entry(trunc_hash) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let full_hash =
+                        rns_wire::hash::packet_hash(&request.raw, parsed.flags.header_type);
+                    let mut receipt = PacketReceipt::new(
+                        full_hash,
+                        trunc_hash,
+                        Some(std::time::Duration::from_secs(180)),
+                    );
+                    receipt
+                        .set_destination_identity(request.destination_hash, destination_public_key);
+                    entry.insert(receipt);
+                    trace!(
+                        trunc = hex::encode(trunc_hash),
+                        "generated receipt for outbound packet"
+                    );
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    // Explicit receipt registration may arrive before the
+                    // outbound packet (for example rnprobe). Complete its
+                    // destination binding here without discarding its timeout
+                    // or application message id.
+                    entry
+                        .get_mut()
+                        .set_destination_identity(request.destination_hash, destination_public_key);
+                }
             }
         }
 

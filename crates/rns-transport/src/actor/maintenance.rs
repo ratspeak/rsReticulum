@@ -131,15 +131,21 @@ impl TransportActor {
         }
 
         if now - self.last_receipts_check >= RECEIPTS_CHECK_INTERVAL {
-            for receipt in self.receipt_table.values_mut() {
+            let mut concluded = Vec::new();
+            for (key, receipt) in &mut self.receipt_table {
                 if receipt.status == ReceiptStatus::Sent && receipt.is_timed_out() {
                     receipt.fail();
+                }
+                if receipt.status != ReceiptStatus::Sent {
+                    concluded.push(*key);
                 }
             }
             // Only in-flight (Sent) receipts are worth keeping; concluded
             // ones (Delivered/Failed/Culled) were already signalled out.
-            self.receipt_table
-                .retain(|_, r| r.status == ReceiptStatus::Sent);
+            for key in concluded {
+                self.receipt_table.remove(&key);
+                self.receipt_msg_ids.remove(&key);
+            }
             let excess = self.receipt_table.len().saturating_sub(MAX_RECEIPTS);
             if excess > 0 {
                 // Cull the oldest in one sorted pass — a min-scan per
@@ -154,6 +160,7 @@ impl TransportActor {
                     if let Some(mut receipt) = self.receipt_table.remove(&key) {
                         receipt.cull();
                     }
+                    self.receipt_msg_ids.remove(&key);
                 }
             }
             self.last_receipts_check = now;

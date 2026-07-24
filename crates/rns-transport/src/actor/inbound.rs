@@ -1000,12 +1000,49 @@ impl TransportActor {
             .is_some_and(|entry| self.is_local_client_interface(entry.receiving_interface));
 
         if header.context != rns_wire::context::PacketContext::Lrproof
-            && let Some(receipt) = self.receipt_table.get_mut(&header.destination_hash)
+            && self.receipt_table.contains_key(&header.destination_hash)
         {
-            let rtt = receipt
-                .get_rtt()
-                .or_else(|| Some(receipt.sent_at.elapsed()));
-            receipt.deliver();
+            let payload_offset = header.size();
+            let Some(proof) = raw.get(payload_offset..) else {
+                return;
+            };
+
+            // Python PacketReceipt retains the destination identity used for
+            // the send and validates every explicit or implicit proof against
+            // it. If registration preceded outbound binding, fill the key from
+            // the validated announce cache before attempting verification.
+            let destination_hash = self
+                .receipt_table
+                .get(&header.destination_hash)
+                .and_then(|receipt| receipt.destination_hash);
+            let recalled_public_key = destination_hash.and_then(|destination_hash| {
+                self.recent_announces
+                    .get(&destination_hash)
+                    .and_then(|announce| announce.public_key)
+            });
+            let (validated, rtt) = {
+                let receipt = self
+                    .receipt_table
+                    .get_mut(&header.destination_hash)
+                    .expect("receipt existence checked above");
+                if receipt.destination_public_key.is_none()
+                    && let Some(destination_hash) = receipt.destination_hash
+                {
+                    receipt.set_destination_identity(destination_hash, recalled_public_key);
+                }
+                let validated = receipt.validate_proof_from_destination(proof);
+                (validated, receipt.get_rtt())
+            };
+
+            if !validated {
+                warn!(
+                    trunc = %hex::encode(header.destination_hash),
+                    proof_len = proof.len(),
+                    identity_known = recalled_public_key.is_some(),
+                    "invalid delivery proof rejected"
+                );
+                return;
+            }
 
             if let Some(msg_id) = self.receipt_msg_ids.remove(&header.destination_hash) {
                 debug!(
