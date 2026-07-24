@@ -427,6 +427,25 @@ struct LocalDiscoveryInterface {
 }
 
 impl ReticulumHandle {
+    /// Register and own an inbound SINGLE destination on this runtime.
+    pub async fn register_destination(
+        &self,
+        identity: Identity,
+        app_name: impl Into<String>,
+        options: crate::destination_runtime::DestinationRuntimeOptions,
+    ) -> Result<
+        crate::destination_runtime::RegisteredDestination,
+        crate::destination_runtime::DestinationRuntimeError,
+    > {
+        crate::destination_runtime::RegisteredDestination::register(
+            self.transport_tx.clone(),
+            identity,
+            app_name,
+            options,
+        )
+        .await
+    }
+
     pub fn transport_enabled(&self) -> bool {
         self.config.enable_transport
     }

@@ -4,6 +4,7 @@
 pub mod buffer_stream;
 pub mod config;
 pub mod constants;
+pub mod destination_runtime;
 pub mod interface_factory;
 pub mod jobs;
 pub mod lifecycle;
