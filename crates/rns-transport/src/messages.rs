@@ -277,6 +277,17 @@ pub struct AnnounceHandlerEvent {
     pub name_hash: [u8; 10],
 }
 
+/// Optional routing controls for an explicit path request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathRequestOptions {
+    /// Send only on this interface. `None` broadcasts on all outbound interfaces.
+    pub on_interface: Option<InterfaceId>,
+    /// Caller-supplied request tag. At most the first 16 bytes are transmitted.
+    pub tag: Option<Vec<u8>>,
+    /// Apply recursive path-request announce-cap gating on an attached interface.
+    pub recursive: bool,
+}
+
 /// Every mutation of transport state enters through this enum — the actor
 /// dispatches on the variant, so adding a new operation is a matter of adding
 /// a variant and a match arm rather than exposing a new lock or shared type.
@@ -347,6 +358,10 @@ pub enum TransportMessage {
     },
     RequestPath {
         destination_hash: [u8; 16],
+    },
+    RequestPathWithOptions {
+        destination_hash: [u8; 16],
+        options: PathRequestOptions,
     },
     RegisterInterface {
         id: InterfaceId,
@@ -436,6 +451,7 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::DeregisterAnnounceSubscription { .. } => "DeregisterAnnounceSubscription",
         TransportMessage::CacheRequest { .. } => "CacheRequest",
         TransportMessage::RequestPath { .. } => "RequestPath",
+        TransportMessage::RequestPathWithOptions { .. } => "RequestPathWithOptions",
         TransportMessage::RegisterInterface { .. } => "RegisterInterface",
         TransportMessage::DeregisterInterface { .. } => "DeregisterInterface",
         TransportMessage::SetStoragePaths { .. } => "SetStoragePaths",
@@ -812,6 +828,14 @@ impl std::fmt::Debug for TransportMessage {
             Self::RequestPath { destination_hash } => f
                 .debug_struct("RequestPath")
                 .field("destination_hash", destination_hash)
+                .finish(),
+            Self::RequestPathWithOptions {
+                destination_hash,
+                options,
+            } => f
+                .debug_struct("RequestPathWithOptions")
+                .field("destination_hash", destination_hash)
+                .field("options", options)
                 .finish(),
             Self::RegisterInterface { id, entry } => f
                 .debug_struct("RegisterInterface")

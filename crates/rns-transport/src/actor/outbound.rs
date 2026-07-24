@@ -685,6 +685,34 @@ impl TransportActor {
         self.broadcast_path_request(destination_hash);
     }
 
+    pub(super) fn on_path_request_with_options(
+        &mut self,
+        destination_hash: [u8; 16],
+        options: crate::messages::PathRequestOptions,
+    ) {
+        let request_tag = options
+            .tag
+            .unwrap_or_else(|| rns_crypto::random::random_bytes(16));
+        if let Some(interface_id) = options.on_interface {
+            self.send_path_request(
+                destination_hash,
+                interface_id,
+                Some(&request_tag),
+                options.recursive,
+            );
+        } else {
+            // Python only applies recursive announce-cap gating when an
+            // interface is explicitly attached.
+            self.forward_path_request(destination_hash, None, Some(&request_tag), false);
+        }
+        debug!(
+            dest = hex::encode(destination_hash),
+            interface = ?options.on_interface,
+            recursive = options.recursive,
+            "explicit path request sent"
+        );
+    }
+
     pub(super) fn on_automatic_path_request(&mut self, destination_hash: [u8; 16]) {
         if self.path_table.has_path(&destination_hash) {
             return;

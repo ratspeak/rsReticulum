@@ -33,8 +33,8 @@ use rns_transport::discovery::{
 };
 use rns_transport::messages::{
     AnnounceHandlerEvent, AnnounceHandlerId, OutboundDispatchResult, OutboundRequest,
-    RecalledDestinationRpcEntry, ReceiptUpdate, TrackedReceiptRegistration, TransportMessage,
-    TransportQuery, TransportQueryResponse,
+    PathRequestOptions, RecalledDestinationRpcEntry, ReceiptUpdate, TrackedReceiptRegistration,
+    TransportMessage, TransportQuery, TransportQueryResponse,
 };
 
 static INSTANCE: OnceLock<ReticulumHandle> = OnceLock::new();
@@ -740,6 +740,21 @@ impl ReticulumHandle {
                 operation: "first-hop timeout query",
             }),
         }
+    }
+
+    /// Request a network path, optionally on one interface with an explicit tag.
+    pub async fn request_path(
+        &self,
+        destination_hash: [u8; 16],
+        options: PathRequestOptions,
+    ) -> Result<(), ControlError> {
+        self.transport_tx
+            .send(TransportMessage::RequestPathWithOptions {
+                destination_hash,
+                options,
+            })
+            .await
+            .map_err(|_| ControlError::ChannelClosed)
     }
 
     /// Return the authoritative path table, optionally limited by hop count.
@@ -5430,6 +5445,34 @@ loglevel = 7
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].hash, [0x61; 16]);
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_path_forwards_explicit_transport_options() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let mut handle = dummy_handle();
+        handle.transport_tx = transport_tx;
+        let destination_hash = [0x63; 16];
+        let options = PathRequestOptions {
+            on_interface: Some(7),
+            tag: Some(vec![0xAA; 16]),
+            recursive: true,
+        };
+
+        handle
+            .request_path(destination_hash, options.clone())
+            .await
+            .unwrap();
+
+        let TransportMessage::RequestPathWithOptions {
+            destination_hash: received_hash,
+            options: received_options,
+        } = transport_rx.try_recv().unwrap()
+        else {
+            panic!("expected path request command");
+        };
+        assert_eq!(received_hash, destination_hash);
+        assert_eq!(received_options, options);
     }
 
     #[tokio::test]

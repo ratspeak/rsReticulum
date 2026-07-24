@@ -537,6 +537,12 @@ impl TransportActor {
             TransportMessage::RequestPath { destination_hash } => {
                 self.on_path_request(destination_hash);
             }
+            TransportMessage::RequestPathWithOptions {
+                destination_hash,
+                options,
+            } => {
+                self.on_path_request_with_options(destination_hash, options);
+            }
             TransportMessage::Rpc { query, response_tx } => {
                 let response = self.handle_query(query);
                 let _ = response_tx.send(response);
@@ -8333,6 +8339,33 @@ mod tests {
         let payload = &raw[offset..];
         assert_eq!(payload.len(), 32);
         assert_eq!(&payload[..16], &requested);
+    }
+
+    #[test]
+    fn path_request_options_attach_interface_tag_and_recursive_gate() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (first, mut first_rx) = make_test_interface("first");
+        let (second, mut second_rx) = make_test_interface("second");
+        actor.interfaces.insert(1, first);
+        actor.interfaces.insert(2, second);
+
+        let requested = [0x34; 16];
+        let tag: Vec<u8> = (0..20).collect();
+        actor.handle_message(TransportMessage::RequestPathWithOptions {
+            destination_hash: requested,
+            options: crate::messages::PathRequestOptions {
+                on_interface: Some(2),
+                tag: Some(tag.clone()),
+                recursive: true,
+            },
+        });
+
+        assert!(first_rx.try_recv().is_err());
+        let raw = second_rx.try_recv().expect("attached path request");
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        assert_eq!(&raw[offset..offset + 16], &requested);
+        assert_eq!(&raw[offset + 16..], &tag[..16]);
+        assert!(actor.interfaces[&2].announce_allowed_at > 0.0);
     }
 
     #[test]
