@@ -1117,6 +1117,11 @@ impl Link {
         ),
     )]
     pub fn tick(&mut self) -> LinkAction {
+        for receipt in &mut self.pending_requests {
+            receipt.check_timeout();
+        }
+        self.pending_requests.retain(|receipt| !receipt.concluded());
+
         match self.state {
             LinkState::Pending | LinkState::Handshake => {
                 if self.request_time.elapsed() > self.establishment_timeout {
@@ -1198,6 +1203,10 @@ impl Link {
 
     fn close(&mut self, reason: CloseReason) {
         tracing::debug!(link_id = ?self.link_id, ?reason, "link state -> Closed");
+        for receipt in &mut self.pending_requests {
+            receipt.fail();
+        }
+        self.pending_requests.clear();
         self.state = LinkState::Closed;
         self.purge_keys();
     }
@@ -2112,6 +2121,53 @@ mod tests {
         assert_eq!(resp_data, b"response data");
 
         // handle_response() must drain the receipt on success.
+        assert!(initiator.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn test_tick_expires_pending_request_and_fires_callback() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (mut initiator, _responder, _) = make_active_link();
+        initiator
+            .request("test.timeout", None, Duration::ZERO)
+            .unwrap();
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let callback_fired = fired.clone();
+        initiator.pending_requests[0].set_failed_callback(move |_| {
+            callback_fired.store(true, Ordering::SeqCst);
+        });
+
+        initiator.tick();
+
+        assert!(fired.load(Ordering::SeqCst));
+        assert!(
+            initiator.pending_requests.is_empty(),
+            "owning runtime tick must reap concluded request receipts"
+        );
+    }
+
+    #[test]
+    fn test_link_close_fails_pending_request() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (mut initiator, _responder, _) = make_active_link();
+        initiator
+            .request("test.close", None, Duration::from_secs(30))
+            .unwrap();
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let callback_fired = fired.clone();
+        initiator.pending_requests[0].set_failed_callback(move |_| {
+            callback_fired.store(true, Ordering::SeqCst);
+        });
+
+        initiator.mark_closed(CloseReason::DestinationClosed);
+
+        assert!(fired.load(Ordering::SeqCst));
         assert!(initiator.pending_requests.is_empty());
     }
 
