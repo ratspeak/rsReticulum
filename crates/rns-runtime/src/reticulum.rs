@@ -136,6 +136,12 @@ impl std::fmt::Debug for RecalledDestination {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
+    #[error("not connected to the shared Reticulum instance")]
+    NotConnectedToSharedInstance,
+    #[error("shared-instance RPC authentication failed")]
+    RpcAuth,
+    #[error("shared-instance RPC failed: {0}")]
+    Rpc(String),
     #[error("transport query channel closed")]
     ChannelClosed,
     #[error("transport query timed out after {0:?}")]
@@ -287,6 +293,97 @@ impl ReticulumHandle {
         }
     }
 
+    /// Return whether a non-expired path is known for `destination_hash`.
+    pub async fn has_path(&self, destination_hash: [u8; 16]) -> Result<bool, ControlError> {
+        match self
+            .query_control_result(TransportQuery::HasPath {
+                dest: destination_hash,
+            })
+            .await?
+        {
+            TransportQueryResponse::BoolResult(has_path) => Ok(has_path),
+            _ => Err(ControlError::UnexpectedResponse {
+                operation: "path presence query",
+            }),
+        }
+    }
+
+    /// Return the path hop count, or `PATHFINDER_M` when no path is known.
+    pub async fn hops_to(&self, destination_hash: [u8; 16]) -> Result<u8, ControlError> {
+        match self
+            .query_control_result(TransportQuery::HopsTo {
+                dest: destination_hash,
+            })
+            .await?
+        {
+            TransportQueryResponse::IntResult(hops) => {
+                u8::try_from(hops).map_err(|_| ControlError::UnexpectedResponse {
+                    operation: "path hop query",
+                })
+            }
+            _ => Err(ControlError::UnexpectedResponse {
+                operation: "path hop query",
+            }),
+        }
+    }
+
+    /// Return the authoritative path table, optionally limited by hop count.
+    pub async fn path_table(
+        &self,
+        max_hops: Option<u8>,
+    ) -> Result<Vec<rns_transport::messages::PathTableRpcEntry>, ControlError> {
+        match self
+            .query_control_result(TransportQuery::GetPathTable)
+            .await?
+        {
+            TransportQueryResponse::PathTable(mut entries) => {
+                if let Some(max_hops) = max_hops {
+                    entries.retain(|entry| entry.hops <= max_hops);
+                }
+                Ok(entries)
+            }
+            _ => Err(ControlError::UnexpectedResponse {
+                operation: "path table query",
+            }),
+        }
+    }
+
+    /// Result-returning control-plane query used by the typed facade.
+    ///
+    /// Unlike the compatibility [`Self::query_control`] method, a failed
+    /// shared-instance request never falls back to this process' local actor.
+    async fn query_control_result(
+        &self,
+        query: TransportQuery,
+    ) -> Result<TransportQueryResponse, ControlError> {
+        if self.instance_mode != InstanceMode::Client {
+            return self.query_transport_result(query).await;
+        }
+
+        let Some(request) = transport_query_to_rpc_request(&query) else {
+            return self.query_transport_result(query).await;
+        };
+        let Some(rpc_key) = self.config.rpc_key.as_deref() else {
+            return Err(ControlError::NotConnectedToSharedInstance);
+        };
+        let timeout = Duration::from_secs(5);
+        let rpc_result = match self.config.shared_rpc_endpoint(&self.socket_base) {
+            SharedInstanceRpcEndpoint::Tcp(port) => {
+                crate::rpc::connect_and_request(port, rpc_key, &request, timeout).await
+            }
+            SharedInstanceRpcEndpoint::Unix(socket_path) => {
+                crate::rpc::connect_unix_and_request(&socket_path, rpc_key, &request, timeout).await
+            }
+        }
+        .map_err(|error| control_error_from_rpc(error, timeout))?;
+        if let crate::rpc::RpcResponse::Error(error) = rpc_result {
+            return Err(ControlError::Rpc(error));
+        }
+        rpc_response_to_transport_response(rpc_result).ok_or(ControlError::UnexpectedResponse {
+            operation: "shared-instance control query",
+        })
+    }
+
     /// Query the authoritative control plane.
     ///
     /// In client mode, Python proxies Reticulum control methods to the local
@@ -397,6 +494,19 @@ fn recalled_destination_from_rpc(
         hops: entry.hops,
         last_heard,
     })
+}
+
+fn control_error_from_rpc(error: crate::rpc::RpcError, timeout: Duration) -> ControlError {
+    match error {
+        crate::rpc::RpcError::AuthFailed => ControlError::RpcAuth,
+        crate::rpc::RpcError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            ControlError::Timeout(timeout)
+        }
+        crate::rpc::RpcError::Io(_) | crate::rpc::RpcError::Connection(_) => {
+            ControlError::NotConnectedToSharedInstance
+        }
+        other => ControlError::Rpc(other.to_string()),
+    }
 }
 
 fn transport_query_to_rpc_request(query: &TransportQuery) -> Option<crate::rpc::RpcRequest> {
@@ -4461,6 +4571,78 @@ loglevel = 7
             timestamp
         );
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_path_queries_validate_and_filter_actor_responses() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(3);
+        let destination_hash = [0x51; 16];
+        let responder = tokio::spawn(async move {
+            for response in [
+                TransportQueryResponse::BoolResult(true),
+                TransportQueryResponse::IntResult(6),
+                TransportQueryResponse::PathTable(vec![
+                    rns_transport::messages::PathTableRpcEntry {
+                        hash: [0x61; 16],
+                        timestamp: 1.0,
+                        via: None,
+                        hops: 2,
+                        expires: 2.0,
+                        interface: "short".to_string(),
+                        interface_id: 1,
+                        interface_mode: rns_transport::constants::InterfaceMode::Full,
+                        interface_role: rns_transport::messages::InterfaceRole::Normal,
+                    },
+                    rns_transport::messages::PathTableRpcEntry {
+                        hash: [0x62; 16],
+                        timestamp: 1.0,
+                        via: None,
+                        hops: 8,
+                        expires: 2.0,
+                        interface: "long".to_string(),
+                        interface_id: 2,
+                        interface_mode: rns_transport::constants::InterfaceMode::Gateway,
+                        interface_role: rns_transport::messages::InterfaceRole::Normal,
+                    },
+                ]),
+            ] {
+                let TransportMessage::Rpc { response_tx, .. } =
+                    transport_rx.recv().await.expect("typed path query")
+                else {
+                    panic!("expected transport RPC");
+                };
+                response_tx.send(response).expect("path query receiver");
+            }
+        });
+
+        let mut handle = dummy_handle();
+        handle.transport_tx = transport_tx;
+        assert!(handle.has_path(destination_hash).await.unwrap());
+        assert_eq!(handle.hops_to(destination_hash).await.unwrap(), 6);
+        let paths = handle.path_table(Some(4)).await.unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].hash, [0x61; 16]);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_control_query_never_falls_back_after_shared_rpc_failure() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let mut handle = dummy_handle();
+        handle.transport_tx = transport_tx;
+        handle.instance_mode = InstanceMode::Client;
+        handle.config.shared_instance_type = SharedInstanceType::Tcp;
+        handle.config.control_port = 0;
+        handle.config.rpc_key = Some(vec![0xA5; 32]);
+
+        assert!(matches!(
+            handle.path_table(None).await,
+            Err(ControlError::NotConnectedToSharedInstance)
+        ));
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "typed control query must not consult stale local actor state"
+        );
     }
 
     struct StaticStamper;

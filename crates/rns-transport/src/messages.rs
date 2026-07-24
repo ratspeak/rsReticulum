@@ -397,6 +397,14 @@ pub enum TransportQuery {
     RecallDestination {
         dest: [u8; 16],
     },
+    /// Whether a non-expired path currently exists for `dest`.
+    HasPath {
+        dest: [u8; 16],
+    },
+    /// Hop count for a non-expired path, or `PATHFINDER_M` when unknown.
+    HopsTo {
+        dest: [u8; 16],
+    },
     GetNextHop {
         dest: [u8; 16],
     },

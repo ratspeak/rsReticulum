@@ -168,6 +168,14 @@ impl TransportActor {
                 });
                 TransportQueryResponse::RecalledDestination(recalled)
             }
+            TransportQuery::HasPath { dest } => {
+                TransportQueryResponse::BoolResult(self.path_table.has_path(&dest))
+            }
+            TransportQuery::HopsTo { dest } => TransportQueryResponse::IntResult(i64::from(
+                self.path_table
+                    .hops_to(&dest)
+                    .unwrap_or(crate::constants::PATHFINDER_M),
+            )),
             TransportQuery::GetNextHop { dest } => {
                 // Python 1.3.8 Transport.py:2685-2688: local destinations
                 // resolve to Transport.identity.hash.

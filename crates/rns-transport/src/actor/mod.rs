@@ -7849,6 +7849,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn path_presence_and_hops_queries_ignore_expired_entries() {
+        let (mut actor, _tx) = TransportActor::new();
+        let live_dest = [0x81; 16];
+        let expired_dest = [0x82; 16];
+        actor.path_table.insert(
+            live_dest,
+            PathEntry::new(None, 7, 1, InterfaceMode::Gateway),
+        );
+        let mut expired = PathEntry::new(None, 9, 1, InterfaceMode::Gateway);
+        expired.expires = crate::now_f64() - 1.0;
+        actor.path_table.insert(expired_dest, expired);
+
+        assert!(matches!(
+            actor.handle_query(TransportQuery::HasPath { dest: live_dest }),
+            TransportQueryResponse::BoolResult(true)
+        ));
+        assert!(matches!(
+            actor.handle_query(TransportQuery::HopsTo { dest: live_dest }),
+            TransportQueryResponse::IntResult(7)
+        ));
+        assert!(matches!(
+            actor.handle_query(TransportQuery::HasPath { dest: expired_dest }),
+            TransportQueryResponse::BoolResult(false)
+        ));
+        assert!(matches!(
+            actor.handle_query(TransportQuery::HopsTo { dest: expired_dest }),
+            TransportQueryResponse::IntResult(hops)
+                if hops == i64::from(crate::constants::PATHFINDER_M)
+        ));
+    }
+
     /// Python 1.3.8 Transport.py:2984: a cached announce that fails to unpack
     /// is a miss — no path response is synthesized from raw bytes.
     #[test]
