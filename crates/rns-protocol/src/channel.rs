@@ -435,6 +435,9 @@ impl Channel {
     /// legitimate. Out-of-range or duplicate sequence numbers are silently
     /// dropped; registered callbacks fire in order on each delivered message.
     pub fn receive(&mut self, raw: &[u8]) -> Result<Vec<(u16, Vec<u8>)>, ChannelError> {
+        if !self.active {
+            return Err(ChannelError::ChannelClosed);
+        }
         let envelope = Envelope::unpack(raw).map_err(|_| ChannelError::InvalidEnvelope)?;
 
         if !self.is_type_registered(envelope.msg_type) {
@@ -681,6 +684,8 @@ impl LinkChannel {
 
     pub fn delivered_by_packet_hash(&mut self, packet_hash: &[u8; 32], rtt: f64) -> Option<u16> {
         let sequence = self.outbound_packet_hashes.remove(packet_hash)?;
+        self.outbound_packet_hashes
+            .retain(|_, tracked_sequence| *tracked_sequence != sequence);
         self.delivered(sequence, rtt);
         Some(sequence)
     }
@@ -720,6 +725,7 @@ impl LinkChannel {
 
     pub fn shutdown(&mut self) {
         self.channel.shutdown();
+        self.outbound_packet_hashes.clear();
     }
 
     pub fn is_active(&self) -> bool {
@@ -1004,6 +1010,10 @@ mod tests {
         ch.shutdown();
         assert!(!ch.active);
         assert!(ch.send(&msg).is_err());
+        assert!(matches!(
+            ch.receive(&Envelope::pack(&msg, 0).raw),
+            Err(ChannelError::ChannelClosed)
+        ));
     }
 
     #[test]
@@ -1256,6 +1266,22 @@ mod tests {
         // An unacknowledged envelope must be handed back for resend.
         let resend = lc.timeout(0).unwrap();
         assert!(resend.is_some());
+    }
+
+    #[test]
+    fn test_channel_delivery_clears_retransmission_hashes_for_sequence() {
+        let mut channel = LinkChannel::new([0xDF; 16], 0.1);
+        channel
+            .prepare_send_tracked(&TestMessage::new(b"tracked"))
+            .unwrap();
+        let first_hash = [1u8; 32];
+        let retry_hash = [2u8; 32];
+        channel.track_outbound_packet_hash(first_hash, 0);
+        channel.track_outbound_packet_hash(retry_hash, 0);
+
+        assert_eq!(channel.delivered_by_packet_hash(&retry_hash, 0.1), Some(0));
+        assert!(channel.outbound_packet_hashes.is_empty());
+        assert_eq!(channel.delivered_by_packet_hash(&first_hash, 0.1), None);
     }
 
     #[test]

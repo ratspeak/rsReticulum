@@ -11,6 +11,10 @@ use bytes::Bytes;
 use rns_crypto::ed25519::Ed25519PublicKey;
 use rns_identity::identity::Identity;
 use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
+use rns_protocol::channel::{
+    ChannelError, HandlerId, LinkChannel, MessageCallback, PreparedChannelData,
+};
+use rns_protocol::channel_message::{ChannelMessageError, MessageBase};
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
     AnnounceRpcEntry, InterfaceId, OutboundRequest, TransportMessage, TransportQuery,
@@ -90,6 +94,25 @@ pub struct LinkSessionResponse {
     pub response_time: Duration,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSessionChannelReceipt {
+    pub link_id: [u8; 16],
+    pub sequence: u16,
+    pub packet_hash: [u8; 32],
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LinkSessionChannelError {
+    #[error("link is not active")]
+    LinkNotActive,
+    #[error("transport channel is unavailable")]
+    TransportUnavailable,
+    #[error("channel error: {0}")]
+    Channel(#[from] ChannelError),
+    #[error("Link session task is no longer running")]
+    SessionClosed,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LinkSessionError {
     #[error("transport channel is unavailable")]
@@ -129,7 +152,41 @@ enum LinkSessionCommand {
         timeout: Option<Duration>,
         result_tx: oneshot::Sender<Result<LinkSessionResponse, LinkSessionError>>,
     },
+    Channel(LinkSessionChannelCommand),
     Close,
+}
+
+enum LinkSessionChannelCommand {
+    RegisterMessageType {
+        msg_type: u16,
+        result_tx: oneshot::Sender<Result<(), LinkSessionChannelError>>,
+    },
+    RegisterSystemType {
+        msg_type: u16,
+        result_tx: oneshot::Sender<Result<(), LinkSessionChannelError>>,
+    },
+    AddMessageHandler {
+        handler: MessageCallback,
+        result_tx: oneshot::Sender<Result<HandlerId, LinkSessionChannelError>>,
+    },
+    RemoveMessageHandler {
+        id: HandlerId,
+        result_tx: oneshot::Sender<Result<bool, LinkSessionChannelError>>,
+    },
+    ClearMessageHandlers {
+        result_tx: oneshot::Sender<Result<(), LinkSessionChannelError>>,
+    },
+    Send {
+        msg_type: u16,
+        payload: Vec<u8>,
+        result_tx: oneshot::Sender<Result<LinkSessionChannelReceipt, LinkSessionChannelError>>,
+    },
+    IsReady {
+        result_tx: oneshot::Sender<Result<bool, LinkSessionChannelError>>,
+    },
+    Shutdown {
+        result_tx: oneshot::Sender<Result<(), LinkSessionChannelError>>,
+    },
 }
 
 struct PendingSessionRequest {
@@ -137,10 +194,143 @@ struct PendingSessionRequest {
     result_tx: oneshot::Sender<Result<LinkSessionResponse, LinkSessionError>>,
 }
 
-#[derive(Default)]
-struct SessionPending {
+struct SessionActorState {
     packets: HashSet<[u8; 32]>,
     requests: HashMap<[u8; 16], PendingSessionRequest>,
+    channel: LinkChannel,
+}
+
+struct PackedChannelMessage {
+    msg_type: u16,
+    payload: Vec<u8>,
+}
+
+impl MessageBase for PackedChannelMessage {
+    fn msg_type(&self) -> u16 {
+        self.msg_type
+    }
+
+    fn pack(&self) -> Vec<u8> {
+        self.payload.clone()
+    }
+
+    fn unpack(&mut self, raw: &[u8]) -> Result<(), ChannelMessageError> {
+        self.payload = raw.to_vec();
+        Ok(())
+    }
+}
+
+/// Cloneable app-facing handle for the reliable channel owned by a Link
+/// session. Sequencing, proofs, retransmissions, and callbacks remain
+/// serialized inside the session actor.
+#[derive(Clone)]
+pub struct LinkSessionChannelHandle {
+    link_id: [u8; 16],
+    mdu: usize,
+    command_tx: mpsc::Sender<LinkSessionCommand>,
+}
+
+impl LinkSessionChannelHandle {
+    pub fn link_id(&self) -> [u8; 16] {
+        self.link_id
+    }
+
+    pub fn mdu(&self) -> usize {
+        self.mdu
+    }
+
+    async fn invoke<T>(
+        &self,
+        command: impl FnOnce(
+            oneshot::Sender<Result<T, LinkSessionChannelError>>,
+        ) -> LinkSessionChannelCommand,
+    ) -> Result<T, LinkSessionChannelError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.command_tx
+            .send(LinkSessionCommand::Channel(command(result_tx)))
+            .await
+            .map_err(|_| LinkSessionChannelError::SessionClosed)?;
+        result_rx
+            .await
+            .map_err(|_| LinkSessionChannelError::SessionClosed)?
+    }
+
+    pub async fn register_message_type(
+        &self,
+        msg_type: u16,
+    ) -> Result<(), LinkSessionChannelError> {
+        self.invoke(|result_tx| LinkSessionChannelCommand::RegisterMessageType {
+            msg_type,
+            result_tx,
+        })
+        .await
+    }
+
+    pub async fn register_system_type(&self, msg_type: u16) -> Result<(), LinkSessionChannelError> {
+        self.invoke(|result_tx| LinkSessionChannelCommand::RegisterSystemType {
+            msg_type,
+            result_tx,
+        })
+        .await
+    }
+
+    pub async fn add_message_handler<F>(
+        &self,
+        handler: F,
+    ) -> Result<HandlerId, LinkSessionChannelError>
+    where
+        F: Fn(u16, &[u8]) -> bool + Send + 'static,
+    {
+        self.invoke(|result_tx| LinkSessionChannelCommand::AddMessageHandler {
+            handler: Box::new(handler),
+            result_tx,
+        })
+        .await
+    }
+
+    pub async fn remove_message_handler(
+        &self,
+        id: HandlerId,
+    ) -> Result<bool, LinkSessionChannelError> {
+        self.invoke(|result_tx| LinkSessionChannelCommand::RemoveMessageHandler { id, result_tx })
+            .await
+    }
+
+    pub async fn clear_message_handlers(&self) -> Result<(), LinkSessionChannelError> {
+        self.invoke(|result_tx| LinkSessionChannelCommand::ClearMessageHandlers { result_tx })
+            .await
+    }
+
+    pub async fn send(
+        &self,
+        message: &dyn MessageBase,
+    ) -> Result<LinkSessionChannelReceipt, LinkSessionChannelError> {
+        self.send_raw(message.msg_type(), message.pack()).await
+    }
+
+    pub async fn send_raw(
+        &self,
+        msg_type: u16,
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<LinkSessionChannelReceipt, LinkSessionChannelError> {
+        let payload = payload.into();
+        self.invoke(|result_tx| LinkSessionChannelCommand::Send {
+            msg_type,
+            payload,
+            result_tx,
+        })
+        .await
+    }
+
+    pub async fn is_ready_to_send(&self) -> Result<bool, LinkSessionChannelError> {
+        self.invoke(|result_tx| LinkSessionChannelCommand::IsReady { result_tx })
+            .await
+    }
+
+    pub async fn shutdown(&self) -> Result<(), LinkSessionChannelError> {
+        self.invoke(|result_tx| LinkSessionChannelCommand::Shutdown { result_tx })
+            .await
+    }
 }
 
 #[derive(Clone)]
@@ -157,6 +347,14 @@ impl LinkSessionHandle {
 
     pub fn mdu(&self) -> usize {
         self.mdu
+    }
+
+    pub fn channel(&self) -> LinkSessionChannelHandle {
+        LinkSessionChannelHandle {
+            link_id: self.link_id,
+            mdu: rns_protocol::channel::Channel::channel_mdu(self.mdu),
+            command_tx: self.command_tx.clone(),
+        }
     }
 
     pub async fn send_packet(
@@ -336,6 +534,9 @@ impl LinkSession {
             tokio::time::sleep(identify_delay).await;
         }
 
+        let channel_keys = link.session_keys().ok_or(LinkSessionError::LinkCrypto)?;
+        let channel =
+            LinkChannel::new_encrypted_with_mdu(link_id, link.rtt_secs(), link.mdu, channel_keys);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_BUFFER);
         let (event_tx, events) = mpsc::channel(EVENT_BUFFER);
         let handle = LinkSessionHandle {
@@ -346,7 +547,7 @@ impl LinkSession {
         tokio::spawn(run_session_actor(
             transport_tx,
             identity,
-            link,
+            (link, channel),
             attached_interface,
             delivery_rx,
             command_rx,
@@ -407,14 +608,19 @@ pub async fn lookup_destination(
 async fn run_session_actor(
     transport_tx: mpsc::Sender<TransportMessage>,
     identity: Identity,
-    mut link: Link,
+    link_and_channel: (Link, LinkChannel),
     attached_interface: InterfaceId,
     mut delivery_rx: mpsc::Receiver<DestinationEvent>,
     mut command_rx: mpsc::Receiver<LinkSessionCommand>,
     event_tx: mpsc::Sender<LinkSessionEvent>,
 ) {
+    let (mut link, channel) = link_and_channel;
     let link_id = link.link_id;
-    let mut pending = SessionPending::default();
+    let mut state = SessionActorState {
+        packets: HashSet::new(),
+        requests: HashMap::new(),
+        channel,
+    };
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let close_reason = loop {
         tokio::select! {
@@ -425,7 +631,7 @@ async fn run_session_actor(
                             &transport_tx,
                             attached_interface,
                             &mut link,
-                            &mut pending.packets,
+                            &mut state.packets,
                             payload,
                         ).await;
                         let transport_failed = matches!(result, Err(LinkSessionError::TransportUnavailable));
@@ -440,7 +646,7 @@ async fn run_session_actor(
                         timeout,
                         result_tx,
                     }) => {
-                        if pending.requests.len() >= MAX_PENDING_REQUESTS {
+                        if state.requests.len() >= MAX_PENDING_REQUESTS {
                             let _ = result_tx.send(Err(LinkSessionError::TooManyPendingRequests));
                             continue;
                         }
@@ -453,7 +659,7 @@ async fn run_session_actor(
                             timeout,
                         ).await {
                             Ok(request_id) => {
-                                pending.requests.insert(
+                                state.requests.insert(
                                     request_id,
                                     PendingSessionRequest {
                                         sent_at: Instant::now(),
@@ -471,6 +677,18 @@ async fn run_session_actor(
                             }
                         }
                     }
+                    Some(LinkSessionCommand::Channel(command)) => {
+                        let transport_failed = handle_channel_command(
+                            &transport_tx,
+                            attached_interface,
+                            &mut link,
+                            &mut state.channel,
+                            command,
+                        ).await;
+                        if transport_failed {
+                            break LinkSessionCloseReason::TransportUnavailable;
+                        }
+                    }
                     Some(LinkSessionCommand::Close) | None => {
                         send_local_teardown(&transport_tx, attached_interface, &mut link).await;
                         break LinkSessionCloseReason::Local;
@@ -486,7 +704,7 @@ async fn run_session_actor(
                     attached_interface,
                     &identity,
                     &mut link,
-                    &mut pending,
+                    &mut state,
                     &event_tx,
                     event,
                 ).await {
@@ -496,8 +714,23 @@ async fn run_session_actor(
                 }
             }
             _ = ticker.tick() => {
+                state.channel.update_rtt(link.rtt_secs());
+                if let Err(error) = resend_timed_out_channel_messages(
+                    &transport_tx,
+                    attached_interface,
+                    &mut link,
+                    &mut state.channel,
+                ).await {
+                    match error {
+                        LinkSessionChannelError::Channel(ChannelError::MaxRetriesExceeded) => {
+                            send_local_teardown(&transport_tx, attached_interface, &mut link).await;
+                            break LinkSessionCloseReason::Timeout;
+                        }
+                        _ => break LinkSessionCloseReason::TransportUnavailable,
+                    }
+                }
                 let action = link.tick();
-                reap_concluded_requests(&link, &mut pending.requests, &event_tx);
+                reap_concluded_requests(&link, &mut state.requests, &event_tx);
                 match action {
                     LinkAction::SendKeepalive => {
                         if send_keepalive(&transport_tx, attached_interface, &mut link)
@@ -532,13 +765,141 @@ async fn run_session_actor(
         }
     };
 
-    fail_pending_requests(&mut pending.requests, &event_tx);
+    state.channel.shutdown();
+    fail_pending_requests(&mut state.requests, &event_tx);
     deregister_destination(&transport_tx, link_id);
     let _ = event_tx
         .send(LinkSessionEvent::Closed {
             reason: close_reason,
         })
         .await;
+}
+
+async fn handle_channel_command(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &mut Link,
+    channel: &mut LinkChannel,
+    command: LinkSessionChannelCommand,
+) -> bool {
+    match command {
+        LinkSessionChannelCommand::RegisterMessageType {
+            msg_type,
+            result_tx,
+        } => {
+            let _ = result_tx.send(
+                channel
+                    .register_message_type(msg_type)
+                    .map_err(LinkSessionChannelError::from),
+            );
+        }
+        LinkSessionChannelCommand::RegisterSystemType {
+            msg_type,
+            result_tx,
+        } => {
+            channel.register_system_type(msg_type);
+            let _ = result_tx.send(Ok(()));
+        }
+        LinkSessionChannelCommand::AddMessageHandler { handler, result_tx } => {
+            let _ = result_tx.send(Ok(channel.add_message_handler(handler)));
+        }
+        LinkSessionChannelCommand::RemoveMessageHandler { id, result_tx } => {
+            let _ = result_tx.send(Ok(channel.remove_message_handler(id)));
+        }
+        LinkSessionChannelCommand::ClearMessageHandlers { result_tx } => {
+            channel.clear_message_handlers();
+            let _ = result_tx.send(Ok(()));
+        }
+        LinkSessionChannelCommand::Send {
+            msg_type,
+            payload,
+            result_tx,
+        } => {
+            let result = send_channel_message(
+                transport_tx,
+                attached_interface,
+                link,
+                channel,
+                PackedChannelMessage { msg_type, payload },
+            )
+            .await;
+            let transport_failed =
+                matches!(result, Err(LinkSessionChannelError::TransportUnavailable));
+            let _ = result_tx.send(result);
+            return transport_failed;
+        }
+        LinkSessionChannelCommand::IsReady { result_tx } => {
+            let ready = matches!(link.state, LinkState::Active | LinkState::Stale)
+                && channel.is_ready_to_send();
+            let _ = result_tx.send(Ok(ready));
+        }
+        LinkSessionChannelCommand::Shutdown { result_tx } => {
+            channel.shutdown();
+            let _ = result_tx.send(Ok(()));
+        }
+    }
+    false
+}
+
+async fn send_channel_message(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &mut Link,
+    channel: &mut LinkChannel,
+    message: PackedChannelMessage,
+) -> Result<LinkSessionChannelReceipt, LinkSessionChannelError> {
+    if !matches!(link.state, LinkState::Active | LinkState::Stale) {
+        return Err(LinkSessionChannelError::LinkNotActive);
+    }
+    let prepared = channel.prepare_send_tracked(&message)?;
+    send_channel_data(transport_tx, attached_interface, link, channel, prepared).await
+}
+
+async fn send_channel_data(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &mut Link,
+    channel: &mut LinkChannel,
+    prepared: PreparedChannelData,
+) -> Result<LinkSessionChannelReceipt, LinkSessionChannelError> {
+    let raw = build_data_packet(
+        link.link_id,
+        rns_wire::context::PacketContext::Channel,
+        &prepared.data,
+    );
+    let packet_hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+    send_raw(transport_tx, attached_interface, link.link_id, raw)
+        .await
+        .map_err(|_| LinkSessionChannelError::TransportUnavailable)?;
+    link.record_tx(prepared.data.len());
+    channel.track_outbound_packet_hash(packet_hash, prepared.sequence);
+    Ok(LinkSessionChannelReceipt {
+        link_id: link.link_id,
+        sequence: prepared.sequence,
+        packet_hash,
+    })
+}
+
+async fn resend_timed_out_channel_messages(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &mut Link,
+    channel: &mut LinkChannel,
+) -> Result<(), LinkSessionChannelError> {
+    for sequence in channel.timed_out_sequences() {
+        let Some(data) = channel.timeout(sequence)? else {
+            continue;
+        };
+        send_channel_data(
+            transport_tx,
+            attached_interface,
+            link,
+            channel,
+            PreparedChannelData { sequence, data },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn send_link_request(
@@ -671,7 +1032,7 @@ async fn process_destination_event(
     attached_interface: InterfaceId,
     identity: &Identity,
     link: &mut Link,
-    pending: &mut SessionPending,
+    state: &mut SessionActorState,
     event_tx: &mpsc::Sender<LinkSessionEvent>,
     event: DestinationEvent,
 ) -> Result<Option<LinkSessionCloseReason>, LinkSessionError> {
@@ -704,13 +1065,25 @@ async fn process_destination_event(
                 if body.len() >= 32 {
                     let mut packet_hash = [0u8; 32];
                     packet_hash.copy_from_slice(&body[..32]);
-                    if pending.packets.contains(&packet_hash)
-                        && link.validate_packet_proof(&packet_hash, body)
-                    {
-                        pending.packets.remove(&packet_hash);
-                        let _ = event_tx
-                            .send(LinkSessionEvent::PacketDelivered { packet_hash })
-                            .await;
+                    if link.validate_packet_proof(&packet_hash, body) {
+                        let delivered_packet = state.packets.remove(&packet_hash);
+                        let delivered_channel = if delivered_packet {
+                            false
+                        } else {
+                            state
+                                .channel
+                                .delivered_by_packet_hash(&packet_hash, link.rtt_secs())
+                                .is_some()
+                        };
+                        if delivered_packet || delivered_channel {
+                            link.record_inbound();
+                            link.keepalive.record_proof();
+                        }
+                        if delivered_packet {
+                            let _ = event_tx
+                                .send(LinkSessionEvent::PacketDelivered { packet_hash })
+                                .await;
+                        }
                     }
                 }
                 return Ok(None);
@@ -741,7 +1114,7 @@ async fn process_destination_event(
                     link.record_inbound();
                     link.record_rx(body.len());
                     if let Ok((request_id, data)) = link.handle_response(body)
-                        && let Some(request) = pending.requests.remove(&request_id)
+                        && let Some(request) = state.requests.remove(&request_id)
                     {
                         let response = LinkSessionResponse {
                             request_id,
@@ -762,17 +1135,14 @@ async fn process_destination_event(
                         return Ok(None);
                     };
                     let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
-                    if let Ok(proof) =
-                        link.prove_packet_with_fallible(&packet_hash, |hash| identity.sign(hash))
-                    {
-                        let proof_raw = build_proof_packet(
-                            link.link_id,
-                            rns_wire::context::PacketContext::LinkProof,
-                            &proof,
-                        );
-                        send_raw(transport_tx, attached_interface, link.link_id, proof_raw).await?;
-                        link.record_tx(proof.len());
-                    }
+                    send_packet_proof(
+                        transport_tx,
+                        attached_interface,
+                        identity,
+                        link,
+                        &packet_hash,
+                    )
+                    .await?;
                     event_tx
                         .send(LinkSessionEvent::Packet {
                             data: plaintext,
@@ -780,6 +1150,20 @@ async fn process_destination_event(
                         })
                         .await
                         .map_err(|_| LinkSessionError::SessionClosed)?;
+                }
+                rns_wire::context::PacketContext::Channel => {
+                    link.record_inbound();
+                    link.record_rx(body.len());
+                    let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
+                    send_packet_proof(
+                        transport_tx,
+                        attached_interface,
+                        identity,
+                        link,
+                        &packet_hash,
+                    )
+                    .await?;
+                    let _ = state.channel.receive_data(body);
                 }
                 _ => {}
             }
@@ -790,6 +1174,26 @@ async fn process_destination_event(
         _ => {}
     }
     Ok(None)
+}
+
+async fn send_packet_proof(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    identity: &Identity,
+    link: &mut Link,
+    packet_hash: &[u8; 32],
+) -> Result<(), LinkSessionError> {
+    let Ok(proof) = link.prove_packet_with_fallible(packet_hash, |hash| identity.sign(hash)) else {
+        return Ok(());
+    };
+    let proof_raw = build_proof_packet(
+        link.link_id,
+        rns_wire::context::PacketContext::LinkProof,
+        &proof,
+    );
+    send_raw(transport_tx, attached_interface, link.link_id, proof_raw).await?;
+    link.record_tx(proof.len());
+    Ok(())
 }
 
 async fn wait_for_link_proof(
@@ -1065,6 +1469,12 @@ mod tests {
 
         let link_id = initiator.link_id;
         let mdu = initiator.mdu;
+        let channel = LinkChannel::new_encrypted_with_mdu(
+            link_id,
+            initiator.rtt_secs(),
+            mdu,
+            initiator.session_keys().unwrap(),
+        );
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(16);
         let (delivery_tx, delivery_rx) = mpsc::channel::<DestinationEvent>(16);
         let (command_tx, command_rx) = mpsc::channel::<LinkSessionCommand>(16);
@@ -1078,7 +1488,7 @@ mod tests {
         tokio::spawn(run_session_actor(
             transport_tx,
             client_identity,
-            initiator,
+            (initiator, channel),
             7,
             delivery_rx,
             command_rx,
@@ -1387,6 +1797,164 @@ mod tests {
                 succeeded: false,
             }) if concluded == timed_out_id
         ));
+
+        let channel = session.handle.channel();
+        assert_eq!(
+            channel.mdu(),
+            rns_protocol::channel::Channel::channel_mdu(session.handle.mdu())
+        );
+        channel.register_message_type(0x0042).await.unwrap();
+        let (message_tx_guard, mut message_rx) = mpsc::unbounded_channel();
+        let message_tx = message_tx_guard.clone();
+        let handler_id = channel
+            .add_message_handler(move |msg_type, payload| {
+                let _ = message_tx.send((msg_type, payload.to_vec()));
+                true
+            })
+            .await
+            .unwrap();
+        let mut responder_channel = LinkChannel::new_encrypted_with_mdu(
+            responder.link_id,
+            responder.rtt_secs(),
+            responder.mdu,
+            responder.session_keys().unwrap(),
+        );
+        responder_channel.register_message_type(0x0042).unwrap();
+
+        let first_receipt = channel
+            .send_raw(0x0042, b"first channel frame")
+            .await
+            .unwrap();
+        let first_channel_packet = match transport_rx.recv().await.unwrap() {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (first_channel_header, first_channel_offset) =
+            rns_wire::header::PacketHeader::unpack(&first_channel_packet.raw).unwrap();
+        assert_eq!(
+            first_channel_header.context,
+            rns_wire::context::PacketContext::Channel
+        );
+        assert_eq!(
+            responder_channel
+                .receive_data(&first_channel_packet.raw[first_channel_offset..])
+                .unwrap(),
+            vec![(0x0042, b"first channel frame".to_vec())]
+        );
+
+        let _second_receipt = channel
+            .send_raw(0x0042, b"second channel frame")
+            .await
+            .unwrap();
+        let second_channel_packet = match transport_rx.recv().await.unwrap() {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (_, second_channel_offset) =
+            rns_wire::header::PacketHeader::unpack(&second_channel_packet.raw).unwrap();
+        assert_eq!(
+            responder_channel
+                .receive_data(&second_channel_packet.raw[second_channel_offset..])
+                .unwrap(),
+            vec![(0x0042, b"second channel frame".to_vec())]
+        );
+        assert!(!channel.is_ready_to_send().await.unwrap());
+
+        let first_proof = responder
+            .prove_packet_with_fallible(&first_receipt.packet_hash, |hash| {
+                server_identity.sign(hash)
+            })
+            .unwrap();
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: build_proof_packet(
+                    responder.link_id,
+                    rns_wire::context::PacketContext::LinkProof,
+                    &first_proof,
+                ),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if channel.is_ready_to_send().await.unwrap() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("channel proof should reopen the send window");
+
+        let inbound_prepared = responder_channel
+            .prepare_send_tracked(&PackedChannelMessage {
+                msg_type: 0x0042,
+                payload: b"inbound channel frame".to_vec(),
+            })
+            .unwrap();
+        let inbound_channel_packet = build_data_packet(
+            responder.link_id,
+            rns_wire::context::PacketContext::Channel,
+            &inbound_prepared.data,
+        );
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: inbound_channel_packet,
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), message_rx.recv())
+                .await
+                .unwrap(),
+            Some((0x0042, b"inbound channel frame".to_vec()))
+        );
+        let inbound_proof = match transport_rx.recv().await.unwrap() {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (inbound_proof_header, _) =
+            rns_wire::header::PacketHeader::unpack(&inbound_proof.raw).unwrap();
+        assert_eq!(
+            inbound_proof_header.flags.packet_type,
+            rns_wire::flags::PacketType::Proof
+        );
+
+        assert!(channel.remove_message_handler(handler_id).await.unwrap());
+        let ignored_prepared = responder_channel
+            .prepare_send_tracked(&PackedChannelMessage {
+                msg_type: 0x0042,
+                payload: b"ignored after removal".to_vec(),
+            })
+            .unwrap();
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: build_data_packet(
+                    responder.link_id,
+                    rns_wire::context::PacketContext::Channel,
+                    &ignored_prepared.data,
+                ),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), message_rx.recv())
+                .await
+                .is_err()
+        );
+        let _ignored_proof = transport_rx.recv().await.unwrap();
 
         let inbound_ciphertext = responder.encrypt(b"hello client").unwrap();
         let inbound = build_data_packet(
