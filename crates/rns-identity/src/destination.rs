@@ -121,6 +121,8 @@ pub enum DestinationError {
     InvalidGroupKeyLength(usize),
     #[error("operation requires a SINGLE destination")]
     NotSingle,
+    #[error("operation requires an inbound destination")]
+    NotInbound,
     #[error("identity does not address this destination")]
     IdentityMismatch,
     #[error("identity cannot sign")]
@@ -784,10 +786,10 @@ impl Destination {
     ) -> Result<(Vec<u8>, bool), DestinationError> {
         let time = AnnounceTime::new(time.wire, time.cache)?;
         if self.dest_type != DestType::Single {
-            return Err(DestinationError::EncryptionUnavailable);
+            return Err(DestinationError::NotSingle);
         }
         if self.direction != Direction::In {
-            return Err(DestinationError::EncryptionUnavailable);
+            return Err(DestinationError::NotInbound);
         }
 
         self.path_responses
@@ -1456,6 +1458,29 @@ mod tests {
                 },
             ),
             Err(DestinationError::InvalidAnnounceTime(_))
+        ));
+    }
+
+    #[test]
+    fn announce_rejects_wrong_destination_shape_precisely() {
+        let identity = Identity::new();
+        let mut group =
+            Destination::new(None, Direction::In, DestType::Group, "test.group").unwrap();
+        assert!(matches!(
+            group.announce_packet(&identity, None, None, false, None, 1.0),
+            Err(DestinationError::NotSingle)
+        ));
+
+        let mut outbound = Destination::new(
+            Some(&identity),
+            Direction::Out,
+            DestType::Single,
+            "test.out",
+        )
+        .unwrap();
+        assert!(matches!(
+            outbound.announce_packet(&identity, None, None, false, None, 1.0),
+            Err(DestinationError::NotInbound)
         ));
     }
 }
