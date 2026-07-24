@@ -499,6 +499,9 @@ pub enum TransportQuery {
     GetNextHopBitrate {
         dest: [u8; 16],
     },
+    GetNextHopHardwareMtu {
+        dest: [u8; 16],
+    },
     GetNextHopInterfaceId {
         dest: [u8; 16],
     },

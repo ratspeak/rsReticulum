@@ -503,6 +503,16 @@ impl TransportActor {
                     .map(|iface| iface.bitrate as f64);
                 TransportQueryResponse::FloatResult(bitrate)
             }
+            TransportQuery::GetNextHopHardwareMtu { dest } => {
+                let mtu = self
+                    .path_table
+                    .get_live(&dest)
+                    .map(|e| e.interface_id)
+                    .or_else(|| self.local_destination_interface_id(&dest))
+                    .and_then(|id| self.interfaces.get(&id))
+                    .map(|iface| i64::from(iface.mtu));
+                TransportQueryResponse::IntResult(mtu.unwrap_or(-1))
+            }
             TransportQuery::GetNextHopInterfaceId { dest } => {
                 let id = self
                     .path_table

@@ -715,6 +715,84 @@ impl ReticulumHandle {
         }
     }
 
+    /// Return the effective bitrate of the next-hop interface.
+    pub async fn next_hop_bitrate(
+        &self,
+        destination_hash: [u8; 16],
+    ) -> Result<Option<u64>, ControlError> {
+        match self
+            .query_control_result(TransportQuery::GetNextHopBitrate {
+                dest: destination_hash,
+            })
+            .await?
+        {
+            TransportQueryResponse::FloatResult(None) => Ok(None),
+            TransportQueryResponse::FloatResult(Some(bitrate))
+                if bitrate.is_finite()
+                    && bitrate >= 0.0
+                    && bitrate.fract() == 0.0
+                    && bitrate <= u64::MAX as f64 =>
+            {
+                Ok(Some(bitrate as u64))
+            }
+            _ => Err(ControlError::UnexpectedResponse {
+                operation: "next-hop bitrate query",
+            }),
+        }
+    }
+
+    /// Return the effective MTU of the next-hop interface.
+    ///
+    /// Rust interfaces normalize fixed and auto-configured hardware MTUs into
+    /// one concrete value, so this is the counterpart to Python's
+    /// `next_hop_interface_hw_mtu()`.
+    pub async fn next_hop_hardware_mtu(
+        &self,
+        destination_hash: [u8; 16],
+    ) -> Result<Option<u32>, ControlError> {
+        match self
+            .query_control_result(TransportQuery::GetNextHopHardwareMtu {
+                dest: destination_hash,
+            })
+            .await?
+        {
+            TransportQueryResponse::IntResult(-1) => Ok(None),
+            TransportQueryResponse::IntResult(mtu) => {
+                u32::try_from(mtu)
+                    .map(Some)
+                    .map_err(|_| ControlError::UnexpectedResponse {
+                        operation: "next-hop hardware MTU query",
+                    })
+            }
+            _ => Err(ControlError::UnexpectedResponse {
+                operation: "next-hop hardware MTU query",
+            }),
+        }
+    }
+
+    /// Return the next-hop transmission latency for one bit, in seconds.
+    pub async fn next_hop_per_bit_latency(
+        &self,
+        destination_hash: [u8; 16],
+    ) -> Result<Option<f64>, ControlError> {
+        Ok(self
+            .next_hop_bitrate(destination_hash)
+            .await?
+            .filter(|bitrate| *bitrate > 0)
+            .map(|bitrate| 1.0 / bitrate as f64))
+    }
+
+    /// Return the next-hop transmission latency for one byte, in seconds.
+    pub async fn next_hop_per_byte_latency(
+        &self,
+        destination_hash: [u8; 16],
+    ) -> Result<Option<f64>, ControlError> {
+        Ok(self
+            .next_hop_per_bit_latency(destination_hash)
+            .await?
+            .map(|latency| latency * 8.0))
+    }
+
     /// Return the first-hop transmission timeout for `destination_hash`.
     ///
     /// Shared-instance clients include the configured simulated local-link
@@ -5397,12 +5475,16 @@ loglevel = 7
 
     #[tokio::test]
     async fn typed_path_queries_validate_and_filter_actor_responses() {
-        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(3);
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(7);
         let destination_hash = [0x51; 16];
         let responder = tokio::spawn(async move {
             for response in [
                 TransportQueryResponse::BoolResult(true),
                 TransportQueryResponse::IntResult(6),
+                TransportQueryResponse::FloatResult(Some(1_000.0)),
+                TransportQueryResponse::FloatResult(Some(1_000.0)),
+                TransportQueryResponse::FloatResult(Some(1_000.0)),
+                TransportQueryResponse::IntResult(1_024),
                 TransportQueryResponse::PathTable(vec![
                     rns_transport::messages::PathTableRpcEntry {
                         hash: [0x61; 16],
@@ -5441,6 +5523,31 @@ loglevel = 7
         handle.transport_tx = transport_tx;
         assert!(handle.has_path(destination_hash).await.unwrap());
         assert_eq!(handle.hops_to(destination_hash).await.unwrap(), 6);
+        assert_eq!(
+            handle.next_hop_bitrate(destination_hash).await.unwrap(),
+            Some(1_000)
+        );
+        assert_eq!(
+            handle
+                .next_hop_per_bit_latency(destination_hash)
+                .await
+                .unwrap(),
+            Some(0.001)
+        );
+        assert_eq!(
+            handle
+                .next_hop_per_byte_latency(destination_hash)
+                .await
+                .unwrap(),
+            Some(0.008)
+        );
+        assert_eq!(
+            handle
+                .next_hop_hardware_mtu(destination_hash)
+                .await
+                .unwrap(),
+            Some(1_024)
+        );
         let paths = handle.path_table(Some(4)).await.unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].hash, [0x61; 16]);

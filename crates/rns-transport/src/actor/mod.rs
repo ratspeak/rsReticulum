@@ -8162,6 +8162,16 @@ mod tests {
             TransportQueryResponse::IntResult(id) => assert_eq!(id, 5),
             other => panic!("unexpected response: {other:?}"),
         }
+        match actor.handle_query(TransportQuery::GetNextHopBitrate { dest }) {
+            TransportQueryResponse::FloatResult(Some(bitrate)) => {
+                assert_eq!(bitrate, 115_200.0)
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match actor.handle_query(TransportQuery::GetNextHopHardwareMtu { dest }) {
+            TransportQueryResponse::IntResult(mtu) => assert_eq!(mtu, 500),
+            other => panic!("unexpected response: {other:?}"),
+        }
 
         // Unknown non-local destinations still resolve to nothing.
         let unknown = [0x72; 16];
@@ -8171,6 +8181,10 @@ mod tests {
         }
         match actor.handle_query(TransportQuery::GetNextHopInterfaceId { dest: unknown }) {
             TransportQueryResponse::IntResult(id) => assert_eq!(id, -1),
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match actor.handle_query(TransportQuery::GetNextHopHardwareMtu { dest: unknown }) {
+            TransportQueryResponse::IntResult(mtu) => assert_eq!(mtu, -1),
             other => panic!("unexpected response: {other:?}"),
         }
     }
