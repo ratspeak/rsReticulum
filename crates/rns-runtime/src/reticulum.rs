@@ -1184,6 +1184,16 @@ impl SharedInstanceType {
     }
 }
 
+/// Per-construction overrides for [`init_with_options`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InitOptions {
+    /// Attach only to an already-running shared instance. The runtime will not
+    /// claim the shared-instance listener when none exists.
+    pub require_shared_instance: bool,
+    /// Override the configured shared-instance transport for this process.
+    pub shared_instance_type: Option<SharedInstanceType>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SharedInstanceRpcEndpoint {
     Tcp(u16),
@@ -1681,6 +1691,24 @@ pub async fn init(
     shutdown: ShutdownSignal,
     is_foreground: Arc<AtomicBool>,
 ) -> Result<ReticulumHandle, ReticulumError> {
+    init_with_options(
+        configdir,
+        socket_dir,
+        shutdown,
+        is_foreground,
+        InitOptions::default(),
+    )
+    .await
+}
+
+/// Bring up Reticulum with explicit construction-time instance options.
+pub async fn init_with_options(
+    configdir: Option<&str>,
+    socket_dir: Option<PathBuf>,
+    shutdown: ShutdownSignal,
+    is_foreground: Arc<AtomicBool>,
+    options: InitOptions,
+) -> Result<ReticulumHandle, ReticulumError> {
     let started_at = std::time::Instant::now();
     let config_dir = resolve_config_dir(configdir);
     let paths = StoragePaths::from_config_dir(&config_dir);
@@ -1696,6 +1724,9 @@ pub async fn init(
         tokio::time::sleep(Duration::from_millis(1500)).await;
     }
     let mut rc = ReticulumConfig::try_from_config(&config).map_err(ReticulumError::Config)?;
+    if let Some(shared_instance_type) = options.shared_instance_type {
+        rc.shared_instance_type = shared_instance_type;
+    }
 
     let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new();
     actor.is_foreground = is_foreground.clone();
@@ -1803,6 +1834,8 @@ pub async fn init(
                     }
                     Err(_) => InstanceMode::Standalone,
                 }
+            } else if options.require_shared_instance {
+                InstanceMode::Standalone
             } else {
                 let server_config = rns_interface::tcp::TcpServerConfig::new(
                     "SharedInstanceServer",
@@ -1911,6 +1944,8 @@ pub async fn init(
                     }
                     Err(_) => InstanceMode::Standalone,
                 }
+            } else if options.require_shared_instance {
+                InstanceMode::Standalone
             } else {
                 let server_config = rns_interface::local::LocalServerConfig {
                     socket_path: socket_path.clone(),
@@ -1965,6 +2000,12 @@ pub async fn init(
     } else {
         InstanceMode::Standalone
     };
+
+    if options.require_shared_instance && instance_mode != InstanceMode::Client {
+        let _ = transport_tx.send(TransportMessage::Shutdown).await;
+        transport_completion.wait().await;
+        return Err(ReticulumError::RequiredSharedInstanceUnavailable);
+    }
 
     if instance_mode == InstanceMode::Client {
         if rc.enable_transport
@@ -4632,6 +4673,8 @@ pub enum ReticulumError {
     Io(std::io::Error),
     #[error("already initialized")]
     AlreadyInitialized,
+    #[error("no existing shared instance is available")]
+    RequiredSharedInstanceUnavailable,
     #[error("transport error: {0}")]
     Transport(String),
     #[error("interface error: {0}")]
@@ -6233,6 +6276,60 @@ enabled = yes
 
         shutdown.trigger();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn init_can_require_an_existing_shared_instance() {
+        let (port, control_port) = free_tcp_port_pair().await;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("reticulum_rs_require_shared_{nonce}_{port}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config"),
+            format!(
+                "[reticulum]\nshare_instance = Yes\nshared_instance_type = unix\nshared_instance_port = {port}\ninstance_control_port = {control_port}\nenable_transport = No\n\n[interfaces]\n"
+            ),
+        )
+        .unwrap();
+
+        let result = init_with_options(
+            Some(dir.to_str().unwrap()),
+            None,
+            ShutdownSignal::new(),
+            Arc::new(AtomicBool::new(true)),
+            InitOptions {
+                require_shared_instance: true,
+                shared_instance_type: Some(SharedInstanceType::Tcp),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ReticulumError::RequiredSharedInstanceUnavailable)
+        ));
+
+        // Requiring a peer must not claim the listener while probing.
+        let shutdown = ShutdownSignal::new();
+        let handle = init_with_options(
+            Some(dir.to_str().unwrap()),
+            None,
+            shutdown.clone(),
+            Arc::new(AtomicBool::new(true)),
+            InitOptions {
+                require_shared_instance: false,
+                shared_instance_type: Some(SharedInstanceType::Tcp),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(handle.instance_mode, InstanceMode::Shared);
+        handle.shutdown_and_wait().await;
 
         let _ = std::fs::remove_dir_all(&dir);
     }
