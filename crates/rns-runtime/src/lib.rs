@@ -21,3 +21,32 @@ pub mod rncp;
 pub mod rnsh;
 pub mod rpc;
 pub mod rpc_server;
+
+/// Common application-facing types for Reticulum programs.
+///
+/// This is additive convenience; module-qualified paths remain supported.
+pub mod prelude {
+    pub use crate::destination_runtime::{
+        DestinationEvents, DestinationHandle, DestinationPacket, DestinationRuntimeError,
+        DestinationRuntimeOptions, RegisteredDestination,
+    };
+    pub use crate::lifecycle::ShutdownSignal;
+    pub use crate::link_manager::{DestinationAnnounceOptions, DestinationRequest, RequestOutcome};
+    pub use crate::link_session::{
+        LinkSession, LinkSessionChannelError, LinkSessionChannelHandle, LinkSessionCloseReason,
+        LinkSessionError, LinkSessionEvent, LinkSessionHandle, LinkSessionResourceError,
+        LinkSessionResourceOffer, LinkSessionResponse,
+    };
+    pub use crate::resource_source::{ResourceOptions, ResourceSource};
+    pub use crate::reticulum::{
+        AnnounceSubscription, ControlError, InitOptions, InterfaceStats, LinkConnectError,
+        LinkConnectOptions, PacketReceiptHandle, PacketReceiptStatus, RecalledDestination,
+        ReceiptError, ReticulumError, ReticulumHandle, SendError, SendOptions, SendResult, init,
+        init_with_options,
+    };
+    pub use rns_identity::destination::{
+        AllowPolicy, DestType, Destination, Direction, ProofStrategy,
+    };
+    pub use rns_identity::identity::Identity;
+    pub use rns_link::link::{CloseReason, ResourceStrategy};
+}
