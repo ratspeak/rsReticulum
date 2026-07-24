@@ -25,6 +25,7 @@ use crate::platform::{StoragePaths, resolve_config_dir};
 use rns_identity::destination::{DestType, Destination, DestinationError, Direction};
 use rns_identity::identity::Identity;
 use rns_transport::await_path::{AwaitPathError, await_path};
+use rns_transport::constants::DESTINATION_TIMEOUT;
 use rns_transport::discovery::{
     Announcer, BLACKHOLE_INITIAL_WAIT, BLACKHOLE_JOB_INTERVAL, BLACKHOLE_SOURCE_TIMEOUT,
     BLACKHOLE_UPDATE_INTERVAL, BlackholeSubscriberState, DiscoveredInterface, DiscoveryDecryptor,
@@ -2182,9 +2183,10 @@ pub async fn init_with_options(
     if instance_mode != InstanceMode::Client {
         let job_tx = transport_tx.clone();
         let cache_dir = paths.cache_dir.clone();
+        let resource_dir = paths.resource_dir.clone();
         let job_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            run_jobs(job_tx, cache_dir, job_shutdown).await;
+            run_jobs(job_tx, cache_dir, resource_dir, job_shutdown).await;
         });
     }
 
@@ -4594,6 +4596,7 @@ fn synthesize_interfaces(
 async fn run_jobs(
     transport_tx: mpsc::Sender<TransportMessage>,
     cache_dir: PathBuf,
+    resource_dir: PathBuf,
     shutdown: ShutdownSignal,
 ) {
     let mut scheduler = JobScheduler::new();
@@ -4607,7 +4610,14 @@ async fn run_jobs(
                     match job {
                         Job::CleanCache => {
                             tracing::debug!("running cache cleanup");
-                            clean_cache(&cache_dir);
+                            clean_cache_dir(
+                                &resource_dir,
+                                std::time::Duration::from_secs(RESOURCE_CACHE),
+                            );
+                            clean_cache_dir(
+                                &cache_dir,
+                                std::time::Duration::from_secs(DESTINATION_TIMEOUT),
+                            );
                         }
                         Job::PersistData => {
                             tracing::debug!("persisting data");
@@ -4631,17 +4641,22 @@ async fn run_jobs(
     }
 }
 
-fn clean_cache(cache_dir: &Path) {
-    let cache_ttl = std::time::Duration::from_secs(RESOURCE_CACHE);
-    let now = std::time::SystemTime::now();
+fn clean_cache_dir(cache_dir: &Path, ttl: std::time::Duration) {
+    clean_cache_dir_at(cache_dir, ttl, std::time::SystemTime::now());
+}
 
+fn clean_cache_dir_at(cache_dir: &Path, ttl: std::time::Duration, now: std::time::SystemTime) {
     if let Ok(entries) = std::fs::read_dir(cache_dir) {
         for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            if file_name.as_encoded_bytes().len() != 32 {
+                continue;
+            }
             if let Ok(metadata) = entry.metadata() {
                 if metadata.is_file() {
                     if let Ok(modified) = metadata.modified() {
                         if let Ok(age) = now.duration_since(modified) {
-                            if age > cache_ttl {
+                            if age > ttl {
                                 let path = entry.path();
                                 if std::fs::remove_file(&path).is_ok() {
                                     tracing::trace!("cleaned cache entry: {}", path.display());
@@ -6780,26 +6795,60 @@ port = 37428
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        clean_cache(&dir);
+        clean_cache_dir(&dir, std::time::Duration::from_secs(DESTINATION_TIMEOUT));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn test_clean_cache_removes_old_files() {
+    fn test_cache_cleanup_uses_python_ttls_and_hash_named_files() {
         use std::fs;
 
         let dir = std::env::temp_dir().join("reticulum_rs_test_clean_old");
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let cache_dir = dir.join("cache");
+        let resource_dir = dir.join("resources");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&resource_dir).unwrap();
 
-        let file_path = dir.join("old_entry");
-        fs::write(&file_path, b"test data").unwrap();
+        let hash_name = "0123456789abcdef0123456789abcdef";
+        let packet_path = cache_dir.join(hash_name);
+        let resource_path = resource_dir.join(hash_name);
+        let unrelated_path = resource_dir.join("unrelated");
+        fs::write(&packet_path, b"packet").unwrap();
+        fs::write(&resource_path, b"resource").unwrap();
+        fs::write(&unrelated_path, b"keep").unwrap();
+        let modified = fs::metadata(&resource_path).unwrap().modified().unwrap();
 
-        // A recent file must survive — we don't mock mtime here.
-        clean_cache(&dir);
-        assert!(file_path.exists());
+        let after_resource_ttl = modified + std::time::Duration::from_secs(RESOURCE_CACHE + 1);
+        clean_cache_dir_at(
+            &resource_dir,
+            std::time::Duration::from_secs(RESOURCE_CACHE),
+            after_resource_ttl,
+        );
+        clean_cache_dir_at(
+            &cache_dir,
+            std::time::Duration::from_secs(DESTINATION_TIMEOUT),
+            after_resource_ttl,
+        );
+        assert!(!resource_path.exists(), "Resources expire after one day");
+        assert!(
+            packet_path.exists(),
+            "packet cache entries live for seven days"
+        );
+        assert!(
+            unrelated_path.exists(),
+            "non-hash files are not cache entries"
+        );
 
-        let _ = fs::remove_dir_all(&dir);
+        let packet_modified = fs::metadata(&packet_path).unwrap().modified().unwrap();
+        clean_cache_dir_at(
+            &cache_dir,
+            std::time::Duration::from_secs(DESTINATION_TIMEOUT),
+            packet_modified + std::time::Duration::from_secs(DESTINATION_TIMEOUT + 1),
+        );
+        assert!(!packet_path.exists());
+
+        let _ = fs::remove_dir_all(dir);
     }
 }
