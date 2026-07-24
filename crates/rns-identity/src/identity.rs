@@ -8,9 +8,20 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::persistence;
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Elliptic curve used for identity encryption and ratchets.
+pub const CURVE: &str = "Curve25519";
+/// Combined X25519 and Ed25519 public/private key size, in bits.
+pub const KEY_SIZE_BITS: usize = 512;
+/// X25519 ratchet key size, in bits.
+pub const RATCHET_SIZE_BITS: usize = 256;
+/// Addressable identity hash size, in bits.
+pub const HASH_LENGTH_BITS: usize = 128;
+/// Ratchet identifier size, in bytes.
+pub const RATCHET_ID_LENGTH: usize = 10;
 /// HKDF-derived key length: 32 bytes AES key || 32 bytes HMAC key.
 pub const DERIVED_KEY_LENGTH: usize = 64;
 
@@ -62,6 +73,15 @@ pub struct Identity {
     pub hash: [u8; 16],
     /// Set only for hardware-backed identities; `None` for all software ones.
     backend: Option<Arc<dyn LocalKeyBackend>>,
+}
+
+/// Successful identity decryption plus the ratchet that authenticated it.
+///
+/// `ratchet_id` is absent when the identity's base key performed decryption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecryptionResult {
+    pub plaintext: Vec<u8>,
+    pub ratchet_id: Option<[u8; RATCHET_ID_LENGTH]>,
 }
 
 impl Clone for Identity {
@@ -216,6 +236,11 @@ impl Identity {
         key
     }
 
+    /// Lowercase, delimiter-free hexadecimal identity hash.
+    pub fn hexhash(&self) -> String {
+        hex::encode(self.hash)
+    }
+
     pub fn has_private_key(&self) -> bool {
         self.prv.is_some() && self.sig_prv.is_some()
     }
@@ -294,6 +319,21 @@ impl Identity {
         ratchets: Option<&[&[u8; 32]]>,
         enforce_ratchets: bool,
     ) -> Result<Vec<u8>, IdentityError> {
+        self.decrypt_with_ratchet_id(ciphertext, ratchets, enforce_ratchets)
+            .map(|result| result.plaintext)
+    }
+
+    /// Decrypt ciphertext and report the ratchet key that authenticated it.
+    ///
+    /// The identifier is `SHA-256(ratchet_public_key)[:10]`, matching the
+    /// reference implementation. Base-identity decryption returns no ratchet
+    /// identifier.
+    pub fn decrypt_with_ratchet_id(
+        &self,
+        ciphertext: &[u8],
+        ratchets: Option<&[&[u8; 32]]>,
+        enforce_ratchets: bool,
+    ) -> Result<DecryptionResult, IdentityError> {
         if ciphertext.len() < 32 {
             return Err(IdentityError::DecryptionFailed);
         }
@@ -311,7 +351,12 @@ impl Identity {
                 shared.zeroize();
                 if let Ok(derived) = derived_result {
                     if let Ok(plaintext) = token::decrypt(ct, &derived) {
-                        return Ok(plaintext);
+                        return Ok(DecryptionResult {
+                            plaintext,
+                            ratchet_id: Some(Self::ratchet_id(
+                                &ratchet_prv.public_key().to_bytes(),
+                            )),
+                        });
                     }
                 }
             }
@@ -337,7 +382,18 @@ impl Identity {
         let derived = derived_result?;
         let plaintext =
             token::decrypt(ct, &derived).map_err(|_| IdentityError::DecryptionFailed)?;
-        Ok(plaintext)
+        Ok(DecryptionResult {
+            plaintext,
+            ratchet_id: None,
+        })
+    }
+
+    /// Derive the stable 80-bit identifier for a ratchet public key.
+    pub fn ratchet_id(ratchet_public_key: &[u8; 32]) -> [u8; RATCHET_ID_LENGTH] {
+        let full = rns_crypto::sha::sha256(ratchet_public_key);
+        let mut id = [0u8; RATCHET_ID_LENGTH];
+        id.copy_from_slice(&full[..RATCHET_ID_LENGTH]);
+        id
     }
 
     /// Sign `packet_hash` and return proof bytes.
@@ -368,6 +424,12 @@ impl Identity {
         combined[..32].copy_from_slice(&pub_key.to_bytes());
         combined[32..].copy_from_slice(&sig_pub.to_bytes());
         truncated_hash(&combined)
+    }
+}
+
+impl fmt::Display for Identity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "<{}>", self.hexhash())
     }
 }
 
@@ -443,8 +505,38 @@ mod tests {
         assert!(id.decrypt(&ct, None, false).is_err());
 
         let ratchets: Vec<&[u8; 32]> = vec![&ratchet_prv_bytes];
-        let pt = id.decrypt(&ct, Some(&ratchets), false).unwrap();
-        assert_eq!(&pt, plaintext);
+        let decrypted = id
+            .decrypt_with_ratchet_id(&ct, Some(&ratchets), false)
+            .unwrap();
+        assert_eq!(&decrypted.plaintext, plaintext);
+        assert_eq!(
+            decrypted.ratchet_id,
+            Some(Identity::ratchet_id(&ratchet_pub))
+        );
+    }
+
+    #[test]
+    fn base_identity_decryption_reports_no_ratchet() {
+        let id = Identity::new();
+        let ciphertext = id.encrypt(b"base identity", None).unwrap();
+        let decrypted = id
+            .decrypt_with_ratchet_id(&ciphertext, None, false)
+            .unwrap();
+
+        assert_eq!(decrypted.plaintext, b"base identity");
+        assert_eq!(decrypted.ratchet_id, None);
+    }
+
+    #[test]
+    fn identity_metadata_and_display_match_wire_identity() {
+        let id = Identity::new();
+
+        assert_eq!(CURVE, "Curve25519");
+        assert_eq!(KEY_SIZE_BITS, id.get_public_key().len() * 8);
+        assert_eq!(RATCHET_SIZE_BITS, 32 * 8);
+        assert_eq!(HASH_LENGTH_BITS, id.hash.len() * 8);
+        assert_eq!(id.hexhash(), hex::encode(id.hash));
+        assert_eq!(id.to_string(), format!("<{}>", hex::encode(id.hash)));
     }
 
     #[test]
