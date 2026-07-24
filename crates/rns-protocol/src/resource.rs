@@ -1391,6 +1391,34 @@ impl OutboundTransfer {
         TransferAction::None
     }
 
+    /// Sender-side advertisement watchdog for request-driven runtimes.
+    ///
+    /// An outbound transfer remains `Advertised` until the receiver's first
+    /// `RESOURCE_REQ` arrives. If that advertisement is lost, resend it up to
+    /// the Python-compatible retry limit instead of leaving the transfer
+    /// dormant forever.
+    pub fn check_timeout(&mut self) -> TransferAction {
+        if self.resource.state != ResourceState::Advertised {
+            return TransferAction::None;
+        }
+
+        let timeout = Duration::from_secs_f64(
+            self.rtt.as_secs_f64() * rns_link::constants::TRAFFIC_TIMEOUT_FACTOR + PROCESSING_GRACE,
+        );
+        if self.started_at.elapsed() <= timeout {
+            return TransferAction::None;
+        }
+
+        if self.retries < MAX_ADV_RETRIES {
+            self.retries += 1;
+            self.started_at = Instant::now();
+            TransferAction::SendAdvertisement(self.create_advertisement())
+        } else {
+            self.resource.state = ResourceState::Failed;
+            TransferAction::Failed("resource advertisement timed out".to_string())
+        }
+    }
+
     /// Consume a hashmap-update frame from the receiver.
     ///
     /// Wire layout:
@@ -2770,6 +2798,47 @@ mod tests {
         // Subsequent ticks should send parts
         let action = transfer.tick();
         assert!(matches!(action, TransferAction::SendPart(0, _)));
+    }
+
+    #[test]
+    fn test_outbound_advertisement_watchdog_retries() {
+        let mut transfer = OutboundTransfer::new(
+            b"retry advertisement".to_vec(),
+            false,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert!(matches!(
+            transfer.tick(),
+            TransferAction::SendAdvertisement(_)
+        ));
+
+        transfer.started_at = Instant::now() - Duration::from_secs(60);
+        assert!(matches!(
+            transfer.check_timeout(),
+            TransferAction::SendAdvertisement(_)
+        ));
+        assert_eq!(transfer.retries, 1);
+        assert_eq!(transfer.resource.state, ResourceState::Advertised);
+    }
+
+    #[test]
+    fn test_outbound_advertisement_watchdog_fails_after_retry_limit() {
+        let mut transfer = OutboundTransfer::new(
+            b"failed advertisement".to_vec(),
+            false,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        transfer.tick();
+        transfer.retries = MAX_ADV_RETRIES;
+        transfer.started_at = Instant::now() - Duration::from_secs(60);
+
+        assert!(matches!(
+            transfer.check_timeout(),
+            TransferAction::Failed(_)
+        ));
+        assert_eq!(transfer.resource.state, ResourceState::Failed);
     }
 
     #[test]
