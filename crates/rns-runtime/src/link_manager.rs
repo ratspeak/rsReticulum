@@ -286,6 +286,8 @@ pub struct LinkManager {
     link_closed_tx: Option<mpsc::Sender<[u8; 16]>>,
     /// Raw pass-through for non-link packets (e.g. opportunistic LXMF).
     inbound_raw_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Whether destination delivery proofs contain only the signature.
+    use_implicit_proof: bool,
     /// Remote identity hash → link_id; populated on LinkIdentify for outbound reuse.
     backchannel_links: HashMap<[u8; 16], [u8; 16]>,
     /// Shared reverse map so sync request handlers can look up the authenticated peer.
@@ -325,6 +327,7 @@ impl LinkManager {
             channel_message_tx: None,
             link_closed_tx: None,
             inbound_raw_tx: None,
+            use_implicit_proof: true,
             backchannel_links: HashMap::new(),
             link_identities: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -378,6 +381,7 @@ impl LinkManager {
             channel_message_tx: None,
             link_closed_tx: None,
             inbound_raw_tx: None,
+            use_implicit_proof: true,
             backchannel_links: HashMap::new(),
             link_identities: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -385,6 +389,22 @@ impl LinkManager {
 
     pub fn get_backchannel_link(&self, identity_hash: &[u8; 16]) -> Option<[u8; 16]> {
         self.backchannel_links.get(identity_hash).copied()
+    }
+
+    /// Destination owned by a manager created with [`Self::with_destination`].
+    pub fn destination(&self) -> Option<&Destination> {
+        self.destination.as_ref()
+    }
+
+    /// Mutable destination access for installing packet/proof callbacks and
+    /// selecting the destination proof strategy before the manager is run.
+    pub fn destination_mut(&mut self) -> Option<&mut Destination> {
+        self.destination.as_mut()
+    }
+
+    /// Match the runtime `use_implicit_proof` setting for destination proofs.
+    pub fn set_use_implicit_proof(&mut self, use_implicit_proof: bool) {
+        self.use_implicit_proof = use_implicit_proof;
     }
 
     /// Shared auth map for sync request handlers (which can't borrow `self`).
@@ -757,7 +777,7 @@ impl LinkManager {
         );
     }
 
-    fn handle_inbound_packet(&mut self, raw: &[u8], _interface_id: u64) {
+    fn handle_inbound_packet(&mut self, raw: &[u8], interface_id: u64) {
         let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(raw) {
             Ok(h) => h,
             Err(e) => {
@@ -777,12 +797,14 @@ impl LinkManager {
         let link_id = header.destination_hash;
 
         if !self.active_links.contains_key(&link_id) {
+            let processed = self.dispatch_destination_packet(raw, interface_id);
             if let Some(ref tx) = self.inbound_raw_tx {
                 let _ = tx.try_send(raw.to_vec());
             }
             tracing::debug!(
                 dest = hex::encode(link_id),
                 data_len = data.len(),
+                processed,
                 "link_manager: non-link packet forwarded to application (raw)"
             );
             return;
@@ -3089,13 +3111,87 @@ impl LinkManager {
     pub fn process_destination_packet(&self, raw: &[u8], identity: &Identity) -> Option<Vec<u8>> {
         let dest = self.destination.as_ref()?;
         let (header, data_offset) = rns_wire::header::PacketHeader::unpack(raw).ok()?;
+        if header.destination_hash != dest.hash
+            || header.flags.destination_type as u8 != dest.dest_type as u8
+        {
+            return None;
+        }
         let data = &raw[data_offset..];
         let packet_type = header.flags.packet_type as u8;
 
-        match dest.receive(packet_type, data, identity) {
+        match dest.receive_packet(packet_type, data, raw, identity) {
             Ok(Some(plaintext)) => Some(plaintext),
             _ => None,
         }
+    }
+
+    fn dispatch_destination_packet(&self, raw: &[u8], interface_id: u64) -> bool {
+        let Some(identity) = self.identity.as_ref() else {
+            return false;
+        };
+        let Some(_plaintext) = self.process_destination_packet(raw, identity) else {
+            return false;
+        };
+        let Some(destination) = self.destination.as_ref() else {
+            return false;
+        };
+        let Ok((header, _)) = rns_wire::header::PacketHeader::unpack(raw) else {
+            return false;
+        };
+
+        if header.flags.packet_type != rns_wire::flags::PacketType::Data
+            || !destination.should_prove(raw)
+        {
+            return true;
+        }
+
+        let (packet_hash, proof_destination) =
+            rns_wire::hash::packet_hash_pair(raw, header.flags.header_type);
+        let proof = match destination.prove(&packet_hash, identity, self.use_implicit_proof) {
+            Ok(proof) => proof,
+            Err(e) => {
+                tracing::warn!(
+                    destination = %hex::encode(destination.hash),
+                    error = %e,
+                    "failed to prove destination packet"
+                );
+                return true;
+            }
+        };
+
+        let proof_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Single,
+                packet_type: rns_wire::flags::PacketType::Proof,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: proof_destination,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut proof_raw = proof_header.pack();
+        proof_raw.extend_from_slice(&proof);
+        let request = OutboundRequest {
+            raw: Bytes::from(proof_raw),
+            destination_hash: proof_destination,
+        };
+        if let Err(e) = self
+            .transport_tx
+            .try_send(TransportMessage::OutboundAttached {
+                request,
+                interface_id,
+            })
+        {
+            tracing::warn!(
+                destination = %hex::encode(destination.hash),
+                err = %e,
+                "failed to queue destination packet proof"
+            );
+        }
+        true
     }
 
     /// Sends ADV + initial window, registers transfer so later HMU drives the rest.
@@ -3700,6 +3796,127 @@ mod tests {
 
         assert!(lm.destination.is_some());
         assert_eq!(lm.active_link_count(), 0);
+    }
+
+    fn destination_data_packet(
+        identity: &Identity,
+        app_name: &str,
+        destination_hash: [u8; 16],
+        plaintext: &[u8],
+    ) -> Vec<u8> {
+        let destination =
+            Destination::new(Some(identity), Direction::Out, DestType::Single, app_name).unwrap();
+        let ciphertext = destination.encrypt(plaintext, identity, None).unwrap();
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Single,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&ciphertext);
+        raw
+    }
+
+    #[test]
+    fn live_destination_dispatch_runs_callback_and_preserves_raw_delivery() {
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let identity = Identity::new();
+        let mut manager = LinkManager::with_destination(
+            transport_tx,
+            event_rx,
+            &identity,
+            "test.dispatch",
+            identity.get_signing_key(),
+        );
+        let observed = Arc::new(Mutex::new(None));
+        let callback_observed = Arc::clone(&observed);
+        manager
+            .destination_mut()
+            .unwrap()
+            .set_packet_callback(Box::new(move |plaintext, raw| {
+                *callback_observed.lock().unwrap() = Some((plaintext.to_vec(), raw.to_vec()));
+            }));
+        let (raw_tx, mut raw_rx) = mpsc::channel(1);
+        manager.set_inbound_raw_channel(raw_tx);
+        let plaintext = b"live destination dispatch";
+        let raw = destination_data_packet(
+            &identity,
+            "test.dispatch",
+            manager.destination_hash,
+            plaintext,
+        );
+
+        manager.handle_inbound_packet(&raw, 23);
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some((plaintext.to_vec(), raw.clone()))
+        );
+        assert_eq!(raw_rx.try_recv().unwrap(), raw);
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "ProveNone must not emit a delivery proof"
+        );
+    }
+
+    #[test]
+    fn live_destination_dispatch_honors_proof_strategy_and_format() {
+        use rns_identity::destination::ProofStrategy;
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let identity = Identity::new();
+        let public_identity = Identity::from_public_key(&identity.get_public_key()).unwrap();
+        let mut manager = LinkManager::with_destination(
+            transport_tx,
+            event_rx,
+            &identity,
+            "test.prove",
+            identity.get_signing_key(),
+        );
+        manager
+            .destination_mut()
+            .unwrap()
+            .set_proof_strategy(ProofStrategy::ProveAll);
+        manager.set_use_implicit_proof(false);
+        let raw = destination_data_packet(
+            &identity,
+            "test.prove",
+            manager.destination_hash,
+            b"prove me",
+        );
+        let (expected_hash, expected_destination) =
+            rns_wire::hash::packet_hash_pair(&raw, rns_wire::flags::HeaderType::Header1);
+
+        manager.handle_inbound_packet(&raw, 41);
+
+        let TransportMessage::OutboundAttached {
+            request,
+            interface_id,
+        } = transport_rx.try_recv().unwrap()
+        else {
+            panic!("expected attached destination proof");
+        };
+        assert_eq!(interface_id, 41);
+        assert_eq!(request.destination_hash, expected_destination);
+        let (header, data_offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(header.flags.packet_type, rns_wire::flags::PacketType::Proof);
+        assert_eq!(header.destination_hash, expected_destination);
+        let proof = &request.raw[data_offset..];
+        assert_eq!(proof.len(), 96);
+        assert_eq!(&proof[..32], expected_hash.as_slice());
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&proof[32..]);
+        assert!(public_identity.verify(&expected_hash, &signature));
     }
 
     #[test]

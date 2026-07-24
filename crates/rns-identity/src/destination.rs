@@ -505,6 +505,21 @@ impl Destination {
         data: &[u8],
         identity: &Identity,
     ) -> Result<Option<Vec<u8>>, DestinationError> {
+        self.receive_packet(packet_type, data, data, identity)
+    }
+
+    /// Decrypt and dispatch an incoming packet while preserving the complete
+    /// raw packet for the packet callback.
+    ///
+    /// Runtime dispatchers should prefer this over [`Self::receive`]. The
+    /// latter remains available for callers that only have the packet payload.
+    pub fn receive_packet(
+        &self,
+        packet_type: u8,
+        data: &[u8],
+        raw_packet: &[u8],
+        identity: &Identity,
+    ) -> Result<Option<Vec<u8>>, DestinationError> {
         if packet_type == 0x02 {
             return Ok(Some(data.to_vec()));
         }
@@ -513,7 +528,7 @@ impl Destination {
 
         if packet_type == 0x00 {
             if let Some(ref cb) = self.packet_callback {
-                cb(&plaintext, data);
+                cb(&plaintext, raw_packet);
             }
         }
 
@@ -918,6 +933,67 @@ mod tests {
         let dest = Destination::new(None, Direction::In, DestType::Plain, "test.app").unwrap();
         let id = Identity::new();
         assert!(dest.prove(b"test", &id, true).is_err());
+    }
+
+    #[test]
+    fn receive_packet_dispatches_plaintext_with_complete_raw_packet() {
+        use std::sync::{Arc, Mutex};
+
+        let identity = Identity::new();
+        let mut inbound = Destination::new(
+            Some(&identity),
+            Direction::In,
+            DestType::Single,
+            "test.receive",
+        )
+        .unwrap();
+        let outbound = Destination::new(
+            Some(&identity),
+            Direction::Out,
+            DestType::Single,
+            "test.receive",
+        )
+        .unwrap();
+        let plaintext = b"destination callback";
+        let ciphertext = outbound.encrypt(plaintext, &identity, None).unwrap();
+        let raw_packet = [b"header".as_slice(), ciphertext.as_slice()].concat();
+        let observed = Arc::new(Mutex::new(None));
+        let callback_observed = Arc::clone(&observed);
+        inbound.set_packet_callback(Box::new(move |data, raw| {
+            *callback_observed.lock().unwrap() = Some((data.to_vec(), raw.to_vec()));
+        }));
+
+        let decrypted = inbound
+            .receive_packet(0x00, &ciphertext, &raw_packet, &identity)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decrypted, plaintext);
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some((plaintext.to_vec(), raw_packet))
+        );
+    }
+
+    #[test]
+    fn proof_strategy_honors_application_decision() {
+        let identity = Identity::new();
+        let mut destination = Destination::new(
+            Some(&identity),
+            Direction::In,
+            DestType::Single,
+            "test.proof",
+        )
+        .unwrap();
+
+        assert!(!destination.should_prove(b"packet"));
+        destination.set_proof_strategy(ProofStrategy::ProveAll);
+        assert!(destination.should_prove(b"packet"));
+        destination.set_proof_strategy(ProofStrategy::ProveApp);
+        assert!(!destination.should_prove(b"packet"));
+        destination.set_proof_requested_callback(Box::new(|packet| packet == b"allowed"));
+        assert!(destination.should_prove(b"allowed"));
+        assert!(!destination.should_prove(b"denied"));
     }
 
     #[test]

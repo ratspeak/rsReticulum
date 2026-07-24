@@ -135,6 +135,9 @@ pub async fn spawn_probe_responder(
             if header.flags.packet_type != PacketType::Data {
                 continue;
             }
+            if !destination.should_prove(&raw) {
+                continue;
+            }
 
             let (full_hash, trunc_hash) = packet_hash_pair(&raw, header.flags.header_type);
             let proof_payload = match identity.prove(&full_hash, implicit) {
