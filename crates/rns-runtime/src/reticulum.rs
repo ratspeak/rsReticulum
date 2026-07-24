@@ -598,18 +598,9 @@ impl ReticulumHandle {
     }
 
     async fn default_packet_receipt_timeout(&self, destination_hash: [u8; 16]) -> Duration {
-        let first_hop = match self
-            .query_control_result(TransportQuery::FirstHopTimeout {
-                dest: destination_hash,
-            })
-            .await
-        {
-            Ok(TransportQueryResponse::FloatResult(Some(seconds)))
-                if seconds.is_finite() && seconds >= 0.0 =>
-            {
-                seconds
-            }
-            _ => return Duration::from_secs(180),
+        let first_hop = match self.first_hop_timeout(destination_hash).await {
+            Ok(timeout) => timeout.as_secs_f64(),
+            Err(_) => return Duration::from_secs(180),
         };
         let hops = match self.hops_to(destination_hash).await {
             Ok(hops) => hops,
@@ -724,6 +715,33 @@ impl ReticulumHandle {
         }
     }
 
+    /// Return the first-hop transmission timeout for `destination_hash`.
+    ///
+    /// Shared-instance clients include the configured simulated local-link
+    /// latency from `force_shared_instance_bitrate`, matching Python.
+    pub async fn first_hop_timeout(
+        &self,
+        destination_hash: [u8; 16],
+    ) -> Result<Duration, ControlError> {
+        match self
+            .query_control_result(TransportQuery::FirstHopTimeout {
+                dest: destination_hash,
+            })
+            .await?
+        {
+            TransportQueryResponse::FloatResult(Some(seconds))
+                if seconds.is_finite() && seconds >= 0.0 =>
+            {
+                Duration::try_from_secs_f64(seconds).map_err(|_| ControlError::UnexpectedResponse {
+                    operation: "first-hop timeout query",
+                })
+            }
+            _ => Err(ControlError::UnexpectedResponse {
+                operation: "first-hop timeout query",
+            }),
+        }
+    }
+
     /// Return the authoritative path table, optionally limited by hop count.
     pub async fn path_table(
         &self,
@@ -789,6 +807,24 @@ impl ReticulumHandle {
         })
     }
 
+    fn apply_shared_instance_latency(
+        &self,
+        query: &TransportQuery,
+        mut response: TransportQueryResponse,
+    ) -> TransportQueryResponse {
+        if self.instance_mode == InstanceMode::Client
+            && matches!(query, TransportQuery::FirstHopTimeout { .. })
+            && let Some(bitrate) = self
+                .config
+                .force_shared_instance_bitrate
+                .filter(|bitrate| *bitrate > 0)
+            && let TransportQueryResponse::FloatResult(Some(seconds)) = &mut response
+        {
+            *seconds += (rns_wire::constants::MTU as f64 * 8.0) / bitrate as f64;
+        }
+        response
+    }
+
     /// Result-returning control-plane query used by the typed facade.
     ///
     /// Unlike the compatibility [`Self::query_control`] method, a failed
@@ -820,9 +856,12 @@ impl ReticulumHandle {
         if let crate::rpc::RpcResponse::Error(error) = rpc_result {
             return Err(ControlError::Rpc(error));
         }
-        rpc_response_to_transport_response(rpc_result).ok_or(ControlError::UnexpectedResponse {
-            operation: "shared-instance control query",
-        })
+        let response = rpc_response_to_transport_response(rpc_result).ok_or(
+            ControlError::UnexpectedResponse {
+                operation: "shared-instance control query",
+            },
+        )?;
+        Ok(self.apply_shared_instance_latency(&query, response))
     }
 
     /// Query the authoritative control plane.
@@ -858,7 +897,7 @@ impl ReticulumHandle {
                     match rpc_result {
                         Ok(response) => {
                             if let Some(mapped) = rpc_response_to_transport_response(response) {
-                                return Some(mapped);
+                                return Some(self.apply_shared_instance_latency(&query, mapped));
                             }
                         }
                         Err(e) => {
@@ -1830,6 +1869,7 @@ pub async fn init_with_options(
                             &transport_tx,
                             &interface_controls,
                             &shutdown,
+                            rc.force_shared_instance_bitrate,
                         )
                         .await
                     }
@@ -1854,6 +1894,11 @@ pub async fn init_with_options(
                 .await
                 {
                     Ok(server_handle) => {
+                        let mut server_handle = server_handle;
+                        apply_forced_shared_instance_bitrate(
+                            &mut server_handle,
+                            rc.force_shared_instance_bitrate,
+                        );
                         register_interface_handle_with_role(
                             &transport_tx,
                             server_handle,
@@ -1880,6 +1925,7 @@ pub async fn init_with_options(
                                         &transport_tx,
                                         &interface_controls,
                                         &shutdown,
+                                        rc.force_shared_instance_bitrate,
                                     )
                                     .await
                                 }
@@ -1940,6 +1986,7 @@ pub async fn init_with_options(
                             &transport_tx,
                             &interface_controls,
                             &shutdown,
+                            rc.force_shared_instance_bitrate,
                         )
                         .await
                     }
@@ -1961,6 +2008,11 @@ pub async fn init_with_options(
                 .await
                 {
                     Ok(server_handle) => {
+                        let mut server_handle = server_handle;
+                        apply_forced_shared_instance_bitrate(
+                            &mut server_handle,
+                            rc.force_shared_instance_bitrate,
+                        );
                         register_interface_handle_with_role(
                             &transport_tx,
                             server_handle,
@@ -1989,6 +2041,7 @@ pub async fn init_with_options(
                                     &transport_tx,
                                     &interface_controls,
                                     &shutdown,
+                                    rc.force_shared_instance_bitrate,
                                 )
                                 .await
                             }
@@ -2127,10 +2180,14 @@ pub async fn init_with_options(
     {
         let reg_tx = transport_tx.clone();
         let reg_controls = interface_controls.clone();
+        let forced_shared_bitrate = rc.force_shared_instance_bitrate;
         tokio::spawn(async move {
-            while let Some(sub_handle) = handle_rx.recv().await {
+            while let Some(mut sub_handle) = handle_rx.recv().await {
                 let (role, ingress_overrides, ifac_key, ifac_size) =
                     child_registration_from_parent(&reg_controls, sub_handle.parent_id);
+                if role == rns_transport::messages::InterfaceRole::LocalClient {
+                    apply_forced_shared_instance_bitrate(&mut sub_handle, forced_shared_bitrate);
+                }
                 register_interface_handle_with_role_and_overrides(
                     &reg_tx,
                     sub_handle,
@@ -2357,14 +2414,28 @@ fn next_id(id_gen: &Arc<AtomicU64>) -> u64 {
     id_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+fn apply_forced_shared_instance_bitrate(
+    handle: &mut rns_interface::traits::InterfaceHandle,
+    forced_bitrate: Option<u64>,
+) {
+    let Some(bitrate) = forced_bitrate.filter(|bitrate| *bitrate > 0) else {
+        return;
+    };
+    handle.bitrate = bitrate;
+    handle.mtu =
+        rns_interface::traits::optimise_mtu(bitrate).unwrap_or(rns_wire::constants::MTU as u32);
+}
+
 /// Register a freshly connected shared-instance client (TCP or local socket)
 /// as the SharedInstancePeer and start its reconnect monitor.
 async fn adopt_shared_instance_client(
-    client_handle: rns_interface::traits::InterfaceHandle,
+    mut client_handle: rns_interface::traits::InterfaceHandle,
     transport_tx: &mpsc::Sender<TransportMessage>,
     interface_controls: &InterfaceControlMap,
     shutdown: &ShutdownSignal,
+    forced_bitrate: Option<u64>,
 ) -> InstanceMode {
+    apply_forced_shared_instance_bitrate(&mut client_handle, forced_bitrate);
     let client_iface_id = client_handle.id;
     let client_online = client_handle.online.clone();
     register_interface_handle_with_role(
@@ -5015,6 +5086,36 @@ loglevel = 7
         let config = Config::parse(input).unwrap();
         let rc = ReticulumConfig::from_config(&config);
         assert_eq!(rc.force_shared_instance_bitrate, None);
+    }
+
+    #[tokio::test]
+    async fn forced_shared_instance_bitrate_updates_interface_metadata() {
+        let mut handle = test_interface_handle(1, None, "shared");
+        apply_forced_shared_instance_bitrate(&mut handle, Some(1_000_000));
+        assert_eq!(handle.bitrate, 1_000_000);
+        assert_eq!(
+            handle.mtu,
+            rns_interface::traits::optimise_mtu(1_000_000).unwrap()
+        );
+
+        apply_forced_shared_instance_bitrate(&mut handle, Some(0));
+        assert_eq!(handle.bitrate, 1_000_000, "zero is not a usable bitrate");
+    }
+
+    #[tokio::test]
+    async fn forced_shared_instance_bitrate_adds_client_first_hop_latency() {
+        let mut handle = dummy_handle();
+        handle.instance_mode = InstanceMode::Client;
+        handle.config.force_shared_instance_bitrate = Some(1_000);
+        let adjusted = handle.apply_shared_instance_latency(
+            &TransportQuery::FirstHopTimeout { dest: [0x42; 16] },
+            TransportQueryResponse::FloatResult(Some(6.0)),
+        );
+        let TransportQueryResponse::FloatResult(Some(seconds)) = adjusted else {
+            panic!("expected first-hop timeout");
+        };
+        let simulated = (rns_wire::constants::MTU as f64 * 8.0) / 1_000.0;
+        assert_eq!(seconds, 6.0 + simulated);
     }
 
     #[test]
