@@ -956,6 +956,23 @@ impl LinkManager {
             return;
         }
 
+        let Some(attached_interface) = self
+            .active_links
+            .get(&link_id)
+            .map(|active| active._interface_id)
+        else {
+            return;
+        };
+        if interface_id != attached_interface {
+            tracing::warn!(
+                link_id = %hex::encode(link_id),
+                interface_id,
+                attached_interface,
+                "link packet ignored on unexpected interface"
+            );
+            return;
+        }
+
         tracing::info!(
             link_id = hex::encode(link_id),
             context = ?header.context,
@@ -4008,6 +4025,15 @@ mod tests {
                 segment_routing: HashMap::new(),
             },
         );
+
+        lm.handle_inbound_packet(&close_raw, 2);
+        assert_eq!(
+            lm.active_link_count(),
+            1,
+            "link traffic from another interface must be ignored"
+        );
+        assert!(closed_rx.try_recv().is_err());
+        assert!(transport_rx.try_recv().is_err());
 
         lm.handle_inbound_packet(&close_raw, 1);
 
