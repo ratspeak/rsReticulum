@@ -4,8 +4,8 @@
 //! request/response exchange, this module keeps the Link alive and exposes
 //! ordinary encrypted Link packets until either peer closes the session.
 
-use std::collections::HashSet;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rns_crypto::ed25519::Ed25519PublicKey;
@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 
 const COMMAND_BUFFER: usize = 64;
 const EVENT_BUFFER: usize = 256;
+const MAX_PENDING_REQUESTS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct LinkSessionConfig {
@@ -65,6 +66,10 @@ pub enum LinkSessionEvent {
     PacketDelivered {
         packet_hash: [u8; 32],
     },
+    RequestConcluded {
+        request_id: [u8; 16],
+        succeeded: bool,
+    },
     Stale,
     Recovered,
     Closed {
@@ -76,6 +81,13 @@ pub enum LinkSessionEvent {
 pub struct LinkSessionPacketReceipt {
     pub link_id: [u8; 16],
     pub packet_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSessionResponse {
+    pub request_id: [u8; 16],
+    pub data: Vec<u8>,
+    pub response_time: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -98,6 +110,10 @@ pub enum LinkSessionError {
     LinkNotActive,
     #[error("payload is {actual} bytes; Link MDU is {max}")]
     PayloadTooLarge { actual: usize, max: usize },
+    #[error("request is {actual} bytes; requests above Link MDU {max} require Resource transfer")]
+    RequestRequiresResource { actual: usize, max: usize },
+    #[error("too many Link requests are already pending")]
+    TooManyPendingRequests,
     #[error("Link session task is no longer running")]
     SessionClosed,
 }
@@ -107,7 +123,24 @@ enum LinkSessionCommand {
         payload: Vec<u8>,
         result_tx: oneshot::Sender<Result<LinkSessionPacketReceipt, LinkSessionError>>,
     },
+    Request {
+        path: String,
+        data: Vec<u8>,
+        timeout: Option<Duration>,
+        result_tx: oneshot::Sender<Result<LinkSessionResponse, LinkSessionError>>,
+    },
     Close,
+}
+
+struct PendingSessionRequest {
+    sent_at: Instant,
+    result_tx: oneshot::Sender<Result<LinkSessionResponse, LinkSessionError>>,
+}
+
+#[derive(Default)]
+struct SessionPending {
+    packets: HashSet<[u8; 32]>,
+    requests: HashMap<[u8; 16], PendingSessionRequest>,
 }
 
 #[derive(Clone)]
@@ -139,6 +172,33 @@ impl LinkSessionHandle {
         let (result_tx, result_rx) = oneshot::channel();
         self.command_tx
             .send(LinkSessionCommand::SendPacket { payload, result_tx })
+            .await
+            .map_err(|_| LinkSessionError::SessionClosed)?;
+        result_rx
+            .await
+            .map_err(|_| LinkSessionError::SessionClosed)?
+    }
+
+    /// Send a packet-sized request and wait for its response.
+    ///
+    /// Requests whose encrypted representation exceeds the current Link MDU
+    /// return [`LinkSessionError::RequestRequiresResource`]; Resource-backed
+    /// requests are handled by the Resource API rather than silently changing
+    /// transport semantics.
+    pub async fn request(
+        &self,
+        path: &str,
+        data: &[u8],
+        timeout: Option<Duration>,
+    ) -> Result<LinkSessionResponse, LinkSessionError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.command_tx
+            .send(LinkSessionCommand::Request {
+                path: path.to_string(),
+                data: data.to_vec(),
+                timeout,
+                result_tx,
+            })
             .await
             .map_err(|_| LinkSessionError::SessionClosed)?;
         result_rx
@@ -354,7 +414,7 @@ async fn run_session_actor(
     event_tx: mpsc::Sender<LinkSessionEvent>,
 ) {
     let link_id = link.link_id;
-    let mut pending_packets = HashSet::<[u8; 32]>::new();
+    let mut pending = SessionPending::default();
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let close_reason = loop {
         tokio::select! {
@@ -365,13 +425,50 @@ async fn run_session_actor(
                             &transport_tx,
                             attached_interface,
                             &mut link,
-                            &mut pending_packets,
+                            &mut pending.packets,
                             payload,
                         ).await;
                         let transport_failed = matches!(result, Err(LinkSessionError::TransportUnavailable));
                         let _ = result_tx.send(result);
                         if transport_failed {
                             break LinkSessionCloseReason::TransportUnavailable;
+                        }
+                    }
+                    Some(LinkSessionCommand::Request {
+                        path,
+                        data,
+                        timeout,
+                        result_tx,
+                    }) => {
+                        if pending.requests.len() >= MAX_PENDING_REQUESTS {
+                            let _ = result_tx.send(Err(LinkSessionError::TooManyPendingRequests));
+                            continue;
+                        }
+                        match send_link_request(
+                            &transport_tx,
+                            attached_interface,
+                            &mut link,
+                            &path,
+                            &data,
+                            timeout,
+                        ).await {
+                            Ok(request_id) => {
+                                pending.requests.insert(
+                                    request_id,
+                                    PendingSessionRequest {
+                                        sent_at: Instant::now(),
+                                        result_tx,
+                                    },
+                                );
+                            }
+                            Err(error) => {
+                                let transport_failed =
+                                    matches!(error, LinkSessionError::TransportUnavailable);
+                                let _ = result_tx.send(Err(error));
+                                if transport_failed {
+                                    break LinkSessionCloseReason::TransportUnavailable;
+                                }
+                            }
                         }
                     }
                     Some(LinkSessionCommand::Close) | None => {
@@ -389,7 +486,7 @@ async fn run_session_actor(
                     attached_interface,
                     &identity,
                     &mut link,
-                    &mut pending_packets,
+                    &mut pending,
                     &event_tx,
                     event,
                 ).await {
@@ -399,7 +496,9 @@ async fn run_session_actor(
                 }
             }
             _ = ticker.tick() => {
-                match link.tick() {
+                let action = link.tick();
+                reap_concluded_requests(&link, &mut pending.requests, &event_tx);
+                match action {
                     LinkAction::SendKeepalive => {
                         if send_keepalive(&transport_tx, attached_interface, &mut link)
                             .await
@@ -433,12 +532,101 @@ async fn run_session_actor(
         }
     };
 
+    fail_pending_requests(&mut pending.requests, &event_tx);
     deregister_destination(&transport_tx, link_id);
     let _ = event_tx
         .send(LinkSessionEvent::Closed {
             reason: close_reason,
         })
         .await;
+}
+
+async fn send_link_request(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
+    link: &mut Link,
+    path: &str,
+    data: &[u8],
+    timeout: Option<Duration>,
+) -> Result<[u8; 16], LinkSessionError> {
+    if link.state != LinkState::Active {
+        return Err(LinkSessionError::LinkNotActive);
+    }
+    let timeout = timeout.unwrap_or_else(|| link.default_request_timeout());
+    let (encrypted, initial_request_id) = link
+        .request(path, Some(data), timeout)
+        .map_err(|_| LinkSessionError::LinkCrypto)?;
+    if encrypted.len() > link.mdu {
+        link.pending_requests
+            .retain(|receipt| receipt.request_id[..16] != initial_request_id);
+        return Err(LinkSessionError::RequestRequiresResource {
+            actual: encrypted.len(),
+            max: link.mdu,
+        });
+    }
+
+    let raw = build_data_packet(
+        link.link_id,
+        rns_wire::context::PacketContext::Request,
+        &encrypted,
+    );
+    let request_id =
+        rns_wire::hash::truncated_packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+    if !link.update_pending_request_id(&initial_request_id, request_id) {
+        return Err(LinkSessionError::LinkCrypto);
+    }
+    if let Err(error) = send_raw(transport_tx, attached_interface, link.link_id, raw).await {
+        link.pending_requests
+            .retain(|receipt| receipt.request_id[..16] != request_id);
+        return Err(error);
+    }
+    link.record_tx(encrypted.len());
+    Ok(request_id)
+}
+
+fn reap_concluded_requests(
+    link: &Link,
+    pending_requests: &mut HashMap<[u8; 16], PendingSessionRequest>,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+) {
+    let active: HashSet<[u8; 16]> = link
+        .pending_requests
+        .iter()
+        .map(|receipt| {
+            let mut request_id = [0u8; 16];
+            request_id.copy_from_slice(&receipt.request_id[..16]);
+            request_id
+        })
+        .collect();
+    let concluded: Vec<[u8; 16]> = pending_requests
+        .keys()
+        .copied()
+        .filter(|request_id| !active.contains(request_id))
+        .collect();
+    for request_id in concluded {
+        if let Some(pending) = pending_requests.remove(&request_id) {
+            let _ = pending
+                .result_tx
+                .send(Err(LinkSessionError::Timeout("Link request")));
+            let _ = event_tx.try_send(LinkSessionEvent::RequestConcluded {
+                request_id,
+                succeeded: false,
+            });
+        }
+    }
+}
+
+fn fail_pending_requests(
+    pending_requests: &mut HashMap<[u8; 16], PendingSessionRequest>,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+) {
+    for (request_id, pending) in pending_requests.drain() {
+        let _ = pending.result_tx.send(Err(LinkSessionError::SessionClosed));
+        let _ = event_tx.try_send(LinkSessionEvent::RequestConcluded {
+            request_id,
+            succeeded: false,
+        });
+    }
 }
 
 async fn send_application_packet(
@@ -483,7 +671,7 @@ async fn process_destination_event(
     attached_interface: InterfaceId,
     identity: &Identity,
     link: &mut Link,
-    pending_packets: &mut HashSet<[u8; 32]>,
+    pending: &mut SessionPending,
     event_tx: &mpsc::Sender<LinkSessionEvent>,
     event: DestinationEvent,
 ) -> Result<Option<LinkSessionCloseReason>, LinkSessionError> {
@@ -516,10 +704,10 @@ async fn process_destination_event(
                 if body.len() >= 32 {
                     let mut packet_hash = [0u8; 32];
                     packet_hash.copy_from_slice(&body[..32]);
-                    if pending_packets.contains(&packet_hash)
+                    if pending.packets.contains(&packet_hash)
                         && link.validate_packet_proof(&packet_hash, body)
                     {
-                        pending_packets.remove(&packet_hash);
+                        pending.packets.remove(&packet_hash);
                         let _ = event_tx
                             .send(LinkSessionEvent::PacketDelivered { packet_hash })
                             .await;
@@ -548,6 +736,24 @@ async fn process_destination_event(
                     link.record_inbound();
                     link.record_rx(body.len());
                     let _ = link.update_rtt_from_packet(body);
+                }
+                rns_wire::context::PacketContext::Response => {
+                    link.record_inbound();
+                    link.record_rx(body.len());
+                    if let Ok((request_id, data)) = link.handle_response(body)
+                        && let Some(request) = pending.requests.remove(&request_id)
+                    {
+                        let response = LinkSessionResponse {
+                            request_id,
+                            data,
+                            response_time: request.sent_at.elapsed(),
+                        };
+                        let _ = request.result_tx.send(Ok(response));
+                        let _ = event_tx.try_send(LinkSessionEvent::RequestConcluded {
+                            request_id,
+                            succeeded: true,
+                        });
+                    }
                 }
                 rns_wire::context::PacketContext::None => {
                     link.record_inbound();
@@ -802,6 +1008,39 @@ mod tests {
             receipt.packet_hash,
             rns_wire::hash::packet_hash(&sent.raw, header.flags.header_type)
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_request_requires_resource_without_leaking_a_receipt() {
+        let destination_hash = [0xBE; 16];
+        let server_signing = Ed25519PrivateKey::generate();
+        let server_public = server_signing.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &server_signing, destination_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &server_public, &server_public.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+        let mdu = initiator.mdu;
+        let payload = vec![0u8; mdu];
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+
+        assert!(matches!(
+            send_link_request(
+                &transport_tx,
+                1,
+                &mut initiator,
+                "/large",
+                &payload,
+                Some(Duration::from_secs(1)),
+            )
+            .await,
+            Err(LinkSessionError::RequestRequiresResource { actual, max })
+                if actual > max && max == mdu
+        ));
+        assert!(initiator.pending_requests.is_empty());
+        assert!(transport_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1063,6 +1302,91 @@ mod tests {
             receipt.packet_hash,
             rns_wire::hash::packet_hash(&sent.raw, sent_header.flags.header_type)
         );
+
+        let request_handle = session.handle.clone();
+        let request_task = tokio::spawn(async move {
+            request_handle
+                .request("/echo", b"request body", Some(Duration::from_secs(2)))
+                .await
+        });
+        let request = match transport_rx.recv().await.unwrap() {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (request_header, request_offset) =
+            rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(
+            request_header.context,
+            rns_wire::context::PacketContext::Request
+        );
+        let (_packed_id, path_hash, _timestamp, request_data) = responder
+            .handle_request(&request.raw[request_offset..])
+            .unwrap();
+        assert_eq!(path_hash, rns_crypto::sha::truncated_hash(b"/echo"));
+        assert_eq!(request_data, b"request body");
+        let request_id =
+            rns_wire::hash::truncated_packet_hash(&request.raw, request_header.flags.header_type);
+        let response = responder
+            .create_response(&request_id, b"response body")
+            .unwrap();
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: build_data_packet(
+                    responder.link_id,
+                    rns_wire::context::PacketContext::Response,
+                    &response,
+                ),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+        let response = request_task.await.unwrap().unwrap();
+        assert_eq!(response.request_id, request_id);
+        assert_eq!(response.data, b"response body");
+        assert!(matches!(
+            session.events.recv().await,
+            Some(LinkSessionEvent::RequestConcluded {
+                request_id: concluded,
+                succeeded: true,
+            }) if concluded == request_id
+        ));
+
+        let timeout_handle = session.handle.clone();
+        let timeout_task = tokio::spawn(async move {
+            timeout_handle
+                .request("/timeout", b"", Some(Duration::ZERO))
+                .await
+        });
+        let timed_out_request = match transport_rx.recv().await.unwrap() {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (timed_out_header, _) =
+            rns_wire::header::PacketHeader::unpack(&timed_out_request.raw).unwrap();
+        let timed_out_id = rns_wire::hash::truncated_packet_hash(
+            &timed_out_request.raw,
+            timed_out_header.flags.header_type,
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), timeout_task)
+                .await
+                .expect("request timeout result")
+                .unwrap(),
+            Err(LinkSessionError::Timeout("Link request"))
+        ));
+        assert!(matches!(
+            session.events.recv().await,
+            Some(LinkSessionEvent::RequestConcluded {
+                request_id: concluded,
+                succeeded: false,
+            }) if concluded == timed_out_id
+        ));
 
         let inbound_ciphertext = responder.encrypt(b"hello client").unwrap();
         let inbound = build_data_packet(
