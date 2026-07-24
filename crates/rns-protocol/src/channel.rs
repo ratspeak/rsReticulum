@@ -208,6 +208,10 @@ impl ChannelWindow {
 /// (subsequent handlers are skipped) or `false` to fall through.
 pub type MessageCallback = Box<dyn Fn(u16, &[u8]) -> bool + Send>;
 
+/// Opaque token for removing one registered message handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HandlerId(u64);
+
 /// Sequenced, reliable message pipe over a Reticulum link.
 ///
 /// The channel is passive: the owning runtime calls `send`/`receive`/
@@ -221,12 +225,13 @@ pub struct Channel {
     rx_ring: VecDeque<Envelope>,
     pub window: ChannelWindow,
     pub active: bool,
-    initial_rtt: f64,
+    current_rtt: f64,
     /// When non-empty, only these types are accepted on `receive`.
     registered_types: Vec<u16>,
     /// Called in registration order on each delivered message; the first
     /// handler that returns `true` stops the chain.
-    message_handlers: Vec<MessageCallback>,
+    message_handlers: Vec<(HandlerId, MessageCallback)>,
+    next_handler_id: u64,
 }
 
 impl Channel {
@@ -238,9 +243,10 @@ impl Channel {
             rx_ring: VecDeque::new(),
             window: ChannelWindow::new(rtt),
             active: true,
-            initial_rtt: rtt,
+            current_rtt: rtt,
             registered_types: Vec::new(),
             message_handlers: Vec::new(),
+            next_handler_id: 0,
         }
     }
 
@@ -265,9 +271,26 @@ impl Channel {
         }
     }
 
-    /// Append `handler` to the end of the callback chain.
-    pub fn add_message_handler(&mut self, handler: MessageCallback) {
-        self.message_handlers.push(handler);
+    /// Append `handler` to the end of the callback chain and return its token.
+    pub fn add_message_handler(&mut self, handler: MessageCallback) -> HandlerId {
+        let id = HandlerId(self.next_handler_id);
+        self.next_handler_id = self.next_handler_id.wrapping_add(1);
+        self.message_handlers.push((id, handler));
+        id
+    }
+
+    /// Remove exactly one previously registered handler.
+    pub fn remove_message_handler(&mut self, id: HandlerId) -> bool {
+        let Some(index) = self
+            .message_handlers
+            .iter()
+            .position(|(candidate, _)| *candidate == id)
+        else {
+            return false;
+        };
+        let (_id, handler) = self.message_handlers.remove(index);
+        drop(handler);
+        true
     }
 
     pub fn clear_message_handlers(&mut self) {
@@ -275,7 +298,7 @@ impl Channel {
     }
 
     fn run_callbacks(&self, msg_type: u16, payload: &[u8]) -> bool {
-        for handler in &self.message_handlers {
+        for (_, handler) in &self.message_handlers {
             if handler(msg_type, payload) {
                 return true;
             }
@@ -312,6 +335,14 @@ impl Channel {
 
     /// As [`Self::send`], but also returns the assigned sequence number.
     pub fn send_tracked(&mut self, msg: &dyn MessageBase) -> Result<(u16, Vec<u8>), ChannelError> {
+        self.send_tracked_with_max_envelope(msg, None)
+    }
+
+    fn send_tracked_with_max_envelope(
+        &mut self,
+        msg: &dyn MessageBase,
+        max_envelope_size: Option<usize>,
+    ) -> Result<(u16, Vec<u8>), ChannelError> {
         if !self.active {
             return Err(ChannelError::ChannelClosed);
         }
@@ -320,9 +351,16 @@ impl Channel {
         }
 
         let seq = self.next_tx_sequence;
-        self.next_tx_sequence = ((self.next_tx_sequence as u32 + 1) % SEQ_MODULUS) as u16;
-
         let mut envelope = Envelope::pack(msg, seq);
+        if let Some(max) = max_envelope_size
+            && envelope.raw.len() > max
+        {
+            return Err(ChannelError::MessageTooLarge {
+                actual: envelope.raw.len(),
+                max,
+            });
+        }
+        self.next_tx_sequence = ((self.next_tx_sequence as u32 + 1) % SEQ_MODULUS) as u16;
         envelope.state = MessageState::Sent;
         envelope.tries = 1;
         envelope.last_sent = Some(Instant::now());
@@ -477,10 +515,10 @@ impl Channel {
             .count()
     }
 
-    /// Retransmit timeout: `1.5^(tries - 1) * max(rtt * 2.5, MIN_TIMEOUT_BASE)
-    /// * (outstanding + 1.5)` seconds, using the RTT captured at construction.
+    /// Retransmit timeout uses the Python-compatible exponential backoff,
+    /// based on the latest Link RTT supplied by the owning runtime.
     pub fn compute_timeout(&self, tries: usize) -> f64 {
-        let rtt = self.initial_rtt;
+        let rtt = self.current_rtt;
         let backoff = 1.5_f64.powi(tries.saturating_sub(1) as i32);
         let base = (rtt * 2.5).max(MIN_TIMEOUT_BASE);
         let outstanding = self.outstanding_count() as f64 + 1.5;
@@ -489,6 +527,13 @@ impl Channel {
 
     fn timeout_duration(&self, tries: usize) -> Duration {
         Duration::from_secs_f64(self.compute_timeout(tries).max(MIN_TIMEOUT_BASE))
+    }
+
+    /// Update the live Link RTT used by subsequent retransmit deadlines.
+    pub fn update_rtt(&mut self, rtt: f64) {
+        if rtt.is_finite() && rtt >= 0.0 {
+            self.current_rtt = rtt;
+        }
     }
 
     /// Mark the channel inactive and drop every buffered envelope and
@@ -522,6 +567,8 @@ pub enum ChannelError {
     UnknownMessageType(u16),
     #[error("invalid message type: 0x{0:04X} (reserved for system use)")]
     InvalidMessageType(u16),
+    #[error("packed channel message is {actual} bytes; Link MDU is {max}")]
+    MessageTooLarge { actual: usize, max: usize },
 }
 
 /// A [`Channel`] paired with its link ID and (optionally) link session keys,
@@ -530,6 +577,7 @@ pub enum ChannelError {
 pub struct LinkChannel {
     channel: Channel,
     link_id: [u8; 16],
+    link_mdu: usize,
     session_keys: Option<rns_link::key_derivation::LinkKeys>,
     outbound_packet_hashes: HashMap<[u8; 32], u16>,
 }
@@ -543,9 +591,15 @@ pub struct PreparedChannelData {
 impl LinkChannel {
     /// Plain-text channel (no transport-side encryption).
     pub fn new(link_id: [u8; 16], rtt: f64) -> Self {
+        Self::new_with_mdu(link_id, rtt, rns_wire::constants::LINK_MDU)
+    }
+
+    /// Plain-text channel with an explicit Link MDU.
+    pub fn new_with_mdu(link_id: [u8; 16], rtt: f64, link_mdu: usize) -> Self {
         Self {
             channel: Channel::new(rtt),
             link_id,
+            link_mdu,
             session_keys: None,
             outbound_packet_hashes: HashMap::new(),
         }
@@ -558,9 +612,20 @@ impl LinkChannel {
         rtt: f64,
         keys: rns_link::key_derivation::LinkKeys,
     ) -> Self {
+        Self::new_encrypted_with_mdu(link_id, rtt, rns_wire::constants::LINK_MDU, keys)
+    }
+
+    /// Encrypted channel with an explicit Link MDU.
+    pub fn new_encrypted_with_mdu(
+        link_id: [u8; 16],
+        rtt: f64,
+        link_mdu: usize,
+        keys: rns_link::key_derivation::LinkKeys,
+    ) -> Self {
         Self {
             channel: Channel::new(rtt),
             link_id,
+            link_mdu,
             session_keys: Some(keys),
             outbound_packet_hashes: HashMap::new(),
         }
@@ -578,7 +643,9 @@ impl LinkChannel {
         &mut self,
         msg: &dyn MessageBase,
     ) -> Result<PreparedChannelData, ChannelError> {
-        let (sequence, raw) = self.channel.send_tracked(msg)?;
+        let (sequence, raw) = self
+            .channel
+            .send_tracked_with_max_envelope(msg, Some(self.link_mdu))?;
         if let Some(ref keys) = self.session_keys {
             let data = rns_link::encryption::link_encrypt(keys, &raw)
                 .map_err(|_| ChannelError::ChannelClosed)?;
@@ -604,6 +671,7 @@ impl LinkChannel {
     }
 
     pub fn delivered(&mut self, sequence: u16, rtt: f64) {
+        self.channel.update_rtt(rtt);
         self.channel.delivered(sequence, rtt);
     }
 
@@ -619,6 +687,31 @@ impl LinkChannel {
 
     pub fn is_ready_to_send(&self) -> bool {
         self.channel.is_ready_to_send()
+    }
+
+    /// Maximum payload bytes available to one channel message.
+    pub fn mdu(&self) -> usize {
+        Channel::channel_mdu(self.link_mdu)
+    }
+
+    pub fn register_message_type(&mut self, msg_type: u16) -> Result<(), ChannelError> {
+        self.channel.register_message_type(msg_type)
+    }
+
+    pub fn register_system_type(&mut self, msg_type: u16) {
+        self.channel.register_system_type(msg_type);
+    }
+
+    pub fn add_message_handler(&mut self, handler: MessageCallback) -> HandlerId {
+        self.channel.add_message_handler(handler)
+    }
+
+    pub fn remove_message_handler(&mut self, id: HandlerId) -> bool {
+        self.channel.remove_message_handler(id)
+    }
+
+    pub fn clear_message_handlers(&mut self) {
+        self.channel.clear_message_handlers();
     }
 
     pub fn link_id(&self) -> &[u8; 16] {
@@ -656,6 +749,10 @@ impl LinkChannel {
 
     pub fn next_timeout_duration(&self) -> Option<Duration> {
         self.channel.next_timeout_duration()
+    }
+
+    pub fn update_rtt(&mut self, rtt: f64) {
+        self.channel.update_rtt(rtt);
     }
 }
 
@@ -1053,6 +1150,44 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_message_handler_removes_only_its_token() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU32, Ordering},
+        };
+
+        let mut tx = Channel::new(0.1);
+        let raw = tx.send(&TestMessage::new(b"handler tokens")).unwrap();
+        let mut rx = Channel::new(0.1);
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let first_counter = counter.clone();
+        let first = rx.add_message_handler(Box::new(move |_, _| {
+            first_counter.fetch_add(1, Ordering::SeqCst);
+            false
+        }));
+        let second_counter = counter.clone();
+        let _second = rx.add_message_handler(Box::new(move |_, _| {
+            second_counter.fetch_add(10, Ordering::SeqCst);
+            false
+        }));
+
+        assert!(rx.remove_message_handler(first));
+        assert!(!rx.remove_message_handler(first));
+        rx.receive(&raw).unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 10);
+    }
+
+    #[test]
+    fn test_live_rtt_updates_retransmit_timeout() {
+        let mut channel = Channel::new(0.1);
+        channel.send(&TestMessage::new(b"rtt")).unwrap();
+        let initial = channel.compute_timeout(1);
+        channel.update_rtt(1.0);
+        assert!(channel.compute_timeout(1) > initial);
+    }
+
+    #[test]
     fn test_link_channel_send_receive() {
         let link_id = [0xAA; 16];
         let mut tx_lc = LinkChannel::new(link_id, 0.1);
@@ -1121,6 +1256,28 @@ mod tests {
         // An unacknowledged envelope must be handed back for resend.
         let resend = lc.timeout(0).unwrap();
         assert!(resend.is_some());
+    }
+
+    #[test]
+    fn test_link_channel_enforces_message_mdu_without_consuming_sequence() {
+        let link_id = [0xDE; 16];
+        let mut channel = LinkChannel::new_with_mdu(link_id, 0.1, 32);
+        assert_eq!(channel.mdu(), 32 - ENVELOPE_HEADER_SIZE);
+
+        let oversized = TestMessage::new(&vec![0u8; channel.mdu() + 1]);
+        assert!(matches!(
+            channel.prepare_send_tracked(&oversized),
+            Err(ChannelError::MessageTooLarge {
+                actual: 33,
+                max: 32
+            })
+        ));
+        assert_eq!(channel.outstanding_count(), 0);
+
+        let prepared = channel
+            .prepare_send_tracked(&TestMessage::new(b"fits"))
+            .unwrap();
+        assert_eq!(prepared.sequence, 0);
     }
 
     #[test]

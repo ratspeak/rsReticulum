@@ -1874,6 +1874,9 @@ impl LinkManager {
         let mut to_remove = Vec::new();
 
         for (link_id, active) in &mut self.active_links {
+            if let Some(channel) = active.channel.as_mut() {
+                channel.update_rtt(active.link.rtt_secs());
+            }
             let timed_out_channel_sequences = active
                 .channel
                 .as_ref()
@@ -2316,8 +2319,9 @@ impl LinkManager {
     fn ensure_link_channel(active: &mut ActiveLink, link_id: [u8; 16]) -> Option<&mut LinkChannel> {
         if active.channel.is_none() {
             let rtt = active.link.rtt_secs();
+            let mdu = active.link.mdu;
             let keys = active.link.session_keys()?;
-            active.channel = Some(LinkChannel::new_encrypted(link_id, rtt, keys));
+            active.channel = Some(LinkChannel::new_encrypted_with_mdu(link_id, rtt, mdu, keys));
             active.link.mark_channel_created();
         }
         active.channel.as_mut()

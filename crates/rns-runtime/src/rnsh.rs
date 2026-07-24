@@ -394,7 +394,8 @@ pub async fn rnsh_client_execute(
     let session_keys = link
         .session_keys()
         .ok_or_else(|| RnshError::LinkCrypto("no session keys".into()))?;
-    let mut channel = LinkChannel::new_encrypted(link_id, link.rtt_secs(), session_keys);
+    let mut channel =
+        LinkChannel::new_encrypted_with_mdu(link_id, link.rtt_secs(), link.mdu, session_keys);
     link.mark_channel_created();
     let mut pending_messages = VecDeque::new();
     let mut stdout = Vec::new();
@@ -1544,6 +1545,7 @@ async fn resend_timed_out_client_channel_messages(
     link: &mut Link,
     channel: &mut LinkChannel,
 ) -> Result<(), RnshError> {
+    channel.update_rtt(link.rtt_secs());
     for sequence in channel.timed_out_sequences() {
         let Some(data) = channel.timeout(sequence)? else {
             continue;
