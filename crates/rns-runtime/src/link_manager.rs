@@ -1917,6 +1917,83 @@ impl LinkManager {
                 active.link.record_tx(data.len());
             }
 
+            let inbound_watchdog_actions: Vec<([u8; 32], TransferAction)> = active
+                .inbound_resources
+                .iter_mut()
+                .filter_map(|(resource_hash, transfer)| {
+                    let action = transfer.check_timeout();
+                    if matches!(action, TransferAction::None) {
+                        None
+                    } else {
+                        Some((*resource_hash, action))
+                    }
+                })
+                .collect();
+            for (resource_hash, action) in inbound_watchdog_actions {
+                if !active.inbound_resources.contains_key(&resource_hash) {
+                    continue;
+                }
+                match action {
+                    TransferAction::Failed(reason) => {
+                        Self::drop_inbound_resource(active, &resource_hash);
+                        tracing::warn!(
+                            link_id = hex::encode(link_id),
+                            resource = hex::encode(&resource_hash[..8]),
+                            %reason,
+                            "inbound resource watchdog exhausted"
+                        );
+                    }
+                    retry => {
+                        if Self::send_resource_action(&self.transport_tx, active, link_id, retry) {
+                            tracing::debug!(
+                                link_id = hex::encode(link_id),
+                                resource = hex::encode(&resource_hash[..8]),
+                                "inbound resource watchdog requested retry"
+                            );
+                        }
+                    }
+                }
+            }
+
+            let outbound_watchdog_actions: Vec<([u8; 32], TransferAction)> = active
+                .outbound_resources
+                .iter_mut()
+                .filter_map(|(resource_hash, transfer)| {
+                    let action = transfer.check_timeout();
+                    if matches!(action, TransferAction::None) {
+                        None
+                    } else {
+                        Some((*resource_hash, action))
+                    }
+                })
+                .collect();
+            for (resource_hash, action) in outbound_watchdog_actions {
+                match action {
+                    TransferAction::Failed(reason) => {
+                        if let Some(transfer) = active.outbound_resources.remove(&resource_hash)
+                            && let Some(original_hash) = transfer.resource.original_hash
+                        {
+                            active.outbound_split_queues.remove(&original_hash);
+                        }
+                        tracing::warn!(
+                            link_id = hex::encode(link_id),
+                            resource = hex::encode(&resource_hash[..8]),
+                            %reason,
+                            "outbound resource watchdog exhausted"
+                        );
+                    }
+                    retry => {
+                        if Self::send_resource_action(&self.transport_tx, active, link_id, retry) {
+                            tracing::debug!(
+                                link_id = hex::encode(link_id),
+                                resource = hex::encode(&resource_hash[..8]),
+                                "outbound resource advertisement retried"
+                            );
+                        }
+                    }
+                }
+            }
+
             if !active.inbound_resources.is_empty() || !active.outbound_resources.is_empty() {
                 active.link.record_inbound();
             }
@@ -2060,6 +2137,118 @@ impl LinkManager {
             raw: Bytes::from(ka_raw),
             destination_hash: *link_id,
         }));
+    }
+
+    fn send_resource_action(
+        transport_tx: &mpsc::Sender<TransportMessage>,
+        active: &mut ActiveLink,
+        link_id: &[u8; 16],
+        action: TransferAction,
+    ) -> bool {
+        let (context, payload, encrypted, packet_type) = match action {
+            TransferAction::SendAdvertisement(payload) => (
+                rns_wire::context::PacketContext::ResourceAdv,
+                payload,
+                true,
+                rns_wire::flags::PacketType::Data,
+            ),
+            TransferAction::SendPart(_, payload) => (
+                rns_wire::context::PacketContext::Resource,
+                payload,
+                false,
+                rns_wire::flags::PacketType::Data,
+            ),
+            TransferAction::SendProof(payload) => (
+                rns_wire::context::PacketContext::ResourcePrf,
+                payload,
+                false,
+                rns_wire::flags::PacketType::Proof,
+            ),
+            TransferAction::SendHmu(payload) => (
+                rns_wire::context::PacketContext::ResourceHmu,
+                payload,
+                true,
+                rns_wire::flags::PacketType::Data,
+            ),
+            TransferAction::SendRequest(payload) => (
+                rns_wire::context::PacketContext::ResourceReq,
+                payload,
+                true,
+                rns_wire::flags::PacketType::Data,
+            ),
+            TransferAction::SendCancel(cancel_type, resource_hash) => {
+                let context = match cancel_type {
+                    rns_protocol::resource::CancelType::Icl => {
+                        rns_wire::context::PacketContext::ResourceIcl
+                    }
+                    rns_protocol::resource::CancelType::Rcl => {
+                        rns_wire::context::PacketContext::ResourceRcl
+                    }
+                };
+                (
+                    context,
+                    resource_hash.to_vec(),
+                    true,
+                    rns_wire::flags::PacketType::Data,
+                )
+            }
+            TransferAction::None | TransferAction::Complete | TransferAction::Failed(_) => {
+                return false;
+            }
+        };
+        let body = if encrypted {
+            let Ok(body) = active.link.encrypt(&payload) else {
+                return false;
+            };
+            body
+        } else {
+            payload
+        };
+
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: *link_id,
+            context,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&body);
+        active.link.record_tx(body.len());
+        transport_tx
+            .try_send(TransportMessage::Outbound(OutboundRequest {
+                raw: Bytes::from(raw),
+                destination_hash: *link_id,
+            }))
+            .is_ok()
+    }
+
+    fn drop_inbound_resource(active: &mut ActiveLink, resource_hash: &[u8; 32]) {
+        active.link.untrack_resource(resource_hash);
+        active.inbound_resources.remove(resource_hash);
+
+        let Some(route) = active.segment_routing.remove(resource_hash) else {
+            return;
+        };
+        active.inbound_split_resources.remove(&route.original_hash);
+        let siblings: Vec<[u8; 32]> = active
+            .segment_routing
+            .iter()
+            .filter_map(|(sibling_hash, sibling_route)| {
+                (sibling_route.original_hash == route.original_hash).then_some(*sibling_hash)
+            })
+            .collect();
+        for sibling_hash in siblings {
+            active.segment_routing.remove(&sibling_hash);
+            active.inbound_resources.remove(&sibling_hash);
+            active.link.untrack_resource(&sibling_hash);
+        }
     }
 
     fn send_link_packet_proof(
@@ -3922,6 +4111,135 @@ mod tests {
         let proof = proof_rx.try_recv().expect("resource proof event");
         assert_eq!(proof.link_id, link_id);
         assert_eq!(proof.resource_hash, receipt.resource_hash);
+    }
+
+    #[test]
+    fn tick_retries_lost_resource_advertisement() {
+        let (peer_link, local_link, _identity_key) = handshaken_link_pair_with_identity();
+        let link_id = local_link.link_id;
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::new(transport_tx, event_rx, [0xC3; 16], None);
+
+        let mut transfer = OutboundTransfer::new(
+            b"advertisement retry".to_vec(),
+            false,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap();
+        assert!(matches!(
+            transfer.tick(),
+            TransferAction::SendAdvertisement(_)
+        ));
+        transfer.started_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        let resource_hash = transfer.resource.resource_hash;
+
+        let mut outbound_resources = HashMap::new();
+        outbound_resources.insert(resource_hash, transfer);
+        manager.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: local_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources,
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        manager.tick();
+
+        let TransportMessage::Outbound(request) =
+            transport_rx.try_recv().expect("retried advertisement")
+        else {
+            panic!("expected outbound advertisement");
+        };
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceAdv
+        );
+        let plaintext = peer_link.decrypt(&request.raw[offset..]).unwrap();
+        let advertisement = ResourceAdvertisement::unpack(&plaintext).unwrap();
+        assert_eq!(advertisement.resource_hash, resource_hash);
+        assert_eq!(
+            manager.active_links[&link_id].outbound_resources[&resource_hash].retries,
+            1
+        );
+    }
+
+    #[test]
+    fn tick_retries_stalled_inbound_resource_request() {
+        let (peer_link, local_link, _identity_key) = handshaken_link_pair_with_identity();
+        let link_id = local_link.link_id;
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::new(transport_tx, event_rx, [0xC4; 16], None);
+
+        let outbound =
+            rns_protocol::resource::OutboundResource::new(vec![0xAB; 2000], false, None).unwrap();
+        let resource_hash = outbound.resource_hash;
+        let mut transfer = InboundTransfer::from_advertisement(
+            outbound.num_parts(),
+            outbound.total_size,
+            outbound.data.len(),
+            outbound.random_hash,
+            resource_hash,
+            outbound.flags,
+            outbound.map_hashes,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap();
+        assert!(matches!(
+            transfer.request_next(),
+            TransferAction::SendRequest(_)
+        ));
+        transfer.last_activity = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        let initial_retries = transfer.retries_left;
+
+        let mut inbound_resources = HashMap::new();
+        inbound_resources.insert(resource_hash, transfer);
+        let mut local_link = local_link;
+        local_link.track_incoming_resource(resource_hash);
+        manager.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: local_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources,
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        manager.tick();
+
+        let TransportMessage::Outbound(request) =
+            transport_rx.try_recv().expect("retried resource request")
+        else {
+            panic!("expected outbound resource request");
+        };
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceReq
+        );
+        let plaintext = peer_link.decrypt(&request.raw[offset..]).unwrap();
+        assert!(
+            plaintext
+                .windows(resource_hash.len())
+                .any(|window| window == resource_hash)
+        );
+        assert_eq!(
+            manager.active_links[&link_id].inbound_resources[&resource_hash].retries_left,
+            initial_retries - 1
+        );
     }
 
     #[test]
