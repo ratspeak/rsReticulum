@@ -21,6 +21,7 @@ use crate::jobs::{Job, JobScheduler};
 use crate::lifecycle::ShutdownSignal;
 use crate::link_client::LinkClient;
 use crate::link_manager::LinkManager;
+use crate::link_session::{LinkSession, LinkSessionConfig, LinkSessionError};
 use crate::platform::{StoragePaths, resolve_config_dir};
 use rns_identity::destination::{DestType, Destination, DestinationError, Direction};
 use rns_identity::identity::Identity;
@@ -323,6 +324,42 @@ pub enum SendError {
     Control(#[from] ControlError),
 }
 
+/// Options for opening a persistent application Link.
+#[derive(Debug, Clone)]
+pub struct LinkConnectOptions {
+    /// How long path discovery may run when no validated announce is cached.
+    pub path_timeout: Duration,
+    /// Deadline for the Link handshake itself.
+    pub establishment_timeout: Duration,
+    /// Registration label used for the temporary Link destination.
+    pub client_label: String,
+    /// Send the local identity over the Link after establishment.
+    pub identify: bool,
+}
+
+impl Default for LinkConnectOptions {
+    fn default() -> Self {
+        Self {
+            path_timeout: Duration::from_secs(15),
+            establishment_timeout: Duration::from_secs(30),
+            client_label: "rns-runtime.link".to_string(),
+            identify: false,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LinkConnectError {
+    #[error("transport control failed: {0}")]
+    Control(#[from] ControlError),
+    #[error("path discovery failed: {0}")]
+    Path(#[from] AwaitPathError),
+    #[error("no validated identity is known for destination {0}")]
+    IdentityUnavailable(String),
+    #[error("Link session failed: {0}")]
+    Session(#[from] LinkSessionError),
+}
+
 impl std::fmt::Debug for RecalledDestination {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RecalledDestination")
@@ -424,6 +461,50 @@ impl ReticulumHandle {
         timeout: Duration,
     ) -> Result<(), AwaitPathError> {
         await_path(&self.transport_tx, destination_hash, timeout).await
+    }
+
+    /// Resolve a destination and open a persistent encrypted Link.
+    ///
+    /// This is the app-facing counterpart to Python's `Link(destination)`:
+    /// it uses the validated announce cache for the remote public key, starts
+    /// path discovery when necessary, and then hands ownership to
+    /// [`LinkSession`].
+    pub async fn connect_link(
+        &self,
+        destination_hash: [u8; 16],
+        local_identity: Identity,
+        options: LinkConnectOptions,
+    ) -> Result<LinkSession, LinkConnectError> {
+        let config = self
+            .resolve_link_session_config(destination_hash, &options)
+            .await?;
+        LinkSession::connect(self.transport_tx.clone(), local_identity, config)
+            .await
+            .map_err(LinkConnectError::Session)
+    }
+
+    async fn resolve_link_session_config(
+        &self,
+        destination_hash: [u8; 16],
+        options: &LinkConnectOptions,
+    ) -> Result<LinkSessionConfig, LinkConnectError> {
+        let mut recalled = self.recall(destination_hash).await?;
+        if recalled.is_none() {
+            self.await_path(destination_hash, options.path_timeout)
+                .await?;
+            recalled = self.recall(destination_hash).await?;
+        }
+        let recalled = recalled
+            .ok_or_else(|| LinkConnectError::IdentityUnavailable(hex::encode(destination_hash)))?;
+
+        Ok(LinkSessionConfig {
+            destination_hash,
+            remote_public_key: recalled.identity.get_public_key(),
+            hops: recalled.hops,
+            establishment_timeout: options.establishment_timeout,
+            client_label: options.client_label.clone(),
+            identify: options.identify,
+        })
     }
 
     pub async fn subscribe_announces(
@@ -5447,6 +5528,111 @@ loglevel = 7
                 .await,
             Err(SendError::NoInterface)
         ));
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn link_connect_config_uses_validated_recall_metadata() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let remote_identity = Identity::new();
+        let remote_public_key = remote_identity.get_public_key();
+        let destination_hash = [0x43; 16];
+        let responder = tokio::spawn(async move {
+            let TransportMessage::Rpc { query, response_tx } =
+                transport_rx.recv().await.expect("recall query")
+            else {
+                panic!("expected transport RPC");
+            };
+            assert!(matches!(
+                query,
+                TransportQuery::RecallDestination { dest } if dest == destination_hash
+            ));
+            response_tx
+                .send(TransportQueryResponse::RecalledDestination(Some(
+                    RecalledDestinationRpcEntry {
+                        dest_hash: destination_hash,
+                        public_key: remote_public_key,
+                        app_data: None,
+                        ratchet: None,
+                        hops: 7,
+                        timestamp: 1_700_000_000.0,
+                    },
+                )))
+                .expect("recall response receiver");
+        });
+
+        let mut handle = dummy_handle();
+        handle.transport_tx = transport_tx;
+        let options = LinkConnectOptions {
+            path_timeout: Duration::from_secs(4),
+            establishment_timeout: Duration::from_secs(9),
+            client_label: "example.client".to_string(),
+            identify: true,
+        };
+        let config = handle
+            .resolve_link_session_config(destination_hash, &options)
+            .await
+            .unwrap();
+        assert_eq!(config.destination_hash, destination_hash);
+        assert_eq!(config.remote_public_key, remote_public_key);
+        assert_eq!(config.hops, 7);
+        assert_eq!(config.establishment_timeout, Duration::from_secs(9));
+        assert_eq!(config.client_label, "example.client");
+        assert!(config.identify);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn link_connect_config_discovers_path_before_retrying_recall() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(3);
+        let remote_identity = Identity::new();
+        let remote_public_key = remote_identity.get_public_key();
+        let destination_hash = [0x44; 16];
+        let responder = tokio::spawn(async move {
+            let TransportMessage::Rpc { response_tx, .. } =
+                transport_rx.recv().await.expect("first recall")
+            else {
+                panic!("expected transport RPC");
+            };
+            response_tx
+                .send(TransportQueryResponse::RecalledDestination(None))
+                .expect("first recall response");
+
+            let TransportMessage::AwaitPath { dest, reply } =
+                transport_rx.recv().await.expect("path discovery")
+            else {
+                panic!("expected path discovery");
+            };
+            assert_eq!(dest, destination_hash);
+            reply.send(true).expect("path waiter");
+
+            let TransportMessage::Rpc { response_tx, .. } =
+                transport_rx.recv().await.expect("second recall")
+            else {
+                panic!("expected transport RPC");
+            };
+            response_tx
+                .send(TransportQueryResponse::RecalledDestination(Some(
+                    RecalledDestinationRpcEntry {
+                        dest_hash: destination_hash,
+                        public_key: remote_public_key,
+                        app_data: None,
+                        ratchet: None,
+                        hops: 2,
+                        timestamp: 1_700_000_001.0,
+                    },
+                )))
+                .expect("second recall response");
+        });
+
+        let mut handle = dummy_handle();
+        handle.transport_tx = transport_tx;
+        let config = handle
+            .resolve_link_session_config(destination_hash, &LinkConnectOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(config.remote_public_key, remote_public_key);
+        assert_eq!(config.hops, 2);
         responder.await.unwrap();
     }
 
