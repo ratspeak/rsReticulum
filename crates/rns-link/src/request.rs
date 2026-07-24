@@ -93,7 +93,7 @@ impl RequestReceipt {
 
     pub fn is_timed_out(&self) -> bool {
         matches!(self.state, RequestState::Sent | RequestState::Receiving)
-            && self.sent_at.elapsed() > self.timeout
+            && self.sent_at.elapsed() >= self.timeout
     }
 
     pub fn is_pending(&self) -> bool {
