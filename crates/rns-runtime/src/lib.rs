@@ -1,6 +1,7 @@
 //! Reticulum runtime: config, lifecycle, RPC, and the [`reticulum::ReticulumHandle`]
 //! that user code holds. Python reference: `RNS/Reticulum.py`.
 
+pub mod buffer_stream;
 pub mod config;
 pub mod constants;
 pub mod interface_factory;

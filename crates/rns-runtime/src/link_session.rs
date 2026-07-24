@@ -711,6 +711,13 @@ impl LinkSessionChannelHandle {
             .await
     }
 
+    pub(crate) fn try_remove_message_handler(&self, id: HandlerId) {
+        let (result_tx, _result_rx) = oneshot::channel();
+        let _ = self.command_tx.try_send(LinkSessionCommand::Channel(
+            LinkSessionChannelCommand::RemoveMessageHandler { id, result_tx },
+        ));
+    }
+
     pub async fn clear_message_handlers(&self) -> Result<(), LinkSessionChannelError> {
         self.invoke(|result_tx| LinkSessionChannelCommand::ClearMessageHandlers { result_tx })
             .await
@@ -3651,6 +3658,9 @@ fn build_packet(
 mod tests {
     use super::*;
     use rns_crypto::ed25519::Ed25519PrivateKey;
+    use rns_protocol::channel_message::{MessageBase, SMT_STREAM_DATA};
+    use rns_protocol::stream_data::StreamDataMessage;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn application_packets_use_link_destination_and_none_context() {
@@ -4248,7 +4258,7 @@ mod tests {
             vec![(0x0042, b"first channel frame".to_vec())]
         );
 
-        let _second_receipt = channel
+        let second_receipt = channel
             .send_raw(0x0042, b"second channel frame")
             .await
             .unwrap();
@@ -4296,6 +4306,33 @@ mod tests {
         .await
         .expect("channel proof should reopen the send window");
 
+        let second_proof = responder
+            .prove_packet_with_fallible(&second_receipt.packet_hash, |hash| {
+                server_identity.sign(hash)
+            })
+            .unwrap();
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: build_proof_packet(
+                    responder.link_id,
+                    rns_wire::context::PacketContext::LinkProof,
+                    &second_proof,
+                ),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if channel.is_drained().await.unwrap() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all channel frames should drain after their proofs");
+
         let inbound_prepared = responder_channel
             .prepare_send_tracked(&PackedChannelMessage {
                 msg_type: 0x0042,
@@ -4333,6 +4370,7 @@ mod tests {
             inbound_proof_header.flags.packet_type,
             rns_wire::flags::PacketType::Proof
         );
+        responder_channel.delivered(inbound_prepared.sequence, responder.rtt_secs());
 
         assert!(channel.remove_message_handler(handler_id).await.unwrap());
         let ignored_prepared = responder_channel
@@ -4358,6 +4396,117 @@ mod tests {
                 .is_err()
         );
         let _ignored_proof = transport_rx.recv().await.unwrap();
+        responder_channel.delivered(ignored_prepared.sequence, responder.rtt_secs());
+
+        responder_channel.register_system_type(SMT_STREAM_DATA);
+        let mut buffer = channel.create_bidirectional_buffer(7, 8).await.unwrap();
+        assert_eq!(buffer.reader().stream_id(), 7);
+
+        let inbound_stream = StreamDataMessage::new(7, b"buffer inbound".to_vec(), false);
+        let inbound_stream_prepared = responder_channel
+            .prepare_send_tracked(&inbound_stream)
+            .unwrap();
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: build_data_packet(
+                    responder.link_id,
+                    rns_wire::context::PacketContext::Channel,
+                    &inbound_stream_prepared.data,
+                ),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+        let mut inbound_buffer = vec![0; b"buffer inbound".len()];
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            buffer.read_exact(&mut inbound_buffer),
+        )
+        .await
+        .expect("Buffer reader should wake for its stream")
+        .unwrap();
+        assert_eq!(inbound_buffer, b"buffer inbound");
+        let _inbound_stream_proof = transport_rx.recv().await.unwrap();
+        responder_channel.delivered(inbound_stream_prepared.sequence, responder.rtt_secs());
+
+        buffer.write_all(b"buffer outbound").await.unwrap();
+        let outbound_stream_packet = match transport_rx.recv().await.unwrap() {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (outbound_stream_header, outbound_stream_offset) =
+            rns_wire::header::PacketHeader::unpack(&outbound_stream_packet.raw).unwrap();
+        let outbound_stream_messages = responder_channel
+            .receive_data(&outbound_stream_packet.raw[outbound_stream_offset..])
+            .unwrap();
+        assert_eq!(outbound_stream_messages.len(), 1);
+        assert_eq!(outbound_stream_messages[0].0, SMT_STREAM_DATA);
+        let mut outbound_stream = StreamDataMessage::new(0, Vec::new(), false);
+        outbound_stream
+            .unpack(&outbound_stream_messages[0].1)
+            .unwrap();
+        assert_eq!(outbound_stream.stream_id, 8);
+        assert_eq!(outbound_stream.data, b"buffer outbound");
+        assert!(!outbound_stream.eof);
+
+        let outbound_stream_hash = rns_wire::hash::packet_hash(
+            &outbound_stream_packet.raw,
+            outbound_stream_header.flags.header_type,
+        );
+        let outbound_stream_proof = responder
+            .prove_packet_with_fallible(&outbound_stream_hash, |hash| server_identity.sign(hash))
+            .unwrap();
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: build_proof_packet(
+                    responder.link_id,
+                    rns_wire::context::PacketContext::LinkProof,
+                    &outbound_stream_proof,
+                ),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+
+        buffer.shutdown().await.unwrap();
+        let eof_packet = match transport_rx.recv().await.unwrap() {
+            TransportMessage::OutboundAttached {
+                request,
+                interface_id: 1,
+            } => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (eof_header, eof_offset) =
+            rns_wire::header::PacketHeader::unpack(&eof_packet.raw).unwrap();
+        let eof_messages = responder_channel
+            .receive_data(&eof_packet.raw[eof_offset..])
+            .unwrap();
+        assert_eq!(eof_messages.len(), 1);
+        let mut eof = StreamDataMessage::new(0, Vec::new(), false);
+        eof.unpack(&eof_messages[0].1).unwrap();
+        assert_eq!(eof.stream_id, 8);
+        assert!(eof.eof);
+        assert!(eof.data.is_empty());
+
+        let eof_hash = rns_wire::hash::packet_hash(&eof_packet.raw, eof_header.flags.header_type);
+        let eof_proof = responder
+            .prove_packet_with_fallible(&eof_hash, |hash| server_identity.sign(hash))
+            .unwrap();
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: build_proof_packet(
+                    responder.link_id,
+                    rns_wire::context::PacketContext::LinkProof,
+                    &eof_proof,
+                ),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+        buffer.close_reader().await.unwrap();
 
         let inbound_ciphertext = responder.encrypt(b"hello client").unwrap();
         let inbound = build_data_packet(
