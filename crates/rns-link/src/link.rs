@@ -785,9 +785,17 @@ impl Link {
         encrypted_data: &[u8],
     ) -> Result<ParsedRequestData, LinkCryptoError> {
         let plaintext = self.decrypt(encrypted_data)?;
+        Self::parse_request(&plaintext)
+    }
 
+    /// Parse an already-decrypted Link request.
+    ///
+    /// Packet requests use [`Self::handle_request`]. Request Resources are
+    /// decrypted by the Resource transfer before reaching the Link runtime,
+    /// so they use this parser directly.
+    pub fn parse_request(plaintext: &[u8]) -> Result<ParsedRequestData, LinkCryptoError> {
         // request_id = SHA-256(packed_request)[:16]
-        let request_id = truncated_hash(&plaintext);
+        let request_id = truncated_hash(plaintext);
 
         // Unpack msgpack array: [timestamp, path_hash, data]
         let value = rmpv::decode::read_value(&mut &plaintext[..])
@@ -2122,6 +2130,25 @@ mod tests {
 
         // handle_response() must drain the receipt on success.
         assert!(initiator.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn test_parse_plaintext_request_resource_payload() {
+        let (mut initiator, responder, _) = make_active_link();
+
+        let (encrypted, request_id) = initiator
+            .request(
+                "resource.path",
+                Some(b"resource request data"),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        let plaintext = responder.decrypt(&encrypted).unwrap();
+
+        let (parsed_id, path_hash, _timestamp, data) = Link::parse_request(&plaintext).unwrap();
+        assert_eq!(parsed_id, request_id);
+        assert_eq!(path_hash, truncated_hash(b"resource.path"));
+        assert_eq!(data, b"resource request data");
     }
 
     #[test]
