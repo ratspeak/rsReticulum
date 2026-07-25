@@ -303,18 +303,10 @@ impl RNodeRuntimeSnapshot {
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
-fn project_rnode_protocol_effect(
+fn project_rnode_protocol_state(
     snapshot: &mut RNodeRuntimeSnapshot,
     state: &RNodeProtocolState,
-    effect: RNodeProtocolEffect,
 ) -> bool {
-    if matches!(
-        effect,
-        RNodeProtocolEffect::NoChange | RNodeProtocolEffect::Rejected(_)
-    ) {
-        return false;
-    }
-
     let before = snapshot.clone();
     let evidence = state.evidence();
     let target = state.target();
@@ -377,6 +369,29 @@ fn project_rnode_protocol_effect(
         RNodeReadiness::Blocked(_) => RNodeRuntimePhase::AwaitingReadiness,
     };
 
+    if evidence.radio_initialisation_fault {
+        snapshot.reason = Some(RNodeRuntimeReason::RadioInitialisationFault);
+    }
+
+    *snapshot != before
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+fn project_rnode_protocol_effect(
+    snapshot: &mut RNodeRuntimeSnapshot,
+    state: &RNodeProtocolState,
+    effect: RNodeProtocolEffect,
+) -> bool {
+    if matches!(
+        effect,
+        RNodeProtocolEffect::NoChange | RNodeProtocolEffect::Rejected(_)
+    ) {
+        return false;
+    }
+
+    let before = snapshot.clone();
+    project_rnode_protocol_state(snapshot, state);
+
     match effect {
         RNodeProtocolEffect::Reset => {
             snapshot.reason = Some(RNodeRuntimeReason::DeviceReset);
@@ -385,7 +400,7 @@ fn project_rnode_protocol_effect(
             snapshot.reason = Some(RNodeRuntimeReason::RadioInitialisationFault);
         }
         RNodeProtocolEffect::EvidenceChanged(_) | RNodeProtocolEffect::FlowPermissionChanged(_) => {
-            if evidence.radio_initialisation_fault {
+            if state.evidence().radio_initialisation_fault {
                 snapshot.reason = Some(RNodeRuntimeReason::RadioInitialisationFault);
             } else if snapshot.phase == RNodeRuntimePhase::Ready
                 && snapshot.reason == Some(RNodeRuntimeReason::DeviceReset)
@@ -562,6 +577,24 @@ impl RNodeSnapshotPublisher {
         let mut projection_changed = false;
         let published = self.update(|snapshot| {
             projection_changed = project_rnode_protocol_effect(snapshot, state, effect);
+        });
+        debug_assert_eq!(published, projection_changed);
+        published
+    }
+
+    /// Publish the current bounded reducer state without replaying raw frames.
+    ///
+    /// Native BLE uses this only after a bridge handshake becomes an admitted
+    /// connection generation. Startup bytes stay private to the pending
+    /// reducer and cannot appear in the public observation surface. This
+    /// projects durable reducer state, not transient effects: a reset observed
+    /// before admission clears pending evidence but is not attributed to a
+    /// generation that did not yet exist. Retained faults remain represented
+    /// by [`RNodeProtocolState`] and are projected.
+    pub(crate) fn sync_protocol_state(&self, state: &RNodeProtocolState) -> bool {
+        let mut projection_changed = false;
+        let published = self.update(|snapshot| {
+            projection_changed = project_rnode_protocol_state(snapshot, state);
         });
         debug_assert_eq!(published, projection_changed);
         published

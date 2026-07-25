@@ -129,6 +129,26 @@ fn is_rnode_handshake_frame(cmd: u8, frame: &[u8]) -> bool {
         || (cmd == rnode::CMD_FW_VERSION && !frame.is_empty())
 }
 
+fn reduce_native_handshake_bytes(
+    protocol_state: &mut RNodeProtocolState,
+    deframer: &mut kiss::RawKissDeframer,
+    bytes: &[u8],
+) -> bool {
+    let frames = deframer.feed(bytes);
+    let accepted = frames
+        .iter()
+        .any(|(command, frame)| is_rnode_handshake_frame(*command, frame));
+
+    // Reduce the complete read batch before admitting the generation. In
+    // particular, DETECT and firmware commonly arrive together; returning at
+    // the first accepted frame would silently discard the remaining evidence.
+    for (command, frame) in frames {
+        protocol_state.apply_frame(command, &frame);
+    }
+
+    accepted
+}
+
 fn is_pairing_transition_error(error: &InterfaceError) -> bool {
     matches!(
         error,
@@ -143,6 +163,7 @@ fn is_pairing_transition_error(error: &InterfaceError) -> bool {
 async fn probe_native_rnode_handshake(
     tcp_read: &mut tokio::net::tcp::OwnedReadHalf,
     tcp_write: &mut tokio::net::tcp::OwnedWriteHalf,
+    protocol_state: &mut RNodeProtocolState,
     timeout: Duration,
     probe_interval: Duration,
     running_task: &AtomicBool,
@@ -188,10 +209,8 @@ async fn probe_native_rnode_handshake(
             Err(_) => continue,
         };
 
-        for (cmd, frame) in deframer.feed(&buf[..n]) {
-            if is_rnode_handshake_frame(cmd, &frame) {
-                return true;
-            }
+        if reduce_native_handshake_bytes(protocol_state, &mut deframer, &buf[..n]) {
+            return true;
         }
     }
 
@@ -452,6 +471,16 @@ fn rnode_config_from_ble_config(config: &BleRNodeConfig) -> rnode::RNodeConfig {
 
 fn build_ble_rnode_init_sequence(config: &BleRNodeConfig) -> Vec<u8> {
     rnode::build_init_sequence(&rnode_config_from_ble_config(config))
+}
+
+/// Native bridge admission deliberately discards handshake deframer state so
+/// a partial pre-init data packet can never cross into active forwarding.
+/// Re-request the bounded detection/firmware evidence after radio init to
+/// recover any typed control frame that was split at that boundary.
+fn build_native_rnode_init_sequence(config: &BleRNodeConfig) -> Vec<u8> {
+    let mut sequence = build_ble_rnode_init_sequence(config);
+    sequence.extend(rnode::build_detect_sequence());
+    sequence
 }
 
 pub(crate) async fn get_adapter() -> Result<Adapter, InterfaceError> {
@@ -1705,8 +1734,37 @@ pub async fn spawn_ble_rnode_interface_native(
     transport_tx: mpsc::Sender<TransportMessage>,
     tcp_port: u16,
 ) -> Result<InterfaceHandle, InterfaceError> {
+    Ok(
+        spawn_ble_rnode_interface_native_with_driver(config, id, transport_tx, tcp_port)
+            .await?
+            .interface,
+    )
+}
+
+/// Spawn an Android native-bridge BLE RNode interface with privacy-safe local
+/// driver observation.
+///
+/// Kotlin retains exclusive GATT ownership. The returned driver handle
+/// observes only the Rust TCP-bridge generation and bounded RNode protocol
+/// state; it never exposes the bridge port, BLE target, device identity, raw
+/// frames, radio values, or unrestricted errors.
+pub async fn spawn_ble_rnode_interface_native_with_driver(
+    config: BleRNodeConfig,
+    id: InterfaceId,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    tcp_port: u16,
+) -> Result<SpawnedRNodeInterface, InterfaceError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    let protocol_target = RNodeProtocolTarget::new(
+        config.frequency,
+        config.bandwidth,
+        config.spreading_factor,
+        config.coding_rate,
+        config.tx_power,
+    );
+    let (snapshot_publisher, driver) =
+        rnode::new_rnode_driver_observation(RNodeTransportClass::Ble);
     let online = Arc::new(AtomicBool::new(false));
     let online_handle = online.clone();
     let shared_rxb = Arc::new(AtomicU64::new(0));
@@ -1722,7 +1780,7 @@ pub async fn spawn_ble_rnode_interface_native(
         config.bandwidth,
     );
 
-    let init_seq_template = build_ble_rnode_init_sequence(&config);
+    let init_seq_template = build_native_rnode_init_sequence(&config);
 
     let name = config.name.clone();
     let mode = config.mode;
@@ -1734,8 +1792,10 @@ pub async fn spawn_ble_rnode_interface_native(
     let running_task = running.clone();
 
     let read_task = tokio::spawn(async move {
+        let mut snapshot_publisher = snapshot_publisher;
         let mut tries: usize = 0;
         let mut backoff = RECONNECT_WAIT;
+        let mut initial_attempt = true;
 
         struct Cleanup(InterfaceId);
         impl Drop for Cleanup {
@@ -1748,18 +1808,30 @@ pub async fn spawn_ble_rnode_interface_native(
         loop {
             if !running_task.load(Ordering::SeqCst) {
                 ble_diag("[ble-native] read_task exiting — running flag cleared");
+                publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
                 return;
+            }
+            if initial_attempt {
+                initial_attempt = false;
+            } else {
+                snapshot_publisher.reconnect_started();
             }
             let stream = match tokio::net::TcpStream::connect(format!("127.0.0.1:{tcp_port}")).await
             {
                 Ok(s) => s,
                 Err(e) => {
+                    snapshot_publisher.connection_attempt_failed();
                     tracing::warn!(name = %log_name, tcp_port, error = %e, "TCP bridge connect failed");
                     if reconnect_try_exhausted(&mut tries) {
                         tracing::warn!(name = %log_name, "BLE RNode native: max reconnect tries reached");
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
                         return;
                     }
                     if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
                         return;
                     }
                     backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
@@ -1768,24 +1840,38 @@ pub async fn spawn_ble_rnode_interface_native(
             };
 
             let (mut tcp_read, mut tcp_write) = stream.into_split();
+            let mut protocol_state = RNodeProtocolState::new(protocol_target);
 
-            // Without gating on DETECT_RESP + firmware version we'd flag
-            // "online" while the radio is asleep or the BLE-NUS bridge
-            // dropped a frame.
+            // Preserve native bridge compatibility: either a confirmed detect
+            // response or any non-empty firmware response admits the
+            // connection. Without that evidence we'd flag "online" while the
+            // radio is asleep or the BLE-NUS bridge dropped a frame.
             let detected = probe_native_rnode_handshake(
                 &mut tcp_read,
                 &mut tcp_write,
+                &mut protocol_state,
                 RNODE_NATIVE_HANDSHAKE_TIMEOUT,
                 RNODE_NATIVE_HANDSHAKE_PROBE,
                 &running_task,
             )
             .await;
             if !detected {
+                if !running_task.load(Ordering::SeqCst) {
+                    publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
+                    return;
+                }
+                snapshot_publisher.connection_attempt_failed();
                 tracing::warn!(
                     name = %log_name,
                     "BLE RNode handshake timed out — RNode did not respond to detect, retrying"
                 );
+                if reconnect_try_exhausted(&mut tries) {
+                    tracing::warn!(name = %log_name, "BLE RNode native: max reconnect tries reached");
+                    snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                    return;
+                }
                 if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                    publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
                     return;
                 }
                 backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
@@ -1794,8 +1880,15 @@ pub async fn spawn_ble_rnode_interface_native(
 
             let init_seq = init_seq_template.clone();
             if let Err(e) = tcp_write.write_all(&init_seq).await {
-                tracing::warn!(error = %e, "BLE RNode native init write failed");
+                snapshot_publisher.connection_attempt_failed();
+                tracing::warn!(error = %e, "BLE RNode native init/evidence refresh write failed");
+                if reconnect_try_exhausted(&mut tries) {
+                    tracing::warn!(name = %log_name, "BLE RNode native: max reconnect tries reached");
+                    snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                    return;
+                }
                 if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                    publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
                     return;
                 }
                 backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
@@ -1813,6 +1906,8 @@ pub async fn spawn_ble_rnode_interface_native(
             online_handle.store(true, Ordering::SeqCst);
             tries = 0;
             backoff = RECONNECT_WAIT;
+            snapshot_publisher.connection_established();
+            snapshot_publisher.sync_protocol_state(&protocol_state);
 
             let ready = Arc::new(AtomicBool::new(true));
 
@@ -1904,6 +1999,7 @@ pub async fn spawn_ble_rnode_interface_native(
                     break 'read;
                 }
                 if !running_task.load(Ordering::SeqCst) {
+                    snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
                     let _ = conn_tx_for_stop
                         .send(NativeBridgeWrite::Raw(rnode::build_detach_sequence()))
                         .await;
@@ -1929,6 +2025,7 @@ pub async fn spawn_ble_rnode_interface_native(
                         // Idle LoRa silence is normal — only break if
                         // shutdown flag cleared.
                         if !running_task.load(Ordering::SeqCst) {
+                            snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
                             let _ = conn_tx_for_stop
                                 .send(NativeBridgeWrite::Raw(rnode::build_detach_sequence()))
                                 .await;
@@ -1941,6 +2038,7 @@ pub async fn spawn_ble_rnode_interface_native(
 
                 let data = &buf[..n];
                 for (cmd, frame) in deframer.feed(data) {
+                    project_ble_rnode_frame(&snapshot_publisher, &mut protocol_state, cmd, &frame);
                     match rnode::process_rnode_response(
                         cmd,
                         &frame,
@@ -1971,26 +2069,34 @@ pub async fn spawn_ble_rnode_interface_native(
             let _ = write_handle.await;
 
             if transport_closed {
+                publish_ble_stopped(
+                    &mut snapshot_publisher,
+                    RNodeRuntimeReason::TransportConsumerClosed,
+                );
                 return;
             }
 
             if !running_task.load(Ordering::SeqCst) {
+                snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
                 return;
             }
 
+            snapshot_publisher.connection_lost();
             if reconnect_try_exhausted(&mut tries) {
                 tracing::warn!(name = %log_name, "BLE RNode native: max reconnect tries reached");
+                snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
                 return;
             }
             tracing::info!(name = %log_name, seconds = backoff, "BLE RNode native reconnecting");
             if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
                 return;
             }
             backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
         }
     });
 
-    Ok(InterfaceHandle {
+    let interface = InterfaceHandle {
         id,
         parent_id: None,
         name,
@@ -2009,7 +2115,9 @@ pub async fn spawn_ble_rnode_interface_native(
         inspection: None,
         tx,
         read_task,
-    })
+    };
+
+    Ok(SpawnedRNodeInterface { interface, driver })
 }
 
 #[cfg(test)]
@@ -2596,6 +2704,335 @@ mod tests {
         assert!(boundary_deframer.feed(active_tail).is_empty());
 
         publisher.stopped(RNodeRuntimeReason::StopRequested);
+    }
+
+    #[test]
+    fn test_native_ble_handshake_reduces_full_accepted_batch_before_publication() {
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        let target = RNodeProtocolTarget::new(
+            config.frequency,
+            config.bandwidth,
+            config.spreading_factor,
+            config.coding_rate,
+            config.tx_power,
+        );
+        let (mut publisher, driver) = rnode::new_rnode_driver_observation(RNodeTransportClass::Ble);
+        let unpublished = driver.snapshot();
+        let mut protocol_state = RNodeProtocolState::new(target);
+        let mut deframer = kiss::RawKissDeframer::new();
+
+        let mut batch = kiss::frame_with_command(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
+        batch.extend(kiss::frame_with_command(
+            rnode::CMD_FW_VERSION,
+            &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+        ));
+
+        assert!(reduce_native_handshake_bytes(
+            &mut protocol_state,
+            &mut deframer,
+            &batch,
+        ));
+        let evidence = protocol_state.evidence();
+        assert!(evidence.detected);
+        assert_eq!(
+            evidence.firmware,
+            Some(crate::rnode_protocol::RNodeFirmwareVersion::new(
+                rnode::REQUIRED_FW_VER_MAJ,
+                rnode::REQUIRED_FW_VER_MIN,
+            ))
+        );
+        assert!(
+            Arc::ptr_eq(&unpublished, &driver.snapshot()),
+            "pending handshake evidence must remain private until generation admission"
+        );
+
+        publisher.connection_established();
+        assert!(publisher.sync_protocol_state(&protocol_state));
+        let admitted = driver.snapshot();
+        assert_eq!(admitted.connection_generation, 1);
+        assert_eq!(admitted.detection, rnode::RNodeDetectionState::Confirmed);
+        assert_eq!(
+            admitted.firmware_compatibility,
+            rnode::RNodeFirmwareCompatibility::Supported
+        );
+
+        publisher.stopped(RNodeRuntimeReason::StopRequested);
+    }
+
+    #[test]
+    fn test_native_ble_init_reissues_typed_handshake_evidence() {
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        let base_init = build_ble_rnode_init_sequence(&config);
+        let evidence_refresh = rnode::build_detect_sequence();
+        let native_init = build_native_rnode_init_sequence(&config);
+
+        assert_eq!(&native_init[..base_init.len()], base_init.as_slice());
+        assert_eq!(&native_init[base_init.len()..], evidence_refresh.as_slice());
+    }
+
+    #[test]
+    fn test_native_ble_split_control_is_recovered_by_post_init_refresh() {
+        let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
+        let mut protocol_state = RNodeProtocolState::new(target);
+        let mut handshake_deframer = kiss::RawKissDeframer::new();
+
+        let firmware = kiss::frame_with_command(
+            rnode::CMD_FW_VERSION,
+            &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+        );
+        let split = firmware.len() - 2;
+        let (firmware_prefix, firmware_tail) = firmware.split_at(split);
+        let mut accepted_read = kiss::frame_with_command(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
+        accepted_read.extend_from_slice(firmware_prefix);
+
+        assert!(reduce_native_handshake_bytes(
+            &mut protocol_state,
+            &mut handshake_deframer,
+            &accepted_read,
+        ));
+        assert!(
+            protocol_state.evidence().firmware.is_none(),
+            "the split firmware frame is not complete at admission"
+        );
+
+        // Admission drops the handshake deframer. The unread tail cannot
+        // complete by itself, but the post-init detect sequence elicits a full
+        // replacement response that restores typed evidence.
+        drop(handshake_deframer);
+        let mut active_bytes = firmware_tail.to_vec();
+        active_bytes.extend_from_slice(&firmware);
+        let mut active_deframer = kiss::RawKissDeframer::new();
+        let active_frames = active_deframer.feed(&active_bytes);
+        assert_eq!(
+            active_frames,
+            vec![(
+                rnode::CMD_FW_VERSION,
+                vec![rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+            )]
+        );
+        for (command, frame) in active_frames {
+            protocol_state.apply_frame(command, &frame);
+        }
+        assert!(protocol_state.evidence().firmware.is_some());
+    }
+
+    #[test]
+    fn test_native_ble_split_data_is_discarded_at_active_boundary() {
+        let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
+        let mut protocol_state = RNodeProtocolState::new(target);
+        let mut handshake_deframer = kiss::RawKissDeframer::new();
+        let partial_packet = kiss::frame(&[0x11, 0x22, 0x33]);
+        let split = partial_packet.len() - 2;
+        let (packet_prefix, packet_tail) = partial_packet.split_at(split);
+        let mut accepted_read = kiss::frame_with_command(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
+        accepted_read.extend_from_slice(packet_prefix);
+
+        assert!(reduce_native_handshake_bytes(
+            &mut protocol_state,
+            &mut handshake_deframer,
+            &accepted_read,
+        ));
+
+        drop(handshake_deframer);
+        let firmware_response = kiss::frame_with_command(
+            rnode::CMD_FW_VERSION,
+            &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+        );
+        let active_packet = vec![0x44, 0x55];
+        let mut active_bytes = packet_tail.to_vec();
+        active_bytes.extend_from_slice(&firmware_response);
+        active_bytes.extend_from_slice(&kiss::frame(&active_packet));
+
+        let mut active_deframer = kiss::RawKissDeframer::new();
+        let active_frames = active_deframer.feed(&active_bytes);
+        assert_eq!(
+            active_frames,
+            vec![
+                (
+                    rnode::CMD_FW_VERSION,
+                    vec![rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+                ),
+                (kiss::CMD_DATA, active_packet),
+            ]
+        );
+        assert!(
+            active_frames
+                .iter()
+                .all(|(command, frame)| *command != kiss::CMD_DATA
+                    || frame.as_slice() != [0x11, 0x22, 0x33]),
+            "partial pre-init data must never enter active legacy forwarding"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_native_ble_handshake_probe_accepts_loopback_batch() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind native bridge loopback");
+        let address = listener.local_addr().expect("loopback address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept native bridge");
+            let mut probe = [0u8; 256];
+            let read = stream.read(&mut probe).await.expect("read detect probe");
+            assert!(read > 0);
+
+            let mut batch = kiss::frame_with_command(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
+            batch.extend(kiss::frame_with_command(
+                rnode::CMD_FW_VERSION,
+                &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+            ));
+            stream
+                .write_all(&batch)
+                .await
+                .expect("write handshake response batch");
+        });
+
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect native bridge loopback");
+        let (mut read, mut write) = stream.into_split();
+        let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
+        let mut protocol_state = RNodeProtocolState::new(target);
+        let running = AtomicBool::new(true);
+
+        assert!(
+            probe_native_rnode_handshake(
+                &mut read,
+                &mut write,
+                &mut protocol_state,
+                Duration::from_secs(1),
+                Duration::from_millis(100),
+                &running,
+            )
+            .await
+        );
+        server.await.expect("native bridge server task");
+
+        let evidence = protocol_state.evidence();
+        assert!(evidence.detected);
+        assert!(evidence.firmware.is_some());
+    }
+
+    #[test]
+    fn test_native_ble_observation_uses_fresh_reducer_each_generation() {
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        let target = RNodeProtocolTarget::new(
+            config.frequency,
+            config.bandwidth,
+            config.spreading_factor,
+            config.coding_rate,
+            config.tx_power,
+        );
+        let (mut publisher, driver) = rnode::new_rnode_driver_observation(RNodeTransportClass::Ble);
+
+        let mut first_generation = RNodeProtocolState::new(target);
+        first_generation.apply_frame(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
+        publisher.connection_established();
+        publisher.sync_protocol_state(&first_generation);
+        assert_eq!(
+            driver.snapshot().detection,
+            rnode::RNodeDetectionState::Confirmed
+        );
+
+        publisher.connection_lost();
+        publisher.reconnect_started();
+        let second_generation = RNodeProtocolState::new(target);
+        publisher.connection_established();
+        assert!(!publisher.sync_protocol_state(&second_generation));
+
+        let fresh = driver.snapshot();
+        assert_eq!(fresh.connection_generation, 2);
+        assert_eq!(fresh.disconnect_total, 1);
+        assert_eq!(fresh.detection, rnode::RNodeDetectionState::Unknown);
+        assert_eq!(
+            fresh.firmware_compatibility,
+            rnode::RNodeFirmwareCompatibility::Unknown
+        );
+        assert_eq!(fresh.transmit_flow, rnode::RNodeTransmitFlowState::Unknown);
+
+        publisher.stopped(RNodeRuntimeReason::StopRequested);
+    }
+
+    #[test]
+    fn test_native_ble_pre_admission_reset_is_not_misattributed_to_new_generation() {
+        let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
+        let mut protocol_state = RNodeProtocolState::new(target);
+        let mut deframer = kiss::RawKissDeframer::new();
+        let mut batch = kiss::frame_with_command(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
+        batch.extend(kiss::frame_with_command(rnode::CMD_RESET, &[0xF8]));
+        batch.extend(kiss::frame_with_command(
+            rnode::CMD_FW_VERSION,
+            &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+        ));
+
+        assert!(reduce_native_handshake_bytes(
+            &mut protocol_state,
+            &mut deframer,
+            &batch,
+        ));
+        assert!(
+            !protocol_state.evidence().detected,
+            "reset must clear evidence accumulated earlier in the pending batch"
+        );
+        assert!(protocol_state.evidence().firmware.is_some());
+
+        let (mut publisher, driver) = rnode::new_rnode_driver_observation(RNodeTransportClass::Ble);
+        publisher.connection_established();
+        publisher.sync_protocol_state(&protocol_state);
+        let admitted = driver.snapshot();
+        assert_eq!(admitted.reason, None);
+        assert_eq!(admitted.detection, rnode::RNodeDetectionState::Unknown);
+        assert_eq!(
+            admitted.firmware_compatibility,
+            rnode::RNodeFirmwareCompatibility::Supported
+        );
+
+        // Once the generation exists, the same typed effect is reported
+        // immediately and clears its public protocol observations.
+        project_ble_rnode_frame(&publisher, &mut protocol_state, rnode::CMD_RESET, &[0xF8]);
+        let reset = driver.snapshot();
+        assert_eq!(reset.reason, Some(RNodeRuntimeReason::DeviceReset));
+        assert_eq!(
+            reset.firmware_compatibility,
+            rnode::RNodeFirmwareCompatibility::Unknown
+        );
+
+        publisher.stopped(RNodeRuntimeReason::StopRequested);
+    }
+
+    #[test]
+    fn test_native_ble_malformed_accepted_handshake_has_no_typed_publication() {
+        let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
+        let mut protocol_state = RNodeProtocolState::new(target);
+        let mut deframer = kiss::RawKissDeframer::new();
+
+        // Preserve the native bridge's historical permissive firmware
+        // handshake: any non-empty firmware response admits the connection.
+        // The strict reducer still rejects this wrong-width payload.
+        let malformed =
+            kiss::frame_with_command(rnode::CMD_FW_VERSION, &[rnode::REQUIRED_FW_VER_MAJ]);
+        assert!(reduce_native_handshake_bytes(
+            &mut protocol_state,
+            &mut deframer,
+            &malformed,
+        ));
+        assert!(protocol_state.evidence().firmware.is_none());
+
+        let (mut publisher, driver) = rnode::new_rnode_driver_observation(RNodeTransportClass::Ble);
+        publisher.connection_established();
+        let before = driver.snapshot();
+        assert!(!publisher.sync_protocol_state(&protocol_state));
+        assert!(Arc::ptr_eq(&before, &driver.snapshot()));
+
+        publisher.stopped(RNodeRuntimeReason::StopRequested);
+    }
+
+    #[test]
+    fn test_native_ble_compatibility_and_observed_spawn_apis_compile() {
+        let _compatibility_facade = spawn_ble_rnode_interface_native;
+        let _observed_api = spawn_ble_rnode_interface_native_with_driver;
     }
 
     // ── process_rnode_response tests ──
