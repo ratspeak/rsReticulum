@@ -709,11 +709,19 @@ impl LinkManager {
 
     fn handle_event(&mut self, event: DestinationEvent) {
         match event {
-            DestinationEvent::LinkRequest { raw, interface_id } => {
-                self.handle_link_request(&raw, interface_id);
+            DestinationEvent::LinkRequest {
+                raw,
+                interface_id,
+                metrics,
+            } => {
+                self.handle_link_request_with_metrics(&raw, interface_id, metrics);
             }
-            DestinationEvent::InboundPacket { raw, interface_id } => {
-                self.handle_inbound_packet(&raw, interface_id);
+            DestinationEvent::InboundPacket {
+                raw,
+                interface_id,
+                metrics,
+            } => {
+                self.handle_inbound_packet_with_metrics(&raw, interface_id, metrics);
             }
             DestinationEvent::LinkEstablished { link_id } => {
                 if let Some(ref tx) = self.link_established_tx {
@@ -797,7 +805,17 @@ impl LinkManager {
         Ok(())
     }
 
+    #[cfg(test)]
     fn handle_link_request(&mut self, raw: &[u8], interface_id: u64) {
+        self.handle_link_request_with_metrics(raw, interface_id, Default::default());
+    }
+
+    fn handle_link_request_with_metrics(
+        &mut self,
+        raw: &[u8],
+        interface_id: u64,
+        metrics: rns_transport::link_messages::PacketMetrics,
+    ) {
         let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(raw) {
             Ok(h) => h,
             Err(_) => return,
@@ -906,6 +924,11 @@ impl LinkManager {
         // but applications can explicitly select Python-style policies.
         let mut link = link;
         link.resource_strategy = self.resource_strategy;
+        link.update_phy_stats_force(
+            metrics.rssi.map(f64::from),
+            metrics.snr.map(f64::from),
+            metrics.q.map(f64::from),
+        );
 
         self.active_links.insert(
             link_id,
@@ -952,7 +975,17 @@ impl LinkManager {
         );
     }
 
+    #[cfg(test)]
     fn handle_inbound_packet(&mut self, raw: &[u8], interface_id: u64) {
+        self.handle_inbound_packet_with_metrics(raw, interface_id, Default::default());
+    }
+
+    fn handle_inbound_packet_with_metrics(
+        &mut self,
+        raw: &[u8],
+        interface_id: u64,
+        metrics: rns_transport::link_messages::PacketMetrics,
+    ) {
         let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(raw) {
             Ok(h) => h,
             Err(e) => {
@@ -1000,6 +1033,13 @@ impl LinkManager {
                 "link packet ignored on unexpected interface"
             );
             return;
+        }
+        if let Some(active) = self.active_links.get_mut(&link_id) {
+            active.link.update_phy_stats(
+                metrics.rssi.map(f64::from),
+                metrics.snr.map(f64::from),
+                metrics.q.map(f64::from),
+            );
         }
 
         tracing::info!(
@@ -4190,6 +4230,65 @@ mod tests {
             )
             .expect("backend-signed proof validates");
         assert!(!rtt.is_empty());
+    }
+
+    #[test]
+    fn responder_phy_stats_retain_handshake_sample_and_follow_tracking_gate() {
+        let destination_hash = [0xD4; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let (transport_tx, _transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager =
+            LinkManager::new(transport_tx, event_rx, destination_hash, Some(identity_key));
+        let (initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        let link_id = initiator.link_id;
+
+        manager.handle_link_request_with_metrics(
+            &link_request_raw(destination_hash, &request_data),
+            7,
+            rns_transport::link_messages::PacketMetrics {
+                rssi: Some(-91.0),
+                snr: Some(4.0),
+                q: Some(0.5),
+            },
+        );
+
+        let link = manager.get_link_mut(&link_id).expect("responder Link");
+        assert_eq!(link.get_rssi(), None);
+        link.track_phy_stats(true);
+        assert_eq!(link.get_rssi(), Some(-91.0));
+        assert_eq!(link.get_snr(), Some(4.0));
+        assert_eq!(link.get_q(), Some(0.5));
+
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Keepalive,
+        };
+        let mut raw = header.pack();
+        raw.push(rns_link::constants::KEEPALIVE_RESPONSE);
+        manager.handle_inbound_packet_with_metrics(
+            &raw,
+            7,
+            rns_transport::link_messages::PacketMetrics {
+                rssi: Some(-73.0),
+                snr: Some(9.0),
+                q: Some(1.0),
+            },
+        );
+
+        let link = manager.get_link(&link_id).expect("responder Link retained");
+        assert_eq!(link.get_rssi(), Some(-73.0));
+        assert_eq!(link.get_snr(), Some(9.0));
+        assert_eq!(link.get_q(), Some(1.0));
     }
 
     #[test]

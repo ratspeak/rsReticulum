@@ -37,6 +37,14 @@ pub enum CloseReason {
     DestinationClosed,
 }
 
+/// Latest physical-layer measurements observed for a Link.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LinkPhyStats {
+    pub rssi: Option<f64>,
+    pub snr: Option<f64>,
+    pub q: Option<f64>,
+}
+
 /// Resource acceptance strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResourceStrategy {
@@ -168,6 +176,7 @@ pub struct Link {
     pub snr: Option<f64>,
     /// Link quality indicator in `[0.0, 1.0]`.
     pub q: Option<f64>,
+    track_phy_stats: bool,
 
     pub has_channel: bool,
 
@@ -256,6 +265,7 @@ impl Link {
             rssi: None,
             snr: None,
             q: None,
+            track_phy_stats: false,
             has_channel: false,
             packet_callback: None,
             resource_callback: None,
@@ -517,6 +527,7 @@ impl Link {
             rssi: None,
             snr: None,
             q: None,
+            track_phy_stats: false,
             has_channel: false,
             packet_callback: None,
             resource_callback: None,
@@ -1178,9 +1189,28 @@ impl Link {
         (self.tx_bytes, self.rx_bytes, self.tx_count, self.rx_count)
     }
 
-    /// Merge PHY measurements from the receiving interface; `None` values leave
-    /// the current reading intact.
+    /// Enable or disable per-packet physical-layer measurement tracking.
+    pub fn track_phy_stats(&mut self, track: bool) {
+        self.track_phy_stats = track;
+    }
+
+    pub fn phy_stats_tracking_enabled(&self) -> bool {
+        self.track_phy_stats
+    }
+
+    /// Merge measurements when tracking is enabled.
     pub fn update_phy_stats(&mut self, rssi: Option<f64>, snr: Option<f64>, q: Option<f64>) {
+        if !self.track_phy_stats {
+            return;
+        }
+        self.update_phy_stats_force(rssi, snr, q);
+    }
+
+    /// Merge measurements regardless of the tracking gate.
+    ///
+    /// Responder Links use this to retain the establishment packet's
+    /// measurements, matching Python's forced initial update.
+    pub fn update_phy_stats_force(&mut self, rssi: Option<f64>, snr: Option<f64>, q: Option<f64>) {
         if rssi.is_some() {
             self.rssi = rssi;
         }
@@ -1194,7 +1224,32 @@ impl Link {
 
     /// Current PHY measurements as `(rssi, snr, q)`.
     pub fn phy_stats(&self) -> (Option<f64>, Option<f64>, Option<f64>) {
-        (self.rssi, self.snr, self.q)
+        let stats = self.phy_stats_snapshot();
+        (stats.rssi, stats.snr, stats.q)
+    }
+
+    pub fn phy_stats_snapshot(&self) -> LinkPhyStats {
+        if self.track_phy_stats {
+            LinkPhyStats {
+                rssi: self.rssi,
+                snr: self.snr,
+                q: self.q,
+            }
+        } else {
+            LinkPhyStats::default()
+        }
+    }
+
+    pub fn get_rssi(&self) -> Option<f64> {
+        self.track_phy_stats.then_some(self.rssi).flatten()
+    }
+
+    pub fn get_snr(&self) -> Option<f64> {
+        self.track_phy_stats.then_some(self.snr).flatten()
+    }
+
+    pub fn get_q(&self) -> Option<f64> {
+        self.track_phy_stats.then_some(self.q).flatten()
     }
 
     /// Clone of the session keys, for handing to a Channel or Resource.
@@ -2472,7 +2527,10 @@ mod tests {
         let (mut link, _, _) = make_active_link();
 
         assert_eq!(link.phy_stats(), (None, None, None));
+        link.update_phy_stats(Some(-90.0), Some(5.0), Some(0.5));
+        assert_eq!(link.rssi, None);
 
+        link.track_phy_stats(true);
         link.update_phy_stats(Some(-80.0), Some(12.5), Some(0.95));
         assert_eq!(link.rssi, Some(-80.0));
         assert_eq!(link.snr, Some(12.5));
@@ -2482,6 +2540,15 @@ mod tests {
         link.update_phy_stats(Some(-75.0), None, None);
         assert_eq!(link.rssi, Some(-75.0));
         assert_eq!(link.snr, Some(12.5));
+        assert_eq!(link.get_rssi(), Some(-75.0));
+
+        link.track_phy_stats(false);
+        assert_eq!(link.phy_stats(), (None, None, None));
+        assert_eq!(link.get_rssi(), None);
+
+        link.update_phy_stats_force(Some(-60.0), None, None);
+        link.track_phy_stats(true);
+        assert_eq!(link.get_rssi(), Some(-60.0));
     }
 
     #[test]

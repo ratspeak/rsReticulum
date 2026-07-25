@@ -13,6 +13,7 @@ use crate::announce::AnnounceTable;
 use crate::blackhole::BlackholeTable;
 use crate::constants::*;
 use crate::hashlist::PacketHashlist;
+use crate::link_messages::PacketMetrics;
 use crate::link_table::LinkTable;
 use crate::messages::{
     InterfaceEntry, InterfaceId, InterfaceRole, TransportMessage, msg_variant_name,
@@ -237,13 +238,6 @@ struct AnnounceHandlerRegistration {
     receive_path_responses: bool,
     tx: tokio::sync::mpsc::Sender<crate::messages::AnnounceHandlerEvent>,
     dropped_events: Arc<AtomicU64>,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PacketMetrics {
-    pub rssi: Option<f32>,
-    pub snr: Option<f32>,
-    pub q: Option<f32>,
 }
 
 impl TransportActor {

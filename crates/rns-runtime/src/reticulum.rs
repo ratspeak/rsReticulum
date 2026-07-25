@@ -335,6 +335,8 @@ pub struct LinkConnectOptions {
     pub client_label: String,
     /// Send the local identity over the Link after establishment.
     pub identify: bool,
+    /// Retain RSSI, SNR and quality measurements reported by interfaces.
+    pub track_phy_stats: bool,
 }
 
 impl Default for LinkConnectOptions {
@@ -344,6 +346,7 @@ impl Default for LinkConnectOptions {
             establishment_timeout: Duration::from_secs(30),
             client_label: "rns-runtime.link".to_string(),
             identify: false,
+            track_phy_stats: false,
         }
     }
 }
@@ -523,6 +526,7 @@ impl ReticulumHandle {
             establishment_timeout: options.establishment_timeout,
             client_label: options.client_label.clone(),
             identify: options.identify,
+            track_phy_stats: options.track_phy_stats,
         })
     }
 
@@ -5590,6 +5594,7 @@ loglevel = 7
             establishment_timeout: Duration::from_secs(9),
             client_label: "example.client".to_string(),
             identify: true,
+            track_phy_stats: true,
         };
         let config = handle
             .resolve_link_session_config(destination_hash, &options)
@@ -5600,6 +5605,7 @@ loglevel = 7
         assert_eq!(config.hops, 7);
         assert_eq!(config.establishment_timeout, Duration::from_secs(9));
         assert_eq!(config.client_label, "example.client");
+        assert!(config.track_phy_stats);
         assert!(config.identify);
         responder.await.unwrap();
     }

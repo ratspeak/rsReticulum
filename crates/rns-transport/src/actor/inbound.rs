@@ -66,14 +66,12 @@ impl TransportActor {
         // repeat (keepalives, resource transfer frames, channel traffic) and
         // must bypass the check.
         let pkt_hash = rns_wire::hash::packet_hash(&raw, parsed.flags.header_type);
-        self.record_packet_metrics(
-            pkt_hash,
-            PacketMetrics {
-                rssi: packet.rssi,
-                snr: packet.snr,
-                q: packet.q,
-            },
-        );
+        let packet_metrics = PacketMetrics {
+            rssi: packet.rssi,
+            snr: packet.snr,
+            q: packet.q,
+        };
+        self.record_packet_metrics(pkt_hash, packet_metrics);
         let skip_hashlist = matches!(
             parsed.context,
             rns_wire::context::PacketContext::Keepalive
@@ -119,13 +117,13 @@ impl TransportActor {
                 self.process_announce(&raw, &parsed, data_offset, packet.interface_id);
             }
             rns_wire::flags::PacketType::LinkRequest => {
-                self.process_link_request(&raw, &parsed, packet.interface_id);
+                self.process_link_request(&raw, &parsed, packet.interface_id, packet_metrics);
             }
             rns_wire::flags::PacketType::Proof => {
-                self.process_proof(&raw, &parsed, packet.interface_id);
+                self.process_proof(&raw, &parsed, packet.interface_id, packet_metrics);
             }
             rns_wire::flags::PacketType::Data => {
-                self.process_data(&raw, &parsed, packet.interface_id);
+                self.process_data(&raw, &parsed, packet.interface_id, packet_metrics);
             }
         }
     }
@@ -629,6 +627,7 @@ impl TransportActor {
         raw: &bytes::Bytes,
         header: &rns_wire::header::PacketHeader,
         interface_id: InterfaceId,
+        metrics: PacketMetrics,
     ) {
         let from_local_client = self.is_local_client_interface(interface_id);
         let for_local_client = self
@@ -749,6 +748,7 @@ impl TransportActor {
                 if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
                     raw: raw.clone(),
                     interface_id,
+                    metrics,
                 }) {
                     self.channel_drops += 1;
                     warn!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
@@ -790,6 +790,7 @@ impl TransportActor {
         raw: &bytes::Bytes,
         header: &rns_wire::header::PacketHeader,
         interface_id: InterfaceId,
+        metrics: PacketMetrics,
     ) {
         let from_local_client = self.is_local_client_interface(interface_id);
         let for_local_client = self
@@ -817,6 +818,7 @@ impl TransportActor {
                 if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::LinkRequest {
                     raw: raw.clone(),
                     interface_id,
+                    metrics,
                 }) {
                     self.channel_drops += 1;
                     error!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
@@ -995,6 +997,7 @@ impl TransportActor {
         raw: &bytes::Bytes,
         header: &rns_wire::header::PacketHeader,
         _interface_id: InterfaceId,
+        metrics: PacketMetrics,
     ) {
         let from_local_client = self.is_local_client_interface(_interface_id);
         let for_local_client_link =
@@ -1173,6 +1176,7 @@ impl TransportActor {
                     tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
                         raw: raw.clone(),
                         interface_id: _interface_id,
+                        metrics,
                     });
                 if let Err(e) = delivered {
                     self.channel_drops += 1;
@@ -1247,6 +1251,7 @@ impl TransportActor {
             if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
                 raw: raw.clone(),
                 interface_id: _interface_id,
+                metrics,
             }) {
                 self.channel_drops += 1;
                 error!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,

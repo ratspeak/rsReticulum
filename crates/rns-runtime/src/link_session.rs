@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rns_crypto::ed25519::Ed25519PublicKey;
 use rns_identity::identity::Identity;
-use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
+use rns_link::link::{CloseReason, Link, LinkAction, LinkPhyStats, LinkState};
 use rns_protocol::channel::{
     ChannelError, HandlerId, LinkChannel, MessageCallback, PreparedChannelData,
 };
@@ -22,7 +22,7 @@ use rns_protocol::resource::{
     parse_hashmap_update,
 };
 use rns_protocol::resource_adv::ResourceAdvertisement;
-use rns_transport::link_messages::DestinationEvent;
+use rns_transport::link_messages::{DestinationEvent, PacketMetrics};
 use rns_transport::messages::{
     AnnounceRpcEntry, InterfaceId, OutboundRequest, TransportMessage, TransportQuery,
     TransportQueryResponse,
@@ -50,6 +50,7 @@ pub struct LinkSessionConfig {
     pub establishment_timeout: Duration,
     pub client_label: String,
     pub identify: bool,
+    pub track_phy_stats: bool,
 }
 
 impl LinkSessionConfig {
@@ -65,6 +66,7 @@ impl LinkSessionConfig {
             establishment_timeout: Duration::from_secs(30),
             client_label: client_label.into(),
             identify: true,
+            track_phy_stats: false,
         }
     }
 }
@@ -601,6 +603,7 @@ struct SessionActorChannels {
     command_tx: mpsc::Sender<LinkSessionCommand>,
     event_tx: mpsc::Sender<LinkSessionEvent>,
     resource_offer_tx: mpsc::Sender<LinkSessionResourceOffer>,
+    phy_stats_tx: watch::Sender<LinkPhyStats>,
 }
 
 struct DestinationEventContext<'a> {
@@ -608,6 +611,7 @@ struct DestinationEventContext<'a> {
     attached_interface: InterfaceId,
     identity: &'a Identity,
     sinks: InboundResourceSinks<'a>,
+    phy_stats_tx: &'a watch::Sender<LinkPhyStats>,
 }
 
 struct SessionRequestContext<'a> {
@@ -787,6 +791,7 @@ pub struct LinkSessionHandle {
     link_id: [u8; 16],
     mdu: usize,
     command_tx: mpsc::Sender<LinkSessionCommand>,
+    phy_stats_rx: watch::Receiver<LinkPhyStats>,
 }
 
 impl LinkSessionHandle {
@@ -796,6 +801,19 @@ impl LinkSessionHandle {
 
     pub fn mdu(&self) -> usize {
         self.mdu
+    }
+
+    /// Latest physical-layer measurements observed for this Link.
+    ///
+    /// Values remain empty unless tracking was enabled when the session was
+    /// opened.
+    pub fn phy_stats(&self) -> LinkPhyStats {
+        *self.phy_stats_rx.borrow()
+    }
+
+    /// Subscribe to physical-layer measurement updates for this Link.
+    pub fn watch_phy_stats(&self) -> watch::Receiver<LinkPhyStats> {
+        self.phy_stats_rx.clone()
     }
 
     pub fn channel(&self) -> LinkSessionChannelHandle {
@@ -953,6 +971,7 @@ impl LinkSession {
         config: LinkSessionConfig,
     ) -> Result<Self, LinkSessionError> {
         let (mut link, request_data) = Link::new_initiator(config.destination_hash, config.hops);
+        link.track_phy_stats(config.track_phy_stats);
         let link_id = link.link_id;
         let (delivery_tx, mut delivery_rx) = mpsc::channel::<DestinationEvent>(EVENT_BUFFER);
 
@@ -987,10 +1006,11 @@ impl LinkSession {
             Ok(result) => result,
             Err(_) => Err(LinkSessionError::Timeout("link proof")),
         };
-        let (proof, attached_interface) = match proof {
+        let (proof, attached_interface, proof_metrics) = match proof {
             Ok(proof) => proof,
             Err(error) => return Err(error),
         };
+        update_link_phy_stats(&mut link, proof_metrics);
 
         let peer_signing_key: [u8; 32] = config.remote_public_key[32..]
             .try_into()
@@ -1041,10 +1061,12 @@ impl LinkSession {
         let (command_tx, command_rx) = mpsc::channel(COMMAND_BUFFER);
         let (event_tx, events) = mpsc::channel(EVENT_BUFFER);
         let (resource_offer_tx, resource_offers) = mpsc::channel(MAX_PENDING_RESOURCE_OFFERS);
+        let (phy_stats_tx, phy_stats_rx) = watch::channel(link.phy_stats_snapshot());
         let handle = LinkSessionHandle {
             link_id,
             mdu: link.mdu,
             command_tx: command_tx.clone(),
+            phy_stats_rx,
         };
         tokio::spawn(run_session_actor(
             identity,
@@ -1057,6 +1079,7 @@ impl LinkSession {
                 command_tx,
                 event_tx,
                 resource_offer_tx,
+                phy_stats_tx,
             },
         ));
         registration.disarm();
@@ -1128,6 +1151,7 @@ async fn run_session_actor(
         command_tx,
         event_tx,
         resource_offer_tx,
+        phy_stats_tx,
     } = channels;
     let (mut link, channel) = link_and_channel;
     let link_id = link.link_id;
@@ -1271,6 +1295,7 @@ async fn run_session_actor(
                             command_tx: &command_tx,
                             offer_tx: &resource_offer_tx,
                         },
+                        phy_stats_tx: &phy_stats_tx,
                     },
                     &mut link,
                     &mut state,
@@ -3519,6 +3544,7 @@ async fn process_destination_event(
         attached_interface,
         identity,
         sinks,
+        phy_stats_tx,
     } = context;
     let InboundResourceSinks {
         event_tx,
@@ -3529,7 +3555,11 @@ async fn process_destination_event(
         DestinationEvent::LinkClosed { link_id } if link_id == link.link_id => {
             return Ok(Some(LinkSessionCloseReason::Remote));
         }
-        DestinationEvent::InboundPacket { raw, interface_id } => {
+        DestinationEvent::InboundPacket {
+            raw,
+            interface_id,
+            metrics,
+        } => {
             // Python pins an established Link to the interface that delivered
             // its proof. Accepting Link traffic from another interface would
             // both break route affinity and permit cross-interface injection.
@@ -3542,6 +3572,8 @@ async fn process_destination_event(
             if header.destination_hash != link.link_id || raw.len() < data_offset {
                 return Ok(None);
             }
+            update_link_phy_stats(link, metrics);
+            publish_link_phy_stats(link, phy_stats_tx);
             let body = &raw[data_offset..];
             let was_stale = link.state == LinkState::Stale;
 
@@ -3804,13 +3836,17 @@ async fn send_packet_proof(
 async fn wait_for_link_proof(
     delivery_rx: &mut mpsc::Receiver<DestinationEvent>,
     link_id: [u8; 16],
-) -> Result<(Vec<u8>, InterfaceId), LinkSessionError> {
+) -> Result<(Vec<u8>, InterfaceId, PacketMetrics), LinkSessionError> {
     while let Some(event) = delivery_rx.recv().await {
         match event {
             DestinationEvent::LinkClosed { link_id: closed } if closed == link_id => {
                 return Err(LinkSessionError::HandshakeFailed("Link closed".into()));
             }
-            DestinationEvent::InboundPacket { raw, interface_id } => {
+            DestinationEvent::InboundPacket {
+                raw,
+                interface_id,
+                metrics,
+            } => {
                 let Ok((header, data_offset)) = rns_wire::header::PacketHeader::unpack(&raw) else {
                     continue;
                 };
@@ -3818,7 +3854,7 @@ async fn wait_for_link_proof(
                     && header.flags.packet_type == rns_wire::flags::PacketType::Proof
                     && raw.len() > data_offset
                 {
-                    return Ok((raw[data_offset..].to_vec(), interface_id));
+                    return Ok((raw[data_offset..].to_vec(), interface_id, metrics));
                 }
             }
             _ => {}
@@ -3827,6 +3863,26 @@ async fn wait_for_link_proof(
     Err(LinkSessionError::HandshakeFailed(
         "destination event stream closed".into(),
     ))
+}
+
+fn update_link_phy_stats(link: &mut Link, metrics: PacketMetrics) {
+    link.update_phy_stats(
+        metrics.rssi.map(f64::from),
+        metrics.snr.map(f64::from),
+        metrics.q.map(f64::from),
+    );
+}
+
+fn publish_link_phy_stats(link: &Link, tx: &watch::Sender<LinkPhyStats>) {
+    let next = link.phy_stats_snapshot();
+    tx.send_if_modified(|current| {
+        if *current == next {
+            false
+        } else {
+            *current = next;
+            true
+        }
+    });
 }
 
 async fn send_keepalive(
@@ -4349,10 +4405,12 @@ mod tests {
         let (command_tx, command_rx) = mpsc::channel::<LinkSessionCommand>(16);
         let (event_tx, mut event_rx) = mpsc::channel::<LinkSessionEvent>(16);
         let (resource_offer_tx, _resource_offer_rx) = mpsc::channel::<LinkSessionResourceOffer>(1);
+        let (phy_stats_tx, phy_stats_rx) = watch::channel(LinkPhyStats::default());
         let handle = LinkSessionHandle {
             link_id,
             mdu,
             command_tx: command_tx.clone(),
+            phy_stats_rx,
         };
 
         tokio::spawn(run_session_actor(
@@ -4366,6 +4424,7 @@ mod tests {
                 command_tx,
                 event_tx,
                 resource_offer_tx,
+                phy_stats_tx,
             },
         ));
 
@@ -4393,6 +4452,7 @@ mod tests {
                     &inbound_ciphertext,
                 ),
                 interface_id: 7,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
@@ -4444,6 +4504,7 @@ mod tests {
                 establishment_timeout: Duration::from_secs(30),
                 client_label: "test.cancelled-link-session".into(),
                 identify: false,
+                track_phy_stats: false,
             },
         ));
 
@@ -4487,6 +4548,7 @@ mod tests {
                 establishment_timeout: Duration::from_secs(2),
                 client_label: "test.link-session".into(),
                 identify: true,
+                track_phy_stats: true,
             },
         ));
 
@@ -4528,6 +4590,11 @@ mod tests {
             .send(DestinationEvent::InboundPacket {
                 raw: proof_packet,
                 interface_id: 1,
+                metrics: PacketMetrics {
+                    rssi: Some(-87.0),
+                    snr: Some(6.5),
+                    q: Some(0.75),
+                },
             })
             .await
             .unwrap();
@@ -4564,6 +4631,15 @@ mod tests {
         assert_eq!(identified, client_identity.get_public_key());
 
         let mut session = connect.await.unwrap().unwrap();
+        assert_eq!(
+            session.handle.phy_stats(),
+            LinkPhyStats {
+                rssi: Some(-87.0),
+                snr: Some(6.5),
+                q: Some(0.75),
+            }
+        );
+        let mut phy_stats_rx = session.handle.watch_phy_stats();
         let receipt = session
             .handle
             .send_packet(b"hello hub".to_vec())
@@ -4624,9 +4700,26 @@ mod tests {
                     &response,
                 ),
                 interface_id: 1,
+                metrics: PacketMetrics {
+                    rssi: Some(-72.0),
+                    snr: Some(8.0),
+                    q: Some(1.0),
+                },
             })
             .await
             .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), phy_stats_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *phy_stats_rx.borrow(),
+            LinkPhyStats {
+                rssi: Some(-72.0),
+                snr: Some(8.0),
+                q: Some(1.0),
+            }
+        );
         let response = request_task.await.unwrap().unwrap();
         assert_eq!(response.request_id, request_id);
         assert_eq!(response.data, b"response body");
@@ -4753,6 +4846,7 @@ mod tests {
                     &first_proof,
                 ),
                 interface_id: 1,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
@@ -4780,6 +4874,7 @@ mod tests {
                     &second_proof,
                 ),
                 interface_id: 1,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
@@ -4809,6 +4904,7 @@ mod tests {
             .send(DestinationEvent::InboundPacket {
                 raw: inbound_channel_packet,
                 interface_id: 1,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
@@ -4848,6 +4944,7 @@ mod tests {
                     &ignored_prepared.data,
                 ),
                 interface_id: 1,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
@@ -4875,6 +4972,7 @@ mod tests {
                     &inbound_stream_prepared.data,
                 ),
                 interface_id: 1,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
@@ -4928,6 +5026,7 @@ mod tests {
                     &outbound_stream_proof,
                 ),
                 interface_id: 1,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
@@ -4964,6 +5063,7 @@ mod tests {
                     &eof_proof,
                 ),
                 interface_id: 1,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
@@ -4979,6 +5079,7 @@ mod tests {
             .send(DestinationEvent::InboundPacket {
                 raw: inbound.clone(),
                 interface_id: 9,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
@@ -4996,6 +5097,7 @@ mod tests {
             .send(DestinationEvent::InboundPacket {
                 raw: inbound,
                 interface_id: 1,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
@@ -5088,6 +5190,7 @@ mod tests {
                     &encrypted_request,
                 ),
                 interface_id: 1,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
@@ -5125,6 +5228,7 @@ mod tests {
                     &resource_proof,
                 ),
                 interface_id: 1,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
@@ -5260,6 +5364,7 @@ mod tests {
                     &responder.encrypt(&inbound_advertisement).unwrap(),
                 ),
                 interface_id: 1,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
@@ -5315,6 +5420,7 @@ mod tests {
                         &part,
                     ),
                     interface_id: 1,
+                    metrics: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -5382,6 +5488,7 @@ mod tests {
                     &responder.encrypt(&rejected_advertisement).unwrap(),
                 ),
                 interface_id: 1,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
@@ -5427,6 +5534,7 @@ mod tests {
                     &responder.encrypt(&cancelled_advertisement).unwrap(),
                 ),
                 interface_id: 1,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
