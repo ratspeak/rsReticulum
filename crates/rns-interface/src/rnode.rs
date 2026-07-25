@@ -14,6 +14,11 @@ use crate::traits::{InterfaceId, InterfaceMode};
 use rns_transport::messages::{InboundPacket, TransportMessage};
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+use crate::rnode_protocol::{
+    FREQUENCY_TOLERANCE_HZ, RNodeProtocolEffect, RNodeProtocolState, RNodeProtocolTarget,
+    RNodeRadioState, RNodeReadiness,
+};
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use crate::traits::{InterfaceDirection, InterfaceHandle};
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use std::collections::HashMap;
@@ -159,7 +164,7 @@ pub enum RNodeTransportClass {
 pub enum RNodeRuntimePhase {
     Connecting,
     AwaitingReadiness,
-    /// Reserved for the protocol-reducer integration.
+    /// The active connection has complete, compatible protocol evidence.
     Ready,
     ReconnectBackoff,
     ShuttingDown,
@@ -216,7 +221,7 @@ pub enum RNodeTransmitFlowState {
     Blocked,
 }
 
-/// Privacy-safe reason for the latest lifecycle transition.
+/// Privacy-safe reason for the latest driver or admitted protocol transition.
 ///
 /// Reasons are deliberately closed classifications: unrestricted transport or
 /// device errors never enter the observation channel.
@@ -229,14 +234,15 @@ pub enum RNodeRuntimeReason {
     StopRequested,
     TransportConsumerClosed,
     DriverTerminated,
+    DeviceReset,
+    RadioInitialisationFault,
 }
 
 /// Privacy-safe local observation of one generic RNode driver.
 ///
 /// This type intentionally contains no interface id or label, path, endpoint,
 /// device identity, raw error, exact firmware/RF values, telemetry, hashes,
-/// EEPROM contents, or frame data. Protocol classifications remain
-/// [`Unknown`](RNodeDetectionState::Unknown) until reducer integration.
+/// EEPROM contents, or frame data.
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -285,6 +291,105 @@ impl RNodeRuntimeSnapshot {
         self.radio = RNodeObservedRadioState::Unknown;
         self.transmit_flow = RNodeTransmitFlowState::Unknown;
     }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn project_rnode_protocol_effect(
+    snapshot: &mut RNodeRuntimeSnapshot,
+    state: &RNodeProtocolState,
+    effect: RNodeProtocolEffect,
+) -> bool {
+    if matches!(
+        effect,
+        RNodeProtocolEffect::NoChange | RNodeProtocolEffect::Rejected(_)
+    ) {
+        return false;
+    }
+
+    let before = snapshot.clone();
+    let evidence = state.evidence();
+    let target = state.target();
+
+    snapshot.detection = if !state.detection_observed() {
+        RNodeDetectionState::Unknown
+    } else if evidence.detected {
+        RNodeDetectionState::Confirmed
+    } else {
+        RNodeDetectionState::Unconfirmed
+    };
+    snapshot.firmware_compatibility = match evidence.firmware {
+        None => RNodeFirmwareCompatibility::Unknown,
+        Some(firmware) if firmware.is_supported() => RNodeFirmwareCompatibility::Supported,
+        Some(_) => RNodeFirmwareCompatibility::Unsupported,
+    };
+
+    let configuration_mismatch = evidence
+        .frequency
+        .is_some_and(|frequency| frequency.abs_diff(target.frequency) > FREQUENCY_TOLERANCE_HZ)
+        || evidence
+            .bandwidth
+            .is_some_and(|bandwidth| bandwidth != target.bandwidth)
+        || evidence
+            .spreading_factor
+            .is_some_and(|spreading_factor| spreading_factor != target.spreading_factor)
+        || evidence
+            .coding_rate
+            .is_some_and(|coding_rate| coding_rate != target.coding_rate)
+        || evidence
+            .tx_power
+            .is_some_and(|tx_power| tx_power != target.tx_power);
+    let configuration_complete = evidence.frequency.is_some()
+        && evidence.bandwidth.is_some()
+        && evidence.spreading_factor.is_some()
+        && evidence.coding_rate.is_some()
+        && evidence.tx_power.is_some();
+    snapshot.configuration = if configuration_mismatch {
+        RNodeConfigurationState::Mismatch
+    } else if configuration_complete {
+        RNodeConfigurationState::Verified
+    } else {
+        RNodeConfigurationState::Unknown
+    };
+
+    snapshot.radio = match evidence.radio_state {
+        None => RNodeObservedRadioState::Unknown,
+        Some(RNodeRadioState::Off) => RNodeObservedRadioState::Off,
+        Some(RNodeRadioState::On) => RNodeObservedRadioState::On,
+    };
+    snapshot.transmit_flow = if !state.flow_permission_observed() {
+        RNodeTransmitFlowState::Unknown
+    } else if evidence.flow_permitted {
+        RNodeTransmitFlowState::Permitted
+    } else {
+        RNodeTransmitFlowState::Blocked
+    };
+    snapshot.phase = match state.readiness() {
+        RNodeReadiness::Ready => RNodeRuntimePhase::Ready,
+        RNodeReadiness::Blocked(_) => RNodeRuntimePhase::AwaitingReadiness,
+    };
+
+    match effect {
+        RNodeProtocolEffect::Reset => {
+            snapshot.reason = Some(RNodeRuntimeReason::DeviceReset);
+        }
+        RNodeProtocolEffect::RadioInitialisationFault => {
+            snapshot.reason = Some(RNodeRuntimeReason::RadioInitialisationFault);
+        }
+        RNodeProtocolEffect::EvidenceChanged(_) | RNodeProtocolEffect::FlowPermissionChanged(_) => {
+            if evidence.radio_initialisation_fault {
+                snapshot.reason = Some(RNodeRuntimeReason::RadioInitialisationFault);
+            } else if snapshot.phase == RNodeRuntimePhase::Ready
+                && snapshot.reason == Some(RNodeRuntimeReason::DeviceReset)
+            {
+                snapshot.reason = None;
+            }
+        }
+        RNodeProtocolEffect::NoChange | RNodeProtocolEffect::Rejected(_) => {
+            unreachable!("non-publishing effects returned above")
+        }
+    }
+
+    *snapshot != before
 }
 
 /// Cloneable, observation-only handle for a generic serial/RNode-TCP driver.
@@ -381,11 +486,15 @@ impl RNodeSnapshotPublisher {
         }
     }
 
-    fn update(&self, update: impl FnOnce(&mut RNodeRuntimeSnapshot)) {
+    fn update(&self, update: impl FnOnce(&mut RNodeRuntimeSnapshot)) -> bool {
         let current = self.state.borrow().clone();
         let mut next = (*current).clone();
         update(&mut next);
+        if &next == current.as_ref() {
+            return false;
+        }
         self.state.send_replace(Arc::new(next));
+        true
     }
 
     fn connection_established(&mut self) {
@@ -428,6 +537,21 @@ impl RNodeSnapshotPublisher {
             snapshot.reason = Some(RNodeRuntimeReason::ConnectionLost);
             snapshot.reset_protocol_observations();
         });
+    }
+
+    fn protocol_effect(&self, state: &RNodeProtocolState, effect: RNodeProtocolEffect) -> bool {
+        if matches!(
+            effect,
+            RNodeProtocolEffect::NoChange | RNodeProtocolEffect::Rejected(_)
+        ) {
+            return false;
+        }
+        let mut projection_changed = false;
+        let published = self.update(|snapshot| {
+            projection_changed = project_rnode_protocol_effect(snapshot, state, effect);
+        });
+        debug_assert_eq!(published, projection_changed);
+        published
     }
 
     fn shutting_down(&self, reason: RNodeRuntimeReason) {
@@ -1337,6 +1461,13 @@ pub async fn spawn_rnode_interface_with_driver(
             error.field()
         ))
     })?;
+    let protocol_target = RNodeProtocolTarget::new(
+        config.frequency,
+        config.bandwidth,
+        config.spreading_factor,
+        config.coding_rate,
+        config.tx_power,
+    );
 
     let port_cfg = PortConfig::parse(&config.port, config.baud_rate).map_err(|e| {
         crate::traits::InterfaceError::SendFailed(format!("rnode port parse: {}", e))
@@ -1456,6 +1587,7 @@ pub async fn spawn_rnode_interface_with_driver(
                     continue;
                 }
             };
+            let mut protocol_state = RNodeProtocolState::new(protocol_target);
             snapshot_publisher.connection_established();
 
             let ready = Arc::new(AtomicBool::new(true));
@@ -1583,6 +1715,8 @@ pub async fn spawn_rnode_interface_with_driver(
                         buf = b;
                         if n > 0 {
                             for (cmd, frame) in deframer.feed(&buf[..n]) {
+                                let effect = protocol_state.apply_frame(cmd, &frame);
+                                snapshot_publisher.protocol_effect(&protocol_state, effect);
                                 match process_rnode_response(
                                     cmd,
                                     &frame,
@@ -2146,6 +2280,437 @@ mod tests {
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    const TEST_PROTOCOL_TARGET: RNodeProtocolTarget =
+        RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn protocol_required_frames(target: RNodeProtocolTarget) -> [(u8, Vec<u8>); 8] {
+        [
+            (CMD_DETECT, vec![DETECT_RESP]),
+            (
+                CMD_FW_VERSION,
+                vec![REQUIRED_FW_VER_MAJ, REQUIRED_FW_VER_MIN],
+            ),
+            (CMD_FREQUENCY, target.frequency.to_be_bytes().to_vec()),
+            (CMD_BANDWIDTH, target.bandwidth.to_be_bytes().to_vec()),
+            (CMD_SF, vec![target.spreading_factor]),
+            (CMD_CR, vec![target.coding_rate]),
+            (CMD_TXPOWER, vec![target.tx_power]),
+            (CMD_RADIO_STATE, vec![RADIO_STATE_ON]),
+        ]
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn protocol_test_snapshot() -> RNodeRuntimeSnapshot {
+        let mut snapshot = RNodeRuntimeSnapshot::initial(RNodeTransportClass::Tcp);
+        snapshot.phase = RNodeRuntimePhase::AwaitingReadiness;
+        snapshot.connection_generation = 1;
+        snapshot
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn apply_projected_frame(
+        state: &mut RNodeProtocolState,
+        snapshot: &mut RNodeRuntimeSnapshot,
+        command: u8,
+        payload: &[u8],
+    ) -> bool {
+        let effect = state.apply_frame(command, payload);
+        project_rnode_protocol_effect(snapshot, state, effect)
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn for_each_protocol_permutation<const N: usize>(
+        values: &mut [usize; N],
+        size: usize,
+        callback: &mut impl FnMut(&[usize; N]),
+    ) {
+        if size == 1 {
+            callback(values);
+            return;
+        }
+
+        for_each_protocol_permutation(values, size - 1, callback);
+        for index in 0..(size - 1) {
+            let swap_index = if size.is_multiple_of(2) { index } else { 0 };
+            values.swap(swap_index, size - 1);
+            for_each_protocol_permutation(values, size - 1, callback);
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_rnode_protocol_projection_is_complete_for_every_required_frame_order() {
+        let frames = protocol_required_frames(TEST_PROTOCOL_TARGET);
+        let mut order = [0, 1, 2, 3, 4, 5, 6, 7];
+        let mut count = 0usize;
+
+        for_each_protocol_permutation(&mut order, 8, &mut |permutation| {
+            let mut state = RNodeProtocolState::new(TEST_PROTOCOL_TARGET);
+            let mut snapshot = protocol_test_snapshot();
+
+            for (position, frame_index) in permutation.iter().copied().enumerate() {
+                let (command, payload) = &frames[frame_index];
+                let effect = state.apply_frame(*command, payload);
+                assert!(!matches!(
+                    effect,
+                    RNodeProtocolEffect::NoChange | RNodeProtocolEffect::Rejected(_)
+                ));
+                project_rnode_protocol_effect(&mut snapshot, &state, effect);
+                if position < 7 {
+                    assert_eq!(snapshot.phase, RNodeRuntimePhase::AwaitingReadiness);
+                }
+            }
+
+            assert_eq!(snapshot.phase, RNodeRuntimePhase::Ready);
+            assert_eq!(snapshot.detection, RNodeDetectionState::Confirmed);
+            assert_eq!(
+                snapshot.firmware_compatibility,
+                RNodeFirmwareCompatibility::Supported
+            );
+            assert_eq!(snapshot.configuration, RNodeConfigurationState::Verified);
+            assert_eq!(snapshot.radio, RNodeObservedRadioState::On);
+            assert_eq!(snapshot.transmit_flow, RNodeTransmitFlowState::Unknown);
+            assert_eq!(snapshot.reason, None);
+            count += 1;
+        });
+
+        assert_eq!(count, 40_320);
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn projected_configuration(
+        frequency: u32,
+        bandwidth: u32,
+        spreading_factor: u8,
+        coding_rate: u8,
+        tx_power: u8,
+    ) -> RNodeConfigurationState {
+        let mut state = RNodeProtocolState::new(TEST_PROTOCOL_TARGET);
+        let mut snapshot = protocol_test_snapshot();
+        for (command, payload) in [
+            (CMD_FREQUENCY, frequency.to_be_bytes().to_vec()),
+            (CMD_BANDWIDTH, bandwidth.to_be_bytes().to_vec()),
+            (CMD_SF, vec![spreading_factor]),
+            (CMD_CR, vec![coding_rate]),
+            (CMD_TXPOWER, vec![tx_power]),
+        ] {
+            apply_projected_frame(&mut state, &mut snapshot, command, &payload);
+        }
+        snapshot.configuration
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_rnode_protocol_projection_configuration_boundaries_and_mismatches() {
+        let target = TEST_PROTOCOL_TARGET;
+        for frequency in [
+            target.frequency - FREQUENCY_TOLERANCE_HZ,
+            target.frequency + FREQUENCY_TOLERANCE_HZ,
+        ] {
+            assert_eq!(
+                projected_configuration(
+                    frequency,
+                    target.bandwidth,
+                    target.spreading_factor,
+                    target.coding_rate,
+                    target.tx_power,
+                ),
+                RNodeConfigurationState::Verified
+            );
+        }
+        for frequency in [
+            target.frequency - FREQUENCY_TOLERANCE_HZ - 1,
+            target.frequency + FREQUENCY_TOLERANCE_HZ + 1,
+        ] {
+            assert_eq!(
+                projected_configuration(
+                    frequency,
+                    target.bandwidth,
+                    target.spreading_factor,
+                    target.coding_rate,
+                    target.tx_power,
+                ),
+                RNodeConfigurationState::Mismatch
+            );
+        }
+
+        for (bandwidth, spreading_factor, coding_rate, tx_power) in [
+            (
+                target.bandwidth - 1,
+                target.spreading_factor,
+                target.coding_rate,
+                target.tx_power,
+            ),
+            (
+                target.bandwidth + 1,
+                target.spreading_factor,
+                target.coding_rate,
+                target.tx_power,
+            ),
+            (
+                target.bandwidth,
+                target.spreading_factor - 1,
+                target.coding_rate,
+                target.tx_power,
+            ),
+            (
+                target.bandwidth,
+                target.spreading_factor + 1,
+                target.coding_rate,
+                target.tx_power,
+            ),
+            (
+                target.bandwidth,
+                target.spreading_factor,
+                target.coding_rate - 1,
+                target.tx_power,
+            ),
+            (
+                target.bandwidth,
+                target.spreading_factor,
+                target.coding_rate + 1,
+                target.tx_power,
+            ),
+            (
+                target.bandwidth,
+                target.spreading_factor,
+                target.coding_rate,
+                target.tx_power - 1,
+            ),
+            (
+                target.bandwidth,
+                target.spreading_factor,
+                target.coding_rate,
+                target.tx_power + 1,
+            ),
+        ] {
+            assert_eq!(
+                projected_configuration(
+                    target.frequency,
+                    bandwidth,
+                    spreading_factor,
+                    coding_rate,
+                    tx_power,
+                ),
+                RNodeConfigurationState::Mismatch
+            );
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_rnode_protocol_projection_suppresses_hidden_value_only_publications() {
+        let mut state = RNodeProtocolState::new(TEST_PROTOCOL_TARGET);
+        let mut snapshot = protocol_test_snapshot();
+        for (command, payload) in protocol_required_frames(TEST_PROTOCOL_TARGET) {
+            apply_projected_frame(&mut state, &mut snapshot, command, &payload);
+        }
+        assert_eq!(snapshot.phase, RNodeRuntimePhase::Ready);
+
+        let (state_tx, state_rx) = watch::channel(Arc::new(snapshot.clone()));
+        let driver = RNodeDriverHandle { state: state_rx };
+        let publisher = RNodeSnapshotPublisher::new(state_tx);
+        let subscription = driver.watch();
+        let retained = subscription.snapshot();
+
+        let firmware_effect = state.apply_frame(
+            CMD_FW_VERSION,
+            &[REQUIRED_FW_VER_MAJ, REQUIRED_FW_VER_MIN + 1],
+        );
+        assert!(matches!(
+            firmware_effect,
+            RNodeProtocolEffect::EvidenceChanged(_)
+        ));
+        let mut projected = snapshot.clone();
+        assert!(!project_rnode_protocol_effect(
+            &mut projected,
+            &state,
+            firmware_effect,
+        ));
+        assert_eq!(projected, snapshot);
+        assert!(!publisher.protocol_effect(&state, firmware_effect));
+        assert!(Arc::ptr_eq(&retained, &subscription.snapshot()));
+
+        let frequency_effect = state.apply_frame(
+            CMD_FREQUENCY,
+            &(TEST_PROTOCOL_TARGET.frequency + FREQUENCY_TOLERANCE_HZ).to_be_bytes(),
+        );
+        assert!(matches!(
+            frequency_effect,
+            RNodeProtocolEffect::EvidenceChanged(_)
+        ));
+        assert!(!project_rnode_protocol_effect(
+            &mut projected,
+            &state,
+            frequency_effect,
+        ));
+        assert_eq!(projected, snapshot);
+        assert!(!publisher.protocol_effect(&state, frequency_effect));
+        assert!(Arc::ptr_eq(&retained, &driver.snapshot()));
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_rnode_protocol_projection_flow_never_establishes_readiness() {
+        let mut state = RNodeProtocolState::new(TEST_PROTOCOL_TARGET);
+        let mut snapshot = protocol_test_snapshot();
+
+        assert!(apply_projected_frame(
+            &mut state,
+            &mut snapshot,
+            CMD_READY,
+            &[1],
+        ));
+        assert_eq!(snapshot.transmit_flow, RNodeTransmitFlowState::Permitted);
+        assert_eq!(snapshot.phase, RNodeRuntimePhase::AwaitingReadiness);
+        assert_eq!(snapshot.detection, RNodeDetectionState::Unknown);
+
+        for (command, payload) in protocol_required_frames(TEST_PROTOCOL_TARGET) {
+            apply_projected_frame(&mut state, &mut snapshot, command, &payload);
+        }
+        assert_eq!(snapshot.phase, RNodeRuntimePhase::Ready);
+
+        assert!(apply_projected_frame(
+            &mut state,
+            &mut snapshot,
+            CMD_READY,
+            &[0],
+        ));
+        assert_eq!(snapshot.transmit_flow, RNodeTransmitFlowState::Blocked);
+        assert_eq!(snapshot.phase, RNodeRuntimePhase::Ready);
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_rnode_protocol_projection_maps_negative_protocol_observations() {
+        let mut state = RNodeProtocolState::new(TEST_PROTOCOL_TARGET);
+        let mut snapshot = protocol_test_snapshot();
+
+        for (command, payload) in [
+            (CMD_DETECT, vec![0]),
+            (
+                CMD_FW_VERSION,
+                vec![REQUIRED_FW_VER_MAJ, REQUIRED_FW_VER_MIN - 1],
+            ),
+            (CMD_RADIO_STATE, vec![RADIO_STATE_OFF]),
+            (CMD_READY, vec![0]),
+        ] {
+            assert!(apply_projected_frame(
+                &mut state,
+                &mut snapshot,
+                command,
+                &payload,
+            ));
+        }
+
+        assert_eq!(snapshot.detection, RNodeDetectionState::Unconfirmed);
+        assert_eq!(
+            snapshot.firmware_compatibility,
+            RNodeFirmwareCompatibility::Unsupported
+        );
+        assert_eq!(snapshot.radio, RNodeObservedRadioState::Off);
+        assert_eq!(snapshot.transmit_flow, RNodeTransmitFlowState::Blocked);
+        assert_eq!(snapshot.phase, RNodeRuntimePhase::AwaitingReadiness);
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_rnode_protocol_projection_rejects_malformed_frames_then_recovers() {
+        let mut state = RNodeProtocolState::new(TEST_PROTOCOL_TARGET);
+        let mut snapshot = protocol_test_snapshot();
+        assert!(apply_projected_frame(
+            &mut state,
+            &mut snapshot,
+            CMD_DETECT,
+            &[DETECT_RESP],
+        ));
+        let before = snapshot.clone();
+
+        for (command, payload) in [
+            (CMD_FW_VERSION, vec![REQUIRED_FW_VER_MAJ]),
+            (
+                CMD_FW_VERSION,
+                vec![REQUIRED_FW_VER_MAJ, REQUIRED_FW_VER_MIN, 0],
+            ),
+            (CMD_RADIO_STATE, vec![2]),
+            (CMD_READY, vec![1, 0]),
+            (CMD_RESET, vec![0]),
+            (CMD_ERROR, vec![0x7F]),
+        ] {
+            assert!(!apply_projected_frame(
+                &mut state,
+                &mut snapshot,
+                command,
+                &payload,
+            ));
+            assert_eq!(snapshot, before);
+        }
+
+        for (command, payload) in protocol_required_frames(TEST_PROTOCOL_TARGET) {
+            apply_projected_frame(&mut state, &mut snapshot, command, &payload);
+        }
+        assert_eq!(snapshot.phase, RNodeRuntimePhase::Ready);
+        assert_eq!(snapshot.configuration, RNodeConfigurationState::Verified);
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_rnode_protocol_projection_reset_and_fault_reasons_are_closed_and_sticky() {
+        let mut state = RNodeProtocolState::new(TEST_PROTOCOL_TARGET);
+        let mut snapshot = protocol_test_snapshot();
+        for (command, payload) in protocol_required_frames(TEST_PROTOCOL_TARGET) {
+            apply_projected_frame(&mut state, &mut snapshot, command, &payload);
+        }
+        assert_eq!(snapshot.phase, RNodeRuntimePhase::Ready);
+
+        assert!(apply_projected_frame(
+            &mut state,
+            &mut snapshot,
+            CMD_ERROR,
+            &[0x01],
+        ));
+        assert_eq!(snapshot.phase, RNodeRuntimePhase::AwaitingReadiness);
+        assert_eq!(
+            snapshot.reason,
+            Some(RNodeRuntimeReason::RadioInitialisationFault)
+        );
+
+        assert!(apply_projected_frame(
+            &mut state,
+            &mut snapshot,
+            CMD_READY,
+            &[1],
+        ));
+        assert_eq!(
+            snapshot.reason,
+            Some(RNodeRuntimeReason::RadioInitialisationFault)
+        );
+        assert_eq!(snapshot.phase, RNodeRuntimePhase::AwaitingReadiness);
+
+        assert!(apply_projected_frame(
+            &mut state,
+            &mut snapshot,
+            CMD_RESET,
+            &[0xF8],
+        ));
+        assert_protocol_observations_unknown(&snapshot);
+        assert_eq!(snapshot.reason, Some(RNodeRuntimeReason::DeviceReset));
+
+        for (position, (command, payload)) in protocol_required_frames(TEST_PROTOCOL_TARGET)
+            .into_iter()
+            .enumerate()
+        {
+            apply_projected_frame(&mut state, &mut snapshot, command, &payload);
+            if position < 7 {
+                assert_eq!(snapshot.reason, Some(RNodeRuntimeReason::DeviceReset));
+            }
+        }
+        assert_eq!(snapshot.phase, RNodeRuntimePhase::Ready);
+        assert_eq!(snapshot.reason, None);
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     async fn wait_for_rnode_snapshot(
         state: &mut RNodeDriverSubscription,
         predicate: impl Fn(&RNodeRuntimeSnapshot) -> bool,
@@ -2167,6 +2732,34 @@ mod tests {
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn write_fragmented_tcp(stream: &mut std::net::TcpStream, bytes: &[u8]) {
+        let chunk_sizes = [1, 2, 5, 3, 8];
+        let mut offset = 0usize;
+        let mut chunk_index = 0usize;
+        while offset < bytes.len() {
+            let end = (offset + chunk_sizes[chunk_index % chunk_sizes.len()]).min(bytes.len());
+            std::io::Write::write_all(stream, &bytes[offset..end]).unwrap();
+            offset = end;
+            chunk_index += 1;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    async fn receive_inbound_packet(
+        receiver: &mut mpsc::Receiver<TransportMessage>,
+    ) -> InboundPacket {
+        match tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("timed out waiting for inbound RNode packet")
+            .expect("transport channel closed before inbound RNode packet")
+        {
+            TransportMessage::Inbound(packet) => packet,
+            _ => panic!("unexpected non-inbound transport message"),
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[tokio::test]
     async fn test_rnode_driver_initial_snapshot_is_private_and_protocol_unknown() {
         const PRIVATE_NAME: &str = "PRIVATE_RNODE_NAME_SENTINEL_2d7f";
@@ -2178,6 +2771,7 @@ mod tests {
         let expected_startup = tcp_startup_bytes(&config);
         let server_expected_startup = expected_startup.clone();
         let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (send_responses_tx, send_responses_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
 
         let server = std::thread::spawn(move || {
@@ -2187,9 +2781,13 @@ mod tests {
                 .unwrap();
             let startup = read_exact_tcp(&mut stream, server_expected_startup.len());
             accepted_tx.send(startup).unwrap();
+            if send_responses_rx
+                .recv_timeout(Duration::from_secs(3))
+                .is_err()
+            {
+                return;
+            }
 
-            // Even grounded protocol frames remain deliberately unprojected in
-            // this lifecycle-only slice.
             let mut responses = Vec::new();
             kiss::frame_with_command_into(CMD_DETECT, &[DETECT_RESP], &mut responses);
             kiss::frame_with_command_into(
@@ -2201,7 +2799,7 @@ mod tests {
             kiss::frame_with_command_into(CMD_READY, &[1], &mut responses);
             kiss::frame_with_command_into(kiss::CMD_DATA, b"snapshot-barrier", &mut responses);
             std::io::Write::write_all(&mut stream, &responses).unwrap();
-            release_rx.recv().unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
         });
 
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
@@ -2229,6 +2827,7 @@ mod tests {
         assert_eq!(connected.reason, None);
         assert_protocol_observations_unknown(&connected);
 
+        send_responses_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(2), transport_rx.recv())
             .await
             .unwrap()
@@ -2238,7 +2837,24 @@ mod tests {
             after_protocol_frames.phase,
             RNodeRuntimePhase::AwaitingReadiness
         );
-        assert_protocol_observations_unknown(&after_protocol_frames);
+        assert_eq!(
+            after_protocol_frames.detection,
+            RNodeDetectionState::Confirmed
+        );
+        assert_eq!(
+            after_protocol_frames.firmware_compatibility,
+            RNodeFirmwareCompatibility::Supported
+        );
+        assert_eq!(
+            after_protocol_frames.configuration,
+            RNodeConfigurationState::Unknown
+        );
+        assert_eq!(after_protocol_frames.radio, RNodeObservedRadioState::On);
+        assert_eq!(
+            after_protocol_frames.transmit_flow,
+            RNodeTransmitFlowState::Permitted
+        );
+        assert_eq!(after_protocol_frames.reason, None);
 
         let debug = format!("{:?} {:?}", spawned.driver, spawned.driver.snapshot());
         assert!(!debug.contains(PRIVATE_NAME), "{debug}");
@@ -2259,11 +2875,181 @@ mod tests {
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[tokio::test]
+    async fn test_rnode_driver_projects_fragmented_reordered_controls_and_forwards_packets() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = RNodeConfig::new("rnode-projection", &format!("tcp://{addr}"));
+        let target = RNodeProtocolTarget::new(
+            config.frequency,
+            config.bandwidth,
+            config.spreading_factor,
+            config.coding_rate,
+            config.tx_power,
+        );
+        let expected_startup = tcp_startup_bytes(&config);
+        let first_packet = vec![0x01, kiss::FEND, kiss::FESC, 0x02];
+        let middle_packet = b"projection-middle".to_vec();
+        let final_packet = b"projection-ready".to_vec();
+        let expected_rxb = (first_packet.len() + middle_packet.len() + final_packet.len()) as u64;
+
+        let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server_first_packet = first_packet.clone();
+        let server_middle_packet = middle_packet.clone();
+        let server_final_packet = final_packet.clone();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_nodelay(true).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            assert_eq!(
+                read_exact_tcp(&mut stream, expected_startup.len()),
+                expected_startup
+            );
+            accepted_tx.send(()).unwrap();
+            if start_rx.recv_timeout(Duration::from_secs(3)).is_err() {
+                return;
+            }
+
+            let mut malformed = Vec::new();
+            kiss::frame_with_command_into(CMD_READY, &[1], &mut malformed);
+            kiss::frame_with_command_into(CMD_DETECT, &[], &mut malformed);
+            kiss::frame_with_command_into(CMD_FW_VERSION, &[REQUIRED_FW_VER_MAJ], &mut malformed);
+            kiss::frame_with_command_into(
+                CMD_FW_VERSION,
+                &[REQUIRED_FW_VER_MAJ, REQUIRED_FW_VER_MIN, 0],
+                &mut malformed,
+            );
+            kiss::frame_with_command_into(CMD_RADIO_STATE, &[2], &mut malformed);
+            kiss::frame_with_command_into(CMD_READY, &[0, 1], &mut malformed);
+            kiss::frame_with_command_into(CMD_RESET, &[0], &mut malformed);
+            kiss::frame_with_command_into(CMD_ERROR, &[0x7F], &mut malformed);
+            kiss::frame_with_command_into(kiss::CMD_DATA, &server_first_packet, &mut malformed);
+            write_fragmented_tcp(&mut stream, &malformed);
+
+            if continue_rx.recv_timeout(Duration::from_secs(3)).is_err() {
+                return;
+            }
+            let mut valid = Vec::new();
+            kiss::frame_with_command_into(
+                CMD_BANDWIDTH,
+                &target.bandwidth.to_be_bytes(),
+                &mut valid,
+            );
+            kiss::frame_with_command_into(CMD_DETECT, &[DETECT_RESP], &mut valid);
+            kiss::frame_with_command_into(
+                CMD_FW_VERSION,
+                &[REQUIRED_FW_VER_MAJ, REQUIRED_FW_VER_MIN],
+                &mut valid,
+            );
+            kiss::frame_with_command_into(CMD_DETECT, &[DETECT_RESP], &mut valid);
+            kiss::frame_with_command_into(kiss::CMD_DATA, &server_middle_packet, &mut valid);
+            kiss::frame_with_command_into(
+                CMD_FREQUENCY,
+                &target.frequency.to_be_bytes(),
+                &mut valid,
+            );
+            kiss::frame_with_command_into(CMD_CR, &[target.coding_rate], &mut valid);
+            kiss::frame_with_command_into(CMD_TXPOWER, &[target.tx_power], &mut valid);
+            kiss::frame_with_command_into(CMD_SF, &[target.spreading_factor], &mut valid);
+            kiss::frame_with_command_into(CMD_RADIO_STATE, &[RADIO_STATE_ON], &mut valid);
+            kiss::frame_with_command_into(CMD_RADIO_STATE, &[RADIO_STATE_ON], &mut valid);
+            kiss::frame_with_command_into(kiss::CMD_DATA, &server_final_packet, &mut valid);
+            write_fragmented_tcp(&mut stream, &valid);
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+        });
+
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let spawned = spawn_rnode_interface_with_driver(config, 0xF12A, transport_tx)
+            .await
+            .unwrap();
+        let mut state = spawned.driver.watch();
+        tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
+            .await
+            .expect("TCP accept notification timed out")
+            .expect("TCP peer ended before accept notification");
+        wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.connection_generation == 1
+                && snapshot.phase == RNodeRuntimePhase::AwaitingReadiness
+        })
+        .await;
+        assert_protocol_observations_unknown(&state.snapshot());
+
+        start_tx.send(()).unwrap();
+        let first = receive_inbound_packet(&mut transport_rx).await;
+        assert_eq!(first.raw.as_ref(), first_packet);
+        let after_malformed = state.snapshot();
+        assert_eq!(
+            after_malformed.transmit_flow,
+            RNodeTransmitFlowState::Permitted
+        );
+        assert_eq!(after_malformed.phase, RNodeRuntimePhase::AwaitingReadiness);
+        assert_eq!(after_malformed.detection, RNodeDetectionState::Unknown);
+        assert_eq!(
+            after_malformed.firmware_compatibility,
+            RNodeFirmwareCompatibility::Unknown
+        );
+        assert_eq!(
+            after_malformed.configuration,
+            RNodeConfigurationState::Unknown
+        );
+        assert_eq!(after_malformed.radio, RNodeObservedRadioState::Unknown);
+        assert_eq!(after_malformed.reason, None);
+
+        continue_tx.send(()).unwrap();
+        let middle = receive_inbound_packet(&mut transport_rx).await;
+        let final_barrier = receive_inbound_packet(&mut transport_rx).await;
+        assert_eq!(middle.raw.as_ref(), middle_packet);
+        assert_eq!(final_barrier.raw.as_ref(), final_packet);
+        let ready = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.connection_generation == 1 && snapshot.phase == RNodeRuntimePhase::Ready
+        })
+        .await;
+        assert_eq!(ready.detection, RNodeDetectionState::Confirmed);
+        assert_eq!(
+            ready.firmware_compatibility,
+            RNodeFirmwareCompatibility::Supported
+        );
+        assert_eq!(ready.configuration, RNodeConfigurationState::Verified);
+        assert_eq!(ready.radio, RNodeObservedRadioState::On);
+        assert_eq!(ready.transmit_flow, RNodeTransmitFlowState::Permitted);
+        assert_eq!(ready.reason, None);
+        assert_eq!(
+            spawned
+                .interface
+                .rxb
+                .as_ref()
+                .expect("RNode RX counter")
+                .load(Ordering::Relaxed),
+            expected_rxb
+        );
+
+        spawned.interface.read_task.abort();
+        let _ = spawned.interface.read_task.await;
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
     async fn test_rnode_driver_eof_reconnect_updates_generation_and_counters() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let config = RNodeConfig::new("rnode-observed-reconnect", &format!("tcp://{addr}"));
+        let target = RNodeProtocolTarget::new(
+            config.frequency,
+            config.bandwidth,
+            config.spreading_factor,
+            config.coding_rate,
+            config.tx_power,
+        );
         let expected_startup = tcp_startup_bytes(&config);
+        let ready_barrier = b"generation-one-ready".to_vec();
+        let server_ready_barrier = ready_barrier.clone();
         let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
         let (close_first_tx, close_first_rx) = std::sync::mpsc::channel();
         let (release_second_tx, release_second_rx) = std::sync::mpsc::channel();
@@ -2277,6 +3063,12 @@ mod tests {
                 read_exact_tcp(&mut first, expected_startup.len()),
                 expected_startup
             );
+            let mut ready_frames = Vec::new();
+            for (command, payload) in protocol_required_frames(target) {
+                kiss::frame_with_command_into(command, &payload, &mut ready_frames);
+            }
+            kiss::frame_with_command_into(kiss::CMD_DATA, &server_ready_barrier, &mut ready_frames);
+            std::io::Write::write_all(&mut first, &ready_frames).unwrap();
             accepted_tx.send(1).unwrap();
             if close_first_rx.recv_timeout(Duration::from_secs(3)).is_err() {
                 return;
@@ -2309,7 +3101,7 @@ mod tests {
             let _ = release_second_rx.recv_timeout(Duration::from_secs(3));
         });
 
-        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
         let spawned = spawn_rnode_interface_with_driver(config, 0xE0F1, transport_tx)
             .await
             .unwrap();
@@ -2322,13 +3114,15 @@ mod tests {
                 .expect("initial TCP peer ended without notification"),
             1
         );
+        let packet = receive_inbound_packet(&mut transport_rx).await;
+        assert_eq!(packet.raw.as_ref(), ready_barrier);
         let first = wait_for_rnode_snapshot(&mut state, |snapshot| {
-            snapshot.connection_generation == 1
-                && snapshot.phase == RNodeRuntimePhase::AwaitingReadiness
+            snapshot.connection_generation == 1 && snapshot.phase == RNodeRuntimePhase::Ready
         })
         .await;
         assert_eq!(first.reconnect_total, 0);
         assert_eq!(first.disconnect_total, 0);
+        assert_eq!(first.configuration, RNodeConfigurationState::Verified);
 
         close_first_tx.send(()).unwrap();
         let disconnected = wait_for_rnode_snapshot(&mut state, |snapshot| {
