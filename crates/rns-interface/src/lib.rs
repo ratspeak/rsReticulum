@@ -31,6 +31,7 @@ pub mod rnode;
 pub mod rnode_admin;
 #[cfg(feature = "serial")]
 pub mod rnode_multi;
+pub mod rnode_protocol;
 #[cfg(feature = "serial")]
 pub mod serial;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
