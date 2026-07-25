@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use std::time::Duration;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 pub const CMD_FREQUENCY: u8 = 0x01;
 pub const CMD_BANDWIDTH: u8 = 0x02;
@@ -139,6 +139,329 @@ const RNODE_TCP_KEEPCNT: u32 = 12;
 const RNODE_TCP_USER_TIMEOUT_SECS: u64 = 24;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_TCP_BUFFER_BYTES: usize = 131_072;
+
+/// Local transport category for the generic RNode driver.
+///
+/// This intentionally carries no endpoint or device identity.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RNodeTransportClass {
+    #[cfg(feature = "serial")]
+    Serial,
+    Tcp,
+}
+
+/// Coarse lifecycle phase of the generic RNode driver.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RNodeRuntimePhase {
+    Connecting,
+    AwaitingReadiness,
+    /// Reserved for the protocol-reducer integration.
+    Ready,
+    ReconnectBackoff,
+    ShuttingDown,
+    Stopped,
+}
+
+/// Detection evidence observed for the active connection generation.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RNodeDetectionState {
+    Unknown,
+    Confirmed,
+    Unconfirmed,
+}
+
+/// Compatibility of the observed firmware with this generic RNode driver.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RNodeFirmwareCompatibility {
+    Unknown,
+    Supported,
+    Unsupported,
+}
+
+/// Verification state for the configured radio parameters.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RNodeConfigurationState {
+    Unknown,
+    Verified,
+    Mismatch,
+}
+
+/// Radio power state observed from the active RNode connection.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RNodeObservedRadioState {
+    Unknown,
+    On,
+    Off,
+}
+
+/// KISS transmit-flow permission observed from the active connection.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RNodeTransmitFlowState {
+    Unknown,
+    Permitted,
+    Blocked,
+}
+
+/// Privacy-safe reason for the latest lifecycle transition.
+///
+/// Reasons are deliberately closed classifications: unrestricted transport or
+/// device errors never enter the observation channel.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RNodeRuntimeReason {
+    ConnectionAttemptFailed,
+    ConnectionLost,
+    StopRequested,
+    TransportConsumerClosed,
+    DriverTerminated,
+}
+
+/// Privacy-safe local observation of one generic RNode driver.
+///
+/// This type intentionally contains no interface id or label, path, endpoint,
+/// device identity, raw error, exact firmware/RF values, telemetry, hashes,
+/// EEPROM contents, or frame data. Protocol classifications remain
+/// [`Unknown`](RNodeDetectionState::Unknown) until reducer integration.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct RNodeRuntimeSnapshot {
+    pub transport: RNodeTransportClass,
+    pub phase: RNodeRuntimePhase,
+    /// Non-zero only while a usable opened and cloned connection is active.
+    pub connection_generation: u64,
+    /// Consecutive post-initial connection attempts; reset on success.
+    pub reconnect_attempt: u64,
+    /// Total post-initial connection attempts for this driver.
+    pub reconnect_total: u64,
+    /// Unplanned active-session losses that entered retry.
+    pub disconnect_total: u64,
+    pub detection: RNodeDetectionState,
+    pub firmware_compatibility: RNodeFirmwareCompatibility,
+    pub configuration: RNodeConfigurationState,
+    pub radio: RNodeObservedRadioState,
+    pub transmit_flow: RNodeTransmitFlowState,
+    pub reason: Option<RNodeRuntimeReason>,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl RNodeRuntimeSnapshot {
+    fn initial(transport: RNodeTransportClass) -> Self {
+        Self {
+            transport,
+            phase: RNodeRuntimePhase::Connecting,
+            connection_generation: 0,
+            reconnect_attempt: 0,
+            reconnect_total: 0,
+            disconnect_total: 0,
+            detection: RNodeDetectionState::Unknown,
+            firmware_compatibility: RNodeFirmwareCompatibility::Unknown,
+            configuration: RNodeConfigurationState::Unknown,
+            radio: RNodeObservedRadioState::Unknown,
+            transmit_flow: RNodeTransmitFlowState::Unknown,
+            reason: None,
+        }
+    }
+
+    fn reset_protocol_observations(&mut self) {
+        self.detection = RNodeDetectionState::Unknown;
+        self.firmware_compatibility = RNodeFirmwareCompatibility::Unknown;
+        self.configuration = RNodeConfigurationState::Unknown;
+        self.radio = RNodeObservedRadioState::Unknown;
+        self.transmit_flow = RNodeTransmitFlowState::Unknown;
+    }
+}
+
+/// Cloneable, observation-only handle for a generic serial/RNode-TCP driver.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone)]
+pub struct RNodeDriverHandle {
+    state: watch::Receiver<Arc<RNodeRuntimeSnapshot>>,
+}
+
+/// Clone-only subscription to generic RNode driver observations.
+///
+/// The underlying Tokio receiver stays private so callers cannot retain a
+/// watch borrow across driver publication. Both accessors return an owned
+/// [`Arc`] and release the internal borrow before returning.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone)]
+pub struct RNodeDriverSubscription {
+    state: watch::Receiver<Arc<RNodeRuntimeSnapshot>>,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl RNodeDriverHandle {
+    /// Return the latest privacy-safe driver snapshot.
+    pub fn snapshot(&self) -> Arc<RNodeRuntimeSnapshot> {
+        self.state.borrow().clone()
+    }
+
+    /// Subscribe to future driver snapshots.
+    pub fn watch(&self) -> RNodeDriverSubscription {
+        RNodeDriverSubscription {
+            state: self.state.clone(),
+        }
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl RNodeDriverSubscription {
+    /// Return the latest snapshot without retaining a watch borrow.
+    pub fn snapshot(&self) -> Arc<RNodeRuntimeSnapshot> {
+        self.state.borrow().clone()
+    }
+
+    /// Wait for a publication and return its cloned snapshot.
+    ///
+    /// `None` means the driver publisher has closed.
+    pub async fn changed(&mut self) -> Option<Arc<RNodeRuntimeSnapshot>> {
+        self.state.changed().await.ok()?;
+        Some(self.snapshot())
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl std::fmt::Debug for RNodeDriverHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RNodeDriverHandle")
+            .field("snapshot", &self.snapshot())
+            .finish()
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl std::fmt::Debug for RNodeDriverSubscription {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RNodeDriverSubscription")
+            .field("snapshot", &self.snapshot())
+            .finish()
+    }
+}
+
+/// Generic interface handle paired with its local RNode driver observation.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[non_exhaustive]
+pub struct SpawnedRNodeInterface {
+    pub interface: InterfaceHandle,
+    pub driver: RNodeDriverHandle,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+struct RNodeSnapshotPublisher {
+    state: watch::Sender<Arc<RNodeRuntimeSnapshot>>,
+    last_connection_generation: u64,
+    terminal: bool,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl RNodeSnapshotPublisher {
+    fn new(state: watch::Sender<Arc<RNodeRuntimeSnapshot>>) -> Self {
+        Self {
+            state,
+            last_connection_generation: 0,
+            terminal: false,
+        }
+    }
+
+    fn update(&self, update: impl FnOnce(&mut RNodeRuntimeSnapshot)) {
+        let current = self.state.borrow().clone();
+        let mut next = (*current).clone();
+        update(&mut next);
+        self.state.send_replace(Arc::new(next));
+    }
+
+    fn connection_established(&mut self) {
+        self.last_connection_generation = self.last_connection_generation.saturating_add(1).max(1);
+        let generation = self.last_connection_generation;
+        self.update(|snapshot| {
+            snapshot.phase = RNodeRuntimePhase::AwaitingReadiness;
+            snapshot.connection_generation = generation;
+            snapshot.reconnect_attempt = 0;
+            snapshot.reason = None;
+            snapshot.reset_protocol_observations();
+        });
+    }
+
+    fn reconnect_started(&self) {
+        self.update(|snapshot| {
+            snapshot.phase = RNodeRuntimePhase::Connecting;
+            snapshot.connection_generation = 0;
+            snapshot.reconnect_attempt = snapshot.reconnect_attempt.saturating_add(1);
+            snapshot.reconnect_total = snapshot.reconnect_total.saturating_add(1);
+            snapshot.reason = None;
+            snapshot.reset_protocol_observations();
+        });
+    }
+
+    fn connection_attempt_failed(&self) {
+        self.update(|snapshot| {
+            snapshot.phase = RNodeRuntimePhase::ReconnectBackoff;
+            snapshot.connection_generation = 0;
+            snapshot.reason = Some(RNodeRuntimeReason::ConnectionAttemptFailed);
+            snapshot.reset_protocol_observations();
+        });
+    }
+
+    fn connection_lost(&self) {
+        self.update(|snapshot| {
+            snapshot.phase = RNodeRuntimePhase::ReconnectBackoff;
+            snapshot.connection_generation = 0;
+            snapshot.disconnect_total = snapshot.disconnect_total.saturating_add(1);
+            snapshot.reason = Some(RNodeRuntimeReason::ConnectionLost);
+            snapshot.reset_protocol_observations();
+        });
+    }
+
+    fn shutting_down(&self, reason: RNodeRuntimeReason) {
+        self.update(|snapshot| {
+            snapshot.phase = RNodeRuntimePhase::ShuttingDown;
+            snapshot.reason = Some(reason);
+        });
+    }
+
+    fn stopped(&mut self, reason: RNodeRuntimeReason) {
+        self.update(|snapshot| {
+            snapshot.phase = RNodeRuntimePhase::Stopped;
+            snapshot.connection_generation = 0;
+            snapshot.reason = Some(reason);
+            snapshot.reset_protocol_observations();
+        });
+        self.terminal = true;
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl Drop for RNodeSnapshotPublisher {
+    fn drop(&mut self) {
+        if self.terminal {
+            return;
+        }
+        self.update(|snapshot| {
+            snapshot.phase = RNodeRuntimePhase::Stopped;
+            snapshot.connection_generation = 0;
+            snapshot.reason = Some(RNodeRuntimeReason::DriverTerminated);
+            snapshot.reset_protocol_observations();
+        });
+    }
+}
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 type RNodeStopRegistry = Mutex<HashMap<InterfaceId, mpsc::Sender<()>>>;
@@ -990,11 +1313,24 @@ pub fn process_rnode_response(
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+/// Compatibility facade returning the original generic interface handle.
 pub async fn spawn_rnode_interface(
     config: RNodeConfig,
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    Ok(spawn_rnode_interface_with_driver(config, id, transport_tx)
+        .await?
+        .interface)
+}
+
+/// Spawn a generic serial/RNode-TCP interface with local lifecycle observation.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+pub async fn spawn_rnode_interface_with_driver(
+    config: RNodeConfig,
+    id: InterfaceId,
+    transport_tx: mpsc::Sender<TransportMessage>,
+) -> Result<SpawnedRNodeInterface, crate::traits::InterfaceError> {
     config.validate().map_err(|error| {
         crate::traits::InterfaceError::SendFailed(format!(
             "rnode config {}: {error}",
@@ -1005,8 +1341,16 @@ pub async fn spawn_rnode_interface(
     let port_cfg = PortConfig::parse(&config.port, config.baud_rate).map_err(|e| {
         crate::traits::InterfaceError::SendFailed(format!("rnode port parse: {}", e))
     })?;
+    let transport = match &port_cfg {
+        #[cfg(feature = "serial")]
+        PortConfig::Serial { .. } => RNodeTransportClass::Serial,
+        PortConfig::Tcp { .. } => RNodeTransportClass::Tcp,
+    };
 
     let port = open_configured_rnode_stream(&config, &port_cfg).await?;
+    let (snapshot_tx, snapshot_rx) =
+        watch::channel(Arc::new(RNodeRuntimeSnapshot::initial(transport)));
+    let driver = RNodeDriverHandle { state: snapshot_rx };
 
     let bitrate = calculate_bitrate(
         config.spreading_factor,
@@ -1053,35 +1397,44 @@ pub async fn spawn_rnode_interface(
     let task_port_cfg = port_cfg.clone();
     let task_name = config.name.clone();
     let read_task = tokio::spawn(async move {
+        let mut snapshot_publisher = RNodeSnapshotPublisher::new(snapshot_tx);
         let _stop_guard = stop_guard;
         let mut next_port = Some(port);
 
         loop {
             if stop_rx.try_recv().is_ok() {
                 tracing::info!(name = %task_name, "RNode stop requested before reconnect");
+                snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
                 return;
             }
             let mut port_r = match next_port.take() {
                 Some(port) => port,
-                None => match open_configured_rnode_stream(&task_config, &task_port_cfg).await {
-                    Ok(port) => port,
-                    Err(e) => {
-                        online_r.store(false, Ordering::SeqCst);
-                        tracing::warn!(
-                            name = %task_name,
-                            error = %e,
-                            "RNode reconnect failed"
-                        );
-                        tokio::select! {
-                            _ = stop_rx.recv() => {
-                                tracing::info!(name = %task_name, "RNode stop requested during reconnect backoff");
-                                return;
+                None => {
+                    snapshot_publisher.reconnect_started();
+                    match open_configured_rnode_stream(&task_config, &task_port_cfg).await {
+                        Ok(port) => port,
+                        Err(e) => {
+                            online_r.store(false, Ordering::SeqCst);
+                            snapshot_publisher.connection_attempt_failed();
+                            tracing::warn!(
+                                name = %task_name,
+                                error = %e,
+                                "RNode reconnect failed"
+                            );
+                            tokio::select! {
+                                _ = stop_rx.recv() => {
+                                    tracing::info!(name = %task_name, "RNode stop requested during reconnect backoff");
+                                    snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                                    snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                                    return;
+                                }
+                                _ = tokio::time::sleep(reconnect_delay()) => {}
                             }
-                            _ = tokio::time::sleep(reconnect_delay()) => {}
+                            continue;
                         }
-                        continue;
                     }
-                },
+                }
             };
 
             online_r.store(true, Ordering::SeqCst);
@@ -1090,9 +1443,12 @@ pub async fn spawn_rnode_interface(
                 Err(e) => {
                     tracing::warn!(error = %e, "RNode clone failed before reconnect");
                     online_r.store(false, Ordering::SeqCst);
+                    snapshot_publisher.connection_attempt_failed();
                     tokio::select! {
                         _ = stop_rx.recv() => {
                             tracing::info!(name = %task_name, "RNode stop requested during reconnect backoff");
+                            snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                            snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
                             return;
                         }
                         _ = tokio::time::sleep(reconnect_delay()) => {}
@@ -1100,6 +1456,7 @@ pub async fn spawn_rnode_interface(
                     continue;
                 }
             };
+            snapshot_publisher.connection_established();
 
             let ready = Arc::new(AtomicBool::new(true));
             let (conn_tx, mut conn_rx) = mpsc::channel::<RNodeWriteRequest>(256);
@@ -1209,6 +1566,7 @@ pub async fn spawn_rnode_interface(
             loop {
                 if stop_rx.try_recv().is_ok() {
                     tracing::info!(name = %task_name, "RNode stop requested");
+                    snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
                     send_detach_request(&conn_tx_for_stop, id).await;
                     stop_requested = true;
                     break;
@@ -1265,20 +1623,31 @@ pub async fn spawn_rnode_interface(
                 }
             }
 
+            if transport_closed {
+                snapshot_publisher.shutting_down(RNodeRuntimeReason::TransportConsumerClosed);
+            }
             online_r.store(false, Ordering::SeqCst);
             fwd_handle.abort();
             let _ = fwd_handle.await;
             write_handle.abort();
             let _ = write_handle.await;
 
-            if stop_requested || transport_closed {
+            if stop_requested {
+                snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                return;
+            }
+            if transport_closed {
+                snapshot_publisher.stopped(RNodeRuntimeReason::TransportConsumerClosed);
                 return;
             }
 
+            snapshot_publisher.connection_lost();
             tracing::info!(name = %task_name, "RNode reconnecting");
             tokio::select! {
                 _ = stop_rx.recv() => {
                     tracing::info!(name = %task_name, "RNode stop requested during reconnect backoff");
+                    snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                    snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
                     return;
                 }
                 _ = tokio::time::sleep(reconnect_delay()) => {}
@@ -1286,7 +1655,7 @@ pub async fn spawn_rnode_interface(
         }
     });
 
-    Ok(InterfaceHandle {
+    let interface = InterfaceHandle {
         id,
         parent_id: None,
         name,
@@ -1305,7 +1674,9 @@ pub async fn spawn_rnode_interface(
         inspection: None,
         tx,
         read_task,
-    })
+    };
+
+    Ok(SpawnedRNodeInterface { interface, driver })
 }
 
 #[cfg(test)]
@@ -1748,6 +2119,373 @@ mod tests {
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn tcp_startup_bytes(config: &RNodeConfig) -> Vec<u8> {
+        let mut startup = build_detect_sequence();
+        startup.extend_from_slice(&build_init_sequence(config));
+        startup
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn read_exact_tcp(stream: &mut std::net::TcpStream, length: usize) -> Vec<u8> {
+        let mut bytes = vec![0; length];
+        std::io::Read::read_exact(stream, &mut bytes).unwrap();
+        bytes
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn assert_protocol_observations_unknown(snapshot: &RNodeRuntimeSnapshot) {
+        assert_eq!(snapshot.detection, RNodeDetectionState::Unknown);
+        assert_eq!(
+            snapshot.firmware_compatibility,
+            RNodeFirmwareCompatibility::Unknown
+        );
+        assert_eq!(snapshot.configuration, RNodeConfigurationState::Unknown);
+        assert_eq!(snapshot.radio, RNodeObservedRadioState::Unknown);
+        assert_eq!(snapshot.transmit_flow, RNodeTransmitFlowState::Unknown);
+        assert_ne!(snapshot.phase, RNodeRuntimePhase::Ready);
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    async fn wait_for_rnode_snapshot(
+        state: &mut RNodeDriverSubscription,
+        predicate: impl Fn(&RNodeRuntimeSnapshot) -> bool,
+    ) -> Arc<RNodeRuntimeSnapshot> {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let snapshot = state.snapshot();
+                if predicate(&snapshot) {
+                    return snapshot;
+                }
+                state
+                    .changed()
+                    .await
+                    .expect("RNode snapshot publisher ended before expected state");
+            }
+        })
+        .await
+        .expect("timed out waiting for RNode snapshot")
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_rnode_driver_initial_snapshot_is_private_and_protocol_unknown() {
+        const PRIVATE_NAME: &str = "PRIVATE_RNODE_NAME_SENTINEL_2d7f";
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = RNodeConfig::new(PRIVATE_NAME, &format!("tcp://{addr}"));
+        config.tx_power = 17;
+        let expected_startup = tcp_startup_bytes(&config);
+        let server_expected_startup = expected_startup.clone();
+        let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let startup = read_exact_tcp(&mut stream, server_expected_startup.len());
+            accepted_tx.send(startup).unwrap();
+
+            // Even grounded protocol frames remain deliberately unprojected in
+            // this lifecycle-only slice.
+            let mut responses = Vec::new();
+            kiss::frame_with_command_into(CMD_DETECT, &[DETECT_RESP], &mut responses);
+            kiss::frame_with_command_into(
+                CMD_FW_VERSION,
+                &[REQUIRED_FW_VER_MAJ, REQUIRED_FW_VER_MIN],
+                &mut responses,
+            );
+            kiss::frame_with_command_into(CMD_RADIO_STATE, &[RADIO_STATE_ON], &mut responses);
+            kiss::frame_with_command_into(CMD_READY, &[1], &mut responses);
+            kiss::frame_with_command_into(kiss::CMD_DATA, b"snapshot-barrier", &mut responses);
+            std::io::Write::write_all(&mut stream, &responses).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let spawned = spawn_rnode_interface_with_driver(config, 0x2D7F, transport_tx)
+            .await
+            .unwrap();
+        let mut state = spawned.driver.watch();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            expected_startup
+        );
+        let connected = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.phase == RNodeRuntimePhase::AwaitingReadiness
+                && snapshot.connection_generation == 1
+        })
+        .await;
+        assert_eq!(connected.transport, RNodeTransportClass::Tcp);
+        assert_eq!(connected.reconnect_attempt, 0);
+        assert_eq!(connected.reconnect_total, 0);
+        assert_eq!(connected.disconnect_total, 0);
+        assert_eq!(connected.reason, None);
+        assert_protocol_observations_unknown(&connected);
+
+        tokio::time::timeout(Duration::from_secs(2), transport_rx.recv())
+            .await
+            .unwrap()
+            .expect("packet barrier must reach transport");
+        let after_protocol_frames = spawned.driver.snapshot();
+        assert_eq!(
+            after_protocol_frames.phase,
+            RNodeRuntimePhase::AwaitingReadiness
+        );
+        assert_protocol_observations_unknown(&after_protocol_frames);
+
+        let debug = format!("{:?} {:?}", spawned.driver, spawned.driver.snapshot());
+        assert!(!debug.contains(PRIVATE_NAME), "{debug}");
+        assert!(!debug.contains(&addr.to_string()), "{debug}");
+
+        spawned.interface.read_task.abort();
+        let _ = spawned.interface.read_task.await;
+        let terminal = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.phase == RNodeRuntimePhase::Stopped
+                && snapshot.reason == Some(RNodeRuntimeReason::DriverTerminated)
+        })
+        .await;
+        assert_eq!(terminal.connection_generation, 0);
+
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_rnode_driver_eof_reconnect_updates_generation_and_counters() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = RNodeConfig::new("rnode-observed-reconnect", &format!("tcp://{addr}"));
+        let expected_startup = tcp_startup_bytes(&config);
+        let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (close_first_tx, close_first_rx) = std::sync::mpsc::channel();
+        let (release_second_tx, release_second_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            first
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            assert_eq!(
+                read_exact_tcp(&mut first, expected_startup.len()),
+                expected_startup
+            );
+            accepted_tx.send(1).unwrap();
+            if close_first_rx.recv_timeout(Duration::from_secs(3)).is_err() {
+                return;
+            }
+            first.shutdown(std::net::Shutdown::Both).unwrap();
+
+            listener.set_nonblocking(true).unwrap();
+            let accept_deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let (mut second, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= accept_deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("second RNode TCP accept failed: {error}"),
+                }
+            };
+            second.set_nonblocking(false).unwrap();
+            second
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            assert_eq!(
+                read_exact_tcp(&mut second, expected_startup.len()),
+                expected_startup
+            );
+            accepted_tx.send(2).unwrap();
+            let _ = release_second_rx.recv_timeout(Duration::from_secs(3));
+        });
+
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let spawned = spawn_rnode_interface_with_driver(config, 0xE0F1, transport_tx)
+            .await
+            .unwrap();
+        let mut state = spawned.driver.watch();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
+                .await
+                .expect("initial TCP accept notification timed out")
+                .expect("initial TCP peer ended without notification"),
+            1
+        );
+        let first = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.connection_generation == 1
+                && snapshot.phase == RNodeRuntimePhase::AwaitingReadiness
+        })
+        .await;
+        assert_eq!(first.reconnect_total, 0);
+        assert_eq!(first.disconnect_total, 0);
+
+        close_first_tx.send(()).unwrap();
+        let disconnected = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.connection_generation == 0
+                && snapshot.phase == RNodeRuntimePhase::ReconnectBackoff
+                && snapshot.disconnect_total == 1
+        })
+        .await;
+        assert_eq!(
+            disconnected.reason,
+            Some(RNodeRuntimeReason::ConnectionLost)
+        );
+        assert_protocol_observations_unknown(&disconnected);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(4), accepted_rx.recv())
+                .await
+                .expect("reconnect TCP accept notification timed out")
+                .expect("TCP peer ended before reconnect notification"),
+            2
+        );
+        let second = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.connection_generation == 2
+                && snapshot.phase == RNodeRuntimePhase::AwaitingReadiness
+        })
+        .await;
+        assert_eq!(second.reconnect_attempt, 0);
+        assert_eq!(second.reconnect_total, 1);
+        assert_eq!(second.disconnect_total, 1);
+        assert_eq!(second.reason, None);
+        assert_protocol_observations_unknown(&second);
+
+        spawned.interface.read_task.abort();
+        let _ = spawned.interface.read_task.await;
+        release_second_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_rnode_driver_retry_failures_increment_attempt_counters() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = RNodeConfig::new("rnode-retry-failures", &format!("tcp://{addr}"));
+        let expected_startup = tcp_startup_bytes(&config);
+        let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (close_tx, close_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            assert_eq!(
+                read_exact_tcp(&mut stream, expected_startup.len()),
+                expected_startup
+            );
+            accepted_tx.send(()).unwrap();
+            close_rx.recv().unwrap();
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
+            // Dropping the listener makes every subsequent attempt fail.
+        });
+
+        let id = 0xFA11;
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let spawned = spawn_rnode_interface_with_driver(config, id, transport_tx)
+            .await
+            .unwrap();
+        let mut state = spawned.driver.watch();
+        accepted_rx.recv().await.unwrap();
+        wait_for_rnode_snapshot(&mut state, |snapshot| snapshot.connection_generation == 1).await;
+
+        close_tx.send(()).unwrap();
+        server.join().unwrap();
+        let failed = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.phase == RNodeRuntimePhase::ReconnectBackoff
+                && snapshot.reason == Some(RNodeRuntimeReason::ConnectionAttemptFailed)
+                && snapshot.reconnect_total >= 2
+                && snapshot.reconnect_attempt >= 2
+        })
+        .await;
+        assert_eq!(failed.connection_generation, 0);
+        assert_eq!(failed.reconnect_attempt, failed.reconnect_total);
+        assert_eq!(failed.disconnect_total, 1);
+        assert_protocol_observations_unknown(&failed);
+
+        stop_rnode_interface(id);
+        let terminal = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.phase == RNodeRuntimePhase::Stopped
+                && snapshot.reason == Some(RNodeRuntimeReason::StopRequested)
+        })
+        .await;
+        assert_eq!(terminal.connection_generation, 0);
+        assert_eq!(terminal.disconnect_total, 1);
+        assert!(terminal.reconnect_total >= 2);
+        let _ = spawned.interface.read_task.await;
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_rnode_driver_stop_is_terminal_and_preserves_exact_detach_bytes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = RNodeConfig::new("rnode-observed-stop", &format!("tcp://{addr}"));
+        let expected_startup = tcp_startup_bytes(&config);
+        let expected_detach = build_detach_sequence();
+        let detach_len = expected_detach.len();
+        let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (detach_tx, mut detach_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            assert_eq!(
+                read_exact_tcp(&mut stream, expected_startup.len()),
+                expected_startup
+            );
+            accepted_tx.send(()).unwrap();
+            detach_tx
+                .send(read_exact_tcp(&mut stream, detach_len))
+                .unwrap();
+        });
+
+        let id = 0x570F;
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let spawned = spawn_rnode_interface_with_driver(config, id, transport_tx)
+            .await
+            .unwrap();
+        let mut state = spawned.driver.watch();
+        accepted_rx.recv().await.unwrap();
+        wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.connection_generation == 1
+                && snapshot.phase == RNodeRuntimePhase::AwaitingReadiness
+        })
+        .await;
+        // This owned clone remains live through publication, detach, and task
+        // completion; it cannot retain Tokio's internal watch read guard.
+        let held_connected_snapshot = state.snapshot();
+
+        stop_rnode_interface(id);
+        let terminal = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.phase == RNodeRuntimePhase::Stopped
+                && snapshot.reason == Some(RNodeRuntimeReason::StopRequested)
+        })
+        .await;
+        assert_eq!(terminal.connection_generation, 0);
+        assert_eq!(terminal.disconnect_total, 0);
+        assert_eq!(detach_rx.recv().await.unwrap(), expected_detach);
+        assert_eq!(held_connected_snapshot.connection_generation, 1);
+
+        let _ = spawned.interface.read_task.await;
+        server.join().unwrap();
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_tcp_eof_is_read_error() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1786,7 +2524,7 @@ mod tests {
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[tokio::test]
-    async fn test_rnode_tcp_reconnects_after_eof() {
+    async fn test_legacy_rnode_spawn_facade_reconnects_after_eof() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let config = RNodeConfig::new("rnode-tcp", &format!("tcp://{addr}"));
