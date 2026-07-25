@@ -10,13 +10,16 @@
 //! 5. upsert into [`DiscoveryStore`] and notify any observer.
 //!
 //! Mirrors Python `Discovery.InterfaceAnnounceHandler.received_announce`.
-//! Runs as a dedicated Tokio task so slow stamp validation does not stall
-//! the transport actor loop.
+//! The spawned path uses a bounded blocking-worker set so slow stamp
+//! validation cannot stall the transport actor or a Tokio runtime worker.
 
-use std::sync::Arc;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, trace, warn};
 
 use crate::messages::AnnounceHandlerEvent;
@@ -25,6 +28,10 @@ use super::app_data::{self, DiscoveryInfo};
 use super::constants::FLAG_ENCRYPTED;
 use super::stamper::DiscoveryStamper;
 use super::storage::{DiscoveredInterface, DiscoveryStore};
+
+const VALID_CACHE_CAPACITY: usize = 2_048;
+const INVALID_CACHE_CAPACITY: usize = 2_048;
+const MAX_IN_FLIGHT_EVENTS: usize = 32;
 
 /// Pluggable decryptor for discovery announces whose flags byte has
 /// `FLAG_ENCRYPTED` set. The concrete impl wraps the `network_identity`
@@ -78,6 +85,8 @@ pub enum Reason {
     EncryptedWithoutKey,
     /// Decryptor returned `None` (ciphertext not addressed to us).
     DecryptFailed,
+    /// Another ingress worker is already performing stamp validation.
+    ValidationBusy,
     /// Stamp did not meet the required value.
     StampInvalid,
     /// Info map did not decode.
@@ -88,12 +97,171 @@ pub enum Reason {
     StorageFailed,
 }
 
+/// Monotonic, payload-free counters for receiver cache and admission behavior.
+///
+/// Values saturate at `u64::MAX`. No announce bytes, hashes, identities, or
+/// decrypted fields are retained in the metrics.
+#[derive(Debug, Default)]
+pub struct ReceiverMetrics {
+    valid_cache_hits: AtomicU64,
+    invalid_cache_hits: AtomicU64,
+    validation_busy_drops: AtomicU64,
+    valid_cache_evictions: AtomicU64,
+    invalid_cache_evictions: AtomicU64,
+}
+
+/// Point-in-time snapshot of [`ReceiverMetrics`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReceiverMetricsSnapshot {
+    pub valid_cache_hits: u64,
+    pub invalid_cache_hits: u64,
+    pub validation_busy_drops: u64,
+    pub valid_cache_evictions: u64,
+    pub invalid_cache_evictions: u64,
+}
+
+impl ReceiverMetrics {
+    pub fn snapshot(&self) -> ReceiverMetricsSnapshot {
+        ReceiverMetricsSnapshot {
+            valid_cache_hits: self.valid_cache_hits.load(Ordering::Relaxed),
+            invalid_cache_hits: self.invalid_cache_hits.load(Ordering::Relaxed),
+            validation_busy_drops: self.validation_busy_drops.load(Ordering::Relaxed),
+            valid_cache_evictions: self.valid_cache_evictions.load(Ordering::Relaxed),
+            invalid_cache_evictions: self.invalid_cache_evictions.load(Ordering::Relaxed),
+        }
+    }
+
+    fn increment(counter: &AtomicU64) -> u64 {
+        let previous = counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(1))
+            })
+            .unwrap_or(u64::MAX);
+        previous.saturating_add(1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CacheKey([u8; 32]);
+
+#[derive(Clone)]
+struct ValidatedMaterial {
+    info: DiscoveryInfo,
+    stamp: Vec<u8>,
+    stamp_value: u8,
+}
+
+enum CacheLookup {
+    Valid(Box<ValidatedMaterial>),
+    Invalid,
+    Miss,
+}
+
+struct ValidationCaches {
+    valid: HashMap<CacheKey, ValidatedMaterial>,
+    valid_order: VecDeque<CacheKey>,
+    invalid: HashSet<CacheKey>,
+    invalid_order: VecDeque<CacheKey>,
+    valid_capacity: usize,
+    invalid_capacity: usize,
+}
+
+impl ValidationCaches {
+    fn new(valid_capacity: usize, invalid_capacity: usize) -> Self {
+        Self {
+            valid: HashMap::with_capacity(valid_capacity),
+            valid_order: VecDeque::with_capacity(valid_capacity),
+            invalid: HashSet::with_capacity(invalid_capacity),
+            invalid_order: VecDeque::with_capacity(invalid_capacity),
+            valid_capacity,
+            invalid_capacity,
+        }
+    }
+
+    fn lookup(&self, key: &CacheKey) -> CacheLookup {
+        if let Some(material) = self.valid.get(key) {
+            CacheLookup::Valid(Box::new(material.clone()))
+        } else if self.invalid.contains(key) {
+            CacheLookup::Invalid
+        } else {
+            CacheLookup::Miss
+        }
+    }
+
+    fn insert_valid(&mut self, key: CacheKey, material: ValidatedMaterial) -> bool {
+        if let Entry::Occupied(mut entry) = self.valid.entry(key) {
+            entry.insert(material);
+            return false;
+        }
+
+        if self.invalid.remove(&key) {
+            self.invalid_order.retain(|queued| queued != &key);
+        }
+        self.valid.insert(key, material);
+        self.valid_order.push_back(key);
+        self.evict_valid_if_needed()
+    }
+
+    fn insert_invalid(&mut self, key: CacheKey) -> bool {
+        if self.invalid.contains(&key) {
+            return false;
+        }
+
+        if self.valid.remove(&key).is_some() {
+            self.valid_order.retain(|queued| queued != &key);
+        }
+        self.invalid.insert(key);
+        self.invalid_order.push_back(key);
+        self.evict_invalid_if_needed()
+    }
+
+    fn evict_valid_if_needed(&mut self) -> bool {
+        let mut evicted = false;
+        while self.valid.len() > self.valid_capacity {
+            if let Some(oldest) = self.valid_order.pop_front() {
+                evicted |= self.valid.remove(&oldest).is_some();
+            } else {
+                break;
+            }
+        }
+        evicted
+    }
+
+    fn evict_invalid_if_needed(&mut self) -> bool {
+        let mut evicted = false;
+        while self.invalid.len() > self.invalid_capacity {
+            if let Some(oldest) = self.invalid_order.pop_front() {
+                evicted |= self.invalid.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        evicted
+    }
+}
+
+struct ReceiverState {
+    config: ReceiverConfig,
+    caches: Mutex<ValidationCaches>,
+    validation_lock: Mutex<()>,
+    persistence_lock: Mutex<()>,
+    metrics: Arc<ReceiverMetrics>,
+}
+
 impl ReceiverConfig {
     /// Classify a single announce event, upsert on accept, emit on observer.
     ///
     /// Synchronous so unit tests can drive it without a task. Returns an
     /// [`Outcome`] describing the decision.
     pub fn process_event(&self, event: &AnnounceHandlerEvent) -> Outcome {
+        self.process_event_inner(event, None)
+    }
+
+    fn process_event_inner(
+        &self,
+        event: &AnnounceHandlerEvent,
+        receiver: Option<&ReceiverState>,
+    ) -> Outcome {
         let Some(raw) = event.app_data.as_ref() else {
             return Outcome::Rejected(Reason::MissingAppData);
         };
@@ -103,13 +271,41 @@ impl ReceiverConfig {
             Err(_) => return Outcome::Rejected(Reason::Malformed),
         };
 
+        let encrypted = flags & FLAG_ENCRYPTED != 0;
+        if encrypted && self.decryptor.is_none() {
+            return Outcome::Rejected(Reason::EncryptedWithoutKey);
+        }
+
+        // Hash the exact wire app_data, including flags and ciphertext. For
+        // encrypted announces, bind the key to this receiver's decryptor
+        // instance so plaintext validated under one network identity cannot
+        // satisfy another identity's cache.
+        let cache_key = receiver.map(|state| {
+            let decryptor = if encrypted {
+                Some(self.decryptor.as_ref().expect("checked above"))
+            } else {
+                None
+            };
+            state.cache_key(raw, decryptor)
+        });
+
+        if let (Some(state), Some(key)) = (receiver, cache_key) {
+            match state.cache_lookup(&key) {
+                CacheLookup::Valid(material) => {
+                    return self.accept_material(event, *material, receiver);
+                }
+                CacheLookup::Invalid => {
+                    return Outcome::Rejected(Reason::StampInvalid);
+                }
+                CacheLookup::Miss => {}
+            }
+        }
+
         // Decrypt body if FLAG_ENCRYPTED set. We own the bytes once we
         // decrypt, but keep a borrow when unencrypted.
         let decrypted: Vec<u8>;
-        let working: &[u8] = if flags & FLAG_ENCRYPTED != 0 {
-            let Some(decryptor) = self.decryptor.as_ref() else {
-                return Outcome::Rejected(Reason::EncryptedWithoutKey);
-            };
+        let working: &[u8] = if encrypted {
+            let decryptor = self.decryptor.as_ref().expect("checked above");
             match decryptor.decrypt(body) {
                 Some(pt) => {
                     decrypted = pt;
@@ -126,19 +322,61 @@ impl ReceiverConfig {
             Err(_) => return Outcome::Rejected(Reason::Malformed),
         };
 
+        let material = if let (Some(state), Some(key)) = (receiver, cache_key) {
+            match state.validate_and_cache(key, packed_info, stamp) {
+                Ok(material) => material,
+                Err(reason) => return Outcome::Rejected(reason),
+            }
+        } else {
+            match self.validate_material(packed_info, stamp) {
+                Ok(material) => material,
+                Err(reason) => return Outcome::Rejected(reason),
+            }
+        };
+
+        self.accept_material(event, material, receiver)
+    }
+
+    fn validate_material(
+        &self,
+        packed_info: &[u8],
+        stamp: &[u8],
+    ) -> Result<ValidatedMaterial, Reason> {
         let infohash = rns_crypto::sha::full_hash(packed_info);
         if !self.stamper.valid(&infohash, stamp, self.required_value) {
-            return Outcome::Rejected(Reason::StampInvalid);
+            return Err(Reason::StampInvalid);
         }
 
         let info: DiscoveryInfo = match app_data::decode_info(packed_info) {
             Ok(i) => i,
             Err(err) => {
                 trace!(?err, "discovery: info decode failed");
-                return Outcome::Rejected(Reason::DecodeFailed);
+                return Err(Reason::DecodeFailed);
             }
         };
 
+        Ok(ValidatedMaterial {
+            info,
+            stamp: stamp.to_vec(),
+            stamp_value: self.stamper.value(&infohash, stamp),
+        })
+    }
+
+    fn accept_material(
+        &self,
+        event: &AnnounceHandlerEvent,
+        material: ValidatedMaterial,
+        receiver: Option<&ReceiverState>,
+    ) -> Outcome {
+        // `DiscoveryStore::upsert` uses a deterministic sidecar name. Keep
+        // concurrent cache hits from racing on that file while leaving stamp
+        // validation independent.
+        let _persistence_guard = receiver.map(|state| lock_unpoisoned(&state.persistence_lock));
+        let ValidatedMaterial {
+            info,
+            stamp,
+            stamp_value,
+        } = material;
         let announced_identity = event.identity_hash.unwrap_or(info.transport_id);
         if let Some(sources) = self.discovery_sources.as_ref() {
             if !sources.iter().any(|s| s == &announced_identity) {
@@ -146,14 +384,13 @@ impl ReceiverConfig {
             }
         }
 
-        let stamp_value = self.stamper.value(&infohash, stamp);
         let now = now_unix();
         let record = DiscoveredInterface {
             info,
             network_id: announced_identity,
             hops: event.hops,
             stamp_value,
-            stamp: stamp.to_vec(),
+            stamp,
             discovered: now,
             last_heard: now,
             heard_count: 0, // overridden by upsert merge
@@ -175,31 +412,181 @@ impl ReceiverConfig {
     }
 }
 
+impl ReceiverState {
+    fn new(config: ReceiverConfig, metrics: Arc<ReceiverMetrics>) -> Self {
+        Self {
+            config,
+            caches: Mutex::new(ValidationCaches::new(
+                VALID_CACHE_CAPACITY,
+                INVALID_CACHE_CAPACITY,
+            )),
+            validation_lock: Mutex::new(()),
+            persistence_lock: Mutex::new(()),
+            metrics,
+        }
+    }
+
+    fn process_event(&self, event: &AnnounceHandlerEvent) -> Outcome {
+        self.config.process_event_inner(event, Some(self))
+    }
+
+    fn cache_key(
+        &self,
+        raw_app_data: &[u8],
+        decryptor: Option<&Arc<dyn DiscoveryDecryptor>>,
+    ) -> CacheKey {
+        const PLAIN_DOMAIN: &[u8] = b"rns.discovery.cache.plain.v1";
+        const ENCRYPTED_DOMAIN: &[u8] = b"rns.discovery.cache.encrypted.v1";
+
+        let mut key_material = Vec::with_capacity(
+            raw_app_data.len() + ENCRYPTED_DOMAIN.len() + std::mem::size_of::<usize>(),
+        );
+        if let Some(decryptor) = decryptor {
+            key_material.extend_from_slice(ENCRYPTED_DOMAIN);
+            let instance = Arc::as_ptr(decryptor) as *const () as usize;
+            key_material.extend_from_slice(&instance.to_ne_bytes());
+        } else {
+            key_material.extend_from_slice(PLAIN_DOMAIN);
+        }
+        key_material.extend_from_slice(raw_app_data);
+        CacheKey(rns_crypto::sha::full_hash(&key_material))
+    }
+
+    fn cache_lookup(&self, key: &CacheKey) -> CacheLookup {
+        let result = lock_unpoisoned(&self.caches).lookup(key);
+        match result {
+            CacheLookup::Valid(_) => {
+                let hits = ReceiverMetrics::increment(&self.metrics.valid_cache_hits);
+                trace!(hits, "discovery: valid announce cache hit");
+            }
+            CacheLookup::Invalid => {
+                let hits = ReceiverMetrics::increment(&self.metrics.invalid_cache_hits);
+                trace!(hits, "discovery: invalid announce cache hit");
+            }
+            CacheLookup::Miss => {}
+        }
+        result
+    }
+
+    fn validate_and_cache(
+        &self,
+        key: CacheKey,
+        packed_info: &[u8],
+        stamp: &[u8],
+    ) -> Result<ValidatedMaterial, Reason> {
+        let _validation_guard = match self.validation_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(err)) => err.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                let drops = ReceiverMetrics::increment(&self.metrics.validation_busy_drops);
+                debug!(
+                    drops,
+                    "discovery: announce dropped while stamp validator is busy"
+                );
+                return Err(Reason::ValidationBusy);
+            }
+        };
+
+        // Another worker may have completed validation between our initial
+        // miss and acquiring the gate.
+        match self.cache_lookup(&key) {
+            CacheLookup::Valid(material) => return Ok(*material),
+            CacheLookup::Invalid => return Err(Reason::StampInvalid),
+            CacheLookup::Miss => {}
+        }
+
+        let infohash = rns_crypto::sha::full_hash(packed_info);
+        if !self
+            .config
+            .stamper
+            .valid(&infohash, stamp, self.config.required_value)
+        {
+            let evicted = lock_unpoisoned(&self.caches).insert_invalid(key);
+            if evicted {
+                ReceiverMetrics::increment(&self.metrics.invalid_cache_evictions);
+            }
+            return Err(Reason::StampInvalid);
+        }
+
+        let info = match app_data::decode_info(packed_info) {
+            Ok(info) => info,
+            Err(err) => {
+                trace!(?err, "discovery: info decode failed");
+                return Err(Reason::DecodeFailed);
+            }
+        };
+        let material = ValidatedMaterial {
+            info,
+            stamp: stamp.to_vec(),
+            stamp_value: self.config.stamper.value(&infohash, stamp),
+        };
+        let evicted = lock_unpoisoned(&self.caches).insert_valid(key, material.clone());
+        if evicted {
+            ReceiverMetrics::increment(&self.metrics.valid_cache_evictions);
+        }
+        Ok(material)
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|err| err.into_inner())
+}
+
 /// Spawn the receiver task. Returns the sender to register with
 /// `TransportMessage::RegisterAnnounceHandler { aspect_filter:
 /// Some("rnstransport.discovery.interface"), callback_tx }` and the
 /// [`JoinHandle`] for shutdown.
 pub fn spawn(config: ReceiverConfig) -> (JoinHandle<()>, mpsc::Sender<AnnounceHandlerEvent>) {
+    let (handle, tx, _metrics) = spawn_with_metrics(config);
+    (handle, tx)
+}
+
+/// Spawn the receiver and retain a handle to its payload-free operational
+/// counters.
+pub fn spawn_with_metrics(
+    config: ReceiverConfig,
+) -> (
+    JoinHandle<()>,
+    mpsc::Sender<AnnounceHandlerEvent>,
+    Arc<ReceiverMetrics>,
+) {
     let (tx, mut rx) = mpsc::channel::<AnnounceHandlerEvent>(128);
+    let metrics = Arc::new(ReceiverMetrics::default());
+    let state = Arc::new(ReceiverState::new(config, metrics.clone()));
     let handle = tokio::spawn(async move {
+        let mut workers = JoinSet::new();
         while let Some(event) = rx.recv().await {
-            let outcome = config.process_event(&event);
-            match outcome {
-                Outcome::Accepted => debug!(
-                    dest = %hex::encode(event.destination_hash),
-                    hops = event.hops,
-                    "discovery announce accepted"
-                ),
-                Outcome::Rejected(ref reason) => trace!(
-                    dest = %hex::encode(event.destination_hash),
-                    ?reason,
-                    "discovery announce rejected"
-                ),
+            let worker_state = state.clone();
+            workers.spawn_blocking(move || {
+                let outcome = worker_state.process_event(&event);
+                match outcome {
+                    Outcome::Accepted => debug!(
+                        dest = %hex::encode(event.destination_hash),
+                        hops = event.hops,
+                        "discovery announce accepted"
+                    ),
+                    Outcome::Rejected(ref reason) => trace!(
+                        dest = %hex::encode(event.destination_hash),
+                        ?reason,
+                        "discovery announce rejected"
+                    ),
+                }
+            });
+
+            // Keep detached blocking work bounded while still admitting
+            // concurrent callbacks. Stamp validation itself is serialized by
+            // `validation_lock`; cache hits and persistence can proceed in
+            // parallel.
+            if workers.len() >= MAX_IN_FLIGHT_EVENTS {
+                let _ = workers.join_next().await;
             }
+            while workers.try_join_next().is_some() {}
         }
+
+        while workers.join_next().await.is_some() {}
         debug!("discovery receiver task exiting");
     });
-    (handle, tx)
+    (handle, tx, metrics)
 }
 
 fn now_unix() -> u64 {
@@ -253,6 +640,50 @@ mod tests {
     impl DiscoveryDecryptor for FailingDecryptor {
         fn decrypt(&self, _ct: &[u8]) -> Option<Vec<u8>> {
             None
+        }
+    }
+
+    struct CountingStamper {
+        valid_result: bool,
+        value: u8,
+        valid_calls: AtomicU64,
+        value_calls: AtomicU64,
+    }
+
+    impl CountingStamper {
+        fn new(valid_result: bool, value: u8) -> Self {
+            Self {
+                valid_result,
+                value,
+                valid_calls: AtomicU64::new(0),
+                value_calls: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl DiscoveryStamper for CountingStamper {
+        fn generate(&self, _ih: &[u8; 32], _tv: u8) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn value(&self, _ih: &[u8; 32], _stamp: &[u8]) -> u8 {
+            self.value_calls.fetch_add(1, Ordering::Relaxed);
+            self.value
+        }
+
+        fn valid(&self, _ih: &[u8; 32], _stamp: &[u8], _required: u8) -> bool {
+            self.valid_calls.fetch_add(1, Ordering::Relaxed);
+            self.valid_result
+        }
+    }
+
+    struct MaskDecryptor {
+        mask: u8,
+    }
+
+    impl DiscoveryDecryptor for MaskDecryptor {
+        fn decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
+            Some(ciphertext.iter().map(|byte| byte ^ self.mask).collect())
         }
     }
 
@@ -572,6 +1003,132 @@ mod tests {
 
         let received = obs_rx.try_recv().expect("observer should receive");
         assert_eq!(received.info.name, "unit-test-iface");
+    }
+
+    #[test]
+    fn valid_cache_hit_runs_stamper_once() {
+        let dir = tmpdir("valid-cache");
+        let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
+        let stamp = vec![0xAB; STAMP_SIZE];
+        let stamper = Arc::new(CountingStamper::new(true, 20));
+        let (blob, _) = stamped_blob(&sample_info(), &stamp);
+        let metrics = Arc::new(ReceiverMetrics::default());
+        let state = ReceiverState::new(
+            make_cfg(stamper.clone(), store, None, None),
+            metrics.clone(),
+        );
+        let event = event_with(blob);
+
+        assert_eq!(state.process_event(&event), Outcome::Accepted);
+        assert_eq!(state.process_event(&event), Outcome::Accepted);
+        assert_eq!(stamper.valid_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(stamper.value_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.snapshot().valid_cache_hits, 1);
+    }
+
+    #[test]
+    fn invalid_cache_hit_runs_stamper_once() {
+        let dir = tmpdir("invalid-cache");
+        let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
+        let stamp = vec![0xAB; STAMP_SIZE];
+        let stamper = Arc::new(CountingStamper::new(false, 0));
+        let (blob, _) = stamped_blob(&sample_info(), &stamp);
+        let metrics = Arc::new(ReceiverMetrics::default());
+        let state = ReceiverState::new(
+            make_cfg(stamper.clone(), store, None, None),
+            metrics.clone(),
+        );
+        let event = event_with(blob);
+
+        assert_eq!(
+            state.process_event(&event),
+            Outcome::Rejected(Reason::StampInvalid)
+        );
+        assert_eq!(
+            state.process_event(&event),
+            Outcome::Rejected(Reason::StampInvalid)
+        );
+        assert_eq!(stamper.valid_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(stamper.value_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.snapshot().invalid_cache_hits, 1);
+    }
+
+    #[test]
+    fn validation_caches_evict_fifo() {
+        assert_eq!(VALID_CACHE_CAPACITY, 2_048);
+        assert_eq!(INVALID_CACHE_CAPACITY, 2_048);
+
+        let material = ValidatedMaterial {
+            info: sample_info(),
+            stamp: vec![0; STAMP_SIZE],
+            stamp_value: 20,
+        };
+        let one = CacheKey([1; 32]);
+        let two = CacheKey([2; 32]);
+        let three = CacheKey([3; 32]);
+
+        let mut valid = ValidationCaches::new(2, 2);
+        assert!(!valid.insert_valid(one, material.clone()));
+        assert!(!valid.insert_valid(two, material.clone()));
+        assert!(matches!(valid.lookup(&one), CacheLookup::Valid(_)));
+        assert!(valid.insert_valid(three, material));
+        assert!(matches!(valid.lookup(&one), CacheLookup::Miss));
+        assert!(matches!(valid.lookup(&two), CacheLookup::Valid(_)));
+        assert!(matches!(valid.lookup(&three), CacheLookup::Valid(_)));
+
+        let mut invalid = ValidationCaches::new(2, 2);
+        assert!(!invalid.insert_invalid(one));
+        assert!(!invalid.insert_invalid(two));
+        assert!(matches!(invalid.lookup(&one), CacheLookup::Invalid));
+        assert!(invalid.insert_invalid(three));
+        assert!(matches!(invalid.lookup(&one), CacheLookup::Miss));
+        assert!(matches!(invalid.lookup(&two), CacheLookup::Invalid));
+        assert!(matches!(invalid.lookup(&three), CacheLookup::Invalid));
+    }
+
+    #[test]
+    fn busy_validator_drops_without_running_stamper() {
+        let dir = tmpdir("busy-drop");
+        let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
+        let stamp = vec![0xAB; STAMP_SIZE];
+        let stamper = Arc::new(CountingStamper::new(true, 20));
+        let (blob, _) = stamped_blob(&sample_info(), &stamp);
+        let metrics = Arc::new(ReceiverMetrics::default());
+        let state = ReceiverState::new(
+            make_cfg(stamper.clone(), store, None, None),
+            metrics.clone(),
+        );
+        let validation_guard = state.validation_lock.lock().unwrap();
+
+        assert_eq!(
+            state.process_event(&event_with(blob)),
+            Outcome::Rejected(Reason::ValidationBusy)
+        );
+        assert_eq!(stamper.valid_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.snapshot().validation_busy_drops, 1);
+        drop(validation_guard);
+    }
+
+    #[test]
+    fn encrypted_cache_keys_are_isolated_by_decryptor() {
+        let dir = tmpdir("encrypted-isolation");
+        let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
+        let stamp = vec![0xAB; STAMP_SIZE];
+        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20));
+        let (blob, _) = encrypted_blob(&sample_info(), &stamp);
+        let decryptor_a: Arc<dyn DiscoveryDecryptor> = Arc::new(MaskDecryptor { mask: 0xFF });
+        let decryptor_b: Arc<dyn DiscoveryDecryptor> = Arc::new(MaskDecryptor { mask: 0xFF });
+        let metrics = Arc::new(ReceiverMetrics::default());
+        let state = ReceiverState::new(
+            make_cfg(stamper, store, None, Some(decryptor_a.clone())),
+            metrics,
+        );
+
+        let key_a = state.cache_key(&blob, Some(&decryptor_a));
+        let key_b = state.cache_key(&blob, Some(&decryptor_b));
+        let plain_key = state.cache_key(&blob, None);
+        assert_ne!(key_a, key_b);
+        assert_ne!(key_a, plain_key);
     }
 
     #[tokio::test]
