@@ -1662,7 +1662,7 @@ pub struct ReticulumConfig {
     /// Maximum number of discovered interfaces to auto-connect to. Python
     /// `autoconnect_discovered_interfaces`.
     pub autoconnect_discovered_interfaces: usize,
-    /// Minimum stamp value (leading-zero bits). Default 14 (LXStamper
+    /// Minimum stamp value (leading-zero bits). Default 16 (LXStamper
     /// `DEFAULT_STAMP_VALUE`). Python `required_discovery_value`.
     pub discover_interfaces_required_value: u8,
     /// Accepted discovery publisher identities. Python
@@ -1714,7 +1714,7 @@ impl Default for ReticulumConfig {
             network_identity_path: None,
             discover_interfaces: false,
             autoconnect_discovered_interfaces: 0,
-            discover_interfaces_required_value: 14,
+            discover_interfaces_required_value: rns_transport::discovery::DEFAULT_STAMP_VALUE,
             interface_discovery_sources: Vec::new(),
             blackhole_sources: Vec::new(),
             publish_blackhole: false,
@@ -3209,8 +3209,9 @@ fn interface_config_mode_mut(
 }
 
 /// Python Reticulum.py:841-848: a `discoverable` interface must run in
-/// Gateway or Access Point mode for discovery to be useful, so the mode is
-/// auto-corrected (AP for RNode radios, Gateway otherwise) with a notice.
+/// Gateway, Internal, or Access Point mode for discovery to be useful, so
+/// other modes are auto-corrected (AP for RNode radios, Gateway otherwise)
+/// with a notice.
 /// `ignore_config_warnings = yes` opts out and keeps the configured mode.
 fn apply_discovery_mode_autocorrect(
     config: &Config,
@@ -3253,7 +3254,10 @@ fn apply_discovery_mode_autocorrect(
 
     let name = interface_config_name(iface_config).to_string();
     let mode = interface_config_mode_mut(iface_config);
-    if matches!(*mode, InterfaceMode::Gateway | InterfaceMode::AccessPoint) {
+    if matches!(
+        *mode,
+        InterfaceMode::Gateway | InterfaceMode::Internal | InterfaceMode::AccessPoint
+    ) {
         return;
     }
     *mode = if is_rnode {
@@ -6175,7 +6179,10 @@ loglevel = 7
         let rc = ReticulumConfig::default();
         assert!(!rc.discover_interfaces);
         assert_eq!(rc.autoconnect_discovered_interfaces, 0);
-        assert_eq!(rc.discover_interfaces_required_value, 14);
+        assert_eq!(
+            rc.discover_interfaces_required_value,
+            rns_transport::discovery::DEFAULT_STAMP_VALUE
+        );
         assert_eq!(rc.network_identity_path, None);
         assert!(rc.interface_discovery_sources.is_empty());
         assert!(rc.blackhole_sources.is_empty());
@@ -6242,7 +6249,8 @@ loglevel = 7
     }
 
     /// Python Reticulum.py:841-848 parity: discoverable interfaces are
-    /// auto-corrected to Gateway/AP mode unless ignore_config_warnings.
+    /// auto-corrected to Gateway/AP mode unless already Internal or
+    /// `ignore_config_warnings` is enabled.
     #[test]
     fn discovery_mode_autocorrect_matches_python() {
         use rns_interface::traits::InterfaceMode;
@@ -6444,14 +6452,14 @@ egress_control = Yes
             rns_interface::traits::InterfaceMode::Internal
         );
 
-        // Reticulum.py:856-863: discoverable autocorrects internal away
-        // unless ignore_config_warnings is set.
+        // Reticulum.py:856-863 in RNS 1.4.0: Internal is a supported
+        // discovery mode and must not be auto-corrected.
         let config = Config::parse(&format!("{base}discoverable = yes\n")).unwrap();
         let mut interfaces = synthesize_interfaces(&config, false).unwrap();
         apply_discovery_mode_autocorrect(&config, &mut interfaces[0]);
         assert_eq!(
             *interface_config_mode_mut(&mut interfaces[0]),
-            rns_interface::traits::InterfaceMode::Gateway
+            rns_interface::traits::InterfaceMode::Internal
         );
 
         let config = Config::parse(&format!(
