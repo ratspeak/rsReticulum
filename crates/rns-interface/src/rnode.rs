@@ -13,23 +13,29 @@ use crate::kiss;
 use crate::traits::{InterfaceId, InterfaceMode};
 use rns_transport::messages::{InboundPacket, TransportMessage};
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 use crate::rnode_protocol::{
-    FREQUENCY_TOLERANCE_HZ, RNodeProtocolEffect, RNodeProtocolState, RNodeProtocolTarget,
-    RNodeRadioState, RNodeReadiness,
+    FREQUENCY_TOLERANCE_HZ, RNodeProtocolEffect, RNodeProtocolState, RNodeRadioState,
+    RNodeReadiness,
 };
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+use crate::traits::InterfaceHandle;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-use crate::traits::{InterfaceDirection, InterfaceHandle};
+use crate::{rnode_protocol::RNodeProtocolTarget, traits::InterfaceDirection};
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use std::collections::HashMap;
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+use std::sync::Arc;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use std::time::Duration;
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+use tokio::sync::watch;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 
 pub const CMD_FREQUENCY: u8 = 0x01;
 pub const CMD_BANDWIDTH: u8 = 0x02;
@@ -148,17 +154,20 @@ const RNODE_TCP_BUFFER_BYTES: usize = 131_072;
 /// Local transport category for the generic RNode driver.
 ///
 /// This intentionally carries no endpoint or device identity.
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RNodeTransportClass {
     #[cfg(feature = "serial")]
     Serial,
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     Tcp,
+    #[cfg(feature = "ble")]
+    Ble,
 }
 
 /// Coarse lifecycle phase of the generic RNode driver.
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RNodeRuntimePhase {
@@ -172,7 +181,7 @@ pub enum RNodeRuntimePhase {
 }
 
 /// Detection evidence observed for the active connection generation.
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RNodeDetectionState {
@@ -182,7 +191,7 @@ pub enum RNodeDetectionState {
 }
 
 /// Compatibility of the observed firmware with this generic RNode driver.
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RNodeFirmwareCompatibility {
@@ -192,7 +201,7 @@ pub enum RNodeFirmwareCompatibility {
 }
 
 /// Verification state for the configured radio parameters.
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RNodeConfigurationState {
@@ -202,7 +211,7 @@ pub enum RNodeConfigurationState {
 }
 
 /// Radio power state observed from the active RNode connection.
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RNodeObservedRadioState {
@@ -212,7 +221,7 @@ pub enum RNodeObservedRadioState {
 }
 
 /// KISS transmit-flow permission observed from the active connection.
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RNodeTransmitFlowState {
@@ -225,7 +234,7 @@ pub enum RNodeTransmitFlowState {
 ///
 /// Reasons are deliberately closed classifications: unrestricted transport or
 /// device errors never enter the observation channel.
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RNodeRuntimeReason {
@@ -243,13 +252,13 @@ pub enum RNodeRuntimeReason {
 /// This type intentionally contains no interface id or label, path, endpoint,
 /// device identity, raw error, exact firmware/RF values, telemetry, hashes,
 /// EEPROM contents, or frame data.
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct RNodeRuntimeSnapshot {
     pub transport: RNodeTransportClass,
     pub phase: RNodeRuntimePhase,
-    /// Non-zero only while a usable opened and cloned connection is active.
+    /// Non-zero only while a usable transport connection is active.
     pub connection_generation: u64,
     /// Consecutive post-initial connection attempts; reset on success.
     pub reconnect_attempt: u64,
@@ -265,7 +274,7 @@ pub struct RNodeRuntimeSnapshot {
     pub reason: Option<RNodeRuntimeReason>,
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 impl RNodeRuntimeSnapshot {
     fn initial(transport: RNodeTransportClass) -> Self {
         Self {
@@ -293,7 +302,7 @@ impl RNodeRuntimeSnapshot {
     }
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 fn project_rnode_protocol_effect(
     snapshot: &mut RNodeRuntimeSnapshot,
     state: &RNodeProtocolState,
@@ -392,8 +401,8 @@ fn project_rnode_protocol_effect(
     *snapshot != before
 }
 
-/// Cloneable, observation-only handle for a generic serial/RNode-TCP driver.
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+/// Cloneable, observation-only handle for a generic RNode driver.
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 #[derive(Clone)]
 pub struct RNodeDriverHandle {
     state: watch::Receiver<Arc<RNodeRuntimeSnapshot>>,
@@ -404,13 +413,13 @@ pub struct RNodeDriverHandle {
 /// The underlying Tokio receiver stays private so callers cannot retain a
 /// watch borrow across driver publication. Both accessors return an owned
 /// [`Arc`] and release the internal borrow before returning.
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 #[derive(Clone)]
 pub struct RNodeDriverSubscription {
     state: watch::Receiver<Arc<RNodeRuntimeSnapshot>>,
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 impl RNodeDriverHandle {
     /// Return the latest privacy-safe driver snapshot.
     pub fn snapshot(&self) -> Arc<RNodeRuntimeSnapshot> {
@@ -425,7 +434,7 @@ impl RNodeDriverHandle {
     }
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 impl RNodeDriverSubscription {
     /// Return the latest snapshot without retaining a watch borrow.
     pub fn snapshot(&self) -> Arc<RNodeRuntimeSnapshot> {
@@ -441,7 +450,7 @@ impl RNodeDriverSubscription {
     }
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 impl std::fmt::Debug for RNodeDriverHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -451,7 +460,7 @@ impl std::fmt::Debug for RNodeDriverHandle {
     }
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 impl std::fmt::Debug for RNodeDriverSubscription {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -462,21 +471,21 @@ impl std::fmt::Debug for RNodeDriverSubscription {
 }
 
 /// Generic interface handle paired with its local RNode driver observation.
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 #[non_exhaustive]
 pub struct SpawnedRNodeInterface {
     pub interface: InterfaceHandle,
     pub driver: RNodeDriverHandle,
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-struct RNodeSnapshotPublisher {
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+pub(crate) struct RNodeSnapshotPublisher {
     state: watch::Sender<Arc<RNodeRuntimeSnapshot>>,
     last_connection_generation: u64,
     terminal: bool,
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 impl RNodeSnapshotPublisher {
     fn new(state: watch::Sender<Arc<RNodeRuntimeSnapshot>>) -> Self {
         Self {
@@ -497,7 +506,7 @@ impl RNodeSnapshotPublisher {
         true
     }
 
-    fn connection_established(&mut self) {
+    pub(crate) fn connection_established(&mut self) {
         self.last_connection_generation = self.last_connection_generation.saturating_add(1).max(1);
         let generation = self.last_connection_generation;
         self.update(|snapshot| {
@@ -509,7 +518,7 @@ impl RNodeSnapshotPublisher {
         });
     }
 
-    fn reconnect_started(&self) {
+    pub(crate) fn reconnect_started(&self) {
         self.update(|snapshot| {
             snapshot.phase = RNodeRuntimePhase::Connecting;
             snapshot.connection_generation = 0;
@@ -520,7 +529,7 @@ impl RNodeSnapshotPublisher {
         });
     }
 
-    fn connection_attempt_failed(&self) {
+    pub(crate) fn connection_attempt_failed(&self) {
         self.update(|snapshot| {
             snapshot.phase = RNodeRuntimePhase::ReconnectBackoff;
             snapshot.connection_generation = 0;
@@ -529,7 +538,7 @@ impl RNodeSnapshotPublisher {
         });
     }
 
-    fn connection_lost(&self) {
+    pub(crate) fn connection_lost(&self) {
         self.update(|snapshot| {
             snapshot.phase = RNodeRuntimePhase::ReconnectBackoff;
             snapshot.connection_generation = 0;
@@ -539,7 +548,11 @@ impl RNodeSnapshotPublisher {
         });
     }
 
-    fn protocol_effect(&self, state: &RNodeProtocolState, effect: RNodeProtocolEffect) -> bool {
+    pub(crate) fn protocol_effect(
+        &self,
+        state: &RNodeProtocolState,
+        effect: RNodeProtocolEffect,
+    ) -> bool {
         if matches!(
             effect,
             RNodeProtocolEffect::NoChange | RNodeProtocolEffect::Rejected(_)
@@ -554,14 +567,14 @@ impl RNodeSnapshotPublisher {
         published
     }
 
-    fn shutting_down(&self, reason: RNodeRuntimeReason) {
+    pub(crate) fn shutting_down(&self, reason: RNodeRuntimeReason) {
         self.update(|snapshot| {
             snapshot.phase = RNodeRuntimePhase::ShuttingDown;
             snapshot.reason = Some(reason);
         });
     }
 
-    fn stopped(&mut self, reason: RNodeRuntimeReason) {
+    pub(crate) fn stopped(&mut self, reason: RNodeRuntimeReason) {
         self.update(|snapshot| {
             snapshot.phase = RNodeRuntimePhase::Stopped;
             snapshot.connection_generation = 0;
@@ -572,7 +585,7 @@ impl RNodeSnapshotPublisher {
     }
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
 impl Drop for RNodeSnapshotPublisher {
     fn drop(&mut self) {
         if self.terminal {
@@ -585,6 +598,17 @@ impl Drop for RNodeSnapshotPublisher {
             snapshot.reset_protocol_observations();
         });
     }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+pub(crate) fn new_rnode_driver_observation(
+    transport: RNodeTransportClass,
+) -> (RNodeSnapshotPublisher, RNodeDriverHandle) {
+    let (state_tx, state_rx) = watch::channel(Arc::new(RNodeRuntimeSnapshot::initial(transport)));
+    (
+        RNodeSnapshotPublisher::new(state_tx),
+        RNodeDriverHandle { state: state_rx },
+    )
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -2308,9 +2332,7 @@ pub async fn spawn_rnode_interface_with_driver(
     };
 
     let port = open_configured_rnode_stream(&config, &port_cfg).await?;
-    let (snapshot_tx, snapshot_rx) =
-        watch::channel(Arc::new(RNodeRuntimeSnapshot::initial(transport)));
-    let driver = RNodeDriverHandle { state: snapshot_rx };
+    let (initial_snapshot_publisher, driver) = new_rnode_driver_observation(transport);
 
     let bitrate = calculate_bitrate(
         config.spreading_factor,
@@ -2361,7 +2383,7 @@ pub async fn spawn_rnode_interface_with_driver(
     let task_port_cfg = port_cfg.clone();
     let task_name = config.name.clone();
     let read_task = tokio::spawn(async move {
-        let mut snapshot_publisher = RNodeSnapshotPublisher::new(snapshot_tx);
+        let mut snapshot_publisher = initial_snapshot_publisher;
         let _stop_guard = stop_guard;
         let mut next_generation = Some((port, initial_writer));
 

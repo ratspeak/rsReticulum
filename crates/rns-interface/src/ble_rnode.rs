@@ -8,7 +8,7 @@ use std::time::Duration;
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -28,7 +28,11 @@ pub fn is_btleplug_initialized() -> bool {
 }
 
 use crate::kiss;
-use crate::rnode::{self, RNodeResponse};
+use crate::rnode::{
+    self, RNodeResponse, RNodeRuntimeReason, RNodeSnapshotPublisher, RNodeTransportClass,
+    SpawnedRNodeInterface,
+};
+use crate::rnode_protocol::{RNodeProtocolState, RNodeProtocolTarget};
 use crate::traits::{
     InterfaceDirection, InterfaceError, InterfaceHandle, InterfaceId, InterfaceMode,
 };
@@ -1198,6 +1202,44 @@ async fn ble_send_radio_off(conn: &BleRNodeConnection) {
     }
 }
 
+fn publish_ble_stopped(publisher: &mut RNodeSnapshotPublisher, reason: RNodeRuntimeReason) {
+    publisher.shutting_down(reason);
+    publisher.stopped(reason);
+}
+
+fn project_ble_rnode_frame(
+    publisher: &RNodeSnapshotPublisher,
+    protocol_state: &mut RNodeProtocolState,
+    command: u8,
+    frame: &[u8],
+) {
+    let effect = protocol_state.apply_frame(command, frame);
+    publisher.protocol_effect(protocol_state, effect);
+}
+
+#[derive(Default, Debug, Eq, PartialEq)]
+struct BleStartupProjection {
+    complete_frames: usize,
+    legacy_packets_suppressed: usize,
+}
+
+fn project_ble_rnode_startup_bytes(
+    publisher: &RNodeSnapshotPublisher,
+    protocol_state: &mut RNodeProtocolState,
+    deframer: &mut kiss::RawKissDeframer,
+    bytes: &[u8],
+) -> BleStartupProjection {
+    let mut projection = BleStartupProjection::default();
+    for (command, frame) in deframer.feed(bytes) {
+        projection.complete_frames += 1;
+        if command == kiss::CMD_DATA && !frame.is_empty() {
+            projection.legacy_packets_suppressed += 1;
+        }
+        project_ble_rnode_frame(publisher, protocol_state, command, &frame);
+    }
+    projection
+}
+
 /// Auto-reconnect across drops; resolve_ble_target re-runs every retry so
 /// iOS RPA rotation heals automatically.
 pub async fn spawn_ble_rnode_interface(
@@ -1205,6 +1247,32 @@ pub async fn spawn_ble_rnode_interface(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, InterfaceError> {
+    Ok(
+        spawn_ble_rnode_interface_with_driver(config, id, transport_tx)
+            .await?
+            .interface,
+    )
+}
+
+/// Spawn a desktop BLE RNode interface with privacy-safe local observation.
+///
+/// This retains btleplug ownership and the compatibility facade above. The
+/// native Android TCP bridge has its own lifecycle and is intentionally not
+/// projected here.
+pub async fn spawn_ble_rnode_interface_with_driver(
+    config: BleRNodeConfig,
+    id: InterfaceId,
+    transport_tx: mpsc::Sender<TransportMessage>,
+) -> Result<SpawnedRNodeInterface, InterfaceError> {
+    let protocol_target = RNodeProtocolTarget::new(
+        config.frequency,
+        config.bandwidth,
+        config.spreading_factor,
+        config.coding_rate,
+        config.tx_power,
+    );
+    let (snapshot_publisher, driver) =
+        rnode::new_rnode_driver_observation(RNodeTransportClass::Ble);
     let online = Arc::new(AtomicBool::new(false));
     let online_handle = online.clone();
     let shared_rxb = Arc::new(AtomicU64::new(0));
@@ -1232,8 +1300,10 @@ pub async fn spawn_ble_rnode_interface(
     let running_task = running.clone();
 
     let read_task = tokio::spawn(async move {
+        let mut snapshot_publisher = snapshot_publisher;
         let mut tries: usize = 0;
         let mut backoff = RECONNECT_WAIT;
+        let mut initial_attempt = true;
 
         // Drop guard: every early return must clear the running-flag map
         // entry, or stale entries confuse later spawns reusing the id.
@@ -1248,19 +1318,31 @@ pub async fn spawn_ble_rnode_interface(
         loop {
             if !running_task.load(Ordering::SeqCst) {
                 ble_diag("[ble] read_task exiting — running flag cleared");
+                publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
                 return;
+            }
+            if initial_attempt {
+                initial_attempt = false;
+            } else {
+                snapshot_publisher.reconnect_started();
             }
             // Re-acquire each iteration so mid-session permission grants or
             // adapter toggles heal automatically.
             let adapter = match get_adapter().await {
                 Ok(a) => a,
                 Err(e) => {
+                    snapshot_publisher.connection_attempt_failed();
                     tracing::warn!(name = %log_name, error = %e, "BLE adapter acquisition failed");
                     if reconnect_try_exhausted(&mut tries) {
                         tracing::warn!(name = %log_name, "BLE RNode: max reconnect tries reached");
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
                         return;
                     }
                     if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
                         return;
                     }
                     backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
@@ -1273,6 +1355,7 @@ pub async fn spawn_ble_rnode_interface(
                 Err(e) => {
                     let pairing_transition = is_pairing_transition_error(&e);
                     let retry_wait = if pairing_transition { 1 } else { backoff };
+                    snapshot_publisher.connection_attempt_failed();
                     tracing::warn!(name = %log_name, error = %e, "BLE RNode connect failed");
                     ble_diag(format!(
                         "[ble] connect_rnode err: {e} — retrying in {retry_wait}s (attempt {})",
@@ -1281,9 +1364,14 @@ pub async fn spawn_ble_rnode_interface(
                     if reconnect_try_exhausted(&mut tries) {
                         tracing::warn!(name = %log_name, "BLE RNode: max reconnect tries reached");
                         ble_diag("[ble] max reconnect tries reached — giving up");
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
                         return;
                     }
                     if wait_or_shutdown(Duration::from_secs(retry_wait), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
                         return;
                     }
                     if pairing_transition {
@@ -1295,16 +1383,51 @@ pub async fn spawn_ble_rnode_interface(
                 }
             };
 
+            // btleplug creates a fresh event/broadcast receiver when
+            // `notifications()` is called. Acquire it before detect/init so
+            // startup evidence cannot race ahead of the observation stream.
+            let mut notification_stream = match conn.peripheral.notifications().await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    snapshot_publisher.connection_attempt_failed();
+                    tracing::warn!(error = %e, "BLE RNode notification stream failed");
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
+                            .await;
+                    if reconnect_try_exhausted(&mut tries) {
+                        tracing::warn!(name = %log_name, "BLE RNode: max reconnect tries reached");
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
+                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    continue;
+                }
+            };
+
             ble_diag("[ble] sending detect sequence");
             let detect_seq = rnode::build_detect_sequence();
             if let Err(e) =
                 ble_write(&conn.peripheral, &conn.rx_char, &detect_seq, conn.write_mtu).await
             {
+                snapshot_publisher.connection_attempt_failed();
                 tracing::warn!(error = %e, "BLE RNode detect write failed");
                 ble_diag(format!("[ble] detect write failed: {e}"));
                 let _ = tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
                     .await;
+                if reconnect_try_exhausted(&mut tries) {
+                    tracing::warn!(name = %log_name, "BLE RNode: max reconnect tries reached");
+                    snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                    return;
+                }
                 if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                    publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
                     return;
                 }
                 backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
@@ -1317,11 +1440,18 @@ pub async fn spawn_ble_rnode_interface(
             if let Err(e) =
                 ble_write(&conn.peripheral, &conn.rx_char, &init_seq, conn.write_mtu).await
             {
+                snapshot_publisher.connection_attempt_failed();
                 tracing::warn!(error = %e, "BLE RNode init write failed");
                 ble_diag(format!("[ble] init write failed: {e}"));
                 let _ = tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
                     .await;
+                if reconnect_try_exhausted(&mut tries) {
+                    tracing::warn!(name = %log_name, "BLE RNode: max reconnect tries reached");
+                    snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                    return;
+                }
                 if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                    publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
                     return;
                 }
                 backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
@@ -1339,6 +1469,9 @@ pub async fn spawn_ble_rnode_interface(
             online_handle.store(true, Ordering::SeqCst);
             tries = 0;
             backoff = RECONNECT_WAIT;
+            let mut protocol_state = RNodeProtocolState::new(protocol_target);
+            snapshot_publisher.connection_established();
+            let mut deframer = kiss::RawKissDeframer::new();
 
             let ready = Arc::new(AtomicBool::new(true));
 
@@ -1411,36 +1544,38 @@ pub async fn spawn_ble_rnode_interface(
                 }
             });
 
-            let mut notification_stream = match conn.peripheral.notifications().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, "BLE RNode notification stream failed");
-                    online_handle.store(false, Ordering::SeqCst);
-                    fwd_handle.abort();
-                    let _ = fwd_handle.await;
-                    write_handle.abort();
-                    let _ = write_handle.await;
-                    let _ =
-                        tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
-                            .await;
-                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
-                        return;
-                    }
-                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
-                    continue;
-                }
-            };
-
-            let mut deframer = kiss::RawKissDeframer::new();
             let mut last_rssi: Option<f32> = None;
             let mut last_snr: Option<f32> = None;
             let mut transport_closed = false;
+
+            // Before R4a, btleplug's receiver was created at this exact
+            // boundary, after per-generation writer/forwarder setup. Preserve
+            // its packet semantics while retaining typed control evidence:
+            // drain only what is immediately queued, project it, and skip
+            // legacy packet/READY handling and byte accounting. Reset framing
+            // state so no pre-boundary frame can complete as active traffic.
+            loop {
+                match notification_stream.next().now_or_never() {
+                    Some(Some(notification)) if notification.uuid == NUS_TX_CHAR_UUID => {
+                        let _projection = project_ble_rnode_startup_bytes(
+                            &snapshot_publisher,
+                            &mut protocol_state,
+                            &mut deframer,
+                            &notification.value,
+                        );
+                    }
+                    Some(Some(_)) => {}
+                    Some(None) | None => break,
+                }
+            }
+            deframer.reset();
 
             'read: loop {
                 if !online_handle.load(Ordering::SeqCst) {
                     break 'read;
                 }
                 if !running_task.load(Ordering::SeqCst) {
+                    snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
                     ble_send_radio_off(&conn).await;
                     break 'read;
                 }
@@ -1451,6 +1586,7 @@ pub async fn spawn_ble_rnode_interface(
                         // Polling slice — bounds disable-while-connected
                         // teardown latency.
                         if !running_task.load(Ordering::SeqCst) {
+                            snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
                             ble_send_radio_off(&conn).await;
                             break 'read;
                         }
@@ -1465,6 +1601,12 @@ pub async fn spawn_ble_rnode_interface(
                 match notification {
                     Some(n) if n.uuid == NUS_TX_CHAR_UUID => {
                         for (cmd, frame) in deframer.feed(&n.value) {
+                            project_ble_rnode_frame(
+                                &snapshot_publisher,
+                                &mut protocol_state,
+                                cmd,
+                                &frame,
+                            );
                             match rnode::process_rnode_response(
                                 cmd,
                                 &frame,
@@ -1504,25 +1646,33 @@ pub async fn spawn_ble_rnode_interface(
                 tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect()).await;
 
             if transport_closed {
+                publish_ble_stopped(
+                    &mut snapshot_publisher,
+                    RNodeRuntimeReason::TransportConsumerClosed,
+                );
                 return;
             }
             if !running_task.load(Ordering::SeqCst) {
+                snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
                 return;
             }
 
+            snapshot_publisher.connection_lost();
             if reconnect_try_exhausted(&mut tries) {
                 tracing::warn!(name = %log_name, "BLE RNode: max reconnect tries reached");
+                snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
                 return;
             }
             tracing::info!(name = %log_name, seconds = backoff, "BLE RNode reconnecting");
             if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
                 return;
             }
             backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
         }
     });
 
-    Ok(InterfaceHandle {
+    let interface = InterfaceHandle {
         id,
         parent_id: None,
         name,
@@ -1541,7 +1691,9 @@ pub async fn spawn_ble_rnode_interface(
         inspection: None,
         tx,
         read_task,
-    })
+    };
+
+    Ok(SpawnedRNodeInterface { interface, driver })
 }
 
 /// Android-only TCP-bridge variant. btleplug's deprecated JNI breaks on
@@ -2234,6 +2386,216 @@ mod tests {
             .expect("CMD_LT_ALOCK present");
         assert!(st < radio_on);
         assert!(lt < radio_on);
+    }
+
+    #[test]
+    fn test_desktop_ble_observation_tracks_attempts_and_fresh_generations() {
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        let target = RNodeProtocolTarget::new(
+            config.frequency,
+            config.bandwidth,
+            config.spreading_factor,
+            config.coding_rate,
+            config.tx_power,
+        );
+        let (mut publisher, driver) = rnode::new_rnode_driver_observation(RNodeTransportClass::Ble);
+
+        let initial = driver.snapshot();
+        assert_eq!(initial.transport, RNodeTransportClass::Ble);
+        assert_eq!(initial.phase, rnode::RNodeRuntimePhase::Connecting);
+        assert_eq!(initial.connection_generation, 0);
+
+        publisher.connection_attempt_failed();
+        let failed = driver.snapshot();
+        assert_eq!(failed.phase, rnode::RNodeRuntimePhase::ReconnectBackoff);
+        assert_eq!(
+            failed.reason,
+            Some(RNodeRuntimeReason::ConnectionAttemptFailed)
+        );
+
+        publisher.reconnect_started();
+        assert_eq!(driver.snapshot().reconnect_attempt, 1);
+        publisher.connection_established();
+
+        let mut first_generation = RNodeProtocolState::new(target);
+        for (command, frame) in [
+            (rnode::CMD_DETECT, vec![rnode::DETECT_RESP]),
+            (
+                rnode::CMD_FW_VERSION,
+                vec![rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+            ),
+            (
+                rnode::CMD_FREQUENCY,
+                target.frequency.to_be_bytes().to_vec(),
+            ),
+            (
+                rnode::CMD_BANDWIDTH,
+                target.bandwidth.to_be_bytes().to_vec(),
+            ),
+            (rnode::CMD_SF, vec![target.spreading_factor]),
+            (rnode::CMD_CR, vec![target.coding_rate]),
+            (rnode::CMD_TXPOWER, vec![target.tx_power]),
+            (rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_ON]),
+        ] {
+            project_ble_rnode_frame(&publisher, &mut first_generation, command, &frame);
+        }
+
+        let ready = driver.snapshot();
+        assert_eq!(ready.connection_generation, 1);
+        assert_eq!(ready.phase, rnode::RNodeRuntimePhase::Ready);
+        assert_eq!(
+            ready.configuration,
+            rnode::RNodeConfigurationState::Verified
+        );
+
+        publisher.connection_lost();
+        let lost = driver.snapshot();
+        assert_eq!(lost.phase, rnode::RNodeRuntimePhase::ReconnectBackoff);
+        assert_eq!(lost.connection_generation, 0);
+        assert_eq!(lost.disconnect_total, 1);
+        assert_eq!(lost.detection, rnode::RNodeDetectionState::Unknown);
+
+        publisher.reconnect_started();
+        publisher.connection_established();
+        let mut second_generation = RNodeProtocolState::new(target);
+        project_ble_rnode_frame(&publisher, &mut second_generation, rnode::CMD_READY, &[1]);
+
+        let second = driver.snapshot();
+        assert_eq!(second.connection_generation, 2);
+        assert_eq!(second.phase, rnode::RNodeRuntimePhase::AwaitingReadiness);
+        assert_eq!(second.detection, rnode::RNodeDetectionState::Unknown);
+        assert_eq!(
+            second.transmit_flow,
+            rnode::RNodeTransmitFlowState::Permitted
+        );
+
+        publish_ble_stopped(&mut publisher, RNodeRuntimeReason::StopRequested);
+        let stopped = driver.snapshot();
+        assert_eq!(stopped.phase, rnode::RNodeRuntimePhase::Stopped);
+        assert_eq!(stopped.reason, Some(RNodeRuntimeReason::StopRequested));
+    }
+
+    #[test]
+    fn test_desktop_ble_observation_rejects_malformed_startup_evidence() {
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        let target = RNodeProtocolTarget::new(
+            config.frequency,
+            config.bandwidth,
+            config.spreading_factor,
+            config.coding_rate,
+            config.tx_power,
+        );
+        let (mut publisher, driver) = rnode::new_rnode_driver_observation(RNodeTransportClass::Ble);
+        publisher.connection_established();
+        let mut protocol_state = RNodeProtocolState::new(target);
+
+        let before = driver.snapshot();
+        project_ble_rnode_frame(&publisher, &mut protocol_state, rnode::CMD_DETECT, &[]);
+        assert!(Arc::ptr_eq(&before, &driver.snapshot()));
+
+        project_ble_rnode_frame(
+            &publisher,
+            &mut protocol_state,
+            rnode::CMD_DETECT,
+            &[rnode::DETECT_RESP],
+        );
+        let detected = driver.snapshot();
+        assert_eq!(detected.detection, rnode::RNodeDetectionState::Confirmed);
+        assert_eq!(detected.phase, rnode::RNodeRuntimePhase::AwaitingReadiness);
+
+        publisher.stopped(RNodeRuntimeReason::StopRequested);
+    }
+
+    #[test]
+    fn test_desktop_ble_startup_drain_projects_control_without_legacy_packet_effect() {
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        let target = RNodeProtocolTarget::new(
+            config.frequency,
+            config.bandwidth,
+            config.spreading_factor,
+            config.coding_rate,
+            config.tx_power,
+        );
+        let (mut publisher, driver) = rnode::new_rnode_driver_observation(RNodeTransportClass::Ble);
+        publisher.connection_established();
+        let mut protocol_state = RNodeProtocolState::new(target);
+        let mut deframer = kiss::RawKissDeframer::new();
+
+        let packet = [0x01, 0x02, 0x03];
+        let mut startup_bytes = kiss::frame(&packet);
+        startup_bytes.extend(kiss::frame_with_command(
+            rnode::CMD_DETECT,
+            &[rnode::DETECT_RESP],
+        ));
+
+        let projection = project_ble_rnode_startup_bytes(
+            &publisher,
+            &mut protocol_state,
+            &mut deframer,
+            &startup_bytes,
+        );
+        assert_eq!(
+            projection,
+            BleStartupProjection {
+                complete_frames: 2,
+                legacy_packets_suppressed: 1,
+            }
+        );
+        assert_eq!(
+            driver.snapshot().detection,
+            rnode::RNodeDetectionState::Confirmed
+        );
+
+        // The startup data was packet-shaped and would have entered the
+        // legacy forwarding path if the drain had called it.
+        let mut rssi = None;
+        let mut snr = None;
+        assert!(matches!(
+            rnode::process_rnode_response(kiss::CMD_DATA, &packet, 7, &mut rssi, &mut snr),
+            RNodeResponse::Packet(_)
+        ));
+
+        publisher.stopped(RNodeRuntimeReason::StopRequested);
+    }
+
+    #[test]
+    fn test_desktop_ble_startup_drain_discards_partial_packet_at_active_boundary() {
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        let target = RNodeProtocolTarget::new(
+            config.frequency,
+            config.bandwidth,
+            config.spreading_factor,
+            config.coding_rate,
+            config.tx_power,
+        );
+        let (mut publisher, _) = rnode::new_rnode_driver_observation(RNodeTransportClass::Ble);
+        publisher.connection_established();
+        let mut protocol_state = RNodeProtocolState::new(target);
+
+        let framed = kiss::frame(&[0x01, 0x02, 0x03]);
+        let split = framed.len() - 1;
+        let (startup_prefix, active_tail) = framed.split_at(split);
+
+        let mut carried = kiss::RawKissDeframer::new();
+        assert!(carried.feed(startup_prefix).is_empty());
+        assert_eq!(
+            carried.feed(active_tail),
+            vec![(kiss::CMD_DATA, vec![0x01, 0x02, 0x03])]
+        );
+
+        let mut boundary_deframer = kiss::RawKissDeframer::new();
+        let projection = project_ble_rnode_startup_bytes(
+            &publisher,
+            &mut protocol_state,
+            &mut boundary_deframer,
+            startup_prefix,
+        );
+        assert_eq!(projection, BleStartupProjection::default());
+
+        boundary_deframer.reset();
+        assert!(boundary_deframer.feed(active_tail).is_empty());
+
+        publisher.stopped(RNodeRuntimeReason::StopRequested);
     }
 
     // ── process_rnode_response tests ──
