@@ -66,7 +66,20 @@ impl PacketHashlist {
         self.previous.clear();
     }
 
-    /// All hashes across both generations; used to snapshot for persistence.
+    /// Snapshot the current generation for persistence.
+    ///
+    /// The previous generation is deliberately transient. Persisting both
+    /// generations would continually carry already-aged hashes across
+    /// restarts instead of letting the normal rotation window expire them.
+    pub fn current_hashes(&self) -> Vec<[u8; 32]> {
+        self.current.iter().copied().collect()
+    }
+
+    /// Snapshot both in-memory generations.
+    ///
+    /// This preserves the pre-1.4 public inspection API. Persistence must use
+    /// [`Self::current_hashes`] so the aged previous generation remains
+    /// transient.
     pub fn all_hashes(&self) -> Vec<[u8; 32]> {
         self.current
             .iter()
@@ -75,10 +88,14 @@ impl PacketHashlist {
             .collect()
     }
 
-    /// Rehydrate from a persisted snapshot. Loaded into `previous` so fresh
-    /// packets land in an empty `current` and rotation behaviour is preserved.
+    /// Rehydrate the current generation from a persisted snapshot.
+    ///
+    /// This mirrors Reticulum's canonical `packet_hashlist.raw` lifecycle:
+    /// the restored generation remains the one written at the next
+    /// persistence boundary, while the previous generation stays ephemeral.
     pub fn load_from(&mut self, hashes: Vec<[u8; 32]>) {
-        self.previous = hashes.into_iter().collect();
+        self.current = hashes.into_iter().collect();
+        self.previous.clear();
     }
 }
 
@@ -134,5 +151,36 @@ mod tests {
         assert_eq!(hl.len(), 2);
         hl.clear();
         assert_eq!(hl.len(), 0);
+    }
+
+    #[test]
+    fn persisted_snapshot_contains_only_current_generation() {
+        let mut hl = PacketHashlist::new_with_capacity(4);
+        hl.insert([0x01; 32]);
+        hl.insert([0x02; 32]);
+        // The third insertion rotates the first two hashes into `previous`.
+        hl.insert([0x03; 32]);
+
+        assert_eq!(hl.current_hashes(), vec![[0x03; 32]]);
+        let all = hl.all_hashes();
+        assert_eq!(all.len(), 3);
+        assert!(all.contains(&[0x01; 32]));
+        assert!(all.contains(&[0x02; 32]));
+        assert!(all.contains(&[0x03; 32]));
+        assert_eq!(hl.len(), 3);
+    }
+
+    #[test]
+    fn restored_hashes_populate_current_generation_and_deduplicate() {
+        let mut hl = PacketHashlist::new_with_capacity(10);
+        hl.insert([0x01; 32]);
+        hl.force_rotate();
+
+        hl.load_from(vec![[0xAA; 32], [0xAA; 32], [0xBB; 32]]);
+
+        assert_eq!(hl.len(), 2);
+        assert!(hl.current_hashes().contains(&[0xAA; 32]));
+        assert!(hl.current_hashes().contains(&[0xBB; 32]));
+        assert!(!hl.contains(&[0x01; 32]));
     }
 }

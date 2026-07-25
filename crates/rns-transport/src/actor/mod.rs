@@ -37,6 +37,8 @@ mod rpc;
 /// reaching into the tables directly.
 pub struct TransportActor {
     rx: mpsc::Receiver<TransportMessage>,
+    persistence_tx: mpsc::Sender<()>,
+    persistence_rx: mpsc::Receiver<()>,
 
     pub path_table: PathTable,
     pub link_table: LinkTable,
@@ -148,6 +150,11 @@ pub struct TransportActor {
     pub shared_instance_client_mode: bool,
 
     pub storage_dir: Option<PathBuf>,
+    /// One-shot guard for lazy packet-hashlist restore. The hashlist is only
+    /// authoritative on an enabled transport node that is not a shared
+    /// instance client, so startup cannot load it before those roles are
+    /// known.
+    hashlist_load_attempted: bool,
 
     /// Last save (Unix seconds) — gates the periodic save tick. 0 forces an
     /// initial baseline write after storage initialisation.
@@ -240,6 +247,24 @@ struct AnnounceHandlerRegistration {
     dropped_events: Arc<AtomicU64>,
 }
 
+/// Dedicated trigger for scheduled full-state persistence.
+///
+/// Keeping this control outside [`TransportMessage`] avoids expanding the
+/// public transport command enum for a runtime-lifecycle concern. Requests
+/// are serialized by the owning actor.
+#[derive(Clone)]
+pub struct PersistenceTrigger {
+    tx: mpsc::Sender<()>,
+}
+
+impl PersistenceTrigger {
+    /// Request a full asynchronous persistence pass. Returns `false` only
+    /// after the owning transport actor has stopped.
+    pub async fn request(&self) -> bool {
+        self.tx.send(()).await.is_ok()
+    }
+}
+
 impl TransportActor {
     pub fn new() -> (Self, mpsc::Sender<TransportMessage>) {
         Self::new_with_capacity(4096, HASHLIST_MAXSIZE)
@@ -252,9 +277,12 @@ impl TransportActor {
         hashlist_cap: usize,
     ) -> (Self, mpsc::Sender<TransportMessage>) {
         let (tx, rx) = mpsc::channel(channel_cap);
+        let (persistence_tx, persistence_rx) = mpsc::channel(1);
 
         let actor = Self {
             rx,
+            persistence_tx,
+            persistence_rx,
             path_table: PathTable::new(),
             link_table: LinkTable::new(),
             announce_table: AnnounceTable::new(),
@@ -302,6 +330,7 @@ impl TransportActor {
             is_shared_instance: false,
             shared_instance_client_mode: false,
             storage_dir: None,
+            hashlist_load_attempted: false,
             last_state_save: 0.0,
             state_dirty: false,
             routing_save_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -323,6 +352,13 @@ impl TransportActor {
         (actor, tx)
     }
 
+    /// Obtain a cloneable lifecycle handle for scheduled persistence.
+    pub fn persistence_trigger(&self) -> PersistenceTrigger {
+        PersistenceTrigger {
+            tx: self.persistence_tx.clone(),
+        }
+    }
+
     /// Load persisted state before the actor starts draining live traffic.
     ///
     /// Startup restore can touch thousands of Python cache files on slow
@@ -332,6 +368,7 @@ impl TransportActor {
     pub fn initialize_storage(&mut self, storage_dir: PathBuf) {
         self.storage_dir = Some(storage_dir);
         self.load_state();
+        self.maybe_load_hashlist();
     }
 
     /// Run the actor event loop. Messages are processed sequentially so no
@@ -350,6 +387,9 @@ impl TransportActor {
                         }
                         Some(msg) => self.handle_message(msg),
                     }
+                }
+                Some(()) = self.persistence_rx.recv() => {
+                    self.save_state_async();
                 }
                 _ = tick_interval.tick() => {
                     let is_fg = self.is_foreground.load(std::sync::atomic::Ordering::Relaxed);
@@ -624,6 +664,7 @@ impl TransportActor {
                 // The runtime sends the identity before the enable flag, so
                 // the swap decision must be re-evaluated here.
                 self.apply_transport_identity_policy();
+                self.maybe_load_hashlist();
             }
             TransportMessage::SetTransportIdentity { identity_hash } => {
                 debug!(
@@ -699,6 +740,7 @@ impl TransportActor {
                 debug!(path = %storage_dir.display(), "setting storage paths");
                 self.storage_dir = Some(storage_dir);
                 self.load_state();
+                self.maybe_load_hashlist();
             }
             TransportMessage::RegisterReceipt {
                 truncated_hash,
@@ -1642,6 +1684,19 @@ mod tests {
         InboundPacket, InterfaceEntry, OutboundRequest, TransportQuery, TransportQueryResponse,
     };
     use crate::path_table::PathEntry;
+
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rns-transport-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn make_valid_announce(app_name: &str, hops: u8) -> (Bytes, [u8; 16]) {
         let identity = rns_identity::identity::Identity::new();
@@ -7468,9 +7523,237 @@ mod tests {
         assert!(!dir.join("path_table.msgpack").exists());
         assert!(!dir.join("destination_table").exists());
         assert!(!dir.join("announce_cache.msgpack").exists());
-        assert!(!dir.join("packet_hashlist").exists());
+        assert!(!dir.join("packet_hashlist.raw").exists());
         assert!(!actor.state_dirty);
         assert!(actor.last_state_save > 0.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hashlist_restore_waits_for_authoritative_transport_role() {
+        let dir = unique_temp_dir("hashlist-lazy-authority");
+        let raw_path = dir.join("packet_hashlist.raw");
+        std::fs::write(&raw_path, [0xAA; 32]).unwrap();
+
+        let (mut actor, _tx) = TransportActor::new();
+        actor.initialize_storage(dir.clone());
+        assert!(actor.packet_hashlist.is_empty());
+        assert!(!actor.hashlist_load_attempted);
+
+        actor.handle_message(TransportMessage::SetTransportEnabled { enabled: true });
+        assert!(actor.hashlist_load_attempted);
+        assert!(actor.packet_hashlist.contains(&[0xAA; 32]));
+
+        // Restore is process-local and one-shot. A later file replacement
+        // cannot silently replace live deduplication state.
+        std::fs::write(&raw_path, [0xBB; 32]).unwrap();
+        actor.handle_message(TransportMessage::SetTransportEnabled { enabled: true });
+        assert!(actor.packet_hashlist.contains(&[0xAA; 32]));
+        assert!(!actor.packet_hashlist.contains(&[0xBB; 32]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shared_instance_client_neither_loads_nor_saves_hashlist() {
+        let load_dir = unique_temp_dir("hashlist-shared-client-load");
+        std::fs::write(load_dir.join("packet_hashlist.raw"), [0xAA; 32]).unwrap();
+
+        let (mut client, _tx) = TransportActor::new();
+        client.is_transport_enabled = true;
+        client.shared_instance_client_mode = true;
+        client.initialize_storage(load_dir.clone());
+        assert!(client.packet_hashlist.is_empty());
+        assert!(!client.hashlist_load_attempted);
+
+        let save_dir = unique_temp_dir("hashlist-shared-client-save");
+        client.storage_dir = Some(save_dir.clone());
+        client.packet_hashlist.insert([0xBB; 32]);
+        client.save_state();
+        assert!(!save_dir.join("packet_hashlist.raw").exists());
+
+        let _ = std::fs::remove_dir_all(&load_dir);
+        let _ = std::fs::remove_dir_all(&save_dir);
+    }
+
+    #[test]
+    fn non_transport_node_does_not_persist_hashlist() {
+        let dir = unique_temp_dir("hashlist-disabled-save");
+        let (mut actor, _tx) = TransportActor::new();
+        actor.storage_dir = Some(dir.clone());
+        actor.packet_hashlist.insert([0xAA; 32]);
+
+        actor.save_state();
+
+        assert!(!dir.join("packet_hashlist.raw").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authoritative_shutdown_flushes_hashlist_synchronously() {
+        let dir = unique_temp_dir("hashlist-shutdown");
+        let (mut actor, _tx) = TransportActor::new();
+        actor.storage_dir = Some(dir.clone());
+        actor.is_transport_enabled = true;
+        actor.packet_hashlist.insert([0xAA; 32]);
+
+        actor.on_shutdown();
+
+        let loaded =
+            crate::persistence::load_hashlist_raw(&dir.join("packet_hashlist.raw")).unwrap();
+        assert_eq!(loaded.hashes, vec![[0xAA; 32]]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn persistence_trigger_flushes_the_authoritative_hashlist() {
+        let dir = unique_temp_dir("hashlist-persistence-trigger");
+        let path = dir.join("packet_hashlist.raw");
+        let (mut actor, tx) = TransportActor::new();
+        actor.storage_dir = Some(dir.clone());
+        actor.is_transport_enabled = true;
+        actor.packet_hashlist.insert([0xAA; 32]);
+        let trigger = actor.persistence_trigger();
+        let actor_task = tokio::spawn(actor.run());
+
+        assert!(trigger.request().await);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if path.exists()
+                    && crate::persistence::load_hashlist_raw(&path)
+                        .is_ok_and(|loaded| loaded.hashes == vec![[0xAA; 32]])
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduled persistence did not complete");
+
+        tx.send(TransportMessage::Shutdown).await.unwrap();
+        actor_task.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn synchronous_flush_cannot_be_overwritten_by_older_async_snapshot() {
+        let dir = unique_temp_dir("hashlist-sync-ordering");
+        let path = dir.join("packet_hashlist.raw");
+        let (mut actor, _tx) = TransportActor::new();
+        actor.storage_dir = Some(dir.clone());
+        actor.is_transport_enabled = true;
+        actor.packet_hashlist.insert([0xBB; 32]);
+
+        actor
+            .hashlist_save_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+        let in_flight = actor.hashlist_save_in_flight.clone();
+        let old_path = path.clone();
+        let old_writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            crate::persistence::save_raw_hashes(&[[0xAA; 32]], &old_path).unwrap();
+            in_flight.store(false, std::sync::atomic::Ordering::Release);
+        });
+
+        actor.save_state();
+        old_writer.join().unwrap();
+
+        let loaded = crate::persistence::load_hashlist_raw(&path).unwrap();
+        assert_eq!(loaded.hashes, vec![[0xBB; 32]]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hashlist_wait_timeout_refuses_a_concurrent_sync_writer() {
+        let (actor, _tx) = TransportActor::new();
+        actor
+            .hashlist_save_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        assert!(!actor.wait_for_hashlist_save_until(std::time::Instant::now()));
+
+        actor
+            .hashlist_save_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    #[test]
+    fn legacy_hashlist_migrates_atomically_without_removing_source() {
+        let dir = unique_temp_dir("hashlist-legacy-migration");
+        let legacy_path = dir.join("packet_hashlist");
+        let legacy = vec![vec![0xAA; 32], vec![0xAA; 32], vec![0xBB; 32]];
+        std::fs::write(&legacy_path, rmp_serde::to_vec(&legacy).unwrap()).unwrap();
+
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        actor.initialize_storage(dir.clone());
+
+        assert!(actor.packet_hashlist.contains(&[0xAA; 32]));
+        assert!(actor.packet_hashlist.contains(&[0xBB; 32]));
+        assert!(legacy_path.exists(), "migration must retain legacy source");
+        let loaded =
+            crate::persistence::load_hashlist_raw(&dir.join("packet_hashlist.raw")).unwrap();
+        assert_eq!(loaded.hashes.len(), 2);
+        assert!(loaded.hashes.contains(&[0xAA; 32]));
+        assert!(loaded.hashes.contains(&[0xBB; 32]));
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp-")),
+            "atomic migration must not leave a temporary file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_partial_raw_hashlist_never_falls_back_to_legacy() {
+        let dir = unique_temp_dir("hashlist-raw-precedence");
+        std::fs::write(dir.join("packet_hashlist.raw"), [0x11; 7]).unwrap();
+        let legacy = vec![vec![0xAA; 32]];
+        std::fs::write(
+            dir.join("packet_hashlist"),
+            rmp_serde::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        actor.initialize_storage(dir.clone());
+
+        assert!(actor.hashlist_load_attempted);
+        assert!(actor.packet_hashlist.is_empty());
+        assert!(
+            !actor.packet_hashlist.contains(&[0xAA; 32]),
+            "an existing canonical file must suppress legacy fallback"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_primary_legacy_hashlist_falls_back_to_rust_sidecar() {
+        let dir = unique_temp_dir("hashlist-legacy-precedence");
+        std::fs::write(dir.join("packet_hashlist"), b"not-msgpack").unwrap();
+        let sidecar = crate::persistence::PersistedHashlist {
+            hashes: vec![vec![0xCC; 32]],
+            version: 1,
+        };
+        std::fs::write(
+            dir.join("hashlist.msgpack"),
+            rmp_serde::to_vec(&sidecar).unwrap(),
+        )
+        .unwrap();
+
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        actor.initialize_storage(dir.clone());
+
+        assert!(actor.packet_hashlist.contains(&[0xCC; 32]));
+        assert!(dir.join("packet_hashlist.raw").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

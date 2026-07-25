@@ -398,10 +398,35 @@ impl TransportActor {
         }
     }
 
+    /// Wait (bounded) for an older asynchronous hashlist snapshot before a
+    /// synchronous flush takes its newer snapshot. Without this ordering, an
+    /// already-queued background writer could replace the shutdown file with
+    /// stale state after the synchronous write completed.
+    pub(super) fn wait_for_hashlist_save(&self) -> bool {
+        self.wait_for_hashlist_save_until(
+            std::time::Instant::now() + std::time::Duration::from_secs(15),
+        )
+    }
+
+    pub(super) fn wait_for_hashlist_save_until(&self, deadline: std::time::Instant) -> bool {
+        while self
+            .hashlist_save_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!("in-flight hashlist save did not finish before sync save");
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        true
+    }
+
     /// Flush the small/critical routing-state files: path_table,
     /// announce_cache, blackhole_table, tunnel_table. Hashlist is excluded —
-    /// it can be multiple MB and is rebuildable from in-flight traffic, so
-    /// we save it only on shutdown / falling-edge via `save_state`.
+    /// it can be multiple MB and is rebuildable from in-flight traffic, so it
+    /// is persisted independently on the scheduled `PersistData` command,
+    /// background falling edges, and shutdown.
     /// Synchronous: used by shutdown / falling-edge / RPC-forced saves where
     /// completion must be guaranteed before proceeding.
     pub(super) fn save_routing_state(&mut self) {
@@ -427,17 +452,20 @@ impl TransportActor {
     pub(super) fn save_state(&mut self) {
         // Routing state first so the order matches the periodic-save shape.
         self.save_routing_state();
-        if self.shared_instance_client_mode {
+        if !self.owns_persistent_hashlist() {
             return;
         }
 
         if let Some(ref dir) = self.storage_dir {
-            let hashlist_path = dir.join("packet_hashlist");
-            if let Err(e) = crate::persistence::save_hashlist(&self.packet_hashlist, &hashlist_path)
-            {
+            if !self.wait_for_hashlist_save() {
+                return;
+            }
+            let hashlist_path = dir.join("packet_hashlist.raw");
+            let hashes = self.packet_hashlist.current_hashes();
+            if let Err(e) = crate::persistence::save_raw_hashes(&hashes, &hashlist_path) {
                 trace!("failed to save hashlist: {}", e);
             } else {
-                info!(entries = self.packet_hashlist.len(), "flushed hashlist");
+                info!(entries = hashes.len(), "flushed hashlist");
             }
         }
     }
@@ -448,7 +476,7 @@ impl TransportActor {
     /// file on macOS) stalls routing + control queries for seconds.
     pub(super) fn save_state_async(&mut self) {
         self.save_routing_state_async();
-        if self.shared_instance_client_mode {
+        if !self.owns_persistent_hashlist() {
             return;
         }
         let Some(dir) = self.storage_dir.clone() else {
@@ -463,12 +491,12 @@ impl TransportActor {
         }
         self.hashlist_save_in_flight
             .store(true, std::sync::atomic::Ordering::Release);
-        let hashlist = self.packet_hashlist.clone();
+        let hashes = self.packet_hashlist.current_hashes();
         let in_flight = self.hashlist_save_in_flight.clone();
-        let entries = hashlist.len();
+        let entries = hashes.len();
         let write = move || {
-            let hashlist_path = dir.join("packet_hashlist");
-            if let Err(e) = crate::persistence::save_hashlist(&hashlist, &hashlist_path) {
+            let hashlist_path = dir.join("packet_hashlist.raw");
+            if let Err(e) = crate::persistence::save_raw_hashes(&hashes, &hashlist_path) {
                 trace!("failed to save hashlist: {}", e);
             } else {
                 info!(entries, "flushed hashlist");
@@ -487,6 +515,98 @@ impl TransportActor {
         self.save_state();
     }
 
+    fn owns_persistent_hashlist(&self) -> bool {
+        self.is_transport_enabled && !self.shared_instance_client_mode
+    }
+
+    /// Restore the canonical packet hashlist once both storage and the
+    /// actor's transport authority are known. Shared-instance clients and
+    /// non-transport leaves must never load or overwrite the authoritative
+    /// transport node's deduplication state.
+    pub(super) fn maybe_load_hashlist(&mut self) {
+        if self.hashlist_load_attempted || !self.owns_persistent_hashlist() {
+            return;
+        }
+        let Some(dir) = self.storage_dir.clone() else {
+            return;
+        };
+        self.hashlist_load_attempted = true;
+
+        let raw_path = dir.join("packet_hashlist.raw");
+        if raw_path.exists() {
+            match crate::persistence::load_hashlist_raw(&raw_path) {
+                Ok(loaded) => {
+                    let count = loaded.hashes.len();
+                    if loaded.partial_tail_bytes > 0 {
+                        tracing::warn!(
+                            path = %raw_path.display(),
+                            ignored_bytes = loaded.partial_tail_bytes,
+                            "ignored partial packet hash at end of canonical hashlist"
+                        );
+                    }
+                    if loaded.duplicate_count > 0 {
+                        debug!(
+                            duplicates = loaded.duplicate_count,
+                            "deduplicated canonical packet hashlist"
+                        );
+                    }
+                    self.packet_hashlist.load_from(loaded.hashes);
+                    debug!(count, "loaded canonical packet hashlist from disk");
+                }
+                Err(e) => {
+                    // The canonical file is authoritative when present. Do
+                    // not mask damage by silently falling back to stale
+                    // legacy state.
+                    tracing::warn!(
+                        path = %raw_path.display(),
+                        error = %e,
+                        "failed to load canonical packet hashlist"
+                    );
+                }
+            }
+            return;
+        }
+
+        let legacy_paths = [dir.join("packet_hashlist"), dir.join("hashlist.msgpack")];
+        for legacy_path in legacy_paths {
+            if !legacy_path.exists() {
+                continue;
+            }
+            match crate::persistence::load_hashlist_legacy(&legacy_path) {
+                Ok(hashes) => {
+                    let count = hashes.len();
+                    self.packet_hashlist.load_from(hashes.clone());
+                    match crate::persistence::save_raw_hashes(&hashes, &raw_path) {
+                        Ok(()) => {
+                            info!(
+                                source = %legacy_path.display(),
+                                destination = %raw_path.display(),
+                                count,
+                                "migrated legacy packet hashlist"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                source = %legacy_path.display(),
+                                destination = %raw_path.display(),
+                                error = %e,
+                                "loaded legacy packet hashlist but failed canonical migration"
+                            );
+                        }
+                    }
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %legacy_path.display(),
+                        error = %e,
+                        "failed to load legacy packet hashlist"
+                    );
+                }
+            }
+        }
+    }
+
     /// Restore on-disk transport state. Entries can't bind to a concrete
     /// `interface_id` until the matching interface re-registers, so they're
     /// staged in `pending_path_entries` / `pending_tunnel_entries` and
@@ -497,30 +617,6 @@ impl TransportActor {
             return;
         };
         let now_ts = now();
-
-        // packet_hashlist — Python-compatible canonical shape. Fall back to
-        // the old Rust sidecar so existing local development state still loads.
-        let hashlist_path = dir.join("packet_hashlist");
-        let legacy_hashlist_path = dir.join("hashlist.msgpack");
-        let hashlist_path = if hashlist_path.exists() {
-            Some(hashlist_path)
-        } else if legacy_hashlist_path.exists() {
-            Some(legacy_hashlist_path)
-        } else {
-            None
-        };
-        if let Some(hashlist_path) = hashlist_path {
-            match crate::persistence::load_hashlist(&hashlist_path) {
-                Ok(hashes) => {
-                    let count = hashes.len();
-                    self.packet_hashlist.load_from(hashes);
-                    debug!(count, "loaded packet hashlist from disk");
-                }
-                Err(e) => {
-                    trace!("failed to load packet hashlist: {}", e);
-                }
-            }
-        }
 
         // Python destination_table — canonical interop shape. Defer interface
         // hash remap until matching interfaces register.

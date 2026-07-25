@@ -2,7 +2,8 @@
 //! write-to-tmp + fsync + rename (via the shared rns-identity helper) so a
 //! crash or power loss leaves either the old or the new file, never a torn one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use rmpv::Value;
@@ -490,19 +491,113 @@ fn value_u8(value: &Value) -> Option<u8> {
     }
 }
 
+/// Result of streaming a canonical `packet_hashlist.raw` file.
+///
+/// A trailing fragment is recoverable: complete 32-byte hashes are returned
+/// and the caller can report the ignored byte count. Duplicates are removed
+/// while reading so a corrupt or manually concatenated file cannot inflate
+/// the in-memory set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawHashlistLoad {
+    pub hashes: Vec<[u8; 32]>,
+    pub duplicate_count: usize,
+    pub partial_tail_bytes: usize,
+}
+
+/// Atomically write the current packet-hash generation in Reticulum 1.4's
+/// canonical raw format: an unframed concatenation of 32-byte hashes.
+pub fn save_hashlist_raw(hashlist: &PacketHashlist, path: &Path) -> Result<(), PersistenceError> {
+    let hashes = hashlist.current_hashes();
+    save_raw_hashes(&hashes, path)
+}
+
+/// Persist a packet hashlist through the stable pre-1.4 facade.
+///
+/// A `.raw` path uses the current canonical format; other paths retain the
+/// legacy msgpack writer so existing save/load callers continue to round-trip.
 pub fn save_hashlist(hashlist: &PacketHashlist, path: &Path) -> Result<(), PersistenceError> {
+    if path.extension().is_some_and(|extension| extension == "raw") {
+        save_hashlist_raw(hashlist, path)
+    } else {
+        save_hashlist_legacy(hashlist, path)
+    }
+}
+
+/// Write both in-memory generations using the legacy msgpack list shape.
+///
+/// Runtime persistence never calls this; it exists only for compatibility
+/// tooling and one-way migration support.
+pub fn save_hashlist_legacy(
+    hashlist: &PacketHashlist,
+    path: &Path,
+) -> Result<(), PersistenceError> {
     let hashes = hashlist
         .all_hashes()
         .iter()
-        .map(|h| Value::Binary(h.to_vec()))
+        .map(|hash| Value::Binary(hash.to_vec()))
         .collect();
     let mut serialized = Vec::new();
     rmpv::encode::write_value(&mut serialized, &Value::Array(hashes))
-        .map_err(|e| PersistenceError::Serialize(e.to_string()))?;
+        .map_err(|error| PersistenceError::Serialize(error.to_string()))?;
     atomic_write_bytes(path, &serialized)
 }
 
-pub fn load_hashlist(path: &Path) -> Result<Vec<[u8; 32]>, PersistenceError> {
+/// Atomically write an explicit hash snapshot. Used by legacy migration so
+/// the canonical file is materialised without deleting or rewriting the
+/// source file.
+pub fn save_raw_hashes(hashes: &[[u8; 32]], path: &Path) -> Result<(), PersistenceError> {
+    let mut serialized = Vec::with_capacity(hashes.len().saturating_mul(32));
+    for hash in hashes {
+        serialized.extend_from_slice(hash);
+    }
+    atomic_write_bytes(path, &serialized)
+}
+
+/// Stream a canonical raw hashlist with fixed-size buffering.
+///
+/// This intentionally does not read the whole file into one byte vector.
+/// The retained memory is the deduplicated set itself plus a bounded reader
+/// buffer. A short final record is ignored and surfaced in the result.
+pub fn load_hashlist_raw(path: &Path) -> Result<RawHashlistLoad, PersistenceError> {
+    const READ_BUFFER_SIZE: usize = 64 * 1024;
+
+    let file = std::fs::File::open(path).map_err(PersistenceError::Io)?;
+    let mut reader = BufReader::with_capacity(READ_BUFFER_SIZE, file);
+    let mut hashes = Vec::new();
+    let mut seen = HashSet::new();
+    let mut duplicate_count = 0usize;
+
+    loop {
+        let mut hash = [0u8; 32];
+        let mut read = 0usize;
+        while read < hash.len() {
+            match reader.read(&mut hash[read..]) {
+                Ok(0) => {
+                    return Ok(RawHashlistLoad {
+                        hashes,
+                        duplicate_count,
+                        partial_tail_bytes: read,
+                    });
+                }
+                Ok(count) => read += count,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(PersistenceError::Io(e)),
+            }
+        }
+
+        if seen.insert(hash) {
+            hashes.push(hash);
+        } else {
+            duplicate_count += 1;
+        }
+    }
+}
+
+/// Load either legacy msgpack shape:
+///
+/// - Python's `packet_hashlist`: a list of binary hashes.
+/// - Rust's old `hashlist.msgpack`: `{ hashes, version }`.
+pub fn load_hashlist_legacy(path: &Path) -> Result<Vec<[u8; 32]>, PersistenceError> {
     let data = std::fs::read(path).map_err(PersistenceError::Io)?;
     let raw_hashes = match rmp_serde::from_slice::<Vec<Vec<u8>>>(&data) {
         Ok(hashes) => hashes,
@@ -514,14 +609,29 @@ pub fn load_hashlist(path: &Path) -> Result<Vec<[u8; 32]>, PersistenceError> {
     };
 
     let mut hashes = Vec::new();
+    let mut seen = HashSet::new();
     for h in raw_hashes {
         if h.len() == 32 {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&h);
-            hashes.push(arr);
+            if seen.insert(arr) {
+                hashes.push(arr);
+            }
         }
     }
     Ok(hashes)
+}
+
+/// Load a packet hashlist through the stable pre-1.4 facade.
+///
+/// A `.raw` path uses the current canonical format; other paths retain the
+/// legacy msgpack reader so existing migration tools keep working.
+pub fn load_hashlist(path: &Path) -> Result<Vec<[u8; 32]>, PersistenceError> {
+    if path.extension().is_some_and(|extension| extension == "raw") {
+        Ok(load_hashlist_raw(path)?.hashes)
+    } else {
+        load_hashlist_legacy(path)
+    }
 }
 
 /// Write to a sibling `.tmp` file and rename on top of the target so a crash
@@ -1202,6 +1312,19 @@ mod tests {
     use crate::constants::InterfaceMode;
     use crate::path_table::PathEntry;
 
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "reticulum-rs-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn test_save_load_path_table() {
         let mut table = PathTable::new();
@@ -1480,45 +1603,110 @@ mod tests {
     }
 
     #[test]
-    fn test_save_load_hashlist() {
-        let mut hashlist = PacketHashlist::new();
+    fn raw_hashlist_persists_only_current_generation() {
+        let mut hashlist = PacketHashlist::new_with_capacity(4);
         let aa = [0xAA; 32];
         let bb = [0xBB; 32];
+        let cc = [0xCC; 32];
         hashlist.insert(aa);
         hashlist.insert(bb);
+        // Rotate aa/bb into the transient previous generation.
+        hashlist.insert(cc);
 
-        let dir = std::env::temp_dir().join("reticulum_rs_test_hashlist");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("packet_hashlist");
+        let dir = unique_temp_dir("raw-hashlist-current");
+        let path = dir.join("packet_hashlist.raw");
 
-        save_hashlist(&hashlist, &path).unwrap();
+        save_hashlist_raw(&hashlist, &path).unwrap();
         let raw = std::fs::read(&path).unwrap();
-        let mut python_shape: Vec<Vec<u8>> = rmp_serde::from_slice(&raw).unwrap();
-        python_shape.sort();
-        assert_eq!(python_shape, vec![aa.to_vec(), bb.to_vec()]);
+        assert_eq!(raw, cc);
 
-        let loaded = load_hashlist(&path).unwrap();
-        assert_eq!(loaded.len(), 2);
-        assert!(loaded.contains(&aa));
-        assert!(loaded.contains(&bb));
+        let loaded = load_hashlist_raw(&path).unwrap();
+        assert_eq!(loaded.hashes, vec![cc]);
+        assert_eq!(loaded.duplicate_count, 0);
+        assert_eq!(loaded.partial_tail_bytes, 0);
+        assert_eq!(load_hashlist(&path).unwrap(), vec![cc]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn load_hashlist_accepts_legacy_rust_sidecar_shape() {
+    fn raw_hashlist_streaming_load_deduplicates_and_reports_partial_tail() {
+        let aa = [0xAA; 32];
+        let bb = [0xBB; 32];
+        let dir = unique_temp_dir("raw-hashlist-dedup-tail");
+        let path = dir.join("packet_hashlist.raw");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&aa);
+        raw.extend_from_slice(&bb);
+        raw.extend_from_slice(&aa);
+        raw.extend_from_slice(&[0x42; 7]);
+        std::fs::write(&path, raw).unwrap();
+
+        let loaded = load_hashlist_raw(&path).unwrap();
+        assert_eq!(loaded.hashes, vec![aa, bb]);
+        assert_eq!(loaded.duplicate_count, 1);
+        assert_eq!(loaded.partial_tail_bytes, 7);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_hashlist_loader_accepts_python_list_and_deduplicates() {
+        let dir = unique_temp_dir("legacy-python-hashlist");
+        let path = dir.join("packet_hashlist");
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(
+            &mut bytes,
+            &Value::Array(vec![
+                Value::Binary(vec![0xAA; 32]),
+                Value::Binary(vec![0x42; 31]),
+                Value::Binary(vec![0xAA; 32]),
+                Value::Binary(vec![0xBB; 32]),
+            ]),
+        )
+        .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+
+        let loaded = load_hashlist_legacy(&path).unwrap();
+        assert_eq!(loaded, vec![[0xAA; 32], [0xBB; 32]]);
+        assert_eq!(load_hashlist(&path).unwrap(), loaded);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stable_hashlist_facade_round_trips_an_extensionless_legacy_path() {
+        let dir = unique_temp_dir("stable-legacy-hashlist-facade");
+        let path = dir.join("packet_hashlist");
+        let mut hashlist = PacketHashlist::new_with_capacity(4);
+        hashlist.insert([0xAA; 32]);
+        hashlist.insert([0xBB; 32]);
+        hashlist.insert([0xCC; 32]);
+
+        save_hashlist(&hashlist, &path).unwrap();
+
+        let loaded = load_hashlist(&path).unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert!(loaded.contains(&[0xAA; 32]));
+        assert!(loaded.contains(&[0xBB; 32]));
+        assert!(loaded.contains(&[0xCC; 32]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_hashlist_loader_accepts_rust_sidecar_shape() {
         let persisted = PersistedHashlist {
             hashes: vec![vec![0xAA; 32], vec![0x42; 31], vec![0xBB; 32]],
             version: 1,
         };
         let bytes = rmp_serde::to_vec(&persisted).unwrap();
 
-        let dir = std::env::temp_dir().join("reticulum_rs_test_hashlist_legacy");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = unique_temp_dir("legacy-rust-hashlist");
         let path = dir.join("hashlist.msgpack");
         std::fs::write(&path, bytes).unwrap();
 
-        let loaded = load_hashlist(&path).unwrap();
+        let loaded = load_hashlist_legacy(&path).unwrap();
         assert_eq!(loaded.len(), 2);
         assert!(loaded.contains(&[0xAA; 32]));
         assert!(loaded.contains(&[0xBB; 32]));

@@ -2093,6 +2093,7 @@ pub async fn init_with_options(
     }
 
     let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new();
+    let persistence_trigger = actor.persistence_trigger();
     actor.is_foreground = is_foreground.clone();
     actor.initialize_storage(paths.storage_dir.clone());
     // Python 1.3.8 Transport.py:234-238: non-transport nodes get a fresh
@@ -2562,12 +2563,11 @@ pub async fn init_with_options(
     });
 
     if instance_mode != InstanceMode::Client {
-        let job_tx = transport_tx.clone();
         let cache_dir = paths.cache_dir.clone();
         let resource_dir = paths.resource_dir.clone();
         let job_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            run_jobs(job_tx, cache_dir, resource_dir, job_shutdown).await;
+            run_jobs(persistence_trigger, cache_dir, resource_dir, job_shutdown).await;
         });
     }
 
@@ -4989,7 +4989,7 @@ fn synthesize_interfaces(
 }
 
 async fn run_jobs(
-    transport_tx: mpsc::Sender<TransportMessage>,
+    persistence_trigger: rns_transport::actor::PersistenceTrigger,
     cache_dir: PathBuf,
     resource_dir: PathBuf,
     shutdown: ShutdownSignal,
@@ -5016,14 +5016,7 @@ async fn run_jobs(
                         }
                         Job::PersistData => {
                             tracing::debug!("persisting data");
-                            let _ = transport_tx.send(TransportMessage::Tick(
-                                rns_transport::messages::TimerTick {
-                                    timestamp: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs_f64(),
-                                },
-                            )).await;
+                            let _ = persistence_trigger.request().await;
                         }
                     }
                 }
