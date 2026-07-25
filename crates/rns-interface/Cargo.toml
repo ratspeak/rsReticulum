@@ -35,6 +35,7 @@ rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+md-5 = { workspace = true }
 
 # Apple BLE Peripheral (CoreBluetooth GATT server, iOS + macOS).
 # Version pinned to match btleplug's internal objc2 version so the shared

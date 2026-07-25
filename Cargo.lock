@@ -1632,6 +1632,7 @@ dependencies = [
  "if-addrs",
  "jni",
  "libc",
+ "md-5",
  "objc2",
  "objc2-core-bluetooth",
  "objc2-foundation",

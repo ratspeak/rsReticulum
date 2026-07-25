@@ -29,6 +29,7 @@ pub mod local;
 pub mod pipe;
 pub mod rnode;
 pub mod rnode_admin;
+pub mod rnode_capabilities;
 #[cfg(feature = "serial")]
 pub mod rnode_multi;
 pub mod rnode_protocol;
