@@ -50,6 +50,9 @@ objc2-core-bluetooth = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 # Keepalive-tuning tests read socket options back via getsockopt.
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

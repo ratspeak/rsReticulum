@@ -653,6 +653,8 @@ const RNODE_FLOW_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_BEACON_POLL_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+const RNODE_TCP_IDLE_PROBE_INTERVAL: Duration = Duration::from_millis(3_500);
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_STARTUP_STAGE_DEADLINE: Duration = Duration::from_secs(5);
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_DETACH_DEADLINE: Duration = Duration::from_millis(500);
@@ -665,6 +667,7 @@ enum RNodeWritePhase {
     Detect,
     Initialise,
     Packet,
+    Probe,
     Detach,
 }
 
@@ -675,6 +678,7 @@ impl RNodeWritePhase {
             Self::Detect => "detect",
             Self::Initialise => "init",
             Self::Packet => "packet",
+            Self::Probe => "probe",
             Self::Detach => "detach",
         }
     }
@@ -765,6 +769,7 @@ struct RNodeWriterContext {
     txb: Arc<AtomicU64>,
     beacon: Option<(Duration, Bytes)>,
     beacon_poll_interval: Duration,
+    idle_probe_interval: Option<Duration>,
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -913,22 +918,48 @@ struct RNodePacketAccounting {
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+struct RNodeIdleProbe {
+    interval: Duration,
+    deadline: tokio::time::Instant,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl RNodeIdleProbe {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            deadline: tokio::time::Instant::now() + interval,
+        }
+    }
+
+    fn is_overdue(&self) -> bool {
+        tokio::time::Instant::now() >= self.deadline
+    }
+
+    fn record_completed_write(&mut self, write_completed_at: tokio::time::Instant) {
+        self.deadline = write_completed_at + self.interval;
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 async fn write_rnode_operation<W>(
     mut writer: W,
     bytes: Vec<u8>,
     phase: RNodeWritePhase,
     packet_accounting: Option<RNodePacketAccounting>,
+    idle_probe: &mut Option<RNodeIdleProbe>,
 ) -> Result<W, RNodeWriteFailure>
 where
     W: std::io::Write + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
+    let (writer, write_completed_at) = tokio::task::spawn_blocking(move || {
         writer
             .write_all(&bytes)
             .map_err(|error| RNodeWriteFailure {
                 phase,
                 kind: RNodeWriteFailureKind::Write(Arc::new(error)),
             })?;
+        let write_completed_at = tokio::time::Instant::now();
         if let Some(accounting) = packet_accounting {
             accounting
                 .txb
@@ -938,13 +969,17 @@ where
             phase,
             kind: RNodeWriteFailureKind::Flush(Arc::new(error)),
         })?;
-        Ok(writer)
+        Ok((writer, write_completed_at))
     })
     .await
     .map_err(|_| RNodeWriteFailure {
         phase,
         kind: RNodeWriteFailureKind::WorkerTerminated,
-    })?
+    })??;
+    if let Some(idle_probe) = idle_probe {
+        idle_probe.record_completed_write(write_completed_at);
+    }
+    Ok(writer)
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -987,8 +1022,17 @@ fn prepare_rnode_packet(
 enum RNodeWriterEvent {
     Control(Option<RNodeControlWriteRequest>),
     Packet(Option<Bytes>),
+    ProbePoll,
     FlowPoll,
     BeaconPoll,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn wait_for_rnode_probe_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -1005,6 +1049,7 @@ where
     let mut first_tx: Option<tokio::time::Instant> = None;
     let mut packet_lane_open = true;
     let mut control_lane_open = true;
+    let mut idle_probe = context.idle_probe_interval.map(RNodeIdleProbe::new);
 
     loop {
         if context.cancelled.load(Ordering::SeqCst) {
@@ -1019,7 +1064,9 @@ where
                     }
                     let phase = request.phase;
                     let terminal = phase == RNodeWritePhase::Detach;
-                    match write_rnode_operation(writer, request.bytes, phase, None).await {
+                    match write_rnode_operation(writer, request.bytes, phase, None, &mut idle_probe)
+                        .await
+                    {
                         Ok(next_writer) => {
                             writer = next_writer;
                             let _ = request.acknowledgement.send(Ok(()));
@@ -1062,9 +1109,14 @@ where
             let packet = pending_packet.take().expect("pending packet checked");
             let (framed, accounting) = prepare_rnode_packet(packet, &context, &mut first_tx);
             let framed_len = framed.len();
-            writer =
-                write_rnode_operation(writer, framed, RNodeWritePhase::Packet, Some(accounting))
-                    .await?;
+            writer = write_rnode_operation(
+                writer,
+                framed,
+                RNodeWritePhase::Packet,
+                Some(accounting),
+                &mut idle_probe,
+            )
+            .await?;
             tracing::debug!(id = context.id, framed_len, "RNode packet write complete");
             continue;
         }
@@ -1076,11 +1128,31 @@ where
             return Ok(RNodeWriterExit::LanesClosed);
         }
 
+        if idle_probe.as_ref().is_some_and(RNodeIdleProbe::is_overdue) {
+            if context.cancelled.load(Ordering::SeqCst) {
+                return Ok(RNodeWriterExit::Cancelled);
+            }
+            writer = write_rnode_operation(
+                writer,
+                build_detect_sequence(),
+                RNodeWritePhase::Probe,
+                None,
+                &mut idle_probe,
+            )
+            .await?;
+            tracing::debug!(id = context.id, "RNode TCP idle probe write complete");
+            continue;
+        }
+
+        let probe_deadline = idle_probe.as_ref().map(|probe| probe.deadline);
         let event = if pending_packet.is_some() {
             tokio::select! {
                 biased;
                 request = control_rx.recv(), if control_lane_open => {
                     RNodeWriterEvent::Control(request)
+                }
+                _ = wait_for_rnode_probe_deadline(probe_deadline) => {
+                    RNodeWriterEvent::ProbePoll
                 }
                 _ = tokio::time::sleep(RNODE_FLOW_POLL_INTERVAL) => {
                     RNodeWriterEvent::FlowPoll
@@ -1091,6 +1163,9 @@ where
                 biased;
                 request = control_rx.recv(), if control_lane_open => {
                     RNodeWriterEvent::Control(request)
+                }
+                _ = wait_for_rnode_probe_deadline(probe_deadline) => {
+                    RNodeWriterEvent::ProbePoll
                 }
                 packet = packet_rx.recv(), if packet_lane_open => {
                     RNodeWriterEvent::Packet(packet)
@@ -1113,7 +1188,9 @@ where
                 }
                 let phase = request.phase;
                 let terminal = phase == RNodeWritePhase::Detach;
-                match write_rnode_operation(writer, request.bytes, phase, None).await {
+                match write_rnode_operation(writer, request.bytes, phase, None, &mut idle_probe)
+                    .await
+                {
                     Ok(next_writer) => {
                         writer = next_writer;
                         let _ = request.acknowledgement.send(Ok(()));
@@ -1139,6 +1216,7 @@ where
             RNodeWriterEvent::Packet(None) => {
                 packet_lane_open = false;
             }
+            RNodeWriterEvent::ProbePoll => {}
             RNodeWriterEvent::FlowPoll => {}
             // Wake the top-of-loop due check even when both input lanes are
             // idle. Checking there also prevents a continuously ready packet
@@ -1207,6 +1285,7 @@ fn spawn_rnode_generation_writer(
             txb,
             beacon,
             beacon_poll_interval: RNODE_BEACON_POLL_INTERVAL,
+            idle_probe_interval: port.is_tcp().then_some(RNODE_TCP_IDLE_PROBE_INTERVAL),
         },
     );
     writer.interrupt = interrupt;
@@ -2684,6 +2763,7 @@ mod tests {
             txb,
             beacon,
             beacon_poll_interval,
+            idle_probe_interval: None,
         }
     }
 
@@ -2705,6 +2785,27 @@ mod tests {
         })
         .await
         .expect("scripted writer condition timed out");
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    async fn yield_until_rnode_test(mut condition: impl FnMut() -> bool, failure: &'static str) {
+        // Keep the paused-clock tests runnable while their real spawn_blocking
+        // operations finish. A timer-based wait could let Tokio auto-advance
+        // to a later probe deadline before the physical writer is observed.
+        for _ in 0..100_000 {
+            if condition() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(condition(), "{failure}");
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    async fn yield_to_rnode_tasks() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -2745,27 +2846,30 @@ mod tests {
         let scripted = ScriptedWriter::failing((!flush).then_some(1), flush.then_some(1));
         let online = Arc::new(AtomicBool::new(true));
         let txb = Arc::new(AtomicU64::new(0));
-        let writer = spawn_rnode_writer(
-            scripted,
-            scripted_writer_context(
-                false,
-                Arc::new(AtomicBool::new(true)),
-                online.clone(),
-                txb.clone(),
-                None,
-                Duration::from_millis(5),
-            ),
+        let mut context = scripted_writer_context(
+            false,
+            Arc::new(AtomicBool::new(true)),
+            online.clone(),
+            txb.clone(),
+            None,
+            Duration::from_millis(5),
         );
+        if phase == RNodeWritePhase::Probe {
+            context.idle_probe_interval = Some(Duration::from_millis(10));
+        }
+        let writer = spawn_rnode_writer(scripted, context);
 
-        let acknowledged_failure = if phase == RNodeWritePhase::Packet {
-            writer
-                .packet_tx
-                .send(Bytes::from_static(b"packet"))
-                .await
-                .unwrap();
-            None
-        } else {
-            Some(
+        let acknowledged_failure = match phase {
+            RNodeWritePhase::Packet => {
+                writer
+                    .packet_tx
+                    .send(Bytes::from_static(b"packet"))
+                    .await
+                    .unwrap();
+                None
+            }
+            RNodeWritePhase::Probe => None,
+            _ => Some(
                 tokio::time::timeout(
                     Duration::from_secs(2),
                     request_rnode_control_write(&writer.control_tx, phase, vec![phase as u8]),
@@ -2773,7 +2877,7 @@ mod tests {
                 .await
                 .expect("scripted control write timed out")
                 .expect_err("scripted control write must fail"),
-            )
+            ),
         };
 
         let RNodeGenerationWriter { mut task, .. } = writer;
@@ -3064,8 +3168,15 @@ mod tests {
         assert!(!seq.is_empty());
         let mut deframer = kiss::RawKissDeframer::new();
         let frames = deframer.feed(&seq);
-        assert_eq!(frames.len(), 4);
-        assert_eq!(frames[0].0, CMD_DETECT);
+        assert_eq!(
+            frames,
+            vec![
+                (CMD_DETECT, vec![DETECT_REQ]),
+                (CMD_FW_VERSION, vec![0x00]),
+                (CMD_PLATFORM, vec![0x00]),
+                (CMD_MCU, vec![0x00]),
+            ]
+        );
     }
 
     #[test]
@@ -3243,11 +3354,449 @@ mod tests {
             RNodeWritePhase::Detect,
             RNodeWritePhase::Initialise,
             RNodeWritePhase::Packet,
+            RNodeWritePhase::Probe,
             RNodeWritePhase::Detach,
         ] {
             exercise_scripted_writer_failure(phase, false).await;
             exercise_scripted_writer_failure(phase, true).await;
         }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_rnode_tcp_idle_probe_interval_matches_driver_contract() {
+        assert_eq!(RNODE_TCP_IDLE_PROBE_INTERVAL, Duration::from_millis(3_500));
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test(start_paused = true)]
+    async fn test_rnode_idle_probe_repeats_without_response_and_bypasses_driver_state() {
+        let scripted = ScriptedWriter::default();
+        let ready = Arc::new(AtomicBool::new(false));
+        let txb = Arc::new(AtomicU64::new(17));
+        let mut context = scripted_writer_context(
+            true,
+            ready.clone(),
+            Arc::new(AtomicBool::new(true)),
+            txb.clone(),
+            None,
+            Duration::from_millis(5),
+        );
+        context.idle_probe_interval = Some(Duration::from_millis(20));
+        let writer = spawn_rnode_writer(scripted.clone(), context);
+
+        yield_to_rnode_tasks().await;
+        for expected_flushes in 1..=3 {
+            tokio::time::advance(Duration::from_millis(20)).await;
+            yield_until_rnode_test(
+                || scripted.flush_calls() >= expected_flushes,
+                "idle probe did not complete after its advanced deadline",
+            )
+            .await;
+        }
+        let writes = scripted.writes();
+        let detect = build_detect_sequence();
+        assert_eq!(writes.len(), 3);
+        assert!(writes.iter().all(|write| write == &detect));
+        assert!(
+            !ready.load(Ordering::SeqCst),
+            "idle probes must not consume or manufacture READY permits"
+        );
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            17,
+            "idle probes must not affect payload accounting"
+        );
+
+        finish_rnode_writer(writer).await;
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test(start_paused = true)]
+    async fn test_serial_style_scripted_writer_has_no_idle_probe() {
+        let scripted = ScriptedWriter::default();
+        let context = scripted_writer_context(
+            false,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Duration::from_millis(5),
+        );
+        assert_eq!(context.idle_probe_interval, None);
+        let writer = spawn_rnode_writer(scripted.clone(), context);
+
+        yield_to_rnode_tasks().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        yield_to_rnode_tasks().await;
+        assert!(scripted.writes().is_empty());
+        assert_eq!(scripted.flush_calls(), 0);
+
+        finish_rnode_writer(writer).await;
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test(start_paused = true)]
+    async fn test_idle_probe_deadline_is_write_relative_and_applied_after_flush() {
+        let scripted = ScriptedWriter::blocking_flush(1);
+        let mut context = scripted_writer_context(
+            false,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Duration::from_millis(5),
+        );
+        context.idle_probe_interval = Some(Duration::from_millis(100));
+        let writer = spawn_rnode_writer(scripted.clone(), context);
+        let control = vec![0xA1, 0xA2];
+        let control_tx = writer.control_tx.clone();
+        let control_bytes = control.clone();
+        let control_task = tokio::spawn(async move {
+            request_rnode_control_write(&control_tx, RNodeWritePhase::Initialise, control_bytes)
+                .await
+        });
+
+        yield_until_rnode_test(
+            || {
+                scripted
+                    .shared
+                    .0
+                    .lock()
+                    .expect("scripted writer poisoned")
+                    .blocked_flush_entered
+            },
+            "control write never entered its blocking flush",
+        )
+        .await;
+        tokio::time::advance(Duration::from_millis(140)).await;
+        assert_eq!(scripted.writes(), vec![control.clone()]);
+        assert_eq!(scripted.flush_calls(), 1);
+
+        scripted.release_flush();
+        yield_until_rnode_test(
+            || scripted.flush_calls() >= 2,
+            "overdue write-relative probe did not run after flush release",
+        )
+        .await;
+        control_task
+            .await
+            .expect("blocked control task panicked")
+            .expect("blocked control must complete after flush release");
+        assert_eq!(
+            scripted.writes(),
+            vec![control, build_detect_sequence()],
+            "the successful flush must apply the already elapsed write-relative deadline"
+        );
+
+        finish_rnode_writer(writer).await;
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test(start_paused = true)]
+    async fn test_rnode_startup_completion_resets_idle_probe_deadline() {
+        let scripted = ScriptedWriter::default();
+        let mut context = scripted_writer_context(
+            false,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Duration::from_millis(5),
+        );
+        context.idle_probe_interval = Some(Duration::from_millis(100));
+        let writer = spawn_rnode_writer(scripted.clone(), context);
+        let config = RNodeConfig::new("scripted-probe", "tcp://127.0.0.1:1");
+        let startup_config = config.clone();
+        let startup = tokio::spawn(async move {
+            let result = initialise_rnode_writer(&writer, &startup_config).await;
+            (result, writer)
+        });
+
+        yield_until_rnode_test(
+            || scripted.flush_calls() >= 2,
+            "startup writes did not complete",
+        )
+        .await;
+        yield_to_rnode_tasks().await;
+        let (startup_result, writer) = startup.await.expect("startup task panicked");
+        startup_result.expect("scripted startup must succeed");
+        assert_eq!(
+            scripted.writes(),
+            vec![build_detect_sequence(), build_init_sequence(&config)]
+        );
+        tokio::time::advance(Duration::from_millis(50)).await;
+        yield_to_rnode_tasks().await;
+        assert_eq!(scripted.writes().len(), 2);
+
+        tokio::time::advance(Duration::from_millis(50)).await;
+        yield_until_rnode_test(
+            || scripted.flush_calls() >= 3,
+            "startup-relative idle probe did not complete",
+        )
+        .await;
+        assert_eq!(
+            scripted.writes(),
+            vec![
+                build_detect_sequence(),
+                build_init_sequence(&config),
+                build_detect_sequence(),
+            ]
+        );
+        finish_rnode_writer(writer).await;
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test(start_paused = true)]
+    async fn test_packet_and_station_id_flushes_each_reset_idle_probe_deadline() {
+        let scripted = ScriptedWriter::default();
+        let txb = Arc::new(AtomicU64::new(0));
+        let callsign = Bytes::from_static(b"PROBE-ID");
+        let mut context = scripted_writer_context(
+            false,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            txb.clone(),
+            Some((Duration::from_millis(120), callsign.clone())),
+            Duration::from_millis(5),
+        );
+        context.idle_probe_interval = Some(Duration::from_millis(240));
+        let writer = spawn_rnode_writer(scripted.clone(), context);
+
+        yield_to_rnode_tasks().await;
+        tokio::time::advance(Duration::from_millis(160)).await;
+        yield_to_rnode_tasks().await;
+        assert!(scripted.writes().is_empty());
+        let payload = Bytes::from_static(b"probe-reset-payload");
+        writer.packet_tx.send(payload.clone()).await.unwrap();
+        yield_until_rnode_test(
+            || scripted.flush_calls() >= 1,
+            "payload write did not complete",
+        )
+        .await;
+        assert_eq!(scripted.writes(), vec![kiss::frame(&payload)]);
+
+        // The generation-relative deadline expires here, but the payload
+        // write moved it forward. No probe may overtake the later station ID.
+        tokio::time::advance(Duration::from_millis(80)).await;
+        yield_to_rnode_tasks().await;
+        assert_eq!(scripted.writes(), vec![kiss::frame(&payload)]);
+
+        tokio::time::advance(Duration::from_millis(40)).await;
+        yield_until_rnode_test(
+            || scripted.flush_calls() >= 2,
+            "station-ID write did not complete",
+        )
+        .await;
+        assert_eq!(
+            scripted.writes(),
+            vec![kiss::frame(&payload), kiss::frame(&callsign)],
+            "the payload must replace the earlier generation deadline"
+        );
+
+        // The payload-relative deadline expires here, but the station-ID
+        // write moved it forward independently.
+        tokio::time::advance(Duration::from_millis(120)).await;
+        yield_to_rnode_tasks().await;
+        assert_eq!(
+            scripted.writes(),
+            vec![kiss::frame(&payload), kiss::frame(&callsign)],
+            "the station-ID flush must replace the payload-relative deadline"
+        );
+
+        tokio::time::advance(Duration::from_millis(120)).await;
+        yield_until_rnode_test(
+            || scripted.flush_calls() >= 3,
+            "station-ID-relative idle probe did not complete",
+        )
+        .await;
+        assert_eq!(
+            scripted.writes(),
+            vec![
+                kiss::frame(&payload),
+                kiss::frame(&callsign),
+                build_detect_sequence(),
+            ]
+        );
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            (payload.len() + callsign.len()) as u64
+        );
+        finish_rnode_writer(writer).await;
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test(start_paused = true)]
+    async fn test_flow_stalled_packet_does_not_block_or_mutate_idle_probe_state() {
+        let scripted = ScriptedWriter::default();
+        let ready = Arc::new(AtomicBool::new(false));
+        let txb = Arc::new(AtomicU64::new(0));
+        let callsign = Bytes::from_static(b"STALLED-ID");
+        let mut context = scripted_writer_context(
+            true,
+            ready.clone(),
+            Arc::new(AtomicBool::new(true)),
+            txb.clone(),
+            Some((Duration::from_millis(120), callsign.clone())),
+            Duration::from_millis(5),
+        );
+        context.idle_probe_interval = Some(Duration::from_millis(25));
+        let writer = spawn_rnode_writer(scripted.clone(), context);
+        let payload = Bytes::from_static(b"flow-stalled-probe-payload");
+        let framed_payload = kiss::frame(&payload);
+        let framed_callsign = kiss::frame(&callsign);
+        writer.packet_tx.send(payload.clone()).await.unwrap();
+
+        yield_until_rnode_test(
+            || writer.packet_tx.capacity() == RNODE_PACKET_WRITE_QUEUE,
+            "writer did not retain the flow-stalled raw packet",
+        )
+        .await;
+        for expected_flushes in 1..=5 {
+            tokio::time::advance(Duration::from_millis(25)).await;
+            yield_until_rnode_test(
+                || scripted.flush_calls() >= expected_flushes,
+                "flow-stalled idle probe did not complete",
+            )
+            .await;
+        }
+        let detect = build_detect_sequence();
+        let stalled_writes = scripted.writes();
+        assert_eq!(stalled_writes.len(), 5);
+        assert!(stalled_writes.iter().all(|write| write == &detect));
+        assert_eq!(writer.packet_tx.capacity(), RNODE_PACKET_WRITE_QUEUE);
+        assert!(!ready.load(Ordering::SeqCst));
+        assert_eq!(txb.load(Ordering::Relaxed), 0);
+
+        apply_scripted_ready_frame(&ready, &[0x01]);
+        tokio::time::advance(RNODE_FLOW_POLL_INTERVAL).await;
+        yield_until_rnode_test(
+            || {
+                scripted
+                    .writes()
+                    .iter()
+                    .any(|write| write == &framed_payload)
+            },
+            "permitted flow-stalled payload did not complete",
+        )
+        .await;
+        assert!(!ready.load(Ordering::SeqCst));
+        assert_eq!(txb.load(Ordering::Relaxed), payload.len() as u64);
+
+        apply_scripted_ready_frame(&ready, &[0x01]);
+        tokio::time::advance(Duration::from_millis(60)).await;
+        yield_until_rnode_test(
+            || scripted.flush_calls() >= 7,
+            "idle probe did not complete while station-ID permit was held",
+        )
+        .await;
+        assert!(
+            scripted
+                .writes()
+                .iter()
+                .all(|write| write != &framed_callsign),
+            "probes must not arm a station-ID timer before the payload write"
+        );
+        assert!(
+            ready.load(Ordering::SeqCst),
+            "idle probes must leave the offered station-ID permit intact"
+        );
+        assert_eq!(txb.load(Ordering::Relaxed), payload.len() as u64);
+
+        tokio::time::advance(Duration::from_millis(60)).await;
+        yield_until_rnode_test(
+            || {
+                scripted
+                    .writes()
+                    .iter()
+                    .any(|write| write == &framed_callsign)
+            },
+            "station-ID beacon did not complete after its advanced deadline",
+        )
+        .await;
+        assert!(!ready.load(Ordering::SeqCst));
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            (payload.len() + callsign.len()) as u64
+        );
+        let writes = scripted.writes();
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|write| *write == &framed_payload)
+                .count(),
+            1
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|write| *write == &framed_callsign)
+                .count(),
+            1
+        );
+        assert!(writes.iter().all(|write| {
+            write == &detect || write == &framed_payload || write == &framed_callsign
+        }));
+
+        finish_rnode_writer(writer).await;
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test(start_paused = true)]
+    async fn test_cancelled_idle_probe_does_not_replay_into_fresh_generation() {
+        let scripted = ScriptedWriter::default();
+        let mut old_context = scripted_writer_context(
+            false,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Duration::from_millis(5),
+        );
+        old_context.idle_probe_interval = Some(Duration::from_millis(80));
+        let old_writer = spawn_rnode_writer(scripted.clone(), old_context);
+
+        yield_to_rnode_tasks().await;
+        tokio::time::advance(Duration::from_millis(30)).await;
+        yield_to_rnode_tasks().await;
+        old_writer.cancel();
+        assert_eq!(
+            finish_rnode_writer(old_writer).await,
+            RNodeWriterFinish::Quiesced
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        yield_to_rnode_tasks().await;
+        assert!(
+            scripted.writes().is_empty(),
+            "cancelled generations cannot leave a deferred probe behind"
+        );
+
+        let mut new_context = scripted_writer_context(
+            false,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Duration::from_millis(5),
+        );
+        new_context.idle_probe_interval = Some(Duration::from_millis(60));
+        let new_writer = spawn_rnode_writer(scripted.clone(), new_context);
+        yield_to_rnode_tasks().await;
+        tokio::time::advance(Duration::from_millis(30)).await;
+        yield_to_rnode_tasks().await;
+        assert!(
+            scripted.writes().is_empty(),
+            "a fresh generation must start with a fresh idle deadline"
+        );
+
+        tokio::time::advance(Duration::from_millis(30)).await;
+        yield_until_rnode_test(
+            || scripted.flush_calls() >= 1,
+            "fresh-generation idle probe did not complete",
+        )
+        .await;
+        assert_eq!(scripted.writes(), vec![build_detect_sequence()]);
+        finish_rnode_writer(new_writer).await;
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
