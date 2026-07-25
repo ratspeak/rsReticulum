@@ -42,10 +42,13 @@ impl Drop for TempDir {
 }
 
 #[cfg(unix)]
-fn write_config(tmp: &TempDir) {
+fn write_config(tmp: &TempDir, enable_transport: bool) {
+    let enable_transport = if enable_transport { "Yes" } else { "No" };
     fs::write(
         tmp.path().join("config"),
-        "[reticulum]\nshare_instance = No\nenable_transport = No\n\n[interfaces]\n",
+        format!(
+            "[reticulum]\nshare_instance = No\nenable_transport = {enable_transport}\n\n[interfaces]\n"
+        ),
     )
     .expect("write config");
 }
@@ -142,7 +145,7 @@ fn assert_signal_exits(
 #[test]
 fn rncp_listener_exits_on_sigint() {
     let tmp = TempDir::new("rncp-sigint");
-    write_config(&tmp);
+    write_config(&tmp, false);
     assert_signal_exits(
         || {
             Command::new(env!("CARGO_BIN_EXE_rncp-rs"))
@@ -166,7 +169,7 @@ fn rncp_listener_exits_on_sigint() {
 #[test]
 fn rnsh_listener_exits_on_sigint() {
     let tmp = TempDir::new("rnsh-sigint");
-    write_config(&tmp);
+    write_config(&tmp, false);
     assert_signal_exits(
         || {
             Command::new(env!("CARGO_BIN_EXE_rnsh-rs"))
@@ -189,7 +192,7 @@ fn rnsh_listener_exits_on_sigint() {
 #[test]
 fn rnsd_flushes_state_and_exits_on_sigterm() {
     let tmp = TempDir::new("rnsd-sigterm");
-    write_config(&tmp);
+    write_config(&tmp, true);
     assert_signal_exits(
         || {
             Command::new(env!("CARGO_BIN_EXE_rnsd-rs"))
@@ -205,7 +208,7 @@ fn rnsd_flushes_state_and_exits_on_sigterm() {
         15,
     );
     assert!(
-        tmp.path().join("storage/packet_hashlist").is_file(),
+        tmp.path().join("storage/packet_hashlist.raw").is_file(),
         "orderly SIGTERM shutdown must flush transport state"
     );
 }
