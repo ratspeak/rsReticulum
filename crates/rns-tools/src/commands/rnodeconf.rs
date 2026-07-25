@@ -14,7 +14,8 @@ use rns_interface::{
     rnode, rnode_admin,
     rnode_capabilities::{
         RNodeCapabilities, RNodeCapabilityParseError, RNodeKnownRadioCapabilities,
-        RNodeRadioCapabilities, RNodeRadioFamily, parse_rnode_capabilities, rnode_product_name,
+        RNodeRadioAdmission, RNodeRadioCapabilities, RNodeRadioFamily, admit_rnode_radio_settings,
+        classify_rnode_radio_capabilities, parse_rnode_capabilities, rnode_product_name,
     },
     rnode_protocol::{
         FREQUENCY_TOLERANCE_HZ, RNodeFirmwareVersion, RNodeProtocolEffect, RNodeProtocolState,
@@ -290,7 +291,11 @@ pub(crate) fn main() -> ExitCode {
     let mut session = SerialFrameSession::new(port);
     if let Some(mutation) = plan.mutation {
         match execute_mutation(&mut session, mutation) {
-            Ok(outcome) => println!("{} ({})", outcome.summary(), outcome.verification.summary()),
+            Ok(outcome) => println!(
+                "{} ({})",
+                outcome.summary(),
+                model_verification_summary(outcome.verification)
+            ),
             Err(error) => {
                 eprintln!("rnodeconf-rs: {error}");
                 return ExitCode::from(1);
@@ -340,27 +345,6 @@ impl std::fmt::Display for MutationError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelVerification {
-    Verified { product: u8, model: u8 },
-    Unverified { product: u8, model: u8 },
-}
-
-impl ModelVerification {
-    fn summary(self) -> String {
-        match self {
-            Self::Verified { product, model } => {
-                format!(
-                    "model-specific limits verified for product 0x{product:02x}, model 0x{model:02x}"
-                )
-            }
-            Self::Unverified { product, model } => format!(
-                "generic RF validation only; model-specific limits unverified for product 0x{product:02x}, model 0x{model:02x}"
-            ),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MutationKind {
     Tnc,
     Normal,
@@ -369,7 +353,7 @@ enum MutationKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MutationOutcome {
     kind: MutationKind,
-    verification: ModelVerification,
+    verification: RNodeRadioAdmission,
 }
 
 impl MutationOutcome {
@@ -378,6 +362,18 @@ impl MutationOutcome {
             MutationKind::Tnc => "TNC startup configuration saved and read back successfully",
             MutationKind::Normal => "Normal startup mode deleted and read back successfully",
         }
+    }
+}
+
+fn model_verification_summary(admission: RNodeRadioAdmission) -> String {
+    let product = admission.product_code();
+    let model = admission.model_code();
+    if admission.is_verified() {
+        format!("model-specific limits verified for product 0x{product:02x}, model 0x{model:02x}")
+    } else {
+        format!(
+            "generic RF validation only; model-specific limits unverified for product 0x{product:02x}, model 0x{model:02x}"
+        )
     }
 }
 
@@ -459,8 +455,8 @@ fn execute_tnc<S: FrameSession>(
     settings: rnode::RNodeRadioSettings,
     preflight: MutationPreflight,
 ) -> Result<MutationOutcome, MutationError> {
-    let verification = gate_model_capabilities(preflight.capabilities, Some(settings))
-        .map_err(MutationError::Failed)?;
+    let verification = admit_rnode_radio_settings(preflight.capabilities, settings)
+        .map_err(|error| MutationError::Failed(error.to_string()))?;
     let target = RNodeProtocolTarget::new(
         settings.frequency,
         settings.bandwidth,
@@ -525,8 +521,7 @@ fn execute_normal<S: FrameSession>(
     session: &mut S,
     preflight: MutationPreflight,
 ) -> Result<MutationOutcome, MutationError> {
-    let verification =
-        gate_model_capabilities(preflight.capabilities, None).map_err(MutationError::Failed)?;
+    let verification = classify_rnode_radio_capabilities(preflight.capabilities);
     let image = persist_then_read(session, rnode::CMD_CONF_DELETE)?;
     if image.radio_config().is_some() {
         return Err(MutationError::PersistenceIndeterminate(
@@ -537,38 +532,6 @@ fn execute_normal<S: FrameSession>(
         kind: MutationKind::Normal,
         verification,
     })
-}
-
-fn gate_model_capabilities(
-    capabilities: RNodeCapabilities,
-    settings: Option<rnode::RNodeRadioSettings>,
-) -> Result<ModelVerification, String> {
-    let product = capabilities.product_code();
-    let model = capabilities.model_code();
-    match capabilities.radio() {
-        RNodeRadioCapabilities::Known(radio) => {
-            if let Some(settings) = settings {
-                if !radio.supports_frequency(settings.frequency) {
-                    return Err(format!(
-                        "frequency {} Hz is outside verified model range {}..={} Hz",
-                        settings.frequency,
-                        radio.min_frequency_hz(),
-                        radio.max_frequency_hz()
-                    ));
-                }
-                if !radio.supports_tx_power(settings.tx_power) {
-                    return Err(format!(
-                        "TX power {} dBm exceeds verified model maximum {} dBm",
-                        settings.tx_power,
-                        radio.max_tx_power_dbm()
-                    ));
-                }
-            }
-            Ok(ModelVerification::Verified { product, model })
-        }
-        RNodeRadioCapabilities::Unknown => Ok(ModelVerification::Unverified { product, model }),
-        _ => Ok(ModelVerification::Unverified { product, model }),
-    }
 }
 
 fn persist_then_read<S: FrameSession>(
@@ -1127,8 +1090,15 @@ mod tests {
         assert_eq!(outcome.kind, MutationKind::Tnc);
         assert!(matches!(
             outcome.verification,
-            ModelVerification::Verified { model: 0xB4, .. }
+            RNodeRadioAdmission::Verified {
+                model_code: 0xB4,
+                ..
+            }
         ));
+        assert_eq!(
+            model_verification_summary(outcome.verification),
+            "model-specific limits verified for product 0x03, model 0xb4"
+        );
         assert_eq!(
             session.commands(),
             vec![
@@ -1389,7 +1359,30 @@ mod tests {
         let unsupported = settings(868_000_000);
         let mut known = ScriptedSession::from_frames(preflight_frames(0xB4));
         let error = execute_mutation(&mut known, MutationPlan::Tnc(unsupported)).unwrap_err();
-        assert!(matches!(error, MutationError::Failed(_)));
+        assert_eq!(
+            error,
+            MutationError::Failed(
+                "frequency 868000000 Hz is outside verified model range 420000000..=520000000 Hz"
+                    .to_string()
+            )
+        );
+        assert_no_save(&known);
+        assert!(
+            known
+                .sent
+                .iter()
+                .all(|request| request.command != rnode::CMD_FREQUENCY)
+        );
+
+        let excessive_power = rnode::RNodeRadioSettings::new(433_000_000, 125_000, 7, 5, 18);
+        let mut known = ScriptedSession::from_frames(preflight_frames(0xB4));
+        let error = execute_mutation(&mut known, MutationPlan::Tnc(excessive_power)).unwrap_err();
+        assert_eq!(
+            error,
+            MutationError::Failed(
+                "TX power 18 dBm exceeds verified model maximum 17 dBm".to_string()
+            )
+        );
         assert_no_save(&known);
         assert!(
             known
@@ -1406,9 +1399,15 @@ mod tests {
         let outcome = execute_mutation(&mut quarantined, MutationPlan::Tnc(unsupported)).unwrap();
         assert!(matches!(
             outcome.verification,
-            ModelVerification::Unverified { model: 0xA6, .. }
+            RNodeRadioAdmission::Unverified {
+                model_code: 0xA6,
+                ..
+            }
         ));
-        assert!(outcome.verification.summary().contains("unverified"));
+        assert_eq!(
+            model_verification_summary(outcome.verification),
+            "generic RF validation only; model-specific limits unverified for product 0x03, model 0xa6"
+        );
     }
 
     #[test]

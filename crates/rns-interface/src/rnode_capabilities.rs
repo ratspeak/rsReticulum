@@ -8,6 +8,8 @@
 
 use md5::{Digest, Md5};
 
+use crate::rnode::{RNodeConfigValidationError, RNodeRadioSettings};
+
 const PRODUCT_ADDRESS: usize = 0x00;
 const MODEL_ADDRESS: usize = 0x01;
 const IDENTITY_CHECKSUM_INPUT_END: usize = 0x0B;
@@ -140,6 +142,58 @@ pub enum RNodeCapabilityParseError {
     ChecksumMismatch,
 }
 
+/// Model-specific classification for a validated RNode capability image.
+///
+/// `Verified` means the exact model has a reviewed capability profile.
+/// `Unverified` means the exact stored model is unknown or quarantined, so no
+/// model profile was inferred. A `Verified` classification alone does not
+/// admit radio settings; use [`admit_rnode_radio_settings`] for that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RNodeRadioAdmission {
+    Verified { product_code: u8, model_code: u8 },
+    Unverified { product_code: u8, model_code: u8 },
+}
+
+impl RNodeRadioAdmission {
+    /// Validated EEPROM product code associated with this admission result.
+    pub const fn product_code(self) -> u8 {
+        match self {
+            Self::Verified { product_code, .. } | Self::Unverified { product_code, .. } => {
+                product_code
+            }
+        }
+    }
+
+    /// Exact, unnormalised EEPROM model code associated with this result.
+    pub const fn model_code(self) -> u8 {
+        match self {
+            Self::Verified { model_code, .. } | Self::Unverified { model_code, .. } => model_code,
+        }
+    }
+
+    /// Whether a reviewed model-specific profile was available.
+    pub const fn is_verified(self) -> bool {
+        matches!(self, Self::Verified { .. })
+    }
+}
+
+/// Typed failure from model-specific RNode radio admission.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RNodeRadioAdmissionError {
+    #[error("generic RNode radio settings are invalid: {0}")]
+    GenericValidation(#[source] RNodeConfigValidationError),
+    #[error("frequency {requested_hz} Hz is outside verified model range {min_hz}..={max_hz} Hz")]
+    FrequencyOutOfRange {
+        requested_hz: u32,
+        min_hz: u32,
+        max_hz: u32,
+    },
+    #[error("TX power {requested_dbm} dBm exceeds verified model maximum {max_dbm} dBm")]
+    TxPowerExceedsMaximum { requested_dbm: u8, max_dbm: u8 },
+}
+
 /// Validate an EEPROM image and retain only non-identifying capability data.
 ///
 /// Validation requires bytes through the identity-information lock at `0x9b`.
@@ -173,6 +227,61 @@ pub fn parse_rnode_capabilities(
         model_code,
         radio,
     })
+}
+
+/// Classify a validated model without admitting radio settings.
+///
+/// `capabilities` can only be obtained from a successfully validated EEPROM
+/// image. Unknown, aliased, ambiguous, and quarantined model codes return
+/// [`RNodeRadioAdmission::Unverified`] without normalisation or an inferred
+/// profile.
+pub fn classify_rnode_radio_capabilities(capabilities: RNodeCapabilities) -> RNodeRadioAdmission {
+    let product_code = capabilities.product_code();
+    let model_code = capabilities.model_code();
+    match capabilities.radio() {
+        RNodeRadioCapabilities::Known(_) => RNodeRadioAdmission::Verified {
+            product_code,
+            model_code,
+        },
+        RNodeRadioCapabilities::Unknown => RNodeRadioAdmission::Unverified {
+            product_code,
+            model_code,
+        },
+    }
+}
+
+/// Apply the sole lower-layer RF admission policy to validated capabilities.
+///
+/// Generic RNode validation runs first. Known exact model codes then enforce
+/// their inclusive frequency range and maximum TX power. Unknown, aliased,
+/// ambiguous, and quarantined model codes continue as an explicit
+/// [`RNodeRadioAdmission::Unverified`] result without normalisation or an
+/// inferred profile.
+pub fn admit_rnode_radio_settings(
+    capabilities: RNodeCapabilities,
+    settings: RNodeRadioSettings,
+) -> Result<RNodeRadioAdmission, RNodeRadioAdmissionError> {
+    settings
+        .validate()
+        .map_err(RNodeRadioAdmissionError::GenericValidation)?;
+
+    if let RNodeRadioCapabilities::Known(radio) = capabilities.radio() {
+        if !radio.supports_frequency(settings.frequency) {
+            return Err(RNodeRadioAdmissionError::FrequencyOutOfRange {
+                requested_hz: settings.frequency,
+                min_hz: radio.min_frequency_hz(),
+                max_hz: radio.max_frequency_hz(),
+            });
+        }
+        if !radio.supports_tx_power(settings.tx_power) {
+            return Err(RNodeRadioAdmissionError::TxPowerExceedsMaximum {
+                requested_dbm: settings.tx_power,
+                max_dbm: radio.max_tx_power_dbm(),
+            });
+        }
+    }
+
+    Ok(classify_rnode_radio_capabilities(capabilities))
 }
 
 /// Return the reviewed display name for an RNode product code.
@@ -420,6 +529,10 @@ mod tests {
         bytes
     }
 
+    fn settings(frequency: u32, tx_power: u8) -> RNodeRadioSettings {
+        RNodeRadioSettings::new(frequency, 125_000, 7, 5, tx_power)
+    }
+
     #[test]
     fn requires_every_byte_through_info_lock() {
         let short = &image(0xA4)[..REQUIRED_EEPROM_LEN - 1];
@@ -519,6 +632,108 @@ mod tests {
         assert!(radio.supports_tx_power(0));
         assert!(radio.supports_tx_power(22));
         assert!(!radio.supports_tx_power(23));
+    }
+
+    #[test]
+    fn known_model_admission_includes_frequency_and_power_boundaries() {
+        let capabilities = parse_rnode_capabilities(&image(0x11)).expect("valid known model");
+
+        assert_eq!(
+            admit_rnode_radio_settings(capabilities, settings(430_000_000, 0)),
+            Ok(RNodeRadioAdmission::Verified {
+                product_code: PRODUCT,
+                model_code: 0x11,
+            })
+        );
+        assert_eq!(
+            admit_rnode_radio_settings(capabilities, settings(510_000_000, 22)),
+            Ok(RNodeRadioAdmission::Verified {
+                product_code: PRODUCT,
+                model_code: 0x11,
+            })
+        );
+        assert_eq!(
+            classify_rnode_radio_capabilities(capabilities),
+            RNodeRadioAdmission::Verified {
+                product_code: PRODUCT,
+                model_code: 0x11,
+            }
+        );
+    }
+
+    #[test]
+    fn known_model_admission_returns_typed_frequency_and_power_mismatches() {
+        let capabilities = parse_rnode_capabilities(&image(0x11)).expect("valid known model");
+
+        for (frequency, expected) in [
+            (
+                429_999_999,
+                RNodeRadioAdmissionError::FrequencyOutOfRange {
+                    requested_hz: 429_999_999,
+                    min_hz: 430_000_000,
+                    max_hz: 510_000_000,
+                },
+            ),
+            (
+                510_000_001,
+                RNodeRadioAdmissionError::FrequencyOutOfRange {
+                    requested_hz: 510_000_001,
+                    min_hz: 430_000_000,
+                    max_hz: 510_000_000,
+                },
+            ),
+        ] {
+            assert_eq!(
+                admit_rnode_radio_settings(capabilities, settings(frequency, 22)),
+                Err(expected)
+            );
+        }
+
+        let error = admit_rnode_radio_settings(capabilities, settings(430_000_000, 23));
+        assert_eq!(
+            error,
+            Err(RNodeRadioAdmissionError::TxPowerExceedsMaximum {
+                requested_dbm: 23,
+                max_dbm: 22,
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_and_quarantined_admission_is_explicitly_unverified() {
+        for model in std::iter::once(0x00).chain(QUARANTINED_MODELS.iter().copied()) {
+            let capabilities =
+                parse_rnode_capabilities(&image(model)).expect("valid identity image");
+            assert_eq!(
+                classify_rnode_radio_capabilities(capabilities),
+                RNodeRadioAdmission::Unverified {
+                    product_code: PRODUCT,
+                    model_code: model,
+                },
+                "model {model:#04x} classification must remain unverified"
+            );
+            assert_eq!(
+                admit_rnode_radio_settings(capabilities, settings(868_000_000, 37)),
+                Ok(RNodeRadioAdmission::Unverified {
+                    product_code: PRODUCT,
+                    model_code: model,
+                }),
+                "model {model:#04x} must remain unverified"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_validation_precedes_known_and_unverified_model_policy() {
+        for model in [0x11, 0xA6] {
+            let capabilities = parse_rnode_capabilities(&image(model)).expect("valid identity");
+            let error = admit_rnode_radio_settings(capabilities, settings(1, 23))
+                .expect_err("model policy must not bypass generic validation");
+            assert!(
+                matches!(error, RNodeRadioAdmissionError::GenericValidation(_)),
+                "model {model:#04x} did not fail generic validation first: {error:?}"
+            );
+        }
     }
 
     #[test]
