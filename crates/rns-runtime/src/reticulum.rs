@@ -11,12 +11,15 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::{Mutex, Notify, mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 
 use crate::config::{Config, ConfigError, ConfigSection};
 use crate::constants::*;
 use crate::interface_factory;
+use crate::interface_registry::{
+    ExactShutdownStart, InterfaceKind, InterfaceRegistration, InterfaceRegistry, InterfaceShutdown,
+    InterfaceShutdownStrategy, ShutdownStart,
+};
 use crate::jobs::{Job, JobScheduler};
 use crate::lifecycle::ShutdownSignal;
 use crate::link_client::LinkClient;
@@ -44,17 +47,9 @@ use rns_transport::messages::{
 static INSTANCE: OnceLock<ReticulumHandle> = OnceLock::new();
 pub const DEFAULT_ANNOUNCE_SUBSCRIPTION_CAPACITY: usize = 128;
 
-/// Spawned interface driver tasks, keyed by `interface_id`. Stash is required:
-/// dropping the JoinHandle only detaches the task, so `teardown_interface`
-/// must abort it explicitly to stop reconnect/read/write loops.
-static INTERFACE_TASKS: OnceLock<std::sync::Mutex<HashMap<u64, JoinHandle<()>>>> = OnceLock::new();
-
-fn interface_tasks() -> &'static std::sync::Mutex<HashMap<u64, JoinHandle<()>>> {
-    INTERFACE_TASKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
 #[derive(Clone)]
 struct InterfaceControlMetadata {
+    registry_owner: u64,
     role: rns_transport::messages::InterfaceRole,
     ingress_overrides: rns_transport::ingress::IngressOverrides,
     // Parent IFAC, inherited by accepted child connections (Python parity:
@@ -101,6 +96,7 @@ pub struct ReticulumHandle {
     /// Used by server-style interfaces to register per-client sub-handles.
     pub handle_tx: mpsc::Sender<rns_interface::traits::InterfaceHandle>,
     interface_controls: InterfaceControlMap,
+    interface_registry: InterfaceRegistry,
     pub socket_base: PathBuf,
     pub config: ReticulumConfig,
     /// Mobile builds throttle tick rates when the app is backgrounded.
@@ -2173,6 +2169,7 @@ pub async fn init_with_options(
     // Sub-interface sink (e.g. TCP per-client).
     let (handle_tx, mut handle_rx) = mpsc::channel::<rns_interface::traits::InterfaceHandle>(64);
     let interface_controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let interface_registry = InterfaceRegistry::default();
 
     let socket_base = socket_dir.clone().unwrap_or_else(std::env::temp_dir);
     let instance_mode = if rc.share_instance {
@@ -2194,6 +2191,7 @@ pub async fn init_with_options(
                             client_handle,
                             &transport_tx,
                             &interface_controls,
+                            &interface_registry,
                             &shutdown,
                             rc.force_shared_instance_bitrate,
                         )
@@ -2225,14 +2223,24 @@ pub async fn init_with_options(
                             &mut server_handle,
                             rc.force_shared_instance_bitrate,
                         );
-                        register_interface_handle_with_role(
+                        match register_interface_handle_with_role(
                             &transport_tx,
                             server_handle,
                             rns_transport::messages::InterfaceRole::SharedServer,
                             &interface_controls,
+                            &interface_registry,
                         )
-                        .await;
-                        InstanceMode::Shared
+                        .await
+                        {
+                            Ok(()) => InstanceMode::Shared,
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    "failed to register shared TCP server interface"
+                                );
+                                InstanceMode::Standalone
+                            }
+                        }
                     }
                     Err(_) => {
                         if detect_shared_tcp_server(rc.shared_instance_port).await {
@@ -2250,6 +2258,7 @@ pub async fn init_with_options(
                                         client_handle,
                                         &transport_tx,
                                         &interface_controls,
+                                        &interface_registry,
                                         &shutdown,
                                         rc.force_shared_instance_bitrate,
                                     )
@@ -2311,6 +2320,7 @@ pub async fn init_with_options(
                             client_handle,
                             &transport_tx,
                             &interface_controls,
+                            &interface_registry,
                             &shutdown,
                             rc.force_shared_instance_bitrate,
                         )
@@ -2339,14 +2349,24 @@ pub async fn init_with_options(
                             &mut server_handle,
                             rc.force_shared_instance_bitrate,
                         );
-                        register_interface_handle_with_role(
+                        match register_interface_handle_with_role(
                             &transport_tx,
                             server_handle,
                             rns_transport::messages::InterfaceRole::SharedServer,
                             &interface_controls,
+                            &interface_registry,
                         )
-                        .await;
-                        InstanceMode::Shared
+                        .await
+                        {
+                            Ok(()) => InstanceMode::Shared,
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    "failed to register shared local server interface"
+                                );
+                                InstanceMode::Standalone
+                            }
+                        }
                     }
                     Err(_) => {
                         let client_config = rns_interface::local::LocalClientConfig {
@@ -2366,6 +2386,7 @@ pub async fn init_with_options(
                                     client_handle,
                                     &transport_tx,
                                     &interface_controls,
+                                    &interface_registry,
                                     &shutdown,
                                     rc.force_shared_instance_bitrate,
                                 )
@@ -2463,34 +2484,44 @@ pub async fn init_with_options(
             )
             .await
             {
-                Ok(iface_handles) => {
-                    for iface_handle in iface_handles {
-                        let registered_id = iface_handle.id;
-                        register_interface_with_post_init(
-                            &transport_tx,
-                            iface_handle,
-                            &post_init,
-                            ifac_key,
-                            &interface_controls,
-                        )
-                        .await;
-                        if let Some(ref cfg) = discovery_config {
-                            discovery_runtime.local_interfaces.lock().await.push(
-                                LocalDiscoveryInterface {
-                                    id: registered_id,
-                                    config: cfg.clone(),
-                                },
-                            );
-                        }
-                        if bootstrap_only {
-                            discovery_runtime
-                                .bootstrap_interfaces
-                                .lock()
-                                .await
-                                .push(registered_id);
+                Ok(iface_handles) => match register_interfaces_with_post_init_batch(
+                    &transport_tx,
+                    iface_handles,
+                    &post_init,
+                    ifac_key,
+                    &interface_controls,
+                    &interface_registry,
+                    interface_kind_for_config(iface_config),
+                )
+                .await
+                {
+                    Ok(registered_ids) => {
+                        for registered_id in registered_ids {
+                            if let Some(ref cfg) = discovery_config {
+                                discovery_runtime.local_interfaces.lock().await.push(
+                                    LocalDiscoveryInterface {
+                                        id: registered_id,
+                                        config: cfg.clone(),
+                                    },
+                                );
+                            }
+                            if bootstrap_only {
+                                discovery_runtime
+                                    .bootstrap_interfaces
+                                    .lock()
+                                    .await
+                                    .push(registered_id);
+                            }
                         }
                     }
-                }
+                    Err(error) if rc.panic_on_interface_error => {
+                        let _ = transport_tx.send(TransportMessage::Shutdown).await;
+                        return Err(ReticulumError::Interface(error.to_string()));
+                    }
+                    Err(error) => {
+                        tracing::warn!("failed to register interface: {error}");
+                    }
+                },
                 Err(e) => {
                     if rc.panic_on_interface_error {
                         let _ = transport_tx.send(TransportMessage::Shutdown).await;
@@ -2506,6 +2537,7 @@ pub async fn init_with_options(
     {
         let reg_tx = transport_tx.clone();
         let reg_controls = interface_controls.clone();
+        let reg_registry = interface_registry.clone();
         let forced_shared_bitrate = rc.force_shared_instance_bitrate;
         tokio::spawn(async move {
             while let Some(mut sub_handle) = handle_rx.recv().await {
@@ -2514,7 +2546,7 @@ pub async fn init_with_options(
                 if role == rns_transport::messages::InterfaceRole::LocalClient {
                     apply_forced_shared_instance_bitrate(&mut sub_handle, forced_shared_bitrate);
                 }
-                register_interface_handle_with_role_and_overrides(
+                if let Err(error) = register_interface_handle_with_role_and_overrides(
                     &reg_tx,
                     sub_handle,
                     role,
@@ -2522,9 +2554,17 @@ pub async fn init_with_options(
                     ifac_key,
                     ifac_size,
                     &reg_controls,
+                    &reg_registry,
+                    InterfaceKind::Standard,
                     false,
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(error = %error, "failed to register accepted child interface");
+                    if matches!(error, InterfaceRegistrationError::TransportClosed { .. }) {
+                        break;
+                    }
+                }
             }
         });
     }
@@ -2537,6 +2577,7 @@ pub async fn init_with_options(
         id_gen: id_gen.clone(),
         handle_tx: handle_tx.clone(),
         interface_controls: interface_controls.clone(),
+        interface_registry: interface_registry.clone(),
         socket_base: socket_base.clone(),
         config: rc.clone(),
         is_foreground,
@@ -2739,6 +2780,18 @@ fn next_id(id_gen: &Arc<AtomicU64>) -> u64 {
     id_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+fn interface_kind_for_config(config: &interface_factory::InterfaceConfig) -> InterfaceKind {
+    match config {
+        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        interface_factory::InterfaceConfig::RNode(_) => InterfaceKind::RNode,
+        #[cfg(feature = "serial")]
+        interface_factory::InterfaceConfig::RNodeMulti(_) => InterfaceKind::RNodeMulti,
+        #[cfg(feature = "ble")]
+        interface_factory::InterfaceConfig::BleRNode(_) => InterfaceKind::BleRNode,
+        _ => InterfaceKind::Standard,
+    }
+}
+
 fn apply_forced_shared_instance_bitrate(
     handle: &mut rns_interface::traits::InterfaceHandle,
     forced_bitrate: Option<u64>,
@@ -2757,19 +2810,25 @@ async fn adopt_shared_instance_client(
     mut client_handle: rns_interface::traits::InterfaceHandle,
     transport_tx: &mpsc::Sender<TransportMessage>,
     interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
     shutdown: &ShutdownSignal,
     forced_bitrate: Option<u64>,
 ) -> InstanceMode {
     apply_forced_shared_instance_bitrate(&mut client_handle, forced_bitrate);
     let client_iface_id = client_handle.id;
     let client_online = client_handle.online.clone();
-    register_interface_handle_with_role(
+    if let Err(error) = register_interface_handle_with_role(
         transport_tx,
         client_handle,
         rns_transport::messages::InterfaceRole::SharedInstancePeer,
         interface_controls,
+        interface_registry,
     )
-    .await;
+    .await
+    {
+        tracing::warn!(error = %error, "failed to register shared-instance client");
+        return InstanceMode::Standalone;
+    }
     spawn_shared_peer_monitor(
         transport_tx.clone(),
         client_iface_id,
@@ -2860,14 +2919,38 @@ async fn register_interface_handle(
     transport_tx: &mpsc::Sender<TransportMessage>,
     handle: rns_interface::traits::InterfaceHandle,
     interface_controls: &InterfaceControlMap,
-) {
-    register_interface_handle_with_role(
+    interface_registry: &InterfaceRegistry,
+) -> Result<(), InterfaceRegistrationError> {
+    register_interface_handle_with_kind(
+        transport_tx,
+        handle,
+        interface_controls,
+        interface_registry,
+        InterfaceKind::Standard,
+    )
+    .await
+}
+
+async fn register_interface_handle_with_kind(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    handle: rns_interface::traits::InterfaceHandle,
+    interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    kind: InterfaceKind,
+) -> Result<(), InterfaceRegistrationError> {
+    register_interface_handle_with_role_and_overrides(
         transport_tx,
         handle,
         rns_transport::messages::InterfaceRole::Normal,
+        rns_transport::ingress::IngressOverrides::default(),
+        None,
+        0,
         interface_controls,
+        interface_registry,
+        kind,
+        false,
     )
-    .await;
+    .await
 }
 
 /// Must use `send().await`, not `try_send`: dropping the registration on a
@@ -2877,7 +2960,8 @@ async fn register_interface_handle_with_role(
     handle: rns_interface::traits::InterfaceHandle,
     role: rns_transport::messages::InterfaceRole,
     interface_controls: &InterfaceControlMap,
-) {
+    interface_registry: &InterfaceRegistry,
+) -> Result<(), InterfaceRegistrationError> {
     register_interface_handle_with_role_and_overrides(
         transport_tx,
         handle,
@@ -2886,9 +2970,11 @@ async fn register_interface_handle_with_role(
         None,
         0,
         interface_controls,
+        interface_registry,
+        InterfaceKind::Standard,
         false,
     )
-    .await;
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2900,22 +2986,67 @@ async fn register_interface_handle_with_role_and_overrides(
     ifac_key: Option<[u8; 64]>,
     ifac_size: usize,
     interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    kind: InterfaceKind,
     multipoint: bool,
-) {
+) -> Result<(), InterfaceRegistrationError> {
+    run_single_registration_worker(
+        transport_tx.clone(),
+        interface_controls.clone(),
+        interface_registry.clone(),
+        SingleRegistrationSpec::Direct {
+            handle,
+            role,
+            ingress_overrides,
+            ifac_key,
+            ifac_size,
+            kind,
+            multipoint,
+        },
+    )
+    .await
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_interface_with_role_and_overrides(
+    handle: rns_interface::traits::InterfaceHandle,
+    role: rns_transport::messages::InterfaceRole,
+    ingress_overrides: rns_transport::ingress::IngressOverrides,
+    ifac_key: Option<[u8; 64]>,
+    ifac_size: usize,
+    interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    kind: InterfaceKind,
+    multipoint: bool,
+) -> Result<PreparedInterfaceRegistration, InterfaceRegistrationError> {
     let name = handle.name.clone();
     let id = handle.id;
     let ingress = ingress_for_role(role, &ingress_overrides);
-    // Stash the driver task so `teardown_interface` can abort it; drop alone only detaches.
-    interface_tasks()
-        .lock()
-        .expect("interface_tasks mutex poisoned")
-        .insert(id, handle.read_task);
+    let online = handle.online.clone();
+    let registration = match interface_registry.reserve_with_online(
+        id,
+        kind,
+        handle.read_task,
+        None,
+        Some(online.clone()),
+    ) {
+        Ok(registration) => registration,
+        Err(rejected) => {
+            online.store(false, Ordering::SeqCst);
+            stop_interface_before_abort(kind, id).await;
+            rejected.abort_and_wait().await;
+            return Err(InterfaceRegistrationError::Duplicate { id });
+        }
+    };
+    let registry_owner = registration.owner();
     interface_controls
         .lock()
         .expect("interface_controls mutex poisoned")
         .insert(
             id,
             InterfaceControlMetadata {
+                registry_owner,
                 role,
                 ingress_overrides: ingress_overrides.clone(),
                 ifac_key,
@@ -2940,7 +3071,7 @@ async fn register_interface_handle_with_role_and_overrides(
         announce_rate_target: None,
         announce_rate_grace: None,
         announce_rate_penalty: None,
-        online: Some(handle.online),
+        online: Some(online.clone()),
         rxb: handle.rxb,
         txb: handle.txb,
         inspection: handle.inspection,
@@ -2953,12 +3084,15 @@ async fn register_interface_handle_with_role_and_overrides(
         recursive_prs: false,
         announces_from_internal: true,
     };
-    if let Err(e) = transport_tx
-        .send(TransportMessage::RegisterInterface { id, entry })
-        .await
-    {
-        tracing::error!(name = %name, id, error = %e, "RegisterInterface failed — transport actor gone");
-    }
+    Ok(PreparedInterfaceRegistration {
+        id,
+        name,
+        kind,
+        online,
+        registry_owner,
+        registration: Some(registration),
+        entry: Some(entry),
+    })
 }
 
 /// See [`register_interface_handle`] for `send().await` rationale.
@@ -2968,7 +3102,53 @@ async fn register_interface_with_post_init(
     post_init: &interface_factory::InterfacePostInit,
     ifac_key: Option<[u8; 64]>,
     interface_controls: &InterfaceControlMap,
-) {
+    interface_registry: &InterfaceRegistry,
+    kind: InterfaceKind,
+) -> Result<(), InterfaceRegistrationError> {
+    run_single_registration_worker(
+        transport_tx.clone(),
+        interface_controls.clone(),
+        interface_registry.clone(),
+        SingleRegistrationSpec::PostInit {
+            handle,
+            post_init: clone_interface_post_init(post_init),
+            ifac_key,
+            kind,
+        },
+    )
+    .await
+    .map(|_| ())
+}
+
+fn clone_interface_post_init(
+    post_init: &interface_factory::InterfacePostInit,
+) -> interface_factory::InterfacePostInit {
+    interface_factory::InterfacePostInit {
+        outgoing: post_init.outgoing,
+        bitrate: post_init.bitrate,
+        announce_cap: post_init.announce_cap,
+        announce_rate_target: post_init.announce_rate_target,
+        announce_rate_grace: post_init.announce_rate_grace,
+        announce_rate_penalty: post_init.announce_rate_penalty,
+        ifac_network_name: post_init.ifac_network_name.clone(),
+        ifac_passphrase: post_init.ifac_passphrase.clone(),
+        ifac_size: post_init.ifac_size,
+        default_ifac_size: post_init.default_ifac_size,
+        ingress_control: post_init.ingress_control,
+        ingress_overrides: post_init.ingress_overrides.clone(),
+        recursive_prs: post_init.recursive_prs,
+        announces_from_internal: post_init.announces_from_internal,
+    }
+}
+
+async fn prepare_interface_with_post_init(
+    handle: rns_interface::traits::InterfaceHandle,
+    post_init: &interface_factory::InterfacePostInit,
+    ifac_key: Option<[u8; 64]>,
+    interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    kind: InterfaceKind,
+) -> Result<PreparedInterfaceRegistration, InterfaceRegistrationError> {
     // Outbound = physical capability AND `outgoing` config flag.
     let direction = rns_transport::constants::InterfaceDirection {
         inbound: handle.direction.inbound,
@@ -2981,16 +3161,30 @@ async fn register_interface_with_post_init(
     };
     let name = handle.name.clone();
     let id = handle.id;
-    interface_tasks()
-        .lock()
-        .expect("interface_tasks mutex poisoned")
-        .insert(id, handle.read_task);
+    let online = handle.online.clone();
+    let registration = match interface_registry.reserve_with_online(
+        id,
+        kind,
+        handle.read_task,
+        None,
+        Some(online.clone()),
+    ) {
+        Ok(registration) => registration,
+        Err(rejected) => {
+            online.store(false, Ordering::SeqCst);
+            stop_interface_before_abort(kind, id).await;
+            rejected.abort_and_wait().await;
+            return Err(InterfaceRegistrationError::Duplicate { id });
+        }
+    };
+    let registry_owner = registration.owner();
     interface_controls
         .lock()
         .expect("interface_controls mutex poisoned")
         .insert(
             id,
             InterfaceControlMetadata {
+                registry_owner,
                 role: rns_transport::messages::InterfaceRole::Normal,
                 ingress_overrides: post_init.ingress_overrides.clone(),
                 ifac_key,
@@ -3012,7 +3206,7 @@ async fn register_interface_with_post_init(
         announce_rate_target: post_init.announce_rate_target.map(|v| v as f64),
         announce_rate_grace: post_init.announce_rate_grace,
         announce_rate_penalty: post_init.announce_rate_penalty.map(|v| v as f64),
-        online: Some(handle.online),
+        online: Some(online.clone()),
         rxb: handle.rxb,
         txb: handle.txb,
         inspection: handle.inspection,
@@ -3023,11 +3217,702 @@ async fn register_interface_with_post_init(
         recursive_prs: post_init.recursive_prs,
         announces_from_internal: post_init.announces_from_internal,
     };
-    if let Err(e) = transport_tx
-        .send(TransportMessage::RegisterInterface { id, entry })
+    Ok(PreparedInterfaceRegistration {
+        id,
+        name,
+        kind,
+        online,
+        registry_owner,
+        registration: Some(registration),
+        entry: Some(entry),
+    })
+}
+
+#[derive(Debug)]
+enum InterfaceRegistrationError {
+    Duplicate { id: u64 },
+    TransportClosed { id: u64 },
+    ReservationLost { id: u64 },
+    WorkerStopped { id: u64 },
+}
+
+impl std::fmt::Display for InterfaceRegistrationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Duplicate { id } => write!(formatter, "duplicate interface ID {id}"),
+            Self::TransportClosed { id } => {
+                write!(
+                    formatter,
+                    "transport closed while registering interface {id}"
+                )
+            }
+            Self::ReservationLost { id } => {
+                write!(formatter, "interface {id} lost its runtime reservation")
+            }
+            Self::WorkerStopped { id } => {
+                write!(formatter, "interface {id} registration worker stopped")
+            }
+        }
+    }
+}
+
+enum SingleRegistrationSpec {
+    Direct {
+        handle: rns_interface::traits::InterfaceHandle,
+        role: rns_transport::messages::InterfaceRole,
+        ingress_overrides: rns_transport::ingress::IngressOverrides,
+        ifac_key: Option<[u8; 64]>,
+        ifac_size: usize,
+        kind: InterfaceKind,
+        multipoint: bool,
+    },
+    PostInit {
+        handle: rns_interface::traits::InterfaceHandle,
+        post_init: interface_factory::InterfacePostInit,
+        ifac_key: Option<[u8; 64]>,
+        kind: InterfaceKind,
+    },
+}
+
+impl SingleRegistrationSpec {
+    fn id(&self) -> u64 {
+        match self {
+            Self::Direct { handle, .. } | Self::PostInit { handle, .. } => handle.id,
+        }
+    }
+}
+
+struct RegistrationCancelGuard {
+    sender: Option<oneshot::Sender<()>>,
+}
+
+impl RegistrationCancelGuard {
+    fn disarm(mut self) {
+        self.sender.take();
+    }
+}
+
+impl Drop for RegistrationCancelGuard {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+struct RegistrationCancellation {
+    receiver: oneshot::Receiver<()>,
+}
+
+impl RegistrationCancellation {
+    async fn send_register(
+        &mut self,
+        transport_tx: &mpsc::Sender<TransportMessage>,
+        message: TransportMessage,
+        interface_registry: &InterfaceRegistry,
+        reservation_tokens: &[(u64, u64)],
+    ) -> Result<(), RegistrationSendError> {
+        tokio::select! {
+            biased;
+            _ = &mut self.receiver => Err(RegistrationSendError::Cancelled),
+            _ = interface_registry.wait_for_any_cancel_requested(reservation_tokens) => {
+                Err(RegistrationSendError::Cancelled)
+            }
+            result = transport_tx.send(message) => {
+                result.map_err(|_| RegistrationSendError::TransportClosed)
+            }
+        }
+    }
+
+    fn is_cancelled(&mut self) -> bool {
+        match self.receiver.try_recv() {
+            Ok(()) | Err(oneshot::error::TryRecvError::Closed) => true,
+            Err(oneshot::error::TryRecvError::Empty) => false,
+        }
+    }
+}
+
+enum RegistrationSendError {
+    Cancelled,
+    TransportClosed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CommittedInterfaceToken {
+    id: u64,
+    registry_owner: u64,
+}
+
+struct RegistrationWorkerReply {
+    result: Result<Vec<CommittedInterfaceToken>, InterfaceRegistrationError>,
+    acknowledgement: Option<oneshot::Sender<()>>,
+}
+
+struct PreparedInterfaceRegistration {
+    id: u64,
+    name: String,
+    kind: InterfaceKind,
+    online: Arc<AtomicBool>,
+    registry_owner: u64,
+    registration: Option<InterfaceRegistration>,
+    entry: Option<rns_transport::messages::InterfaceEntry>,
+}
+
+async fn run_single_registration_worker(
+    transport_tx: mpsc::Sender<TransportMessage>,
+    interface_controls: InterfaceControlMap,
+    interface_registry: InterfaceRegistry,
+    spec: SingleRegistrationSpec,
+) -> Result<Vec<u64>, InterfaceRegistrationError> {
+    let id = spec.id();
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let cancel_guard = RegistrationCancelGuard {
+        sender: Some(cancel_tx),
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tokio::spawn(single_registration_worker(
+        transport_tx,
+        interface_controls,
+        interface_registry,
+        spec,
+        RegistrationCancellation {
+            receiver: cancel_rx,
+        },
+        reply_tx,
+    ));
+
+    let mut reply = match reply_rx.await {
+        Ok(reply) => reply,
+        Err(_) => return Err(InterfaceRegistrationError::WorkerStopped { id }),
+    };
+    let result = reply.result;
+    if let Some(acknowledgement) = reply.acknowledgement.take() {
+        let _ = acknowledgement.send(());
+    }
+    cancel_guard.disarm();
+    result.map(|tokens| tokens.into_iter().map(|token| token.id).collect())
+}
+
+async fn single_registration_worker(
+    transport_tx: mpsc::Sender<TransportMessage>,
+    interface_controls: InterfaceControlMap,
+    interface_registry: InterfaceRegistry,
+    spec: SingleRegistrationSpec,
+    mut cancellation: RegistrationCancellation,
+    reply_tx: oneshot::Sender<RegistrationWorkerReply>,
+) {
+    let result = match spec {
+        SingleRegistrationSpec::Direct {
+            handle,
+            role,
+            ingress_overrides,
+            ifac_key,
+            ifac_size,
+            kind,
+            multipoint,
+        } => {
+            match prepare_interface_with_role_and_overrides(
+                handle,
+                role,
+                ingress_overrides,
+                ifac_key,
+                ifac_size,
+                &interface_controls,
+                &interface_registry,
+                kind,
+                multipoint,
+            )
+            .await
+            {
+                Ok(prepared) => publish_prepared_interface(
+                    &transport_tx,
+                    &interface_controls,
+                    &interface_registry,
+                    prepared,
+                    &mut cancellation,
+                )
+                .await
+                .map(|token| vec![token]),
+                Err(error) => Err(error),
+            }
+        }
+        SingleRegistrationSpec::PostInit {
+            handle,
+            post_init,
+            ifac_key,
+            kind,
+        } => {
+            match prepare_interface_with_post_init(
+                handle,
+                &post_init,
+                ifac_key,
+                &interface_controls,
+                &interface_registry,
+                kind,
+            )
+            .await
+            {
+                Ok(prepared) => publish_prepared_interface(
+                    &transport_tx,
+                    &interface_controls,
+                    &interface_registry,
+                    prepared,
+                    &mut cancellation,
+                )
+                .await
+                .map(|token| vec![token]),
+                Err(error) => Err(error),
+            }
+        }
+    };
+    finish_registration_worker(
+        result,
+        transport_tx,
+        interface_controls,
+        interface_registry,
+        cancellation,
+        reply_tx,
+    )
+    .await;
+}
+
+async fn finish_registration_worker(
+    result: Result<Vec<CommittedInterfaceToken>, InterfaceRegistrationError>,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    interface_controls: InterfaceControlMap,
+    interface_registry: InterfaceRegistry,
+    mut cancellation: RegistrationCancellation,
+    reply_tx: oneshot::Sender<RegistrationWorkerReply>,
+) {
+    let Ok(ids) = result else {
+        let _ = reply_tx.send(RegistrationWorkerReply {
+            result,
+            acknowledgement: None,
+        });
+        return;
+    };
+
+    let cleanup_ids = ids.clone();
+    let (ack_tx, mut ack_rx) = oneshot::channel();
+    if reply_tx
+        .send(RegistrationWorkerReply {
+            result: Ok(ids),
+            acknowledgement: Some(ack_tx),
+        })
+        .is_err()
+    {
+        cleanup_committed_interfaces(
+            &transport_tx,
+            &interface_controls,
+            &interface_registry,
+            cleanup_ids,
+        )
+        .await;
+        return;
+    }
+
+    let acknowledged = tokio::select! {
+        biased;
+        result = &mut ack_rx => result.is_ok(),
+        _ = &mut cancellation.receiver => false,
+    };
+    if !acknowledged {
+        cleanup_committed_interfaces(
+            &transport_tx,
+            &interface_controls,
+            &interface_registry,
+            cleanup_ids,
+        )
+        .await;
+    }
+}
+
+async fn publish_prepared_interface(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    mut prepared: PreparedInterfaceRegistration,
+    cancellation: &mut RegistrationCancellation,
+) -> Result<CommittedInterfaceToken, InterfaceRegistrationError> {
+    let id = prepared.id;
+    let reservation_token = [(prepared.id, prepared.registry_owner)];
+    let entry = prepared
+        .entry
+        .take()
+        .expect("prepared interface owns an entry");
+    match cancellation
+        .send_register(
+            transport_tx,
+            TransportMessage::RegisterInterface { id, entry },
+            interface_registry,
+            &reservation_token,
+        )
         .await
     {
-        tracing::error!(name = %name, id, error = %e, "RegisterInterface failed — transport actor gone");
+        Ok(()) => {}
+        Err(RegistrationSendError::Cancelled) => {
+            rollback_prepared_interface(interface_controls, prepared).await;
+            return Err(InterfaceRegistrationError::ReservationLost { id });
+        }
+        Err(RegistrationSendError::TransportClosed) => {
+            tracing::error!(
+                name = %prepared.name,
+                id,
+                "RegisterInterface failed — transport actor gone"
+            );
+            rollback_prepared_interface(interface_controls, prepared).await;
+            return Err(InterfaceRegistrationError::TransportClosed { id });
+        }
+    }
+
+    let registration = prepared
+        .registration
+        .take()
+        .expect("prepared interface owns a reservation");
+    if cancellation.is_cancelled() {
+        prepared.registration = Some(registration);
+        rollback_published_interfaces(transport_tx, interface_controls, vec![prepared]).await;
+        return Err(InterfaceRegistrationError::ReservationLost { id });
+    }
+    if let Err(registration) = registration.commit() {
+        prepared.registration = Some(registration);
+        rollback_published_interfaces(transport_tx, interface_controls, vec![prepared]).await;
+        return Err(InterfaceRegistrationError::ReservationLost { id });
+    }
+    Ok(CommittedInterfaceToken {
+        id,
+        registry_owner: prepared.registry_owner,
+    })
+}
+
+async fn rollback_prepared_interface(
+    interface_controls: &InterfaceControlMap,
+    mut prepared: PreparedInterfaceRegistration,
+) {
+    prepared.online.store(false, Ordering::SeqCst);
+    remove_interface_control_if_owner(interface_controls, prepared.id, prepared.registry_owner);
+    stop_interface_before_abort(prepared.kind, prepared.id).await;
+    if let Some(registration) = prepared.registration.take() {
+        registration.rollback().await;
+    }
+}
+
+async fn rollback_published_interfaces(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    interface_controls: &InterfaceControlMap,
+    mut prepared: Vec<PreparedInterfaceRegistration>,
+) {
+    // Stop and join every exact task before the actor can observe a
+    // deregistration for a potentially reusable ID.
+    for interface in &mut prepared {
+        interface.online.store(false, Ordering::SeqCst);
+        remove_interface_control_if_owner(
+            interface_controls,
+            interface.id,
+            interface.registry_owner,
+        );
+        stop_interface_before_abort(interface.kind, interface.id).await;
+        if let Some(registration) = interface.registration.as_mut() {
+            registration.stop_task_and_wait().await;
+        }
+    }
+
+    for mut interface in prepared {
+        let deregistered = transport_tx
+            .send(TransportMessage::DeregisterInterface { id: interface.id })
+            .await
+            .is_ok();
+        if deregistered {
+            if let Some(registration) = interface.registration.take() {
+                registration.release();
+            }
+        }
+        // A closed actor leaves the Pending cancellation tombstone in place;
+        // same-ID reuse is unsafe because the stale registration cannot be
+        // ordered before a replacement.
+    }
+}
+
+async fn register_interfaces_with_post_init_batch(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    handles: Vec<rns_interface::traits::InterfaceHandle>,
+    post_init: &interface_factory::InterfacePostInit,
+    ifac_key: Option<[u8; 64]>,
+    interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    kind: InterfaceKind,
+) -> Result<Vec<u64>, InterfaceRegistrationError> {
+    let fallback_id = handles.first().map_or(0, |handle| handle.id);
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let cancel_guard = RegistrationCancelGuard {
+        sender: Some(cancel_tx),
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tokio::spawn(batch_registration_worker(
+        transport_tx.clone(),
+        handles,
+        clone_interface_post_init(post_init),
+        ifac_key,
+        interface_controls.clone(),
+        interface_registry.clone(),
+        kind,
+        RegistrationCancellation {
+            receiver: cancel_rx,
+        },
+        reply_tx,
+    ));
+
+    let mut reply = match reply_rx.await {
+        Ok(reply) => reply,
+        Err(_) => {
+            return Err(InterfaceRegistrationError::WorkerStopped { id: fallback_id });
+        }
+    };
+    let result = reply.result;
+    if let Some(acknowledgement) = reply.acknowledgement.take() {
+        let _ = acknowledgement.send(());
+    }
+    cancel_guard.disarm();
+    result.map(|tokens| tokens.into_iter().map(|token| token.id).collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn batch_registration_worker(
+    transport_tx: mpsc::Sender<TransportMessage>,
+    handles: Vec<rns_interface::traits::InterfaceHandle>,
+    post_init: interface_factory::InterfacePostInit,
+    ifac_key: Option<[u8; 64]>,
+    interface_controls: InterfaceControlMap,
+    interface_registry: InterfaceRegistry,
+    kind: InterfaceKind,
+    mut cancellation: RegistrationCancellation,
+    reply_tx: oneshot::Sender<RegistrationWorkerReply>,
+) {
+    let result = register_interfaces_with_post_init_batch_transaction(
+        &transport_tx,
+        handles,
+        &post_init,
+        ifac_key,
+        &interface_controls,
+        &interface_registry,
+        kind,
+        &mut cancellation,
+    )
+    .await;
+    finish_registration_worker(
+        result,
+        transport_tx,
+        interface_controls,
+        interface_registry,
+        cancellation,
+        reply_tx,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn register_interfaces_with_post_init_batch_transaction(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    handles: Vec<rns_interface::traits::InterfaceHandle>,
+    post_init: &interface_factory::InterfacePostInit,
+    ifac_key: Option<[u8; 64]>,
+    interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    kind: InterfaceKind,
+    cancellation: &mut RegistrationCancellation,
+) -> Result<Vec<CommittedInterfaceToken>, InterfaceRegistrationError> {
+    let mut prepared = Vec::with_capacity(handles.len());
+    let mut handles = handles.into_iter();
+    while let Some(handle) = handles.next() {
+        match prepare_interface_with_post_init(
+            handle,
+            post_init,
+            ifac_key,
+            interface_controls,
+            interface_registry,
+            kind,
+        )
+        .await
+        {
+            Ok(registration) => prepared.push(registration),
+            Err(error) => {
+                for registration in prepared {
+                    rollback_prepared_interface(interface_controls, registration).await;
+                }
+                for handle in handles {
+                    rollback_unreserved_interface(handle, kind).await;
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    if cancellation.is_cancelled() {
+        for registration in prepared {
+            rollback_prepared_interface(interface_controls, registration).await;
+        }
+        return Err(InterfaceRegistrationError::ReservationLost { id: 0 });
+    }
+
+    let reservation_tokens: Vec<(u64, u64)> = prepared
+        .iter()
+        .map(|interface| (interface.id, interface.registry_owner))
+        .collect();
+    let mut sent_ids = Vec::with_capacity(prepared.len());
+    for registration in &mut prepared {
+        let entry = registration
+            .entry
+            .take()
+            .expect("prepared interface owns an entry");
+        let send_result = cancellation
+            .send_register(
+                transport_tx,
+                TransportMessage::RegisterInterface {
+                    id: registration.id,
+                    entry,
+                },
+                interface_registry,
+                &reservation_tokens,
+            )
+            .await;
+        if let Err(send_error) = send_result {
+            let failed_id = registration.id;
+            rollback_batch_interfaces(transport_tx, interface_controls, prepared, &sent_ids).await;
+            return Err(match send_error {
+                RegistrationSendError::Cancelled => {
+                    InterfaceRegistrationError::ReservationLost { id: failed_id }
+                }
+                RegistrationSendError::TransportClosed => {
+                    InterfaceRegistrationError::TransportClosed { id: failed_id }
+                }
+            });
+        }
+        sent_ids.push(registration.id);
+    }
+
+    if cancellation.is_cancelled() {
+        let failed_id = sent_ids.first().copied().unwrap_or(0);
+        rollback_batch_interfaces(transport_tx, interface_controls, prepared, &sent_ids).await;
+        return Err(InterfaceRegistrationError::ReservationLost { id: failed_id });
+    }
+
+    let committed_tokens: Vec<CommittedInterfaceToken> = prepared
+        .iter()
+        .map(|interface| CommittedInterfaceToken {
+            id: interface.id,
+            registry_owner: interface.registry_owner,
+        })
+        .collect();
+    let reservations = prepared
+        .iter_mut()
+        .map(|registration| {
+            registration
+                .registration
+                .take()
+                .expect("prepared interface owns a reservation")
+        })
+        .collect();
+    if let Err(reservations) = interface_registry.commit_batch(reservations) {
+        for (prepared, reservation) in prepared.iter_mut().zip(reservations) {
+            prepared.registration = Some(reservation);
+        }
+        let failed_id = prepared.first().map_or(0, |registration| registration.id);
+        rollback_batch_interfaces(transport_tx, interface_controls, prepared, &sent_ids).await;
+        return Err(InterfaceRegistrationError::ReservationLost { id: failed_id });
+    }
+
+    Ok(committed_tokens)
+}
+
+async fn rollback_batch_interfaces(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    interface_controls: &InterfaceControlMap,
+    mut prepared: Vec<PreparedInterfaceRegistration>,
+    published_ids: &[u64],
+) {
+    for interface in &mut prepared {
+        interface.online.store(false, Ordering::SeqCst);
+        remove_interface_control_if_owner(
+            interface_controls,
+            interface.id,
+            interface.registry_owner,
+        );
+        stop_interface_before_abort(interface.kind, interface.id).await;
+        if let Some(registration) = interface.registration.as_mut() {
+            registration.stop_task_and_wait().await;
+        }
+    }
+
+    for mut interface in prepared {
+        let published = published_ids.contains(&interface.id);
+        let safe_to_release = !published
+            || transport_tx
+                .send(TransportMessage::DeregisterInterface { id: interface.id })
+                .await
+                .is_ok();
+        if safe_to_release {
+            if let Some(registration) = interface.registration.take() {
+                registration.release();
+            }
+        }
+    }
+}
+
+async fn rollback_unreserved_interface(
+    handle: rns_interface::traits::InterfaceHandle,
+    kind: InterfaceKind,
+) {
+    handle.online.store(false, Ordering::SeqCst);
+    stop_interface_before_abort(kind, handle.id).await;
+    handle.read_task.abort();
+    let _ = handle.read_task.await;
+}
+
+async fn stop_interface_before_abort(kind: InterfaceKind, _id: u64) {
+    match kind.shutdown_strategy() {
+        InterfaceShutdownStrategy::Abort => {}
+        #[cfg(feature = "ble")]
+        InterfaceShutdownStrategy::StopBlePeer => {
+            rns_interface::ble_peer::stop_ble_peer_interface().await;
+        }
+        #[cfg(feature = "ble")]
+        InterfaceShutdownStrategy::StopBleRNodeCompatibility => {
+            rns_interface::ble_rnode::stop_ble_rnode_interface(_id);
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        }
+        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        InterfaceShutdownStrategy::StopRNodeCompatibility => {
+            rns_interface::rnode::stop_rnode_interface(_id);
+            tokio::time::sleep(Duration::from_millis(700)).await;
+        }
+        #[cfg(target_os = "android")]
+        InterfaceShutdownStrategy::StopAndroidUsbRNodeCompatibility => {
+            if let Err(error) =
+                rns_interface::android_usb::stop_android_usb_rnode_interface_and_wait(_id).await
+            {
+                tracing::warn!(
+                    id = _id,
+                    error = %error,
+                    "Android USB registration rollback completed with errors"
+                );
+            }
+        }
+    }
+}
+
+fn remove_interface_control_if_owner(
+    interface_controls: &InterfaceControlMap,
+    id: u64,
+    registry_owner: u64,
+) {
+    let mut controls = interface_controls
+        .lock()
+        .expect("interface_controls mutex poisoned");
+    if controls
+        .get(&id)
+        .is_some_and(|control| control.registry_owner == registry_owner)
+    {
+        controls.remove(&id);
     }
 }
 
@@ -3729,8 +4614,11 @@ async fn spawn_discovered_backbone_client(
         &post_init,
         ifac_key,
         &handle.interface_controls,
+        &handle.interface_registry,
+        InterfaceKind::Standard,
     )
-    .await;
+    .await
+    .map_err(|error| format!("Backbone client registration failed: {error}"))?;
     tracing::info!(name = %name, id, endpoint = %format!("{host}:{port}"), "auto-connected discovered interface");
     Ok(id)
 }
@@ -4020,15 +4908,20 @@ pub async fn spawn_tcp_client_runtime_with_ifac(
             &post_init,
             ifac_key,
             &handle.interface_controls,
+            &handle.interface_registry,
+            InterfaceKind::Standard,
         )
-        .await;
+        .await
+        .map_err(|error| format!("TCP client registration failed: {error}"))?;
     } else {
         register_interface_handle(
             &handle.transport_tx,
             iface_handle,
             &handle.interface_controls,
+            &handle.interface_registry,
         )
-        .await;
+        .await
+        .map_err(|error| format!("TCP client registration failed: {error}"))?;
     }
     tracing::info!(name = %name, id, "runtime TCP client interface spawned");
     Ok(id)
@@ -4074,15 +4967,20 @@ pub async fn spawn_tcp_server_runtime_with_ifac(
             &post_init,
             ifac_key,
             &handle.interface_controls,
+            &handle.interface_registry,
+            InterfaceKind::Standard,
         )
-        .await;
+        .await
+        .map_err(|error| format!("TCP server registration failed: {error}"))?;
     } else {
         register_interface_handle(
             &handle.transport_tx,
             iface_handle,
             &handle.interface_controls,
+            &handle.interface_registry,
         )
-        .await;
+        .await
+        .map_err(|error| format!("TCP server registration failed: {error}"))?;
     }
     tracing::info!(name = %name, id, "runtime TCP server interface spawned");
     Ok(id)
@@ -4146,15 +5044,20 @@ pub async fn spawn_backbone_client_runtime_with_ifac(
             &post_init,
             ifac_key,
             &handle.interface_controls,
+            &handle.interface_registry,
+            InterfaceKind::Standard,
         )
-        .await;
+        .await
+        .map_err(|error| format!("Backbone client registration failed: {error}"))?;
     } else {
         register_interface_handle(
             &handle.transport_tx,
             iface_handle,
             &handle.interface_controls,
+            &handle.interface_registry,
         )
-        .await;
+        .await
+        .map_err(|error| format!("Backbone client registration failed: {error}"))?;
     }
     tracing::info!(name = %runtime_config.name, id, "runtime Backbone client interface spawned");
     Ok(id)
@@ -4216,15 +5119,20 @@ pub async fn spawn_backbone_server_runtime_with_ifac(
             &post_init,
             ifac_key,
             &handle.interface_controls,
+            &handle.interface_registry,
+            InterfaceKind::Standard,
         )
-        .await;
+        .await
+        .map_err(|error| format!("Backbone server registration failed: {error}"))?;
     } else {
         register_interface_handle(
             &handle.transport_tx,
             iface_handle,
             &handle.interface_controls,
+            &handle.interface_registry,
         )
-        .await;
+        .await
+        .map_err(|error| format!("Backbone server registration failed: {error}"))?;
     }
     tracing::info!(name = %name, id, "runtime Backbone server interface spawned");
     Ok(id)
@@ -4301,12 +5209,15 @@ pub async fn spawn_ble_rnode_runtime(
     .map_err(|e| format!("BLE RNode spawn failed: {e}"))?;
 
     let online = iface_handle.online.clone();
-    register_interface_handle(
+    register_interface_handle_with_kind(
         &handle.transport_tx,
         iface_handle,
         &handle.interface_controls,
+        &handle.interface_registry,
+        InterfaceKind::BleRNode,
     )
-    .await;
+    .await
+    .map_err(|error| format!("BLE RNode registration failed: {error}"))?;
     tracing::info!(name = %name, id, "runtime BLE RNode interface spawned");
     Ok((id, online))
 }
@@ -4382,12 +5293,15 @@ pub async fn spawn_rnode_runtime(
             .map_err(|e| format!("RNode spawn failed: {e}"))?;
 
     let online = iface_handle.online.clone();
-    register_interface_handle(
+    register_interface_handle_with_kind(
         &handle.transport_tx,
         iface_handle,
         &handle.interface_controls,
+        &handle.interface_registry,
+        InterfaceKind::RNode,
     )
-    .await;
+    .await
+    .map_err(|error| format!("RNode registration failed: {error}"))?;
     tracing::info!(name = %name, id, "runtime RNode interface spawned");
     Ok((id, online))
 }
@@ -4437,12 +5351,15 @@ pub async fn spawn_ble_rnode_runtime_native(
     .map_err(|e| format!("BLE RNode native spawn failed: {e}"))?;
 
     let online = iface_handle.online.clone();
-    register_interface_handle(
+    register_interface_handle_with_kind(
         &handle.transport_tx,
         iface_handle,
         &handle.interface_controls,
+        &handle.interface_registry,
+        InterfaceKind::BleRNode,
     )
-    .await;
+    .await
+    .map_err(|error| format!("BLE RNode native registration failed: {error}"))?;
     tracing::info!(name = %name, id, tcp_port, "runtime BLE RNode interface spawned (native bridge)");
     Ok((id, online))
 }
@@ -4469,8 +5386,10 @@ pub async fn spawn_auto_interface_runtime_with_config(
         &handle.transport_tx,
         iface_handle,
         &handle.interface_controls,
+        &handle.interface_registry,
     )
-    .await;
+    .await
+    .map_err(|error| format!("Auto interface registration failed: {error}"))?;
     tracing::info!(name = %name, id, "runtime Auto interface spawned");
     Ok(id)
 }
@@ -4539,9 +5458,12 @@ pub async fn spawn_ble_peer_runtime(
         None,
         0,
         &handle.interface_controls,
+        &handle.interface_registry,
+        InterfaceKind::BlePeer,
         true,
     )
-    .await;
+    .await
+    .map_err(|error| format!("BLE Peer registration failed: {error}"))?;
     tracing::info!(name = %name, id, "runtime BLE Peer mesh interface spawned");
     Ok(id)
 }
@@ -4554,7 +5476,6 @@ pub fn teardown_ble_peer_events() {
 /// Stop peripheral (advertising + GATT server), clear dispatcher, deregister.
 #[cfg(feature = "ble")]
 pub async fn teardown_ble_peer_interface(handle: &ReticulumHandle, id: u64) {
-    rns_interface::ble_peer::stop_ble_peer_interface().await;
     teardown_interface(handle, id).await;
 }
 
@@ -4562,8 +5483,6 @@ pub async fn teardown_ble_peer_interface(handle: &ReticulumHandle, id: u64) {
 /// interfaces coexist, each with its own `AtomicBool`); idempotent.
 #[cfg(feature = "ble")]
 pub async fn teardown_ble_rnode_interface(handle: &ReticulumHandle, id: u64) {
-    rns_interface::ble_rnode::stop_ble_rnode_interface(id);
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
     teardown_interface(handle, id).await;
 }
 
@@ -4571,8 +5490,6 @@ pub async fn teardown_ble_rnode_interface(handle: &ReticulumHandle, id: u64) {
 /// interface deregistration aborts the driver task.
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 pub async fn teardown_rnode_interface(handle: &ReticulumHandle, id: u64) {
-    rns_interface::rnode::stop_rnode_interface(id);
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
     teardown_interface(handle, id).await;
 }
 
@@ -4613,53 +5530,165 @@ pub async fn spawn_android_usb_rnode_runtime(
     .await
     .map_err(|e| format!("Android USB spawn failed: {e}"))?;
 
-    register_interface_handle(
+    register_interface_handle_with_kind(
         &handle.transport_tx,
         iface_handle,
         &handle.interface_controls,
+        &handle.interface_registry,
+        InterfaceKind::AndroidUsbRNode,
     )
-    .await;
+    .await
+    .map_err(|error| format!("Android USB registration failed: {error}"))?;
     tracing::info!(name = %name, id, "runtime Android USB RNode interface spawned");
     Ok(id)
 }
 
 #[cfg(target_os = "android")]
 pub async fn teardown_android_usb_rnode_interface(handle: &ReticulumHandle, id: u64) {
-    if let Err(error) =
-        rns_interface::android_usb::stop_android_usb_rnode_interface_and_wait(id).await
-    {
-        tracing::warn!(
-            id,
-            error = %error,
-            "Android USB owner shutdown completed with errors"
-        );
-    }
     teardown_interface(handle, id).await;
 }
 
 pub async fn teardown_interface(handle: &ReticulumHandle, id: u64) {
-    // Abort the driver task FIRST so loops stop accepting traffic; then
-    // deregister so the dropped tx cascades through writer/forwarder.
-    // Order matters: dereg-first would let the master task reconnect once
-    // before the abort lands.
-    if let Some(task) = interface_tasks()
-        .lock()
-        .expect("interface_tasks mutex poisoned")
-        .remove(&id)
-    {
-        task.abort();
-        tracing::debug!(id, "interface driver task aborted");
-    }
-    handle
-        .interface_controls
-        .lock()
-        .expect("interface_controls mutex poisoned")
-        .remove(&id);
-    let _ = handle
-        .transport_tx
-        .send(TransportMessage::DeregisterInterface { id })
+    let transport_tx = handle.transport_tx.clone();
+    let interface_controls = handle.interface_controls.clone();
+    let interface_registry = handle.interface_registry.clone();
+    let (done_tx, done_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        teardown_interface_transaction(&transport_tx, &interface_controls, &interface_registry, id)
+            .await;
+        let _ = done_tx.send(());
+    });
+    let _ = done_rx.await;
+}
+
+async fn cleanup_committed_interfaces(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    tokens: Vec<CommittedInterfaceToken>,
+) {
+    for token in tokens {
+        teardown_interface_exact_transaction(
+            transport_tx,
+            interface_controls,
+            interface_registry,
+            token,
+        )
         .await;
-    tracing::info!(id, "interface deregistered");
+    }
+}
+
+async fn teardown_interface_exact_transaction(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    token: CommittedInterfaceToken,
+) {
+    let shutdown = match interface_registry.begin_shutdown_exact(token.id, token.registry_owner) {
+        ExactShutdownStart::Acquired(shutdown) => shutdown,
+        ExactShutdownStart::AlreadyStopping => {
+            interface_registry
+                .wait_until_not_owner(token.id, token.registry_owner)
+                .await;
+            return;
+        }
+        ExactShutdownStart::NotOwned => return,
+    };
+    finish_interface_shutdown(transport_tx, interface_controls, token.id, shutdown).await;
+}
+
+async fn teardown_interface_transaction(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    id: u64,
+) {
+    let shutdown = match interface_registry.begin_shutdown(id) {
+        ShutdownStart::Acquired(shutdown) => shutdown,
+        ShutdownStart::RegistrationPending { owner } => {
+            tracing::debug!(
+                id,
+                "interface registration is pending; waiting for cancellation rollback"
+            );
+            interface_registry.wait_until_not_owner(id, owner).await;
+            return;
+        }
+        ShutdownStart::AlreadyStopping { owner } => {
+            tracing::debug!(id, "interface teardown is in progress; waiting");
+            interface_registry.wait_until_not_owner(id, owner).await;
+            return;
+        }
+    };
+    finish_interface_shutdown(transport_tx, interface_controls, id, shutdown).await;
+}
+
+async fn finish_interface_shutdown(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    interface_controls: &InterfaceControlMap,
+    id: u64,
+    mut shutdown: InterfaceShutdown,
+) {
+    tracing::debug!(id, kind = ?shutdown.kind(), "stopping owned interface");
+    shutdown.mark_offline();
+    // Compatibility ID lookups remain transitional in R6b. The exact local
+    // lease is acquired first, so an unknown/non-owned ID never reaches them.
+    match shutdown.strategy() {
+        InterfaceShutdownStrategy::Abort => {}
+        #[cfg(feature = "ble")]
+        InterfaceShutdownStrategy::StopBlePeer => {
+            rns_interface::ble_peer::stop_ble_peer_interface().await;
+        }
+        #[cfg(feature = "ble")]
+        InterfaceShutdownStrategy::StopBleRNodeCompatibility => {
+            rns_interface::ble_rnode::stop_ble_rnode_interface(id);
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        }
+        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        InterfaceShutdownStrategy::StopRNodeCompatibility => {
+            rns_interface::rnode::stop_rnode_interface(id);
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        }
+        #[cfg(target_os = "android")]
+        InterfaceShutdownStrategy::StopAndroidUsbRNodeCompatibility => {
+            if let Err(error) =
+                rns_interface::android_usb::stop_android_usb_rnode_interface_and_wait(id).await
+            {
+                tracing::warn!(
+                    id,
+                    error = %error,
+                    "Android USB owner shutdown completed with errors"
+                );
+            }
+        }
+    }
+
+    // Stop the exact owned task before deregistering; deregister-first can let
+    // reconnect loops run once more before cancellation lands.
+    shutdown.stop_task_and_wait().await;
+    if let Some(control_owner) = shutdown.control_owner() {
+        remove_interface_control_if_owner(interface_controls, id, control_owner);
+    } else {
+        // An orphan tombstone cannot share the stale control's owner token.
+        // The tombstone blocks replacement until this deregistration is
+        // ordered, so unconditional removal is safe in this branch.
+        interface_controls
+            .lock()
+            .expect("interface_controls mutex poisoned")
+            .remove(&id);
+    }
+    let deregistered = transport_tx
+        .send(TransportMessage::DeregisterInterface { id })
+        .await
+        .is_ok();
+    if deregistered {
+        shutdown.finish();
+        tracing::info!(id, "interface deregistered");
+    } else {
+        tracing::warn!(
+            id,
+            "transport closed before interface deregistration; retaining ID tombstone"
+        );
+    }
 }
 
 async fn spawn_interface(
@@ -5102,6 +6131,21 @@ pub enum ReticulumError {
 mod tests {
     use super::*;
 
+    async fn wait_for_registry_len(registry: &InterfaceRegistry, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while registry.len() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "registry did not reach length {expected}; current length {}",
+                registry.len()
+            )
+        });
+    }
+
     #[tokio::test]
     async fn announce_subscription_close_is_exact_and_idempotent() {
         let (actor, transport_tx) = rns_transport::actor::TransportActor::new();
@@ -5467,6 +6511,7 @@ loglevel = 7
             id_gen: Arc::new(AtomicU64::new(0)),
             handle_tx: htx,
             interface_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            interface_registry: InterfaceRegistry::default(),
             socket_base: PathBuf::from("/tmp/dummy"),
             config: ReticulumConfig::default(),
             is_foreground: Arc::new(AtomicBool::new(true)),
@@ -6487,10 +7532,628 @@ egress_control = Yes
     }
 
     #[tokio::test]
+    async fn failed_registration_rolls_back_task_control_and_online_state() {
+        let (transport_tx, transport_rx) = mpsc::channel::<TransportMessage>(1);
+        drop(transport_rx);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
+        let handle = test_interface_handle(920_090, None, "rollback");
+        let online = handle.online.clone();
+
+        let result = register_interface_handle(
+            &transport_tx,
+            handle,
+            &interface_controls,
+            &interface_registry,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(InterfaceRegistrationError::TransportClosed { id: 920_090 })
+        ));
+        assert!(!online.load(Ordering::SeqCst));
+        assert!(
+            interface_controls
+                .lock()
+                .expect("interface_controls mutex poisoned")
+                .is_empty()
+        );
+
+        let replacement = interface_registry
+            .reserve(
+                920_090,
+                InterfaceKind::Standard,
+                tokio::spawn(std::future::pending()),
+                None,
+            )
+            .expect("rollback must release the exact reservation");
+        replacement.rollback().await;
+    }
+
+    #[tokio::test]
+    async fn batch_duplicate_rolls_back_prepared_and_unprocessed_handles() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
+        let first = test_interface_handle(920_091, None, "batch-first");
+        let duplicate = test_interface_handle(920_091, None, "batch-duplicate");
+        let remaining = test_interface_handle(920_092, None, "batch-remaining");
+        let online = [
+            first.online.clone(),
+            duplicate.online.clone(),
+            remaining.online.clone(),
+        ];
+        let post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
+
+        let result = register_interfaces_with_post_init_batch(
+            &transport_tx,
+            vec![first, duplicate, remaining],
+            &post_init,
+            None,
+            &interface_controls,
+            &interface_registry,
+            InterfaceKind::Standard,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(InterfaceRegistrationError::Duplicate { id: 920_091 })
+        ));
+        assert!(online.iter().all(|flag| !flag.load(Ordering::SeqCst)));
+        assert!(
+            interface_controls
+                .lock()
+                .expect("interface_controls mutex poisoned")
+                .is_empty()
+        );
+        assert!(transport_rx.try_recv().is_err());
+
+        for id in [920_091, 920_092] {
+            let replacement = interface_registry
+                .reserve(
+                    id,
+                    InterfaceKind::Standard,
+                    tokio::spawn(std::future::pending()),
+                    None,
+                )
+                .expect("batch rollback must release every reservation");
+            replacement.rollback().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn teardown_stops_exact_task_before_deregister_and_allows_reuse() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let id = 920_093;
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_task = stopped.clone();
+        let mut interface = test_interface_handle(id, None, "teardown");
+        interface.read_task = tokio::spawn(async move {
+            let _dropped = Dropped(stopped_task);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        register_interface_handle(
+            &transport_tx,
+            interface,
+            &interface_controls,
+            &interface_registry,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::RegisterInterface {
+                id: registered_id,
+                ..
+            }) if registered_id == id
+        ));
+
+        let mut runtime = dummy_handle();
+        runtime.transport_tx = transport_tx;
+        runtime.interface_controls = interface_controls.clone();
+        runtime.interface_registry = interface_registry.clone();
+        teardown_interface(&runtime, id).await;
+
+        assert!(stopped.load(Ordering::Acquire));
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::DeregisterInterface {
+                id: deregistered_id
+            }) if deregistered_id == id
+        ));
+        assert!(
+            interface_controls
+                .lock()
+                .expect("interface_controls mutex poisoned")
+                .is_empty()
+        );
+        let replacement = interface_registry
+            .reserve(
+                id,
+                InterfaceKind::Standard,
+                tokio::spawn(std::future::pending()),
+                None,
+            )
+            .expect("completed teardown must release the exact reservation");
+        replacement.rollback().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_blocked_single_registration_fully_rolls_back() {
+        let id = 920_094;
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        transport_tx
+            .send(TransportMessage::Shutdown)
+            .await
+            .expect("fill transport channel");
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
+        let handle = test_interface_handle(id, None, "cancelled-single");
+        let online = handle.online.clone();
+        let worker_tx = transport_tx.clone();
+        let worker_controls = interface_controls.clone();
+        let worker_registry = interface_registry.clone();
+        let caller = tokio::spawn(async move {
+            register_interface_handle(&worker_tx, handle, &worker_controls, &worker_registry).await
+        });
+
+        wait_for_registry_len(&interface_registry, 1).await;
+        caller.abort();
+        let _ = caller.await;
+        wait_for_registry_len(&interface_registry, 0).await;
+
+        assert!(!online.load(Ordering::SeqCst));
+        assert!(
+            interface_controls
+                .lock()
+                .expect("interface_controls mutex poisoned")
+                .is_empty()
+        );
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::Shutdown)
+        ));
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "cancelled blocked send must never publish RegisterInterface"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_partially_published_batch_removes_actor_entry_and_tasks() {
+        let ids = [920_095, 920_096];
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
+        let first = test_interface_handle(ids[0], None, "batch-cancel-first");
+        let second = test_interface_handle(ids[1], None, "batch-cancel-second");
+        let online = [first.online.clone(), second.online.clone()];
+        let post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
+        let worker_tx = transport_tx.clone();
+        let worker_controls = interface_controls.clone();
+        let worker_registry = interface_registry.clone();
+        let caller = tokio::spawn(async move {
+            register_interfaces_with_post_init_batch(
+                &worker_tx,
+                vec![first, second],
+                &post_init,
+                None,
+                &worker_controls,
+                &worker_registry,
+                InterfaceKind::Standard,
+            )
+            .await
+        });
+
+        wait_for_registry_len(&interface_registry, 2).await;
+        while transport_tx.capacity() != 0 {
+            tokio::task::yield_now().await;
+        }
+        caller.abort();
+        let _ = caller.await;
+        tokio::task::yield_now().await;
+        assert!(online.iter().all(|flag| !flag.load(Ordering::SeqCst)));
+        assert!(
+            interface_controls
+                .lock()
+                .expect("interface_controls mutex poisoned")
+                .is_empty()
+        );
+
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::RegisterInterface { id, .. }) if id == ids[0]
+        ));
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::DeregisterInterface { id }) if id == ids[0]
+        ));
+        wait_for_registry_len(&interface_registry, 0).await;
+        assert!(transport_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn successful_registration_with_undeliverable_result_is_torn_down() {
+        let id = 920_097;
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
+        let handle = test_interface_handle(id, None, "undeliverable-result");
+        let online = handle.online.clone();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        drop(reply_rx);
+
+        single_registration_worker(
+            transport_tx.clone(),
+            interface_controls.clone(),
+            interface_registry.clone(),
+            SingleRegistrationSpec::Direct {
+                handle,
+                role: rns_transport::messages::InterfaceRole::Normal,
+                ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
+                ifac_key: None,
+                ifac_size: 0,
+                kind: InterfaceKind::Standard,
+                multipoint: false,
+            },
+            RegistrationCancellation {
+                receiver: cancel_rx,
+            },
+            reply_tx,
+        )
+        .await;
+        drop(cancel_tx);
+
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::RegisterInterface {
+                id: registered_id,
+                ..
+            }) if registered_id == id
+        ));
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::DeregisterInterface {
+                id: deregistered_id
+            }) if deregistered_id == id
+        ));
+        assert!(!online.load(Ordering::SeqCst));
+        assert!(interface_controls.lock().unwrap().is_empty());
+        assert_eq!(interface_registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_committed_cleanup_token_cannot_teardown_reused_id() {
+        let id = 920_103;
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
+        let first = test_interface_handle(id, None, "stale-owner-a");
+        let prepared = prepare_interface_with_role_and_overrides(
+            first,
+            rns_transport::messages::InterfaceRole::Normal,
+            rns_transport::ingress::IngressOverrides::default(),
+            None,
+            0,
+            &interface_controls,
+            &interface_registry,
+            InterfaceKind::Standard,
+            false,
+        )
+        .await
+        .expect("prepare owner A");
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let mut cancellation = RegistrationCancellation {
+            receiver: cancel_rx,
+        };
+        let stale_token = publish_prepared_interface(
+            &transport_tx,
+            &interface_controls,
+            &interface_registry,
+            prepared,
+            &mut cancellation,
+        )
+        .await
+        .expect("commit owner A");
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::RegisterInterface {
+                id: registered_id,
+                ..
+            }) if registered_id == id
+        ));
+
+        teardown_interface_transaction(&transport_tx, &interface_controls, &interface_registry, id)
+            .await;
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::DeregisterInterface {
+                id: deregistered_id
+            }) if deregistered_id == id
+        ));
+
+        let second = test_interface_handle(id, None, "stale-owner-b");
+        let second_online = second.online.clone();
+        register_interface_handle(
+            &transport_tx,
+            second,
+            &interface_controls,
+            &interface_registry,
+        )
+        .await
+        .expect("register owner B");
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::RegisterInterface {
+                id: registered_id,
+                ..
+            }) if registered_id == id
+        ));
+
+        cleanup_committed_interfaces(
+            &transport_tx,
+            &interface_controls,
+            &interface_registry,
+            vec![stale_token],
+        )
+        .await;
+        assert!(second_online.load(Ordering::SeqCst));
+        assert_eq!(interface_registry.len(), 1);
+        assert!(interface_controls.lock().unwrap().contains_key(&id));
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "stale owner cleanup must not enqueue deregistration for owner B"
+        );
+
+        teardown_interface_transaction(&transport_tx, &interface_controls, &interface_registry, id)
+            .await;
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::DeregisterInterface {
+                id: deregistered_id
+            }) if deregistered_id == id
+        ));
+        drop(cancel_tx);
+    }
+
+    #[tokio::test]
+    async fn missing_teardown_tombstone_blocks_reuse_until_deregister_is_enqueued() {
+        let id = 920_098;
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        transport_tx
+            .send(TransportMessage::Shutdown)
+            .await
+            .expect("fill transport channel");
+        let interface_registry = InterfaceRegistry::default();
+        let mut runtime = dummy_handle();
+        runtime.transport_tx = transport_tx;
+        runtime.interface_registry = interface_registry.clone();
+        let teardown = tokio::spawn(async move {
+            teardown_interface(&runtime, id).await;
+        });
+
+        wait_for_registry_len(&interface_registry, 1).await;
+        let rejected = match interface_registry.reserve(
+            id,
+            InterfaceKind::Standard,
+            tokio::spawn(std::future::pending()),
+            None,
+        ) {
+            Ok(_) => panic!("orphan cleanup must hold a same-ID tombstone"),
+            Err(rejected) => rejected,
+        };
+        rejected.abort_and_wait().await;
+
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::Shutdown)
+        ));
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::DeregisterInterface {
+                id: deregistered_id
+            }) if deregistered_id == id
+        ));
+        teardown.await.expect("teardown caller");
+        let replacement = interface_registry
+            .reserve(
+                id,
+                InterfaceKind::Standard,
+                tokio::spawn(std::future::pending()),
+                None,
+            )
+            .expect("ID may be reused after deregistration is enqueued");
+        replacement.rollback().await;
+    }
+
+    #[tokio::test]
+    async fn pending_teardown_forces_commit_failure_and_complete_rollback() {
+        let id = 920_099;
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        transport_tx
+            .send(TransportMessage::Shutdown)
+            .await
+            .expect("fill transport channel");
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
+        let handle = test_interface_handle(id, None, "pending-teardown");
+        let online = handle.online.clone();
+        let worker_tx = transport_tx.clone();
+        let worker_controls = interface_controls.clone();
+        let worker_registry = interface_registry.clone();
+        let registration = tokio::spawn(async move {
+            register_interface_handle(&worker_tx, handle, &worker_controls, &worker_registry).await
+        });
+        wait_for_registry_len(&interface_registry, 1).await;
+
+        let mut runtime = dummy_handle();
+        runtime.transport_tx = transport_tx;
+        runtime.interface_controls = interface_controls.clone();
+        runtime.interface_registry = interface_registry.clone();
+        let teardown = tokio::spawn(async move {
+            teardown_interface(&runtime, id).await;
+        });
+
+        let registration_result = tokio::time::timeout(Duration::from_secs(2), registration)
+            .await
+            .expect("pending registration must wake without actor-channel progress")
+            .expect("registration caller");
+        assert!(matches!(
+            registration_result,
+            Err(InterfaceRegistrationError::ReservationLost {
+                id: failed_id
+            }) if failed_id == id
+        ));
+        tokio::time::timeout(Duration::from_secs(2), teardown)
+            .await
+            .expect("teardown must finish while the actor channel remains full")
+            .expect("teardown caller");
+        assert!(!online.load(Ordering::SeqCst));
+        assert!(interface_controls.lock().unwrap().is_empty());
+        assert_eq!(interface_registry.len(), 0);
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::Shutdown)
+        ));
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "cancelled pending registration must not queue actor work"
+        );
+    }
+
+    #[tokio::test]
+    async fn naturally_completed_task_is_explicitly_joined_and_released() {
+        let id = 920_100;
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
+        let mut handle = test_interface_handle(id, None, "natural-completion");
+        handle.read_task = tokio::spawn(async {});
+        register_interface_handle(
+            &transport_tx,
+            handle,
+            &interface_controls,
+            &interface_registry,
+        )
+        .await
+        .expect("register completed task");
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::RegisterInterface {
+                id: registered_id,
+                ..
+            }) if registered_id == id
+        ));
+
+        let mut runtime = dummy_handle();
+        runtime.transport_tx = transport_tx;
+        runtime.interface_controls = interface_controls;
+        runtime.interface_registry = interface_registry.clone();
+        teardown_interface(&runtime, id).await;
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::DeregisterInterface {
+                id: deregistered_id
+            }) if deregistered_id == id
+        ));
+        let replacement = interface_registry
+            .reserve(
+                id,
+                InterfaceKind::Standard,
+                tokio::spawn(std::future::pending()),
+                None,
+            )
+            .expect("explicit cleanup releases naturally completed task ID");
+        replacement.rollback().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_teardown_caller_does_not_cancel_owned_cleanup() {
+        let id = 920_102;
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
+        let handle = test_interface_handle(id, None, "cancelled-teardown");
+        let online = handle.online.clone();
+        register_interface_handle(
+            &transport_tx,
+            handle,
+            &interface_controls,
+            &interface_registry,
+        )
+        .await
+        .expect("registration");
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::RegisterInterface {
+                id: registered_id,
+                ..
+            }) if registered_id == id
+        ));
+        transport_tx
+            .send(TransportMessage::Shutdown)
+            .await
+            .expect("block teardown deregistration");
+
+        let mut runtime = dummy_handle();
+        runtime.transport_tx = transport_tx;
+        runtime.interface_controls = interface_controls.clone();
+        runtime.interface_registry = interface_registry.clone();
+        let caller = tokio::spawn(async move {
+            teardown_interface(&runtime, id).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while online.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("teardown worker must take ownership and mark offline");
+        caller.abort();
+        let _ = caller.await;
+
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::Shutdown)
+        ));
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::DeregisterInterface {
+                id: deregistered_id
+            }) if deregistered_id == id
+        ));
+        wait_for_registry_len(&interface_registry, 0).await;
+        assert!(interface_controls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn registration_applies_parsed_interface_flags_and_internal_mode() {
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
         let interface_controls: InterfaceControlMap =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
 
         let mut section = ConfigSection::new();
         section.set("recursive_prs", "yes");
@@ -6504,8 +8167,11 @@ egress_control = Yes
             &post_init,
             None,
             &interface_controls,
+            &interface_registry,
+            InterfaceKind::Standard,
         )
-        .await;
+        .await
+        .unwrap();
         let TransportMessage::RegisterInterface { entry, .. } =
             transport_rx.recv().await.expect("registration")
         else {
@@ -6517,11 +8183,6 @@ egress_control = Yes
         );
         assert!(entry.recursive_prs);
         assert!(!entry.announces_from_internal);
-
-        interface_tasks()
-            .lock()
-            .expect("interface_tasks mutex poisoned")
-            .remove(&920_101);
     }
 
     #[test]
@@ -6553,6 +8214,7 @@ egress_control = Yes
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
         let interface_controls: InterfaceControlMap =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
 
         let post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
         register_interface_with_post_init(
@@ -6561,8 +8223,11 @@ egress_control = Yes
             &post_init,
             None,
             &interface_controls,
+            &interface_registry,
+            InterfaceKind::Standard,
         )
-        .await;
+        .await
+        .unwrap();
         let TransportMessage::RegisterInterface { entry, .. } =
             transport_rx.recv().await.expect("default cap registration")
         else {
@@ -6579,23 +8244,17 @@ egress_control = Yes
             &post_init,
             None,
             &interface_controls,
+            &interface_registry,
+            InterfaceKind::Standard,
         )
-        .await;
+        .await
+        .unwrap();
         let TransportMessage::RegisterInterface { entry, .. } =
             transport_rx.recv().await.expect("custom cap registration")
         else {
             panic!("expected RegisterInterface");
         };
         assert!((entry.announce_cap - 0.05).abs() < f64::EPSILON);
-
-        interface_tasks()
-            .lock()
-            .expect("interface_tasks mutex poisoned")
-            .remove(&920_001);
-        interface_tasks()
-            .lock()
-            .expect("interface_tasks mutex poisoned")
-            .remove(&920_002);
     }
 
     #[tokio::test]
@@ -6605,6 +8264,7 @@ egress_control = Yes
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
         let interface_controls: InterfaceControlMap =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
 
         let mut section = ConfigSection::new();
         section.set("ic_pr_burst_freq_new", "4.0");
@@ -6619,8 +8279,11 @@ egress_control = Yes
             &post_init,
             None,
             &interface_controls,
+            &interface_registry,
+            InterfaceKind::Standard,
         )
-        .await;
+        .await
+        .unwrap();
         let _ = transport_rx.recv().await.expect("parent registration");
 
         let (role, inherited, ifac_key, ifac_size) =
@@ -6634,9 +8297,12 @@ egress_control = Yes
             ifac_key,
             ifac_size,
             &interface_controls,
+            &interface_registry,
+            InterfaceKind::Standard,
             false,
         )
-        .await;
+        .await
+        .unwrap();
 
         let msg = transport_rx.recv().await.expect("child registration");
         let TransportMessage::RegisterInterface { entry, .. } = msg else {
@@ -6646,15 +8312,6 @@ egress_control = Yes
         assert_eq!(entry.ingress.pr_burst_freq(), 9.0);
         assert_eq!(entry.ingress.ec_pr_freq(), 6.0);
         assert!(entry.ingress.is_egress_control_enabled());
-
-        interface_tasks()
-            .lock()
-            .expect("interface_tasks mutex poisoned")
-            .remove(&parent_id);
-        interface_tasks()
-            .lock()
-            .expect("interface_tasks mutex poisoned")
-            .remove(&child_id);
     }
 
     #[tokio::test]
@@ -6662,6 +8319,7 @@ egress_control = Yes
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
         let interface_controls: InterfaceControlMap =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
 
         let overrides = rns_transport::ingress::IngressOverrides {
             enabled: Some(true),
@@ -6684,9 +8342,12 @@ egress_control = Yes
                 None,
                 0,
                 &interface_controls,
+                &interface_registry,
+                InterfaceKind::Standard,
                 false,
             )
-            .await;
+            .await
+            .unwrap();
 
             let msg = transport_rx.recv().await.expect("registration");
             let TransportMessage::RegisterInterface { entry, .. } = msg else {
@@ -6694,11 +8355,6 @@ egress_control = Yes
             };
             assert_eq!(entry.role, role);
             assert!(!entry.ingress.is_enabled());
-
-            interface_tasks()
-                .lock()
-                .expect("interface_tasks mutex poisoned")
-                .remove(&id);
         }
     }
 
@@ -6713,6 +8369,7 @@ egress_control = Yes
             .insert(
                 parent_id,
                 InterfaceControlMetadata {
+                    registry_owner: 1,
                     role: rns_transport::messages::InterfaceRole::SharedServer,
                     ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
                     ifac_key: None,
@@ -6732,6 +8389,7 @@ egress_control = Yes
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
         let interface_controls: InterfaceControlMap =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
 
         let mut section = ConfigSection::new();
         section.set("networkname", "testnet");
@@ -6747,8 +8405,11 @@ egress_control = Yes
             &post_init,
             ifac_key,
             &interface_controls,
+            &interface_registry,
+            InterfaceKind::Standard,
         )
-        .await;
+        .await
+        .unwrap();
         let TransportMessage::RegisterInterface {
             entry: parent_entry,
             ..
@@ -6772,9 +8433,12 @@ egress_control = Yes
             child_key,
             child_size,
             &interface_controls,
+            &interface_registry,
+            InterfaceKind::Standard,
             false,
         )
-        .await;
+        .await
+        .unwrap();
         let TransportMessage::RegisterInterface { entry, .. } =
             transport_rx.recv().await.expect("child registration")
         else {
@@ -6782,13 +8446,6 @@ egress_control = Yes
         };
         assert_eq!(entry.ifac_key, ifac_key);
         assert_eq!(entry.ifac_size, 16);
-
-        for id in [parent_id, child_id] {
-            interface_tasks()
-                .lock()
-                .expect("interface_tasks mutex poisoned")
-                .remove(&id);
-        }
     }
 
     #[test]

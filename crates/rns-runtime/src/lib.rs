@@ -6,6 +6,7 @@ pub mod config;
 pub mod constants;
 pub mod destination_runtime;
 pub mod interface_factory;
+mod interface_registry;
 pub mod jobs;
 pub mod lifecycle;
 pub mod link_client;
