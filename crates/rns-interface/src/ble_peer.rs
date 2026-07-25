@@ -6656,6 +6656,7 @@ pub async fn spawn_ble_peer_interface(
         online: interface_online_flag(),
         txb: Some(shared_txb),
         rxb: Some(shared_rxb),
+        inspection: None,
         tx,
         read_task,
     })

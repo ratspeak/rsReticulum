@@ -482,6 +482,7 @@ pub async fn spawn_rnode_multi_interface(
             online: sub_onlines[i].clone(),
             rxb: Some(rxb),
             txb: Some(txb),
+            inspection: None,
             tx: sub_tx,
             read_task: sub_read_task,
         });

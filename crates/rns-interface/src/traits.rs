@@ -20,6 +20,10 @@ pub struct InterfaceHandle {
     pub online: Arc<AtomicBool>,
     pub rxb: Option<Arc<AtomicU64>>,
     pub txb: Option<Arc<AtomicU64>>,
+    /// Optional live aggregate inspection source carried into the transport
+    /// actor. This field intentionally makes pre-freeze struct literals update
+    /// explicitly so new interface drivers choose whether they expose stats.
+    pub inspection: Option<rns_transport::messages::InterfaceInspectionSource>,
     pub tx: mpsc::Sender<Bytes>,
     pub read_task: tokio::task::JoinHandle<()>,
 }

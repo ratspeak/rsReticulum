@@ -726,6 +726,7 @@ pub async fn spawn_android_usb_rnode_interface(
         online: connected,
         txb: Some(shared_txb),
         rxb: Some(shared_rxb),
+        inspection: None,
         tx,
         read_task,
     })

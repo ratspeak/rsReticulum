@@ -17,6 +17,50 @@ use crate::ingress::IngressController;
 
 pub type InterfaceId = u64;
 
+/// Privacy-bounded, aggregate-only inspection values supplied by an
+/// interface driver.
+///
+/// This deliberately has no endpoint, address, name or free-form field. Keep
+/// that property when extending it: inspection snapshots cross shared-instance
+/// and authorized remote-management boundaries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InterfaceInspectionSnapshot {
+    pub active_clients: Option<u64>,
+    pub blocked_ips: Option<u64>,
+}
+
+/// A driver-owned source for a live aggregate interface snapshot.
+///
+/// The callback is invoked synchronously once for each transport stats
+/// snapshot. Implementations must therefore take only short-lived locks and
+/// must not perform I/O.
+#[derive(Clone)]
+pub struct InterfaceInspectionSource {
+    snapshot: Arc<dyn Fn() -> InterfaceInspectionSnapshot + Send + Sync>,
+}
+
+impl InterfaceInspectionSource {
+    pub fn new<F>(snapshot: F) -> Self
+    where
+        F: Fn() -> InterfaceInspectionSnapshot + Send + Sync + 'static,
+    {
+        Self {
+            snapshot: Arc::new(snapshot),
+        }
+    }
+
+    pub fn snapshot(&self) -> InterfaceInspectionSnapshot {
+        (self.snapshot)()
+    }
+}
+
+impl std::fmt::Debug for InterfaceInspectionSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InterfaceInspectionSource")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Opaque identity for one transport announce-handler registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AnnounceHandlerId(pub(crate) u64);
@@ -131,6 +175,8 @@ pub struct InterfaceEntry {
     pub online: Option<Arc<AtomicBool>>,
     pub rxb: Option<Arc<std::sync::atomic::AtomicU64>>,
     pub txb: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Optional driver-owned aggregate inspection source.
+    pub inspection: Option<InterfaceInspectionSource>,
     /// Incremented when an outbound `try_send` cannot enqueue — surfaced in
     /// interface stats to flag a driver whose receiver is falling behind.
     pub tx_drops: Arc<std::sync::atomic::AtomicU64>,
@@ -185,6 +231,7 @@ impl InterfaceEntry {
             online: None,
             rxb: None,
             txb: None,
+            inspection: None,
             tx_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ingress: IngressController::new(),
             announce_queue: Vec::new(),
@@ -252,6 +299,7 @@ impl std::fmt::Debug for InterfaceEntry {
             .field("ifac_size", &self.ifac_size)
             .field("announce_cap", &self.announce_cap)
             .field("announce_allowed_at", &self.announce_allowed_at)
+            .field("has_inspection", &self.inspection.is_some())
             .field("held_announces", &self.ingress.held_count())
             .field("announce_queue", &self.announce_queue.len())
             .finish()
@@ -712,6 +760,7 @@ pub struct InterfaceStatRpcEntry {
     pub pr_burst_active: bool,
     pub pr_burst_activated: f64,
     pub clients: Option<u64>,
+    pub blocked_ips: Option<u64>,
     pub announce_rate_target: Option<f64>,
     pub announce_rate_grace: Option<u32>,
     pub announce_rate_penalty: Option<f64>,

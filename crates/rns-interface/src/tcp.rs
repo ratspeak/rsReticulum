@@ -439,6 +439,7 @@ pub async fn spawn_tcp_client(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
+        inspection: None,
         tx,
         read_task,
     })
@@ -507,6 +508,7 @@ async fn spawn_tcp_accepted(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
+        inspection: None,
         tx,
         read_task,
     }
@@ -593,6 +595,7 @@ pub async fn spawn_tcp_server(
         online,
         rxb: Some(Arc::new(AtomicU64::new(0))),
         txb: Some(Arc::new(AtomicU64::new(0))),
+        inspection: None,
         tx,
         read_task,
     })

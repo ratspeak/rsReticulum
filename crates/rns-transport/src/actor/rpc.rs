@@ -62,6 +62,22 @@ impl TransportActor {
                             .as_ref()
                             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
                             .unwrap_or(0);
+                        let inspection = entry
+                            .inspection
+                            .as_ref()
+                            .map(|source| {
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    source.snapshot()
+                                }))
+                                .unwrap_or_else(|_| {
+                                    tracing::warn!(
+                                        interface_id = iface_id,
+                                        "interface inspection callback panicked",
+                                    );
+                                    InterfaceInspectionSnapshot::default()
+                                })
+                            })
+                            .unwrap_or_default();
                         InterfaceStatRpcEntry {
                             id: iface_id,
                             name: entry.name.clone(),
@@ -96,7 +112,8 @@ impl TransportActor {
                                 entry.ingress.is_pr_burst_active(),
                                 entry.ingress.pr_burst_activated(),
                             ),
-                            clients: None,
+                            clients: inspection.active_clients,
+                            blocked_ips: inspection.blocked_ips,
                             announce_rate_target: entry.announce_rate_target,
                             announce_rate_grace: entry.announce_rate_grace,
                             announce_rate_penalty: entry.announce_rate_penalty,

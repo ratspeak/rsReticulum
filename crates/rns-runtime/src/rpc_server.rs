@@ -335,6 +335,7 @@ async fn process_rpc_request(
                             pr_burst_active: e.pr_burst_active,
                             pr_burst_activated: e.pr_burst_activated,
                             clients: e.clients,
+                            blocked_ips: e.blocked_ips,
                             announce_rate_target: e.announce_rate_target,
                             announce_rate_grace: e.announce_rate_grace,
                             announce_rate_penalty: e.announce_rate_penalty,

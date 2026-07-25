@@ -18,7 +18,9 @@ use tokio::sync::mpsc;
 use crate::hdlc;
 use crate::socket_tuning::{iface_addr_for, set_keepalive_tuned, set_socket_buffers};
 use crate::traits::{InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode};
-use rns_transport::messages::{InboundPacket, TransportMessage};
+use rns_transport::messages::{
+    InboundPacket, InterfaceInspectionSnapshot, InterfaceInspectionSource, TransportMessage,
+};
 
 /// 1 MiB MTU — also the SO_RCVBUF/SNDBUF target (kernel clamps).
 pub const HW_MTU: u32 = 1_048_576;
@@ -254,6 +256,30 @@ impl FastFlapRuntime {
             },
         );
     }
+
+    fn inspection_snapshot(
+        &self,
+        policy: FastFlapPolicy,
+        active_clients: &AtomicU64,
+    ) -> InterfaceInspectionSnapshot {
+        let blocked_ips = if policy.enabled {
+            let now = self.clock.now();
+            let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+            table.prune_expired(now, policy.block_time);
+            table
+                .entries
+                .values()
+                .filter(|entry| entry.flaps > policy.grace)
+                .count() as u64
+        } else {
+            0
+        };
+
+        InterfaceInspectionSnapshot {
+            active_clients: Some(active_clients.load(Ordering::Relaxed)),
+            blocked_ips: Some(blocked_ips),
+        }
+    }
 }
 
 enum FastFlapAdmission {
@@ -286,6 +312,23 @@ impl Drop for FastFlapConnection {
         // The guard lives in the child read-task future, so cancellation and
         // panic exits account for the connection just like normal EOF/errors.
         self.record_disconnect();
+    }
+}
+
+struct ActiveClientGuard {
+    active_clients: Arc<AtomicU64>,
+}
+
+impl ActiveClientGuard {
+    fn new(active_clients: Arc<AtomicU64>) -> Self {
+        active_clients.fetch_add(1, Ordering::Relaxed);
+        Self { active_clients }
+    }
+}
+
+impl Drop for ActiveClientGuard {
+    fn drop(&mut self) {
+        self.active_clients.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -478,6 +521,13 @@ fn spawn_backbone_server_on_listener(
     let name = config.name.clone();
     let mode = config.mode;
     let fast_flap_policy = FastFlapPolicy::from(&config);
+    let active_clients = Arc::new(AtomicU64::new(0));
+    let inspection_runtime = fast_flap_runtime.clone();
+    let inspection_active_clients = Arc::clone(&active_clients);
+    let inspection = InterfaceInspectionSource::new(move || {
+        inspection_runtime.inspection_snapshot(fast_flap_policy, inspection_active_clients.as_ref())
+    });
+    let task_active_clients = Arc::clone(&active_clients);
 
     // Parent listener is inbound-only; drain task warns on stray writes.
     let (tx, mut listener_rx) = mpsc::channel::<Bytes>(1);
@@ -533,7 +583,10 @@ fn spawn_backbone_server_on_listener(
                     let transport_tx2 = transport_tx.clone();
                     let dereg_tx = transport_tx.clone();
                     let cname = client_name.clone();
+                    let active_client_guard =
+                        ActiveClientGuard::new(Arc::clone(&task_active_clients));
                     let read_handle = tokio::spawn(async move {
+                        let _active_client_guard = active_client_guard;
                         backbone_read_loop(reader, client_id, transport_tx2, c_online_r, c_rxb_r)
                             .await;
                         fast_flap_connection.disconnected();
@@ -560,6 +613,7 @@ fn spawn_backbone_server_on_listener(
                         online: c_online,
                         rxb: Some(c_rxb),
                         txb: Some(c_txb),
+                        inspection: None,
                         tx: c_tx,
                         read_task: read_handle,
                     };
@@ -593,6 +647,7 @@ fn spawn_backbone_server_on_listener(
         online,
         rxb: Some(Arc::new(AtomicU64::new(0))),
         txb: Some(Arc::new(AtomicU64::new(0))),
+        inspection: Some(inspection),
         tx,
         read_task,
     })
@@ -761,6 +816,7 @@ pub async fn spawn_backbone_client(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
+        inspection: None,
         tx,
         read_task,
     })
@@ -856,6 +912,14 @@ mod tests {
             .entries
             .get(&ip)
             .map(|entry| entry.flaps)
+    }
+
+    fn inspection_snapshot(handle: &InterfaceHandle) -> InterfaceInspectionSnapshot {
+        handle
+            .inspection
+            .as_ref()
+            .expect("backbone listener exposes aggregate inspection")
+            .snapshot()
     }
 
     #[test]
@@ -1008,6 +1072,79 @@ mod tests {
         assert_eq!(tracked_flaps(&runtime, ip), None);
         let admitted = allow_connection(&runtime, ip, policy);
         admitted.disconnected();
+        let active_clients = AtomicU64::new(0);
+        assert_eq!(
+            runtime.inspection_snapshot(policy, &active_clients),
+            InterfaceInspectionSnapshot {
+                active_clients: Some(0),
+                blocked_ips: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn inspection_uses_strict_grace_and_expiry_boundaries() {
+        let (runtime, clock) = test_runtime(16);
+        let policy = default_policy();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12));
+        let active_clients = AtomicU64::new(3);
+
+        for _ in 0..policy.grace {
+            record_short_connection(&runtime, &clock, ip, policy);
+        }
+        assert_eq!(
+            runtime.inspection_snapshot(policy, &active_clients),
+            InterfaceInspectionSnapshot {
+                active_clients: Some(3),
+                blocked_ips: Some(0),
+            }
+        );
+
+        record_short_connection(&runtime, &clock, ip, policy);
+        assert_eq!(
+            runtime
+                .inspection_snapshot(policy, &active_clients)
+                .blocked_ips,
+            Some(1)
+        );
+        clock.advance(policy.block_time);
+        assert_eq!(
+            runtime
+                .inspection_snapshot(policy, &active_clients)
+                .blocked_ips,
+            Some(1)
+        );
+        clock.advance(Duration::from_nanos(1));
+        assert_eq!(
+            runtime
+                .inspection_snapshot(policy, &active_clients)
+                .blocked_ips,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn repeated_inspection_snapshots_are_live_and_non_destructive() {
+        let (runtime, clock) = test_runtime(16);
+        let mut policy = default_policy();
+        policy.grace = 0;
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 13));
+        let active_clients = AtomicU64::new(1);
+        record_short_connection(&runtime, &clock, ip, policy);
+
+        let first = runtime.inspection_snapshot(policy, &active_clients);
+        let second = runtime.inspection_snapshot(policy, &active_clients);
+        assert_eq!(first, second);
+        assert_eq!(first.active_clients, Some(1));
+        assert_eq!(first.blocked_ips, Some(1));
+
+        active_clients.store(2, Ordering::Relaxed);
+        assert_eq!(
+            runtime
+                .inspection_snapshot(policy, &active_clients)
+                .active_clients,
+            Some(2)
+        );
     }
 
     #[test]
@@ -1096,16 +1233,19 @@ mod tests {
             listener,
         )
         .unwrap();
+        assert_eq!(inspection_snapshot(&parent).active_clients, Some(0));
 
         let _stream = TcpStream::connect(listen_addr).await.unwrap();
         let child = tokio::time::timeout(Duration::from_secs(1), handle_rx.recv())
             .await
             .expect("accepted child handle timed out")
             .expect("child handle channel closed");
+        assert_eq!(inspection_snapshot(&parent).active_clients, Some(1));
         clock.advance(Duration::from_millis(1));
         child.read_task.abort();
         let _ = child.read_task.await;
 
+        assert_eq!(inspection_snapshot(&parent).active_clients, Some(0));
         assert_eq!(
             tracked_flaps(&runtime, IpAddr::V4(Ipv4Addr::LOCALHOST)),
             Some(1)
@@ -1141,6 +1281,7 @@ mod tests {
             listener,
         )
         .unwrap();
+        assert_eq!(inspection_snapshot(&parent).active_clients, Some(0));
 
         let mut stream = TcpStream::connect(listen_addr).await.unwrap();
         let mut byte = [0u8; 1];
@@ -1150,6 +1291,8 @@ mod tests {
         assert!(matches!(closed, Ok(0) | Err(_)));
         assert_eq!(id_gen.load(Ordering::SeqCst), 100);
         assert!(handle_rx.try_recv().is_err());
+        assert_eq!(inspection_snapshot(&parent).active_clients, Some(0));
+        assert_eq!(inspection_snapshot(&parent).blocked_ips, Some(1));
 
         parent.read_task.abort();
     }

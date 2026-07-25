@@ -1737,6 +1737,7 @@ pub async fn spawn_auto_interface(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
+        inspection: None,
         tx,
         read_task,
     })

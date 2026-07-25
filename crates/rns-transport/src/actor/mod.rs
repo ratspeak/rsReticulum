@@ -1681,7 +1681,8 @@ mod tests {
     use super::*;
     use crate::constants::{InterfaceDirection, InterfaceMode};
     use crate::messages::{
-        InboundPacket, InterfaceEntry, OutboundRequest, TransportQuery, TransportQueryResponse,
+        InboundPacket, InterfaceEntry, InterfaceInspectionSnapshot, InterfaceInspectionSource,
+        OutboundRequest, TransportQuery, TransportQueryResponse,
     };
     use crate::path_table::PathEntry;
 
@@ -1945,6 +1946,7 @@ mod tests {
             online: None,
             rxb: None,
             txb: None,
+            inspection: None,
             tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             multipoint: false,
             recursive_prs: false,
@@ -5775,6 +5777,49 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn interface_inspection_runs_once_per_stats_snapshot() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut entry, _rx) = make_test_interface("inspected_iface");
+        let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let callback_calls = Arc::clone(&calls);
+        entry.inspection = Some(InterfaceInspectionSource::new(move || {
+            callback_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            InterfaceInspectionSnapshot {
+                active_clients: Some(7),
+                blocked_ips: Some(2),
+            }
+        }));
+        actor.interfaces.insert(1, entry);
+
+        let TransportQueryResponse::InterfaceStats(stats) =
+            actor.handle_query(TransportQuery::GetInterfaceStats)
+        else {
+            panic!("unexpected interface stats response");
+        };
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(stats[0].clients, Some(7));
+        assert_eq!(stats[0].blocked_ips, Some(2));
+    }
+
+    #[test]
+    fn panicking_interface_inspection_cannot_unwind_transport_actor() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut entry, _rx) = make_test_interface("panicking_inspection");
+        entry.inspection = Some(InterfaceInspectionSource::new(|| {
+            panic!("driver inspection bug")
+        }));
+        actor.interfaces.insert(1, entry);
+
+        let TransportQueryResponse::InterfaceStats(stats) =
+            actor.handle_query(TransportQuery::GetInterfaceStats)
+        else {
+            panic!("unexpected interface stats response");
+        };
+        assert_eq!(stats[0].clients, None);
+        assert_eq!(stats[0].blocked_ips, None);
     }
 
     /// Floods a fresh actor with a tight burst of *unique* announces on one

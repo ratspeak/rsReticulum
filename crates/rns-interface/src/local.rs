@@ -289,6 +289,7 @@ where
         online,
         rxb: Some(rxb),
         txb: Some(txb),
+        inspection: None,
         tx,
         read_task,
     }
@@ -318,6 +319,7 @@ fn server_listener_handle(
         online,
         rxb: Some(Arc::new(AtomicU64::new(0))),
         txb: Some(Arc::new(AtomicU64::new(0))),
+        inspection: None,
         tx,
         read_task,
     }
@@ -532,6 +534,7 @@ mod platform {
             online,
             rxb: Some(rxb),
             txb: Some(txb),
+            inspection: None,
             tx,
             read_task,
         })
