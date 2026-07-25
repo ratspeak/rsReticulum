@@ -107,6 +107,9 @@ pub struct Link {
     /// Truncated SHA-256 of the request's hashable part.
     pub link_id: [u8; 16],
     pub state: LinkState,
+    /// Terminal close reason, retained after keys and transient state are
+    /// purged. Remains `None` until an orderly or timeout close occurs.
+    pub teardown_reason: Option<CloseReason>,
     pub is_initiator: bool,
     pub mode: u8,
 
@@ -216,6 +219,7 @@ impl Link {
         let link = Self {
             link_id,
             state: LinkState::Pending,
+            teardown_reason: None,
             is_initiator: true,
             mode: DEFAULT_MODE,
             ephemeral_keys: Some(ephemeral_keys),
@@ -476,6 +480,7 @@ impl Link {
         let link = Self {
             link_id,
             state: LinkState::Handshake,
+            teardown_reason: None,
             is_initiator: false,
             mode: request.signalling.mode,
             ephemeral_keys: Some(responder_keys),
@@ -1298,6 +1303,7 @@ impl Link {
 
     fn close(&mut self, reason: CloseReason) {
         tracing::debug!(link_id = ?self.link_id, ?reason, "link state -> Closed");
+        self.teardown_reason = Some(reason);
         for receipt in &mut self.pending_requests {
             receipt.fail();
         }
@@ -1616,11 +1622,19 @@ mod tests {
 
         let teardown_data = initiator.teardown(CloseReason::InitiatorClosed);
         assert_eq!(initiator.state, LinkState::Closed);
+        assert_eq!(
+            initiator.teardown_reason,
+            Some(CloseReason::InitiatorClosed)
+        );
         assert!(teardown_data.is_some());
 
         let accepted = responder.receive_teardown(&teardown_data.unwrap());
         assert!(accepted);
         assert_eq!(responder.state, LinkState::Closed);
+        assert_eq!(
+            responder.teardown_reason,
+            Some(CloseReason::DestinationClosed)
+        );
     }
 
     #[test]

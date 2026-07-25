@@ -306,11 +306,8 @@ impl Channel {
         false
     }
 
-    /// Empty registration list means "accept anything", matching the
-    /// permissive behaviour of the Python reference before type filters were
-    /// added.
     fn is_type_registered(&self, msg_type: u16) -> bool {
-        self.registered_types.is_empty() || self.registered_types.contains(&msg_type)
+        self.registered_types.contains(&msg_type)
     }
 
     /// True when the channel has window headroom to accept a new outbound message.
@@ -843,6 +840,7 @@ mod tests {
     fn test_channel_send_receive() {
         let mut tx_channel = Channel::new(0.1);
         let mut rx_channel = Channel::new(0.1);
+        rx_channel.register_message_type(0x0001).unwrap();
 
         let msg = TestMessage::new(b"hello");
         let raw = tx_channel.send(&msg).unwrap();
@@ -857,6 +855,7 @@ mod tests {
     fn test_channel_ordering() {
         let mut tx = Channel::new(0.1);
         let mut rx = Channel::new(0.1);
+        rx.register_message_type(0x0001).unwrap();
 
         let msg1 = TestMessage::new(b"first");
         let msg2 = TestMessage::new(b"second");
@@ -925,6 +924,7 @@ mod tests {
     fn test_duplicate_rejection() {
         let mut tx = Channel::new(0.1);
         let mut rx = Channel::new(0.1);
+        rx.register_message_type(0x0001).unwrap();
 
         let msg = TestMessage::new(b"once");
         let raw = tx.send(&msg).unwrap();
@@ -1094,8 +1094,8 @@ mod tests {
     }
 
     #[test]
-    fn test_no_registered_types_allows_all() {
-        // With an empty registry the channel must not filter inbound frames.
+    fn test_no_registered_types_rejects_all() {
+        // Python requires every inbound user or system type to be registered.
         let mut ch = Channel::new(0.1);
 
         let mut raw = Vec::new();
@@ -1105,7 +1105,10 @@ mod tests {
         raw.extend_from_slice(b"test");
 
         let result = ch.receive(&raw);
-        assert!(result.is_ok());
+        assert!(matches!(
+            result,
+            Err(ChannelError::UnknownMessageType(0x1234))
+        ));
     }
 
     #[test]
@@ -1152,6 +1155,7 @@ mod tests {
         let raw = ch.send(&msg).unwrap();
 
         let mut rx = Channel::new(0.1);
+        rx.register_message_type(0x0001).unwrap();
         let counter2 = counter.clone();
         let c4 = counter2.clone();
         rx.add_message_handler(Box::new(move |_msg_type, _payload| {
@@ -1183,6 +1187,7 @@ mod tests {
         let mut tx = Channel::new(0.1);
         let raw = tx.send(&TestMessage::new(b"handler tokens")).unwrap();
         let mut rx = Channel::new(0.1);
+        rx.register_message_type(0x0001).unwrap();
         let counter = Arc::new(AtomicU32::new(0));
 
         let first_counter = counter.clone();
@@ -1216,6 +1221,7 @@ mod tests {
         let link_id = [0xAA; 16];
         let mut tx_lc = LinkChannel::new(link_id, 0.1);
         let mut rx_lc = LinkChannel::new(link_id, 0.1);
+        rx_lc.register_message_type(0x0001).unwrap();
 
         assert_eq!(*tx_lc.link_id(), link_id);
         assert!(tx_lc.is_active());
@@ -1235,6 +1241,7 @@ mod tests {
         let link_id = [0xBB; 16];
         let mut tx_lc = LinkChannel::new(link_id, 0.1);
         let mut rx_lc = LinkChannel::new(link_id, 0.1);
+        rx_lc.register_message_type(0x0001).unwrap();
 
         // Send two messages
         let msg1 = TestMessage::new(b"first");
@@ -1338,6 +1345,7 @@ mod tests {
 
         let mut tx_lc = LinkChannel::new_encrypted(link_id, 0.1, keys_a);
         let mut rx_lc = LinkChannel::new_encrypted(link_id, 0.1, keys_b);
+        rx_lc.register_message_type(0x0001).unwrap();
 
         let msg = TestMessage::new(b"encrypted hello");
         let raw = tx_lc.prepare_send(&msg).unwrap();

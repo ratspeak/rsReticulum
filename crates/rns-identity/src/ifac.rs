@@ -2,8 +2,12 @@ use rns_crypto::hkdf::hkdf_sha256;
 use rns_crypto::sha::sha256;
 use thiserror::Error;
 
-// Fixed IFAC HKDF salt. Shared with the Python reference; changing it breaks interop.
-const IFAC_SALT: &str = "adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8";
+/// Fixed IFAC HKDF salt shared with the Python reference.
+///
+/// This is public for applications that need to derive or inspect
+/// Python-compatible IFAC material outside the runtime helper. Changing it
+/// would break interoperability.
+pub const IFAC_SALT: &str = "adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8";
 
 #[derive(Debug, Error)]
 pub enum IfacError {

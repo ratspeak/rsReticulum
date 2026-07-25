@@ -18,6 +18,8 @@ pub const CURVE: &str = "Curve25519";
 pub const KEY_SIZE_BITS: usize = 512;
 /// X25519 ratchet key size, in bits.
 pub const RATCHET_SIZE_BITS: usize = 256;
+/// X25519 ratchet key size, in bytes (Python `Identity.RATCHETSIZE`).
+pub const RATCHETSIZE: usize = RATCHET_SIZE_BITS / 8;
 /// Addressable identity hash size, in bits.
 pub const HASH_LENGTH_BITS: usize = 128;
 /// Ratchet identifier size, in bytes.
@@ -115,6 +117,7 @@ impl Identity {
     pub const CURVE: &'static str = CURVE;
     pub const KEY_SIZE_BITS: usize = KEY_SIZE_BITS;
     pub const RATCHET_SIZE_BITS: usize = RATCHET_SIZE_BITS;
+    pub const RATCHETSIZE: usize = RATCHET_SIZE_BITS / 8;
     pub const HASH_LENGTH_BITS: usize = HASH_LENGTH_BITS;
 
     pub fn new() -> Self {
@@ -451,6 +454,8 @@ mod tests {
     #[test]
     fn test_generate_identity() {
         let id = Identity::new();
+        assert_eq!(Identity::CURVE, "Curve25519");
+        assert_eq!(Identity::RATCHETSIZE, 32);
         assert!(id.has_private_key());
         assert_ne!(id.hash, [0u8; 16]);
     }

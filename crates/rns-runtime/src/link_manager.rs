@@ -1179,12 +1179,10 @@ impl LinkManager {
                         return;
                     }
 
-                    if active.channel.is_none()
-                        && Self::ensure_link_channel(active, link_id).is_none()
-                    {
+                    if active.channel.is_none() {
                         tracing::debug!(
                             link_id = hex::encode(link_id),
-                            "channel data received before session keys were available"
+                            "channel data received before the application opened a channel"
                         );
                         return;
                     }
@@ -5150,16 +5148,17 @@ mod tests {
         let mut lm = LinkManager::new(transport_tx, event_rx, [0xBB; 16], None);
         let (channel_tx, mut channel_rx) = mpsc::channel(4);
         lm.set_channel_message_channel(channel_tx);
+        let mut receiver_channel =
+            rns_protocol::channel::LinkChannel::new_encrypted(link_id, receiver_rtt, receiver_keys);
+        receiver_channel
+            .register_message_type(TEST_CHANNEL_MSG_TYPE)
+            .unwrap();
         lm.active_links.insert(
             link_id,
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
-                channel: Some(rns_protocol::channel::LinkChannel::new_encrypted(
-                    link_id,
-                    receiver_rtt,
-                    receiver_keys,
-                )),
+                channel: Some(receiver_channel),
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
                 outbound_split_queues: HashMap::new(),
@@ -5234,6 +5233,14 @@ mod tests {
         let mut lm_b = LinkManager::new(tx_b, event_rx_b, [0xB1; 16], None);
         lm_b.active_links
             .insert(link_id, active_link_entry(responder));
+        lm_a.get_channel(&link_id)
+            .unwrap()
+            .register_message_type(TEST_CHANNEL_MSG_TYPE)
+            .unwrap();
+        lm_b.get_channel(&link_id)
+            .unwrap()
+            .register_message_type(TEST_CHANNEL_MSG_TYPE)
+            .unwrap();
 
         // A -> B channel data; B proves it back.
         lm_a.send_channel_message(&link_id, &TestChannelNoop)
@@ -5345,7 +5352,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_packet_opens_channel_before_proof_and_dispatch() {
+    fn channel_packet_without_open_channel_is_dropped() {
         let (sender_link, receiver_link, _identity_key) = handshaken_link_pair_with_identity();
         let link_id = receiver_link.link_id;
         let mut sender_channel = rns_protocol::channel::LinkChannel::new_encrypted(
@@ -5392,12 +5399,9 @@ mod tests {
 
         lm.handle_inbound_packet(&raw, 1);
 
-        let delivered = channel_rx.try_recv().expect("channel message dispatched");
-        assert_eq!(delivered.link_id, link_id);
-        assert_eq!(delivered.msg_type, TEST_CHANNEL_MSG_TYPE);
-        let outbound = transport_rx.try_recv().expect("channel proof queued");
-        assert!(matches!(outbound, TransportMessage::Outbound(_)));
-        assert!(lm.active_links.get(&link_id).unwrap().channel.is_some());
+        assert!(channel_rx.try_recv().is_err());
+        assert!(transport_rx.try_recv().is_err());
+        assert!(lm.active_links.get(&link_id).unwrap().channel.is_none());
     }
 
     #[test]

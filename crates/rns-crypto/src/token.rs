@@ -11,10 +11,16 @@ use crate::random::{random_16, random_bytes};
 
 /// IV (16) + HMAC (32). A token is this plus the PKCS7-padded ciphertext.
 pub const TOKEN_OVERHEAD: usize = 48;
+/// AES block size used by legacy AES-128 tokens.
+pub const AES128_BLOCKSIZE: usize = 16;
+/// AES block size used by current AES-256 tokens.
+pub const AES256_BLOCKSIZE: usize = 16;
 /// AES-256 token key size: 32-byte signing key + 32-byte encryption key.
 pub const KEY_LENGTH: usize = 64;
 /// Legacy AES-128 token key size: 16-byte signing key + 16-byte encryption key.
 pub const LEGACY_KEY_LENGTH: usize = 32;
+/// Python `Identity.DERIVED_KEY_LENGTH_LEGACY`.
+pub const DERIVED_KEY_LENGTH_LEGACY: usize = LEGACY_KEY_LENGTH;
 
 /// Errors surfaced by [`encrypt`] and [`decrypt`].
 #[derive(Debug, Error)]
