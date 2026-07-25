@@ -675,7 +675,12 @@ pub async fn spawn_android_usb_rnode_interface(
     let online = connected.clone();
     let read_task = tokio::spawn(async move {
         let _stop_guard = stop_guard;
-        let mut deframer = kiss::KissDeframer::new();
+        // RNode extends KISS with full-byte commands such as CMD_FW_VERSION
+        // (0x50) and CMD_ERROR (0x90). A classic KISS deframer masks the high
+        // nibble as a TNC port, which would turn both into CMD_DATA and forward
+        // their metadata as Reticulum packets. Preserve the complete command
+        // byte so control frames reach the RNode response handler unchanged.
+        let mut deframer = kiss::RawKissDeframer::new();
         let mut last_rssi: Option<f32> = None;
         let mut last_snr: Option<f32> = None;
         while let Some(bytes) = raw_read_rx.recv().await {
@@ -738,4 +743,87 @@ pub async fn send_raw_frame(
         .send(frame)
         .await
         .map_err(|_| InterfaceError::SendFailed("USB raw writer closed".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fragmented_decode(wire: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut deframer = kiss::RawKissDeframer::new();
+        let fragment_widths = [1, 2, 1, 3, 2, 4];
+        let mut decoded = Vec::new();
+        let mut offset = 0;
+        let mut fragment = 0;
+
+        while offset < wire.len() {
+            let end = (offset + fragment_widths[fragment % fragment_widths.len()]).min(wire.len());
+            decoded.extend(deframer.feed(&wire[offset..end]));
+            offset = end;
+            fragment += 1;
+        }
+
+        decoded
+    }
+
+    #[test]
+    fn android_usb_deframer_preserves_extended_commands_when_fragmented_and_escaped() {
+        let expected = vec![
+            (
+                rnode::CMD_FW_VERSION,
+                vec![0x01, kiss::FEND, 0x02, kiss::FESC],
+            ),
+            (rnode::CMD_ERROR, vec![kiss::FESC, kiss::FEND]),
+            (
+                rnode::CMD_ROM_READ,
+                vec![0x00, kiss::FEND, kiss::FESC, 0xFF],
+            ),
+            (
+                kiss::CMD_DATA,
+                vec![0x10, kiss::FESC, 0x20, kiss::FEND, 0x30],
+            ),
+        ];
+        let mut wire = Vec::new();
+        for (command, payload) in &expected {
+            kiss::frame_with_command_into(*command, payload, &mut wire);
+        }
+
+        assert_eq!(fragmented_decode(&wire), expected);
+    }
+
+    #[test]
+    fn android_usb_only_forwards_and_accounts_real_data_frames() {
+        let data_payload = vec![0xAA, kiss::FEND, kiss::FESC, 0x55];
+        let expected_controls = [rnode::CMD_FW_VERSION, rnode::CMD_ERROR, rnode::CMD_ROM_READ];
+        let mut wire = Vec::new();
+        kiss::frame_with_command_into(rnode::CMD_FW_VERSION, &[1, 2], &mut wire);
+        kiss::frame_with_command_into(rnode::CMD_ERROR, &[0x01], &mut wire);
+        kiss::frame_with_command_into(rnode::CMD_ROM_READ, &[0x10, 0x20], &mut wire);
+        kiss::frame_with_command_into(kiss::CMD_DATA, &data_payload, &mut wire);
+
+        let mut last_rssi = None;
+        let mut last_snr = None;
+        let mut control_commands = Vec::new();
+        let mut packet_count = 0;
+        let mut packet_bytes = 0;
+
+        for (command, frame) in fragmented_decode(&wire) {
+            match rnode::process_rnode_response(command, &frame, 7, &mut last_rssi, &mut last_snr) {
+                rnode::RNodeResponse::Packet(_) => {
+                    assert_eq!(command, kiss::CMD_DATA);
+                    packet_count += 1;
+                    packet_bytes += frame.len();
+                }
+                rnode::RNodeResponse::Ready(_) | rnode::RNodeResponse::None => {
+                    if command != kiss::CMD_DATA {
+                        control_commands.push(command);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(control_commands, expected_controls);
+        assert_eq!(packet_count, 1);
+        assert_eq!(packet_bytes, data_payload.len());
+    }
 }
