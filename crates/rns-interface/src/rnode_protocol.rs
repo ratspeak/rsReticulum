@@ -301,6 +301,8 @@ pub enum RNodeProtocolEffect {
 pub struct RNodeProtocolState {
     target: RNodeProtocolTarget,
     evidence: RNodeProtocolEvidence,
+    detection_observed: bool,
+    flow_permission_observed: bool,
 }
 
 impl RNodeProtocolState {
@@ -319,6 +321,8 @@ impl RNodeProtocolState {
                 flow_permitted: false,
                 radio_initialisation_fault: false,
             },
+            detection_observed: false,
+            flow_permission_observed: false,
         }
     }
 
@@ -328,6 +332,16 @@ impl RNodeProtocolState {
 
     pub const fn evidence(&self) -> RNodeProtocolEvidence {
         self.evidence
+    }
+
+    /// Whether a valid detect response was observed, including a negative one.
+    pub const fn detection_observed(&self) -> bool {
+        self.detection_observed
+    }
+
+    /// Whether a valid flow response was observed, including a blocked one.
+    pub const fn flow_permission_observed(&self) -> bool {
+        self.flow_permission_observed
     }
 
     /// Apply one already-deframed command payload.
@@ -449,17 +463,19 @@ impl RNodeProtocolState {
             ),
             RNodeProtocolFrame::Detection(value) => {
                 let detected = value == RNodeDetection::Confirmed;
-                if self.evidence.detected == detected {
+                if self.detection_observed && self.evidence.detected == detected {
                     RNodeProtocolEffect::NoChange
                 } else {
+                    self.detection_observed = true;
                     self.evidence.detected = detected;
                     RNodeProtocolEffect::EvidenceChanged(RNodeReadinessEvidence::Detection)
                 }
             }
             RNodeProtocolFrame::FlowPermission(permitted) => {
-                if self.evidence.flow_permitted == permitted {
+                if self.flow_permission_observed && self.evidence.flow_permitted == permitted {
                     RNodeProtocolEffect::NoChange
                 } else {
+                    self.flow_permission_observed = true;
                     self.evidence.flow_permitted = permitted;
                     RNodeProtocolEffect::FlowPermissionChanged(permitted)
                 }
@@ -471,6 +487,8 @@ impl RNodeProtocolState {
             ),
             RNodeProtocolFrame::Reset => {
                 self.evidence = RNodeProtocolEvidence::default();
+                self.detection_observed = false;
+                self.flow_permission_observed = false;
                 RNodeProtocolEffect::Reset
             }
             RNodeProtocolFrame::RadioInitialisationError => {
@@ -763,11 +781,28 @@ mod tests {
     #[test]
     fn flow_ready_is_only_transmit_permission() {
         let mut state = RNodeProtocolState::new(TARGET);
+        assert!(!state.flow_permission_observed());
+        assert!(!state.evidence().flow_permitted);
+        assert_eq!(
+            state.apply_frame(rnode::CMD_READY, &[0]),
+            RNodeProtocolEffect::FlowPermissionChanged(false)
+        );
+        assert!(state.flow_permission_observed());
+        assert!(!state.evidence().flow_permitted);
+        assert_eq!(
+            state.apply_frame(rnode::CMD_READY, &[0]),
+            RNodeProtocolEffect::NoChange
+        );
         assert_eq!(
             state.apply_frame(rnode::CMD_READY, &[1]),
             RNodeProtocolEffect::FlowPermissionChanged(true)
         );
+        assert!(state.flow_permission_observed());
         assert!(state.evidence().flow_permitted);
+        assert_eq!(
+            state.apply_frame(rnode::CMD_READY, &[0]),
+            RNodeProtocolEffect::FlowPermissionChanged(false)
+        );
         assert_eq!(
             state.readiness(),
             RNodeReadiness::Blocked(RNodeReadinessBlocker::Missing(
@@ -778,8 +813,10 @@ mod tests {
         let mut ready = ready_state();
         assert_eq!(
             ready.apply_frame(rnode::CMD_READY, &[0]),
-            RNodeProtocolEffect::NoChange
+            RNodeProtocolEffect::FlowPermissionChanged(false)
         );
+        assert!(ready.flow_permission_observed());
+        assert!(!ready.evidence().flow_permitted);
         assert_eq!(ready.readiness(), RNodeReadiness::Ready);
     }
 
@@ -822,19 +859,99 @@ mod tests {
     }
 
     #[test]
-    fn invalid_detect_clears_previous_confirmation_without_retaining_value() {
-        let mut state = ready_state();
+    fn negative_detection_is_observed_idempotent_and_can_transition() {
+        let mut state = RNodeProtocolState::new(TARGET);
+        assert!(!state.detection_observed());
+        assert!(!state.evidence().detected);
+
         assert_eq!(
             state.apply_frame(rnode::CMD_DETECT, &[0x00]),
             RNodeProtocolEffect::EvidenceChanged(RNodeReadinessEvidence::Detection)
         );
+        assert!(state.detection_observed());
         assert!(!state.evidence().detected);
+        assert_eq!(
+            state.apply_frame(rnode::CMD_DETECT, &[0x00]),
+            RNodeProtocolEffect::NoChange
+        );
         assert_eq!(
             state.readiness(),
             RNodeReadiness::Blocked(RNodeReadinessBlocker::Missing(
                 RNodeReadinessEvidence::Detection
             ))
         );
+
+        assert_eq!(
+            state.apply_frame(rnode::CMD_DETECT, &[rnode::DETECT_RESP]),
+            RNodeProtocolEffect::EvidenceChanged(RNodeReadinessEvidence::Detection)
+        );
+        assert!(state.detection_observed());
+        assert!(state.evidence().detected);
+
+        assert_eq!(
+            state.apply_frame(rnode::CMD_DETECT, &[0x00]),
+            RNodeProtocolEffect::EvidenceChanged(RNodeReadinessEvidence::Detection)
+        );
+        assert!(state.detection_observed());
+        assert!(!state.evidence().detected);
+    }
+
+    #[test]
+    fn malformed_negative_evidence_frames_do_not_mark_observation() {
+        let mut state = RNodeProtocolState::new(TARGET);
+        let initial = state.clone();
+
+        for payload in [&[][..], &[0x00, 0x00][..]] {
+            assert!(matches!(
+                state.apply_frame(rnode::CMD_DETECT, payload),
+                RNodeProtocolEffect::Rejected(RNodeFrameRejection::InvalidLength {
+                    command: RNodeProtocolCommand::Detect,
+                    ..
+                })
+            ));
+            assert!(matches!(
+                state.apply_frame(rnode::CMD_READY, payload),
+                RNodeProtocolEffect::Rejected(RNodeFrameRejection::InvalidLength {
+                    command: RNodeProtocolCommand::FlowReady,
+                    ..
+                })
+            ));
+        }
+
+        assert_eq!(state, initial);
+        assert!(!state.detection_observed());
+        assert!(!state.flow_permission_observed());
+    }
+
+    #[test]
+    fn reset_clears_observed_negative_evidence() {
+        let default_evidence = RNodeProtocolEvidence {
+            detected: false,
+            firmware: None,
+            frequency: None,
+            bandwidth: None,
+            spreading_factor: None,
+            coding_rate: None,
+            tx_power: None,
+            radio_state: None,
+            flow_permitted: false,
+            radio_initialisation_fault: false,
+        };
+        assert_eq!(RNodeProtocolEvidence::default(), default_evidence);
+
+        let mut state = RNodeProtocolState::new(TARGET);
+        state.apply_frame(rnode::CMD_DETECT, &[0x00]);
+        state.apply_frame(rnode::CMD_READY, &[0x00]);
+        assert!(state.detection_observed());
+        assert!(state.flow_permission_observed());
+
+        assert_eq!(
+            state.apply_frame(rnode::CMD_RESET, &[0xF8]),
+            RNodeProtocolEffect::Reset
+        );
+        assert_eq!(state.evidence(), default_evidence);
+        assert!(!state.detection_observed());
+        assert!(!state.flow_permission_observed());
     }
 
     #[test]
