@@ -483,6 +483,20 @@ pub struct RNodeRuntimeObserver {
     state: rns_interface::rnode::RNodeDriverSubscription,
 }
 
+/// Exact observation returned atomically with a newly registered RNode.
+///
+/// `online` is the legacy shared online/enabled flag retained for compatibility.
+/// It is not authoritative physical state or protocol readiness. Use `observer`
+/// for protocol state and [`RNodeRuntimeObserver::await_ready`] when readiness
+/// is required.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct SpawnedRNodeRuntime {
+    pub interface_id: rns_interface::traits::InterfaceId,
+    pub online: Arc<AtomicBool>,
+    pub observer: RNodeRuntimeObserver,
+}
+
 impl RNodeRuntimeObserver {
     /// Runtime-local interface ID associated with this exact observation.
     pub fn interface_id(&self) -> rns_interface::traits::InterfaceId {
@@ -5985,6 +5999,18 @@ pub async fn spawn_ble_rnode_runtime(
     handle: &ReticulumHandle,
     args: BleRnodeRuntimeArgs<'_>,
 ) -> Result<(u64, std::sync::Arc<std::sync::atomic::AtomicBool>), String> {
+    let spawned = spawn_ble_rnode_runtime_observed(handle, args).await?;
+    Ok((spawned.interface_id, spawned.online))
+}
+
+/// Spawn and register a BLE RNode, returning an observer bound to that exact
+/// registration. Successful return does not imply protocol readiness; call
+/// [`RNodeRuntimeObserver::await_ready`] when readiness is required.
+#[cfg(feature = "ble")]
+pub async fn spawn_ble_rnode_runtime_observed(
+    handle: &ReticulumHandle,
+    args: BleRnodeRuntimeArgs<'_>,
+) -> Result<SpawnedRNodeRuntime, String> {
     let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let BleRnodeRuntimeArgs {
         name,
@@ -6000,19 +6026,24 @@ pub async fn spawn_ble_rnode_runtime(
         flow_control,
     } = args;
 
-    let id = handle
-        .id_gen
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut config = rns_interface::ble_rnode::BleRNodeConfig::new(name, port);
     config.frequency = frequency;
     config.bandwidth = bandwidth;
     config.spreading_factor = spreading_factor;
     config.coding_rate = coding_rate;
-    config.tx_power = tx_power as u8;
+    config.tx_power = u8::try_from(tx_power)
+        .map_err(|_| format!("invalid value for '{name}.txpower': {tx_power} is below 0 dBm"))?;
     config.mode = mode;
     config.st_alock = st_alock;
     config.lt_alock = lt_alock;
     config.flow_control = flow_control;
+    config
+        .validate()
+        .map_err(|error| format!("invalid value for '{name}.{}': {error}", error.field()))?;
+
+    let id = handle
+        .id_gen
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let spawned = rns_interface::ble_rnode::spawn_ble_rnode_interface_with_driver(
         config,
@@ -6023,6 +6054,7 @@ pub async fn spawn_ble_rnode_runtime(
     .map_err(|e| format!("BLE RNode spawn failed: {e}"))?;
 
     let online = spawned.interface.online.clone();
+    let state = spawned.driver.watch();
     register_observed_rnode_handle_with_kind_and_spawn_permit(
         &handle.transport_tx,
         spawned,
@@ -6034,7 +6066,14 @@ pub async fn spawn_ble_rnode_runtime(
     .await
     .map_err(|error| format!("BLE RNode registration failed: {error}"))?;
     tracing::info!(name = %name, id, "runtime BLE RNode interface spawned");
-    Ok((id, online))
+    Ok(SpawnedRNodeRuntime {
+        interface_id: id,
+        online,
+        observer: RNodeRuntimeObserver {
+            interface_id: id,
+            state,
+        },
+    })
 }
 
 /// Runtime-spawned RNode over USB serial or TCP (`tcp://host[:port]`).
@@ -6069,6 +6108,18 @@ pub async fn spawn_rnode_runtime(
     handle: &ReticulumHandle,
     args: RnodeRuntimeArgs<'_>,
 ) -> Result<(u64, std::sync::Arc<std::sync::atomic::AtomicBool>), String> {
+    let spawned = spawn_rnode_runtime_observed(handle, args).await?;
+    Ok((spawned.interface_id, spawned.online))
+}
+
+/// Spawn a serial/TCP RNode and return an observer bound to that exact
+/// registration. Successful return does not imply protocol readiness; call
+/// [`RNodeRuntimeObserver::await_ready`] when readiness is required.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+pub async fn spawn_rnode_runtime_observed(
+    handle: &ReticulumHandle,
+    args: RnodeRuntimeArgs<'_>,
+) -> Result<SpawnedRNodeRuntime, String> {
     let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let RnodeRuntimeArgs {
         name,
@@ -6112,6 +6163,7 @@ pub async fn spawn_rnode_runtime(
     .map_err(|e| format!("RNode spawn failed: {e}"))?;
 
     let online = spawned.interface.online.clone();
+    let state = spawned.driver.watch();
     register_observed_rnode_handle_with_kind_and_spawn_permit(
         &handle.transport_tx,
         spawned,
@@ -6123,7 +6175,14 @@ pub async fn spawn_rnode_runtime(
     .await
     .map_err(|error| format!("RNode registration failed: {error}"))?;
     tracing::info!(name = %name, id, "runtime RNode interface spawned");
-    Ok((id, online))
+    Ok(SpawnedRNodeRuntime {
+        interface_id: id,
+        online,
+        observer: RNodeRuntimeObserver {
+            interface_id: id,
+            state,
+        },
+    })
 }
 
 /// Android bridge variant: Kotlin owns GATT, Rust connects via a local TCP socket.
@@ -6133,6 +6192,19 @@ pub async fn spawn_ble_rnode_runtime_native(
     args: BleRnodeRuntimeArgs<'_>,
     tcp_port: u16,
 ) -> Result<(u64, std::sync::Arc<std::sync::atomic::AtomicBool>), String> {
+    let spawned = spawn_ble_rnode_runtime_native_observed(handle, args, tcp_port).await?;
+    Ok((spawned.interface_id, spawned.online))
+}
+
+/// Spawn a native-bridge BLE RNode and return an observer bound to that exact
+/// registration. Successful return does not imply protocol readiness; call
+/// [`RNodeRuntimeObserver::await_ready`] when readiness is required.
+#[cfg(feature = "ble")]
+pub async fn spawn_ble_rnode_runtime_native_observed(
+    handle: &ReticulumHandle,
+    args: BleRnodeRuntimeArgs<'_>,
+    tcp_port: u16,
+) -> Result<SpawnedRNodeRuntime, String> {
     let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let BleRnodeRuntimeArgs {
         name,
@@ -6148,19 +6220,24 @@ pub async fn spawn_ble_rnode_runtime_native(
         flow_control,
     } = args;
 
-    let id = handle
-        .id_gen
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut config = rns_interface::ble_rnode::BleRNodeConfig::new(name, port);
     config.frequency = frequency;
     config.bandwidth = bandwidth;
     config.spreading_factor = spreading_factor;
     config.coding_rate = coding_rate;
-    config.tx_power = tx_power as u8;
+    config.tx_power = u8::try_from(tx_power)
+        .map_err(|_| format!("invalid value for '{name}.txpower': {tx_power} is below 0 dBm"))?;
     config.mode = mode;
     config.st_alock = st_alock;
     config.lt_alock = lt_alock;
     config.flow_control = flow_control;
+    config
+        .validate()
+        .map_err(|error| format!("invalid value for '{name}.{}': {error}", error.field()))?;
+
+    let id = handle
+        .id_gen
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let spawned = rns_interface::ble_rnode::spawn_ble_rnode_interface_native_with_driver(
         config,
@@ -6172,6 +6249,7 @@ pub async fn spawn_ble_rnode_runtime_native(
     .map_err(|e| format!("BLE RNode native spawn failed: {e}"))?;
 
     let online = spawned.interface.online.clone();
+    let state = spawned.driver.watch();
     register_observed_rnode_handle_with_kind_and_spawn_permit(
         &handle.transport_tx,
         spawned,
@@ -6183,7 +6261,14 @@ pub async fn spawn_ble_rnode_runtime_native(
     .await
     .map_err(|error| format!("BLE RNode native registration failed: {error}"))?;
     tracing::info!(name = %name, id, tcp_port, "runtime BLE RNode interface spawned (native bridge)");
-    Ok((id, online))
+    Ok(SpawnedRNodeRuntime {
+        interface_id: id,
+        online,
+        observer: RNodeRuntimeObserver {
+            interface_id: id,
+            state,
+        },
+    })
 }
 
 /// Spawn an AutoInterface (local-network discovery) with a resolved config.
@@ -6319,6 +6404,7 @@ pub async fn teardown_rnode_interface(handle: &ReticulumHandle, id: u64) {
 }
 
 #[cfg(target_os = "android")]
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_android_usb_rnode_runtime(
     handle: &ReticulumHandle,
     name: &str,
@@ -6333,20 +6419,62 @@ pub async fn spawn_android_usb_rnode_runtime(
     lt_alock: Option<f32>,
     flow_control: bool,
 ) -> Result<u64, String> {
+    let spawned = spawn_android_usb_rnode_runtime_observed(
+        handle,
+        name,
+        device_name,
+        frequency,
+        bandwidth,
+        spreading_factor,
+        coding_rate,
+        tx_power,
+        mode,
+        st_alock,
+        lt_alock,
+        flow_control,
+    )
+    .await?;
+    Ok(spawned.interface_id)
+}
+
+/// Spawn an Android USB RNode and return an observer bound to that exact
+/// registration. Successful return does not imply protocol readiness; call
+/// [`RNodeRuntimeObserver::await_ready`] when readiness is required.
+#[cfg(target_os = "android")]
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_android_usb_rnode_runtime_observed(
+    handle: &ReticulumHandle,
+    name: &str,
+    device_name: &str,
+    frequency: u32,
+    bandwidth: u32,
+    spreading_factor: u8,
+    coding_rate: u8,
+    tx_power: i8,
+    mode: rns_interface::traits::InterfaceMode,
+    st_alock: Option<f32>,
+    lt_alock: Option<f32>,
+    flow_control: bool,
+) -> Result<SpawnedRNodeRuntime, String> {
     let spawn_permit = ensure_runtime_interface_admission(handle)?;
-    let id = handle
-        .id_gen
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut config = rns_interface::android_usb::AndroidUsbConfig::new(name, device_name);
     config.frequency = frequency;
     config.bandwidth = bandwidth;
     config.spreading_factor = spreading_factor;
     config.coding_rate = coding_rate;
-    config.tx_power = tx_power as u8;
+    config.tx_power = u8::try_from(tx_power)
+        .map_err(|_| format!("invalid value for '{name}.txpower': {tx_power} is below 0 dBm"))?;
     config.mode = mode;
     config.st_alock = st_alock;
     config.lt_alock = lt_alock;
     config.flow_control = flow_control;
+    config
+        .validate()
+        .map_err(|error| format!("invalid value for '{name}.{}': {error}", error.field()))?;
+
+    let id = handle
+        .id_gen
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let spawned = rns_interface::android_usb::spawn_android_usb_rnode_interface_with_driver(
         config,
@@ -6356,6 +6484,8 @@ pub async fn spawn_android_usb_rnode_runtime(
     .await
     .map_err(|e| format!("Android USB spawn failed: {e}"))?;
 
+    let online = spawned.interface.online.clone();
+    let state = spawned.driver.watch();
     register_observed_rnode_handle_with_kind_and_spawn_permit(
         &handle.transport_tx,
         spawned,
@@ -6367,7 +6497,14 @@ pub async fn spawn_android_usb_rnode_runtime(
     .await
     .map_err(|error| format!("Android USB registration failed: {error}"))?;
     tracing::info!(name = %name, id, "runtime Android USB RNode interface spawned");
-    Ok(id)
+    Ok(SpawnedRNodeRuntime {
+        interface_id: id,
+        online,
+        observer: RNodeRuntimeObserver {
+            interface_id: id,
+            state,
+        },
+    })
 }
 
 #[cfg(target_os = "android")]
@@ -7542,6 +7679,254 @@ mod tests {
     }
 
     #[cfg(feature = "rnode-tcp")]
+    fn test_rnode_runtime_args<'a>(name: &'a str, port: &'a str) -> RnodeRuntimeArgs<'a> {
+        let defaults = rns_interface::rnode::RNodeConfig::new(name, port);
+        RnodeRuntimeArgs {
+            name,
+            port,
+            frequency: defaults.frequency,
+            bandwidth: defaults.bandwidth,
+            spreading_factor: defaults.spreading_factor,
+            coding_rate: defaults.coding_rate,
+            tx_power: i8::try_from(defaults.tx_power).expect("default RNode power fits i8"),
+            mode: defaults.mode,
+            st_alock: defaults.st_alock,
+            lt_alock: defaults.lt_alock,
+            flow_control: defaults.flow_control,
+        }
+    }
+
+    #[cfg(feature = "ble")]
+    fn test_ble_rnode_runtime_args<'a>(name: &'a str, port: &'a str) -> BleRnodeRuntimeArgs<'a> {
+        let defaults = rns_interface::ble_rnode::BleRNodeConfig::new(name, port);
+        BleRnodeRuntimeArgs {
+            name,
+            port,
+            frequency: defaults.frequency,
+            bandwidth: defaults.bandwidth,
+            spreading_factor: defaults.spreading_factor,
+            coding_rate: defaults.coding_rate,
+            tx_power: i8::try_from(defaults.tx_power).expect("default RNode power fits i8"),
+            mode: defaults.mode,
+            st_alock: defaults.st_alock,
+            lt_alock: defaults.lt_alock,
+            flow_control: defaults.flow_control,
+        }
+    }
+
+    #[cfg(feature = "ble")]
+    #[tokio::test]
+    async fn ble_runtime_spawns_validate_before_allocating_interface_ids() {
+        let runtime = dummy_handle();
+
+        let mut direct = test_ble_rnode_runtime_args("invalid-direct", "ble://RNode");
+        direct.tx_power = -1;
+        let direct_error = spawn_ble_rnode_runtime_observed(&runtime, direct)
+            .await
+            .expect_err("negative BLE transmit power must be rejected");
+        assert!(direct_error.contains("txpower"));
+        assert_eq!(runtime.id_gen.load(Ordering::SeqCst), 0);
+
+        let mut native = test_ble_rnode_runtime_args("invalid-native", "ble://RNode");
+        native.frequency = 0;
+        let native_error = spawn_ble_rnode_runtime_native_observed(&runtime, native, 1)
+            .await
+            .expect_err("invalid native BLE frequency must be rejected");
+        assert!(native_error.contains("frequency"));
+        assert_eq!(runtime.id_gen.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.interface_registry.len(), 0);
+        assert!(
+            runtime
+                .interface_controls
+                .lock()
+                .expect("interface_controls mutex poisoned")
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn observed_rnode_spawn_returns_its_exact_registered_driver() {
+        let defaults =
+            rns_interface::rnode::RNodeConfig::new("atomic-observer-template", "tcp://127.0.0.1:1");
+        let settings = rns_interface::rnode::RNodeRadioSettings::from(&defaults);
+        let (port, closed_rx, peer) = test_ready_rnode_tcp_peer(settings);
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let mut runtime = dummy_handle();
+        runtime.transport_tx = transport_tx;
+
+        let spawned = spawn_rnode_runtime_observed(
+            &runtime,
+            test_rnode_runtime_args("atomic-observer", &port),
+        )
+        .await
+        .expect("spawn observed runtime RNode");
+        assert_eq!(spawned.interface_id, 0);
+        assert_eq!(spawned.observer.interface_id(), spawned.interface_id);
+        let registered = runtime
+            .rnode_runtime(spawned.interface_id)
+            .expect("registered exact RNode observer");
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::RegisterInterface {
+                id: registered_id,
+                ..
+            }) if registered_id == spawned.interface_id
+        ));
+
+        let ready = spawned
+            .observer
+            .await_ready(Duration::from_secs(2))
+            .await
+            .expect("exact spawned RNode readiness");
+        assert_eq!(ready.phase, rns_interface::rnode::RNodeRuntimePhase::Ready);
+        let registered_ready = registered
+            .await_ready(Duration::ZERO)
+            .await
+            .expect("registered observer shares exact ready publication");
+        assert!(
+            Arc::ptr_eq(&ready, &registered_ready),
+            "spawn result and registry lookup must share the exact driver publication"
+        );
+        assert!(spawned.online.load(Ordering::SeqCst));
+
+        teardown_rnode_interface(&runtime, spawned.interface_id).await;
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::DeregisterInterface {
+                id: deregistered_id
+            }) if deregistered_id == spawned.interface_id
+        ));
+        let observed = closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("exact spawned RNode did not close");
+        assert!(observed.ends_with(&rns_interface::rnode::build_detach_sequence()));
+        peer.join().unwrap();
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn legacy_rnode_spawn_preserves_id_and_online_result() {
+        let (port, closed_rx, peer) = test_rnode_tcp_peer();
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let mut runtime = dummy_handle();
+        runtime.transport_tx = transport_tx;
+
+        let (id, online) =
+            spawn_rnode_runtime(&runtime, test_rnode_runtime_args("legacy-spawn", &port))
+                .await
+                .expect("legacy RNode spawn");
+        assert_eq!(id, 0);
+        assert!(online.load(Ordering::SeqCst));
+        assert!(
+            runtime.rnode_runtime(id).is_ok(),
+            "legacy spawn must still register an observable RNode"
+        );
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::RegisterInterface {
+                id: registered_id,
+                ..
+            }) if registered_id == id
+        ));
+
+        teardown_rnode_interface(&runtime, id).await;
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::DeregisterInterface {
+                id: deregistered_id
+            }) if deregistered_id == id
+        ));
+        let observed = closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("legacy spawned RNode did not close");
+        assert!(observed.ends_with(&rns_interface::rnode::build_detach_sequence()));
+        peer.join().unwrap();
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn cancelled_observed_rnode_spawn_rolls_back_without_publishing() {
+        let (port, closed_rx, peer) = test_rnode_tcp_peer();
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        transport_tx
+            .send(TransportMessage::Shutdown)
+            .await
+            .expect("fill transport channel");
+        let mut runtime = dummy_handle();
+        runtime.transport_tx = transport_tx;
+        let registry = runtime.interface_registry.clone();
+        let controls = runtime.interface_controls.clone();
+
+        let caller = tokio::spawn(async move {
+            spawn_rnode_runtime_observed(
+                &runtime,
+                test_rnode_runtime_args("cancelled-observed-spawn", &port),
+            )
+            .await
+        });
+        wait_for_registry_len(&registry, 1).await;
+        caller.abort();
+        let _ = caller.await;
+        wait_for_registry_len(&registry, 0).await;
+
+        assert!(
+            controls
+                .lock()
+                .expect("interface_controls mutex poisoned")
+                .is_empty()
+        );
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::Shutdown)
+        ));
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "cancelled observed spawn must never publish RegisterInterface"
+        );
+        let observed = closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled observed spawn did not close its exact RNode");
+        assert!(observed.ends_with(&rns_interface::rnode::build_detach_sequence()));
+        peer.join().unwrap();
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn observed_rnode_spawn_registration_failure_stops_exact_driver() {
+        let (port, closed_rx, peer) = test_rnode_tcp_peer();
+        let (transport_tx, transport_rx) = mpsc::channel::<TransportMessage>(1);
+        drop(transport_rx);
+        let mut runtime = dummy_handle();
+        runtime.transport_tx = transport_tx;
+
+        let result = spawn_rnode_runtime_observed(
+            &runtime,
+            test_rnode_runtime_args("failed-observed-spawn", &port),
+        )
+        .await;
+        assert!(
+            result
+                .expect_err("closed transport must reject observed spawn registration")
+                .contains("RNode registration failed"),
+            "public spawn error must preserve registration context"
+        );
+        assert_eq!(runtime.interface_registry.len(), 0);
+        assert!(
+            runtime
+                .interface_controls
+                .lock()
+                .expect("interface_controls mutex poisoned")
+                .is_empty()
+        );
+        let observed = closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("failed observed spawn did not close its exact RNode");
+        assert!(observed.ends_with(&rns_interface::rnode::build_detach_sequence()));
+        peer.join().unwrap();
+    }
+
+    #[cfg(feature = "rnode-tcp")]
     #[tokio::test]
     async fn rnode_runtime_observer_waits_for_exact_protocol_readiness_and_terminal_stop() {
         let id = 920_199;
@@ -7701,27 +8086,17 @@ mod tests {
         runtime.transport_tx = transport_tx.clone();
         runtime.interface_controls = controls.clone();
         runtime.interface_registry = registry.clone();
+        runtime.id_gen = Arc::new(AtomicU64::new(id));
 
         let (first_port, first_closed_rx, first_peer) = test_rnode_tcp_peer();
-        let first = rns_interface::rnode::spawn_rnode_interface_with_driver(
-            rns_interface::rnode::RNodeConfig::new("observer-owner-a", &first_port),
-            id,
-            transport_tx.clone(),
+        let first = spawn_rnode_runtime_observed(
+            &runtime,
+            test_rnode_runtime_args("observer-owner-a", &first_port),
         )
         .await
         .expect("spawn first RNode owner");
-        register_observed_rnode_handle_with_kind(
-            &transport_tx,
-            first,
-            &controls,
-            &registry,
-            InterfaceKind::RNode,
-        )
-        .await
-        .expect("register first RNode owner");
-        let first_observer = runtime
-            .rnode_runtime(id)
-            .expect("observe first RNode owner");
+        assert_eq!(first.interface_id, id);
+        let first_observer = first.observer;
 
         teardown_interface(&runtime, id).await;
         let first_terminal = first_observer
@@ -7744,25 +8119,15 @@ mod tests {
         );
         let settings = rns_interface::rnode::RNodeRadioSettings::from(&template);
         let (second_port, second_closed_rx, second_peer) = test_ready_rnode_tcp_peer(settings);
-        let second = rns_interface::rnode::spawn_rnode_interface_with_driver(
-            rns_interface::rnode::RNodeConfig::new("observer-owner-b", &second_port),
-            id,
-            transport_tx.clone(),
+        runtime.id_gen.store(id, Ordering::SeqCst);
+        let second = spawn_rnode_runtime_observed(
+            &runtime,
+            test_rnode_runtime_args("observer-owner-b", &second_port),
         )
         .await
         .expect("spawn replacement RNode owner");
-        register_observed_rnode_handle_with_kind(
-            &transport_tx,
-            second,
-            &controls,
-            &registry,
-            InterfaceKind::RNode,
-        )
-        .await
-        .expect("register replacement RNode owner");
-        let second_observer = runtime
-            .rnode_runtime(id)
-            .expect("observe replacement RNode owner");
+        assert_eq!(second.interface_id, id);
+        let second_observer = second.observer;
         let second_ready = second_observer
             .await_ready(Duration::from_secs(2))
             .await

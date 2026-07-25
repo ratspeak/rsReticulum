@@ -43,8 +43,8 @@ pub mod prelude {
         AnnounceSubscription, ControlError, InitOptions, InterfaceStats, LinkConnectError,
         LinkConnectOptions, OutboundPacket, PacketReceiptHandle, PacketReceiptStatus,
         RNodeReadinessError, RNodeRuntimeLookupError, RNodeRuntimeObserver, RecalledDestination,
-        ReceiptError, ReticulumError, ReticulumHandle, SendError, SendOptions, SendResult, init,
-        init_with_options,
+        ReceiptError, ReticulumError, ReticulumHandle, SendError, SendOptions, SendResult,
+        SpawnedRNodeRuntime, init, init_with_options,
     };
     pub use rns_identity::destination::{
         AllowPolicy, DestType, Destination, DestinationPacketError, DestinationPacketOptions,
