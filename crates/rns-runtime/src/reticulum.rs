@@ -238,6 +238,66 @@ pub struct SendResult {
     pub receipt: Option<PacketReceiptHandle>,
 }
 
+/// Stateful non-Link application packet that can be sent and re-sent.
+///
+/// Re-sending runs the normal destination encryption path again, producing
+/// fresh ciphertext, a new packet hash, and a new receipt when requested.
+pub struct OutboundPacket<'a> {
+    runtime: &'a ReticulumHandle,
+    destination: &'a Destination,
+    data: &'a [u8],
+    options: SendOptions,
+    sent: bool,
+}
+
+impl std::fmt::Debug for OutboundPacket<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OutboundPacket")
+            .field("destination_hash", &hex::encode(self.destination.hash))
+            .field("data_len", &self.data.len())
+            .field("sent", &self.sent)
+            .finish()
+    }
+}
+
+impl OutboundPacket<'_> {
+    pub fn is_sent(&self) -> bool {
+        self.sent
+    }
+
+    /// Send this packet for the first time.
+    pub async fn send(&mut self) -> Result<SendResult, SendError> {
+        if self.sent {
+            return Err(SendError::AlreadySent);
+        }
+        let result = self
+            .runtime
+            .send_to(self.destination, self.data, self.options.clone())
+            .await?;
+        self.sent = true;
+        Ok(result)
+    }
+
+    /// Re-send a previously-sent packet with fresh destination encryption.
+    pub async fn resend(&mut self) -> Result<SendResult, SendError> {
+        if !self.sent {
+            return Err(SendError::NotSent);
+        }
+        match self
+            .runtime
+            .send_to(self.destination, self.data, self.options.clone())
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.sent = false;
+                Err(error)
+            }
+        }
+    }
+}
+
 /// Current lifecycle state of a tracked packet.
 pub type PacketReceiptStatus = ReceiptUpdate;
 
@@ -247,6 +307,7 @@ pub struct PacketReceiptHandle {
     pub packet_hash: [u8; 32],
     pub truncated_hash: [u8; 16],
     status_rx: watch::Receiver<ReceiptUpdate>,
+    transport_tx: mpsc::Sender<TransportMessage>,
 }
 
 impl std::fmt::Debug for PacketReceiptHandle {
@@ -267,6 +328,30 @@ impl PacketReceiptHandle {
     /// Subscribe to future receipt state changes.
     pub fn watch(&self) -> watch::Receiver<PacketReceiptStatus> {
         self.status_rx.clone()
+    }
+
+    /// Change the timeout of this receipt while it is still pending.
+    ///
+    /// The new duration is measured from the original send time, matching
+    /// Python `PacketReceipt.set_timeout`.
+    pub async fn set_timeout(&self, timeout: Duration) -> Result<(), ReceiptError> {
+        if self.status() != ReceiptUpdate::Sent {
+            return Err(ReceiptError::NoLongerTracked);
+        }
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.transport_tx
+            .send(TransportMessage::SetReceiptTimeout {
+                truncated_hash: self.truncated_hash,
+                timeout,
+                result_tx,
+            })
+            .await
+            .map_err(|_| ReceiptError::TransportClosed)?;
+        if result_rx.await.map_err(|_| ReceiptError::TransportClosed)? {
+            Ok(())
+        } else {
+            Err(ReceiptError::NoLongerTracked)
+        }
     }
 
     /// Wait until the packet is delivered or reaches another terminal state.
@@ -296,6 +381,8 @@ pub enum ReceiptError {
     Failed,
     #[error("packet receipt was culled")]
     Culled,
+    #[error("packet receipt is no longer pending")]
+    NoLongerTracked,
     #[error("transport closed before the receipt concluded")]
     TransportClosed,
 }
@@ -320,6 +407,10 @@ pub enum SendError {
     NoInterface,
     #[error("another in-flight receipt has the same truncated packet hash")]
     ReceiptCollision,
+    #[error("packet was already sent; use resend")]
+    AlreadySent,
+    #[error("packet has not been sent yet")]
+    NotSent,
     #[error("transport control failed: {0}")]
     Control(#[from] ControlError),
 }
@@ -576,11 +667,31 @@ impl ReticulumHandle {
         })
     }
 
+    /// Prepare one stateful non-Link application packet.
+    ///
+    /// [`OutboundPacket::send`] performs the same validated destination
+    /// resolution, encryption, receipt registration, and dispatch as
+    /// [`Self::send_to`]. [`OutboundPacket::resend`] repeats that complete
+    /// path so each attempt receives fresh ciphertext and receipt state.
+    pub fn outbound_packet<'a>(
+        &'a self,
+        destination: &'a Destination,
+        data: &'a [u8],
+        options: SendOptions,
+    ) -> OutboundPacket<'a> {
+        OutboundPacket {
+            runtime: self,
+            destination,
+            data,
+            options,
+            sent: false,
+        }
+    }
+
     /// Encrypt and dispatch one non-Link application packet.
     ///
-    /// SINGLE destinations are resolved from the validated announce cache so
-    /// callers do not need to manually compose packet headers, encryption,
-    /// receipt registration, and proof correlation.
+    /// Call [`Self::outbound_packet`] when the same logical packet may need
+    /// to be re-sent with fresh ciphertext.
     pub async fn send_to(
         &self,
         destination: &Destination,
@@ -660,6 +771,7 @@ impl ReticulumHandle {
                     packet_hash,
                     truncated_hash,
                     status_rx,
+                    transport_tx: self.transport_tx.clone(),
                 }),
                 Some(TrackedReceiptRegistration {
                     truncated_hash,
@@ -5473,6 +5585,18 @@ loglevel = 7
                 b"hello"
             );
             result_tx.send(OutboundDispatchResult::Sent).unwrap();
+
+            let TransportMessage::SetReceiptTimeout {
+                truncated_hash,
+                timeout,
+                result_tx,
+            } = transport_rx.recv().await.expect("receipt timeout update")
+            else {
+                panic!("expected receipt timeout update");
+            };
+            assert_eq!(truncated_hash, receipt.truncated_hash);
+            assert_eq!(timeout, Duration::from_secs(3));
+            result_tx.send(true).unwrap();
             receipt.status_tx.send_replace(ReceiptUpdate::Delivered {
                 rtt: Duration::from_millis(42),
             });
@@ -5493,10 +5617,99 @@ loglevel = 7
             .unwrap();
         let receipt = sent.receipt.expect("receipt requested");
         assert_eq!(receipt.packet_hash, sent.packet_hash);
+        receipt.set_timeout(Duration::from_secs(3)).await.unwrap();
         assert_eq!(
             receipt.delivered().await.unwrap(),
             Duration::from_millis(42)
         );
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbound_packet_resend_uses_fresh_ciphertext_and_enforces_state() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let (raw_tx, mut raw_rx) = mpsc::channel::<Bytes>(2);
+        let remote_identity = Identity::new();
+        let destination = Destination::new(
+            Some(&remote_identity),
+            Direction::Out,
+            DestType::Single,
+            "resend.test",
+        )
+        .unwrap();
+        let destination_hash = destination.hash;
+        let public_key = remote_identity.get_public_key();
+        let responder = tokio::spawn(async move {
+            for _ in 0..2 {
+                let TransportMessage::Rpc { query, response_tx } =
+                    transport_rx.recv().await.expect("recall query")
+                else {
+                    panic!("expected recall query");
+                };
+                assert!(matches!(
+                    query,
+                    TransportQuery::RecallDestination { dest } if dest == destination_hash
+                ));
+                response_tx
+                    .send(TransportQueryResponse::RecalledDestination(Some(
+                        RecalledDestinationRpcEntry {
+                            dest_hash: destination_hash,
+                            public_key,
+                            app_data: None,
+                            ratchet: None,
+                            hops: 1,
+                            timestamp: 1.0,
+                        },
+                    )))
+                    .unwrap();
+
+                let TransportMessage::SendPacket {
+                    request,
+                    receipt,
+                    result_tx,
+                    ..
+                } = transport_rx.recv().await.expect("packet send")
+                else {
+                    panic!("expected packet send");
+                };
+                assert!(receipt.is_none());
+                raw_tx.send(request.raw).await.unwrap();
+                result_tx.send(OutboundDispatchResult::Sent).unwrap();
+            }
+        });
+
+        let mut handle = dummy_handle();
+        handle.transport_tx = transport_tx;
+        let options = SendOptions {
+            create_receipt: false,
+            ..SendOptions::default()
+        };
+        let mut packet = handle.outbound_packet(&destination, b"again", options);
+        assert!(matches!(packet.resend().await, Err(SendError::NotSent)));
+
+        let first = packet.send().await.unwrap();
+        assert!(packet.is_sent());
+        assert!(matches!(packet.send().await, Err(SendError::AlreadySent)));
+        let second = packet.resend().await.unwrap();
+        assert_ne!(first.packet_hash, second.packet_hash);
+
+        let first_raw = raw_rx.recv().await.unwrap();
+        let second_raw = raw_rx.recv().await.unwrap();
+        assert_ne!(first_raw, second_raw);
+        let inbound = Destination::new(
+            Some(&remote_identity),
+            Direction::In,
+            DestType::Single,
+            "resend.test",
+        )
+        .unwrap();
+        for raw in [first_raw, second_raw] {
+            let packed = rns_wire::packet::Packet::from_raw(&raw).unwrap();
+            assert_eq!(
+                inbound.decrypt(packed.data(), &remote_identity).unwrap(),
+                b"again"
+            );
+        }
         responder.await.unwrap();
     }
 

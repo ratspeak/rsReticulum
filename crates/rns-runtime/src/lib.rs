@@ -40,9 +40,9 @@ pub mod prelude {
     pub use crate::resource_source::{ResourceOptions, ResourceSource};
     pub use crate::reticulum::{
         AnnounceSubscription, ControlError, InitOptions, InterfaceStats, LinkConnectError,
-        LinkConnectOptions, PacketReceiptHandle, PacketReceiptStatus, RecalledDestination,
-        ReceiptError, ReticulumError, ReticulumHandle, SendError, SendOptions, SendResult, init,
-        init_with_options,
+        LinkConnectOptions, OutboundPacket, PacketReceiptHandle, PacketReceiptStatus,
+        RecalledDestination, ReceiptError, ReticulumError, ReticulumHandle, SendError, SendOptions,
+        SendResult, init, init_with_options,
     };
     pub use rns_identity::destination::{
         AllowPolicy, DestType, Destination, Direction, ProofStrategy,

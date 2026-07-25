@@ -310,6 +310,12 @@ pub enum TransportMessage {
         receipt: Option<TrackedReceiptRegistration>,
         result_tx: tokio::sync::oneshot::Sender<OutboundDispatchResult>,
     },
+    /// Change the timeout of one still-pending tracked packet.
+    SetReceiptTimeout {
+        truncated_hash: [u8; 16],
+        timeout: std::time::Duration,
+        result_tx: tokio::sync::oneshot::Sender<bool>,
+    },
     Tick(TimerTick),
     /// Read-only query paired with a oneshot reply channel — used for all
     /// RPC and introspection so callers don't need direct state access.
@@ -441,6 +447,7 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::Outbound(_) => "Outbound",
         TransportMessage::OutboundAttached { .. } => "OutboundAttached",
         TransportMessage::SendPacket { .. } => "SendPacket",
+        TransportMessage::SetReceiptTimeout { .. } => "SetReceiptTimeout",
         TransportMessage::Tick(_) => "Tick",
         TransportMessage::Rpc { .. } => "Rpc",
         TransportMessage::RegisterDestination { .. } => "RegisterDestination",
@@ -793,6 +800,15 @@ impl std::fmt::Debug for TransportMessage {
                 .field("attached_interface", attached_interface)
                 .field("receipt", receipt)
                 .finish(),
+            Self::SetReceiptTimeout {
+                truncated_hash,
+                timeout,
+                ..
+            } => f
+                .debug_struct("SetReceiptTimeout")
+                .field("truncated_hash", truncated_hash)
+                .field("timeout", timeout)
+                .finish_non_exhaustive(),
             Self::Tick(t) => f.debug_tuple("Tick").field(t).finish(),
             Self::Rpc { query, .. } => f.debug_struct("Rpc").field("query", query).finish(),
             Self::RegisterDestination { hash, app_name, .. } => f

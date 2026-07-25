@@ -443,6 +443,24 @@ impl TransportActor {
                     let _ = result_tx.send(result);
                 }
             }
+            TransportMessage::SetReceiptTimeout {
+                truncated_hash,
+                timeout,
+                result_tx,
+            } => {
+                let updated = self
+                    .receipt_table
+                    .get_mut(&truncated_hash)
+                    .is_some_and(|receipt| {
+                        if receipt.status == ReceiptStatus::Sent {
+                            receipt.timeout = Some(timeout);
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                let _ = result_tx.send(updated);
+            }
             TransportMessage::Tick(_) => {
                 self.on_tick();
             }
@@ -7699,6 +7717,46 @@ mod tests {
         });
         assert!(!actor.receipt_table.contains_key(&proof_hash));
         assert!(!actor.receipt_msg_ids.contains_key(&proof_hash));
+    }
+
+    #[test]
+    fn set_receipt_timeout_updates_only_pending_receipts() {
+        let (mut actor, _tx) = TransportActor::new();
+        let packet_hash = [0x62; 32];
+        let truncated_hash = [0x62; 16];
+        actor.receipt_table.insert(
+            truncated_hash,
+            PacketReceipt::new(packet_hash, truncated_hash, Some(Duration::from_secs(180))),
+        );
+
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::SetReceiptTimeout {
+            truncated_hash,
+            timeout: Duration::from_secs(7),
+            result_tx,
+        });
+        assert!(result_rx.blocking_recv().unwrap());
+        assert_eq!(
+            actor.receipt_table[&truncated_hash].timeout,
+            Some(Duration::from_secs(7))
+        );
+
+        actor
+            .receipt_table
+            .get_mut(&truncated_hash)
+            .unwrap()
+            .deliver();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::SetReceiptTimeout {
+            truncated_hash,
+            timeout: Duration::from_secs(1),
+            result_tx,
+        });
+        assert!(!result_rx.blocking_recv().unwrap());
+        assert_eq!(
+            actor.receipt_table[&truncated_hash].timeout,
+            Some(Duration::from_secs(7))
+        );
     }
 
     #[test]
