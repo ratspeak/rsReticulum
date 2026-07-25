@@ -645,28 +645,742 @@ pub fn stop_rnode_interface(id: InterfaceId) {
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-enum RNodeWriteRequest {
-    Packet(Bytes),
-    Raw(Vec<u8>, oneshot::Sender<()>),
+const RNODE_PACKET_WRITE_QUEUE: usize = 256;
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+const RNODE_CONTROL_WRITE_QUEUE: usize = 4;
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+const RNODE_FLOW_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+const RNODE_BEACON_POLL_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+const RNODE_STARTUP_STAGE_DEADLINE: Duration = Duration::from_secs(5);
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+const RNODE_DETACH_DEADLINE: Duration = Duration::from_millis(500);
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+const RNODE_WRITER_JOIN_DEADLINE: Duration = Duration::from_millis(500);
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RNodeWritePhase {
+    Detect,
+    Initialise,
+    Packet,
+    Detach,
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-async fn send_detach_request(conn_tx: &mpsc::Sender<RNodeWriteRequest>, id: InterfaceId) {
-    let (done_tx, done_rx) = oneshot::channel();
-    if conn_tx
-        .send(RNodeWriteRequest::Raw(build_detach_sequence(), done_tx))
-        .await
-        .is_err()
-    {
-        tracing::warn!(id, "RNode detach sequence could not be queued");
-        return;
+impl RNodeWritePhase {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Detect => "detect",
+            Self::Initialise => "init",
+            Self::Packet => "packet",
+            Self::Detach => "detach",
+        }
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone, Debug)]
+enum RNodeWriteFailureKind {
+    Write(Arc<std::io::Error>),
+    Flush(Arc<std::io::Error>),
+    WorkerTerminated,
+    QueueClosed,
+    AcknowledgementDropped,
+    DeadlineElapsed,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone, Debug)]
+struct RNodeWriteFailure {
+    phase: RNodeWritePhase,
+    kind: RNodeWriteFailureKind,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl std::fmt::Display for RNodeWriteFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            RNodeWriteFailureKind::Write(error) => {
+                write!(formatter, "{} write: {error}", self.phase.label())
+            }
+            RNodeWriteFailureKind::Flush(error) => {
+                write!(formatter, "{} flush: {error}", self.phase.label())
+            }
+            RNodeWriteFailureKind::WorkerTerminated => {
+                write!(formatter, "{} writer worker terminated", self.phase.label())
+            }
+            RNodeWriteFailureKind::QueueClosed => {
+                write!(
+                    formatter,
+                    "{} writer control queue closed",
+                    self.phase.label()
+                )
+            }
+            RNodeWriteFailureKind::AcknowledgementDropped => {
+                write!(
+                    formatter,
+                    "{} writer acknowledgement dropped",
+                    self.phase.label()
+                )
+            }
+            RNodeWriteFailureKind::DeadlineElapsed => {
+                write!(formatter, "{} deadline elapsed", self.phase.label())
+            }
+        }
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+struct RNodeControlWriteRequest {
+    phase: RNodeWritePhase,
+    bytes: Vec<u8>,
+    acknowledgement: oneshot::Sender<Result<(), RNodeWriteFailure>>,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RNodeWriterExit {
+    Detached,
+    Cancelled,
+    Offline,
+    LanesClosed,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RNodeWriterFinish {
+    Quiesced,
+    NonQuiesced,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+struct RNodeWriterContext {
+    id: InterfaceId,
+    flow_control: bool,
+    ready: Arc<AtomicBool>,
+    online: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+    txb: Arc<AtomicU64>,
+    beacon: Option<(Duration, Bytes)>,
+    beacon_poll_interval: Duration,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+struct RNodeWriteInterrupt {
+    #[cfg(feature = "serial")]
+    serial: Option<Mutex<Box<dyn serialport::SerialPort>>>,
+    tcp: Option<std::net::TcpStream>,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl RNodeWriteInterrupt {
+    fn none() -> Self {
+        Self {
+            #[cfg(feature = "serial")]
+            serial: None,
+            tcp: None,
+        }
     }
 
-    match tokio::time::timeout(Duration::from_millis(500), done_rx).await {
-        Ok(Ok(())) => tracing::info!(id, "RNode detach sequence sent"),
-        Ok(Err(_)) => tracing::warn!(id, "RNode detach writer dropped acknowledgement"),
-        Err(_) => tracing::warn!(id, "RNode detach sequence timed out"),
+    fn from_stream(stream: &RNodeStream) -> std::io::Result<Self> {
+        match stream {
+            #[cfg(feature = "serial")]
+            RNodeStream::Serial(stream) => Ok(Self {
+                serial: Some(Mutex::new(
+                    stream.try_clone().map_err(std::io::Error::other)?,
+                )),
+                tcp: None,
+            }),
+            RNodeStream::Tcp(stream) => Ok(Self {
+                #[cfg(feature = "serial")]
+                serial: None,
+                tcp: Some(stream.try_clone()?),
+            }),
+        }
     }
+
+    fn interrupt(&mut self) {
+        #[cfg(feature = "serial")]
+        if let Some(stream) = self.serial.take()
+            && let Err(error) = stream
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear(serialport::ClearBuffer::Output)
+        {
+            tracing::debug!(error = %error, "RNode serial output purge during writer cleanup");
+        }
+        if let Some(stream) = self.tcp.take()
+            && let Err(error) = stream.shutdown(std::net::Shutdown::Both)
+        {
+            tracing::debug!(error = %error, "RNode TCP shutdown during writer cleanup");
+        }
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl Drop for RNodeWriteInterrupt {
+    fn drop(&mut self) {
+        self.interrupt();
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+struct RNodeTaskGuard<T> {
+    task: Option<tokio::task::JoinHandle<T>>,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl<T> RNodeTaskGuard<T> {
+    fn new(task: tokio::task::JoinHandle<T>) -> Self {
+        Self { task: Some(task) }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
+    #[cfg(test)]
+    fn take(&mut self) -> tokio::task::JoinHandle<T> {
+        self.task.take().expect("RNode task already taken")
+    }
+
+    fn task_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
+        self.task.as_mut().expect("RNode task already taken")
+    }
+
+    fn abort(&self) {
+        if let Some(task) = self.task.as_ref() {
+            task.abort();
+        }
+    }
+
+    fn disarm(&mut self) {
+        let _ = self.task.take();
+    }
+
+    async fn abort_and_wait(mut self) {
+        self.abort();
+        let _ = self.task_mut().await;
+        self.disarm();
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl<T> Drop for RNodeTaskGuard<T> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+struct RNodeGenerationWriter {
+    // First field on purpose: cancellation of an owning future interrupts the
+    // physical transport before the actor task guard aborts.
+    interrupt: RNodeWriteInterrupt,
+    packet_tx: mpsc::Sender<Bytes>,
+    control_tx: mpsc::Sender<RNodeControlWriteRequest>,
+    ready: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+    task: RNodeTaskGuard<Result<RNodeWriterExit, RNodeWriteFailure>>,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl RNodeGenerationWriter {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn write_rnode_operation<W>(
+    mut writer: W,
+    bytes: Vec<u8>,
+    phase: RNodeWritePhase,
+) -> Result<W, RNodeWriteFailure>
+where
+    W: std::io::Write + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        writer
+            .write_all(&bytes)
+            .map_err(|error| RNodeWriteFailure {
+                phase,
+                kind: RNodeWriteFailureKind::Write(Arc::new(error)),
+            })?;
+        writer.flush().map_err(|error| RNodeWriteFailure {
+            phase,
+            kind: RNodeWriteFailureKind::Flush(Arc::new(error)),
+        })?;
+        Ok(writer)
+    })
+    .await
+    .map_err(|_| RNodeWriteFailure {
+        phase,
+        kind: RNodeWriteFailureKind::WorkerTerminated,
+    })?
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn prepare_rnode_packet(
+    data: Bytes,
+    context: &RNodeWriterContext,
+    first_tx: &mut Option<tokio::time::Instant>,
+) -> Vec<u8> {
+    if let Some((_, ref callsign)) = context.beacon {
+        if data == *callsign {
+            *first_tx = None;
+        } else if first_tx.is_none() {
+            *first_tx = Some(tokio::time::Instant::now());
+        }
+    }
+    if let Ok((header, _)) = rns_wire::header::PacketHeader::unpack(&data) {
+        tracing::debug!(
+            id = context.id,
+            raw_len = data.len(),
+            packet_type = ?header.flags.packet_type,
+            context = ?header.context,
+            dest = %hex::encode(header.destination_hash),
+            "RNode queued packet"
+        );
+    } else {
+        tracing::debug!(id = context.id, raw_len = data.len(), "RNode queued packet");
+    }
+    context.txb.fetch_add(data.len() as u64, Ordering::Relaxed);
+    kiss::frame(&data)
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+enum RNodeWriterEvent {
+    Control(Option<RNodeControlWriteRequest>),
+    Packet(Option<Bytes>),
+    FlowPoll,
+    BeaconPoll,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn run_rnode_writer<W>(
+    mut writer: W,
+    mut packet_rx: mpsc::Receiver<Bytes>,
+    mut control_rx: mpsc::Receiver<RNodeControlWriteRequest>,
+    context: RNodeWriterContext,
+) -> Result<RNodeWriterExit, RNodeWriteFailure>
+where
+    W: std::io::Write + Send + 'static,
+{
+    let mut pending_packet: Option<Vec<u8>> = None;
+    let mut first_tx: Option<tokio::time::Instant> = None;
+    let mut packet_lane_open = true;
+    let mut control_lane_open = true;
+
+    loop {
+        if context.cancelled.load(Ordering::SeqCst) {
+            return Ok(RNodeWriterExit::Cancelled);
+        }
+
+        if control_lane_open {
+            match control_rx.try_recv() {
+                Ok(request) => {
+                    if context.cancelled.load(Ordering::SeqCst) {
+                        return Ok(RNodeWriterExit::Cancelled);
+                    }
+                    let phase = request.phase;
+                    let terminal = phase == RNodeWritePhase::Detach;
+                    match write_rnode_operation(writer, request.bytes, phase).await {
+                        Ok(next_writer) => {
+                            writer = next_writer;
+                            let _ = request.acknowledgement.send(Ok(()));
+                            if terminal {
+                                return Ok(RNodeWriterExit::Detached);
+                            }
+                        }
+                        Err(failure) => {
+                            let _ = request.acknowledgement.send(Err(failure.clone()));
+                            return Err(failure);
+                        }
+                    }
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    control_lane_open = false;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+
+        if pending_packet.is_some()
+            && (!context.flow_control || context.ready.load(Ordering::SeqCst))
+        {
+            if context.cancelled.load(Ordering::SeqCst) {
+                return Ok(RNodeWriterExit::Cancelled);
+            }
+            let framed = pending_packet.take().expect("pending packet checked");
+            let framed_len = framed.len();
+            writer = write_rnode_operation(writer, framed, RNodeWritePhase::Packet).await?;
+            tracing::debug!(id = context.id, framed_len, "RNode packet write complete");
+            continue;
+        }
+
+        if pending_packet.is_some() && !context.online.load(Ordering::SeqCst) {
+            return Ok(RNodeWriterExit::Offline);
+        }
+        if !packet_lane_open && !control_lane_open && pending_packet.is_none() {
+            return Ok(RNodeWriterExit::LanesClosed);
+        }
+
+        let event = if pending_packet.is_some() {
+            tokio::select! {
+                biased;
+                request = control_rx.recv(), if control_lane_open => {
+                    RNodeWriterEvent::Control(request)
+                }
+                _ = tokio::time::sleep(RNODE_FLOW_POLL_INTERVAL) => {
+                    RNodeWriterEvent::FlowPoll
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                request = control_rx.recv(), if control_lane_open => {
+                    RNodeWriterEvent::Control(request)
+                }
+                packet = packet_rx.recv(), if packet_lane_open => {
+                    RNodeWriterEvent::Packet(packet)
+                }
+                _ = tokio::time::sleep(context.beacon_poll_interval),
+                    if context.beacon.is_some() => {
+                    RNodeWriterEvent::BeaconPoll
+                }
+            }
+        };
+
+        if context.cancelled.load(Ordering::SeqCst) {
+            return Ok(RNodeWriterExit::Cancelled);
+        }
+
+        match event {
+            RNodeWriterEvent::Control(Some(request)) => {
+                if context.cancelled.load(Ordering::SeqCst) {
+                    return Ok(RNodeWriterExit::Cancelled);
+                }
+                let phase = request.phase;
+                let terminal = phase == RNodeWritePhase::Detach;
+                match write_rnode_operation(writer, request.bytes, phase).await {
+                    Ok(next_writer) => {
+                        writer = next_writer;
+                        let _ = request.acknowledgement.send(Ok(()));
+                        if terminal {
+                            return Ok(RNodeWriterExit::Detached);
+                        }
+                    }
+                    Err(failure) => {
+                        let _ = request.acknowledgement.send(Err(failure.clone()));
+                        return Err(failure);
+                    }
+                }
+            }
+            RNodeWriterEvent::Control(None) => {
+                control_lane_open = false;
+            }
+            RNodeWriterEvent::Packet(Some(data)) => {
+                if context.cancelled.load(Ordering::SeqCst) {
+                    return Ok(RNodeWriterExit::Cancelled);
+                }
+                pending_packet = Some(prepare_rnode_packet(data, &context, &mut first_tx));
+            }
+            RNodeWriterEvent::Packet(None) => {
+                packet_lane_open = false;
+            }
+            RNodeWriterEvent::FlowPoll => {}
+            RNodeWriterEvent::BeaconPoll => {
+                let Some((interval, ref callsign)) = context.beacon else {
+                    continue;
+                };
+                if first_tx.is_some_and(|started| started.elapsed() >= interval) {
+                    if context.cancelled.load(Ordering::SeqCst) {
+                        return Ok(RNodeWriterExit::Cancelled);
+                    }
+                    tracing::debug!(id = context.id, "RNode transmitting station-ID beacon");
+                    pending_packet = Some(prepare_rnode_packet(
+                        callsign.clone(),
+                        &context,
+                        &mut first_tx,
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn spawn_rnode_writer<W>(writer: W, context: RNodeWriterContext) -> RNodeGenerationWriter
+where
+    W: std::io::Write + Send + 'static,
+{
+    let (packet_tx, packet_rx) = mpsc::channel(RNODE_PACKET_WRITE_QUEUE);
+    let (control_tx, control_rx) = mpsc::channel(RNODE_CONTROL_WRITE_QUEUE);
+    let ready = context.ready.clone();
+    let cancelled = context.cancelled.clone();
+    let online = context.online.clone();
+    let id = context.id;
+    let task = tokio::spawn(async move {
+        let result = run_rnode_writer(writer, packet_rx, control_rx, context).await;
+        if let Err(ref failure) = result {
+            tracing::warn!(
+                id,
+                phase = failure.phase.label(),
+                failure = ?failure.kind,
+                "RNode writer failed"
+            );
+            online.store(false, Ordering::SeqCst);
+        }
+        result
+    });
+    RNodeGenerationWriter {
+        interrupt: RNodeWriteInterrupt::none(),
+        packet_tx,
+        control_tx,
+        ready,
+        cancelled,
+        task: RNodeTaskGuard::new(task),
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn spawn_rnode_generation_writer(
+    port: &RNodeStream,
+    config: &RNodeConfig,
+    id: InterfaceId,
+    online: Arc<AtomicBool>,
+    txb: Arc<AtomicU64>,
+    beacon: Option<(Duration, Bytes)>,
+) -> std::io::Result<RNodeGenerationWriter> {
+    let interrupt = RNodeWriteInterrupt::from_stream(port)?;
+    let write_stream = port.try_clone()?;
+    let mut writer = spawn_rnode_writer(
+        write_stream,
+        RNodeWriterContext {
+            id,
+            flow_control: config.flow_control,
+            // Legacy flow control starts permissive and is changed only by
+            // CMD_READY. Reducer readiness remains observational.
+            ready: Arc::new(AtomicBool::new(true)),
+            online,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            txb,
+            beacon,
+            beacon_poll_interval: RNODE_BEACON_POLL_INTERVAL,
+        },
+    );
+    writer.interrupt = interrupt;
+    Ok(writer)
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn finish_rnode_writer(writer: RNodeGenerationWriter) -> RNodeWriterFinish {
+    writer.cancel();
+    let RNodeGenerationWriter {
+        mut interrupt,
+        packet_tx,
+        control_tx,
+        ready: _,
+        cancelled: _,
+        mut task,
+    } = writer;
+    drop(packet_tx);
+    drop(control_tx);
+    interrupt.interrupt();
+
+    match tokio::time::timeout(RNODE_WRITER_JOIN_DEADLINE, task.task_mut()).await {
+        Ok(Ok(Ok(exit))) => {
+            task.disarm();
+            tracing::debug!(exit = ?exit, "RNode writer stopped");
+            RNodeWriterFinish::Quiesced
+        }
+        Ok(Ok(Err(failure))) => {
+            task.disarm();
+            tracing::debug!(
+                phase = failure.phase.label(),
+                failure = ?failure.kind,
+                "RNode writer failure observed during cleanup"
+            );
+            RNodeWriterFinish::Quiesced
+        }
+        Ok(Err(error)) => {
+            task.disarm();
+            tracing::warn!(error = %error, "RNode writer task failed to join");
+            RNodeWriterFinish::NonQuiesced
+        }
+        Err(_) => {
+            tracing::warn!("RNode writer did not stop within cleanup deadline");
+            task.abort();
+            let _ = task.task_mut().await;
+            task.disarm();
+            RNodeWriterFinish::NonQuiesced
+        }
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn rnode_generation_terminal_reason(
+    stop_requested: bool,
+    transport_closed: bool,
+    read_task_failed: bool,
+    writer_finish: RNodeWriterFinish,
+) -> Option<RNodeRuntimeReason> {
+    if stop_requested {
+        Some(RNodeRuntimeReason::StopRequested)
+    } else if transport_closed {
+        Some(RNodeRuntimeReason::TransportConsumerClosed)
+    } else if read_task_failed || writer_finish == RNodeWriterFinish::NonQuiesced {
+        Some(RNodeRuntimeReason::DriverTerminated)
+    } else {
+        None
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn request_rnode_control_write(
+    control_tx: &mpsc::Sender<RNodeControlWriteRequest>,
+    phase: RNodeWritePhase,
+    bytes: Vec<u8>,
+) -> Result<(), RNodeWriteFailure> {
+    let (acknowledgement, result) = oneshot::channel();
+    control_tx
+        .send(RNodeControlWriteRequest {
+            phase,
+            bytes,
+            acknowledgement,
+        })
+        .await
+        .map_err(|_| RNodeWriteFailure {
+            phase,
+            kind: RNodeWriteFailureKind::QueueClosed,
+        })?;
+    result.await.map_err(|_| RNodeWriteFailure {
+        phase,
+        kind: RNodeWriteFailureKind::AcknowledgementDropped,
+    })?
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn request_rnode_control_write_before(
+    control_tx: &mpsc::Sender<RNodeControlWriteRequest>,
+    phase: RNodeWritePhase,
+    bytes: Vec<u8>,
+    deadline: tokio::time::Instant,
+) -> Result<(), RNodeWriteFailure> {
+    tokio::time::timeout_at(
+        deadline,
+        request_rnode_control_write(control_tx, phase, bytes),
+    )
+    .await
+    .map_err(|_| RNodeWriteFailure {
+        phase,
+        kind: RNodeWriteFailureKind::DeadlineElapsed,
+    })?
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn request_rnode_startup_write(
+    control_tx: &mpsc::Sender<RNodeControlWriteRequest>,
+    phase: RNodeWritePhase,
+    bytes: Vec<u8>,
+) -> Result<(), RNodeWriteFailure> {
+    debug_assert!(matches!(
+        phase,
+        RNodeWritePhase::Detect | RNodeWritePhase::Initialise
+    ));
+    request_rnode_control_write_before(
+        control_tx,
+        phase,
+        bytes,
+        tokio::time::Instant::now() + RNODE_STARTUP_STAGE_DEADLINE,
+    )
+    .await
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn initialise_rnode_writer(
+    writer: &RNodeGenerationWriter,
+    config: &RNodeConfig,
+) -> Result<(), RNodeWriteFailure> {
+    request_rnode_startup_write(
+        &writer.control_tx,
+        RNodeWritePhase::Detect,
+        build_detect_sequence(),
+    )
+    .await?;
+    request_rnode_startup_write(
+        &writer.control_tx,
+        RNodeWritePhase::Initialise,
+        build_init_sequence(config),
+    )
+    .await
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RNodeReconnectStartup {
+    Complete,
+    StopRequested,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn initialise_reconnecting_rnode_writer(
+    writer: &RNodeGenerationWriter,
+    config: &RNodeConfig,
+    stop_rx: &mut mpsc::Receiver<()>,
+) -> Result<RNodeReconnectStartup, RNodeWriteFailure> {
+    for (phase, bytes) in [
+        (RNodeWritePhase::Detect, build_detect_sequence()),
+        (RNodeWritePhase::Initialise, build_init_sequence(config)),
+    ] {
+        let stage = tokio::select! {
+            biased;
+            _ = stop_rx.recv() => {
+                return Ok(RNodeReconnectStartup::StopRequested);
+            }
+            result = request_rnode_startup_write(&writer.control_tx, phase, bytes) => result,
+        };
+        stage?;
+    }
+
+    if stop_rx.try_recv().is_ok() {
+        Ok(RNodeReconnectStartup::StopRequested)
+    } else {
+        Ok(RNodeReconnectStartup::Complete)
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn send_detach_request(
+    control_tx: &mpsc::Sender<RNodeControlWriteRequest>,
+    id: InterfaceId,
+) -> Result<(), RNodeWriteFailure> {
+    let deadline = tokio::time::Instant::now() + RNODE_DETACH_DEADLINE;
+    let result = request_rnode_control_write_before(
+        control_tx,
+        RNodeWritePhase::Detach,
+        build_detach_sequence(),
+        deadline,
+    )
+    .await;
+
+    match result {
+        Ok(()) => tracing::info!(id, "RNode detach sequence sent"),
+        Err(ref failure) => tracing::warn!(
+            id,
+            failure = ?failure.kind,
+            "RNode detach sequence failed"
+        ),
+    }
+    result
 }
 
 // Transport abstraction
@@ -956,35 +1670,39 @@ async fn open_configured_rnode_stream(
         "RNode interface opened"
     );
 
-    {
-        let mut detect_port = port.try_clone().map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("rnode clone: {}", e))
-        })?;
-        let detect_seq = build_detect_sequence();
-        use std::io::Write;
-        detect_port.write_all(&detect_seq).map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("rnode detect write: {}", e))
-        })?;
-        detect_port.flush().map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("rnode detect flush: {}", e))
-        })?;
-    }
-
-    {
-        let mut init_port = port.try_clone().map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("rnode clone: {}", e))
-        })?;
-        let init_seq = build_init_sequence(config);
-        use std::io::Write;
-        init_port.write_all(&init_seq).map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("rnode init write: {}", e))
-        })?;
-        init_port.flush().map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("rnode init flush: {}", e))
-        })?;
-    }
-
     Ok(port)
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn start_rnode_generation(
+    port: RNodeStream,
+    config: &RNodeConfig,
+    id: InterfaceId,
+    online: &Arc<AtomicBool>,
+    txb: &Arc<AtomicU64>,
+    beacon: &Option<(Duration, Bytes)>,
+) -> Result<(RNodeStream, RNodeGenerationWriter), crate::traits::InterfaceError> {
+    let writer = spawn_rnode_generation_writer(
+        &port,
+        config,
+        id,
+        online.clone(),
+        txb.clone(),
+        beacon.clone(),
+    )
+    .map_err(|error| {
+        crate::traits::InterfaceError::SendFailed(format!("rnode writer clone: {error}"))
+    })?;
+
+    if let Err(failure) = initialise_rnode_writer(&writer, config).await {
+        online.store(false, Ordering::SeqCst);
+        finish_rnode_writer(writer).await;
+        return Err(crate::traits::InterfaceError::SendFailed(format!(
+            "rnode writer startup: {failure}"
+        )));
+    }
+
+    Ok((port, writer))
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -1499,11 +2217,8 @@ pub async fn spawn_rnode_interface_with_driver(
     let shared_txb = Arc::new(AtomicU64::new(0));
     let (tx, rx) = mpsc::channel::<Bytes>(256);
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
-    let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
-    let stop_guard = register_rnode_stop(id, stop_tx);
     let name = config.name.clone();
     let mode = config.mode;
-    let flow_control = config.flow_control;
     // Python RNodeInterface.py:333-343: oversized callsigns disable beaconing.
     let beacon: Option<(Duration, Bytes)> = config
         .id_interval
@@ -1521,6 +2236,13 @@ pub async fn spawn_rnode_interface_with_driver(
         })
         .map(|(interval, callsign)| (Duration::from_secs(interval), Bytes::from(callsign)));
 
+    // Startup is part of spawn: the single per-generation writer clone must
+    // complete detect and initialise as two acknowledged write+flush stages.
+    let (port, initial_writer) =
+        start_rnode_generation(port, &config, id, &online, &shared_txb, &beacon).await?;
+
+    let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    let stop_guard = register_rnode_stop(id, stop_tx);
     let online_r = online.clone();
     let rxb_r = shared_rxb.clone();
     let txb_r = shared_txb.clone();
@@ -1530,20 +2252,30 @@ pub async fn spawn_rnode_interface_with_driver(
     let read_task = tokio::spawn(async move {
         let mut snapshot_publisher = RNodeSnapshotPublisher::new(snapshot_tx);
         let _stop_guard = stop_guard;
-        let mut next_port = Some(port);
+        let mut next_generation = Some((port, initial_writer));
 
         loop {
-            if stop_rx.try_recv().is_ok() {
+            if next_generation.is_none() && stop_rx.try_recv().is_ok() {
                 tracing::info!(name = %task_name, "RNode stop requested before reconnect");
                 snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
                 snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
                 return;
             }
-            let mut port_r = match next_port.take() {
-                Some(port) => port,
+            let (port_r, generation_writer) = match next_generation.take() {
+                Some(generation) => generation,
                 None => {
                     snapshot_publisher.reconnect_started();
-                    match open_configured_rnode_stream(&task_config, &task_port_cfg).await {
+                    let open_result = tokio::select! {
+                        biased;
+                        _ = stop_rx.recv() => {
+                            tracing::info!(name = %task_name, "RNode stop requested during reconnect open");
+                            snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                            snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                            return;
+                        }
+                        result = open_configured_rnode_stream(&task_config, &task_port_cfg) => result,
+                    };
+                    let opened = match open_result {
                         Ok(port) => port,
                         Err(e) => {
                             online_r.store(false, Ordering::SeqCst);
@@ -1564,129 +2296,105 @@ pub async fn spawn_rnode_interface_with_driver(
                             }
                             continue;
                         }
+                    };
+
+                    let reconnect_writer = match spawn_rnode_generation_writer(
+                        &opened,
+                        &task_config,
+                        id,
+                        online_r.clone(),
+                        txb_r.clone(),
+                        beacon.clone(),
+                    ) {
+                        Ok(writer) => writer,
+                        Err(e) => {
+                            online_r.store(false, Ordering::SeqCst);
+                            snapshot_publisher.connection_attempt_failed();
+                            tracing::warn!(
+                                name = %task_name,
+                                error = %e,
+                                "RNode reconnect startup failed"
+                            );
+                            tokio::select! {
+                                _ = stop_rx.recv() => {
+                                    tracing::info!(name = %task_name, "RNode stop requested during reconnect backoff");
+                                    snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                                    snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                                    return;
+                                }
+                                _ = tokio::time::sleep(reconnect_delay()) => {}
+                            }
+                            continue;
+                        }
+                    };
+
+                    match initialise_reconnecting_rnode_writer(
+                        &reconnect_writer,
+                        &task_config,
+                        &mut stop_rx,
+                    )
+                    .await
+                    {
+                        Ok(RNodeReconnectStartup::Complete) => (opened, reconnect_writer),
+                        Ok(RNodeReconnectStartup::StopRequested) => {
+                            tracing::info!(
+                                name = %task_name,
+                                "RNode stop requested during reconnect startup"
+                            );
+                            snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                            let _ = send_detach_request(&reconnect_writer.control_tx, id).await;
+                            reconnect_writer.cancel();
+                            let _ = finish_rnode_writer(reconnect_writer).await;
+                            snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                            return;
+                        }
+                        Err(failure) => {
+                            online_r.store(false, Ordering::SeqCst);
+                            reconnect_writer.cancel();
+                            let writer_finish = finish_rnode_writer(reconnect_writer).await;
+                            if writer_finish == RNodeWriterFinish::NonQuiesced {
+                                snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                                return;
+                            }
+                            snapshot_publisher.connection_attempt_failed();
+                            tracing::warn!(
+                                name = %task_name,
+                                error = %failure,
+                                "RNode reconnect startup failed"
+                            );
+                            tokio::select! {
+                                _ = stop_rx.recv() => {
+                                    tracing::info!(name = %task_name, "RNode stop requested during reconnect backoff");
+                                    snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                                    snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                                    return;
+                                }
+                                _ = tokio::time::sleep(reconnect_delay()) => {}
+                            }
+                            continue;
+                        }
                     }
                 }
             };
 
             online_r.store(true, Ordering::SeqCst);
-            let port_write = match port_r.try_clone() {
-                Ok(port) => port,
-                Err(e) => {
-                    tracing::warn!(error = %e, "RNode clone failed before reconnect");
-                    online_r.store(false, Ordering::SeqCst);
-                    snapshot_publisher.connection_attempt_failed();
-                    tokio::select! {
-                        _ = stop_rx.recv() => {
-                            tracing::info!(name = %task_name, "RNode stop requested during reconnect backoff");
-                            snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                            snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
-                            return;
-                        }
-                        _ = tokio::time::sleep(reconnect_delay()) => {}
-                    }
-                    continue;
-                }
-            };
             let mut protocol_state = RNodeProtocolState::new(protocol_target);
             snapshot_publisher.connection_established();
+            let mut port_r = port_r;
 
-            let ready = Arc::new(AtomicBool::new(true));
-            let (conn_tx, mut conn_rx) = mpsc::channel::<RNodeWriteRequest>(256);
-            let conn_tx_for_stop = conn_tx.clone();
-
-            let online_w = online_r.clone();
-            let ready_w = ready.clone();
-            let txb_w = txb_r.clone();
-            let beacon_w = beacon.clone();
-            let write_handle = tokio::spawn(async move {
-                let mut port_w = port_write;
-                // Python first_tx semantics: armed by data TX, cleared when
-                // the callsign beacon goes out (RNodeInterface.py:712-718, 1142-1146).
-                let mut first_tx: Option<tokio::time::Instant> = None;
-                loop {
-                    let request = if let Some((interval, ref callsign)) = beacon_w {
-                        match tokio::time::timeout(Duration::from_secs(1), conn_rx.recv()).await {
-                            Ok(Some(request)) => request,
-                            Ok(None) => break,
-                            Err(_) => {
-                                if first_tx.is_none_or(|t| t.elapsed() < interval) {
-                                    continue;
-                                }
-                                tracing::debug!("RNode transmitting station-ID beacon");
-                                RNodeWriteRequest::Packet(callsign.clone())
-                            }
-                        }
-                    } else {
-                        match conn_rx.recv().await {
-                            Some(request) => request,
-                            None => break,
-                        }
-                    };
-                    let (framed, is_packet, done_tx) = match request {
-                        RNodeWriteRequest::Packet(data) => {
-                            if let Some((_, ref callsign)) = beacon_w {
-                                if data == *callsign {
-                                    first_tx = None;
-                                } else if first_tx.is_none() {
-                                    first_tx = Some(tokio::time::Instant::now());
-                                }
-                            }
-                            if let Ok((header, _)) = rns_wire::header::PacketHeader::unpack(&data) {
-                                tracing::debug!(
-                                    id,
-                                    raw_len = data.len(),
-                                    packet_type = ?header.flags.packet_type,
-                                    context = ?header.context,
-                                    dest = %hex::encode(header.destination_hash),
-                                    "RNode queued packet"
-                                );
-                            } else {
-                                tracing::debug!(id, raw_len = data.len(), "RNode queued packet");
-                            }
-                            txb_w
-                                .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                            (kiss::frame(&data), true, None)
-                        }
-                        RNodeWriteRequest::Raw(frame, done_tx) => (frame, false, Some(done_tx)),
-                    };
-                    if is_packet && flow_control {
-                        while !ready_w.load(Ordering::SeqCst) {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                            if !online_w.load(Ordering::SeqCst) {
-                                return;
-                            }
-                        }
-                    }
-                    let framed_len = framed.len();
-                    let result = crate::serial_io::blocking_write_all(port_w, framed).await;
-                    if let Some(done_tx) = done_tx {
-                        let _ = done_tx.send(());
-                    }
-                    match result {
-                        Ok(p) => {
-                            if is_packet {
-                                tracing::debug!(id, framed_len, "RNode packet write complete");
-                            }
-                            port_w = p;
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "RNode write error");
-                            online_w.store(false, Ordering::SeqCst);
-                            break;
-                        }
-                    }
-                }
-            });
+            let ready = generation_writer.ready.clone();
+            let packet_tx = generation_writer.packet_tx.clone();
+            let control_tx = generation_writer.control_tx.clone();
 
             let rx_ref = rx.clone();
-            let fwd_handle = tokio::spawn(async move {
-                let mut guard = rx_ref.lock().await;
-                while let Some(data) = guard.recv().await {
-                    if conn_tx.send(RNodeWriteRequest::Packet(data)).await.is_err() {
+            let fwd_handle = RNodeTaskGuard::new(tokio::spawn(async move {
+                let mut receiver = rx_ref.lock().await;
+                while let Some(data) = receiver.recv().await {
+                    if packet_tx.send(data).await.is_err() {
                         break;
                     }
                 }
-            });
+            }));
 
             let mut deframer = kiss::RawKissDeframer::new();
             let mut buf = [0u8; 1024];
@@ -1694,16 +2402,17 @@ pub async fn spawn_rnode_interface_with_driver(
             let mut last_snr: Option<f32> = None;
             let mut transport_closed = false;
             let mut stop_requested = false;
+            let mut read_task_failed = false;
 
             loop {
                 if stop_rx.try_recv().is_ok() {
                     tracing::info!(name = %task_name, "RNode stop requested");
                     snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                    send_detach_request(&conn_tx_for_stop, id).await;
+                    let _ = send_detach_request(&control_tx, id).await;
                     stop_requested = true;
                     break;
                 }
-                if !online_r.load(Ordering::SeqCst) {
+                if generation_writer.task.is_finished() || !online_r.load(Ordering::SeqCst) {
                     break;
                 }
                 let result =
@@ -1746,12 +2455,13 @@ pub async fn spawn_rnode_interface_with_driver(
                             }
                         }
                     }
-                    Ok(Err((_p, e))) => {
+                    Ok(Err((_port, e))) => {
                         tracing::warn!(error = %e, "RNode read error");
                         break;
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "RNode read task panicked");
+                        read_task_failed = true;
                         break;
                     }
                 }
@@ -1761,17 +2471,19 @@ pub async fn spawn_rnode_interface_with_driver(
                 snapshot_publisher.shutting_down(RNodeRuntimeReason::TransportConsumerClosed);
             }
             online_r.store(false, Ordering::SeqCst);
-            fwd_handle.abort();
-            let _ = fwd_handle.await;
-            write_handle.abort();
-            let _ = write_handle.await;
+            generation_writer.cancel();
+            fwd_handle.abort_and_wait().await;
+            drop(control_tx);
+            drop(ready);
+            let writer_finish = finish_rnode_writer(generation_writer).await;
 
-            if stop_requested {
-                snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
-                return;
-            }
-            if transport_closed {
-                snapshot_publisher.stopped(RNodeRuntimeReason::TransportConsumerClosed);
+            if let Some(reason) = rnode_generation_terminal_reason(
+                stop_requested,
+                transport_closed,
+                read_task_failed,
+                writer_finish,
+            ) {
+                snapshot_publisher.stopped(reason);
                 return;
             }
 
@@ -1816,6 +2528,229 @@ pub async fn spawn_rnode_interface_with_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[derive(Default)]
+    struct ScriptedWriterState {
+        writes: Vec<Vec<u8>>,
+        write_calls: usize,
+        flush_calls: usize,
+        fail_write_at: Option<usize>,
+        fail_flush_at: Option<usize>,
+        block_flush_at: Option<usize>,
+        blocked_flush_entered: bool,
+        release_blocked_flush: bool,
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[derive(Clone, Default)]
+    struct ScriptedWriter {
+        shared: Arc<(std::sync::Mutex<ScriptedWriterState>, std::sync::Condvar)>,
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    impl ScriptedWriter {
+        fn failing(fail_write_at: Option<usize>, fail_flush_at: Option<usize>) -> Self {
+            let writer = Self::default();
+            {
+                let mut state = writer.shared.0.lock().expect("scripted writer poisoned");
+                state.fail_write_at = fail_write_at;
+                state.fail_flush_at = fail_flush_at;
+            }
+            writer
+        }
+
+        fn blocking_flush(call: usize) -> Self {
+            let writer = Self::default();
+            writer
+                .shared
+                .0
+                .lock()
+                .expect("scripted writer poisoned")
+                .block_flush_at = Some(call);
+            writer
+        }
+
+        fn release_flush(&self) {
+            let mut state = self.shared.0.lock().expect("scripted writer poisoned");
+            state.release_blocked_flush = true;
+            self.shared.1.notify_all();
+        }
+
+        fn writes(&self) -> Vec<Vec<u8>> {
+            self.shared
+                .0
+                .lock()
+                .expect("scripted writer poisoned")
+                .writes
+                .clone()
+        }
+
+        fn flush_calls(&self) -> usize {
+            self.shared
+                .0
+                .lock()
+                .expect("scripted writer poisoned")
+                .flush_calls
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    impl std::io::Write for ScriptedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let mut state = self.shared.0.lock().expect("scripted writer poisoned");
+            state.write_calls += 1;
+            let call = state.write_calls;
+            if state.fail_write_at == Some(call) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    format!("scripted write failure at call {call}"),
+                ));
+            }
+            state.writes.push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            let (lock, condition) = &*self.shared;
+            let mut state = lock.lock().expect("scripted writer poisoned");
+            state.flush_calls += 1;
+            let call = state.flush_calls;
+            if state.block_flush_at == Some(call) {
+                state.blocked_flush_entered = true;
+                condition.notify_all();
+                while !state.release_blocked_flush {
+                    state = condition
+                        .wait(state)
+                        .expect("scripted writer poisoned while blocked");
+                }
+            }
+            if state.fail_flush_at == Some(call) {
+                return Err(std::io::Error::other(format!(
+                    "scripted flush failure at call {call}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn scripted_writer_context(
+        flow_control: bool,
+        ready: Arc<AtomicBool>,
+        online: Arc<AtomicBool>,
+        txb: Arc<AtomicU64>,
+        beacon: Option<(Duration, Bytes)>,
+        beacon_poll_interval: Duration,
+    ) -> RNodeWriterContext {
+        RNodeWriterContext {
+            id: 0x5C71,
+            flow_control,
+            ready,
+            online,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            txb,
+            beacon,
+            beacon_poll_interval,
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    async fn wait_for_scripted_writer(
+        writer: &ScriptedWriter,
+        predicate: impl Fn(&ScriptedWriterState) -> bool,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                {
+                    let state = writer.shared.0.lock().expect("scripted writer poisoned");
+                    if predicate(&state) {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("scripted writer condition timed out");
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn assert_scripted_io_failure(
+        failure: &RNodeWriteFailure,
+        phase: RNodeWritePhase,
+        flush: bool,
+    ) {
+        assert_eq!(failure.phase, phase);
+        let error = match (&failure.kind, flush) {
+            (RNodeWriteFailureKind::Write(error), false) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+                error
+            }
+            (RNodeWriteFailureKind::Flush(error), true) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                error
+            }
+            (kind, _) => panic!("unexpected scripted failure: {kind:?}"),
+        };
+        assert!(error.to_string().contains("scripted"));
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    async fn exercise_scripted_writer_failure(phase: RNodeWritePhase, flush: bool) {
+        let scripted = ScriptedWriter::failing((!flush).then_some(1), flush.then_some(1));
+        let online = Arc::new(AtomicBool::new(true));
+        let writer = spawn_rnode_writer(
+            scripted,
+            scripted_writer_context(
+                false,
+                Arc::new(AtomicBool::new(true)),
+                online.clone(),
+                Arc::new(AtomicU64::new(0)),
+                None,
+                Duration::from_millis(5),
+            ),
+        );
+
+        let acknowledged_failure = if phase == RNodeWritePhase::Packet {
+            writer
+                .packet_tx
+                .send(Bytes::from_static(b"packet"))
+                .await
+                .unwrap();
+            None
+        } else {
+            Some(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    request_rnode_control_write(&writer.control_tx, phase, vec![phase as u8]),
+                )
+                .await
+                .expect("scripted control write timed out")
+                .expect_err("scripted control write must fail"),
+            )
+        };
+
+        let RNodeGenerationWriter { mut task, .. } = writer;
+        let actor_failure = tokio::time::timeout(Duration::from_secs(2), task.take())
+            .await
+            .expect("scripted writer task timed out")
+            .expect("scripted writer task panicked")
+            .expect_err("scripted writer must report its I/O failure");
+        assert_scripted_io_failure(&actor_failure, phase, flush);
+        assert!(!online.load(Ordering::SeqCst));
+
+        if let Some(acknowledged_failure) = acknowledged_failure {
+            assert_scripted_io_failure(&acknowledged_failure, phase, flush);
+            match (&acknowledged_failure.kind, &actor_failure.kind) {
+                (RNodeWriteFailureKind::Write(ack), RNodeWriteFailureKind::Write(actor))
+                | (RNodeWriteFailureKind::Flush(ack), RNodeWriteFailureKind::Flush(actor)) => {
+                    assert!(Arc::ptr_eq(ack, actor));
+                }
+                _ => panic!("ack and actor failures must describe the same operation"),
+            }
+        }
+    }
 
     #[test]
     fn test_rnode_config() {
@@ -2111,6 +3046,472 @@ mod tests {
         assert!(stop_rx.try_recv().is_ok());
         drop(guard);
         stop_rnode_interface(id);
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_rnode_writer_startup_has_two_flush_acked_stages() {
+        let scripted = ScriptedWriter::blocking_flush(1);
+        let writer = spawn_rnode_writer(
+            scripted.clone(),
+            scripted_writer_context(
+                false,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicU64::new(0)),
+                None,
+                Duration::from_millis(5),
+            ),
+        );
+        assert!(writer.ready.load(Ordering::SeqCst));
+        let config = RNodeConfig::new("scripted", "tcp://127.0.0.1:1");
+        let startup_config = config.clone();
+        let mut startup = tokio::spawn(async move {
+            let result = initialise_rnode_writer(&writer, &startup_config).await;
+            (result, writer)
+        });
+
+        wait_for_scripted_writer(&scripted, |state| state.blocked_flush_entered).await;
+        assert_eq!(scripted.writes(), vec![build_detect_sequence()]);
+        assert_eq!(scripted.flush_calls(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut startup)
+                .await
+                .is_err(),
+            "detect must not be acknowledged before its flush completes"
+        );
+
+        scripted.release_flush();
+        let (result, writer) = tokio::time::timeout(Duration::from_secs(2), startup)
+            .await
+            .expect("startup task timed out")
+            .expect("startup task panicked");
+        result.expect("scripted startup must succeed");
+        assert_eq!(
+            scripted.writes(),
+            vec![build_detect_sequence(), build_init_sequence(&config)]
+        );
+        assert_eq!(scripted.flush_calls(), 2);
+        finish_rnode_writer(writer).await;
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_rnode_writer_startup_reports_exact_failed_stage() {
+        for (fail_write_at, fail_flush_at, phase) in [
+            (Some(1), None, RNodeWritePhase::Detect),
+            (None, Some(1), RNodeWritePhase::Detect),
+            (Some(2), None, RNodeWritePhase::Initialise),
+            (None, Some(2), RNodeWritePhase::Initialise),
+        ] {
+            let scripted = ScriptedWriter::failing(fail_write_at, fail_flush_at);
+            let writer = spawn_rnode_writer(
+                scripted,
+                scripted_writer_context(
+                    false,
+                    Arc::new(AtomicBool::new(true)),
+                    Arc::new(AtomicBool::new(true)),
+                    Arc::new(AtomicU64::new(0)),
+                    None,
+                    Duration::from_millis(5),
+                ),
+            );
+            let config = RNodeConfig::new("scripted", "tcp://127.0.0.1:1");
+            let failure = tokio::time::timeout(
+                Duration::from_secs(2),
+                initialise_rnode_writer(&writer, &config),
+            )
+            .await
+            .expect("scripted startup timed out")
+            .expect_err("scripted startup must fail");
+            assert_scripted_io_failure(&failure, phase, fail_flush_at.is_some());
+            finish_rnode_writer(writer).await;
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_reconnect_startup_stop_preempts_init_and_retains_writer_for_detach() {
+        let scripted = ScriptedWriter::blocking_flush(1);
+        let writer = spawn_rnode_writer(
+            scripted.clone(),
+            scripted_writer_context(
+                false,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU64::new(0)),
+                None,
+                Duration::from_millis(5),
+            ),
+        );
+        let config = RNodeConfig::new("scripted-reconnect", "tcp://127.0.0.1:1");
+        let startup_config = config.clone();
+        let (stop_tx, mut stop_rx) = mpsc::channel(1);
+        let startup = tokio::spawn(async move {
+            let result =
+                initialise_reconnecting_rnode_writer(&writer, &startup_config, &mut stop_rx).await;
+            (result, writer)
+        });
+
+        wait_for_scripted_writer(&scripted, |state| state.blocked_flush_entered).await;
+        stop_tx.send(()).await.unwrap();
+        let (result, writer) = tokio::time::timeout(Duration::from_secs(2), startup)
+            .await
+            .expect("interruptible reconnect startup timed out")
+            .expect("interruptible reconnect startup panicked");
+        assert_eq!(result.unwrap(), RNodeReconnectStartup::StopRequested);
+
+        let release = scripted.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            release.release_flush();
+        });
+        send_detach_request(&writer.control_tx, 0x5C71)
+            .await
+            .expect("retained reconnect writer must detach");
+        assert_eq!(
+            scripted.writes(),
+            vec![build_detect_sequence(), build_detach_sequence()],
+            "stop between stages must never enqueue init"
+        );
+        assert_eq!(
+            finish_rnode_writer(writer).await,
+            RNodeWriterFinish::Quiesced
+        );
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_rnode_writer_reports_write_and_flush_errors_for_every_phase() {
+        for phase in [
+            RNodeWritePhase::Detect,
+            RNodeWritePhase::Initialise,
+            RNodeWritePhase::Packet,
+            RNodeWritePhase::Detach,
+        ] {
+            exercise_scripted_writer_failure(phase, false).await;
+            exercise_scripted_writer_failure(phase, true).await;
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_rnode_writer_flow_block_does_not_head_of_line_block_control() {
+        let scripted = ScriptedWriter::default();
+        let ready = Arc::new(AtomicBool::new(false));
+        let txb = Arc::new(AtomicU64::new(0));
+        let writer = spawn_rnode_writer(
+            scripted.clone(),
+            scripted_writer_context(
+                true,
+                ready.clone(),
+                Arc::new(AtomicBool::new(true)),
+                txb.clone(),
+                None,
+                Duration::from_millis(5),
+            ),
+        );
+        let first = Bytes::from_static(b"first");
+        let second = Bytes::from_static(b"second");
+        writer.packet_tx.send(first.clone()).await.unwrap();
+        writer.packet_tx.send(second.clone()).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while txb.load(Ordering::Relaxed) != first.len() as u64 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("first packet was not admitted as the sole pending packet");
+        let control = vec![0xAA, 0xBB];
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            request_rnode_control_write(
+                &writer.control_tx,
+                RNodeWritePhase::Detect,
+                control.clone(),
+            ),
+        )
+        .await
+        .expect("flow-bypass control write timed out")
+        .expect("control must bypass a flow-blocked packet");
+        assert_eq!(scripted.writes(), vec![control]);
+        assert_eq!(txb.load(Ordering::Relaxed), first.len() as u64);
+
+        ready.store(true, Ordering::SeqCst);
+        wait_for_scripted_writer(&scripted, |state| state.writes.len() == 3).await;
+        assert_eq!(
+            scripted.writes(),
+            vec![vec![0xAA, 0xBB], kiss::frame(&first), kiss::frame(&second)]
+        );
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            (first.len() + second.len()) as u64
+        );
+
+        send_detach_request(&writer.control_tx, 0x5C71)
+            .await
+            .expect("flow-bypass writer must detach");
+        finish_rnode_writer(writer).await;
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_rnode_writer_detach_is_flush_acked_and_terminal() {
+        let scripted = ScriptedWriter::default();
+        let writer = spawn_rnode_writer(
+            scripted.clone(),
+            scripted_writer_context(
+                false,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicU64::new(0)),
+                None,
+                Duration::from_millis(5),
+            ),
+        );
+
+        send_detach_request(&writer.control_tx, 0x5C71)
+            .await
+            .expect("detach must be acknowledged after flush");
+        assert_eq!(scripted.flush_calls(), 1);
+        assert_eq!(scripted.writes(), vec![build_detach_sequence()]);
+        assert!(
+            writer
+                .packet_tx
+                .send(Bytes::from_static(b"after-leave"))
+                .await
+                .is_err()
+        );
+        let failure = tokio::time::timeout(
+            Duration::from_secs(2),
+            request_rnode_control_write(&writer.control_tx, RNodeWritePhase::Detect, vec![0xCC]),
+        )
+        .await
+        .expect("post-detach control request timed out")
+        .expect_err("control lane must close after leave");
+        assert!(matches!(failure.kind, RNodeWriteFailureKind::QueueClosed));
+
+        let RNodeGenerationWriter { mut task, .. } = writer;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), task.take())
+                .await
+                .expect("detach writer task timed out")
+                .expect("writer task panicked")
+                .expect("detach writer failed"),
+            RNodeWriterExit::Detached
+        );
+        assert_eq!(scripted.writes(), vec![build_detach_sequence()]);
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_rnode_detach_deadline_includes_control_queue_wait() {
+        let scripted = ScriptedWriter::blocking_flush(1);
+        let writer = spawn_rnode_writer(
+            scripted.clone(),
+            scripted_writer_context(
+                false,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicU64::new(0)),
+                None,
+                Duration::from_millis(5),
+            ),
+        );
+
+        let mut acknowledgements = Vec::new();
+        for byte in 0..=RNODE_CONTROL_WRITE_QUEUE {
+            let (acknowledgement, result) = oneshot::channel();
+            writer
+                .control_tx
+                .send(RNodeControlWriteRequest {
+                    phase: RNodeWritePhase::Detect,
+                    bytes: vec![byte as u8],
+                    acknowledgement,
+                })
+                .await
+                .unwrap();
+            acknowledgements.push(result);
+            if byte == 0 {
+                wait_for_scripted_writer(&scripted, |state| state.blocked_flush_entered).await;
+            }
+        }
+
+        let started = tokio::time::Instant::now();
+        let failure = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_detach_request(&writer.control_tx, 0x5C71),
+        )
+        .await
+        .expect("outer detach test timeout elapsed")
+        .expect_err("full control lane must consume the detach deadline");
+        let elapsed = started.elapsed();
+        assert!(matches!(
+            failure.kind,
+            RNodeWriteFailureKind::DeadlineElapsed
+        ));
+        assert!(elapsed >= Duration::from_millis(450), "{elapsed:?}");
+
+        scripted.release_flush();
+        finish_rnode_writer(writer).await;
+        drop(acknowledgements);
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_non_quiesced_rnode_writer_finish_is_terminal_not_reconnectable() {
+        let scripted = ScriptedWriter::blocking_flush(1);
+        let writer = spawn_rnode_writer(
+            scripted.clone(),
+            scripted_writer_context(
+                false,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicU64::new(0)),
+                None,
+                Duration::from_millis(5),
+            ),
+        );
+        writer
+            .packet_tx
+            .send(Bytes::from_static(b"blocked-physical-write"))
+            .await
+            .unwrap();
+        wait_for_scripted_writer(&scripted, |state| state.blocked_flush_entered).await;
+
+        let finish = finish_rnode_writer(writer).await;
+        assert_eq!(finish, RNodeWriterFinish::NonQuiesced);
+        assert_eq!(
+            rnode_generation_terminal_reason(false, false, false, finish),
+            Some(RNodeRuntimeReason::DriverTerminated)
+        );
+        assert_eq!(
+            rnode_generation_terminal_reason(true, false, false, finish),
+            Some(RNodeRuntimeReason::StopRequested),
+            "explicit stop classification must win"
+        );
+        assert_eq!(
+            rnode_generation_terminal_reason(false, true, false, finish),
+            Some(RNodeRuntimeReason::TransportConsumerClosed),
+            "transport closure classification must win"
+        );
+        assert_eq!(
+            rnode_generation_terminal_reason(false, false, true, RNodeWriterFinish::Quiesced,),
+            Some(RNodeRuntimeReason::DriverTerminated),
+            "losing the read stream must prevent reconnect"
+        );
+
+        // `abort` cannot cancel spawn_blocking. Release the test writer so its
+        // physical operation can really finish after the terminal decision.
+        scripted.release_flush();
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_cancelled_rnode_generation_never_replays_pending_packet() {
+        let scripted = ScriptedWriter::blocking_flush(1);
+        let old_txb = Arc::new(AtomicU64::new(0));
+        let old_writer = spawn_rnode_writer(
+            scripted.clone(),
+            scripted_writer_context(
+                false,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                old_txb.clone(),
+                None,
+                Duration::from_millis(5),
+            ),
+        );
+        let old_first = Bytes::from_static(b"old-active");
+        let old_buffered_one = Bytes::from_static(b"old-buffered-one");
+        let old_buffered_two = Bytes::from_static(b"old-buffered-two");
+        old_writer.packet_tx.send(old_first.clone()).await.unwrap();
+        wait_for_scripted_writer(&scripted, |state| state.blocked_flush_entered).await;
+        old_writer
+            .packet_tx
+            .send(old_buffered_one.clone())
+            .await
+            .unwrap();
+        old_writer
+            .packet_tx
+            .send(old_buffered_two.clone())
+            .await
+            .unwrap();
+
+        old_writer.cancel();
+        scripted.release_flush();
+        assert_eq!(
+            finish_rnode_writer(old_writer).await,
+            RNodeWriterFinish::Quiesced
+        );
+        assert_eq!(scripted.writes(), vec![kiss::frame(&old_first)]);
+        assert_eq!(
+            old_txb.load(Ordering::Relaxed),
+            old_first.len() as u64,
+            "cancellation must prevent buffered packet preparation/accounting"
+        );
+
+        let new_writer = spawn_rnode_writer(
+            scripted.clone(),
+            scripted_writer_context(
+                false,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicU64::new(0)),
+                None,
+                Duration::from_millis(5),
+            ),
+        );
+        let new_packet = Bytes::from_static(b"new-generation");
+        new_writer.packet_tx.send(new_packet.clone()).await.unwrap();
+        wait_for_scripted_writer(&scripted, |state| state.writes.len() == 2).await;
+        assert_eq!(
+            scripted.writes(),
+            vec![kiss::frame(&old_first), kiss::frame(&new_packet)]
+        );
+
+        send_detach_request(&new_writer.control_tx, 0x5C71)
+            .await
+            .expect("new generation writer must detach");
+        finish_rnode_writer(new_writer).await;
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_rnode_writer_preserves_packet_accounting_and_beacon_semantics() {
+        let scripted = ScriptedWriter::default();
+        let txb = Arc::new(AtomicU64::new(0));
+        let callsign = Bytes::from_static(b"N0CALL");
+        let writer = spawn_rnode_writer(
+            scripted.clone(),
+            scripted_writer_context(
+                false,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                txb.clone(),
+                Some((Duration::from_millis(20), callsign.clone())),
+                Duration::from_millis(5),
+            ),
+        );
+        let packet = Bytes::from_static(b"payload");
+        writer.packet_tx.send(packet.clone()).await.unwrap();
+        wait_for_scripted_writer(&scripted, |state| state.writes.len() == 2).await;
+        assert_eq!(
+            scripted.writes(),
+            vec![kiss::frame(&packet), kiss::frame(&callsign)]
+        );
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            (packet.len() + callsign.len()) as u64
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(scripted.writes().len(), 2, "beacon must disarm itself");
+
+        send_detach_request(&writer.control_tx, 0x5C71)
+            .await
+            .expect("beacon writer must detach");
+        finish_rnode_writer(writer).await;
     }
 
     #[test]
@@ -2761,6 +4162,146 @@ mod tests {
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[tokio::test]
+    async fn test_rnode_driver_stop_immediately_after_spawn_detaches_without_reconnect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = RNodeConfig::new("rnode-immediate-stop", &format!("tcp://{addr}"));
+        let expected_startup = tcp_startup_bytes(&config);
+        let expected_detach = build_detach_sequence();
+        let detach_len = expected_detach.len();
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            assert_eq!(
+                read_exact_tcp(&mut stream, expected_startup.len()),
+                expected_startup
+            );
+            let detach = read_exact_tcp(&mut stream, detach_len);
+
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_millis(350);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => panic!("terminal stop must not open a reconnect generation"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("RNode listener failed: {error}"),
+                }
+            }
+            observed_tx.send(detach).unwrap();
+        });
+
+        let id = 0x1A11;
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let spawned = spawn_rnode_interface_with_driver(config, id, transport_tx)
+            .await
+            .unwrap();
+        let mut state = spawned.driver.watch();
+
+        // No yield between spawn completion and stop: this exercises the
+        // initial-generation handoff window directly.
+        stop_rnode_interface(id);
+        let stopped = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.phase == RNodeRuntimePhase::Stopped
+                && snapshot.reason == Some(RNodeRuntimeReason::StopRequested)
+        })
+        .await;
+        assert_eq!(stopped.disconnect_total, 0);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), observed_rx.recv())
+                .await
+                .expect("immediate-stop server timed out")
+                .expect("immediate-stop server ended"),
+            expected_detach
+        );
+        tokio::time::timeout(Duration::from_secs(2), spawned.interface.read_task)
+            .await
+            .expect("immediate-stop read task timed out")
+            .expect("immediate-stop read task panicked");
+        server.join().unwrap();
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_rnode_driver_transmits_while_lifecycle_awaits_readiness() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = RNodeConfig::new("rnode-awaiting-traffic", &format!("tcp://{addr}"));
+        let expected_startup = tcp_startup_bytes(&config);
+        let payload = Bytes::from_static(b"traffic-before-protocol-readiness");
+        let expected_packet = kiss::frame(&payload);
+        let server_expected_packet = expected_packet.clone();
+        let expected_detach = build_detach_sequence();
+        let (packet_tx, mut packet_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            assert_eq!(
+                read_exact_tcp(&mut stream, expected_startup.len()),
+                expected_startup
+            );
+            packet_tx
+                .send(read_exact_tcp(&mut stream, server_expected_packet.len()))
+                .unwrap();
+            assert_eq!(
+                read_exact_tcp(&mut stream, expected_detach.len()),
+                expected_detach
+            );
+        });
+
+        let id = 0xA417;
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let spawned = spawn_rnode_interface_with_driver(config, id, transport_tx)
+            .await
+            .unwrap();
+        let mut state = spawned.driver.watch();
+        wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.connection_generation == 1
+                && snapshot.phase == RNodeRuntimePhase::AwaitingReadiness
+        })
+        .await;
+
+        spawned.interface.tx.send(payload.clone()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), packet_rx.recv())
+                .await
+                .expect("outbound RNode packet timed out")
+                .expect("outbound RNode server ended"),
+            expected_packet
+        );
+        assert_eq!(state.snapshot().phase, RNodeRuntimePhase::AwaitingReadiness);
+        assert_eq!(
+            spawned
+                .interface
+                .txb
+                .as_ref()
+                .expect("RNode TX counter")
+                .load(Ordering::Relaxed),
+            payload.len() as u64
+        );
+
+        stop_rnode_interface(id);
+        wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.phase == RNodeRuntimePhase::Stopped
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), spawned.interface.read_task)
+            .await
+            .expect("awaiting-readiness read task timed out")
+            .expect("awaiting-readiness read task panicked");
+        server.join().unwrap();
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
     async fn test_rnode_driver_initial_snapshot_is_private_and_protocol_unknown() {
         const PRIVATE_NAME: &str = "PRIVATE_RNODE_NAME_SENTINEL_2d7f";
 
@@ -3281,6 +4822,39 @@ mod tests {
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
+    fn test_tcp_write_interrupt_applies_to_cloned_stream() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut byte = [0u8; 1];
+            match std::io::Read::read(&mut stream, &mut byte) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                result => panic!("peer did not observe interrupted RNode socket: {result:?}"),
+            }
+        });
+
+        let stream = RNodeStream::connect_tcp(&addr.to_string()).unwrap();
+        let mut write_clone = stream.try_clone().unwrap();
+        let interrupt = RNodeWriteInterrupt::from_stream(&stream).unwrap();
+        drop(interrupt);
+        assert!(
+            std::io::Write::write_all(&mut write_clone, b"after-shutdown").is_err(),
+            "shutdown on the read stream must interrupt its write clone"
+        );
+        peer.join().unwrap();
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
     fn test_tcp_eof_is_read_error() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3372,7 +4946,13 @@ mod tests {
                 .unwrap(),
             2
         );
-        assert!(handle.online.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !handle.online.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reconnected RNode did not become online");
 
         handle.read_task.abort();
         drop(handle.tx);

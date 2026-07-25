@@ -34,7 +34,7 @@ pub mod rnode_multi;
 pub mod rnode_protocol;
 #[cfg(feature = "serial")]
 pub mod serial;
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(feature = "serial")]
 mod serial_io;
 pub mod socket_tuning;
 pub mod tcp;
