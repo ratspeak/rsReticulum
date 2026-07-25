@@ -17,8 +17,8 @@ use crate::config::{Config, ConfigError, ConfigSection};
 use crate::constants::*;
 use crate::interface_factory;
 use crate::interface_registry::{
-    ExactShutdownStart, InterfaceKind, InterfaceRegistration, InterfaceRegistry, InterfaceShutdown,
-    InterfaceShutdownStrategy, ShutdownStart,
+    ExactShutdownStart, InterfaceKind, InterfaceRegistration, InterfaceRegistrationRejection,
+    InterfaceRegistry, InterfaceShutdown, InterfaceShutdownStrategy, ShutdownStart,
 };
 use crate::jobs::{Job, JobScheduler};
 use crate::lifecycle::ShutdownSignal;
@@ -2792,6 +2792,29 @@ fn interface_kind_for_config(config: &interface_factory::InterfaceConfig) -> Int
     }
 }
 
+struct OwnedInterfaceHandle {
+    interface: rns_interface::traits::InterfaceHandle,
+    driver: Option<rns_interface::rnode::RNodeDriverHandle>,
+}
+
+impl From<rns_interface::traits::InterfaceHandle> for OwnedInterfaceHandle {
+    fn from(interface: rns_interface::traits::InterfaceHandle) -> Self {
+        Self {
+            interface,
+            driver: None,
+        }
+    }
+}
+
+impl From<rns_interface::rnode::SpawnedRNodeInterface> for OwnedInterfaceHandle {
+    fn from(spawned: rns_interface::rnode::SpawnedRNodeInterface) -> Self {
+        Self {
+            interface: spawned.interface,
+            driver: Some(spawned.driver),
+        }
+    }
+}
+
 fn apply_forced_shared_instance_bitrate(
     handle: &mut rns_interface::traits::InterfaceHandle,
     forced_bitrate: Option<u64>,
@@ -2921,26 +2944,37 @@ async fn register_interface_handle(
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
 ) -> Result<(), InterfaceRegistrationError> {
-    register_interface_handle_with_kind(
+    register_owned_interface_handle_with_role_and_overrides(
         transport_tx,
-        handle,
+        handle.into(),
+        rns_transport::messages::InterfaceRole::Normal,
+        rns_transport::ingress::IngressOverrides::default(),
+        None,
+        0,
         interface_controls,
         interface_registry,
         InterfaceKind::Standard,
+        false,
     )
     .await
 }
 
-async fn register_interface_handle_with_kind(
+#[cfg(any(
+    feature = "serial",
+    feature = "rnode-tcp",
+    feature = "ble",
+    target_os = "android"
+))]
+async fn register_observed_rnode_handle_with_kind(
     transport_tx: &mpsc::Sender<TransportMessage>,
-    handle: rns_interface::traits::InterfaceHandle,
+    spawned: rns_interface::rnode::SpawnedRNodeInterface,
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
 ) -> Result<(), InterfaceRegistrationError> {
-    register_interface_handle_with_role_and_overrides(
+    register_owned_interface_handle_with_role_and_overrides(
         transport_tx,
-        handle,
+        spawned.into(),
         rns_transport::messages::InterfaceRole::Normal,
         rns_transport::ingress::IngressOverrides::default(),
         None,
@@ -2990,12 +3024,40 @@ async fn register_interface_handle_with_role_and_overrides(
     kind: InterfaceKind,
     multipoint: bool,
 ) -> Result<(), InterfaceRegistrationError> {
+    register_owned_interface_handle_with_role_and_overrides(
+        transport_tx,
+        handle.into(),
+        role,
+        ingress_overrides,
+        ifac_key,
+        ifac_size,
+        interface_controls,
+        interface_registry,
+        kind,
+        multipoint,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn register_owned_interface_handle_with_role_and_overrides(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    owned: OwnedInterfaceHandle,
+    role: rns_transport::messages::InterfaceRole,
+    ingress_overrides: rns_transport::ingress::IngressOverrides,
+    ifac_key: Option<[u8; 64]>,
+    ifac_size: usize,
+    interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    kind: InterfaceKind,
+    multipoint: bool,
+) -> Result<(), InterfaceRegistrationError> {
     run_single_registration_worker(
         transport_tx.clone(),
         interface_controls.clone(),
         interface_registry.clone(),
         SingleRegistrationSpec::Direct {
-            handle,
+            owned,
             role,
             ingress_overrides,
             ifac_key,
@@ -3010,7 +3072,7 @@ async fn register_interface_handle_with_role_and_overrides(
 
 #[allow(clippy::too_many_arguments)]
 async fn prepare_interface_with_role_and_overrides(
-    handle: rns_interface::traits::InterfaceHandle,
+    owned: OwnedInterfaceHandle,
     role: rns_transport::messages::InterfaceRole,
     ingress_overrides: rns_transport::ingress::IngressOverrides,
     ifac_key: Option<[u8; 64]>,
@@ -3020,6 +3082,8 @@ async fn prepare_interface_with_role_and_overrides(
     kind: InterfaceKind,
     multipoint: bool,
 ) -> Result<PreparedInterfaceRegistration, InterfaceRegistrationError> {
+    let OwnedInterfaceHandle { interface, driver } = owned;
+    let handle = interface;
     let name = handle.name.clone();
     let id = handle.id;
     let ingress = ingress_for_role(role, &ingress_overrides);
@@ -3028,15 +3092,25 @@ async fn prepare_interface_with_role_and_overrides(
         id,
         kind,
         handle.read_task,
-        None,
+        driver,
         Some(online.clone()),
     ) {
         Ok(registration) => registration,
         Err(rejected) => {
+            let rejection = rejected.reason();
             online.store(false, Ordering::SeqCst);
-            stop_interface_before_abort(kind, id).await;
-            rejected.abort_and_wait().await;
-            return Err(InterfaceRegistrationError::Duplicate { id });
+            if rejection == InterfaceRegistrationRejection::Duplicate {
+                stop_special_interface_before_abort(kind).await;
+            }
+            rejected.stop_and_wait().await;
+            return Err(match rejection {
+                InterfaceRegistrationRejection::Duplicate => {
+                    InterfaceRegistrationError::Duplicate { id }
+                }
+                InterfaceRegistrationRejection::InvalidDriverOwnership => {
+                    InterfaceRegistrationError::InvalidDriverOwnership { id }
+                }
+            });
         }
     };
     let registry_owner = registration.owner();
@@ -3105,12 +3179,33 @@ async fn register_interface_with_post_init(
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
 ) -> Result<(), InterfaceRegistrationError> {
+    register_owned_interface_with_post_init(
+        transport_tx,
+        handle.into(),
+        post_init,
+        ifac_key,
+        interface_controls,
+        interface_registry,
+        kind,
+    )
+    .await
+}
+
+async fn register_owned_interface_with_post_init(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    owned: OwnedInterfaceHandle,
+    post_init: &interface_factory::InterfacePostInit,
+    ifac_key: Option<[u8; 64]>,
+    interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    kind: InterfaceKind,
+) -> Result<(), InterfaceRegistrationError> {
     run_single_registration_worker(
         transport_tx.clone(),
         interface_controls.clone(),
         interface_registry.clone(),
         SingleRegistrationSpec::PostInit {
-            handle,
+            owned,
             post_init: clone_interface_post_init(post_init),
             ifac_key,
             kind,
@@ -3142,13 +3237,15 @@ fn clone_interface_post_init(
 }
 
 async fn prepare_interface_with_post_init(
-    handle: rns_interface::traits::InterfaceHandle,
+    owned: OwnedInterfaceHandle,
     post_init: &interface_factory::InterfacePostInit,
     ifac_key: Option<[u8; 64]>,
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
 ) -> Result<PreparedInterfaceRegistration, InterfaceRegistrationError> {
+    let OwnedInterfaceHandle { interface, driver } = owned;
+    let handle = interface;
     // Outbound = physical capability AND `outgoing` config flag.
     let direction = rns_transport::constants::InterfaceDirection {
         inbound: handle.direction.inbound,
@@ -3166,15 +3263,25 @@ async fn prepare_interface_with_post_init(
         id,
         kind,
         handle.read_task,
-        None,
+        driver,
         Some(online.clone()),
     ) {
         Ok(registration) => registration,
         Err(rejected) => {
+            let rejection = rejected.reason();
             online.store(false, Ordering::SeqCst);
-            stop_interface_before_abort(kind, id).await;
-            rejected.abort_and_wait().await;
-            return Err(InterfaceRegistrationError::Duplicate { id });
+            if rejection == InterfaceRegistrationRejection::Duplicate {
+                stop_special_interface_before_abort(kind).await;
+            }
+            rejected.stop_and_wait().await;
+            return Err(match rejection {
+                InterfaceRegistrationRejection::Duplicate => {
+                    InterfaceRegistrationError::Duplicate { id }
+                }
+                InterfaceRegistrationRejection::InvalidDriverOwnership => {
+                    InterfaceRegistrationError::InvalidDriverOwnership { id }
+                }
+            });
         }
     };
     let registry_owner = registration.owner();
@@ -3231,6 +3338,7 @@ async fn prepare_interface_with_post_init(
 #[derive(Debug)]
 enum InterfaceRegistrationError {
     Duplicate { id: u64 },
+    InvalidDriverOwnership { id: u64 },
     TransportClosed { id: u64 },
     ReservationLost { id: u64 },
     WorkerStopped { id: u64 },
@@ -3240,6 +3348,12 @@ impl std::fmt::Display for InterfaceRegistrationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Duplicate { id } => write!(formatter, "duplicate interface ID {id}"),
+            Self::InvalidDriverOwnership { id } => {
+                write!(
+                    formatter,
+                    "interface {id} has inconsistent exact-driver ownership"
+                )
+            }
             Self::TransportClosed { id } => {
                 write!(
                     formatter,
@@ -3258,7 +3372,7 @@ impl std::fmt::Display for InterfaceRegistrationError {
 
 enum SingleRegistrationSpec {
     Direct {
-        handle: rns_interface::traits::InterfaceHandle,
+        owned: OwnedInterfaceHandle,
         role: rns_transport::messages::InterfaceRole,
         ingress_overrides: rns_transport::ingress::IngressOverrides,
         ifac_key: Option<[u8; 64]>,
@@ -3267,7 +3381,7 @@ enum SingleRegistrationSpec {
         multipoint: bool,
     },
     PostInit {
-        handle: rns_interface::traits::InterfaceHandle,
+        owned: OwnedInterfaceHandle,
         post_init: interface_factory::InterfacePostInit,
         ifac_key: Option<[u8; 64]>,
         kind: InterfaceKind,
@@ -3277,7 +3391,7 @@ enum SingleRegistrationSpec {
 impl SingleRegistrationSpec {
     fn id(&self) -> u64 {
         match self {
-            Self::Direct { handle, .. } | Self::PostInit { handle, .. } => handle.id,
+            Self::Direct { owned, .. } | Self::PostInit { owned, .. } => owned.interface.id,
         }
     }
 }
@@ -3403,7 +3517,7 @@ async fn single_registration_worker(
 ) {
     let result = match spec {
         SingleRegistrationSpec::Direct {
-            handle,
+            owned,
             role,
             ingress_overrides,
             ifac_key,
@@ -3412,7 +3526,7 @@ async fn single_registration_worker(
             multipoint,
         } => {
             match prepare_interface_with_role_and_overrides(
-                handle,
+                owned,
                 role,
                 ingress_overrides,
                 ifac_key,
@@ -3437,13 +3551,13 @@ async fn single_registration_worker(
             }
         }
         SingleRegistrationSpec::PostInit {
-            handle,
+            owned,
             post_init,
             ifac_key,
             kind,
         } => {
             match prepare_interface_with_post_init(
-                handle,
+                owned,
                 &post_init,
                 ifac_key,
                 &interface_controls,
@@ -3591,7 +3705,7 @@ async fn rollback_prepared_interface(
 ) {
     prepared.online.store(false, Ordering::SeqCst);
     remove_interface_control_if_owner(interface_controls, prepared.id, prepared.registry_owner);
-    stop_interface_before_abort(prepared.kind, prepared.id).await;
+    stop_special_interface_before_abort(prepared.kind).await;
     if let Some(registration) = prepared.registration.take() {
         registration.rollback().await;
     }
@@ -3611,7 +3725,7 @@ async fn rollback_published_interfaces(
             interface.id,
             interface.registry_owner,
         );
-        stop_interface_before_abort(interface.kind, interface.id).await;
+        stop_special_interface_before_abort(interface.kind).await;
         if let Some(registration) = interface.registration.as_mut() {
             registration.stop_task_and_wait().await;
         }
@@ -3635,14 +3749,14 @@ async fn rollback_published_interfaces(
 
 async fn register_interfaces_with_post_init_batch(
     transport_tx: &mpsc::Sender<TransportMessage>,
-    handles: Vec<rns_interface::traits::InterfaceHandle>,
+    handles: Vec<OwnedInterfaceHandle>,
     post_init: &interface_factory::InterfacePostInit,
     ifac_key: Option<[u8; 64]>,
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
 ) -> Result<Vec<u64>, InterfaceRegistrationError> {
-    let fallback_id = handles.first().map_or(0, |handle| handle.id);
+    let fallback_id = handles.first().map_or(0, |owned| owned.interface.id);
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let cancel_guard = RegistrationCancelGuard {
         sender: Some(cancel_tx),
@@ -3679,7 +3793,7 @@ async fn register_interfaces_with_post_init_batch(
 #[allow(clippy::too_many_arguments)]
 async fn batch_registration_worker(
     transport_tx: mpsc::Sender<TransportMessage>,
-    handles: Vec<rns_interface::traits::InterfaceHandle>,
+    handles: Vec<OwnedInterfaceHandle>,
     post_init: interface_factory::InterfacePostInit,
     ifac_key: Option<[u8; 64]>,
     interface_controls: InterfaceControlMap,
@@ -3713,7 +3827,7 @@ async fn batch_registration_worker(
 #[allow(clippy::too_many_arguments)]
 async fn register_interfaces_with_post_init_batch_transaction(
     transport_tx: &mpsc::Sender<TransportMessage>,
-    handles: Vec<rns_interface::traits::InterfaceHandle>,
+    handles: Vec<OwnedInterfaceHandle>,
     post_init: &interface_factory::InterfacePostInit,
     ifac_key: Option<[u8; 64]>,
     interface_controls: &InterfaceControlMap,
@@ -3723,9 +3837,9 @@ async fn register_interfaces_with_post_init_batch_transaction(
 ) -> Result<Vec<CommittedInterfaceToken>, InterfaceRegistrationError> {
     let mut prepared = Vec::with_capacity(handles.len());
     let mut handles = handles.into_iter();
-    while let Some(handle) = handles.next() {
+    while let Some(owned) = handles.next() {
         match prepare_interface_with_post_init(
-            handle,
+            owned,
             post_init,
             ifac_key,
             interface_controls,
@@ -3739,8 +3853,8 @@ async fn register_interfaces_with_post_init_batch_transaction(
                 for registration in prepared {
                     rollback_prepared_interface(interface_controls, registration).await;
                 }
-                for handle in handles {
-                    rollback_unreserved_interface(handle, kind).await;
+                for owned in handles {
+                    rollback_unreserved_interface(owned, kind).await;
                 }
                 return Err(error);
             }
@@ -3837,7 +3951,7 @@ async fn rollback_batch_interfaces(
             interface.id,
             interface.registry_owner,
         );
-        stop_interface_before_abort(interface.kind, interface.id).await;
+        stop_special_interface_before_abort(interface.kind).await;
         if let Some(registration) = interface.registration.as_mut() {
             registration.stop_task_and_wait().await;
         }
@@ -3858,44 +3972,29 @@ async fn rollback_batch_interfaces(
     }
 }
 
-async fn rollback_unreserved_interface(
-    handle: rns_interface::traits::InterfaceHandle,
-    kind: InterfaceKind,
-) {
+async fn rollback_unreserved_interface(owned: OwnedInterfaceHandle, kind: InterfaceKind) {
+    let OwnedInterfaceHandle {
+        interface: handle,
+        driver,
+    } = owned;
     handle.online.store(false, Ordering::SeqCst);
-    stop_interface_before_abort(kind, handle.id).await;
-    handle.read_task.abort();
-    let _ = handle.read_task.await;
+    stop_special_interface_before_abort(kind).await;
+    crate::interface_registry::stop_unregistered_task(handle.read_task, driver).await;
 }
 
-async fn stop_interface_before_abort(kind: InterfaceKind, _id: u64) {
+async fn stop_special_interface_before_abort(kind: InterfaceKind) {
     match kind.shutdown_strategy() {
         InterfaceShutdownStrategy::Abort => {}
+        #[cfg(any(
+            feature = "serial",
+            feature = "rnode-tcp",
+            feature = "ble",
+            target_os = "android"
+        ))]
+        InterfaceShutdownStrategy::ExactRNodeDriver => {}
         #[cfg(feature = "ble")]
         InterfaceShutdownStrategy::StopBlePeer => {
             rns_interface::ble_peer::stop_ble_peer_interface().await;
-        }
-        #[cfg(feature = "ble")]
-        InterfaceShutdownStrategy::StopBleRNodeCompatibility => {
-            rns_interface::ble_rnode::stop_ble_rnode_interface(_id);
-            tokio::time::sleep(Duration::from_millis(1200)).await;
-        }
-        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-        InterfaceShutdownStrategy::StopRNodeCompatibility => {
-            rns_interface::rnode::stop_rnode_interface(_id);
-            tokio::time::sleep(Duration::from_millis(700)).await;
-        }
-        #[cfg(target_os = "android")]
-        InterfaceShutdownStrategy::StopAndroidUsbRNodeCompatibility => {
-            if let Err(error) =
-                rns_interface::android_usb::stop_android_usb_rnode_interface_and_wait(_id).await
-            {
-                tracing::warn!(
-                    id = _id,
-                    error = %error,
-                    "Android USB registration rollback completed with errors"
-                );
-            }
         }
     }
 }
@@ -5200,7 +5299,7 @@ pub async fn spawn_ble_rnode_runtime(
     config.lt_alock = lt_alock;
     config.flow_control = flow_control;
 
-    let iface_handle = rns_interface::ble_rnode::spawn_ble_rnode_interface(
+    let spawned = rns_interface::ble_rnode::spawn_ble_rnode_interface_with_driver(
         config,
         id,
         handle.transport_tx.clone(),
@@ -5208,10 +5307,10 @@ pub async fn spawn_ble_rnode_runtime(
     .await
     .map_err(|e| format!("BLE RNode spawn failed: {e}"))?;
 
-    let online = iface_handle.online.clone();
-    register_interface_handle_with_kind(
+    let online = spawned.interface.online.clone();
+    register_observed_rnode_handle_with_kind(
         &handle.transport_tx,
-        iface_handle,
+        spawned,
         &handle.interface_controls,
         &handle.interface_registry,
         InterfaceKind::BleRNode,
@@ -5287,15 +5386,18 @@ pub async fn spawn_rnode_runtime(
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-    let iface_handle =
-        rns_interface::rnode::spawn_rnode_interface(config, id, handle.transport_tx.clone())
-            .await
-            .map_err(|e| format!("RNode spawn failed: {e}"))?;
+    let spawned = rns_interface::rnode::spawn_rnode_interface_with_driver(
+        config,
+        id,
+        handle.transport_tx.clone(),
+    )
+    .await
+    .map_err(|e| format!("RNode spawn failed: {e}"))?;
 
-    let online = iface_handle.online.clone();
-    register_interface_handle_with_kind(
+    let online = spawned.interface.online.clone();
+    register_observed_rnode_handle_with_kind(
         &handle.transport_tx,
-        iface_handle,
+        spawned,
         &handle.interface_controls,
         &handle.interface_registry,
         InterfaceKind::RNode,
@@ -5341,7 +5443,7 @@ pub async fn spawn_ble_rnode_runtime_native(
     config.lt_alock = lt_alock;
     config.flow_control = flow_control;
 
-    let iface_handle = rns_interface::ble_rnode::spawn_ble_rnode_interface_native(
+    let spawned = rns_interface::ble_rnode::spawn_ble_rnode_interface_native_with_driver(
         config,
         id,
         handle.transport_tx.clone(),
@@ -5350,10 +5452,10 @@ pub async fn spawn_ble_rnode_runtime_native(
     .await
     .map_err(|e| format!("BLE RNode native spawn failed: {e}"))?;
 
-    let online = iface_handle.online.clone();
-    register_interface_handle_with_kind(
+    let online = spawned.interface.online.clone();
+    register_observed_rnode_handle_with_kind(
         &handle.transport_tx,
-        iface_handle,
+        spawned,
         &handle.interface_controls,
         &handle.interface_registry,
         InterfaceKind::BleRNode,
@@ -5486,8 +5588,7 @@ pub async fn teardown_ble_rnode_interface(handle: &ReticulumHandle, id: u64) {
     teardown_interface(handle, id).await;
 }
 
-/// Stop serial/TCP RNode radio and leave host-controlled mode before generic
-/// interface deregistration aborts the driver task.
+/// Stop the exact serial/TCP RNode driver before generic deregistration.
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 pub async fn teardown_rnode_interface(handle: &ReticulumHandle, id: u64) {
     teardown_interface(handle, id).await;
@@ -5522,7 +5623,7 @@ pub async fn spawn_android_usb_rnode_runtime(
     config.lt_alock = lt_alock;
     config.flow_control = flow_control;
 
-    let iface_handle = rns_interface::android_usb::spawn_android_usb_rnode_interface(
+    let spawned = rns_interface::android_usb::spawn_android_usb_rnode_interface_with_driver(
         config,
         id,
         handle.transport_tx.clone(),
@@ -5530,9 +5631,9 @@ pub async fn spawn_android_usb_rnode_runtime(
     .await
     .map_err(|e| format!("Android USB spawn failed: {e}"))?;
 
-    register_interface_handle_with_kind(
+    register_observed_rnode_handle_with_kind(
         &handle.transport_tx,
-        iface_handle,
+        spawned,
         &handle.interface_controls,
         &handle.interface_registry,
         InterfaceKind::AndroidUsbRNode,
@@ -5630,40 +5731,24 @@ async fn finish_interface_shutdown(
 ) {
     tracing::debug!(id, kind = ?shutdown.kind(), "stopping owned interface");
     shutdown.mark_offline();
-    // Compatibility ID lookups remain transitional in R6b. The exact local
-    // lease is acquired first, so an unknown/non-owned ID never reaches them.
     match shutdown.strategy() {
         InterfaceShutdownStrategy::Abort => {}
+        #[cfg(any(
+            feature = "serial",
+            feature = "rnode-tcp",
+            feature = "ble",
+            target_os = "android"
+        ))]
+        InterfaceShutdownStrategy::ExactRNodeDriver => {}
         #[cfg(feature = "ble")]
         InterfaceShutdownStrategy::StopBlePeer => {
             rns_interface::ble_peer::stop_ble_peer_interface().await;
         }
-        #[cfg(feature = "ble")]
-        InterfaceShutdownStrategy::StopBleRNodeCompatibility => {
-            rns_interface::ble_rnode::stop_ble_rnode_interface(id);
-            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-        }
-        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-        InterfaceShutdownStrategy::StopRNodeCompatibility => {
-            rns_interface::rnode::stop_rnode_interface(id);
-            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-        }
-        #[cfg(target_os = "android")]
-        InterfaceShutdownStrategy::StopAndroidUsbRNodeCompatibility => {
-            if let Err(error) =
-                rns_interface::android_usb::stop_android_usb_rnode_interface_and_wait(id).await
-            {
-                tracing::warn!(
-                    id,
-                    error = %error,
-                    "Android USB owner shutdown completed with errors"
-                );
-            }
-        }
     }
 
-    // Stop the exact owned task before deregistering; deregister-first can let
-    // reconnect loops run once more before cancellation lands.
+    // Exact RNode ownership is retained in the registry. Request its local
+    // shutdown primitive and join that exact task before deregistering;
+    // same-ID compatibility lookups cannot redirect teardown.
     shutdown.stop_task_and_wait().await;
     if let Some(control_owner) = shutdown.control_owner() {
         remove_interface_control_if_owner(interface_controls, id, control_owner);
@@ -5699,24 +5784,24 @@ async fn spawn_interface(
     handle_tx: mpsc::Sender<rns_interface::traits::InterfaceHandle>,
     socket_base: &Path,
     is_foreground: Arc<AtomicBool>,
-) -> Result<Vec<rns_interface::traits::InterfaceHandle>, String> {
+) -> Result<Vec<OwnedInterfaceHandle>, String> {
     match iface_config {
         interface_factory::InterfaceConfig::TcpClient(c) => {
             rns_interface::tcp::spawn_tcp_client(c.clone(), id, transport_tx)
                 .await
-                .map(|h| vec![h])
+                .map(|h| vec![h.into()])
                 .map_err(|e| format!("TCP client: {e}"))
         }
         interface_factory::InterfaceConfig::TcpServer(c) => {
             rns_interface::tcp::spawn_tcp_server(c.clone(), id, id_gen, transport_tx, handle_tx)
                 .await
-                .map(|h| vec![h])
+                .map(|h| vec![h.into()])
                 .map_err(|e| format!("TCP server: {e}"))
         }
         interface_factory::InterfaceConfig::Udp(c) => {
             rns_interface::udp::spawn_udp_interface(c.clone(), id, transport_tx)
                 .await
-                .map(|h| vec![h])
+                .map(|h| vec![h.into()])
                 .map_err(|e| format!("UDP: {e}"))
         }
         #[cfg(feature = "serial")]
@@ -5731,7 +5816,7 @@ async fn spawn_interface(
             serial_config.stop_bits = stop;
             rns_interface::serial::spawn_serial_interface(serial_config, id, transport_tx)
                 .await
-                .map(|h| vec![h])
+                .map(|h| vec![h.into()])
                 .map_err(|e| format!("Serial: {e}"))
         }
         #[cfg(feature = "serial")]
@@ -5756,7 +5841,7 @@ async fn spawn_interface(
             kiss_config.id_callsign = c.id_callsign.as_ref().map(|s| s.as_bytes().to_vec());
             rns_interface::kiss_iface::spawn_kiss_interface(kiss_config, id, transport_tx)
                 .await
-                .map(|h| vec![h])
+                .map(|h| vec![h.into()])
                 .map_err(|e| format!("KISS: {e}"))
         }
         interface_factory::InterfaceConfig::Auto(c) => {
@@ -5774,7 +5859,7 @@ async fn spawn_interface(
             };
             rns_interface::auto::spawn_auto_interface(auto_config, id, transport_tx, is_foreground)
                 .await
-                .map(|h| vec![h])
+                .map(|h| vec![h.into()])
                 .map_err(|e| format!("Auto: {e}"))
         }
         #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -5782,9 +5867,9 @@ async fn spawn_interface(
             let rnode_config = c
                 .to_rnode_config()
                 .map_err(|error| format!("RNode: {error}"))?;
-            rns_interface::rnode::spawn_rnode_interface(rnode_config, id, transport_tx)
+            rns_interface::rnode::spawn_rnode_interface_with_driver(rnode_config, id, transport_tx)
                 .await
-                .map(|h| vec![h])
+                .map(|spawned| vec![spawned.into()])
                 .map_err(|e| format!("RNode: {e}"))
         }
         interface_factory::InterfaceConfig::Local(c) => {
@@ -5797,7 +5882,7 @@ async fn spawn_interface(
             };
             rns_interface::local::spawn_local_client(local_config, id, transport_tx)
                 .await
-                .map(|h| vec![h])
+                .map(|h| vec![h.into()])
                 .map_err(|e| format!("Local: {e}"))
         }
         interface_factory::InterfaceConfig::I2P(c) => {
@@ -5808,7 +5893,7 @@ async fn spawn_interface(
                 server_config.mode = c.mode;
                 rns_interface::i2p::spawn_i2p_server(server_config, id_gen, transport_tx, handle_tx)
                     .await
-                    .map(|h| vec![h])
+                    .map(|h| vec![h.into()])
                     .map_err(|e| format!("I2P server: {e}"))
             } else if let Some(peer) = c.peers.first() {
                 let mut client_config = rns_interface::i2p::I2PClientConfig::new(&c.name, peer);
@@ -5817,7 +5902,7 @@ async fn spawn_interface(
                 client_config.mode = c.mode;
                 rns_interface::i2p::spawn_i2p_client(client_config, id, transport_tx)
                     .await
-                    .map(|h| vec![h])
+                    .map(|h| vec![h.into()])
                     .map_err(|e| format!("I2P client: {e}"))
             } else {
                 Err(format!(
@@ -5835,7 +5920,7 @@ async fn spawn_interface(
             };
             rns_interface::pipe::spawn_pipe_interface(pipe_config, id, transport_tx)
                 .await
-                .map(|h| vec![h])
+                .map(|h| vec![h.into()])
                 .map_err(|e| format!("Pipe: {e}"))
         }
         #[cfg(feature = "serial")]
@@ -5880,6 +5965,7 @@ async fn spawn_interface(
                 transport_tx,
             )
             .await
+            .map(|handles| handles.into_iter().map(Into::into).collect())
             .map_err(|e| format!("RNodeMulti: {e}"))
         }
         #[cfg(feature = "serial")]
@@ -5899,7 +5985,7 @@ async fn spawn_interface(
             ax25_config.mode = c.mode;
             rns_interface::ax25kiss::spawn_ax25kiss_interface(ax25_config, id, transport_tx)
                 .await
-                .map(|h| vec![h])
+                .map(|h| vec![h.into()])
                 .map_err(|e| format!("AX25KISS: {e}"))
         }
         #[cfg(feature = "ble")]
@@ -5916,10 +6002,14 @@ async fn spawn_interface(
             config.lt_alock = c.lt_alock;
             config.id_interval = c.id_interval;
             config.id_callsign = c.id_callsign.as_ref().map(|s| s.as_bytes().to_vec());
-            rns_interface::ble_rnode::spawn_ble_rnode_interface(config, id, transport_tx)
-                .await
-                .map(|h| vec![h])
-                .map_err(|e| format!("BLE RNode: {e}"))
+            rns_interface::ble_rnode::spawn_ble_rnode_interface_with_driver(
+                config,
+                id,
+                transport_tx,
+            )
+            .await
+            .map(|spawned| vec![spawned.into()])
+            .map_err(|e| format!("BLE RNode: {e}"))
         }
         interface_factory::InterfaceConfig::Backbone(c) => {
             // `target_host` selects client mode; otherwise listen.
@@ -5932,7 +6022,7 @@ async fn spawn_interface(
                 config.max_reconnect_tries = c.max_reconnect_tries;
                 rns_interface::backbone::spawn_backbone_client(config, id, transport_tx)
                     .await
-                    .map(|h| vec![h])
+                    .map(|h| vec![h.into()])
                     .map_err(|e| format!("Backbone client: {e}"))
             } else {
                 let listen_ip = c.listen_on.as_deref().unwrap_or("0.0.0.0");
@@ -5953,7 +6043,7 @@ async fn spawn_interface(
                     handle_tx,
                 )
                 .await
-                .map(|h| vec![h])
+                .map(|h| vec![h.into()])
                 .map_err(|e| format!("Backbone server: {e}"))
             }
         }
@@ -6362,6 +6452,77 @@ mod tests {
             tx,
             read_task: tokio::spawn(async {}),
         }
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    fn test_rnode_tcp_peer() -> (
+        String,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = format!("tcp://{}", listener.local_addr().unwrap());
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut observed = Vec::new();
+            let mut buffer = [0u8; 512];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => observed.extend_from_slice(&buffer[..read]),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        panic!("timed out waiting for exact RNode shutdown: {error}");
+                    }
+                    Err(error) => panic!("RNode peer read failed: {error}"),
+                }
+            }
+            closed_tx.send(observed).unwrap();
+        });
+        (port, closed_rx, peer)
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    fn assert_exact_rnode_stopped(driver: &rns_interface::rnode::RNodeDriverSubscription) {
+        let snapshot = driver.snapshot();
+        assert_eq!(
+            snapshot.phase,
+            rns_interface::rnode::RNodeRuntimePhase::Stopped
+        );
+        assert_eq!(
+            snapshot.reason,
+            Some(rns_interface::rnode::RNodeRuntimeReason::StopRequested)
+        );
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    async fn wait_for_exact_rnode_stop(driver: &mut rns_interface::rnode::RNodeDriverSubscription) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if driver.snapshot().phase == rns_interface::rnode::RNodeRuntimePhase::Stopped {
+                    return;
+                }
+                driver
+                    .changed()
+                    .await
+                    .expect("RNode observation closed before terminal snapshot");
+            }
+        })
+        .await
+        .expect("exact RNode driver did not publish its terminal snapshot");
+        assert_exact_rnode_stopped(driver);
     }
 
     #[test]
@@ -7589,7 +7750,7 @@ egress_control = Yes
 
         let result = register_interfaces_with_post_init_batch(
             &transport_tx,
-            vec![first, duplicate, remaining],
+            vec![first.into(), duplicate.into(), remaining.into()],
             &post_init,
             None,
             &interface_controls,
@@ -7692,6 +7853,291 @@ egress_control = Yes
         replacement.rollback().await;
     }
 
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn observed_rnode_registration_rollback_requests_exact_driver_shutdown() {
+        let id = 920_193;
+        let (port, closed_rx, peer) = test_rnode_tcp_peer();
+        let config = rns_interface::rnode::RNodeConfig::new("rollback-rnode", &port);
+        let (transport_tx, transport_rx) = mpsc::channel::<TransportMessage>(1);
+        drop(transport_rx);
+        let spawned = rns_interface::rnode::spawn_rnode_interface_with_driver(
+            config,
+            id,
+            transport_tx.clone(),
+        )
+        .await
+        .expect("spawn observed RNode");
+        let driver = spawned.driver.watch();
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
+
+        let result = register_observed_rnode_handle_with_kind(
+            &transport_tx,
+            spawned,
+            &interface_controls,
+            &interface_registry,
+            InterfaceKind::RNode,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(InterfaceRegistrationError::TransportClosed { id: failed_id })
+                if failed_id == id
+        ));
+        assert_exact_rnode_stopped(&driver);
+        let observed = closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("exact rollback did not close the RNode peer");
+        assert!(
+            observed.ends_with(&rns_interface::rnode::build_detach_sequence()),
+            "exact rollback must send the RNode detach sequence"
+        );
+        peer.join().unwrap();
+        assert_eq!(interface_registry.len(), 0);
+        assert!(
+            interface_controls
+                .lock()
+                .expect("interface_controls mutex poisoned")
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn same_id_observed_rnode_teardown_is_registry_local() {
+        let id = 920_194;
+        let (first_port, first_closed_rx, first_peer) = test_rnode_tcp_peer();
+        let (second_port, second_closed_rx, second_peer) = test_rnode_tcp_peer();
+        let (first_transport_tx, mut first_transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let (second_transport_tx, mut second_transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let first_spawned = rns_interface::rnode::spawn_rnode_interface_with_driver(
+            rns_interface::rnode::RNodeConfig::new("same-id-first", &first_port),
+            id,
+            first_transport_tx.clone(),
+        )
+        .await
+        .expect("spawn first observed RNode");
+        let first_driver = first_spawned.driver.watch();
+        let second_spawned = rns_interface::rnode::spawn_rnode_interface_with_driver(
+            rns_interface::rnode::RNodeConfig::new("same-id-second", &second_port),
+            id,
+            second_transport_tx.clone(),
+        )
+        .await
+        .expect("spawn second observed RNode");
+        let second_driver = second_spawned.driver.watch();
+        let first_controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let second_controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let first_registry = InterfaceRegistry::default();
+        let second_registry = InterfaceRegistry::default();
+
+        register_observed_rnode_handle_with_kind(
+            &first_transport_tx,
+            first_spawned,
+            &first_controls,
+            &first_registry,
+            InterfaceKind::RNode,
+        )
+        .await
+        .unwrap();
+        register_observed_rnode_handle_with_kind(
+            &second_transport_tx,
+            second_spawned,
+            &second_controls,
+            &second_registry,
+            InterfaceKind::RNode,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            first_transport_rx.recv().await,
+            Some(TransportMessage::RegisterInterface { id: registered, .. })
+                if registered == id
+        ));
+        assert!(matches!(
+            second_transport_rx.recv().await,
+            Some(TransportMessage::RegisterInterface { id: registered, .. })
+                if registered == id
+        ));
+
+        let mut first_runtime = dummy_handle();
+        first_runtime.transport_tx = first_transport_tx;
+        first_runtime.interface_controls = first_controls;
+        first_runtime.interface_registry = first_registry;
+        teardown_interface(&first_runtime, id).await;
+        assert_exact_rnode_stopped(&first_driver);
+        assert_ne!(
+            second_driver.snapshot().phase,
+            rns_interface::rnode::RNodeRuntimePhase::Stopped,
+            "same-ID teardown in one runtime must not stop another runtime's driver"
+        );
+        assert!(
+            matches!(
+                second_closed_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "second same-ID peer closed during first runtime teardown"
+        );
+        assert!(matches!(
+            first_transport_rx.recv().await,
+            Some(TransportMessage::DeregisterInterface { id: deregistered })
+                if deregistered == id
+        ));
+
+        let mut second_runtime = dummy_handle();
+        second_runtime.transport_tx = second_transport_tx;
+        second_runtime.interface_controls = second_controls;
+        second_runtime.interface_registry = second_registry;
+        teardown_interface(&second_runtime, id).await;
+        assert_exact_rnode_stopped(&second_driver);
+        assert!(matches!(
+            second_transport_rx.recv().await,
+            Some(TransportMessage::DeregisterInterface { id: deregistered })
+                if deregistered == id
+        ));
+
+        for (closed_rx, peer) in [
+            (first_closed_rx, first_peer),
+            (second_closed_rx, second_peer),
+        ] {
+            let observed = closed_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("exact teardown did not close the RNode peer");
+            assert!(observed.ends_with(&rns_interface::rnode::build_detach_sequence()));
+            peer.join().unwrap();
+        }
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn dropped_exact_shutdown_requests_driver_and_keeps_tombstone() {
+        let id = 920_195;
+        let (port, closed_rx, peer) = test_rnode_tcp_peer();
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let spawned = rns_interface::rnode::spawn_rnode_interface_with_driver(
+            rns_interface::rnode::RNodeConfig::new("dropped-shutdown", &port),
+            id,
+            transport_tx,
+        )
+        .await
+        .expect("spawn observed RNode");
+        let mut observer = spawned.driver.watch();
+        let interface = spawned.interface;
+        let _keep_application_sender = interface.tx.clone();
+        let online = interface.online.clone();
+        let registry = InterfaceRegistry::default();
+        let registration = registry
+            .reserve_with_online(
+                id,
+                InterfaceKind::RNode,
+                interface.read_task,
+                Some(spawned.driver),
+                Some(online),
+            )
+            .expect("reserve exact RNode");
+        assert!(registration.commit().is_ok(), "commit exact RNode");
+
+        let ShutdownStart::Acquired(shutdown) = registry.begin_shutdown(id) else {
+            panic!("active exact RNode must yield shutdown ownership");
+        };
+        drop(shutdown);
+
+        wait_for_exact_rnode_stop(&mut observer).await;
+        let observed = closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("dropped exact shutdown did not close the RNode peer");
+        assert!(observed.ends_with(&rns_interface::rnode::build_detach_sequence()));
+        peer.join().unwrap();
+        assert_eq!(
+            registry.len(),
+            1,
+            "unjoined dropped shutdown must retain its Stopping tombstone"
+        );
+        let duplicate = match registry.reserve(
+            id,
+            InterfaceKind::Standard,
+            tokio::spawn(std::future::pending()),
+            None,
+        ) {
+            Ok(_) => panic!("Stopping tombstone must block same-ID reuse"),
+            Err(rejected) => rejected,
+        };
+        assert_eq!(
+            duplicate.reason(),
+            InterfaceRegistrationRejection::Duplicate
+        );
+        duplicate.stop_and_wait().await;
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn registration_rejects_both_driver_ownership_mismatches() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registry = InterfaceRegistry::default();
+        let plain = test_interface_handle(920_196, None, "plain-as-rnode");
+        let plain_online = plain.online.clone();
+        let result = register_owned_interface_handle_with_role_and_overrides(
+            &transport_tx,
+            plain.into(),
+            rns_transport::messages::InterfaceRole::Normal,
+            rns_transport::ingress::IngressOverrides::default(),
+            None,
+            0,
+            &controls,
+            &registry,
+            InterfaceKind::RNode,
+            false,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(InterfaceRegistrationError::InvalidDriverOwnership { id: 920_196 })
+        ));
+        assert!(!plain_online.load(Ordering::SeqCst));
+
+        let (port, closed_rx, peer) = test_rnode_tcp_peer();
+        let spawned = rns_interface::rnode::spawn_rnode_interface_with_driver(
+            rns_interface::rnode::RNodeConfig::new("rnode-as-standard", &port),
+            920_197,
+            transport_tx.clone(),
+        )
+        .await
+        .expect("spawn observed RNode");
+        let mut observer = spawned.driver.watch();
+        let result = register_owned_interface_handle_with_role_and_overrides(
+            &transport_tx,
+            spawned.into(),
+            rns_transport::messages::InterfaceRole::Normal,
+            rns_transport::ingress::IngressOverrides::default(),
+            None,
+            0,
+            &controls,
+            &registry,
+            InterfaceKind::Standard,
+            false,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(InterfaceRegistrationError::InvalidDriverOwnership { id: 920_197 })
+        ));
+        wait_for_exact_rnode_stop(&mut observer).await;
+        let observed = closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("invalid driver ownership cleanup did not close the RNode peer");
+        assert!(observed.ends_with(&rns_interface::rnode::build_detach_sequence()));
+        peer.join().unwrap();
+        assert_eq!(registry.len(), 0);
+        assert!(controls.lock().unwrap().is_empty());
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "ownership mismatch must never publish an actor registration"
+        );
+    }
+
     #[tokio::test]
     async fn cancelled_blocked_single_registration_fully_rolls_back() {
         let id = 920_094;
@@ -7751,7 +8197,7 @@ egress_control = Yes
         let caller = tokio::spawn(async move {
             register_interfaces_with_post_init_batch(
                 &worker_tx,
-                vec![first, second],
+                vec![first.into(), second.into()],
                 &post_init,
                 None,
                 &worker_controls,
@@ -7806,7 +8252,7 @@ egress_control = Yes
             interface_controls.clone(),
             interface_registry.clone(),
             SingleRegistrationSpec::Direct {
-                handle,
+                owned: handle.into(),
                 role: rns_transport::messages::InterfaceRole::Normal,
                 ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
                 ifac_key: None,
@@ -7849,7 +8295,7 @@ egress_control = Yes
         let interface_registry = InterfaceRegistry::default();
         let first = test_interface_handle(id, None, "stale-owner-a");
         let prepared = prepare_interface_with_role_and_overrides(
-            first,
+            first.into(),
             rns_transport::messages::InterfaceRole::Normal,
             rns_transport::ingress::IngressOverrides::default(),
             None,
@@ -7961,7 +8407,7 @@ egress_control = Yes
             Ok(_) => panic!("orphan cleanup must hold a same-ID tombstone"),
             Err(rejected) => rejected,
         };
-        rejected.abort_and_wait().await;
+        rejected.stop_and_wait().await;
 
         assert!(matches!(
             transport_rx.recv().await,

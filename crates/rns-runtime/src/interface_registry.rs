@@ -21,19 +21,19 @@ pub(crate) enum InterfaceKind {
     AndroidUsbRNode,
 }
 
-/// Closed set of teardown strategies. Compatibility strategies remain
-/// transitional until every RNode spawn path supplies an exact driver handle.
+/// Closed set of teardown strategies owned by one runtime-local registry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InterfaceShutdownStrategy {
     Abort,
     #[cfg(feature = "ble")]
     StopBlePeer,
-    #[cfg(feature = "ble")]
-    StopBleRNodeCompatibility,
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-    StopRNodeCompatibility,
-    #[cfg(target_os = "android")]
-    StopAndroidUsbRNodeCompatibility,
+    #[cfg(any(
+        feature = "serial",
+        feature = "rnode-tcp",
+        feature = "ble",
+        target_os = "android"
+    ))]
+    ExactRNodeDriver,
 }
 
 impl InterfaceKind {
@@ -43,15 +43,33 @@ impl InterfaceKind {
             #[cfg(feature = "ble")]
             Self::BlePeer => InterfaceShutdownStrategy::StopBlePeer,
             #[cfg(feature = "ble")]
-            Self::BleRNode => InterfaceShutdownStrategy::StopBleRNodeCompatibility,
+            Self::BleRNode => InterfaceShutdownStrategy::ExactRNodeDriver,
             #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-            Self::RNode => InterfaceShutdownStrategy::StopRNodeCompatibility,
+            Self::RNode => InterfaceShutdownStrategy::ExactRNodeDriver,
             #[cfg(feature = "serial")]
             Self::RNodeMulti => InterfaceShutdownStrategy::Abort,
             #[cfg(target_os = "android")]
-            Self::AndroidUsbRNode => InterfaceShutdownStrategy::StopAndroidUsbRNodeCompatibility,
+            Self::AndroidUsbRNode => InterfaceShutdownStrategy::ExactRNodeDriver,
         }
     }
+
+    fn requires_exact_driver(self) -> bool {
+        match self {
+            #[cfg(feature = "ble")]
+            Self::BleRNode => true,
+            #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+            Self::RNode => true,
+            #[cfg(target_os = "android")]
+            Self::AndroidUsbRNode => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InterfaceRegistrationRejection {
+    Duplicate,
+    InvalidDriverOwnership,
 }
 
 #[derive(Clone, Default)]
@@ -72,9 +90,7 @@ struct InterfaceRecord {
     strategy: InterfaceShutdownStrategy,
     task: Option<JoinHandle<()>>,
     online: Option<Arc<std::sync::atomic::AtomicBool>>,
-    // R6c will populate this from observed RNode spawn paths. R6b deliberately
-    // leaves it empty and preserves the compatibility shutdown routes.
-    _driver: Option<rns_interface::rnode::RNodeDriverHandle>,
+    driver: Option<rns_interface::rnode::RNodeDriverHandle>,
     state: RecordState,
 }
 
@@ -132,6 +148,13 @@ impl InterfaceRegistry {
         driver: Option<rns_interface::rnode::RNodeDriverHandle>,
         online: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<InterfaceRegistration, RejectedInterfaceRegistration> {
+        if kind.requires_exact_driver() != driver.is_some() {
+            return Err(RejectedInterfaceRegistration {
+                task: Some(task),
+                driver,
+                reason: InterfaceRegistrationRejection::InvalidDriverOwnership,
+            });
+        }
         let owner = self.inner.next_owner();
         let mut records = self
             .inner
@@ -141,7 +164,8 @@ impl InterfaceRegistry {
         if records.contains_key(&id) {
             return Err(RejectedInterfaceRegistration {
                 task: Some(task),
-                _driver: driver,
+                driver,
+                reason: InterfaceRegistrationRejection::Duplicate,
             });
         }
         records.insert(
@@ -152,7 +176,7 @@ impl InterfaceRegistry {
                 strategy: kind.shutdown_strategy(),
                 task: None,
                 online,
-                _driver: None,
+                driver: None,
                 state: RecordState::Pending {
                     cancel_requested: false,
                 },
@@ -185,7 +209,7 @@ impl InterfaceRegistry {
                     strategy: InterfaceShutdownStrategy::Abort,
                     task: None,
                     online: None,
-                    _driver: None,
+                    driver: None,
                     state: RecordState::Stopping,
                 },
             );
@@ -197,7 +221,7 @@ impl InterfaceRegistry {
                 strategy: InterfaceShutdownStrategy::Abort,
                 task: None,
                 online: None,
-                _driver: None,
+                driver: None,
                 control_owner: None,
                 finished: false,
             });
@@ -225,8 +249,7 @@ impl InterfaceRegistry {
                     strategy: record.strategy,
                     task: record.task.take(),
                     online: record.online.clone(),
-                    // R6b does not consume the future exact driver handle.
-                    _driver: record._driver.clone(),
+                    driver: record.driver.take(),
                     control_owner: Some(record.owner),
                     finished: false,
                 })
@@ -257,7 +280,7 @@ impl InterfaceRegistry {
                     strategy: record.strategy,
                     task: record.task.take(),
                     online: record.online.clone(),
-                    _driver: record._driver.clone(),
+                    driver: record.driver.take(),
                     control_owner: Some(record.owner),
                     finished: false,
                 })
@@ -348,7 +371,7 @@ impl InterfaceRegistry {
                 .get_mut(&registration.id)
                 .expect("batch reservation was validated");
             record.task = registration.task.take();
-            record._driver = registration.driver.take();
+            record.driver = registration.driver.take();
             record.state = RecordState::Active;
             registration.committed = true;
         }
@@ -413,7 +436,7 @@ impl InterfaceRegistration {
         let task = self.task.take().expect("pending registration owns a task");
         let driver = self.driver.take();
         record.task = Some(task);
-        record._driver = driver;
+        record.driver = driver;
         record.state = RecordState::Active;
         self.committed = true;
         Ok(())
@@ -425,10 +448,7 @@ impl InterfaceRegistration {
     }
 
     pub(crate) async fn stop_task_and_wait(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-            let _ = task.await;
-        }
+        stop_owned_task(&mut self.task, &mut self.driver, Some(self.id)).await;
     }
 
     pub(crate) fn release(mut self) {
@@ -442,37 +462,48 @@ impl Drop for InterfaceRegistration {
         if self.committed {
             return;
         }
-        if let Some(task) = self.task.take() {
+        if let Some(driver) = self.driver.take() {
+            driver.request_shutdown();
+        } else if let Some(task) = self.task.take() {
             task.abort();
         }
-        // Cancellation cannot await the aborted task. Keep the reservation as
-        // a fail-closed tombstone so the ID cannot be reused before join proof.
+        // Cancellation cannot await completion. Exact RNode tasks receive
+        // their local stop request and detach; plain tasks are aborted. Keep
+        // the reservation as a fail-closed tombstone until owned cleanup
+        // proves completion.
     }
 }
 
 pub(crate) struct RejectedInterfaceRegistration {
     task: Option<JoinHandle<()>>,
-    _driver: Option<rns_interface::rnode::RNodeDriverHandle>,
+    driver: Option<rns_interface::rnode::RNodeDriverHandle>,
+    reason: InterfaceRegistrationRejection,
 }
 
 impl std::fmt::Debug for RejectedInterfaceRegistration {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("RejectedInterfaceRegistration")
+        formatter
+            .debug_struct("RejectedInterfaceRegistration")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
     }
 }
 
 impl RejectedInterfaceRegistration {
-    pub(crate) async fn abort_and_wait(mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-            let _ = task.await;
-        }
+    pub(crate) fn reason(&self) -> InterfaceRegistrationRejection {
+        self.reason
+    }
+
+    pub(crate) async fn stop_and_wait(mut self) {
+        stop_owned_task(&mut self.task, &mut self.driver, None).await;
     }
 }
 
 impl Drop for RejectedInterfaceRegistration {
     fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
+        if let Some(driver) = self.driver.take() {
+            driver.request_shutdown();
+        } else if let Some(task) = self.task.take() {
             task.abort();
         }
     }
@@ -498,7 +529,7 @@ pub(crate) struct InterfaceShutdown {
     strategy: InterfaceShutdownStrategy,
     task: Option<JoinHandle<()>>,
     online: Option<Arc<std::sync::atomic::AtomicBool>>,
-    _driver: Option<rns_interface::rnode::RNodeDriverHandle>,
+    driver: Option<rns_interface::rnode::RNodeDriverHandle>,
     control_owner: Option<u64>,
     finished: bool,
 }
@@ -523,10 +554,7 @@ impl InterfaceShutdown {
     }
 
     pub(crate) async fn stop_task_and_wait(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-            let _ = task.await;
-        }
+        stop_owned_task(&mut self.task, &mut self.driver, Some(self.id)).await;
     }
 
     pub(crate) fn finish(mut self) {
@@ -537,12 +565,56 @@ impl InterfaceShutdown {
 
 impl Drop for InterfaceShutdown {
     fn drop(&mut self) {
-        // Never abort from Drop. In particular, an Android USB owner may be
-        // inside its ordered Java-release sequence. Public teardown runs in a
-        // cancellation-independent worker; if that worker panics, retaining
-        // the Stopping tombstone and detaching the task is the fail-closed
-        // fallback.
+        if let Some(driver) = self.driver.take() {
+            driver.request_shutdown();
+        }
+        // Never abort or await from Drop. Exact RNode tasks receive their
+        // instance-local shutdown request and remain detached so ordered
+        // cleanup can complete. Plain tasks also detach. The Stopping
+        // tombstone remains fail-closed because completion was not joined.
     }
+}
+
+const EXACT_RNODE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn stop_owned_task(
+    task: &mut Option<JoinHandle<()>>,
+    driver: &mut Option<rns_interface::rnode::RNodeDriverHandle>,
+    id: Option<u64>,
+) {
+    let graceful = if let Some(driver) = driver.take() {
+        driver.request_shutdown();
+        true
+    } else {
+        false
+    };
+    let Some(mut task) = task.take() else {
+        return;
+    };
+    if graceful {
+        if tokio::time::timeout(EXACT_RNODE_SHUTDOWN_GRACE, &mut task)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        tracing::warn!(
+            interface_id = ?id,
+            grace_ms = EXACT_RNODE_SHUTDOWN_GRACE.as_millis(),
+            "exact RNode driver did not stop before the bounded join deadline; aborting task"
+        );
+    }
+    task.abort();
+    let _ = task.await;
+}
+
+pub(crate) async fn stop_unregistered_task(
+    task: JoinHandle<()>,
+    driver: Option<rns_interface::rnode::RNodeDriverHandle>,
+) {
+    let mut task = Some(task);
+    let mut driver = driver;
+    stop_owned_task(&mut task, &mut driver, None).await;
 }
 
 #[cfg(test)]
@@ -601,11 +673,43 @@ mod tests {
             Ok(_) => panic!("duplicate must be rejected"),
             Err(duplicate) => duplicate,
         };
-        duplicate.abort_and_wait().await;
+        duplicate.stop_and_wait().await;
         assert!(duplicate_dropped.load(Ordering::Acquire));
         assert_eq!(registry.owner_for_test(11), Some(first_owner));
 
         first.rollback().await;
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn exact_kind_without_driver_is_rejected_and_joined() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let registry = InterfaceRegistry::default();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let task = tokio::spawn(async move {
+            let _dropped = Dropped(task_dropped);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        let rejected = match registry.reserve(13, InterfaceKind::RNode, task, None) {
+            Ok(_) => panic!("exact RNode kind must require an exact driver"),
+            Err(rejected) => rejected,
+        };
+        assert_eq!(
+            rejected.reason(),
+            InterfaceRegistrationRejection::InvalidDriverOwnership
+        );
+        rejected.stop_and_wait().await;
+        assert!(dropped.load(Ordering::Acquire));
         assert_eq!(registry.len(), 0);
     }
 
@@ -712,7 +816,7 @@ mod tests {
                 Ok(_) => panic!("dropped Pending owner must block same-ID reuse"),
                 Err(rejected) => rejected,
             };
-        rejected.abort_and_wait().await;
+        rejected.stop_and_wait().await;
 
         let stopping_registry = InterfaceRegistry::default();
         let task_release = Arc::new(Notify::new());
@@ -740,7 +844,7 @@ mod tests {
                 Ok(_) => panic!("dropped Stopping owner must block same-ID reuse"),
                 Err(rejected) => rejected,
             };
-        rejected.abort_and_wait().await;
+        rejected.stop_and_wait().await;
         task_release.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(1), completed_rx)
             .await
@@ -760,7 +864,7 @@ mod tests {
             Ok(_) => panic!("orphan cleanup tombstone must block same-ID reuse"),
             Err(rejected) => rejected,
         };
-        rejected.abort_and_wait().await;
+        rejected.stop_and_wait().await;
         shutdown.finish();
 
         let replacement = registry
@@ -788,18 +892,18 @@ mod tests {
             );
             assert_eq!(
                 InterfaceKind::BleRNode.shutdown_strategy(),
-                InterfaceShutdownStrategy::StopBleRNodeCompatibility
+                InterfaceShutdownStrategy::ExactRNodeDriver
             );
         }
         #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
         assert_eq!(
             InterfaceKind::RNode.shutdown_strategy(),
-            InterfaceShutdownStrategy::StopRNodeCompatibility
+            InterfaceShutdownStrategy::ExactRNodeDriver
         );
         #[cfg(target_os = "android")]
         assert_eq!(
             InterfaceKind::AndroidUsbRNode.shutdown_strategy(),
-            InterfaceShutdownStrategy::StopAndroidUsbRNodeCompatibility
+            InterfaceShutdownStrategy::ExactRNodeDriver
         );
     }
 }
