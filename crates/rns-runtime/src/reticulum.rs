@@ -4906,6 +4906,10 @@ async fn spawn_interface(
                 config.mode = c.mode;
                 config.prefer_ipv6 = c.prefer_ipv6;
                 config.device = c.device.clone();
+                config.block_fast_flapping = c.block_fast_flapping;
+                config.fast_flapping_threshold = c.fast_flapping_threshold;
+                config.fast_flapping_grace = c.fast_flapping_grace;
+                config.fast_flapping_block_time = c.fast_flapping_block_time;
                 rns_interface::backbone::spawn_backbone_server(
                     config,
                     id,

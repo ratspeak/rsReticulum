@@ -1,6 +1,8 @@
 //! Mirrors `Reticulum._synthesize_interface` in the Python reference but
 //! rejects external-program interfaces.
 
+use std::time::Duration;
+
 use crate::config::ConfigSection;
 use rns_interface::tcp::{TcpClientConfig, TcpServerConfig};
 use rns_interface::traits::InterfaceMode;
@@ -237,6 +239,14 @@ pub struct BackboneInterfaceConfig {
     pub max_reconnect_tries: Option<usize>,
     /// Parsed for Python config compatibility; advisory only.
     pub i2p_tunneled: bool,
+    /// Listener-only fast-flap blocking switch. Python default: enabled.
+    pub block_fast_flapping: bool,
+    /// Listener-only short-connection threshold. Python default: 20 seconds.
+    pub fast_flapping_threshold: Duration,
+    /// Listener-only tolerated short-connection count. Python default: 5.
+    pub fast_flapping_grace: u64,
+    /// Listener-only block time. Configured in minutes; Python default: 720.
+    pub fast_flapping_block_time: Duration,
 }
 
 fn parse_interface_mode(s: &str) -> Option<InterfaceMode> {
@@ -272,6 +282,92 @@ fn parse_port_opt(
         .get_uint(field)
         .map(|v| parse_port(name, field, v))
         .transpose()
+}
+
+fn parse_bool_strict(
+    name: &str,
+    field: &str,
+    section: &ConfigSection,
+    default: bool,
+) -> Result<bool, InterfaceFactoryError> {
+    if !section.has(field) {
+        return Ok(default);
+    }
+    section
+        .get_bool(field)
+        .ok_or_else(|| InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: "expected a boolean value".to_string(),
+        })
+}
+
+fn parse_uint_strict(
+    name: &str,
+    field: &str,
+    section: &ConfigSection,
+    default: u64,
+) -> Result<u64, InterfaceFactoryError> {
+    if !section.has(field) {
+        return Ok(default);
+    }
+    let raw = section
+        .get(field)
+        .ok_or_else(|| InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: "expected a non-negative integer".to_string(),
+        })?;
+    raw.parse::<u64>()
+        .map_err(|_| InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: format!("'{raw}' is not a non-negative integer"),
+        })
+}
+
+fn parse_duration_strict(
+    name: &str,
+    field: &str,
+    section: &ConfigSection,
+    unit_seconds: f64,
+    default: Duration,
+) -> Result<Duration, InterfaceFactoryError> {
+    if !section.has(field) {
+        return Ok(default);
+    }
+    let raw = section
+        .get(field)
+        .ok_or_else(|| InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: "expected a finite non-negative number".to_string(),
+        })?;
+    let value = raw
+        .parse::<f64>()
+        .map_err(|_| InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: format!("'{raw}' is not a number"),
+        })?;
+    if !value.is_finite() {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: format!("'{raw}' is not finite"),
+        });
+    }
+    if value < 0.0 {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: format!("'{raw}' must not be negative"),
+        });
+    }
+    let seconds = value * unit_seconds;
+    if !seconds.is_finite() {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: format!("'{raw}' is too large"),
+        });
+    }
+    Duration::try_from_secs_f64(seconds).map_err(|_| InterfaceFactoryError::InvalidValue {
+        field: format!("{name}.{field}"),
+        message: format!("'{raw}' is outside the supported duration range"),
+    })
 }
 
 pub fn synthesize_interface(
@@ -1133,6 +1229,32 @@ fn synthesize_backbone(
     let connect_timeout = section.get_uint("connect_timeout").unwrap_or(5);
     let max_reconnect_tries = section.get_uint("max_reconnect_tries").map(|v| v as usize);
     let i2p_tunneled = section.get_bool("i2p_tunneled").unwrap_or(false);
+    let block_fast_flapping = parse_bool_strict(
+        name,
+        "block_fast_flapping",
+        section,
+        rns_interface::backbone::BLOCK_FAST_FLAPPING,
+    )?;
+    let fast_flapping_threshold = parse_duration_strict(
+        name,
+        "fast_flapping_threshold",
+        section,
+        1.0,
+        rns_interface::backbone::FAST_FLAPPING_THRESHOLD,
+    )?;
+    let fast_flapping_grace = parse_uint_strict(
+        name,
+        "fast_flapping_grace",
+        section,
+        rns_interface::backbone::FAST_FLAPPING_GRACE,
+    )?;
+    let fast_flapping_block_time = parse_duration_strict(
+        name,
+        "fast_flapping_block_time",
+        section,
+        60.0,
+        rns_interface::backbone::FAST_FLAPPING_BLOCK_TIME,
+    )?;
 
     Ok(InterfaceConfig::Backbone(BackboneInterfaceConfig {
         name: name.to_string(),
@@ -1145,6 +1267,10 @@ fn synthesize_backbone(
         connect_timeout,
         max_reconnect_tries,
         i2p_tunneled,
+        block_fast_flapping,
+        fast_flapping_threshold,
+        fast_flapping_grace,
+        fast_flapping_block_time,
     }))
 }
 
@@ -2284,8 +2410,65 @@ mod tests {
                 assert_eq!(c.connect_timeout, 5);
                 assert!(c.max_reconnect_tries.is_none());
                 assert!(!c.i2p_tunneled);
+                assert!(c.block_fast_flapping);
+                assert_eq!(c.fast_flapping_threshold, Duration::from_secs(20));
+                assert_eq!(c.fast_flapping_grace, 5);
+                assert_eq!(c.fast_flapping_block_time, Duration::from_secs(720 * 60));
             }
             _ => panic!("expected Backbone"),
+        }
+    }
+
+    #[test]
+    fn test_synthesize_backbone_fast_flap_overrides_allow_fractions() {
+        let mut section = ConfigSection::new();
+        section.set("type", "BackboneInterface");
+        section.set("listen_on", "0.0.0.0");
+        section.set("port", "4242");
+        section.set("block_fast_flapping", "no");
+        section.set("fast_flapping_threshold", "1.25");
+        section.set("fast_flapping_grace", "9");
+        section.set("fast_flapping_block_time", "0.5");
+
+        let config = synthesize_interface("backbone_flap_overrides", &section).unwrap();
+        match config {
+            InterfaceConfig::Backbone(c) => {
+                assert!(!c.block_fast_flapping);
+                assert_eq!(c.fast_flapping_threshold, Duration::from_millis(1250));
+                assert_eq!(c.fast_flapping_grace, 9);
+                assert_eq!(c.fast_flapping_block_time, Duration::from_secs(30));
+            }
+            _ => panic!("expected Backbone"),
+        }
+    }
+
+    #[test]
+    fn test_synthesize_backbone_rejects_invalid_fast_flap_values() {
+        for (field, value) in [
+            ("block_fast_flapping", "sometimes"),
+            ("fast_flapping_threshold", "not-a-number"),
+            ("fast_flapping_threshold", "NaN"),
+            ("fast_flapping_threshold", "-0.1"),
+            ("fast_flapping_threshold", "1e30"),
+            ("fast_flapping_grace", "-1"),
+            ("fast_flapping_grace", "1.5"),
+            ("fast_flapping_grace", "18446744073709551616"),
+            ("fast_flapping_block_time", "inf"),
+            ("fast_flapping_block_time", "-1"),
+            ("fast_flapping_block_time", "1e307"),
+        ] {
+            let mut section = ConfigSection::new();
+            section.set("type", "BackboneInterface");
+            section.set("listen_on", "0.0.0.0");
+            section.set("port", "4242");
+            section.set(field, value);
+
+            match synthesize_interface("backbone_invalid_flap", &section) {
+                Err(InterfaceFactoryError::InvalidValue {
+                    field: error_field, ..
+                }) => assert_eq!(error_field, format!("backbone_invalid_flap.{field}")),
+                other => panic!("expected InvalidValue for {field}={value}, got {other:?}"),
+            }
         }
     }
 
