@@ -4357,19 +4357,24 @@ pub async fn spawn_rnode_runtime(
         flow_control,
     } = args;
 
-    let id = handle
-        .id_gen
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut config = rns_interface::rnode::RNodeConfig::new(name, port);
     config.frequency = frequency;
     config.bandwidth = bandwidth;
     config.spreading_factor = spreading_factor;
     config.coding_rate = coding_rate;
-    config.tx_power = tx_power as u8;
+    config.tx_power = u8::try_from(tx_power)
+        .map_err(|_| format!("invalid value for '{name}.txpower': {tx_power} is below 0 dBm"))?;
     config.mode = mode;
     config.st_alock = st_alock;
     config.lt_alock = lt_alock;
     config.flow_control = flow_control;
+    config
+        .validate()
+        .map_err(|error| format!("invalid value for '{name}.{}': {error}", error.field()))?;
+
+    let id = handle
+        .id_gen
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let iface_handle =
         rns_interface::rnode::spawn_rnode_interface(config, id, handle.transport_tx.clone())
@@ -4738,18 +4743,9 @@ async fn spawn_interface(
         }
         #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
         interface_factory::InterfaceConfig::RNode(c) => {
-            let mut rnode_config = rns_interface::rnode::RNodeConfig::new(&c.name, &c.port);
-            rnode_config.frequency = c.frequency;
-            rnode_config.bandwidth = c.bandwidth;
-            rnode_config.spreading_factor = c.spreading_factor;
-            rnode_config.coding_rate = c.coding_rate;
-            rnode_config.tx_power = c.tx_power as u8;
-            rnode_config.mode = c.mode;
-            rnode_config.flow_control = c.flow_control;
-            rnode_config.st_alock = c.st_alock;
-            rnode_config.lt_alock = c.lt_alock;
-            rnode_config.id_interval = c.id_interval;
-            rnode_config.id_callsign = c.id_callsign.as_ref().map(|s| s.as_bytes().to_vec());
+            let rnode_config = c
+                .to_rnode_config()
+                .map_err(|error| format!("RNode: {error}"))?;
             rns_interface::rnode::spawn_rnode_interface(rnode_config, id, transport_tx)
                 .await
                 .map(|h| vec![h])

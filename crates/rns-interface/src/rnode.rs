@@ -107,6 +107,21 @@ pub const RECONNECT_WAIT: u64 = 5;
 pub const RADIO_STATE_ON: u8 = 0x01;
 pub const RADIO_STATE_OFF: u8 = 0x00;
 
+/// Lowest RF frequency accepted by the generic upstream RNode interface.
+pub const RNODE_FREQUENCY_MIN_HZ: u32 = 137_000_000;
+/// Highest RF frequency accepted by the generic upstream RNode interface.
+pub const RNODE_FREQUENCY_MAX_HZ: u32 = 3_000_000_000;
+/// Lowest RF bandwidth accepted by the generic upstream RNode interface.
+pub const RNODE_BANDWIDTH_MIN_HZ: u32 = 7_800;
+/// Highest RF bandwidth accepted by the generic upstream RNode interface.
+pub const RNODE_BANDWIDTH_MAX_HZ: u32 = 1_625_000;
+pub const RNODE_SPREADING_FACTOR_MIN: u8 = 5;
+pub const RNODE_SPREADING_FACTOR_MAX: u8 = 12;
+pub const RNODE_CODING_RATE_MIN: u8 = 5;
+pub const RNODE_CODING_RATE_MAX: u8 = 8;
+pub const RNODE_TX_POWER_MIN_DBM: u8 = 0;
+pub const RNODE_TX_POWER_MAX_DBM: u8 = 37;
+
 /// Default TCP port for RNode-over-IP.
 pub const DEFAULT_TCP_PORT: u16 = 7633;
 
@@ -563,6 +578,60 @@ pub struct RNodeConfig {
     pub id_callsign: Option<Vec<u8>>,
 }
 
+/// A generic RNode configuration field rejected before any device I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RNodeConfigField {
+    Frequency,
+    Bandwidth,
+    SpreadingFactor,
+    CodingRate,
+    TxPower,
+    ShortTermAirtime,
+    LongTermAirtime,
+}
+
+impl RNodeConfigField {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Frequency => "frequency",
+            Self::Bandwidth => "bandwidth",
+            Self::SpreadingFactor => "spreadingfactor",
+            Self::CodingRate => "codingrate",
+            Self::TxPower => "txpower",
+            Self::ShortTermAirtime => "airtime_limit_short",
+            Self::LongTermAirtime => "airtime_limit_long",
+        }
+    }
+}
+
+impl std::fmt::Display for RNodeConfigField {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Typed failure returned by [`RNodeConfig::validate`].
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum RNodeConfigValidationError {
+    #[error("{value} is outside {minimum}..={maximum}")]
+    OutOfRange {
+        field: RNodeConfigField,
+        value: f64,
+        minimum: f64,
+        maximum: f64,
+    },
+    #[error("must be finite, got {value}")]
+    NonFinite { field: RNodeConfigField, value: f32 },
+}
+
+impl RNodeConfigValidationError {
+    pub const fn field(&self) -> RNodeConfigField {
+        match self {
+            Self::OutOfRange { field, .. } | Self::NonFinite { field, .. } => *field,
+        }
+    }
+}
+
 /// Python `RNodeInterface.CALLSIGN_MAX_LEN`.
 pub const CALLSIGN_MAX_LEN: usize = 32;
 
@@ -586,6 +655,85 @@ impl RNodeConfig {
             id_callsign: None,
         }
     }
+
+    /// Validate all generic RNode RF and airtime settings without touching the
+    /// configured endpoint. These bounds match upstream RNodeInterface 1.4.
+    pub fn validate(&self) -> Result<(), RNodeConfigValidationError> {
+        validate_integer_range(
+            RNodeConfigField::Frequency,
+            self.frequency,
+            RNODE_FREQUENCY_MIN_HZ,
+            RNODE_FREQUENCY_MAX_HZ,
+        )?;
+        validate_integer_range(
+            RNodeConfigField::Bandwidth,
+            self.bandwidth,
+            RNODE_BANDWIDTH_MIN_HZ,
+            RNODE_BANDWIDTH_MAX_HZ,
+        )?;
+        validate_integer_range(
+            RNodeConfigField::SpreadingFactor,
+            self.spreading_factor,
+            RNODE_SPREADING_FACTOR_MIN,
+            RNODE_SPREADING_FACTOR_MAX,
+        )?;
+        validate_integer_range(
+            RNodeConfigField::CodingRate,
+            self.coding_rate,
+            RNODE_CODING_RATE_MIN,
+            RNODE_CODING_RATE_MAX,
+        )?;
+        validate_integer_range(
+            RNodeConfigField::TxPower,
+            self.tx_power,
+            RNODE_TX_POWER_MIN_DBM,
+            RNODE_TX_POWER_MAX_DBM,
+        )?;
+        validate_airtime(RNodeConfigField::ShortTermAirtime, self.st_alock)?;
+        validate_airtime(RNodeConfigField::LongTermAirtime, self.lt_alock)?;
+        Ok(())
+    }
+}
+
+fn validate_integer_range<T>(
+    field: RNodeConfigField,
+    value: T,
+    minimum: T,
+    maximum: T,
+) -> Result<(), RNodeConfigValidationError>
+where
+    T: Copy + PartialOrd + Into<f64>,
+{
+    if value < minimum || value > maximum {
+        return Err(RNodeConfigValidationError::OutOfRange {
+            field,
+            value: value.into(),
+            minimum: minimum.into(),
+            maximum: maximum.into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_airtime(
+    field: RNodeConfigField,
+    value: Option<f32>,
+) -> Result<(), RNodeConfigValidationError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if !value.is_finite() {
+        return Err(RNodeConfigValidationError::NonFinite { field, value });
+    }
+    if !(0.0..=100.0).contains(&value) {
+        return Err(RNodeConfigValidationError::OutOfRange {
+            field,
+            value: f64::from(value),
+            minimum: 0.0,
+            maximum: 100.0,
+        });
+    }
+    Ok(())
 }
 
 /// LoRa on-air bps via `SF * (4/CR) / (2^SF / BW_kHz) * 1000`. 0 on invalid.
@@ -847,6 +995,13 @@ pub async fn spawn_rnode_interface(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    config.validate().map_err(|error| {
+        crate::traits::InterfaceError::SendFailed(format!(
+            "rnode config {}: {error}",
+            error.field()
+        ))
+    })?;
+
     let port_cfg = PortConfig::parse(&config.port, config.baud_rate).map_err(|e| {
         crate::traits::InterfaceError::SendFailed(format!("rnode port parse: {}", e))
     })?;
@@ -1169,6 +1324,109 @@ mod tests {
         );
         assert!(cfg.st_alock.is_none());
         assert!(cfg.lt_alock.is_none());
+        assert!(cfg.validate().is_ok());
+    }
+
+    fn assert_invalid_config_field(config: &RNodeConfig, expected: RNodeConfigField) {
+        let error = config.validate().expect_err("configuration must fail");
+        assert_eq!(error.field(), expected, "{error}");
+    }
+
+    #[test]
+    fn test_rnode_config_validation_accepts_all_inclusive_boundaries() {
+        let mut config = RNodeConfig::new("rnode0", "/dev/ttyACM0");
+        config.frequency = RNODE_FREQUENCY_MIN_HZ;
+        config.bandwidth = RNODE_BANDWIDTH_MIN_HZ;
+        config.spreading_factor = RNODE_SPREADING_FACTOR_MIN;
+        config.coding_rate = RNODE_CODING_RATE_MIN;
+        config.tx_power = RNODE_TX_POWER_MIN_DBM;
+        config.st_alock = Some(0.0);
+        config.lt_alock = Some(0.0);
+        assert!(config.validate().is_ok());
+
+        config.frequency = RNODE_FREQUENCY_MAX_HZ;
+        config.bandwidth = RNODE_BANDWIDTH_MAX_HZ;
+        config.spreading_factor = RNODE_SPREADING_FACTOR_MAX;
+        config.coding_rate = RNODE_CODING_RATE_MAX;
+        config.tx_power = RNODE_TX_POWER_MAX_DBM;
+        config.st_alock = Some(100.0);
+        config.lt_alock = Some(100.0);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_rnode_config_validation_rejects_each_just_outside_boundary() {
+        let mut config = RNodeConfig::new("rnode0", "/dev/ttyACM0");
+
+        config.frequency = RNODE_FREQUENCY_MIN_HZ - 1;
+        assert_invalid_config_field(&config, RNodeConfigField::Frequency);
+        config.frequency = RNODE_FREQUENCY_MAX_HZ + 1;
+        assert_invalid_config_field(&config, RNodeConfigField::Frequency);
+        config.frequency = 868_000_000;
+
+        config.bandwidth = RNODE_BANDWIDTH_MIN_HZ - 1;
+        assert_invalid_config_field(&config, RNodeConfigField::Bandwidth);
+        config.bandwidth = RNODE_BANDWIDTH_MAX_HZ + 1;
+        assert_invalid_config_field(&config, RNodeConfigField::Bandwidth);
+        config.bandwidth = 125_000;
+
+        config.spreading_factor = RNODE_SPREADING_FACTOR_MIN - 1;
+        assert_invalid_config_field(&config, RNodeConfigField::SpreadingFactor);
+        config.spreading_factor = RNODE_SPREADING_FACTOR_MAX + 1;
+        assert_invalid_config_field(&config, RNodeConfigField::SpreadingFactor);
+        config.spreading_factor = 7;
+
+        config.coding_rate = RNODE_CODING_RATE_MIN - 1;
+        assert_invalid_config_field(&config, RNodeConfigField::CodingRate);
+        config.coding_rate = RNODE_CODING_RATE_MAX + 1;
+        assert_invalid_config_field(&config, RNodeConfigField::CodingRate);
+        config.coding_rate = 5;
+
+        // The lower config stores TX power as u8, so its lower just-outside
+        // case is covered at the signed runtime boundary below.
+        config.tx_power = RNODE_TX_POWER_MAX_DBM + 1;
+        assert_invalid_config_field(&config, RNodeConfigField::TxPower);
+        config.tx_power = 14;
+
+        config.st_alock = Some(-f32::EPSILON);
+        assert_invalid_config_field(&config, RNodeConfigField::ShortTermAirtime);
+        config.st_alock = Some(100.0 + f32::EPSILON * 100.0);
+        assert_invalid_config_field(&config, RNodeConfigField::ShortTermAirtime);
+        config.st_alock = None;
+
+        config.lt_alock = Some(-f32::EPSILON);
+        assert_invalid_config_field(&config, RNodeConfigField::LongTermAirtime);
+        config.lt_alock = Some(100.0 + f32::EPSILON * 100.0);
+        assert_invalid_config_field(&config, RNodeConfigField::LongTermAirtime);
+    }
+
+    #[test]
+    fn test_rnode_config_validation_rejects_non_finite_airtime() {
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut config = RNodeConfig::new("rnode0", "/dev/ttyACM0");
+            config.st_alock = Some(invalid);
+            assert_invalid_config_field(&config, RNodeConfigField::ShortTermAirtime);
+
+            config.st_alock = None;
+            config.lt_alock = Some(invalid);
+            assert_invalid_config_field(&config, RNodeConfigField::LongTermAirtime);
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_invalid_rnode_config_fails_before_endpoint_parsing() {
+        let mut config = RNodeConfig::new("rnode-invalid", "tcp://");
+        config.frequency = RNODE_FREQUENCY_MIN_HZ - 1;
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(1);
+
+        let error = match spawn_rnode_interface(config, 1, transport_tx).await {
+            Err(error) => error,
+            Ok(_) => panic!("invalid RF configuration must fail"),
+        };
+        let message = error.to_string();
+        assert!(message.contains("frequency"), "{message}");
+        assert!(!message.contains("port parse"), "{message}");
     }
 
     /// Python parity (RNodeInterface.py:878,880): RSSI = raw byte − 157,
