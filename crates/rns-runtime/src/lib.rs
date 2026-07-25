@@ -45,7 +45,8 @@ pub mod prelude {
         SendResult, init, init_with_options,
     };
     pub use rns_identity::destination::{
-        AllowPolicy, DestType, Destination, Direction, ProofStrategy,
+        AllowPolicy, DestType, Destination, DestinationPacketError, DestinationPacketOptions,
+        Direction, PackedDestinationPacket, ProofStrategy,
     };
     pub use rns_identity::identity::Identity;
     pub use rns_identity::ratchet::PersistentRatchetRing;

@@ -23,7 +23,10 @@ use crate::link_client::LinkClient;
 use crate::link_manager::LinkManager;
 use crate::link_session::{LinkSession, LinkSessionConfig, LinkSessionError};
 use crate::platform::{StoragePaths, resolve_config_dir};
-use rns_identity::destination::{DestType, Destination, DestinationError, Direction};
+use rns_identity::destination::{
+    DestType, Destination, DestinationError, DestinationPacketError, DestinationPacketOptions,
+    Direction,
+};
 use rns_identity::identity::Identity;
 use rns_transport::await_path::{AwaitPathError, await_path};
 use rns_transport::constants::DESTINATION_TIMEOUT;
@@ -401,6 +404,8 @@ pub enum SendError {
     Encryption(#[from] DestinationError),
     #[error("packet construction failed: {0}")]
     Packet(#[from] rns_wire::packet::PacketError),
+    #[error("destination-aware packet construction failed: {0}")]
+    PacketBuild(#[from] DestinationPacketError),
     #[error("transport channel is unavailable")]
     TransportUnavailable,
     #[error("no outbound interface accepted the packet")]
@@ -753,28 +758,14 @@ impl ReticulumHandle {
             .remote_ratchet_pub
             .as_ref()
             .or_else(|| recalled.as_ref().and_then(|entry| entry.ratchet.as_ref()));
-        let encrypted = destination.encrypt(data, encryption_identity, ratchet)?;
-
-        let destination_type = match destination.dest_type {
-            DestType::Single => rns_wire::flags::DestinationType::Single,
-            DestType::Group => rns_wire::flags::DestinationType::Group,
-            DestType::Plain => rns_wire::flags::DestinationType::Plain,
-            DestType::Link => unreachable!("Link destinations rejected above"),
-        };
-        let header = rns_wire::header::PacketHeader {
-            flags: rns_wire::flags::PacketFlags {
-                header_type: rns_wire::flags::HeaderType::Header1,
-                context_flag: false,
-                transport_type: rns_wire::flags::TransportType::Broadcast,
-                destination_type,
-                packet_type: rns_wire::flags::PacketType::Data,
-            },
-            hops: 0,
-            transport_id: None,
-            destination_hash: destination.hash,
-            context: rns_wire::context::PacketContext::None,
-        };
-        let packet = rns_wire::packet::Packet::new(header, encrypted)?;
+        let packet = destination
+            .pack_packet(
+                data,
+                Some(encryption_identity),
+                ratchet,
+                DestinationPacketOptions::default(),
+            )?
+            .packet;
         let packet_hash = packet.packet_hash;
         let truncated_hash = packet.truncated_hash;
 

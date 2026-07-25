@@ -129,6 +129,62 @@ pub enum DestinationError {
     SigningUnavailable,
 }
 
+/// Wire-shape controls for [`Destination::pack_packet`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DestinationPacketOptions {
+    /// DATA, ANNOUNCE, LINKREQUEST, or PROOF.
+    pub packet_type: rns_wire::flags::PacketType,
+    /// One-byte packet context.
+    pub context: rns_wire::context::PacketContext,
+    /// Context flag bit carried in the packet flags.
+    pub context_flag: bool,
+    /// Header1 for ordinary packets, Header2 for transport-wrapped packets.
+    pub header_type: rns_wire::flags::HeaderType,
+    /// Broadcast or transport propagation mode.
+    pub transport_type: rns_wire::flags::TransportType,
+    /// Required for Header2 packets and ignored for Header1 packets.
+    pub transport_id: Option<[u8; 16]>,
+}
+
+impl Default for DestinationPacketOptions {
+    fn default() -> Self {
+        Self {
+            packet_type: rns_wire::flags::PacketType::Data,
+            context: rns_wire::context::PacketContext::None,
+            context_flag: false,
+            header_type: rns_wire::flags::HeaderType::Header1,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            transport_id: None,
+        }
+    }
+}
+
+/// Destination-aware packed packet plus outbound ratchet metadata.
+#[derive(Debug, Clone)]
+pub struct PackedDestinationPacket {
+    /// Complete packet with raw bytes and cached hashes.
+    pub packet: rns_wire::packet::Packet,
+    /// Ratchet used for SINGLE-destination encryption, if any.
+    pub ratchet_id: Option<[u8; crate::identity::RATCHET_ID_LENGTH]>,
+}
+
+/// Errors from destination-aware packet construction.
+#[derive(Debug, Error)]
+pub enum DestinationPacketError {
+    #[error(transparent)]
+    Destination(#[from] DestinationError),
+    #[error(transparent)]
+    Packet(#[from] rns_wire::packet::PacketError),
+    #[error("SINGLE packet encryption requires its destination identity")]
+    MissingIdentity,
+    #[error("Header2 packets require a transport id")]
+    MissingTransportId,
+    #[error("ordinary Link packets must use the Link runtime")]
+    LinkRuntimeRequired,
+    #[error("LRPROOF packets require a Link destination")]
+    LrproofRequiresLink,
+}
+
 pub struct Destination {
     pub dest_type: DestType,
     pub direction: Direction,
@@ -462,6 +518,108 @@ impl Destination {
         identity
             .sign(message)
             .ok_or(DestinationError::SigningUnavailable)
+    }
+
+    /// Pack one packet with Python-compatible destination encryption rules.
+    ///
+    /// Announce and LinkRequest packets are plaintext. Resource payload,
+    /// Resource proof, keepalive, cache-request, and LRPROOF contexts are also
+    /// already protected or intentionally plaintext and therefore bypass
+    /// destination encryption. Other SINGLE/GROUP packets are encrypted here.
+    ///
+    /// Ordinary Link packets remain owned by `LinkSession`; LRPROOF is the
+    /// sole Link context accepted by this stateless builder.
+    pub fn pack_packet(
+        &self,
+        data: &[u8],
+        identity: Option<&Identity>,
+        remote_ratchet_pub: Option<&[u8; 32]>,
+        options: DestinationPacketOptions,
+    ) -> Result<PackedDestinationPacket, DestinationPacketError> {
+        use rns_wire::context::PacketContext;
+        use rns_wire::flags::{DestinationType, HeaderType, PacketType};
+
+        if options.context == PacketContext::Lrproof && self.dest_type != DestType::Link {
+            return Err(DestinationPacketError::LrproofRequiresLink);
+        }
+        if self.dest_type == DestType::Link && options.context != PacketContext::Lrproof {
+            return Err(DestinationPacketError::LinkRuntimeRequired);
+        }
+
+        let bypass_encryption = matches!(
+            options.packet_type,
+            PacketType::Announce | PacketType::LinkRequest
+        ) || (options.packet_type == PacketType::Proof
+            && options.context == PacketContext::ResourcePrf)
+            || options.context.is_plaintext_context()
+            || options.context == PacketContext::Lrproof;
+
+        let selected_ratchet = remote_ratchet_pub.or(self.remote_ratchet_pub.as_ref());
+        let (payload, ratchet_id) = if bypass_encryption {
+            (data.to_vec(), None)
+        } else {
+            match self.dest_type {
+                DestType::Plain => (data.to_vec(), None),
+                DestType::Single => {
+                    let identity = identity.ok_or(DestinationPacketError::MissingIdentity)?;
+                    self.ensure_identity(identity)?;
+                    let ciphertext = identity
+                        .encrypt(data, selected_ratchet)
+                        .map_err(DestinationError::Identity)?;
+                    let ratchet_id = selected_ratchet.map(Identity::ratchet_id);
+                    (ciphertext, ratchet_id)
+                }
+                DestType::Group => {
+                    let key = self
+                        .group_key
+                        .as_ref()
+                        .ok_or(DestinationError::EncryptionUnavailable)?;
+                    (
+                        token::encrypt(data, key)
+                            .map_err(|_| DestinationError::DecryptionFailed)?,
+                        None,
+                    )
+                }
+                DestType::Link => unreachable!("ordinary Link packets rejected above"),
+            }
+        };
+
+        let destination_type = if options.context == PacketContext::Lrproof {
+            DestinationType::Link
+        } else {
+            match self.dest_type {
+                DestType::Single => DestinationType::Single,
+                DestType::Group => DestinationType::Group,
+                DestType::Plain => DestinationType::Plain,
+                DestType::Link => DestinationType::Link,
+            }
+        };
+        let transport_id = match options.header_type {
+            HeaderType::Header1 => None,
+            HeaderType::Header2 => Some(
+                options
+                    .transport_id
+                    .ok_or(DestinationPacketError::MissingTransportId)?,
+            ),
+        };
+        let packet = rns_wire::packet::Packet::new(
+            rns_wire::header::PacketHeader {
+                flags: rns_wire::flags::PacketFlags {
+                    header_type: options.header_type,
+                    context_flag: options.context_flag,
+                    transport_type: options.transport_type,
+                    destination_type,
+                    packet_type: options.packet_type,
+                },
+                hops: 0,
+                transport_id,
+                destination_hash: self.hash,
+                context: options.context,
+            },
+            payload,
+        )?;
+
+        Ok(PackedDestinationPacket { packet, ratchet_id })
     }
 
     /// Encrypt data for this destination.
@@ -1324,6 +1482,158 @@ mod tests {
         assert_eq!(
             decrypted.ratchet_id,
             Some(Identity::ratchet_id(&ratchet_pub))
+        );
+    }
+
+    #[test]
+    fn destination_packet_builder_encrypts_single_data_and_reports_ratchet() {
+        let identity = Identity::new();
+        let destination = Destination::new(
+            Some(&identity),
+            Direction::Out,
+            DestType::Single,
+            "test.packet-builder",
+        )
+        .unwrap();
+        let ratchet_private = rns_crypto::x25519::X25519PrivateKey::generate();
+        let ratchet_public = ratchet_private.public_key().to_bytes();
+        let packed = destination
+            .pack_packet(
+                b"builder payload",
+                Some(&identity),
+                Some(&ratchet_public),
+                DestinationPacketOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            packed.packet.header.flags.packet_type,
+            rns_wire::flags::PacketType::Data
+        );
+        assert_eq!(
+            packed.packet.header.flags.destination_type,
+            rns_wire::flags::DestinationType::Single
+        );
+        assert_ne!(packed.packet.data(), b"builder payload");
+        assert_eq!(
+            packed.ratchet_id,
+            Some(Identity::ratchet_id(&ratchet_public))
+        );
+        let private = ratchet_private.to_bytes();
+        let plaintext = identity
+            .decrypt(packed.packet.data(), Some(&[&private]), false)
+            .unwrap();
+        assert_eq!(plaintext, b"builder payload");
+    }
+
+    #[test]
+    fn destination_packet_builder_preserves_python_plaintext_cases() {
+        use rns_wire::context::PacketContext;
+        use rns_wire::flags::PacketType;
+
+        let identity = Identity::new();
+        let destination = Destination::new(
+            Some(&identity),
+            Direction::Out,
+            DestType::Single,
+            "test.packet-plaintext",
+        )
+        .unwrap();
+        let cases = [
+            (PacketType::Announce, PacketContext::None),
+            (PacketType::LinkRequest, PacketContext::None),
+            (PacketType::Proof, PacketContext::ResourcePrf),
+            (PacketType::Data, PacketContext::Resource),
+            (PacketType::Data, PacketContext::Keepalive),
+            (PacketType::Data, PacketContext::CacheRequest),
+        ];
+
+        for (packet_type, context) in cases {
+            let packed = destination
+                .pack_packet(
+                    b"already protected",
+                    None,
+                    None,
+                    DestinationPacketOptions {
+                        packet_type,
+                        context,
+                        ..DestinationPacketOptions::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(packed.packet.data(), b"already protected");
+            assert_eq!(packed.ratchet_id, None);
+        }
+    }
+
+    #[test]
+    fn destination_packet_builder_validates_header2_and_link_ownership() {
+        use rns_wire::context::PacketContext;
+        use rns_wire::flags::{HeaderType, TransportType};
+
+        let plain =
+            Destination::new(None, Direction::Out, DestType::Plain, "test.header2").unwrap();
+        assert!(matches!(
+            plain.pack_packet(
+                b"payload",
+                None,
+                None,
+                DestinationPacketOptions {
+                    header_type: HeaderType::Header2,
+                    transport_type: TransportType::Transport,
+                    ..DestinationPacketOptions::default()
+                }
+            ),
+            Err(DestinationPacketError::MissingTransportId)
+        ));
+        let transport_id = [0xA5; 16];
+        let packed = plain
+            .pack_packet(
+                b"payload",
+                None,
+                None,
+                DestinationPacketOptions {
+                    header_type: HeaderType::Header2,
+                    transport_type: TransportType::Transport,
+                    transport_id: Some(transport_id),
+                    ..DestinationPacketOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(packed.packet.header.transport_id, Some(transport_id));
+        assert!(matches!(
+            plain.pack_packet(
+                b"invalid proof",
+                None,
+                None,
+                DestinationPacketOptions {
+                    context: PacketContext::Lrproof,
+                    ..DestinationPacketOptions::default()
+                }
+            ),
+            Err(DestinationPacketError::LrproofRequiresLink)
+        ));
+
+        let link = Destination::new(None, Direction::Out, DestType::Link, "test.link").unwrap();
+        assert!(matches!(
+            link.pack_packet(b"payload", None, None, DestinationPacketOptions::default()),
+            Err(DestinationPacketError::LinkRuntimeRequired)
+        ));
+        let proof = link
+            .pack_packet(
+                b"link request proof",
+                None,
+                None,
+                DestinationPacketOptions {
+                    context: PacketContext::Lrproof,
+                    ..DestinationPacketOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(proof.packet.data(), b"link request proof");
+        assert_eq!(
+            proof.packet.header.flags.destination_type,
+            rns_wire::flags::DestinationType::Link
         );
     }
 
