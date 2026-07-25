@@ -29,8 +29,8 @@ pub fn is_btleplug_initialized() -> bool {
 
 use crate::kiss;
 use crate::rnode::{
-    self, RNodeResponse, RNodeRuntimeReason, RNodeSnapshotPublisher, RNodeTransportClass,
-    SpawnedRNodeInterface,
+    self, RNodeDriverShutdown, RNodeResponse, RNodeRuntimeReason, RNodeSnapshotPublisher,
+    RNodeTransportClass, SpawnedRNodeInterface,
 };
 use crate::rnode_protocol::{RNodeProtocolState, RNodeProtocolTarget};
 use crate::traits::{
@@ -76,14 +76,23 @@ fn register_running(id: InterfaceId) -> Arc<AtomicBool> {
     flag
 }
 
-fn unregister_running(id: InterfaceId) {
+fn unregister_running(id: InterfaceId, running: &Arc<AtomicBool>) {
     if let Ok(mut map) = running_map().lock() {
-        map.remove(&id);
+        let owns_entry = map
+            .get(&id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, running));
+        if owns_entry {
+            map.remove(&id);
+        }
     }
 }
 
-/// Idempotent. Safe to call before or after deregistering from the
-/// transport actor.
+/// Compatibility facade requesting shutdown of the currently registered BLE
+/// RNode for `id`.
+///
+/// New owners should retain [`crate::rnode::RNodeDriverHandle`] and call
+/// [`crate::rnode::RNodeDriverHandle::request_shutdown`] so later ID reuse
+/// cannot redirect the request.
 pub fn stop_ble_rnode_interface(id: InterfaceId) {
     if let Ok(map) = running_map().lock() {
         if let Some(flag) = map.get(&id) {
@@ -1300,8 +1309,6 @@ pub async fn spawn_ble_rnode_interface_with_driver(
         config.coding_rate,
         config.tx_power,
     );
-    let (snapshot_publisher, driver) =
-        rnode::new_rnode_driver_observation(RNodeTransportClass::Ble);
     let online = Arc::new(AtomicBool::new(false));
     let online_handle = online.clone();
     let shared_rxb = Arc::new(AtomicU64::new(0));
@@ -1311,6 +1318,10 @@ pub async fn spawn_ble_rnode_interface_with_driver(
     let (tx, rx) = mpsc::channel::<Bytes>(256);
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
     let running = register_running(id);
+    let (snapshot_publisher, driver) = rnode::new_rnode_driver_observation_with_shutdown(
+        RNodeTransportClass::Ble,
+        RNodeDriverShutdown::from_running_flag(running.clone()),
+    );
 
     let bitrate = rnode::calculate_bitrate(
         config.spreading_factor,
@@ -1336,13 +1347,13 @@ pub async fn spawn_ble_rnode_interface_with_driver(
 
         // Drop guard: every early return must clear the running-flag map
         // entry, or stale entries confuse later spawns reusing the id.
-        struct Cleanup(InterfaceId);
+        struct Cleanup(InterfaceId, Arc<AtomicBool>);
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                unregister_running(self.0);
+                unregister_running(self.0, &self.1);
             }
         }
-        let _cleanup = Cleanup(id);
+        let _cleanup = Cleanup(id, running_task.clone());
 
         loop {
             if !running_task.load(Ordering::SeqCst) {
@@ -1763,8 +1774,6 @@ pub async fn spawn_ble_rnode_interface_native_with_driver(
         config.coding_rate,
         config.tx_power,
     );
-    let (snapshot_publisher, driver) =
-        rnode::new_rnode_driver_observation(RNodeTransportClass::Ble);
     let online = Arc::new(AtomicBool::new(false));
     let online_handle = online.clone();
     let shared_rxb = Arc::new(AtomicU64::new(0));
@@ -1789,6 +1798,10 @@ pub async fn spawn_ble_rnode_interface_native_with_driver(
     let ble_uri = config.ble_uri.clone();
     let log_name = name.clone();
     let running = register_running(id);
+    let (snapshot_publisher, driver) = rnode::new_rnode_driver_observation_with_shutdown(
+        RNodeTransportClass::Ble,
+        RNodeDriverShutdown::from_running_flag(running.clone()),
+    );
     let running_task = running.clone();
 
     let read_task = tokio::spawn(async move {
@@ -1797,13 +1810,13 @@ pub async fn spawn_ble_rnode_interface_native_with_driver(
         let mut backoff = RECONNECT_WAIT;
         let mut initial_attempt = true;
 
-        struct Cleanup(InterfaceId);
+        struct Cleanup(InterfaceId, Arc<AtomicBool>);
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                unregister_running(self.0);
+                unregister_running(self.0, &self.1);
             }
         }
-        let _cleanup = Cleanup(id);
+        let _cleanup = Cleanup(id, running_task.clone());
 
         loop {
             if !running_task.load(Ordering::SeqCst) {
@@ -2218,7 +2231,7 @@ mod tests {
         let flag = register_running(id);
         assert!(is_registered(id));
         assert!(flag.load(Ordering::SeqCst));
-        unregister_running(id);
+        unregister_running(id, &flag);
         assert!(!is_registered(id));
     }
 
@@ -2230,7 +2243,7 @@ mod tests {
         stop_ble_rnode_interface(id);
         assert!(!flag.load(Ordering::SeqCst));
         // Map entry survives until the owning task's Drop runs; clean up.
-        unregister_running(id);
+        unregister_running(id, &flag);
     }
 
     #[test]
@@ -2239,6 +2252,41 @@ mod tests {
         assert!(!is_registered(id));
         stop_ble_rnode_interface(id);
         assert!(!is_registered(id));
+    }
+
+    #[test]
+    fn test_ble_exact_shutdown_and_cleanup_resist_same_id_aba() {
+        let id: InterfaceId = 0xDEAD_BEEF_0000_0004;
+        let old_running = register_running(id);
+        let (_old_publisher, old_driver) = rnode::new_rnode_driver_observation_with_shutdown(
+            RNodeTransportClass::Ble,
+            RNodeDriverShutdown::from_running_flag(old_running.clone()),
+        );
+
+        let new_running = register_running(id);
+        let (_new_publisher, _new_driver) = rnode::new_rnode_driver_observation_with_shutdown(
+            RNodeTransportClass::Ble,
+            RNodeDriverShutdown::from_running_flag(new_running.clone()),
+        );
+
+        unregister_running(id, &old_running);
+        assert!(
+            is_registered(id),
+            "retired task cleanup must preserve the newer compatibility entry"
+        );
+        old_driver.request_shutdown();
+        assert!(!old_running.load(Ordering::SeqCst));
+        assert!(
+            new_running.load(Ordering::SeqCst),
+            "the retired handle must not stop the newer same-ID BLE driver"
+        );
+
+        stop_ble_rnode_interface(id);
+        assert!(
+            !new_running.load(Ordering::SeqCst),
+            "the compatibility facade must still stop the current registration"
+        );
+        unregister_running(id, &new_running);
     }
 
     #[tokio::test]

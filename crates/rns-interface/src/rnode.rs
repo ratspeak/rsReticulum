@@ -30,14 +30,17 @@ use crate::{rnode_protocol::RNodeProtocolTarget, traits::InterfaceDirection};
 use std::collections::HashMap;
 use std::sync::Arc;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use std::sync::{Mutex, OnceLock};
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use std::time::Duration;
-use tokio::sync::watch;
+#[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android", test))]
+use tokio::sync::mpsc;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 pub const CMD_FREQUENCY: u8 = 0x01;
 pub const CMD_BANDWIDTH: u8 = 0x02;
@@ -425,10 +428,93 @@ fn project_rnode_protocol_effect(
     *snapshot != before
 }
 
-/// Cloneable, observation-only handle for a generic RNode driver.
+enum RNodeDriverShutdownSignal {
+    #[cfg(test)]
+    InertTest,
+    #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android", test))]
+    StopSender(mpsc::Sender<()>),
+    #[cfg(feature = "ble")]
+    RunningFlag(Arc<AtomicBool>),
+}
+
+struct RNodeDriverShutdownInner {
+    requested: AtomicBool,
+    signal: RNodeDriverShutdownSignal,
+}
+
+/// Exact-instance shutdown request shared by every clone of a driver handle.
+///
+/// This stays crate-private so observed drivers can expose only the one
+/// bounded lifecycle action, never arbitrary RNode controls.
+#[derive(Clone)]
+pub(crate) struct RNodeDriverShutdown {
+    inner: Arc<RNodeDriverShutdownInner>,
+}
+
+impl RNodeDriverShutdown {
+    #[cfg(test)]
+    fn inert_test() -> Self {
+        Self::new(RNodeDriverShutdownSignal::InertTest)
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android", test))]
+    pub(crate) fn from_stop_sender(stop_tx: mpsc::Sender<()>) -> Self {
+        Self::new(RNodeDriverShutdownSignal::StopSender(stop_tx))
+    }
+
+    #[cfg(feature = "ble")]
+    pub(crate) fn from_running_flag(running: Arc<AtomicBool>) -> Self {
+        Self::new(RNodeDriverShutdownSignal::RunningFlag(running))
+    }
+
+    #[cfg(any(
+        feature = "serial",
+        feature = "rnode-tcp",
+        feature = "ble",
+        target_os = "android",
+        test
+    ))]
+    fn new(signal: RNodeDriverShutdownSignal) -> Self {
+        Self {
+            inner: Arc::new(RNodeDriverShutdownInner {
+                requested: AtomicBool::new(false),
+                signal,
+            }),
+        }
+    }
+
+    fn request(&self) {
+        if self.inner.requested.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        match &self.inner.signal {
+            #[cfg(test)]
+            RNodeDriverShutdownSignal::InertTest => {}
+            #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android", test))]
+            RNodeDriverShutdownSignal::StopSender(stop_tx) => {
+                let _ = stop_tx.try_send(());
+            }
+            #[cfg(feature = "ble")]
+            RNodeDriverShutdownSignal::RunningFlag(running) => {
+                running.store(false, Ordering::SeqCst);
+            }
+            #[cfg(not(any(
+                feature = "serial",
+                feature = "rnode-tcp",
+                feature = "ble",
+                target_os = "android",
+                test
+            )))]
+            _ => unreachable!("no RNode driver transport can construct a shutdown primitive"),
+        }
+    }
+}
+
+/// Cloneable, privacy-safe lifecycle handle for one exact RNode driver.
 #[derive(Clone)]
 pub struct RNodeDriverHandle {
     state: watch::Receiver<Arc<RNodeRuntimeSnapshot>>,
+    shutdown: RNodeDriverShutdown,
 }
 
 /// Clone-only subscription to generic RNode driver observations.
@@ -452,6 +538,16 @@ impl RNodeDriverHandle {
         RNodeDriverSubscription {
             state: self.state.clone(),
         }
+    }
+
+    /// Request shutdown of this exact spawned driver instance.
+    ///
+    /// The request is idempotent across every clone. It never resolves an
+    /// interface ID or another global registry entry, so later reuse of the
+    /// same ID cannot redirect it to a different session. Completion remains
+    /// owned by the spawned interface task and its normal join path.
+    pub fn request_shutdown(&self) {
+        self.shutdown.request();
     }
 }
 
@@ -668,6 +764,13 @@ impl Drop for RNodeSnapshotPublisher {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn new_rnode_driver_observation(
+    transport: RNodeTransportClass,
+) -> (RNodeSnapshotPublisher, RNodeDriverHandle) {
+    new_rnode_driver_observation_with_shutdown(transport, RNodeDriverShutdown::inert_test())
+}
+
 #[cfg(any(
     feature = "serial",
     feature = "rnode-tcp",
@@ -675,13 +778,17 @@ impl Drop for RNodeSnapshotPublisher {
     target_os = "android",
     test
 ))]
-pub(crate) fn new_rnode_driver_observation(
+pub(crate) fn new_rnode_driver_observation_with_shutdown(
     transport: RNodeTransportClass,
+    shutdown: RNodeDriverShutdown,
 ) -> (RNodeSnapshotPublisher, RNodeDriverHandle) {
     let (state_tx, state_rx) = watch::channel(Arc::new(RNodeRuntimeSnapshot::initial(transport)));
     (
         RNodeSnapshotPublisher::new(state_tx),
-        RNodeDriverHandle { state: state_rx },
+        RNodeDriverHandle {
+            state: state_rx,
+            shutdown,
+        },
     )
 }
 
@@ -697,15 +804,21 @@ fn rnode_stop_registry() -> &'static RNodeStopRegistry {
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 struct RNodeStopRegistryGuard {
     id: InterfaceId,
+    stop_tx: mpsc::Sender<()>,
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 impl Drop for RNodeStopRegistryGuard {
     fn drop(&mut self) {
-        rnode_stop_registry()
+        let mut registry = rnode_stop_registry()
             .lock()
-            .expect("rnode_stop_registry mutex poisoned")
-            .remove(&self.id);
+            .expect("rnode_stop_registry mutex poisoned");
+        let owns_entry = registry
+            .get(&self.id)
+            .is_some_and(|registered| registered.same_channel(&self.stop_tx));
+        if owns_entry {
+            registry.remove(&self.id);
+        }
     }
 }
 
@@ -714,12 +827,16 @@ fn register_rnode_stop(id: InterfaceId, stop_tx: mpsc::Sender<()>) -> RNodeStopR
     rnode_stop_registry()
         .lock()
         .expect("rnode_stop_registry mutex poisoned")
-        .insert(id, stop_tx);
-    RNodeStopRegistryGuard { id }
+        .insert(id, stop_tx.clone());
+    RNodeStopRegistryGuard { id, stop_tx }
 }
 
-/// Ask a serial/TCP RNode interface to send upstream's detach sequence before
-/// runtime teardown aborts the task. Idempotent; unknown ids are ignored.
+/// Compatibility facade requesting shutdown of the currently registered
+/// serial/TCP RNode for `id`.
+///
+/// New owners should retain [`RNodeDriverHandle`] and call
+/// [`RNodeDriverHandle::request_shutdown`] so later ID reuse cannot redirect
+/// the request. Unknown IDs are ignored.
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 pub fn stop_rnode_interface(id: InterfaceId) {
     let stop_tx = rnode_stop_registry()
@@ -2406,7 +2523,6 @@ pub async fn spawn_rnode_interface_with_driver(
     };
 
     let port = open_configured_rnode_stream(&config, &port_cfg).await?;
-    let (initial_snapshot_publisher, driver) = new_rnode_driver_observation(transport);
 
     let bitrate = calculate_bitrate(
         config.spreading_factor,
@@ -2449,6 +2565,10 @@ pub async fn spawn_rnode_interface_with_driver(
         start_rnode_generation(port, &config, id, &online, &shared_txb, &beacon).await?;
 
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    let (initial_snapshot_publisher, driver) = new_rnode_driver_observation_with_shutdown(
+        transport,
+        RNodeDriverShutdown::from_stop_sender(stop_tx.clone()),
+    );
     let stop_guard = register_rnode_stop(id, stop_tx);
     let online_r = online.clone();
     let rxb_r = shared_rxb.clone();
@@ -3297,6 +3417,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_driver_shutdown_is_idempotent_across_clones() {
+        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(4);
+        let (_publisher, driver) = new_rnode_driver_observation_with_shutdown(
+            RNodeTransportClass::Tcp,
+            RNodeDriverShutdown::from_stop_sender(stop_tx),
+        );
+        let clone = driver.clone();
+
+        driver.request_shutdown();
+        clone.request_shutdown();
+        driver.request_shutdown();
+
+        assert!(stop_rx.try_recv().is_ok());
+        assert!(
+            matches!(stop_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "all handle clones must share one shutdown request"
+        );
+    }
+
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_stop_rnode_interface_signals_registered_driver() {
@@ -3309,6 +3449,40 @@ mod tests {
         assert!(stop_rx.try_recv().is_ok());
         drop(guard);
         stop_rnode_interface(id);
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_exact_shutdown_and_registry_cleanup_resist_same_id_aba() {
+        let id = 0x0BAD_5701;
+        let (old_tx, mut old_rx) = mpsc::channel::<()>(2);
+        let (_old_publisher, old_driver) = new_rnode_driver_observation_with_shutdown(
+            RNodeTransportClass::Tcp,
+            RNodeDriverShutdown::from_stop_sender(old_tx.clone()),
+        );
+        let old_guard = register_rnode_stop(id, old_tx);
+
+        let (new_tx, mut new_rx) = mpsc::channel::<()>(2);
+        let (_new_publisher, _new_driver) = new_rnode_driver_observation_with_shutdown(
+            RNodeTransportClass::Tcp,
+            RNodeDriverShutdown::from_stop_sender(new_tx.clone()),
+        );
+        let new_guard = register_rnode_stop(id, new_tx);
+
+        drop(old_guard);
+        old_driver.request_shutdown();
+        assert!(old_rx.try_recv().is_ok());
+        assert!(
+            matches!(new_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "the retired handle must not stop the newer same-ID driver"
+        );
+
+        stop_rnode_interface(id);
+        assert!(
+            new_rx.try_recv().is_ok(),
+            "retired guard cleanup must preserve the newer compatibility entry"
+        );
+        drop(new_guard);
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -4909,7 +5083,10 @@ mod tests {
         assert_eq!(snapshot.phase, RNodeRuntimePhase::Ready);
 
         let (state_tx, state_rx) = watch::channel(Arc::new(snapshot.clone()));
-        let driver = RNodeDriverHandle { state: state_rx };
+        let driver = RNodeDriverHandle {
+            state: state_rx,
+            shutdown: RNodeDriverShutdown::inert_test(),
+        };
         let publisher = RNodeSnapshotPublisher::new(state_tx);
         let subscription = driver.watch();
         let retained = subscription.snapshot();

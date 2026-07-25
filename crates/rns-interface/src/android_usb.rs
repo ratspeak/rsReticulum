@@ -16,7 +16,9 @@ use crate::android_usb_lifecycle::{
 };
 #[cfg(test)]
 use crate::kiss;
-use crate::rnode::{self, RNodeRuntimeReason, RNodeTransportClass, SpawnedRNodeInterface};
+use crate::rnode::{
+    self, RNodeDriverShutdown, RNodeRuntimeReason, RNodeTransportClass, SpawnedRNodeInterface,
+};
 use crate::rnode_protocol::RNodeProtocolTarget;
 use crate::traits::{
     InterfaceDirection, InterfaceError, InterfaceHandle, InterfaceId, InterfaceMode,
@@ -66,6 +68,7 @@ fn android_usb_rnode_stop_registry() -> &'static AndroidUsbRNodeStopRegistry {
 
 struct AndroidUsbRNodeStopRegistryGuard {
     id: InterfaceId,
+    stop_tx: mpsc::Sender<()>,
     status: watch::Receiver<AndroidUsbShutdownStatus>,
 }
 
@@ -79,10 +82,15 @@ impl Drop for AndroidUsbRNodeStopRegistryGuard {
             // quarantine separately blocks a competing reopen.
             return;
         }
-        android_usb_rnode_stop_registry()
+        let mut registry = android_usb_rnode_stop_registry()
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owns_entry = registry
+            .get(&self.id)
+            .is_some_and(|registered| registered.stop_tx.same_channel(&self.stop_tx));
+        if owns_entry {
+            registry.remove(&self.id);
+        }
     }
 }
 
@@ -95,9 +103,16 @@ fn register_android_usb_rnode_stop(
     android_usb_rnode_stop_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(id, AndroidUsbStopHandle { stop_tx, status });
+        .insert(
+            id,
+            AndroidUsbStopHandle {
+                stop_tx: stop_tx.clone(),
+                status,
+            },
+        );
     AndroidUsbRNodeStopRegistryGuard {
         id,
+        stop_tx,
         status: guard_status,
     }
 }
@@ -124,8 +139,12 @@ fn request_android_usb_rnode_stop(id: InterfaceId) -> Option<AndroidUsbStopHandl
     Some(stop_handle)
 }
 
-/// Compatibility stop request. The runtime uses the acknowledged async form
-/// below before deregistering/aborting the outer driver task.
+/// Compatibility stop request for the currently registered Android USB RNode.
+///
+/// New owners should retain [`crate::rnode::RNodeDriverHandle`] and call
+/// [`crate::rnode::RNodeDriverHandle::request_shutdown`] so later ID reuse
+/// cannot redirect the request. The acknowledged compatibility form below
+/// remains available to existing runtime callers.
 pub fn stop_android_usb_rnode_interface(id: InterfaceId) {
     let _ = request_android_usb_rnode_stop(id);
 }
@@ -1154,15 +1173,16 @@ pub async fn spawn_android_usb_rnode_interface_with_driver(
         )));
     }
 
-    let (mut snapshot_publisher, driver) =
-        rnode::new_rnode_driver_observation(RNodeTransportClass::Usb);
-    snapshot_publisher.connection_established();
-
     let shared_txb = Arc::new(AtomicU64::new(0));
     let shared_rxb = Arc::new(AtomicU64::new(0));
 
     let (tx, app_rx) = mpsc::channel::<Bytes>(64);
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    let (mut snapshot_publisher, driver) = rnode::new_rnode_driver_observation_with_shutdown(
+        RNodeTransportClass::Usb,
+        RNodeDriverShutdown::from_stop_sender(stop_tx.clone()),
+    );
+    snapshot_publisher.connection_established();
     let (shutdown_status_tx, shutdown_status_rx) =
         watch::channel(AndroidUsbShutdownStatus::Running);
     let stop_guard = register_android_usb_rnode_stop(id, stop_tx, shutdown_status_rx);
@@ -1425,6 +1445,47 @@ mod tests {
         assert_facade_shape(spawn_android_usb_rnode_interface);
         assert_driver_shape(spawn_android_usb_rnode_interface_with_driver);
         let _usb_transport: RNodeTransportClass = RNodeTransportClass::Usb;
+    }
+
+    #[test]
+    fn android_usb_exact_shutdown_and_cleanup_resist_same_id_aba() {
+        let id: InterfaceId = 0xA11D_0001;
+        let (old_tx, mut old_rx) = mpsc::channel::<()>(2);
+        let (_old_status_tx, old_status_rx) = watch::channel(AndroidUsbShutdownStatus::Running);
+        let (_old_publisher, old_driver) = rnode::new_rnode_driver_observation_with_shutdown(
+            RNodeTransportClass::Usb,
+            RNodeDriverShutdown::from_stop_sender(old_tx.clone()),
+        );
+        let old_guard = register_android_usb_rnode_stop(id, old_tx, old_status_rx);
+
+        let (new_tx, mut new_rx) = mpsc::channel::<()>(2);
+        let (_new_status_tx, new_status_rx) = watch::channel(AndroidUsbShutdownStatus::Running);
+        let (_new_publisher, _new_driver) = rnode::new_rnode_driver_observation_with_shutdown(
+            RNodeTransportClass::Usb,
+            RNodeDriverShutdown::from_stop_sender(new_tx.clone()),
+        );
+        let new_guard = register_android_usb_rnode_stop(id, new_tx, new_status_rx);
+
+        drop(old_guard);
+        old_driver.request_shutdown();
+        assert!(old_rx.try_recv().is_ok());
+        assert!(
+            matches!(new_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "the retired handle must not stop the newer same-ID USB driver"
+        );
+
+        stop_android_usb_rnode_interface(id);
+        assert!(
+            new_rx.try_recv().is_ok(),
+            "retired guard cleanup must preserve the newer compatibility entry"
+        );
+        drop(new_guard);
+        assert!(
+            !android_usb_rnode_stop_registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id)
+        );
     }
 
     fn fragmented_decode(wire: &[u8]) -> Vec<(u8, Vec<u8>)> {
