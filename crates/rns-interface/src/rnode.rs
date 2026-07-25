@@ -898,10 +898,26 @@ impl RNodeGenerationWriter {
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn apply_rnode_ready_permit(ready: &AtomicBool, frame: &[u8], is_ready: bool) {
+    // Keep the shared response decoder (also used by BLE) unchanged while the
+    // serial/TCP writer accepts operational grants only at the exact width.
+    if frame.len() == 1 {
+        ready.store(is_ready, Ordering::SeqCst);
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+struct RNodePacketAccounting {
+    txb: Arc<AtomicU64>,
+    raw_len: u64,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 async fn write_rnode_operation<W>(
     mut writer: W,
     bytes: Vec<u8>,
     phase: RNodeWritePhase,
+    packet_accounting: Option<RNodePacketAccounting>,
 ) -> Result<W, RNodeWriteFailure>
 where
     W: std::io::Write + Send + 'static,
@@ -913,6 +929,11 @@ where
                 phase,
                 kind: RNodeWriteFailureKind::Write(Arc::new(error)),
             })?;
+        if let Some(accounting) = packet_accounting {
+            accounting
+                .txb
+                .fetch_add(accounting.raw_len, Ordering::Relaxed);
+        }
         writer.flush().map_err(|error| RNodeWriteFailure {
             phase,
             kind: RNodeWriteFailureKind::Flush(Arc::new(error)),
@@ -931,7 +952,7 @@ fn prepare_rnode_packet(
     data: Bytes,
     context: &RNodeWriterContext,
     first_tx: &mut Option<tokio::time::Instant>,
-) -> Vec<u8> {
+) -> (Vec<u8>, RNodePacketAccounting) {
     if let Some((_, ref callsign)) = context.beacon {
         if data == *callsign {
             *first_tx = None;
@@ -946,13 +967,20 @@ fn prepare_rnode_packet(
             packet_type = ?header.flags.packet_type,
             context = ?header.context,
             dest = %hex::encode(header.destination_hash),
-            "RNode queued packet"
+            "RNode writing packet"
         );
     } else {
-        tracing::debug!(id = context.id, raw_len = data.len(), "RNode queued packet");
+        tracing::debug!(
+            id = context.id,
+            raw_len = data.len(),
+            "RNode writing packet"
+        );
     }
-    context.txb.fetch_add(data.len() as u64, Ordering::Relaxed);
-    kiss::frame(&data)
+    let accounting = RNodePacketAccounting {
+        txb: context.txb.clone(),
+        raw_len: data.len() as u64,
+    };
+    (kiss::frame(&data), accounting)
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -973,7 +1001,7 @@ async fn run_rnode_writer<W>(
 where
     W: std::io::Write + Send + 'static,
 {
-    let mut pending_packet: Option<Vec<u8>> = None;
+    let mut pending_packet: Option<Bytes> = None;
     let mut first_tx: Option<tokio::time::Instant> = None;
     let mut packet_lane_open = true;
     let mut control_lane_open = true;
@@ -991,7 +1019,7 @@ where
                     }
                     let phase = request.phase;
                     let terminal = phase == RNodeWritePhase::Detach;
-                    match write_rnode_operation(writer, request.bytes, phase).await {
+                    match write_rnode_operation(writer, request.bytes, phase, None).await {
                         Ok(next_writer) => {
                             writer = next_writer;
                             let _ = request.acknowledgement.send(Ok(()));
@@ -1013,15 +1041,30 @@ where
             }
         }
 
-        if pending_packet.is_some()
-            && (!context.flow_control || context.ready.load(Ordering::SeqCst))
+        if pending_packet.is_none()
+            && let Some((interval, ref callsign)) = context.beacon
+            && first_tx.is_some_and(|started| started.elapsed() >= interval)
         {
+            tracing::debug!(id = context.id, "RNode station-ID beacon is due");
+            pending_packet = Some(callsign.clone());
+        }
+
+        let packet_permitted = pending_packet.is_some()
+            && (!context.flow_control
+                || context
+                    .ready
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok());
+        if packet_permitted {
             if context.cancelled.load(Ordering::SeqCst) {
                 return Ok(RNodeWriterExit::Cancelled);
             }
-            let framed = pending_packet.take().expect("pending packet checked");
+            let packet = pending_packet.take().expect("pending packet checked");
+            let (framed, accounting) = prepare_rnode_packet(packet, &context, &mut first_tx);
             let framed_len = framed.len();
-            writer = write_rnode_operation(writer, framed, RNodeWritePhase::Packet).await?;
+            writer =
+                write_rnode_operation(writer, framed, RNodeWritePhase::Packet, Some(accounting))
+                    .await?;
             tracing::debug!(id = context.id, framed_len, "RNode packet write complete");
             continue;
         }
@@ -1070,7 +1113,7 @@ where
                 }
                 let phase = request.phase;
                 let terminal = phase == RNodeWritePhase::Detach;
-                match write_rnode_operation(writer, request.bytes, phase).await {
+                match write_rnode_operation(writer, request.bytes, phase, None).await {
                     Ok(next_writer) => {
                         writer = next_writer;
                         let _ = request.acknowledgement.send(Ok(()));
@@ -1091,28 +1134,16 @@ where
                 if context.cancelled.load(Ordering::SeqCst) {
                     return Ok(RNodeWriterExit::Cancelled);
                 }
-                pending_packet = Some(prepare_rnode_packet(data, &context, &mut first_tx));
+                pending_packet = Some(data);
             }
             RNodeWriterEvent::Packet(None) => {
                 packet_lane_open = false;
             }
             RNodeWriterEvent::FlowPoll => {}
-            RNodeWriterEvent::BeaconPoll => {
-                let Some((interval, ref callsign)) = context.beacon else {
-                    continue;
-                };
-                if first_tx.is_some_and(|started| started.elapsed() >= interval) {
-                    if context.cancelled.load(Ordering::SeqCst) {
-                        return Ok(RNodeWriterExit::Cancelled);
-                    }
-                    tracing::debug!(id = context.id, "RNode transmitting station-ID beacon");
-                    pending_packet = Some(prepare_rnode_packet(
-                        callsign.clone(),
-                        &context,
-                        &mut first_tx,
-                    ));
-                }
-            }
+            // Wake the top-of-loop due check even when both input lanes are
+            // idle. Checking there also prevents a continuously ready packet
+            // lane from starving an elapsed station-ID beacon.
+            RNodeWriterEvent::BeaconPoll => {}
         }
     }
 }
@@ -1167,8 +1198,9 @@ fn spawn_rnode_generation_writer(
         RNodeWriterContext {
             id,
             flow_control: config.flow_control,
-            // Legacy flow control starts permissive and is changed only by
-            // CMD_READY. Reducer readiness remains observational.
+            // Upstream flow control starts with one permissive packet token;
+            // exact-width CMD_READY frames replenish or revoke that token.
+            // Reducer readiness remains observational.
             ready: Arc::new(AtomicBool::new(true)),
             online,
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -2445,7 +2477,7 @@ pub async fn spawn_rnode_interface_with_driver(
                                         }
                                     }
                                     RNodeResponse::Ready(is_ready) => {
-                                        ready.store(is_ready, Ordering::SeqCst);
+                                        apply_rnode_ready_permit(&ready, &frame, is_ready);
                                     }
                                     RNodeResponse::None => {}
                                 }
@@ -2697,16 +2729,29 @@ mod tests {
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn apply_scripted_ready_frame(ready: &AtomicBool, frame: &[u8]) {
+        let mut last_rssi = None;
+        let mut last_snr = None;
+        let RNodeResponse::Ready(is_ready) =
+            process_rnode_response(CMD_READY, frame, 0x5C71, &mut last_rssi, &mut last_snr)
+        else {
+            panic!("CMD_READY must produce a readiness response");
+        };
+        apply_rnode_ready_permit(ready, frame, is_ready);
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     async fn exercise_scripted_writer_failure(phase: RNodeWritePhase, flush: bool) {
         let scripted = ScriptedWriter::failing((!flush).then_some(1), flush.then_some(1));
         let online = Arc::new(AtomicBool::new(true));
+        let txb = Arc::new(AtomicU64::new(0));
         let writer = spawn_rnode_writer(
             scripted,
             scripted_writer_context(
                 false,
                 Arc::new(AtomicBool::new(true)),
                 online.clone(),
-                Arc::new(AtomicU64::new(0)),
+                txb.clone(),
                 None,
                 Duration::from_millis(5),
             ),
@@ -2750,6 +2795,17 @@ mod tests {
                 _ => panic!("ack and actor failures must describe the same operation"),
             }
         }
+
+        let expected_txb = if phase == RNodeWritePhase::Packet && flush {
+            b"packet".len() as u64
+        } else {
+            0
+        };
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            expected_txb,
+            "only a fully written packet payload is accounted; controls never are"
+        );
     }
 
     #[test]
@@ -3196,9 +3252,9 @@ mod tests {
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[tokio::test]
-    async fn test_rnode_writer_flow_block_does_not_head_of_line_block_control() {
+    async fn test_rnode_writer_flow_permits_saturate_preserve_fifo_and_bypass_control() {
         let scripted = ScriptedWriter::default();
-        let ready = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(true));
         let txb = Arc::new(AtomicU64::new(0));
         let writer = spawn_rnode_writer(
             scripted.clone(),
@@ -3213,16 +3269,44 @@ mod tests {
         );
         let first = Bytes::from_static(b"first");
         let second = Bytes::from_static(b"second");
-        writer.packet_tx.send(first.clone()).await.unwrap();
-        writer.packet_tx.send(second.clone()).await.unwrap();
+        let third = Bytes::from_static(b"third");
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while txb.load(Ordering::Relaxed) != first.len() as u64 {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        })
-        .await
-        .expect("first packet was not admitted as the sole pending packet");
+        assert!(
+            writer.ready.load(Ordering::SeqCst),
+            "flow control must start with one permissive packet token"
+        );
+        writer.packet_tx.send(first.clone()).await.unwrap();
+        wait_for_scripted_writer(&scripted, |state| state.flush_calls == 1).await;
+        assert_eq!(scripted.writes(), vec![kiss::frame(&first)]);
+        assert!(!ready.load(Ordering::SeqCst));
+        assert_eq!(txb.load(Ordering::Relaxed), first.len() as u64);
+
+        // Multiple positive readiness frames received before a packet can only
+        // saturate the single boolean token; they cannot bank future permits.
+        apply_scripted_ready_frame(&ready, &[0x01]);
+        apply_scripted_ready_frame(&ready, &[]);
+        apply_scripted_ready_frame(&ready, &[0x01, 0x01]);
+        assert!(
+            ready.load(Ordering::SeqCst),
+            "malformed readiness frames must have no operational effect"
+        );
+        apply_scripted_ready_frame(&ready, &[0x7F]);
+        writer.packet_tx.send(second.clone()).await.unwrap();
+        writer.packet_tx.send(third.clone()).await.unwrap();
+        wait_for_scripted_writer(&scripted, |state| state.flush_calls == 2).await;
+        assert!(!ready.load(Ordering::SeqCst));
+        assert_eq!(
+            scripted.writes(),
+            vec![kiss::frame(&first), kiss::frame(&second)]
+        );
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            (first.len() + second.len()) as u64
+        );
+
+        // Give the actor several flow polls to retain the third packet as raw
+        // pending data before exercising the independent control lane.
+        tokio::time::sleep(RNODE_FLOW_POLL_INTERVAL * 3).await;
         let control = vec![0xAA, 0xBB];
         tokio::time::timeout(
             Duration::from_secs(2),
@@ -3235,23 +3319,200 @@ mod tests {
         .await
         .expect("flow-bypass control write timed out")
         .expect("control must bypass a flow-blocked packet");
-        assert_eq!(scripted.writes(), vec![control]);
-        assert_eq!(txb.load(Ordering::Relaxed), first.len() as u64);
-
-        ready.store(true, Ordering::SeqCst);
-        wait_for_scripted_writer(&scripted, |state| state.writes.len() == 3).await;
         assert_eq!(
             scripted.writes(),
-            vec![vec![0xAA, 0xBB], kiss::frame(&first), kiss::frame(&second)]
+            vec![kiss::frame(&first), kiss::frame(&second), control.clone()]
         );
         assert_eq!(
             txb.load(Ordering::Relaxed),
             (first.len() + second.len()) as u64
         );
 
+        // Malformed frames have no operational effect, while an exact-width
+        // zero frame explicitly retains the blocked state.
+        apply_scripted_ready_frame(&ready, &[]);
+        apply_scripted_ready_frame(&ready, &[0x01, 0x00]);
+        apply_scripted_ready_frame(&ready, &[0x00]);
+        tokio::time::sleep(RNODE_FLOW_POLL_INTERVAL * 3).await;
+        assert_eq!(
+            scripted.writes(),
+            vec![kiss::frame(&first), kiss::frame(&second), control]
+        );
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            (first.len() + second.len()) as u64
+        );
+
+        apply_scripted_ready_frame(&ready, &[0x01]);
+        wait_for_scripted_writer(&scripted, |state| state.flush_calls == 4).await;
+        assert_eq!(
+            scripted.writes(),
+            vec![
+                kiss::frame(&first),
+                kiss::frame(&second),
+                vec![0xAA, 0xBB],
+                kiss::frame(&third),
+            ]
+        );
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            (first.len() + second.len() + third.len()) as u64
+        );
+        assert!(!ready.load(Ordering::SeqCst));
+
         send_detach_request(&writer.control_tx, 0x5C71)
             .await
             .expect("flow-bypass writer must detach");
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            (first.len() + second.len() + third.len()) as u64,
+            "control frames must not contribute to payload accounting"
+        );
+        finish_rnode_writer(writer).await;
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_flow_stall_arms_beacon_only_at_granted_write_boundary() {
+        let scripted = ScriptedWriter::default();
+        let ready = Arc::new(AtomicBool::new(false));
+        let txb = Arc::new(AtomicU64::new(0));
+        let callsign = Bytes::from_static(b"FLOW-ID");
+        let beacon_interval = Duration::from_millis(500);
+        let writer = spawn_rnode_writer(
+            scripted.clone(),
+            scripted_writer_context(
+                true,
+                ready.clone(),
+                Arc::new(AtomicBool::new(true)),
+                txb.clone(),
+                Some((beacon_interval, callsign.clone())),
+                Duration::from_millis(5),
+            ),
+        );
+        let payload = Bytes::from_static(b"flow-stalled-payload");
+        writer.packet_tx.send(payload.clone()).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while writer.packet_tx.capacity() != RNODE_PACKET_WRITE_QUEUE {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("writer did not retain the flow-stalled raw packet");
+        tokio::time::sleep(beacon_interval + Duration::from_millis(50)).await;
+        assert!(scripted.writes().is_empty());
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            0,
+            "dequeueing a flow-stalled packet must not account or arm its beacon timer"
+        );
+
+        apply_scripted_ready_frame(&ready, &[0x01]);
+        wait_for_scripted_writer(&scripted, |state| state.flush_calls == 1).await;
+        assert_eq!(scripted.writes(), vec![kiss::frame(&payload)]);
+        assert_eq!(txb.load(Ordering::Relaxed), payload.len() as u64);
+        assert!(!ready.load(Ordering::SeqCst));
+
+        // A token offered immediately after the payload would expose a beacon
+        // whose timer was incorrectly armed at dequeue. It must remain unused
+        // until the new write-boundary-relative interval has elapsed.
+        apply_scripted_ready_frame(&ready, &[0x01]);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(scripted.writes(), vec![kiss::frame(&payload)]);
+        assert_eq!(txb.load(Ordering::Relaxed), payload.len() as u64);
+        assert!(ready.load(Ordering::SeqCst));
+        apply_scripted_ready_frame(&ready, &[0x00]);
+
+        tokio::time::sleep(beacon_interval).await;
+        let control = vec![0xD1, 0xD2];
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            request_rnode_control_write(
+                &writer.control_tx,
+                RNodeWritePhase::Detect,
+                control.clone(),
+            ),
+        )
+        .await
+        .expect("due-beacon control bypass timed out")
+        .expect("control must bypass a flow-stalled due beacon");
+        assert_eq!(
+            scripted.writes(),
+            vec![kiss::frame(&payload), control.clone()]
+        );
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            payload.len() as u64,
+            "a due beacon without a permit remains unaccounted"
+        );
+
+        apply_scripted_ready_frame(&ready, &[0x01]);
+        wait_for_scripted_writer(&scripted, |state| state.flush_calls == 3).await;
+        assert_eq!(
+            scripted.writes(),
+            vec![kiss::frame(&payload), control, kiss::frame(&callsign)]
+        );
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            (payload.len() + callsign.len()) as u64
+        );
+        assert!(!ready.load(Ordering::SeqCst));
+
+        send_detach_request(&writer.control_tx, 0x5C71)
+            .await
+            .expect("flow/beacon writer must detach");
+        finish_rnode_writer(writer).await;
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_due_beacon_is_not_starved_by_continuously_ready_packet_lane() {
+        let scripted = ScriptedWriter::default();
+        let txb = Arc::new(AtomicU64::new(0));
+        let callsign = Bytes::from_static(b"LANE-ID");
+        let writer = spawn_rnode_writer(
+            scripted.clone(),
+            scripted_writer_context(
+                false,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                txb.clone(),
+                Some((Duration::ZERO, callsign.clone())),
+                Duration::from_millis(2),
+            ),
+        );
+        let packets = [
+            Bytes::from_static(b"lane-one"),
+            Bytes::from_static(b"lane-two"),
+            Bytes::from_static(b"lane-three"),
+        ];
+        for packet in &packets {
+            writer.packet_tx.send(packet.clone()).await.unwrap();
+        }
+
+        wait_for_scripted_writer(&scripted, |state| state.flush_calls == 6).await;
+        assert_eq!(
+            scripted.writes(),
+            vec![
+                kiss::frame(&packets[0]),
+                kiss::frame(&callsign),
+                kiss::frame(&packets[1]),
+                kiss::frame(&callsign),
+                kiss::frame(&packets[2]),
+                kiss::frame(&callsign),
+            ],
+            "elapsed beacons may interleave but must preserve application FIFO"
+        );
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            packets.iter().map(Bytes::len).sum::<usize>() as u64
+                + (callsign.len() * packets.len()) as u64
+        );
+
+        send_detach_request(&writer.control_tx, 0x5C71)
+            .await
+            .expect("continuous-lane writer must detach");
         finish_rnode_writer(writer).await;
     }
 
@@ -3479,6 +3740,86 @@ mod tests {
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[tokio::test]
+    async fn test_flow_stalled_cancelled_backlog_does_not_account_or_replay() {
+        let scripted = ScriptedWriter::default();
+        let txb = Arc::new(AtomicU64::new(0));
+        let stalled_writer = spawn_rnode_writer(
+            scripted.clone(),
+            scripted_writer_context(
+                true,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+                txb.clone(),
+                Some((Duration::from_millis(5), Bytes::from_static(b"STALL-ID"))),
+                Duration::from_millis(2),
+            ),
+        );
+
+        // One raw packet can be held by the actor in addition to the entire
+        // bounded packet lane. Completing all 257 sends therefore proves that
+        // the flow-stalled pending slot has been populated.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for index in 0..=RNODE_PACKET_WRITE_QUEUE {
+                stalled_writer
+                    .packet_tx
+                    .send(Bytes::from(vec![
+                        (index & 0xFF) as u8,
+                        ((index >> 8) & 0xFF) as u8,
+                    ]))
+                    .await
+                    .expect("stalled generation packet lane closed");
+            }
+        })
+        .await
+        .expect("stalled generation never populated its pending slot");
+
+        assert!(scripted.writes().is_empty());
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            0,
+            "raw pending and queued packets must not account before a write attempt"
+        );
+        stalled_writer.cancel();
+        assert_eq!(
+            finish_rnode_writer(stalled_writer).await,
+            RNodeWriterFinish::Quiesced
+        );
+        assert!(scripted.writes().is_empty());
+        assert_eq!(txb.load(Ordering::Relaxed), 0);
+
+        let next_writer = spawn_rnode_writer(
+            scripted.clone(),
+            scripted_writer_context(
+                false,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                txb.clone(),
+                None,
+                Duration::from_millis(2),
+            ),
+        );
+        let next_packet = Bytes::from_static(b"next-generation-only");
+        next_writer
+            .packet_tx
+            .send(next_packet.clone())
+            .await
+            .unwrap();
+        wait_for_scripted_writer(&scripted, |state| state.flush_calls == 1).await;
+        assert_eq!(scripted.writes(), vec![kiss::frame(&next_packet)]);
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            next_packet.len() as u64,
+            "only the new generation's attempted payload may account"
+        );
+
+        send_detach_request(&next_writer.control_tx, 0x5C71)
+            .await
+            .expect("next generation writer must detach");
+        finish_rnode_writer(next_writer).await;
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
     async fn test_rnode_writer_preserves_packet_accounting_and_beacon_semantics() {
         let scripted = ScriptedWriter::default();
         let txb = Arc::new(AtomicU64::new(0));
@@ -3490,13 +3831,21 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(true)),
                 txb.clone(),
-                Some((Duration::from_millis(20), callsign.clone())),
+                Some((Duration::from_millis(100), callsign.clone())),
                 Duration::from_millis(5),
             ),
         );
         let packet = Bytes::from_static(b"payload");
         writer.packet_tx.send(packet.clone()).await.unwrap();
-        wait_for_scripted_writer(&scripted, |state| state.writes.len() == 2).await;
+        wait_for_scripted_writer(&scripted, |state| state.flush_calls >= 1).await;
+        assert_eq!(scripted.writes(), vec![kiss::frame(&packet)]);
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            packet.len() as u64,
+            "normal payload accounting uses the raw, unframed length"
+        );
+
+        wait_for_scripted_writer(&scripted, |state| state.flush_calls >= 2).await;
         assert_eq!(
             scripted.writes(),
             vec![kiss::frame(&packet), kiss::frame(&callsign)]
@@ -3511,6 +3860,11 @@ mod tests {
         send_detach_request(&writer.control_tx, 0x5C71)
             .await
             .expect("beacon writer must detach");
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            (packet.len() + callsign.len()) as u64,
+            "detach control bytes must not affect payload accounting"
+        );
         finish_rnode_writer(writer).await;
     }
 
