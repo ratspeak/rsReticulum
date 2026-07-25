@@ -2,7 +2,6 @@ mod support;
 
 use std::path::Path;
 
-use rns_identity::ratchet::RatchetRing;
 use rns_runtime::prelude::*;
 use support::*;
 
@@ -17,16 +16,9 @@ fn load_or_create_identity(path: &Path) -> ExampleResult<Identity> {
     Ok(identity)
 }
 
-fn load_or_create_ring(path: &Path, identity: &Identity) -> ExampleResult<RatchetRing> {
-    let mut ring = if path.exists() {
-        RatchetRing::load_verified(path, identity)?.into_ring()
-    } else {
-        RatchetRing::new()
-    };
-    if ring.needs_rotation() {
-        ring.rotate();
-        ring.save_verified(path, identity)?;
-    }
+fn load_or_create_ring(path: &Path, identity: &Identity) -> ExampleResult<PersistentRatchetRing> {
+    let mut ring = PersistentRatchetRing::open(path, identity)?;
+    ring.ensure_current(identity)?;
     Ok(ring)
 }
 

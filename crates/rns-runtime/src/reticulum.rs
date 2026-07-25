@@ -540,6 +540,27 @@ impl ReticulumHandle {
         .await
     }
 
+    /// Register and own a persistent-ratcheted inbound SINGLE destination.
+    pub async fn register_ratcheted_destination(
+        &self,
+        identity: Identity,
+        app_name: impl Into<String>,
+        options: crate::destination_runtime::DestinationRuntimeOptions,
+        ratchet_options: crate::destination_runtime::DestinationRatchetOptions,
+    ) -> Result<
+        crate::destination_runtime::RegisteredDestination,
+        crate::destination_runtime::DestinationRuntimeError,
+    > {
+        crate::destination_runtime::RegisteredDestination::register_ratcheted(
+            self.transport_tx.clone(),
+            identity,
+            app_name,
+            options,
+            ratchet_options,
+        )
+        .await
+    }
+
     pub fn transport_enabled(&self) -> bool {
         self.config.enable_transport
     }

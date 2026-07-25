@@ -12,6 +12,7 @@ use rns_crypto::ed25519::Ed25519PrivateKey;
 use rns_crypto::sha::truncated_hash;
 use rns_identity::destination::{AllowPolicy, DestType, Destination, Direction};
 use rns_identity::identity::Identity;
+use rns_identity::ratchet::PersistentRatchetRing;
 use rns_link::link::{CloseReason, Link, LinkAction, LinkState, ResourceStrategy};
 use rns_protocol::channel::{ChannelError, LinkChannel};
 use rns_protocol::channel_message::MessageBase;
@@ -243,6 +244,10 @@ pub enum DestinationControlError {
     IdentityUnavailable,
     #[error("destination operation failed: {0}")]
     Destination(#[from] rns_identity::destination::DestinationError),
+    #[error("destination ratchet persistence failed: {0}")]
+    RatchetPersistence(#[from] std::io::Error),
+    #[error("caller-supplied announce ratchet does not match the managed ring")]
+    ManagedRatchetMismatch,
     #[error("transport channel is full or closed")]
     TransportUnavailable,
 }
@@ -320,6 +325,9 @@ pub struct LinkManager {
     pub destination_hash: [u8; 16],
     destination: Option<Destination>,
     identity: Option<Identity>,
+    /// Private ratchets for a live inbound destination. The manager owns this
+    /// alongside `destination` so enforced decryption cannot outlive its keys.
+    destination_ratchets: Option<PersistentRatchetRing>,
     /// `(link_id, path_hash, data) -> Option<response>`.
     request_handler: Option<RequestHandler>,
     /// Wins over `request_handler` when set; can schedule a resource transfer.
@@ -384,6 +392,7 @@ impl LinkManager {
             destination_hash,
             destination: None,
             identity: None,
+            destination_ratchets: None,
             request_handler: None,
             request_handler_ex: None,
             destination_request_handlers: HashMap::new(),
@@ -440,6 +449,7 @@ impl LinkManager {
             destination_hash,
             destination: dest,
             identity: manager_identity,
+            destination_ratchets: None,
             request_handler: None,
             request_handler_ex: None,
             destination_request_handlers: HashMap::new(),
@@ -468,6 +478,31 @@ impl LinkManager {
 
     pub fn get_backchannel_link(&self, identity_hash: &[u8; 16]) -> Option<[u8; 16]> {
         self.backchannel_links.get(identity_hash).copied()
+    }
+
+    /// Enable a verified, persistent ratchet ring for the owned destination.
+    ///
+    /// A current ratchet is persisted before the destination starts
+    /// advertising or enforcing it.
+    pub fn enable_persistent_ratchets(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+        enforce: bool,
+    ) -> Result<[u8; 32], DestinationControlError> {
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or(DestinationControlError::IdentityUnavailable)?;
+        let destination = self
+            .destination
+            .as_mut()
+            .ok_or(DestinationControlError::DestinationUnavailable)?;
+        let mut ratchets = PersistentRatchetRing::open(path, identity)?;
+        let current = ratchets.ensure_current(identity)?;
+        destination.enable_ratchets(enforce);
+        destination.set_local_ratchet(current);
+        self.destination_ratchets = Some(ratchets);
+        Ok(current)
     }
 
     /// Destination owned by a manager created with [`Self::with_destination`].
@@ -755,14 +790,14 @@ impl LinkManager {
         app_data: Option<&[u8]>,
         ratchet: Option<&[u8; 32]>,
     ) -> Result<(), DestinationControlError> {
-        let Some(destination) = self.destination.as_mut() else {
+        if self.destination.is_none() {
             tracing::debug!(
                 app_name = %request.app_name,
                 path_response = request.path_response,
                 "announce requested but no destination is configured"
             );
             return Err(DestinationControlError::DestinationUnavailable);
-        };
+        }
         let Some(identity) = self.identity.as_ref() else {
             tracing::warn!(
                 app_name = %request.app_name,
@@ -772,10 +807,28 @@ impl LinkManager {
             return Err(DestinationControlError::IdentityUnavailable);
         };
 
+        let managed_ratchet = match self.destination_ratchets.as_mut() {
+            Some(ratchets) => {
+                let current = ratchets.ensure_current(identity)?;
+                if ratchet.is_some_and(|supplied| supplied != &current) {
+                    return Err(DestinationControlError::ManagedRatchetMismatch);
+                }
+                Some(current)
+            }
+            None => None,
+        };
+        let destination = self
+            .destination
+            .as_mut()
+            .expect("destination presence checked above");
+        if let Some(current) = managed_ratchet {
+            destination.set_local_ratchet(current);
+        }
+        let announce_ratchet = managed_ratchet.as_ref().or(ratchet);
         let raw = destination.announce_packet(
             identity,
             app_data,
-            ratchet,
+            announce_ratchet,
             request.path_response,
             request.tag.as_deref(),
             unix_now(),
@@ -3560,7 +3613,11 @@ impl LinkManager {
         let data = &raw[data_offset..];
         let packet_type = header.flags.packet_type as u8;
 
-        match dest.receive_packet(packet_type, data, raw, identity) {
+        let ratchet_keys = self
+            .destination_ratchets
+            .as_ref()
+            .map(PersistentRatchetRing::private_keys);
+        match dest.receive_packet_with_ratchets(packet_type, data, raw, identity, ratchet_keys) {
             Ok(Some(plaintext)) => Some(plaintext),
             _ => None,
         }

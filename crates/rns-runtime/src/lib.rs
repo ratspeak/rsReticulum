@@ -27,8 +27,8 @@ pub mod rpc_server;
 /// This is additive convenience; module-qualified paths remain supported.
 pub mod prelude {
     pub use crate::destination_runtime::{
-        DestinationEvents, DestinationHandle, DestinationPacket, DestinationRuntimeError,
-        DestinationRuntimeOptions, RegisteredDestination,
+        DestinationEvents, DestinationHandle, DestinationPacket, DestinationRatchetOptions,
+        DestinationRuntimeError, DestinationRuntimeOptions, RegisteredDestination,
     };
     pub use crate::lifecycle::ShutdownSignal;
     pub use crate::link_manager::{DestinationAnnounceOptions, DestinationRequest, RequestOutcome};
@@ -48,5 +48,6 @@ pub mod prelude {
         AllowPolicy, DestType, Destination, Direction, ProofStrategy,
     };
     pub use rns_identity::identity::Identity;
+    pub use rns_identity::ratchet::PersistentRatchetRing;
     pub use rns_link::link::{CloseReason, ResourceStrategy};
 }

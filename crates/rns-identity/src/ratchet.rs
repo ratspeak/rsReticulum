@@ -424,6 +424,110 @@ impl RatchetRing {
     }
 }
 
+/// A verified ratchet ring bound to one crash-safe persistence path.
+///
+/// This is the high-level counterpart to Python's
+/// `Destination.enable_ratchets(path)`: opening loads and verifies an existing
+/// Python-compatible ring or creates a signed empty one. Rotations persist a
+/// candidate before replacing the live secret state.
+pub struct PersistentRatchetRing {
+    path: PathBuf,
+    ring: RatchetRing,
+}
+
+impl std::fmt::Debug for PersistentRatchetRing {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PersistentRatchetRing")
+            .field("path", &self.path)
+            .field("retained_keys", &self.ring.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PersistentRatchetRing {
+    /// Load and verify `path`, or initialize it with a signed empty ring.
+    pub fn open(path: impl AsRef<Path>, identity: &Identity) -> std::io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let ring = if path.is_file() {
+            RatchetRing::load_verified(&path, identity)?.into_ring()
+        } else {
+            let ring = RatchetRing::new();
+            ring.save_verified(&path, identity)?;
+            ring
+        };
+        Ok(Self { path, ring })
+    }
+
+    /// Persistence path for this ring.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Borrow the underlying secret ring for policy inspection.
+    pub fn ring(&self) -> &RatchetRing {
+        &self.ring
+    }
+
+    /// Most recently persisted ratchet public key.
+    pub fn current_public_key(&self) -> Option<[u8; 32]> {
+        self.ring.current_public_key()
+    }
+
+    /// Retained private keys, newest first, for destination decryption.
+    pub fn private_keys(&self) -> &[[u8; 32]] {
+        self.ring.private_keys()
+    }
+
+    /// Number of retained private ratchets.
+    pub fn len(&self) -> usize {
+        self.ring.len()
+    }
+
+    /// Whether no ratchet has been generated yet.
+    pub fn is_empty(&self) -> bool {
+        self.ring.is_empty()
+    }
+
+    /// Return a usable current public key, rotating first when due.
+    pub fn ensure_current(&mut self, identity: &Identity) -> std::io::Result<[u8; 32]> {
+        self.ensure_current_at(identity, wall_time_secs())
+    }
+
+    /// Deterministic form of [`Self::ensure_current`] for runtime/tests.
+    pub fn ensure_current_at(
+        &mut self,
+        identity: &Identity,
+        now: f64,
+    ) -> std::io::Result<[u8; 32]> {
+        if self.ring.is_empty() || self.ring.needs_rotation_at(now) {
+            self.rotate_at(identity, now)
+        } else {
+            self.ring
+                .current_public_key()
+                .ok_or_else(|| invalid_data("ratchet ring has no current key"))
+        }
+    }
+
+    /// Force a crash-safe rotation now.
+    pub fn rotate(&mut self, identity: &Identity) -> std::io::Result<[u8; 32]> {
+        self.rotate_at(identity, wall_time_secs())
+    }
+
+    /// Force a crash-safe rotation at an explicit wall-clock time.
+    pub fn rotate_at(&mut self, identity: &Identity, now: f64) -> std::io::Result<[u8; 32]> {
+        if !now.is_finite() || now < 0.0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ratchet rotation time must be finite and non-negative",
+            ));
+        }
+        let prepared = self.ring.prepare_rotation_at(now);
+        prepared.ring().save_verified(&self.path, identity)?;
+        Ok(self.ring.commit_prepared_rotation(prepared))
+    }
+}
+
 struct DecodedRatchetRing {
     ring: RatchetRing,
     signature: [u8; 64],
@@ -840,6 +944,61 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn persistent_ring_initializes_rotates_and_verifies_before_use() {
+        let identity = Identity::new();
+        let wrong_identity = Identity::new();
+        let dir = std::env::temp_dir().join(format!(
+            "reticulum_persistent_ratchets_{}",
+            identity.hexhash()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ratchets");
+
+        let mut persistent = PersistentRatchetRing::open(&path, &identity).unwrap();
+        assert!(path.is_file());
+        assert!(persistent.is_empty());
+        let first = persistent.ensure_current_at(&identity, 100.0).unwrap();
+        assert_eq!(persistent.current_public_key(), Some(first));
+        assert_eq!(persistent.len(), 1);
+
+        assert!(PersistentRatchetRing::open(&path, &wrong_identity).is_err());
+        let mut reloaded = PersistentRatchetRing::open(&path, &identity).unwrap();
+        assert_eq!(reloaded.current_public_key(), Some(first));
+        let second = reloaded.ensure_current_at(&identity, 200.0).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(reloaded.len(), 2);
+        assert_eq!(
+            RatchetRing::load_verified(&path, &identity)
+                .unwrap()
+                .ring()
+                .current_public_key(),
+            Some(second)
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_ring_does_not_commit_when_rotation_cannot_be_saved() {
+        let identity = Identity::new();
+        let dir = std::env::temp_dir().join(format!(
+            "reticulum_persistent_ratchet_failure_{}",
+            identity.hexhash()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ratchets");
+        let mut persistent = PersistentRatchetRing::open(&path, &identity).unwrap();
+        let first = persistent.ensure_current_at(&identity, 100.0).unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(persistent.rotate_at(&identity, 200.0).is_err());
+        assert_eq!(persistent.current_public_key(), Some(first));
+        assert_eq!(persistent.len(), 1);
     }
 
     #[test]

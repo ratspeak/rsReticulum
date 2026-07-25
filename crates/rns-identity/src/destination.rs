@@ -673,11 +673,26 @@ impl Destination {
         raw_packet: &[u8],
         identity: &Identity,
     ) -> Result<Option<Vec<u8>>, DestinationError> {
+        self.receive_packet_with_ratchets(packet_type, data, raw_packet, identity, None)
+    }
+
+    /// Decrypt and dispatch an incoming packet using retained ratchet keys.
+    ///
+    /// Live destination runtimes use this form when they own a persistent
+    /// ratchet ring. LINKREQUEST packets still bypass destination decryption.
+    pub fn receive_packet_with_ratchets(
+        &self,
+        packet_type: u8,
+        data: &[u8],
+        raw_packet: &[u8],
+        identity: &Identity,
+        ratchet_keys: Option<&[[u8; 32]]>,
+    ) -> Result<Option<Vec<u8>>, DestinationError> {
         if packet_type == 0x02 {
             return Ok(Some(data.to_vec()));
         }
 
-        let plaintext = self.decrypt(data, identity)?;
+        let plaintext = self.decrypt_with_ratchets(data, identity, ratchet_keys)?;
 
         if packet_type == 0x00 {
             if let Some(ref cb) = self.packet_callback {
