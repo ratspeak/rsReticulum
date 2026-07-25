@@ -2043,6 +2043,78 @@ fn reconnect_delay() -> Duration {
     }
 }
 
+/// Transport-independent, non-secret settings for one generic RNode radio.
+///
+/// This value contains only RF parameters. It deliberately carries no
+/// endpoint, interface label, device identity, EEPROM data, or other device
+/// configuration, so callers such as `rnodeconf` can validate and encode a
+/// reviewed radio configuration without constructing a runtime interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RNodeRadioSettings {
+    /// RF centre frequency in hertz.
+    pub frequency: u32,
+    /// RF bandwidth in hertz.
+    pub bandwidth: u32,
+    pub spreading_factor: u8,
+    pub coding_rate: u8,
+    /// Transmit power in dBm.
+    pub tx_power: u8,
+}
+
+impl RNodeRadioSettings {
+    pub const fn new(
+        frequency: u32,
+        bandwidth: u32,
+        spreading_factor: u8,
+        coding_rate: u8,
+        tx_power: u8,
+    ) -> Self {
+        Self {
+            frequency,
+            bandwidth,
+            spreading_factor,
+            coding_rate,
+            tx_power,
+        }
+    }
+
+    /// Validate all generic RNode RF settings without touching a device.
+    pub fn validate(&self) -> Result<(), RNodeConfigValidationError> {
+        validate_integer_range(
+            RNodeConfigField::Frequency,
+            self.frequency,
+            RNODE_FREQUENCY_MIN_HZ,
+            RNODE_FREQUENCY_MAX_HZ,
+        )?;
+        validate_integer_range(
+            RNodeConfigField::Bandwidth,
+            self.bandwidth,
+            RNODE_BANDWIDTH_MIN_HZ,
+            RNODE_BANDWIDTH_MAX_HZ,
+        )?;
+        validate_integer_range(
+            RNodeConfigField::SpreadingFactor,
+            self.spreading_factor,
+            RNODE_SPREADING_FACTOR_MIN,
+            RNODE_SPREADING_FACTOR_MAX,
+        )?;
+        validate_integer_range(
+            RNodeConfigField::CodingRate,
+            self.coding_rate,
+            RNODE_CODING_RATE_MIN,
+            RNODE_CODING_RATE_MAX,
+        )?;
+        validate_integer_range(
+            RNodeConfigField::TxPower,
+            self.tx_power,
+            RNODE_TX_POWER_MIN_DBM,
+            RNODE_TX_POWER_MAX_DBM,
+        )?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RNodeConfig {
     pub name: String,
@@ -2101,7 +2173,8 @@ impl std::fmt::Display for RNodeConfigField {
     }
 }
 
-/// Typed failure returned by [`RNodeConfig::validate`].
+/// Typed failure returned by [`RNodeRadioSettings::validate`] and
+/// [`RNodeConfig::validate`].
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum RNodeConfigValidationError {
     #[error("{value} is outside {minimum}..={maximum}")]
@@ -2150,39 +2223,22 @@ impl RNodeConfig {
     /// Validate all generic RNode RF and airtime settings without touching the
     /// configured endpoint. These bounds match upstream RNodeInterface 1.4.
     pub fn validate(&self) -> Result<(), RNodeConfigValidationError> {
-        validate_integer_range(
-            RNodeConfigField::Frequency,
-            self.frequency,
-            RNODE_FREQUENCY_MIN_HZ,
-            RNODE_FREQUENCY_MAX_HZ,
-        )?;
-        validate_integer_range(
-            RNodeConfigField::Bandwidth,
-            self.bandwidth,
-            RNODE_BANDWIDTH_MIN_HZ,
-            RNODE_BANDWIDTH_MAX_HZ,
-        )?;
-        validate_integer_range(
-            RNodeConfigField::SpreadingFactor,
-            self.spreading_factor,
-            RNODE_SPREADING_FACTOR_MIN,
-            RNODE_SPREADING_FACTOR_MAX,
-        )?;
-        validate_integer_range(
-            RNodeConfigField::CodingRate,
-            self.coding_rate,
-            RNODE_CODING_RATE_MIN,
-            RNODE_CODING_RATE_MAX,
-        )?;
-        validate_integer_range(
-            RNodeConfigField::TxPower,
-            self.tx_power,
-            RNODE_TX_POWER_MIN_DBM,
-            RNODE_TX_POWER_MAX_DBM,
-        )?;
+        RNodeRadioSettings::from(self).validate()?;
         validate_airtime(RNodeConfigField::ShortTermAirtime, self.st_alock)?;
         validate_airtime(RNodeConfigField::LongTermAirtime, self.lt_alock)?;
         Ok(())
+    }
+}
+
+impl From<&RNodeConfig> for RNodeRadioSettings {
+    fn from(config: &RNodeConfig) -> Self {
+        Self::new(
+            config.frequency,
+            config.bandwidth,
+            config.spreading_factor,
+            config.coding_rate,
+            config.tx_power,
+        )
     }
 }
 
@@ -2274,24 +2330,44 @@ pub fn build_airtime_sequence(config: &RNodeConfig) -> Vec<u8> {
     out
 }
 
-fn u32_to_bytes(val: u32) -> [u8; 4] {
-    val.to_be_bytes()
+fn u32_to_bytes(value: u32) -> [u8; 4] {
+    value.to_be_bytes()
+}
+
+/// Build the reviewed generic RNode radio-configuration command sequence.
+///
+/// The returned bytes contain exactly these extended-KISS commands, in order:
+/// radio off, frequency, bandwidth, spreading factor, coding rate, transmit
+/// power, and radio on. The helper performs no endpoint I/O. Call
+/// [`RNodeRadioSettings::validate`] before sending settings obtained from an
+/// untrusted source.
+pub fn build_radio_configuration_sequence(settings: &RNodeRadioSettings) -> Vec<u8> {
+    build_radio_configuration_sequence_before_on(settings, &[])
+}
+
+fn build_radio_configuration_sequence_before_on(
+    settings: &RNodeRadioSettings,
+    before_radio_on: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + before_radio_on.len());
+    kiss::frame_with_command_into(CMD_RADIO_STATE, &[RADIO_STATE_OFF], &mut out);
+    kiss::frame_with_command_into(CMD_FREQUENCY, &u32_to_bytes(settings.frequency), &mut out);
+    kiss::frame_with_command_into(CMD_BANDWIDTH, &u32_to_bytes(settings.bandwidth), &mut out);
+    kiss::frame_with_command_into(CMD_SF, &[settings.spreading_factor], &mut out);
+    kiss::frame_with_command_into(CMD_CR, &[settings.coding_rate], &mut out);
+    kiss::frame_with_command_into(CMD_TXPOWER, &[settings.tx_power], &mut out);
+    out.extend_from_slice(before_radio_on);
+    kiss::frame_with_command_into(CMD_RADIO_STATE, &[RADIO_STATE_ON], &mut out);
+    out
 }
 
 /// KISS init sequence. Order matters: turn the radio off first so persisted
 /// TNC startup profiles cannot keep old parameters active, airtime locks
 /// precede RADIO_STATE=ON, and RADIO_STATE=ON must be last.
 pub fn build_init_sequence(config: &RNodeConfig) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64);
-    kiss::frame_with_command_into(CMD_RADIO_STATE, &[RADIO_STATE_OFF], &mut out);
-    kiss::frame_with_command_into(CMD_FREQUENCY, &u32_to_bytes(config.frequency), &mut out);
-    kiss::frame_with_command_into(CMD_BANDWIDTH, &u32_to_bytes(config.bandwidth), &mut out);
-    kiss::frame_with_command_into(CMD_SF, &[config.spreading_factor], &mut out);
-    kiss::frame_with_command_into(CMD_CR, &[config.coding_rate], &mut out);
-    kiss::frame_with_command_into(CMD_TXPOWER, &[config.tx_power], &mut out);
-    out.extend_from_slice(&build_airtime_sequence(config));
-    kiss::frame_with_command_into(CMD_RADIO_STATE, &[RADIO_STATE_ON], &mut out);
-    out
+    let settings = RNodeRadioSettings::from(config);
+    let airtime = build_airtime_sequence(config);
+    build_radio_configuration_sequence_before_on(&settings, &airtime)
 }
 
 /// KISS sequence for returning an RNode radio to idle before disconnecting.
@@ -3148,6 +3224,86 @@ mod tests {
         assert_eq!(error.field(), expected, "{error}");
     }
 
+    fn assert_invalid_radio_settings_field(
+        settings: &RNodeRadioSettings,
+        expected: RNodeConfigField,
+    ) {
+        let error = settings.validate().expect_err("radio settings must fail");
+        assert_eq!(error.field(), expected, "{error}");
+    }
+
+    #[test]
+    fn test_rnode_radio_settings_validation_accepts_inclusive_boundaries() {
+        assert!(
+            RNodeRadioSettings::new(
+                RNODE_FREQUENCY_MIN_HZ,
+                RNODE_BANDWIDTH_MIN_HZ,
+                RNODE_SPREADING_FACTOR_MIN,
+                RNODE_CODING_RATE_MIN,
+                RNODE_TX_POWER_MIN_DBM,
+            )
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            RNodeRadioSettings::new(
+                RNODE_FREQUENCY_MAX_HZ,
+                RNODE_BANDWIDTH_MAX_HZ,
+                RNODE_SPREADING_FACTOR_MAX,
+                RNODE_CODING_RATE_MAX,
+                RNODE_TX_POWER_MAX_DBM,
+            )
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_rnode_radio_settings_validation_rejects_each_outside_boundary() {
+        let valid = RNodeRadioSettings::new(868_000_000, 125_000, 7, 5, 14);
+
+        for frequency in [RNODE_FREQUENCY_MIN_HZ - 1, RNODE_FREQUENCY_MAX_HZ + 1] {
+            assert_invalid_radio_settings_field(
+                &RNodeRadioSettings { frequency, ..valid },
+                RNodeConfigField::Frequency,
+            );
+        }
+        for bandwidth in [RNODE_BANDWIDTH_MIN_HZ - 1, RNODE_BANDWIDTH_MAX_HZ + 1] {
+            assert_invalid_radio_settings_field(
+                &RNodeRadioSettings { bandwidth, ..valid },
+                RNodeConfigField::Bandwidth,
+            );
+        }
+        for spreading_factor in [
+            RNODE_SPREADING_FACTOR_MIN - 1,
+            RNODE_SPREADING_FACTOR_MAX + 1,
+        ] {
+            assert_invalid_radio_settings_field(
+                &RNodeRadioSettings {
+                    spreading_factor,
+                    ..valid
+                },
+                RNodeConfigField::SpreadingFactor,
+            );
+        }
+        for coding_rate in [RNODE_CODING_RATE_MIN - 1, RNODE_CODING_RATE_MAX + 1] {
+            assert_invalid_radio_settings_field(
+                &RNodeRadioSettings {
+                    coding_rate,
+                    ..valid
+                },
+                RNodeConfigField::CodingRate,
+            );
+        }
+        assert_invalid_radio_settings_field(
+            &RNodeRadioSettings {
+                tx_power: RNODE_TX_POWER_MAX_DBM + 1,
+                ..valid
+            },
+            RNodeConfigField::TxPower,
+        );
+    }
+
     #[test]
     fn test_rnode_config_validation_accepts_all_inclusive_boundaries() {
         let mut config = RNodeConfig::new("rnode0", "/dev/ttyACM0");
@@ -3281,12 +3437,46 @@ mod tests {
         let seq = build_init_sequence(&cfg);
         assert!(!seq.is_empty());
         assert_eq!(seq[0], kiss::FEND);
+        assert_eq!(
+            seq,
+            build_radio_configuration_sequence(&RNodeRadioSettings::from(&cfg)),
+            "runtime init without airtime limits must preserve the public radio sequence"
+        );
 
         let mut deframer = kiss::RawKissDeframer::new();
         let frames = deframer.feed(&seq);
-        assert_eq!(frames.len(), 7);
-        assert_eq!(frames[0], (CMD_RADIO_STATE, vec![RADIO_STATE_OFF]));
-        assert_eq!(frames[6], (CMD_RADIO_STATE, vec![RADIO_STATE_ON]));
+        assert_eq!(
+            frames,
+            vec![
+                (CMD_RADIO_STATE, vec![RADIO_STATE_OFF]),
+                (CMD_FREQUENCY, cfg.frequency.to_be_bytes().to_vec()),
+                (CMD_BANDWIDTH, cfg.bandwidth.to_be_bytes().to_vec()),
+                (CMD_SF, vec![cfg.spreading_factor]),
+                (CMD_CR, vec![cfg.coding_rate]),
+                (CMD_TXPOWER, vec![cfg.tx_power]),
+                (CMD_RADIO_STATE, vec![RADIO_STATE_ON]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_radio_configuration_sequence_has_exact_reviewed_order_and_payloads() {
+        let settings = RNodeRadioSettings::new(915_000_000, 250_000, 10, 8, 22);
+        let sequence = build_radio_configuration_sequence(&settings);
+
+        let mut deframer = kiss::RawKissDeframer::new();
+        assert_eq!(
+            deframer.feed(&sequence),
+            vec![
+                (CMD_RADIO_STATE, vec![RADIO_STATE_OFF]),
+                (CMD_FREQUENCY, settings.frequency.to_be_bytes().to_vec()),
+                (CMD_BANDWIDTH, settings.bandwidth.to_be_bytes().to_vec()),
+                (CMD_SF, vec![settings.spreading_factor]),
+                (CMD_CR, vec![settings.coding_rate]),
+                (CMD_TXPOWER, vec![settings.tx_power]),
+                (CMD_RADIO_STATE, vec![RADIO_STATE_ON]),
+            ]
+        );
     }
 
     /// Byte-exact vs Python `setSTALock`/`setLTALock` (RNodeInterface.py:612-630):
@@ -3329,11 +3519,22 @@ mod tests {
         let mut deframer = kiss::RawKissDeframer::new();
         let frames = deframer.feed(&seq);
         let cmds: Vec<u8> = frames.iter().map(|(c, _)| *c).collect();
-        assert_eq!(frames[0], (CMD_RADIO_STATE, vec![RADIO_STATE_OFF]));
         assert_eq!(
-            frames.last().unwrap(),
-            &(CMD_RADIO_STATE, vec![RADIO_STATE_ON])
+            cmds,
+            vec![
+                CMD_RADIO_STATE,
+                CMD_FREQUENCY,
+                CMD_BANDWIDTH,
+                CMD_SF,
+                CMD_CR,
+                CMD_TXPOWER,
+                CMD_ST_ALOCK,
+                CMD_LT_ALOCK,
+                CMD_RADIO_STATE,
+            ]
         );
+        assert_eq!(frames[0].1, vec![RADIO_STATE_OFF]);
+        assert_eq!(frames.last().unwrap().1, vec![RADIO_STATE_ON]);
         assert_eq!(
             cmds.iter().filter(|&&cmd| cmd == CMD_ST_ALOCK).count(),
             1,

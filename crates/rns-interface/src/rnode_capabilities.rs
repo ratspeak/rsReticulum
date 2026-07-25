@@ -205,7 +205,9 @@ pub const fn rnode_product_name(product_code: u8) -> Option<&'static str> {
 ///
 /// Unknown, ambiguous, and quarantined model codes return
 /// [`RNodeRadioCapabilities::Unknown`]. In particular, EEPROM aliases are not
-/// normalised by this lookup.
+/// normalised by this lookup. Model codes `0xA6`, `0xAA`, and `0xC8` remain
+/// quarantined because the trusted Rust sources do not establish a single,
+/// internally consistent numeric capability profile for them.
 pub fn rnode_model_capabilities(model_code: u8) -> RNodeRadioCapabilities {
     KNOWN_RADIOS
         .iter()
@@ -228,10 +230,10 @@ const fn known(
     }
 }
 
-// Numeric profiles copied from the existing rns-tools RNode model table.
-// Firmware filenames and human labels intentionally do not cross this lower
-// boundary. Models with aliases, contradictory ranges, or explicitly unknown
-// limits are absent and therefore resolve to Unknown.
+// Reviewed numeric profiles owned by this lower-core module. Firmware
+// filenames and human labels intentionally do not cross this boundary.
+// Models with aliases, contradictory ranges, ambiguous evidence, or explicitly
+// unknown limits are absent and therefore resolve to Unknown.
 const KNOWN_RADIOS: &[(u8, RNodeKnownRadioCapabilities)] = &[
     (
         0xA4,
@@ -246,16 +248,8 @@ const KNOWN_RADIOS: &[(u8, RNodeKnownRadioCapabilities)] = &[
         known(RNodeRadioFamily::Sx1268, 410_000_000, 525_000_000, 22),
     ),
     (
-        0xA6,
-        known(RNodeRadioFamily::Sx1262, 820_000_000, 1_020_000_000, 22),
-    ),
-    (
         0xA5,
         known(RNodeRadioFamily::Sx1278, 410_000_000, 525_000_000, 17),
-    ),
-    (
-        0xAA,
-        known(RNodeRadioFamily::Sx1276, 820_000_000, 1_020_000_000, 17),
     ),
     (
         0xAC,
@@ -316,10 +310,6 @@ const KNOWN_RADIOS: &[(u8, RNodeKnownRadioCapabilities)] = &[
     (
         0xCA,
         known(RNodeRadioFamily::Sx1262, 850_000_000, 950_000_000, 22),
-    ),
-    (
-        0xC8,
-        known(RNodeRadioFamily::Sx1262, 860_000_000, 930_000_000, 28),
     ),
     (
         0xC6,
@@ -415,6 +405,7 @@ mod tests {
     use super::*;
 
     const PRODUCT: u8 = 0x03;
+    const QUARANTINED_MODELS: &[u8] = &[0x04, 0x09, 0x16, 0xA6, 0xAA, 0xC8, 0xFE, 0xFF];
 
     fn image(model: u8) -> [u8; REQUIRED_EEPROM_LEN] {
         let mut bytes = [0xA5; REQUIRED_EEPROM_LEN];
@@ -564,7 +555,7 @@ mod tests {
 
     #[test]
     fn unknown_and_quarantined_models_never_invent_limits() {
-        for model in [0x00, 0x04, 0x09, 0x16, 0xFE, 0xFF] {
+        for model in std::iter::once(0x00).chain(QUARANTINED_MODELS.iter().copied()) {
             let parsed = parse_rnode_capabilities(&image(model)).expect("valid identity image");
             assert_eq!(parsed.model_code(), model);
             assert_eq!(
@@ -587,7 +578,7 @@ mod tests {
             ))
         );
 
-        for model in [0x00, 0x04, 0x09, 0x16, 0xFE, 0xFF] {
+        for model in std::iter::once(0x00).chain(QUARANTINED_MODELS.iter().copied()) {
             assert_eq!(
                 rnode_model_capabilities(model),
                 RNodeRadioCapabilities::Unknown,
@@ -618,11 +609,11 @@ mod tests {
 
     #[test]
     fn known_model_table_is_unique_valid_and_excludes_quarantine() {
-        assert_eq!(KNOWN_RADIOS.len(), 40);
+        assert_eq!(KNOWN_RADIOS.len(), 37);
 
         for (index, (model, profile)) in KNOWN_RADIOS.iter().enumerate() {
             assert!(
-                ![0x04, 0x09, 0x16, 0xFE, 0xFF].contains(model),
+                !QUARANTINED_MODELS.contains(model),
                 "quarantined model {model:#04x} entered the known table"
             );
             assert!(
