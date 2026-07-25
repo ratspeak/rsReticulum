@@ -5,6 +5,8 @@
 
 #[cfg(target_os = "android")]
 pub mod android_usb;
+#[cfg(any(target_os = "android", test))]
+mod android_usb_lifecycle;
 pub mod auto;
 pub mod ax25kiss;
 pub mod backbone;

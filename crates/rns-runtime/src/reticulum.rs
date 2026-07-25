@@ -4625,8 +4625,15 @@ pub async fn spawn_android_usb_rnode_runtime(
 
 #[cfg(target_os = "android")]
 pub async fn teardown_android_usb_rnode_interface(handle: &ReticulumHandle, id: u64) {
-    rns_interface::android_usb::stop_android_usb_rnode_interface(id);
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    if let Err(error) =
+        rns_interface::android_usb::stop_android_usb_rnode_interface_and_wait(id).await
+    {
+        tracing::warn!(
+            id,
+            error = %error,
+            "Android USB owner shutdown completed with errors"
+        );
+    }
     teardown_interface(handle, id).await;
 }
 
