@@ -4,6 +4,7 @@
 //! interfaces and exposes no IPC. Python: `RNS/Reticulum.py`.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -19,7 +20,7 @@ use crate::interface_factory;
 use crate::interface_registry::{
     DrainStart, ExactShutdownStart, InterfaceKind, InterfaceRegistration,
     InterfaceRegistrationRejection, InterfaceRegistry, InterfaceShutdown,
-    InterfaceShutdownStrategy, InterfaceSpawnPermit, ShutdownStart,
+    InterfaceShutdownStrategy, InterfaceSpawnPermit, RNodeObservationLookupError, ShutdownStart,
 };
 use crate::jobs::{Job, JobScheduler};
 use crate::lifecycle::ShutdownSignal;
@@ -471,6 +472,153 @@ pub struct InterfaceStats {
     pub rss_bytes: Option<u64>,
 }
 
+/// Observation-only capability for one exact runtime-owned RNode driver.
+///
+/// The subscription is cloned from the active registry record once and never
+/// resolves the interface ID again. It therefore cannot follow a later
+/// same-ID replacement and carries no shutdown or configuration authority.
+#[derive(Clone, Debug)]
+pub struct RNodeRuntimeObserver {
+    interface_id: rns_interface::traits::InterfaceId,
+    state: rns_interface::rnode::RNodeDriverSubscription,
+}
+
+impl RNodeRuntimeObserver {
+    /// Runtime-local interface ID associated with this exact observation.
+    pub fn interface_id(&self) -> rns_interface::traits::InterfaceId {
+        self.interface_id
+    }
+
+    /// Return the latest privacy-safe snapshot without waiting.
+    pub fn snapshot(&self) -> Arc<rns_interface::rnode::RNodeRuntimeSnapshot> {
+        self.state.snapshot()
+    }
+
+    /// Wait up to `timeout` for complete protocol readiness.
+    ///
+    /// One absolute deadline spans reconnects. Dropping this future has no
+    /// effect on the driver or registry.
+    pub async fn await_ready(
+        &self,
+        timeout: Duration,
+    ) -> Result<Arc<rns_interface::rnode::RNodeRuntimeSnapshot>, RNodeReadinessError> {
+        let deadline = tokio::time::Instant::now().checked_add(timeout);
+        let mut state = self.state.clone();
+        loop {
+            let snapshot = state.snapshot();
+            if let Some(result) = rnode_readiness_result(snapshot) {
+                return result;
+            }
+
+            let Some(changed) = await_before_rnode_deadline(deadline, state.changed()).await else {
+                // Once the absolute deadline wins, a concurrent late Ready
+                // publication remains visible in `last` but cannot turn this
+                // bounded wait into success.
+                return Err(RNodeReadinessError::Timeout {
+                    last: state.snapshot(),
+                });
+            };
+            if changed.is_none() {
+                let last = state.snapshot();
+                if let Some(result) = rnode_readiness_result(last.clone()) {
+                    return result;
+                }
+                return Err(RNodeReadinessError::ObservationClosed { last });
+            }
+        }
+    }
+}
+
+async fn await_before_rnode_deadline<F>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> Option<F::Output>
+where
+    F: Future,
+{
+    match deadline {
+        Some(deadline) => {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => None,
+                output = future => Some(output),
+            }
+        }
+        None => Some(future.await),
+    }
+}
+
+fn rnode_readiness_result(
+    snapshot: Arc<rns_interface::rnode::RNodeRuntimeSnapshot>,
+) -> Option<Result<Arc<rns_interface::rnode::RNodeRuntimeSnapshot>, RNodeReadinessError>> {
+    use rns_interface::rnode::RNodeRuntimePhase;
+
+    match snapshot.phase {
+        RNodeRuntimePhase::Ready if snapshot.connection_generation != 0 => Some(Ok(snapshot)),
+        RNodeRuntimePhase::ShuttingDown => {
+            Some(Err(RNodeReadinessError::ShuttingDown { last: snapshot }))
+        }
+        RNodeRuntimePhase::Stopped => Some(Err(RNodeReadinessError::Stopped { last: snapshot })),
+        _ => None,
+    }
+}
+
+/// Failure to acquire an observation of the current runtime-owned RNode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RNodeRuntimeLookupError {
+    #[error("interface {interface_id} is not owned by this shared-instance client")]
+    NotOwned {
+        interface_id: rns_interface::traits::InterfaceId,
+    },
+    #[error("interface {interface_id} is not registered")]
+    NotFound {
+        interface_id: rns_interface::traits::InterfaceId,
+    },
+    #[error("interface {interface_id} is not an observable RNode")]
+    NotRNode {
+        interface_id: rns_interface::traits::InterfaceId,
+    },
+    #[error("RNode interface {interface_id} is not active")]
+    NotActive {
+        interface_id: rns_interface::traits::InterfaceId,
+    },
+}
+
+/// Terminal outcome while waiting for one exact RNode to become ready.
+#[derive(Clone, Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RNodeReadinessError {
+    #[error("RNode readiness timed out")]
+    Timeout {
+        last: Arc<rns_interface::rnode::RNodeRuntimeSnapshot>,
+    },
+    #[error("RNode began shutting down before becoming ready")]
+    ShuttingDown {
+        last: Arc<rns_interface::rnode::RNodeRuntimeSnapshot>,
+    },
+    #[error("RNode stopped before becoming ready")]
+    Stopped {
+        last: Arc<rns_interface::rnode::RNodeRuntimeSnapshot>,
+    },
+    #[error("RNode observation closed before readiness concluded")]
+    ObservationClosed {
+        last: Arc<rns_interface::rnode::RNodeRuntimeSnapshot>,
+    },
+}
+
+impl RNodeReadinessError {
+    /// Latest privacy-safe state associated with the terminal outcome.
+    pub fn last_snapshot(&self) -> Arc<rns_interface::rnode::RNodeRuntimeSnapshot> {
+        match self {
+            Self::Timeout { last }
+            | Self::ShuttingDown { last }
+            | Self::Stopped { last }
+            | Self::ObservationClosed { last } => last.clone(),
+        }
+    }
+}
+
 /// Options for [`ReticulumHandle::send_to`].
 #[derive(Debug, Clone)]
 pub struct SendOptions {
@@ -834,6 +982,38 @@ impl ReticulumHandle {
 
     pub fn remote_management_enabled(&self) -> bool {
         self.config.enable_remote_management
+    }
+
+    /// Observe the current exact RNode registered under `interface_id`.
+    ///
+    /// Shared-instance clients do not own physical interfaces and fail
+    /// closed. The returned observer remains bound to this registry record
+    /// even if the numeric ID is later reused.
+    pub fn rnode_runtime(
+        &self,
+        interface_id: rns_interface::traits::InterfaceId,
+    ) -> Result<RNodeRuntimeObserver, RNodeRuntimeLookupError> {
+        if self.instance_mode == InstanceMode::Client {
+            return Err(RNodeRuntimeLookupError::NotOwned { interface_id });
+        }
+        let state = self
+            .interface_registry
+            .observe_active_rnode(interface_id)
+            .map_err(|error| match error {
+                RNodeObservationLookupError::NotFound => {
+                    RNodeRuntimeLookupError::NotFound { interface_id }
+                }
+                RNodeObservationLookupError::NotRNode => {
+                    RNodeRuntimeLookupError::NotRNode { interface_id }
+                }
+                RNodeObservationLookupError::NotActive => {
+                    RNodeRuntimeLookupError::NotActive { interface_id }
+                }
+            })?;
+        Ok(RNodeRuntimeObserver {
+            interface_id,
+            state,
+        })
     }
 
     pub fn link_mtu_discovery(&self) -> bool {
@@ -6786,6 +6966,19 @@ mod tests {
         });
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn rnode_readiness_deadline_wins_a_tied_publication() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let publication = async {
+            tokio::time::sleep_until(deadline).await;
+            "late-ready"
+        };
+        assert_eq!(
+            await_before_rnode_deadline(Some(deadline), publication).await,
+            None
+        );
+    }
+
     #[tokio::test]
     async fn runtime_shutdown_is_single_cancellation_independent_and_persistence_ordered() {
         struct TaskDrop(Arc<AtomicBool>);
@@ -7214,13 +7407,60 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn rnode_runtime_lookup_is_local_and_classifies_missing_and_non_rnode_records() {
+        let id = 920_198;
+        let mut client = dummy_handle();
+        client.instance_mode = InstanceMode::Client;
+        assert!(matches!(
+            client.rnode_runtime(id),
+            Err(RNodeRuntimeLookupError::NotOwned {
+                interface_id
+            }) if interface_id == id
+        ));
+
+        let runtime = dummy_handle();
+        assert!(matches!(
+            runtime.rnode_runtime(id),
+            Err(RNodeRuntimeLookupError::NotFound {
+                interface_id
+            }) if interface_id == id
+        ));
+
+        let registration = runtime
+            .interface_registry
+            .reserve(
+                id,
+                InterfaceKind::Standard,
+                tokio::spawn(std::future::pending()),
+                None,
+            )
+            .expect("reserve standard interface");
+        assert!(registration.commit().is_ok(), "commit standard interface");
+        assert!(matches!(
+            runtime.rnode_runtime(id),
+            Err(RNodeRuntimeLookupError::NotRNode {
+                interface_id
+            }) if interface_id == id
+        ));
+
+        let ShutdownStart::Acquired(mut shutdown) = runtime.interface_registry.begin_shutdown(id)
+        else {
+            panic!("active standard interface must yield shutdown ownership");
+        };
+        shutdown.stop_task_and_wait().await;
+        shutdown.finish();
+    }
+
     #[cfg(feature = "rnode-tcp")]
-    fn test_rnode_tcp_peer() -> (
+    fn test_rnode_tcp_peer_with_responses(
+        responses: Vec<u8>,
+    ) -> (
         String,
         std::sync::mpsc::Receiver<Vec<u8>>,
         std::thread::JoinHandle<()>,
     ) {
-        use std::io::Read;
+        use std::io::{Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = format!("tcp://{}", listener.local_addr().unwrap());
@@ -7230,6 +7470,9 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
+            if !responses.is_empty() {
+                stream.write_all(&responses).unwrap();
+            }
             let mut observed = Vec::new();
             let mut buffer = [0u8; 512];
             loop {
@@ -7252,6 +7495,298 @@ mod tests {
             closed_tx.send(observed).unwrap();
         });
         (port, closed_rx, peer)
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    fn test_rnode_tcp_peer() -> (
+        String,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        test_rnode_tcp_peer_with_responses(Vec::new())
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    fn test_ready_rnode_tcp_peer(
+        settings: rns_interface::rnode::RNodeRadioSettings,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use rns_interface::{kiss, rnode};
+
+        let mut responses = Vec::new();
+        for (command, payload) in [
+            (rnode::CMD_DETECT, vec![rnode::DETECT_RESP]),
+            (
+                rnode::CMD_FW_VERSION,
+                vec![rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+            ),
+            (
+                rnode::CMD_FREQUENCY,
+                settings.frequency.to_be_bytes().to_vec(),
+            ),
+            (
+                rnode::CMD_BANDWIDTH,
+                settings.bandwidth.to_be_bytes().to_vec(),
+            ),
+            (rnode::CMD_SF, vec![settings.spreading_factor]),
+            (rnode::CMD_CR, vec![settings.coding_rate]),
+            (rnode::CMD_TXPOWER, vec![settings.tx_power]),
+            (rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_ON]),
+        ] {
+            kiss::frame_with_command_into(command, &payload, &mut responses);
+        }
+        test_rnode_tcp_peer_with_responses(responses)
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn rnode_runtime_observer_waits_for_exact_protocol_readiness_and_terminal_stop() {
+        let id = 920_199;
+        let template =
+            rns_interface::rnode::RNodeConfig::new("ready-observer-template", "tcp://127.0.0.1:1");
+        let settings = rns_interface::rnode::RNodeRadioSettings::from(&template);
+        let (port, closed_rx, peer) = test_ready_rnode_tcp_peer(settings);
+        let config = rns_interface::rnode::RNodeConfig::new("ready-observer", &port);
+        assert_eq!(
+            rns_interface::rnode::RNodeRadioSettings::from(&config),
+            settings
+        );
+
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registry = InterfaceRegistry::default();
+        let spawned = rns_interface::rnode::spawn_rnode_interface_with_driver(
+            config,
+            id,
+            transport_tx.clone(),
+        )
+        .await
+        .expect("spawn ready observed RNode");
+        register_observed_rnode_handle_with_kind(
+            &transport_tx,
+            spawned,
+            &controls,
+            &registry,
+            InterfaceKind::RNode,
+        )
+        .await
+        .expect("register ready observed RNode");
+
+        let mut runtime = dummy_handle();
+        runtime.transport_tx = transport_tx;
+        runtime.interface_controls = controls;
+        runtime.interface_registry = registry;
+        let observer = runtime.rnode_runtime(id).expect("active RNode observer");
+        assert_eq!(observer.interface_id(), id);
+        let ready = observer
+            .await_ready(Duration::from_secs(2))
+            .await
+            .expect("RNode protocol readiness");
+        assert_eq!(ready.phase, rns_interface::rnode::RNodeRuntimePhase::Ready);
+        assert_ne!(ready.connection_generation, 0);
+        assert!(
+            observer.await_ready(Duration::ZERO).await.is_ok(),
+            "an already-ready exact observer must return without waiting"
+        );
+
+        teardown_interface(&runtime, id).await;
+        let stopped = observer
+            .await_ready(Duration::from_secs(1))
+            .await
+            .expect_err("stopped RNode cannot become ready");
+        assert!(matches!(stopped, RNodeReadinessError::Stopped { .. }));
+        assert_eq!(
+            stopped.last_snapshot().phase,
+            rns_interface::rnode::RNodeRuntimePhase::Stopped
+        );
+
+        let observed = closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("exact teardown did not close ready RNode peer");
+        assert!(observed.ends_with(&rns_interface::rnode::build_detach_sequence()));
+        peer.join().unwrap();
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn rnode_runtime_wait_timeout_and_cancellation_are_observation_only() {
+        let id = 920_200;
+        let (port, closed_rx, peer) = test_rnode_tcp_peer();
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registry = InterfaceRegistry::default();
+        let spawned = rns_interface::rnode::spawn_rnode_interface_with_driver(
+            rns_interface::rnode::RNodeConfig::new("waiting-observer", &port),
+            id,
+            transport_tx.clone(),
+        )
+        .await
+        .expect("spawn waiting observed RNode");
+        register_observed_rnode_handle_with_kind(
+            &transport_tx,
+            spawned,
+            &controls,
+            &registry,
+            InterfaceKind::RNode,
+        )
+        .await
+        .expect("register waiting observed RNode");
+
+        let mut runtime = dummy_handle();
+        runtime.transport_tx = transport_tx;
+        runtime.interface_controls = controls;
+        runtime.interface_registry = registry;
+        let observer = runtime
+            .rnode_runtime(id)
+            .expect("active waiting RNode observer");
+
+        let timeout = observer
+            .await_ready(Duration::from_millis(50))
+            .await
+            .expect_err("incomplete protocol evidence must time out");
+        assert!(matches!(timeout, RNodeReadinessError::Timeout { .. }));
+        assert_ne!(
+            timeout.last_snapshot().phase,
+            rns_interface::rnode::RNodeRuntimePhase::Ready
+        );
+
+        let cancelled_observer = observer.clone();
+        let waiter = tokio::spawn(async move {
+            cancelled_observer
+                .await_ready(Duration::from_secs(30))
+                .await
+        });
+        tokio::task::yield_now().await;
+        waiter.abort();
+        let _ = waiter.await;
+        assert!(
+            runtime.rnode_runtime(id).is_ok(),
+            "cancelling a readiness waiter must not mutate registry ownership"
+        );
+        assert!(!matches!(
+            observer.snapshot().phase,
+            rns_interface::rnode::RNodeRuntimePhase::ShuttingDown
+                | rns_interface::rnode::RNodeRuntimePhase::Stopped
+        ));
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                observer.await_ready(Duration::MAX),
+            )
+            .await
+            .is_err(),
+            "an overflowing public timeout must remain pending instead of panicking"
+        );
+
+        teardown_interface(&runtime, id).await;
+        let observed = closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("exact teardown did not close waiting RNode peer");
+        assert!(observed.ends_with(&rns_interface::rnode::build_detach_sequence()));
+        peer.join().unwrap();
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn rnode_runtime_observer_never_follows_same_id_replacement() {
+        let id = 920_201;
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registry = InterfaceRegistry::default();
+        let mut runtime = dummy_handle();
+        runtime.transport_tx = transport_tx.clone();
+        runtime.interface_controls = controls.clone();
+        runtime.interface_registry = registry.clone();
+
+        let (first_port, first_closed_rx, first_peer) = test_rnode_tcp_peer();
+        let first = rns_interface::rnode::spawn_rnode_interface_with_driver(
+            rns_interface::rnode::RNodeConfig::new("observer-owner-a", &first_port),
+            id,
+            transport_tx.clone(),
+        )
+        .await
+        .expect("spawn first RNode owner");
+        register_observed_rnode_handle_with_kind(
+            &transport_tx,
+            first,
+            &controls,
+            &registry,
+            InterfaceKind::RNode,
+        )
+        .await
+        .expect("register first RNode owner");
+        let first_observer = runtime
+            .rnode_runtime(id)
+            .expect("observe first RNode owner");
+
+        teardown_interface(&runtime, id).await;
+        let first_terminal = first_observer
+            .await_ready(Duration::from_secs(1))
+            .await
+            .expect_err("retired first owner cannot become ready");
+        assert!(matches!(
+            first_terminal,
+            RNodeReadinessError::Stopped { .. }
+        ));
+        let first_closed = first_closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first RNode owner did not close");
+        assert!(first_closed.ends_with(&rns_interface::rnode::build_detach_sequence()));
+        first_peer.join().unwrap();
+
+        let template = rns_interface::rnode::RNodeConfig::new(
+            "observer-owner-b-template",
+            "tcp://127.0.0.1:1",
+        );
+        let settings = rns_interface::rnode::RNodeRadioSettings::from(&template);
+        let (second_port, second_closed_rx, second_peer) = test_ready_rnode_tcp_peer(settings);
+        let second = rns_interface::rnode::spawn_rnode_interface_with_driver(
+            rns_interface::rnode::RNodeConfig::new("observer-owner-b", &second_port),
+            id,
+            transport_tx.clone(),
+        )
+        .await
+        .expect("spawn replacement RNode owner");
+        register_observed_rnode_handle_with_kind(
+            &transport_tx,
+            second,
+            &controls,
+            &registry,
+            InterfaceKind::RNode,
+        )
+        .await
+        .expect("register replacement RNode owner");
+        let second_observer = runtime
+            .rnode_runtime(id)
+            .expect("observe replacement RNode owner");
+        let second_ready = second_observer
+            .await_ready(Duration::from_secs(2))
+            .await
+            .expect("replacement RNode readiness");
+        assert_eq!(
+            second_ready.phase,
+            rns_interface::rnode::RNodeRuntimePhase::Ready
+        );
+        assert_eq!(
+            first_observer.snapshot().phase,
+            rns_interface::rnode::RNodeRuntimePhase::Stopped,
+            "the retired observer must remain bound to owner A"
+        );
+        assert!(matches!(
+            first_observer.await_ready(Duration::ZERO).await,
+            Err(RNodeReadinessError::Stopped { .. })
+        ));
+
+        teardown_interface(&runtime, id).await;
+        let second_closed = second_closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("replacement RNode owner did not close");
+        assert!(second_closed.ends_with(&rns_interface::rnode::build_detach_sequence()));
+        second_peer.join().unwrap();
     }
 
     #[cfg(feature = "rnode-tcp")]

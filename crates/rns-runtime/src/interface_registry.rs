@@ -74,6 +74,15 @@ pub(crate) enum InterfaceRegistrationRejection {
     Closed,
 }
 
+/// Closed, registry-local failures for exact RNode observation lookup.
+#[allow(clippy::enum_variant_names)] // The shared API contract uses these exact classifications.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RNodeObservationLookupError {
+    NotFound,
+    NotRNode,
+    NotActive,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct InterfaceRegistry {
     inner: Arc<RegistryInner>,
@@ -172,6 +181,37 @@ impl InterfaceRegistry {
             .expect("interface registry mutex poisoned")
             .admission
             == RegistryAdmission::Open
+    }
+
+    /// Subscribe to one active exact RNode without transferring lifecycle
+    /// ownership or exposing its shutdown handle.
+    pub(crate) fn observe_active_rnode(
+        &self,
+        id: u64,
+    ) -> Result<rns_interface::rnode::RNodeDriverSubscription, RNodeObservationLookupError> {
+        let subscription = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .expect("interface registry mutex poisoned");
+            let record = state
+                .records
+                .get(&id)
+                .ok_or(RNodeObservationLookupError::NotFound)?;
+            if !record.kind.requires_exact_driver() {
+                return Err(RNodeObservationLookupError::NotRNode);
+            }
+            if record.state != RecordState::Active {
+                return Err(RNodeObservationLookupError::NotActive);
+            }
+            record
+                .driver
+                .as_ref()
+                .ok_or(RNodeObservationLookupError::NotActive)?
+                .watch()
+        };
+        Ok(subscription)
     }
 
     /// Acquire lifecycle ownership before beginning a physical interface
@@ -1057,6 +1097,161 @@ mod tests {
 
     fn pending_task() -> JoinHandle<()> {
         tokio::spawn(std::future::pending())
+    }
+
+    fn assert_registry_mutex_is_available(registry: &InterfaceRegistry) {
+        let state = registry
+            .inner
+            .state
+            .try_lock()
+            .expect("observation lookup must release the registry mutex");
+        drop(state);
+    }
+
+    async fn assert_non_rnode_kind_is_rejected(kind: InterfaceKind, id: u64) {
+        let registry = InterfaceRegistry::default();
+        assert!(matches!(
+            registry.observe_active_rnode(id),
+            Err(RNodeObservationLookupError::NotFound)
+        ));
+        assert_registry_mutex_is_available(&registry);
+
+        let registration = registry
+            .reserve(id, kind, pending_task(), None)
+            .expect("non-RNode reservation");
+        assert!(matches!(
+            registry.observe_active_rnode(id),
+            Err(RNodeObservationLookupError::NotRNode)
+        ));
+        assert_registry_mutex_is_available(&registry);
+
+        assert!(registration.commit().is_ok(), "commit non-RNode record");
+        assert!(matches!(
+            registry.observe_active_rnode(id),
+            Err(RNodeObservationLookupError::NotRNode)
+        ));
+        assert_registry_mutex_is_available(&registry);
+
+        let ShutdownStart::Acquired(mut shutdown) = registry.begin_shutdown(id) else {
+            panic!("active non-RNode record must yield shutdown ownership");
+        };
+        assert!(matches!(
+            registry.observe_active_rnode(id),
+            Err(RNodeObservationLookupError::NotRNode)
+        ));
+        assert_registry_mutex_is_available(&registry);
+        shutdown.stop_task_and_wait().await;
+        shutdown.finish();
+    }
+
+    #[tokio::test]
+    async fn observation_lookup_rejects_missing_and_non_exact_kinds_without_holding_lock() {
+        assert_non_rnode_kind_is_rejected(InterfaceKind::Standard, 1_001).await;
+        #[cfg(feature = "serial")]
+        assert_non_rnode_kind_is_rejected(InterfaceKind::RNodeMulti, 1_002).await;
+        #[cfg(feature = "ble")]
+        assert_non_rnode_kind_is_rejected(InterfaceKind::BlePeer, 1_003).await;
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn observation_lookup_exposes_only_active_exact_rnode_and_releases_lock() {
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut buffer = [0_u8; 512];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        panic!("timed out waiting for exact RNode shutdown: {error}");
+                    }
+                    Err(error) => panic!("RNode peer read failed: {error}"),
+                }
+            }
+        });
+
+        let id = 1_005;
+        let (transport_tx, _transport_rx) = tokio::sync::mpsc::channel(4);
+        let spawned = rns_interface::rnode::spawn_rnode_interface_with_driver(
+            rns_interface::rnode::RNodeConfig::new("observed-rnode", &endpoint),
+            id,
+            transport_tx,
+        )
+        .await
+        .expect("spawn observed RNode");
+        let registry = InterfaceRegistry::default();
+        let registration = registry
+            .reserve(
+                id,
+                InterfaceKind::RNode,
+                spawned.interface.read_task,
+                Some(spawned.driver),
+            )
+            .expect("reserve observed RNode");
+
+        assert!(matches!(
+            registry.observe_active_rnode(id),
+            Err(RNodeObservationLookupError::NotActive)
+        ));
+        assert_registry_mutex_is_available(&registry);
+
+        assert!(registration.commit().is_ok(), "commit observed RNode");
+        let subscription = registry
+            .observe_active_rnode(id)
+            .expect("active exact RNode must be observable");
+        assert_eq!(
+            subscription.snapshot().transport,
+            rns_interface::rnode::RNodeTransportClass::Tcp
+        );
+        assert_registry_mutex_is_available(&registry);
+
+        let ShutdownStart::Acquired(mut shutdown) = registry.begin_shutdown(id) else {
+            panic!("active exact RNode must yield shutdown ownership");
+        };
+        assert!(matches!(
+            registry.observe_active_rnode(id),
+            Err(RNodeObservationLookupError::NotActive)
+        ));
+        assert_registry_mutex_is_available(&registry);
+
+        {
+            let mut state = registry.inner.state.lock().unwrap();
+            state.records.get_mut(&id).unwrap().state = RecordState::Abandoned;
+        }
+        assert!(matches!(
+            registry.observe_active_rnode(id),
+            Err(RNodeObservationLookupError::NotActive)
+        ));
+        assert_registry_mutex_is_available(&registry);
+
+        {
+            let mut state = registry.inner.state.lock().unwrap();
+            state.records.get_mut(&id).unwrap().state = RecordState::Active;
+        }
+        assert!(matches!(
+            registry.observe_active_rnode(id),
+            Err(RNodeObservationLookupError::NotActive)
+        ));
+        assert_registry_mutex_is_available(&registry);
+
+        shutdown.stop_task_and_wait().await;
+        shutdown.finish();
+        peer.join().unwrap();
     }
 
     #[tokio::test]

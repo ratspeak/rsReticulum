@@ -42,8 +42,9 @@ pub mod prelude {
     pub use crate::reticulum::{
         AnnounceSubscription, ControlError, InitOptions, InterfaceStats, LinkConnectError,
         LinkConnectOptions, OutboundPacket, PacketReceiptHandle, PacketReceiptStatus,
-        RecalledDestination, ReceiptError, ReticulumError, ReticulumHandle, SendError, SendOptions,
-        SendResult, init, init_with_options,
+        RNodeReadinessError, RNodeRuntimeLookupError, RNodeRuntimeObserver, RecalledDestination,
+        ReceiptError, ReticulumError, ReticulumHandle, SendError, SendOptions, SendResult, init,
+        init_with_options,
     };
     pub use rns_identity::destination::{
         AllowPolicy, DestType, Destination, DestinationPacketError, DestinationPacketOptions,
@@ -51,5 +52,10 @@ pub mod prelude {
     };
     pub use rns_identity::identity::Identity;
     pub use rns_identity::ratchet::PersistentRatchetRing;
+    pub use rns_interface::rnode::{
+        RNodeConfigurationState, RNodeDetectionState, RNodeFirmwareCompatibility,
+        RNodeObservedRadioState, RNodeRuntimePhase, RNodeRuntimeReason, RNodeRuntimeSnapshot,
+        RNodeTransmitFlowState, RNodeTransportClass,
+    };
     pub use rns_link::link::{CloseReason, ResourceStrategy};
 }
