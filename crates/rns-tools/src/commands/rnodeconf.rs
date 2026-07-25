@@ -12,7 +12,13 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{CommandFactory, Parser};
-use rns_interface::{kiss, rnode, rnode_admin};
+use rns_interface::{
+    kiss, rnode, rnode_admin,
+    rnode_capabilities::{
+        RNodeCapabilities, RNodeCapabilityParseError, RNodeKnownRadioCapabilities,
+        RNodeRadioCapabilities, RNodeRadioFamily, parse_rnode_capabilities, rnode_product_name,
+    },
+};
 use rns_tools::RS_RETICULUM_VERSION;
 
 // rnodeconf support is staged: safe inspection/config modules are compiled now,
@@ -528,36 +534,98 @@ fn print_responses(
 }
 
 fn eeprom_summary_lines(image: &eeprom::EepromImage) -> Vec<String> {
-    if !image.info_locked() {
-        return vec!["EEPROM: not provisioned or info lock missing".to_string()];
-    }
-
     let identity = image.identity();
-    let product = model::product_name(identity.product).unwrap_or("Unknown product");
-    let model_info = model::model_info(identity.model);
-    let model_label = model_info
-        .map(|info| info.band_label)
-        .unwrap_or("unknown band");
-    let radio_label = model_info.map(|info| info.radio).unwrap_or("unknown radio");
-    let checksum_status = if image.checksum_valid() {
+    let capabilities = match parse_rnode_capabilities(image.bytes()) {
+        Ok(capabilities) => capabilities,
+        Err(RNodeCapabilityParseError::InfoNotLocked) => {
+            return vec!["EEPROM: not provisioned or info lock missing".to_string()];
+        }
+        Err(error) => {
+            let mut lines = private_eeprom_identity_lines(&identity, false);
+            lines.push(format!("  Radio capabilities: unavailable ({error})"));
+            append_startup_config_lines(image, &mut lines);
+            return lines;
+        }
+    };
+
+    let mut lines = private_eeprom_identity_lines(&identity, true);
+    append_capability_lines(capabilities, &mut lines);
+    append_startup_config_lines(image, &mut lines);
+    lines
+}
+
+fn private_eeprom_identity_lines(
+    identity: &eeprom::IdentityInfo,
+    identity_validated: bool,
+) -> Vec<String> {
+    let checksum_status = if identity_validated {
         "valid"
     } else {
         "invalid"
     };
+    let product = if identity_validated {
+        format!("  Product code: 0x{:02x}", identity.product)
+    } else {
+        format!("  Product code: 0x{:02x} (unvalidated)", identity.product)
+    };
+    let model = if identity_validated {
+        format!("  Model: 0x{:02x}", identity.model)
+    } else {
+        format!("  Model code: 0x{:02x} (unvalidated)", identity.model)
+    };
 
-    let mut lines = vec![
+    vec![
         "EEPROM: provisioned".to_string(),
-        format!("  Product: {product} (0x{:02x})", identity.product),
-        format!(
-            "  Model: 0x{:02x} ({model_label}, {radio_label})",
-            identity.model
-        ),
+        product,
+        model,
         format!("  Hardware revision: {}", identity.hw_rev),
         format!("  Serial: {}", hex::encode(identity.serial.to_be_bytes())),
         format!("  Manufactured: {}", identity.made),
         format!("  Identity checksum: {checksum_status}"),
-    ];
+    ]
+}
 
+fn append_capability_lines(capabilities: RNodeCapabilities, lines: &mut Vec<String>) {
+    let product = rnode_product_name(capabilities.product_code()).unwrap_or("Unknown product");
+    lines[1] = format!(
+        "  Product: {product} (0x{:02x})",
+        capabilities.product_code()
+    );
+    lines[2] = format!("  Model: 0x{:02x}", capabilities.model_code());
+
+    match capabilities.radio() {
+        RNodeRadioCapabilities::Known(radio) => append_known_radio_lines(radio, lines),
+        _ => {
+            lines.push("  Radio capabilities: unavailable for this model".to_string());
+        }
+    }
+}
+
+fn append_known_radio_lines(radio: RNodeKnownRadioCapabilities, lines: &mut Vec<String>) {
+    lines.extend([
+        format!("  Radio family: {}", radio_family_name(radio.family())),
+        format!(
+            "  Frequency range: {} - {} Hz",
+            radio.min_frequency_hz(),
+            radio.max_frequency_hz()
+        ),
+        format!("  Maximum TX power: {} dBm", radio.max_tx_power_dbm()),
+    ]);
+}
+
+fn radio_family_name(family: RNodeRadioFamily) -> &'static str {
+    match family {
+        RNodeRadioFamily::Sx1262 => "SX1262",
+        RNodeRadioFamily::Sx1268 => "SX1268",
+        RNodeRadioFamily::Sx1276 => "SX1276",
+        RNodeRadioFamily::Sx1278 => "SX1278",
+        RNodeRadioFamily::Sx1280 => "SX1280",
+        RNodeRadioFamily::Sx1262AndSx1280 => "SX1262 + SX1280",
+        _ => "Unrecognized",
+    }
+}
+
+fn append_startup_config_lines(image: &eeprom::EepromImage, lines: &mut Vec<String>) {
     if let Some(radio) = image.radio_config() {
         let bitrate =
             rnode::calculate_bitrate(radio.spreading_factor, radio.coding_rate, radio.bandwidth);
@@ -573,8 +641,6 @@ fn eeprom_summary_lines(image: &eeprom::EepromImage) -> Vec<String> {
     } else {
         lines.push("  Startup mode: Normal (host-controlled)".to_string());
     }
-
-    lines
 }
 
 fn rnodeconf_cache_paths() -> Result<firmware::CachePaths, String> {
@@ -747,6 +813,26 @@ mod tests {
             "missing command 0x{command:02x} with payload {} in {frames:?}",
             hex::encode(payload)
         );
+    }
+
+    fn provisioned_eeprom(model: u8, radio: Option<&eeprom::RadioConfig>) -> eeprom::EepromImage {
+        let identity = eeprom::IdentityInfo {
+            product: model::PRODUCT_RNODE,
+            model,
+            hw_rev: 2,
+            serial: 0x01020304,
+            made: 0x6553F100,
+        };
+        let mut bytes = vec![0xFF; eeprom::EEPROM_SIZE];
+        let mut writes = eeprom::identity_write_frames(&identity);
+        if let Some(radio) = radio {
+            writes.extend(eeprom::radio_config_write_frames(radio));
+        }
+        for frame in writes {
+            let address = frame.payload[0] as usize;
+            bytes[address] = frame.payload[1];
+        }
+        eeprom::EepromImage::new(bytes).unwrap()
     }
 
     #[test]
@@ -999,14 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn eeprom_summary_reports_identity_and_radio_config() {
-        let info = eeprom::IdentityInfo {
-            product: model::PRODUCT_RNODE,
-            model: 0xB4,
-            hw_rev: 2,
-            serial: 0x01020304,
-            made: 0x6553F100,
-        };
+    fn eeprom_summary_reports_validated_identity_capabilities_and_radio_config() {
         let radio = eeprom::RadioConfig {
             spreading_factor: 7,
             coding_rate: 5,
@@ -1014,21 +1093,26 @@ mod tests {
             bandwidth: 125000,
             frequency: 868000000,
         };
-        let mut bytes = vec![0xFF; eeprom::EEPROM_SIZE];
-        for frame in eeprom::identity_write_frames(&info)
-            .into_iter()
-            .chain(eeprom::radio_config_write_frames(&radio))
-        {
-            let address = frame.payload[0] as usize;
-            bytes[address] = frame.payload[1];
-        }
-        let image = eeprom::EepromImage::new(bytes).unwrap();
+        let image = provisioned_eeprom(0xB4, Some(&radio));
         let lines = eeprom_summary_lines(&image);
+
         assert!(lines.iter().any(|line| line == "EEPROM: provisioned"));
         assert!(
             lines
                 .iter()
                 .any(|line| line.contains("Product: RNode (0x03)"))
+        );
+        assert!(lines.iter().any(|line| line == "  Model: 0xb4"));
+        assert!(lines.iter().any(|line| line == "  Radio family: SX1278"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  Frequency range: 420000000 - 520000000 Hz")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  Maximum TX power: 17 dBm")
         );
         assert!(lines.iter().any(|line| line.contains("Startup mode: TNC")));
         assert!(
@@ -1036,6 +1120,58 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Frequency: 868000000 Hz"))
         );
+        assert!(!lines.iter().any(|line| line.contains("420 - 520 MHz")));
+    }
+
+    #[test]
+    fn eeprom_summary_quarantines_ambiguous_model_capabilities() {
+        let image = provisioned_eeprom(0x16, None);
+        let lines = eeprom_summary_lines(&image);
+
+        assert!(lines.iter().any(|line| line == "  Model: 0x16"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  Radio capabilities: unavailable for this model")
+        );
+        assert!(!lines.iter().any(|line| line.contains("Radio family:")));
+        assert!(!lines.iter().any(|line| line.contains("Frequency range:")));
+        assert!(!lines.iter().any(|line| line.contains("Maximum TX power:")));
+    }
+
+    #[test]
+    fn eeprom_summary_does_not_trust_an_invalid_identity_checksum() {
+        let image = provisioned_eeprom(0xB4, None);
+        let mut bytes = image.bytes().to_vec();
+        bytes[eeprom::ADDR_CHKSUM] ^= 0x01;
+        let invalid = eeprom::EepromImage::new(bytes).unwrap();
+        let lines = eeprom_summary_lines(&invalid);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  Product code: 0x03 (unvalidated)")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  Model code: 0xb4 (unvalidated)")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  Identity checksum: invalid")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Radio capabilities: unavailable"))
+        );
+        assert!(lines.iter().any(|line| line == "  Serial: 01020304"));
+        assert!(!lines.iter().any(|line| line.contains("Product: RNode")));
+        assert!(!lines.iter().any(|line| line.contains("Radio family:")));
+        assert!(!lines.iter().any(|line| line.contains("Frequency range:")));
+        assert!(!lines.iter().any(|line| line.contains("Maximum TX power:")));
     }
 
     #[test]
