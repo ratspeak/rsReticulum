@@ -70,6 +70,8 @@ impl InterfaceKind {
 pub(crate) enum InterfaceRegistrationRejection {
     Duplicate,
     InvalidDriverOwnership,
+    Draining,
+    Closed,
 }
 
 #[derive(Clone, Default)]
@@ -77,11 +79,37 @@ pub(crate) struct InterfaceRegistry {
     inner: Arc<RegistryInner>,
 }
 
-#[derive(Default)]
 struct RegistryInner {
     next_owner: AtomicU64,
-    records: Mutex<HashMap<u64, InterfaceRecord>>,
+    state: Mutex<RegistryState>,
     changed: Notify,
+}
+
+struct RegistryState {
+    admission: RegistryAdmission,
+    in_flight_spawns: usize,
+    records: HashMap<u64, InterfaceRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegistryAdmission {
+    Open,
+    Draining,
+    Closed,
+}
+
+impl Default for RegistryInner {
+    fn default() -> Self {
+        Self {
+            next_owner: AtomicU64::new(0),
+            state: Mutex::new(RegistryState {
+                admission: RegistryAdmission::Open,
+                in_flight_spawns: 0,
+                records: HashMap::new(),
+            }),
+            changed: Notify::new(),
+        }
+    }
 }
 
 struct InterfaceRecord {
@@ -96,9 +124,13 @@ struct InterfaceRecord {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RecordState {
-    Pending { cancel_requested: bool },
+    Pending {
+        cancel_requested: bool,
+        abandoned: bool,
+    },
     Active,
     Stopping,
+    Abandoned,
 }
 
 impl RegistryInner {
@@ -116,19 +148,73 @@ impl RegistryInner {
     }
 
     fn remove_exact(&self, id: u64, owner: u64) {
-        let mut records = self
-            .records
+        let mut state = self
+            .state
             .lock()
             .expect("interface registry mutex poisoned");
-        if records.get(&id).is_some_and(|record| record.owner == owner) {
-            records.remove(&id);
-            drop(records);
+        if state
+            .records
+            .get(&id)
+            .is_some_and(|record| record.owner == owner)
+        {
+            state.records.remove(&id);
+            drop(state);
             self.changed.notify_waiters();
         }
     }
 }
 
 impl InterfaceRegistry {
+    pub(crate) fn is_open(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .expect("interface registry mutex poisoned")
+            .admission
+            == RegistryAdmission::Open
+    }
+
+    /// Acquire lifecycle ownership before beginning a physical interface
+    /// spawn. The permit spans spawn plus registration/rollback, closing the
+    /// otherwise unavoidable gap before an interface has an ID reservation.
+    pub(crate) fn acquire_spawn_permit(&self) -> Result<InterfaceSpawnPermit, RegistryAdmission> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("interface registry mutex poisoned");
+        if state.admission != RegistryAdmission::Open {
+            return Err(state.admission);
+        }
+        state.in_flight_spawns = state
+            .in_flight_spawns
+            .checked_add(1)
+            .expect("interface spawn permit count overflowed");
+        Ok(InterfaceSpawnPermit {
+            registry: self.clone(),
+            released: false,
+        })
+    }
+
+    pub(crate) async fn wait_for_spawn_permits(&self) {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .inner
+                .state
+                .lock()
+                .expect("interface registry mutex poisoned")
+                .in_flight_spawns
+                == 0
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn reserve(
         &self,
@@ -156,19 +242,31 @@ impl InterfaceRegistry {
             });
         }
         let owner = self.inner.next_owner();
-        let mut records = self
+        let mut state = self
             .inner
-            .records
+            .state
             .lock()
             .expect("interface registry mutex poisoned");
-        if records.contains_key(&id) {
+        let admission_rejection = match state.admission {
+            RegistryAdmission::Open => None,
+            RegistryAdmission::Draining => Some(InterfaceRegistrationRejection::Draining),
+            RegistryAdmission::Closed => Some(InterfaceRegistrationRejection::Closed),
+        };
+        if let Some(reason) = admission_rejection {
+            return Err(RejectedInterfaceRegistration {
+                task: Some(task),
+                driver,
+                reason,
+            });
+        }
+        if state.records.contains_key(&id) {
             return Err(RejectedInterfaceRegistration {
                 task: Some(task),
                 driver,
                 reason: InterfaceRegistrationRejection::Duplicate,
             });
         }
-        records.insert(
+        state.records.insert(
             id,
             InterfaceRecord {
                 owner,
@@ -179,10 +277,11 @@ impl InterfaceRegistry {
                 driver: None,
                 state: RecordState::Pending {
                     cancel_requested: false,
+                    abandoned: false,
                 },
             },
         );
-        drop(records);
+        drop(state);
         Ok(InterfaceRegistration {
             registry: self.clone(),
             id,
@@ -194,14 +293,17 @@ impl InterfaceRegistry {
     }
 
     pub(crate) fn begin_shutdown(&self, id: u64) -> ShutdownStart {
-        let mut records = self
+        let mut state = self
             .inner
-            .records
+            .state
             .lock()
             .expect("interface registry mutex poisoned");
-        let Some(record) = records.get_mut(&id) else {
+        let Some(record) = state.records.get_mut(&id) else {
+            if state.admission != RegistryAdmission::Open {
+                return ShutdownStart::RegistryDraining;
+            }
             let owner = self.inner.next_owner();
-            records.insert(
+            state.records.insert(
                 id,
                 InterfaceRecord {
                     owner,
@@ -229,14 +331,15 @@ impl InterfaceRegistry {
         match record.state {
             RecordState::Pending {
                 ref mut cancel_requested,
+                ..
             } => {
                 *cancel_requested = true;
                 let owner = record.owner;
-                drop(records);
+                drop(state);
                 self.inner.changed.notify_waiters();
                 ShutdownStart::RegistrationPending { owner }
             }
-            RecordState::Stopping => ShutdownStart::AlreadyStopping {
+            RecordState::Stopping | RecordState::Abandoned => ShutdownStart::AlreadyStopping {
                 owner: record.owner,
             },
             RecordState::Active => {
@@ -258,12 +361,12 @@ impl InterfaceRegistry {
     }
 
     pub(crate) fn begin_shutdown_exact(&self, id: u64, owner: u64) -> ExactShutdownStart {
-        let mut records = self
+        let mut state = self
             .inner
-            .records
+            .state
             .lock()
             .expect("interface registry mutex poisoned");
-        let Some(record) = records.get_mut(&id) else {
+        let Some(record) = state.records.get_mut(&id) else {
             return ExactShutdownStart::NotOwned;
         };
         if record.owner != owner {
@@ -285,7 +388,7 @@ impl InterfaceRegistry {
                     finished: false,
                 })
             }
-            RecordState::Stopping => ExactShutdownStart::AlreadyStopping,
+            RecordState::Stopping | RecordState::Abandoned => ExactShutdownStart::AlreadyStopping,
             RecordState::Pending { .. } => ExactShutdownStart::NotOwned,
         }
     }
@@ -296,13 +399,13 @@ impl InterfaceRegistry {
             tokio::pin!(changed);
             changed.as_mut().enable();
             let cancelled = {
-                let records = self
+                let state = self
                     .inner
-                    .records
+                    .state
                     .lock()
                     .expect("interface registry mutex poisoned");
                 tokens.iter().any(|(id, owner)| {
-                    let Some(record) = records.get(id) else {
+                    let Some(record) = state.records.get(id) else {
                         return true;
                     };
                     if record.owner != *owner {
@@ -311,8 +414,10 @@ impl InterfaceRegistry {
                     matches!(
                         record.state,
                         RecordState::Pending {
-                            cancel_requested: true
+                            cancel_requested: true,
+                            ..
                         } | RecordState::Stopping
+                            | RecordState::Abandoned
                     )
                 })
             };
@@ -330,9 +435,10 @@ impl InterfaceRegistry {
             changed.as_mut().enable();
             if self
                 .inner
-                .records
+                .state
                 .lock()
                 .expect("interface registry mutex poisoned")
+                .records
                 .get(&id)
                 .is_none_or(|record| record.owner != owner)
             {
@@ -342,32 +448,107 @@ impl InterfaceRegistry {
         }
     }
 
+    /// Wait until a cleanup owner disappears, or claim a Pending registration
+    /// whose task cleanup completed after its transaction future was dropped.
+    pub(crate) async fn wait_or_claim_abandoned(&self, id: u64, owner: u64) -> Option<(u64, u64)> {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let abandoned = {
+                let state = self
+                    .inner
+                    .state
+                    .lock()
+                    .expect("interface registry mutex poisoned");
+                let record = state.records.get(&id)?;
+                if record.owner != owner {
+                    return None;
+                }
+                record.state == RecordState::Abandoned
+            };
+            if abandoned {
+                return Some((id, owner));
+            }
+            changed.await;
+        }
+    }
+
+    fn mark_abandoned_pending(&self, id: u64, owner: u64) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("interface registry mutex poisoned");
+        let admission = state.admission;
+        let Some(record) = state.records.get_mut(&id) else {
+            return;
+        };
+        if record.owner != owner {
+            return;
+        }
+        if let RecordState::Pending { abandoned, .. } = &mut record.state {
+            *abandoned = true;
+            if admission != RegistryAdmission::Open {
+                record.state = RecordState::Abandoned;
+            }
+            drop(state);
+            self.inner.changed.notify_waiters();
+        }
+    }
+
+    fn mark_abandoned_shutdown(&self, id: u64, owner: u64) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("interface registry mutex poisoned");
+        let Some(record) = state.records.get_mut(&id) else {
+            return;
+        };
+        if record.owner == owner && record.state == RecordState::Stopping {
+            record.state = RecordState::Abandoned;
+            drop(state);
+            self.inner.changed.notify_waiters();
+        }
+    }
+
+    pub(crate) fn finish_abandoned(&self, id: u64, owner: u64) {
+        self.inner.remove_exact(id, owner);
+    }
+
     pub(crate) fn commit_batch(
         &self,
         mut registrations: Vec<InterfaceRegistration>,
     ) -> Result<(), Vec<InterfaceRegistration>> {
-        let mut records = self
+        let mut state = self
             .inner
-            .records
+            .state
             .lock()
             .expect("interface registry mutex poisoned");
+        if state.admission != RegistryAdmission::Open {
+            drop(state);
+            return Err(registrations);
+        }
         let valid = registrations.iter().all(|registration| {
             Arc::ptr_eq(&self.inner, &registration.registry.inner)
-                && records.get(&registration.id).is_some_and(|record| {
+                && state.records.get(&registration.id).is_some_and(|record| {
                     record.owner == registration.owner
                         && record.state
                             == (RecordState::Pending {
                                 cancel_requested: false,
+                                abandoned: false,
                             })
                 })
         });
         if !valid {
-            drop(records);
+            drop(state);
             return Err(registrations);
         }
 
         for registration in &mut registrations {
-            let record = records
+            let record = state
+                .records
                 .get_mut(&registration.id)
                 .expect("batch reservation was validated");
             record.task = registration.task.take();
@@ -381,20 +562,167 @@ impl InterfaceRegistry {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.inner
-            .records
+            .state
             .lock()
             .expect("interface registry mutex poisoned")
+            .records
             .len()
     }
 
     #[cfg(test)]
     fn owner_for_test(&self, id: u64) -> Option<u64> {
         self.inner
-            .records
+            .state
             .lock()
             .expect("interface registry mutex poisoned")
+            .records
             .get(&id)
             .map(|record| record.owner)
+    }
+
+    /// Atomically close admission and lease every active interface to the
+    /// runtime-wide drain coordinator. Pending registrations are cancelled
+    /// under the same lock, so a concurrent commit cannot cross the drain
+    /// boundary.
+    pub(crate) fn begin_drain(&self) -> DrainStart {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("interface registry mutex poisoned");
+        match state.admission {
+            RegistryAdmission::Draining => return DrainStart::AlreadyDraining,
+            RegistryAdmission::Closed => return DrainStart::Closed,
+            RegistryAdmission::Open => state.admission = RegistryAdmission::Draining,
+        }
+
+        let mut shutdowns = Vec::new();
+        let mut waiters = Vec::new();
+        let mut abandoned_registrations = Vec::new();
+        for (&id, record) in &mut state.records {
+            if let Some(online) = &record.online {
+                online.store(false, Ordering::SeqCst);
+            }
+            match &mut record.state {
+                RecordState::Pending {
+                    cancel_requested,
+                    abandoned,
+                } => {
+                    *cancel_requested = true;
+                    if *abandoned {
+                        record.state = RecordState::Abandoned;
+                        abandoned_registrations.push((id, record.owner));
+                    } else {
+                        waiters.push((id, record.owner));
+                    }
+                }
+                RecordState::Active => {
+                    record.state = RecordState::Stopping;
+                    shutdowns.push(InterfaceShutdown {
+                        registry: self.clone(),
+                        id,
+                        owner: record.owner,
+                        kind: record.kind,
+                        strategy: record.strategy,
+                        task: record.task.take(),
+                        online: record.online.clone(),
+                        driver: record.driver.take(),
+                        control_owner: Some(record.owner),
+                        finished: false,
+                    });
+                }
+                RecordState::Stopping => waiters.push((id, record.owner)),
+                RecordState::Abandoned => abandoned_registrations.push((id, record.owner)),
+            }
+        }
+        drop(state);
+        self.inner.changed.notify_waiters();
+        DrainStart::Acquired(InterfaceDrain {
+            shutdowns,
+            waiters,
+            abandoned_registrations,
+        })
+    }
+
+    /// Finish the one-way runtime lifecycle. This is called only after the
+    /// transport actor has persisted and stopped, so any remaining entries
+    /// are shutdown-only tombstones and can no longer race ID reuse.
+    fn try_finish_drain(&self, expected: &[(u64, u64)]) -> Result<(), ()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("interface registry mutex poisoned");
+        let exact_shutdown_leases = state.records.len() == expected.len()
+            && expected.iter().all(|(id, owner)| {
+                state.records.get(id).is_some_and(|record| {
+                    record.owner == *owner
+                        && record.state == RecordState::Stopping
+                        && record.task.is_none()
+                        && record.driver.is_none()
+                })
+            });
+        if !exact_shutdown_leases || state.in_flight_spawns != 0 {
+            return Err(());
+        }
+        state.admission = RegistryAdmission::Closed;
+        state.records.clear();
+        drop(state);
+        self.inner.changed.notify_waiters();
+        Ok(())
+    }
+
+    pub(crate) async fn finish_drain_when_owned(&self, expected: &[(u64, u64)]) {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.try_finish_drain(expected).is_ok() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admission_for_test(&self) -> RegistryAdmission {
+        self.inner
+            .state
+            .lock()
+            .expect("interface registry mutex poisoned")
+            .admission
+    }
+}
+
+pub(crate) struct InterfaceSpawnPermit {
+    registry: InterfaceRegistry,
+    released: bool,
+}
+
+impl InterfaceSpawnPermit {
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        let mut state = self
+            .registry
+            .inner
+            .state
+            .lock()
+            .expect("interface registry mutex poisoned");
+        state.in_flight_spawns = state
+            .in_flight_spawns
+            .checked_sub(1)
+            .expect("interface spawn permit count underflowed");
+        self.released = true;
+        drop(state);
+        self.registry.inner.changed.notify_waiters();
+    }
+}
+
+impl Drop for InterfaceSpawnPermit {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -413,23 +741,28 @@ impl InterfaceRegistration {
     }
 
     pub(crate) fn commit(mut self) -> Result<(), Self> {
-        let mut records = self
+        let mut state = self
             .registry
             .inner
-            .records
+            .state
             .lock()
             .expect("interface registry mutex poisoned");
-        let Some(record) = records.get_mut(&self.id) else {
-            drop(records);
+        if state.admission != RegistryAdmission::Open {
+            drop(state);
+            return Err(self);
+        }
+        let Some(record) = state.records.get_mut(&self.id) else {
+            drop(state);
             return Err(self);
         };
         if record.owner != self.owner
             || record.state
                 != (RecordState::Pending {
                     cancel_requested: false,
+                    abandoned: false,
                 })
         {
-            drop(records);
+            drop(state);
             return Err(self);
         }
 
@@ -462,15 +795,30 @@ impl Drop for InterfaceRegistration {
         if self.committed {
             return;
         }
-        if let Some(driver) = self.driver.take() {
-            driver.request_shutdown();
-        } else if let Some(task) = self.task.take() {
-            task.abort();
+        let registry = self.registry.clone();
+        let id = self.id;
+        let owner = self.owner;
+        let mut task = self.task.take();
+        let mut driver = self.driver.take();
+        if task.is_none() && driver.is_none() {
+            registry.mark_abandoned_pending(id, owner);
+            return;
         }
-        // Cancellation cannot await completion. Exact RNode tasks receive
-        // their local stop request and detach; plain tasks are aborted. Keep
-        // the reservation as a fail-closed tombstone until owned cleanup
-        // proves completion.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                stop_owned_task(&mut task, &mut driver, Some(id)).await;
+                registry.mark_abandoned_pending(id, owner);
+            });
+        } else {
+            if let Some(driver) = driver.take() {
+                driver.request_shutdown();
+            } else if let Some(task) = task.take() {
+                task.abort();
+            }
+        }
+        // The exact owner remains fail-closed until the detached cleanup has
+        // joined the task. During a runtime drain the coordinator claims the
+        // resulting Abandoned record and orders any possible actor rollback.
     }
 }
 
@@ -513,12 +861,38 @@ pub(crate) enum ShutdownStart {
     Acquired(InterfaceShutdown),
     RegistrationPending { owner: u64 },
     AlreadyStopping { owner: u64 },
+    RegistryDraining,
 }
 
 pub(crate) enum ExactShutdownStart {
     Acquired(InterfaceShutdown),
     AlreadyStopping,
     NotOwned,
+}
+
+pub(crate) enum DrainStart {
+    Acquired(InterfaceDrain),
+    AlreadyDraining,
+    Closed,
+}
+
+pub(crate) struct InterfaceDrain {
+    shutdowns: Vec<InterfaceShutdown>,
+    waiters: Vec<InterfaceOwnerToken>,
+    abandoned_registrations: Vec<InterfaceOwnerToken>,
+}
+
+pub(crate) type InterfaceOwnerToken = (u64, u64);
+pub(crate) type InterfaceDrainParts = (
+    Vec<InterfaceShutdown>,
+    Vec<InterfaceOwnerToken>,
+    Vec<InterfaceOwnerToken>,
+);
+
+impl InterfaceDrain {
+    pub(crate) fn into_parts(self) -> InterfaceDrainParts {
+        (self.shutdowns, self.waiters, self.abandoned_registrations)
+    }
 }
 
 pub(crate) struct InterfaceShutdown {
@@ -535,6 +909,10 @@ pub(crate) struct InterfaceShutdown {
 }
 
 impl InterfaceShutdown {
+    pub(crate) fn token(&self) -> (u64, u64) {
+        (self.id, self.owner)
+    }
+
     pub(crate) fn kind(&self) -> InterfaceKind {
         self.kind
     }
@@ -557,6 +935,42 @@ impl InterfaceShutdown {
         stop_owned_task(&mut self.task, &mut self.driver, Some(self.id)).await;
     }
 
+    /// Signal exact RNode owners before joining any one interface. Standard
+    /// tasks have no cooperative stop primitive and are aborted by the join
+    /// phase instead.
+    pub(crate) fn request_driver_shutdown(&self) {
+        if let Some(driver) = &self.driver {
+            driver.request_shutdown();
+        }
+    }
+
+    /// Stop this interface within the runtime drain's one absolute deadline.
+    /// Returns false when the graceful exact-driver join exceeded the shared
+    /// budget and the task had to be aborted.
+    pub(crate) async fn stop_task_until(&mut self, deadline: tokio::time::Instant) -> bool {
+        let graceful = if let Some(driver) = self.driver.take() {
+            driver.request_shutdown();
+            true
+        } else {
+            false
+        };
+        let Some(mut task) = self.task.take() else {
+            return true;
+        };
+        if graceful && tokio::time::timeout_at(deadline, &mut task).await.is_ok() {
+            return true;
+        }
+        if graceful {
+            tracing::warn!(
+                interface_id = self.id,
+                "exact RNode driver did not stop before the runtime drain deadline; aborting task"
+            );
+        }
+        task.abort();
+        let _ = task.await;
+        !graceful
+    }
+
     pub(crate) fn finish(mut self) {
         self.registry.inner.remove_exact(self.id, self.owner);
         self.finished = true;
@@ -565,13 +979,31 @@ impl InterfaceShutdown {
 
 impl Drop for InterfaceShutdown {
     fn drop(&mut self) {
-        if let Some(driver) = self.driver.take() {
-            driver.request_shutdown();
+        if self.finished {
+            return;
         }
-        // Never abort or await from Drop. Exact RNode tasks receive their
-        // instance-local shutdown request and remain detached so ordered
-        // cleanup can complete. Plain tasks also detach. The Stopping
-        // tombstone remains fail-closed because completion was not joined.
+        let registry = self.registry.clone();
+        let id = self.id;
+        let owner = self.owner;
+        let mut task = self.task.take();
+        let mut driver = self.driver.take();
+        if task.is_none() && driver.is_none() {
+            registry.mark_abandoned_shutdown(id, owner);
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                stop_owned_task(&mut task, &mut driver, Some(id)).await;
+                registry.mark_abandoned_shutdown(id, owner);
+            });
+        } else if let Some(driver) = driver.take() {
+            driver.request_shutdown();
+        } else if let Some(task) = task.take() {
+            task.abort();
+        }
+        // The Stopping tombstone remains fail-closed until the detached task
+        // join completes. A later runtime drain claims Abandoned and orders
+        // the possible actor deregistration before closing permanently.
     }
 }
 
@@ -819,20 +1251,28 @@ mod tests {
         rejected.stop_and_wait().await;
 
         let stopping_registry = InterfaceRegistry::default();
-        let task_release = Arc::new(Notify::new());
-        let task_release_clone = task_release.clone();
-        let (completed_tx, completed_rx) = oneshot::channel();
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let task_dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped_clone = task_dropped.clone();
+        let (started_tx, started_rx) = oneshot::channel();
         let registration = stopping_registry
             .reserve(
                 31,
                 InterfaceKind::Standard,
                 tokio::spawn(async move {
-                    task_release_clone.notified().await;
-                    let _ = completed_tx.send(());
+                    let _dropped = Dropped(task_dropped_clone);
+                    let _ = started_tx.send(());
+                    std::future::pending::<()>().await;
                 }),
                 None,
             )
             .expect("stopping reservation");
+        started_rx.await.expect("owned task started");
         assert!(registration.commit().is_ok(), "commit");
         let ShutdownStart::Acquired(shutdown) = stopping_registry.begin_shutdown(31) else {
             panic!("active registration must yield shutdown ownership");
@@ -845,11 +1285,13 @@ mod tests {
                 Err(rejected) => rejected,
             };
         rejected.stop_and_wait().await;
-        task_release.notify_one();
-        tokio::time::timeout(std::time::Duration::from_secs(1), completed_rx)
-            .await
-            .expect("InterfaceShutdown Drop must not abort the owned task")
-            .expect("completion sender");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !task_dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped shutdown cleanup must join the owned task");
     }
 
     #[tokio::test]
@@ -871,6 +1313,156 @@ mod tests {
             .reserve(37, InterfaceKind::Standard, pending_task(), None)
             .expect("explicit finish releases orphan tombstone");
         replacement.rollback().await;
+    }
+
+    #[tokio::test]
+    async fn drain_closes_admission_and_waits_for_pre_spawn_permits() {
+        let registry = InterfaceRegistry::default();
+        let permit = registry
+            .acquire_spawn_permit()
+            .expect("open registry grants a pre-spawn permit");
+
+        let DrainStart::Acquired(drain) = registry.begin_drain() else {
+            panic!("first drain owns the transition");
+        };
+        assert_eq!(registry.admission_for_test(), RegistryAdmission::Draining);
+        let (shutdowns, waiters, abandoned) = drain.into_parts();
+        assert!(shutdowns.is_empty());
+        assert!(waiters.is_empty());
+        assert!(abandoned.is_empty());
+
+        let rejected = match registry.reserve(41, InterfaceKind::Standard, pending_task(), None) {
+            Ok(_) => panic!("draining registry must reject a newly spawned interface"),
+            Err(rejected) => rejected,
+        };
+        assert_eq!(rejected.reason(), InterfaceRegistrationRejection::Draining);
+        rejected.stop_and_wait().await;
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                registry.wait_for_spawn_permits(),
+            )
+            .await
+            .is_err(),
+            "drain must wait while physical spawn ownership is outstanding"
+        );
+        drop(permit);
+        registry.wait_for_spawn_permits().await;
+        registry.finish_drain_when_owned(&[]).await;
+        assert_eq!(registry.admission_for_test(), RegistryAdmission::Closed);
+
+        let rejected = match registry.reserve(43, InterfaceKind::Standard, pending_task(), None) {
+            Ok(_) => panic!("closed registry must never reopen"),
+            Err(rejected) => rejected,
+        };
+        assert_eq!(rejected.reason(), InterfaceRegistrationRejection::Closed);
+        rejected.stop_and_wait().await;
+        assert!(matches!(
+            registry.begin_shutdown(99),
+            ShutdownStart::RegistryDraining
+        ));
+    }
+
+    #[tokio::test]
+    async fn drain_cancels_pending_and_exactly_leases_active_records() {
+        let registry = InterfaceRegistry::default();
+        let pending_online = Arc::new(AtomicBool::new(true));
+        let pending = registry
+            .reserve_with_online(
+                45,
+                InterfaceKind::Standard,
+                pending_task(),
+                None,
+                Some(pending_online.clone()),
+            )
+            .expect("pending reservation");
+        let active_online = Arc::new(AtomicBool::new(true));
+        let active = registry
+            .reserve_with_online(
+                47,
+                InterfaceKind::Standard,
+                pending_task(),
+                None,
+                Some(active_online.clone()),
+            )
+            .expect("active reservation");
+        assert!(active.commit().is_ok(), "commit active record");
+
+        let DrainStart::Acquired(drain) = registry.begin_drain() else {
+            panic!("first drain owns the transition");
+        };
+        assert!(!pending_online.load(Ordering::SeqCst));
+        assert!(!active_online.load(Ordering::SeqCst));
+        let (mut shutdowns, waiters, abandoned) = drain.into_parts();
+        assert_eq!(shutdowns.len(), 1);
+        assert_eq!(waiters.len(), 1);
+        assert!(abandoned.is_empty());
+
+        let pending = pending
+            .commit()
+            .expect_err("drain-cancelled pending record cannot commit");
+        pending.rollback().await;
+        registry
+            .wait_until_not_owner(waiters[0].0, waiters[0].1)
+            .await;
+
+        let token = shutdowns[0].token();
+        shutdowns[0]
+            .stop_task_until(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await;
+        registry.finish_drain_when_owned(&[token]).await;
+        drop(shutdowns);
+        assert_eq!(registry.admission_for_test(), RegistryAdmission::Closed);
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn abandoned_pending_owner_is_joined_then_claimed_by_drain() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let registry = InterfaceRegistry::default();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_task = dropped.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let registration = registry
+            .reserve(
+                49,
+                InterfaceKind::Standard,
+                tokio::spawn(async move {
+                    let _dropped = Dropped(dropped_in_task);
+                    let _ = started_tx.send(());
+                    std::future::pending::<()>().await;
+                }),
+                None,
+            )
+            .expect("pending owner");
+        let owner = registration.owner();
+        started_rx.await.expect("task started");
+        drop(registration);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("abandoned task cleanup joined");
+
+        let DrainStart::Acquired(drain) = registry.begin_drain() else {
+            panic!("drain acquired");
+        };
+        let (shutdowns, waiters, abandoned) = drain.into_parts();
+        assert!(shutdowns.is_empty());
+        assert!(waiters.is_empty());
+        assert_eq!(abandoned, vec![(49, owner)]);
+        registry.finish_abandoned(49, owner);
+        registry.finish_drain_when_owned(&[]).await;
+        assert_eq!(registry.admission_for_test(), RegistryAdmission::Closed);
     }
 
     #[test]

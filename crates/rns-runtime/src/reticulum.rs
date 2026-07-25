@@ -17,8 +17,9 @@ use crate::config::{Config, ConfigError, ConfigSection};
 use crate::constants::*;
 use crate::interface_factory;
 use crate::interface_registry::{
-    ExactShutdownStart, InterfaceKind, InterfaceRegistration, InterfaceRegistrationRejection,
-    InterfaceRegistry, InterfaceShutdown, InterfaceShutdownStrategy, ShutdownStart,
+    DrainStart, ExactShutdownStart, InterfaceKind, InterfaceRegistration,
+    InterfaceRegistrationRejection, InterfaceRegistry, InterfaceShutdown,
+    InterfaceShutdownStrategy, InterfaceSpawnPermit, ShutdownStart,
 };
 use crate::jobs::{Job, JobScheduler};
 use crate::lifecycle::ShutdownSignal;
@@ -66,6 +67,246 @@ struct TransportCompletion {
     notify: Notify,
 }
 
+const RUNTIME_INTERFACE_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// One cancellation-independent shutdown operation shared by explicit API
+/// callers and the process-signal watcher. The coordinator intentionally owns
+/// the accepted-child pump and all runtime-local interface ownership; callers
+/// only wait on its completion and cannot cancel the cleanup by disappearing.
+#[derive(Clone)]
+struct RuntimeShutdownCoordinator {
+    inner: Arc<RuntimeShutdownInner>,
+}
+
+struct RuntimeShutdownInner {
+    started: AtomicBool,
+    completed: AtomicBool,
+    notify: Notify,
+    shutdown: ShutdownSignal,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    transport_completion: Arc<TransportCompletion>,
+    interface_controls: InterfaceControlMap,
+    interface_registry: InterfaceRegistry,
+    accepted_child_pump: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl RuntimeShutdownCoordinator {
+    fn new(
+        shutdown: ShutdownSignal,
+        transport_tx: mpsc::Sender<TransportMessage>,
+        transport_completion: Arc<TransportCompletion>,
+        interface_controls: InterfaceControlMap,
+        interface_registry: InterfaceRegistry,
+    ) -> Self {
+        Self {
+            inner: Arc::new(RuntimeShutdownInner {
+                started: AtomicBool::new(false),
+                completed: AtomicBool::new(false),
+                notify: Notify::new(),
+                shutdown,
+                transport_tx,
+                transport_completion,
+                interface_controls,
+                interface_registry,
+                accepted_child_pump: std::sync::Mutex::new(None),
+            }),
+        }
+    }
+
+    fn install_accepted_child_pump(&self, pump: tokio::task::JoinHandle<()>) {
+        let mut slot = self
+            .inner
+            .accepted_child_pump
+            .lock()
+            .expect("accepted child pump mutex poisoned");
+        debug_assert!(slot.is_none(), "accepted child pump installed twice");
+        *slot = Some(pump);
+    }
+
+    fn is_started(&self) -> bool {
+        self.inner.started.load(Ordering::Acquire)
+    }
+
+    fn start(&self) {
+        self.inner.shutdown.trigger();
+        if self
+            .inner
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let coordinator = self.clone();
+            tokio::spawn(async move {
+                coordinator.run().await;
+            });
+        }
+    }
+
+    async fn start_and_wait(&self) {
+        self.start();
+        self.wait().await;
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.inner.completed.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn run(&self) {
+        let drain = match self.inner.interface_registry.begin_drain() {
+            DrainStart::Acquired(drain) => drain,
+            DrainStart::AlreadyDraining | DrainStart::Closed => {
+                self.inner.transport_completion.wait().await;
+                self.mark_completed();
+                return;
+            }
+        };
+        // The signal also stops interface producers and makes the retained
+        // accepted-child pump close its receiver. Joining that exact pump
+        // prevents a late accepted socket from entering registration after
+        // admission has closed.
+        self.inner.shutdown.trigger();
+        let pump = self
+            .inner
+            .accepted_child_pump
+            .lock()
+            .expect("accepted child pump mutex poisoned")
+            .take();
+        if let Some(pump) = pump {
+            let _ = pump.await;
+        }
+
+        // A physical spawn begins before it has a registry record. Permits
+        // bridge that gap and remain held through registration or exact
+        // rejection cleanup, so shutdown cannot complete ahead of a late
+        // spawned interface.
+        self.inner.interface_registry.wait_for_spawn_permits().await;
+
+        let (mut shutdowns, waiters, mut abandoned_registrations) = drain.into_parts();
+        // Exact device owners are all signalled before any sequential join,
+        // so a slow first device cannot delay another device's detach path.
+        for shutdown in &shutdowns {
+            shutdown.request_driver_shutdown();
+        }
+
+        #[cfg(feature = "ble")]
+        if shutdowns
+            .iter()
+            .any(|shutdown| shutdown.kind() == InterfaceKind::BlePeer)
+        {
+            // BLE Peer remains a process singleton. Stop it exactly once for
+            // this runtime drain, then join each registry-owned façade below.
+            rns_interface::ble_peer::stop_ble_peer_interface().await;
+        }
+
+        // The shared absolute deadline applies to registry-owned interface
+        // task joins. Process-singleton BLE teardown above is a distinct
+        // producer stop phase and must finish rather than be cancellation-
+        // truncated half way through platform cleanup.
+        let deadline = tokio::time::Instant::now() + RUNTIME_INTERFACE_DRAIN_DEADLINE;
+
+        for shutdown in &mut shutdowns {
+            shutdown.mark_offline();
+            let _ = shutdown.stop_task_until(deadline).await;
+        }
+        for (id, owner) in waiters {
+            if let Some(abandoned) = self
+                .inner
+                .interface_registry
+                .wait_or_claim_abandoned(id, owner)
+                .await
+            {
+                abandoned_registrations.push(abandoned);
+            }
+        }
+
+        // Abandoned Pending/Stopping owners have completed their task join
+        // but may have published an actor entry before their transaction was
+        // cancelled or unwound. Admission is already closed, so order a
+        // conservative exact-ID rollback before releasing each tombstone.
+        for (id, owner) in abandoned_registrations {
+            remove_interface_control_if_owner(&self.inner.interface_controls, id, owner);
+            if !self
+                .inner
+                .transport_completion
+                .stopped
+                .load(Ordering::Acquire)
+            {
+                let _ = self
+                    .inner
+                    .transport_tx
+                    .send(TransportMessage::DeregisterInterface { id })
+                    .await;
+            }
+            self.inner.interface_registry.finish_abandoned(id, owner);
+        }
+
+        // Do not deregister active interfaces here. Transport shutdown owns
+        // the synchronous persistence snapshot; retaining offline interface
+        // bindings until that snapshot preserves route/tunnel state. Pending
+        // registration rollback may still enqueue its own ordered deregister.
+        if !self
+            .inner
+            .transport_completion
+            .stopped
+            .load(Ordering::Acquire)
+        {
+            let _ = self
+                .inner
+                .transport_tx
+                .send(TransportMessage::Shutdown)
+                .await;
+        }
+        self.inner.transport_completion.wait().await;
+
+        // Once persistence is complete the runtime is permanently closed;
+        // exact-owner leases and shutdown-only tombstones can be discarded
+        // without opening an ABA window.
+        let shutdown_tokens: Vec<_> = shutdowns.iter().map(InterfaceShutdown::token).collect();
+        self.inner
+            .interface_registry
+            .finish_drain_when_owned(&shutdown_tokens)
+            .await;
+        self.inner
+            .interface_controls
+            .lock()
+            .expect("interface_controls mutex poisoned")
+            .clear();
+        drop(shutdowns);
+        self.mark_completed();
+    }
+
+    fn mark_completed(&self) {
+        self.inner.completed.store(true, Ordering::Release);
+        self.inner.notify.notify_waiters();
+    }
+}
+
+struct InitShutdownGuard {
+    coordinator: Option<RuntimeShutdownCoordinator>,
+}
+
+impl InitShutdownGuard {
+    fn disarm(mut self) {
+        self.coordinator.take();
+    }
+}
+
+impl Drop for InitShutdownGuard {
+    fn drop(&mut self) {
+        if let Some(coordinator) = self.coordinator.take() {
+            coordinator.start();
+        }
+    }
+}
+
 impl TransportCompletion {
     fn mark_stopped(&self) {
         self.stopped.store(true, Ordering::Release);
@@ -81,6 +322,27 @@ impl TransportCompletion {
                 return;
             }
             notified.await;
+        }
+    }
+}
+
+/// Guarantees completion signalling even if `TransportActor::run` unwinds.
+/// An exit not initiated by the runtime coordinator also begins the same
+/// ownership drain used for explicit and process-signal shutdown.
+struct TransportActorCompletionGuard {
+    completion: Arc<TransportCompletion>,
+    coordinator: RuntimeShutdownCoordinator,
+}
+
+impl Drop for TransportActorCompletionGuard {
+    fn drop(&mut self) {
+        let unexpected = !self.coordinator.is_started();
+        self.completion.mark_stopped();
+        if unexpected {
+            tracing::error!(
+                "transport actor exited without an orderly shutdown request; draining runtime ownership"
+            );
+            self.coordinator.start();
         }
     }
 }
@@ -111,7 +373,7 @@ pub struct ReticulumHandle {
     /// Present even when `discover_interfaces = No` so a downstream can
     /// still install a stamper and start publishing.
     pub discovery: Arc<DiscoveryRuntime>,
-    transport_completion: Arc<TransportCompletion>,
+    shutdown_coordinator: RuntimeShutdownCoordinator,
     started_at: std::time::Instant,
 }
 
@@ -579,13 +841,10 @@ impl ReticulumHandle {
     }
 
     /// Trigger orderly runtime shutdown and wait until the transport actor has
-    /// synchronously flushed its persisted state.
+    /// synchronously flushed its persisted state. Dropping this future does
+    /// not cancel the runtime-owned drain operation.
     pub async fn shutdown_and_wait(&self) {
-        self.shutdown.trigger();
-        if !self.transport_completion.stopped.load(Ordering::Acquire) {
-            let _ = self.transport_tx.send(TransportMessage::Shutdown).await;
-        }
-        self.transport_completion.wait().await;
+        self.shutdown_coordinator.start_and_wait().await;
     }
 
     /// Wait up to `timeout` for the transport actor to resolve a path.
@@ -2109,14 +2368,50 @@ pub async fn init_with_options(
         actor.ephemeral_identity_hash = Some(ephemeral.hash);
     }
 
-    let shutdown_tx = transport_tx.clone();
-    let shutdown_clone = shutdown.clone();
     let transport_completion = Arc::new(TransportCompletion::default());
-    let actor_completion = transport_completion.clone();
-    tokio::spawn(async move {
-        actor.run().await;
-        actor_completion.mark_stopped();
-    });
+    let id_gen = Arc::new(AtomicU64::new(1));
+    // Sub-interface sink (e.g. TCP per-client). The receiver task is retained
+    // by the shutdown coordinator instead of being detached.
+    let (handle_tx, handle_rx) = mpsc::channel::<rns_interface::traits::InterfaceHandle>(64);
+    let interface_controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let interface_registry = InterfaceRegistry::default();
+    let shutdown_coordinator = RuntimeShutdownCoordinator::new(
+        shutdown.clone(),
+        transport_tx.clone(),
+        transport_completion.clone(),
+        interface_controls.clone(),
+        interface_registry.clone(),
+    );
+    let init_shutdown_guard = InitShutdownGuard {
+        coordinator: Some(shutdown_coordinator.clone()),
+    };
+    let accepted_child_pump = tokio::spawn(run_accepted_child_registration_pump(
+        handle_rx,
+        transport_tx.clone(),
+        interface_controls.clone(),
+        interface_registry.clone(),
+        shutdown.clone(),
+        rc.force_shared_instance_bitrate,
+    ));
+    shutdown_coordinator.install_accepted_child_pump(accepted_child_pump);
+    {
+        let coordinator = shutdown_coordinator.clone();
+        let shutdown_watcher = shutdown.clone();
+        tokio::spawn(async move {
+            shutdown_watcher.wait().await;
+            coordinator.start();
+        });
+    }
+    {
+        let completion_guard = TransportActorCompletionGuard {
+            completion: transport_completion.clone(),
+            coordinator: shutdown_coordinator.clone(),
+        };
+        tokio::spawn(async move {
+            let _completion_guard = completion_guard;
+            actor.run().await;
+        });
+    }
 
     // Persistent transport identity (Python 1.3.8 Transport._identity /
     // internal_identity()): the actor keeps it for RPC-key parity and swaps
@@ -2164,14 +2459,16 @@ pub async fn init_with_options(
         .map(|path| load_or_create_network_identity(path))
         .transpose()?;
 
-    let id_gen = Arc::new(AtomicU64::new(1));
-
-    // Sub-interface sink (e.g. TCP per-client).
-    let (handle_tx, mut handle_rx) = mpsc::channel::<rns_interface::traits::InterfaceHandle>(64);
-    let interface_controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let interface_registry = InterfaceRegistry::default();
-
     let socket_base = socket_dir.clone().unwrap_or_else(std::env::temp_dir);
+    let mut shared_spawn_permit = Some(match interface_registry.acquire_spawn_permit() {
+        Ok(permit) => permit,
+        Err(_) => {
+            shutdown_coordinator.wait().await;
+            return Err(ReticulumError::Interface(
+                "runtime shutdown during interface initialization".to_string(),
+            ));
+        }
+    });
     let instance_mode = if rc.share_instance {
         if rc.shared_instance_type == SharedInstanceType::Tcp {
             let live_server_detected = detect_shared_tcp_server(rc.shared_instance_port).await;
@@ -2194,6 +2491,7 @@ pub async fn init_with_options(
                             &interface_registry,
                             &shutdown,
                             rc.force_shared_instance_bitrate,
+                            shared_spawn_permit.take(),
                         )
                         .await
                     }
@@ -2223,12 +2521,13 @@ pub async fn init_with_options(
                             &mut server_handle,
                             rc.force_shared_instance_bitrate,
                         );
-                        match register_interface_handle_with_role(
+                        match register_interface_handle_with_role_and_spawn_permit(
                             &transport_tx,
                             server_handle,
                             rns_transport::messages::InterfaceRole::SharedServer,
                             &interface_controls,
                             &interface_registry,
+                            shared_spawn_permit.take(),
                         )
                         .await
                         {
@@ -2261,6 +2560,7 @@ pub async fn init_with_options(
                                         &interface_registry,
                                         &shutdown,
                                         rc.force_shared_instance_bitrate,
+                                        shared_spawn_permit.take(),
                                     )
                                     .await
                                 }
@@ -2323,6 +2623,7 @@ pub async fn init_with_options(
                             &interface_registry,
                             &shutdown,
                             rc.force_shared_instance_bitrate,
+                            shared_spawn_permit.take(),
                         )
                         .await
                     }
@@ -2349,12 +2650,13 @@ pub async fn init_with_options(
                             &mut server_handle,
                             rc.force_shared_instance_bitrate,
                         );
-                        match register_interface_handle_with_role(
+                        match register_interface_handle_with_role_and_spawn_permit(
                             &transport_tx,
                             server_handle,
                             rns_transport::messages::InterfaceRole::SharedServer,
                             &interface_controls,
                             &interface_registry,
+                            shared_spawn_permit.take(),
                         )
                         .await
                         {
@@ -2389,6 +2691,7 @@ pub async fn init_with_options(
                                     &interface_registry,
                                     &shutdown,
                                     rc.force_shared_instance_bitrate,
+                                    shared_spawn_permit.take(),
                                 )
                                 .await
                             }
@@ -2401,10 +2704,17 @@ pub async fn init_with_options(
     } else {
         InstanceMode::Standalone
     };
+    drop(shared_spawn_permit);
+
+    if !interface_registry.is_open() {
+        shutdown_coordinator.wait().await;
+        return Err(ReticulumError::Interface(
+            "runtime shutdown during interface initialization".to_string(),
+        ));
+    }
 
     if options.require_shared_instance && instance_mode != InstanceMode::Client {
-        let _ = transport_tx.send(TransportMessage::Shutdown).await;
-        transport_completion.wait().await;
+        shutdown_coordinator.start_and_wait().await;
         return Err(ReticulumError::RequiredSharedInstanceUnavailable);
     }
 
@@ -2441,7 +2751,7 @@ pub async fn init_with_options(
     let mut interfaces = match synthesize_interfaces(&config, rc.panic_on_interface_error) {
         Ok(interfaces) => interfaces,
         Err(e) => {
-            let _ = transport_tx.send(TransportMessage::Shutdown).await;
+            shutdown_coordinator.start_and_wait().await;
             return Err(e);
         }
     };
@@ -2461,6 +2771,15 @@ pub async fn init_with_options(
     // Client mode leaves hardware to the Shared sibling.
     if instance_mode != InstanceMode::Client {
         for iface_config in &interfaces {
+            let spawn_permit = match interface_registry.acquire_spawn_permit() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    shutdown_coordinator.wait().await;
+                    return Err(ReticulumError::Interface(
+                        "runtime shutdown during interface initialization".to_string(),
+                    ));
+                }
+            };
             let iface_id = next_id(&id_gen);
             let mut post_init = get_post_init_for_config(&config, iface_config);
             finalize_post_init(&mut post_init, &rc);
@@ -2492,6 +2811,7 @@ pub async fn init_with_options(
                     &interface_controls,
                     &interface_registry,
                     interface_kind_for_config(iface_config),
+                    Some(spawn_permit),
                 )
                 .await
                 {
@@ -2515,7 +2835,7 @@ pub async fn init_with_options(
                         }
                     }
                     Err(error) if rc.panic_on_interface_error => {
-                        let _ = transport_tx.send(TransportMessage::Shutdown).await;
+                        shutdown_coordinator.start_and_wait().await;
                         return Err(ReticulumError::Interface(error.to_string()));
                     }
                     Err(error) => {
@@ -2524,49 +2844,16 @@ pub async fn init_with_options(
                 },
                 Err(e) => {
                     if rc.panic_on_interface_error {
-                        let _ = transport_tx.send(TransportMessage::Shutdown).await;
+                        drop(spawn_permit);
+                        shutdown_coordinator.start_and_wait().await;
                         return Err(ReticulumError::Interface(e));
                     } else {
+                        drop(spawn_permit);
                         tracing::warn!("failed to spawn interface: {}", e);
                     }
                 }
             }
         }
-    }
-
-    {
-        let reg_tx = transport_tx.clone();
-        let reg_controls = interface_controls.clone();
-        let reg_registry = interface_registry.clone();
-        let forced_shared_bitrate = rc.force_shared_instance_bitrate;
-        tokio::spawn(async move {
-            while let Some(mut sub_handle) = handle_rx.recv().await {
-                let (role, ingress_overrides, ifac_key, ifac_size) =
-                    child_registration_from_parent(&reg_controls, sub_handle.parent_id);
-                if role == rns_transport::messages::InterfaceRole::LocalClient {
-                    apply_forced_shared_instance_bitrate(&mut sub_handle, forced_shared_bitrate);
-                }
-                if let Err(error) = register_interface_handle_with_role_and_overrides(
-                    &reg_tx,
-                    sub_handle,
-                    role,
-                    ingress_overrides,
-                    ifac_key,
-                    ifac_size,
-                    &reg_controls,
-                    &reg_registry,
-                    InterfaceKind::Standard,
-                    false,
-                )
-                .await
-                {
-                    tracing::warn!(error = %error, "failed to register accepted child interface");
-                    if matches!(error, InterfaceRegistrationError::TransportClosed { .. }) {
-                        break;
-                    }
-                }
-            }
-        });
     }
 
     let handle = ReticulumHandle {
@@ -2585,9 +2872,16 @@ pub async fn init_with_options(
         transport_identity: wire_transport_identity,
         network_identity: network_identity.clone(),
         discovery: discovery_runtime,
-        transport_completion,
+        shutdown_coordinator: shutdown_coordinator.clone(),
         started_at,
     };
+
+    if !interface_registry.is_open() {
+        shutdown_coordinator.wait().await;
+        return Err(ReticulumError::Interface(
+            "runtime shutdown during interface initialization".to_string(),
+        ));
+    }
 
     if instance_mode != InstanceMode::Client && rc.publish_blackhole {
         match start_blackhole_publisher(&handle).await {
@@ -2598,11 +2892,6 @@ pub async fn init_with_options(
     if instance_mode != InstanceMode::Client && !rc.blackhole_sources.is_empty() {
         start_blackhole_subscriber(handle.clone()).await;
     }
-
-    tokio::spawn(async move {
-        shutdown_clone.wait().await;
-        let _ = shutdown_tx.send(TransportMessage::Shutdown).await;
-    });
 
     if instance_mode != InstanceMode::Client {
         let cache_dir = paths.cache_dir.clone();
@@ -2727,7 +3016,69 @@ pub async fn init_with_options(
 
     let _ = INSTANCE.set(handle.clone());
 
+    init_shutdown_guard.disarm();
     Ok(handle)
+}
+
+async fn run_accepted_child_registration_pump(
+    mut handle_rx: mpsc::Receiver<rns_interface::traits::InterfaceHandle>,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    interface_controls: InterfaceControlMap,
+    interface_registry: InterfaceRegistry,
+    shutdown: ShutdownSignal,
+    forced_shared_bitrate: Option<u64>,
+) {
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = shutdown.wait() => {
+                handle_rx.close();
+                None
+            }
+            handle = handle_rx.recv() => handle,
+        };
+        let Some(mut sub_handle) = next else {
+            break;
+        };
+        let (role, ingress_overrides, ifac_key, ifac_size) =
+            child_registration_from_parent(&interface_controls, sub_handle.parent_id);
+        if role == rns_transport::messages::InterfaceRole::LocalClient {
+            apply_forced_shared_instance_bitrate(&mut sub_handle, forced_shared_bitrate);
+        }
+        // The coordinator retains and joins this pump before waiting producer
+        // permits, so accepted children do not need a separate spawn permit.
+        if let Err(error) = register_interface_handle_with_role_and_overrides(
+            &transport_tx,
+            sub_handle,
+            role,
+            ingress_overrides,
+            ifac_key,
+            ifac_size,
+            &interface_controls,
+            &interface_registry,
+            InterfaceKind::Standard,
+            false,
+        )
+        .await
+        {
+            tracing::warn!(error = %error, "failed to register accepted child interface");
+            if matches!(
+                error,
+                InterfaceRegistrationError::TransportClosed { .. }
+                    | InterfaceRegistrationError::RuntimeUnavailable { .. }
+            ) {
+                break;
+            }
+        }
+    }
+
+    // Closing the receiver rejects new children; anything already queued was
+    // never published and is reclaimed directly.
+    handle_rx.close();
+    while let Some(handle) = handle_rx.recv().await {
+        handle.online.store(false, Ordering::SeqCst);
+        crate::interface_registry::stop_unregistered_task(handle.read_task, None).await;
+    }
 }
 
 fn child_registration_from_parent(
@@ -2836,16 +3187,18 @@ async fn adopt_shared_instance_client(
     interface_registry: &InterfaceRegistry,
     shutdown: &ShutdownSignal,
     forced_bitrate: Option<u64>,
+    spawn_permit: Option<InterfaceSpawnPermit>,
 ) -> InstanceMode {
     apply_forced_shared_instance_bitrate(&mut client_handle, forced_bitrate);
     let client_iface_id = client_handle.id;
     let client_online = client_handle.online.clone();
-    if let Err(error) = register_interface_handle_with_role(
+    if let Err(error) = register_interface_handle_with_role_and_spawn_permit(
         transport_tx,
         client_handle,
         rns_transport::messages::InterfaceRole::SharedInstancePeer,
         interface_controls,
         interface_registry,
+        spawn_permit,
     )
     .await
     {
@@ -2938,6 +3291,7 @@ fn convert_mode(
 
 /// Must use `send().await`, not `try_send`: dropping the registration on a
 /// full channel leaves a spawned interface that never receives traffic.
+#[cfg(test)]
 async fn register_interface_handle(
     transport_tx: &mpsc::Sender<TransportMessage>,
     handle: rns_interface::traits::InterfaceHandle,
@@ -2955,16 +3309,35 @@ async fn register_interface_handle(
         interface_registry,
         InterfaceKind::Standard,
         false,
+        None,
     )
     .await
 }
 
-#[cfg(any(
-    feature = "serial",
-    feature = "rnode-tcp",
-    feature = "ble",
-    target_os = "android"
-))]
+async fn register_interface_handle_with_spawn_permit(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    handle: rns_interface::traits::InterfaceHandle,
+    interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    spawn_permit: InterfaceSpawnPermit,
+) -> Result<(), InterfaceRegistrationError> {
+    register_owned_interface_handle_with_role_and_overrides(
+        transport_tx,
+        handle.into(),
+        rns_transport::messages::InterfaceRole::Normal,
+        rns_transport::ingress::IngressOverrides::default(),
+        None,
+        0,
+        interface_controls,
+        interface_registry,
+        InterfaceKind::Standard,
+        false,
+        Some(spawn_permit),
+    )
+    .await
+}
+
+#[cfg(all(test, feature = "rnode-tcp"))]
 async fn register_observed_rnode_handle_with_kind(
     transport_tx: &mpsc::Sender<TransportMessage>,
     spawned: rns_interface::rnode::SpawnedRNodeInterface,
@@ -2983,22 +3356,52 @@ async fn register_observed_rnode_handle_with_kind(
         interface_registry,
         kind,
         false,
+        None,
     )
     .await
 }
 
-/// Must use `send().await`, not `try_send`: dropping the registration on a
-/// full channel leaves a spawned interface that never receives traffic.
-async fn register_interface_handle_with_role(
+#[cfg(any(
+    feature = "serial",
+    feature = "rnode-tcp",
+    feature = "ble",
+    target_os = "android"
+))]
+async fn register_observed_rnode_handle_with_kind_and_spawn_permit(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    spawned: rns_interface::rnode::SpawnedRNodeInterface,
+    interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    kind: InterfaceKind,
+    spawn_permit: InterfaceSpawnPermit,
+) -> Result<(), InterfaceRegistrationError> {
+    register_owned_interface_handle_with_role_and_overrides(
+        transport_tx,
+        spawned.into(),
+        rns_transport::messages::InterfaceRole::Normal,
+        rns_transport::ingress::IngressOverrides::default(),
+        None,
+        0,
+        interface_controls,
+        interface_registry,
+        kind,
+        false,
+        Some(spawn_permit),
+    )
+    .await
+}
+
+async fn register_interface_handle_with_role_and_spawn_permit(
     transport_tx: &mpsc::Sender<TransportMessage>,
     handle: rns_interface::traits::InterfaceHandle,
     role: rns_transport::messages::InterfaceRole,
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
+    spawn_permit: Option<InterfaceSpawnPermit>,
 ) -> Result<(), InterfaceRegistrationError> {
-    register_interface_handle_with_role_and_overrides(
+    register_owned_interface_handle_with_role_and_overrides(
         transport_tx,
-        handle,
+        handle.into(),
         role,
         rns_transport::ingress::IngressOverrides::default(),
         None,
@@ -3007,6 +3410,7 @@ async fn register_interface_handle_with_role(
         interface_registry,
         InterfaceKind::Standard,
         false,
+        spawn_permit,
     )
     .await
 }
@@ -3035,6 +3439,38 @@ async fn register_interface_handle_with_role_and_overrides(
         interface_registry,
         kind,
         multipoint,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "ble")]
+async fn register_interface_handle_with_role_and_overrides_and_spawn_permit(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    handle: rns_interface::traits::InterfaceHandle,
+    role: rns_transport::messages::InterfaceRole,
+    ingress_overrides: rns_transport::ingress::IngressOverrides,
+    ifac_key: Option<[u8; 64]>,
+    ifac_size: usize,
+    interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    kind: InterfaceKind,
+    multipoint: bool,
+    spawn_permit: InterfaceSpawnPermit,
+) -> Result<(), InterfaceRegistrationError> {
+    register_owned_interface_handle_with_role_and_overrides(
+        transport_tx,
+        handle.into(),
+        role,
+        ingress_overrides,
+        ifac_key,
+        ifac_size,
+        interface_controls,
+        interface_registry,
+        kind,
+        multipoint,
+        Some(spawn_permit),
     )
     .await
 }
@@ -3051,6 +3487,7 @@ async fn register_owned_interface_handle_with_role_and_overrides(
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
     multipoint: bool,
+    spawn_permit: Option<InterfaceSpawnPermit>,
 ) -> Result<(), InterfaceRegistrationError> {
     run_single_registration_worker(
         transport_tx.clone(),
@@ -3065,6 +3502,7 @@ async fn register_owned_interface_handle_with_role_and_overrides(
             kind,
             multipoint,
         },
+        spawn_permit,
     )
     .await
     .map(|_| ())
@@ -3099,7 +3537,12 @@ async fn prepare_interface_with_role_and_overrides(
         Err(rejected) => {
             let rejection = rejected.reason();
             online.store(false, Ordering::SeqCst);
-            if rejection == InterfaceRegistrationRejection::Duplicate {
+            if matches!(
+                rejection,
+                InterfaceRegistrationRejection::Duplicate
+                    | InterfaceRegistrationRejection::Draining
+                    | InterfaceRegistrationRejection::Closed
+            ) {
                 stop_special_interface_before_abort(kind).await;
             }
             rejected.stop_and_wait().await;
@@ -3109,6 +3552,10 @@ async fn prepare_interface_with_role_and_overrides(
                 }
                 InterfaceRegistrationRejection::InvalidDriverOwnership => {
                     InterfaceRegistrationError::InvalidDriverOwnership { id }
+                }
+                InterfaceRegistrationRejection::Draining
+                | InterfaceRegistrationRejection::Closed => {
+                    InterfaceRegistrationError::RuntimeUnavailable { id }
                 }
             });
         }
@@ -3170,6 +3617,7 @@ async fn prepare_interface_with_role_and_overrides(
 }
 
 /// See [`register_interface_handle`] for `send().await` rationale.
+#[cfg(test)]
 async fn register_interface_with_post_init(
     transport_tx: &mpsc::Sender<TransportMessage>,
     handle: rns_interface::traits::InterfaceHandle,
@@ -3187,10 +3635,36 @@ async fn register_interface_with_post_init(
         interface_controls,
         interface_registry,
         kind,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn register_interface_with_post_init_and_spawn_permit(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    handle: rns_interface::traits::InterfaceHandle,
+    post_init: &interface_factory::InterfacePostInit,
+    ifac_key: Option<[u8; 64]>,
+    interface_controls: &InterfaceControlMap,
+    interface_registry: &InterfaceRegistry,
+    kind: InterfaceKind,
+    spawn_permit: InterfaceSpawnPermit,
+) -> Result<(), InterfaceRegistrationError> {
+    register_owned_interface_with_post_init(
+        transport_tx,
+        handle.into(),
+        post_init,
+        ifac_key,
+        interface_controls,
+        interface_registry,
+        kind,
+        Some(spawn_permit),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn register_owned_interface_with_post_init(
     transport_tx: &mpsc::Sender<TransportMessage>,
     owned: OwnedInterfaceHandle,
@@ -3199,6 +3673,7 @@ async fn register_owned_interface_with_post_init(
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
+    spawn_permit: Option<InterfaceSpawnPermit>,
 ) -> Result<(), InterfaceRegistrationError> {
     run_single_registration_worker(
         transport_tx.clone(),
@@ -3210,6 +3685,7 @@ async fn register_owned_interface_with_post_init(
             ifac_key,
             kind,
         },
+        spawn_permit,
     )
     .await
     .map(|_| ())
@@ -3270,7 +3746,12 @@ async fn prepare_interface_with_post_init(
         Err(rejected) => {
             let rejection = rejected.reason();
             online.store(false, Ordering::SeqCst);
-            if rejection == InterfaceRegistrationRejection::Duplicate {
+            if matches!(
+                rejection,
+                InterfaceRegistrationRejection::Duplicate
+                    | InterfaceRegistrationRejection::Draining
+                    | InterfaceRegistrationRejection::Closed
+            ) {
                 stop_special_interface_before_abort(kind).await;
             }
             rejected.stop_and_wait().await;
@@ -3280,6 +3761,10 @@ async fn prepare_interface_with_post_init(
                 }
                 InterfaceRegistrationRejection::InvalidDriverOwnership => {
                     InterfaceRegistrationError::InvalidDriverOwnership { id }
+                }
+                InterfaceRegistrationRejection::Draining
+                | InterfaceRegistrationRejection::Closed => {
+                    InterfaceRegistrationError::RuntimeUnavailable { id }
                 }
             });
         }
@@ -3339,6 +3824,7 @@ async fn prepare_interface_with_post_init(
 enum InterfaceRegistrationError {
     Duplicate { id: u64 },
     InvalidDriverOwnership { id: u64 },
+    RuntimeUnavailable { id: u64 },
     TransportClosed { id: u64 },
     ReservationLost { id: u64 },
     WorkerStopped { id: u64 },
@@ -3352,6 +3838,12 @@ impl std::fmt::Display for InterfaceRegistrationError {
                 write!(
                     formatter,
                     "interface {id} has inconsistent exact-driver ownership"
+                )
+            }
+            Self::RuntimeUnavailable { id } => {
+                write!(
+                    formatter,
+                    "runtime is draining; interface {id} was not admitted"
                 )
             }
             Self::TransportClosed { id } => {
@@ -3477,6 +3969,7 @@ async fn run_single_registration_worker(
     interface_controls: InterfaceControlMap,
     interface_registry: InterfaceRegistry,
     spec: SingleRegistrationSpec,
+    spawn_permit: Option<InterfaceSpawnPermit>,
 ) -> Result<Vec<u64>, InterfaceRegistrationError> {
     let id = spec.id();
     let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -3493,6 +3986,7 @@ async fn run_single_registration_worker(
             receiver: cancel_rx,
         },
         reply_tx,
+        spawn_permit,
     ));
 
     let mut reply = match reply_rx.await {
@@ -3514,6 +4008,7 @@ async fn single_registration_worker(
     spec: SingleRegistrationSpec,
     mut cancellation: RegistrationCancellation,
     reply_tx: oneshot::Sender<RegistrationWorkerReply>,
+    spawn_permit: Option<InterfaceSpawnPermit>,
 ) {
     let result = match spec {
         SingleRegistrationSpec::Direct {
@@ -3579,6 +4074,12 @@ async fn single_registration_worker(
             }
         }
     };
+    // The registration transaction does not resolve until either the task is
+    // Active under registry ownership or rejection/rollback has joined it.
+    // Release the producer permit at that ownership boundary. Holding it
+    // while waiting for the caller acknowledgement would deadlock a drain
+    // that has already leased the Active record and is waiting on permits.
+    drop(spawn_permit);
     finish_registration_worker(
         result,
         transport_tx,
@@ -3747,6 +4248,7 @@ async fn rollback_published_interfaces(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn register_interfaces_with_post_init_batch(
     transport_tx: &mpsc::Sender<TransportMessage>,
     handles: Vec<OwnedInterfaceHandle>,
@@ -3755,6 +4257,7 @@ async fn register_interfaces_with_post_init_batch(
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
+    spawn_permit: Option<InterfaceSpawnPermit>,
 ) -> Result<Vec<u64>, InterfaceRegistrationError> {
     let fallback_id = handles.first().map_or(0, |owned| owned.interface.id);
     let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -3774,6 +4277,7 @@ async fn register_interfaces_with_post_init_batch(
             receiver: cancel_rx,
         },
         reply_tx,
+        spawn_permit,
     ));
 
     let mut reply = match reply_rx.await {
@@ -3801,6 +4305,7 @@ async fn batch_registration_worker(
     kind: InterfaceKind,
     mut cancellation: RegistrationCancellation,
     reply_tx: oneshot::Sender<RegistrationWorkerReply>,
+    spawn_permit: Option<InterfaceSpawnPermit>,
 ) {
     let result = register_interfaces_with_post_init_batch_transaction(
         &transport_tx,
@@ -3813,6 +4318,9 @@ async fn batch_registration_worker(
         &mut cancellation,
     )
     .await;
+    // As above, batch commit transfers every task to registry ownership;
+    // every error path has already completed exact rollback before returning.
+    drop(spawn_permit);
     finish_registration_worker(
         result,
         transport_tx,
@@ -4631,6 +5139,9 @@ async fn run_discovery_autoconnect(
 }
 
 async fn maybe_autoconnect_discovered(handle: &ReticulumHandle, record: DiscoveredInterface) {
+    if !handle.interface_registry.is_open() {
+        return;
+    }
     let limit = handle.config.autoconnect_discovered_interfaces;
     if limit == 0 {
         return;
@@ -4684,6 +5195,7 @@ async fn spawn_discovered_backbone_client(
     host: &str,
     port: u16,
 ) -> Result<u64, String> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let id = next_id(&handle.id_gen);
     let name = format!(
         "Discovered/{}",
@@ -4707,7 +5219,7 @@ async fn spawn_discovered_backbone_client(
     post_init.ifac_network_name = record.info.ifac_netname.clone();
     post_init.ifac_passphrase = record.info.ifac_netkey.clone();
     let ifac_key = derive_ifac_key_from_post_init(&post_init);
-    register_interface_with_post_init(
+    register_interface_with_post_init_and_spawn_permit(
         &handle.transport_tx,
         iface_handle,
         &post_init,
@@ -4715,6 +5227,7 @@ async fn spawn_discovered_backbone_client(
         &handle.interface_controls,
         &handle.interface_registry,
         InterfaceKind::Standard,
+        spawn_permit,
     )
     .await
     .map_err(|error| format!("Backbone client registration failed: {error}"))?;
@@ -4971,6 +5484,15 @@ fn blocking_transport_query(
     tokio::task::block_in_place(|| resp_rx.blocking_recv().ok())
 }
 
+fn ensure_runtime_interface_admission(
+    handle: &ReticulumHandle,
+) -> Result<InterfaceSpawnPermit, String> {
+    handle
+        .interface_registry
+        .acquire_spawn_permit()
+        .map_err(|_| "runtime is shutting down; interface spawn rejected".to_string())
+}
+
 /// Spawn a TCP client interface at runtime; returns the interface ID.
 pub async fn spawn_tcp_client_runtime(
     handle: &ReticulumHandle,
@@ -4989,6 +5511,7 @@ pub async fn spawn_tcp_client_runtime_with_ifac(
     port: u16,
     ifac: Option<RuntimeInterfaceIfacConfig>,
 ) -> Result<u64, String> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let id = handle
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5001,7 +5524,7 @@ pub async fn spawn_tcp_client_runtime_with_ifac(
 
     if let Some(post_init) = post_init {
         let ifac_key = derive_ifac_key_from_post_init(&post_init);
-        register_interface_with_post_init(
+        register_interface_with_post_init_and_spawn_permit(
             &handle.transport_tx,
             iface_handle,
             &post_init,
@@ -5009,15 +5532,17 @@ pub async fn spawn_tcp_client_runtime_with_ifac(
             &handle.interface_controls,
             &handle.interface_registry,
             InterfaceKind::Standard,
+            spawn_permit,
         )
         .await
         .map_err(|error| format!("TCP client registration failed: {error}"))?;
     } else {
-        register_interface_handle(
+        register_interface_handle_with_spawn_permit(
             &handle.transport_tx,
             iface_handle,
             &handle.interface_controls,
             &handle.interface_registry,
+            spawn_permit,
         )
         .await
         .map_err(|error| format!("TCP client registration failed: {error}"))?;
@@ -5045,6 +5570,7 @@ pub async fn spawn_tcp_server_runtime_with_ifac(
     port: u16,
     ifac: Option<RuntimeInterfaceIfacConfig>,
 ) -> Result<u64, String> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let id = next_id(&handle.id_gen);
     let post_init = runtime_ifac_post_init(ifac, 16)?;
     let config = rns_interface::tcp::TcpServerConfig::new(name, listen_ip, port);
@@ -5060,7 +5586,7 @@ pub async fn spawn_tcp_server_runtime_with_ifac(
 
     if let Some(post_init) = post_init {
         let ifac_key = derive_ifac_key_from_post_init(&post_init);
-        register_interface_with_post_init(
+        register_interface_with_post_init_and_spawn_permit(
             &handle.transport_tx,
             iface_handle,
             &post_init,
@@ -5068,15 +5594,17 @@ pub async fn spawn_tcp_server_runtime_with_ifac(
             &handle.interface_controls,
             &handle.interface_registry,
             InterfaceKind::Standard,
+            spawn_permit,
         )
         .await
         .map_err(|error| format!("TCP server registration failed: {error}"))?;
     } else {
-        register_interface_handle(
+        register_interface_handle_with_spawn_permit(
             &handle.transport_tx,
             iface_handle,
             &handle.interface_controls,
             &handle.interface_registry,
+            spawn_permit,
         )
         .await
         .map_err(|error| format!("TCP server registration failed: {error}"))?;
@@ -5115,6 +5643,7 @@ pub async fn spawn_backbone_client_runtime_with_ifac(
     handle: &ReticulumHandle,
     runtime_config: RuntimeBackboneClientConfig<'_>,
 ) -> Result<u64, String> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let id = handle
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5137,7 +5666,7 @@ pub async fn spawn_backbone_client_runtime_with_ifac(
 
     if let Some(post_init) = post_init {
         let ifac_key = derive_ifac_key_from_post_init(&post_init);
-        register_interface_with_post_init(
+        register_interface_with_post_init_and_spawn_permit(
             &handle.transport_tx,
             iface_handle,
             &post_init,
@@ -5145,15 +5674,17 @@ pub async fn spawn_backbone_client_runtime_with_ifac(
             &handle.interface_controls,
             &handle.interface_registry,
             InterfaceKind::Standard,
+            spawn_permit,
         )
         .await
         .map_err(|error| format!("Backbone client registration failed: {error}"))?;
     } else {
-        register_interface_handle(
+        register_interface_handle_with_spawn_permit(
             &handle.transport_tx,
             iface_handle,
             &handle.interface_controls,
             &handle.interface_registry,
+            spawn_permit,
         )
         .await
         .map_err(|error| format!("Backbone client registration failed: {error}"))?;
@@ -5194,6 +5725,7 @@ pub async fn spawn_backbone_server_runtime_with_ifac(
     device: Option<&str>,
     ifac: Option<RuntimeInterfaceIfacConfig>,
 ) -> Result<u64, String> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let id = next_id(&handle.id_gen);
     let post_init = runtime_ifac_post_init(ifac, 16)?;
     let mut config = rns_interface::backbone::BackboneServerConfig::new(name, listen_ip, port);
@@ -5212,7 +5744,7 @@ pub async fn spawn_backbone_server_runtime_with_ifac(
 
     if let Some(post_init) = post_init {
         let ifac_key = derive_ifac_key_from_post_init(&post_init);
-        register_interface_with_post_init(
+        register_interface_with_post_init_and_spawn_permit(
             &handle.transport_tx,
             iface_handle,
             &post_init,
@@ -5220,15 +5752,17 @@ pub async fn spawn_backbone_server_runtime_with_ifac(
             &handle.interface_controls,
             &handle.interface_registry,
             InterfaceKind::Standard,
+            spawn_permit,
         )
         .await
         .map_err(|error| format!("Backbone server registration failed: {error}"))?;
     } else {
-        register_interface_handle(
+        register_interface_handle_with_spawn_permit(
             &handle.transport_tx,
             iface_handle,
             &handle.interface_controls,
             &handle.interface_registry,
+            spawn_permit,
         )
         .await
         .map_err(|error| format!("Backbone server registration failed: {error}"))?;
@@ -5271,6 +5805,7 @@ pub async fn spawn_ble_rnode_runtime(
     handle: &ReticulumHandle,
     args: BleRnodeRuntimeArgs<'_>,
 ) -> Result<(u64, std::sync::Arc<std::sync::atomic::AtomicBool>), String> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let BleRnodeRuntimeArgs {
         name,
         port,
@@ -5308,12 +5843,13 @@ pub async fn spawn_ble_rnode_runtime(
     .map_err(|e| format!("BLE RNode spawn failed: {e}"))?;
 
     let online = spawned.interface.online.clone();
-    register_observed_rnode_handle_with_kind(
+    register_observed_rnode_handle_with_kind_and_spawn_permit(
         &handle.transport_tx,
         spawned,
         &handle.interface_controls,
         &handle.interface_registry,
         InterfaceKind::BleRNode,
+        spawn_permit,
     )
     .await
     .map_err(|error| format!("BLE RNode registration failed: {error}"))?;
@@ -5353,6 +5889,7 @@ pub async fn spawn_rnode_runtime(
     handle: &ReticulumHandle,
     args: RnodeRuntimeArgs<'_>,
 ) -> Result<(u64, std::sync::Arc<std::sync::atomic::AtomicBool>), String> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let RnodeRuntimeArgs {
         name,
         port,
@@ -5395,12 +5932,13 @@ pub async fn spawn_rnode_runtime(
     .map_err(|e| format!("RNode spawn failed: {e}"))?;
 
     let online = spawned.interface.online.clone();
-    register_observed_rnode_handle_with_kind(
+    register_observed_rnode_handle_with_kind_and_spawn_permit(
         &handle.transport_tx,
         spawned,
         &handle.interface_controls,
         &handle.interface_registry,
         InterfaceKind::RNode,
+        spawn_permit,
     )
     .await
     .map_err(|error| format!("RNode registration failed: {error}"))?;
@@ -5415,6 +5953,7 @@ pub async fn spawn_ble_rnode_runtime_native(
     args: BleRnodeRuntimeArgs<'_>,
     tcp_port: u16,
 ) -> Result<(u64, std::sync::Arc<std::sync::atomic::AtomicBool>), String> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let BleRnodeRuntimeArgs {
         name,
         port,
@@ -5453,12 +5992,13 @@ pub async fn spawn_ble_rnode_runtime_native(
     .map_err(|e| format!("BLE RNode native spawn failed: {e}"))?;
 
     let online = spawned.interface.online.clone();
-    register_observed_rnode_handle_with_kind(
+    register_observed_rnode_handle_with_kind_and_spawn_permit(
         &handle.transport_tx,
         spawned,
         &handle.interface_controls,
         &handle.interface_registry,
         InterfaceKind::BleRNode,
+        spawn_permit,
     )
     .await
     .map_err(|error| format!("BLE RNode native registration failed: {error}"))?;
@@ -5471,6 +6011,7 @@ pub async fn spawn_auto_interface_runtime_with_config(
     handle: &ReticulumHandle,
     config: rns_interface::auto::AutoInterfaceConfig,
 ) -> Result<u64, String> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let id = handle
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5484,11 +6025,12 @@ pub async fn spawn_auto_interface_runtime_with_config(
     .await
     .map_err(|e| format!("Auto interface spawn failed: {e}"))?;
 
-    register_interface_handle(
+    register_interface_handle_with_spawn_permit(
         &handle.transport_tx,
         iface_handle,
         &handle.interface_controls,
         &handle.interface_registry,
+        spawn_permit,
     )
     .await
     .map_err(|error| format!("Auto interface registration failed: {error}"))?;
@@ -5525,6 +6067,7 @@ pub async fn spawn_ble_peer_runtime(
     foreground_wake: std::sync::Arc<tokio::sync::Notify>,
     seed_addresses: Vec<String>,
 ) -> Result<u64, String> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let id = handle
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5552,7 +6095,7 @@ pub async fn spawn_ble_peer_runtime(
 
     // multipoint = true: BLE peers can't hear each other, so the transport must
     // relay announces back out this interface to reach its other peers.
-    register_interface_handle_with_role_and_overrides(
+    register_interface_handle_with_role_and_overrides_and_spawn_permit(
         &handle.transport_tx,
         iface_handle,
         rns_transport::messages::InterfaceRole::Normal,
@@ -5563,6 +6106,7 @@ pub async fn spawn_ble_peer_runtime(
         &handle.interface_registry,
         InterfaceKind::BlePeer,
         true,
+        spawn_permit,
     )
     .await
     .map_err(|error| format!("BLE Peer registration failed: {error}"))?;
@@ -5609,6 +6153,7 @@ pub async fn spawn_android_usb_rnode_runtime(
     lt_alock: Option<f32>,
     flow_control: bool,
 ) -> Result<u64, String> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let id = handle
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5631,12 +6176,13 @@ pub async fn spawn_android_usb_rnode_runtime(
     .await
     .map_err(|e| format!("Android USB spawn failed: {e}"))?;
 
-    register_observed_rnode_handle_with_kind(
+    register_observed_rnode_handle_with_kind_and_spawn_permit(
         &handle.transport_tx,
         spawned,
         &handle.interface_controls,
         &handle.interface_registry,
         InterfaceKind::AndroidUsbRNode,
+        spawn_permit,
     )
     .await
     .map_err(|error| format!("Android USB registration failed: {error}"))?;
@@ -5717,6 +6263,10 @@ async fn teardown_interface_transaction(
         ShutdownStart::AlreadyStopping { owner } => {
             tracing::debug!(id, "interface teardown is in progress; waiting");
             interface_registry.wait_until_not_owner(id, owner).await;
+            return;
+        }
+        ShutdownStart::RegistryDraining => {
+            tracing::debug!(id, "runtime drain already owns interface teardown");
             return;
         }
     };
@@ -6237,6 +6787,216 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_shutdown_is_single_cancellation_independent_and_persistence_ordered() {
+        struct TaskDrop(Arc<AtomicBool>);
+        impl Drop for TaskDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let completion = Arc::new(TransportCompletion::default());
+        let shutdown = ShutdownSignal::new();
+        let controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registry = InterfaceRegistry::default();
+        let coordinator = RuntimeShutdownCoordinator::new(
+            shutdown.clone(),
+            transport_tx,
+            completion.clone(),
+            controls.clone(),
+            registry.clone(),
+        );
+
+        let id = 930_001;
+        let online = Arc::new(AtomicBool::new(true));
+        let task_stopped = Arc::new(AtomicBool::new(false));
+        let (task_started_tx, task_started_rx) = oneshot::channel();
+        let task_stopped_in_task = task_stopped.clone();
+        let task = tokio::spawn(async move {
+            let _drop = TaskDrop(task_stopped_in_task);
+            let _ = task_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        task_started_rx.await.expect("interface task started");
+        let registration = registry
+            .reserve_with_online(
+                id,
+                InterfaceKind::Standard,
+                task,
+                None,
+                Some(online.clone()),
+            )
+            .expect("reserve interface");
+        let owner = registration.owner();
+        assert!(registration.commit().is_ok());
+        controls.lock().unwrap().insert(
+            id,
+            InterfaceControlMetadata {
+                registry_owner: owner,
+                role: rns_transport::messages::InterfaceRole::Normal,
+                ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
+                ifac_key: None,
+                ifac_size: 0,
+            },
+        );
+
+        let (shutdown_seen_tx, shutdown_seen_rx) = oneshot::channel();
+        let (persist_release_tx, persist_release_rx) = oneshot::channel();
+        let actor_completion = completion.clone();
+        let actor_online = online.clone();
+        let actor_task_stopped = task_stopped.clone();
+        let actor_controls = controls.clone();
+        let actor = tokio::spawn(async move {
+            let mut shutdown_count = 0usize;
+            let mut saw_deregister = false;
+            while let Some(message) = transport_rx.recv().await {
+                match message {
+                    TransportMessage::Shutdown => {
+                        shutdown_count += 1;
+                        assert!(!actor_online.load(Ordering::SeqCst));
+                        assert!(actor_task_stopped.load(Ordering::Acquire));
+                        assert!(
+                            actor_controls.lock().unwrap().contains_key(&id),
+                            "controls remain through the persistence boundary"
+                        );
+                        let _ = shutdown_seen_tx.send(());
+                        let _ = persist_release_rx.await;
+                        actor_completion.mark_stopped();
+                        break;
+                    }
+                    TransportMessage::DeregisterInterface { .. } => saw_deregister = true,
+                    _ => {}
+                }
+            }
+            (shutdown_count, saw_deregister)
+        });
+
+        let first_coordinator = coordinator.clone();
+        let first = tokio::spawn(async move {
+            first_coordinator.start_and_wait().await;
+        });
+        shutdown_seen_rx.await.expect("actor received shutdown");
+        first.abort();
+        let _ = first.await;
+
+        let second_coordinator = coordinator.clone();
+        let second = tokio::spawn(async move {
+            second_coordinator.start_and_wait().await;
+        });
+        let third_coordinator = coordinator.clone();
+        let third = tokio::spawn(async move {
+            third_coordinator.start_and_wait().await;
+        });
+        persist_release_tx.send(()).expect("release persistence");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            second.await.unwrap();
+            third.await.unwrap();
+        })
+        .await
+        .expect("remaining shutdown callers complete");
+
+        let (shutdown_count, saw_deregister) = actor.await.unwrap();
+        assert_eq!(shutdown_count, 1);
+        assert!(!saw_deregister, "global drain must preserve actor bindings");
+        assert!(controls.lock().unwrap().is_empty());
+        assert_eq!(
+            registry.admission_for_test(),
+            crate::interface_registry::RegistryAdmission::Closed
+        );
+        assert!(shutdown.is_triggered());
+    }
+
+    #[tokio::test]
+    async fn transport_actor_panic_guard_completes_and_triggers_runtime_drain() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(2);
+        let completion = Arc::new(TransportCompletion::default());
+        let shutdown = ShutdownSignal::new();
+        let controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registry = InterfaceRegistry::default();
+        let coordinator = RuntimeShutdownCoordinator::new(
+            shutdown.clone(),
+            transport_tx,
+            completion.clone(),
+            controls,
+            registry.clone(),
+        );
+        let guard = TransportActorCompletionGuard {
+            completion: completion.clone(),
+            coordinator: coordinator.clone(),
+        };
+        let actor = tokio::spawn(async move {
+            let _guard = guard;
+            panic!("deterministic actor panic");
+        });
+        assert!(actor.await.is_err());
+
+        tokio::time::timeout(Duration::from_secs(1), coordinator.wait())
+            .await
+            .expect("panic-triggered coordinator completed");
+        completion.wait().await;
+        assert!(shutdown.is_triggered());
+        assert_eq!(
+            registry.admission_for_test(),
+            crate::interface_registry::RegistryAdmission::Closed
+        );
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "already-stopped actor must not receive a redundant Shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_closed_pending_registration_cannot_strand_runtime_drain() {
+        let (transport_tx, transport_rx) = mpsc::channel::<TransportMessage>(1);
+        drop(transport_rx);
+        let completion = Arc::new(TransportCompletion::default());
+        completion.mark_stopped();
+        let shutdown = ShutdownSignal::new();
+        let controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registry = InterfaceRegistry::default();
+        let coordinator = RuntimeShutdownCoordinator::new(
+            shutdown,
+            transport_tx,
+            completion,
+            controls.clone(),
+            registry.clone(),
+        );
+
+        let id = 930_002;
+        let registration = registry
+            .reserve(
+                id,
+                InterfaceKind::Standard,
+                tokio::spawn(std::future::pending()),
+                None,
+            )
+            .expect("pending reservation");
+        let owner = registration.owner();
+        controls.lock().unwrap().insert(
+            id,
+            InterfaceControlMetadata {
+                registry_owner: owner,
+                role: rns_transport::messages::InterfaceRole::Normal,
+                ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
+                ifac_key: None,
+                ifac_size: 0,
+            },
+        );
+        drop(registration);
+
+        tokio::time::timeout(Duration::from_secs(1), coordinator.start_and_wait())
+            .await
+            .expect("closed-actor Pending cleanup must not strand drain");
+        assert!(controls.lock().unwrap().is_empty());
+        assert_eq!(registry.len(), 0);
+        assert_eq!(
+            registry.admission_for_test(),
+            crate::interface_registry::RegistryAdmission::Closed
+        );
+    }
+
+    #[tokio::test]
     async fn announce_subscription_close_is_exact_and_idempotent() {
         let (actor, transport_tx) = rns_transport::actor::TransportActor::new();
         let actor_task = tokio::spawn(actor.run());
@@ -6664,6 +7424,20 @@ loglevel = 7
     fn dummy_handle() -> ReticulumHandle {
         let (tx, _rx) = mpsc::channel::<TransportMessage>(1);
         let (htx, _hrx) = mpsc::channel::<rns_interface::traits::InterfaceHandle>(1);
+        let shutdown = ShutdownSignal::new();
+        let interface_controls = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
+        let transport_completion = Arc::new(TransportCompletion {
+            stopped: AtomicBool::new(true),
+            notify: Notify::new(),
+        });
+        let shutdown_coordinator = RuntimeShutdownCoordinator::new(
+            shutdown.clone(),
+            tx.clone(),
+            transport_completion.clone(),
+            interface_controls.clone(),
+            interface_registry.clone(),
+        );
         ReticulumHandle {
             transport_tx: tx,
             config_dir: PathBuf::from("/tmp/dummy"),
@@ -6671,19 +7445,16 @@ loglevel = 7
             interface_configs: Vec::new(),
             id_gen: Arc::new(AtomicU64::new(0)),
             handle_tx: htx,
-            interface_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            interface_registry: InterfaceRegistry::default(),
+            interface_controls,
+            interface_registry,
             socket_base: PathBuf::from("/tmp/dummy"),
             config: ReticulumConfig::default(),
             is_foreground: Arc::new(AtomicBool::new(true)),
-            shutdown: ShutdownSignal::new(),
+            shutdown,
             transport_identity: Arc::new(Identity::new()),
             network_identity: None,
             discovery: Arc::new(DiscoveryRuntime::default()),
-            transport_completion: Arc::new(TransportCompletion {
-                stopped: AtomicBool::new(true),
-                notify: Notify::new(),
-            }),
+            shutdown_coordinator,
             started_at: std::time::Instant::now(),
         }
     }
@@ -7756,6 +8527,7 @@ egress_control = Yes
             &interface_controls,
             &interface_registry,
             InterfaceKind::Standard,
+            None,
         )
         .await;
         assert!(matches!(
@@ -8090,6 +8862,7 @@ egress_control = Yes
             &registry,
             InterfaceKind::RNode,
             false,
+            None,
         )
         .await;
         assert!(matches!(
@@ -8118,6 +8891,7 @@ egress_control = Yes
             &registry,
             InterfaceKind::Standard,
             false,
+            None,
         )
         .await;
         assert!(matches!(
@@ -8180,6 +8954,209 @@ egress_control = Yes
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_caller_before_worker_poll_keeps_drain_blocked_until_cleanup() {
+        struct TaskDrop(Arc<AtomicBool>);
+        impl Drop for TaskDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let id = 920_104;
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
+        let spawn_permit = interface_registry
+            .acquire_spawn_permit()
+            .expect("runtime admission is open");
+
+        let task_stopped = Arc::new(AtomicBool::new(false));
+        let (task_started_tx, task_started_rx) = oneshot::channel();
+        let task_stopped_in_task = task_stopped.clone();
+        let mut handle = test_interface_handle(id, None, "cancel-before-worker-poll");
+        handle.read_task = tokio::spawn(async move {
+            let _drop = TaskDrop(task_stopped_in_task);
+            let _ = task_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        task_started_rx
+            .await
+            .expect("physical interface task started");
+        let online = handle.online.clone();
+
+        let mut caller = Box::pin(register_interface_handle_with_spawn_permit(
+            &transport_tx,
+            handle,
+            &interface_controls,
+            &interface_registry,
+            spawn_permit,
+        ));
+        // Poll exactly through detached-worker creation. On a current-thread
+        // runtime, the spawned worker cannot poll until this task yields.
+        tokio::select! {
+            biased;
+            result = &mut caller => panic!("registration unexpectedly completed: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        drop(caller);
+
+        let drain = match interface_registry.begin_drain() {
+            DrainStart::Acquired(drain) => drain,
+            _ => panic!("first drain must acquire ownership"),
+        };
+        let (shutdowns, waiters, abandoned) = drain.into_parts();
+        assert!(shutdowns.is_empty());
+        assert!(waiters.is_empty());
+        assert!(abandoned.is_empty());
+
+        let mut permits_released = Box::pin(interface_registry.wait_for_spawn_permits());
+        tokio::select! {
+            biased;
+            _ = &mut permits_released => {
+                panic!("drain crossed a detached registration worker before it polled")
+            }
+            _ = std::future::ready(()) => {}
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), &mut permits_released)
+            .await
+            .expect("registration worker did not finish exact rejection cleanup");
+        assert!(task_stopped.load(Ordering::Acquire));
+        assert!(!online.load(Ordering::SeqCst));
+        assert!(interface_controls.lock().unwrap().is_empty());
+        assert_eq!(interface_registry.len(), 0);
+        assert!(transport_rx.try_recv().is_err());
+
+        interface_registry.finish_drain_when_owned(&[]).await;
+        assert_eq!(
+            interface_registry.admission_for_test(),
+            crate::interface_registry::RegistryAdmission::Closed
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn committed_unacknowledged_registration_does_not_deadlock_drain() {
+        struct TaskDrop(Arc<AtomicBool>);
+        impl Drop for TaskDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let id = 920_105;
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
+        let spawn_permit = interface_registry
+            .acquire_spawn_permit()
+            .expect("runtime admission is open");
+
+        let task_stopped = Arc::new(AtomicBool::new(false));
+        let (task_started_tx, task_started_rx) = oneshot::channel();
+        let task_stopped_in_task = task_stopped.clone();
+        let mut handle = test_interface_handle(id, None, "committed-without-ack");
+        handle.read_task = tokio::spawn(async move {
+            let _drop = TaskDrop(task_stopped_in_task);
+            let _ = task_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        task_started_rx
+            .await
+            .expect("physical interface task started");
+
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let worker = tokio::spawn(single_registration_worker(
+            transport_tx.clone(),
+            interface_controls.clone(),
+            interface_registry.clone(),
+            SingleRegistrationSpec::Direct {
+                owned: handle.into(),
+                role: rns_transport::messages::InterfaceRole::Normal,
+                ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
+                ifac_key: None,
+                ifac_size: 0,
+                kind: InterfaceKind::Standard,
+                multipoint: false,
+            },
+            RegistrationCancellation {
+                receiver: cancel_rx,
+            },
+            reply_tx,
+            Some(spawn_permit),
+        ));
+
+        let mut reply = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+            .await
+            .expect("registration worker did not reply")
+            .expect("registration worker dropped its reply");
+        let committed = reply.result.expect("registration must commit");
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].id, id);
+        let _withheld_acknowledgement = reply
+            .acknowledgement
+            .take()
+            .expect("committed registration must require acknowledgement");
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::RegisterInterface {
+                id: registered_id,
+                ..
+            }) if registered_id == id
+        ));
+
+        let drain = match interface_registry.begin_drain() {
+            DrainStart::Acquired(drain) => drain,
+            _ => panic!("first drain must acquire ownership"),
+        };
+        let (mut shutdowns, waiters, abandoned) = drain.into_parts();
+        assert_eq!(shutdowns.len(), 1, "drain must lease the Active record");
+        assert!(waiters.is_empty());
+        assert!(abandoned.is_empty());
+
+        // Once the transaction commits, the registry owns the task. Permit
+        // release must not depend on the caller acknowledging the reply.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            interface_registry.wait_for_spawn_permits(),
+        )
+        .await
+        .expect("committed worker retained its producer permit across acknowledgement");
+
+        drop(cancel_tx);
+        tokio::task::yield_now().await;
+        assert!(
+            !worker.is_finished(),
+            "cancelled worker must wait for the drain's exact Active lease"
+        );
+
+        for shutdown in &mut shutdowns {
+            shutdown.mark_offline();
+            shutdown.stop_task_and_wait().await;
+        }
+        let shutdown_tokens: Vec<_> = shutdowns.iter().map(InterfaceShutdown::token).collect();
+        interface_registry
+            .finish_drain_when_owned(&shutdown_tokens)
+            .await;
+        interface_controls.lock().unwrap().clear();
+        drop(shutdowns);
+
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("registration worker deadlocked with runtime drain")
+            .expect("registration worker panicked");
+        assert!(task_stopped.load(Ordering::Acquire));
+        assert_eq!(
+            interface_registry.admission_for_test(),
+            crate::interface_registry::RegistryAdmission::Closed
+        );
+        assert!(interface_controls.lock().unwrap().is_empty());
+        assert!(transport_rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn cancelled_partially_published_batch_removes_actor_entry_and_tasks() {
         let ids = [920_095, 920_096];
@@ -8191,6 +9168,9 @@ egress_control = Yes
         let second = test_interface_handle(ids[1], None, "batch-cancel-second");
         let online = [first.online.clone(), second.online.clone()];
         let post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
+        let spawn_permit = interface_registry
+            .acquire_spawn_permit()
+            .expect("runtime admission is open");
         let worker_tx = transport_tx.clone();
         let worker_controls = interface_controls.clone();
         let worker_registry = interface_registry.clone();
@@ -8203,6 +9183,7 @@ egress_control = Yes
                 &worker_controls,
                 &worker_registry,
                 InterfaceKind::Standard,
+                Some(spawn_permit),
             )
             .await
         });
@@ -8231,6 +9212,7 @@ egress_control = Yes
             Some(TransportMessage::DeregisterInterface { id }) if id == ids[0]
         ));
         wait_for_registry_len(&interface_registry, 0).await;
+        interface_registry.wait_for_spawn_permits().await;
         assert!(transport_rx.try_recv().is_err());
     }
 
@@ -8264,6 +9246,7 @@ egress_control = Yes
                 receiver: cancel_rx,
             },
             reply_tx,
+            None,
         )
         .await;
         drop(cancel_tx);
