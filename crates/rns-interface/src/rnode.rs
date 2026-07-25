@@ -141,6 +141,134 @@ pub const RNODE_TX_POWER_MAX_DBM: u8 = 37;
 /// Default TCP port for RNode-over-IP.
 pub const DEFAULT_TCP_PORT: u16 = 7633;
 
+/// Startup policy for a generic serial or TCP RNode.
+///
+/// The fields stay private so adding a future policy cannot silently change
+/// external struct literals. [`Default`] preserves the historical startup
+/// sequence exactly and does not request EEPROM contents.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RNodeStartupOptions {
+    capability_policy: RNodeCapabilityPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RNodeCapabilityPolicy {
+    #[default]
+    Legacy,
+    RequireValidatedAdmission,
+}
+
+impl RNodeStartupOptions {
+    /// Require a validated EEPROM capability image before radio settings are
+    /// sent to each connection generation.
+    ///
+    /// Known models enforce their reviewed frequency and TX-power limits.
+    /// A validated but unknown or quarantined model is admitted explicitly as
+    /// unverified; no model alias or capability profile is inferred.
+    ///
+    /// Initial deterministic admission failure is returned by the
+    /// options-aware spawn API as [`RNodeSpawnError::CapabilityAdmission`]. A
+    /// deterministic rejection on a later generation terminates the driver
+    /// with [`RNodeRuntimeReason::CapabilityAdmissionRejected`]. Ordinary
+    /// transport read, write, and EOF failures, plus an otherwise valid
+    /// response timeout, retain reconnect retry.
+    pub const fn require_capability_admission() -> Self {
+        Self {
+            capability_policy: RNodeCapabilityPolicy::RequireValidatedAdmission,
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    const fn requires_capability_admission(self) -> bool {
+        matches!(
+            self.capability_policy,
+            RNodeCapabilityPolicy::RequireValidatedAdmission
+        )
+    }
+}
+
+impl Default for RNodeStartupOptions {
+    fn default() -> Self {
+        Self {
+            capability_policy: RNodeCapabilityPolicy::Legacy,
+        }
+    }
+}
+
+/// Typed, privacy-bounded failure from strict RNode capability admission.
+///
+/// No variant can retain EEPROM contents, stable device identifiers, raw
+/// frames, endpoints, or unrestricted device error values.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RNodeCapabilityAdmissionError {
+    #[error("RNode capability response timed out")]
+    ResponseTimedOut,
+    #[error("RNode capability preflight exceeded its bounded read count ({limit})")]
+    ReadLimitExceeded { limit: usize },
+    #[error("RNode capability preflight exceeded its bounded input size ({limit} bytes)")]
+    InputLimitExceeded { limit: usize },
+    #[error("RNode capability preflight exceeded its bounded frame count ({limit})")]
+    FrameLimitExceeded { limit: usize },
+    #[error("RNode capability preflight received a malformed protocol frame")]
+    MalformedProtocolFrame {
+        rejection: crate::rnode_protocol::RNodeFrameRejection,
+    },
+    #[error("RNode reported a device error during capability preflight")]
+    DeviceError,
+    #[error("RNode detection was not confirmed during capability preflight")]
+    DetectionRejected,
+    #[error("RNode firmware is unsupported")]
+    UnsupportedFirmware,
+    #[error("RNode returned more than one EEPROM capability response")]
+    DuplicateEepromResponse,
+    #[error("invalid RNode EEPROM capability image: {0}")]
+    CapabilityImage(#[source] crate::rnode_capabilities::RNodeCapabilityParseError),
+    #[error("RNode radio settings were rejected: {0}")]
+    RadioSettings(#[source] crate::rnode_capabilities::RNodeRadioAdmissionError),
+}
+
+impl RNodeCapabilityAdmissionError {
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn log_class(&self) -> &'static str {
+        match self {
+            Self::ResponseTimedOut => "response_timeout",
+            Self::ReadLimitExceeded { .. } => "read_limit",
+            Self::InputLimitExceeded { .. } => "input_limit",
+            Self::FrameLimitExceeded { .. } => "frame_limit",
+            Self::MalformedProtocolFrame { .. } => "malformed_protocol",
+            Self::DeviceError => "device_error",
+            Self::DetectionRejected => "detection_rejected",
+            Self::UnsupportedFirmware => "unsupported_firmware",
+            Self::DuplicateEepromResponse => "duplicate_eeprom",
+            Self::CapabilityImage(_) => "invalid_capability_image",
+            Self::RadioSettings(_) => "radio_settings_rejected",
+        }
+    }
+}
+
+/// Typed startup failure for the options-aware generic RNode spawn API.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RNodeSpawnError {
+    #[error(transparent)]
+    Interface(#[from] crate::traits::InterfaceError),
+    #[error(transparent)]
+    CapabilityAdmission(#[from] RNodeCapabilityAdmissionError),
+}
+
+impl RNodeSpawnError {
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn into_legacy_interface_error(self) -> crate::traits::InterfaceError {
+        match self {
+            Self::Interface(error) => error,
+            Self::CapabilityAdmission(error) => crate::traits::InterfaceError::SendFailed(format!(
+                "rnode capability admission: {error}"
+            )),
+        }
+    }
+}
+
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_READ_TIMEOUT_MS: u64 = 100;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -208,6 +336,22 @@ pub enum RNodeConfigurationState {
     Mismatch,
 }
 
+/// Privacy-safe capability admission state for the active connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RNodeCapabilityState {
+    /// Strict capability admission was not requested, or there is no active
+    /// admitted connection generation.
+    NotRequested,
+    /// A validated exact model with a reviewed profile admitted the settings.
+    /// Fresh post-init RF echoes are still required for runtime readiness.
+    Verified,
+    /// EEPROM identity validated, but the exact model is unknown or
+    /// quarantined, so only generic bounds were applied. Fresh post-init RF
+    /// echoes are still required for runtime readiness.
+    Unverified,
+}
+
 /// Radio power state observed from the active RNode connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -240,6 +384,7 @@ pub enum RNodeRuntimeReason {
     DriverTerminated,
     DeviceReset,
     RadioInitialisationFault,
+    CapabilityAdmissionRejected,
 }
 
 /// Privacy-safe local observation of one generic RNode driver.
@@ -263,6 +408,7 @@ pub struct RNodeRuntimeSnapshot {
     pub detection: RNodeDetectionState,
     pub firmware_compatibility: RNodeFirmwareCompatibility,
     pub configuration: RNodeConfigurationState,
+    pub capability: RNodeCapabilityState,
     pub radio: RNodeObservedRadioState,
     pub transmit_flow: RNodeTransmitFlowState,
     pub reason: Option<RNodeRuntimeReason>,
@@ -287,6 +433,7 @@ impl RNodeRuntimeSnapshot {
             detection: RNodeDetectionState::Unknown,
             firmware_compatibility: RNodeFirmwareCompatibility::Unknown,
             configuration: RNodeConfigurationState::Unknown,
+            capability: RNodeCapabilityState::NotRequested,
             radio: RNodeObservedRadioState::Unknown,
             transmit_flow: RNodeTransmitFlowState::Unknown,
             reason: None,
@@ -297,6 +444,7 @@ impl RNodeRuntimeSnapshot {
         self.detection = RNodeDetectionState::Unknown;
         self.firmware_compatibility = RNodeFirmwareCompatibility::Unknown;
         self.configuration = RNodeConfigurationState::Unknown;
+        self.capability = RNodeCapabilityState::NotRequested;
         self.radio = RNodeObservedRadioState::Unknown;
         self.transmit_flow = RNodeTransmitFlowState::Unknown;
     }
@@ -643,6 +791,32 @@ impl RNodeSnapshotPublisher {
         });
     }
 
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn capability_connection_established(
+        &mut self,
+        state: &RNodeProtocolState,
+        admission: crate::rnode_capabilities::RNodeRadioAdmission,
+    ) {
+        self.last_connection_generation = self.last_connection_generation.saturating_add(1).max(1);
+        let generation = self.last_connection_generation;
+        self.update(|snapshot| {
+            snapshot.phase = RNodeRuntimePhase::AwaitingReadiness;
+            snapshot.connection_generation = generation;
+            snapshot.reconnect_attempt = 0;
+            snapshot.reason = None;
+            snapshot.reset_protocol_observations();
+            snapshot.capability = match admission {
+                crate::rnode_capabilities::RNodeRadioAdmission::Verified { .. } => {
+                    RNodeCapabilityState::Verified
+                }
+                crate::rnode_capabilities::RNodeRadioAdmission::Unverified { .. } => {
+                    RNodeCapabilityState::Unverified
+                }
+            };
+            project_rnode_protocol_state(snapshot, state);
+        });
+    }
+
     #[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
     pub(crate) fn reconnect_started(&self) {
         self.update(|snapshot| {
@@ -708,13 +882,10 @@ impl RNodeSnapshotPublisher {
 
     /// Publish the current bounded reducer state without replaying raw frames.
     ///
-    /// Native BLE uses this only after a bridge handshake becomes an admitted
+    /// Drivers use this only after a pending handshake becomes an admitted
     /// connection generation. Startup bytes stay private to the pending
     /// reducer and cannot appear in the public observation surface. This
-    /// projects durable reducer state, not transient effects: a reset observed
-    /// before admission clears pending evidence but is not attributed to a
-    /// generation that did not yet exist. Retained faults remain represented
-    /// by [`RNodeProtocolState`] and are projected.
+    /// projects durable reducer state, not transient effects.
     #[cfg(feature = "ble")]
     pub(crate) fn sync_protocol_state(&self, state: &RNodeProtocolState) -> bool {
         let mut projection_changed = false;
@@ -880,6 +1051,7 @@ const RNODE_WRITER_JOIN_DEADLINE: Duration = Duration::from_millis(500);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RNodeWritePhase {
     Detect,
+    Capability,
     Initialise,
     Packet,
     Probe,
@@ -891,6 +1063,7 @@ impl RNodeWritePhase {
     const fn label(self) -> &'static str {
         match self {
             Self::Detect => "detect",
+            Self::Capability => "capability",
             Self::Initialise => "init",
             Self::Packet => "packet",
             Self::Probe => "probe",
@@ -985,6 +1158,7 @@ struct RNodeWriterContext {
     beacon: Option<(Duration, Bytes)>,
     beacon_poll_interval: Duration,
     idle_probe_interval: Option<Duration>,
+    idle_probes_enabled: Arc<AtomicBool>,
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -1108,6 +1282,7 @@ struct RNodeGenerationWriter {
     control_tx: mpsc::Sender<RNodeControlWriteRequest>,
     ready: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    idle_probes_enabled: Arc<AtomicBool>,
     task: RNodeTaskGuard<Result<RNodeWriterExit, RNodeWriteFailure>>,
 }
 
@@ -1268,6 +1443,13 @@ where
     let mut idle_probe = context.idle_probe_interval.map(RNodeIdleProbe::new);
 
     loop {
+        if context.idle_probes_enabled.load(Ordering::SeqCst) {
+            if idle_probe.is_none() {
+                idle_probe = context.idle_probe_interval.map(RNodeIdleProbe::new);
+            }
+        } else {
+            idle_probe = None;
+        }
         if context.cancelled.load(Ordering::SeqCst) {
             return Ok(RNodeWriterExit::Cancelled);
         }
@@ -1452,6 +1634,7 @@ where
     let (control_tx, control_rx) = mpsc::channel(RNODE_CONTROL_WRITE_QUEUE);
     let ready = context.ready.clone();
     let cancelled = context.cancelled.clone();
+    let idle_probes_enabled = context.idle_probes_enabled.clone();
     let online = context.online.clone();
     let id = context.id;
     let task = tokio::spawn(async move {
@@ -1473,6 +1656,7 @@ where
         control_tx,
         ready,
         cancelled,
+        idle_probes_enabled,
         task: RNodeTaskGuard::new(task),
     }
 }
@@ -1485,6 +1669,7 @@ fn spawn_rnode_generation_writer(
     online: Arc<AtomicBool>,
     txb: Arc<AtomicU64>,
     beacon: Option<(Duration, Bytes)>,
+    idle_probes_enabled: bool,
 ) -> std::io::Result<RNodeGenerationWriter> {
     let interrupt = RNodeWriteInterrupt::from_stream(port)?;
     let write_stream = port.try_clone()?;
@@ -1503,6 +1688,7 @@ fn spawn_rnode_generation_writer(
             beacon,
             beacon_poll_interval: RNODE_BEACON_POLL_INTERVAL,
             idle_probe_interval: port.is_tcp().then_some(RNODE_TCP_IDLE_PROBE_INTERVAL),
+            idle_probes_enabled: Arc::new(AtomicBool::new(idle_probes_enabled)),
         },
     );
     writer.interrupt = interrupt;
@@ -1518,6 +1704,7 @@ async fn finish_rnode_writer(writer: RNodeGenerationWriter) -> RNodeWriterFinish
         control_tx,
         ready: _,
         cancelled: _,
+        idle_probes_enabled: _,
         mut task,
     } = writer;
     drop(packet_tx);
@@ -1622,7 +1809,7 @@ async fn request_rnode_startup_write(
 ) -> Result<(), RNodeWriteFailure> {
     debug_assert!(matches!(
         phase,
-        RNodeWritePhase::Detect | RNodeWritePhase::Initialise
+        RNodeWritePhase::Detect | RNodeWritePhase::Capability | RNodeWritePhase::Initialise
     ));
     request_rnode_control_write_before(
         control_tx,
@@ -2017,6 +2204,7 @@ async fn start_rnode_generation(
         online.clone(),
         txb.clone(),
         beacon.clone(),
+        true,
     )
     .map_err(|error| {
         crate::traits::InterfaceError::SendFailed(format!("rnode writer clone: {error}"))
@@ -2031,6 +2219,208 @@ async fn start_rnode_generation(
     }
 
     Ok((port, writer))
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+enum RNodeStrictPreflightError {
+    Transport(crate::traits::InterfaceError),
+    Capability(RNodeCapabilityAdmissionError),
+    StopRequestedBeforeInit,
+    StopRequestedAfterInitQueued,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+struct RNodeStrictAdmission {
+    port: RNodeStream,
+    protocol_state: RNodeProtocolState,
+    admission: crate::rnode_capabilities::RNodeRadioAdmission,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+enum RNodeGenerationProtocolSeed {
+    Legacy,
+    CapabilityAdmitted {
+        protocol_state: RNodeProtocolState,
+        admission: crate::rnode_capabilities::RNodeRadioAdmission,
+    },
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn rnode_preflight_stop_requested(stop_rx: &mut Option<&mut mpsc::Receiver<()>>) -> bool {
+    stop_rx
+        .as_deref_mut()
+        .is_some_and(|receiver| receiver.try_recv().is_ok())
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn request_rnode_preflight_write(
+    writer: &RNodeGenerationWriter,
+    phase: RNodeWritePhase,
+    bytes: Vec<u8>,
+    stop_rx: &mut Option<&mut mpsc::Receiver<()>>,
+) -> Result<(), RNodeStrictPreflightError> {
+    let result = if let Some(receiver) = stop_rx.as_deref_mut() {
+        tokio::select! {
+            biased;
+            _ = receiver.recv() => return Err(RNodeStrictPreflightError::StopRequestedBeforeInit),
+            result = request_rnode_startup_write(&writer.control_tx, phase, bytes) => result,
+        }
+    } else {
+        request_rnode_startup_write(&writer.control_tx, phase, bytes).await
+    };
+    result.map_err(|failure| {
+        RNodeStrictPreflightError::Transport(crate::traits::InterfaceError::SendFailed(format!(
+            "rnode capability startup: {failure}"
+        )))
+    })
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn run_rnode_capability_preflight(
+    mut port: RNodeStream,
+    writer: &RNodeGenerationWriter,
+    config: &RNodeConfig,
+    mut stop_rx: Option<&mut mpsc::Receiver<()>>,
+) -> Result<RNodeStrictAdmission, RNodeStrictPreflightError> {
+    request_rnode_preflight_write(
+        writer,
+        RNodeWritePhase::Detect,
+        build_detect_sequence(),
+        &mut stop_rx,
+    )
+    .await?;
+    request_rnode_preflight_write(
+        writer,
+        RNodeWritePhase::Capability,
+        crate::rnode_capability_preflight::build_rnode_capability_request(),
+        &mut stop_rx,
+    )
+    .await?;
+
+    let deadline = tokio::time::Instant::now()
+        + crate::rnode_capability_preflight::RNODE_CAPABILITY_PREFLIGHT_DEADLINE;
+    let mut preflight = crate::rnode_capability_preflight::RNodeCapabilityPreflight::new(
+        RNodeRadioSettings::from(config),
+    );
+    let mut buf = [0u8; crate::rnode_capability_preflight::RNODE_CAPABILITY_READ_BUFFER_BYTES];
+
+    loop {
+        if rnode_preflight_stop_requested(&mut stop_rx) {
+            return Err(RNodeStrictPreflightError::StopRequestedBeforeInit);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(RNodeStrictPreflightError::Capability(
+                RNodeCapabilityAdmissionError::ResponseTimedOut,
+            ));
+        }
+
+        // Never select or time out away from this task: it owns the sole read
+        // stream until it returns. The physical stream already has a bounded
+        // 100 ms read timeout, so the absolute deadline is checked around
+        // every joined read without abandoning ownership.
+        let read = tokio::task::spawn_blocking(move || read_rnode_stream(port, buf))
+            .await
+            .map_err(|error| {
+                RNodeStrictPreflightError::Transport(crate::traits::InterfaceError::SendFailed(
+                    format!("rnode capability read task: {error}"),
+                ))
+            })?;
+
+        let (next_port, next_buf, count) = read.map_err(|(_port, error)| {
+            RNodeStrictPreflightError::Transport(crate::traits::InterfaceError::SendFailed(
+                format!("rnode capability read: {error}"),
+            ))
+        })?;
+        port = next_port;
+        buf = next_buf;
+        if rnode_preflight_stop_requested(&mut stop_rx) {
+            return Err(RNodeStrictPreflightError::StopRequestedBeforeInit);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(RNodeStrictPreflightError::Capability(
+                RNodeCapabilityAdmissionError::ResponseTimedOut,
+            ));
+        }
+
+        let admission = preflight
+            .observe_read(&buf[..count])
+            .map_err(RNodeStrictPreflightError::Capability)?;
+        let Some(admission) = admission else {
+            continue;
+        };
+        if rnode_preflight_stop_requested(&mut stop_rx) {
+            return Err(RNodeStrictPreflightError::StopRequestedBeforeInit);
+        }
+
+        // Control writes are writer-priority, so enabling immediately before
+        // enqueueing init cannot let a recurring detect probe overtake it. It
+        // also prevents the writer from re-entering a no-deadline wait after
+        // acknowledging init.
+        writer.idle_probes_enabled.store(true, Ordering::SeqCst);
+        let init_result = request_rnode_preflight_write(
+            writer,
+            RNodeWritePhase::Initialise,
+            build_init_sequence(config),
+            &mut stop_rx,
+        )
+        .await
+        .map_err(|error| match error {
+            RNodeStrictPreflightError::StopRequestedBeforeInit => {
+                RNodeStrictPreflightError::StopRequestedAfterInitQueued
+            }
+            other => other,
+        });
+        if init_result.is_err() {
+            writer.idle_probes_enabled.store(false, Ordering::SeqCst);
+        }
+        init_result?;
+        return Ok(RNodeStrictAdmission {
+            port,
+            protocol_state: preflight.into_protocol_state(),
+            admission,
+        });
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn start_strict_rnode_generation(
+    port: RNodeStream,
+    config: &RNodeConfig,
+    id: InterfaceId,
+    online: &Arc<AtomicBool>,
+    txb: &Arc<AtomicU64>,
+    beacon: &Option<(Duration, Bytes)>,
+) -> Result<(RNodeStrictAdmission, RNodeGenerationWriter), RNodeSpawnError> {
+    let writer = spawn_rnode_generation_writer(
+        &port,
+        config,
+        id,
+        online.clone(),
+        txb.clone(),
+        beacon.clone(),
+        false,
+    )
+    .map_err(|error| {
+        crate::traits::InterfaceError::SendFailed(format!("rnode writer clone: {error}"))
+    })?;
+
+    match run_rnode_capability_preflight(port, &writer, config, None).await {
+        Ok(admission) => Ok((admission, writer)),
+        Err(error) => {
+            online.store(false, Ordering::SeqCst);
+            let _ = finish_rnode_writer(writer).await;
+            Err(match error {
+                RNodeStrictPreflightError::Transport(error) => RNodeSpawnError::Interface(error),
+                RNodeStrictPreflightError::Capability(error) => {
+                    RNodeSpawnError::CapabilityAdmission(error)
+                }
+                RNodeStrictPreflightError::StopRequestedBeforeInit
+                | RNodeStrictPreflightError::StopRequestedAfterInitQueued => {
+                    unreachable!("initial strict startup has no stop receiver")
+                }
+            })
+        }
+    }
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -2577,6 +2967,31 @@ pub async fn spawn_rnode_interface_with_driver(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<SpawnedRNodeInterface, crate::traits::InterfaceError> {
+    spawn_rnode_interface_with_driver_and_options(
+        config,
+        id,
+        transport_tx,
+        RNodeStartupOptions::default(),
+    )
+    .await
+    .map_err(RNodeSpawnError::into_legacy_interface_error)
+}
+
+/// Spawn a generic serial/RNode-TCP interface with an explicit startup policy.
+///
+/// Unlike the compatibility facade, this preserves capability-admission
+/// failures as typed errors. [`RNodeStartupOptions::default`] retains the
+/// historical wire sequence and behavior. Under strict admission, a later
+/// deterministic rejection is terminal and publishes
+/// [`RNodeRuntimeReason::CapabilityAdmissionRejected`]; transport failures and
+/// capability-response timeouts continue through the normal reconnect policy.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+pub async fn spawn_rnode_interface_with_driver_and_options(
+    config: RNodeConfig,
+    id: InterfaceId,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    options: RNodeStartupOptions,
+) -> Result<SpawnedRNodeInterface, RNodeSpawnError> {
     config.validate().map_err(|error| {
         crate::traits::InterfaceError::SendFailed(format!(
             "rnode config {}: {error}",
@@ -2637,10 +3052,25 @@ pub async fn spawn_rnode_interface_with_driver(
         })
         .map(|(interval, callsign)| (Duration::from_secs(interval), Bytes::from(callsign)));
 
-    // Startup is part of spawn: the single per-generation writer clone must
-    // complete detect and initialise as two acknowledged write+flush stages.
-    let (port, initial_writer) =
-        start_rnode_generation(port, &config, id, &online, &shared_txb, &beacon).await?;
+    // Startup is part of spawn. Legacy uses the historical two acknowledged
+    // detect/init write+flush stages; strict mode inserts bounded capability
+    // admission after detect and before any init bytes.
+    let (port, initial_writer, initial_protocol_seed) = if options.requires_capability_admission() {
+        let (admitted, writer) =
+            start_strict_rnode_generation(port, &config, id, &online, &shared_txb, &beacon).await?;
+        (
+            admitted.port,
+            writer,
+            RNodeGenerationProtocolSeed::CapabilityAdmitted {
+                protocol_state: admitted.protocol_state,
+                admission: admitted.admission,
+            },
+        )
+    } else {
+        let (port, writer) =
+            start_rnode_generation(port, &config, id, &online, &shared_txb, &beacon).await?;
+        (port, writer, RNodeGenerationProtocolSeed::Legacy)
+    };
 
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
     let (initial_snapshot_publisher, driver) = new_rnode_driver_observation_with_shutdown(
@@ -2657,7 +3087,7 @@ pub async fn spawn_rnode_interface_with_driver(
     let read_task = tokio::spawn(async move {
         let mut snapshot_publisher = initial_snapshot_publisher;
         let _stop_guard = stop_guard;
-        let mut next_generation = Some((port, initial_writer));
+        let mut next_generation = Some((port, initial_writer, initial_protocol_seed));
 
         loop {
             if next_generation.is_none() && stop_rx.try_recv().is_ok() {
@@ -2666,7 +3096,7 @@ pub async fn spawn_rnode_interface_with_driver(
                 snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
                 return;
             }
-            let (port_r, generation_writer) = match next_generation.take() {
+            let (port_r, generation_writer, protocol_seed) = match next_generation.take() {
                 Some(generation) => generation,
                 None => {
                     snapshot_publisher.reconnect_started();
@@ -2710,6 +3140,7 @@ pub async fn spawn_rnode_interface_with_driver(
                         online_r.clone(),
                         txb_r.clone(),
                         beacon.clone(),
+                        !options.requires_capability_admission(),
                     ) {
                         Ok(writer) => writer,
                         Err(e) => {
@@ -2733,58 +3164,191 @@ pub async fn spawn_rnode_interface_with_driver(
                         }
                     };
 
-                    match initialise_reconnecting_rnode_writer(
-                        &reconnect_writer,
-                        &task_config,
-                        &mut stop_rx,
-                    )
-                    .await
-                    {
-                        Ok(RNodeReconnectStartup::Complete) => (opened, reconnect_writer),
-                        Ok(RNodeReconnectStartup::StopRequested) => {
-                            tracing::info!(
-                                name = %task_name,
-                                "RNode stop requested during reconnect startup"
-                            );
-                            snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                            let _ = send_detach_request(&reconnect_writer.control_tx, id).await;
-                            reconnect_writer.cancel();
-                            let _ = finish_rnode_writer(reconnect_writer).await;
-                            snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
-                            return;
-                        }
-                        Err(failure) => {
-                            online_r.store(false, Ordering::SeqCst);
-                            reconnect_writer.cancel();
-                            let writer_finish = finish_rnode_writer(reconnect_writer).await;
-                            if writer_finish == RNodeWriterFinish::NonQuiesced {
-                                snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                    if options.requires_capability_admission() {
+                        match run_rnode_capability_preflight(
+                            opened,
+                            &reconnect_writer,
+                            &task_config,
+                            Some(&mut stop_rx),
+                        )
+                        .await
+                        {
+                            Ok(admitted) => (
+                                admitted.port,
+                                reconnect_writer,
+                                RNodeGenerationProtocolSeed::CapabilityAdmitted {
+                                    protocol_state: admitted.protocol_state,
+                                    admission: admitted.admission,
+                                },
+                            ),
+                            Err(RNodeStrictPreflightError::StopRequestedBeforeInit) => {
+                                tracing::info!(
+                                    name = %task_name,
+                                    "RNode stop requested during capability preflight"
+                                );
+                                snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                                reconnect_writer.cancel();
+                                let _ = finish_rnode_writer(reconnect_writer).await;
+                                snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
                                 return;
                             }
-                            snapshot_publisher.connection_attempt_failed();
-                            tracing::warn!(
-                                name = %task_name,
-                                error = %failure,
-                                "RNode reconnect startup failed"
-                            );
-                            tokio::select! {
-                                _ = stop_rx.recv() => {
-                                    tracing::info!(name = %task_name, "RNode stop requested during reconnect backoff");
-                                    snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                                    snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                            Err(RNodeStrictPreflightError::StopRequestedAfterInitQueued) => {
+                                tracing::info!(
+                                    name = %task_name,
+                                    "RNode stop requested during admitted reconnect init"
+                                );
+                                snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                                let _ = send_detach_request(&reconnect_writer.control_tx, id).await;
+                                reconnect_writer.cancel();
+                                let _ = finish_rnode_writer(reconnect_writer).await;
+                                snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                                return;
+                            }
+                            Err(RNodeStrictPreflightError::Capability(
+                                RNodeCapabilityAdmissionError::ResponseTimedOut,
+                            )) => {
+                                online_r.store(false, Ordering::SeqCst);
+                                reconnect_writer.cancel();
+                                let writer_finish = finish_rnode_writer(reconnect_writer).await;
+                                if writer_finish == RNodeWriterFinish::NonQuiesced {
+                                    snapshot_publisher
+                                        .stopped(RNodeRuntimeReason::DriverTerminated);
                                     return;
                                 }
-                                _ = tokio::time::sleep(reconnect_delay()) => {}
+                                snapshot_publisher.connection_attempt_failed();
+                                tracing::warn!(
+                                    name = %task_name,
+                                    admission_failure = "response_timeout",
+                                    "RNode reconnect capability response timed out"
+                                );
+                                tokio::select! {
+                                    _ = stop_rx.recv() => {
+                                        tracing::info!(name = %task_name, "RNode stop requested during reconnect backoff");
+                                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                                        return;
+                                    }
+                                    _ = tokio::time::sleep(reconnect_delay()) => {}
+                                }
+                                continue;
                             }
-                            continue;
+                            Err(RNodeStrictPreflightError::Capability(error)) => {
+                                online_r.store(false, Ordering::SeqCst);
+                                reconnect_writer.cancel();
+                                let writer_finish = finish_rnode_writer(reconnect_writer).await;
+                                if writer_finish == RNodeWriterFinish::NonQuiesced {
+                                    snapshot_publisher
+                                        .stopped(RNodeRuntimeReason::DriverTerminated);
+                                    return;
+                                }
+                                tracing::warn!(
+                                    name = %task_name,
+                                    admission_failure = error.log_class(),
+                                    "RNode reconnect capability admission rejected"
+                                );
+                                snapshot_publisher
+                                    .stopped(RNodeRuntimeReason::CapabilityAdmissionRejected);
+                                return;
+                            }
+                            Err(RNodeStrictPreflightError::Transport(error)) => {
+                                online_r.store(false, Ordering::SeqCst);
+                                reconnect_writer.cancel();
+                                let writer_finish = finish_rnode_writer(reconnect_writer).await;
+                                if writer_finish == RNodeWriterFinish::NonQuiesced {
+                                    snapshot_publisher
+                                        .stopped(RNodeRuntimeReason::DriverTerminated);
+                                    return;
+                                }
+                                snapshot_publisher.connection_attempt_failed();
+                                tracing::warn!(
+                                    name = %task_name,
+                                    error = %error,
+                                    "RNode reconnect capability transport failed"
+                                );
+                                tokio::select! {
+                                    _ = stop_rx.recv() => {
+                                        tracing::info!(name = %task_name, "RNode stop requested during reconnect backoff");
+                                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                                        return;
+                                    }
+                                    _ = tokio::time::sleep(reconnect_delay()) => {}
+                                }
+                                continue;
+                            }
+                        }
+                    } else {
+                        match initialise_reconnecting_rnode_writer(
+                            &reconnect_writer,
+                            &task_config,
+                            &mut stop_rx,
+                        )
+                        .await
+                        {
+                            Ok(RNodeReconnectStartup::Complete) => (
+                                opened,
+                                reconnect_writer,
+                                RNodeGenerationProtocolSeed::Legacy,
+                            ),
+                            Ok(RNodeReconnectStartup::StopRequested) => {
+                                tracing::info!(
+                                    name = %task_name,
+                                    "RNode stop requested during reconnect startup"
+                                );
+                                snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                                let _ = send_detach_request(&reconnect_writer.control_tx, id).await;
+                                reconnect_writer.cancel();
+                                let _ = finish_rnode_writer(reconnect_writer).await;
+                                snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                                return;
+                            }
+                            Err(failure) => {
+                                online_r.store(false, Ordering::SeqCst);
+                                reconnect_writer.cancel();
+                                let writer_finish = finish_rnode_writer(reconnect_writer).await;
+                                if writer_finish == RNodeWriterFinish::NonQuiesced {
+                                    snapshot_publisher
+                                        .stopped(RNodeRuntimeReason::DriverTerminated);
+                                    return;
+                                }
+                                snapshot_publisher.connection_attempt_failed();
+                                tracing::warn!(
+                                    name = %task_name,
+                                    error = %failure,
+                                    "RNode reconnect startup failed"
+                                );
+                                tokio::select! {
+                                    _ = stop_rx.recv() => {
+                                        tracing::info!(name = %task_name, "RNode stop requested during reconnect backoff");
+                                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                                        return;
+                                    }
+                                    _ = tokio::time::sleep(reconnect_delay()) => {}
+                                }
+                                continue;
+                            }
                         }
                     }
                 }
             };
 
             online_r.store(true, Ordering::SeqCst);
-            let mut protocol_state = RNodeProtocolState::new(protocol_target);
-            snapshot_publisher.connection_established();
+            let mut protocol_state = match protocol_seed {
+                RNodeGenerationProtocolSeed::Legacy => {
+                    let state = RNodeProtocolState::new(protocol_target);
+                    snapshot_publisher.connection_established();
+                    state
+                }
+                RNodeGenerationProtocolSeed::CapabilityAdmitted {
+                    protocol_state,
+                    admission,
+                } => {
+                    snapshot_publisher
+                        .capability_connection_established(&protocol_state, admission);
+                    protocol_state
+                }
+            };
             let mut port_r = port_r;
 
             let ready = generation_writer.ready.clone();
@@ -3058,6 +3622,7 @@ mod tests {
             beacon,
             beacon_poll_interval,
             idle_probe_interval: None,
+            idle_probes_enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -3825,6 +4390,7 @@ mod tests {
     async fn test_rnode_writer_reports_write_and_flush_errors_for_every_phase() {
         for phase in [
             RNodeWritePhase::Detect,
+            RNodeWritePhase::Capability,
             RNodeWritePhase::Initialise,
             RNodeWritePhase::Packet,
             RNodeWritePhase::Probe,
@@ -3839,6 +4405,56 @@ mod tests {
     #[test]
     fn test_rnode_tcp_idle_probe_interval_matches_driver_contract() {
         assert_eq!(RNODE_TCP_IDLE_PROBE_INTERVAL, Duration::from_millis(3_500));
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test(start_paused = true)]
+    async fn test_strict_probe_gate_emits_nothing_before_init_then_starts_fresh_deadline() {
+        let scripted = ScriptedWriter::default();
+        let mut context = scripted_writer_context(
+            false,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Duration::from_millis(5),
+        );
+        let interval = Duration::from_millis(20);
+        context.idle_probe_interval = Some(interval);
+        context.idle_probes_enabled.store(false, Ordering::SeqCst);
+        let writer = spawn_rnode_writer(scripted.clone(), context);
+
+        yield_to_rnode_tasks().await;
+        tokio::time::advance(interval * 4).await;
+        yield_to_rnode_tasks().await;
+        assert!(
+            scripted.writes().is_empty(),
+            "strict preflight must not emit recurring detect probes"
+        );
+
+        writer.idle_probes_enabled.store(true, Ordering::SeqCst);
+        let init = vec![0xA1, 0xA2, 0xA3];
+        request_rnode_startup_write(
+            &writer.control_tx,
+            RNodeWritePhase::Initialise,
+            init.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scripted.writes(), vec![init.clone()]);
+
+        tokio::time::advance(interval - Duration::from_millis(1)).await;
+        yield_to_rnode_tasks().await;
+        assert_eq!(scripted.writes(), vec![init.clone()]);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        yield_until_rnode_test(
+            || scripted.flush_calls() >= 2,
+            "post-init idle probe did not start from a fresh deadline",
+        )
+        .await;
+        assert_eq!(scripted.writes(), vec![init, build_detect_sequence()]);
+
+        finish_rnode_writer(writer).await;
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -5033,7 +5649,67 @@ mod tests {
     fn tcp_startup_bytes(config: &RNodeConfig) -> Vec<u8> {
         let mut startup = build_detect_sequence();
         startup.extend_from_slice(&build_init_sequence(config));
+        debug_assert!(
+            !kiss::RawKissDeframer::new()
+                .feed(&startup)
+                .iter()
+                .any(|(command, _)| *command == CMD_ROM_READ),
+            "legacy startup must never request EEPROM contents"
+        );
         startup
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn strict_capability_eeprom(model: u8) -> Vec<u8> {
+        use md5::{Digest, Md5};
+
+        let mut bytes = vec![0xFF; 296];
+        bytes[0] = 0x03;
+        bytes[1] = model;
+        bytes[2..11].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let checksum: [u8; 16] = Md5::digest(&bytes[..11]).into();
+        bytes[11..27].copy_from_slice(&checksum);
+        bytes[100] = kiss::FEND;
+        bytes[101] = kiss::FESC;
+        bytes[0x9B] = 0x73;
+        bytes
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn strict_capability_responses(model: u8) -> Vec<u8> {
+        let mut responses = Vec::new();
+        kiss::frame_with_command_into(CMD_DETECT, &[DETECT_RESP], &mut responses);
+        kiss::frame_with_command_into(
+            CMD_FW_VERSION,
+            &[REQUIRED_FW_VER_MAJ, REQUIRED_FW_VER_MIN],
+            &mut responses,
+        );
+        kiss::frame_with_command_into(
+            CMD_ROM_READ,
+            &strict_capability_eeprom(model),
+            &mut responses,
+        );
+        responses
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn strict_radio_echoes(config: &RNodeConfig) -> Vec<u8> {
+        let mut responses = Vec::new();
+        kiss::frame_with_command_into(
+            CMD_FREQUENCY,
+            &config.frequency.to_be_bytes(),
+            &mut responses,
+        );
+        kiss::frame_with_command_into(
+            CMD_BANDWIDTH,
+            &config.bandwidth.to_be_bytes(),
+            &mut responses,
+        );
+        kiss::frame_with_command_into(CMD_SF, &[config.spreading_factor], &mut responses);
+        kiss::frame_with_command_into(CMD_CR, &[config.coding_rate], &mut responses);
+        kiss::frame_with_command_into(CMD_TXPOWER, &[config.tx_power], &mut responses);
+        kiss::frame_with_command_into(CMD_RADIO_STATE, &[RADIO_STATE_ON], &mut responses);
+        responses
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -5051,6 +5727,7 @@ mod tests {
             RNodeFirmwareCompatibility::Unknown
         );
         assert_eq!(snapshot.configuration, RNodeConfigurationState::Unknown);
+        assert_eq!(snapshot.capability, RNodeCapabilityState::NotRequested);
         assert_eq!(snapshot.radio, RNodeObservedRadioState::Unknown);
         assert_eq!(snapshot.transmit_flow, RNodeTransmitFlowState::Unknown);
         assert_ne!(snapshot.phase, RNodeRuntimePhase::Ready);
@@ -5094,6 +5771,591 @@ mod tests {
     ) -> bool {
         let effect = state.apply_frame(command, payload);
         project_rnode_protocol_effect(snapshot, state, effect)
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_strict_rnode_startup_orders_preflight_and_publishes_atomic_admission() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = RNodeConfig::new("strict-startup", &format!("tcp://{addr}"));
+        let server_config = config.clone();
+        let detect = build_detect_sequence();
+        let capability_request =
+            crate::rnode_capability_preflight::build_rnode_capability_request();
+        let init = build_init_sequence(&config);
+        let detach = build_detach_sequence();
+        let (init_tx, mut init_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (echo_tx, echo_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            assert_eq!(read_exact_tcp(&mut stream, detect.len()), detect);
+            assert_eq!(
+                read_exact_tcp(&mut stream, capability_request.len()),
+                capability_request
+            );
+
+            // These matching controls and this packet predate admitted init.
+            // They must be reduced/suppressed privately and never make the
+            // active generation ready or reach Transport.
+            let mut responses = strict_radio_echoes(&server_config);
+            kiss::frame_with_command_into(kiss::CMD_DATA, b"preflight-private", &mut responses);
+            kiss::frame_with_command_into(CMD_PLATFORM, &[0x80], &mut responses);
+            responses.extend_from_slice(&strict_capability_responses(0xB8));
+            write_fragmented_tcp(&mut stream, &responses);
+
+            assert_eq!(read_exact_tcp(&mut stream, init.len()), init);
+            init_tx.send(()).unwrap();
+            if echo_rx.recv_timeout(Duration::from_secs(3)).is_err() {
+                return;
+            }
+            let mut active = strict_radio_echoes(&server_config);
+            kiss::frame_with_command_into(kiss::CMD_DATA, b"post-init", &mut active);
+            std::io::Write::write_all(&mut stream, &active).unwrap();
+            assert_eq!(read_exact_tcp(&mut stream, detach.len()), detach);
+        });
+
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let spawned = spawn_rnode_interface_with_driver_and_options(
+            config,
+            0xCA91,
+            transport_tx,
+            RNodeStartupOptions::require_capability_admission(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), init_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut state = spawned.driver.watch();
+        let admitted =
+            wait_for_rnode_snapshot(&mut state, |snapshot| snapshot.connection_generation == 1)
+                .await;
+        assert_eq!(admitted.capability, RNodeCapabilityState::Verified);
+        assert_eq!(admitted.phase, RNodeRuntimePhase::AwaitingReadiness);
+        assert_eq!(admitted.detection, RNodeDetectionState::Confirmed);
+        assert_eq!(
+            admitted.firmware_compatibility,
+            RNodeFirmwareCompatibility::Supported
+        );
+        assert_eq!(admitted.configuration, RNodeConfigurationState::Unknown);
+        assert_eq!(admitted.radio, RNodeObservedRadioState::Unknown);
+        assert!(transport_rx.try_recv().is_err());
+
+        echo_tx.send(()).unwrap();
+        let packet = receive_inbound_packet(&mut transport_rx).await;
+        assert_eq!(packet.raw.as_ref(), b"post-init");
+        let ready = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.connection_generation == 1 && snapshot.phase == RNodeRuntimePhase::Ready
+        })
+        .await;
+        assert_eq!(ready.capability, RNodeCapabilityState::Verified);
+
+        spawned.driver.request_shutdown();
+        wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.phase == RNodeRuntimePhase::Stopped
+        })
+        .await;
+        spawned.interface.read_task.await.unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_strict_initial_model_mismatch_is_typed_and_sends_no_init_or_detach() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = RNodeConfig::new("strict-mismatch", &format!("tcp://{addr}"));
+        let detect = build_detect_sequence();
+        let capability_request =
+            crate::rnode_capability_preflight::build_rnode_capability_request();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            assert_eq!(read_exact_tcp(&mut stream, detect.len()), detect);
+            assert_eq!(
+                read_exact_tcp(&mut stream, capability_request.len()),
+                capability_request
+            );
+            // 0xB4 is a reviewed 420-520 MHz model; default 868 MHz settings
+            // must be rejected before any radio mutation.
+            std::io::Write::write_all(&mut stream, &strict_capability_responses(0xB4)).unwrap();
+            let mut extra = [0u8; 1024];
+            match std::io::Read::read(&mut stream, &mut extra) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::UnexpectedEof
+                    ) => {}
+                Ok(count) => panic!("strict rejection emitted {count} unexpected bytes"),
+                Err(error) => panic!("unexpected strict rejection read error: {error}"),
+            }
+        });
+
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let error = match spawn_rnode_interface_with_driver_and_options(
+            config,
+            0xB401,
+            transport_tx,
+            RNodeStartupOptions::require_capability_admission(),
+        )
+        .await
+        {
+            Ok(_) => panic!("known-model mismatch must reject initial spawn"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RNodeSpawnError::CapabilityAdmission(RNodeCapabilityAdmissionError::RadioSettings(
+                crate::rnode_capabilities::RNodeRadioAdmissionError::FrequencyOutOfRange { .. }
+            ))
+        ));
+        server.join().unwrap();
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_strict_initial_response_timeout_is_typed_and_sends_no_init_or_detach() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = RNodeConfig::new("strict-timeout", &format!("tcp://{addr}"));
+        let detect = build_detect_sequence();
+        let capability_request =
+            crate::rnode_capability_preflight::build_rnode_capability_request();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            assert_eq!(read_exact_tcp(&mut stream, detect.len()), detect);
+            assert_eq!(
+                read_exact_tcp(&mut stream, capability_request.len()),
+                capability_request
+            );
+            let mut extra = [0u8; 1024];
+            match std::io::Read::read(&mut stream, &mut extra) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::UnexpectedEof
+                    ) => {}
+                Ok(count) => panic!("strict timeout emitted {count} unexpected bytes"),
+                Err(error) => panic!("unexpected strict timeout read error: {error}"),
+            }
+        });
+
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let error = match spawn_rnode_interface_with_driver_and_options(
+            config,
+            0x710E,
+            transport_tx,
+            RNodeStartupOptions::require_capability_admission(),
+        )
+        .await
+        {
+            Ok(_) => panic!("missing capability response must reject initial spawn"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RNodeSpawnError::CapabilityAdmission(RNodeCapabilityAdmissionError::ResponseTimedOut)
+        ));
+        server.join().unwrap();
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_strict_reconnect_capability_rejection_is_terminal_without_init_or_detach() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = RNodeConfig::new("strict-terminal-reconnect", &format!("tcp://{addr}"));
+        let detect = build_detect_sequence();
+        let capability_request =
+            crate::rnode_capability_preflight::build_rnode_capability_request();
+        let init = build_init_sequence(&config);
+        let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (close_tx, close_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            first
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            assert_eq!(read_exact_tcp(&mut first, detect.len()), detect);
+            assert_eq!(
+                read_exact_tcp(&mut first, capability_request.len()),
+                capability_request
+            );
+            std::io::Write::write_all(&mut first, &strict_capability_responses(0xB8)).unwrap();
+            assert_eq!(read_exact_tcp(&mut first, init.len()), init);
+            first_tx.send(()).unwrap();
+            close_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            second
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            assert_eq!(read_exact_tcp(&mut second, detect.len()), detect);
+            assert_eq!(
+                read_exact_tcp(&mut second, capability_request.len()),
+                capability_request
+            );
+            std::io::Write::write_all(&mut second, &strict_capability_responses(0xB4)).unwrap();
+            let mut extra = [0u8; 1024];
+            match std::io::Read::read(&mut second, &mut extra) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::UnexpectedEof
+                    ) => {}
+                Ok(count) => panic!("rejected reconnect emitted {count} unexpected bytes"),
+                Err(error) => panic!("unexpected rejected reconnect read error: {error}"),
+            }
+
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_millis(700);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => panic!("capability rejection must terminate reconnects"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("reconnect listener failed: {error}"),
+                }
+            }
+        });
+
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let spawned = spawn_rnode_interface_with_driver_and_options(
+            config,
+            0xCA92,
+            transport_tx,
+            RNodeStartupOptions::require_capability_admission(),
+        )
+        .await
+        .unwrap();
+        first_rx.recv().await.unwrap();
+        let mut state = spawned.driver.watch();
+        wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.connection_generation == 1
+                && snapshot.capability == RNodeCapabilityState::Verified
+        })
+        .await;
+        close_tx.send(()).unwrap();
+        let stopped = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.phase == RNodeRuntimePhase::Stopped
+                && snapshot.reason == Some(RNodeRuntimeReason::CapabilityAdmissionRejected)
+        })
+        .await;
+        assert_eq!(stopped.disconnect_total, 1);
+        assert_eq!(stopped.reconnect_total, 1);
+        spawned.interface.read_task.await.unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[derive(Clone, Copy)]
+    enum StrictReconnectTransient {
+        Eof,
+        ResponseTimeout,
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    async fn assert_strict_reconnect_transient_retries_then_readmits(
+        transient: StrictReconnectTransient,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (interface_name, interface_id) = match transient {
+            StrictReconnectTransient::Eof => ("strict-eof-reconnect", 0xCA93),
+            StrictReconnectTransient::ResponseTimeout => ("strict-timeout-reconnect", 0xCA96),
+        };
+        let config = RNodeConfig::new(interface_name, &format!("tcp://{addr}"));
+        let detect = build_detect_sequence();
+        let capability_request =
+            crate::rnode_capability_preflight::build_rnode_capability_request();
+        let init = build_init_sequence(&config);
+        let detach = build_detach_sequence();
+        let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (third_tx, mut third_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (close_tx, close_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            first
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            assert_eq!(read_exact_tcp(&mut first, detect.len()), detect);
+            assert_eq!(
+                read_exact_tcp(&mut first, capability_request.len()),
+                capability_request
+            );
+            std::io::Write::write_all(&mut first, &strict_capability_responses(0xB8)).unwrap();
+            assert_eq!(read_exact_tcp(&mut first, init.len()), init);
+            first_tx.send(()).unwrap();
+            close_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            drop(first);
+
+            // This failed connection receives one ROM request and no init
+            // before a fresh retry generation.
+            let (mut second, _) = listener.accept().unwrap();
+            second
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            assert_eq!(read_exact_tcp(&mut second, detect.len()), detect);
+            assert_eq!(
+                read_exact_tcp(&mut second, capability_request.len()),
+                capability_request
+            );
+            if matches!(transient, StrictReconnectTransient::ResponseTimeout) {
+                let mut extra = [0u8; 1024];
+                match std::io::Read::read(&mut second, &mut extra) {
+                    Ok(0) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::UnexpectedEof
+                        ) => {}
+                    Ok(count) => panic!("timed-out reconnect emitted {count} unexpected bytes"),
+                    Err(error) => panic!("unexpected timed-out reconnect read error: {error}"),
+                }
+            }
+            drop(second);
+
+            let (mut third, _) = listener.accept().unwrap();
+            third
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            assert_eq!(read_exact_tcp(&mut third, detect.len()), detect);
+            assert_eq!(
+                read_exact_tcp(&mut third, capability_request.len()),
+                capability_request
+            );
+            std::io::Write::write_all(&mut third, &strict_capability_responses(0xB8)).unwrap();
+            assert_eq!(read_exact_tcp(&mut third, init.len()), init);
+            third_tx.send(()).unwrap();
+            assert_eq!(read_exact_tcp(&mut third, detach.len()), detach);
+        });
+
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let spawned = spawn_rnode_interface_with_driver_and_options(
+            config,
+            interface_id,
+            transport_tx,
+            RNodeStartupOptions::require_capability_admission(),
+        )
+        .await
+        .unwrap();
+        first_rx.recv().await.unwrap();
+        let mut state = spawned.driver.watch();
+        wait_for_rnode_snapshot(&mut state, |snapshot| snapshot.connection_generation == 1).await;
+        close_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), third_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let readmitted = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.connection_generation == 2
+                && snapshot.capability == RNodeCapabilityState::Verified
+        })
+        .await;
+        assert_eq!(readmitted.disconnect_total, 1);
+        assert_eq!(readmitted.reconnect_total, 2);
+
+        spawned.driver.request_shutdown();
+        wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.phase == RNodeRuntimePhase::Stopped
+        })
+        .await;
+        spawned.interface.read_task.await.unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_strict_reconnect_transport_eof_retries_then_readmits() {
+        assert_strict_reconnect_transient_retries_then_readmits(StrictReconnectTransient::Eof)
+            .await;
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_strict_reconnect_response_timeout_retries_then_readmits() {
+        assert_strict_reconnect_transient_retries_then_readmits(
+            StrictReconnectTransient::ResponseTimeout,
+        )
+        .await;
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_stop_during_reconnect_preflight_quiesces_without_init_or_detach() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = RNodeConfig::new("strict-stop-preflight", &format!("tcp://{addr}"));
+        let detect = build_detect_sequence();
+        let capability_request =
+            crate::rnode_capability_preflight::build_rnode_capability_request();
+        let init = build_init_sequence(&config);
+        let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (waiting_tx, mut waiting_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (close_tx, close_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            first
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            assert_eq!(read_exact_tcp(&mut first, detect.len()), detect);
+            assert_eq!(
+                read_exact_tcp(&mut first, capability_request.len()),
+                capability_request
+            );
+            std::io::Write::write_all(&mut first, &strict_capability_responses(0xB8)).unwrap();
+            assert_eq!(read_exact_tcp(&mut first, init.len()), init);
+            first_tx.send(()).unwrap();
+            close_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            second
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            assert_eq!(read_exact_tcp(&mut second, detect.len()), detect);
+            assert_eq!(
+                read_exact_tcp(&mut second, capability_request.len()),
+                capability_request
+            );
+            waiting_tx.send(()).unwrap();
+            let mut extra = [0u8; 1024];
+            match std::io::Read::read(&mut second, &mut extra) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::UnexpectedEof
+                    ) => {}
+                Ok(count) => panic!("pre-init stop emitted {count} unexpected bytes"),
+                Err(error) => panic!("unexpected pre-init stop read error: {error}"),
+            }
+        });
+
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let spawned = spawn_rnode_interface_with_driver_and_options(
+            config,
+            0xCA94,
+            transport_tx,
+            RNodeStartupOptions::require_capability_admission(),
+        )
+        .await
+        .unwrap();
+        first_rx.recv().await.unwrap();
+        let mut state = spawned.driver.watch();
+        wait_for_rnode_snapshot(&mut state, |snapshot| snapshot.connection_generation == 1).await;
+        close_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(4), waiting_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        spawned.driver.request_shutdown();
+        let stopped = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.phase == RNodeRuntimePhase::Stopped
+                && snapshot.reason == Some(RNodeRuntimeReason::StopRequested)
+        })
+        .await;
+        assert_eq!(stopped.disconnect_total, 1);
+        spawned.interface.read_task.await.unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_stop_after_strict_admission_queues_detach_behind_blocked_init() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = RNodeConfig::new("strict-init-stop", &format!("tcp://{addr}"));
+        let responses = strict_capability_responses(0xB8);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            std::io::Write::write_all(&mut stream, &responses).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+        });
+
+        let port = RNodeStream::connect_tcp(&addr.to_string()).unwrap();
+        let scripted = ScriptedWriter::blocking_flush(3);
+        let writer = spawn_rnode_writer(
+            scripted.clone(),
+            scripted_writer_context(
+                false,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicU64::new(0)),
+                None,
+                Duration::from_millis(5),
+            ),
+        );
+        let (stop_tx, mut stop_rx) = mpsc::channel(1);
+        let result = {
+            let preflight =
+                run_rnode_capability_preflight(port, &writer, &config, Some(&mut stop_rx));
+            tokio::pin!(preflight);
+
+            tokio::select! {
+                _ = wait_for_scripted_writer(&scripted, |state| state.blocked_flush_entered) => {}
+                _ = &mut preflight => panic!("strict preflight ended before init entered its blocked flush"),
+            }
+            stop_tx.send(()).await.unwrap();
+            preflight.await
+        };
+        assert!(matches!(
+            result,
+            Err(RNodeStrictPreflightError::StopRequestedAfterInitQueued)
+        ));
+
+        scripted.release_flush();
+        send_detach_request(&writer.control_tx, 0xCA95)
+            .await
+            .expect("detach must follow an init that may have reached the radio");
+        assert_eq!(
+            scripted.writes(),
+            vec![
+                build_detect_sequence(),
+                crate::rnode_capability_preflight::build_rnode_capability_request(),
+                build_init_sequence(&config),
+                build_detach_sequence(),
+            ]
+        );
+        assert_eq!(
+            finish_rnode_writer(writer).await,
+            RNodeWriterFinish::Quiesced
+        );
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
