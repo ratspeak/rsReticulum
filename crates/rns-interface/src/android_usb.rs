@@ -11,12 +11,13 @@ use tokio::sync::{mpsc, watch};
 use crate::android_usb_lifecycle::{
     OwnedUsbIo, UsbConnectionCleanup, UsbConnectionLifecycle, UsbInboundOutcome, UsbInboundState,
     UsbIoEvent, UsbLeaseTable, UsbReadDrainOutcome, UsbReadResult, UsbReaderBackend,
-    UsbShutdownReport, UsbTransferError, UsbTxPumpExit, UsbWritePhase, UsbWriterBackend,
-    drain_usb_reader_tail, forward_usb_read_chunk, run_usb_tx_pump, spawn_owned_usb_io,
+    UsbShutdownReport, UsbTransferError, UsbTxPumpExit, UsbWriterBackend, drain_usb_reader_tail,
+    forward_usb_read_chunk, run_usb_rnode_startup, run_usb_tx_pump, spawn_owned_usb_io,
 };
 #[cfg(test)]
 use crate::kiss;
-use crate::rnode;
+use crate::rnode::{self, RNodeRuntimeReason, RNodeTransportClass, SpawnedRNodeInterface};
+use crate::rnode_protocol::RNodeProtocolTarget;
 use crate::traits::{
     InterfaceDirection, InterfaceError, InterfaceHandle, InterfaceId, InterfaceMode,
 };
@@ -1092,12 +1093,34 @@ pub async fn spawn_android_usb_rnode_interface(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, InterfaceError> {
+    Ok(
+        spawn_android_usb_rnode_interface_with_driver(config, id, transport_tx)
+            .await?
+            .interface,
+    )
+}
+
+/// Spawn Android USB with the same privacy-safe RNode observation surface as
+/// the serial, TCP, and BLE drivers.
+pub async fn spawn_android_usb_rnode_interface_with_driver(
+    config: AndroidUsbConfig,
+    id: InterfaceId,
+    transport_tx: mpsc::Sender<TransportMessage>,
+) -> Result<SpawnedRNodeInterface, InterfaceError> {
     let (mut usb, connected) = open_usb_serial(&config.device_name, config.baud_rate).await?;
 
     let name = config.name.clone();
+    let protocol_target = RNodeProtocolTarget::new(
+        config.frequency,
+        config.bandwidth,
+        config.spreading_factor,
+        config.coding_rate,
+        config.tx_power,
+    );
 
-    // Radio stays disabled until initialization. Wait for the physical bulk
-    // write acknowledgement before exposing the transport-facing sender.
+    // Detect and initialization are distinct, physically acknowledged startup
+    // phases. The radio remains disabled until the exact existing init
+    // sequence reaches the device.
     let mut rnode_cfg = rnode::RNodeConfig::new(&config.name, &config.device_name);
     rnode_cfg.baud_rate = config.baud_rate;
     rnode_cfg.frequency = config.frequency;
@@ -1110,14 +1133,13 @@ pub async fn spawn_android_usb_rnode_interface(
     rnode_cfg.st_alock = config.st_alock;
     rnode_cfg.lt_alock = config.lt_alock;
     let init_bytes = rnode::build_init_sequence(&rnode_cfg);
-    if let Err(error) = usb
-        .writer
-        .request_before(
-            UsbWritePhase::Initialise,
-            init_bytes,
-            USB_STARTUP_ACK_DEADLINE,
-        )
-        .await
+    if let Err(error) = run_usb_rnode_startup(
+        &usb.writer,
+        rnode::build_detect_sequence(),
+        init_bytes,
+        USB_STARTUP_ACK_DEADLINE,
+    )
+    .await
     {
         let shutdown = usb
             .shutdown(None, USB_DETACH_ACK_DEADLINE, USB_WORKER_JOIN_DEADLINE)
@@ -1128,9 +1150,13 @@ pub async fn spawn_android_usb_rnode_interface(
             .map(|cleanup| format!("; cleanup: {cleanup}"))
             .unwrap_or_default();
         return Err(InterfaceError::SendFailed(format!(
-            "Android USB RNode initialization failed: {error}{cleanup}"
+            "Android USB RNode startup failed: {error}{cleanup}"
         )));
     }
+
+    let (mut snapshot_publisher, driver) =
+        rnode::new_rnode_driver_observation(RNodeTransportClass::Usb);
+    snapshot_publisher.connection_established();
 
     let shared_txb = Arc::new(AtomicU64::new(0));
     let shared_rxb = Arc::new(AtomicU64::new(0));
@@ -1155,20 +1181,25 @@ pub async fn spawn_android_usb_rnode_interface(
             let exit = run_usb_tx_pump(app_rx, pump_writer, pump_txb, tx_pump_stop_rx).await;
             let _ = tx_pump_exit_tx.send(exit);
         });
-        let mut inbound = UsbInboundState::new();
+        let mut inbound = UsbInboundState::projected(protocol_target, snapshot_publisher);
         let mut stop_requested = false;
         let mut drain_reader_tail = false;
+        let mut terminal_reason = RNodeRuntimeReason::DriverTerminated;
 
         loop {
             tokio::select! {
                 biased;
                 stop = stop_rx.recv() => {
                     stop_requested = stop.is_some();
+                    if stop_requested {
+                        terminal_reason = RNodeRuntimeReason::StopRequested;
+                    }
                     break;
                 }
                 pump = &mut tx_pump_exit_rx => {
                     match pump {
                         Ok(UsbTxPumpExit::WriterRejected(error)) => {
+                            terminal_reason = RNodeRuntimeReason::ConnectionLost;
                             tracing::warn!(
                                 name = %read_name,
                                 error = %error,
@@ -1176,9 +1207,12 @@ pub async fn spawn_android_usb_rnode_interface(
                             );
                             drain_reader_tail = true;
                         }
-                        Ok(UsbTxPumpExit::ApplicationClosed) => {}
+                        Ok(UsbTxPumpExit::ApplicationClosed) => {
+                            terminal_reason = RNodeRuntimeReason::TransportConsumerClosed;
+                        }
                         Ok(UsbTxPumpExit::StopRequested) => {
                             stop_requested = true;
+                            terminal_reason = RNodeRuntimeReason::StopRequested;
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -1194,6 +1228,7 @@ pub async fn spawn_android_usb_rnode_interface(
                 event = usb.events.recv() => {
                     match event {
                         Some(UsbIoEvent::Writer(exit)) => {
+                            terminal_reason = RNodeRuntimeReason::ConnectionLost;
                             tracing::debug!(
                                 name = %read_name,
                                 worker = ?exit,
@@ -1203,6 +1238,7 @@ pub async fn spawn_android_usb_rnode_interface(
                             break;
                         }
                         Some(UsbIoEvent::Reader(exit)) => {
+                            terminal_reason = RNodeRuntimeReason::ConnectionLost;
                             tracing::debug!(
                                 name = %read_name,
                                 worker = ?exit,
@@ -1222,9 +1258,12 @@ pub async fn spawn_android_usb_rnode_interface(
                                 UsbInboundOutcome::Complete => {}
                                 UsbInboundOutcome::StopRequested => {
                                     stop_requested = true;
+                                    terminal_reason = RNodeRuntimeReason::StopRequested;
                                     break;
                                 }
                                 UsbInboundOutcome::TransportClosed => {
+                                    terminal_reason =
+                                        RNodeRuntimeReason::TransportConsumerClosed;
                                     tracing::warn!(
                                         name = %read_name,
                                         "transport channel closed"
@@ -1234,11 +1273,16 @@ pub async fn spawn_android_usb_rnode_interface(
                                 UsbInboundOutcome::DeadlineElapsed => break,
                             }
                         }
-                        None => break,
+                        None => {
+                            terminal_reason = RNodeRuntimeReason::ConnectionLost;
+                            break;
+                        }
                     }
                 }
             }
         }
+
+        inbound.shutting_down(terminal_reason);
 
         let _ = tx_pump_stop_tx.send(());
         if tokio::time::timeout(USB_WORKER_JOIN_DEADLINE, &mut tx_pump)
@@ -1264,11 +1308,19 @@ pub async fn spawn_android_usb_rnode_interface(
             .await
             {
                 UsbReadDrainOutcome::Drained => {}
-                UsbReadDrainOutcome::StopRequested => stop_requested = true,
-                UsbReadDrainOutcome::TransportClosed => tracing::warn!(
-                    name = %read_name,
-                    "transport channel closed while draining Android USB reader tail"
-                ),
+                UsbReadDrainOutcome::StopRequested => {
+                    stop_requested = true;
+                    terminal_reason = RNodeRuntimeReason::StopRequested;
+                    inbound.shutting_down(terminal_reason);
+                }
+                UsbReadDrainOutcome::TransportClosed => {
+                    terminal_reason = RNodeRuntimeReason::TransportConsumerClosed;
+                    inbound.shutting_down(terminal_reason);
+                    tracing::warn!(
+                        name = %read_name,
+                        "transport channel closed while draining Android USB reader tail"
+                    );
+                }
                 UsbReadDrainOutcome::DeadlineElapsed => tracing::warn!(
                     name = %read_name,
                     "Android USB reader tail did not finish before shutdown deadline"
@@ -1307,11 +1359,12 @@ pub async fn spawn_android_usb_rnode_interface(
                 "Android USB owner shutdown complete"
             );
         }
-        shutdown_status_tx.send_replace(AndroidUsbShutdownStatus::Complete(report));
         online.store(false, Ordering::SeqCst);
+        inbound.stopped(terminal_reason);
+        shutdown_status_tx.send_replace(AndroidUsbShutdownStatus::Complete(report));
     });
 
-    Ok(InterfaceHandle {
+    let interface = InterfaceHandle {
         id,
         parent_id: None,
         name,
@@ -1330,7 +1383,8 @@ pub async fn spawn_android_usb_rnode_interface(
         inspection: None,
         tx,
         read_task,
-    })
+    };
+    Ok(SpawnedRNodeInterface { interface, driver })
 }
 
 /// Push an already-KISS-framed control frame through the raw USB writer,
@@ -1350,6 +1404,28 @@ pub async fn send_raw_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+
+    fn assert_facade_shape<F, Fut>(_spawn: F)
+    where
+        F: Fn(AndroidUsbConfig, InterfaceId, mpsc::Sender<TransportMessage>) -> Fut,
+        Fut: Future<Output = Result<InterfaceHandle, InterfaceError>>,
+    {
+    }
+
+    fn assert_driver_shape<F, Fut>(_spawn: F)
+    where
+        F: Fn(AndroidUsbConfig, InterfaceId, mpsc::Sender<TransportMessage>) -> Fut,
+        Fut: Future<Output = Result<SpawnedRNodeInterface, InterfaceError>>,
+    {
+    }
+
+    #[test]
+    fn android_usb_spawn_api_keeps_the_facade_and_adds_the_driver_shape() {
+        assert_facade_shape(spawn_android_usb_rnode_interface);
+        assert_driver_shape(spawn_android_usb_rnode_interface_with_driver);
+        let _usb_transport: RNodeTransportClass = RNodeTransportClass::Usb;
+    }
 
     fn fragmented_decode(wire: &[u8]) -> Vec<(u8, Vec<u8>)> {
         let mut deframer = kiss::RawKissDeframer::new();

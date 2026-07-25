@@ -14,7 +14,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::kiss;
-use crate::rnode;
+use crate::rnode::{self, RNodeRuntimeReason, RNodeSnapshotPublisher};
+use crate::rnode_protocol::{RNodeProtocolState, RNodeProtocolTarget};
 use crate::traits::InterfaceId;
 use rns_transport::messages::TransportMessage;
 
@@ -148,6 +149,7 @@ impl<R> UsbLeaseTable<R> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UsbWritePhase {
+    Detect,
     Initialise,
     Packet,
     Detach,
@@ -156,6 +158,7 @@ pub(crate) enum UsbWritePhase {
 impl UsbWritePhase {
     const fn label(self) -> &'static str {
         match self {
+            Self::Detect => "detect",
             Self::Initialise => "init",
             Self::Packet => "packet",
             Self::Detach => "detach",
@@ -480,6 +483,12 @@ pub(crate) struct UsbInboundState {
     deframer: kiss::RawKissDeframer,
     last_rssi: Option<f32>,
     last_snr: Option<f32>,
+    projection: Option<UsbRNodeProjection>,
+}
+
+struct UsbRNodeProjection {
+    protocol: RNodeProtocolState,
+    publisher: RNodeSnapshotPublisher,
 }
 
 impl UsbInboundState {
@@ -488,6 +497,42 @@ impl UsbInboundState {
             deframer: kiss::RawKissDeframer::new(),
             last_rssi: None,
             last_snr: None,
+            projection: None,
+        }
+    }
+
+    pub(crate) fn projected(
+        target: RNodeProtocolTarget,
+        publisher: RNodeSnapshotPublisher,
+    ) -> Self {
+        Self {
+            projection: Some(UsbRNodeProjection {
+                protocol: RNodeProtocolState::new(target),
+                publisher,
+            }),
+            ..Self::new()
+        }
+    }
+
+    fn project_frame(&mut self, command: u8, frame: &[u8]) {
+        let Some(projection) = self.projection.as_mut() else {
+            return;
+        };
+        let effect = projection.protocol.apply_frame(command, frame);
+        projection
+            .publisher
+            .protocol_effect(&projection.protocol, effect);
+    }
+
+    pub(crate) fn shutting_down(&self, reason: RNodeRuntimeReason) {
+        if let Some(projection) = &self.projection {
+            projection.publisher.shutting_down(reason);
+        }
+    }
+
+    pub(crate) fn stopped(&mut self, reason: RNodeRuntimeReason) {
+        if let Some(projection) = self.projection.as_mut() {
+            projection.publisher.stopped(reason);
         }
     }
 }
@@ -535,6 +580,7 @@ async fn forward_usb_read_chunk_inner(
         return UsbInboundOutcome::Complete;
     }
     for (command, frame) in state.deframer.feed(bytes) {
+        state.project_frame(command, &frame);
         match rnode::process_rnode_response(
             command,
             &frame,
@@ -838,6 +884,24 @@ impl UsbWriterHandle {
         transmitted_bytes.fetch_add(length, Ordering::Relaxed);
         Ok(())
     }
+}
+
+/// Complete the two acknowledged RNode startup phases in strict wire order.
+///
+/// Each phase gets its own queue-to-transfer deadline. These are control
+/// writes, so they intentionally bypass application-payload accounting.
+pub(crate) async fn run_usb_rnode_startup(
+    writer: &UsbWriterHandle,
+    detect_bytes: Vec<u8>,
+    init_bytes: Vec<u8>,
+    phase_timeout: Duration,
+) -> Result<(), UsbWriteFailure> {
+    writer
+        .request_before(UsbWritePhase::Detect, detect_bytes, phase_timeout)
+        .await?;
+    writer
+        .request_before(UsbWritePhase::Initialise, init_bytes, phase_timeout)
+        .await
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1398,6 +1462,353 @@ mod tests {
             8,
             Duration::from_millis(100),
         )
+    }
+
+    const USB_TEST_TARGET: RNodeProtocolTarget =
+        RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
+
+    fn projected_inbound() -> (UsbInboundState, rnode::RNodeDriverHandle) {
+        let (mut publisher, driver) =
+            rnode::new_rnode_driver_observation(rnode::RNodeTransportClass::Usb);
+        publisher.connection_established();
+        (
+            UsbInboundState::projected(USB_TEST_TARGET, publisher),
+            driver,
+        )
+    }
+
+    fn required_protocol_frames(target: RNodeProtocolTarget) -> [(u8, Vec<u8>); 8] {
+        [
+            (rnode::CMD_DETECT, vec![rnode::DETECT_RESP]),
+            (
+                rnode::CMD_FW_VERSION,
+                vec![rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+            ),
+            (
+                rnode::CMD_FREQUENCY,
+                target.frequency.to_be_bytes().to_vec(),
+            ),
+            (
+                rnode::CMD_BANDWIDTH,
+                target.bandwidth.to_be_bytes().to_vec(),
+            ),
+            (rnode::CMD_SF, vec![target.spreading_factor]),
+            (rnode::CMD_CR, vec![target.coding_rate]),
+            (rnode::CMD_TXPOWER, vec![target.tx_power]),
+            (rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_ON]),
+        ]
+    }
+
+    fn framed_protocol_frames(frames: impl IntoIterator<Item = (u8, Vec<u8>)>) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for (command, payload) in frames {
+            kiss::frame_with_command_into(command, &payload, &mut wire);
+        }
+        wire
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rnode_startup_acknowledges_detect_then_exact_init_without_accounting() {
+        let writer = ScriptedWriter::new([]);
+        let calls = writer.calls.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let io = test_io(writer, events);
+        let transmitted = AtomicU64::new(0);
+
+        let mut config = rnode::RNodeConfig::new("android-usb-test", "/dev/bus/usb/test");
+        config.frequency = USB_TEST_TARGET.frequency;
+        config.bandwidth = USB_TEST_TARGET.bandwidth;
+        config.spreading_factor = USB_TEST_TARGET.spreading_factor;
+        config.coding_rate = USB_TEST_TARGET.coding_rate;
+        config.tx_power = USB_TEST_TARGET.tx_power;
+        let detect = rnode::build_detect_sequence();
+        let init = rnode::build_init_sequence(&config);
+
+        run_usb_rnode_startup(
+            &io.writer,
+            detect.clone(),
+            init.clone(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("both startup phases should be physically acknowledged");
+
+        assert_eq!(
+            transmitted.load(Ordering::Relaxed),
+            0,
+            "startup control bytes must never enter packet TX accounting"
+        );
+
+        let packet = vec![0xAA, 0xBB, 0xCC];
+        io.writer
+            .queue_packet_and_account(packet.clone(), &transmitted)
+            .await
+            .expect("packet should be admitted after startup");
+        assert_eq!(
+            transmitted.load(Ordering::Relaxed),
+            packet.len() as u64,
+            "only the admitted packet should enter TX accounting"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+                != 3
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("packet write did not complete");
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|(bytes, _)| bytes.clone())
+                .collect::<Vec<_>>(),
+            vec![detect, init, packet]
+        );
+
+        let _ = io
+            .shutdown(None, Duration::from_millis(20), Duration::from_secs(1))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn projected_ready_frames_preserve_the_following_packet_and_accounting() {
+        let (mut inbound, driver) = projected_inbound();
+        let payload = vec![0xAA, kiss::FEND, kiss::FESC, 0x55];
+        let mut wire = framed_protocol_frames(required_protocol_frames(USB_TEST_TARGET));
+        kiss::frame_with_command_into(kiss::CMD_DATA, &payload, &mut wire);
+        let split = wire.len() / 2;
+        let (_stop_tx, mut stop_rx) = mpsc::channel(1);
+        let (transport_tx, mut transport_rx) = mpsc::channel(1);
+        let received = AtomicU64::new(0);
+
+        for chunk in [&wire[..split], &wire[split..]] {
+            assert_eq!(
+                forward_usb_read_chunk(
+                    &mut inbound,
+                    chunk,
+                    0x55,
+                    &received,
+                    &transport_tx,
+                    &mut stop_rx,
+                )
+                .await,
+                UsbInboundOutcome::Complete
+            );
+        }
+
+        let snapshot = driver.snapshot();
+        assert_eq!(snapshot.transport, rnode::RNodeTransportClass::Usb);
+        assert_eq!(snapshot.phase, rnode::RNodeRuntimePhase::Ready);
+        assert_eq!(
+            snapshot.configuration,
+            rnode::RNodeConfigurationState::Verified
+        );
+        match transport_rx.recv().await.expect("projected packet") {
+            TransportMessage::Inbound(packet) => {
+                assert_eq!(packet.raw.as_ref(), payload);
+                assert_eq!(packet.interface_id, 0x55);
+            }
+            _ => panic!("unexpected transport message"),
+        }
+        assert_eq!(received.load(Ordering::Relaxed), payload.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn malformed_and_unknown_control_frames_do_not_change_usb_observation() {
+        let (mut inbound, driver) = projected_inbound();
+        let before = driver.snapshot();
+        let malformed = [
+            (0xE7, vec![0xDE, 0xAD]),
+            (rnode::CMD_DETECT, Vec::new()),
+            (rnode::CMD_FW_VERSION, vec![rnode::REQUIRED_FW_VER_MAJ]),
+            (rnode::CMD_FREQUENCY, vec![1, 2, 3]),
+            (rnode::CMD_RADIO_STATE, vec![2]),
+            (rnode::CMD_READY, vec![1, 0]),
+            (rnode::CMD_RESET, vec![0]),
+            (rnode::CMD_ERROR, vec![0x7F]),
+        ];
+        let wire = framed_protocol_frames(malformed);
+        let (_stop_tx, mut stop_rx) = mpsc::channel(1);
+        let (transport_tx, mut transport_rx) = mpsc::channel(1);
+        let received = AtomicU64::new(0);
+
+        assert_eq!(
+            forward_usb_read_chunk(
+                &mut inbound,
+                &wire,
+                7,
+                &received,
+                &transport_tx,
+                &mut stop_rx,
+            )
+            .await,
+            UsbInboundOutcome::Complete
+        );
+        assert_eq!(driver.snapshot().as_ref(), before.as_ref());
+        assert!(transport_rx.try_recv().is_err());
+        assert_eq!(received.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cmd_ready_is_observation_only_and_does_not_gate_tx_admission() {
+        let (mut inbound, driver) = projected_inbound();
+        let mut ready_blocked = Vec::new();
+        kiss::frame_with_command_into(rnode::CMD_READY, &[0], &mut ready_blocked);
+        let (_stop_tx, mut stop_rx) = mpsc::channel(1);
+        let (transport_tx, _transport_rx) = mpsc::channel(1);
+
+        assert_eq!(
+            forward_usb_read_chunk(
+                &mut inbound,
+                &ready_blocked,
+                8,
+                &AtomicU64::new(0),
+                &transport_tx,
+                &mut stop_rx,
+            )
+            .await,
+            UsbInboundOutcome::Complete
+        );
+        assert_eq!(
+            driver.snapshot().transmit_flow,
+            rnode::RNodeTransmitFlowState::Blocked
+        );
+
+        let writer = UsbWriterHandle {
+            queue: UsbWriteQueue::new(1),
+        };
+        let transmitted = AtomicU64::new(0);
+        writer
+            .queue_packet_and_account(vec![1, 2, 3], &transmitted)
+            .await
+            .expect("observed CMD_READY=false must not gate USB packet admission");
+        assert_eq!(transmitted.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn reader_tail_drain_projects_protocol_frames_before_exit() {
+        let (mut inbound, driver) = projected_inbound();
+        inbound.shutting_down(RNodeRuntimeReason::ConnectionLost);
+        let (event_tx, mut events) = mpsc::channel(2);
+        event_tx
+            .send(UsbIoEvent::Read(framed_protocol_frames(
+                required_protocol_frames(USB_TEST_TARGET),
+            )))
+            .await
+            .expect("buffer protocol frames");
+        event_tx
+            .send(UsbIoEvent::Reader(UsbReaderExit::Stopped))
+            .await
+            .expect("reader exit");
+        drop(event_tx);
+        let (_stop_tx, mut stop_rx) = mpsc::channel(1);
+        let (transport_tx, mut transport_rx) = mpsc::channel(1);
+
+        assert_eq!(
+            drain_usb_reader_tail(
+                &mut events,
+                &mut inbound,
+                9,
+                &AtomicU64::new(0),
+                &transport_tx,
+                &mut stop_rx,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await,
+            UsbReadDrainOutcome::Drained
+        );
+        let snapshot = driver.snapshot();
+        assert_eq!(snapshot.phase, rnode::RNodeRuntimePhase::ShuttingDown);
+        assert_eq!(
+            snapshot.reason,
+            Some(RNodeRuntimeReason::ConnectionLost),
+            "late reducer evidence must not overwrite the shutdown cause"
+        );
+        assert_eq!(
+            snapshot.configuration,
+            rnode::RNodeConfigurationState::Verified,
+            "the shutdown invariant must not hide bounded late evidence"
+        );
+        assert!(transport_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn usb_observation_has_one_generation_then_closed_terminal_zero_without_reconnects() {
+        let (mut publisher, driver) =
+            rnode::new_rnode_driver_observation(rnode::RNodeTransportClass::Usb);
+        let initial = driver.snapshot();
+        assert_eq!(initial.connection_generation, 0);
+
+        publisher.connection_established();
+        let connected = driver.snapshot();
+        assert_eq!(connected.connection_generation, 1);
+        assert_eq!(connected.reconnect_attempt, 0);
+        assert_eq!(connected.reconnect_total, 0);
+        assert_eq!(connected.disconnect_total, 0);
+
+        let mut inbound = UsbInboundState::projected(USB_TEST_TARGET, publisher);
+        inbound.shutting_down(RNodeRuntimeReason::StopRequested);
+        let shutting_down = driver.snapshot();
+        assert_eq!(shutting_down.phase, rnode::RNodeRuntimePhase::ShuttingDown);
+        assert_eq!(shutting_down.connection_generation, 1);
+        assert_eq!(
+            shutting_down.reason,
+            Some(RNodeRuntimeReason::StopRequested)
+        );
+
+        let mut closed = driver.watch();
+        inbound.stopped(RNodeRuntimeReason::StopRequested);
+        let stopped = driver.snapshot();
+        assert_eq!(stopped.phase, rnode::RNodeRuntimePhase::Stopped);
+        assert_eq!(stopped.connection_generation, 0);
+        assert_eq!(stopped.reconnect_attempt, 0);
+        assert_eq!(stopped.reconnect_total, 0);
+        assert_eq!(stopped.disconnect_total, 0);
+        assert_eq!(stopped.reason, Some(RNodeRuntimeReason::StopRequested));
+
+        let mut late_detect = Vec::new();
+        kiss::frame_with_command_into(rnode::CMD_DETECT, &[rnode::DETECT_RESP], &mut late_detect);
+        let (_stop_tx, mut stop_rx) = mpsc::channel(1);
+        let (transport_tx, _transport_rx) = mpsc::channel(1);
+        assert_eq!(
+            forward_usb_read_chunk(
+                &mut inbound,
+                &late_detect,
+                10,
+                &AtomicU64::new(0),
+                &transport_tx,
+                &mut stop_rx,
+            )
+            .await,
+            UsbInboundOutcome::Complete
+        );
+        assert_eq!(
+            driver.snapshot().as_ref(),
+            stopped.as_ref(),
+            "terminal observations must ignore later protocol effects"
+        );
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), closed.changed())
+                .await
+                .expect("terminal publication should be immediate")
+                .expect("terminal publication must precede closure")
+                .phase,
+            rnode::RNodeRuntimePhase::Stopped
+        );
+        drop(inbound);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), closed.changed())
+                .await
+                .expect("publisher closure should be immediate")
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
