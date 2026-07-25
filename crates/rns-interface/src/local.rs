@@ -9,7 +9,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::hdlc;
-use crate::traits::{InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode};
+use crate::traits::{
+    InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, handoff_accepted_interface,
+};
 use rns_transport::messages::{InboundPacket, TransportMessage};
 
 pub const LOCAL_MTU: u32 = 262_144;
@@ -425,7 +427,10 @@ mod platform {
                             transport_tx.clone(),
                             true,
                         );
-                        if handle_tx.send(handle).await.is_err() {
+                        if handoff_accepted_interface(&handle_tx, handle)
+                            .await
+                            .is_err()
+                        {
                             tracing::warn!("local handle registry closed");
                             break;
                         }
@@ -591,7 +596,10 @@ mod platform {
                             transport_tx.clone(),
                             true,
                         );
-                        if handle_tx.send(handle).await.is_err() {
+                        if handoff_accepted_interface(&handle_tx, handle)
+                            .await
+                            .is_err()
+                        {
                             tracing::warn!("local handle registry closed");
                             break;
                         }

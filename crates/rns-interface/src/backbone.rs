@@ -17,7 +17,9 @@ use tokio::sync::mpsc;
 
 use crate::hdlc;
 use crate::socket_tuning::{iface_addr_for, set_keepalive_tuned, set_socket_buffers};
-use crate::traits::{InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode};
+use crate::traits::{
+    InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, handoff_accepted_interface,
+};
 use rns_transport::messages::{
     InboundPacket, InterfaceInspectionSnapshot, InterfaceInspectionSource, TransportMessage,
 };
@@ -617,7 +619,10 @@ fn spawn_backbone_server_on_listener(
                         tx: c_tx,
                         read_task: read_handle,
                     };
-                    if handle_tx.send(handle).await.is_err() {
+                    if handoff_accepted_interface(&handle_tx, handle)
+                        .await
+                        .is_err()
+                    {
                         tracing::warn!("backbone handle registry closed");
                         break;
                     }

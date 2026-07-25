@@ -8,7 +8,9 @@ use tokio::sync::mpsc;
 
 use crate::hdlc;
 use crate::kiss;
-use crate::traits::{InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode};
+use crate::traits::{
+    InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, handoff_accepted_interface,
+};
 use rns_transport::messages::{InboundPacket, TransportMessage};
 
 pub const RECONNECT_WAIT_INITIAL: u64 = 5;
@@ -564,7 +566,10 @@ pub async fn spawn_tcp_server(
                         mode,
                     )
                     .await;
-                    if handle_tx.send(handle).await.is_err() {
+                    if handoff_accepted_interface(&handle_tx, handle)
+                        .await
+                        .is_err()
+                    {
                         tracing::warn!("handle registry channel closed, stopping accept loop");
                         break;
                     }
