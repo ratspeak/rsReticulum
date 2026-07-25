@@ -374,6 +374,7 @@ pub struct ReticulumHandle {
     /// Present even when `discover_interfaces = No` so a downstream can
     /// still install a stamper and start publishing.
     pub discovery: Arc<DiscoveryRuntime>,
+    startup_rnode_runtimes: Vec<StartupRNodeRuntime>,
     shutdown_coordinator: RuntimeShutdownCoordinator,
     started_at: std::time::Instant,
 }
@@ -474,9 +475,11 @@ pub struct InterfaceStats {
 
 /// Observation-only capability for one exact runtime-owned RNode driver.
 ///
-/// The subscription is cloned from the active registry record once and never
-/// resolves the interface ID again. It therefore cannot follow a later
-/// same-ID replacement and carries no shutdown or configuration authority.
+/// The subscription is captured from one exact driver (either at its
+/// successful registration transaction or from its active registry record)
+/// and never resolves the interface ID again. It therefore cannot follow a
+/// later same-ID replacement and carries no shutdown or configuration
+/// authority.
 #[derive(Clone, Debug)]
 pub struct RNodeRuntimeObserver {
     interface_id: rns_interface::traits::InterfaceId,
@@ -494,6 +497,22 @@ pub struct RNodeRuntimeObserver {
 pub struct SpawnedRNodeRuntime {
     pub interface_id: rns_interface::traits::InterfaceId,
     pub online: Arc<AtomicBool>,
+    pub observer: RNodeRuntimeObserver,
+}
+
+/// Observation-only record for one RNode created from startup configuration.
+///
+/// Records are captured from the exact successful registration transaction;
+/// they never resolve through an interface name or a later stats snapshot.
+/// Duplicate configured names therefore remain distinct exact registrations.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct StartupRNodeRuntime {
+    /// Interface section name from the Reticulum configuration.
+    pub configured_name: String,
+    /// Runtime-local ID returned by the successful registration transaction.
+    pub interface_id: rns_interface::traits::InterfaceId,
+    /// Observer permanently bound to that registration's RNode driver.
     pub observer: RNodeRuntimeObserver,
 }
 
@@ -1028,6 +1047,18 @@ impl ReticulumHandle {
             interface_id,
             state,
         })
+    }
+
+    /// Return exact observers for single RNodes successfully registered from
+    /// startup configuration, in configuration/registration order.
+    ///
+    /// The returned records are owned clones and carry no lifecycle or
+    /// configuration authority. Runtime-spawned RNodes, RNodeMulti children,
+    /// disabled or failed entries, and shared-instance client hardware are
+    /// intentionally absent. In [`InstanceMode::Client`], an empty result is
+    /// an ownership statement, not permission to respawn hardware locally.
+    pub fn startup_rnode_runtimes(&self) -> Vec<StartupRNodeRuntime> {
+        self.startup_rnode_runtimes.clone()
     }
 
     pub fn link_mtu_discovery(&self) -> bool {
@@ -2961,6 +2992,7 @@ pub async fn init_with_options(
     if let Ok(store) = DiscoveryStore::open(&paths.storage_dir) {
         *discovery_runtime.store.lock().await = Some(Arc::new(store));
     }
+    let mut startup_rnode_runtimes = Vec::new();
 
     // Client mode leaves hardware to the Shared sibling.
     if instance_mode != InstanceMode::Client {
@@ -2997,45 +3029,54 @@ pub async fn init_with_options(
             )
             .await
             {
-                Ok(iface_handles) => match register_interfaces_with_post_init_batch(
-                    &transport_tx,
-                    iface_handles,
-                    &post_init,
-                    ifac_key,
-                    &interface_controls,
-                    &interface_registry,
-                    interface_kind_for_config(iface_config),
-                    Some(spawn_permit),
-                )
-                .await
-                {
-                    Ok(registered_ids) => {
-                        for registered_id in registered_ids {
-                            if let Some(ref cfg) = discovery_config {
-                                discovery_runtime.local_interfaces.lock().await.push(
-                                    LocalDiscoveryInterface {
-                                        id: registered_id,
-                                        config: cfg.clone(),
-                                    },
-                                );
+                Ok(iface_handles) => {
+                    let pending_rnode =
+                        pending_configured_rnode_runtime(iface_config, &iface_handles);
+                    match register_interfaces_with_post_init_batch(
+                        &transport_tx,
+                        iface_handles,
+                        &post_init,
+                        ifac_key,
+                        &interface_controls,
+                        &interface_registry,
+                        interface_kind_for_config(iface_config),
+                        Some(spawn_permit),
+                    )
+                    .await
+                    {
+                        Ok(registered_ids) => {
+                            if let Some(runtime) =
+                                pending_rnode.and_then(|pending| pending.commit(&registered_ids))
+                            {
+                                startup_rnode_runtimes.push(runtime);
                             }
-                            if bootstrap_only {
-                                discovery_runtime
-                                    .bootstrap_interfaces
-                                    .lock()
-                                    .await
-                                    .push(registered_id);
+                            for registered_id in registered_ids {
+                                if let Some(ref cfg) = discovery_config {
+                                    discovery_runtime.local_interfaces.lock().await.push(
+                                        LocalDiscoveryInterface {
+                                            id: registered_id,
+                                            config: cfg.clone(),
+                                        },
+                                    );
+                                }
+                                if bootstrap_only {
+                                    discovery_runtime
+                                        .bootstrap_interfaces
+                                        .lock()
+                                        .await
+                                        .push(registered_id);
+                                }
                             }
                         }
+                        Err(error) if rc.panic_on_interface_error => {
+                            shutdown_coordinator.start_and_wait().await;
+                            return Err(ReticulumError::Interface(error.to_string()));
+                        }
+                        Err(error) => {
+                            tracing::warn!("failed to register interface: {error}");
+                        }
                     }
-                    Err(error) if rc.panic_on_interface_error => {
-                        shutdown_coordinator.start_and_wait().await;
-                        return Err(ReticulumError::Interface(error.to_string()));
-                    }
-                    Err(error) => {
-                        tracing::warn!("failed to register interface: {error}");
-                    }
-                },
+                }
                 Err(e) => {
                     if rc.panic_on_interface_error {
                         drop(spawn_permit);
@@ -3066,6 +3107,7 @@ pub async fn init_with_options(
         transport_identity: wire_transport_identity,
         network_identity: network_identity.clone(),
         discovery: discovery_runtime,
+        startup_rnode_runtimes,
         shutdown_coordinator: shutdown_coordinator.clone(),
         started_at,
     };
@@ -3340,6 +3382,70 @@ fn interface_kind_for_config(config: &interface_factory::InterfaceConfig) -> Int
 struct OwnedInterfaceHandle {
     interface: rns_interface::traits::InterfaceHandle,
     driver: Option<rns_interface::rnode::RNodeDriverHandle>,
+}
+
+/// Startup-only observation captured before ownership moves into the
+/// registration worker. It becomes public only if that exact interface ID is
+/// returned by the successful registration transaction.
+struct PendingConfiguredRNodeRuntime {
+    configured_name: String,
+    spawned_interface_id: rns_interface::traits::InterfaceId,
+    state: rns_interface::rnode::RNodeDriverSubscription,
+}
+
+impl PendingConfiguredRNodeRuntime {
+    fn commit(
+        self,
+        registered_ids: &[rns_interface::traits::InterfaceId],
+    ) -> Option<StartupRNodeRuntime> {
+        let interface_id = registered_ids
+            .iter()
+            .copied()
+            .find(|registered_id| *registered_id == self.spawned_interface_id)?;
+        Some(StartupRNodeRuntime {
+            configured_name: self.configured_name,
+            interface_id,
+            observer: RNodeRuntimeObserver {
+                interface_id,
+                state: self.state,
+            },
+        })
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+fn pending_configured_rnode_runtime(
+    config: &interface_factory::InterfaceConfig,
+    handles: &[OwnedInterfaceHandle],
+) -> Option<PendingConfiguredRNodeRuntime> {
+    let configured_name = match config {
+        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        interface_factory::InterfaceConfig::RNode(config) => config.name.clone(),
+        #[cfg(feature = "ble")]
+        interface_factory::InterfaceConfig::BleRNode(config) => config.name.clone(),
+        _ => return None,
+    };
+
+    // Both supported startup variants are single-interface factories. Refuse
+    // an unexpected shape rather than accidentally associating one observer
+    // with another registration in the same batch.
+    let [owned] = handles else {
+        return None;
+    };
+    let driver = owned.driver.as_ref()?;
+    Some(PendingConfiguredRNodeRuntime {
+        configured_name,
+        spawned_interface_id: owned.interface.id,
+        state: driver.watch(),
+    })
+}
+
+#[cfg(not(any(feature = "serial", feature = "rnode-tcp", feature = "ble")))]
+fn pending_configured_rnode_runtime(
+    _config: &interface_factory::InterfaceConfig,
+    _handles: &[OwnedInterfaceHandle],
+) -> Option<PendingConfiguredRNodeRuntime> {
+    None
 }
 
 impl From<rns_interface::traits::InterfaceHandle> for OwnedInterfaceHandle {
@@ -8354,6 +8460,7 @@ loglevel = 7
             transport_identity: Arc::new(Identity::new()),
             network_identity: None,
             discovery: Arc::new(DiscoveryRuntime::default()),
+            startup_rnode_runtimes: Vec::new(),
             shutdown_coordinator,
             started_at: std::time::Instant::now(),
         }
@@ -10982,6 +11089,93 @@ enabled = yes
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn init_exposes_exact_successfully_registered_configured_rnode() {
+        let template =
+            rns_interface::rnode::RNodeConfig::new("Configured RNode", "tcp://127.0.0.1:1");
+        let settings = rns_interface::rnode::RNodeRadioSettings::from(&template);
+        let (port, closed_rx, peer) = test_ready_rnode_tcp_peer(settings);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("reticulum_rs_configured_rnode_observer_{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config"),
+            format!(
+                "[reticulum]\nshare_instance = No\nenable_transport = No\npanic_on_interface_error = Yes\n\n[interfaces]\n\n[[Configured RNode]]\ntype = RNodeInterface\nenabled = Yes\nport = {port}\nfrequency = {}\nbandwidth = {}\nspreadingfactor = {}\ncodingrate = {}\ntxpower = {}\n",
+                template.frequency,
+                template.bandwidth,
+                template.spreading_factor,
+                template.coding_rate,
+                template.tx_power,
+            ),
+        )
+        .unwrap();
+
+        let handle = init(
+            Some(dir.to_str().unwrap()),
+            None,
+            ShutdownSignal::new(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .expect("configured RNode init");
+
+        let configured = handle.startup_rnode_runtimes();
+        assert_eq!(configured.len(), 1);
+        let runtime = &configured[0];
+        assert_eq!(runtime.configured_name, "Configured RNode");
+        assert_eq!(runtime.interface_id, runtime.observer.interface_id());
+
+        let ready = runtime
+            .observer
+            .await_ready(Duration::from_secs(2))
+            .await
+            .expect("configured observer should reach exact readiness");
+        let registry_ready = handle
+            .rnode_runtime(runtime.interface_id)
+            .expect("same exact registry record")
+            .await_ready(Duration::ZERO)
+            .await
+            .expect("registry observer should share ready publication");
+        assert!(
+            Arc::ptr_eq(&ready, &registry_ready),
+            "startup and registry observers must share the exact driver publication"
+        );
+
+        // A candidate can only become public when its own ID appears in the
+        // successful registration result; a different ID cannot redirect it.
+        let unmatched = PendingConfiguredRNodeRuntime {
+            configured_name: runtime.configured_name.clone(),
+            spawned_interface_id: runtime.interface_id,
+            state: runtime.observer.state.clone(),
+        };
+        assert!(unmatched.commit(&[runtime.interface_id + 1]).is_none());
+
+        handle.shutdown_and_wait().await;
+        let observed = closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("configured RNode did not close");
+        assert!(observed.ends_with(&rns_interface::rnode::build_detach_sequence()));
+        peer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn configured_rnode_results_exclude_non_rnode() {
+        let handle = dummy_handle();
+        let standard = interface_factory::InterfaceConfig::TcpClient(
+            rns_interface::tcp::TcpClientConfig::new("ordinary", "127.0.0.1", 1),
+        );
+        let handles = vec![test_interface_handle(41, None, "ordinary").into()];
+        assert!(pending_configured_rnode_runtime(&standard, &handles).is_none());
+        assert!(handle.startup_rnode_runtimes().is_empty());
     }
 
     #[tokio::test]
