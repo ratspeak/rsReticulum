@@ -1171,11 +1171,23 @@ impl Link {
         self.keepalive.record_outbound();
     }
 
-    /// Count an outbound keepalive beat (Python counts them too, Packet.py:291)
-    /// without touching `last_outbound` — that would defer `is_stale` forever.
+    /// Count an outbound keepalive beat and retain its send time.
+    ///
+    /// Stale detection deliberately ignores local outbound activity, while the
+    /// retained timestamp prevents redundant keepalive traffic.
     pub fn record_tx_keepalive(&mut self, bytes: usize) {
         self.tx_bytes += bytes as u64;
         self.tx_count += 1;
+        self.keepalive.record_keepalive_outbound();
+    }
+
+    /// Whether this responder should answer a keepalive request.
+    ///
+    /// Recent outbound traffic already proves the responder can transmit, so
+    /// an immediate extra reply would only duplicate that traffic.
+    pub fn should_respond_to_keepalive(&self) -> bool {
+        self.keepalive
+            .should_respond_to_keepalive_at(Instant::now())
     }
 
     /// `bytes` is the link payload after the context byte (Link.py:929).
@@ -1272,6 +1284,7 @@ impl Link {
         ),
     )]
     pub fn tick(&mut self) -> LinkAction {
+        let now = Instant::now();
         for receipt in &mut self.pending_requests {
             receipt.check_timeout();
         }
@@ -1279,7 +1292,7 @@ impl Link {
 
         match self.state {
             LinkState::Pending | LinkState::Handshake => {
-                if self.request_time.elapsed() > self.establishment_timeout {
+                if now.saturating_duration_since(self.request_time) > self.establishment_timeout {
                     self.close(CloseReason::Timeout);
                     return LinkAction::Closed(CloseReason::Timeout);
                 }
@@ -1288,13 +1301,13 @@ impl Link {
             LinkState::Active => {
                 // Emit any pending keepalive before checking staleness so a final
                 // beat goes out on the same tick the link transitions to STALE.
-                if self.keepalive.should_send_keepalive() {
-                    self.keepalive.mark_keepalive_sent();
+                if self.keepalive.should_send_keepalive_at(now) {
+                    self.keepalive.mark_keepalive_sent_at(now);
                     return LinkAction::SendKeepalive;
                 }
-                if self.keepalive.is_stale() {
+                if self.keepalive.is_stale_at(now) {
                     self.state = LinkState::Stale;
-                    self.stale_since = Some(Instant::now());
+                    self.stale_since = Some(now);
                     tracing::debug!(link_id = ?self.link_id, "link state -> Stale");
                     return LinkAction::TransitionedToStale;
                 }
@@ -1306,7 +1319,7 @@ impl Link {
                 let rtt = self.rtt.unwrap_or(Duration::from_secs(1));
                 let grace = self.keepalive.stale_grace_timeout(rtt);
                 if let Some(stale_since) = self.stale_since {
-                    if stale_since.elapsed() >= grace {
+                    if now.saturating_duration_since(stale_since) >= grace {
                         let teardown_data = self.encrypt(&self.link_id).unwrap_or_default();
                         self.close(CloseReason::Timeout);
                         return LinkAction::SendTeardownAndClose(teardown_data);
@@ -2492,11 +2505,10 @@ mod tests {
         assert_eq!(rx_c, 1);
     }
 
-    /// Keepalive beats count into traffic stats (Packet.py:291) but must not
-    /// refresh `last_outbound`, or an initiator pinging a dead peer would
-    /// never go stale.
+    /// Keepalive beats count into traffic stats and refresh the outbound
+    /// keepalive clock. Peer-liveness detection remains inbound-only.
     #[test]
-    fn test_record_tx_keepalive_counts_without_outbound_refresh() {
+    fn test_record_tx_keepalive_counts_and_refreshes_outbound() {
         let (mut link, _, _) = make_active_link();
         assert!(link.keepalive.last_outbound.is_none());
 
@@ -2505,7 +2517,8 @@ mod tests {
         let (tx_b, _, tx_c, _) = link.traffic_stats();
         assert_eq!(tx_b, 1);
         assert_eq!(tx_c, 1);
-        assert!(link.keepalive.last_outbound.is_none());
+        assert!(link.keepalive.last_outbound.is_some());
+        assert!(link.keepalive.last_keepalive_sent.is_some());
     }
 
     /// Initiator knows expected_hops at creation (Link.py:282); the responder

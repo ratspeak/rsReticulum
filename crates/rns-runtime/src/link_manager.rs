@@ -1221,7 +1221,7 @@ impl LinkManager {
                                 link_id = hex::encode(link_id),
                                 "ignoring keepalive request on initiator side"
                             );
-                        } else {
+                        } else if active.link.should_respond_to_keepalive() {
                             let resp_header = rns_wire::header::PacketHeader {
                                 flags: rns_wire::flags::PacketFlags {
                                     header_type: rns_wire::flags::HeaderType::Header1,
@@ -1244,6 +1244,11 @@ impl LinkManager {
                                     destination_hash: link_id,
                                 },
                             ));
+                        } else {
+                            tracing::trace!(
+                                link_id = hex::encode(link_id),
+                                "recent outbound traffic suppresses redundant keepalive response"
+                            );
                         }
                     }
                 }
@@ -4029,6 +4034,73 @@ mod tests {
         let lm = LinkManager::new(tx, event_rx, [0xAA; 16], None);
         assert_eq!(lm.active_link_count(), 0);
         assert_eq!(lm.resource_strategy, ResourceStrategy::AcceptAll);
+    }
+
+    #[test]
+    fn responder_suppresses_redundant_keepalive_after_recent_outbound() {
+        let destination_hash = [0xA1; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &identity_key, destination_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+        responder.record_tx(1);
+        let link_id = responder.link_id;
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager =
+            LinkManager::new(transport_tx, event_rx, destination_hash, Some(identity_key));
+        manager.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder,
+                _interface_id: 7,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Keepalive,
+        };
+        let mut request = header.pack();
+        request.push(rns_link::constants::KEEPALIVE_REQUEST);
+
+        manager.handle_inbound_packet(&request, 7);
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "recent responder traffic must suppress a duplicate keepalive response"
+        );
+
+        let active = manager.active_links.get_mut(&link_id).unwrap();
+        active.link.keepalive.last_outbound =
+            std::time::Instant::now().checked_sub(active.link.keepalive.keepalive_interval);
+        manager.handle_inbound_packet(&request, 7);
+        assert!(matches!(
+            transport_rx.try_recv().unwrap(),
+            TransportMessage::Outbound(OutboundRequest { raw, destination_hash })
+                if destination_hash == link_id
+                    && raw.last() == Some(&rns_link::constants::KEEPALIVE_RESPONSE)
+        ));
     }
 
     #[tokio::test]
