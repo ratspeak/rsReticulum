@@ -436,6 +436,11 @@ impl BleRNodeConfig {
             id_callsign: None,
         }
     }
+
+    /// Validate RF and airtime settings before adapter or task side effects.
+    pub fn validate(&self) -> Result<(), rnode::RNodeConfigValidationError> {
+        rnode_config_from_ble_config(self).validate()
+    }
 }
 
 /// Station-ID beacon parameters, disabled for oversized callsigns
@@ -1302,6 +1307,9 @@ pub async fn spawn_ble_rnode_interface_with_driver(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<SpawnedRNodeInterface, InterfaceError> {
+    config.validate().map_err(|error| {
+        InterfaceError::SendFailed(format!("rnode config {}: {error}", error.field()))
+    })?;
     let protocol_target = RNodeProtocolTarget::new(
         config.frequency,
         config.bandwidth,
@@ -1767,6 +1775,9 @@ pub async fn spawn_ble_rnode_interface_native_with_driver(
 ) -> Result<SpawnedRNodeInterface, InterfaceError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    config.validate().map_err(|error| {
+        InterfaceError::SendFailed(format!("rnode config {}: {error}", error.field()))
+    })?;
     let protocol_target = RNodeProtocolTarget::new(
         config.frequency,
         config.bandwidth,
@@ -2179,6 +2190,53 @@ mod tests {
         assert!(!cfg.flow_control);
         assert_eq!(cfg.st_alock, Some(50.0));
         assert_eq!(cfg.lt_alock, Some(75.0));
+    }
+
+    #[test]
+    fn ble_rnode_config_uses_canonical_rf_and_airtime_validation() {
+        let mut cfg = BleRNodeConfig::new("validated", "ble://RNode");
+        assert!(cfg.validate().is_ok());
+
+        cfg.frequency = 0;
+        assert!(matches!(
+            cfg.validate(),
+            Err(rnode::RNodeConfigValidationError::OutOfRange {
+                field: rnode::RNodeConfigField::Frequency,
+                ..
+            })
+        ));
+
+        cfg = BleRNodeConfig::new("validated", "ble://RNode");
+        cfg.st_alock = Some(f32::NAN);
+        assert!(matches!(
+            cfg.validate(),
+            Err(rnode::RNodeConfigValidationError::NonFinite {
+                field: rnode::RNodeConfigField::ShortTermAirtime,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn ble_rnode_spawns_reject_invalid_config_before_running_registration() {
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(1);
+        for (id, native) in [(0xB1E0_0001, false), (0xB1E0_0002, true)] {
+            let mut cfg = BleRNodeConfig::new("invalid", "ble://RNode");
+            cfg.tx_power = u8::MAX;
+            let result = if native {
+                spawn_ble_rnode_interface_native_with_driver(cfg, id, transport_tx.clone(), 1).await
+            } else {
+                spawn_ble_rnode_interface_with_driver(cfg, id, transport_tx.clone()).await
+            };
+            assert!(matches!(result, Err(InterfaceError::SendFailed(_))));
+            assert!(
+                !running_map()
+                    .lock()
+                    .expect("running map mutex poisoned")
+                    .contains_key(&id),
+                "invalid config must not create a running-map entry"
+            );
+        }
     }
 
     #[test]

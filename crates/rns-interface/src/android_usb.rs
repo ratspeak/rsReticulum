@@ -215,6 +215,26 @@ impl AndroidUsbConfig {
             lt_alock: None,
         }
     }
+
+    /// Validate RF and airtime settings before opening the physical device.
+    pub fn validate(&self) -> Result<(), rnode::RNodeConfigValidationError> {
+        rnode_config_from_android_usb_config(self).validate()
+    }
+}
+
+fn rnode_config_from_android_usb_config(config: &AndroidUsbConfig) -> rnode::RNodeConfig {
+    let mut rnode = rnode::RNodeConfig::new(&config.name, &config.device_name);
+    rnode.baud_rate = config.baud_rate;
+    rnode.frequency = config.frequency;
+    rnode.bandwidth = config.bandwidth;
+    rnode.spreading_factor = config.spreading_factor;
+    rnode.coding_rate = config.coding_rate;
+    rnode.tx_power = config.tx_power;
+    rnode.mode = config.mode;
+    rnode.flow_control = config.flow_control;
+    rnode.st_alock = config.st_alock;
+    rnode.lt_alock = config.lt_alock;
+    rnode
 }
 
 use jni::JavaVM;
@@ -1126,6 +1146,9 @@ pub async fn spawn_android_usb_rnode_interface_with_driver(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<SpawnedRNodeInterface, InterfaceError> {
+    config.validate().map_err(|error| {
+        InterfaceError::SendFailed(format!("rnode config {}: {error}", error.field()))
+    })?;
     let (mut usb, connected) = open_usb_serial(&config.device_name, config.baud_rate).await?;
 
     let name = config.name.clone();
@@ -1140,17 +1163,7 @@ pub async fn spawn_android_usb_rnode_interface_with_driver(
     // Detect and initialization are distinct, physically acknowledged startup
     // phases. The radio remains disabled until the exact existing init
     // sequence reaches the device.
-    let mut rnode_cfg = rnode::RNodeConfig::new(&config.name, &config.device_name);
-    rnode_cfg.baud_rate = config.baud_rate;
-    rnode_cfg.frequency = config.frequency;
-    rnode_cfg.bandwidth = config.bandwidth;
-    rnode_cfg.spreading_factor = config.spreading_factor;
-    rnode_cfg.coding_rate = config.coding_rate;
-    rnode_cfg.tx_power = config.tx_power;
-    rnode_cfg.mode = config.mode;
-    rnode_cfg.flow_control = config.flow_control;
-    rnode_cfg.st_alock = config.st_alock;
-    rnode_cfg.lt_alock = config.lt_alock;
+    let rnode_cfg = rnode_config_from_android_usb_config(&config);
     let init_bytes = rnode::build_init_sequence(&rnode_cfg);
     if let Err(error) = run_usb_rnode_startup(
         &usb.writer,
@@ -1445,6 +1458,31 @@ mod tests {
         assert_facade_shape(spawn_android_usb_rnode_interface);
         assert_driver_shape(spawn_android_usb_rnode_interface_with_driver);
         let _usb_transport: RNodeTransportClass = RNodeTransportClass::Usb;
+    }
+
+    #[test]
+    fn android_usb_config_uses_canonical_rf_and_airtime_validation() {
+        let mut config = AndroidUsbConfig::new("validated", "device");
+        assert!(config.validate().is_ok());
+
+        config.bandwidth = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(rnode::RNodeConfigValidationError::OutOfRange {
+                field: rnode::RNodeConfigField::Bandwidth,
+                ..
+            })
+        ));
+
+        config = AndroidUsbConfig::new("validated", "device");
+        config.lt_alock = Some(f32::INFINITY);
+        assert!(matches!(
+            config.validate(),
+            Err(rnode::RNodeConfigValidationError::NonFinite {
+                field: rnode::RNodeConfigField::LongTermAirtime,
+                ..
+            })
+        ));
     }
 
     #[test]
