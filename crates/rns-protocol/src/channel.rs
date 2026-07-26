@@ -299,7 +299,15 @@ impl Channel {
 
     fn run_callbacks(&self, msg_type: u16, payload: &[u8]) -> bool {
         for (_, handler) in &self.message_handlers {
-            if handler(msg_type, payload) {
+            // Application callbacks must not prevent the channel from
+            // advancing its receive sequence or starve handlers registered
+            // after them. The process panic hook still reports the failure;
+            // this boundary only isolates unwinding builds.
+            let consumed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler(msg_type, payload)
+            }))
+            .unwrap_or(false);
+            if consumed {
                 return true;
             }
         }
@@ -1175,6 +1183,31 @@ mod tests {
 
         rx.receive(&raw).unwrap();
         assert_eq!(counter2.load(Ordering::SeqCst), 11);
+    }
+
+    #[test]
+    fn panicking_handler_does_not_block_delivery_or_later_handlers() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let mut tx = Channel::new(0.1);
+        let raw = tx.send(&TestMessage::new(b"isolated")).unwrap();
+        let mut rx = Channel::new(0.1);
+        rx.register_message_type(0x0001).unwrap();
+        rx.add_message_handler(Box::new(|_, _| panic!("consumer failed")));
+
+        let later_handler_ran = Arc::new(AtomicBool::new(false));
+        let observed = later_handler_ran.clone();
+        rx.add_message_handler(Box::new(move |_, _| {
+            observed.store(true, Ordering::SeqCst);
+            false
+        }));
+
+        let delivered = rx.receive(&raw).unwrap();
+        assert_eq!(delivered, vec![(0x0001, b"isolated".to_vec())]);
+        assert!(later_handler_ran.load(Ordering::SeqCst));
     }
 
     #[test]
