@@ -3880,6 +3880,29 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_interface_rejects_ifac_flag_before_packet_accounting() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (entry, _rx) = make_test_interface("clear_in");
+        actor.interfaces.insert(1, entry);
+
+        let (raw, _dest_hash) = make_valid_announce("test.ifac_on_clear", 0);
+        let mut raw = raw.to_vec();
+        raw[0] |= 0x80;
+
+        actor.on_inbound(InboundPacket {
+            raw: Bytes::from(raw),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+
+        assert!(actor.packet_hashlist.is_empty());
+        assert!(actor.packet_metrics.is_empty());
+        assert!(actor.path_table.is_empty());
+    }
+
+    #[test]
     fn test_announce_retransmit() {
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;

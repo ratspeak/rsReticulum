@@ -28,6 +28,12 @@ impl TransportActor {
                         return;
                     }
                 }
+            } else if crate::ifac::has_ifac_flag(&packet.raw) {
+                trace!(
+                    interface_id = packet.interface_id,
+                    "IFAC packet received on clear interface, dropping packet"
+                );
+                return;
             } else {
                 packet.raw.clone()
             }
@@ -736,7 +742,7 @@ impl TransportActor {
             return;
         }
 
-        tracing::info!(
+        tracing::debug!(
             dest = %hex::encode(header.destination_hash),
             is_local = self.local_destinations.contains(&header.destination_hash),
             has_channel = self.destination_channels.contains_key(&header.destination_hash),
