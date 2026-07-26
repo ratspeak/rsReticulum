@@ -141,7 +141,7 @@ pub const RNODE_TX_POWER_MAX_DBM: u8 = 37;
 /// Default TCP port for RNode-over-IP.
 pub const DEFAULT_TCP_PORT: u16 = 7633;
 
-/// Startup policy for a generic serial or TCP RNode.
+/// Startup policy for an RNode transport.
 ///
 /// The fields stay private so adding a future policy cannot silently change
 /// external struct literals. [`Default`] preserves the historical startup
@@ -166,20 +166,26 @@ impl RNodeStartupOptions {
     /// A validated but unknown or quarantined model is admitted explicitly as
     /// unverified; no model alias or capability profile is inferred.
     ///
-    /// Initial deterministic admission failure is returned by the
-    /// options-aware spawn API as [`RNodeSpawnError::CapabilityAdmission`]. A
-    /// deterministic rejection on a later generation terminates the driver
+    /// Each options-aware transport documents how its first connection reports
+    /// admission failure. Synchronously prepared transports can return
+    /// [`RNodeSpawnError::CapabilityAdmission`]; asynchronously connecting
+    /// transports publish the outcome through their driver observation. A
+    /// deterministic rejection after a driver has been returned terminates it
     /// with [`RNodeRuntimeReason::CapabilityAdmissionRejected`]. Ordinary
-    /// transport read, write, and EOF failures, plus an otherwise valid
-    /// response timeout, retain reconnect retry.
+    /// transport failures retain that transport's reconnect policy.
     pub const fn require_capability_admission() -> Self {
         Self {
             capability_policy: RNodeCapabilityPolicy::RequireValidatedAdmission,
         }
     }
 
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-    const fn requires_capability_admission(self) -> bool {
+    #[cfg(any(
+        feature = "serial",
+        feature = "rnode-tcp",
+        feature = "ble",
+        target_os = "android"
+    ))]
+    pub(crate) const fn requires_capability_admission(self) -> bool {
         matches!(
             self.capability_policy,
             RNodeCapabilityPolicy::RequireValidatedAdmission
@@ -229,8 +235,13 @@ pub enum RNodeCapabilityAdmissionError {
 }
 
 impl RNodeCapabilityAdmissionError {
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-    fn log_class(&self) -> &'static str {
+    #[cfg(any(
+        feature = "serial",
+        feature = "rnode-tcp",
+        feature = "ble",
+        target_os = "android"
+    ))]
+    pub(crate) fn log_class(&self) -> &'static str {
         match self {
             Self::ResponseTimedOut => "response_timeout",
             Self::ReadLimitExceeded { .. } => "read_limit",
@@ -247,7 +258,7 @@ impl RNodeCapabilityAdmissionError {
     }
 }
 
-/// Typed startup failure for the options-aware generic RNode spawn API.
+/// Typed startup failure for an options-aware RNode spawn API.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RNodeSpawnError {
@@ -258,8 +269,13 @@ pub enum RNodeSpawnError {
 }
 
 impl RNodeSpawnError {
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-    fn into_legacy_interface_error(self) -> crate::traits::InterfaceError {
+    #[cfg(any(
+        feature = "serial",
+        feature = "rnode-tcp",
+        feature = "ble",
+        target_os = "android"
+    ))]
+    pub(crate) fn into_legacy_interface_error(self) -> crate::traits::InterfaceError {
         match self {
             Self::Interface(error) => error,
             Self::CapabilityAdmission(error) => crate::traits::InterfaceError::SendFailed(format!(
@@ -791,8 +807,13 @@ impl RNodeSnapshotPublisher {
         });
     }
 
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-    fn capability_connection_established(
+    #[cfg(any(
+        feature = "serial",
+        feature = "rnode-tcp",
+        feature = "ble",
+        target_os = "android"
+    ))]
+    pub(crate) fn capability_connection_established(
         &mut self,
         state: &RNodeProtocolState,
         admission: crate::rnode_capabilities::RNodeRadioAdmission,

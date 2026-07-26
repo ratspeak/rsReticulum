@@ -32,7 +32,13 @@ pub mod pipe;
 pub mod rnode;
 pub mod rnode_admin;
 pub mod rnode_capabilities;
-#[cfg(any(feature = "serial", feature = "rnode-tcp", test))]
+#[cfg(any(
+    feature = "serial",
+    feature = "rnode-tcp",
+    feature = "ble",
+    target_os = "android",
+    test
+))]
 mod rnode_capability_preflight;
 #[cfg(feature = "serial")]
 pub mod rnode_multi;

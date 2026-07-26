@@ -5,10 +5,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
+use btleplug::api::{
+    Central, Manager as _, Peripheral as _, ScanFilter, ValueNotification, WriteType,
+};
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
+use rand::RngCore;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -29,10 +32,13 @@ pub fn is_btleplug_initialized() -> bool {
 
 use crate::kiss;
 use crate::rnode::{
-    self, RNodeDriverShutdown, RNodeResponse, RNodeRuntimeReason, RNodeSnapshotPublisher,
+    self, RNodeCapabilityAdmissionError, RNodeDriverShutdown, RNodeRadioSettings, RNodeResponse,
+    RNodeRuntimeReason, RNodeSnapshotPublisher, RNodeSpawnError, RNodeStartupOptions,
     RNodeTransportClass, SpawnedRNodeInterface,
 };
-use crate::rnode_protocol::{RNodeProtocolState, RNodeProtocolTarget};
+use crate::rnode_capabilities::RNodeRadioAdmission;
+use crate::rnode_capability_preflight::{RNodeCapabilityPreflight, build_rnode_capability_request};
+use crate::rnode_protocol::{RNodeProtocolState, RNodeProtocolTarget, RNodeReadiness};
 use crate::traits::{
     InterfaceDirection, InterfaceError, InterfaceHandle, InterfaceId, InterfaceMode,
 };
@@ -56,6 +62,21 @@ const RUNNING_POLL: Duration = Duration::from_secs(1);
 const RNODE_POST_BOND_SETTLE: Duration = Duration::from_millis(2600);
 const RNODE_NATIVE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(6);
 const RNODE_NATIVE_HANDSHAKE_PROBE: Duration = Duration::from_millis(650);
+#[cfg(not(test))]
+const RNODE_BLE_CAPABILITY_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const RNODE_BLE_CAPABILITY_PREFLIGHT_TIMEOUT: Duration = Duration::from_millis(500);
+/// A short idle interval closes the ordered receive side before strict startup
+/// mutates the radio. RNode command responses are normally immediate; a busy or
+/// continuously ambiguous stream is safer to reconnect than to misattribute.
+#[cfg(not(test))]
+const RNODE_BLE_STARTUP_QUIET: Duration = Duration::from_millis(100);
+#[cfg(test)]
+const RNODE_BLE_STARTUP_QUIET: Duration = Duration::from_millis(5);
+#[cfg(not(test))]
+const RNODE_BLE_RADIO_OFF_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const RNODE_BLE_RADIO_OFF_RESPONSE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// `stop_ble_rnode_interface` flips false; the read_task removes the entry
 /// on its way out.
@@ -224,6 +245,555 @@ async fn probe_native_rnode_handshake(
     }
 
     false
+}
+
+enum BleCapabilityPreflightOutcome {
+    Admitted {
+        protocol_state: RNodeProtocolState,
+        admission: RNodeRadioAdmission,
+    },
+    Stopped,
+    Retry(BleCapabilityRetry),
+    Rejected(RNodeCapabilityAdmissionError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BleCapabilityRetry {
+    ResponseTimedOut,
+    TransportEnded,
+    TransportIo,
+    BoundaryOverflow,
+    BoundaryTimedOut,
+    RadioOffResponseTimedOut,
+}
+
+impl BleCapabilityRetry {
+    const fn log_class(self) -> &'static str {
+        match self {
+            Self::ResponseTimedOut => "response_timeout",
+            Self::TransportEnded => "transport_ended",
+            Self::TransportIo => "transport_io",
+            Self::BoundaryOverflow => "boundary_overflow",
+            Self::BoundaryTimedOut => "boundary_timeout",
+            Self::RadioOffResponseTimedOut => "radio_off_response_timeout",
+        }
+    }
+}
+
+const BLE_PREFLIGHT_BOUNDARY_MAX_ITEMS: usize = 128;
+const BLE_PREFLIGHT_BOUNDARY_MAX_BYTES: usize = 4 * 1024;
+
+enum BlePreflightBoundaryError {
+    Stopped,
+    Retry(BleCapabilityRetry),
+    Rejected(RNodeCapabilityAdmissionError),
+}
+
+/// Consume the ordered desktop notification tail until the stream has been
+/// quiet for `quiet`. The already-admitted preflight remains authoritative:
+/// deterministic evidence such as a duplicate EEPROM response, CMD_ERROR, or
+/// malformed control still rejects this connection generation.
+async fn drain_desktop_ble_preinit<S>(
+    notification_stream: &mut S,
+    preflight: &mut RNodeCapabilityPreflight,
+    running: &AtomicBool,
+    timeout: Duration,
+    quiet: Duration,
+) -> Result<(), BlePreflightBoundaryError>
+where
+    S: futures::Stream<Item = ValueNotification> + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut quiet_deadline = tokio::time::Instant::now() + quiet;
+    let mut items = 0usize;
+    let mut total = 0usize;
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            return Err(BlePreflightBoundaryError::Stopped);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= quiet_deadline {
+            return Ok(());
+        }
+        if now >= deadline {
+            return Err(BlePreflightBoundaryError::Retry(
+                BleCapabilityRetry::BoundaryTimedOut,
+            ));
+        }
+
+        let wake = quiet_deadline.min(deadline).min(now + RUNNING_POLL);
+        let notification = tokio::select! {
+            biased;
+            notification = notification_stream.next() => Some(notification),
+            _ = tokio::time::sleep_until(wake) => None,
+        };
+        let Some(notification) = notification else {
+            continue;
+        };
+        let Some(notification) = notification else {
+            return Err(BlePreflightBoundaryError::Retry(
+                BleCapabilityRetry::TransportEnded,
+            ));
+        };
+        items = items.saturating_add(1);
+        total = total.saturating_add(notification.value.len());
+        if items > BLE_PREFLIGHT_BOUNDARY_MAX_ITEMS || total > BLE_PREFLIGHT_BOUNDARY_MAX_BYTES {
+            return Err(BlePreflightBoundaryError::Retry(
+                BleCapabilityRetry::BoundaryOverflow,
+            ));
+        }
+        quiet_deadline = tokio::time::Instant::now() + quiet;
+        if notification.uuid == NUS_TX_CHAR_UUID {
+            preflight
+                .observe_read(&notification.value)
+                .map_err(BlePreflightBoundaryError::Rejected)?;
+        }
+    }
+}
+
+async fn drain_native_ble_preinit(
+    tcp_read: &mut tokio::net::tcp::OwnedReadHalf,
+    preflight: &mut RNodeCapabilityPreflight,
+    running: &AtomicBool,
+    timeout: Duration,
+    quiet: Duration,
+) -> Result<(), BlePreflightBoundaryError> {
+    use tokio::io::AsyncReadExt;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut quiet_deadline = tokio::time::Instant::now() + quiet;
+    let mut items = 0usize;
+    let mut total = 0usize;
+    let mut buffer = [0u8; crate::rnode_capability_preflight::RNODE_CAPABILITY_READ_BUFFER_BYTES];
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            return Err(BlePreflightBoundaryError::Stopped);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= quiet_deadline {
+            return Ok(());
+        }
+        if now >= deadline {
+            return Err(BlePreflightBoundaryError::Retry(
+                BleCapabilityRetry::BoundaryTimedOut,
+            ));
+        }
+
+        let wake = quiet_deadline.min(deadline).min(now + RUNNING_POLL);
+        let read = tokio::time::timeout_at(wake, tcp_read.read(&mut buffer)).await;
+        let count = match read {
+            Ok(Ok(0)) => {
+                return Err(BlePreflightBoundaryError::Retry(
+                    BleCapabilityRetry::TransportEnded,
+                ));
+            }
+            Ok(Ok(count)) => count,
+            Ok(Err(_)) => {
+                return Err(BlePreflightBoundaryError::Retry(
+                    BleCapabilityRetry::TransportIo,
+                ));
+            }
+            Err(_) => continue,
+        };
+        items = items.saturating_add(1);
+        total = total.saturating_add(count);
+        if items > BLE_PREFLIGHT_BOUNDARY_MAX_ITEMS || total > BLE_PREFLIGHT_BOUNDARY_MAX_BYTES {
+            return Err(BlePreflightBoundaryError::Retry(
+                BleCapabilityRetry::BoundaryOverflow,
+            ));
+        }
+        quiet_deadline = tokio::time::Instant::now() + quiet;
+        preflight
+            .observe_read(&buffer[..count])
+            .map_err(BlePreflightBoundaryError::Rejected)?;
+    }
+}
+
+const BLE_RADIO_OFF_CHALLENGE_BITS: usize = 64;
+
+fn build_ble_radio_off_challenge(challenge: u64) -> Vec<u8> {
+    let mut wire = Vec::with_capacity(BLE_RADIO_OFF_CHALLENGE_BITS * 4);
+    for bit in 0..BLE_RADIO_OFF_CHALLENGE_BITS {
+        let command = if challenge & (1_u64 << bit) == 0 {
+            rnode::CMD_READY
+        } else {
+            rnode::CMD_STAT_TX
+        };
+        // These request payloads match official RNode firmware. READY ignores
+        // the byte value; STAT_TX treats it only as a request marker.
+        kiss::frame_with_command_into(
+            command,
+            &[if command == rnode::CMD_READY { 1 } else { 0 }],
+            &mut wire,
+        );
+    }
+    wire
+}
+
+fn new_ble_radio_off_challenge() -> u64 {
+    rand::rngs::OsRng.next_u64()
+}
+
+/// Tracks the receive half of the strict standalone RADIO_STATE=OFF
+/// transaction. Official RNode firmware from the supported 1.52 minimum
+/// exposes READY and STAT_TX as non-mutating, request-only controls whose
+/// responses are emitted synchronously in request order. A fresh 64-bit OS
+/// random sequence of those commands therefore binds the preceding OFF write
+/// to this connection generation without retaining or logging the challenge.
+/// Third-party firmware that claims compatibility but lacks these controls
+/// safely times out and reconnects.
+struct BleRadioOffBoundary {
+    deframer: kiss::RawKissDeframer,
+    items: usize,
+    bytes: usize,
+    challenge: u64,
+    saw_off: bool,
+    matched_bits: usize,
+}
+
+impl BleRadioOffBoundary {
+    fn new(challenge: u64) -> Self {
+        Self {
+            deframer: kiss::RawKissDeframer::new(),
+            items: 0,
+            bytes: 0,
+            challenge,
+            saw_off: false,
+            matched_bits: 0,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) -> Result<(), BleCapabilityRetry> {
+        self.items = self.items.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes.len());
+        if self.items > BLE_PREFLIGHT_BOUNDARY_MAX_ITEMS
+            || self.bytes > BLE_PREFLIGHT_BOUNDARY_MAX_BYTES
+        {
+            return Err(BleCapabilityRetry::BoundaryOverflow);
+        }
+
+        for (command, payload) in self.deframer.feed(bytes) {
+            if command == rnode::CMD_RADIO_STATE && payload.as_slice() == [rnode::RADIO_STATE_OFF] {
+                self.saw_off = true;
+                self.matched_bits = 0;
+                continue;
+            }
+            if !self.saw_off || self.matched_bits == BLE_RADIO_OFF_CHALLENGE_BITS {
+                continue;
+            }
+
+            let expected = if self.challenge & (1_u64 << self.matched_bits) == 0 {
+                rnode::CMD_READY
+            } else {
+                rnode::CMD_STAT_TX
+            };
+            let width_matches = match expected {
+                rnode::CMD_READY => payload.len() == 1,
+                rnode::CMD_STAT_TX => payload.len() == 4,
+                _ => unreachable!("strict BLE challenge uses known request-only controls"),
+            };
+            if command == expected && width_matches {
+                self.matched_bits += 1;
+            } else if matches!(command, rnode::CMD_READY | rnode::CMD_STAT_TX) {
+                // A stale replay or malformed marker-alphabet response cannot
+                // contribute to this challenge. Wait for a later OFF boundary;
+                // continuous ambiguity remains bounded by item/byte/time caps.
+                self.saw_off = false;
+                self.matched_bits = 0;
+            }
+        }
+        Ok(())
+    }
+
+    const fn is_confirmed(&self) -> bool {
+        self.saw_off && self.matched_bits == BLE_RADIO_OFF_CHALLENGE_BITS
+    }
+}
+
+enum BleRadioOffBoundaryOutcome {
+    Confirmed,
+    Stopped,
+    Retry(BleCapabilityRetry),
+}
+
+async fn await_desktop_ble_radio_off_boundary<S>(
+    notification_stream: &mut S,
+    running: &AtomicBool,
+    challenge: u64,
+    timeout: Duration,
+    quiet: Duration,
+) -> BleRadioOffBoundaryOutcome
+where
+    S: futures::Stream<Item = ValueNotification> + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut candidate_deadline = None;
+    let mut boundary = BleRadioOffBoundary::new(challenge);
+
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            return BleRadioOffBoundaryOutcome::Stopped;
+        }
+        let now = tokio::time::Instant::now();
+        if candidate_deadline.is_some_and(|candidate| now >= candidate) {
+            return BleRadioOffBoundaryOutcome::Confirmed;
+        }
+        if now >= deadline {
+            return BleRadioOffBoundaryOutcome::Retry(BleCapabilityRetry::RadioOffResponseTimedOut);
+        }
+        let wake = candidate_deadline
+            .unwrap_or(deadline)
+            .min(deadline)
+            .min(now + RUNNING_POLL);
+        let notification = tokio::select! {
+            biased;
+            notification = notification_stream.next() => Some(notification),
+            _ = tokio::time::sleep_until(wake) => None,
+        };
+        let Some(notification) = notification else {
+            continue;
+        };
+        let Some(notification) = notification else {
+            return BleRadioOffBoundaryOutcome::Retry(BleCapabilityRetry::TransportEnded);
+        };
+        if notification.uuid != NUS_TX_CHAR_UUID {
+            continue;
+        }
+        if let Err(reason) = boundary.observe(&notification.value) {
+            return BleRadioOffBoundaryOutcome::Retry(reason);
+        }
+        candidate_deadline = boundary
+            .is_confirmed()
+            .then(|| tokio::time::Instant::now() + quiet);
+    }
+}
+
+async fn await_native_ble_radio_off_boundary(
+    tcp_read: &mut tokio::net::tcp::OwnedReadHalf,
+    running: &AtomicBool,
+    challenge: u64,
+    timeout: Duration,
+    quiet: Duration,
+) -> BleRadioOffBoundaryOutcome {
+    use tokio::io::AsyncReadExt;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut candidate_deadline = None;
+    let mut boundary = BleRadioOffBoundary::new(challenge);
+    let mut buffer = [0u8; crate::rnode_capability_preflight::RNODE_CAPABILITY_READ_BUFFER_BYTES];
+
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            return BleRadioOffBoundaryOutcome::Stopped;
+        }
+        let now = tokio::time::Instant::now();
+        if candidate_deadline.is_some_and(|candidate| now >= candidate) {
+            return BleRadioOffBoundaryOutcome::Confirmed;
+        }
+        if now >= deadline {
+            return BleRadioOffBoundaryOutcome::Retry(BleCapabilityRetry::RadioOffResponseTimedOut);
+        }
+        let wake = candidate_deadline
+            .unwrap_or(deadline)
+            .min(deadline)
+            .min(now + RUNNING_POLL);
+        let read = tokio::time::timeout_at(wake, tcp_read.read(&mut buffer)).await;
+        let count = match read {
+            Ok(Ok(0)) => {
+                return BleRadioOffBoundaryOutcome::Retry(BleCapabilityRetry::TransportEnded);
+            }
+            Ok(Ok(count)) => count,
+            Ok(Err(_)) => {
+                return BleRadioOffBoundaryOutcome::Retry(BleCapabilityRetry::TransportIo);
+            }
+            Err(_) => continue,
+        };
+        if let Err(reason) = boundary.observe(&buffer[..count]) {
+            return BleRadioOffBoundaryOutcome::Retry(reason);
+        }
+        candidate_deadline = boundary
+            .is_confirmed()
+            .then(|| tokio::time::Instant::now() + quiet);
+    }
+}
+
+fn ble_radio_settings(config: &BleRNodeConfig) -> RNodeRadioSettings {
+    RNodeRadioSettings::new(
+        config.frequency,
+        config.bandwidth,
+        config.spreading_factor,
+        config.coding_rate,
+        config.tx_power,
+    )
+}
+
+async fn observe_desktop_ble_capability<S>(
+    notification_stream: &mut S,
+    settings: RNodeRadioSettings,
+    running: &AtomicBool,
+    timeout: Duration,
+) -> BleCapabilityPreflightOutcome
+where
+    S: futures::Stream<Item = ValueNotification> + Unpin,
+{
+    let mut preflight = RNodeCapabilityPreflight::new(settings);
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            return BleCapabilityPreflightOutcome::Stopped;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return BleCapabilityPreflightOutcome::Retry(BleCapabilityRetry::ResponseTimedOut);
+        }
+        let wait = deadline.saturating_duration_since(now).min(RUNNING_POLL);
+        let notification = tokio::select! {
+            notification = notification_stream.next() => Some(notification),
+            _ = tokio::time::sleep(wait) => None,
+        };
+        let Some(notification) = notification else {
+            continue;
+        };
+        let Some(notification) = notification else {
+            return BleCapabilityPreflightOutcome::Retry(BleCapabilityRetry::TransportEnded);
+        };
+        if notification.uuid != NUS_TX_CHAR_UUID {
+            continue;
+        }
+        match preflight.observe_read(&notification.value) {
+            Ok(Some(admission)) => {
+                if let Err(error) = drain_desktop_ble_preinit(
+                    notification_stream,
+                    &mut preflight,
+                    running,
+                    timeout,
+                    RNODE_BLE_STARTUP_QUIET,
+                )
+                .await
+                {
+                    return match error {
+                        BlePreflightBoundaryError::Stopped => {
+                            BleCapabilityPreflightOutcome::Stopped
+                        }
+                        BlePreflightBoundaryError::Retry(reason) => {
+                            BleCapabilityPreflightOutcome::Retry(reason)
+                        }
+                        BlePreflightBoundaryError::Rejected(error) => {
+                            BleCapabilityPreflightOutcome::Rejected(error)
+                        }
+                    };
+                }
+                return BleCapabilityPreflightOutcome::Admitted {
+                    protocol_state: preflight.into_protocol_state(),
+                    admission,
+                };
+            }
+            Ok(None) => {}
+            Err(error) => return BleCapabilityPreflightOutcome::Rejected(error),
+        }
+    }
+}
+
+async fn run_native_ble_capability_preflight(
+    tcp_read: &mut tokio::net::tcp::OwnedReadHalf,
+    tcp_write: &mut tokio::net::tcp::OwnedWriteHalf,
+    settings: RNodeRadioSettings,
+    running: &AtomicBool,
+    timeout: Duration,
+    probe_interval: Duration,
+) -> BleCapabilityPreflightOutcome {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if !running.load(Ordering::SeqCst) {
+        return BleCapabilityPreflightOutcome::Stopped;
+    }
+    let detect = rnode::build_detect_sequence();
+    if tcp_write.write_all(&detect).await.is_err() || tcp_write.flush().await.is_err() {
+        return BleCapabilityPreflightOutcome::Retry(BleCapabilityRetry::TransportIo);
+    }
+    // The EEPROM request is intentionally issued exactly once per connection
+    // generation. Repeated native handshake probes below never repeat it.
+    if tcp_write
+        .write_all(&build_rnode_capability_request())
+        .await
+        .is_err()
+        || tcp_write.flush().await.is_err()
+    {
+        return BleCapabilityPreflightOutcome::Retry(BleCapabilityRetry::TransportIo);
+    }
+
+    let mut preflight = RNodeCapabilityPreflight::new(settings);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut next_probe = tokio::time::Instant::now() + probe_interval;
+    let mut buffer = [0u8; crate::rnode_capability_preflight::RNODE_CAPABILITY_READ_BUFFER_BYTES];
+
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            return BleCapabilityPreflightOutcome::Stopped;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return BleCapabilityPreflightOutcome::Retry(BleCapabilityRetry::ResponseTimedOut);
+        }
+        if now >= next_probe {
+            if tcp_write.write_all(&detect).await.is_err() || tcp_write.flush().await.is_err() {
+                return BleCapabilityPreflightOutcome::Retry(BleCapabilityRetry::TransportIo);
+            }
+            next_probe = tokio::time::Instant::now() + probe_interval;
+        }
+
+        let wait = next_probe
+            .min(deadline)
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(RUNNING_POLL);
+        if wait.is_zero() {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        let read = tokio::time::timeout(wait, tcp_read.read(&mut buffer)).await;
+        let count = match read {
+            Ok(Ok(0)) => {
+                return BleCapabilityPreflightOutcome::Retry(BleCapabilityRetry::TransportEnded);
+            }
+            Ok(Ok(count)) => count,
+            Ok(Err(_)) => {
+                return BleCapabilityPreflightOutcome::Retry(BleCapabilityRetry::TransportIo);
+            }
+            Err(_) => continue,
+        };
+        match preflight.observe_read(&buffer[..count]) {
+            Ok(Some(admission)) => {
+                if let Err(error) = drain_native_ble_preinit(
+                    tcp_read,
+                    &mut preflight,
+                    running,
+                    timeout,
+                    RNODE_BLE_STARTUP_QUIET,
+                )
+                .await
+                {
+                    return match error {
+                        BlePreflightBoundaryError::Stopped => {
+                            BleCapabilityPreflightOutcome::Stopped
+                        }
+                        BlePreflightBoundaryError::Retry(reason) => {
+                            BleCapabilityPreflightOutcome::Retry(reason)
+                        }
+                        BlePreflightBoundaryError::Rejected(error) => {
+                            BleCapabilityPreflightOutcome::Rejected(error)
+                        }
+                    };
+                }
+                return BleCapabilityPreflightOutcome::Admitted {
+                    protocol_state: preflight.into_protocol_state(),
+                    admission,
+                };
+            }
+            Ok(None) => {}
+            Err(error) => return BleCapabilityPreflightOutcome::Rejected(error),
+        }
+    }
 }
 
 // iOS drops sandboxed-app stdout/stderr; embedding UIs can surface this
@@ -487,10 +1057,23 @@ fn build_ble_rnode_init_sequence(config: &BleRNodeConfig) -> Vec<u8> {
     rnode::build_init_sequence(&rnode_config_from_ble_config(config))
 }
 
-/// Native bridge admission deliberately discards handshake deframer state so
-/// a partial pre-init data packet can never cross into active forwarding.
-/// Re-request the bounded detection/firmware evidence after radio init to
-/// recover any typed control frame that was split at that boundary.
+/// Strict BLE sends OFF as its own ordered transaction. This is the exact
+/// historical init sequence with only that first frame removed.
+fn build_ble_rnode_init_after_radio_off(config: &BleRNodeConfig) -> Vec<u8> {
+    let mut sequence = build_ble_rnode_init_sequence(config);
+    let radio_off = rnode::build_radio_off_sequence();
+    assert!(
+        sequence.starts_with(&radio_off),
+        "RNode init must begin with RADIO_STATE=OFF"
+    );
+    sequence.drain(..radio_off.len());
+    sequence
+}
+
+/// Native legacy admission deliberately discards handshake deframer state, so
+/// re-request detection/firmware evidence after radio init. Strict admission
+/// instead uses RADIO_STATE=OFF as its ordered response fence and does not need
+/// this refresh marker.
 fn build_native_rnode_init_sequence(config: &BleRNodeConfig) -> Vec<u8> {
     let mut sequence = build_ble_rnode_init_sequence(config);
     sequence.extend(rnode::build_detect_sequence());
@@ -1307,6 +1890,30 @@ pub async fn spawn_ble_rnode_interface_with_driver(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<SpawnedRNodeInterface, InterfaceError> {
+    spawn_ble_rnode_interface_with_driver_and_options(
+        config,
+        id,
+        transport_tx,
+        RNodeStartupOptions::default(),
+    )
+    .await
+    .map_err(RNodeSpawnError::into_legacy_interface_error)
+}
+
+/// Spawn a desktop BLE RNode interface with an explicit startup policy.
+///
+/// BLE connection work remains asynchronous, so capability results arrive on
+/// the returned driver observation rather than as a late function error. A
+/// deterministic capability rejection on any connection generation publishes
+/// terminal [`RNodeRuntimeReason::CapabilityAdmissionRejected`]. A response
+/// timeout or transport loss retains the established BLE reconnect policy.
+/// [`RNodeStartupOptions::default`] preserves the historical wire sequence.
+pub async fn spawn_ble_rnode_interface_with_driver_and_options(
+    config: BleRNodeConfig,
+    id: InterfaceId,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    options: RNodeStartupOptions,
+) -> Result<SpawnedRNodeInterface, RNodeSpawnError> {
     config.validate().map_err(|error| {
         InterfaceError::SendFailed(format!("rnode config {}: {error}", error.field()))
     })?;
@@ -1483,29 +2090,356 @@ pub async fn spawn_ble_rnode_interface_with_driver(
             }
             ble_diag("[ble] detect sent ok");
 
-            ble_diag("[ble] sending init sequence");
-            let init_seq = init_seq_template.clone();
-            if let Err(e) =
-                ble_write(&conn.peripheral, &conn.rx_char, &init_seq, conn.write_mtu).await
-            {
-                snapshot_publisher.connection_attempt_failed();
-                tracing::warn!(error = %e, "BLE RNode init write failed");
-                ble_diag(format!("[ble] init write failed: {e}"));
-                let _ = tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
-                    .await;
-                if reconnect_try_exhausted(&mut tries) {
-                    tracing::warn!(name = %log_name, "BLE RNode: max reconnect tries reached");
-                    snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
-                    return;
-                }
-                if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+            let mut capability_admission = if options.requires_capability_admission() {
+                if !running_task.load(Ordering::SeqCst) {
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
+                            .await;
                     publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
                     return;
                 }
-                backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
-                continue;
+                if let Err(error) = ble_write(
+                    &conn.peripheral,
+                    &conn.rx_char,
+                    &build_rnode_capability_request(),
+                    conn.write_mtu,
+                )
+                .await
+                {
+                    snapshot_publisher.connection_attempt_failed();
+                    tracing::warn!(
+                        name = %log_name,
+                        error = %error,
+                        "BLE RNode capability request write failed"
+                    );
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
+                            .await;
+                    if reconnect_try_exhausted(&mut tries) {
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
+                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    continue;
+                }
+
+                match observe_desktop_ble_capability(
+                    &mut notification_stream,
+                    ble_radio_settings(&config),
+                    &running_task,
+                    RNODE_BLE_CAPABILITY_PREFLIGHT_TIMEOUT,
+                )
+                .await
+                {
+                    BleCapabilityPreflightOutcome::Admitted {
+                        protocol_state,
+                        admission,
+                    } => Some((protocol_state, admission)),
+                    BleCapabilityPreflightOutcome::Stopped => {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            conn.peripheral.disconnect(),
+                        )
+                        .await;
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    BleCapabilityPreflightOutcome::Retry(reason) => {
+                        snapshot_publisher.connection_attempt_failed();
+                        tracing::warn!(
+                            name = %log_name,
+                            admission_failure = reason.log_class(),
+                            "BLE RNode capability preflight will retry"
+                        );
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            conn.peripheral.disconnect(),
+                        )
+                        .await;
+                        if reconnect_try_exhausted(&mut tries) {
+                            snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                            return;
+                        }
+                        if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                            publish_ble_stopped(
+                                &mut snapshot_publisher,
+                                RNodeRuntimeReason::StopRequested,
+                            );
+                            return;
+                        }
+                        backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                        continue;
+                    }
+                    BleCapabilityPreflightOutcome::Rejected(error) => {
+                        tracing::warn!(
+                            name = %log_name,
+                            admission_failure = error.log_class(),
+                            "BLE RNode capability admission rejected"
+                        );
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            conn.peripheral.disconnect(),
+                        )
+                        .await;
+                        snapshot_publisher.stopped(RNodeRuntimeReason::CapabilityAdmissionRejected);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            // A strict preflight stop cannot mutate the radio. The legacy path
+            // intentionally retains its historical detect/init sequence.
+            if options.requires_capability_admission() && !running_task.load(Ordering::SeqCst) {
+                let _ = tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
+                    .await;
+                publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
+                return;
+            }
+
+            ble_diag("[ble] sending init sequence");
+            if options.requires_capability_admission() {
+                // OFF is a standalone transaction. The same task owns the
+                // only notification stream from preflight through this
+                // boundary, so ordered stale output remains private.
+                let radio_off = rnode::build_radio_off_sequence();
+                if let Err(error) =
+                    ble_write(&conn.peripheral, &conn.rx_char, &radio_off, conn.write_mtu).await
+                {
+                    ble_send_radio_off(&conn).await;
+                    if !running_task.load(Ordering::SeqCst) {
+                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            conn.peripheral.disconnect(),
+                        )
+                        .await;
+                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                        return;
+                    }
+                    snapshot_publisher.connection_attempt_failed();
+                    tracing::warn!(error = %error, "BLE RNode standalone radio-off write failed");
+                    ble_diag(format!("[ble] standalone radio-off write failed: {error}"));
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
+                            .await;
+                    if reconnect_try_exhausted(&mut tries) {
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
+                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    continue;
+                }
+
+                let challenge = new_ble_radio_off_challenge();
+                let challenge_wire = build_ble_radio_off_challenge(challenge);
+                if let Err(error) = ble_write(
+                    &conn.peripheral,
+                    &conn.rx_char,
+                    &challenge_wire,
+                    conn.write_mtu,
+                )
+                .await
+                {
+                    ble_send_radio_off(&conn).await;
+                    if !running_task.load(Ordering::SeqCst) {
+                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            conn.peripheral.disconnect(),
+                        )
+                        .await;
+                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                        return;
+                    }
+                    snapshot_publisher.connection_attempt_failed();
+                    tracing::warn!(error = %error, "BLE RNode radio-off challenge write failed");
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
+                            .await;
+                    if reconnect_try_exhausted(&mut tries) {
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
+                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    continue;
+                }
+
+                match await_desktop_ble_radio_off_boundary(
+                    &mut notification_stream,
+                    &running_task,
+                    challenge,
+                    RNODE_BLE_RADIO_OFF_RESPONSE_TIMEOUT,
+                    RNODE_BLE_STARTUP_QUIET,
+                )
+                .await
+                {
+                    BleRadioOffBoundaryOutcome::Confirmed => {
+                        let Some((protocol_state, _)) = capability_admission.as_mut() else {
+                            unreachable!("strict BLE init requires admitted protocol state")
+                        };
+                        // `into_protocol_state` already stripped every stale RF
+                        // observation. Apply only the causally fenced OFF echo.
+                        protocol_state
+                            .apply_frame(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]);
+                    }
+                    BleRadioOffBoundaryOutcome::Stopped => {
+                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                        ble_send_radio_off(&conn).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            conn.peripheral.disconnect(),
+                        )
+                        .await;
+                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                        return;
+                    }
+                    BleRadioOffBoundaryOutcome::Retry(reason) => {
+                        ble_send_radio_off(&conn).await;
+                        snapshot_publisher.connection_attempt_failed();
+                        tracing::warn!(
+                            name = %log_name,
+                            startup_failure = reason.log_class(),
+                            "BLE RNode radio-off boundary will retry"
+                        );
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            conn.peripheral.disconnect(),
+                        )
+                        .await;
+                        if reconnect_try_exhausted(&mut tries) {
+                            snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                            return;
+                        }
+                        if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                            publish_ble_stopped(
+                                &mut snapshot_publisher,
+                                RNodeRuntimeReason::StopRequested,
+                            );
+                            return;
+                        }
+                        backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                        continue;
+                    }
+                }
+
+                if !running_task.load(Ordering::SeqCst) {
+                    snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                    ble_send_radio_off(&conn).await;
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
+                            .await;
+                    snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                    return;
+                }
+
+                let init_after_off = build_ble_rnode_init_after_radio_off(&config);
+                if let Err(error) = ble_write(
+                    &conn.peripheral,
+                    &conn.rx_char,
+                    &init_after_off,
+                    conn.write_mtu,
+                )
+                .await
+                {
+                    // A chunked write can fail after a mutating prefix. Always
+                    // return the radio to detached/off before retrying.
+                    ble_send_radio_off(&conn).await;
+                    if !running_task.load(Ordering::SeqCst) {
+                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            conn.peripheral.disconnect(),
+                        )
+                        .await;
+                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                        return;
+                    }
+                    snapshot_publisher.connection_attempt_failed();
+                    tracing::warn!(error = %error, "BLE RNode init remainder write failed");
+                    ble_diag(format!("[ble] init remainder write failed: {error}"));
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
+                            .await;
+                    if reconnect_try_exhausted(&mut tries) {
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
+                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    continue;
+                }
+            } else {
+                // Preserve the legacy single-write init exactly.
+                let init_seq = init_seq_template.clone();
+                if let Err(e) =
+                    ble_write(&conn.peripheral, &conn.rx_char, &init_seq, conn.write_mtu).await
+                {
+                    snapshot_publisher.connection_attempt_failed();
+                    tracing::warn!(error = %e, "BLE RNode init write failed");
+                    ble_diag(format!("[ble] init write failed: {e}"));
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
+                            .await;
+                    if reconnect_try_exhausted(&mut tries) {
+                        tracing::warn!(name = %log_name, "BLE RNode: max reconnect tries reached");
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
+                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    continue;
+                }
             }
             ble_diag("[ble] init sent ok — marking online");
+
+            // Once init has been attempted, shutdown must make a best-effort
+            // radio-off/detach before releasing the BLE owner.
+            if options.requires_capability_admission() && !running_task.load(Ordering::SeqCst) {
+                snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                ble_send_radio_off(&conn).await;
+                let _ = tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
+                    .await;
+                snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                return;
+            }
 
             tracing::info!(
                 name = %log_name,
@@ -1514,11 +2448,22 @@ pub async fn spawn_ble_rnode_interface_with_driver(
                 "BLE RNode connection established"
             );
 
-            online_handle.store(true, Ordering::SeqCst);
             tries = 0;
             backoff = RECONNECT_WAIT;
-            let mut protocol_state = RNodeProtocolState::new(protocol_target);
-            snapshot_publisher.connection_established();
+            let mut protocol_state = match capability_admission {
+                Some((protocol_state, admission)) => {
+                    snapshot_publisher
+                        .capability_connection_established(&protocol_state, admission);
+                    online_handle.store(true, Ordering::SeqCst);
+                    protocol_state
+                }
+                None => {
+                    // Preserve the legacy publication order exactly.
+                    online_handle.store(true, Ordering::SeqCst);
+                    snapshot_publisher.connection_established();
+                    RNodeProtocolState::new(protocol_target)
+                }
+            };
             let mut deframer = kiss::RawKissDeframer::new();
 
             let ready = Arc::new(AtomicBool::new(true));
@@ -1596,27 +2541,27 @@ pub async fn spawn_ble_rnode_interface_with_driver(
             let mut last_snr: Option<f32> = None;
             let mut transport_closed = false;
 
-            // Before R4a, btleplug's receiver was created at this exact
-            // boundary, after per-generation writer/forwarder setup. Preserve
-            // its packet semantics while retaining typed control evidence:
-            // drain only what is immediately queued, project it, and skip
-            // legacy packet/READY handling and byte accounting. Reset framing
-            // state so no pre-boundary frame can complete as active traffic.
-            loop {
-                match notification_stream.next().now_or_never() {
-                    Some(Some(notification)) if notification.uuid == NUS_TX_CHAR_UUID => {
-                        let _projection = project_ble_rnode_startup_bytes(
-                            &snapshot_publisher,
-                            &mut protocol_state,
-                            &mut deframer,
-                            &notification.value,
-                        );
+            // Preserve the historical immediate startup drain only for the
+            // legacy policy. Strict startup already established an ordered
+            // OFF boundary; every queued post-init notification now belongs to
+            // the single normal handler below.
+            if !options.requires_capability_admission() {
+                loop {
+                    match notification_stream.next().now_or_never() {
+                        Some(Some(notification)) if notification.uuid == NUS_TX_CHAR_UUID => {
+                            let _projection = project_ble_rnode_startup_bytes(
+                                &snapshot_publisher,
+                                &mut protocol_state,
+                                &mut deframer,
+                                &notification.value,
+                            );
+                        }
+                        Some(Some(_)) => {}
+                        Some(None) | None => break,
                     }
-                    Some(Some(_)) => {}
-                    Some(None) | None => break,
                 }
+                deframer.reset();
             }
-            deframer.reset();
 
             'read: loop {
                 if !online_handle.load(Ordering::SeqCst) {
@@ -1655,6 +2600,8 @@ pub async fn spawn_ble_rnode_interface_with_driver(
                                 cmd,
                                 &frame,
                             );
+                            let data_allowed = !options.requires_capability_admission()
+                                || matches!(protocol_state.readiness(), RNodeReadiness::Ready);
                             match rnode::process_rnode_response(
                                 cmd,
                                 &frame,
@@ -1663,11 +2610,13 @@ pub async fn spawn_ble_rnode_interface_with_driver(
                                 &mut last_snr,
                             ) {
                                 RNodeResponse::Packet(msg) => {
-                                    task_rxb.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                                    if transport_tx.send(msg).await.is_err() {
-                                        tracing::warn!(id, "transport channel closed");
-                                        transport_closed = true;
-                                        break 'read;
+                                    if data_allowed {
+                                        task_rxb.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                                        if transport_tx.send(msg).await.is_err() {
+                                            tracing::warn!(id, "transport channel closed");
+                                            transport_closed = true;
+                                            break 'read;
+                                        }
                                     }
                                 }
                                 RNodeResponse::Ready(is_ready) => {
@@ -1773,6 +2722,31 @@ pub async fn spawn_ble_rnode_interface_native_with_driver(
     transport_tx: mpsc::Sender<TransportMessage>,
     tcp_port: u16,
 ) -> Result<SpawnedRNodeInterface, InterfaceError> {
+    spawn_ble_rnode_interface_native_with_driver_and_options(
+        config,
+        id,
+        transport_tx,
+        tcp_port,
+        RNodeStartupOptions::default(),
+    )
+    .await
+    .map_err(RNodeSpawnError::into_legacy_interface_error)
+}
+
+/// Spawn an Android native-bridge BLE RNode with an explicit startup policy.
+///
+/// Kotlin retains exclusive GATT ownership; strict admission runs only across
+/// the existing Rust TCP bridge. Because bridge connection is asynchronous,
+/// deterministic capability rejection is reported as terminal
+/// [`RNodeRuntimeReason::CapabilityAdmissionRejected`] on the returned driver.
+/// Response timeout, EOF, and transport I/O retain reconnect behavior.
+pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
+    config: BleRNodeConfig,
+    id: InterfaceId,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    tcp_port: u16,
+    options: RNodeStartupOptions,
+) -> Result<SpawnedRNodeInterface, RNodeSpawnError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     config.validate().map_err(|error| {
@@ -1865,58 +2839,278 @@ pub async fn spawn_ble_rnode_interface_native_with_driver(
 
             let (mut tcp_read, mut tcp_write) = stream.into_split();
             let mut protocol_state = RNodeProtocolState::new(protocol_target);
+            let capability_admission = if options.requires_capability_admission() {
+                match run_native_ble_capability_preflight(
+                    &mut tcp_read,
+                    &mut tcp_write,
+                    ble_radio_settings(&config),
+                    &running_task,
+                    RNODE_BLE_CAPABILITY_PREFLIGHT_TIMEOUT,
+                    RNODE_NATIVE_HANDSHAKE_PROBE,
+                )
+                .await
+                {
+                    BleCapabilityPreflightOutcome::Admitted {
+                        protocol_state: admitted_state,
+                        admission,
+                    } => {
+                        protocol_state = admitted_state;
+                        Some(admission)
+                    }
+                    BleCapabilityPreflightOutcome::Stopped => {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    BleCapabilityPreflightOutcome::Retry(reason) => {
+                        snapshot_publisher.connection_attempt_failed();
+                        tracing::warn!(
+                            name = %log_name,
+                            admission_failure = reason.log_class(),
+                            "BLE RNode native capability preflight will retry"
+                        );
+                        if reconnect_try_exhausted(&mut tries) {
+                            snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                            return;
+                        }
+                        if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                            publish_ble_stopped(
+                                &mut snapshot_publisher,
+                                RNodeRuntimeReason::StopRequested,
+                            );
+                            return;
+                        }
+                        backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                        continue;
+                    }
+                    BleCapabilityPreflightOutcome::Rejected(error) => {
+                        tracing::warn!(
+                            name = %log_name,
+                            admission_failure = error.log_class(),
+                            "BLE RNode native capability admission rejected"
+                        );
+                        snapshot_publisher.stopped(RNodeRuntimeReason::CapabilityAdmissionRejected);
+                        return;
+                    }
+                }
+            } else {
+                // Preserve native bridge compatibility: either a confirmed
+                // detect response or any non-empty firmware response admits
+                // the connection in the legacy policy.
+                let detected = probe_native_rnode_handshake(
+                    &mut tcp_read,
+                    &mut tcp_write,
+                    &mut protocol_state,
+                    RNODE_NATIVE_HANDSHAKE_TIMEOUT,
+                    RNODE_NATIVE_HANDSHAKE_PROBE,
+                    &running_task,
+                )
+                .await;
+                if !detected {
+                    if !running_task.load(Ordering::SeqCst) {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    snapshot_publisher.connection_attempt_failed();
+                    tracing::warn!(
+                        name = %log_name,
+                        "BLE RNode handshake timed out — RNode did not respond to detect, retrying"
+                    );
+                    if reconnect_try_exhausted(&mut tries) {
+                        tracing::warn!(name = %log_name, "BLE RNode native: max reconnect tries reached");
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
+                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    continue;
+                }
+                None
+            };
 
-            // Preserve native bridge compatibility: either a confirmed detect
-            // response or any non-empty firmware response admits the
-            // connection. Without that evidence we'd flag "online" while the
-            // radio is asleep or the BLE-NUS bridge dropped a frame.
-            let detected = probe_native_rnode_handshake(
-                &mut tcp_read,
-                &mut tcp_write,
-                &mut protocol_state,
-                RNODE_NATIVE_HANDSHAKE_TIMEOUT,
-                RNODE_NATIVE_HANDSHAKE_PROBE,
-                &running_task,
-            )
-            .await;
-            if !detected {
-                if !running_task.load(Ordering::SeqCst) {
-                    publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
-                    return;
-                }
-                snapshot_publisher.connection_attempt_failed();
-                tracing::warn!(
-                    name = %log_name,
-                    "BLE RNode handshake timed out — RNode did not respond to detect, retrying"
-                );
-                if reconnect_try_exhausted(&mut tries) {
-                    tracing::warn!(name = %log_name, "BLE RNode native: max reconnect tries reached");
-                    snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
-                    return;
-                }
-                if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
-                    publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
-                    return;
-                }
-                backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
-                continue;
+            if options.requires_capability_admission() && !running_task.load(Ordering::SeqCst) {
+                publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
+                return;
             }
 
-            let init_seq = init_seq_template.clone();
-            if let Err(e) = tcp_write.write_all(&init_seq).await {
-                snapshot_publisher.connection_attempt_failed();
-                tracing::warn!(error = %e, "BLE RNode native init/evidence refresh write failed");
-                if reconnect_try_exhausted(&mut tries) {
-                    tracing::warn!(name = %log_name, "BLE RNode native: max reconnect tries reached");
-                    snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+            if options.requires_capability_admission() {
+                let radio_off = rnode::build_radio_off_sequence();
+                if tcp_write.write_all(&radio_off).await.is_err()
+                    || tcp_write.flush().await.is_err()
+                {
+                    let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
+                    let _ = tcp_write.flush().await;
+                    if !running_task.load(Ordering::SeqCst) {
+                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                        return;
+                    }
+                    snapshot_publisher.connection_attempt_failed();
+                    tracing::warn!("BLE RNode native standalone radio-off write failed");
+                    if reconnect_try_exhausted(&mut tries) {
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
+                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    continue;
+                }
+
+                let challenge = new_ble_radio_off_challenge();
+                let challenge_wire = build_ble_radio_off_challenge(challenge);
+                if tcp_write.write_all(&challenge_wire).await.is_err()
+                    || tcp_write.flush().await.is_err()
+                {
+                    let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
+                    let _ = tcp_write.flush().await;
+                    if !running_task.load(Ordering::SeqCst) {
+                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                        return;
+                    }
+                    snapshot_publisher.connection_attempt_failed();
+                    tracing::warn!("BLE RNode native radio-off challenge write failed");
+                    if reconnect_try_exhausted(&mut tries) {
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
+                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    continue;
+                }
+
+                match await_native_ble_radio_off_boundary(
+                    &mut tcp_read,
+                    &running_task,
+                    challenge,
+                    RNODE_BLE_RADIO_OFF_RESPONSE_TIMEOUT,
+                    RNODE_BLE_STARTUP_QUIET,
+                )
+                .await
+                {
+                    BleRadioOffBoundaryOutcome::Confirmed => {
+                        protocol_state
+                            .apply_frame(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]);
+                    }
+                    BleRadioOffBoundaryOutcome::Stopped => {
+                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                        let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
+                        let _ = tcp_write.flush().await;
+                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                        return;
+                    }
+                    BleRadioOffBoundaryOutcome::Retry(reason) => {
+                        let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
+                        let _ = tcp_write.flush().await;
+                        snapshot_publisher.connection_attempt_failed();
+                        tracing::warn!(
+                            name = %log_name,
+                            startup_failure = reason.log_class(),
+                            "BLE RNode native radio-off boundary will retry"
+                        );
+                        if reconnect_try_exhausted(&mut tries) {
+                            snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                            return;
+                        }
+                        if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                            publish_ble_stopped(
+                                &mut snapshot_publisher,
+                                RNodeRuntimeReason::StopRequested,
+                            );
+                            return;
+                        }
+                        backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                        continue;
+                    }
+                }
+
+                if !running_task.load(Ordering::SeqCst) {
+                    snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                    let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
+                    let _ = tcp_write.flush().await;
+                    snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
                     return;
                 }
-                if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
-                    publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
-                    return;
+
+                let init_after_off = build_ble_rnode_init_after_radio_off(&config);
+                if tcp_write.write_all(&init_after_off).await.is_err()
+                    || tcp_write.flush().await.is_err()
+                {
+                    let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
+                    let _ = tcp_write.flush().await;
+                    if !running_task.load(Ordering::SeqCst) {
+                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                        return;
+                    }
+                    snapshot_publisher.connection_attempt_failed();
+                    tracing::warn!("BLE RNode native init remainder write failed");
+                    if reconnect_try_exhausted(&mut tries) {
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
+                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    continue;
                 }
-                backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
-                continue;
+            } else {
+                // Preserve the native legacy init plus evidence refresh as one
+                // write, byte-for-byte.
+                if let Err(e) = tcp_write.write_all(&init_seq_template).await {
+                    snapshot_publisher.connection_attempt_failed();
+                    tracing::warn!(error = %e, "BLE RNode native init/evidence refresh write failed");
+                    if reconnect_try_exhausted(&mut tries) {
+                        tracing::warn!(name = %log_name, "BLE RNode native: max reconnect tries reached");
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
+                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    continue;
+                }
+            }
+
+            if options.requires_capability_admission() && !running_task.load(Ordering::SeqCst) {
+                snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
+                let _ = tcp_write.flush().await;
+                snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                return;
             }
 
             tracing::info!(
@@ -1927,11 +3121,17 @@ pub async fn spawn_ble_rnode_interface_native_with_driver(
                 "BLE RNode native bridge established (handshake confirmed)"
             );
 
-            online_handle.store(true, Ordering::SeqCst);
             tries = 0;
             backoff = RECONNECT_WAIT;
-            snapshot_publisher.connection_established();
-            snapshot_publisher.sync_protocol_state(&protocol_state);
+            if let Some(admission) = capability_admission {
+                snapshot_publisher.capability_connection_established(&protocol_state, admission);
+                online_handle.store(true, Ordering::SeqCst);
+            } else {
+                // Preserve the legacy publication order exactly.
+                online_handle.store(true, Ordering::SeqCst);
+                snapshot_publisher.connection_established();
+                snapshot_publisher.sync_protocol_state(&protocol_state);
+            }
 
             let ready = Arc::new(AtomicBool::new(true));
 
@@ -2063,6 +3263,8 @@ pub async fn spawn_ble_rnode_interface_native_with_driver(
                 let data = &buf[..n];
                 for (cmd, frame) in deframer.feed(data) {
                     project_ble_rnode_frame(&snapshot_publisher, &mut protocol_state, cmd, &frame);
+                    let data_allowed = !options.requires_capability_admission()
+                        || matches!(protocol_state.readiness(), RNodeReadiness::Ready);
                     match rnode::process_rnode_response(
                         cmd,
                         &frame,
@@ -2071,11 +3273,13 @@ pub async fn spawn_ble_rnode_interface_native_with_driver(
                         &mut last_snr,
                     ) {
                         RNodeResponse::Packet(msg) => {
-                            task_rxb.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                            if transport_tx.send(msg).await.is_err() {
-                                tracing::warn!(id, "transport channel closed");
-                                transport_closed = true;
-                                break 'read;
+                            if data_allowed {
+                                task_rxb.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                                if transport_tx.send(msg).await.is_err() {
+                                    tracing::warn!(id, "transport channel closed");
+                                    transport_closed = true;
+                                    break 'read;
+                                }
                             }
                         }
                         RNodeResponse::Ready(is_ready) => {
@@ -2149,6 +3353,57 @@ mod tests {
     use super::*;
     use crate::kiss;
     use crate::rnode;
+    use md5::{Digest, Md5};
+
+    fn capability_eeprom(model: u8) -> Vec<u8> {
+        let mut bytes = vec![0xFF; 1024];
+        bytes[0] = 0x03;
+        bytes[1] = model;
+        bytes[2..11].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let checksum: [u8; 16] = Md5::digest(&bytes[..11]).into();
+        bytes[11..27].copy_from_slice(&checksum);
+        bytes[0x9B] = 0x73;
+        bytes
+    }
+
+    fn strict_capability_response(model: u8) -> Vec<u8> {
+        let mut response = kiss::frame_with_command(kiss::CMD_DATA, b"preflight-private");
+        response.extend(kiss::frame_with_command(
+            rnode::CMD_DETECT,
+            &[rnode::DETECT_RESP],
+        ));
+        response.extend(kiss::frame_with_command(
+            rnode::CMD_FW_VERSION,
+            &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+        ));
+        response.extend(kiss::frame_with_command(
+            rnode::CMD_ROM_READ,
+            &capability_eeprom(model),
+        ));
+        response
+    }
+
+    fn capability_notifications(bytes: &[u8]) -> Vec<ValueNotification> {
+        bytes
+            .chunks(180)
+            .map(|chunk| ValueNotification {
+                uuid: NUS_TX_CHAR_UUID,
+                value: chunk.to_vec(),
+            })
+            .collect()
+    }
+
+    fn radio_off_challenge_responses(challenge: u64) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for bit in 0..BLE_RADIO_OFF_CHALLENGE_BITS {
+            if challenge & (1_u64 << bit) == 0 {
+                kiss::frame_with_command_into(rnode::CMD_READY, &[1], &mut wire);
+            } else {
+                kiss::frame_with_command_into(rnode::CMD_STAT_TX, &[0, 0, 0, 1], &mut wire);
+            }
+        }
+        wire
+    }
 
     #[test]
     fn test_ble_rnode_config_defaults() {
@@ -2813,6 +4068,43 @@ mod tests {
     }
 
     #[test]
+    fn strict_radio_off_boundary_requires_a_complete_clean_off_frame() {
+        let challenge = 0xA5A5_5A5A_F00F_0FF0;
+        let mut boundary = BleRadioOffBoundary::new(challenge);
+        let off = kiss::frame_with_command(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]);
+        let split = off.len() - 1;
+
+        boundary.observe(&off[..split]).expect("bounded prefix");
+        assert!(!boundary.is_confirmed());
+        boundary.observe(&off[split..]).expect("bounded tail");
+        assert!(!boundary.is_confirmed(), "OFF alone is not causal proof");
+
+        let responses = radio_off_challenge_responses(challenge);
+        let response_split = responses.len() - 1;
+        boundary
+            .observe(&responses[..response_split])
+            .expect("bounded response prefix");
+        assert!(!boundary.is_confirmed());
+        boundary
+            .observe(&responses[response_split..])
+            .expect("bounded response tail");
+        assert!(boundary.is_confirmed());
+
+        let mut mismatched = BleRadioOffBoundary::new(0);
+        mismatched.observe(&off).expect("bounded OFF");
+        mismatched
+            .observe(&kiss::frame_with_command(rnode::CMD_READY, &[1, 0]))
+            .expect("bounded wrong-width READY");
+        mismatched
+            .observe(&radio_off_challenge_responses(0))
+            .expect("bounded responses after mismatch");
+        assert!(
+            !mismatched.is_confirmed(),
+            "a command or width mismatch requires a new OFF boundary"
+        );
+    }
+
+    #[test]
     fn test_native_ble_handshake_reduces_full_accepted_batch_before_publication() {
         let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
         let target = RNodeProtocolTarget::new(
@@ -2874,6 +4166,64 @@ mod tests {
 
         assert_eq!(&native_init[..base_init.len()], base_init.as_slice());
         assert_eq!(&native_init[base_init.len()..], evidence_refresh.as_slice());
+    }
+
+    #[test]
+    fn strict_ble_init_uses_radio_off_fence_without_legacy_refresh() {
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        let strict_init = build_ble_rnode_init_sequence(&config);
+        let init_after_off = build_ble_rnode_init_after_radio_off(&config);
+        let mut split_init = rnode::build_radio_off_sequence();
+        split_init.extend_from_slice(&init_after_off);
+        assert_eq!(split_init, strict_init);
+
+        let mut deframer = kiss::RawKissDeframer::new();
+        let frames = deframer.feed(&strict_init);
+
+        assert_eq!(
+            frames.first(),
+            Some(&(rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_OFF]))
+        );
+        assert_eq!(
+            frames.last(),
+            Some(&(rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_ON]))
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|(command, _)| *command != rnode::CMD_DETECT)
+        );
+
+        let mut tail_deframer = kiss::RawKissDeframer::new();
+        let tail_frames = tail_deframer.feed(&init_after_off);
+        assert_eq!(
+            tail_frames.first().map(|frame| frame.0),
+            Some(rnode::CMD_FREQUENCY)
+        );
+        assert_eq!(
+            frame_command_count(&tail_frames, rnode::CMD_RADIO_STATE),
+            1,
+            "strict init tail contains only RADIO_STATE=ON"
+        );
+    }
+
+    #[test]
+    fn strict_ble_radio_off_challenge_uses_only_request_only_controls() {
+        let challenge = 0x8000_0000_0000_0001;
+        let wire = build_ble_radio_off_challenge(challenge);
+        let mut deframer = kiss::RawKissDeframer::new();
+        let frames = deframer.feed(&wire);
+        assert_eq!(frames.len(), BLE_RADIO_OFF_CHALLENGE_BITS);
+        for (bit, (command, payload)) in frames.into_iter().enumerate() {
+            let expected = if challenge & (1_u64 << bit) == 0 {
+                rnode::CMD_READY
+            } else {
+                rnode::CMD_STAT_TX
+            };
+            assert_eq!(command, expected);
+            assert_eq!(payload.len(), 1);
+            assert!(matches!(command, rnode::CMD_READY | rnode::CMD_STAT_TX));
+        }
     }
 
     #[test]
@@ -2993,6 +4343,7 @@ mod tests {
                 .write_all(&batch)
                 .await
                 .expect("write handshake response batch");
+            probe[..read].to_vec()
         });
 
         let stream = tokio::net::TcpStream::connect(address)
@@ -3014,11 +4365,719 @@ mod tests {
             )
             .await
         );
-        server.await.expect("native bridge server task");
+        let legacy_request = server.await.expect("native bridge server task");
+        assert_eq!(legacy_request, rnode::build_detect_sequence());
+        assert!(
+            !RNodeStartupOptions::default().requires_capability_admission(),
+            "legacy wrapper must not opt into EEPROM admission"
+        );
 
         let evidence = protocol_state.evidence();
         assert!(evidence.detected);
         assert!(evidence.firmware.is_some());
+    }
+
+    #[tokio::test]
+    async fn strict_desktop_ble_preflight_admits_verified_and_unverified_without_data_leakage() {
+        for (model, verified) in [(0xB8, true), (0xFE, false)] {
+            let response = strict_capability_response(model);
+            let mut queued = capability_notifications(&response);
+            queued.push(ValueNotification {
+                uuid: NUS_TX_CHAR_UUID,
+                value: kiss::frame(b"queued-before-init"),
+            });
+            let mut notifications = futures::stream::iter(queued.into_iter())
+                .chain(futures::stream::pending::<ValueNotification>());
+            let running = AtomicBool::new(true);
+            let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+            let outcome = observe_desktop_ble_capability(
+                &mut notifications,
+                ble_radio_settings(&config),
+                &running,
+                Duration::from_secs(1),
+            )
+            .await;
+
+            let BleCapabilityPreflightOutcome::Admitted {
+                protocol_state,
+                admission,
+            } = outcome
+            else {
+                panic!("strict desktop BLE response should admit");
+            };
+            assert_eq!(
+                matches!(admission, RNodeRadioAdmission::Verified { .. }),
+                verified
+            );
+            let evidence = protocol_state.evidence();
+            assert!(evidence.detected);
+            assert!(evidence.firmware.is_some());
+            assert_eq!(evidence.frequency, None);
+            assert_eq!(evidence.radio_state, None);
+            assert!(
+                notifications.next().now_or_never().is_none(),
+                "the distinct queued pre-init notification must be drained"
+            );
+
+            let (mut publisher, driver) =
+                rnode::new_rnode_driver_observation(RNodeTransportClass::Ble);
+            publisher.capability_connection_established(&protocol_state, admission);
+            let snapshot = driver.snapshot();
+            assert_eq!(snapshot.connection_generation, 1);
+            assert_eq!(
+                snapshot.capability,
+                if verified {
+                    rnode::RNodeCapabilityState::Verified
+                } else {
+                    rnode::RNodeCapabilityState::Unverified
+                }
+            );
+            assert_eq!(
+                snapshot.configuration,
+                rnode::RNodeConfigurationState::Unknown
+            );
+            assert_eq!(snapshot.radio, rnode::RNodeObservedRadioState::Unknown);
+            publisher.stopped(RNodeRuntimeReason::StopRequested);
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_desktop_ble_preflight_classifies_rejection_and_transient_loss() {
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        let settings = ble_radio_settings(&config);
+        let running = AtomicBool::new(true);
+
+        let mut invalid_bytes = kiss::frame_with_command(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
+        invalid_bytes.extend(kiss::frame_with_command(
+            rnode::CMD_FW_VERSION,
+            &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+        ));
+        invalid_bytes.extend(kiss::frame_with_command(rnode::CMD_ROM_READ, &[0; 8]));
+        let mut invalid = futures::stream::iter(capability_notifications(&invalid_bytes));
+        assert!(matches!(
+            observe_desktop_ble_capability(
+                &mut invalid,
+                settings,
+                &running,
+                Duration::from_secs(1)
+            )
+            .await,
+            BleCapabilityPreflightOutcome::Rejected(
+                RNodeCapabilityAdmissionError::CapabilityImage(_)
+            )
+        ));
+
+        let response = strict_capability_response(0xB8);
+        let mut duplicate_tail = capability_notifications(&response);
+        duplicate_tail.extend(capability_notifications(&kiss::frame_with_command(
+            rnode::CMD_ROM_READ,
+            &capability_eeprom(0xB8),
+        )));
+        let mut duplicate_tail = futures::stream::iter(duplicate_tail)
+            .chain(futures::stream::pending::<ValueNotification>());
+        assert!(matches!(
+            observe_desktop_ble_capability(
+                &mut duplicate_tail,
+                settings,
+                &running,
+                Duration::from_secs(1),
+            )
+            .await,
+            BleCapabilityPreflightOutcome::Rejected(
+                RNodeCapabilityAdmissionError::DuplicateEepromResponse
+            )
+        ));
+
+        let mut ended = futures::stream::empty::<ValueNotification>();
+        assert!(matches!(
+            observe_desktop_ble_capability(&mut ended, settings, &running, Duration::from_secs(1))
+                .await,
+            BleCapabilityPreflightOutcome::Retry(BleCapabilityRetry::TransportEnded)
+        ));
+
+        let mut pending = futures::stream::pending::<ValueNotification>();
+        assert!(matches!(
+            observe_desktop_ble_capability(
+                &mut pending,
+                settings,
+                &running,
+                Duration::from_millis(5)
+            )
+            .await,
+            BleCapabilityPreflightOutcome::Retry(BleCapabilityRetry::ResponseTimedOut)
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_desktop_radio_off_boundary_stop_and_timeout_are_bounded() {
+        let stopped = AtomicBool::new(false);
+        let mut pending = futures::stream::pending::<ValueNotification>();
+        assert!(matches!(
+            await_desktop_ble_radio_off_boundary(
+                &mut pending,
+                &stopped,
+                0xCAFE_BABE_DEAD_BEEF,
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+            )
+            .await,
+            BleRadioOffBoundaryOutcome::Stopped
+        ));
+
+        let running = AtomicBool::new(true);
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            await_desktop_ble_radio_off_boundary(
+                &mut pending,
+                &running,
+                0xCAFE_BABE_DEAD_BEEF,
+                Duration::from_millis(5),
+                Duration::from_millis(1),
+            )
+            .await,
+            BleRadioOffBoundaryOutcome::Retry(BleCapabilityRetry::RadioOffResponseTimedOut)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        let off = ValueNotification {
+            uuid: NUS_TX_CHAR_UUID,
+            value: kiss::frame_with_command(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]),
+        };
+        let noise = ValueNotification {
+            uuid: NUS_TX_CHAR_UUID,
+            value: kiss::frame_with_command(rnode::CMD_READY, &[1, 0]),
+        };
+        let mut continuous = futures::stream::iter([off]).chain(futures::stream::repeat(noise));
+        assert!(matches!(
+            await_desktop_ble_radio_off_boundary(
+                &mut continuous,
+                &running,
+                0,
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+            )
+            .await,
+            BleRadioOffBoundaryOutcome::Retry(BleCapabilityRetry::BoundaryOverflow)
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_desktop_radio_off_boundary_drains_post_challenge_tail_before_success() {
+        let challenge = 0x5AA5_F00F_1234_5678;
+        let notifications = [
+            ValueNotification {
+                uuid: NUS_TX_CHAR_UUID,
+                value: kiss::frame_with_command(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]),
+            },
+            ValueNotification {
+                uuid: NUS_TX_CHAR_UUID,
+                value: radio_off_challenge_responses(challenge),
+            },
+            ValueNotification {
+                uuid: NUS_TX_CHAR_UUID,
+                value: kiss::frame(b"post-challenge-pre-init"),
+            },
+        ];
+        let mut notifications = futures::stream::iter(notifications)
+            .chain(futures::stream::pending::<ValueNotification>());
+        let running = AtomicBool::new(true);
+        assert!(matches!(
+            await_desktop_ble_radio_off_boundary(
+                &mut notifications,
+                &running,
+                challenge,
+                Duration::from_secs(1),
+                Duration::from_millis(5),
+            )
+            .await,
+            BleRadioOffBoundaryOutcome::Confirmed
+        ));
+        assert!(
+            notifications.next().now_or_never().is_none(),
+            "post-challenge pre-init traffic must be consumed before activation"
+        );
+    }
+
+    #[test]
+    fn strict_ble_off_transaction_ignores_delayed_stale_off_and_rf_until_final_off() {
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        let target = RNodeProtocolTarget::new(
+            config.frequency,
+            config.bandwidth,
+            config.spreading_factor,
+            config.coding_rate,
+            config.tx_power,
+        );
+        let mut state = RNodeProtocolState::new(target);
+        state.apply_frame(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
+        state.apply_frame(
+            rnode::CMD_FW_VERSION,
+            &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+        );
+        let admitted_seed = state.clone();
+        let challenge = 0x0123_4567_89AB_CDEF;
+        let mut boundary = BleRadioOffBoundary::new(challenge);
+        let mut stale = kiss::frame_with_command(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]);
+        stale.extend(radio_off_challenge_responses(!challenge));
+        stale.extend(kiss::frame_with_command(
+            rnode::CMD_FREQUENCY,
+            &target.frequency.to_be_bytes(),
+        ));
+        stale.extend(kiss::frame_with_command(
+            rnode::CMD_BANDWIDTH,
+            &target.bandwidth.to_be_bytes(),
+        ));
+        stale.extend(kiss::frame_with_command(
+            rnode::CMD_SF,
+            &[target.spreading_factor],
+        ));
+        stale.extend(kiss::frame_with_command(
+            rnode::CMD_CR,
+            &[target.coding_rate],
+        ));
+        stale.extend(kiss::frame_with_command(
+            rnode::CMD_TXPOWER,
+            &[target.tx_power],
+        ));
+        stale.extend(kiss::frame_with_command(
+            rnode::CMD_RADIO_STATE,
+            &[rnode::RADIO_STATE_ON],
+        ));
+        stale.extend(kiss::frame(b"late-preinit"));
+        stale.extend(kiss::frame_with_command(rnode::CMD_READY, &[1]));
+        stale.extend(kiss::frame_with_command(rnode::CMD_STAT_RSSI, &[67]));
+
+        boundary.observe(&stale).expect("bounded stale batch");
+        assert!(
+            !boundary.is_confirmed(),
+            "stale OFF/challenge replay followed by RF cannot arm the boundary"
+        );
+        assert_eq!(
+            state, admitted_seed,
+            "private stale output cannot mutate state"
+        );
+
+        boundary
+            .observe(&kiss::frame_with_command(
+                rnode::CMD_RADIO_STATE,
+                &[rnode::RADIO_STATE_OFF],
+            ))
+            .expect("bounded genuine OFF");
+        assert!(!boundary.is_confirmed());
+        boundary
+            .observe(&radio_off_challenge_responses(challenge))
+            .expect("bounded genuine challenge");
+        assert!(boundary.is_confirmed());
+
+        // Confirmation resets to the admitted detect/FW seed and applies only
+        // the genuine standalone OFF response. Remaining init is still needed
+        // before readiness can become true.
+        state = admitted_seed;
+        state.apply_frame(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]);
+        assert_eq!(state.evidence().frequency, None);
+        assert_eq!(
+            state.evidence().radio_state,
+            Some(crate::rnode_protocol::RNodeRadioState::Off)
+        );
+        assert!(!matches!(state.readiness(), RNodeReadiness::Ready));
+    }
+
+    #[test]
+    fn strict_active_handler_keeps_same_notification_data_ready_and_rssi_after_fresh_rf() {
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        let target = RNodeProtocolTarget::new(
+            config.frequency,
+            config.bandwidth,
+            config.spreading_factor,
+            config.coding_rate,
+            config.tx_power,
+        );
+        let mut state = RNodeProtocolState::new(target);
+        state.apply_frame(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
+        state.apply_frame(
+            rnode::CMD_FW_VERSION,
+            &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+        );
+        state.apply_frame(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]);
+        let (mut publisher, driver) = rnode::new_rnode_driver_observation(RNodeTransportClass::Ble);
+        publisher.capability_connection_established(
+            &state,
+            RNodeRadioAdmission::Verified {
+                product_code: 0x03,
+                model_code: 0xB8,
+            },
+        );
+
+        let mut notification =
+            kiss::frame_with_command(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]);
+        notification.extend(kiss::frame_with_command(
+            rnode::CMD_FREQUENCY,
+            &target.frequency.to_be_bytes(),
+        ));
+        notification.extend(kiss::frame_with_command(
+            rnode::CMD_BANDWIDTH,
+            &target.bandwidth.to_be_bytes(),
+        ));
+        notification.extend(kiss::frame_with_command(
+            rnode::CMD_SF,
+            &[target.spreading_factor],
+        ));
+        notification.extend(kiss::frame_with_command(
+            rnode::CMD_CR,
+            &[target.coding_rate],
+        ));
+        notification.extend(kiss::frame_with_command(
+            rnode::CMD_TXPOWER,
+            &[target.tx_power],
+        ));
+        notification.extend(kiss::frame_with_command(
+            rnode::CMD_RADIO_STATE,
+            &[rnode::RADIO_STATE_ON],
+        ));
+        notification.extend(kiss::frame(b"first-active-packet"));
+        notification.extend(kiss::frame_with_command(rnode::CMD_READY, &[1]));
+        notification.extend(kiss::frame_with_command(rnode::CMD_STAT_RSSI, &[67]));
+
+        let mut deframer = kiss::RawKissDeframer::new();
+        let mut last_rssi = None;
+        let mut last_snr = None;
+        let mut packets = 0usize;
+        let mut flow_ready = false;
+        for (command, frame) in deframer.feed(&notification) {
+            project_ble_rnode_frame(&publisher, &mut state, command, &frame);
+            let data_allowed = matches!(state.readiness(), RNodeReadiness::Ready);
+            match rnode::process_rnode_response(command, &frame, 1, &mut last_rssi, &mut last_snr) {
+                RNodeResponse::Packet(_) if data_allowed => packets += 1,
+                RNodeResponse::Ready(value) => flow_ready = value,
+                RNodeResponse::Packet(_) | RNodeResponse::None => {}
+            }
+        }
+
+        assert_eq!(packets, 1, "fresh post-Ready DATA must not be drained");
+        assert!(flow_ready, "same-notification READY must be applied");
+        assert_eq!(
+            last_rssi,
+            Some(-90.0),
+            "same-notification RSSI must be retained"
+        );
+        assert!(matches!(state.readiness(), RNodeReadiness::Ready));
+        assert_eq!(driver.snapshot().phase, rnode::RNodeRuntimePhase::Ready);
+        publisher.stopped(RNodeRuntimeReason::StopRequested);
+    }
+
+    #[tokio::test]
+    async fn strict_native_ble_preflight_orders_one_rom_request_before_admission() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind native strict bridge loopback");
+        let address = listener.local_addr().expect("strict bridge address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept strict bridge");
+            let mut commands = Vec::new();
+            let mut deframer = kiss::RawKissDeframer::new();
+            let mut buffer = [0u8; 1024];
+            while !commands.contains(&rnode::CMD_ROM_READ) {
+                let count = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buffer))
+                    .await
+                    .expect("strict request timeout")
+                    .expect("strict request read");
+                assert!(count > 0, "strict request ended before ROM read");
+                commands.extend(
+                    deframer
+                        .feed(&buffer[..count])
+                        .into_iter()
+                        .map(|(command, _)| command),
+                );
+            }
+            stream
+                .write_all(&strict_capability_response(0xB8))
+                .await
+                .expect("write strict response");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            commands
+        });
+
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect strict bridge");
+        let (mut read, mut write) = stream.into_split();
+        let running = AtomicBool::new(true);
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        let outcome = run_native_ble_capability_preflight(
+            &mut read,
+            &mut write,
+            ble_radio_settings(&config),
+            &running,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            BleCapabilityPreflightOutcome::Admitted {
+                admission: RNodeRadioAdmission::Verified { .. },
+                ..
+            }
+        ));
+
+        let commands = server.await.expect("strict bridge server task");
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| **command == rnode::CMD_ROM_READ)
+                .count(),
+            1
+        );
+        let detect = commands
+            .iter()
+            .position(|command| *command == rnode::CMD_DETECT)
+            .expect("detect command");
+        let rom = commands
+            .iter()
+            .position(|command| *command == rnode::CMD_ROM_READ)
+            .expect("ROM command");
+        assert!(detect < rom);
+        assert!(
+            commands.iter().all(|command| {
+                !matches!(
+                    *command,
+                    rnode::CMD_FREQUENCY
+                        | rnode::CMD_BANDWIDTH
+                        | rnode::CMD_SF
+                        | rnode::CMD_CR
+                        | rnode::CMD_TXPOWER
+                        | rnode::CMD_RADIO_STATE
+                )
+            }),
+            "strict preflight must not send radio init"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_native_ble_stop_before_preflight_writes_nothing() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind stopped strict bridge");
+        let address = listener.local_addr().expect("stopped bridge address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept stopped bridge");
+            let mut byte = [0u8; 1];
+            stream.read(&mut byte).await.expect("stopped bridge read")
+        });
+
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect stopped bridge");
+        let (mut read, mut write) = stream.into_split();
+        let running = AtomicBool::new(false);
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        assert!(matches!(
+            run_native_ble_capability_preflight(
+                &mut read,
+                &mut write,
+                ble_radio_settings(&config),
+                &running,
+                Duration::from_secs(1),
+                Duration::from_millis(100),
+            )
+            .await,
+            BleCapabilityPreflightOutcome::Stopped
+        ));
+        drop(read);
+        drop(write);
+        assert_eq!(server.await.expect("stopped bridge server task"), 0);
+    }
+
+    #[tokio::test]
+    async fn strict_native_ble_boundary_drains_buffered_preinit_read() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind buffered strict bridge");
+        let address = listener.local_addr().expect("buffered bridge address");
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept buffered bridge");
+            stream
+                .write_all(&kiss::frame(b"queued-before-init"))
+                .await
+                .expect("write queued pre-init packet");
+            stream.flush().await.expect("flush queued pre-init packet");
+            let _ = written_tx.send(());
+            let _ = release_rx.await;
+        });
+
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect buffered bridge");
+        let (mut read, _write) = stream.into_split();
+        written_rx.await.expect("queued write notification");
+        read.readable().await.expect("buffered read readiness");
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        let mut preflight = RNodeCapabilityPreflight::new(ble_radio_settings(&config));
+        let running = AtomicBool::new(true);
+        assert!(
+            drain_native_ble_preinit(
+                &mut read,
+                &mut preflight,
+                &running,
+                Duration::from_secs(1),
+                Duration::from_millis(5),
+            )
+            .await
+            .is_ok()
+        );
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            read.try_read(&mut byte)
+                .expect_err("buffer must be empty")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let _ = release_tx.send(());
+        server.await.expect("buffered bridge server task");
+    }
+
+    #[tokio::test]
+    async fn strict_native_ble_boundary_rejects_duplicate_rom_after_admission() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind duplicate-ROM bridge");
+        let address = listener.local_addr().expect("duplicate-ROM address");
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let duplicate = kiss::frame_with_command(rnode::CMD_ROM_READ, &capability_eeprom(0xB8));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("accept duplicate-ROM bridge");
+            stream
+                .write_all(&duplicate)
+                .await
+                .expect("write duplicate ROM response");
+            stream.flush().await.expect("flush duplicate ROM response");
+            let _ = written_tx.send(());
+            let _ = release_rx.await;
+        });
+
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect duplicate-ROM bridge");
+        let (mut read, _write) = stream.into_split();
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        let mut preflight = RNodeCapabilityPreflight::new(ble_radio_settings(&config));
+        let mut admitted = false;
+        for chunk in strict_capability_response(0xB8).chunks(512) {
+            admitted |= preflight
+                .observe_read(chunk)
+                .expect("valid initial capability response")
+                .is_some();
+        }
+        assert!(admitted);
+        let running = AtomicBool::new(true);
+        written_rx.await.expect("duplicate ROM write notification");
+        assert!(matches!(
+            drain_native_ble_preinit(
+                &mut read,
+                &mut preflight,
+                &running,
+                Duration::from_secs(1),
+                Duration::from_millis(5),
+            )
+            .await,
+            Err(BlePreflightBoundaryError::Rejected(
+                RNodeCapabilityAdmissionError::DuplicateEepromResponse
+            ))
+        ));
+        let _ = release_tx.send(());
+        server.await.expect("duplicate-ROM bridge task");
+    }
+
+    #[tokio::test]
+    async fn strict_native_ble_spawn_publishes_deterministic_rejection_as_terminal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind rejecting strict bridge");
+        let port = listener
+            .local_addr()
+            .expect("rejecting bridge address")
+            .port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept rejecting bridge");
+            let mut deframer = kiss::RawKissDeframer::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let count = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("read rejecting request");
+                assert!(count > 0, "strict request ended before ROM read");
+                if deframer
+                    .feed(&buffer[..count])
+                    .iter()
+                    .any(|(command, _)| *command == rnode::CMD_ROM_READ)
+                {
+                    break;
+                }
+            }
+            let mut invalid = kiss::frame_with_command(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
+            invalid.extend(kiss::frame_with_command(
+                rnode::CMD_FW_VERSION,
+                &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+            ));
+            invalid.extend(kiss::frame_with_command(rnode::CMD_ROM_READ, &[0; 8]));
+            stream
+                .write_all(&invalid)
+                .await
+                .expect("write rejecting response");
+        });
+
+        let (transport_tx, _transport_rx) = mpsc::channel(8);
+        let spawned = spawn_ble_rnode_interface_native_with_driver_and_options(
+            BleRNodeConfig::new("strict-native", "ble://RNode 1234"),
+            987_654,
+            transport_tx,
+            port,
+            RNodeStartupOptions::require_capability_admission(),
+        )
+        .await
+        .expect("spawn strict native observer");
+        let mut subscription = spawned.driver.watch();
+        let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = subscription
+                    .changed()
+                    .await
+                    .expect("strict native publisher closed");
+                if snapshot.phase == rnode::RNodeRuntimePhase::Stopped {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .expect("strict rejection publication timeout");
+        assert_eq!(
+            terminal.reason,
+            Some(RNodeRuntimeReason::CapabilityAdmissionRejected)
+        );
+        assert!(!spawned.interface.online.load(Ordering::SeqCst));
+        spawned
+            .interface
+            .read_task
+            .await
+            .expect("strict rejecting task join");
+        server.await.expect("rejecting bridge server task");
     }
 
     #[test]
@@ -3139,6 +5198,10 @@ mod tests {
     fn test_native_ble_compatibility_and_observed_spawn_apis_compile() {
         let _compatibility_facade = spawn_ble_rnode_interface_native;
         let _observed_api = spawn_ble_rnode_interface_native_with_driver;
+        let _strict_observed_api = spawn_ble_rnode_interface_native_with_driver_and_options;
+        let _desktop_compatibility_facade = spawn_ble_rnode_interface;
+        let _desktop_observed_api = spawn_ble_rnode_interface_with_driver;
+        let _desktop_strict_observed_api = spawn_ble_rnode_interface_with_driver_and_options;
     }
 
     // ── process_rnode_response tests ──
