@@ -6805,7 +6805,6 @@ mod tests {
             std::io::Write::write_all(stream, &bytes[offset..end]).unwrap();
             offset = end;
             chunk_index += 1;
-            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
