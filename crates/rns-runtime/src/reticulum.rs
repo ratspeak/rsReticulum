@@ -904,8 +904,12 @@ pub enum SendError {
 pub struct LinkConnectOptions {
     /// How long path discovery may run when no validated announce is cached.
     pub path_timeout: Duration,
-    /// Deadline for the Link handshake itself.
-    pub establishment_timeout: Duration,
+    /// Explicit deadline for the Link handshake itself.
+    ///
+    /// When omitted, the runtime derives Python-compatible timing from the
+    /// destination's first-hop timeout and current path hop count.
+    /// `Some(Duration::ZERO)` deliberately requests an immediate deadline.
+    pub establishment_timeout: Option<Duration>,
     /// Registration label used for the temporary Link destination.
     pub client_label: String,
     /// Send the local identity over the Link after establishment.
@@ -918,7 +922,7 @@ impl Default for LinkConnectOptions {
     fn default() -> Self {
         Self {
             path_timeout: Duration::from_secs(15),
-            establishment_timeout: Duration::from_secs(30),
+            establishment_timeout: None,
             client_label: "rns-runtime.link".to_string(),
             identify: false,
             track_phy_stats: false,
@@ -936,6 +940,23 @@ pub enum LinkConnectError {
     IdentityUnavailable(String),
     #[error("Link session failed: {0}")]
     Session(#[from] LinkSessionError),
+}
+
+fn link_establishment_timeout(
+    first_hop_timeout: Duration,
+    hops: u8,
+) -> Result<Duration, ControlError> {
+    let per_hop_timeout = Duration::try_from_secs_f64(
+        rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT * f64::from(hops.max(1)),
+    )
+    .map_err(|_| ControlError::UnexpectedResponse {
+        operation: "Link establishment timeout derivation",
+    })?;
+    first_hop_timeout
+        .checked_add(per_hop_timeout)
+        .ok_or(ControlError::UnexpectedResponse {
+            operation: "Link establishment timeout derivation",
+        })
 }
 
 impl std::fmt::Debug for RecalledDestination {
@@ -1158,12 +1179,20 @@ impl ReticulumHandle {
         }
         let recalled = recalled
             .ok_or_else(|| LinkConnectError::IdentityUnavailable(hex::encode(destination_hash)))?;
+        let (establishment_timeout, hops) = match options.establishment_timeout {
+            Some(timeout) => (timeout, recalled.hops),
+            None => {
+                let hops = self.hops_to(destination_hash).await?;
+                let first_hop_timeout = self.first_hop_timeout(destination_hash).await?;
+                (link_establishment_timeout(first_hop_timeout, hops)?, hops)
+            }
+        };
 
         Ok(LinkSessionConfig {
             destination_hash,
             remote_public_key: recalled.identity.get_public_key(),
-            hops: recalled.hops,
-            establishment_timeout: options.establishment_timeout,
+            hops,
+            establishment_timeout,
             client_label: options.client_label.clone(),
             identify: options.identify,
             track_phy_stats: options.track_phy_stats,
@@ -9091,6 +9120,11 @@ loglevel = 7
         };
         let simulated = (rns_wire::constants::MTU as f64 * 8.0) / 1_000.0;
         assert_eq!(seconds, 6.0 + simulated);
+        assert_eq!(
+            link_establishment_timeout(Duration::from_secs_f64(seconds), 2).unwrap(),
+            Duration::from_secs_f64(6.0 + simulated + 12.0),
+            "Link timing must retain both master and simulated client latency"
+        );
     }
 
     #[test]
@@ -9447,7 +9481,7 @@ loglevel = 7
     }
 
     #[tokio::test]
-    async fn link_connect_config_uses_validated_recall_metadata() {
+    async fn link_connect_config_preserves_explicit_override_and_recall_metadata() {
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
         let remote_identity = Identity::new();
         let remote_public_key = remote_identity.get_public_key();
@@ -9480,7 +9514,7 @@ loglevel = 7
         handle.transport_tx = transport_tx;
         let options = LinkConnectOptions {
             path_timeout: Duration::from_secs(4),
-            establishment_timeout: Duration::from_secs(9),
+            establishment_timeout: Some(Duration::ZERO),
             client_label: "example.client".to_string(),
             identify: true,
             track_phy_stats: true,
@@ -9492,7 +9526,7 @@ loglevel = 7
         assert_eq!(config.destination_hash, destination_hash);
         assert_eq!(config.remote_public_key, remote_public_key);
         assert_eq!(config.hops, 7);
-        assert_eq!(config.establishment_timeout, Duration::from_secs(9));
+        assert_eq!(config.establishment_timeout, Duration::ZERO);
         assert_eq!(config.client_label, "example.client");
         assert!(config.track_phy_stats);
         assert!(config.identify);
@@ -9501,7 +9535,7 @@ loglevel = 7
 
     #[tokio::test]
     async fn link_connect_config_discovers_path_before_retrying_recall() {
-        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(3);
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(5);
         let remote_identity = Identity::new();
         let remote_public_key = remote_identity.get_public_key();
         let destination_hash = [0x44; 16];
@@ -9535,11 +9569,37 @@ loglevel = 7
                         public_key: remote_public_key,
                         app_data: None,
                         ratchet: None,
-                        hops: 2,
+                        hops: 7,
                         timestamp: 1_700_000_001.0,
                     },
                 )))
                 .expect("second recall response");
+
+            let TransportMessage::Rpc { query, response_tx } =
+                transport_rx.recv().await.expect("hop query")
+            else {
+                panic!("expected transport RPC");
+            };
+            assert!(matches!(
+                query,
+                TransportQuery::HopsTo { dest } if dest == destination_hash
+            ));
+            response_tx
+                .send(TransportQueryResponse::IntResult(2))
+                .expect("hop response");
+
+            let TransportMessage::Rpc { query, response_tx } =
+                transport_rx.recv().await.expect("first-hop query")
+            else {
+                panic!("expected transport RPC");
+            };
+            assert!(matches!(
+                query,
+                TransportQuery::FirstHopTimeout { dest } if dest == destination_hash
+            ));
+            response_tx
+                .send(TransportQueryResponse::FloatResult(Some(2.5)))
+                .expect("first-hop response");
         });
 
         let mut handle = dummy_handle();
@@ -9549,7 +9609,78 @@ loglevel = 7
             .await
             .unwrap();
         assert_eq!(config.remote_public_key, remote_public_key);
-        assert_eq!(config.hops, 2);
+        assert_eq!(
+            config.hops, 2,
+            "current authoritative hops must replace stale recalled metadata"
+        );
+        assert_eq!(config.establishment_timeout, Duration::from_secs_f64(14.5));
+        responder.await.unwrap();
+    }
+
+    #[test]
+    fn link_establishment_timeout_matches_python_hop_floor_and_scaling() {
+        assert_eq!(
+            link_establishment_timeout(Duration::from_secs_f64(1.25), 0).unwrap(),
+            Duration::from_secs_f64(7.25)
+        );
+        assert_eq!(
+            link_establishment_timeout(Duration::from_secs_f64(1.25), 1).unwrap(),
+            Duration::from_secs_f64(7.25)
+        );
+        assert_eq!(
+            link_establishment_timeout(Duration::from_secs_f64(1.25), 4).unwrap(),
+            Duration::from_secs_f64(25.25)
+        );
+        assert_eq!(
+            link_establishment_timeout(
+                Duration::from_secs_f64(1.25),
+                rns_transport::constants::PATHFINDER_M,
+            )
+            .unwrap(),
+            Duration::from_secs_f64(769.25)
+        );
+        assert!(matches!(
+            link_establishment_timeout(Duration::MAX, 1),
+            Err(ControlError::UnexpectedResponse {
+                operation: "Link establishment timeout derivation"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn derived_link_timeout_propagates_control_failure() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let remote_identity = Identity::new();
+        let remote_public_key = remote_identity.get_public_key();
+        let destination_hash = [0x45; 16];
+        let responder = tokio::spawn(async move {
+            let TransportMessage::Rpc { response_tx, .. } =
+                transport_rx.recv().await.expect("recall query")
+            else {
+                panic!("expected transport RPC");
+            };
+            response_tx
+                .send(TransportQueryResponse::RecalledDestination(Some(
+                    RecalledDestinationRpcEntry {
+                        dest_hash: destination_hash,
+                        public_key: remote_public_key,
+                        app_data: None,
+                        ratchet: None,
+                        hops: 2,
+                        timestamp: 1_700_000_002.0,
+                    },
+                )))
+                .expect("recall response receiver");
+        });
+
+        let mut handle = dummy_handle();
+        handle.transport_tx = transport_tx;
+        assert!(matches!(
+            handle
+                .resolve_link_session_config(destination_hash, &LinkConnectOptions::default())
+                .await,
+            Err(LinkConnectError::Control(ControlError::ChannelClosed))
+        ));
         responder.await.unwrap();
     }
 
