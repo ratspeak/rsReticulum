@@ -640,6 +640,31 @@ pub enum RNodeReadinessError {
     },
 }
 
+/// Failure to validate, spawn, or atomically register a runtime-owned RNode.
+///
+/// Options-aware entry points preserve the lower typed RNode startup failure,
+/// including capability-admission rejection. Compatibility entry points keep
+/// returning their historical strings by formatting this error.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RNodeRuntimeSpawnError {
+    #[error("{0}")]
+    RuntimeAdmission(String),
+    #[error("{0}")]
+    InvalidConfiguration(String),
+    #[error("RNode spawn failed: {0}")]
+    RNodeSpawn(#[source] rns_interface::rnode::RNodeSpawnError),
+    #[error("BLE RNode spawn failed: {0}")]
+    BleRNodeSpawn(#[source] rns_interface::rnode::RNodeSpawnError),
+    #[error("BLE RNode native spawn failed: {0}")]
+    NativeBleRNodeSpawn(#[source] rns_interface::rnode::RNodeSpawnError),
+    #[cfg(target_os = "android")]
+    #[error("Android USB spawn failed: {0}")]
+    AndroidUsbSpawn(#[source] rns_interface::rnode::RNodeSpawnError),
+    #[error("{0}")]
+    Registration(String),
+}
+
 impl RNodeReadinessError {
     /// Latest privacy-safe state associated with the terminal outcome.
     pub fn last_snapshot(&self) -> Arc<rns_interface::rnode::RNodeRuntimeSnapshot> {
@@ -2554,6 +2579,31 @@ pub async fn init_with_options(
     is_foreground: Arc<AtomicBool>,
     options: InitOptions,
 ) -> Result<ReticulumHandle, ReticulumError> {
+    init_with_options_and_rnode_startup_options(
+        configdir,
+        socket_dir,
+        shutdown,
+        is_foreground,
+        options,
+        rns_interface::rnode::RNodeStartupOptions::default(),
+    )
+    .await
+}
+
+/// Bring up Reticulum with explicit instance and configured-RNode startup
+/// policies.
+///
+/// The RNode policy applies only to configured `RNodeInterface` and
+/// `RNodeInterface_BLE` entries. Other interface kinds, including RNodeMulti,
+/// retain their established startup behavior.
+pub async fn init_with_options_and_rnode_startup_options(
+    configdir: Option<&str>,
+    socket_dir: Option<PathBuf>,
+    shutdown: ShutdownSignal,
+    is_foreground: Arc<AtomicBool>,
+    options: InitOptions,
+    rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
+) -> Result<ReticulumHandle, ReticulumError> {
     let started_at = std::time::Instant::now();
     let config_dir = resolve_config_dir(configdir);
     let paths = StoragePaths::from_config_dir(&config_dir);
@@ -3018,7 +3068,7 @@ pub async fn init_with_options(
             let bootstrap_only = interface_bootstrap_only(&config, iface_config);
             let ifac_key = derive_ifac_key_from_post_init(&post_init);
 
-            match spawn_interface(
+            match spawn_interface_with_rnode_startup_options(
                 iface_config,
                 iface_id,
                 transport_tx.clone(),
@@ -3026,6 +3076,7 @@ pub async fn init_with_options(
                 handle_tx.clone(),
                 &socket_base,
                 is_foreground.clone(),
+                rnode_startup_options,
             )
             .await
             {
@@ -6117,7 +6168,27 @@ pub async fn spawn_ble_rnode_runtime_observed(
     handle: &ReticulumHandle,
     args: BleRnodeRuntimeArgs<'_>,
 ) -> Result<SpawnedRNodeRuntime, String> {
-    let spawn_permit = ensure_runtime_interface_admission(handle)?;
+    spawn_ble_rnode_runtime_observed_with_options(
+        handle,
+        args,
+        rns_interface::rnode::RNodeStartupOptions::default(),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Spawn and register a BLE RNode with an explicit startup policy.
+///
+/// BLE connection work remains asynchronous, so post-return capability state
+/// and deterministic rejection are observed through the returned exact driver.
+#[cfg(feature = "ble")]
+pub async fn spawn_ble_rnode_runtime_observed_with_options(
+    handle: &ReticulumHandle,
+    args: BleRnodeRuntimeArgs<'_>,
+    rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
+) -> Result<SpawnedRNodeRuntime, RNodeRuntimeSpawnError> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)
+        .map_err(RNodeRuntimeSpawnError::RuntimeAdmission)?;
     let BleRnodeRuntimeArgs {
         name,
         port,
@@ -6137,27 +6208,34 @@ pub async fn spawn_ble_rnode_runtime_observed(
     config.bandwidth = bandwidth;
     config.spreading_factor = spreading_factor;
     config.coding_rate = coding_rate;
-    config.tx_power = u8::try_from(tx_power)
-        .map_err(|_| format!("invalid value for '{name}.txpower': {tx_power} is below 0 dBm"))?;
+    config.tx_power = u8::try_from(tx_power).map_err(|_| {
+        RNodeRuntimeSpawnError::InvalidConfiguration(format!(
+            "invalid value for '{name}.txpower': {tx_power} is below 0 dBm"
+        ))
+    })?;
     config.mode = mode;
     config.st_alock = st_alock;
     config.lt_alock = lt_alock;
     config.flow_control = flow_control;
-    config
-        .validate()
-        .map_err(|error| format!("invalid value for '{name}.{}': {error}", error.field()))?;
+    config.validate().map_err(|error| {
+        RNodeRuntimeSpawnError::InvalidConfiguration(format!(
+            "invalid value for '{name}.{}': {error}",
+            error.field()
+        ))
+    })?;
 
     let id = handle
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-    let spawned = rns_interface::ble_rnode::spawn_ble_rnode_interface_with_driver(
+    let spawned = rns_interface::ble_rnode::spawn_ble_rnode_interface_with_driver_and_options(
         config,
         id,
         handle.transport_tx.clone(),
+        rnode_startup_options,
     )
     .await
-    .map_err(|e| format!("BLE RNode spawn failed: {e}"))?;
+    .map_err(RNodeRuntimeSpawnError::BleRNodeSpawn)?;
 
     let online = spawned.interface.online.clone();
     let state = spawned.driver.watch();
@@ -6170,7 +6248,9 @@ pub async fn spawn_ble_rnode_runtime_observed(
         spawn_permit,
     )
     .await
-    .map_err(|error| format!("BLE RNode registration failed: {error}"))?;
+    .map_err(|error| {
+        RNodeRuntimeSpawnError::Registration(format!("BLE RNode registration failed: {error}"))
+    })?;
     tracing::info!(name = %name, id, "runtime BLE RNode interface spawned");
     Ok(SpawnedRNodeRuntime {
         interface_id: id,
@@ -6226,7 +6306,24 @@ pub async fn spawn_rnode_runtime_observed(
     handle: &ReticulumHandle,
     args: RnodeRuntimeArgs<'_>,
 ) -> Result<SpawnedRNodeRuntime, String> {
-    let spawn_permit = ensure_runtime_interface_admission(handle)?;
+    spawn_rnode_runtime_observed_with_options(
+        handle,
+        args,
+        rns_interface::rnode::RNodeStartupOptions::default(),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Spawn and register a serial/TCP RNode with an explicit startup policy.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+pub async fn spawn_rnode_runtime_observed_with_options(
+    handle: &ReticulumHandle,
+    args: RnodeRuntimeArgs<'_>,
+    rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
+) -> Result<SpawnedRNodeRuntime, RNodeRuntimeSpawnError> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)
+        .map_err(RNodeRuntimeSpawnError::RuntimeAdmission)?;
     let RnodeRuntimeArgs {
         name,
         port,
@@ -6246,27 +6343,34 @@ pub async fn spawn_rnode_runtime_observed(
     config.bandwidth = bandwidth;
     config.spreading_factor = spreading_factor;
     config.coding_rate = coding_rate;
-    config.tx_power = u8::try_from(tx_power)
-        .map_err(|_| format!("invalid value for '{name}.txpower': {tx_power} is below 0 dBm"))?;
+    config.tx_power = u8::try_from(tx_power).map_err(|_| {
+        RNodeRuntimeSpawnError::InvalidConfiguration(format!(
+            "invalid value for '{name}.txpower': {tx_power} is below 0 dBm"
+        ))
+    })?;
     config.mode = mode;
     config.st_alock = st_alock;
     config.lt_alock = lt_alock;
     config.flow_control = flow_control;
-    config
-        .validate()
-        .map_err(|error| format!("invalid value for '{name}.{}': {error}", error.field()))?;
+    config.validate().map_err(|error| {
+        RNodeRuntimeSpawnError::InvalidConfiguration(format!(
+            "invalid value for '{name}.{}': {error}",
+            error.field()
+        ))
+    })?;
 
     let id = handle
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-    let spawned = rns_interface::rnode::spawn_rnode_interface_with_driver(
+    let spawned = rns_interface::rnode::spawn_rnode_interface_with_driver_and_options(
         config,
         id,
         handle.transport_tx.clone(),
+        rnode_startup_options,
     )
     .await
-    .map_err(|e| format!("RNode spawn failed: {e}"))?;
+    .map_err(RNodeRuntimeSpawnError::RNodeSpawn)?;
 
     let online = spawned.interface.online.clone();
     let state = spawned.driver.watch();
@@ -6279,7 +6383,9 @@ pub async fn spawn_rnode_runtime_observed(
         spawn_permit,
     )
     .await
-    .map_err(|error| format!("RNode registration failed: {error}"))?;
+    .map_err(|error| {
+        RNodeRuntimeSpawnError::Registration(format!("RNode registration failed: {error}"))
+    })?;
     tracing::info!(name = %name, id, "runtime RNode interface spawned");
     Ok(SpawnedRNodeRuntime {
         interface_id: id,
@@ -6311,7 +6417,27 @@ pub async fn spawn_ble_rnode_runtime_native_observed(
     args: BleRnodeRuntimeArgs<'_>,
     tcp_port: u16,
 ) -> Result<SpawnedRNodeRuntime, String> {
-    let spawn_permit = ensure_runtime_interface_admission(handle)?;
+    spawn_ble_rnode_runtime_native_observed_with_options(
+        handle,
+        args,
+        tcp_port,
+        rns_interface::rnode::RNodeStartupOptions::default(),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Spawn and register a native-bridge BLE RNode with an explicit startup
+/// policy. Post-return admission state is reported by the exact observer.
+#[cfg(feature = "ble")]
+pub async fn spawn_ble_rnode_runtime_native_observed_with_options(
+    handle: &ReticulumHandle,
+    args: BleRnodeRuntimeArgs<'_>,
+    tcp_port: u16,
+    rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
+) -> Result<SpawnedRNodeRuntime, RNodeRuntimeSpawnError> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)
+        .map_err(RNodeRuntimeSpawnError::RuntimeAdmission)?;
     let BleRnodeRuntimeArgs {
         name,
         port,
@@ -6331,28 +6457,36 @@ pub async fn spawn_ble_rnode_runtime_native_observed(
     config.bandwidth = bandwidth;
     config.spreading_factor = spreading_factor;
     config.coding_rate = coding_rate;
-    config.tx_power = u8::try_from(tx_power)
-        .map_err(|_| format!("invalid value for '{name}.txpower': {tx_power} is below 0 dBm"))?;
+    config.tx_power = u8::try_from(tx_power).map_err(|_| {
+        RNodeRuntimeSpawnError::InvalidConfiguration(format!(
+            "invalid value for '{name}.txpower': {tx_power} is below 0 dBm"
+        ))
+    })?;
     config.mode = mode;
     config.st_alock = st_alock;
     config.lt_alock = lt_alock;
     config.flow_control = flow_control;
-    config
-        .validate()
-        .map_err(|error| format!("invalid value for '{name}.{}': {error}", error.field()))?;
+    config.validate().map_err(|error| {
+        RNodeRuntimeSpawnError::InvalidConfiguration(format!(
+            "invalid value for '{name}.{}': {error}",
+            error.field()
+        ))
+    })?;
 
     let id = handle
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-    let spawned = rns_interface::ble_rnode::spawn_ble_rnode_interface_native_with_driver(
-        config,
-        id,
-        handle.transport_tx.clone(),
-        tcp_port,
-    )
-    .await
-    .map_err(|e| format!("BLE RNode native spawn failed: {e}"))?;
+    let spawned =
+        rns_interface::ble_rnode::spawn_ble_rnode_interface_native_with_driver_and_options(
+            config,
+            id,
+            handle.transport_tx.clone(),
+            tcp_port,
+            rnode_startup_options,
+        )
+        .await
+        .map_err(RNodeRuntimeSpawnError::NativeBleRNodeSpawn)?;
 
     let online = spawned.interface.online.clone();
     let state = spawned.driver.watch();
@@ -6365,7 +6499,11 @@ pub async fn spawn_ble_rnode_runtime_native_observed(
         spawn_permit,
     )
     .await
-    .map_err(|error| format!("BLE RNode native registration failed: {error}"))?;
+    .map_err(|error| {
+        RNodeRuntimeSpawnError::Registration(format!(
+            "BLE RNode native registration failed: {error}"
+        ))
+    })?;
     tracing::info!(name = %name, id, tcp_port, "runtime BLE RNode interface spawned (native bridge)");
     Ok(SpawnedRNodeRuntime {
         interface_id: id,
@@ -6562,33 +6700,79 @@ pub async fn spawn_android_usb_rnode_runtime_observed(
     lt_alock: Option<f32>,
     flow_control: bool,
 ) -> Result<SpawnedRNodeRuntime, String> {
-    let spawn_permit = ensure_runtime_interface_admission(handle)?;
+    spawn_android_usb_rnode_runtime_observed_with_options(
+        handle,
+        name,
+        device_name,
+        frequency,
+        bandwidth,
+        spreading_factor,
+        coding_rate,
+        tx_power,
+        mode,
+        st_alock,
+        lt_alock,
+        flow_control,
+        rns_interface::rnode::RNodeStartupOptions::default(),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Spawn and register an Android USB RNode with an explicit startup policy.
+#[cfg(target_os = "android")]
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_android_usb_rnode_runtime_observed_with_options(
+    handle: &ReticulumHandle,
+    name: &str,
+    device_name: &str,
+    frequency: u32,
+    bandwidth: u32,
+    spreading_factor: u8,
+    coding_rate: u8,
+    tx_power: i8,
+    mode: rns_interface::traits::InterfaceMode,
+    st_alock: Option<f32>,
+    lt_alock: Option<f32>,
+    flow_control: bool,
+    rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
+) -> Result<SpawnedRNodeRuntime, RNodeRuntimeSpawnError> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)
+        .map_err(RNodeRuntimeSpawnError::RuntimeAdmission)?;
     let mut config = rns_interface::android_usb::AndroidUsbConfig::new(name, device_name);
     config.frequency = frequency;
     config.bandwidth = bandwidth;
     config.spreading_factor = spreading_factor;
     config.coding_rate = coding_rate;
-    config.tx_power = u8::try_from(tx_power)
-        .map_err(|_| format!("invalid value for '{name}.txpower': {tx_power} is below 0 dBm"))?;
+    config.tx_power = u8::try_from(tx_power).map_err(|_| {
+        RNodeRuntimeSpawnError::InvalidConfiguration(format!(
+            "invalid value for '{name}.txpower': {tx_power} is below 0 dBm"
+        ))
+    })?;
     config.mode = mode;
     config.st_alock = st_alock;
     config.lt_alock = lt_alock;
     config.flow_control = flow_control;
-    config
-        .validate()
-        .map_err(|error| format!("invalid value for '{name}.{}': {error}", error.field()))?;
+    config.validate().map_err(|error| {
+        RNodeRuntimeSpawnError::InvalidConfiguration(format!(
+            "invalid value for '{name}.{}': {error}",
+            error.field()
+        ))
+    })?;
 
     let id = handle
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-    let spawned = rns_interface::android_usb::spawn_android_usb_rnode_interface_with_driver(
-        config,
-        id,
-        handle.transport_tx.clone(),
-    )
-    .await
-    .map_err(|e| format!("Android USB spawn failed: {e}"))?;
+    let spawned =
+        rns_interface::android_usb::spawn_android_usb_rnode_interface_with_driver_and_options(
+            config,
+            id,
+            handle.transport_tx.clone(),
+            rnode_startup_options,
+        )
+        .await
+        .map_err(RNodeRuntimeSpawnError::AndroidUsbSpawn)?;
 
     let online = spawned.interface.online.clone();
     let state = spawned.driver.watch();
@@ -6601,7 +6785,9 @@ pub async fn spawn_android_usb_rnode_runtime_observed(
         spawn_permit,
     )
     .await
-    .map_err(|error| format!("Android USB registration failed: {error}"))?;
+    .map_err(|error| {
+        RNodeRuntimeSpawnError::Registration(format!("Android USB registration failed: {error}"))
+    })?;
     tracing::info!(name = %name, id, "runtime Android USB RNode interface spawned");
     Ok(SpawnedRNodeRuntime {
         interface_id: id,
@@ -6749,7 +6935,8 @@ async fn finish_interface_shutdown(
     }
 }
 
-async fn spawn_interface(
+#[allow(clippy::too_many_arguments)]
+async fn spawn_interface_with_rnode_startup_options(
     iface_config: &interface_factory::InterfaceConfig,
     id: u64,
     transport_tx: mpsc::Sender<TransportMessage>,
@@ -6757,7 +6944,11 @@ async fn spawn_interface(
     handle_tx: mpsc::Sender<rns_interface::traits::InterfaceHandle>,
     socket_base: &Path,
     is_foreground: Arc<AtomicBool>,
+    rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
 ) -> Result<Vec<OwnedInterfaceHandle>, String> {
+    #[cfg(not(any(feature = "serial", feature = "rnode-tcp", feature = "ble")))]
+    let _ = rnode_startup_options;
+
     match iface_config {
         interface_factory::InterfaceConfig::TcpClient(c) => {
             rns_interface::tcp::spawn_tcp_client(c.clone(), id, transport_tx)
@@ -6840,10 +7031,15 @@ async fn spawn_interface(
             let rnode_config = c
                 .to_rnode_config()
                 .map_err(|error| format!("RNode: {error}"))?;
-            rns_interface::rnode::spawn_rnode_interface_with_driver(rnode_config, id, transport_tx)
-                .await
-                .map(|spawned| vec![spawned.into()])
-                .map_err(|e| format!("RNode: {e}"))
+            rns_interface::rnode::spawn_rnode_interface_with_driver_and_options(
+                rnode_config,
+                id,
+                transport_tx,
+                rnode_startup_options,
+            )
+            .await
+            .map(|spawned| vec![spawned.into()])
+            .map_err(|e| format!("RNode: {e}"))
         }
         interface_factory::InterfaceConfig::Local(c) => {
             let local_config = rns_interface::local::LocalClientConfig {
@@ -6975,10 +7171,11 @@ async fn spawn_interface(
             config.lt_alock = c.lt_alock;
             config.id_interval = c.id_interval;
             config.id_callsign = c.id_callsign.as_ref().map(|s| s.as_bytes().to_vec());
-            rns_interface::ble_rnode::spawn_ble_rnode_interface_with_driver(
+            rns_interface::ble_rnode::spawn_ble_rnode_interface_with_driver_and_options(
                 config,
                 id,
                 transport_tx,
+                rnode_startup_options,
             )
             .await
             .map(|spawned| vec![spawned.into()])
@@ -7785,6 +7982,119 @@ mod tests {
     }
 
     #[cfg(feature = "rnode-tcp")]
+    fn strict_test_capability_eeprom() -> Vec<u8> {
+        let mut bytes = vec![0xFF; 296];
+        bytes[0] = 0x03;
+        bytes[1] = 0xB8;
+        bytes[2..11].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        bytes[11..27].copy_from_slice(&[
+            0x7B, 0x80, 0x24, 0xF3, 0xDE, 0xB6, 0xA8, 0x31, 0x7C, 0xCA, 0x6F, 0xA5, 0x7A, 0x56,
+            0x8E, 0x41,
+        ]);
+        bytes[100] = rns_interface::kiss::FEND;
+        bytes[101] = rns_interface::kiss::FESC;
+        bytes[0x9B] = 0x73;
+        bytes
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    fn test_strict_ready_rnode_tcp_peer(
+        config: rns_interface::rnode::RNodeConfig,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use rns_interface::{kiss, rnode};
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = format!("tcp://{}", listener.local_addr().unwrap());
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let detect = rnode::build_detect_sequence();
+            let capability_request = kiss::frame_with_command(rnode::CMD_ROM_READ, &[0]);
+            let init = rnode::build_init_sequence(&config);
+            let mut observed = Vec::new();
+
+            for expected in [&detect, &capability_request] {
+                let mut bytes = vec![0; expected.len()];
+                stream.read_exact(&mut bytes).unwrap();
+                assert_eq!(&bytes, expected);
+                observed.extend_from_slice(&bytes);
+            }
+
+            let mut capability = Vec::new();
+            kiss::frame_with_command_into(
+                rnode::CMD_DETECT,
+                &[rnode::DETECT_RESP],
+                &mut capability,
+            );
+            kiss::frame_with_command_into(
+                rnode::CMD_FW_VERSION,
+                &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+                &mut capability,
+            );
+            kiss::frame_with_command_into(
+                rnode::CMD_ROM_READ,
+                &strict_test_capability_eeprom(),
+                &mut capability,
+            );
+            stream.write_all(&capability).unwrap();
+
+            let mut init_bytes = vec![0; init.len()];
+            stream.read_exact(&mut init_bytes).unwrap();
+            assert_eq!(init_bytes, init);
+            observed.extend_from_slice(&init_bytes);
+
+            let settings = rnode::RNodeRadioSettings::from(&config);
+            let mut echoes = Vec::new();
+            for (command, payload) in [
+                (
+                    rnode::CMD_FREQUENCY,
+                    settings.frequency.to_be_bytes().to_vec(),
+                ),
+                (
+                    rnode::CMD_BANDWIDTH,
+                    settings.bandwidth.to_be_bytes().to_vec(),
+                ),
+                (rnode::CMD_SF, vec![settings.spreading_factor]),
+                (rnode::CMD_CR, vec![settings.coding_rate]),
+                (rnode::CMD_TXPOWER, vec![settings.tx_power]),
+                (rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_ON]),
+            ] {
+                kiss::frame_with_command_into(command, &payload, &mut echoes);
+            }
+            stream.write_all(&echoes).unwrap();
+
+            let mut buffer = [0u8; 512];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => observed.extend_from_slice(&buffer[..read]),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        panic!("timed out waiting for exact strict RNode shutdown: {error}");
+                    }
+                    Err(error) => panic!("strict RNode peer read failed: {error}"),
+                }
+            }
+            closed_tx.send(observed).unwrap();
+        });
+        (port, closed_rx, peer)
+    }
+
+    #[cfg(feature = "rnode-tcp")]
     fn test_rnode_runtime_args<'a>(name: &'a str, port: &'a str) -> RnodeRuntimeArgs<'a> {
         let defaults = rns_interface::rnode::RNodeConfig::new(name, port);
         RnodeRuntimeArgs {
@@ -7800,6 +8110,112 @@ mod tests {
             lt_alock: defaults.lt_alock,
             flow_control: defaults.flow_control,
         }
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn rnode_options_wrapper_preserves_legacy_validation_text() {
+        let legacy_runtime = dummy_handle();
+        let mut legacy_args = test_rnode_runtime_args("invalid-runtime-rnode", "tcp://127.0.0.1:1");
+        legacy_args.tx_power = -1;
+        let legacy = spawn_rnode_runtime_observed(&legacy_runtime, legacy_args)
+            .await
+            .expect_err("legacy wrapper must reject negative transmit power");
+
+        let typed_runtime = dummy_handle();
+        let mut typed_args = test_rnode_runtime_args("invalid-runtime-rnode", "tcp://127.0.0.1:1");
+        typed_args.tx_power = -1;
+        let typed = spawn_rnode_runtime_observed_with_options(
+            &typed_runtime,
+            typed_args,
+            rns_interface::rnode::RNodeStartupOptions::require_capability_admission(),
+        )
+        .await
+        .expect_err("options wrapper must reject negative transmit power");
+
+        assert!(matches!(
+            typed,
+            RNodeRuntimeSpawnError::InvalidConfiguration(_)
+        ));
+        assert_eq!(legacy, typed.to_string());
+        assert_eq!(legacy_runtime.id_gen.load(Ordering::SeqCst), 0);
+        assert_eq!(typed_runtime.id_gen.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn rnode_options_wrapper_preserves_typed_lower_spawn_failure() {
+        let runtime = dummy_handle();
+        let error = spawn_rnode_runtime_observed_with_options(
+            &runtime,
+            test_rnode_runtime_args("strict-runtime-rnode", "tcp://127.0.0.1:0"),
+            rns_interface::rnode::RNodeStartupOptions::require_capability_admission(),
+        )
+        .await
+        .expect_err("port zero cannot accept the strict startup connection");
+
+        assert!(matches!(
+            error,
+            RNodeRuntimeSpawnError::RNodeSpawn(rns_interface::rnode::RNodeSpawnError::Interface(_))
+        ));
+        assert!(error.to_string().starts_with("RNode spawn failed: "));
+        assert_eq!(runtime.interface_registry.len(), 0);
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn rnode_options_wrapper_routes_strict_capability_rejection() {
+        use rns_interface::{kiss, rnode};
+
+        let mut responses = Vec::new();
+        kiss::frame_with_command_into(rnode::CMD_DETECT, &[rnode::DETECT_RESP], &mut responses);
+        kiss::frame_with_command_into(
+            rnode::CMD_FW_VERSION,
+            &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+            &mut responses,
+        );
+        kiss::frame_with_command_into(rnode::CMD_ROM_READ, &[0], &mut responses);
+        let (port, closed_rx, peer) = test_rnode_tcp_peer_with_responses(responses);
+        let runtime = dummy_handle();
+
+        let error = spawn_rnode_runtime_observed_with_options(
+            &runtime,
+            test_rnode_runtime_args("strict-capability-runtime-rnode", &port),
+            rnode::RNodeStartupOptions::require_capability_admission(),
+        )
+        .await
+        .expect_err("empty EEPROM response must be a typed capability rejection");
+
+        assert!(
+            matches!(
+                &error,
+                RNodeRuntimeSpawnError::RNodeSpawn(rnode::RNodeSpawnError::CapabilityAdmission(
+                    rnode::RNodeCapabilityAdmissionError::CapabilityImage(_)
+                ))
+            ),
+            "unexpected strict runtime error: {error:?}"
+        );
+        assert_eq!(runtime.interface_registry.len(), 0);
+        let observed = closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("strict rejected RNode connection did not close");
+        let detect = rnode::build_detect_sequence();
+        assert!(
+            observed
+                .windows(detect.len())
+                .any(|window| window == detect.as_slice()),
+            "strict startup must send detection"
+        );
+        let capability_request = kiss::frame_with_command(rnode::CMD_ROM_READ, &[0]);
+        assert_eq!(
+            observed
+                .windows(capability_request.len())
+                .filter(|window| *window == capability_request.as_slice())
+                .count(),
+            1,
+            "strict startup must request exactly one capability image"
+        );
+        peer.join().unwrap();
     }
 
     #[cfg(feature = "ble")]
@@ -7833,12 +8249,45 @@ mod tests {
         assert!(direct_error.contains("txpower"));
         assert_eq!(runtime.id_gen.load(Ordering::SeqCst), 0);
 
+        let mut typed_direct = test_ble_rnode_runtime_args("invalid-direct", "ble://RNode");
+        typed_direct.tx_power = -1;
+        let typed_direct_error = spawn_ble_rnode_runtime_observed_with_options(
+            &runtime,
+            typed_direct,
+            rns_interface::rnode::RNodeStartupOptions::require_capability_admission(),
+        )
+        .await
+        .expect_err("typed BLE spawn must reject negative transmit power");
+        assert!(matches!(
+            typed_direct_error,
+            RNodeRuntimeSpawnError::InvalidConfiguration(_)
+        ));
+        assert_eq!(direct_error, typed_direct_error.to_string());
+        assert_eq!(runtime.id_gen.load(Ordering::SeqCst), 0);
+
         let mut native = test_ble_rnode_runtime_args("invalid-native", "ble://RNode");
         native.frequency = 0;
         let native_error = spawn_ble_rnode_runtime_native_observed(&runtime, native, 1)
             .await
             .expect_err("invalid native BLE frequency must be rejected");
         assert!(native_error.contains("frequency"));
+        assert_eq!(runtime.id_gen.load(Ordering::SeqCst), 0);
+
+        let mut typed_native = test_ble_rnode_runtime_args("invalid-native", "ble://RNode");
+        typed_native.frequency = 0;
+        let typed_native_error = spawn_ble_rnode_runtime_native_observed_with_options(
+            &runtime,
+            typed_native,
+            1,
+            rns_interface::rnode::RNodeStartupOptions::require_capability_admission(),
+        )
+        .await
+        .expect_err("typed native BLE spawn must reject invalid frequency");
+        assert!(matches!(
+            typed_native_error,
+            RNodeRuntimeSpawnError::InvalidConfiguration(_)
+        ));
+        assert_eq!(native_error, typed_native_error.to_string());
         assert_eq!(runtime.id_gen.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.interface_registry.len(), 0);
         assert!(
@@ -7907,6 +8356,77 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("exact spawned RNode did not close");
         assert!(observed.ends_with(&rns_interface::rnode::build_detach_sequence()));
+        peer.join().unwrap();
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn strict_observed_rnode_spawn_registers_exact_admitted_driver() {
+        use rns_interface::{kiss, rnode};
+
+        let template =
+            rnode::RNodeConfig::new("strict-atomic-observer-template", "tcp://127.0.0.1:1");
+        let (port, closed_rx, peer) = test_strict_ready_rnode_tcp_peer(template.clone());
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let mut runtime = dummy_handle();
+        runtime.transport_tx = transport_tx;
+
+        let spawned = spawn_rnode_runtime_observed_with_options(
+            &runtime,
+            test_rnode_runtime_args("strict-atomic-observer", &port),
+            rnode::RNodeStartupOptions::require_capability_admission(),
+        )
+        .await
+        .expect("spawn strict observed runtime RNode");
+        let registered = runtime
+            .rnode_runtime(spawned.interface_id)
+            .expect("registered exact strict RNode observer");
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::RegisterInterface {
+                id: registered_id,
+                ..
+            }) if registered_id == spawned.interface_id
+        ));
+
+        let ready = spawned
+            .observer
+            .await_ready(Duration::from_secs(2))
+            .await
+            .expect("strict spawned RNode readiness");
+        assert_eq!(ready.capability, rnode::RNodeCapabilityState::Verified);
+        let registered_ready = registered
+            .await_ready(Duration::ZERO)
+            .await
+            .expect("registered strict observer shares ready publication");
+        assert!(Arc::ptr_eq(&ready, &registered_ready));
+
+        teardown_rnode_interface(&runtime, spawned.interface_id).await;
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::DeregisterInterface {
+                id: deregistered_id
+            }) if deregistered_id == spawned.interface_id
+        ));
+        let observed = closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("strict spawned RNode did not close");
+        let capability_request = kiss::frame_with_command(rnode::CMD_ROM_READ, &[0]);
+        let init = rnode::build_init_sequence(&template);
+        let capability_positions: Vec<_> = observed
+            .windows(capability_request.len())
+            .enumerate()
+            .filter_map(|(index, window)| {
+                (window == capability_request.as_slice()).then_some(index)
+            })
+            .collect();
+        assert_eq!(capability_positions.len(), 1);
+        let init_position = observed
+            .windows(init.len())
+            .position(|window| window == init.as_slice())
+            .expect("strict startup init sequence missing");
+        assert!(capability_positions[0] < init_position);
+        assert!(observed.ends_with(&rnode::build_detach_sequence()));
         peer.join().unwrap();
     }
 
@@ -11163,6 +11683,157 @@ enabled = yes
             .recv_timeout(Duration::from_secs(2))
             .expect("configured RNode did not close");
         assert!(observed.ends_with(&rns_interface::rnode::build_detach_sequence()));
+        peer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn strict_init_exposes_exact_successfully_registered_configured_rnode() {
+        use rns_interface::{kiss, rnode};
+
+        let template = rnode::RNodeConfig::new("Strict Configured RNode", "tcp://127.0.0.1:1");
+        let (port, closed_rx, peer) = test_strict_ready_rnode_tcp_peer(template.clone());
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "reticulum_rs_configured_strict_rnode_observer_{nonce}"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config"),
+            format!(
+                "[reticulum]\nshare_instance = No\nenable_transport = No\npanic_on_interface_error = Yes\n\n[interfaces]\n\n[[Strict Configured RNode]]\ntype = RNodeInterface\nenabled = Yes\nport = {port}\nfrequency = {}\nbandwidth = {}\nspreadingfactor = {}\ncodingrate = {}\ntxpower = {}\n",
+                template.frequency,
+                template.bandwidth,
+                template.spreading_factor,
+                template.coding_rate,
+                template.tx_power,
+            ),
+        )
+        .unwrap();
+
+        let handle = init_with_options_and_rnode_startup_options(
+            Some(dir.to_str().unwrap()),
+            None,
+            ShutdownSignal::new(),
+            Arc::new(AtomicBool::new(true)),
+            InitOptions::default(),
+            rnode::RNodeStartupOptions::require_capability_admission(),
+        )
+        .await
+        .expect("strict configured RNode init");
+
+        let configured = handle.startup_rnode_runtimes();
+        assert_eq!(configured.len(), 1);
+        let runtime = &configured[0];
+        assert_eq!(runtime.configured_name, "Strict Configured RNode");
+        let ready = runtime
+            .observer
+            .await_ready(Duration::from_secs(2))
+            .await
+            .expect("strict configured observer readiness");
+        assert_eq!(ready.capability, rnode::RNodeCapabilityState::Verified);
+        let registry_ready = handle
+            .rnode_runtime(runtime.interface_id)
+            .expect("same exact strict configured registry record")
+            .await_ready(Duration::ZERO)
+            .await
+            .expect("strict registry observer shares ready publication");
+        assert!(Arc::ptr_eq(&ready, &registry_ready));
+
+        handle.shutdown_and_wait().await;
+        let observed = closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("strict configured RNode did not close");
+        let capability_request = kiss::frame_with_command(rnode::CMD_ROM_READ, &[0]);
+        let init = rnode::build_init_sequence(&template);
+        let capability_positions: Vec<_> = observed
+            .windows(capability_request.len())
+            .enumerate()
+            .filter_map(|(index, window)| {
+                (window == capability_request.as_slice()).then_some(index)
+            })
+            .collect();
+        assert_eq!(capability_positions.len(), 1);
+        let init_position = observed
+            .windows(init.len())
+            .position(|window| window == init.as_slice())
+            .expect("strict configured init sequence missing");
+        assert!(capability_positions[0] < init_position);
+        assert!(observed.ends_with(&rnode::build_detach_sequence()));
+        peer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn configured_rnode_init_routes_explicit_strict_startup_policy() {
+        use rns_interface::{kiss, rnode};
+
+        let template = rnode::RNodeConfig::new("Strict Configured RNode", "tcp://127.0.0.1:1");
+        let mut responses = Vec::new();
+        kiss::frame_with_command_into(rnode::CMD_DETECT, &[rnode::DETECT_RESP], &mut responses);
+        kiss::frame_with_command_into(
+            rnode::CMD_FW_VERSION,
+            &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+            &mut responses,
+        );
+        kiss::frame_with_command_into(rnode::CMD_ROM_READ, &[0], &mut responses);
+        let (port, closed_rx, peer) = test_rnode_tcp_peer_with_responses(responses);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("reticulum_rs_configured_strict_rnode_{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config"),
+            format!(
+                "[reticulum]\nshare_instance = No\nenable_transport = No\npanic_on_interface_error = Yes\n\n[interfaces]\n\n[[Strict Configured RNode]]\ntype = RNodeInterface\nenabled = Yes\nport = {port}\nfrequency = {}\nbandwidth = {}\nspreadingfactor = {}\ncodingrate = {}\ntxpower = {}\n",
+                template.frequency,
+                template.bandwidth,
+                template.spreading_factor,
+                template.coding_rate,
+                template.tx_power,
+            ),
+        )
+        .unwrap();
+
+        let result = init_with_options_and_rnode_startup_options(
+            Some(dir.to_str().unwrap()),
+            None,
+            ShutdownSignal::new(),
+            Arc::new(AtomicBool::new(true)),
+            InitOptions::default(),
+            rnode::RNodeStartupOptions::require_capability_admission(),
+        )
+        .await;
+
+        match result {
+            Err(ReticulumError::Interface(message)) => assert!(
+                message.contains("EEPROM capability image"),
+                "unexpected strict configured error: {message}"
+            ),
+            Err(error) => panic!("unexpected strict configured error: {error}"),
+            Ok(handle) => {
+                handle.shutdown_and_wait().await;
+                panic!("strict configured startup accepted an invalid capability image");
+            }
+        }
+        let observed = closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("strict configured RNode connection did not close");
+        let capability_request = kiss::frame_with_command(rnode::CMD_ROM_READ, &[0]);
+        assert!(
+            observed
+                .windows(capability_request.len())
+                .any(|window| window == capability_request.as_slice()),
+            "strict configured startup must request capability admission"
+        );
         peer.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
