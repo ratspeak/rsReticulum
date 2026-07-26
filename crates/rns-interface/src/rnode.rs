@@ -1,6 +1,7 @@
 //! LoRa radio control via RNode firmware's extended-KISS protocol.
 //! Shared constants + transport-agnostic response handler. Serial:
-//! [`spawn_rnode_interface`] (feature `serial`); BLE: [`crate::ble_rnode`].
+//! [`spawn_rnode_interface`] (feature `serial`); BLE: the optional
+//! `ble_rnode` module (feature `ble`).
 //!
 //! Transport selection is driven by the `port` string in [`RNodeConfig`]:
 //!   - `/dev/ttyUSB0`, `COM3`, etc.  -> serial (feature `serial` required)

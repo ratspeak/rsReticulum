@@ -125,7 +125,7 @@ struct Args {
     #[arg(short = 'q', long, action = clap::ArgAction::Count)]
     quiet: u8,
 
-    /// Run as service and log to <configdir>/logfile.
+    /// Run as service and log to `<configdir>/logfile`.
     #[arg(short = 's', long)]
     service: bool,
 

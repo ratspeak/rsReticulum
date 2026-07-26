@@ -65,8 +65,8 @@ pub struct ReceiverConfig {
 }
 
 /// Result of a single announce classification. Returned by
-/// [`process_event`] so tests can assert on decisions without needing a
-/// live tokio task.
+/// [`ReceiverConfig::process_event`] so tests can assert on decisions without
+/// needing a live tokio task.
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
     /// Announce accepted and upserted.
