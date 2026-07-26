@@ -1515,6 +1515,31 @@ impl Link {
         self.establishment_rate.map(|rate| rate * 8.0)
     }
 
+    /// Negotiated MTU for an active Link.
+    pub fn get_mtu(&self) -> Option<u32> {
+        (self.state == LinkState::Active).then_some(self.mtu)
+    }
+
+    /// Negotiated encrypted-payload MDU for an active Link.
+    pub fn get_mdu(&self) -> Option<usize> {
+        (self.state == LinkState::Active).then_some(self.mdu)
+    }
+
+    /// Negotiated Link mode.
+    pub const fn get_mode(&self) -> u8 {
+        self.mode
+    }
+
+    /// Duration since activation, or `None` before the Link is established.
+    pub fn age(&self) -> Option<Duration> {
+        self.activated_at.map(|activated| activated.elapsed())
+    }
+
+    /// Python-compatible Link age in seconds.
+    pub fn get_age(&self) -> Option<f64> {
+        self.age().map(|age| age.as_secs_f64())
+    }
+
     /// Expected in-flight rate in bits/sec for an active link; `None` until the
     /// first resource transfer completes.
     pub fn get_expected_rate(&self) -> Option<f64> {
@@ -2000,6 +2025,29 @@ mod tests {
         let initiator_rate_bps = initiator.get_establishment_rate().unwrap();
         let initiator_rate_bytes = initiator.establishment_rate.unwrap();
         assert!((initiator_rate_bps - initiator_rate_bytes * 8.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn active_link_metric_accessors_gate_negotiated_sizes_and_report_age() {
+        let (mut link, _) = Link::new_initiator([0xA4; 16], 1);
+        assert_eq!(link.get_mtu(), None);
+        assert_eq!(link.get_mdu(), None);
+        assert_eq!(link.get_age(), None);
+        assert_eq!(link.get_mode(), link.mode);
+
+        link.state = LinkState::Active;
+        link.activated_at = Instant::now().checked_sub(Duration::from_millis(10));
+        assert_eq!(link.get_mtu(), Some(link.mtu));
+        assert_eq!(link.get_mdu(), Some(link.mdu));
+        assert!(
+            link.age()
+                .is_some_and(|age| age >= Duration::from_millis(10))
+        );
+        assert!(link.get_age().is_some_and(|age| age >= 0.01));
+
+        link.state = LinkState::Stale;
+        assert_eq!(link.get_mtu(), None);
+        assert_eq!(link.get_mdu(), None);
     }
 
     #[test]
