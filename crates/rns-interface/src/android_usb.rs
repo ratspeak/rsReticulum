@@ -10,14 +10,16 @@ use tokio::sync::{mpsc, watch};
 
 use crate::android_usb_lifecycle::{
     OwnedUsbIo, UsbConnectionCleanup, UsbConnectionLifecycle, UsbInboundOutcome, UsbInboundState,
-    UsbIoEvent, UsbLeaseTable, UsbReadDrainOutcome, UsbReadResult, UsbReaderBackend,
-    UsbShutdownReport, UsbTransferError, UsbTxPumpExit, UsbWriterBackend, drain_usb_reader_tail,
-    forward_usb_read_chunk, run_usb_rnode_startup, run_usb_tx_pump, spawn_owned_usb_io,
+    UsbIoEvent, UsbLeaseTable, UsbRNodeCapabilityAdmission, UsbRNodeCapabilityStartupError,
+    UsbReadDrainOutcome, UsbReadResult, UsbReaderBackend, UsbShutdownReport, UsbTransferError,
+    UsbTxPumpExit, UsbWriterBackend, drain_usb_reader_tail, forward_usb_read_chunk,
+    run_usb_rnode_capability_startup, run_usb_rnode_startup, run_usb_tx_pump, spawn_owned_usb_io,
 };
 #[cfg(test)]
 use crate::kiss;
 use crate::rnode::{
-    self, RNodeDriverShutdown, RNodeRuntimeReason, RNodeTransportClass, SpawnedRNodeInterface,
+    self, RNodeDriverShutdown, RNodeRuntimeReason, RNodeSpawnError, RNodeStartupOptions,
+    RNodeTransportClass, SpawnedRNodeInterface,
 };
 use crate::rnode_protocol::RNodeProtocolTarget;
 use crate::traits::{
@@ -32,6 +34,7 @@ const USB_WRITE_TIMEOUT_MS: i32 = 1_000;
 const USB_READ_TIMEOUT_MS: i32 = 100;
 const USB_DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_millis(USB_WRITE_TIMEOUT_MS as u64);
 const USB_STARTUP_ACK_DEADLINE: Duration = Duration::from_secs(2);
+const USB_CAPABILITY_RESPONSE_DEADLINE: Duration = Duration::from_secs(5);
 const USB_DETACH_ACK_DEADLINE: Duration = Duration::from_millis(500);
 const USB_WORKER_JOIN_DEADLINE: Duration = Duration::from_millis(1_250);
 
@@ -1126,6 +1129,21 @@ async fn open_usb_serial(
     Ok((io, online))
 }
 
+/// Explicitly quiesce and release an Android USB session that failed before
+/// publication. Strict capability rejection must never fall through
+/// `OwnedUsbIo::drop`, whose only safe fallback is permanent quarantine.
+async fn shutdown_failed_android_usb_startup(
+    usb: OwnedUsbIo<JniUsbConnectionOwner>,
+    init_may_have_started: bool,
+) -> Option<String> {
+    let detach = init_may_have_started.then(rnode::build_detach_sequence);
+    usb.shutdown(detach, USB_DETACH_ACK_DEADLINE, USB_WORKER_JOIN_DEADLINE)
+        .await
+        .report
+        .as_result()
+        .err()
+}
+
 /// Same shape as the serial/BLE RNode interfaces, but over Android USB.
 pub async fn spawn_android_usb_rnode_interface(
     config: AndroidUsbConfig,
@@ -1146,6 +1164,28 @@ pub async fn spawn_android_usb_rnode_interface_with_driver(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<SpawnedRNodeInterface, InterfaceError> {
+    spawn_android_usb_rnode_interface_with_driver_and_options(
+        config,
+        id,
+        transport_tx,
+        RNodeStartupOptions::default(),
+    )
+    .await
+    .map_err(RNodeSpawnError::into_legacy_interface_error)
+}
+
+/// Spawn Android USB with an explicit startup policy and local observation.
+///
+/// [`RNodeStartupOptions::default`] preserves the historical two-write startup
+/// sequence exactly. Strict admission inserts one bounded ROM_READ(0) on the
+/// same owned session between Detect and Init and preserves deterministic
+/// capability failures as [`RNodeSpawnError::CapabilityAdmission`].
+pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
+    config: AndroidUsbConfig,
+    id: InterfaceId,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    options: RNodeStartupOptions,
+) -> Result<SpawnedRNodeInterface, RNodeSpawnError> {
     config.validate().map_err(|error| {
         InterfaceError::SendFailed(format!("rnode config {}: {error}", error.field()))
     })?;
@@ -1165,7 +1205,62 @@ pub async fn spawn_android_usb_rnode_interface_with_driver(
     // sequence reaches the device.
     let rnode_cfg = rnode_config_from_android_usb_config(&config);
     let init_bytes = rnode::build_init_sequence(&rnode_cfg);
-    if let Err(error) = run_usb_rnode_startup(
+    let capability_admission = if options.requires_capability_admission() {
+        match run_usb_rnode_capability_startup(
+            &mut usb,
+            rnode::RNodeRadioSettings::from(&rnode_cfg),
+            rnode::build_detect_sequence(),
+            init_bytes,
+            USB_STARTUP_ACK_DEADLINE,
+            USB_CAPABILITY_RESPONSE_DEADLINE,
+        )
+        .await
+        {
+            Ok(admission) => Some(admission),
+            Err(error) => {
+                let init_may_have_started =
+                    matches!(&error, UsbRNodeCapabilityStartupError::Initialise(_));
+                let cleanup = shutdown_failed_android_usb_startup(usb, init_may_have_started).await;
+                return Err(match error {
+                    UsbRNodeCapabilityStartupError::Capability(error) => {
+                        if let Some(cleanup) = cleanup {
+                            tracing::warn!(
+                                name = %config.name,
+                                class = error.log_class(),
+                                cleanup = %cleanup,
+                                "Android USB capability rejection cleanup completed with errors"
+                            );
+                        }
+                        RNodeSpawnError::CapabilityAdmission(error)
+                    }
+                    UsbRNodeCapabilityStartupError::Write(error) => {
+                        let cleanup = cleanup
+                            .map(|cleanup| format!("; cleanup: {cleanup}"))
+                            .unwrap_or_default();
+                        RNodeSpawnError::Interface(InterfaceError::SendFailed(format!(
+                            "Android USB RNode capability startup failed: {error}{cleanup}"
+                        )))
+                    }
+                    UsbRNodeCapabilityStartupError::Initialise(error) => {
+                        let cleanup = cleanup
+                            .map(|cleanup| format!("; cleanup: {cleanup}"))
+                            .unwrap_or_default();
+                        RNodeSpawnError::Interface(InterfaceError::SendFailed(format!(
+                            "Android USB RNode capability init failed: {error}{cleanup}"
+                        )))
+                    }
+                    UsbRNodeCapabilityStartupError::Transport(error) => {
+                        let cleanup = cleanup
+                            .map(|cleanup| format!("; cleanup: {cleanup}"))
+                            .unwrap_or_default();
+                        RNodeSpawnError::Interface(InterfaceError::SendFailed(format!(
+                            "Android USB RNode capability startup failed: {error}{cleanup}"
+                        )))
+                    }
+                });
+            }
+        }
+    } else if let Err(error) = run_usb_rnode_startup(
         &usb.writer,
         rnode::build_detect_sequence(),
         init_bytes,
@@ -1173,18 +1268,16 @@ pub async fn spawn_android_usb_rnode_interface_with_driver(
     )
     .await
     {
-        let shutdown = usb
-            .shutdown(None, USB_DETACH_ACK_DEADLINE, USB_WORKER_JOIN_DEADLINE)
-            .await;
-        let cleanup = shutdown.report.as_result();
+        let cleanup = shutdown_failed_android_usb_startup(usb, false).await;
         let cleanup = cleanup
-            .err()
             .map(|cleanup| format!("; cleanup: {cleanup}"))
             .unwrap_or_default();
-        return Err(InterfaceError::SendFailed(format!(
-            "Android USB RNode startup failed: {error}{cleanup}"
+        return Err(RNodeSpawnError::Interface(InterfaceError::SendFailed(
+            format!("Android USB RNode startup failed: {error}{cleanup}"),
         )));
-    }
+    } else {
+        None
+    };
 
     let shared_txb = Arc::new(AtomicU64::new(0));
     let shared_rxb = Arc::new(AtomicU64::new(0));
@@ -1195,7 +1288,19 @@ pub async fn spawn_android_usb_rnode_interface_with_driver(
         RNodeTransportClass::Usb,
         RNodeDriverShutdown::from_stop_sender(stop_tx.clone()),
     );
-    snapshot_publisher.connection_established();
+    let initial_protocol_state = match capability_admission {
+        Some(UsbRNodeCapabilityAdmission {
+            protocol_state,
+            admission,
+        }) => {
+            snapshot_publisher.capability_connection_established(&protocol_state, admission);
+            Some(protocol_state)
+        }
+        None => {
+            snapshot_publisher.connection_established();
+            None
+        }
+    };
     let (shutdown_status_tx, shutdown_status_rx) =
         watch::channel(AndroidUsbShutdownStatus::Running);
     let stop_guard = register_android_usb_rnode_stop(id, stop_tx, shutdown_status_rx);
@@ -1214,7 +1319,12 @@ pub async fn spawn_android_usb_rnode_interface_with_driver(
             let exit = run_usb_tx_pump(app_rx, pump_writer, pump_txb, tx_pump_stop_rx).await;
             let _ = tx_pump_exit_tx.send(exit);
         });
-        let mut inbound = UsbInboundState::projected(protocol_target, snapshot_publisher);
+        let mut inbound = match initial_protocol_state {
+            Some(protocol_state) => {
+                UsbInboundState::projected_with_protocol_state(protocol_state, snapshot_publisher)
+            }
+            None => UsbInboundState::projected(protocol_target, snapshot_publisher),
+        };
         let mut stop_requested = false;
         let mut drain_reader_tail = false;
         let mut terminal_reason = RNodeRuntimeReason::DriverTerminated;
@@ -1453,10 +1563,23 @@ mod tests {
     {
     }
 
+    fn assert_options_driver_shape<F, Fut>(_spawn: F)
+    where
+        F: Fn(
+            AndroidUsbConfig,
+            InterfaceId,
+            mpsc::Sender<TransportMessage>,
+            RNodeStartupOptions,
+        ) -> Fut,
+        Fut: Future<Output = Result<SpawnedRNodeInterface, RNodeSpawnError>>,
+    {
+    }
+
     #[test]
     fn android_usb_spawn_api_keeps_the_facade_and_adds_the_driver_shape() {
         assert_facade_shape(spawn_android_usb_rnode_interface);
         assert_driver_shape(spawn_android_usb_rnode_interface_with_driver);
+        assert_options_driver_shape(spawn_android_usb_rnode_interface_with_driver_and_options);
         let _usb_transport: RNodeTransportClass = RNodeTransportClass::Usb;
     }
 

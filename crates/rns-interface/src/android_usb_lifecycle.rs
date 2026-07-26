@@ -14,12 +14,18 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::kiss;
-use crate::rnode::{self, RNodeRuntimeReason, RNodeSnapshotPublisher};
+use crate::rnode::{
+    self, RNodeCapabilityAdmissionError, RNodeRadioSettings, RNodeRuntimeReason,
+    RNodeSnapshotPublisher,
+};
+use crate::rnode_capabilities::RNodeRadioAdmission;
+use crate::rnode_capability_preflight::RNodeCapabilityPreflight;
 use crate::rnode_protocol::{RNodeProtocolState, RNodeProtocolTarget};
 use crate::traits::InterfaceId;
 use rns_transport::messages::TransportMessage;
 
 const MIN_TRANSFER_TIMEOUT: Duration = Duration::from_millis(1);
+const USB_READER_BOUNDARY_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,6 +156,7 @@ impl<R> UsbLeaseTable<R> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UsbWritePhase {
     Detect,
+    Capability,
     Initialise,
     Packet,
     Detach,
@@ -159,6 +166,7 @@ impl UsbWritePhase {
     const fn label(self) -> &'static str {
         match self {
             Self::Detect => "detect",
+            Self::Capability => "capability",
             Self::Initialise => "init",
             Self::Packet => "packet",
             Self::Detach => "detach",
@@ -282,6 +290,7 @@ struct UsbWriteRequest {
     bytes: Vec<u8>,
     deadline: Option<Instant>,
     acknowledgement: Option<oneshot::Sender<Result<(), UsbWriteFailure>>>,
+    await_terminal_detach_on_failure: bool,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -326,6 +335,18 @@ impl UsbWriteQueue {
         deadline: Option<Instant>,
         acknowledgement: Option<oneshot::Sender<Result<(), UsbWriteFailure>>>,
     ) -> Result<(), UsbWriteFailure> {
+        self.enqueue_with_failure_policy(phase, bytes, deadline, acknowledgement, false)
+            .await
+    }
+
+    async fn enqueue_with_failure_policy(
+        &self,
+        phase: UsbWritePhase,
+        bytes: Vec<u8>,
+        deadline: Option<Instant>,
+        acknowledgement: Option<oneshot::Sender<Result<(), UsbWriteFailure>>>,
+        await_terminal_detach_on_failure: bool,
+    ) -> Result<(), UsbWriteFailure> {
         let permit = self
             .inner
             .slots
@@ -352,6 +373,7 @@ impl UsbWriteQueue {
             bytes,
             deadline,
             acknowledgement,
+            await_terminal_detach_on_failure,
             _permit: Some(permit),
         });
         drop(state);
@@ -388,6 +410,7 @@ impl UsbWriteQueue {
             bytes,
             deadline: Some(deadline),
             acknowledgement: Some(acknowledgement),
+            await_terminal_detach_on_failure: false,
             _permit: None,
         });
         drop(state);
@@ -505,9 +528,22 @@ impl UsbInboundState {
         target: RNodeProtocolTarget,
         publisher: RNodeSnapshotPublisher,
     ) -> Self {
+        Self::projected_with_protocol_state(RNodeProtocolState::new(target), publisher)
+    }
+
+    /// Begin active processing from a capability-admitted protocol seed.
+    ///
+    /// Only DETECT and supported-firmware evidence can cross this boundary;
+    /// [`RNodeCapabilityPreflight::into_protocol_state`] deliberately drops
+    /// every pre-init RF echo and any partial framing. Fresh init responses
+    /// must still satisfy readiness after this state becomes active.
+    pub(crate) fn projected_with_protocol_state(
+        protocol: RNodeProtocolState,
+        publisher: RNodeSnapshotPublisher,
+    ) -> Self {
         Self {
             projection: Some(UsbRNodeProjection {
-                protocol: RNodeProtocolState::new(target),
+                protocol,
                 publisher,
             }),
             ..Self::new()
@@ -774,6 +810,7 @@ where
     let _worker_guard = UsbWriteWorkerGuard {
         queue: queue.clone(),
     };
+    let mut terminal_detach_only = false;
     while running.load(Ordering::Acquire) {
         let Some(request) = queue.recv() else {
             return UsbWriterExit::Stopped;
@@ -782,12 +819,33 @@ where
             return UsbWriterExit::Stopped;
         }
         let phase = request.phase;
+        if terminal_detach_only && phase != UsbWritePhase::Detach {
+            let failure = UsbWriteFailure {
+                phase,
+                kind: UsbWriteFailureKind::QueueClosed,
+            };
+            if let Some(acknowledgement) = request.acknowledgement {
+                let _ = acknowledgement.send(Err(failure));
+            }
+            online.store(false, Ordering::Release);
+            return UsbWriterExit::Failed(
+                "non-detach write followed an ambiguous USB init failure".into(),
+            );
+        }
+        debug_assert!(
+            !request.await_terminal_detach_on_failure || phase == UsbWritePhase::Initialise
+        );
+        let await_terminal_detach_on_failure = request.await_terminal_detach_on_failure;
         let result = write_request(&mut backend, &request, default_timeout);
         if let Some(acknowledgement) = request.acknowledgement {
             let _ = acknowledgement.send(result.clone());
         }
         if let Err(failure) = result {
             online.store(false, Ordering::Release);
+            if await_terminal_detach_on_failure {
+                terminal_detach_only = true;
+                continue;
+            }
             return UsbWriterExit::Failed(failure.to_string());
         }
         if phase == UsbWritePhase::Detach {
@@ -801,11 +859,56 @@ fn send_usb_read_chunk(sender: &mpsc::Sender<UsbIoEvent>, bytes: Vec<u8>) -> boo
     sender.blocking_send(UsbIoEvent::Read(bytes)).is_ok()
 }
 
+/// One-shot receive-side barrier used only around strict Init admission.
+///
+/// A pause is acknowledged only after the reader observes an idle physical
+/// read. Every completed pre-boundary data read is therefore enqueued first,
+/// and continuous traffic fails the bounded barrier instead of being mistaken
+/// for fresh post-init evidence.
+struct UsbReaderBoundary {
+    pause_requested: AtomicBool,
+    paused_after_idle: AtomicBool,
+}
+
+impl UsbReaderBoundary {
+    fn new() -> Self {
+        Self {
+            pause_requested: AtomicBool::new(false),
+            paused_after_idle: AtomicBool::new(false),
+        }
+    }
+
+    fn request_pause(&self) {
+        self.paused_after_idle.store(false, Ordering::Release);
+        self.pause_requested.store(true, Ordering::Release);
+    }
+
+    fn is_paused_after_idle(&self) -> bool {
+        self.paused_after_idle.load(Ordering::Acquire)
+    }
+
+    fn resume(&self) {
+        self.pause_requested.store(false, Ordering::Release);
+    }
+
+    fn pause_after_idle_if_requested(&self, running: &AtomicBool) {
+        if !self.pause_requested.load(Ordering::Acquire) {
+            return;
+        }
+        self.paused_after_idle.store(true, Ordering::Release);
+        while self.pause_requested.load(Ordering::Acquire) && running.load(Ordering::Acquire) {
+            std::thread::sleep(USB_READER_BOUNDARY_POLL_INTERVAL);
+        }
+        self.paused_after_idle.store(false, Ordering::Release);
+    }
+}
+
 fn run_usb_reader<R>(
     mut backend: R,
     event_tx: mpsc::Sender<UsbIoEvent>,
     running: Arc<AtomicBool>,
     online: Arc<AtomicBool>,
+    boundary: Arc<UsbReaderBoundary>,
 ) -> UsbReaderExit
 where
     R: UsbReaderBackend,
@@ -826,7 +929,7 @@ where
             }
             // Android bulkTransfer uses -1 for an ordinary finite read
             // timeout. The adapter maps every non-positive count here.
-            Ok(UsbReadResult::Idle) => {}
+            Ok(UsbReadResult::Idle) => boundary.pause_after_idle_if_requested(&running),
             Err(error) => {
                 online.store(false, Ordering::Release);
                 return UsbReaderExit::Failed(error);
@@ -848,10 +951,36 @@ impl UsbWriterHandle {
         bytes: Vec<u8>,
         timeout: Duration,
     ) -> Result<(), UsbWriteFailure> {
+        self.request_before_with_failure_policy(phase, bytes, timeout, false)
+            .await
+    }
+
+    async fn request_initialise_before_terminal_detach(
+        &self,
+        bytes: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<(), UsbWriteFailure> {
+        self.request_before_with_failure_policy(UsbWritePhase::Initialise, bytes, timeout, true)
+            .await
+    }
+
+    async fn request_before_with_failure_policy(
+        &self,
+        phase: UsbWritePhase,
+        bytes: Vec<u8>,
+        timeout: Duration,
+        await_terminal_detach_on_failure: bool,
+    ) -> Result<(), UsbWriteFailure> {
         let deadline = Instant::now() + timeout;
         let (acknowledgement, result) = oneshot::channel();
         self.queue
-            .enqueue(phase, bytes, Some(deadline), Some(acknowledgement))
+            .enqueue_with_failure_policy(
+                phase,
+                bytes,
+                Some(deadline),
+                Some(acknowledgement),
+                await_terminal_detach_on_failure,
+            )
             .await?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -902,6 +1031,153 @@ pub(crate) async fn run_usb_rnode_startup(
     writer
         .request_before(UsbWritePhase::Initialise, init_bytes, phase_timeout)
         .await
+}
+
+/// Successful strict startup evidence retained for the active USB session.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) struct UsbRNodeCapabilityAdmission {
+    pub(crate) protocol_state: RNodeProtocolState,
+    pub(crate) admission: RNodeRadioAdmission,
+}
+
+/// Failure classes from strict USB startup before an interface is published.
+///
+/// Capability failures remain typed for the options-aware public API. Worker
+/// and acknowledged-write failures remain transport/interface failures.
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) enum UsbRNodeCapabilityStartupError {
+    Write(UsbWriteFailure),
+    Initialise(UsbWriteFailure),
+    Capability(RNodeCapabilityAdmissionError),
+    Transport(String),
+}
+
+fn observe_usb_capability_event(
+    preflight: &mut RNodeCapabilityPreflight,
+    event: UsbIoEvent,
+) -> Result<Option<RNodeRadioAdmission>, UsbRNodeCapabilityStartupError> {
+    match event {
+        UsbIoEvent::Read(bytes) => preflight
+            .observe_read(&bytes)
+            .map_err(UsbRNodeCapabilityStartupError::Capability),
+        UsbIoEvent::Writer(exit) => Err(UsbRNodeCapabilityStartupError::Transport(format!(
+            "Android USB capability writer ended: {exit:?}"
+        ))),
+        UsbIoEvent::Reader(exit) => Err(UsbRNodeCapabilityStartupError::Transport(format!(
+            "Android USB capability reader ended: {exit:?}"
+        ))),
+    }
+}
+
+/// Run capability admission on the already-owned USB session and event stream.
+///
+/// The strict wire order is Detect, one ROM_READ(0), bounded response
+/// consumption, and only then Init. Reads are consumed from `usb.events`, so
+/// there is no second reader and no ownership race. All preflight CMD_DATA and
+/// partial KISS state are discarded by the shared preflight before this
+/// function returns.
+pub(crate) async fn run_usb_rnode_capability_startup<O>(
+    usb: &mut OwnedUsbIo<O>,
+    settings: RNodeRadioSettings,
+    detect_bytes: Vec<u8>,
+    init_bytes: Vec<u8>,
+    phase_timeout: Duration,
+    response_timeout: Duration,
+) -> Result<UsbRNodeCapabilityAdmission, UsbRNodeCapabilityStartupError>
+where
+    O: UsbConnectionLifecycle,
+{
+    usb.writer
+        .request_before(UsbWritePhase::Detect, detect_bytes, phase_timeout)
+        .await
+        .map_err(UsbRNodeCapabilityStartupError::Write)?;
+    usb.writer
+        .request_before(
+            UsbWritePhase::Capability,
+            crate::rnode_capability_preflight::build_rnode_capability_request(),
+            phase_timeout,
+        )
+        .await
+        .map_err(UsbRNodeCapabilityStartupError::Write)?;
+
+    let deadline = tokio::time::Instant::now() + response_timeout;
+    let mut preflight = RNodeCapabilityPreflight::new(settings);
+    let admission = loop {
+        let event = tokio::time::timeout_at(deadline, usb.events.recv())
+            .await
+            .map_err(|_| {
+                UsbRNodeCapabilityStartupError::Capability(
+                    RNodeCapabilityAdmissionError::ResponseTimedOut,
+                )
+            })?
+            .ok_or_else(|| {
+                UsbRNodeCapabilityStartupError::Transport(
+                    "Android USB capability event stream closed".into(),
+                )
+            })?;
+
+        if let Some(admission) = observe_usb_capability_event(&mut preflight, event)? {
+            break admission;
+        }
+    };
+
+    // Stop the sole reader only after it has drained every immediately
+    // available pre-init physical read and observed an idle read. Consume the
+    // ordered event tail while waiting so a full bounded queue cannot deadlock
+    // the reader before it acknowledges the boundary.
+    usb.request_reader_boundary();
+    let boundary_deadline = tokio::time::Instant::now() + phase_timeout;
+    while !usb.reader_boundary_reached() {
+        if tokio::time::Instant::now() >= boundary_deadline {
+            return Err(UsbRNodeCapabilityStartupError::Transport(
+                "Android USB capability reader boundary timed out".into(),
+            ));
+        }
+        tokio::select! {
+            biased;
+            event = usb.events.recv() => {
+                let event = event.ok_or_else(|| {
+                    UsbRNodeCapabilityStartupError::Transport(
+                        "Android USB capability event stream closed at reader boundary".into(),
+                    )
+                })?;
+                let _ = observe_usb_capability_event(&mut preflight, event)?;
+            }
+            _ = tokio::time::sleep(USB_READER_BOUNDARY_POLL_INTERVAL) => {}
+        }
+    }
+
+    // The reader publishes `paused_after_idle` only after its last completed
+    // pre-init read is enqueued. No producer can add another Read until resume,
+    // so this finite drain closes the queue-side freshness race.
+    loop {
+        match usb.events.try_recv() {
+            Ok(event) => {
+                let _ = observe_usb_capability_event(&mut preflight, event)?;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                return Err(UsbRNodeCapabilityStartupError::Transport(
+                    "Android USB capability event stream closed at reader boundary".into(),
+                ));
+            }
+        }
+    }
+
+    let init_result = usb
+        .writer
+        .request_initialise_before_terminal_detach(init_bytes, phase_timeout)
+        .await;
+    match init_result {
+        Ok(()) => usb.resume_reader(),
+        Err(error) => return Err(UsbRNodeCapabilityStartupError::Initialise(error)),
+    }
+
+    Ok(UsbRNodeCapabilityAdmission {
+        protocol_state: preflight.into_protocol_state(),
+        admission,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1024,6 +1300,7 @@ pub(crate) struct OwnedUsbIo<O: UsbConnectionLifecycle> {
     pub(crate) events: mpsc::Receiver<UsbIoEvent>,
     running: Arc<AtomicBool>,
     online: Arc<AtomicBool>,
+    reader_boundary: Arc<UsbReaderBoundary>,
     owner: Option<O>,
 }
 
@@ -1042,6 +1319,7 @@ where
     O: UsbConnectionLifecycle,
 {
     let running = Arc::new(AtomicBool::new(true));
+    let reader_boundary = Arc::new(UsbReaderBoundary::new());
     let queue = UsbWriteQueue::new(write_queue_capacity);
     let (event_tx, events) = mpsc::channel(read_queue_capacity.max(1));
 
@@ -1063,12 +1341,14 @@ where
 
     let reader_running = running.clone();
     let reader_online = online.clone();
+    let reader_boundary_task = reader_boundary.clone();
     let reader_task = tokio::task::spawn_blocking(move || {
         let exit = run_usb_reader(
             reader_backend,
             event_tx.clone(),
             reader_running,
             reader_online,
+            reader_boundary_task,
         );
         let _ = event_tx.blocking_send(UsbIoEvent::Reader(exit.clone()));
         exit
@@ -1081,6 +1361,7 @@ where
         events,
         running,
         online,
+        reader_boundary,
         owner: Some(owner),
     }
 }
@@ -1117,7 +1398,20 @@ where
     pub(crate) fn request_worker_stop(&self) {
         self.running.store(false, Ordering::Release);
         self.online.store(false, Ordering::Release);
+        self.reader_boundary.resume();
         self.writer.queue.cancel_and_wake();
+    }
+
+    fn request_reader_boundary(&self) {
+        self.reader_boundary.request_pause();
+    }
+
+    fn reader_boundary_reached(&self) -> bool {
+        self.reader_boundary.is_paused_after_idle()
+    }
+
+    fn resume_reader(&self) {
+        self.reader_boundary.resume();
     }
 }
 
@@ -1287,6 +1581,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use md5::{Digest, Md5};
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
 
@@ -1386,6 +1681,34 @@ mod tests {
         }
     }
 
+    /// Delay a synthetic device response until both strict control writes
+    /// have reached the same fake writer. This makes the test exercise the
+    /// owned-session wire order instead of pre-buffering a response.
+    struct CapabilityResponseReader {
+        writer_calls: RecordedWriteCalls,
+        responses: VecDeque<Vec<u8>>,
+    }
+
+    impl UsbReaderBackend for CapabilityResponseReader {
+        fn read(&mut self) -> Result<UsbReadResult, String> {
+            if self
+                .writer_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+                < 2
+            {
+                std::thread::sleep(Duration::from_millis(1));
+                return Ok(UsbReadResult::Idle);
+            }
+            if let Some(response) = self.responses.pop_front() {
+                return Ok(UsbReadResult::Data(response));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            Ok(UsbReadResult::Idle)
+        }
+    }
+
     struct RecordingOwner {
         events: Arc<Mutex<Vec<&'static str>>>,
         release_result: Result<(), String>,
@@ -1464,6 +1787,29 @@ mod tests {
         )
     }
 
+    fn capability_test_io(
+        writer: ScriptedWriter,
+        response: Vec<u8>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    ) -> OwnedUsbIo<RecordingOwner> {
+        let writer_calls = writer.calls.clone();
+        spawn_owned_usb_io(
+            writer,
+            CapabilityResponseReader {
+                writer_calls,
+                responses: response.chunks(512).map(|chunk| chunk.to_vec()).collect(),
+            },
+            RecordingOwner {
+                events,
+                release_result: Ok(()),
+            },
+            Arc::new(AtomicBool::new(true)),
+            8,
+            8,
+            Duration::from_millis(100),
+        )
+    }
+
     const USB_TEST_TARGET: RNodeProtocolTarget =
         RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
 
@@ -1505,6 +1851,32 @@ mod tests {
             kiss::frame_with_command_into(command, &payload, &mut wire);
         }
         wire
+    }
+
+    fn capability_eeprom(model: u8) -> Vec<u8> {
+        let mut bytes = vec![0xFF; 1024];
+        bytes[0] = 0x03;
+        bytes[1] = model;
+        bytes[2..11].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let checksum: [u8; 16] = Md5::digest(&bytes[..11]).into();
+        bytes[11..27].copy_from_slice(&checksum);
+        bytes[0x9B] = 0x73;
+        bytes
+    }
+
+    fn capability_response(model: u8) -> Vec<u8> {
+        framed_protocol_frames([
+            (rnode::CMD_DETECT, vec![rnode::DETECT_RESP]),
+            (
+                rnode::CMD_FW_VERSION,
+                vec![rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+            ),
+            (rnode::CMD_ROM_READ, capability_eeprom(model)),
+        ])
+    }
+
+    fn strict_settings() -> RNodeRadioSettings {
+        RNodeRadioSettings::new(868_000_000, 125_000, 7, 5, 14)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1574,6 +1946,540 @@ mod tests {
         let _ = io
             .shutdown(None, Duration::from_millis(20), Duration::from_secs(1))
             .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_usb_startup_orders_one_capability_request_before_init() {
+        let writer = ScriptedWriter::new([]);
+        let calls = writer.calls.clone();
+        let owner_events = Arc::new(Mutex::new(Vec::new()));
+        let mut io = capability_test_io(writer, capability_response(0xB8), owner_events);
+        let detect = rnode::build_detect_sequence();
+        let capability = crate::rnode_capability_preflight::build_rnode_capability_request();
+        let mut config = rnode::RNodeConfig::new("strict-usb", "test");
+        let settings = strict_settings();
+        config.frequency = settings.frequency;
+        config.bandwidth = settings.bandwidth;
+        config.spreading_factor = settings.spreading_factor;
+        config.coding_rate = settings.coding_rate;
+        config.tx_power = settings.tx_power;
+        let init = rnode::build_init_sequence(&config);
+
+        let admitted = run_usb_rnode_capability_startup(
+            &mut io,
+            settings,
+            detect.clone(),
+            init.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("known model should pass strict USB admission");
+        assert!(matches!(
+            admitted.admission,
+            RNodeRadioAdmission::Verified {
+                model_code: 0xB8,
+                ..
+            }
+        ));
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|(bytes, _)| bytes.clone())
+                .collect::<Vec<_>>(),
+            vec![detect, capability.clone(), init]
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|(bytes, _)| bytes == &capability)
+                .count(),
+            1,
+            "strict startup must issue exactly one ROM_READ(0)"
+        );
+
+        let shutdown = io
+            .shutdown(None, Duration::from_millis(20), Duration::from_secs(1))
+            .await;
+        assert_eq!(shutdown.report.disposition, UsbCleanupDisposition::Released);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_usb_rejection_sends_no_init_or_detach_and_releases_owner() {
+        let mut writer = ScriptedWriter::new([]);
+        let calls = writer.calls.clone();
+        let owner_events = Arc::new(Mutex::new(Vec::new()));
+        writer.events = Some(owner_events.clone());
+        let mut io = capability_test_io(writer, capability_response(0xB4), owner_events.clone());
+        let result = run_usb_rnode_capability_startup(
+            &mut io,
+            strict_settings(),
+            rnode::build_detect_sequence(),
+            vec![0xA1, 0xA2],
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(UsbRNodeCapabilityStartupError::Capability(
+                RNodeCapabilityAdmissionError::RadioSettings(
+                    crate::rnode_capabilities::RNodeRadioAdmissionError::FrequencyOutOfRange { .. }
+                )
+            ))
+        ));
+
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|(bytes, _)| bytes.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                rnode::build_detect_sequence(),
+                crate::rnode_capability_preflight::build_rnode_capability_request(),
+            ],
+            "deterministic rejection must not send init or detach"
+        );
+
+        let shutdown = io
+            .shutdown(None, Duration::from_millis(20), Duration::from_secs(1))
+            .await;
+        assert_eq!(shutdown.report.disposition, UsbCleanupDisposition::Released);
+        let owner_events = owner_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(owner_events.contains(&"release"));
+        assert!(owner_events.contains(&"close"));
+        assert!(!owner_events.contains(&"quarantined"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_usb_ambiguous_init_failure_requests_ordered_detach_cleanup() {
+        struct FailInitWriter {
+            calls: RecordedWriteCalls,
+            init: Vec<u8>,
+        }
+
+        impl UsbWriterBackend for FailInitWriter {
+            fn transfer(
+                &mut self,
+                bytes: &[u8],
+                timeout: Duration,
+            ) -> Result<i32, UsbTransferError> {
+                self.calls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((bytes.to_vec(), timeout));
+                if bytes == self.init {
+                    Err(UsbTransferError::Backend("ambiguous init failure".into()))
+                } else {
+                    Ok(bytes.len() as i32)
+                }
+            }
+        }
+
+        let settings = strict_settings();
+        let mut config = rnode::RNodeConfig::new("strict-usb-init-failure", "test");
+        config.frequency = settings.frequency;
+        config.bandwidth = settings.bandwidth;
+        config.spreading_factor = settings.spreading_factor;
+        config.coding_rate = settings.coding_rate;
+        config.tx_power = settings.tx_power;
+        let init = rnode::build_init_sequence(&config);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let owner_events = Arc::new(Mutex::new(Vec::new()));
+        let writer = FailInitWriter {
+            calls: calls.clone(),
+            init: init.clone(),
+        };
+        let writer_calls = calls.clone();
+        let response = capability_response(0xB8);
+        let mut io = spawn_owned_usb_io(
+            writer,
+            CapabilityResponseReader {
+                writer_calls,
+                responses: response.chunks(512).map(|chunk| chunk.to_vec()).collect(),
+            },
+            RecordingOwner {
+                events: owner_events.clone(),
+                release_result: Ok(()),
+            },
+            Arc::new(AtomicBool::new(true)),
+            8,
+            8,
+            Duration::from_millis(100),
+        );
+
+        let detect = rnode::build_detect_sequence();
+        let capability = crate::rnode_capability_preflight::build_rnode_capability_request();
+        let detach = rnode::build_detach_sequence();
+        let result = run_usb_rnode_capability_startup(
+            &mut io,
+            settings,
+            detect.clone(),
+            init.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(UsbRNodeCapabilityStartupError::Initialise(
+                UsbWriteFailure {
+                    phase: UsbWritePhase::Initialise,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last()
+                .map(|(bytes, _)| bytes.as_slice()),
+            Some(init.as_slice())
+        );
+
+        let shutdown = io
+            .shutdown(
+                Some(detach.clone()),
+                Duration::from_millis(20),
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(
+            shutdown.report.detach,
+            Some(Ok(())),
+            "ambiguous init must physically acknowledge ordered detach cleanup"
+        );
+        assert_eq!(shutdown.report.disposition, UsbCleanupDisposition::Released);
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|(bytes, _)| bytes.clone())
+                .collect::<Vec<_>>(),
+            vec![detect, capability, init, detach]
+        );
+        let owner_events = owner_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(owner_events.contains(&"release"));
+        assert!(owner_events.contains(&"close"));
+        assert!(!owner_events.contains(&"quarantined"));
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_usb_unknown_model_is_unverified_and_preflight_bytes_do_not_escape() {
+        let settings = strict_settings();
+        let target = RNodeProtocolTarget::new(
+            settings.frequency,
+            settings.bandwidth,
+            settings.spreading_factor,
+            settings.coding_rate,
+            settings.tx_power,
+        );
+        let mut response = Vec::new();
+        kiss::frame_with_command_into(kiss::CMD_DATA, b"preflight packet", &mut response);
+        kiss::frame_with_command_into(
+            rnode::CMD_FREQUENCY,
+            &settings.frequency.to_be_bytes(),
+            &mut response,
+        );
+        response.extend_from_slice(&capability_response(0xFE));
+        response.extend_from_slice(&[kiss::FEND, kiss::CMD_DATA, 0xAA]);
+
+        let writer = ScriptedWriter::new([]);
+        let owner_events = Arc::new(Mutex::new(Vec::new()));
+        let mut io = capability_test_io(writer, response, owner_events);
+        let mut config = rnode::RNodeConfig::new("strict-usb", "test");
+        config.frequency = settings.frequency;
+        config.bandwidth = settings.bandwidth;
+        config.spreading_factor = settings.spreading_factor;
+        config.coding_rate = settings.coding_rate;
+        config.tx_power = settings.tx_power;
+        let admitted = run_usb_rnode_capability_startup(
+            &mut io,
+            settings,
+            rnode::build_detect_sequence(),
+            rnode::build_init_sequence(&config),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("validated unknown model should be admitted as unverified");
+        assert!(matches!(
+            admitted.admission,
+            RNodeRadioAdmission::Unverified {
+                model_code: 0xFE,
+                ..
+            }
+        ));
+        let evidence = admitted.protocol_state.evidence();
+        assert!(evidence.detected);
+        assert!(evidence.firmware.is_some());
+        assert_eq!(
+            evidence.frequency, None,
+            "pre-init RF evidence must be reset"
+        );
+
+        let (mut publisher, driver) =
+            rnode::new_rnode_driver_observation(rnode::RNodeTransportClass::Usb);
+        publisher.capability_connection_established(&admitted.protocol_state, admitted.admission);
+        let seeded = driver.snapshot();
+        assert_eq!(seeded.capability, rnode::RNodeCapabilityState::Unverified);
+        assert_eq!(seeded.detection, rnode::RNodeDetectionState::Confirmed);
+        assert_eq!(
+            seeded.configuration,
+            rnode::RNodeConfigurationState::Unknown
+        );
+
+        let mut inbound =
+            UsbInboundState::projected_with_protocol_state(admitted.protocol_state, publisher);
+        let (_stop_tx, mut stop_rx) = mpsc::channel(1);
+        let (transport_tx, mut transport_rx) = mpsc::channel(1);
+        let received = AtomicU64::new(0);
+        assert_eq!(
+            forward_usb_read_chunk(
+                &mut inbound,
+                &[0xBB, kiss::FEND],
+                0x66,
+                &received,
+                &transport_tx,
+                &mut stop_rx,
+            )
+            .await,
+            UsbInboundOutcome::Complete
+        );
+        assert!(transport_rx.try_recv().is_err());
+        assert_eq!(received.load(Ordering::Relaxed), 0);
+
+        assert_eq!(
+            forward_usb_read_chunk(
+                &mut inbound,
+                &framed_protocol_frames(required_protocol_frames(target)),
+                0x66,
+                &received,
+                &transport_tx,
+                &mut stop_rx,
+            )
+            .await,
+            UsbInboundOutcome::Complete
+        );
+        let ready = driver.snapshot();
+        assert_eq!(ready.phase, rnode::RNodeRuntimePhase::Ready);
+        assert_eq!(ready.capability, rnode::RNodeCapabilityState::Unverified);
+        assert_eq!(
+            ready.configuration,
+            rnode::RNodeConfigurationState::Verified
+        );
+
+        let shutdown = io
+            .shutdown(None, Duration::from_millis(20), Duration::from_secs(1))
+            .await;
+        assert_eq!(shutdown.report.disposition, UsbCleanupDisposition::Released);
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_usb_reader_boundary_drains_separately_queued_preinit_rf_evidence() {
+        struct InitAfterStaleWriter {
+            calls: RecordedWriteCalls,
+            init: Vec<u8>,
+            stale_enqueued: Arc<AtomicBool>,
+        }
+
+        impl UsbWriterBackend for InitAfterStaleWriter {
+            fn transfer(
+                &mut self,
+                bytes: &[u8],
+                _timeout: Duration,
+            ) -> Result<i32, UsbTransferError> {
+                self.calls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((bytes.to_vec(), Duration::ZERO));
+                if bytes == self.init {
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    while !self.stale_enqueued.load(Ordering::Acquire) {
+                        if Instant::now() >= deadline {
+                            return Err(UsbTransferError::Backend(
+                                "stale pre-init test read was not enqueued".into(),
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Ok(bytes.len() as i32)
+            }
+        }
+
+        struct SeparateStaleReader {
+            writer_calls: RecordedWriteCalls,
+            capability_reads: VecDeque<Vec<u8>>,
+            stale: Option<Vec<u8>>,
+            post_init: Option<Vec<u8>>,
+            stale_returned: bool,
+            stale_enqueued: Arc<AtomicBool>,
+        }
+
+        impl UsbReaderBackend for SeparateStaleReader {
+            fn read(&mut self) -> Result<UsbReadResult, String> {
+                if self
+                    .writer_calls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+                    < 2
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                    return Ok(UsbReadResult::Idle);
+                }
+                if let Some(bytes) = self.capability_reads.pop_front() {
+                    return Ok(UsbReadResult::Data(bytes));
+                }
+                if let Some(stale) = self.stale.take() {
+                    self.stale_returned = true;
+                    return Ok(UsbReadResult::Data(stale));
+                }
+                if self.stale_returned {
+                    let init_was_sent = self
+                        .writer_calls
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .len()
+                        >= 3;
+                    if init_was_sent {
+                        if let Some(post_init) = self.post_init.take() {
+                            return Ok(UsbReadResult::Data(post_init));
+                        }
+                    }
+                    // `run_usb_reader` can call us again only after its prior
+                    // blocking_send of the stale read completed.
+                    self.stale_enqueued.store(true, Ordering::Release);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+                Ok(UsbReadResult::Idle)
+            }
+        }
+
+        let settings = strict_settings();
+        let target = RNodeProtocolTarget::new(
+            settings.frequency,
+            settings.bandwidth,
+            settings.spreading_factor,
+            settings.coding_rate,
+            settings.tx_power,
+        );
+        let mut config = rnode::RNodeConfig::new("strict-usb-boundary", "test");
+        config.frequency = settings.frequency;
+        config.bandwidth = settings.bandwidth;
+        config.spreading_factor = settings.spreading_factor;
+        config.coding_rate = settings.coding_rate;
+        config.tx_power = settings.tx_power;
+        let init = rnode::build_init_sequence(&config);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stale_enqueued = Arc::new(AtomicBool::new(false));
+        let response = capability_response(0xB8);
+        let stale_rf = framed_protocol_frames(required_protocol_frames(target).into_iter().skip(2));
+        let post_init =
+            framed_protocol_frames(required_protocol_frames(target).into_iter().skip(2));
+        let reader = SeparateStaleReader {
+            writer_calls: calls.clone(),
+            capability_reads: response.chunks(512).map(|chunk| chunk.to_vec()).collect(),
+            stale: Some(stale_rf),
+            post_init: Some(post_init.clone()),
+            stale_returned: false,
+            stale_enqueued: stale_enqueued.clone(),
+        };
+        let owner_events = Arc::new(Mutex::new(Vec::new()));
+        let mut io = spawn_owned_usb_io(
+            InitAfterStaleWriter {
+                calls,
+                init: init.clone(),
+                stale_enqueued: stale_enqueued.clone(),
+            },
+            reader,
+            RecordingOwner {
+                events: owner_events,
+                release_result: Ok(()),
+            },
+            Arc::new(AtomicBool::new(true)),
+            8,
+            8,
+            Duration::from_millis(100),
+        );
+
+        let admitted = run_usb_rnode_capability_startup(
+            &mut io,
+            settings,
+            rnode::build_detect_sequence(),
+            init,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("reader boundary should drain queued pre-init evidence");
+        assert!(stale_enqueued.load(Ordering::Acquire));
+        assert_eq!(admitted.protocol_state.evidence().frequency, None);
+
+        let (mut publisher, driver) =
+            rnode::new_rnode_driver_observation(rnode::RNodeTransportClass::Usb);
+        publisher.capability_connection_established(&admitted.protocol_state, admitted.admission);
+        let mut inbound =
+            UsbInboundState::projected_with_protocol_state(admitted.protocol_state, publisher);
+        let snapshot = driver.snapshot();
+        assert_eq!(
+            snapshot.phase,
+            rnode::RNodeRuntimePhase::AwaitingReadiness,
+            "queued pre-init RF evidence must not make the admitted session ready"
+        );
+        assert_eq!(
+            snapshot.configuration,
+            rnode::RNodeConfigurationState::Unknown
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(1), io.events.recv())
+            .await
+            .expect("fresh init response should be read after resume")
+            .expect("USB event stream should remain open");
+        let UsbIoEvent::Read(bytes) = event else {
+            panic!("expected fresh post-init read");
+        };
+        assert_eq!(
+            bytes, post_init,
+            "the first active read must be the response obtained after Init, not queued stale RF"
+        );
+        let (_stop_tx, mut stop_rx) = mpsc::channel(1);
+        let (transport_tx, _transport_rx) = mpsc::channel(1);
+        assert_eq!(
+            forward_usb_read_chunk(
+                &mut inbound,
+                &bytes,
+                0x77,
+                &AtomicU64::new(0),
+                &transport_tx,
+                &mut stop_rx,
+            )
+            .await,
+            UsbInboundOutcome::Complete
+        );
+        assert_eq!(driver.snapshot().phase, rnode::RNodeRuntimePhase::Ready);
+
+        let shutdown = io
+            .shutdown(None, Duration::from_millis(20), Duration::from_secs(1))
+            .await;
+        assert_eq!(shutdown.report.disposition, UsbCleanupDisposition::Released);
     }
 
     #[tokio::test]
@@ -1921,10 +2827,40 @@ mod tests {
                 .await
                 .expect_err("invalid transfer result must fail");
             assert_eq!(error.kind, expected);
-            let _ = io
+            let shutdown = io
                 .shutdown(None, Duration::from_millis(20), Duration::from_secs(1))
                 .await;
+            assert_eq!(shutdown.report.detach, None);
+            assert!(matches!(
+                shutdown.report.writer,
+                UsbJoinOutcome::Joined(UsbWriterExit::Failed(_))
+            ));
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ambiguous_init_writer_still_quiesces_when_cleanup_has_no_detach() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let io = test_io(
+            ScriptedWriter::new([Err(UsbTransferError::Backend("init".into()))]),
+            events,
+        );
+        let error = io
+            .writer
+            .request_initialise_before_terminal_detach(vec![1, 2, 3], Duration::from_secs(1))
+            .await
+            .expect_err("synthetic init failure must be acknowledged");
+        assert_eq!(error.phase, UsbWritePhase::Initialise);
+
+        let shutdown = io
+            .shutdown(None, Duration::from_millis(20), Duration::from_secs(1))
+            .await;
+        assert_eq!(shutdown.report.detach, None);
+        assert!(matches!(
+            shutdown.report.writer,
+            UsbJoinOutcome::Joined(UsbWriterExit::Stopped)
+        ));
+        assert_eq!(shutdown.report.disposition, UsbCleanupDisposition::Released);
     }
 
     #[tokio::test]
@@ -2069,6 +3005,7 @@ mod tests {
             bytes: vec![1, 2, 3],
             deadline: Some(Instant::now() + Duration::from_millis(15)),
             acknowledgement: None,
+            await_terminal_detach_on_failure: false,
             _permit: None,
         };
         let error = write_request(
@@ -2446,6 +3383,7 @@ mod tests {
                 reader_events.clone(),
                 reader_running,
                 Arc::new(AtomicBool::new(true)),
+                Arc::new(UsbReaderBoundary::new()),
             );
             let _ = reader_events.blocking_send(UsbIoEvent::Reader(exit.clone()));
             exit
