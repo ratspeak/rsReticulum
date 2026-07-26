@@ -327,9 +327,9 @@ impl TransportCompletion {
     }
 }
 
-/// Guarantees completion signalling even if `TransportActor::run` unwinds.
-/// An exit not initiated by the runtime coordinator also begins the same
-/// ownership drain used for explicit and process-signal shutdown.
+/// Guarantees completion signalling even if `TransportActor::run` exits or
+/// unwinds. An exit not initiated by the runtime coordinator also begins the
+/// same ownership drain used for explicit and process-signal shutdown.
 struct TransportActorCompletionGuard {
     completion: Arc<TransportCompletion>,
     coordinator: RuntimeShutdownCoordinator,
@@ -340,9 +340,15 @@ impl Drop for TransportActorCompletionGuard {
         let unexpected = !self.coordinator.is_started();
         self.completion.mark_stopped();
         if unexpected {
-            tracing::error!(
-                "transport actor exited without an orderly shutdown request; draining runtime ownership"
-            );
+            if std::thread::panicking() {
+                tracing::error!("transport actor unwound; draining runtime ownership");
+            } else {
+                // Dropping the last runtime handle closes the actor's command
+                // channel and is a normal RAII shutdown path for short-lived
+                // CLI tools. Keep it observable without polluting stderr at
+                // the default log level.
+                tracing::debug!("transport command channel closed; draining runtime ownership");
+            }
             self.coordinator.start();
         }
     }
