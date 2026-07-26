@@ -285,18 +285,31 @@ impl TransportActor {
         self.routing_save_in_flight
             .store(true, std::sync::atomic::Ordering::Release);
         let snapshot = self.routing_snapshot();
+        let generation = self
+            .routing_save_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .wrapping_add(1);
+        let latest_generation = self.routing_save_generation.clone();
+        let write_lock = self.routing_save_lock.clone();
         let in_flight = self.routing_save_in_flight.clone();
+        let write = move || {
+            let _guard = write_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if latest_generation.load(std::sync::atomic::Ordering::Acquire) == generation {
+                write_routing_snapshot(&dir, &snapshot);
+            } else {
+                trace!(generation, "skipping superseded routing-state snapshot");
+            }
+            in_flight.store(false, std::sync::atomic::Ordering::Release);
+        };
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn_blocking(move || {
-                    write_routing_snapshot(&dir, &snapshot);
-                    in_flight.store(false, std::sync::atomic::Ordering::Release);
-                });
+                handle.spawn_blocking(write);
             }
             Err(_) => {
                 // No runtime (tests, exotic embedders): write inline.
-                write_routing_snapshot(&dir, &snapshot);
-                in_flight.store(false, std::sync::atomic::Ordering::Release);
+                write();
             }
         }
         self.state_dirty = false;
@@ -382,22 +395,6 @@ impl TransportActor {
         true
     }
 
-    /// Wait (bounded) for an in-flight async save so a synchronous save
-    /// can't race it on the shared `<file>.tmp` paths.
-    pub(super) fn wait_for_routing_save(&self) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while self
-            .routing_save_in_flight
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            if std::time::Instant::now() >= deadline {
-                tracing::warn!("in-flight routing-state save did not finish before sync save");
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    }
-
     /// Wait (bounded) for an older asynchronous hashlist snapshot before a
     /// synchronous flush takes its newer snapshot. Without this ordering, an
     /// already-queued background writer could replace the shutdown file with
@@ -437,9 +434,14 @@ impl TransportActor {
             return;
         }
 
-        self.wait_for_routing_save();
         if let Some(dir) = self.storage_dir.clone() {
             let snapshot = self.routing_snapshot();
+            self.routing_save_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let _guard = self
+                .routing_save_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             write_routing_snapshot(&dir, &snapshot);
         }
         self.state_dirty = false;
@@ -1448,6 +1450,18 @@ mod async_save_tests {
     fn dirty_actor(dir: &std::path::Path) -> TransportActor {
         let (mut actor, _tx) = TransportActor::new();
         actor.storage_dir = Some(dir.to_path_buf());
+        let (interface_tx, _interface_rx) = tokio::sync::mpsc::channel(1);
+        actor.interfaces.insert(
+            7,
+            crate::messages::InterfaceEntry::new(
+                "persisted-test-interface".to_string(),
+                crate::constants::InterfaceMode::Gateway,
+                crate::constants::InterfaceDirection::bidirectional(),
+                1_000_000,
+                rns_wire::constants::MTU as u32,
+                interface_tx,
+            ),
+        );
         actor.path_table.insert(
             [0x11; 16],
             crate::path_table::PathEntry {
@@ -1518,22 +1532,23 @@ mod async_save_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The synchronous path (shutdown / falling edge) waits for an in-flight
-    /// async save before writing, then completes inline.
+    /// The synchronous path (shutdown / falling edge) serializes behind an
+    /// in-flight publication, then completes inline.
     #[test]
     fn sync_save_waits_for_in_flight_then_writes() {
         let dir = temp_storage();
         let mut actor = dirty_actor(&dir);
 
-        let flag = actor.routing_save_in_flight.clone();
-        flag.store(true, std::sync::atomic::Ordering::Release);
-        let release = std::thread::spawn({
-            let flag = flag.clone();
-            move || {
-                std::thread::sleep(std::time::Duration::from_millis(150));
-                flag.store(false, std::sync::atomic::Ordering::Release);
-            }
+        let write_lock = actor.routing_save_lock.clone();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            let _guard = write_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            acquired_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
         });
+        acquired_rx.recv().unwrap();
 
         let started = std::time::Instant::now();
         actor.save_routing_state();
@@ -1541,10 +1556,78 @@ mod async_save_tests {
 
         assert!(
             started.elapsed() >= std::time::Duration::from_millis(140),
-            "sync save must wait out the in-flight writer"
+            "sync save must serialize behind the active writer"
         );
         assert!(dir.join("path_table.msgpack").exists());
         assert!(!actor.state_dirty);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A queued periodic snapshot that loses the generation race must not
+    /// publish after a newer synchronous snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn superseded_periodic_snapshot_cannot_replace_sync_state() {
+        let dir = temp_storage();
+        let path = dir.join("path_table.msgpack");
+        let mut actor = dirty_actor(&dir);
+        let write_lock = actor.routing_save_lock.clone();
+        let guard = write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        actor.save_routing_state_async();
+        let generation = actor.routing_save_generation.clone();
+        let sync_writer = std::thread::spawn(move || {
+            actor.path_table.insert(
+                [0x44; 16],
+                crate::path_table::PathEntry {
+                    timestamp: crate::now_f64(),
+                    next_hop: Some([0x55; 16]),
+                    hops: 2,
+                    expires: crate::now_f64() + 600.0,
+                    random_blobs: std::collections::VecDeque::new(),
+                    interface_id: 7,
+                    packet_hash: Some([0x66; 32]),
+                },
+            );
+            actor.save_routing_state();
+            actor
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while generation.load(std::sync::atomic::Ordering::Acquire) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sync writer did not claim a newer generation"
+            );
+            std::thread::yield_now();
+        }
+        drop(guard);
+        let actor = sync_writer.join().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while actor
+            .routing_save_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "superseded periodic writer did not retire"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let entries = crate::persistence::load_path_table(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.destination_hash == [0x44; 16])
+        );
+        assert!(
+            !actor
+                .routing_save_in_flight
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

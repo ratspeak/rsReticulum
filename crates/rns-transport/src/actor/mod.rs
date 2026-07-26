@@ -166,6 +166,12 @@ pub struct TransportActor {
     /// Guards the blocking-pool routing-state writer; concurrent writers
     /// would race on the shared `<file>.tmp` paths.
     pub routing_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Monotonic claim used to prevent an older queued routing snapshot from
+    /// replacing a newer synchronous/shutdown snapshot.
+    pub routing_save_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Serializes routing snapshot publication while generation ordering
+    /// decides whether a queued writer is still current.
+    pub routing_save_lock: std::sync::Arc<std::sync::Mutex<()>>,
     pub hashlist_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Guards the blocking-pool announce-cache sweep (Python parity with the
     /// non-blocking `cache_clean_lock`: an in-flight sweep skips the pass).
@@ -334,6 +340,8 @@ impl TransportActor {
             last_state_save: 0.0,
             state_dirty: false,
             routing_save_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            routing_save_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            routing_save_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             hashlist_save_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             announce_sweep_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
