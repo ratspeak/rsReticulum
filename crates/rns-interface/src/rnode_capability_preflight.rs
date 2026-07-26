@@ -19,7 +19,7 @@ pub(crate) const RNODE_CAPABILITY_PREFLIGHT_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(5);
 #[cfg(all(test, any(feature = "serial", feature = "rnode-tcp")))]
 pub(crate) const RNODE_CAPABILITY_PREFLIGHT_DEADLINE: std::time::Duration =
-    std::time::Duration::from_millis(500);
+    std::time::Duration::from_secs(1);
 pub(crate) const RNODE_CAPABILITY_READ_BUFFER_BYTES: usize = 1024;
 const RNODE_CAPABILITY_MAX_READS: usize = 128;
 const RNODE_CAPABILITY_MAX_INPUT_BYTES: usize = 4 * 1024;

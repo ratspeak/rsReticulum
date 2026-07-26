@@ -2895,12 +2895,13 @@ impl LinkManager {
         let _ = self
             .transport_tx
             .try_send(TransportMessage::DeregisterDestination { hash: link_id });
-        if let Some(ref tx) = self.accounting_event_tx
-            && tx
+        if let Some(ref tx) = self.accounting_event_tx {
+            if tx
                 .send(LinkManagerAccountingEvent::LinkClosed { link_id })
                 .is_err()
-        {
-            tracing::debug!("Link accounting event receiver is closed");
+            {
+                tracing::debug!("Link accounting event receiver is closed");
+            }
         }
         if let Some(ref tx) = self.link_closed_tx {
             let _ = tx.try_send(link_id);
@@ -3097,13 +3098,15 @@ impl LinkManager {
         accounting_event_tx: &Option<mpsc::UnboundedSender<LinkManagerAccountingEvent>>,
         event: LinkResourceEvent,
     ) {
-        if !matches!(&event, LinkResourceEvent::Progress { .. })
-            && let Some(tx) = accounting_event_tx
-            && tx
-                .send(LinkManagerAccountingEvent::ResourceEvent(event.clone()))
-                .is_err()
-        {
-            tracing::debug!("Link accounting event receiver is closed");
+        if !matches!(&event, LinkResourceEvent::Progress { .. }) {
+            if let Some(tx) = accounting_event_tx {
+                if tx
+                    .send(LinkManagerAccountingEvent::ResourceEvent(event.clone()))
+                    .is_err()
+                {
+                    tracing::debug!("Link accounting event receiver is closed");
+                }
+            }
         }
         if let Some(tx) = resource_event_tx {
             let _ = tx.try_send(event);
