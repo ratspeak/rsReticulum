@@ -952,6 +952,7 @@ impl std::fmt::Debug for RecalledDestination {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ControlError {
     #[error("not connected to the shared Reticulum instance")]
     NotConnectedToSharedInstance,
@@ -959,6 +960,8 @@ pub enum ControlError {
     RpcAuth,
     #[error("shared-instance RPC failed: {0}")]
     Rpc(String),
+    #[error("control query is not supported by the shared-instance RPC")]
+    UnsupportedBySharedInstance,
     #[error("transport query channel closed")]
     ChannelClosed,
     #[error("transport query timed out after {0:?}")]
@@ -1406,8 +1409,10 @@ impl ReticulumHandle {
 
     /// Recall the identity and latest announce metadata for `destination_hash`.
     ///
-    /// This reads the process' live, validated announce cache in O(1) without
-    /// extending the entry's lifetime. It mirrors
+    /// This reads this process' live, validated replicated announce cache in
+    /// O(1) without extending the entry's lifetime. In shared-instance client
+    /// mode it intentionally remains a process-local cache lookup, not an
+    /// authoritative control-plane query. It mirrors
     /// `Identity.recall(destination_hash, _no_use=True)` and returns `None`
     /// when no identity-bearing announce is known.
     pub async fn recall(
@@ -1431,6 +1436,14 @@ impl ReticulumHandle {
 
     /// Return whether a non-expired path is known for `destination_hash`.
     pub async fn has_path(&self, destination_hash: [u8; 16]) -> Result<bool, ControlError> {
+        if self.instance_mode == InstanceMode::Client {
+            return Ok(self
+                .path_table(None)
+                .await?
+                .iter()
+                .any(|entry| entry.hash == destination_hash));
+        }
+
         match self
             .query_control_result(TransportQuery::HasPath {
                 dest: destination_hash,
@@ -1446,6 +1459,16 @@ impl ReticulumHandle {
 
     /// Return the path hop count, or `PATHFINDER_M` when no path is known.
     pub async fn hops_to(&self, destination_hash: [u8; 16]) -> Result<u8, ControlError> {
+        if self.instance_mode == InstanceMode::Client {
+            return Ok(self
+                .path_table(None)
+                .await?
+                .into_iter()
+                .find(|entry| entry.hash == destination_hash)
+                .map(|entry| entry.hops)
+                .unwrap_or(rns_transport::constants::PATHFINDER_M));
+        }
+
         match self
             .query_control_result(TransportQuery::HopsTo {
                 dest: destination_hash,
@@ -1468,6 +1491,13 @@ impl ReticulumHandle {
         &self,
         destination_hash: [u8; 16],
     ) -> Result<Option<u64>, ControlError> {
+        if self.instance_mode == InstanceMode::Client {
+            return Ok(self
+                .shared_next_hop_interface(destination_hash)
+                .await?
+                .map(|interface| interface.bitrate));
+        }
+
         match self
             .query_control_result(TransportQuery::GetNextHopBitrate {
                 dest: destination_hash,
@@ -1498,6 +1528,13 @@ impl ReticulumHandle {
         &self,
         destination_hash: [u8; 16],
     ) -> Result<Option<u32>, ControlError> {
+        if self.instance_mode == InstanceMode::Client {
+            return Ok(self
+                .shared_next_hop_interface(destination_hash)
+                .await?
+                .and_then(|interface| (interface.mtu != 0).then_some(interface.mtu)));
+        }
+
         match self
             .query_control_result(TransportQuery::GetNextHopHardwareMtu {
                 dest: destination_hash,
@@ -1669,10 +1706,51 @@ impl ReticulumHandle {
         response
     }
 
+    async fn shared_next_hop_interface(
+        &self,
+        destination_hash: [u8; 16],
+    ) -> Result<Option<rns_transport::messages::InterfaceStatRpcEntry>, ControlError> {
+        let interface_name = match self
+            .query_control_result(TransportQuery::GetNextHopIfName {
+                dest: destination_hash,
+            })
+            .await?
+        {
+            TransportQueryResponse::StringResult(interface_name) => interface_name,
+            _ => {
+                return Err(ControlError::UnexpectedResponse {
+                    operation: "next-hop interface query",
+                });
+            }
+        };
+        let Some(interface_name) = interface_name else {
+            return Ok(None);
+        };
+        let interfaces = match self
+            .query_control_result(TransportQuery::GetInterfaceStats)
+            .await?
+        {
+            TransportQueryResponse::InterfaceStats(interfaces) => interfaces,
+            _ => {
+                return Err(ControlError::UnexpectedResponse {
+                    operation: "interface stats query",
+                });
+            }
+        };
+        let mut matches = interfaces
+            .into_iter()
+            .filter(|interface| interface.name == interface_name);
+        let matched = matches.next();
+        if matches.next().is_some() {
+            return Ok(None);
+        }
+        Ok(matched)
+    }
+
     /// Result-returning control-plane query used by the typed facade.
     ///
-    /// Unlike the compatibility [`Self::query_control`] method, a failed
-    /// shared-instance request never falls back to this process' local actor.
+    /// In client mode, a failed or unsupported shared-instance request never
+    /// falls back to this process' local actor.
     async fn query_control_result(
         &self,
         query: TransportQuery,
@@ -1682,7 +1760,7 @@ impl ReticulumHandle {
         }
 
         let Some(request) = transport_query_to_rpc_request(&query) else {
-            return self.query_transport_result(query).await;
+            return Err(ControlError::UnsupportedBySharedInstance);
         };
         let Some(rpc_key) = self.config.rpc_key.as_deref() else {
             return Err(ControlError::NotConnectedToSharedInstance);
@@ -1711,48 +1789,12 @@ impl ReticulumHandle {
     /// Query the authoritative control plane.
     ///
     /// In client mode, Python proxies Reticulum control methods to the local
-    /// shared instance over the RPC listener. Mirror that for the operations
-    /// Python exposes, then fall back to the local actor for Rust-only/local
-    /// diagnostics such as recent announce snapshots.
+    /// shared instance over the RPC listener. Only operations exposed by that
+    /// listener are available here; failures and unsupported queries return
+    /// `None` without consulting this process' local actor. Use
+    /// [`Self::query_transport`] for explicit process-local access.
     pub async fn query_control(&self, query: TransportQuery) -> Option<TransportQueryResponse> {
-        if self.instance_mode == InstanceMode::Client {
-            if let Some(request) = transport_query_to_rpc_request(&query) {
-                if let Some(rpc_key) = self.config.rpc_key.as_deref() {
-                    let rpc_result = match self.config.shared_rpc_endpoint(&self.socket_base) {
-                        SharedInstanceRpcEndpoint::Tcp(port) => {
-                            crate::rpc::connect_and_request(
-                                port,
-                                rpc_key,
-                                &request,
-                                Duration::from_secs(5),
-                            )
-                            .await
-                        }
-                        SharedInstanceRpcEndpoint::Unix(socket_path) => {
-                            crate::rpc::connect_unix_and_request(
-                                &socket_path,
-                                rpc_key,
-                                &request,
-                                Duration::from_secs(5),
-                            )
-                            .await
-                        }
-                    };
-                    match rpc_result {
-                        Ok(response) => {
-                            if let Some(mapped) = rpc_response_to_transport_response(response) {
-                                return Some(self.apply_shared_instance_latency(&query, mapped));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "shared instance control RPC failed; falling back to local actor");
-                        }
-                    }
-                }
-            }
-        }
-
-        self.query_transport(query).await
+        self.query_control_result(query).await.ok()
     }
 
     /// Install a [`DiscoveryStamper`] so this node can emit PoW-stamped
@@ -1870,8 +1912,6 @@ fn transport_query_to_rpc_request(query: &TransportQuery) -> Option<crate::rpc::
         TransportQuery::DropAllVia { next_hop } => RpcRequest::DropAllVia {
             transport_hash: next_hop.to_vec(),
         },
-        TransportQuery::DropPathTable => RpcRequest::DropPathTable,
-        TransportQuery::DropRecentAnnounces => RpcRequest::DropRecentAnnounces,
         TransportQuery::DropAnnounceQueues => RpcRequest::DropAnnounceQueues,
         TransportQuery::BlackholeIdentity {
             hash,
@@ -9720,7 +9760,7 @@ loglevel = 7
     }
 
     #[tokio::test]
-    async fn typed_control_query_never_falls_back_after_shared_rpc_failure() {
+    async fn client_control_failures_never_enqueue_local_actor_work() {
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
         let mut handle = dummy_handle();
         handle.transport_tx = transport_tx;
@@ -9729,14 +9769,276 @@ loglevel = 7
         handle.config.control_port = 0;
         handle.config.rpc_key = Some(vec![0xA5; 32]);
 
-        assert!(matches!(
-            handle.path_table(None).await,
-            Err(ControlError::NotConnectedToSharedInstance)
-        ));
+        let read = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.query_control(TransportQuery::GetInterfaceStats),
+        )
+        .await
+        .expect("failed shared read must be bounded");
+        assert!(read.is_none());
+        let mutation = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.query_control(TransportQuery::DropPath { dest: [0x52; 16] }),
+        )
+        .await
+        .expect("failed shared mutation must be bounded");
+        assert!(mutation.is_none());
         assert!(
             transport_rx.try_recv().is_err(),
-            "typed control query must not consult stale local actor state"
+            "failed mapped client queries must not enqueue local actor work"
         );
+    }
+
+    #[tokio::test]
+    async fn strict_client_control_rejects_unmapped_queries_without_local_work() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let mut handle = dummy_handle();
+        handle.transport_tx = transport_tx;
+        handle.instance_mode = InstanceMode::Client;
+
+        for query in [
+            TransportQuery::GetRecentAnnounces,
+            TransportQuery::DropPathTable,
+            TransportQuery::DropRecentAnnounces,
+        ] {
+            assert!(matches!(
+                handle.query_control_result(query).await,
+                Err(ControlError::UnsupportedBySharedInstance)
+            ));
+        }
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "unsupported strict client query must not enqueue local actor work"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_client_path_metrics_use_authoritative_shared_data() {
+        let (port, _) = free_tcp_port_pair().await;
+        let rpc_key = vec![0xA6; 32];
+        let destination_hash = [0x53; 16];
+        let missing_mtu_destination = [0x55; 16];
+        let ambiguous_destination = [0x56; 16];
+        let interface_name = "authoritative-link".to_string();
+        let missing_mtu_interface_name = "python-interface-without-mtu".to_string();
+        let ambiguous_interface_name = "duplicate-name".to_string();
+        let master_path = rns_transport::messages::PathTableRpcEntry {
+            hash: destination_hash,
+            timestamp: 1.0,
+            via: Some([0x54; 16]),
+            hops: 6,
+            expires: 2.0,
+            interface: interface_name.clone(),
+            interface_id: 81,
+            interface_mode: rns_transport::constants::InterfaceMode::Full,
+            interface_role: rns_transport::messages::InterfaceRole::Normal,
+        };
+        let master_interface = rns_transport::messages::InterfaceStatRpcEntry {
+            id: 81,
+            name: interface_name.clone(),
+            rx_bytes: 0,
+            tx_bytes: 0,
+            rx_rate: 0,
+            tx_rate: 0,
+            online: true,
+            bitrate: 128_000,
+            mtu: 1_200,
+            mode: "Full".to_string(),
+            role: "normal".to_string(),
+            announce_queue: Some(0),
+            held_announces: 0,
+            incoming_announce_frequency: 0.0,
+            outgoing_announce_frequency: 0.0,
+            incoming_pr_frequency: 0.0,
+            outgoing_pr_frequency: 0.0,
+            burst_active: false,
+            burst_activated: 0.0,
+            pr_burst_active: false,
+            pr_burst_activated: 0.0,
+            clients: None,
+            blocked_ips: None,
+            announce_rate_target: None,
+            announce_rate_grace: None,
+            announce_rate_penalty: None,
+            announce_cap: 0.02,
+            ifac_size: 0,
+            tx_drops: 0,
+        };
+        let mut missing_mtu_interface = master_interface.clone();
+        missing_mtu_interface.id = 82;
+        missing_mtu_interface.name = missing_mtu_interface_name.clone();
+        missing_mtu_interface.mtu = 0;
+        let mut ambiguous_interface_a = master_interface.clone();
+        ambiguous_interface_a.id = 83;
+        ambiguous_interface_a.name = ambiguous_interface_name.clone();
+        ambiguous_interface_a.bitrate = 64_000;
+        ambiguous_interface_a.mtu = 900;
+        let mut ambiguous_interface_b = ambiguous_interface_a.clone();
+        ambiguous_interface_b.id = 84;
+        ambiguous_interface_b.bitrate = 32_000;
+        ambiguous_interface_b.mtu = 800;
+        let master_interfaces = vec![
+            master_interface,
+            missing_mtu_interface,
+            ambiguous_interface_a,
+            ambiguous_interface_b,
+        ];
+
+        let (master_tx, mut master_rx) = mpsc::channel::<TransportMessage>(4);
+        let master_responder = tokio::spawn(async move {
+            while let Some(message) = master_rx.recv().await {
+                let TransportMessage::Rpc { query, response_tx } = message else {
+                    panic!("shared control server sent non-RPC actor work");
+                };
+                let response = match query {
+                    TransportQuery::GetPathTable => {
+                        TransportQueryResponse::PathTable(vec![master_path.clone()])
+                    }
+                    TransportQuery::GetNextHopIfName { dest } => {
+                        let name = if dest == destination_hash {
+                            interface_name.clone()
+                        } else if dest == missing_mtu_destination {
+                            missing_mtu_interface_name.clone()
+                        } else if dest == ambiguous_destination {
+                            ambiguous_interface_name.clone()
+                        } else {
+                            panic!("unexpected next-hop destination")
+                        };
+                        TransportQueryResponse::StringResult(Some(name))
+                    }
+                    TransportQuery::GetInterfaceStats => {
+                        TransportQueryResponse::InterfaceStats(master_interfaces.clone())
+                    }
+                    other => panic!("unexpected authoritative query: {other:?}"),
+                };
+                response_tx
+                    .send(response)
+                    .expect("shared control response receiver");
+            }
+        });
+        let rpc_shutdown = ShutdownSignal::new();
+        let server_shutdown = rpc_shutdown.clone();
+        let server_key = rpc_key.clone();
+        let server = tokio::spawn(async move {
+            crate::rpc_server::run_rpc_server(port, server_key, master_tx, server_shutdown).await
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(stream) => {
+                    drop(stream);
+                    break;
+                }
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("shared control server did not start: {error}"),
+            }
+        }
+
+        let (local_tx, mut local_rx) = mpsc::channel::<TransportMessage>(4);
+        let local_query_count = Arc::new(AtomicU64::new(0));
+        let observed_local_queries = Arc::clone(&local_query_count);
+        let local_responder = tokio::spawn(async move {
+            while let Some(message) = local_rx.recv().await {
+                let TransportMessage::Rpc { query, response_tx } = message else {
+                    continue;
+                };
+                observed_local_queries.fetch_add(1, Ordering::Relaxed);
+                let response = match query {
+                    TransportQuery::HasPath { .. } => TransportQueryResponse::BoolResult(false),
+                    TransportQuery::HopsTo { .. } => TransportQueryResponse::IntResult(99),
+                    TransportQuery::GetNextHopBitrate { .. } => {
+                        TransportQueryResponse::FloatResult(Some(9.0))
+                    }
+                    TransportQuery::GetNextHopHardwareMtu { .. } => {
+                        TransportQueryResponse::IntResult(9)
+                    }
+                    other => panic!("unexpected local query: {other:?}"),
+                };
+                response_tx
+                    .send(response)
+                    .expect("local control response receiver");
+            }
+        });
+
+        let mut handle = dummy_handle();
+        handle.transport_tx = local_tx;
+        handle.instance_mode = InstanceMode::Client;
+        handle.config.shared_instance_type = SharedInstanceType::Tcp;
+        handle.config.control_port = port;
+        handle.config.rpc_key = Some(rpc_key);
+
+        assert!(handle.has_path(destination_hash).await.unwrap());
+        assert_eq!(handle.hops_to(destination_hash).await.unwrap(), 6);
+        assert_eq!(
+            handle.next_hop_bitrate(destination_hash).await.unwrap(),
+            Some(128_000)
+        );
+        assert_eq!(
+            handle
+                .next_hop_hardware_mtu(destination_hash)
+                .await
+                .unwrap(),
+            Some(1_200)
+        );
+        assert_eq!(
+            handle
+                .next_hop_per_bit_latency(destination_hash)
+                .await
+                .unwrap(),
+            Some(1.0 / 128_000.0)
+        );
+        assert_eq!(
+            handle
+                .next_hop_per_byte_latency(destination_hash)
+                .await
+                .unwrap(),
+            Some(8.0 / 128_000.0)
+        );
+        assert_eq!(
+            handle
+                .next_hop_hardware_mtu(missing_mtu_destination)
+                .await
+                .unwrap(),
+            None,
+            "Python-compatible stats without MTU must remain unknown"
+        );
+        assert_eq!(
+            handle
+                .next_hop_bitrate(ambiguous_destination)
+                .await
+                .unwrap(),
+            None,
+            "duplicate interface names must not select an arbitrary bitrate"
+        );
+        assert_eq!(
+            handle
+                .next_hop_hardware_mtu(ambiguous_destination)
+                .await
+                .unwrap(),
+            None,
+            "duplicate interface names must not select an arbitrary MTU"
+        );
+        assert_eq!(
+            handle
+                .next_hop_per_bit_latency(ambiguous_destination)
+                .await
+                .unwrap(),
+            None,
+            "duplicate interface names must not select an arbitrary latency"
+        );
+        assert_eq!(
+            local_query_count.load(Ordering::Relaxed),
+            0,
+            "typed client metrics must ignore divergent local actor state"
+        );
+
+        rpc_shutdown.trigger();
+        server.await.unwrap().unwrap();
+        master_responder.abort();
+        local_responder.abort();
     }
 
     struct StaticStamper;

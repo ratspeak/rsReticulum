@@ -676,6 +676,10 @@ fn py_value_to_response_for_request(
     value: &PyValue,
     request: &RpcRequest,
 ) -> Result<RpcResponse, RpcError> {
+    if matches!(value, PyValue::Dict(entries) if dict_get(entries, "error").is_some()) {
+        return py_value_to_response(value);
+    }
+
     match request {
         RpcRequest::GetPathTable { .. } => Ok(RpcResponse::PathTable(parse_path_table(value)?)),
         RpcRequest::GetInterfaceStats => {
@@ -1832,8 +1836,26 @@ mod tests {
                 assert!(!entry.pr_burst_active);
                 assert_eq!(entry.pr_burst_activated, 0.0);
                 assert_eq!(entry.blocked_ips, None);
+                assert_eq!(entry.mtu, 0, "Python stats omit MTU");
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn request_specific_decoder_preserves_rpc_errors() {
+        let encoded = encode_response(&RpcResponse::Error("transport unavailable".to_string()))
+            .expect("encode RPC error");
+        for request in [
+            RpcRequest::GetPathTable { max_hops: None },
+            RpcRequest::DropPath {
+                destination_hash: vec![0; 16],
+            },
+        ] {
+            assert!(matches!(
+                decode_response_for_request(&encoded, &request),
+                Ok(RpcResponse::Error(message)) if message == "transport unavailable"
+            ));
         }
     }
 
