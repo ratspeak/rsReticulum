@@ -564,6 +564,10 @@ impl InboundResource {
         initial_map_hashes: Vec<[u8; MAPHASH_LEN]>,
         link_sdu: Option<usize>,
     ) -> Result<Self, ResourceError> {
+        if total_parts == 0 {
+            return Err(ResourceError::InvalidAdvertisement);
+        }
+
         // `total_size` is post-encryption: max plaintext + random_hash +
         // TOKEN_OVERHEAD + worst-case PKCS7 pad.
         const MAX_AES_BLOCK_PAD: usize = 16;
@@ -2187,11 +2191,17 @@ impl InboundTransfer {
             return self.cancel();
         }
 
+        let hashmap_max_len = crate::resource_adv::hashmap_max_len(rns_wire::constants::LINK_MDU);
+        let Some(segment_start) = segment.checked_mul(hashmap_max_len) else {
+            return self.cancel();
+        };
+        if segment_start >= self.resource.total_parts {
+            return self.cancel();
+        }
+
         self.resource.state = ResourceState::Transferring;
         self.last_activity = Instant::now();
         self.retries_left = MAX_RETRIES;
-
-        let hashmap_max_len = crate::resource_adv::hashmap_max_len(rns_wire::constants::LINK_MDU);
 
         // Parse hashes from the hashmap data and insert into our map_hashes.
         // `segment` is wire-supplied: indices are bounded by total_parts
@@ -2199,10 +2209,7 @@ impl InboundTransfer {
         // writes are impossible there) — anything beyond is hostile.
         let hashes_count = hashmap_data.len() / MAPHASH_LEN;
         for i in 0..hashes_count {
-            let idx = match segment
-                .checked_mul(hashmap_max_len)
-                .and_then(|base| base.checked_add(i))
-            {
+            let idx = match segment_start.checked_add(i) {
                 Some(idx) if idx < self.resource.total_parts => idx,
                 _ => break,
             };
@@ -2929,6 +2936,17 @@ mod tests {
             Duration::from_millis(100),
         );
         assert!(matches!(result, Err(ResourceError::TooLarge)));
+
+        let result = InboundResource::new(
+            0,
+            1024,
+            1000,
+            [0xAA; RANDOM_HASH_SIZE],
+            [0xBB; 32],
+            ResourceFlags::default(),
+            Vec::new(),
+        );
+        assert!(matches!(result, Err(ResourceError::InvalidAdvertisement)));
 
         // Same bound at the InboundResource layer directly.
         let result = InboundResource::new(
@@ -4361,31 +4379,33 @@ mod tests {
         let outbound = OutboundResource::new(data.clone(), false, None).unwrap();
         let total_parts = outbound.num_parts();
 
-        let mut inbound = InboundTransfer::from_advertisement(
-            total_parts,
-            outbound.total_size,
-            data.len(),
-            outbound.random_hash,
-            outbound.resource_hash,
-            ResourceFlags {
-                compressed: false,
-                ..Default::default()
-            },
-            outbound.map_hashes[..2].to_vec(),
-            Duration::from_millis(100),
-        )
-        .unwrap();
+        for segment in [1_000_000, usize::MAX] {
+            let mut inbound = InboundTransfer::from_advertisement(
+                total_parts,
+                outbound.total_size,
+                data.len(),
+                outbound.random_hash,
+                outbound.resource_hash,
+                ResourceFlags {
+                    compressed: false,
+                    ..Default::default()
+                },
+                outbound.map_hashes[..2].to_vec(),
+                Duration::from_millis(100),
+            )
+            .unwrap();
 
-        // Hostile segment index: would previously push ~segment*74 zero
-        // entries into map_hashes. Must be ignored without growth or panic.
-        inbound.waiting_for_hmu = true;
-        inbound.hashmap_update(1_000_000, &outbound.map_hashes[0]);
-        assert_eq!(inbound.resource.map_hashes.len(), 2);
-
-        // Overflowing segment*hashmap_max_len must not panic either.
-        inbound.waiting_for_hmu = true;
-        inbound.hashmap_update(usize::MAX, &outbound.map_hashes[0]);
-        assert_eq!(inbound.resource.map_hashes.len(), 2);
+            // Hostile and overflowing segment indices must neither grow the
+            // hashmap nor refresh the watchdog indefinitely.
+            inbound.waiting_for_hmu = true;
+            let action = inbound.hashmap_update(segment, &outbound.map_hashes[0]);
+            assert!(matches!(
+                action,
+                TransferAction::SendCancel(CancelType::Rcl, _)
+            ));
+            assert_eq!(inbound.resource.map_hashes.len(), 2);
+            assert_eq!(inbound.resource.state, ResourceState::Failed);
+        }
     }
 
     #[test]
