@@ -4815,21 +4815,20 @@ mod tests {
         assert_eq!(txb.load(Ordering::Relaxed), payload.len() as u64);
 
         tokio::time::advance(Duration::from_millis(60)).await;
+        let expected_txb = (payload.len() + callsign.len()) as u64;
         yield_until_rnode_test(
             || {
                 scripted
                     .writes()
                     .iter()
                     .any(|write| write == &framed_callsign)
+                    && txb.load(Ordering::Relaxed) == expected_txb
             },
             "station-ID beacon did not complete after its advanced deadline",
         )
         .await;
         assert!(!ready.load(Ordering::SeqCst));
-        assert_eq!(
-            txb.load(Ordering::Relaxed),
-            (payload.len() + callsign.len()) as u64
-        );
+        assert_eq!(txb.load(Ordering::Relaxed), expected_txb);
         let writes = scripted.writes();
         assert_eq!(
             writes
