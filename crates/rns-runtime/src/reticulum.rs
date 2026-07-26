@@ -527,6 +527,21 @@ impl RNodeRuntimeObserver {
         self.state.snapshot()
     }
 
+    /// Wait for the next publication from this exact driver's observation.
+    ///
+    /// This is a latest-state watch, not a lossless event stream: if multiple
+    /// snapshots are published before the caller polls again, they may be
+    /// coalesced and the returned [`Arc`] contains the newest observed state.
+    /// Each cloned observer has an independent seen-version cursor. `None`
+    /// means the exact driver's publisher has closed; [`Self::snapshot`] still
+    /// returns the last published state after closure.
+    ///
+    /// Waiting for, cancelling, or dropping this observation has no effect on
+    /// the driver or registry and grants no shutdown or configuration authority.
+    pub async fn changed(&mut self) -> Option<Arc<rns_interface::rnode::RNodeRuntimeSnapshot>> {
+        self.state.changed().await
+    }
+
     /// Wait up to `timeout` for complete protocol readiness.
     ///
     /// One absolute deadline spans reconnects. Dropping this future has no
@@ -7893,10 +7908,11 @@ mod tests {
     }
 
     #[cfg(feature = "rnode-tcp")]
-    fn test_rnode_tcp_peer_with_responses(
+    fn test_rnode_tcp_peer_with_gated_responses(
         responses: Vec<u8>,
     ) -> (
         String,
+        std::sync::mpsc::Sender<()>,
         std::sync::mpsc::Receiver<Vec<u8>>,
         std::thread::JoinHandle<()>,
     ) {
@@ -7904,12 +7920,16 @@ mod tests {
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = format!("tcp://{}", listener.local_addr().unwrap());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (closed_tx, closed_rx) = std::sync::mpsc::channel();
         let peer = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("timed out waiting to release RNode peer responses");
             if !responses.is_empty() {
                 stream.write_all(&responses).unwrap();
             }
@@ -7934,6 +7954,20 @@ mod tests {
             }
             closed_tx.send(observed).unwrap();
         });
+        (port, release_tx, closed_rx, peer)
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    fn test_rnode_tcp_peer_with_responses(
+        responses: Vec<u8>,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (port, release_tx, closed_rx, peer) =
+            test_rnode_tcp_peer_with_gated_responses(responses);
+        release_tx.send(()).unwrap();
         (port, closed_rx, peer)
     }
 
@@ -7947,13 +7981,9 @@ mod tests {
     }
 
     #[cfg(feature = "rnode-tcp")]
-    fn test_ready_rnode_tcp_peer(
+    fn test_ready_rnode_tcp_responses(
         settings: rns_interface::rnode::RNodeRadioSettings,
-    ) -> (
-        String,
-        std::sync::mpsc::Receiver<Vec<u8>>,
-        std::thread::JoinHandle<()>,
-    ) {
+    ) -> Vec<u8> {
         use rns_interface::{kiss, rnode};
 
         let mut responses = Vec::new();
@@ -7978,7 +8008,18 @@ mod tests {
         ] {
             kiss::frame_with_command_into(command, &payload, &mut responses);
         }
-        test_rnode_tcp_peer_with_responses(responses)
+        responses
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    fn test_ready_rnode_tcp_peer(
+        settings: rns_interface::rnode::RNodeRadioSettings,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        test_rnode_tcp_peer_with_responses(test_ready_rnode_tcp_responses(settings))
     }
 
     #[cfg(feature = "rnode-tcp")]
@@ -8559,7 +8600,8 @@ mod tests {
         let template =
             rns_interface::rnode::RNodeConfig::new("ready-observer-template", "tcp://127.0.0.1:1");
         let settings = rns_interface::rnode::RNodeRadioSettings::from(&template);
-        let (port, closed_rx, peer) = test_ready_rnode_tcp_peer(settings);
+        let (port, release_responses, closed_rx, peer) =
+            test_rnode_tcp_peer_with_gated_responses(test_ready_rnode_tcp_responses(settings));
         let config = rns_interface::rnode::RNodeConfig::new("ready-observer", &port);
         assert_eq!(
             rns_interface::rnode::RNodeRadioSettings::from(&config),
@@ -8592,18 +8634,88 @@ mod tests {
         runtime.interface_registry = registry;
         let observer = runtime.rnode_runtime(id).expect("active RNode observer");
         assert_eq!(observer.interface_id(), id);
-        let ready = observer
-            .await_ready(Duration::from_secs(2))
+        assert_ne!(
+            observer.snapshot().phase,
+            rns_interface::rnode::RNodeRuntimePhase::Ready,
+            "the gated peer must not publish readiness before release"
+        );
+
+        let readiness_observer = observer.clone();
+        let (readiness_started_tx, readiness_started_rx) = oneshot::channel();
+        let readiness = tokio::spawn(async move {
+            let _ = readiness_started_tx.send(());
+            readiness_observer.await_ready(Duration::from_secs(2)).await
+        });
+        let mut update_observer = observer.clone();
+        let (updates_started_tx, updates_started_rx) = oneshot::channel();
+        let updates = tokio::spawn(async move {
+            let _ = updates_started_tx.send(());
+            loop {
+                let snapshot = update_observer
+                    .changed()
+                    .await
+                    .expect("RNode observation closed before readiness");
+                if snapshot.phase == rns_interface::rnode::RNodeRuntimePhase::Ready {
+                    return (update_observer, snapshot);
+                }
+            }
+        });
+        readiness_started_rx
             .await
+            .expect("readiness waiter did not start");
+        updates_started_rx
+            .await
+            .expect("update observer did not start");
+        tokio::task::yield_now().await;
+        assert!(!readiness.is_finished());
+        assert!(!updates.is_finished());
+        release_responses
+            .send(())
+            .expect("release gated RNode peer responses");
+
+        let ready = readiness
+            .await
+            .expect("readiness task panicked")
             .expect("RNode protocol readiness");
+        let (mut update_observer, streamed_ready) =
+            updates.await.expect("update observer task panicked");
         assert_eq!(ready.phase, rns_interface::rnode::RNodeRuntimePhase::Ready);
         assert_ne!(ready.connection_generation, 0);
         assert!(
+            Arc::ptr_eq(&ready, &streamed_ready),
+            "changed and await_ready clones must observe the same latest publication"
+        );
+        assert!(
             observer.await_ready(Duration::ZERO).await.is_ok(),
-            "an already-ready exact observer must return without waiting"
+            "consuming updates on a clone must not consume readiness"
         );
 
         teardown_interface(&runtime, id).await;
+        let streamed_stopped = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = update_observer
+                    .changed()
+                    .await
+                    .expect("RNode observation closed before terminal publication");
+                if snapshot.phase == rns_interface::rnode::RNodeRuntimePhase::Stopped {
+                    return snapshot;
+                }
+            }
+        })
+        .await
+        .expect("update observer did not receive terminal publication");
+        assert_eq!(
+            streamed_stopped.reason,
+            Some(rns_interface::rnode::RNodeRuntimeReason::StopRequested)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), update_observer.changed())
+                .await
+                .expect("closed observation did not resolve")
+                .is_none(),
+            "changed must return None after the exact publisher closes"
+        );
+        assert!(Arc::ptr_eq(&streamed_stopped, &update_observer.snapshot()));
         let stopped = observer
             .await_ready(Duration::from_secs(1))
             .await
