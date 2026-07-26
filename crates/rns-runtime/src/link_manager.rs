@@ -15,7 +15,7 @@ use rns_identity::identity::Identity;
 use rns_identity::ratchet::PersistentRatchetRing;
 use rns_link::link::{CloseReason, Link, LinkAction, LinkState, ResourceStrategy};
 use rns_protocol::channel::{ChannelError, LinkChannel};
-use rns_protocol::channel_message::MessageBase;
+use rns_protocol::channel_message::{MessageBase, SYSTEM_MESSAGE_TYPE_MIN};
 use rns_protocol::resource::{
     InboundTransfer, MAX_EFFICIENT_SIZE, MAX_SEGMENTS, MultiSegmentInbound, MultiSegmentOutbound,
     OutboundTransfer, TransferAction,
@@ -423,6 +423,12 @@ pub struct LinkManager {
     accounting_event_tx: Option<mpsc::UnboundedSender<LinkManagerAccountingEvent>>,
     /// Decrypted channel envelopes as `(link_id, msg_type, payload)`.
     channel_message_tx: Option<mpsc::Sender<LinkChannelMessage>>,
+    /// User message types accepted by channels owned by this manager.
+    ///
+    /// Keeping this registration at the manager boundary lets responder
+    /// applications declare their protocol before the first inbound envelope
+    /// creates a channel.
+    channel_message_types: Vec<u16>,
     /// Fires when an active link is closed or torn down.
     link_closed_tx: Option<mpsc::Sender<[u8; 16]>>,
     /// Raw pass-through for non-link packets (e.g. opportunistic LXMF).
@@ -471,6 +477,7 @@ impl LinkManager {
             resource_event_tx: None,
             accounting_event_tx: None,
             channel_message_tx: None,
+            channel_message_types: Vec::new(),
             link_closed_tx: None,
             inbound_raw_tx: None,
             use_implicit_proof: true,
@@ -530,6 +537,7 @@ impl LinkManager {
             resource_event_tx: None,
             accounting_event_tx: None,
             channel_message_tx: None,
+            channel_message_types: Vec::new(),
             link_closed_tx: None,
             inbound_raw_tx: None,
             use_implicit_proof: true,
@@ -1356,6 +1364,11 @@ impl LinkManager {
                             "channel data received before active link"
                         );
                         return;
+                    }
+
+                    if active.channel.is_none() && !self.channel_message_types.is_empty() {
+                        let _ =
+                            Self::ensure_link_channel(active, link_id, &self.channel_message_types);
                     }
 
                     if active.channel.is_none() {
@@ -3432,12 +3445,20 @@ impl LinkManager {
         packet_hash
     }
 
-    fn ensure_link_channel(active: &mut ActiveLink, link_id: [u8; 16]) -> Option<&mut LinkChannel> {
+    fn ensure_link_channel<'a>(
+        active: &'a mut ActiveLink,
+        link_id: [u8; 16],
+        message_types: &[u16],
+    ) -> Option<&'a mut LinkChannel> {
         if active.channel.is_none() {
             let rtt = active.link.rtt_secs();
             let mdu = active.link.mdu;
             let keys = active.link.session_keys()?;
-            active.channel = Some(LinkChannel::new_encrypted_with_mdu(link_id, rtt, mdu, keys));
+            let mut channel = LinkChannel::new_encrypted_with_mdu(link_id, rtt, mdu, keys);
+            for msg_type in message_types {
+                channel.register_message_type(*msg_type).ok()?;
+            }
+            active.channel = Some(channel);
             active.link.mark_channel_created();
         }
         active.channel.as_mut()
@@ -3859,6 +3880,27 @@ impl LinkManager {
         self.channel_message_tx = Some(tx);
     }
 
+    /// Register a user Channel message type for current and future Links.
+    ///
+    /// Responder applications should call this before [`Self::run`] or
+    /// [`Self::run_with_commands`]. Once at least one type is registered, the
+    /// first valid inbound Channel packet may create the per-Link channel.
+    pub fn register_channel_message_type(&mut self, msg_type: u16) -> Result<(), ChannelError> {
+        if msg_type >= SYSTEM_MESSAGE_TYPE_MIN {
+            return Err(ChannelError::InvalidMessageType(msg_type));
+        }
+
+        if !self.channel_message_types.contains(&msg_type) {
+            self.channel_message_types.push(msg_type);
+        }
+        for active in self.active_links.values_mut() {
+            if let Some(channel) = active.channel.as_mut() {
+                channel.register_message_type(msg_type)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Install the bounded best-effort Link-close channel.
     pub fn set_link_closed_channel(&mut self, tx: mpsc::Sender<[u8; 16]>) {
         self.link_closed_tx = Some(tx);
@@ -3883,7 +3925,7 @@ impl LinkManager {
 
     pub fn get_channel(&mut self, link_id: &[u8; 16]) -> Option<&mut LinkChannel> {
         let active = self.active_links.get_mut(link_id)?;
-        Self::ensure_link_channel(active, *link_id)
+        Self::ensure_link_channel(active, *link_id, &self.channel_message_types)
     }
 
     pub fn send_channel_message(
@@ -3908,7 +3950,7 @@ impl LinkManager {
             .active_links
             .get_mut(link_id)
             .ok_or(ChannelSendError::LinkNotFound)?;
-        let prepared = Self::ensure_link_channel(active, *link_id)
+        let prepared = Self::ensure_link_channel(active, *link_id, &self.channel_message_types)
             .ok_or(ChannelSendError::NoSessionKeys)?
             .prepare_send_tracked(msg)?;
 
@@ -4568,6 +4610,21 @@ mod tests {
     };
 
     const TEST_CHANNEL_MSG_TYPE: u16 = 0x1234;
+
+    #[test]
+    fn channel_message_registration_is_bounded_to_user_types_and_idempotent() {
+        let (transport_tx, _transport_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let mut manager = LinkManager::new(transport_tx, event_rx, [0xA1; 16], None);
+
+        manager.register_channel_message_type(0xAC05).unwrap();
+        manager.register_channel_message_type(0xAC05).unwrap();
+        assert_eq!(manager.channel_message_types, vec![0xAC05]);
+        assert!(matches!(
+            manager.register_channel_message_type(SYSTEM_MESSAGE_TYPE_MIN),
+            Err(ChannelError::InvalidMessageType(SYSTEM_MESSAGE_TYPE_MIN))
+        ));
+    }
 
     struct TestSigningBackend {
         signing_key: Ed25519PrivateKey,

@@ -23,9 +23,9 @@ use rns_link::link::{CloseReason, Link};
 use rns_protocol::channel::{ChannelError, LinkChannel};
 use rns_protocol::channel_message::MessageBase;
 use rns_protocol::rnsh::{
-    CommandExitedMessage, ErrorMessage, ExecuteCommandMessage, NoopMessage, PROTOCOL_VERSION,
-    RnshMessage, RnshStreamDataMessage, STREAM_ID_STDERR, STREAM_ID_STDIN, STREAM_ID_STDOUT,
-    VersionInfoMessage, WindowSizeMessage,
+    CommandExitedMessage, ErrorMessage, ExecuteCommandMessage, MESSAGE_TYPES, NoopMessage,
+    PROTOCOL_VERSION, RnshMessage, RnshStreamDataMessage, STREAM_ID_STDERR, STREAM_ID_STDIN,
+    STREAM_ID_STDOUT, VersionInfoMessage, WindowSizeMessage,
 };
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
@@ -171,6 +171,9 @@ async fn run_rnsh_listener_inner(
         RNSH_APP_NAME,
         Some(signing_key),
     );
+    for msg_type in MESSAGE_TYPES {
+        link_mgr.register_channel_message_type(msg_type)?;
+    }
 
     let announce_tx = transport_tx.clone();
     let announce_packet = build_announce_packet(&cfg.identity, RNSH_APP_NAME)?;
@@ -396,6 +399,7 @@ pub async fn rnsh_client_execute(
         .ok_or_else(|| RnshError::LinkCrypto("no session keys".into()))?;
     let mut channel =
         LinkChannel::new_encrypted_with_mdu(link_id, link.rtt_secs(), link.mdu, session_keys);
+    register_rnsh_message_types(&mut channel)?;
     link.mark_channel_created();
     let mut pending_messages = VecDeque::new();
     let mut stdout = Vec::new();
@@ -503,6 +507,13 @@ pub async fn rnsh_client_execute(
         stderr,
         return_code,
     })
+}
+
+fn register_rnsh_message_types(channel: &mut LinkChannel) -> Result<(), ChannelError> {
+    for msg_type in MESSAGE_TYPES {
+        channel.register_message_type(msg_type)?;
+    }
+    Ok(())
 }
 
 fn pending_has_remote_terminal(pending_messages: &VecDeque<RnshMessage>) -> bool {
@@ -1987,6 +1998,21 @@ fn parse_identity_hash16(input: &str) -> Option<[u8; 16]> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn rnsh_channel_registration_accepts_every_protocol_type() {
+        let mut channel = LinkChannel::new([0xA2; 16], 0.1);
+        register_rnsh_message_types(&mut channel).unwrap();
+
+        for (sequence, msg_type) in MESSAGE_TYPES.into_iter().enumerate() {
+            let mut envelope = Vec::with_capacity(6);
+            envelope.extend_from_slice(&msg_type.to_be_bytes());
+            envelope.extend_from_slice(&(sequence as u16).to_be_bytes());
+            envelope.extend_from_slice(&0u16.to_be_bytes());
+            let received = channel.receive_data(&envelope).unwrap();
+            assert_eq!(received, vec![(msg_type, Vec::new())]);
+        }
+    }
 
     fn spawn_ack_manager(
         mut rx: mpsc::Receiver<LinkManagerCommand>,
