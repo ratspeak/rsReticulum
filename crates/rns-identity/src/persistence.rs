@@ -203,10 +203,23 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn unique_test_dir(label: &str) -> PathBuf {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "reticulum-{label}-{}-{}-{id}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
     #[test]
     fn test_atomic_write_and_read() {
-        let dir = std::env::temp_dir().join("reticulum_test_persistence");
-        let _ = fs::create_dir_all(&dir);
+        let dir = unique_test_dir("persistence");
+        fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test_atomic");
 
         atomic_write(&path, b"hello world").unwrap();
@@ -220,21 +233,19 @@ mod tests {
             "Windows must replace an existing state file instead of failing after the first write"
         );
 
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_dir(&dir);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn test_read_nonexistent() {
-        let path = PathBuf::from("/tmp/reticulum_nonexistent_file_xyz");
+        let path = unique_test_dir("nonexistent").join("missing");
         let result = read_file(&path).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn test_bounded_read_rejects_oversize_file() {
-        let dir = std::env::temp_dir().join("reticulum_test_bounded_read");
-        let _ = fs::remove_dir_all(&dir);
+        let dir = unique_test_dir("bounded-read");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bounded");
         fs::write(&path, [0xA5; 17]).unwrap();
@@ -248,8 +259,7 @@ mod tests {
 
     #[test]
     fn test_atomic_write_faults_before_rename_preserve_previous_file() {
-        let dir = std::env::temp_dir().join("reticulum_test_atomic_faults");
-        let _ = fs::remove_dir_all(&dir);
+        let dir = unique_test_dir("atomic-faults");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state");
         fs::write(&path, b"previous").unwrap();
@@ -272,8 +282,7 @@ mod tests {
 
     #[test]
     fn test_atomic_write_final_readback_failure_is_reported() {
-        let dir = std::env::temp_dir().join("reticulum_test_atomic_readback_fault");
-        let _ = fs::remove_dir_all(&dir);
+        let dir = unique_test_dir("atomic-readback-fault");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state");
         fs::write(&path, b"previous").unwrap();
@@ -292,8 +301,7 @@ mod tests {
 
     #[test]
     fn concurrent_atomic_writers_do_not_share_temp_paths() {
-        let dir = std::env::temp_dir().join("reticulum_test_atomic_concurrent");
-        let _ = fs::remove_dir_all(&dir);
+        let dir = unique_test_dir("atomic-concurrent");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state");
 
