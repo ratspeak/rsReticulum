@@ -262,6 +262,47 @@ pub struct ResourceCompletion {
     pub metadata: Option<Vec<u8>>,
 }
 
+/// Ordered, capacity-lossless Link accounting notifications.
+///
+/// This opt-in stream contains Resource starts and conclusions, ordinary
+/// inbound completion payloads, and Link closure. Progress remains available
+/// only through the bounded best-effort Resource event channel. Delivery is
+/// guaranteed while the unbounded receiver remains alive. Request Resources
+/// retain their start and conclusion events but dispatch inline and never
+/// produce a [`LinkManagerAccountingEvent::ResourceCompletion`].
+#[derive(Clone)]
+#[non_exhaustive]
+pub enum LinkManagerAccountingEvent {
+    /// Resource start or terminal conclusion; progress is omitted.
+    ResourceEvent(LinkResourceEvent),
+    /// Complete ordinary inbound Resource data and metadata.
+    ResourceCompletion(ResourceCompletion),
+    /// The owning Link reached a terminal state.
+    LinkClosed { link_id: [u8; 16] },
+}
+
+impl std::fmt::Debug for LinkManagerAccountingEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ResourceEvent(event) => f.debug_tuple("ResourceEvent").field(event).finish(),
+            Self::ResourceCompletion(completion) => f
+                .debug_struct("ResourceCompletion")
+                .field("link_id", &hex::encode(completion.link_id))
+                .field("resource_hash", &hex::encode(completion.resource_hash))
+                .field("data_len", &completion.data.len())
+                .field(
+                    "metadata_len",
+                    &completion.metadata.as_ref().map(std::vec::Vec::len),
+                )
+                .finish(),
+            Self::LinkClosed { link_id } => f
+                .debug_struct("LinkClosed")
+                .field("link_id", &hex::encode(link_id))
+                .finish(),
+        }
+    }
+}
+
 /// Result of an extended request handler. `Reply` is the ordinary response;
 /// `ReplyWithResource` sends an inline ack followed by a resource transfer
 /// (rncp --fetch). Python: `RNS.Resource(..., target_link=link)`.
@@ -363,6 +404,9 @@ pub struct LinkManager {
     outbound_resource_proof_tx: Option<mpsc::Sender<LinkResourceProof>>,
     /// Unified inbound/outbound Resource lifecycle.
     resource_event_tx: Option<mpsc::Sender<LinkResourceEvent>>,
+    /// Ordered non-progress accounting stream for owners that cannot tolerate
+    /// capacity loss.
+    accounting_event_tx: Option<mpsc::UnboundedSender<LinkManagerAccountingEvent>>,
     /// Decrypted channel envelopes as `(link_id, msg_type, payload)`.
     channel_message_tx: Option<mpsc::Sender<LinkChannelMessage>>,
     /// Fires when an active link is closed or torn down.
@@ -410,6 +454,7 @@ impl LinkManager {
             link_packet_proof_tx: None,
             outbound_resource_proof_tx: None,
             resource_event_tx: None,
+            accounting_event_tx: None,
             channel_message_tx: None,
             link_closed_tx: None,
             inbound_raw_tx: None,
@@ -467,6 +512,7 @@ impl LinkManager {
             link_packet_proof_tx: None,
             outbound_resource_proof_tx: None,
             resource_event_tx: None,
+            accounting_event_tx: None,
             channel_message_tx: None,
             link_closed_tx: None,
             inbound_raw_tx: None,
@@ -1519,6 +1565,7 @@ impl LinkManager {
                                 if adv.segment_index == 1 {
                                     Self::emit_resource_event(
                                         &self.resource_event_tx,
+                                        &self.accounting_event_tx,
                                         LinkResourceEvent::Started {
                                             link_id,
                                             resource_id: if adv.total_segments > 1 {
@@ -1593,6 +1640,7 @@ impl LinkManager {
                         if let Some(resource_hash) = progressed_rh {
                             Self::emit_inbound_resource_progress(
                                 &self.resource_event_tx,
+                                &self.accounting_event_tx,
                                 active,
                                 link_id,
                                 resource_hash,
@@ -1726,25 +1774,18 @@ impl LinkManager {
                                                         if is_request {
                                                             completed_request_resource = Some(blob);
                                                         } else {
-                                                            if let Some(ref tx) =
-                                                                self.resource_completion_tx
-                                                            {
-                                                                let _ = tx.try_send(
-                                                                    ResourceCompletion {
-                                                                        link_id,
-                                                                        resource_hash: route
-                                                                            .original_hash,
-                                                                        data: blob.clone(),
-                                                                        metadata,
-                                                                    },
-                                                                );
-                                                            }
-                                                            if let Some(ref tx) =
-                                                                self.resource_completed_tx
-                                                            {
-                                                                let _ =
-                                                                    tx.try_send((blob, link_id));
-                                                            }
+                                                            Self::emit_resource_completion(
+                                                                &self.resource_completion_tx,
+                                                                &self.resource_completed_tx,
+                                                                &self.accounting_event_tx,
+                                                                ResourceCompletion {
+                                                                    link_id,
+                                                                    resource_hash: route
+                                                                        .original_hash,
+                                                                    data: blob,
+                                                                    metadata,
+                                                                },
+                                                            );
                                                         }
                                                         tracing::info!(
                                                             link_id = hex::encode(link_id),
@@ -1756,6 +1797,7 @@ impl LinkManager {
                                                         );
                                                         Self::emit_resource_event(
                                                             &self.resource_event_tx,
+                                                            &self.accounting_event_tx,
                                                             LinkResourceEvent::Concluded {
                                                                 link_id,
                                                                 resource_id: route.original_hash,
@@ -1782,6 +1824,7 @@ impl LinkManager {
                                                         );
                                                         Self::emit_resource_event(
                                                             &self.resource_event_tx,
+                                                            &self.accounting_event_tx,
                                                             LinkResourceEvent::Concluded {
                                                                 link_id,
                                                                 resource_id: route.original_hash,
@@ -1825,22 +1868,21 @@ impl LinkManager {
                                         if is_request {
                                             completed_request_resource = Some(assembled_data);
                                         } else {
-                                            if let Some(ref tx) = self.resource_completion_tx {
-                                                let metadata = active
-                                                    .inbound_resources
-                                                    .get(&rh)
-                                                    .and_then(|t| t.resource.metadata.clone());
-                                                let _ = tx.try_send(ResourceCompletion {
+                                            let metadata = active
+                                                .inbound_resources
+                                                .get(&rh)
+                                                .and_then(|t| t.resource.metadata.clone());
+                                            Self::emit_resource_completion(
+                                                &self.resource_completion_tx,
+                                                &self.resource_completed_tx,
+                                                &self.accounting_event_tx,
+                                                ResourceCompletion {
                                                     link_id,
                                                     resource_hash: rh,
-                                                    data: assembled_data.clone(),
+                                                    data: assembled_data,
                                                     metadata,
-                                                });
-                                            }
-
-                                            if let Some(ref tx) = self.resource_completed_tx {
-                                                let _ = tx.try_send((assembled_data, link_id));
-                                            }
+                                                },
+                                            );
                                         }
 
                                         tracing::debug!(
@@ -1850,6 +1892,7 @@ impl LinkManager {
                                         );
                                         Self::emit_resource_event(
                                             &self.resource_event_tx,
+                                            &self.accounting_event_tx,
                                             LinkResourceEvent::Concluded {
                                                 link_id,
                                                 resource_id: rh,
@@ -1973,6 +2016,7 @@ impl LinkManager {
                                 if progressed {
                                     Self::emit_outbound_resource_progress(
                                         &self.resource_event_tx,
+                                        &self.accounting_event_tx,
                                         active,
                                         link_id,
                                         rh,
@@ -2004,6 +2048,7 @@ impl LinkManager {
                                 );
                                 Self::emit_resource_event(
                                     &self.resource_event_tx,
+                                    &self.accounting_event_tx,
                                     LinkResourceEvent::Concluded {
                                         link_id,
                                         resource_id,
@@ -2043,6 +2088,7 @@ impl LinkManager {
                                 );
                                 Self::emit_resource_event(
                                     &self.resource_event_tx,
+                                    &self.accounting_event_tx,
                                     LinkResourceEvent::Concluded {
                                         link_id,
                                         resource_id,
@@ -2171,6 +2217,7 @@ impl LinkManager {
                                 }
                                 Self::emit_resource_event(
                                     &self.resource_event_tx,
+                                    &self.accounting_event_tx,
                                     LinkResourceEvent::Concluded {
                                         link_id,
                                         resource_id: completed_resource_hash,
@@ -2399,6 +2446,7 @@ impl LinkManager {
                         Self::drop_inbound_resource(active, &resource_hash);
                         Self::emit_resource_event(
                             &self.resource_event_tx,
+                            &self.accounting_event_tx,
                             LinkResourceEvent::Concluded {
                                 link_id: *link_id,
                                 resource_id,
@@ -2446,6 +2494,7 @@ impl LinkManager {
                             active.link.untrack_resource(&resource_hash);
                             Self::emit_resource_event(
                                 &self.resource_event_tx,
+                                &self.accounting_event_tx,
                                 LinkResourceEvent::Concluded {
                                     link_id: *link_id,
                                     resource_id,
@@ -2576,6 +2625,13 @@ impl LinkManager {
         let _ = self
             .transport_tx
             .try_send(TransportMessage::DeregisterDestination { hash: link_id });
+        if let Some(ref tx) = self.accounting_event_tx
+            && tx
+                .send(LinkManagerAccountingEvent::LinkClosed { link_id })
+                .is_err()
+        {
+            tracing::debug!("Link accounting event receiver is closed");
+        }
         if let Some(ref tx) = self.link_closed_tx {
             let _ = tx.try_send(link_id);
         }
@@ -2583,6 +2639,7 @@ impl LinkManager {
         for resource_id in inbound_resource_ids {
             Self::emit_resource_event(
                 &self.resource_event_tx,
+                &self.accounting_event_tx,
                 LinkResourceEvent::Concluded {
                     link_id,
                     resource_id,
@@ -2594,6 +2651,7 @@ impl LinkManager {
         for resource_id in outbound_resource_ids {
             Self::emit_resource_event(
                 &self.resource_event_tx,
+                &self.accounting_event_tx,
                 LinkResourceEvent::Concluded {
                     link_id,
                     resource_id,
@@ -2746,11 +2804,75 @@ impl LinkManager {
 
     fn emit_resource_event(
         resource_event_tx: &Option<mpsc::Sender<LinkResourceEvent>>,
+        accounting_event_tx: &Option<mpsc::UnboundedSender<LinkManagerAccountingEvent>>,
         event: LinkResourceEvent,
     ) {
+        if !matches!(&event, LinkResourceEvent::Progress { .. })
+            && let Some(tx) = accounting_event_tx
+            && tx
+                .send(LinkManagerAccountingEvent::ResourceEvent(event.clone()))
+                .is_err()
+        {
+            tracing::debug!("Link accounting event receiver is closed");
+        }
         if let Some(tx) = resource_event_tx {
             let _ = tx.try_send(event);
         }
+    }
+
+    fn emit_resource_completion(
+        resource_completion_tx: &Option<mpsc::Sender<ResourceCompletion>>,
+        resource_completed_tx: &Option<mpsc::Sender<(Vec<u8>, [u8; 16])>>,
+        accounting_event_tx: &Option<mpsc::UnboundedSender<LinkManagerAccountingEvent>>,
+        completion: ResourceCompletion,
+    ) {
+        let mut remaining = usize::from(accounting_event_tx.is_some())
+            + usize::from(resource_completion_tx.is_some())
+            + usize::from(resource_completed_tx.is_some());
+        if remaining == 0 {
+            return;
+        }
+
+        let mut completion = Some(completion);
+        if let Some(tx) = accounting_event_tx {
+            remaining -= 1;
+            let accounting_completion = if remaining == 0 {
+                completion.take().expect("completion is still owned")
+            } else {
+                completion
+                    .as_ref()
+                    .expect("completion is still owned")
+                    .clone()
+            };
+            if tx
+                .send(LinkManagerAccountingEvent::ResourceCompletion(
+                    accounting_completion,
+                ))
+                .is_err()
+            {
+                tracing::debug!("Link accounting event receiver is closed");
+            }
+        }
+
+        if let Some(tx) = resource_completion_tx {
+            remaining -= 1;
+            let rich_completion = if remaining == 0 {
+                completion.take().expect("completion is still owned")
+            } else {
+                completion
+                    .as_ref()
+                    .expect("completion is still owned")
+                    .clone()
+            };
+            let _ = tx.try_send(rich_completion);
+        }
+
+        if let Some(tx) = resource_completed_tx {
+            remaining -= 1;
+            let completion = completion.take().expect("completion is still owned");
+            let _ = tx.try_send((completion.data, completion.link_id));
+        }
+        debug_assert_eq!(remaining, 0);
     }
 
     fn inbound_resource_identity(
@@ -2784,6 +2906,7 @@ impl LinkManager {
 
     fn emit_inbound_resource_progress(
         resource_event_tx: &Option<mpsc::Sender<LinkResourceEvent>>,
+        accounting_event_tx: &Option<mpsc::UnboundedSender<LinkManagerAccountingEvent>>,
         active: &ActiveLink,
         link_id: [u8; 16],
         resource_hash: [u8; 32],
@@ -2799,6 +2922,7 @@ impl LinkManager {
             .clamp(0.0, 1.0);
         Self::emit_resource_event(
             resource_event_tx,
+            accounting_event_tx,
             LinkResourceEvent::Progress {
                 link_id,
                 resource_id,
@@ -2811,6 +2935,7 @@ impl LinkManager {
 
     fn emit_outbound_resource_progress(
         resource_event_tx: &Option<mpsc::Sender<LinkResourceEvent>>,
+        accounting_event_tx: &Option<mpsc::UnboundedSender<LinkManagerAccountingEvent>>,
         active: &ActiveLink,
         link_id: [u8; 16],
         resource_hash: [u8; 32],
@@ -2826,6 +2951,7 @@ impl LinkManager {
             .clamp(0.0, 1.0);
         Self::emit_resource_event(
             resource_event_tx,
+            accounting_event_tx,
             LinkResourceEvent::Progress {
                 link_id,
                 resource_id,
@@ -3262,10 +3388,12 @@ impl LinkManager {
         self.response_tx = Some(tx);
     }
 
+    /// Install the legacy bounded best-effort completion channel.
     pub fn set_resource_completed_channel(&mut self, tx: mpsc::Sender<(Vec<u8>, [u8; 16])>) {
         self.resource_completed_tx = Some(tx);
     }
 
+    /// Install the rich bounded best-effort completion channel.
     pub fn set_resource_completion_channel(&mut self, tx: mpsc::Sender<ResourceCompletion>) {
         self.resource_completion_tx = Some(tx);
     }
@@ -3324,14 +3452,28 @@ impl LinkManager {
         self.outbound_resource_proof_tx = Some(tx);
     }
 
+    /// Install the bounded best-effort Resource lifecycle channel.
     pub fn set_resource_event_channel(&mut self, tx: mpsc::Sender<LinkResourceEvent>) {
         self.resource_event_tx = Some(tx);
+    }
+
+    /// Install one ordered, capacity-lossless non-progress accounting stream.
+    ///
+    /// The receiver must be drained for the manager's lifetime. Existing
+    /// bounded completion, Resource-event, and Link-close channels remain
+    /// independent compatibility notifications.
+    pub fn set_accounting_event_channel(
+        &mut self,
+        tx: mpsc::UnboundedSender<LinkManagerAccountingEvent>,
+    ) {
+        self.accounting_event_tx = Some(tx);
     }
 
     pub fn set_channel_message_channel(&mut self, tx: mpsc::Sender<LinkChannelMessage>) {
         self.channel_message_tx = Some(tx);
     }
 
+    /// Install the bounded best-effort Link-close channel.
     pub fn set_link_closed_channel(&mut self, tx: mpsc::Sender<[u8; 16]>) {
         self.link_closed_tx = Some(tx);
     }
@@ -3597,6 +3739,7 @@ impl LinkManager {
 
         Self::emit_resource_event(
             &self.resource_event_tx,
+            &self.accounting_event_tx,
             LinkResourceEvent::Concluded {
                 link_id: *link_id,
                 resource_id: cancelled_id,
@@ -3832,6 +3975,7 @@ impl LinkManager {
         }
         Self::emit_resource_event(
             &self.resource_event_tx,
+            &self.accounting_event_tx,
             LinkResourceEvent::Started {
                 link_id: *link_id,
                 resource_id: resource_key,
@@ -5216,6 +5360,8 @@ mod tests {
         manager.set_resource_completion_channel(completion_tx);
         let (legacy_tx, mut legacy_rx) = mpsc::channel(1);
         manager.set_resource_completed_channel(legacy_tx);
+        let (accounting_tx, mut accounting_rx) = mpsc::unbounded_channel();
+        manager.set_accounting_event_channel(accounting_tx);
         manager.active_links.insert(
             link_id,
             ActiveLink {
@@ -5313,6 +5459,28 @@ mod tests {
         assert_eq!(observed.2, 1_234.5);
         assert!(completion_rx.try_recv().is_err());
         assert!(legacy_rx.try_recv().is_err());
+        assert!(matches!(
+            accounting_rx.try_recv().unwrap(),
+            LinkManagerAccountingEvent::ResourceEvent(LinkResourceEvent::Started {
+                link_id: seen_link,
+                resource_id: seen_resource,
+                direction: LinkResourceDirection::Inbound,
+                ..
+            }) if seen_link == link_id && seen_resource == resource_hash
+        ));
+        assert!(matches!(
+            accounting_rx.try_recv().unwrap(),
+            LinkManagerAccountingEvent::ResourceEvent(LinkResourceEvent::Concluded {
+                link_id: seen_link,
+                resource_id: seen_resource,
+                direction: LinkResourceDirection::Inbound,
+                conclusion: LinkResourceConclusion::Complete,
+            }) if seen_link == link_id && seen_resource == resource_hash
+        ));
+        assert!(
+            accounting_rx.try_recv().is_err(),
+            "request Resources must not enter the ordinary completion stream"
+        );
         assert!(
             !manager
                 .pending_inbound_request_resources
@@ -6211,6 +6379,8 @@ mod tests {
         lm.set_resource_completion_channel(completion_tx);
         let (legacy_tx, mut legacy_rx) = mpsc::channel(8);
         lm.set_resource_completed_channel(legacy_tx);
+        let (accounting_tx, mut accounting_rx) = mpsc::unbounded_channel();
+        lm.set_accounting_event_channel(accounting_tx);
 
         lm.active_links.insert(
             link_id,
@@ -6336,6 +6506,38 @@ mod tests {
         assert!(
             legacy_rx.try_recv().is_err(),
             "legacy channel must also collapse to one event per original"
+        );
+
+        assert!(matches!(
+            accounting_rx.try_recv().unwrap(),
+            LinkManagerAccountingEvent::ResourceEvent(LinkResourceEvent::Started {
+                link_id: seen_link,
+                resource_id,
+                direction: LinkResourceDirection::Inbound,
+                total_segments: 2,
+                ..
+            }) if seen_link == link_id && resource_id == original_hash
+        ));
+        let LinkManagerAccountingEvent::ResourceCompletion(accounting_completion) =
+            accounting_rx.try_recv().unwrap()
+        else {
+            panic!("expected split Resource completion");
+        };
+        assert_eq!(accounting_completion.link_id, link_id);
+        assert_eq!(accounting_completion.resource_hash, original_hash);
+        assert_eq!(accounting_completion.data, payload);
+        assert!(matches!(
+            accounting_rx.try_recv().unwrap(),
+            LinkManagerAccountingEvent::ResourceEvent(LinkResourceEvent::Concluded {
+                link_id: seen_link,
+                resource_id,
+                direction: LinkResourceDirection::Inbound,
+                conclusion: LinkResourceConclusion::Complete,
+            }) if seen_link == link_id && resource_id == original_hash
+        ));
+        assert!(
+            accounting_rx.try_recv().is_err(),
+            "split Resource accounting must collapse to one logical completion"
         );
 
         // Coordinator + routing entries cleaned up after success.
@@ -6688,6 +6890,8 @@ mod tests {
         let mut manager = LinkManager::new(transport_tx, event_rx, [0xCF; 16], None);
         let (resource_event_tx, mut resource_event_rx) = mpsc::channel(8);
         manager.set_resource_event_channel(resource_event_tx);
+        let (accounting_tx, mut accounting_rx) = mpsc::unbounded_channel();
+        manager.set_accounting_event_channel(accounting_tx);
         manager.active_links.insert(
             link_id,
             ActiveLink {
@@ -6785,6 +6989,40 @@ mod tests {
             }
         );
 
+        assert!(matches!(
+            accounting_rx.try_recv().unwrap(),
+            LinkManagerAccountingEvent::ResourceEvent(LinkResourceEvent::Started {
+                link_id: seen_link,
+                resource_id: seen_resource,
+                direction: LinkResourceDirection::Inbound,
+                data_size,
+                total_segments: 1,
+            }) if seen_link == link_id
+                && seen_resource == resource_id
+                && data_size == payload.len()
+        ));
+        let LinkManagerAccountingEvent::ResourceCompletion(completion) =
+            accounting_rx.try_recv().unwrap()
+        else {
+            panic!("expected ordered Resource completion");
+        };
+        assert_eq!(completion.link_id, link_id);
+        assert_eq!(completion.resource_hash, resource_id);
+        assert_eq!(completion.data, payload);
+        assert!(matches!(
+            accounting_rx.try_recv().unwrap(),
+            LinkManagerAccountingEvent::ResourceEvent(LinkResourceEvent::Concluded {
+                link_id: seen_link,
+                resource_id: seen_resource,
+                direction: LinkResourceDirection::Inbound,
+                conclusion: LinkResourceConclusion::Complete,
+            }) if seen_link == link_id && seen_resource == resource_id
+        ));
+        assert!(
+            accounting_rx.try_recv().is_err(),
+            "progress is intentionally excluded from accounting"
+        );
+
         let TransportMessage::Outbound(proof) = transport_rx.try_recv().expect("Resource proof")
         else {
             panic!("expected outbound Resource proof");
@@ -6797,6 +7035,271 @@ mod tests {
         );
         assert!(sender.handle_proof(&proof.raw[proof_offset..]));
         assert!(manager.active_links[&link_id].inbound_resources.is_empty());
+    }
+
+    #[test]
+    fn accounting_stream_survives_full_legacy_channels() {
+        let link_id = [0xD1; 16];
+        let resource_id = [0xD2; 32];
+        let payload = b"capacity-lossless completion".to_vec();
+        let (legacy_event_tx, mut legacy_event_rx) = mpsc::channel(1);
+        legacy_event_tx
+            .try_send(LinkResourceEvent::Progress {
+                link_id: [0xEE; 16],
+                resource_id: [0xEE; 32],
+                direction: LinkResourceDirection::Inbound,
+                transferred: 1,
+                total: 2,
+            })
+            .unwrap();
+        let (legacy_completion_tx, mut legacy_completion_rx) = mpsc::channel(1);
+        legacy_completion_tx
+            .try_send(ResourceCompletion {
+                link_id: [0xEE; 16],
+                resource_hash: [0xEE; 32],
+                data: b"already queued".to_vec(),
+                metadata: None,
+            })
+            .unwrap();
+        let (legacy_tuple_tx, mut legacy_tuple_rx) = mpsc::channel(1);
+        legacy_tuple_tx
+            .try_send((b"legacy tuple queued".to_vec(), [0xEE; 16]))
+            .unwrap();
+        let (accounting_tx, mut accounting_rx) = mpsc::unbounded_channel();
+        let legacy_event_tx = Some(legacy_event_tx);
+        let legacy_completion_tx = Some(legacy_completion_tx);
+        let legacy_tuple_tx = Some(legacy_tuple_tx);
+        let accounting_tx = Some(accounting_tx);
+
+        LinkManager::emit_resource_event(
+            &legacy_event_tx,
+            &accounting_tx,
+            LinkResourceEvent::Started {
+                link_id,
+                resource_id,
+                direction: LinkResourceDirection::Inbound,
+                data_size: payload.len(),
+                total_segments: 1,
+            },
+        );
+        LinkManager::emit_resource_completion(
+            &legacy_completion_tx,
+            &legacy_tuple_tx,
+            &accounting_tx,
+            ResourceCompletion {
+                link_id,
+                resource_hash: resource_id,
+                data: payload.clone(),
+                metadata: Some(b"metadata".to_vec()),
+            },
+        );
+        LinkManager::emit_resource_event(
+            &legacy_event_tx,
+            &accounting_tx,
+            LinkResourceEvent::Concluded {
+                link_id,
+                resource_id,
+                direction: LinkResourceDirection::Inbound,
+                conclusion: LinkResourceConclusion::Complete,
+            },
+        );
+
+        assert!(matches!(
+            legacy_event_rx.try_recv().unwrap(),
+            LinkResourceEvent::Progress {
+                link_id: seen_link,
+                ..
+            } if seen_link == [0xEE; 16]
+        ));
+        assert_eq!(
+            legacy_completion_rx.try_recv().unwrap().data,
+            b"already queued"
+        );
+        assert_eq!(
+            legacy_tuple_rx.try_recv().unwrap(),
+            (b"legacy tuple queued".to_vec(), [0xEE; 16])
+        );
+        assert!(matches!(
+            accounting_rx.try_recv().unwrap(),
+            LinkManagerAccountingEvent::ResourceEvent(LinkResourceEvent::Started {
+                link_id: seen_link,
+                resource_id: seen_resource,
+                ..
+            }) if seen_link == link_id && seen_resource == resource_id
+        ));
+        let LinkManagerAccountingEvent::ResourceCompletion(completion) =
+            accounting_rx.try_recv().unwrap()
+        else {
+            panic!("expected capacity-lossless completion");
+        };
+        assert_eq!(completion.link_id, link_id);
+        assert_eq!(completion.resource_hash, resource_id);
+        assert_eq!(completion.data, payload);
+        assert_eq!(completion.metadata, Some(b"metadata".to_vec()));
+        assert!(matches!(
+            accounting_rx.try_recv().unwrap(),
+            LinkManagerAccountingEvent::ResourceEvent(LinkResourceEvent::Concluded {
+                link_id: seen_link,
+                resource_id: seen_resource,
+                conclusion: LinkResourceConclusion::Complete,
+                ..
+            }) if seen_link == link_id && seen_resource == resource_id
+        ));
+        assert!(accounting_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn accounting_debug_redacts_completion_content() {
+        let event = LinkManagerAccountingEvent::ResourceCompletion(ResourceCompletion {
+            link_id: [0xD6; 16],
+            resource_hash: [0xD7; 32],
+            data: b"secret payload".to_vec(),
+            metadata: Some(b"secret metadata".to_vec()),
+        });
+
+        let rendered = format!("{event:?}");
+        assert!(rendered.contains("data_len: 14"));
+        assert!(rendered.contains("metadata_len: Some(15)"));
+        assert!(!rendered.contains("secret payload"));
+        assert!(!rendered.contains("secret metadata"));
+    }
+
+    #[test]
+    fn link_close_accounting_survives_full_legacy_channels_in_actor_order() {
+        let (_peer_link, mut local_link, _identity_key) = handshaken_link_pair_with_identity();
+        let link_id = local_link.link_id;
+        let (transport_tx, _transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::new(transport_tx, event_rx, [0xD3; 16], None);
+        let outbound =
+            rns_protocol::resource::OutboundResource::new(vec![0xAB; 2000], false, None).unwrap();
+        let resource_id = outbound.resource_hash;
+        let transfer = InboundTransfer::from_advertisement(
+            outbound.num_parts(),
+            outbound.total_size,
+            outbound.data.len(),
+            outbound.random_hash,
+            resource_id,
+            outbound.flags,
+            outbound.map_hashes,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap();
+        local_link.track_incoming_resource(resource_id);
+        manager.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: local_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::from([(resource_id, transfer)]),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let (legacy_event_tx, mut legacy_event_rx) = mpsc::channel(1);
+        legacy_event_tx
+            .try_send(LinkResourceEvent::Progress {
+                link_id,
+                resource_id,
+                direction: LinkResourceDirection::Inbound,
+                transferred: 1,
+                total: 2,
+            })
+            .unwrap();
+        manager.set_resource_event_channel(legacy_event_tx);
+        let (legacy_close_tx, mut legacy_close_rx) = mpsc::channel(1);
+        legacy_close_tx.try_send([0xEE; 16]).unwrap();
+        manager.set_link_closed_channel(legacy_close_tx);
+        let (accounting_tx, mut accounting_rx) = mpsc::unbounded_channel();
+        manager.set_accounting_event_channel(accounting_tx);
+
+        LinkManager::emit_resource_event(
+            &manager.resource_event_tx,
+            &manager.accounting_event_tx,
+            LinkResourceEvent::Started {
+                link_id,
+                resource_id,
+                direction: LinkResourceDirection::Inbound,
+                data_size: outbound.data.len(),
+                total_segments: 1,
+            },
+        );
+        assert!(manager.close_active_link(link_id, CloseReason::Timeout, false));
+
+        assert!(matches!(
+            legacy_event_rx.try_recv().unwrap(),
+            LinkResourceEvent::Progress { .. }
+        ));
+        assert_eq!(legacy_close_rx.try_recv().unwrap(), [0xEE; 16]);
+        assert!(matches!(
+            accounting_rx.try_recv().unwrap(),
+            LinkManagerAccountingEvent::ResourceEvent(LinkResourceEvent::Started {
+                link_id: seen_link,
+                resource_id: seen_resource,
+                ..
+            }) if seen_link == link_id && seen_resource == resource_id
+        ));
+        assert!(matches!(
+            accounting_rx.try_recv().unwrap(),
+            LinkManagerAccountingEvent::LinkClosed { link_id: seen_link }
+                if seen_link == link_id
+        ));
+        assert!(matches!(
+            accounting_rx.try_recv().unwrap(),
+            LinkManagerAccountingEvent::ResourceEvent(LinkResourceEvent::Concluded {
+                link_id: seen_link,
+                resource_id: seen_resource,
+                direction: LinkResourceDirection::Inbound,
+                conclusion: LinkResourceConclusion::Failed(_),
+            }) if seen_link == link_id && seen_resource == resource_id
+        ));
+        assert!(accounting_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn closed_accounting_receiver_does_not_block_or_panic() {
+        let (accounting_tx, accounting_rx) = mpsc::unbounded_channel();
+        drop(accounting_rx);
+        let accounting_tx = Some(accounting_tx);
+        let no_events = None;
+        let no_completions = None;
+        let no_legacy_completions = None;
+        LinkManager::emit_resource_event(
+            &no_events,
+            &accounting_tx,
+            LinkResourceEvent::Started {
+                link_id: [0xD4; 16],
+                resource_id: [0xD5; 32],
+                direction: LinkResourceDirection::Inbound,
+                data_size: 1,
+                total_segments: 1,
+            },
+        );
+        LinkManager::emit_resource_completion(
+            &no_completions,
+            &no_legacy_completions,
+            &accounting_tx,
+            ResourceCompletion {
+                link_id: [0xD4; 16],
+                resource_hash: [0xD5; 32],
+                data: vec![1],
+                metadata: None,
+            },
+        );
+        LinkManager::emit_resource_event(
+            &no_events,
+            &accounting_tx,
+            LinkResourceEvent::Concluded {
+                link_id: [0xD4; 16],
+                resource_id: [0xD5; 32],
+                direction: LinkResourceDirection::Inbound,
+                conclusion: LinkResourceConclusion::Complete,
+            },
+        );
     }
 
     // 1.3.9: a successfully-decrypted but unparseable advertisement tears down
