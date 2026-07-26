@@ -171,6 +171,8 @@ pub struct InterfaceStatEntry {
     #[serde(default)]
     pub pr_burst_activated: f64,
     pub clients: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_ips: Option<u64>,
     pub announce_rate_target: Option<f64>,
     pub announce_rate_grace: Option<u32>,
     pub announce_rate_penalty: Option<f64>,
@@ -513,7 +515,7 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
             let interfaces = entries
                 .iter()
                 .map(|e| {
-                    py_dict(vec![
+                    let mut fields = vec![
                         ("id", PyValue::Int(i128::from(e.id))),
                         ("name", PyValue::String(e.name.clone())),
                         ("short_name", PyValue::String(e.name.clone())),
@@ -564,7 +566,11 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                                 .unwrap_or(PyValue::None),
                         ),
                         ("tx_drops", PyValue::Int(i128::from(e.tx_drops))),
-                    ])
+                    ];
+                    if let Some(blocked_ips) = e.blocked_ips {
+                        fields.push(("blocked_ips", PyValue::Int(i128::from(blocked_ips))));
+                    }
+                    py_dict(fields)
                 })
                 .collect();
             let rxb = entries.iter().map(|e| e.rx_bytes).sum::<u64>();
@@ -670,6 +676,10 @@ fn py_value_to_response_for_request(
     value: &PyValue,
     request: &RpcRequest,
 ) -> Result<RpcResponse, RpcError> {
+    if matches!(value, PyValue::Dict(entries) if dict_get(entries, "error").is_some()) {
+        return py_value_to_response(value);
+    }
+
     match request {
         RpcRequest::GetPathTable { .. } => Ok(RpcResponse::PathTable(parse_path_table(value)?)),
         RpcRequest::GetInterfaceStats => {
@@ -833,6 +843,10 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, Rpc
                     .and_then(py_f64)
                     .unwrap_or(0.0),
                 clients: match dict_get(m, "clients") {
+                    Some(PyValue::None) | None => None,
+                    Some(value) => py_u64(value),
+                },
+                blocked_ips: match dict_get(m, "blocked_ips") {
                     Some(PyValue::None) | None => None,
                     Some(value) => py_u64(value),
                 },
@@ -1684,6 +1698,19 @@ pub enum RpcError {
 mod tests {
     use super::*;
 
+    fn contains_string_key(value: &PyValue, expected: &str) -> bool {
+        match value {
+            PyValue::List(values) => values
+                .iter()
+                .any(|value| contains_string_key(value, expected)),
+            PyValue::Dict(entries) => entries.iter().any(|(key, value)| {
+                matches!(key, PyDictKey::String(key) if key == expected)
+                    || contains_string_key(value, expected)
+            }),
+            _ => false,
+        }
+    }
+
     #[test]
     fn test_request_roundtrip() {
         let req = RpcRequest::GetPathTable { max_hops: Some(8) };
@@ -1752,6 +1779,7 @@ mod tests {
             pr_burst_active: true,
             pr_burst_activated: 1_700_000_002.0,
             clients: Some(4),
+            blocked_ips: Some(2),
             announce_rate_target: Some(3600.0),
             announce_rate_grace: Some(5),
             announce_rate_penalty: Some(30.0),
@@ -1777,6 +1805,7 @@ mod tests {
                 assert_eq!(entry.burst_activated, 1_700_000_001.0);
                 assert!(entry.pr_burst_active);
                 assert_eq!(entry.pr_burst_activated, 1_700_000_002.0);
+                assert_eq!(entry.blocked_ips, Some(2));
             }
             _ => panic!("wrong variant"),
         }
@@ -1806,9 +1835,67 @@ mod tests {
                 assert_eq!(entry.burst_activated, 0.0);
                 assert!(!entry.pr_burst_active);
                 assert_eq!(entry.pr_burst_activated, 0.0);
+                assert_eq!(entry.blocked_ips, None);
+                assert_eq!(entry.mtu, 0, "Python stats omit MTU");
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn request_specific_decoder_preserves_rpc_errors() {
+        let encoded = encode_response(&RpcResponse::Error("transport unavailable".to_string()))
+            .expect("encode RPC error");
+        for request in [
+            RpcRequest::GetPathTable { max_hops: None },
+            RpcRequest::DropPath {
+                destination_hash: vec![0; 16],
+            },
+        ] {
+            assert!(matches!(
+                decode_response_for_request(&encoded, &request),
+                Ok(RpcResponse::Error(message)) if message == "transport unavailable"
+            ));
+        }
+    }
+
+    #[test]
+    fn interface_stats_omit_absent_blocked_ip_count() {
+        let mut entry = interface_stat_entry();
+        entry.blocked_ips = None;
+        let encoded = encode_response(&RpcResponse::InterfaceStats(vec![entry])).unwrap();
+        let raw = decode_umsgpack(&encoded).unwrap();
+        assert!(!contains_string_key(&raw, "blocked_ips"));
+    }
+
+    #[test]
+    fn interface_stats_ignore_blocked_ip_lists_and_never_reencode_them() {
+        let upstream = py_dict(vec![(
+            "interfaces",
+            PyValue::List(vec![py_dict(vec![
+                ("name", PyValue::String("Backbone".to_string())),
+                ("rxb", PyValue::Int(1)),
+                ("txb", PyValue::Int(2)),
+                ("status", PyValue::Bool(true)),
+                ("blocked_ips", PyValue::Int(3)),
+                (
+                    "blocked_ip_list",
+                    PyValue::List(vec![PyValue::String("192.0.2.1".to_string())]),
+                ),
+            ])]),
+        )]);
+        let encoded = encode_umsgpack(&upstream).unwrap();
+        let decoded =
+            decode_response_for_request(&encoded, &RpcRequest::GetInterfaceStats).unwrap();
+        let RpcResponse::InterfaceStats(entries) = &decoded else {
+            panic!("unexpected interface stats response");
+        };
+        assert_eq!(entries[0].blocked_ips, Some(3));
+
+        let reencoded = encode_response(&decoded).unwrap();
+        let raw = decode_umsgpack(&reencoded).unwrap();
+        assert!(contains_string_key(&raw, "blocked_ips"));
+        assert!(!contains_string_key(&raw, "blocked_ip_list"));
     }
 
     #[test]

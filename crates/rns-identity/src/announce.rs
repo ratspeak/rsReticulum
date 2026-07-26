@@ -261,7 +261,7 @@ impl AnnounceData {
     }
 
     /// Validate destination-hash binding and first-seen public-key continuity
-    /// after [`verify_signature`] has succeeded.
+    /// after [`Self::verify_signature`] has succeeded.
     pub fn validate_destination_binding(
         &self,
         packet_dest_hash: &[u8; 16],

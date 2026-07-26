@@ -8,7 +8,9 @@ use tokio::sync::mpsc;
 
 use crate::hdlc;
 use crate::kiss;
-use crate::traits::{InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode};
+use crate::traits::{
+    InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, handoff_accepted_interface,
+};
 use rns_transport::messages::{InboundPacket, TransportMessage};
 
 pub const RECONNECT_WAIT_INITIAL: u64 = 5;
@@ -100,8 +102,10 @@ fn address_for_device(device: &str, prefer_ipv6: bool) -> Option<std::net::IpAdd
         .filter(|a| a.name == device)
         .map(|a| a.ip())
         .collect();
-    if prefer_ipv6 && let Some(v6) = on_dev.iter().find(|ip| ip.is_ipv6()) {
-        return Some(*v6);
+    if prefer_ipv6 {
+        if let Some(v6) = on_dev.iter().find(|ip| ip.is_ipv6()) {
+            return Some(*v6);
+        }
     }
     on_dev
         .iter()
@@ -437,6 +441,7 @@ pub async fn spawn_tcp_client(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
+        inspection: None,
         tx,
         read_task,
     })
@@ -505,6 +510,7 @@ async fn spawn_tcp_accepted(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
+        inspection: None,
         tx,
         read_task,
     }
@@ -560,7 +566,10 @@ pub async fn spawn_tcp_server(
                         mode,
                     )
                     .await;
-                    if handle_tx.send(handle).await.is_err() {
+                    if handoff_accepted_interface(&handle_tx, handle)
+                        .await
+                        .is_err()
+                    {
                         tracing::warn!("handle registry channel closed, stopping accept loop");
                         break;
                     }
@@ -591,6 +600,7 @@ pub async fn spawn_tcp_server(
         online,
         rxb: Some(Arc::new(AtomicU64::new(0))),
         txb: Some(Arc::new(AtomicU64::new(0))),
+        inspection: None,
         tx,
         read_task,
     })

@@ -2,7 +2,7 @@ use crate::now_f64;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -13,6 +13,7 @@ use crate::announce::AnnounceTable;
 use crate::blackhole::BlackholeTable;
 use crate::constants::*;
 use crate::hashlist::PacketHashlist;
+use crate::link_messages::PacketMetrics;
 use crate::link_table::LinkTable;
 use crate::messages::{
     InterfaceEntry, InterfaceId, InterfaceRole, TransportMessage, msg_variant_name,
@@ -36,6 +37,8 @@ mod rpc;
 /// reaching into the tables directly.
 pub struct TransportActor {
     rx: mpsc::Receiver<TransportMessage>,
+    persistence_tx: mpsc::Sender<()>,
+    persistence_rx: mpsc::Receiver<()>,
 
     pub path_table: PathTable,
     pub link_table: LinkTable,
@@ -56,6 +59,9 @@ pub struct TransportActor {
     /// Truncated packet hash → LXMF msg_id for pairing delivery proofs back
     /// to their originating outbound message.
     pub receipt_msg_ids: HashMap<[u8; 16], String>,
+    /// Direct per-send receipt observers used by the high-level runtime API.
+    pub receipt_updates:
+        HashMap<[u8; 16], tokio::sync::watch::Sender<crate::messages::ReceiptUpdate>>,
 
     pub interfaces: HashMap<InterfaceId, InterfaceEntry>,
 
@@ -144,6 +150,11 @@ pub struct TransportActor {
     pub shared_instance_client_mode: bool,
 
     pub storage_dir: Option<PathBuf>,
+    /// One-shot guard for lazy packet-hashlist restore. The hashlist is only
+    /// authoritative on an enabled transport node that is not a shared
+    /// instance client, so startup cannot load it before those roles are
+    /// known.
+    hashlist_load_attempted: bool,
 
     /// Last save (Unix seconds) — gates the periodic save tick. 0 forces an
     /// initial baseline write after storage initialisation.
@@ -155,6 +166,12 @@ pub struct TransportActor {
     /// Guards the blocking-pool routing-state writer; concurrent writers
     /// would race on the shared `<file>.tmp` paths.
     pub routing_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Monotonic claim used to prevent an older queued routing snapshot from
+    /// replacing a newer synchronous/shutdown snapshot.
+    pub routing_save_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Serializes routing snapshot publication while generation ordering
+    /// decides whether a queued writer is still current.
+    pub routing_save_lock: std::sync::Arc<std::sync::Mutex<()>>,
     pub hashlist_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Guards the blocking-pool announce-cache sweep (Python parity with the
     /// non-blocking `cache_clean_lock`: an in-flight sweep skips the pass).
@@ -178,6 +195,7 @@ pub struct TransportActor {
     pub channel_drops: u64,
 
     announce_handlers: Vec<AnnounceHandlerRegistration>,
+    next_announce_handler_id: u64,
 
     /// Foreground/background flag shared with the app layer. Flipping to
     /// background switches the maintenance tick to the long interval so the
@@ -228,16 +246,29 @@ pub struct PendingDiscoveryPathRequest {
 }
 
 struct AnnounceHandlerRegistration {
+    id: crate::messages::AnnounceHandlerId,
     aspect_filter: Option<String>,
     receive_path_responses: bool,
     tx: tokio::sync::mpsc::Sender<crate::messages::AnnounceHandlerEvent>,
+    dropped_events: Arc<AtomicU64>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PacketMetrics {
-    pub rssi: Option<f32>,
-    pub snr: Option<f32>,
-    pub q: Option<f32>,
+/// Dedicated trigger for scheduled full-state persistence.
+///
+/// Keeping this control outside [`TransportMessage`] avoids expanding the
+/// public transport command enum for a runtime-lifecycle concern. Requests
+/// are serialized by the owning actor.
+#[derive(Clone)]
+pub struct PersistenceTrigger {
+    tx: mpsc::Sender<()>,
+}
+
+impl PersistenceTrigger {
+    /// Request a full asynchronous persistence pass. Returns `false` only
+    /// after the owning transport actor has stopped.
+    pub async fn request(&self) -> bool {
+        self.tx.send(()).await.is_ok()
+    }
 }
 
 impl TransportActor {
@@ -252,9 +283,12 @@ impl TransportActor {
         hashlist_cap: usize,
     ) -> (Self, mpsc::Sender<TransportMessage>) {
         let (tx, rx) = mpsc::channel(channel_cap);
+        let (persistence_tx, persistence_rx) = mpsc::channel(1);
 
         let actor = Self {
             rx,
+            persistence_tx,
+            persistence_rx,
             path_table: PathTable::new(),
             link_table: LinkTable::new(),
             announce_table: AnnounceTable::new(),
@@ -269,6 +303,7 @@ impl TransportActor {
             packet_metrics_order: VecDeque::new(),
             receipt_table: HashMap::new(),
             receipt_msg_ids: HashMap::new(),
+            receipt_updates: HashMap::new(),
             interfaces: HashMap::new(),
             local_destinations: HashSet::new(),
             destination_channels: HashMap::new(),
@@ -301,9 +336,12 @@ impl TransportActor {
             is_shared_instance: false,
             shared_instance_client_mode: false,
             storage_dir: None,
+            hashlist_load_attempted: false,
             last_state_save: 0.0,
             state_dirty: false,
             routing_save_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            routing_save_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            routing_save_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             hashlist_save_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             announce_sweep_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
@@ -315,10 +353,18 @@ impl TransportActor {
             startup_time: 0.0,
             channel_drops: 0,
             announce_handlers: Vec::new(),
+            next_announce_handler_id: 0,
             is_foreground: Arc::new(AtomicBool::new(true)),
         };
 
         (actor, tx)
+    }
+
+    /// Obtain a cloneable lifecycle handle for scheduled persistence.
+    pub fn persistence_trigger(&self) -> PersistenceTrigger {
+        PersistenceTrigger {
+            tx: self.persistence_tx.clone(),
+        }
     }
 
     /// Load persisted state before the actor starts draining live traffic.
@@ -330,6 +376,7 @@ impl TransportActor {
     pub fn initialize_storage(&mut self, storage_dir: PathBuf) {
         self.storage_dir = Some(storage_dir);
         self.load_state();
+        self.maybe_load_hashlist();
     }
 
     /// Run the actor event loop. Messages are processed sequentially so no
@@ -348,6 +395,9 @@ impl TransportActor {
                         }
                         Some(msg) => self.handle_message(msg),
                     }
+                }
+                Some(()) = self.persistence_rx.recv() => {
+                    self.save_state_async();
                 }
                 _ = tick_interval.tick() => {
                     let is_fg = self.is_foreground.load(std::sync::atomic::Ordering::Relaxed);
@@ -392,6 +442,73 @@ impl TransportActor {
             } => {
                 self.on_outbound_attached(request, interface_id);
             }
+            TransportMessage::SendPacket {
+                request,
+                attached_interface,
+                receipt,
+                result_tx,
+            } => {
+                let receipt_hash = receipt
+                    .as_ref()
+                    .map(|registration| registration.truncated_hash);
+                if receipt_hash.is_some_and(|hash| self.receipt_table.contains_key(&hash)) {
+                    let _ =
+                        result_tx.send(crate::messages::OutboundDispatchResult::ReceiptCollision);
+                } else {
+                    if let Some(registration) = receipt {
+                        let mut packet_receipt = PacketReceipt::new(
+                            registration.full_hash,
+                            registration.truncated_hash,
+                            Some(
+                                registration
+                                    .timeout
+                                    .unwrap_or(std::time::Duration::from_secs(180)),
+                            ),
+                        );
+                        packet_receipt.set_destination_identity(
+                            registration.destination_hash,
+                            Some(registration.destination_public_key),
+                        );
+                        self.receipt_table
+                            .insert(registration.truncated_hash, packet_receipt);
+                        self.receipt_updates
+                            .insert(registration.truncated_hash, registration.status_tx);
+                    }
+
+                    let sent = match attached_interface {
+                        Some(interface_id) => self.on_outbound_attached(request, interface_id),
+                        None => self.on_outbound_with_receipt_policy(request, false),
+                    };
+                    let result = if sent {
+                        crate::messages::OutboundDispatchResult::Sent
+                    } else {
+                        if let Some(hash) = receipt_hash {
+                            self.receipt_table.remove(&hash);
+                            self.receipt_updates.remove(&hash);
+                        }
+                        crate::messages::OutboundDispatchResult::NoInterface
+                    };
+                    let _ = result_tx.send(result);
+                }
+            }
+            TransportMessage::SetReceiptTimeout {
+                truncated_hash,
+                timeout,
+                result_tx,
+            } => {
+                let updated = self
+                    .receipt_table
+                    .get_mut(&truncated_hash)
+                    .is_some_and(|receipt| {
+                        if receipt.status == ReceiptStatus::Sent {
+                            receipt.timeout = Some(timeout);
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                let _ = result_tx.send(updated);
+            }
             TransportMessage::Tick(_) => {
                 self.on_tick();
             }
@@ -410,7 +527,12 @@ impl TransportActor {
                     if self.is_shared_instance {
                         if let Err(e) =
                             tx.try_send(crate::link_messages::DestinationEvent::AnnounceRequested(
-                                crate::link_messages::AnnounceRequest::normal(app_name.clone()),
+                                crate::link_messages::AnnounceRequest {
+                                    app_name: app_name.clone(),
+                                    path_response: true,
+                                    tag: None,
+                                    attached_interface: None,
+                                },
                             ))
                         {
                             self.channel_drops += 1;
@@ -475,6 +597,12 @@ impl TransportActor {
             TransportMessage::RequestPath { destination_hash } => {
                 self.on_path_request(destination_hash);
             }
+            TransportMessage::RequestPathWithOptions {
+                destination_hash,
+                options,
+            } => {
+                self.on_path_request_with_options(destination_hash, options);
+            }
             TransportMessage::Rpc { query, response_tx } => {
                 let response = self.handle_query(query);
                 let _ = response_tx.send(response);
@@ -484,11 +612,33 @@ impl TransportActor {
                 receive_path_responses,
                 callback_tx,
             } => {
+                let id = crate::messages::AnnounceHandlerId(self.next_announce_handler_id);
+                self.next_announce_handler_id = self.next_announce_handler_id.wrapping_add(1);
                 self.announce_handlers.push(AnnounceHandlerRegistration {
+                    id,
                     aspect_filter,
                     receive_path_responses,
                     tx: callback_tx,
+                    dropped_events: Arc::new(AtomicU64::new(0)),
                 });
+            }
+            TransportMessage::RegisterAnnounceSubscription {
+                aspect_filter,
+                receive_path_responses,
+                callback_tx,
+                dropped_events,
+                result_tx,
+            } => {
+                let id = crate::messages::AnnounceHandlerId(self.next_announce_handler_id);
+                self.next_announce_handler_id = self.next_announce_handler_id.wrapping_add(1);
+                self.announce_handlers.push(AnnounceHandlerRegistration {
+                    id,
+                    aspect_filter,
+                    receive_path_responses,
+                    tx: callback_tx,
+                    dropped_events,
+                });
+                let _ = result_tx.send(id);
             }
             TransportMessage::DeregisterAnnounceHandler { aspect_filter } => {
                 // Also sweep closed channels here so deregister doubles as
@@ -501,9 +651,20 @@ impl TransportActor {
                     if let Some(ref target) = aspect_filter {
                         registration.aspect_filter.as_ref() != Some(target)
                     } else {
-                        true
+                        false
                     }
                 });
+            }
+            TransportMessage::DeregisterAnnounceSubscription { id, result_tx } => {
+                let removed = self
+                    .announce_handlers
+                    .iter()
+                    .any(|registration| registration.id == id);
+                self.announce_handlers
+                    .retain(|registration| registration.id != id && !registration.tx.is_closed());
+                if let Some(result_tx) = result_tx {
+                    let _ = result_tx.send(removed);
+                }
             }
             TransportMessage::SetTransportEnabled { enabled } => {
                 debug!(enabled, "setting transport enabled");
@@ -511,6 +672,7 @@ impl TransportActor {
                 // The runtime sends the identity before the enable flag, so
                 // the swap decision must be re-evaluated here.
                 self.apply_transport_identity_policy();
+                self.maybe_load_hashlist();
             }
             TransportMessage::SetTransportIdentity { identity_hash } => {
                 debug!(
@@ -586,18 +748,22 @@ impl TransportActor {
                 debug!(path = %storage_dir.display(), "setting storage paths");
                 self.storage_dir = Some(storage_dir);
                 self.load_state();
+                self.maybe_load_hashlist();
             }
             TransportMessage::RegisterReceipt {
                 truncated_hash,
                 full_hash,
+                destination_hash,
+                destination_public_key,
                 msg_id,
                 timeout,
             } => {
-                let receipt = PacketReceipt::new(
+                let mut receipt = PacketReceipt::new(
                     full_hash,
                     truncated_hash,
                     Some(timeout.unwrap_or(std::time::Duration::from_secs(180))),
                 );
+                receipt.set_destination_identity(destination_hash, Some(destination_public_key));
                 self.receipt_table.insert(truncated_hash, receipt);
                 self.receipt_msg_ids.insert(truncated_hash, msg_id);
                 debug!(
@@ -711,20 +877,22 @@ impl TransportActor {
         header: &rns_wire::header::PacketHeader,
         transport_insert: bool,
     ) -> Vec<u8> {
-        if transport_insert && let Some(transport_id) = self.transport_identity_hash {
-            let mut flags = header.flags;
-            flags.header_type = rns_wire::flags::HeaderType::Header2;
-            flags.transport_type = rns_wire::flags::TransportType::Transport;
-            let new_header = rns_wire::header::PacketHeader {
-                flags,
-                hops: self.local_hops_delta,
-                transport_id: Some(transport_id),
-                destination_hash: header.destination_hash,
-                context: header.context,
-            };
-            let mut out = new_header.pack();
-            out.extend_from_slice(&raw[header.size()..]);
-            return out;
+        if transport_insert {
+            if let Some(transport_id) = self.transport_identity_hash {
+                let mut flags = header.flags;
+                flags.header_type = rns_wire::flags::HeaderType::Header2;
+                flags.transport_type = rns_wire::flags::TransportType::Transport;
+                let new_header = rns_wire::header::PacketHeader {
+                    flags,
+                    hops: self.local_hops_delta,
+                    transport_id: Some(transport_id),
+                    destination_hash: header.destination_hash,
+                    context: header.context,
+                };
+                let mut out = new_header.pack();
+                out.extend_from_slice(&raw[header.size()..]);
+                return out;
+            }
         }
         let mut out = raw.to_vec();
         out[1] = self.local_hops_delta;
@@ -1103,9 +1271,9 @@ impl TransportActor {
         skip_all,
         fields(interface_id = id, raw_len = raw.len()),
     )]
-    fn send_to_interface(&mut self, id: InterfaceId, raw: &[u8]) {
+    fn send_to_interface(&mut self, id: InterfaceId, raw: &[u8]) -> bool {
         let Some(entry) = self.interfaces.get(&id) else {
-            return;
+            return false;
         };
         if entry.role == InterfaceRole::LocalClient && interface_marked_offline(entry) {
             tracing::info!(
@@ -1114,13 +1282,13 @@ impl TransportActor {
                 "interface marked offline; auto-deregistering"
             );
             self.deregister_interface(id);
-            return;
+            return false;
         }
         let Some(entry) = self.interfaces.get(&id) else {
-            return;
+            return false;
         };
         if !entry.direction.outbound {
-            return;
+            return false;
         }
         let data: Bytes = if let Some(ref ifac_key) = entry.ifac_key {
             Bytes::from(crate::ifac::ifac_sign(raw, ifac_key, entry.ifac_size))
@@ -1128,7 +1296,7 @@ impl TransportActor {
             Bytes::copy_from_slice(raw)
         };
         match entry.tx.try_send(data) {
-            Ok(()) => {}
+            Ok(()) => true,
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 let tx_drops = entry
                     .tx_drops
@@ -1144,6 +1312,7 @@ impl TransportActor {
                         "PACKET DROPPED: interface TX channel full"
                     );
                 }
+                false
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 tracing::info!(
@@ -1152,6 +1321,7 @@ impl TransportActor {
                     "interface TX channel closed (downstream task exited); auto-deregistering"
                 );
                 self.deregister_interface(id);
+                false
             }
         }
     }
@@ -1162,7 +1332,7 @@ impl TransportActor {
         skip_all,
         fields(raw_len = raw.len()),
     )]
-    fn broadcast_on_interfaces(&mut self, raw: &[u8], except: Option<InterfaceId>) {
+    fn broadcast_on_interfaces(&mut self, raw: &[u8], except: Option<InterfaceId>) -> bool {
         // Collect ids first so the borrow on self.interfaces ends before
         // send_to_interface (which may mutate it via auto-deregister) runs.
         let ids: Vec<InterfaceId> = self
@@ -1182,15 +1352,17 @@ impl TransportActor {
             .then(|| rns_wire::header::PacketHeader::unpack(raw).ok())
             .flatten()
             .map(|(header, _)| header);
+        let mut sent = false;
         for id in ids {
-            match &delta_header {
+            sent |= match &delta_header {
                 Some(header) if self.should_apply_delta(header, id) => {
                     let mangled = self.mangle_hops(raw, header, false);
-                    self.send_to_interface(id, &mangled);
+                    self.send_to_interface(id, &mangled)
                 }
                 _ => self.send_to_interface(id, raw),
-            }
+            };
         }
+        sent
     }
 
     fn interface_allows_announce(
@@ -1297,17 +1469,19 @@ impl TransportActor {
         for id in ids {
             // Python 1.3.8 Transport.py:1345: delta-mangled HEADER_1 announces
             // are re-framed as HEADER_2|TRANSPORT with our transport identity.
-            match &header {
+            let sent = match &header {
                 Some(h) if self.should_apply_delta(h, id) => {
                     let transport_insert =
                         h.flags.header_type == rns_wire::flags::HeaderType::Header1;
                     let mangled = self.mangle_hops(raw, h, transport_insert);
-                    self.send_to_interface(id, &mangled);
+                    self.send_to_interface(id, &mangled)
                 }
                 _ => self.send_to_interface(id, raw),
-            }
-            if let Some(entry) = self.interfaces.get_mut(&id) {
-                entry.ingress.sent_announce();
+            };
+            if sent {
+                if let Some(entry) = self.interfaces.get_mut(&id) {
+                    entry.ingress.sent_announce();
+                }
             }
         }
     }
@@ -1461,7 +1635,9 @@ impl TransportActor {
                     _ => None,
                 };
                 match next {
-                    Some(raw) => self.send_to_interface(iface_id, &raw),
+                    Some(raw) => {
+                        self.send_to_interface(iface_id, &raw);
+                    }
                     None => break,
                 }
             }
@@ -1513,9 +1689,23 @@ mod tests {
     use super::*;
     use crate::constants::{InterfaceDirection, InterfaceMode};
     use crate::messages::{
-        InboundPacket, InterfaceEntry, OutboundRequest, TransportQuery, TransportQueryResponse,
+        InboundPacket, InterfaceEntry, InterfaceInspectionSnapshot, InterfaceInspectionSource,
+        OutboundRequest, TransportQuery, TransportQueryResponse,
     };
     use crate::path_table::PathEntry;
+
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rns-transport-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn make_valid_announce(app_name: &str, hops: u8) -> (Bytes, [u8; 16]) {
         let identity = rns_identity::identity::Identity::new();
@@ -1700,7 +1890,7 @@ mod tests {
         Bytes::from(raw)
     }
 
-    fn make_proof_packet(dest_hash: [u8; 16], hops: u8) -> Bytes {
+    fn make_proof_packet_with_payload(dest_hash: [u8; 16], hops: u8, payload: &[u8]) -> Bytes {
         let flags = rns_wire::flags::PacketFlags {
             header_type: rns_wire::flags::HeaderType::Header1,
             context_flag: false,
@@ -1716,8 +1906,12 @@ mod tests {
             context: rns_wire::context::PacketContext::None,
         };
         let mut raw = header.pack();
-        raw.extend_from_slice(&[0xEE; 32]);
+        raw.extend_from_slice(payload);
         Bytes::from(raw)
+    }
+
+    fn make_proof_packet(dest_hash: [u8; 16], hops: u8) -> Bytes {
+        make_proof_packet_with_payload(dest_hash, hops, &[0xEE; 32])
     }
 
     fn make_link_proof_packet(link_id: [u8; 16], hops: u8) -> Bytes {
@@ -1760,6 +1954,7 @@ mod tests {
             online: None,
             rxb: None,
             txb: None,
+            inspection: None,
             tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             multipoint: false,
             recursive_prs: false,
@@ -1791,12 +1986,94 @@ mod tests {
     }
 
     #[test]
+    fn shared_instance_registration_requests_path_response_announce() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_shared_instance = true;
+        let hash = [0xAB; 16];
+        let (delivery_tx, mut delivery_rx) = mpsc::channel(1);
+
+        actor.handle_message(TransportMessage::RegisterDestination {
+            hash,
+            app_name: "test.shared".to_string(),
+            delivery_tx: Some(delivery_tx),
+        });
+
+        let crate::link_messages::DestinationEvent::AnnounceRequested(request) =
+            delivery_rx.try_recv().unwrap()
+        else {
+            panic!("expected announce request");
+        };
+        assert_eq!(request.app_name, "test.shared");
+        assert!(request.path_response);
+        assert!(request.tag.is_none());
+        assert!(request.attached_interface.is_none());
+    }
+
+    #[test]
     fn test_deregister_destination() {
         let (mut actor, _tx) = TransportActor::new();
         let hash = [0xAA; 16];
         actor.local_destinations.insert(hash);
         actor.handle_message(TransportMessage::DeregisterDestination { hash });
         assert!(!actor.local_destinations.contains(&hash));
+    }
+
+    #[test]
+    fn deregister_announce_handler_without_filter_removes_all() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        actor.handle_message(TransportMessage::RegisterAnnounceHandler {
+            aspect_filter: Some("first.aspect".into()),
+            receive_path_responses: false,
+            callback_tx: first_tx,
+        });
+        actor.handle_message(TransportMessage::RegisterAnnounceHandler {
+            aspect_filter: None,
+            receive_path_responses: true,
+            callback_tx: second_tx,
+        });
+        assert_eq!(actor.announce_handlers.len(), 2);
+
+        actor.handle_message(TransportMessage::DeregisterAnnounceHandler {
+            aspect_filter: None,
+        });
+        assert!(actor.announce_handlers.is_empty());
+    }
+
+    #[test]
+    fn deregister_announce_subscription_removes_only_its_token() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        let (first_result_tx, mut first_result_rx) = tokio::sync::oneshot::channel();
+        let (second_result_tx, mut second_result_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::RegisterAnnounceSubscription {
+            aspect_filter: Some("same.aspect".into()),
+            receive_path_responses: false,
+            callback_tx: first_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
+            result_tx: first_result_tx,
+        });
+        actor.handle_message(TransportMessage::RegisterAnnounceSubscription {
+            aspect_filter: Some("same.aspect".into()),
+            receive_path_responses: false,
+            callback_tx: second_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
+            result_tx: second_result_tx,
+        });
+        let first_id = first_result_rx.try_recv().unwrap();
+        let second_id = second_result_rx.try_recv().unwrap();
+        assert_ne!(first_id, second_id);
+
+        let (removed_tx, mut removed_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::DeregisterAnnounceSubscription {
+            id: first_id,
+            result_tx: Some(removed_tx),
+        });
+        assert!(removed_rx.try_recv().unwrap());
+        assert_eq!(actor.announce_handlers.len(), 1);
+        assert_eq!(actor.announce_handlers[0].id, second_id);
     }
 
     #[tokio::test]
@@ -3611,6 +3888,29 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_interface_rejects_ifac_flag_before_packet_accounting() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (entry, _rx) = make_test_interface("clear_in");
+        actor.interfaces.insert(1, entry);
+
+        let (raw, _dest_hash) = make_valid_announce("test.ifac_on_clear", 0);
+        let mut raw = raw.to_vec();
+        raw[0] |= 0x80;
+
+        actor.on_inbound(InboundPacket {
+            raw: Bytes::from(raw),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+
+        assert!(actor.packet_hashlist.is_empty());
+        assert!(actor.packet_metrics.is_empty());
+        assert!(actor.path_table.is_empty());
+    }
+
+    #[test]
     fn test_announce_retransmit() {
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
@@ -3913,9 +4213,11 @@ mod tests {
             make_announce_for_with_random_blob(&identity, "test.replay.same", 1, blob);
         let (htx, mut hrx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(0),
             aspect_filter: None,
             receive_path_responses: false,
             tx: htx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
 
         actor.on_inbound(InboundPacket {
@@ -5506,6 +5808,49 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn interface_inspection_runs_once_per_stats_snapshot() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut entry, _rx) = make_test_interface("inspected_iface");
+        let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let callback_calls = Arc::clone(&calls);
+        entry.inspection = Some(InterfaceInspectionSource::new(move || {
+            callback_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            InterfaceInspectionSnapshot {
+                active_clients: Some(7),
+                blocked_ips: Some(2),
+            }
+        }));
+        actor.interfaces.insert(1, entry);
+
+        let TransportQueryResponse::InterfaceStats(stats) =
+            actor.handle_query(TransportQuery::GetInterfaceStats)
+        else {
+            panic!("unexpected interface stats response");
+        };
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(stats[0].clients, Some(7));
+        assert_eq!(stats[0].blocked_ips, Some(2));
+    }
+
+    #[test]
+    fn panicking_interface_inspection_cannot_unwind_transport_actor() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut entry, _rx) = make_test_interface("panicking_inspection");
+        entry.inspection = Some(InterfaceInspectionSource::new(|| {
+            panic!("driver inspection bug")
+        }));
+        actor.interfaces.insert(1, entry);
+
+        let TransportQueryResponse::InterfaceStats(stats) =
+            actor.handle_query(TransportQuery::GetInterfaceStats)
+        else {
+            panic!("unexpected interface stats response");
+        };
+        assert_eq!(stats[0].clients, None);
+        assert_eq!(stats[0].blocked_ips, None);
     }
 
     /// Floods a fresh actor with a tight burst of *unique* announces on one
@@ -7254,9 +7599,237 @@ mod tests {
         assert!(!dir.join("path_table.msgpack").exists());
         assert!(!dir.join("destination_table").exists());
         assert!(!dir.join("announce_cache.msgpack").exists());
-        assert!(!dir.join("packet_hashlist").exists());
+        assert!(!dir.join("packet_hashlist.raw").exists());
         assert!(!actor.state_dirty);
         assert!(actor.last_state_save > 0.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hashlist_restore_waits_for_authoritative_transport_role() {
+        let dir = unique_temp_dir("hashlist-lazy-authority");
+        let raw_path = dir.join("packet_hashlist.raw");
+        std::fs::write(&raw_path, [0xAA; 32]).unwrap();
+
+        let (mut actor, _tx) = TransportActor::new();
+        actor.initialize_storage(dir.clone());
+        assert!(actor.packet_hashlist.is_empty());
+        assert!(!actor.hashlist_load_attempted);
+
+        actor.handle_message(TransportMessage::SetTransportEnabled { enabled: true });
+        assert!(actor.hashlist_load_attempted);
+        assert!(actor.packet_hashlist.contains(&[0xAA; 32]));
+
+        // Restore is process-local and one-shot. A later file replacement
+        // cannot silently replace live deduplication state.
+        std::fs::write(&raw_path, [0xBB; 32]).unwrap();
+        actor.handle_message(TransportMessage::SetTransportEnabled { enabled: true });
+        assert!(actor.packet_hashlist.contains(&[0xAA; 32]));
+        assert!(!actor.packet_hashlist.contains(&[0xBB; 32]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shared_instance_client_neither_loads_nor_saves_hashlist() {
+        let load_dir = unique_temp_dir("hashlist-shared-client-load");
+        std::fs::write(load_dir.join("packet_hashlist.raw"), [0xAA; 32]).unwrap();
+
+        let (mut client, _tx) = TransportActor::new();
+        client.is_transport_enabled = true;
+        client.shared_instance_client_mode = true;
+        client.initialize_storage(load_dir.clone());
+        assert!(client.packet_hashlist.is_empty());
+        assert!(!client.hashlist_load_attempted);
+
+        let save_dir = unique_temp_dir("hashlist-shared-client-save");
+        client.storage_dir = Some(save_dir.clone());
+        client.packet_hashlist.insert([0xBB; 32]);
+        client.save_state();
+        assert!(!save_dir.join("packet_hashlist.raw").exists());
+
+        let _ = std::fs::remove_dir_all(&load_dir);
+        let _ = std::fs::remove_dir_all(&save_dir);
+    }
+
+    #[test]
+    fn non_transport_node_does_not_persist_hashlist() {
+        let dir = unique_temp_dir("hashlist-disabled-save");
+        let (mut actor, _tx) = TransportActor::new();
+        actor.storage_dir = Some(dir.clone());
+        actor.packet_hashlist.insert([0xAA; 32]);
+
+        actor.save_state();
+
+        assert!(!dir.join("packet_hashlist.raw").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authoritative_shutdown_flushes_hashlist_synchronously() {
+        let dir = unique_temp_dir("hashlist-shutdown");
+        let (mut actor, _tx) = TransportActor::new();
+        actor.storage_dir = Some(dir.clone());
+        actor.is_transport_enabled = true;
+        actor.packet_hashlist.insert([0xAA; 32]);
+
+        actor.on_shutdown();
+
+        let loaded =
+            crate::persistence::load_hashlist_raw(&dir.join("packet_hashlist.raw")).unwrap();
+        assert_eq!(loaded.hashes, vec![[0xAA; 32]]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn persistence_trigger_flushes_the_authoritative_hashlist() {
+        let dir = unique_temp_dir("hashlist-persistence-trigger");
+        let path = dir.join("packet_hashlist.raw");
+        let (mut actor, tx) = TransportActor::new();
+        actor.storage_dir = Some(dir.clone());
+        actor.is_transport_enabled = true;
+        actor.packet_hashlist.insert([0xAA; 32]);
+        let trigger = actor.persistence_trigger();
+        let actor_task = tokio::spawn(actor.run());
+
+        assert!(trigger.request().await);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if path.exists()
+                    && crate::persistence::load_hashlist_raw(&path)
+                        .is_ok_and(|loaded| loaded.hashes == vec![[0xAA; 32]])
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduled persistence did not complete");
+
+        tx.send(TransportMessage::Shutdown).await.unwrap();
+        actor_task.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn synchronous_flush_cannot_be_overwritten_by_older_async_snapshot() {
+        let dir = unique_temp_dir("hashlist-sync-ordering");
+        let path = dir.join("packet_hashlist.raw");
+        let (mut actor, _tx) = TransportActor::new();
+        actor.storage_dir = Some(dir.clone());
+        actor.is_transport_enabled = true;
+        actor.packet_hashlist.insert([0xBB; 32]);
+
+        actor
+            .hashlist_save_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+        let in_flight = actor.hashlist_save_in_flight.clone();
+        let old_path = path.clone();
+        let old_writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            crate::persistence::save_raw_hashes(&[[0xAA; 32]], &old_path).unwrap();
+            in_flight.store(false, std::sync::atomic::Ordering::Release);
+        });
+
+        actor.save_state();
+        old_writer.join().unwrap();
+
+        let loaded = crate::persistence::load_hashlist_raw(&path).unwrap();
+        assert_eq!(loaded.hashes, vec![[0xBB; 32]]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hashlist_wait_timeout_refuses_a_concurrent_sync_writer() {
+        let (actor, _tx) = TransportActor::new();
+        actor
+            .hashlist_save_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        assert!(!actor.wait_for_hashlist_save_until(std::time::Instant::now()));
+
+        actor
+            .hashlist_save_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    #[test]
+    fn legacy_hashlist_migrates_atomically_without_removing_source() {
+        let dir = unique_temp_dir("hashlist-legacy-migration");
+        let legacy_path = dir.join("packet_hashlist");
+        let legacy = vec![vec![0xAA; 32], vec![0xAA; 32], vec![0xBB; 32]];
+        std::fs::write(&legacy_path, rmp_serde::to_vec(&legacy).unwrap()).unwrap();
+
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        actor.initialize_storage(dir.clone());
+
+        assert!(actor.packet_hashlist.contains(&[0xAA; 32]));
+        assert!(actor.packet_hashlist.contains(&[0xBB; 32]));
+        assert!(legacy_path.exists(), "migration must retain legacy source");
+        let loaded =
+            crate::persistence::load_hashlist_raw(&dir.join("packet_hashlist.raw")).unwrap();
+        assert_eq!(loaded.hashes.len(), 2);
+        assert!(loaded.hashes.contains(&[0xAA; 32]));
+        assert!(loaded.hashes.contains(&[0xBB; 32]));
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp-")),
+            "atomic migration must not leave a temporary file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_partial_raw_hashlist_never_falls_back_to_legacy() {
+        let dir = unique_temp_dir("hashlist-raw-precedence");
+        std::fs::write(dir.join("packet_hashlist.raw"), [0x11; 7]).unwrap();
+        let legacy = vec![vec![0xAA; 32]];
+        std::fs::write(
+            dir.join("packet_hashlist"),
+            rmp_serde::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        actor.initialize_storage(dir.clone());
+
+        assert!(actor.hashlist_load_attempted);
+        assert!(actor.packet_hashlist.is_empty());
+        assert!(
+            !actor.packet_hashlist.contains(&[0xAA; 32]),
+            "an existing canonical file must suppress legacy fallback"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_primary_legacy_hashlist_falls_back_to_rust_sidecar() {
+        let dir = unique_temp_dir("hashlist-legacy-precedence");
+        std::fs::write(dir.join("packet_hashlist"), b"not-msgpack").unwrap();
+        let sidecar = crate::persistence::PersistedHashlist {
+            hashes: vec![vec![0xCC; 32]],
+            version: 1,
+        };
+        std::fs::write(
+            dir.join("hashlist.msgpack"),
+            rmp_serde::to_vec(&sidecar).unwrap(),
+        )
+        .unwrap();
+
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        actor.initialize_storage(dir.clone());
+
+        assert!(actor.packet_hashlist.contains(&[0xCC; 32]));
+        assert!(dir.join("packet_hashlist.raw").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7408,14 +7981,18 @@ mod tests {
             "hops=127 link request must be processed"
         );
 
-        // Proof: 128 leaves the receipt pending, 127 delivers it.
+        // Proof: 128 leaves the receipt pending, 127 validates and delivers it.
         let proof_dest = [0xE3; 16];
-        actor.receipt_table.insert(
-            proof_dest,
-            PacketReceipt::new([0u8; 32], proof_dest, Some(Duration::from_secs(180))),
-        );
+        let proof_identity = rns_identity::identity::Identity::new();
+        let mut packet_hash = [0x44; 32];
+        packet_hash[..16].copy_from_slice(&proof_dest);
+        let proof_signature = proof_identity.sign(&packet_hash).unwrap();
+        let mut receipt =
+            PacketReceipt::new(packet_hash, proof_dest, Some(Duration::from_secs(180)));
+        receipt.set_destination_identity([0xA3; 16], Some(proof_identity.get_public_key()));
+        actor.receipt_table.insert(proof_dest, receipt);
         actor.on_inbound(InboundPacket {
-            raw: make_proof_packet(proof_dest, PATHFINDER_M),
+            raw: make_proof_packet_with_payload(proof_dest, PATHFINDER_M, &proof_signature),
             interface_id: 1,
             rssi: None,
             snr: None,
@@ -7426,7 +8003,7 @@ mod tests {
             "hops=128 proof must be dropped"
         );
         actor.on_inbound(InboundPacket {
-            raw: make_proof_packet(proof_dest, PATHFINDER_M - 1),
+            raw: make_proof_packet_with_payload(proof_dest, PATHFINDER_M - 1, &proof_signature),
             interface_id: 1,
             rssi: None,
             snr: None,
@@ -7450,6 +8027,301 @@ mod tests {
             actor.path_table.get(&announce_dest).is_none(),
             "hops=128 announce must be dropped"
         );
+    }
+
+    #[test]
+    fn delivery_proof_requires_destination_signature() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (iface, _rx) = make_test_interface("proof");
+        actor.interfaces.insert(1, iface);
+
+        let destination = rns_identity::identity::Identity::new();
+        let attacker = rns_identity::identity::Identity::new();
+        let destination_hash = [0xD1; 16];
+        let packet_hash = [0x61; 32];
+        let mut proof_hash = [0u8; 16];
+        proof_hash.copy_from_slice(&packet_hash[..16]);
+        let mut receipt =
+            PacketReceipt::new(packet_hash, proof_hash, Some(Duration::from_secs(180)));
+        receipt.set_destination_identity(destination_hash, Some(destination.get_public_key()));
+        actor.receipt_table.insert(proof_hash, receipt);
+        actor
+            .receipt_msg_ids
+            .insert(proof_hash, "message-1".to_string());
+
+        let forged = attacker.sign(&packet_hash).unwrap();
+        actor.on_inbound(InboundPacket {
+            raw: make_proof_packet_with_payload(proof_hash, 0, &forged),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(
+            actor.receipt_table.contains_key(&proof_hash),
+            "forged proof must leave the receipt pending"
+        );
+        assert!(
+            actor.receipt_msg_ids.contains_key(&proof_hash),
+            "forged proof must not conclude application delivery"
+        );
+
+        let valid = destination.sign(&packet_hash).unwrap();
+        actor.on_inbound(InboundPacket {
+            raw: make_proof_packet_with_payload(proof_hash, 0, &valid),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(!actor.receipt_table.contains_key(&proof_hash));
+        assert!(!actor.receipt_msg_ids.contains_key(&proof_hash));
+    }
+
+    #[test]
+    fn set_receipt_timeout_updates_only_pending_receipts() {
+        let (mut actor, _tx) = TransportActor::new();
+        let packet_hash = [0x62; 32];
+        let truncated_hash = [0x62; 16];
+        actor.receipt_table.insert(
+            truncated_hash,
+            PacketReceipt::new(packet_hash, truncated_hash, Some(Duration::from_secs(180))),
+        );
+
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::SetReceiptTimeout {
+            truncated_hash,
+            timeout: Duration::from_secs(7),
+            result_tx,
+        });
+        assert!(result_rx.blocking_recv().unwrap());
+        assert_eq!(
+            actor.receipt_table[&truncated_hash].timeout,
+            Some(Duration::from_secs(7))
+        );
+
+        actor
+            .receipt_table
+            .get_mut(&truncated_hash)
+            .unwrap()
+            .deliver();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::SetReceiptTimeout {
+            truncated_hash,
+            timeout: Duration::from_secs(1),
+            result_tx,
+        });
+        assert!(!result_rx.blocking_recv().unwrap());
+        assert_eq!(
+            actor.receipt_table[&truncated_hash].timeout,
+            Some(Duration::from_secs(7))
+        );
+    }
+
+    #[test]
+    fn outbound_destination_binding_survives_receipt_registration_order() {
+        let destination = rns_identity::identity::Identity::new();
+        let destination_hash = [0xD2; 16];
+        let raw = make_data_packet(destination_hash, 0);
+        let (packet_hash, proof_hash) =
+            rns_wire::hash::packet_hash_pair(&raw, rns_wire::flags::HeaderType::Header1);
+
+        // LXMF registers after enqueueing the outbound packet.
+        let (mut outbound_first, _tx) = TransportActor::new();
+        insert_announce_for(&mut outbound_first, destination_hash, &destination);
+        outbound_first.on_outbound(OutboundRequest {
+            raw: raw.clone(),
+            destination_hash,
+        });
+        outbound_first.handle_message(TransportMessage::RegisterReceipt {
+            truncated_hash: proof_hash,
+            full_hash: packet_hash,
+            destination_hash,
+            destination_public_key: destination.get_public_key(),
+            msg_id: "outbound-first".to_string(),
+            timeout: None,
+        });
+        let receipt = &outbound_first.receipt_table[&proof_hash];
+        assert_eq!(receipt.destination_hash, Some(destination_hash));
+        assert_eq!(
+            receipt.destination_public_key,
+            Some(destination.get_public_key())
+        );
+
+        // rnprobe registers before enqueueing the outbound packet.
+        let (mut registration_first, _tx) = TransportActor::new();
+        insert_announce_for(&mut registration_first, destination_hash, &destination);
+        registration_first.handle_message(TransportMessage::RegisterReceipt {
+            truncated_hash: proof_hash,
+            full_hash: packet_hash,
+            destination_hash,
+            destination_public_key: destination.get_public_key(),
+            msg_id: "registration-first".to_string(),
+            timeout: None,
+        });
+        registration_first.on_outbound(OutboundRequest {
+            raw,
+            destination_hash,
+        });
+        let receipt = &registration_first.receipt_table[&proof_hash];
+        assert_eq!(receipt.destination_hash, Some(destination_hash));
+        assert_eq!(
+            receipt.destination_public_key,
+            Some(destination.get_public_key())
+        );
+    }
+
+    #[test]
+    fn receipt_maintenance_removes_application_message_index() {
+        let (mut actor, _tx) = TransportActor::new();
+        let proof_hash = [0x71; 16];
+        actor.receipt_table.insert(
+            proof_hash,
+            PacketReceipt::new([0x71; 32], proof_hash, Some(Duration::ZERO)),
+        );
+        actor
+            .receipt_msg_ids
+            .insert(proof_hash, "timed-out-message".to_string());
+
+        actor.on_tick();
+
+        assert!(!actor.receipt_table.contains_key(&proof_hash));
+        assert!(!actor.receipt_msg_ids.contains_key(&proof_hash));
+    }
+
+    #[test]
+    fn tracked_send_reports_no_interface_and_does_not_leak_receipt() {
+        let (mut actor, _tx) = TransportActor::new();
+        let destination = rns_identity::identity::Identity::new();
+        let destination_hash = [0x72; 16];
+        let raw = make_data_packet(destination_hash, 0);
+        let (packet_hash, truncated_hash) =
+            rns_wire::hash::packet_hash_pair(&raw, rns_wire::flags::HeaderType::Header1);
+        let (status_tx, _status_rx) =
+            tokio::sync::watch::channel(crate::messages::ReceiptUpdate::Sent);
+        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+
+        actor.handle_message(TransportMessage::SendPacket {
+            request: OutboundRequest {
+                raw,
+                destination_hash,
+            },
+            attached_interface: None,
+            receipt: Some(crate::messages::TrackedReceiptRegistration {
+                truncated_hash,
+                full_hash: packet_hash,
+                destination_hash,
+                destination_public_key: destination.get_public_key(),
+                timeout: Some(Duration::from_secs(1)),
+                status_tx,
+            }),
+            result_tx,
+        });
+
+        assert_eq!(
+            result_rx.try_recv().unwrap(),
+            crate::messages::OutboundDispatchResult::NoInterface
+        );
+        assert!(!actor.receipt_table.contains_key(&truncated_hash));
+        assert!(!actor.receipt_updates.contains_key(&truncated_hash));
+    }
+
+    #[test]
+    fn tracked_send_receives_authenticated_delivery_update() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (interface, mut interface_rx) = make_test_interface("tracked");
+        actor.interfaces.insert(1, interface);
+        let destination = rns_identity::identity::Identity::new();
+        let destination_hash = [0x73; 16];
+        let raw = make_data_packet(destination_hash, 0);
+        let (packet_hash, truncated_hash) =
+            rns_wire::hash::packet_hash_pair(&raw, rns_wire::flags::HeaderType::Header1);
+        let (status_tx, mut status_rx) =
+            tokio::sync::watch::channel(crate::messages::ReceiptUpdate::Sent);
+        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+
+        actor.handle_message(TransportMessage::SendPacket {
+            request: OutboundRequest {
+                raw: raw.clone(),
+                destination_hash,
+            },
+            attached_interface: None,
+            receipt: Some(crate::messages::TrackedReceiptRegistration {
+                truncated_hash,
+                full_hash: packet_hash,
+                destination_hash,
+                destination_public_key: destination.get_public_key(),
+                timeout: Some(Duration::from_secs(1)),
+                status_tx,
+            }),
+            result_tx,
+        });
+
+        assert_eq!(
+            result_rx.try_recv().unwrap(),
+            crate::messages::OutboundDispatchResult::Sent
+        );
+        assert_eq!(interface_rx.try_recv().unwrap(), raw);
+        assert_eq!(
+            *status_rx.borrow_and_update(),
+            crate::messages::ReceiptUpdate::Sent
+        );
+
+        let proof = destination.sign(&packet_hash).unwrap();
+        actor.on_inbound(InboundPacket {
+            raw: make_proof_packet_with_payload(truncated_hash, 0, &proof),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+
+        assert!(matches!(
+            *status_rx.borrow_and_update(),
+            crate::messages::ReceiptUpdate::Delivered { .. }
+        ));
+        assert!(!actor.receipt_table.contains_key(&truncated_hash));
+        assert!(!actor.receipt_updates.contains_key(&truncated_hash));
+    }
+
+    #[test]
+    fn tracked_receipt_timeout_is_reported_and_reaped() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (interface, _interface_rx) = make_test_interface("tracked-timeout");
+        actor.interfaces.insert(1, interface);
+        let destination = rns_identity::identity::Identity::new();
+        let destination_hash = [0x74; 16];
+        let raw = make_data_packet(destination_hash, 0);
+        let (packet_hash, truncated_hash) =
+            rns_wire::hash::packet_hash_pair(&raw, rns_wire::flags::HeaderType::Header1);
+        let (status_tx, mut status_rx) =
+            tokio::sync::watch::channel(crate::messages::ReceiptUpdate::Sent);
+        let (result_tx, _result_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::SendPacket {
+            request: OutboundRequest {
+                raw,
+                destination_hash,
+            },
+            attached_interface: None,
+            receipt: Some(crate::messages::TrackedReceiptRegistration {
+                truncated_hash,
+                full_hash: packet_hash,
+                destination_hash,
+                destination_public_key: destination.get_public_key(),
+                timeout: Some(Duration::ZERO),
+                status_tx,
+            }),
+            result_tx,
+        });
+
+        actor.on_tick();
+
+        assert_eq!(
+            *status_rx.borrow_and_update(),
+            crate::messages::ReceiptUpdate::TimedOut
+        );
+        assert!(!actor.receipt_table.contains_key(&truncated_hash));
+        assert!(!actor.receipt_updates.contains_key(&truncated_hash));
     }
 
     /// The announce hop cap is checked post-adjustment with `>=`: a raw
@@ -7705,6 +8577,16 @@ mod tests {
             TransportQueryResponse::IntResult(id) => assert_eq!(id, 5),
             other => panic!("unexpected response: {other:?}"),
         }
+        match actor.handle_query(TransportQuery::GetNextHopBitrate { dest }) {
+            TransportQueryResponse::FloatResult(Some(bitrate)) => {
+                assert_eq!(bitrate, 115_200.0)
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match actor.handle_query(TransportQuery::GetNextHopHardwareMtu { dest }) {
+            TransportQueryResponse::IntResult(mtu) => assert_eq!(mtu, 500),
+            other => panic!("unexpected response: {other:?}"),
+        }
 
         // Unknown non-local destinations still resolve to nothing.
         let unknown = [0x72; 16];
@@ -7716,6 +8598,42 @@ mod tests {
             TransportQueryResponse::IntResult(id) => assert_eq!(id, -1),
             other => panic!("unexpected response: {other:?}"),
         }
+        match actor.handle_query(TransportQuery::GetNextHopHardwareMtu { dest: unknown }) {
+            TransportQueryResponse::IntResult(mtu) => assert_eq!(mtu, -1),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_presence_and_hops_queries_ignore_expired_entries() {
+        let (mut actor, _tx) = TransportActor::new();
+        let live_dest = [0x81; 16];
+        let expired_dest = [0x82; 16];
+        actor.path_table.insert(
+            live_dest,
+            PathEntry::new(None, 7, 1, InterfaceMode::Gateway),
+        );
+        let mut expired = PathEntry::new(None, 9, 1, InterfaceMode::Gateway);
+        expired.expires = crate::now_f64() - 1.0;
+        actor.path_table.insert(expired_dest, expired);
+
+        assert!(matches!(
+            actor.handle_query(TransportQuery::HasPath { dest: live_dest }),
+            TransportQueryResponse::BoolResult(true)
+        ));
+        assert!(matches!(
+            actor.handle_query(TransportQuery::HopsTo { dest: live_dest }),
+            TransportQueryResponse::IntResult(7)
+        ));
+        assert!(matches!(
+            actor.handle_query(TransportQuery::HasPath { dest: expired_dest }),
+            TransportQueryResponse::BoolResult(false)
+        ));
+        assert!(matches!(
+            actor.handle_query(TransportQuery::HopsTo { dest: expired_dest }),
+            TransportQueryResponse::IntResult(hops)
+                if hops == i64::from(crate::constants::PATHFINDER_M)
+        ));
     }
 
     /// Python 1.3.8 Transport.py:2984: a cached announce that fails to unpack
@@ -7850,6 +8768,33 @@ mod tests {
         let payload = &raw[offset..];
         assert_eq!(payload.len(), 32);
         assert_eq!(&payload[..16], &requested);
+    }
+
+    #[test]
+    fn path_request_options_attach_interface_tag_and_recursive_gate() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (first, mut first_rx) = make_test_interface("first");
+        let (second, mut second_rx) = make_test_interface("second");
+        actor.interfaces.insert(1, first);
+        actor.interfaces.insert(2, second);
+
+        let requested = [0x34; 16];
+        let tag: Vec<u8> = (0..20).collect();
+        actor.handle_message(TransportMessage::RequestPathWithOptions {
+            destination_hash: requested,
+            options: crate::messages::PathRequestOptions {
+                on_interface: Some(2),
+                tag: Some(tag.clone()),
+                recursive: true,
+            },
+        });
+
+        assert!(first_rx.try_recv().is_err());
+        let raw = second_rx.try_recv().expect("attached path request");
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        assert_eq!(&raw[offset..offset + 16], &requested);
+        assert_eq!(&raw[offset + 16..], &tag[..16]);
+        assert!(actor.interfaces[&2].announce_allowed_at > 0.0);
     }
 
     #[test]
@@ -9264,9 +10209,11 @@ mod tests {
 
         let (htx, mut hrx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(0),
             aspect_filter: None,
             receive_path_responses: false,
             tx: htx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
 
         let identity = rns_identity::identity::Identity::new();
@@ -9289,6 +10236,52 @@ mod tests {
     }
 
     #[test]
+    fn bounded_announce_subscription_counts_drops_and_reaps_closed_receiver() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut entry, _rx) = make_test_interface("test_iface");
+        entry.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(1, entry);
+
+        let (callback_tx, callback_rx) = mpsc::channel(1);
+        let dropped_events = Arc::new(AtomicU64::new(0));
+        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::RegisterAnnounceSubscription {
+            aspect_filter: Some("test.subscription".into()),
+            receive_path_responses: false,
+            callback_tx,
+            dropped_events: Arc::clone(&dropped_events),
+            result_tx,
+        });
+        let _id = result_rx.try_recv().unwrap();
+
+        for _ in 0..2 {
+            let identity = rns_identity::identity::Identity::new();
+            let (raw, _) = make_announce_for(&identity, "test.subscription", 1);
+            actor.on_inbound(crate::messages::InboundPacket {
+                raw,
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+        }
+        assert_eq!(dropped_events.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(actor.announce_handlers.len(), 1);
+
+        drop(callback_rx);
+        let identity = rns_identity::identity::Identity::new();
+        let (raw, _) = make_announce_for(&identity, "test.subscription", 1);
+        actor.on_inbound(crate::messages::InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(actor.announce_handlers.is_empty());
+    }
+
+    #[test]
     fn dispatch_with_filter_only_matching_aspect() {
         let (mut actor, _tx) = TransportActor::new();
         let (entry, _rx) = make_test_interface("test_iface");
@@ -9296,9 +10289,11 @@ mod tests {
 
         let (htx, mut hrx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(0),
             aspect_filter: Some("lxmf.delivery".to_string()),
             receive_path_responses: false,
             tx: htx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
 
         let identity = rns_identity::identity::Identity::new();
@@ -9341,14 +10336,18 @@ mod tests {
         let (h_del_tx, mut h_del_rx) = mpsc::channel(8);
         let (h_prop_tx, mut h_prop_rx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(0),
             aspect_filter: Some("lxmf.delivery".to_string()),
             receive_path_responses: false,
             tx: h_del_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(1),
             aspect_filter: Some("lxmf.propagation".to_string()),
             receive_path_responses: false,
             tx: h_prop_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
 
         let identity = rns_identity::identity::Identity::new();
@@ -9382,15 +10381,19 @@ mod tests {
 
         let (default_tx, mut default_rx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(0),
             aspect_filter: None,
             receive_path_responses: false,
             tx: default_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
         let (opt_in_tx, mut opt_in_rx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(1),
             aspect_filter: None,
             receive_path_responses: true,
             tx: opt_in_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
 
         let identity = rns_identity::identity::Identity::new();
@@ -9434,9 +10437,11 @@ mod tests {
 
         let (handler_tx, mut handler_rx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(0),
             aspect_filter: None,
             receive_path_responses: true,
             tx: handler_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         });
 
         let identity = rns_identity::identity::Identity::new();
@@ -9571,6 +10576,53 @@ mod tests {
             }
             other => panic!("expected Announces response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn recall_destination_is_keyed_and_does_not_touch_lifetime() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (entry, _rx) = make_test_interface("test_iface");
+        actor.interfaces.insert(1, entry);
+
+        let identity = rns_identity::identity::Identity::new();
+        let (raw, dest_hash) = make_announce_for(&identity, "lxmf.delivery", 3);
+        actor.on_inbound(crate::messages::InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        let cached = actor.recent_announces.get_mut(&dest_hash).unwrap();
+        cached.app_data = Some(b"display name".to_vec());
+        cached.ratchet = Some([0x5A; 32]);
+        let timestamp = cached.timestamp;
+        let hops = cached.hops;
+        assert_eq!(cached.last_used, None);
+        actor.state_dirty = false;
+
+        match actor
+            .handle_query(crate::messages::TransportQuery::RecallDestination { dest: dest_hash })
+        {
+            crate::messages::TransportQueryResponse::RecalledDestination(Some(entry)) => {
+                assert_eq!(entry.dest_hash, dest_hash);
+                assert_eq!(entry.public_key, identity.get_public_key());
+                assert_eq!(entry.app_data.as_deref(), Some(b"display name".as_slice()));
+                assert_eq!(entry.ratchet, Some([0x5A; 32]));
+                assert_eq!(entry.hops, hops);
+                assert_eq!(entry.timestamp, timestamp);
+            }
+            other => panic!("expected recalled destination, got {other:?}"),
+        }
+
+        assert_eq!(actor.recent_announces[&dest_hash].last_used, None);
+        assert!(!actor.state_dirty, "read-only recall must not dirty state");
+        assert!(matches!(
+            actor.handle_query(crate::messages::TransportQuery::RecallDestination {
+                dest: [0xFF; 16]
+            }),
+            crate::messages::TransportQueryResponse::RecalledDestination(None)
+        ));
     }
 
     #[test]

@@ -89,6 +89,10 @@ impl KeepaliveState {
 
     /// Whether the initiator should emit a keepalive now (jitter applied).
     pub fn should_send_keepalive(&self) -> bool {
+        self.should_send_keepalive_at(Instant::now())
+    }
+
+    pub(crate) fn should_send_keepalive_at(&self, now: Instant) -> bool {
         let jittered = if self.jitter_negative {
             self.keepalive_interval
                 .saturating_sub(self.jitter_offset)
@@ -97,29 +101,45 @@ impl KeepaliveState {
             self.keepalive_interval + self.jitter_offset
         };
 
-        let inbound_elapsed = self.last_inbound.elapsed();
+        let inbound_elapsed = now.saturating_duration_since(self.last_inbound);
+        let outbound_elapsed = self
+            .last_outbound
+            .or(self.activated_at)
+            .map(|baseline| now.saturating_duration_since(baseline))
+            .unwrap_or(inbound_elapsed);
         let keepalive_elapsed = self
             .last_keepalive_sent
-            .map(|t| t.elapsed())
+            .map(|last_keepalive| now.saturating_duration_since(last_keepalive))
             .unwrap_or(Duration::MAX);
 
-        self.is_initiator && inbound_elapsed >= jittered && keepalive_elapsed >= jittered
+        self.is_initiator
+            && (inbound_elapsed >= jittered || outbound_elapsed >= jittered)
+            && keepalive_elapsed >= jittered
+    }
+
+    pub(crate) fn should_respond_to_keepalive_at(&self, now: Instant) -> bool {
+        !self.is_initiator
+            && self
+                .last_outbound
+                .map(|last_outbound| {
+                    now.saturating_duration_since(last_outbound) >= self.keepalive_interval
+                })
+                .unwrap_or(true)
     }
 
     /// Whether the link should transition to STALE.
     ///
-    /// Uses the most recent of inbound, proof, or activation as the baseline so a
-    /// link that just came up isn't immediately flagged stale on a quiet channel.
+    /// Uses only peer evidence — inbound traffic, proof, or activation — as the
+    /// baseline. Local outbound traffic cannot prove that the peer remains alive.
     pub fn is_stale(&self) -> bool {
+        self.is_stale_at(Instant::now())
+    }
+
+    pub(crate) fn is_stale_at(&self, now: Instant) -> bool {
         let mut latest = self.last_inbound;
         if let Some(proof) = self.last_proof {
             if proof > latest {
                 latest = proof;
-            }
-        }
-        if let Some(outbound) = self.last_outbound {
-            if outbound > latest {
-                latest = outbound;
             }
         }
         if let Some(activated) = self.activated_at {
@@ -127,7 +147,7 @@ impl KeepaliveState {
                 latest = activated;
             }
         }
-        latest.elapsed() >= self.stale_time
+        now.saturating_duration_since(latest) >= self.stale_time
     }
 
     /// How long to wait in STALE before tearing the link down.
@@ -137,6 +157,16 @@ impl KeepaliveState {
 
     pub fn mark_keepalive_sent(&mut self) {
         self.last_keepalive_sent = Some(Instant::now());
+    }
+
+    pub(crate) fn mark_keepalive_sent_at(&mut self, now: Instant) {
+        self.last_keepalive_sent = Some(now);
+    }
+
+    pub(crate) fn record_keepalive_outbound(&mut self) {
+        let now = Instant::now();
+        self.last_outbound = Some(now);
+        self.last_keepalive_sent = Some(now);
     }
 
     pub fn since_inbound(&self) -> Duration {
@@ -218,6 +248,60 @@ mod tests {
         ks2.jitter_offset = Duration::ZERO;
         thread::sleep(Duration::from_millis(5));
         assert!(!ks2.should_send_keepalive());
+    }
+
+    #[test]
+    fn continuous_inbound_still_schedules_keepalive_when_outbound_is_quiet() {
+        let now = Instant::now();
+        let mut state = KeepaliveState::new(true);
+        state.keepalive_interval = Duration::from_secs(5);
+        state.jitter_offset = Duration::ZERO;
+        state.jitter_negative = false;
+        state.last_inbound = now;
+        state.last_outbound = None;
+        state.activated_at = Some(now - Duration::from_secs(6));
+        state.last_keepalive_sent = Some(now - Duration::from_secs(6));
+
+        assert!(state.should_send_keepalive_at(now));
+    }
+
+    #[test]
+    fn recent_keepalive_suppresses_duplicate_at_exact_tick_time() {
+        let now = Instant::now();
+        let mut state = KeepaliveState::new(true);
+        state.keepalive_interval = Duration::from_secs(5);
+        state.jitter_offset = Duration::ZERO;
+        state.jitter_negative = false;
+        state.last_inbound = now - Duration::from_secs(6);
+        state.last_outbound = Some(now - Duration::from_secs(6));
+        state.last_keepalive_sent = Some(now - Duration::from_secs(4));
+
+        assert!(!state.should_send_keepalive_at(now));
+        assert!(state.should_send_keepalive_at(now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn local_outbound_traffic_does_not_mask_a_stale_peer() {
+        let now = Instant::now();
+        let mut state = KeepaliveState::new(true);
+        state.stale_time = Duration::from_secs(5);
+        state.last_inbound = now - Duration::from_secs(6);
+        state.last_outbound = Some(now);
+        state.last_proof = None;
+        state.activated_at = None;
+
+        assert!(state.is_stale_at(now));
+    }
+
+    #[test]
+    fn responder_suppresses_keepalive_reply_after_recent_outbound() {
+        let now = Instant::now();
+        let mut state = KeepaliveState::new(false);
+        state.keepalive_interval = Duration::from_secs(5);
+        state.last_outbound = Some(now);
+
+        assert!(!state.should_respond_to_keepalive_at(now));
+        assert!(state.should_respond_to_keepalive_at(now + Duration::from_secs(5)));
     }
 
     #[test]

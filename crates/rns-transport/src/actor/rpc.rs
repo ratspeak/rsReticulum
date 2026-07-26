@@ -62,6 +62,22 @@ impl TransportActor {
                             .as_ref()
                             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
                             .unwrap_or(0);
+                        let inspection = entry
+                            .inspection
+                            .as_ref()
+                            .map(|source| {
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    source.snapshot()
+                                }))
+                                .unwrap_or_else(|_| {
+                                    tracing::warn!(
+                                        interface_id = iface_id,
+                                        "interface inspection callback panicked",
+                                    );
+                                    InterfaceInspectionSnapshot::default()
+                                })
+                            })
+                            .unwrap_or_default();
                         InterfaceStatRpcEntry {
                             id: iface_id,
                             name: entry.name.clone(),
@@ -96,7 +112,8 @@ impl TransportActor {
                                 entry.ingress.is_pr_burst_active(),
                                 entry.ingress.pr_burst_activated(),
                             ),
-                            clients: None,
+                            clients: inspection.active_clients,
+                            blocked_ips: inspection.blocked_ips,
                             announce_rate_target: entry.announce_rate_target,
                             announce_rate_grace: entry.announce_rate_grace,
                             announce_rate_penalty: entry.announce_rate_penalty,
@@ -155,6 +172,27 @@ impl TransportActor {
                 });
                 TransportQueryResponse::Announces(entries)
             }
+            TransportQuery::RecallDestination { dest } => {
+                let recalled = self.recent_announces.get(&dest).and_then(|entry| {
+                    Some(RecalledDestinationRpcEntry {
+                        dest_hash: entry.dest_hash,
+                        public_key: entry.public_key?,
+                        app_data: entry.app_data.clone(),
+                        ratchet: entry.ratchet,
+                        hops: entry.hops,
+                        timestamp: entry.timestamp,
+                    })
+                });
+                TransportQueryResponse::RecalledDestination(recalled)
+            }
+            TransportQuery::HasPath { dest } => {
+                TransportQueryResponse::BoolResult(self.path_table.has_path(&dest))
+            }
+            TransportQuery::HopsTo { dest } => TransportQueryResponse::IntResult(i64::from(
+                self.path_table
+                    .hops_to(&dest)
+                    .unwrap_or(crate::constants::PATHFINDER_M),
+            )),
             TransportQuery::GetNextHop { dest } => {
                 // Python 1.3.8 Transport.py:2685-2688: local destinations
                 // resolve to Transport.identity.hash.
@@ -482,6 +520,16 @@ impl TransportActor {
                     .map(|iface| iface.bitrate as f64);
                 TransportQueryResponse::FloatResult(bitrate)
             }
+            TransportQuery::GetNextHopHardwareMtu { dest } => {
+                let mtu = self
+                    .path_table
+                    .get_live(&dest)
+                    .map(|e| e.interface_id)
+                    .or_else(|| self.local_destination_interface_id(&dest))
+                    .and_then(|id| self.interfaces.get(&id))
+                    .map(|iface| i64::from(iface.mtu));
+                TransportQueryResponse::IntResult(mtu.unwrap_or(-1))
+            }
             TransportQuery::GetNextHopInterfaceId { dest } => {
                 let id = self
                     .path_table
@@ -550,11 +598,11 @@ impl TransportActor {
             }
             TransportQuery::ResolveIdentityHash { input } => {
                 // First treat input as a destination hash.
-                if let Some(entry) = self.recent_announces.get(&input)
-                    && let Some(public_key) = entry.public_key
-                {
-                    let id_hash = rns_crypto::sha::truncated_hash(&public_key);
-                    return TransportQueryResponse::HashResult(Some(id_hash));
+                if let Some(entry) = self.recent_announces.get(&input) {
+                    if let Some(public_key) = entry.public_key {
+                        let id_hash = rns_crypto::sha::truncated_hash(&public_key);
+                        return TransportQueryResponse::HashResult(Some(id_hash));
+                    }
                 }
                 // Fall back to treating input as an identity hash already.
                 for entry in self.recent_announces.values() {

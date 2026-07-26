@@ -528,6 +528,9 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
             if let Some(clients) = entry.clients {
                 println!("    Clients  : {clients}");
             }
+            if let Some(blocked) = blocked_count_text(entry.blocked_ips) {
+                println!("    Blocked  : {blocked}");
+            }
             if entry.ifac_size > 0 {
                 println!("    IFAC     : {} bits", entry.ifac_size * 8);
             }
@@ -616,7 +619,7 @@ fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, 
             print!(",");
         }
         print!(
-            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"tx_drops\":{}}}",
+            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"tx_drops\":{}}}",
             json_str(&e.name),
             e.online,
             json_str(&e.mode),
@@ -640,6 +643,7 @@ fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, 
             e.pr_burst_active,
             e.pr_burst_activated,
             opt_u64_json(e.clients),
+            opt_u64_json(e.blocked_ips),
             opt_f64_json(e.announce_rate_target),
             opt_u32_json(e.announce_rate_grace),
             opt_f64_json(e.announce_rate_penalty),
@@ -1037,6 +1041,7 @@ struct RemoteInterface {
     pr_burst_active: bool,
     pr_burst_activated: f64,
     clients: Option<u64>,
+    blocked_ips: Option<u64>,
     announce_rate_target: Option<f64>,
     announce_rate_grace: Option<u32>,
     announce_rate_penalty: Option<f64>,
@@ -1137,7 +1142,7 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 print!(",");
             }
             print!(
-                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{}}}",
+                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{}}}",
                 json_str(&iface.name),
                 iface.online,
                 iface.mode,
@@ -1160,6 +1165,7 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 iface.pr_burst_active,
                 iface.pr_burst_activated,
                 opt_u64_json(iface.clients),
+                opt_u64_json(iface.blocked_ips),
                 opt_f64_json(iface.announce_rate_target),
                 opt_u32_json(iface.announce_rate_grace),
                 opt_f64_json(iface.announce_rate_penalty),
@@ -1188,6 +1194,9 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
             println!("    Bitrate  : {}", format::pretty_speed(iface.bitrate));
             if let Some(clients) = iface.clients {
                 println!("    Clients  : {clients}");
+            }
+            if let Some(blocked) = blocked_count_text(iface.blocked_ips) {
+                println!("    Blocked  : {blocked}");
             }
             if args.announce_stats {
                 if let Some(queued) = iface.announce_queue {
@@ -1284,6 +1293,7 @@ fn remote_interface_from_map(m: &[(rmpv::Value, rmpv::Value)]) -> RemoteInterfac
         pr_burst_active: map_bool(m, "pr_burst_active").unwrap_or(false),
         pr_burst_activated: map_f64_or_u64(m, "pr_burst_activated").unwrap_or(0.0),
         clients: map_u64(m, "clients"),
+        blocked_ips: map_u64(m, "blocked_ips"),
         announce_rate_target: map_f64_or_u64(m, "announce_rate_target"),
         announce_rate_grace: map_u64(m, "announce_rate_grace")
             .map(|v| v.min(u32::MAX as u64) as u32),
@@ -1397,6 +1407,12 @@ fn opt_u64_json(value: Option<u64>) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
+fn blocked_count_text(blocked_ips: Option<u64>) -> Option<String> {
+    let count = blocked_ips.filter(|count| *count > 0)?;
+    let noun = if count == 1 { "IP" } else { "IPs" };
+    Some(format!("{count} {noun}"))
+}
+
 fn opt_u32_json(value: Option<u32>) -> String {
     value
         .map(|v| v.to_string())
@@ -1501,6 +1517,7 @@ mod tests {
                 0.0
             },
             clients: None,
+            blocked_ips: None,
             announce_rate_target: None,
             announce_rate_grace: None,
             announce_rate_penalty: None,
@@ -1566,6 +1583,33 @@ mod tests {
         assert_eq!(iface.burst_activated, 0.0);
         assert!(!iface.pr_burst_active);
         assert_eq!(iface.pr_burst_activated, 0.0);
+        assert_eq!(iface.blocked_ips, None);
+    }
+
+    #[test]
+    fn remote_status_parser_accepts_only_scalar_blocked_count() {
+        let iface = remote_interface_from_map(&[
+            (rmpv::Value::from("name"), rmpv::Value::from("BackboneIf")),
+            (rmpv::Value::from("blocked_ips"), rmpv::Value::from(2)),
+            (
+                rmpv::Value::from("blocked_ip_list"),
+                rmpv::Value::Array(vec![
+                    rmpv::Value::from("198.51.100.2"),
+                    rmpv::Value::from("203.0.113.7"),
+                ]),
+            ),
+        ]);
+
+        assert_eq!(iface.blocked_ips, Some(2));
+        assert_eq!(blocked_count_text(iface.blocked_ips), Some("2 IPs".into()));
+    }
+
+    #[test]
+    fn blocked_count_text_omits_empty_counts_and_pluralizes() {
+        assert_eq!(blocked_count_text(None), None);
+        assert_eq!(blocked_count_text(Some(0)), None);
+        assert_eq!(blocked_count_text(Some(1)), Some("1 IP".into()));
+        assert_eq!(blocked_count_text(Some(2)), Some("2 IPs".into()));
     }
 
     #[test]

@@ -3,6 +3,7 @@ name = "rns-identity"
 description = "Identity, Destination, and Announce system for Reticulum"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

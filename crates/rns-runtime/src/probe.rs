@@ -85,7 +85,9 @@ pub async fn spawn_probe_responder(
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             let (raw, interface_id) = match event {
-                DestinationEvent::InboundPacket { raw, interface_id } => (raw, interface_id),
+                DestinationEvent::InboundPacket {
+                    raw, interface_id, ..
+                } => (raw, interface_id),
                 DestinationEvent::AnnounceRequested(request) => {
                     let raw = match destination.announce_packet(
                         identity.as_ref(),
@@ -133,6 +135,9 @@ pub async fn spawn_probe_responder(
                 }
             };
             if header.flags.packet_type != PacketType::Data {
+                continue;
+            }
+            if !destination.should_prove(&raw) {
                 continue;
             }
 
@@ -366,6 +371,8 @@ pub async fn probe_once(
         .send(TransportMessage::RegisterReceipt {
             truncated_hash: trunc_hash,
             full_hash,
+            destination_hash: dest_hash,
+            destination_public_key: pubkey,
             msg_id: msg_id.clone(),
             timeout: Some(proof_wait + Duration::from_secs(1)),
         })
@@ -596,6 +603,7 @@ mod tests {
             .send(DestinationEvent::InboundPacket {
                 raw: bytes::Bytes::from(raw),
                 interface_id: 0,
+                metrics: Default::default(),
             })
             .await
             .unwrap();
@@ -729,6 +737,7 @@ mod tests {
             .send(DestinationEvent::InboundPacket {
                 raw: bytes::Bytes::from(raw),
                 interface_id: 0,
+                metrics: Default::default(),
             })
             .await
             .unwrap();

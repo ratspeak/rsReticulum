@@ -33,9 +33,8 @@ pub const UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// establishment / request when it lands.
 pub const SOURCE_TIMEOUT: Duration = Duration::from_secs(25);
 
-/// Per-process subscriber state. Cheap to clone-on-snapshot via the
-/// [`SubscriberState::snapshot`] helper; the runtime owner holds the
-/// authoritative copy.
+/// Per-process subscriber state. Cheap to clone for inspection; the runtime
+/// owner holds the authoritative copy.
 #[derive(Debug, Clone)]
 pub struct SubscriberState {
     /// Unix-seconds timestamp of the most recent successful pull, keyed by

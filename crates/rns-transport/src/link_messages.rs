@@ -7,6 +7,14 @@ use tokio::sync::oneshot;
 
 use crate::messages::InterfaceId;
 
+/// Physical-layer measurements attached to one received packet.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PacketMetrics {
+    pub rssi: Option<f32>,
+    pub snr: Option<f32>,
+    pub q: Option<f32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AnnounceRequest {
     pub app_name: String,
@@ -32,10 +40,12 @@ pub enum DestinationEvent {
     InboundPacket {
         raw: Bytes,
         interface_id: InterfaceId,
+        metrics: PacketMetrics,
     },
     LinkRequest {
         raw: Bytes,
         interface_id: InterfaceId,
+        metrics: PacketMetrics,
     },
     LinkEstablished {
         link_id: [u8; 16],
@@ -75,12 +85,14 @@ mod tests {
         let evt1 = DestinationEvent::InboundPacket {
             raw: Bytes::from_static(&[1, 2, 3]),
             interface_id: 42,
+            metrics: PacketMetrics::default(),
         };
         assert!(matches!(evt1, DestinationEvent::InboundPacket { .. }));
 
         let evt2 = DestinationEvent::LinkRequest {
             raw: Bytes::from_static(&[4, 5, 6]),
             interface_id: 99,
+            metrics: PacketMetrics::default(),
         };
         assert!(matches!(evt2, DestinationEvent::LinkRequest { .. }));
 

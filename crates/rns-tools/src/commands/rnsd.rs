@@ -125,7 +125,7 @@ struct Args {
     #[arg(short = 'q', long, action = clap::ArgAction::Count)]
     quiet: u8,
 
-    /// Run as service and log to <configdir>/logfile.
+    /// Run as service and log to `<configdir>/logfile`.
     #[arg(short = 's', long)]
     service: bool,
 
@@ -209,6 +209,7 @@ pub(crate) async fn main() {
             }
 
             shutdown.wait().await;
+            handle.shutdown_and_wait().await;
             tracing::info!("rnsd-rs shutting down");
         }
         Err(e) => {

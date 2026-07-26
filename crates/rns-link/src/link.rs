@@ -12,7 +12,7 @@ use crate::handshake::{
 use crate::keepalive::KeepaliveState;
 use crate::key_derivation::LinkKeys;
 use crate::mtu_discovery::SignallingData;
-use crate::request::{RequestReceipt, RequestState};
+use crate::request::RequestReceipt;
 
 /// Link lifecycle states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +35,14 @@ pub enum CloseReason {
     Timeout,
     InitiatorClosed,
     DestinationClosed,
+}
+
+/// Latest physical-layer measurements observed for a Link.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LinkPhyStats {
+    pub rssi: Option<f64>,
+    pub snr: Option<f64>,
+    pub q: Option<f64>,
 }
 
 /// Resource acceptance strategy.
@@ -107,6 +115,9 @@ pub struct Link {
     /// Truncated SHA-256 of the request's hashable part.
     pub link_id: [u8; 16],
     pub state: LinkState,
+    /// Terminal close reason, retained after keys and transient state are
+    /// purged. Remains `None` until an orderly or timeout close occurs.
+    pub teardown_reason: Option<CloseReason>,
     pub is_initiator: bool,
     pub mode: u8,
 
@@ -165,6 +176,7 @@ pub struct Link {
     pub snr: Option<f64>,
     /// Link quality indicator in `[0.0, 1.0]`.
     pub q: Option<f64>,
+    track_phy_stats: bool,
 
     pub has_channel: bool,
 
@@ -216,6 +228,7 @@ impl Link {
         let link = Self {
             link_id,
             state: LinkState::Pending,
+            teardown_reason: None,
             is_initiator: true,
             mode: DEFAULT_MODE,
             ephemeral_keys: Some(ephemeral_keys),
@@ -231,7 +244,7 @@ impl Link {
             stale_since: None,
             keepalive: KeepaliveState::new(true),
             mtu: rns_wire::constants::MTU as u32,
-            mdu: rns_wire::constants::ENCRYPTED_MDU,
+            mdu: rns_wire::constants::LINK_MDU,
             resource_strategy: ResourceStrategy::default(),
             pending_requests: Vec::new(),
             incoming_resources: Vec::new(),
@@ -252,6 +265,7 @@ impl Link {
             rssi: None,
             snr: None,
             q: None,
+            track_phy_stats: false,
             has_channel: false,
             packet_callback: None,
             resource_callback: None,
@@ -476,6 +490,7 @@ impl Link {
         let link = Self {
             link_id,
             state: LinkState::Handshake,
+            teardown_reason: None,
             is_initiator: false,
             mode: request.signalling.mode,
             ephemeral_keys: Some(responder_keys),
@@ -490,7 +505,7 @@ impl Link {
             stale_since: None,
             keepalive: KeepaliveState::new(false),
             mtu: request.signalling.mtu.min(rns_wire::constants::MTU as u32),
-            mdu: rns_wire::constants::ENCRYPTED_MDU,
+            mdu: rns_wire::constants::LINK_MDU,
             resource_strategy: ResourceStrategy::default(),
             pending_requests: Vec::new(),
             incoming_resources: Vec::new(),
@@ -512,6 +527,7 @@ impl Link {
             rssi: None,
             snr: None,
             q: None,
+            track_phy_stats: false,
             has_channel: false,
             packet_callback: None,
             resource_callback: None,
@@ -701,10 +717,30 @@ impl Link {
         data: Option<&[u8]>,
         timeout: Duration,
     ) -> Result<(Vec<u8>, [u8; 16]), LinkCryptoError> {
+        let (packed, request_id) = self.prepare_request(path, data, timeout)?;
+        match self.encrypt(&packed) {
+            Ok(encrypted) => Ok((encrypted, request_id)),
+            Err(error) => {
+                self.discard_pending_request(&request_id);
+                Err(error)
+            }
+        }
+    }
+
+    /// Build the plaintext MsgPack request body and register its receipt.
+    ///
+    /// Packet-sized callers encrypt the returned body directly. Bodies larger
+    /// than the Link MDU are passed to Resource with the returned request ID.
+    pub fn prepare_request(
+        &mut self,
+        path: &str,
+        data: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<(Vec<u8>, [u8; 16]), LinkCryptoError> {
         let data_value = data
             .map(msgpack_value_from_bytes_or_binary)
             .unwrap_or(rmpv::Value::Nil);
-        self.request_value(path, data_value, timeout)
+        self.prepare_request_value(path, data_value, timeout)
     }
 
     /// Build a REQUEST payload with a MsgPack string body.
@@ -717,10 +753,18 @@ impl Link {
         data: &str,
         timeout: Duration,
     ) -> Result<(Vec<u8>, [u8; 16]), LinkCryptoError> {
-        self.request_value(path, rmpv::Value::String(data.into()), timeout)
+        let (packed, request_id) =
+            self.prepare_request_value(path, rmpv::Value::String(data.into()), timeout)?;
+        match self.encrypt(&packed) {
+            Ok(encrypted) => Ok((encrypted, request_id)),
+            Err(error) => {
+                self.discard_pending_request(&request_id);
+                Err(error)
+            }
+        }
     }
 
-    fn request_value(
+    fn prepare_request_value(
         &mut self,
         path: &str,
         data_value: rmpv::Value,
@@ -745,8 +789,6 @@ impl Link {
         rmpv::encode::write_value(&mut packed, &array)
             .map_err(|_| LinkCryptoError::EncryptionFailed)?;
 
-        let encrypted = self.encrypt(&packed)?;
-
         // request_id is a truncated SHA-256 of the plaintext, so both sides derive
         // the same ID without exchanging it.
         let request_id = truncated_hash(&packed);
@@ -756,7 +798,53 @@ impl Link {
         let receipt = RequestReceipt::new(receipt_id, self.link_id, timeout);
         self.pending_requests.push(receipt);
 
-        Ok((encrypted, request_id))
+        Ok((packed, request_id))
+    }
+
+    /// Suspend a request's response timeout while its body is sent by Resource.
+    pub fn mark_request_resource_sending(&mut self, request_id: &[u8; 16]) -> bool {
+        let Some(receipt) = self
+            .pending_requests
+            .iter_mut()
+            .find(|receipt| receipt.request_id[..16] == request_id[..])
+        else {
+            return false;
+        };
+        receipt.mark_resource_sending();
+        true
+    }
+
+    /// Start a Resource-backed request's response timeout after send proof.
+    pub fn mark_request_resource_sent(&mut self, request_id: &[u8; 16]) -> bool {
+        let Some(receipt) = self
+            .pending_requests
+            .iter_mut()
+            .find(|receipt| receipt.request_id[..16] == request_id[..])
+        else {
+            return false;
+        };
+        receipt.mark_resource_sent();
+        true
+    }
+
+    /// Fail and remove a pending request by its truncated request ID.
+    pub fn fail_pending_request(&mut self, request_id: &[u8; 16]) -> bool {
+        let Some(receipt) = self
+            .pending_requests
+            .iter_mut()
+            .find(|receipt| receipt.request_id[..16] == request_id[..])
+        else {
+            return false;
+        };
+        receipt.fail();
+        self.pending_requests
+            .retain(|receipt| receipt.request_id[..16] != request_id[..]);
+        true
+    }
+
+    fn discard_pending_request(&mut self, request_id: &[u8; 16]) {
+        self.pending_requests
+            .retain(|receipt| receipt.request_id[..16] != request_id[..]);
     }
 
     /// Replace the initial request id with the packet-hash id used by
@@ -785,9 +873,17 @@ impl Link {
         encrypted_data: &[u8],
     ) -> Result<ParsedRequestData, LinkCryptoError> {
         let plaintext = self.decrypt(encrypted_data)?;
+        Self::parse_request(&plaintext)
+    }
 
+    /// Parse an already-decrypted Link request.
+    ///
+    /// Packet requests use [`Self::handle_request`]. Request Resources are
+    /// decrypted by the Resource transfer before reaching the Link runtime,
+    /// so they use this parser directly.
+    pub fn parse_request(plaintext: &[u8]) -> Result<ParsedRequestData, LinkCryptoError> {
         // request_id = SHA-256(packed_request)[:16]
-        let request_id = truncated_hash(&plaintext);
+        let request_id = truncated_hash(plaintext);
 
         // Unpack msgpack array: [timestamp, path_hash, data]
         let value = rmpv::decode::read_value(&mut &plaintext[..])
@@ -862,6 +958,16 @@ impl Link {
         &mut self,
         plaintext: &[u8],
     ) -> Result<([u8; 16], Vec<u8>), LinkCryptoError> {
+        let (request_id, response_data) = Self::parse_response_plaintext(plaintext)?;
+        self.deliver_response_data(&request_id, response_data.clone());
+        Ok((request_id, response_data))
+    }
+
+    /// Parse plaintext MsgPack `[request_id, response_data]` without mutating
+    /// pending request state.
+    pub fn parse_response_plaintext(
+        plaintext: &[u8],
+    ) -> Result<([u8; 16], Vec<u8>), LinkCryptoError> {
         let value = rmpv::decode::read_value(&mut &plaintext[..])
             .map_err(|_| LinkCryptoError::DecryptionFailed)?;
 
@@ -881,18 +987,23 @@ impl Link {
 
         let response_data = msgpack_value_to_bytes(&array[1])?;
 
-        if let Some(receipt) = self
+        Ok((request_id, response_data))
+    }
+
+    /// Deliver already-decoded response bytes to a pending request.
+    pub fn deliver_response_data(&mut self, request_id: &[u8; 16], response_data: Vec<u8>) -> bool {
+        let Some(receipt) = self
             .pending_requests
             .iter_mut()
             .find(|r| r.request_id[..16] == request_id[..])
-        {
-            receipt.receive_response(response_data.clone());
-        }
+        else {
+            return false;
+        };
+        receipt.receive_response(response_data);
 
         self.pending_requests
-            .retain(|r| r.state == RequestState::Sent);
-
-        Ok((request_id, response_data))
+            .retain(|receipt| receipt.request_id[..16] != request_id[..]);
+        true
     }
 
     /// Update RTT from an LRRTT packet (context 0xFE) received after handshake.
@@ -1060,11 +1171,23 @@ impl Link {
         self.keepalive.record_outbound();
     }
 
-    /// Count an outbound keepalive beat (Python counts them too, Packet.py:291)
-    /// without touching `last_outbound` — that would defer `is_stale` forever.
+    /// Count an outbound keepalive beat and retain its send time.
+    ///
+    /// Stale detection deliberately ignores local outbound activity, while the
+    /// retained timestamp prevents redundant keepalive traffic.
     pub fn record_tx_keepalive(&mut self, bytes: usize) {
         self.tx_bytes += bytes as u64;
         self.tx_count += 1;
+        self.keepalive.record_keepalive_outbound();
+    }
+
+    /// Whether this responder should answer a keepalive request.
+    ///
+    /// Recent outbound traffic already proves the responder can transmit, so
+    /// an immediate extra reply would only duplicate that traffic.
+    pub fn should_respond_to_keepalive(&self) -> bool {
+        self.keepalive
+            .should_respond_to_keepalive_at(Instant::now())
     }
 
     /// `bytes` is the link payload after the context byte (Link.py:929).
@@ -1078,9 +1201,28 @@ impl Link {
         (self.tx_bytes, self.rx_bytes, self.tx_count, self.rx_count)
     }
 
-    /// Merge PHY measurements from the receiving interface; `None` values leave
-    /// the current reading intact.
+    /// Enable or disable per-packet physical-layer measurement tracking.
+    pub fn track_phy_stats(&mut self, track: bool) {
+        self.track_phy_stats = track;
+    }
+
+    pub fn phy_stats_tracking_enabled(&self) -> bool {
+        self.track_phy_stats
+    }
+
+    /// Merge measurements when tracking is enabled.
     pub fn update_phy_stats(&mut self, rssi: Option<f64>, snr: Option<f64>, q: Option<f64>) {
+        if !self.track_phy_stats {
+            return;
+        }
+        self.update_phy_stats_force(rssi, snr, q);
+    }
+
+    /// Merge measurements regardless of the tracking gate.
+    ///
+    /// Responder Links use this to retain the establishment packet's
+    /// measurements, matching Python's forced initial update.
+    pub fn update_phy_stats_force(&mut self, rssi: Option<f64>, snr: Option<f64>, q: Option<f64>) {
         if rssi.is_some() {
             self.rssi = rssi;
         }
@@ -1094,7 +1236,32 @@ impl Link {
 
     /// Current PHY measurements as `(rssi, snr, q)`.
     pub fn phy_stats(&self) -> (Option<f64>, Option<f64>, Option<f64>) {
-        (self.rssi, self.snr, self.q)
+        let stats = self.phy_stats_snapshot();
+        (stats.rssi, stats.snr, stats.q)
+    }
+
+    pub fn phy_stats_snapshot(&self) -> LinkPhyStats {
+        if self.track_phy_stats {
+            LinkPhyStats {
+                rssi: self.rssi,
+                snr: self.snr,
+                q: self.q,
+            }
+        } else {
+            LinkPhyStats::default()
+        }
+    }
+
+    pub fn get_rssi(&self) -> Option<f64> {
+        self.track_phy_stats.then_some(self.rssi).flatten()
+    }
+
+    pub fn get_snr(&self) -> Option<f64> {
+        self.track_phy_stats.then_some(self.snr).flatten()
+    }
+
+    pub fn get_q(&self) -> Option<f64> {
+        self.track_phy_stats.then_some(self.q).flatten()
     }
 
     /// Clone of the session keys, for handing to a Channel or Resource.
@@ -1117,9 +1284,15 @@ impl Link {
         ),
     )]
     pub fn tick(&mut self) -> LinkAction {
+        let now = Instant::now();
+        for receipt in &mut self.pending_requests {
+            receipt.check_timeout();
+        }
+        self.pending_requests.retain(|receipt| !receipt.concluded());
+
         match self.state {
             LinkState::Pending | LinkState::Handshake => {
-                if self.request_time.elapsed() > self.establishment_timeout {
+                if now.saturating_duration_since(self.request_time) > self.establishment_timeout {
                     self.close(CloseReason::Timeout);
                     return LinkAction::Closed(CloseReason::Timeout);
                 }
@@ -1128,13 +1301,13 @@ impl Link {
             LinkState::Active => {
                 // Emit any pending keepalive before checking staleness so a final
                 // beat goes out on the same tick the link transitions to STALE.
-                if self.keepalive.should_send_keepalive() {
-                    self.keepalive.mark_keepalive_sent();
+                if self.keepalive.should_send_keepalive_at(now) {
+                    self.keepalive.mark_keepalive_sent_at(now);
                     return LinkAction::SendKeepalive;
                 }
-                if self.keepalive.is_stale() {
+                if self.keepalive.is_stale_at(now) {
                     self.state = LinkState::Stale;
-                    self.stale_since = Some(Instant::now());
+                    self.stale_since = Some(now);
                     tracing::debug!(link_id = ?self.link_id, "link state -> Stale");
                     return LinkAction::TransitionedToStale;
                 }
@@ -1146,7 +1319,7 @@ impl Link {
                 let rtt = self.rtt.unwrap_or(Duration::from_secs(1));
                 let grace = self.keepalive.stale_grace_timeout(rtt);
                 if let Some(stale_since) = self.stale_since {
-                    if stale_since.elapsed() >= grace {
+                    if now.saturating_duration_since(stale_since) >= grace {
                         let teardown_data = self.encrypt(&self.link_id).unwrap_or_default();
                         self.close(CloseReason::Timeout);
                         return LinkAction::SendTeardownAndClose(teardown_data);
@@ -1198,6 +1371,11 @@ impl Link {
 
     fn close(&mut self, reason: CloseReason) {
         tracing::debug!(link_id = ?self.link_id, ?reason, "link state -> Closed");
+        self.teardown_reason = Some(reason);
+        for receipt in &mut self.pending_requests {
+            receipt.fail();
+        }
+        self.pending_requests.clear();
         self.state = LinkState::Closed;
         self.purge_keys();
     }
@@ -1335,6 +1513,31 @@ impl Link {
     /// Handshake throughput in bits/sec, or `None` before activation.
     pub fn get_establishment_rate(&self) -> Option<f64> {
         self.establishment_rate.map(|rate| rate * 8.0)
+    }
+
+    /// Negotiated MTU for an active Link.
+    pub fn get_mtu(&self) -> Option<u32> {
+        (self.state == LinkState::Active).then_some(self.mtu)
+    }
+
+    /// Negotiated encrypted-payload MDU for an active Link.
+    pub fn get_mdu(&self) -> Option<usize> {
+        (self.state == LinkState::Active).then_some(self.mdu)
+    }
+
+    /// Negotiated Link mode.
+    pub const fn get_mode(&self) -> u8 {
+        self.mode
+    }
+
+    /// Duration since activation, or `None` before the Link is established.
+    pub fn age(&self) -> Option<Duration> {
+        self.activated_at.map(|activated| activated.elapsed())
+    }
+
+    /// Python-compatible Link age in seconds.
+    pub fn get_age(&self) -> Option<f64> {
+        self.age().map(|age| age.as_secs_f64())
     }
 
     /// Expected in-flight rate in bits/sec for an active link; `None` until the
@@ -1512,11 +1715,19 @@ mod tests {
 
         let teardown_data = initiator.teardown(CloseReason::InitiatorClosed);
         assert_eq!(initiator.state, LinkState::Closed);
+        assert_eq!(
+            initiator.teardown_reason,
+            Some(CloseReason::InitiatorClosed)
+        );
         assert!(teardown_data.is_some());
 
         let accepted = responder.receive_teardown(&teardown_data.unwrap());
         assert!(accepted);
         assert_eq!(responder.state, LinkState::Closed);
+        assert_eq!(
+            responder.teardown_reason,
+            Some(CloseReason::DestinationClosed)
+        );
     }
 
     #[test]
@@ -1814,6 +2025,29 @@ mod tests {
         let initiator_rate_bps = initiator.get_establishment_rate().unwrap();
         let initiator_rate_bytes = initiator.establishment_rate.unwrap();
         assert!((initiator_rate_bps - initiator_rate_bytes * 8.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn active_link_metric_accessors_gate_negotiated_sizes_and_report_age() {
+        let (mut link, _) = Link::new_initiator([0xA4; 16], 1);
+        assert_eq!(link.get_mtu(), None);
+        assert_eq!(link.get_mdu(), None);
+        assert_eq!(link.get_age(), None);
+        assert_eq!(link.get_mode(), link.mode);
+
+        link.state = LinkState::Active;
+        link.activated_at = Instant::now().checked_sub(Duration::from_millis(10));
+        assert_eq!(link.get_mtu(), Some(link.mtu));
+        assert_eq!(link.get_mdu(), Some(link.mdu));
+        assert!(
+            link.age()
+                .is_some_and(|age| age >= Duration::from_millis(10))
+        );
+        assert!(link.get_age().is_some_and(|age| age >= 0.01));
+
+        link.state = LinkState::Stale;
+        assert_eq!(link.get_mtu(), None);
+        assert_eq!(link.get_mdu(), None);
     }
 
     #[test]
@@ -2116,6 +2350,72 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_plaintext_request_resource_payload() {
+        let (mut initiator, responder, _) = make_active_link();
+
+        let (encrypted, request_id) = initiator
+            .request(
+                "resource.path",
+                Some(b"resource request data"),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        let plaintext = responder.decrypt(&encrypted).unwrap();
+
+        let (parsed_id, path_hash, _timestamp, data) = Link::parse_request(&plaintext).unwrap();
+        assert_eq!(parsed_id, request_id);
+        assert_eq!(path_hash, truncated_hash(b"resource.path"));
+        assert_eq!(data, b"resource request data");
+    }
+
+    #[test]
+    fn test_tick_expires_pending_request_and_fires_callback() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (mut initiator, _responder, _) = make_active_link();
+        initiator
+            .request("test.timeout", None, Duration::ZERO)
+            .unwrap();
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let callback_fired = fired.clone();
+        initiator.pending_requests[0].set_failed_callback(move |_| {
+            callback_fired.store(true, Ordering::SeqCst);
+        });
+
+        initiator.tick();
+
+        assert!(fired.load(Ordering::SeqCst));
+        assert!(
+            initiator.pending_requests.is_empty(),
+            "owning runtime tick must reap concluded request receipts"
+        );
+    }
+
+    #[test]
+    fn test_link_close_fails_pending_request() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (mut initiator, _responder, _) = make_active_link();
+        initiator
+            .request("test.close", None, Duration::from_secs(30))
+            .unwrap();
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let callback_fired = fired.clone();
+        initiator.pending_requests[0].set_failed_callback(move |_| {
+            callback_fired.store(true, Ordering::SeqCst);
+        });
+
+        initiator.mark_closed(CloseReason::DestinationClosed);
+
+        assert!(fired.load(Ordering::SeqCst));
+        assert!(initiator.pending_requests.is_empty());
+    }
+
+    #[test]
     fn test_request_response_preserves_msgpack_object_bodies() {
         use rmpv::Value;
 
@@ -2253,11 +2553,10 @@ mod tests {
         assert_eq!(rx_c, 1);
     }
 
-    /// Keepalive beats count into traffic stats (Packet.py:291) but must not
-    /// refresh `last_outbound`, or an initiator pinging a dead peer would
-    /// never go stale.
+    /// Keepalive beats count into traffic stats and refresh the outbound
+    /// keepalive clock. Peer-liveness detection remains inbound-only.
     #[test]
-    fn test_record_tx_keepalive_counts_without_outbound_refresh() {
+    fn test_record_tx_keepalive_counts_and_refreshes_outbound() {
         let (mut link, _, _) = make_active_link();
         assert!(link.keepalive.last_outbound.is_none());
 
@@ -2266,7 +2565,8 @@ mod tests {
         let (tx_b, _, tx_c, _) = link.traffic_stats();
         assert_eq!(tx_b, 1);
         assert_eq!(tx_c, 1);
-        assert!(link.keepalive.last_outbound.is_none());
+        assert!(link.keepalive.last_outbound.is_some());
+        assert!(link.keepalive.last_keepalive_sent.is_some());
     }
 
     /// Initiator knows expected_hops at creation (Link.py:282); the responder
@@ -2288,7 +2588,10 @@ mod tests {
         let (mut link, _, _) = make_active_link();
 
         assert_eq!(link.phy_stats(), (None, None, None));
+        link.update_phy_stats(Some(-90.0), Some(5.0), Some(0.5));
+        assert_eq!(link.rssi, None);
 
+        link.track_phy_stats(true);
         link.update_phy_stats(Some(-80.0), Some(12.5), Some(0.95));
         assert_eq!(link.rssi, Some(-80.0));
         assert_eq!(link.snr, Some(12.5));
@@ -2298,6 +2601,15 @@ mod tests {
         link.update_phy_stats(Some(-75.0), None, None);
         assert_eq!(link.rssi, Some(-75.0));
         assert_eq!(link.snr, Some(12.5));
+        assert_eq!(link.get_rssi(), Some(-75.0));
+
+        link.track_phy_stats(false);
+        assert_eq!(link.phy_stats(), (None, None, None));
+        assert_eq!(link.get_rssi(), None);
+
+        link.update_phy_stats_force(Some(-60.0), None, None);
+        link.track_phy_stats(true);
+        assert_eq!(link.get_rssi(), Some(-60.0));
     }
 
     #[test]

@@ -564,6 +564,10 @@ impl InboundResource {
         initial_map_hashes: Vec<[u8; MAPHASH_LEN]>,
         link_sdu: Option<usize>,
     ) -> Result<Self, ResourceError> {
+        if total_parts == 0 {
+            return Err(ResourceError::InvalidAdvertisement);
+        }
+
         // `total_size` is post-encryption: max plaintext + random_hash +
         // TOKEN_OVERHEAD + worst-case PKCS7 pad.
         const MAX_AES_BLOCK_PAD: usize = 16;
@@ -807,6 +811,17 @@ pub struct MultiSegmentOutbound {
     pub data_size: usize,
 }
 
+fn required_segment_count(data_size: usize, metadata_wire_size: usize) -> usize {
+    if data_size == 0 {
+        return 1;
+    }
+    let first_payload_size = MAX_EFFICIENT_SIZE.saturating_sub(metadata_wire_size);
+    let first_len = data_size.min(first_payload_size);
+    1 + data_size
+        .saturating_sub(first_len)
+        .div_ceil(MAX_EFFICIENT_SIZE)
+}
+
 impl MultiSegmentOutbound {
     /// Split `data` into `MAX_EFFICIENT_SIZE`-sized chunks, each wrapped in
     /// its own `OutboundResource` with `flags.split = true` and the correct
@@ -854,9 +869,13 @@ impl MultiSegmentOutbound {
         if metadata_wire_size > MAX_EFFICIENT_SIZE {
             return Err(ResourceError::MetadataTooLarge);
         }
+        let planned_segments = required_segment_count(data.len(), metadata_wire_size);
+        if planned_segments > MAX_SEGMENTS {
+            return Err(ResourceError::TooLarge);
+        }
 
         let first_payload_max = MAX_EFFICIENT_SIZE - metadata_wire_size;
-        let mut chunk_specs: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        let mut chunk_specs: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(planned_segments);
 
         if data.is_empty() {
             chunk_specs.push((Vec::new(), metadata.clone()));
@@ -873,6 +892,7 @@ impl MultiSegmentOutbound {
         }
 
         let total_segments = chunk_specs.len();
+        debug_assert_eq!(total_segments, planned_segments);
         let mut segments = Vec::with_capacity(total_segments);
 
         for (i, (chunk, segment_metadata)) in chunk_specs.into_iter().enumerate() {
@@ -1391,6 +1411,34 @@ impl OutboundTransfer {
         TransferAction::None
     }
 
+    /// Sender-side advertisement watchdog for request-driven runtimes.
+    ///
+    /// An outbound transfer remains `Advertised` until the receiver's first
+    /// `RESOURCE_REQ` arrives. If that advertisement is lost, resend it up to
+    /// the Python-compatible retry limit instead of leaving the transfer
+    /// dormant forever.
+    pub fn check_timeout(&mut self) -> TransferAction {
+        if self.resource.state != ResourceState::Advertised {
+            return TransferAction::None;
+        }
+
+        let timeout = Duration::from_secs_f64(
+            self.rtt.as_secs_f64() * rns_link::constants::TRAFFIC_TIMEOUT_FACTOR + PROCESSING_GRACE,
+        );
+        if self.started_at.elapsed() <= timeout {
+            return TransferAction::None;
+        }
+
+        if self.retries < MAX_ADV_RETRIES {
+            self.retries += 1;
+            self.started_at = Instant::now();
+            TransferAction::SendAdvertisement(self.create_advertisement())
+        } else {
+            self.resource.state = ResourceState::Failed;
+            TransferAction::Failed("resource advertisement timed out".to_string())
+        }
+    }
+
     /// Consume a hashmap-update frame from the receiver.
     ///
     /// Wire layout:
@@ -1551,8 +1599,7 @@ impl OutboundTransfer {
         // The collision guard widens the search window so out-of-order
         // part requests don't fall outside the scanned range when the
         // receiver's consecutive height lags ours.
-        let guard_size =
-            crate::resource_adv::collision_guard_size(rns_wire::constants::ENCRYPTED_MDU);
+        let guard_size = crate::resource_adv::collision_guard_size(rns_wire::constants::LINK_MDU);
         let search_start = self.receiver_min_consecutive_height;
         let search_end = (search_start + guard_size).min(self.resource.num_parts());
 
@@ -1599,7 +1646,7 @@ impl OutboundTransfer {
             };
 
             let hashmap_max_len =
-                crate::resource_adv::hashmap_max_len(rns_wire::constants::ENCRYPTED_MDU);
+                crate::resource_adv::hashmap_max_len(rns_wire::constants::LINK_MDU);
 
             // Python cancels if an exhausted request cursor is not aligned to
             // a hashmap segment boundary.
@@ -1695,7 +1742,7 @@ impl OutboundTransfer {
             self.resource.random_hash.to_vec(),
             self.resource.flags,
             &self.resource.map_hashes,
-            rns_wire::constants::ENCRYPTED_MDU,
+            rns_wire::constants::LINK_MDU,
         );
         // `ResourceAdvertisement::new` defaults to single-segment metadata
         // (`segment_index = 1`, `total_segments = 1`, `original_hash =
@@ -2144,12 +2191,17 @@ impl InboundTransfer {
             return self.cancel();
         }
 
+        let hashmap_max_len = crate::resource_adv::hashmap_max_len(rns_wire::constants::LINK_MDU);
+        let Some(segment_start) = segment.checked_mul(hashmap_max_len) else {
+            return self.cancel();
+        };
+        if segment_start >= self.resource.total_parts {
+            return self.cancel();
+        }
+
         self.resource.state = ResourceState::Transferring;
         self.last_activity = Instant::now();
         self.retries_left = MAX_RETRIES;
-
-        let hashmap_max_len =
-            crate::resource_adv::hashmap_max_len(rns_wire::constants::ENCRYPTED_MDU);
 
         // Parse hashes from the hashmap data and insert into our map_hashes.
         // `segment` is wire-supplied: indices are bounded by total_parts
@@ -2157,10 +2209,7 @@ impl InboundTransfer {
         // writes are impossible there) — anything beyond is hostile.
         let hashes_count = hashmap_data.len() / MAPHASH_LEN;
         for i in 0..hashes_count {
-            let idx = match segment
-                .checked_mul(hashmap_max_len)
-                .and_then(|base| base.checked_add(i))
-            {
+            let idx = match segment_start.checked_add(i) {
                 Some(idx) if idx < self.resource.total_parts => idx,
                 _ => break,
             };
@@ -2773,6 +2822,47 @@ mod tests {
     }
 
     #[test]
+    fn test_outbound_advertisement_watchdog_retries() {
+        let mut transfer = OutboundTransfer::new(
+            b"retry advertisement".to_vec(),
+            false,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert!(matches!(
+            transfer.tick(),
+            TransferAction::SendAdvertisement(_)
+        ));
+
+        transfer.started_at = Instant::now() - Duration::from_secs(60);
+        assert!(matches!(
+            transfer.check_timeout(),
+            TransferAction::SendAdvertisement(_)
+        ));
+        assert_eq!(transfer.retries, 1);
+        assert_eq!(transfer.resource.state, ResourceState::Advertised);
+    }
+
+    #[test]
+    fn test_outbound_advertisement_watchdog_fails_after_retry_limit() {
+        let mut transfer = OutboundTransfer::new(
+            b"failed advertisement".to_vec(),
+            false,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        transfer.tick();
+        transfer.retries = MAX_ADV_RETRIES;
+        transfer.started_at = Instant::now() - Duration::from_secs(60);
+
+        assert!(matches!(
+            transfer.check_timeout(),
+            TransferAction::Failed(_)
+        ));
+        assert_eq!(transfer.resource.state, ResourceState::Failed);
+    }
+
+    #[test]
     fn test_outbound_transfer_hmu_handling() {
         let data = b"small data".to_vec();
         let mut transfer =
@@ -2846,6 +2936,17 @@ mod tests {
             Duration::from_millis(100),
         );
         assert!(matches!(result, Err(ResourceError::TooLarge)));
+
+        let result = InboundResource::new(
+            0,
+            1024,
+            1000,
+            [0xAA; RANDOM_HASH_SIZE],
+            [0xBB; 32],
+            ResourceFlags::default(),
+            Vec::new(),
+        );
+        assert!(matches!(result, Err(ResourceError::InvalidAdvertisement)));
 
         // Same bound at the InboundResource layer directly.
         let result = InboundResource::new(
@@ -3285,6 +3386,17 @@ mod tests {
     fn test_multi_segment_outbound_too_large() {
         let data = vec![0; MAX_RESOURCE_SIZE + 1];
         assert!(MultiSegmentOutbound::new(data, false).is_err());
+    }
+
+    #[test]
+    fn test_multi_segment_plan_caps_metadata_induced_extra_segment() {
+        let bounded_payload = MAX_EFFICIENT_SIZE * MAX_SEGMENTS;
+        assert_eq!(required_segment_count(bounded_payload, 0), MAX_SEGMENTS);
+        assert_eq!(required_segment_count(bounded_payload, 4), MAX_SEGMENTS + 1);
+        assert_eq!(
+            required_segment_count(MAX_RESOURCE_SIZE, 0),
+            MAX_SEGMENTS + 1
+        );
     }
 
     #[test]
@@ -3954,7 +4066,7 @@ mod tests {
         let mut sender =
             OutboundTransfer::new(data.clone(), false, Duration::from_millis(100)).unwrap();
         assert!(
-            crate::resource_adv::hashmap_max_len(rns_wire::constants::ENCRYPTED_MDU) > 1,
+            crate::resource_adv::hashmap_max_len(rns_wire::constants::LINK_MDU) > 1,
             "test requires a multi-entry hashmap segment"
         );
 
@@ -4183,8 +4295,7 @@ mod tests {
         assert_eq!(inbound.hashmap_height, initial_height);
 
         // Build hashmap data for segment 0 with additional hashes
-        let hashmap_max_len =
-            crate::resource_adv::hashmap_max_len(rns_wire::constants::ENCRYPTED_MDU);
+        let hashmap_max_len = crate::resource_adv::hashmap_max_len(rns_wire::constants::LINK_MDU);
         let mut hashmap_bytes = Vec::new();
         let end = outbound.map_hashes.len().min(hashmap_max_len);
         for i in 0..end {
@@ -4268,39 +4379,40 @@ mod tests {
         let outbound = OutboundResource::new(data.clone(), false, None).unwrap();
         let total_parts = outbound.num_parts();
 
-        let mut inbound = InboundTransfer::from_advertisement(
-            total_parts,
-            outbound.total_size,
-            data.len(),
-            outbound.random_hash,
-            outbound.resource_hash,
-            ResourceFlags {
-                compressed: false,
-                ..Default::default()
-            },
-            outbound.map_hashes[..2].to_vec(),
-            Duration::from_millis(100),
-        )
-        .unwrap();
+        for segment in [1_000_000, usize::MAX] {
+            let mut inbound = InboundTransfer::from_advertisement(
+                total_parts,
+                outbound.total_size,
+                data.len(),
+                outbound.random_hash,
+                outbound.resource_hash,
+                ResourceFlags {
+                    compressed: false,
+                    ..Default::default()
+                },
+                outbound.map_hashes[..2].to_vec(),
+                Duration::from_millis(100),
+            )
+            .unwrap();
 
-        // Hostile segment index: would previously push ~segment*74 zero
-        // entries into map_hashes. Must be ignored without growth or panic.
-        inbound.waiting_for_hmu = true;
-        inbound.hashmap_update(1_000_000, &outbound.map_hashes[0]);
-        assert_eq!(inbound.resource.map_hashes.len(), 2);
-
-        // Overflowing segment*hashmap_max_len must not panic either.
-        inbound.waiting_for_hmu = true;
-        inbound.hashmap_update(usize::MAX, &outbound.map_hashes[0]);
-        assert_eq!(inbound.resource.map_hashes.len(), 2);
+            // Hostile and overflowing segment indices must neither grow the
+            // hashmap nor refresh the watchdog indefinitely.
+            inbound.waiting_for_hmu = true;
+            let action = inbound.hashmap_update(segment, &outbound.map_hashes[0]);
+            assert!(matches!(
+                action,
+                TransferAction::SendCancel(CancelType::Rcl, _)
+            ));
+            assert_eq!(inbound.resource.map_hashes.len(), 2);
+            assert_eq!(inbound.resource.state, ResourceState::Failed);
+        }
     }
 
     #[test]
     fn test_hashmap_update_second_segment_bounded_by_total_parts() {
         // Resource large enough that its hashmap spans >1 segment: segment 1
         // writes land, but never past total_parts even if overfull.
-        let hashmap_max_len =
-            crate::resource_adv::hashmap_max_len(rns_wire::constants::ENCRYPTED_MDU);
+        let hashmap_max_len = crate::resource_adv::hashmap_max_len(rns_wire::constants::LINK_MDU);
         let data = vec![0xCD; (hashmap_max_len + 12) * SDU];
         let outbound = OutboundResource::new(data.clone(), false, None).unwrap();
         let total_parts = outbound.num_parts();
@@ -4508,8 +4620,7 @@ mod tests {
         let mut request_data = Vec::new();
         request_data.push(HASHMAP_IS_EXHAUSTED);
         // last_map_hash -- use the hash at hashmap_max_len boundary
-        let hashmap_max_len =
-            crate::resource_adv::hashmap_max_len(rns_wire::constants::ENCRYPTED_MDU);
+        let hashmap_max_len = crate::resource_adv::hashmap_max_len(rns_wire::constants::LINK_MDU);
         let boundary_idx = hashmap_max_len.min(sender.resource.num_parts()) - 1;
         request_data.extend_from_slice(&sender.resource.map_hashes[boundary_idx]);
         request_data.extend_from_slice(&sender.resource.resource_hash);

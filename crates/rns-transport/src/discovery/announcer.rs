@@ -48,7 +48,7 @@ pub struct DiscoveryInterfaceConfig {
     pub longitude: f64,
     pub height: f64,
     /// Set the `FLAG_ENCRYPTED` bit; caller supplies `encrypt` closure at
-    /// announce time via [`AnnounceRequest::assemble`].
+    /// announce time via [`Announcer::tick`].
     pub encrypt: bool,
     /// Set the `FLAG_SIGNED` bit (independent of `encrypt`).
     pub signed: bool,
@@ -106,7 +106,8 @@ struct InterfaceAnnounceState {
 #[derive(Debug, Clone)]
 pub struct AnnounceRequest {
     pub interface_id: InterfaceId,
-    /// Fully-assembled `app_data` bytes (flags || [encrypted] body).
+    /// Fully assembled `app_data` bytes (flags followed by the optionally
+    /// encrypted body).
     pub app_data: Vec<u8>,
     /// Stamp value actually achieved — useful for logging.
     pub stamp_value: u8,
