@@ -2871,6 +2871,11 @@ impl LinkManager {
         let Some(mut active) = self.active_links.remove(&link_id) else {
             return false;
         };
+        // Python removes responder Links from the owning Destination when they
+        // close. Keep the Rust Destination's live-link bookkeeping in sync.
+        if let Some(destination) = self.destination.as_mut() {
+            destination.remove_link(&link_id);
+        }
         let inbound_resource_ids =
             Self::active_inbound_logical_ids(&self.active_inbound_lifecycles, link_id);
         let outbound_resource_ids: HashSet<[u8; 32]> = active
@@ -5030,6 +5035,34 @@ mod tests {
             )
             .expect("backend-signed proof validates");
         assert!(!rtt.is_empty());
+    }
+
+    #[test]
+    fn accepted_inbound_link_is_removed_from_owned_destination_on_close() {
+        let (transport_tx, _transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let identity = Identity::new();
+        let mut manager = LinkManager::with_destination(
+            transport_tx,
+            event_rx,
+            &identity,
+            "test.link-lifecycle",
+            identity.get_signing_key(),
+        );
+        let destination_hash = manager.destination_hash;
+        let (initiator, request_data) = Link::new_initiator(destination_hash, 1);
+
+        manager.handle_link_request(&link_request_raw(destination_hash, &request_data), 1);
+
+        assert_eq!(manager.active_link_count(), 1);
+        assert_eq!(manager.destination().unwrap().link_count(), 1);
+
+        manager.handle_event(DestinationEvent::LinkClosed {
+            link_id: initiator.link_id,
+        });
+
+        assert_eq!(manager.active_link_count(), 0);
+        assert_eq!(manager.destination().unwrap().link_count(), 0);
     }
 
     #[test]
