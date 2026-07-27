@@ -70,12 +70,14 @@ pub struct DestinationPacket {
     pub raw: Vec<u8>,
 }
 
-/// Bounded event receivers owned by one registered destination.
+/// Event receivers owned by one registered destination. All are bounded by
+/// `event_capacity` except `link_packets`: inbound link data is proved to the
+/// peer on receipt, so its local delivery is lossless and must be drained.
 pub struct DestinationEvents {
     pub packets: mpsc::Receiver<DestinationPacket>,
     pub links_established: mpsc::Receiver<[u8; 16]>,
     pub links_identified: mpsc::Receiver<([u8; 16], [u8; 16])>,
-    pub link_packets: mpsc::Receiver<(Vec<u8>, [u8; 16])>,
+    pub link_packets: mpsc::UnboundedReceiver<(Vec<u8>, [u8; 16])>,
     pub link_packet_proofs: mpsc::Receiver<LinkPacketProof>,
     pub resource_completions: mpsc::Receiver<ResourceCompletion>,
     pub resource_proofs: mpsc::Receiver<LinkResourceProof>,
@@ -392,7 +394,7 @@ impl RegisteredDestination {
 
         let (links_established_tx, links_established) = mpsc::channel(capacity);
         let (links_identified_tx, links_identified) = mpsc::channel(capacity);
-        let (link_packets_tx, link_packets) = mpsc::channel(capacity);
+        let (link_packets_tx, link_packets) = mpsc::unbounded_channel();
         let (link_packet_proofs_tx, link_packet_proofs) = mpsc::channel(capacity);
         let (resource_completions_tx, resource_completions) = mpsc::channel(capacity);
         let (resource_proofs_tx, resource_proofs) = mpsc::channel(capacity);

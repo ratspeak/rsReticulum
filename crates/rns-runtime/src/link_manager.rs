@@ -410,8 +410,9 @@ pub struct LinkManager {
     /// Synchronous LinkIdentify gate. Returning false closes the link before
     /// later resource packets can be accepted.
     link_identity_gate: Option<LinkIdentityGate>,
-    /// Decrypted link-packet stream (LXMF DIRECT).
-    link_packet_tx: Option<mpsc::Sender<(Vec<u8>, [u8; 16])>>,
+    /// Decrypted link-packet stream (LXMF DIRECT). Unbounded: inbound link
+    /// data is proved to the peer on receipt, so local delivery must not drop.
+    link_packet_tx: Option<mpsc::UnboundedSender<(Vec<u8>, [u8; 16])>>,
     /// Valid proof for an application link packet sent through this manager.
     link_packet_proof_tx: Option<mpsc::Sender<LinkPacketProof>>,
     /// Valid proof for an application resource sent through this manager.
@@ -2538,7 +2539,7 @@ impl LinkManager {
                             cb(&plaintext);
                         }
                         if let Some(ref tx) = self.link_packet_tx {
-                            let _ = tx.try_send((plaintext, link_id));
+                            let _ = tx.send((plaintext, link_id));
                         }
                         tracing::debug!(
                             link_id = hex::encode(link_id),
@@ -3855,7 +3856,11 @@ impl LinkManager {
         self.link_identity_gate = Some(Box::new(gate));
     }
 
-    pub fn set_link_packet_channel(&mut self, tx: mpsc::Sender<(Vec<u8>, [u8; 16])>) {
+    /// Install the decrypted link-packet stream.
+    ///
+    /// Unbounded and lossless: inbound link data is proved to the peer on
+    /// receipt, so the receiver must be drained for the manager's lifetime.
+    pub fn set_link_packet_channel(&mut self, tx: mpsc::UnboundedSender<(Vec<u8>, [u8; 16])>) {
         self.link_packet_tx = Some(tx);
     }
 
@@ -6591,6 +6596,60 @@ mod tests {
         let proof = proof_rx.try_recv().expect("link packet proof event");
         assert_eq!(proof.link_id, link_id);
         assert_eq!(proof.packet_hash, receipt.packet_hash);
+    }
+
+    #[test]
+    fn inbound_link_data_delivery_is_lossless_without_draining() {
+        let (initiator_link, responder_link, _identity_key) = handshaken_link_pair_with_identity();
+        let link_id = responder_link.link_id;
+
+        let (transport_tx, _transport_rx) = mpsc::channel(8);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xC4; 16], None);
+        let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
+        lm.set_link_packet_channel(packet_tx);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::None,
+        };
+
+        // Burst far past any bounded capacity before a single receive; every
+        // one of these is proved to the peer, so none may drop locally.
+        for i in 0..300u16 {
+            let mut raw = header.pack();
+            raw.extend_from_slice(&initiator_link.encrypt(&i.to_be_bytes()).unwrap());
+            lm.handle_inbound_packet(&raw, 1);
+        }
+
+        for i in 0..300u16 {
+            let (payload, from) = packet_rx.try_recv().expect("lossless link data delivery");
+            assert_eq!(from, link_id);
+            assert_eq!(payload, i.to_be_bytes());
+        }
+        assert!(packet_rx.try_recv().is_err());
     }
 
     #[test]
