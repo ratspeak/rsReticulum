@@ -573,7 +573,10 @@ pub enum TransportQuery {
     FirstHopTimeout {
         dest: [u8; 16],
     },
-    /// Extra link-proof timeout for a slow interface: `MTU * per_byte_latency`.
+    /// Python-compatible slow-interface timing query: `MTU * per_byte_latency`.
+    ///
+    /// Link sessions may use this as establishment policy. Unvalidated
+    /// transport-table retention deliberately remains bitrate-independent.
     ExtraLinkProofTimeout {
         interface_id: InterfaceId,
     },
