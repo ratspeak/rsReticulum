@@ -29,7 +29,8 @@ pub mod rpc_server;
 pub mod prelude {
     pub use crate::destination_runtime::{
         DestinationEvents, DestinationHandle, DestinationPacket, DestinationRatchetOptions,
-        DestinationRuntimeError, DestinationRuntimeOptions, RegisteredDestination,
+        DestinationRuntimeError, DestinationRuntimeOptions, IdentityGatePolicy,
+        RegisteredDestination, ResourceAcceptPolicy,
     };
     pub use crate::lifecycle::ShutdownSignal;
     pub use crate::link_manager::{DestinationAnnounceOptions, DestinationRequest, RequestOutcome};

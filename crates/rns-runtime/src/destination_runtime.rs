@@ -11,9 +11,13 @@ use rns_identity::destination::{
 };
 use rns_identity::identity::Identity;
 use rns_link::link::{CloseReason, ResourceStrategy};
+use rns_protocol::channel::ChannelError;
 use rns_protocol::channel_message::{ChannelMessageError, MessageBase};
+use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::messages::TransportMessage;
+use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::link_manager::{
@@ -35,6 +39,13 @@ pub struct DestinationRuntimeOptions {
     /// Announce app data used whenever an announce (including a path
     /// response) carries none explicitly.
     pub default_app_data: Option<Vec<u8>>,
+    /// Per-advertisement acceptance policy consulted when
+    /// `resource_strategy` is `AcceptApp`.
+    pub resource_accept: Option<ResourceAcceptPolicy>,
+    /// Synchronous LinkIdentify gate; returning false closes the link.
+    pub identity_gate: Option<IdentityGatePolicy>,
+    /// User Channel message types registered before the manager starts.
+    pub channel_message_types: Vec<u16>,
 }
 
 impl Default for DestinationRuntimeOptions {
@@ -45,7 +56,47 @@ impl Default for DestinationRuntimeOptions {
             resource_strategy: ResourceStrategy::AcceptNone,
             event_capacity: DEFAULT_EVENT_CAPACITY,
             default_app_data: None,
+            resource_accept: None,
+            identity_gate: None,
+            channel_message_types: Vec::new(),
         }
+    }
+}
+
+/// Clonable per-advertisement inbound Resource acceptance policy.
+#[derive(Clone)]
+pub struct ResourceAcceptPolicy(
+    Arc<dyn Fn([u8; 16], &ResourceAdvertisement) -> bool + Send + Sync>,
+);
+
+impl ResourceAcceptPolicy {
+    pub fn new(
+        policy: impl Fn([u8; 16], &ResourceAdvertisement) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(policy))
+    }
+}
+
+impl fmt::Debug for ResourceAcceptPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ResourceAcceptPolicy")
+    }
+}
+
+/// Clonable synchronous LinkIdentify gate, consulted before any later
+/// resource advertisement can race the admission decision.
+#[derive(Clone)]
+pub struct IdentityGatePolicy(Arc<dyn Fn([u8; 16], [u8; 16]) -> bool + Send + Sync>);
+
+impl IdentityGatePolicy {
+    pub fn new(gate: impl Fn([u8; 16], [u8; 16]) -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(gate))
+    }
+}
+
+impl fmt::Debug for IdentityGatePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("IdentityGatePolicy")
     }
 }
 
@@ -100,6 +151,8 @@ pub enum DestinationRuntimeError {
     LinkSend(#[from] LinkSendError),
     #[error(transparent)]
     ChannelSend(#[from] ChannelSendError),
+    #[error(transparent)]
+    Channel(#[from] ChannelError),
     #[error("destination event capacity must be greater than zero")]
     InvalidEventCapacity,
     #[error("destination manager is no longer available")]
@@ -392,6 +445,15 @@ impl RegisteredDestination {
         }
         manager.set_resource_strategy(options.resource_strategy);
         manager.set_use_implicit_proof(true);
+        if let Some(policy) = options.resource_accept.clone() {
+            manager.set_resource_accept_handler(move |link_id, adv| (policy.0)(link_id, adv));
+        }
+        if let Some(gate) = options.identity_gate.clone() {
+            manager.set_link_identity_gate(move |link_id, identity| (gate.0)(link_id, identity));
+        }
+        for msg_type in &options.channel_message_types {
+            manager.register_channel_message_type(*msg_type)?;
+        }
         let owned_destination = manager
             .destination_mut()
             .ok_or(DestinationControlError::DestinationUnavailable)?;
@@ -524,7 +586,47 @@ impl MessageBase for RawChannelMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rns_protocol::channel_message::SYSTEM_MESSAGE_TYPE_MIN;
     use rns_transport::messages::TransportMessage;
+
+    #[tokio::test]
+    async fn register_applies_policy_options_and_rejects_reserved_channel_types() {
+        let identity = Identity::new();
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+
+        let reserved = RegisteredDestination::register(
+            transport_tx.clone(),
+            identity.clone(),
+            "example.runtime.policies",
+            DestinationRuntimeOptions {
+                channel_message_types: vec![SYSTEM_MESSAGE_TYPE_MIN],
+                ..DestinationRuntimeOptions::default()
+            },
+        )
+        .await;
+        assert!(matches!(reserved, Err(DestinationRuntimeError::Channel(_))));
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "a reserved channel type must fail before transport registration"
+        );
+
+        let registration = RegisteredDestination::register(
+            transport_tx,
+            identity,
+            "example.runtime.policies",
+            DestinationRuntimeOptions {
+                resource_strategy: ResourceStrategy::AcceptApp,
+                resource_accept: Some(ResourceAcceptPolicy::new(|_, _| false)),
+                identity_gate: Some(IdentityGatePolicy::new(|_, _| true)),
+                channel_message_types: vec![0x0100],
+                default_app_data: Some(b"policy app data".to_vec()),
+                ..DestinationRuntimeOptions::default()
+            },
+        )
+        .await
+        .expect("valid policy options must register");
+        registration.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn registration_announces_and_deregisters_exact_destination() {

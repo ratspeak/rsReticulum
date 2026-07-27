@@ -797,7 +797,10 @@ impl LinkManager {
                 }
                 true
             }
-            LinkManagerCommand::SetDefaultAppData { app_data, result_tx } => {
+            LinkManagerCommand::SetDefaultAppData {
+                app_data,
+                result_tx,
+            } => {
                 let result = self
                     .destination
                     .as_mut()
@@ -4391,10 +4394,9 @@ impl LinkManager {
         } = request;
         let data_size = data.len();
         let active = self.active_links.get_mut(link_id)?;
-        let state_allows_transfer = matches!(
-            active.link.state,
-            LinkState::Active | LinkState::Stale
-        ) || (allow_handshake && active.link.state == LinkState::Handshake);
+        let state_allows_transfer =
+            matches!(active.link.state, LinkState::Active | LinkState::Stale)
+                || (allow_handshake && active.link.state == LinkState::Handshake);
         if !state_allows_transfer {
             return None;
         }
