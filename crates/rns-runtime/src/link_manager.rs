@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use rns_crypto::ed25519::Ed25519PrivateKey;
 use rns_crypto::sha::truncated_hash;
-use rns_identity::destination::{AllowPolicy, DestType, Destination, Direction};
+use rns_identity::destination::{AllowPolicy, DefaultAppData, DestType, Destination, Direction};
 use rns_identity::identity::Identity;
 use rns_identity::ratchet::PersistentRatchetRing;
 use rns_link::link::{CloseReason, Link, LinkAction, LinkState, ResourceStrategy};
@@ -218,6 +218,12 @@ pub enum LinkManagerCommand {
     /// Change whether the owned Destination accepts new inbound Links.
     SetAcceptsLinks {
         accepts: bool,
+        result_tx: Option<oneshot::Sender<Result<(), DestinationControlError>>>,
+    },
+    /// Set or clear the owned Destination's default announce app data, used
+    /// whenever an announce (including a path response) carries none.
+    SetDefaultAppData {
+        app_data: Option<Vec<u8>>,
         result_tx: Option<oneshot::Sender<Result<(), DestinationControlError>>>,
     },
     /// Register or replace a Python-compatible per-path request handler.
@@ -786,6 +792,22 @@ impl LinkManager {
                     .as_mut()
                     .ok_or(DestinationControlError::DestinationUnavailable)
                     .map(|destination| destination.set_accepts_links(accepts));
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(result);
+                }
+                true
+            }
+            LinkManagerCommand::SetDefaultAppData { app_data, result_tx } => {
+                let result = self
+                    .destination
+                    .as_mut()
+                    .ok_or(DestinationControlError::DestinationUnavailable)
+                    .map(|destination| match app_data {
+                        Some(data) => {
+                            destination.set_default_app_data(DefaultAppData::Static(data))
+                        }
+                        None => destination.clear_default_app_data(),
+                    });
                 if let Some(tx) = result_tx {
                     let _ = tx.send(result);
                 }
@@ -5348,6 +5370,63 @@ mod tests {
         assert_eq!(
             second_request.raw, first_raw,
             "same path-response tag should reuse cached announce bytes"
+        );
+    }
+
+    #[test]
+    fn path_response_announces_carry_default_app_data() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+
+        let identity = Identity::new();
+        let signing_key = identity.get_signing_key().unwrap();
+        let mut lm =
+            LinkManager::with_destination(tx, event_rx, &identity, "test.app", Some(signing_key));
+
+        let app_data = b"\xa3dprotocrrcav\x01chubhTest Hub".to_vec();
+        assert!(lm.handle_command(LinkManagerCommand::SetDefaultAppData {
+            app_data: Some(app_data.clone()),
+            result_tx: None,
+        }));
+
+        lm.handle_event(DestinationEvent::AnnounceRequested(AnnounceRequest {
+            app_name: "test.app".to_string(),
+            path_response: true,
+            tag: Some(vec![0xB6; 16]),
+            attached_interface: Some(9),
+        }));
+        let TransportMessage::OutboundAttached { request, .. } =
+            rx.try_recv().expect("path response announce queued")
+        else {
+            panic!("expected attached outbound path response");
+        };
+        assert!(
+            request.raw.ends_with(&app_data),
+            "path response announce must fall back to the default app data"
+        );
+
+        assert!(lm.handle_command(LinkManagerCommand::SetDefaultAppData {
+            app_data: None,
+            result_tx: None,
+        }));
+        lm.handle_event(DestinationEvent::AnnounceRequested(AnnounceRequest {
+            app_name: "test.app".to_string(),
+            path_response: true,
+            tag: Some(vec![0xB7; 16]),
+            attached_interface: Some(9),
+        }));
+        let TransportMessage::OutboundAttached {
+            request: cleared, ..
+        } = rx.try_recv().expect("cleared announce queued")
+        else {
+            panic!("expected attached outbound path response");
+        };
+        assert!(
+            !cleared
+                .raw
+                .windows(app_data.len())
+                .any(|window| window == app_data),
+            "cleared default app data must not appear in later announces"
         );
     }
 

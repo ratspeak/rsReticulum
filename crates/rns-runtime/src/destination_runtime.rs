@@ -7,7 +7,7 @@
 //! closed.
 
 use rns_identity::destination::{
-    AllowPolicy, DestType, Destination, DestinationError, Direction, ProofStrategy,
+    AllowPolicy, DefaultAppData, DestType, Destination, DestinationError, Direction, ProofStrategy,
 };
 use rns_identity::identity::Identity;
 use rns_link::link::{CloseReason, ResourceStrategy};
@@ -32,6 +32,9 @@ pub struct DestinationRuntimeOptions {
     pub accepts_links: bool,
     pub resource_strategy: ResourceStrategy,
     pub event_capacity: usize,
+    /// Announce app data used whenever an announce (including a path
+    /// response) carries none explicitly.
+    pub default_app_data: Option<Vec<u8>>,
 }
 
 impl Default for DestinationRuntimeOptions {
@@ -41,6 +44,7 @@ impl Default for DestinationRuntimeOptions {
             accepts_links: true,
             resource_strategy: ResourceStrategy::AcceptNone,
             event_capacity: DEFAULT_EVENT_CAPACITY,
+            default_app_data: None,
         }
     }
 }
@@ -141,6 +145,26 @@ impl DestinationHandle {
         self.command_tx
             .send(LinkManagerCommand::SetAcceptsLinks {
                 accepts,
+                result_tx: Some(result_tx),
+            })
+            .await
+            .map_err(|_| DestinationRuntimeError::ManagerUnavailable)?;
+        result_rx
+            .await
+            .map_err(|_| DestinationRuntimeError::ManagerUnavailable)??;
+        Ok(())
+    }
+
+    /// Set or clear the default app data used whenever an announce (including
+    /// a path response) carries none explicitly.
+    pub async fn set_default_app_data(
+        &self,
+        app_data: Option<Vec<u8>>,
+    ) -> Result<(), DestinationRuntimeError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.command_tx
+            .send(LinkManagerCommand::SetDefaultAppData {
+                app_data,
                 result_tx: Some(result_tx),
             })
             .await
@@ -373,6 +397,9 @@ impl RegisteredDestination {
             .ok_or(DestinationControlError::DestinationUnavailable)?;
         owned_destination.set_proof_strategy(options.proof_strategy);
         owned_destination.set_accepts_links(options.accepts_links);
+        if let Some(app_data) = options.default_app_data.clone() {
+            owned_destination.set_default_app_data(DefaultAppData::Static(app_data));
+        }
 
         transport_tx
             .send(TransportMessage::RegisterDestination {
