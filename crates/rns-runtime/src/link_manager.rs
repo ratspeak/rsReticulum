@@ -4010,7 +4010,9 @@ impl LinkManager {
             .active_links
             .get(link_id)
             .ok_or(LinkSendError::LinkNotFound)?;
-        if active.link.state != LinkState::Active {
+        // Python refuses outbound only on CLOSED links (Packet.py:286); Stale
+        // links stay sendable so peers can probe and recover them.
+        if !matches!(active.link.state, LinkState::Active | LinkState::Stale) {
             return Err(LinkSendError::LinkNotActive);
         }
 
@@ -4066,7 +4068,7 @@ impl LinkManager {
             .active_links
             .get(link_id)
             .ok_or(LinkSendError::LinkNotFound)?;
-        if active.link.state != LinkState::Active {
+        if !matches!(active.link.state, LinkState::Active | LinkState::Stale) {
             return Err(LinkSendError::LinkNotActive);
         }
         if active.link.session_keys().is_none() {
@@ -4093,7 +4095,7 @@ impl LinkManager {
             .active_links
             .get(link_id)
             .ok_or(LinkSendError::LinkNotFound)?;
-        if active.link.state != LinkState::Active {
+        if !matches!(active.link.state, LinkState::Active | LinkState::Stale) {
             return Err(LinkSendError::LinkNotActive);
         }
 
@@ -4367,8 +4369,10 @@ impl LinkManager {
         } = request;
         let data_size = data.len();
         let active = self.active_links.get_mut(link_id)?;
-        let state_allows_transfer = active.link.state == LinkState::Active
-            || (allow_handshake && active.link.state == LinkState::Handshake);
+        let state_allows_transfer = matches!(
+            active.link.state,
+            LinkState::Active | LinkState::Stale
+        ) || (allow_handshake && active.link.state == LinkState::Handshake);
         if !state_allows_transfer {
             return None;
         }
@@ -6650,6 +6654,48 @@ mod tests {
             assert_eq!(payload, i.to_be_bytes());
         }
         assert!(packet_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stale_links_remain_sendable_for_packets_and_resources() {
+        let (initiator_link, mut responder_link, _identity_key) =
+            handshaken_link_pair_with_identity();
+        let link_id = responder_link.link_id;
+        responder_link.state = LinkState::Stale;
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(64);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xC5; 16], None);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let receipt = lm
+            .send_link_packet(&link_id, b"stale reply")
+            .expect("a stale link must still be able to answer its peer");
+        assert_eq!(receipt.link_id, link_id);
+        let outbound = transport_rx.try_recv().expect("outbound packet queued");
+        let TransportMessage::Outbound(request) = outbound else {
+            panic!("expected outbound link packet");
+        };
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(
+            initiator_link.decrypt(&request.raw[offset..]).unwrap(),
+            b"stale reply"
+        );
+
+        lm.send_link_resource(&link_id, vec![0xAB; 2048], false)
+            .expect("a stale link must still start outbound resources");
     }
 
     #[test]
