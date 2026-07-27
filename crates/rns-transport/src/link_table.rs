@@ -49,6 +49,15 @@ impl From<&LinkEntry> for ExpiredLink {
     }
 }
 
+/// Absolute deadline for transport bookkeeping that is waiting on a Link proof.
+///
+/// The Link state machine owns interface-specific establishment allowances.
+/// Transport entries stay bounded to the canonical per-hop proof window so a
+/// slow or adversarial interface cannot extend unvalidated routing state.
+pub(crate) fn pending_link_proof_deadline(now: f64, remaining_hops: u8) -> f64 {
+    now + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT * f64::from(remaining_hops.max(1))
+}
+
 pub struct LinkTable {
     entries: HashMap<LinkId, LinkEntry>,
 }
@@ -143,6 +152,16 @@ impl Default for LinkTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_link_proof_deadline_uses_the_canonical_per_hop_window() {
+        let now = 1_000.25;
+
+        assert_eq!(pending_link_proof_deadline(now, 0), 1_006.25);
+        assert_eq!(pending_link_proof_deadline(now, 1), 1_006.25);
+        assert_eq!(pending_link_proof_deadline(now, 3), 1_018.25);
+        assert_eq!(pending_link_proof_deadline(now, u8::MAX), 2_530.25);
+    }
 
     #[test]
     fn test_link_table_basic() {

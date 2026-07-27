@@ -790,7 +790,10 @@ impl TransportActor {
                     destination_hash,
                     established: !initiator,
                     validated: !initiator,
-                    proof_timeout: now + 60.0,
+                    proof_timeout: crate::link_table::pending_link_proof_deadline(
+                        now,
+                        remaining_hops,
+                    ),
                     receiving_interface: interface_id,
                     taken_hops: 0,
                 };
@@ -5700,6 +5703,10 @@ mod tests {
         let entry = actor.link_table.get(&link_id).unwrap();
         assert!(!entry.validated);
         assert!(!entry.established);
+        assert_eq!(
+            entry.proof_timeout,
+            crate::link_table::pending_link_proof_deadline(entry.timestamp, 3)
+        );
     }
 
     #[test]
