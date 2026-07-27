@@ -2924,7 +2924,8 @@ mod tests {
         actor.transport_identity_hash = Some(transport_id);
 
         let (entry1, _rx1) = make_test_interface("iface1");
-        let (entry2, mut rx2) = make_test_interface("iface2");
+        let (mut entry2, mut rx2) = make_test_interface("iface2");
+        entry2.bitrate = 5;
         actor.interfaces.insert(1, entry1);
         actor.interfaces.insert(2, entry2);
 
@@ -2936,6 +2937,7 @@ mod tests {
 
         // Inject in-transport link request on interface 1
         let raw = make_header2_link_request_packet(transport_id, dest_hash, 0, &[0x42; 64]);
+        let link_id = rns_wire::hash::link_id_from_raw(&raw, rns_wire::flags::HeaderType::Header2);
         actor.on_inbound(InboundPacket {
             raw,
             interface_id: 1,
@@ -2953,6 +2955,16 @@ mod tests {
             rns_wire::flags::HeaderType::Header1
         );
         assert_eq!(forwarded_header.transport_id, None);
+
+        let link_entry = actor.link_table.get(&link_id).unwrap();
+        assert_eq!(
+            link_entry.proof_timeout,
+            crate::link_table::pending_link_proof_deadline(
+                link_entry.timestamp,
+                link_entry.remaining_hops,
+            ),
+            "relay proof lifetime must not grow with interface serialization time"
+        );
     }
 
     fn make_lrproof_packet_with_payload(link_id: [u8; 16], hops: u8, payload: &[u8]) -> Bytes {

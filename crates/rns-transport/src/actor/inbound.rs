@@ -853,19 +853,12 @@ impl TransportActor {
             }
 
             // Cache the relay so the matching LRPROOF can be routed back to
-            // the initiator without a fresh path lookup. Proof timeout scales
-            // with remaining hops and adds a serialization allowance for
-            // slow outbound interfaces.
+            // the initiator without a fresh path lookup. The transport table
+            // uses the canonical bounded per-hop proof window; Link session
+            // policy owns any interface-specific establishment allowance.
             let link_id = rns_wire::hash::link_id_from_raw(raw, header.flags.header_type);
             let now = now_f64();
-            let base_timeout = 60.0 * (remaining_hops.max(1) as f64);
-            let extra_timeout = if let Some(iface) = self.interfaces.get(&target_interface) {
-                let bitrate = iface.bitrate.max(1) as f64;
-                (raw.len() as f64 * 8.0) / bitrate
-            } else {
-                0.0
-            };
-            let proof_timeout = now + base_timeout + extra_timeout;
+            let proof_timeout = crate::link_table::pending_link_proof_deadline(now, remaining_hops);
             let link_entry = crate::link_table::LinkEntry {
                 timestamp: now,
                 next_hop,
