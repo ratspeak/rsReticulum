@@ -586,8 +586,11 @@ impl MessageBase for RawChannelMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link_session::{LinkSession, LinkSessionConfig, LinkSessionEvent};
     use rns_protocol::channel_message::SYSTEM_MESSAGE_TYPE_MIN;
+    use rns_transport::actor::TransportActor;
     use rns_transport::messages::TransportMessage;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn register_applies_policy_options_and_rejects_reserved_channel_types() {
@@ -664,6 +667,101 @@ mod tests {
             transport_rx.recv().await,
             Some(TransportMessage::DeregisterDestination { hash }) if hash == destination_hash
         ));
+    }
+
+    #[tokio::test]
+    async fn link_session_connects_to_destination_on_same_transport_actor() {
+        let (actor, transport_tx) = TransportActor::new();
+        let actor_task = tokio::spawn(actor.run());
+        let server_identity = Identity::new();
+        let server_public_key = server_identity.get_public_key();
+        let mut registration = RegisteredDestination::register(
+            transport_tx.clone(),
+            server_identity,
+            "example.runtime.loopback",
+            DestinationRuntimeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let destination_hash = registration.handle.destination_hash();
+        let client_identity = Identity::new();
+        let expected_client = client_identity.hash;
+
+        let mut session = tokio::time::timeout(
+            Duration::from_secs(3),
+            LinkSession::connect(
+                transport_tx.clone(),
+                client_identity,
+                LinkSessionConfig {
+                    destination_hash,
+                    remote_public_key: server_public_key,
+                    hops: 1,
+                    establishment_timeout: Duration::from_secs(2),
+                    client_label: "test.same-actor-link".into(),
+                    identify: true,
+                    track_phy_stats: false,
+                },
+            ),
+        )
+        .await
+        .expect("same-actor Link establishment timed out")
+        .expect("same-actor Link establishment failed");
+        let link_id = session.handle.link_id();
+
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                registration.events.links_established.recv()
+            )
+            .await
+            .unwrap(),
+            Some(link_id)
+        );
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                registration.events.links_identified.recv()
+            )
+            .await
+            .unwrap(),
+            Some((link_id, expected_client))
+        );
+
+        session
+            .handle
+            .send_packet(b"client to server".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                registration.events.link_packets.recv()
+            )
+            .await
+            .unwrap(),
+            Some((b"client to server".to_vec(), link_id))
+        );
+
+        registration
+            .handle
+            .send_link_packet(link_id, b"server to client".to_vec())
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(LinkSessionEvent::Packet { data, .. }) = session.events.recv().await {
+                    break data;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, b"server to client");
+
+        session.handle.close().await;
+        registration.close().await.unwrap();
+        transport_tx.send(TransportMessage::Shutdown).await.unwrap();
+        actor_task.await.unwrap();
     }
 
     #[tokio::test]

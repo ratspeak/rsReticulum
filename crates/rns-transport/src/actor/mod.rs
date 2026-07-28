@@ -31,6 +31,19 @@ mod outbound;
 mod persistence;
 mod rpc;
 
+// In-process Links need two distinguishable ingress edges even though both
+// endpoints are owned by this actor. Real interface ids are allocated upward
+// from zero by the runtime, so reserve the top two values for this private
+// duplex route. They never appear on the wire or in the interface registry.
+const LOCAL_LINK_INITIATOR_INTERFACE: InterfaceId = InterfaceId::MAX;
+const LOCAL_LINK_RESPONDER_INTERFACE: InterfaceId = InterfaceId::MAX - 1;
+
+#[derive(Clone)]
+struct LocalLinkRoute {
+    initiator_tx: mpsc::Sender<crate::link_messages::DestinationEvent>,
+    responder_tx: mpsc::Sender<crate::link_messages::DestinationEvent>,
+}
+
 /// Owns every routing table and drains the `TransportMessage` channel in one
 /// task. The single-owner model means the hot path has no shared state and no
 /// locks — callers drive the actor by sending typed commands rather than
@@ -68,6 +81,11 @@ pub struct TransportActor {
     pub local_destinations: HashSet<[u8; 16]>,
     pub destination_channels:
         HashMap<[u8; 16], mpsc::Sender<crate::link_messages::DestinationEvent>>,
+    /// Duplex routes for Links whose initiator and responder are registered
+    /// on this same transport actor. Keeping both endpoints here avoids the
+    /// single `destination_channels[link_id]` slot aliasing one side over the
+    /// other after the responder registers the Link.
+    local_link_routes: HashMap<[u8; 16], LocalLinkRoute>,
     pub path_requests: HashMap<[u8; 16], f64>,
     /// Python `discovery_path_requests`: external interfaces waiting for a
     /// matching announce while this transport recursively searches elsewhere.
@@ -307,6 +325,7 @@ impl TransportActor {
             interfaces: HashMap::new(),
             local_destinations: HashSet::new(),
             destination_channels: HashMap::new(),
+            local_link_routes: HashMap::new(),
             path_requests: HashMap::new(),
             discovery_path_requests: HashMap::new(),
             discovery_pr_tags: HashMap::new(),
@@ -549,6 +568,7 @@ impl TransportActor {
             TransportMessage::DeregisterDestination { hash } => {
                 self.local_destinations.remove(&hash);
                 self.destination_channels.remove(&hash);
+                self.local_link_routes.remove(&hash);
             }
             TransportMessage::CacheRequest {
                 packet_hash,
@@ -779,6 +799,15 @@ impl TransportActor {
                 remaining_hops,
                 initiator,
             } => {
+                if interface_id == LOCAL_LINK_RESPONDER_INTERFACE
+                    && self.local_link_routes.contains_key(&link_id)
+                {
+                    // The private duplex route owns both directions. A normal
+                    // LinkTable entry would point at a non-registry interface,
+                    // be culled as dead, and is not consulted for local sends.
+                    debug!(link_id = hex::encode(link_id), "registered in-process Link");
+                    return;
+                }
                 // Initiators start pending (validated=false) until the proof
                 // arrives; non-initiators already hold a validated link.
                 let now = now_f64();
@@ -3994,6 +4023,103 @@ mod tests {
             }
             _ => panic!("expected InboundPacket event"),
         }
+    }
+
+    #[test]
+    fn in_process_link_route_keeps_initiator_and_responder_duplex() {
+        let (mut actor, _tx) = TransportActor::new();
+        let destination_hash = [0xC1; 16];
+        let request_raw = make_link_request_packet(destination_hash, 0);
+        let link_id =
+            rns_wire::hash::link_id_from_raw(&request_raw, rns_wire::flags::HeaderType::Header1);
+        let (initiator_tx, mut initiator_rx) = mpsc::channel(8);
+        let (responder_tx, mut responder_rx) = mpsc::channel(8);
+        actor.local_destinations.insert(destination_hash);
+        actor.local_destinations.insert(link_id);
+        actor
+            .destination_channels
+            .insert(destination_hash, responder_tx);
+        actor.destination_channels.insert(link_id, initiator_tx);
+
+        assert!(actor.on_outbound_with_receipt_policy(
+            OutboundRequest {
+                raw: request_raw.clone(),
+                destination_hash,
+            },
+            true,
+        ));
+        assert!(matches!(
+            responder_rx.try_recv().unwrap(),
+            crate::link_messages::DestinationEvent::LinkRequest {
+                raw,
+                interface_id: LOCAL_LINK_RESPONDER_INTERFACE,
+                ..
+            } if raw == request_raw
+        ));
+
+        actor.handle_message(TransportMessage::RegisterLink {
+            link_id,
+            destination_hash,
+            interface_id: LOCAL_LINK_RESPONDER_INTERFACE,
+            next_hop: None,
+            remaining_hops: 0,
+            initiator: false,
+        });
+        assert!(actor.link_table.get(&link_id).is_none());
+
+        let proof = make_link_proof_packet(link_id, 0);
+        assert!(actor.on_outbound_attached(
+            OutboundRequest {
+                raw: proof.clone(),
+                destination_hash: link_id,
+            },
+            LOCAL_LINK_RESPONDER_INTERFACE,
+        ));
+        assert!(matches!(
+            initiator_rx.try_recv().unwrap(),
+            crate::link_messages::DestinationEvent::InboundPacket {
+                raw,
+                interface_id: LOCAL_LINK_INITIATOR_INTERFACE,
+                ..
+            } if raw == proof
+        ));
+
+        let from_initiator = make_link_data_packet(link_id, 0);
+        assert!(actor.on_outbound_attached(
+            OutboundRequest {
+                raw: from_initiator.clone(),
+                destination_hash: link_id,
+            },
+            LOCAL_LINK_INITIATOR_INTERFACE,
+        ));
+        assert!(matches!(
+            responder_rx.try_recv().unwrap(),
+            crate::link_messages::DestinationEvent::InboundPacket {
+                raw,
+                interface_id: LOCAL_LINK_RESPONDER_INTERFACE,
+                ..
+            } if raw == from_initiator
+        ));
+
+        let from_responder = make_link_data_packet(link_id, 0);
+        assert!(actor.on_outbound_with_receipt_policy(
+            OutboundRequest {
+                raw: from_responder.clone(),
+                destination_hash: link_id,
+            },
+            true,
+        ));
+        assert!(matches!(
+            initiator_rx.try_recv().unwrap(),
+            crate::link_messages::DestinationEvent::InboundPacket {
+                raw,
+                interface_id: LOCAL_LINK_INITIATOR_INTERFACE,
+                ..
+            } if raw == from_responder
+        ));
+
+        actor.handle_message(TransportMessage::DeregisterDestination { hash: link_id });
+        assert!(!actor.local_link_routes.contains_key(&link_id));
     }
 
     #[test]

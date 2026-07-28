@@ -30,6 +30,14 @@ impl TransportActor {
             Err(_) => return false,
         };
 
+        // A Link can be initiated to another destination registered on this
+        // same actor (for example, Ratspeak joining the RRC hub it hosts).
+        // Route that traffic through two private logical edges so initiator
+        // and responder never overwrite each other's `link_id` channel.
+        if let Some(sent) = self.dispatch_local_link_outbound(&request, &parsed) {
+            return sent;
+        }
+
         // Seed the dedup set with our own packet hash so echoes looped back
         // from the fabric aren't re-processed.
         let pkt_hash = rns_wire::hash::packet_hash(&request.raw, parsed.flags.header_type);
@@ -204,6 +212,10 @@ impl TransportActor {
     ) -> bool {
         self.traffic.record_tx(0, request.raw.len() as u64);
 
+        if let Some(sent) = self.dispatch_local_link_attached(&request, interface_id) {
+            return sent;
+        }
+
         if let Ok((parsed, _)) = rns_wire::header::PacketHeader::unpack(&request.raw) {
             let pkt_hash = rns_wire::hash::packet_hash(&request.raw, parsed.flags.header_type);
             self.packet_hashlist.insert(pkt_hash);
@@ -227,6 +239,118 @@ impl TransportActor {
         } else {
             false
         }
+    }
+
+    fn dispatch_local_link_outbound(
+        &mut self,
+        request: &crate::messages::OutboundRequest,
+        header: &rns_wire::header::PacketHeader,
+    ) -> Option<bool> {
+        if header.flags.packet_type == rns_wire::flags::PacketType::LinkRequest
+            && self.local_destinations.contains(&request.destination_hash)
+        {
+            let link_id = rns_wire::hash::link_id_from_raw(&request.raw, header.flags.header_type);
+            let initiator_tx = self.destination_channels.get(&link_id)?.clone();
+            let responder_tx = self
+                .destination_channels
+                .get(&request.destination_hash)?
+                .clone();
+            self.local_link_routes.insert(
+                link_id,
+                LocalLinkRoute {
+                    initiator_tx,
+                    responder_tx: responder_tx.clone(),
+                },
+            );
+            let delivered =
+                responder_tx.try_send(crate::link_messages::DestinationEvent::LinkRequest {
+                    raw: request.raw.clone(),
+                    interface_id: LOCAL_LINK_RESPONDER_INTERFACE,
+                    metrics: PacketMetrics::default(),
+                });
+            if let Err(error) = delivered {
+                self.local_link_routes.remove(&link_id);
+                self.channel_drops += 1;
+                warn!(
+                    link_id = %hex::encode(link_id),
+                    drops = self.channel_drops,
+                    err = %error,
+                    "failed to deliver in-process Link request"
+                );
+                return Some(false);
+            }
+            self.traffic.record_rx(0, request.raw.len() as u64);
+            debug!(
+                link_id = %hex::encode(link_id),
+                dest = %hex::encode(request.destination_hash),
+                "in-process Link request routed to local destination"
+            );
+            return Some(true);
+        }
+
+        // LinkManager responder traffic uses ordinary Outbound messages.
+        // Initiator traffic is pinned with OutboundAttached below, so the
+        // message shape itself supplies the side without changing public APIs.
+        let route = self.local_link_routes.get(&request.destination_hash)?;
+        let delivered =
+            route
+                .initiator_tx
+                .try_send(crate::link_messages::DestinationEvent::InboundPacket {
+                    raw: request.raw.clone(),
+                    interface_id: LOCAL_LINK_INITIATOR_INTERFACE,
+                    metrics: PacketMetrics::default(),
+                });
+        if let Err(error) = delivered {
+            self.channel_drops += 1;
+            warn!(
+                link_id = %hex::encode(request.destination_hash),
+                drops = self.channel_drops,
+                err = %error,
+                "failed to deliver in-process responder Link packet"
+            );
+            return Some(false);
+        }
+        self.traffic.record_rx(0, request.raw.len() as u64);
+        Some(true)
+    }
+
+    fn dispatch_local_link_attached(
+        &mut self,
+        request: &crate::messages::OutboundRequest,
+        interface_id: InterfaceId,
+    ) -> Option<bool> {
+        let route = self.local_link_routes.get(&request.destination_hash)?;
+        let (target, target_interface, direction) = match interface_id {
+            LOCAL_LINK_INITIATOR_INTERFACE => (
+                &route.responder_tx,
+                LOCAL_LINK_RESPONDER_INTERFACE,
+                "initiator",
+            ),
+            LOCAL_LINK_RESPONDER_INTERFACE => (
+                &route.initiator_tx,
+                LOCAL_LINK_INITIATOR_INTERFACE,
+                "responder",
+            ),
+            _ => return None,
+        };
+        let delivered = target.try_send(crate::link_messages::DestinationEvent::InboundPacket {
+            raw: request.raw.clone(),
+            interface_id: target_interface,
+            metrics: PacketMetrics::default(),
+        });
+        if let Err(error) = delivered {
+            self.channel_drops += 1;
+            warn!(
+                link_id = %hex::encode(request.destination_hash),
+                side = direction,
+                drops = self.channel_drops,
+                err = %error,
+                "failed to deliver in-process attached Link packet"
+            );
+            return Some(false);
+        }
+        self.traffic.record_rx(0, request.raw.len() as u64);
+        Some(true)
     }
 
     /// Payload is a 32-byte packet hash identifying a cached announce. Look
