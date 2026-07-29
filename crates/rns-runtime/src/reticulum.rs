@@ -1046,10 +1046,13 @@ impl Default for DiscoveryRuntime {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct LocalDiscoveryInterface {
     id: u64,
     config: DiscoveryInterfaceConfig,
+    /// Shared online flag from the interface driver. When `None`, treat as
+    /// always online (interfaces that never expose a readiness latch).
+    online: Option<Arc<AtomicBool>>,
 }
 
 impl ReticulumHandle {
@@ -3224,6 +3227,10 @@ pub async fn init_with_options_and_rnode_startup_options(
                 Ok(iface_handles) => {
                     let pending_rnode =
                         pending_configured_rnode_runtime(iface_config, &iface_handles);
+                    let online_by_spawned_id: Vec<(u64, Arc<AtomicBool>)> = iface_handles
+                        .iter()
+                        .map(|owned| (owned.interface.id, owned.interface.online.clone()))
+                        .collect();
                     match register_interfaces_with_post_init_batch(
                         &transport_tx,
                         iface_handles,
@@ -3244,10 +3251,15 @@ pub async fn init_with_options_and_rnode_startup_options(
                             }
                             for registered_id in registered_ids {
                                 if let Some(ref cfg) = discovery_config {
+                                    let online = online_by_spawned_id
+                                        .iter()
+                                        .find(|(id, _)| *id == registered_id)
+                                        .map(|(_, flag)| flag.clone());
                                     discovery_runtime.local_interfaces.lock().await.push(
                                         LocalDiscoveryInterface {
                                             id: registered_id,
                                             config: cfg.clone(),
+                                            online,
                                         },
                                     );
                                 }
@@ -5648,15 +5660,68 @@ async fn run_discovery_subscription(
     }
 }
 
+/// Whether a discoverable interface is ready for `Announcer::register`.
+///
+/// `None` online latch means always ready (drivers that never expose readiness).
+fn discovery_interface_is_online(local: &LocalDiscoveryInterface) -> bool {
+    local
+        .online
+        .as_ref()
+        .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(true)
+}
+
+/// Move online discoverable interfaces out of `pending` and return those newly
+/// ready for announcer registration. Offline ones stay pending. Already-
+/// registered ids are ignored.
+fn take_online_discovery_interfaces(
+    pending: &mut Vec<LocalDiscoveryInterface>,
+    registered: &mut std::collections::HashSet<u64>,
+) -> Vec<LocalDiscoveryInterface> {
+    let mut ready = Vec::new();
+    pending.retain(|local| {
+        if !discovery_interface_is_online(local) {
+            return true;
+        }
+        if registered.insert(local.id) {
+            ready.push(local.clone());
+        }
+        false
+    });
+    ready
+}
+
+/// Hash + `RegisterDestination` that marks the discovery aspect as instance-local
+/// so outbound announces pass `interface_allows_announce` (non-local + no path
+/// is blocked on every interface).
+fn discovery_local_destination_registration(
+    identity_hash: &[u8; 16],
+) -> ([u8; 16], TransportMessage) {
+    let hash = rns_identity::destination::Destination::hash_from_name_and_identity(
+        rns_transport::discovery::DISCOVERY_ASPECT_FILTER,
+        Some(identity_hash),
+    );
+    (
+        hash,
+        TransportMessage::RegisterDestination {
+            hash,
+            app_name: rns_transport::discovery::DISCOVERY_ASPECT_FILTER.to_string(),
+            delivery_tx: None,
+        },
+    )
+}
 async fn run_discovery_announcer(
     handle: ReticulumHandle,
     stamper: Arc<dyn DiscoveryStamper + Send + Sync>,
     locals: Vec<LocalDiscoveryInterface>,
 ) {
     let mut announcer = Announcer::new(stamper);
-    for local in locals {
-        announcer.register(local.id, handle.transport_identity.hash, local.config);
-    }
+    // Defer Announcer::register until the driver marks the interface online.
+    // BLE RNode (and similar) come up seconds after init — registering and
+    // announcing immediately rate-limits the next publish for announce_interval
+    // (often hours) even though the first packet left before TX was ready.
+    let mut pending: Vec<LocalDiscoveryInterface> = locals;
+    let mut registered: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     let announce_identity = handle
         .network_identity
@@ -5665,13 +5730,38 @@ async fn run_discovery_announcer(
     let encrypt_identity = handle.network_identity.clone();
     let tick_interval = Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
 
+    let (discovery_dest, register_msg) =
+        discovery_local_destination_registration(&announce_identity.hash);
+    let _ = handle.transport_tx.send(register_msg).await;
+    tracing::info!(
+        dest = %hex::encode(discovery_dest),
+        "discovery destination registered as local for announce egress"
+    );
+
     loop {
+        for local in take_online_discovery_interfaces(&mut pending, &mut registered) {
+            tracing::info!(
+                iface_id = local.id,
+                name = %local.config.name,
+                "discovery interface online — starting announces"
+            );
+            announcer.register(
+                local.id,
+                handle.transport_identity.hash,
+                local.config.clone(),
+            );
+        }
+
         let encrypt = |plaintext: &[u8]| {
             encrypt_identity
                 .as_ref()
                 .and_then(|identity| identity.encrypt(plaintext, None).ok())
         };
-        let (requests, _skips) = announcer.tick(unix_now(), Some(&encrypt));
+        let (requests, _skips) = if announcer.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            announcer.tick(unix_now(), Some(&encrypt))
+        };
         for request in requests {
             match build_announce_packet(
                 &announce_identity,
@@ -5679,15 +5769,16 @@ async fn run_discovery_announcer(
                 Some(&request.app_data),
             ) {
                 Ok(raw) => {
+                    let destination_hash =
+                        rns_identity::destination::Destination::hash_from_name_and_identity(
+                            rns_transport::discovery::DISCOVERY_ASPECT_FILTER,
+                            Some(&announce_identity.hash),
+                        );
                     let _ = handle
                         .transport_tx
                         .send(TransportMessage::Outbound(OutboundRequest {
                             raw: Bytes::from(raw),
-                            destination_hash:
-                                rns_identity::destination::Destination::hash_from_name_and_identity(
-                                    rns_transport::discovery::DISCOVERY_ASPECT_FILTER,
-                                    Some(&announce_identity.hash),
-                                ),
+                            destination_hash,
                         }))
                         .await;
                 }
@@ -5699,7 +5790,14 @@ async fn run_discovery_announcer(
 
         tokio::select! {
             _ = handle.shutdown.wait() => break,
-            _ = tokio::time::sleep(tick_interval) => {}
+            // While waiting for offline discoverable interfaces, poll frequently
+            // so the first announce fires soon after BLE/serial comes up rather
+            // than waiting a full announce-job minute.
+            _ = tokio::time::sleep(if pending.is_empty() {
+                tick_interval
+            } else {
+                Duration::from_secs(1)
+            }) => {}
         }
     }
 }
@@ -10558,6 +10656,77 @@ loglevel = 7
         let h = dummy_handle();
         h.enable_on_network_discovery(Arc::new(StaticStamper)).await;
         assert!(h.discovery_enabled().await);
+    }
+
+    #[test]
+    fn discovery_local_destination_registration_uses_discovery_aspect() {
+        let identity_hash = [0x2e; 16];
+        let (dest, msg) = discovery_local_destination_registration(&identity_hash);
+        let expected = rns_identity::destination::Destination::hash_from_name_and_identity(
+            rns_transport::discovery::DISCOVERY_ASPECT_FILTER,
+            Some(&identity_hash),
+        );
+        assert_eq!(dest, expected);
+        match msg {
+            TransportMessage::RegisterDestination {
+                hash,
+                app_name,
+                delivery_tx,
+            } => {
+                assert_eq!(hash, expected);
+                assert_eq!(app_name, rns_transport::discovery::DISCOVERY_ASPECT_FILTER);
+                assert!(delivery_tx.is_none());
+            }
+            other => panic!("expected RegisterDestination, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn take_online_discovery_interfaces_defers_offline_until_flag_flips() {
+        let online = Arc::new(AtomicBool::new(false));
+        let cfg = DiscoveryInterfaceConfig::backbone("NV0N".into(), "unused".into(), 0);
+        let mut pending = vec![LocalDiscoveryInterface {
+            id: 7,
+            config: cfg.clone(),
+            online: Some(online.clone()),
+        }];
+        let mut registered = std::collections::HashSet::new();
+
+        let ready = take_online_discovery_interfaces(&mut pending, &mut registered);
+        assert!(ready.is_empty(), "offline iface must stay pending");
+        assert_eq!(pending.len(), 1);
+        assert!(registered.is_empty());
+
+        online.store(true, Ordering::SeqCst);
+        let ready = take_online_discovery_interfaces(&mut pending, &mut registered);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, 7);
+        assert!(pending.is_empty());
+        assert!(registered.contains(&7));
+
+        // Idempotent: already-registered id is not returned again even if re-queued.
+        pending.push(LocalDiscoveryInterface {
+            id: 7,
+            config: cfg,
+            online: Some(online),
+        });
+        let ready = take_online_discovery_interfaces(&mut pending, &mut registered);
+        assert!(ready.is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn take_online_discovery_interfaces_treats_missing_latch_as_online() {
+        let cfg = DiscoveryInterfaceConfig::backbone("hub".into(), "10.0.0.1".into(), 4242);
+        let mut pending = vec![LocalDiscoveryInterface {
+            id: 1,
+            config: cfg,
+            online: None,
+        }];
+        let mut registered = std::collections::HashSet::new();
+        let ready = take_online_discovery_interfaces(&mut pending, &mut registered);
+        assert_eq!(ready.len(), 1);
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]
