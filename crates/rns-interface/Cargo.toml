@@ -3,6 +3,7 @@ name = "rns-interface"
 description = "Network interface trait and implementations for Reticulum"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [features]
@@ -34,6 +35,7 @@ rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+md-5 = { workspace = true }
 
 # Apple BLE Peripheral (CoreBluetooth GATT server, iOS + macOS).
 # Version pinned to match btleplug's internal objc2 version so the shared
@@ -48,6 +50,9 @@ objc2-core-bluetooth = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 # Keepalive-tuning tests read socket options back via getsockopt.
 [target.'cfg(unix)'.dev-dependencies]

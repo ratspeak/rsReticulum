@@ -3,6 +3,7 @@ name = "rns-wire"
 description = "Wire format, packet encoding, and hash computation for Reticulum"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [features]

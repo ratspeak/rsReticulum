@@ -20,8 +20,34 @@ pub struct InterfaceHandle {
     pub online: Arc<AtomicBool>,
     pub rxb: Option<Arc<AtomicU64>>,
     pub txb: Option<Arc<AtomicU64>>,
+    /// Optional live aggregate inspection source carried into the transport
+    /// actor. This field intentionally makes pre-freeze struct literals update
+    /// explicitly so new interface drivers choose whether they expose stats.
+    pub inspection: Option<rns_transport::messages::InterfaceInspectionSource>,
     pub tx: mpsc::Sender<Bytes>,
     pub read_task: tokio::task::JoinHandle<()>,
+}
+
+/// Deliver a dynamically accepted interface to its owner.
+///
+/// A failed handoff returns the handle to this producer. The producer must
+/// finish disposing of the exact child it created rather than detaching its
+/// read task when the receiving runtime has gone away.
+pub(crate) async fn handoff_accepted_interface(
+    handle_tx: &mpsc::Sender<InterfaceHandle>,
+    handle: InterfaceHandle,
+) -> Result<(), ()> {
+    match handle_tx.send(handle).await {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::SendError(handle)) => {
+            handle
+                .online
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            handle.read_task.abort();
+            let _ = handle.read_task.await;
+            Err(())
+        }
+    }
 }
 
 /// Interface operating mode. Byte values are on-wire constants.
@@ -160,6 +186,19 @@ pub enum InterfaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+
+    struct TaskExitGuard {
+        exited: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Drop for TaskExitGuard {
+        fn drop(&mut self) {
+            if let Some(exited) = self.exited.take() {
+                let _ = exited.send(());
+            }
+        }
+    }
 
     #[test]
     fn test_optimise_mtu() {
@@ -238,5 +277,91 @@ mod tests {
         assert_eq!(IC_BURST_MIN_SAMPLES, 6);
         assert_eq!(EC_PR_FREQ, 5.0);
         const { assert!(!EGRESS_CONTROL) };
+    }
+
+    #[tokio::test]
+    async fn rejected_accepted_interface_is_stopped_and_disposed() {
+        let (handle_tx, handle_rx) = mpsc::channel(1);
+        drop(handle_rx);
+
+        let online = Arc::new(AtomicBool::new(true));
+        let (interface_tx, mut interface_rx) = mpsc::channel(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel();
+        let read_task = tokio::spawn(async move {
+            let _exit_guard = TaskExitGuard {
+                exited: Some(exited_tx),
+            };
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("read task should start");
+
+        let handle = InterfaceHandle {
+            id: 1,
+            parent_id: Some(0),
+            name: "rejected-child".to_string(),
+            mode: InterfaceMode::Full,
+            direction: InterfaceDirection::default(),
+            bitrate: 1,
+            mtu: 1,
+            online: Arc::clone(&online),
+            rxb: None,
+            txb: None,
+            inspection: None,
+            tx: interface_tx,
+            read_task,
+        };
+
+        assert_eq!(
+            handoff_accepted_interface(&handle_tx, handle).await,
+            Err(())
+        );
+        assert!(!online.load(Ordering::SeqCst));
+        exited_rx
+            .await
+            .expect("helper should await exact read-task termination");
+        assert_eq!(
+            interface_rx.recv().await,
+            None,
+            "rejected handle resources should be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_interface_handoff_preserves_live_handle() {
+        let (handle_tx, mut handle_rx) = mpsc::channel(1);
+        let online = Arc::new(AtomicBool::new(true));
+        let (interface_tx, _interface_rx) = mpsc::channel(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let read_task = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("read task should start");
+
+        let handle = InterfaceHandle {
+            id: 2,
+            parent_id: Some(0),
+            name: "accepted-child".to_string(),
+            mode: InterfaceMode::Full,
+            direction: InterfaceDirection::default(),
+            bitrate: 1,
+            mtu: 1,
+            online: Arc::clone(&online),
+            rxb: None,
+            txb: None,
+            inspection: None,
+            tx: interface_tx,
+            read_task,
+        };
+
+        assert_eq!(handoff_accepted_interface(&handle_tx, handle).await, Ok(()));
+        let delivered = handle_rx.recv().await.expect("handle should be delivered");
+        assert!(online.load(Ordering::SeqCst));
+        assert!(!delivered.read_task.is_finished());
+
+        delivered.read_task.abort();
+        let _ = delivered.read_task.await;
     }
 }

@@ -2,14 +2,25 @@
 
 use alloc::vec::Vec;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::aes_cbc;
 use crate::hmac::{hmac_sha256, hmac_verify};
 use crate::pkcs7;
-use crate::random::random_16;
+use crate::random::{random_16, random_bytes};
 
 /// IV (16) + HMAC (32). A token is this plus the PKCS7-padded ciphertext.
 pub const TOKEN_OVERHEAD: usize = 48;
+/// AES block size used by legacy AES-128 tokens.
+pub const AES128_BLOCKSIZE: usize = 16;
+/// AES block size used by current AES-256 tokens.
+pub const AES256_BLOCKSIZE: usize = 16;
+/// AES-256 token key size: 32-byte signing key + 32-byte encryption key.
+pub const KEY_LENGTH: usize = 64;
+/// Legacy AES-128 token key size: 16-byte signing key + 16-byte encryption key.
+pub const LEGACY_KEY_LENGTH: usize = 32;
+/// Python `Identity.DERIVED_KEY_LENGTH_LEGACY`.
+pub const DERIVED_KEY_LENGTH_LEGACY: usize = LEGACY_KEY_LENGTH;
 
 /// Errors surfaced by [`encrypt`] and [`decrypt`].
 #[derive(Debug, Error)]
@@ -35,10 +46,15 @@ pub enum TokenError {
 /// 64 → 32/32 (AES-256 + HMAC-SHA256); 32 → 16/16 (AES-128, legacy).
 fn split_key(key: &[u8]) -> Result<(&[u8], &[u8]), TokenError> {
     match key.len() {
-        64 => Ok((&key[..32], &key[32..])),
-        32 => Ok((&key[..16], &key[16..])),
+        KEY_LENGTH => Ok((&key[..32], &key[32..])),
+        LEGACY_KEY_LENGTH => Ok((&key[..16], &key[16..])),
         n => Err(TokenError::InvalidKeyLength(n)),
     }
+}
+
+/// Generate a fresh AES-256 token key with the operating-system CSPRNG.
+pub fn generate_key() -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(random_bytes(KEY_LENGTH))
 }
 
 /// Token encrypt (Modified Fernet — no version byte, no timestamp).
@@ -110,6 +126,20 @@ mod tests {
         let token = encrypt(plaintext, &key).unwrap();
         let decrypted = decrypt(&token, &key).unwrap();
         assert_eq!(&decrypted, plaintext);
+    }
+
+    #[test]
+    fn generated_key_is_valid_and_unique() {
+        let first = generate_key();
+        let second = generate_key();
+
+        assert_eq!(first.len(), KEY_LENGTH);
+        assert_eq!(second.len(), KEY_LENGTH);
+        assert_ne!(&*first, &*second);
+        assert_eq!(
+            decrypt(&encrypt(b"generated", &first).unwrap(), &first).unwrap(),
+            b"generated"
+        );
     }
 
     #[test]

@@ -289,8 +289,8 @@ mod tests {
 
     #[test]
     fn test_default_link_mdu_matches_python_hashmap_capacity() {
-        assert_eq!(rns_wire::constants::ENCRYPTED_MDU, 431);
-        assert_eq!(hashmap_max_len(rns_wire::constants::ENCRYPTED_MDU), 74);
+        assert_eq!(rns_wire::constants::LINK_MDU, 431);
+        assert_eq!(hashmap_max_len(rns_wire::constants::LINK_MDU), 74);
     }
 
     #[test]

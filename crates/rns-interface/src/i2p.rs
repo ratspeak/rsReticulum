@@ -11,7 +11,9 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::hdlc;
-use crate::traits::{InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode};
+use crate::traits::{
+    InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, handoff_accepted_interface,
+};
 use rns_transport::messages::{InboundPacket, TransportMessage};
 
 pub const DEFAULT_SAM_ADDRESS: &str = "127.0.0.1";
@@ -581,6 +583,7 @@ pub async fn spawn_i2p_client(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
+        inspection: None,
         tx,
         read_task,
     })
@@ -775,11 +778,15 @@ pub async fn spawn_i2p_server(
                     online: c_online,
                     rxb: Some(c_rxb),
                     txb: Some(c_txb),
+                    inspection: None,
                     tx: c_tx,
                     read_task: c_read_task,
                 };
 
-                if handle_tx.send(handle).await.is_err() {
+                if handoff_accepted_interface(&handle_tx, handle)
+                    .await
+                    .is_err()
+                {
                     tracing::warn!("I2P server: handle registry channel closed");
                     online_task.store(false, Ordering::SeqCst);
                     return;
@@ -812,6 +819,7 @@ pub async fn spawn_i2p_server(
         online,
         rxb: Some(Arc::new(AtomicU64::new(0))),
         txb: Some(Arc::new(AtomicU64::new(0))),
+        inspection: None,
         tx,
         read_task,
     })

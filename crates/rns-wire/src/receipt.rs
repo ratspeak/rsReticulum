@@ -22,6 +22,13 @@ pub enum ReceiptStatus {
 pub struct PacketReceipt {
     pub hash: [u8; 32],
     pub truncated_hash: [u8; 16],
+    /// Destination this packet was sent to. Proofs are only accepted from the
+    /// identity bound to this destination.
+    pub destination_hash: Option<[u8; 16]>,
+    /// Full Reticulum public key (`X25519 || Ed25519`) captured for the
+    /// destination. Keeping the exact identity used for the send prevents an
+    /// unrelated signature from concluding the receipt.
+    pub destination_public_key: Option<[u8; 64]>,
     pub status: ReceiptStatus,
     pub sent_at: Instant,
     pub concluded_at: Option<Instant>,
@@ -46,11 +53,33 @@ impl PacketReceipt {
         Self {
             hash,
             truncated_hash,
+            destination_hash: None,
+            destination_public_key: None,
             status: ReceiptStatus::Sent,
             sent_at: Instant::now(),
             concluded_at: None,
             timeout,
             callbacks: ReceiptCallbacks::default(),
+        }
+    }
+
+    /// Bind this receipt to the destination identity used for the send.
+    ///
+    /// The public key may be supplied later when the destination hash is
+    /// already known but its validated announce has not yet been recalled.
+    pub fn set_destination_identity(
+        &mut self,
+        destination_hash: [u8; 16],
+        public_key: Option<[u8; 64]>,
+    ) {
+        if self.destination_hash.is_none() {
+            self.destination_hash = Some(destination_hash);
+        }
+        if self.destination_hash == Some(destination_hash)
+            && self.destination_public_key.is_none()
+            && public_key.is_some()
+        {
+            self.destination_public_key = public_key;
         }
     }
 
@@ -134,6 +163,28 @@ impl PacketReceipt {
         false
     }
 
+    /// Validate a PROOF body against the destination identity captured for
+    /// this receipt. A receipt without a known identity cannot be concluded by
+    /// a proof.
+    pub fn validate_proof_from_destination(&mut self, proof: &[u8]) -> bool {
+        let Some(public_key) = self.destination_public_key else {
+            return false;
+        };
+
+        let mut signing_key = [0u8; 32];
+        signing_key.copy_from_slice(&public_key[32..]);
+        let Ok(verifier) = rns_crypto::ed25519::Ed25519PublicKey::from_bytes(&signing_key) else {
+            return false;
+        };
+
+        self.validate_proof(proof, |signature, message| {
+            let Ok(signature) = <&[u8; 64]>::try_from(signature) else {
+                return false;
+            };
+            verifier.verify(message, signature).is_ok()
+        })
+    }
+
     /// If the timeout has elapsed while still in `Sent`, transition to
     /// `Failed` and fire the timeout callback. Returns whether a timeout fired.
     pub fn check_timeout(&mut self) -> bool {
@@ -153,6 +204,7 @@ impl PacketReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rns_crypto::ed25519::Ed25519PrivateKey;
 
     #[test]
     fn test_initial_state() {
@@ -176,5 +228,49 @@ mod tests {
         let mut receipt = PacketReceipt::new([0; 32], [0; 16], None);
         receipt.fail();
         assert_eq!(receipt.status, ReceiptStatus::Failed);
+    }
+
+    #[test]
+    fn destination_identity_validates_explicit_and_implicit_proofs() {
+        let signer = Ed25519PrivateKey::generate();
+        let mut public_key = [0u8; 64];
+        public_key[32..].copy_from_slice(&signer.public_key().to_bytes());
+        let packet_hash = [0xA5; 32];
+        let signature = signer.sign(&packet_hash);
+
+        let mut explicit =
+            PacketReceipt::new(packet_hash, [0xA5; 16], Some(Duration::from_secs(10)));
+        explicit.set_destination_identity([0x11; 16], Some(public_key));
+        let mut explicit_proof = Vec::with_capacity(EXPL_LENGTH);
+        explicit_proof.extend_from_slice(&packet_hash);
+        explicit_proof.extend_from_slice(&signature);
+        assert!(explicit.validate_proof_from_destination(&explicit_proof));
+        assert_eq!(explicit.status, ReceiptStatus::Delivered);
+
+        let mut implicit =
+            PacketReceipt::new(packet_hash, [0xA5; 16], Some(Duration::from_secs(10)));
+        implicit.set_destination_identity([0x11; 16], Some(public_key));
+        assert!(implicit.validate_proof_from_destination(&signature));
+        assert_eq!(implicit.status, ReceiptStatus::Delivered);
+    }
+
+    #[test]
+    fn destination_identity_rejects_forged_or_unbound_proofs() {
+        let expected = Ed25519PrivateKey::generate();
+        let attacker = Ed25519PrivateKey::generate();
+        let mut public_key = [0u8; 64];
+        public_key[32..].copy_from_slice(&expected.public_key().to_bytes());
+        let packet_hash = [0xB6; 32];
+        let forged_signature = attacker.sign(&packet_hash);
+
+        let mut forged = PacketReceipt::new(packet_hash, [0xB6; 16], None);
+        forged.set_destination_identity([0x22; 16], Some(public_key));
+        assert!(!forged.validate_proof_from_destination(&forged_signature));
+        assert_eq!(forged.status, ReceiptStatus::Sent);
+
+        let valid_signature = expected.sign(&packet_hash);
+        let mut unbound = PacketReceipt::new(packet_hash, [0xB6; 16], None);
+        assert!(!unbound.validate_proof_from_destination(&valid_signature));
+        assert_eq!(unbound.status, ReceiptStatus::Sent);
     }
 }

@@ -3,6 +3,7 @@ name = "rns-runtime"
 description = "Core runtime, config parsing, and lifecycle for Reticulum"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [features]
@@ -32,3 +33,6 @@ serde = { workspace = true }
 subtle = { workspace = true }
 hex = { workspace = true }
 nix = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

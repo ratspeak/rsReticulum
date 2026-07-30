@@ -1,6 +1,8 @@
 //! Mirrors `Reticulum._synthesize_interface` in the Python reference but
 //! rejects external-program interfaces.
 
+use std::time::Duration;
+
 use crate::config::ConfigSection;
 use rns_interface::tcp::{TcpClientConfig, TcpServerConfig};
 use rns_interface::traits::InterfaceMode;
@@ -112,6 +114,43 @@ pub struct RNodeInterfaceConfig {
     /// Station-ID beacon: seconds between IDs, sent only after data TX.
     pub id_interval: Option<u64>,
     pub id_callsign: Option<String>,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl RNodeInterfaceConfig {
+    /// Convert runtime configuration into the lower driver type while
+    /// preserving signed-value and RF-range validation.
+    pub(crate) fn to_rnode_config(
+        &self,
+    ) -> Result<rns_interface::rnode::RNodeConfig, InterfaceFactoryError> {
+        let tx_power =
+            u8::try_from(self.tx_power).map_err(|_| InterfaceFactoryError::InvalidValue {
+                field: format!("{}.txpower", self.name),
+                message: format!("{} is outside 0..=37 dBm", self.tx_power),
+            })?;
+        let mut config = rns_interface::rnode::RNodeConfig::new(&self.name, &self.port);
+        config.frequency = self.frequency;
+        config.bandwidth = self.bandwidth;
+        config.spreading_factor = self.spreading_factor;
+        config.coding_rate = self.coding_rate;
+        config.tx_power = tx_power;
+        config.mode = self.mode;
+        config.flow_control = self.flow_control;
+        config.st_alock = self.st_alock;
+        config.lt_alock = self.lt_alock;
+        config.id_interval = self.id_interval;
+        config.id_callsign = self
+            .id_callsign
+            .as_ref()
+            .map(|callsign| callsign.as_bytes().to_vec());
+        config
+            .validate()
+            .map_err(|error| InterfaceFactoryError::InvalidValue {
+                field: format!("{}.{}", self.name, error.field().as_str()),
+                message: error.to_string(),
+            })?;
+        Ok(config)
+    }
 }
 
 /// LoRa RNode reached over Bluetooth LE.
@@ -237,6 +276,14 @@ pub struct BackboneInterfaceConfig {
     pub max_reconnect_tries: Option<usize>,
     /// Parsed for Python config compatibility; advisory only.
     pub i2p_tunneled: bool,
+    /// Listener-only fast-flap blocking switch. Python default: enabled.
+    pub block_fast_flapping: bool,
+    /// Listener-only short-connection threshold. Python default: 20 seconds.
+    pub fast_flapping_threshold: Duration,
+    /// Listener-only tolerated short-connection count. Python default: 5.
+    pub fast_flapping_grace: u64,
+    /// Listener-only block time. Configured in minutes; Python default: 720.
+    pub fast_flapping_block_time: Duration,
 }
 
 fn parse_interface_mode(s: &str) -> Option<InterfaceMode> {
@@ -272,6 +319,92 @@ fn parse_port_opt(
         .get_uint(field)
         .map(|v| parse_port(name, field, v))
         .transpose()
+}
+
+fn parse_bool_strict(
+    name: &str,
+    field: &str,
+    section: &ConfigSection,
+    default: bool,
+) -> Result<bool, InterfaceFactoryError> {
+    if !section.has(field) {
+        return Ok(default);
+    }
+    section
+        .get_bool(field)
+        .ok_or_else(|| InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: "expected a boolean value".to_string(),
+        })
+}
+
+fn parse_uint_strict(
+    name: &str,
+    field: &str,
+    section: &ConfigSection,
+    default: u64,
+) -> Result<u64, InterfaceFactoryError> {
+    if !section.has(field) {
+        return Ok(default);
+    }
+    let raw = section
+        .get(field)
+        .ok_or_else(|| InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: "expected a non-negative integer".to_string(),
+        })?;
+    raw.parse::<u64>()
+        .map_err(|_| InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: format!("'{raw}' is not a non-negative integer"),
+        })
+}
+
+fn parse_duration_strict(
+    name: &str,
+    field: &str,
+    section: &ConfigSection,
+    unit_seconds: f64,
+    default: Duration,
+) -> Result<Duration, InterfaceFactoryError> {
+    if !section.has(field) {
+        return Ok(default);
+    }
+    let raw = section
+        .get(field)
+        .ok_or_else(|| InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: "expected a finite non-negative number".to_string(),
+        })?;
+    let value = raw
+        .parse::<f64>()
+        .map_err(|_| InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: format!("'{raw}' is not a number"),
+        })?;
+    if !value.is_finite() {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: format!("'{raw}' is not finite"),
+        });
+    }
+    if value < 0.0 {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: format!("'{raw}' must not be negative"),
+        });
+    }
+    let seconds = value * unit_seconds;
+    if !seconds.is_finite() {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: format!("'{raw}' is too large"),
+        });
+    }
+    Duration::try_from_secs_f64(seconds).map_err(|_| InterfaceFactoryError::InvalidValue {
+        field: format!("{name}.{field}"),
+        message: format!("'{raw}' is outside the supported duration range"),
+    })
 }
 
 pub fn synthesize_interface(
@@ -651,11 +784,11 @@ fn synthesize_rnode(
         .to_string();
 
     let (frequency, bandwidth, spreading_factor, coding_rate, tx_power) =
-        require_rnode_radio_params(name, section)?;
+        require_generic_rnode_radio_params(name, section)?;
 
-    let (flow_control, st_alock, lt_alock) = parse_rnode_airtime(name, section)?;
+    let (flow_control, st_alock, lt_alock) = parse_generic_rnode_airtime(name, section)?;
 
-    Ok(InterfaceConfig::RNode(RNodeInterfaceConfig {
+    let config = RNodeInterfaceConfig {
         name: name.to_string(),
         port,
         frequency,
@@ -669,14 +802,205 @@ fn synthesize_rnode(
         lt_alock,
         id_interval: section.get_uint("id_interval"),
         id_callsign: section.get("id_callsign").map(|s| s.to_string()),
-    }))
+    };
+    // Report invalid user configuration here with its exact section field.
+    // The lower driver repeats this check before any endpoint I/O so manually
+    // constructed runtime configurations receive the same protection.
+    config.to_rnode_config()?;
+    Ok(InterfaceConfig::RNode(config))
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn require_generic_rnode_radio_params(
+    name: &str,
+    section: &ConfigSection,
+) -> Result<(u32, u32, u8, u8, i8), InterfaceFactoryError> {
+    let (frequency_key, frequency) =
+        parse_required_rnode_unsigned::<u32>(name, section, &["frequency"])?;
+    let frequency = validate_parsed_rnode_integer(
+        name,
+        &frequency_key,
+        frequency,
+        i64::from(rns_interface::rnode::RNODE_FREQUENCY_MIN_HZ),
+        i64::from(rns_interface::rnode::RNODE_FREQUENCY_MAX_HZ),
+    )?;
+    let (bandwidth_key, bandwidth) =
+        parse_required_rnode_unsigned::<u32>(name, section, &["bandwidth"])?;
+    let bandwidth = validate_parsed_rnode_integer(
+        name,
+        &bandwidth_key,
+        bandwidth,
+        i64::from(rns_interface::rnode::RNODE_BANDWIDTH_MIN_HZ),
+        i64::from(rns_interface::rnode::RNODE_BANDWIDTH_MAX_HZ),
+    )?;
+    let (spreading_factor_key, spreading_factor) = parse_required_rnode_unsigned::<u8>(
+        name,
+        section,
+        &["spreadingfactor", "spreading_factor"],
+    )?;
+    let spreading_factor = validate_parsed_rnode_integer(
+        name,
+        &spreading_factor_key,
+        spreading_factor,
+        i64::from(rns_interface::rnode::RNODE_SPREADING_FACTOR_MIN),
+        i64::from(rns_interface::rnode::RNODE_SPREADING_FACTOR_MAX),
+    )?;
+    let (coding_rate_key, coding_rate) =
+        parse_required_rnode_unsigned::<u8>(name, section, &["codingrate", "coding_rate"])?;
+    let coding_rate = validate_parsed_rnode_integer(
+        name,
+        &coding_rate_key,
+        coding_rate,
+        i64::from(rns_interface::rnode::RNODE_CODING_RATE_MIN),
+        i64::from(rns_interface::rnode::RNODE_CODING_RATE_MAX),
+    )?;
+    let (tx_power_key, tx_power) =
+        parse_required_rnode_signed::<i8>(name, section, &["txpower", "tx_power"])?;
+    let tx_power = validate_parsed_rnode_integer(
+        name,
+        &tx_power_key,
+        tx_power,
+        i64::from(rns_interface::rnode::RNODE_TX_POWER_MIN_DBM),
+        i64::from(rns_interface::rnode::RNODE_TX_POWER_MAX_DBM),
+    )?;
+    Ok((
+        frequency,
+        bandwidth,
+        spreading_factor,
+        coding_rate,
+        tx_power,
+    ))
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn required_rnode_scalar<'a>(
+    name: &str,
+    section: &'a ConfigSection,
+    keys: &[&str],
+) -> Result<(String, &'a str), InterfaceFactoryError> {
+    for key in keys {
+        if let Some(value) = section.get(key) {
+            return Ok(((*key).to_string(), value));
+        }
+    }
+    Err(InterfaceFactoryError::MissingField {
+        name: name.to_string(),
+        field: keys[0].to_string(),
+    })
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn parse_required_rnode_unsigned<T>(
+    name: &str,
+    section: &ConfigSection,
+    keys: &[&str],
+) -> Result<(String, T), InterfaceFactoryError>
+where
+    T: TryFrom<u64>,
+{
+    let (key, raw) = required_rnode_scalar(name, section, keys)?;
+    let parsed = raw
+        .parse::<u64>()
+        .map_err(|_| InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{key}"),
+            message: format!("'{raw}' is not a valid unsigned integer"),
+        })?;
+    let value = T::try_from(parsed).map_err(|_| InterfaceFactoryError::InvalidValue {
+        field: format!("{name}.{key}"),
+        message: format!("{parsed} cannot be represented by this field"),
+    })?;
+    Ok((key, value))
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn parse_required_rnode_signed<T>(
+    name: &str,
+    section: &ConfigSection,
+    keys: &[&str],
+) -> Result<(String, T), InterfaceFactoryError>
+where
+    T: TryFrom<i64>,
+{
+    let (key, raw) = required_rnode_scalar(name, section, keys)?;
+    let parsed = raw
+        .parse::<i64>()
+        .map_err(|_| InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{key}"),
+            message: format!("'{raw}' is not a valid signed integer"),
+        })?;
+    let value = T::try_from(parsed).map_err(|_| InterfaceFactoryError::InvalidValue {
+        field: format!("{name}.{key}"),
+        message: format!("{parsed} cannot be represented by this field"),
+    })?;
+    Ok((key, value))
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn validate_parsed_rnode_integer<T>(
+    name: &str,
+    key: &str,
+    value: T,
+    minimum: i64,
+    maximum: i64,
+) -> Result<T, InterfaceFactoryError>
+where
+    T: Copy + Into<i64>,
+{
+    let comparable = value.into();
+    if comparable < minimum || comparable > maximum {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{key}"),
+            message: format!("{comparable} is outside {minimum}..={maximum}"),
+        });
+    }
+    Ok(value)
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn parse_generic_rnode_airtime(
+    name: &str,
+    section: &ConfigSection,
+) -> Result<(bool, Option<f32>, Option<f32>), InterfaceFactoryError> {
+    let flow_control = section.get_bool("flow_control").unwrap_or(false);
+    let st_alock =
+        parse_generic_rnode_airtime_value(name, section, &["airtime_limit_short", "st_alock"])?;
+    let lt_alock =
+        parse_generic_rnode_airtime_value(name, section, &["airtime_limit_long", "lt_alock"])?;
+    Ok((flow_control, st_alock, lt_alock))
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn parse_generic_rnode_airtime_value(
+    name: &str,
+    section: &ConfigSection,
+    keys: &[&str],
+) -> Result<Option<f32>, InterfaceFactoryError> {
+    let Some((key, raw)) = keys
+        .iter()
+        .find_map(|key| section.get(key).map(|value| (*key, value)))
+    else {
+        return Ok(None);
+    };
+    let value = raw
+        .parse::<f64>()
+        .map_err(|_| InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{key}"),
+            message: format!("'{raw}' is not a valid percentage"),
+        })?;
+    if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{key}"),
+            message: format!("{value} must be finite and within 0..=100 percent"),
+        });
+    }
+    Ok(Some(value as f32))
 }
 
 /// Radio parameters are deliberately required: Python errors when they are
 /// absent (RNodeInterface validation fails on the 0 fallbacks), and silently
 /// inventing RF parameters — especially TX power — risks misconfigured
 /// transmissions. Documented in fix-registry (final sweep decision items).
-#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+#[cfg(any(feature = "serial", feature = "ble"))]
 fn require_rnode_radio_params(
     name: &str,
     section: &ConfigSection,
@@ -715,7 +1039,7 @@ fn require_rnode_radio_params(
 /// Shared RNode airtime/flow-control parsing. Python `RNodeInterface.py:156-160`:
 /// `flow_control` defaults off, `airtime_limit_short`/`airtime_limit_long` are
 /// duty-cycle percentages validated to 0..=100.
-#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+#[cfg(feature = "ble")]
 fn parse_rnode_airtime(
     name: &str,
     section: &ConfigSection,
@@ -729,21 +1053,21 @@ fn parse_rnode_airtime(
         .get_float("airtime_limit_long")
         .or_else(|| section.get_float("lt_alock"))
         .map(|v| v as f32);
-    if let Some(v) = st_alock
-        && !(0.0..=100.0).contains(&v)
-    {
-        return Err(InterfaceFactoryError::InvalidValue {
-            field: format!("{name}.airtime_limit_short"),
-            message: format!("{v} is outside 0..=100 percent"),
-        });
+    if let Some(v) = st_alock {
+        if !(0.0..=100.0).contains(&v) {
+            return Err(InterfaceFactoryError::InvalidValue {
+                field: format!("{name}.airtime_limit_short"),
+                message: format!("{v} is outside 0..=100 percent"),
+            });
+        }
     }
-    if let Some(v) = lt_alock
-        && !(0.0..=100.0).contains(&v)
-    {
-        return Err(InterfaceFactoryError::InvalidValue {
-            field: format!("{name}.airtime_limit_long"),
-            message: format!("{v} is outside 0..=100 percent"),
-        });
+    if let Some(v) = lt_alock {
+        if !(0.0..=100.0).contains(&v) {
+            return Err(InterfaceFactoryError::InvalidValue {
+                field: format!("{name}.airtime_limit_long"),
+                message: format!("{v} is outside 0..=100 percent"),
+            });
+        }
     }
     Ok((flow_control, st_alock, lt_alock))
 }
@@ -1133,6 +1457,32 @@ fn synthesize_backbone(
     let connect_timeout = section.get_uint("connect_timeout").unwrap_or(5);
     let max_reconnect_tries = section.get_uint("max_reconnect_tries").map(|v| v as usize);
     let i2p_tunneled = section.get_bool("i2p_tunneled").unwrap_or(false);
+    let block_fast_flapping = parse_bool_strict(
+        name,
+        "block_fast_flapping",
+        section,
+        rns_interface::backbone::BLOCK_FAST_FLAPPING,
+    )?;
+    let fast_flapping_threshold = parse_duration_strict(
+        name,
+        "fast_flapping_threshold",
+        section,
+        1.0,
+        rns_interface::backbone::FAST_FLAPPING_THRESHOLD,
+    )?;
+    let fast_flapping_grace = parse_uint_strict(
+        name,
+        "fast_flapping_grace",
+        section,
+        rns_interface::backbone::FAST_FLAPPING_GRACE,
+    )?;
+    let fast_flapping_block_time = parse_duration_strict(
+        name,
+        "fast_flapping_block_time",
+        section,
+        60.0,
+        rns_interface::backbone::FAST_FLAPPING_BLOCK_TIME,
+    )?;
 
     Ok(InterfaceConfig::Backbone(BackboneInterfaceConfig {
         name: name.to_string(),
@@ -1145,6 +1495,10 @@ fn synthesize_backbone(
         connect_timeout,
         max_reconnect_tries,
         i2p_tunneled,
+        block_fast_flapping,
+        fast_flapping_threshold,
+        fast_flapping_grace,
+        fast_flapping_block_time,
     }))
 }
 
@@ -1894,6 +2248,180 @@ mod tests {
         section.set("txpower", "17");
     }
 
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn complete_rnode_section() -> ConfigSection {
+        let mut section = ConfigSection::new();
+        section.set("type", "RNodeInterface");
+        section.set("port", "tcp://rnode.local");
+        section.set("frequency", "868000000");
+        set_rnode_radio_params(&mut section);
+        section
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn complete_rnode_alias_section() -> ConfigSection {
+        let mut section = ConfigSection::new();
+        section.set("type", "RNodeInterface");
+        section.set("port", "tcp://rnode.local");
+        section.set("frequency", "868000000");
+        section.set("bandwidth", "125000");
+        section.set("spreading_factor", "7");
+        section.set("coding_rate", "5");
+        section.set("tx_power", "17");
+        section
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    fn assert_invalid_rnode_field(section: &ConfigSection, expected_field: &str) {
+        match synthesize_interface("rnode_invalid", section) {
+            Err(InterfaceFactoryError::InvalidValue { field, .. }) => {
+                assert_eq!(field, format!("rnode_invalid.{expected_field}"));
+            }
+            other => panic!("expected InvalidValue for {expected_field}, got {other:?}"),
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_synthesize_rnode_accepts_all_inclusive_rf_boundaries() {
+        let mut section = complete_rnode_section();
+        section.set("frequency", "137000000");
+        section.set("bandwidth", "7800");
+        section.set("spreadingfactor", "5");
+        section.set("codingrate", "5");
+        section.set("txpower", "0");
+        section.set("airtime_limit_short", "0");
+        section.set("airtime_limit_long", "0");
+        assert!(synthesize_interface("rnode_min", &section).is_ok());
+
+        section.set("frequency", "3000000000");
+        section.set("bandwidth", "1625000");
+        section.set("spreadingfactor", "12");
+        section.set("codingrate", "8");
+        section.set("txpower", "37");
+        section.set("airtime_limit_short", "100");
+        section.set("airtime_limit_long", "100");
+        assert!(synthesize_interface("rnode_max", &section).is_ok());
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_synthesize_rnode_rejects_every_just_outside_boundary() {
+        for (field, value) in [
+            ("frequency", "136999999"),
+            ("frequency", "3000000001"),
+            ("bandwidth", "7799"),
+            ("bandwidth", "1625001"),
+            ("spreadingfactor", "4"),
+            ("spreadingfactor", "13"),
+            ("codingrate", "4"),
+            ("codingrate", "9"),
+            ("txpower", "-1"),
+            ("txpower", "38"),
+            ("airtime_limit_short", "-0.0001"),
+            ("airtime_limit_short", "100.0001"),
+            ("airtime_limit_long", "-0.0001"),
+            ("airtime_limit_long", "100.0001"),
+        ] {
+            let mut section = complete_rnode_section();
+            section.set(field, value);
+            assert_invalid_rnode_field(&section, field);
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_synthesize_rnode_rejects_integer_narrowing_and_negative_unsigned_values() {
+        for (field, value) in [
+            ("frequency", "4294967296"),
+            ("frequency", "-1"),
+            ("bandwidth", "4294967296"),
+            ("bandwidth", "-1"),
+            ("spreadingfactor", "256"),
+            ("spreadingfactor", "-1"),
+            ("codingrate", "256"),
+            ("codingrate", "-1"),
+            ("txpower", "128"),
+            ("txpower", "-129"),
+            ("txpower", "18446744073709551616"),
+        ] {
+            let mut section = complete_rnode_section();
+            section.set(field, value);
+            assert_invalid_rnode_field(&section, field);
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_synthesize_rnode_rejects_non_finite_airtime() {
+        for field in ["airtime_limit_short", "airtime_limit_long"] {
+            for value in ["NaN", "inf", "-inf"] {
+                let mut section = complete_rnode_section();
+                section.set(field, value);
+                assert_invalid_rnode_field(&section, field);
+            }
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_synthesize_rnode_reports_airtime_alias_that_was_supplied() {
+        for (field, value) in [("st_alock", "-1"), ("lt_alock", "inf")] {
+            let mut section = complete_rnode_section();
+            section.set(field, value);
+            assert_invalid_rnode_field(&section, field);
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_synthesize_rnode_reports_rf_alias_that_was_supplied() {
+        assert!(synthesize_interface("rnode_aliases", &complete_rnode_alias_section()).is_ok());
+
+        for (field, value) in [
+            ("spreading_factor", "13"),
+            ("coding_rate", "9"),
+            ("tx_power", "-1"),
+        ] {
+            let mut section = complete_rnode_alias_section();
+            section.set(field, value);
+            assert_invalid_rnode_field(&section, field);
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_synthesize_rnode_error_does_not_repeat_field_name() {
+        let mut section = complete_rnode_section();
+        section.set("frequency", "136999999");
+        match synthesize_interface("rnode_invalid", &section) {
+            Err(InterfaceFactoryError::InvalidValue { field, message }) => {
+                assert_eq!(field, "rnode_invalid.frequency");
+                assert!(!message.contains("frequency"), "{message}");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_manual_runtime_rnode_config_cannot_wrap_negative_tx_power() {
+        let mut config = match synthesize_interface("rnode_manual", &complete_rnode_section())
+            .expect("valid baseline")
+        {
+            InterfaceConfig::RNode(config) => config,
+            other => panic!("expected RNode, got {other:?}"),
+        };
+        config.tx_power = -1;
+
+        match config.to_rnode_config() {
+            Err(InterfaceFactoryError::InvalidValue { field, .. }) => {
+                assert_eq!(field, "rnode_manual.txpower");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
     /// Python parity: all radio params required — no invented defaults.
     #[cfg(feature = "serial")]
     #[test]
@@ -2284,8 +2812,65 @@ mod tests {
                 assert_eq!(c.connect_timeout, 5);
                 assert!(c.max_reconnect_tries.is_none());
                 assert!(!c.i2p_tunneled);
+                assert!(c.block_fast_flapping);
+                assert_eq!(c.fast_flapping_threshold, Duration::from_secs(20));
+                assert_eq!(c.fast_flapping_grace, 5);
+                assert_eq!(c.fast_flapping_block_time, Duration::from_secs(720 * 60));
             }
             _ => panic!("expected Backbone"),
+        }
+    }
+
+    #[test]
+    fn test_synthesize_backbone_fast_flap_overrides_allow_fractions() {
+        let mut section = ConfigSection::new();
+        section.set("type", "BackboneInterface");
+        section.set("listen_on", "0.0.0.0");
+        section.set("port", "4242");
+        section.set("block_fast_flapping", "no");
+        section.set("fast_flapping_threshold", "1.25");
+        section.set("fast_flapping_grace", "9");
+        section.set("fast_flapping_block_time", "0.5");
+
+        let config = synthesize_interface("backbone_flap_overrides", &section).unwrap();
+        match config {
+            InterfaceConfig::Backbone(c) => {
+                assert!(!c.block_fast_flapping);
+                assert_eq!(c.fast_flapping_threshold, Duration::from_millis(1250));
+                assert_eq!(c.fast_flapping_grace, 9);
+                assert_eq!(c.fast_flapping_block_time, Duration::from_secs(30));
+            }
+            _ => panic!("expected Backbone"),
+        }
+    }
+
+    #[test]
+    fn test_synthesize_backbone_rejects_invalid_fast_flap_values() {
+        for (field, value) in [
+            ("block_fast_flapping", "sometimes"),
+            ("fast_flapping_threshold", "not-a-number"),
+            ("fast_flapping_threshold", "NaN"),
+            ("fast_flapping_threshold", "-0.1"),
+            ("fast_flapping_threshold", "1e30"),
+            ("fast_flapping_grace", "-1"),
+            ("fast_flapping_grace", "1.5"),
+            ("fast_flapping_grace", "18446744073709551616"),
+            ("fast_flapping_block_time", "inf"),
+            ("fast_flapping_block_time", "-1"),
+            ("fast_flapping_block_time", "1e307"),
+        ] {
+            let mut section = ConfigSection::new();
+            section.set("type", "BackboneInterface");
+            section.set("listen_on", "0.0.0.0");
+            section.set("port", "4242");
+            section.set(field, value);
+
+            match synthesize_interface("backbone_invalid_flap", &section) {
+                Err(InterfaceFactoryError::InvalidValue {
+                    field: error_field, ..
+                }) => assert_eq!(error_field, format!("backbone_invalid_flap.{field}")),
+                other => panic!("expected InvalidValue for {field}={value}, got {other:?}"),
+            }
         }
     }
 

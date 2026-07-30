@@ -64,10 +64,10 @@ impl LocalKeyBackend for HardwareBackend {
 
     fn lock(&self) {
         let (reply, rx) = mpsc::channel();
-        if let Ok(tx) = self.cmd_tx.lock()
-            && tx.send(Cmd::Lock { reply }).is_ok()
-        {
-            let _ = rx.recv();
+        if let Ok(tx) = self.cmd_tx.lock() {
+            if tx.send(Cmd::Lock { reply }).is_ok() {
+                let _ = rx.recv();
+            }
         }
     }
 }

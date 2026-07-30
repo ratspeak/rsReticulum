@@ -220,16 +220,56 @@ async fn handle_rpc_client(
     Ok(())
 }
 
+const TRANSPORT_QUERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportQueryFailure {
+    SendTimedOut,
+    ChannelClosed,
+    ResponseTimedOut,
+    ResponseClosed,
+}
+
+impl TransportQueryFailure {
+    fn description(self) -> &'static str {
+        match self {
+            Self::SendTimedOut => "request enqueue timed out",
+            Self::ChannelClosed => "query channel is closed",
+            Self::ResponseTimedOut => "response timed out",
+            Self::ResponseClosed => "response channel closed without an answer",
+        }
+    }
+}
+
+fn transport_failure_response(
+    operation: &'static str,
+    failure: TransportQueryFailure,
+) -> RpcResponse {
+    RpcResponse::Error(format!(
+        "transport actor failed {operation}: {}",
+        failure.description()
+    ))
+}
+
+fn unexpected_transport_response(operation: &'static str) -> RpcResponse {
+    RpcResponse::Error(format!(
+        "transport actor returned an unexpected response to {operation}"
+    ))
+}
+
+fn invalid_request_hash(kind: &'static str) -> RpcResponse {
+    RpcResponse::Error(format!("invalid {kind} hash in RPC request"))
+}
+
 /// 5 s cap so a wedged actor can't hold a client open indefinitely.
 async fn query_transport(
     transport_tx: &mpsc::Sender<TransportMessage>,
     query: rns_transport::messages::TransportQuery,
-) -> Option<rns_transport::messages::TransportQueryResponse> {
+) -> Result<rns_transport::messages::TransportQueryResponse, TransportQueryFailure> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let budget = std::time::Duration::from_secs(5);
     let started = std::time::Instant::now();
     match tokio::time::timeout(
-        budget,
+        TRANSPORT_QUERY_BUDGET,
         transport_tx.send(TransportMessage::Rpc {
             query,
             response_tx: tx,
@@ -238,45 +278,57 @@ async fn query_transport(
     .await
     {
         Ok(Ok(())) => {}
-        Ok(Err(_)) => return None,
-        Err(_) => return None,
+        Ok(Err(_)) => return Err(TransportQueryFailure::ChannelClosed),
+        Err(_) => return Err(TransportQueryFailure::SendTimedOut),
     }
-    let remaining = budget.checked_sub(started.elapsed())?;
-    tokio::time::timeout(remaining, rx)
-        .await
-        .ok()
-        .and_then(|r| r.ok())
+    let remaining = TRANSPORT_QUERY_BUDGET
+        .checked_sub(started.elapsed())
+        .ok_or(TransportQueryFailure::ResponseTimedOut)?;
+    match tokio::time::timeout(remaining, rx).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(_)) => Err(TransportQueryFailure::ResponseClosed),
+        Err(_) => Err(TransportQueryFailure::ResponseTimedOut),
+    }
 }
 
 async fn request_path(
     transport_tx: &mpsc::Sender<TransportMessage>,
     destination_hash: [u8; 16],
     timeout_secs: Option<f64>,
-) -> bool {
+) -> Result<bool, TransportQueryFailure> {
     let wait = std::time::Duration::from_secs_f64(timeout_secs.unwrap_or(5.0).max(0.1));
-    if transport_tx
-        .send(TransportMessage::RequestPath { destination_hash })
-        .await
-        .is_err()
+    match tokio::time::timeout(
+        TRANSPORT_QUERY_BUDGET,
+        transport_tx.send(TransportMessage::RequestPath { destination_hash }),
+    )
+    .await
     {
-        return false;
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return Err(TransportQueryFailure::ChannelClosed),
+        Err(_) => return Err(TransportQueryFailure::SendTimedOut),
     }
 
     let (reply, rx) = tokio::sync::oneshot::channel();
-    if transport_tx
-        .send(TransportMessage::AwaitPath {
+    match tokio::time::timeout(
+        TRANSPORT_QUERY_BUDGET,
+        transport_tx.send(TransportMessage::AwaitPath {
             dest: destination_hash,
             reply,
-        })
-        .await
-        .is_err()
+        }),
+    )
+    .await
     {
-        return false;
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return Err(TransportQueryFailure::ChannelClosed),
+        Err(_) => return Err(TransportQueryFailure::SendTimedOut),
     }
 
     match tokio::time::timeout(wait, rx).await {
-        Ok(Ok(found)) => found,
-        _ => false,
+        Ok(Ok(found)) => Ok(found),
+        Ok(Err(_)) => Err(TransportQueryFailure::ResponseClosed),
+        // This is the caller-selected path-discovery deadline, so an intact
+        // actor that simply did not discover a path reports `false`.
+        Err(_) => Ok(false),
     }
 }
 
@@ -286,10 +338,19 @@ async fn process_rpc_request(
 ) -> RpcResponse {
     use rns_transport::messages::{TransportQuery, TransportQueryResponse};
 
+    macro_rules! authoritative_query {
+        ($query:expr, $operation:literal) => {
+            match query_transport(transport_tx, $query).await {
+                Ok(response) => response,
+                Err(failure) => return transport_failure_response($operation, failure),
+            }
+        };
+    }
+
     match request {
         RpcRequest::GetPathTable { max_hops } => {
-            match query_transport(transport_tx, TransportQuery::GetPathTable).await {
-                Some(TransportQueryResponse::PathTable(entries)) => {
+            match authoritative_query!(TransportQuery::GetPathTable, "path table query") {
+                TransportQueryResponse::PathTable(entries) => {
                     let rpc_entries = entries
                         .into_iter()
                         .filter(|e| max_hops.is_none_or(|max| e.hops <= max))
@@ -304,12 +365,12 @@ async fn process_rpc_request(
                         .collect();
                     RpcResponse::PathTable(rpc_entries)
                 }
-                _ => RpcResponse::PathTable(Vec::new()),
+                _ => unexpected_transport_response("path table query"),
             }
         }
         RpcRequest::GetInterfaceStats => {
-            match query_transport(transport_tx, TransportQuery::GetInterfaceStats).await {
-                Some(TransportQueryResponse::InterfaceStats(entries)) => {
+            match authoritative_query!(TransportQuery::GetInterfaceStats, "interface stats query") {
+                TransportQueryResponse::InterfaceStats(entries) => {
                     let rpc_entries = entries
                         .into_iter()
                         .map(|e| rpc::InterfaceStatEntry {
@@ -335,6 +396,7 @@ async fn process_rpc_request(
                             pr_burst_active: e.pr_burst_active,
                             pr_burst_activated: e.pr_burst_activated,
                             clients: e.clients,
+                            blocked_ips: e.blocked_ips,
                             announce_rate_target: e.announce_rate_target,
                             announce_rate_grace: e.announce_rate_grace,
                             announce_rate_penalty: e.announce_rate_penalty,
@@ -345,14 +407,12 @@ async fn process_rpc_request(
                         .collect();
                     RpcResponse::InterfaceStats(rpc_entries)
                 }
-                _ => RpcResponse::Error(
-                    "transport actor did not answer interface stats query".to_string(),
-                ),
+                _ => unexpected_transport_response("interface stats query"),
             }
         }
         RpcRequest::GetRateTable => {
-            match query_transport(transport_tx, TransportQuery::GetRateTable).await {
-                Some(TransportQueryResponse::RateTable(entries)) => {
+            match authoritative_query!(TransportQuery::GetRateTable, "rate table query") {
+                TransportQueryResponse::RateTable(entries) => {
                     let rpc_entries = entries
                         .into_iter()
                         .map(|e| rpc::RateTableEntry {
@@ -366,266 +426,266 @@ async fn process_rpc_request(
                         .collect();
                     RpcResponse::RateTable(rpc_entries)
                 }
-                _ => RpcResponse::RateTable(Vec::new()),
+                _ => unexpected_transport_response("rate table query"),
             }
         }
         RpcRequest::GetLinkCount => {
-            match query_transport(transport_tx, TransportQuery::GetLinkCount).await {
-                Some(TransportQueryResponse::IntResult(n)) => RpcResponse::IntResult(n),
-                _ => RpcResponse::IntResult(0),
+            match authoritative_query!(TransportQuery::GetLinkCount, "link count query") {
+                TransportQueryResponse::IntResult(n) => RpcResponse::IntResult(n),
+                _ => unexpected_transport_response("link count query"),
             }
         }
         RpcRequest::GetNextHopIfName { destination_hash } => {
-            let dest = hash_to_array(&destination_hash);
-            match dest {
-                Some(d) => {
-                    match query_transport(
-                        transport_tx,
-                        TransportQuery::GetNextHopIfName { dest: d },
-                    )
-                    .await
-                    {
-                        Some(TransportQueryResponse::StringResult(s)) => {
-                            RpcResponse::StringResult(s)
-                        }
-                        _ => RpcResponse::StringResult(None),
-                    }
-                }
-                None => RpcResponse::StringResult(None),
+            let Some(dest) = hash_to_array(&destination_hash) else {
+                return invalid_request_hash("destination");
+            };
+            match authoritative_query!(
+                TransportQuery::GetNextHopIfName { dest },
+                "next-hop interface query"
+            ) {
+                TransportQueryResponse::StringResult(name) => RpcResponse::StringResult(name),
+                _ => unexpected_transport_response("next-hop interface query"),
             }
         }
         RpcRequest::GetNextHop { destination_hash } => {
-            let dest = hash_to_array(&destination_hash);
-            match dest {
-                Some(d) => {
-                    match query_transport(transport_tx, TransportQuery::GetNextHop { dest: d })
-                        .await
-                    {
-                        Some(TransportQueryResponse::HashResult(h)) => {
-                            RpcResponse::HashResult(h.map(|a| a.to_vec()))
-                        }
-                        _ => RpcResponse::HashResult(None),
-                    }
+            let Some(dest) = hash_to_array(&destination_hash) else {
+                return invalid_request_hash("destination");
+            };
+            match authoritative_query!(TransportQuery::GetNextHop { dest }, "next-hop query") {
+                TransportQueryResponse::HashResult(hash) => {
+                    RpcResponse::HashResult(hash.map(|hash| hash.to_vec()))
                 }
-                None => RpcResponse::HashResult(None),
+                _ => unexpected_transport_response("next-hop query"),
             }
         }
         RpcRequest::RequestPath {
             destination_hash,
             timeout_secs,
-        } => match hash_to_array(&destination_hash) {
-            Some(dest) => {
-                RpcResponse::BoolResult(request_path(transport_tx, dest, timeout_secs).await)
+        } => {
+            let Some(dest) = hash_to_array(&destination_hash) else {
+                return invalid_request_hash("destination");
+            };
+            match request_path(transport_tx, dest, timeout_secs).await {
+                Ok(found) => RpcResponse::BoolResult(found),
+                Err(failure) => transport_failure_response("path request", failure),
             }
-            None => RpcResponse::BoolResult(false),
-        },
+        }
         RpcRequest::DropPath { destination_hash } => {
-            let dest = hash_to_array(&destination_hash);
-            if let Some(d) = dest {
-                let _ = query_transport(transport_tx, TransportQuery::DropPath { dest: d }).await;
+            let Some(dest) = hash_to_array(&destination_hash) else {
+                return invalid_request_hash("destination");
+            };
+            match authoritative_query!(TransportQuery::DropPath { dest }, "path drop") {
+                TransportQueryResponse::Ok => RpcResponse::Ok,
+                _ => unexpected_transport_response("path drop"),
             }
-            RpcResponse::Ok
         }
         RpcRequest::DropPathTable => {
-            if let Some(TransportQueryResponse::IntResult(n)) =
-                query_transport(transport_tx, TransportQuery::DropPathTable).await
-            {
-                return RpcResponse::IntResult(n);
+            match authoritative_query!(TransportQuery::DropPathTable, "path table drop") {
+                TransportQueryResponse::IntResult(n) => RpcResponse::IntResult(n),
+                _ => unexpected_transport_response("path table drop"),
             }
-            RpcResponse::IntResult(0)
         }
         RpcRequest::DropRecentAnnounces => {
-            if let Some(TransportQueryResponse::IntResult(n)) =
-                query_transport(transport_tx, TransportQuery::DropRecentAnnounces).await
+            match authoritative_query!(TransportQuery::DropRecentAnnounces, "recent announces drop")
             {
-                return RpcResponse::IntResult(n);
+                TransportQueryResponse::IntResult(n) => RpcResponse::IntResult(n),
+                _ => unexpected_transport_response("recent announces drop"),
             }
-            RpcResponse::IntResult(0)
         }
         RpcRequest::DropAnnounceQueues => {
-            let _ = query_transport(transport_tx, TransportQuery::DropAnnounceQueues).await;
-            RpcResponse::Ok
-        }
-        RpcRequest::GetBlackholedIdentities => {
-            match query_transport(transport_tx, TransportQuery::GetBlackholedIdentities).await {
-                Some(TransportQueryResponse::BlackholeList(entries)) => {
-                    let rpc_entries = entries
-                        .into_iter()
-                        .map(|e| rpc::BlackholeEntry {
-                            identity_hash: e.identity_hash.to_vec(),
-                            source: e.source.map(|source| source.to_vec()),
-                            // Wire compat: `until` is absolute expiry (created + ttl);
-                            // permanent entries report `None`.
-                            until: e.ttl.map(|t| e.created + t),
-                            reason: Some(
-                                e.reason_label
-                                    .unwrap_or_else(|| e.reason.as_str().to_string()),
-                            ),
-                        })
-                        .collect();
-                    RpcResponse::BlackholeList(rpc_entries)
-                }
-                _ => RpcResponse::BlackholeList(Vec::new()),
+            match authoritative_query!(TransportQuery::DropAnnounceQueues, "announce queue drop") {
+                TransportQueryResponse::Ok => RpcResponse::Ok,
+                _ => unexpected_transport_response("announce queue drop"),
             }
         }
+        RpcRequest::GetBlackholedIdentities => match authoritative_query!(
+            TransportQuery::GetBlackholedIdentities,
+            "blackholed identity query"
+        ) {
+            TransportQueryResponse::BlackholeList(entries) => {
+                let rpc_entries = entries
+                    .into_iter()
+                    .map(|e| rpc::BlackholeEntry {
+                        identity_hash: e.identity_hash.to_vec(),
+                        source: e.source.map(|source| source.to_vec()),
+                        // Wire compat: `until` is absolute expiry (created + ttl);
+                        // permanent entries report `None`.
+                        until: e.ttl.map(|t| e.created + t),
+                        reason: Some(
+                            e.reason_label
+                                .unwrap_or_else(|| e.reason.as_str().to_string()),
+                        ),
+                    })
+                    .collect();
+                RpcResponse::BlackholeList(rpc_entries)
+            }
+            _ => unexpected_transport_response("blackholed identity query"),
+        },
         RpcRequest::IsBlackholed { identity_hash } => {
-            if let Some(hash) = hash_to_array(&identity_hash) {
-                if let Some(TransportQueryResponse::BoolResult(v)) =
-                    query_transport(transport_tx, TransportQuery::IsBlackholed { hash }).await
-                {
-                    return RpcResponse::BoolResult(v);
-                }
+            let Some(hash) = hash_to_array(&identity_hash) else {
+                return invalid_request_hash("identity");
+            };
+            match authoritative_query!(
+                TransportQuery::IsBlackholed { hash },
+                "blackhole status query"
+            ) {
+                TransportQueryResponse::BoolResult(value) => RpcResponse::BoolResult(value),
+                _ => unexpected_transport_response("blackhole status query"),
             }
-            RpcResponse::BoolResult(false)
         }
         RpcRequest::BlackholeIdentity {
             identity_hash,
             until,
             reason,
         } => {
-            if let Some(h) = hash_to_array(&identity_hash) {
-                // `until` (absolute unix ts) → relative TTL; past timestamps
-                // clamp to ~0 so the entry expires on the next maintenance tick.
-                let ttl = until.map(|u| {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs_f64();
-                    (u - now).max(0.001)
-                });
-                let reason_enum = reason
-                    .as_deref()
-                    .map(rns_transport::blackhole::BlackholeReason::parse)
-                    .unwrap_or_default();
-                let _ = query_transport(
-                    transport_tx,
-                    TransportQuery::BlackholeIdentity {
-                        hash: h,
-                        ttl,
-                        reason: reason_enum,
-                        reason_label: reason,
-                    },
-                )
-                .await;
+            let Some(hash) = hash_to_array(&identity_hash) else {
+                return invalid_request_hash("identity");
+            };
+            // `until` (absolute unix ts) → relative TTL; past timestamps
+            // clamp to ~0 so the entry expires on the next maintenance tick.
+            let ttl = until.map(|until| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+                (until - now).max(0.001)
+            });
+            let reason_enum = reason
+                .as_deref()
+                .map(rns_transport::blackhole::BlackholeReason::parse)
+                .unwrap_or_default();
+            match authoritative_query!(
+                TransportQuery::BlackholeIdentity {
+                    hash,
+                    ttl,
+                    reason: reason_enum,
+                    reason_label: reason,
+                },
+                "identity blackhole"
+            ) {
+                TransportQueryResponse::Ok => RpcResponse::Ok,
+                _ => unexpected_transport_response("identity blackhole"),
             }
-            RpcResponse::Ok
         }
         RpcRequest::UnblackholeIdentity { identity_hash } => {
-            if let Some(h) = hash_to_array(&identity_hash) {
-                let _ = query_transport(
-                    transport_tx,
-                    TransportQuery::UnblackholeIdentity { hash: h },
-                )
-                .await;
+            let Some(hash) = hash_to_array(&identity_hash) else {
+                return invalid_request_hash("identity");
+            };
+            match authoritative_query!(
+                TransportQuery::UnblackholeIdentity { hash },
+                "identity unblackhole"
+            ) {
+                // Python's mutation response is success-shaped even when the
+                // identity was not present; the typed actor result proves the
+                // mutation was authoritatively processed.
+                TransportQueryResponse::BoolResult(_) => RpcResponse::Ok,
+                _ => unexpected_transport_response("identity unblackhole"),
             }
-            RpcResponse::Ok
         }
         RpcRequest::GetFirstHopTimeout { destination_hash } => {
-            let dest = hash_to_array(&destination_hash);
-            match dest {
-                Some(d) => {
-                    match query_transport(transport_tx, TransportQuery::FirstHopTimeout { dest: d })
-                        .await
-                    {
-                        Some(TransportQueryResponse::FloatResult(v)) => RpcResponse::FloatResult(v),
-                        _ => RpcResponse::FloatResult(None),
-                    }
-                }
-                None => RpcResponse::FloatResult(None),
+            let Some(dest) = hash_to_array(&destination_hash) else {
+                return invalid_request_hash("destination");
+            };
+            match authoritative_query!(
+                TransportQuery::FirstHopTimeout { dest },
+                "first-hop timeout query"
+            ) {
+                TransportQueryResponse::FloatResult(value) => RpcResponse::FloatResult(value),
+                _ => unexpected_transport_response("first-hop timeout query"),
             }
         }
         RpcRequest::GetPacketRssi { packet_hash } => {
-            if let Some(hash) = packet_hash_to_array(&packet_hash) {
-                if let Some(TransportQueryResponse::FloatResult(v)) = query_transport(
-                    transport_tx,
-                    TransportQuery::GetPacketRssi { packet_hash: hash },
-                )
-                .await
-                {
-                    return RpcResponse::FloatResult(v);
-                }
+            let Some(packet_hash) = packet_hash_to_array(&packet_hash) else {
+                return invalid_request_hash("packet");
+            };
+            match authoritative_query!(
+                TransportQuery::GetPacketRssi { packet_hash },
+                "packet RSSI query"
+            ) {
+                TransportQueryResponse::FloatResult(value) => RpcResponse::FloatResult(value),
+                _ => unexpected_transport_response("packet RSSI query"),
             }
-            RpcResponse::FloatResult(None)
         }
         RpcRequest::GetPacketSnr { packet_hash } => {
-            if let Some(hash) = packet_hash_to_array(&packet_hash) {
-                if let Some(TransportQueryResponse::FloatResult(v)) = query_transport(
-                    transport_tx,
-                    TransportQuery::GetPacketSnr { packet_hash: hash },
-                )
-                .await
-                {
-                    return RpcResponse::FloatResult(v);
-                }
+            let Some(packet_hash) = packet_hash_to_array(&packet_hash) else {
+                return invalid_request_hash("packet");
+            };
+            match authoritative_query!(
+                TransportQuery::GetPacketSnr { packet_hash },
+                "packet SNR query"
+            ) {
+                TransportQueryResponse::FloatResult(value) => RpcResponse::FloatResult(value),
+                _ => unexpected_transport_response("packet SNR query"),
             }
-            RpcResponse::FloatResult(None)
         }
         RpcRequest::GetPacketQ { packet_hash } => {
-            if let Some(hash) = packet_hash_to_array(&packet_hash) {
-                if let Some(TransportQueryResponse::FloatResult(v)) = query_transport(
-                    transport_tx,
-                    TransportQuery::GetPacketQ { packet_hash: hash },
-                )
-                .await
-                {
-                    return RpcResponse::FloatResult(v);
-                }
+            let Some(packet_hash) = packet_hash_to_array(&packet_hash) else {
+                return invalid_request_hash("packet");
+            };
+            match authoritative_query!(
+                TransportQuery::GetPacketQ { packet_hash },
+                "packet quality query"
+            ) {
+                TransportQueryResponse::FloatResult(value) => RpcResponse::FloatResult(value),
+                _ => unexpected_transport_response("packet quality query"),
             }
-            RpcResponse::FloatResult(None)
         }
         RpcRequest::DropAllVia { transport_hash } => {
-            if let Some(next_hop) = hash_to_array(&transport_hash) {
-                if let Some(TransportQueryResponse::IntResult(n)) =
-                    query_transport(transport_tx, TransportQuery::DropAllVia { next_hop }).await
-                {
-                    return RpcResponse::IntResult(n);
-                }
+            let Some(next_hop) = hash_to_array(&transport_hash) else {
+                return invalid_request_hash("transport");
+            };
+            match authoritative_query!(
+                TransportQuery::DropAllVia { next_hop },
+                "drop all via transport"
+            ) {
+                TransportQueryResponse::IntResult(count) => RpcResponse::IntResult(count),
+                _ => unexpected_transport_response("drop all via transport"),
             }
-            RpcResponse::IntResult(0)
         }
         RpcRequest::UseDestination { destination_hash } => {
-            if let Some(dest) = hash_to_array(&destination_hash) {
-                if let Some(TransportQueryResponse::BoolResult(v)) =
-                    query_transport(transport_tx, TransportQuery::UseDestination { dest }).await
-                {
-                    return RpcResponse::BoolResult(v);
-                }
+            let Some(dest) = hash_to_array(&destination_hash) else {
+                return invalid_request_hash("destination");
+            };
+            match authoritative_query!(TransportQuery::UseDestination { dest }, "destination use") {
+                TransportQueryResponse::BoolResult(value) => RpcResponse::BoolResult(value),
+                _ => unexpected_transport_response("destination use"),
             }
-            RpcResponse::BoolResult(false)
         }
         RpcRequest::RetainDestination { destination_hash } => {
-            if let Some(dest) = hash_to_array(&destination_hash) {
-                if let Some(TransportQueryResponse::BoolResult(v)) =
-                    query_transport(transport_tx, TransportQuery::RetainDestination { dest }).await
-                {
-                    return RpcResponse::BoolResult(v);
-                }
+            let Some(dest) = hash_to_array(&destination_hash) else {
+                return invalid_request_hash("destination");
+            };
+            match authoritative_query!(
+                TransportQuery::RetainDestination { dest },
+                "destination retention"
+            ) {
+                TransportQueryResponse::BoolResult(value) => RpcResponse::BoolResult(value),
+                _ => unexpected_transport_response("destination retention"),
             }
-            RpcResponse::BoolResult(false)
         }
         RpcRequest::RetainIdentity { identity_hash } => {
-            if let Some(identity_hash) = hash_to_array(&identity_hash) {
-                if let Some(TransportQueryResponse::BoolResult(v)) = query_transport(
-                    transport_tx,
-                    TransportQuery::RetainIdentity { identity_hash },
-                )
-                .await
-                {
-                    return RpcResponse::BoolResult(v);
-                }
+            let Some(identity_hash) = hash_to_array(&identity_hash) else {
+                return invalid_request_hash("identity");
+            };
+            match authoritative_query!(
+                TransportQuery::RetainIdentity { identity_hash },
+                "identity retention"
+            ) {
+                TransportQueryResponse::BoolResult(value) => RpcResponse::BoolResult(value),
+                _ => unexpected_transport_response("identity retention"),
             }
-            RpcResponse::BoolResult(false)
         }
         RpcRequest::UnretainDestination { destination_hash } => {
-            if let Some(dest) = hash_to_array(&destination_hash) {
-                if let Some(TransportQueryResponse::BoolResult(v)) =
-                    query_transport(transport_tx, TransportQuery::UnretainDestination { dest })
-                        .await
-                {
-                    return RpcResponse::BoolResult(v);
-                }
+            let Some(dest) = hash_to_array(&destination_hash) else {
+                return invalid_request_hash("destination");
+            };
+            match authoritative_query!(
+                TransportQuery::UnretainDestination { dest },
+                "destination release"
+            ) {
+                TransportQueryResponse::BoolResult(value) => RpcResponse::BoolResult(value),
+                _ => unexpected_transport_response("destination release"),
             }
-            RpcResponse::BoolResult(false)
         }
     }
 }
@@ -653,6 +713,70 @@ fn packet_hash_to_array(hash: &[u8]) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn all_rpc_requests() -> Vec<RpcRequest> {
+        vec![
+            RpcRequest::GetPathTable { max_hops: Some(5) },
+            RpcRequest::GetInterfaceStats,
+            RpcRequest::GetRateTable,
+            RpcRequest::GetNextHopIfName {
+                destination_hash: vec![0; 16],
+            },
+            RpcRequest::GetNextHop {
+                destination_hash: vec![0; 16],
+            },
+            RpcRequest::RequestPath {
+                destination_hash: vec![0; 16],
+                timeout_secs: Some(0.01),
+            },
+            RpcRequest::GetFirstHopTimeout {
+                destination_hash: vec![0; 16],
+            },
+            RpcRequest::GetLinkCount,
+            RpcRequest::GetPacketRssi {
+                packet_hash: vec![0; 32],
+            },
+            RpcRequest::GetPacketSnr {
+                packet_hash: vec![0; 32],
+            },
+            RpcRequest::GetPacketQ {
+                packet_hash: vec![0; 32],
+            },
+            RpcRequest::GetBlackholedIdentities,
+            RpcRequest::IsBlackholed {
+                identity_hash: vec![0; 16],
+            },
+            RpcRequest::DropPath {
+                destination_hash: vec![0; 16],
+            },
+            RpcRequest::DropAllVia {
+                transport_hash: vec![0; 16],
+            },
+            RpcRequest::DropPathTable,
+            RpcRequest::DropRecentAnnounces,
+            RpcRequest::DropAnnounceQueues,
+            RpcRequest::BlackholeIdentity {
+                identity_hash: vec![0; 16],
+                until: Some(99999.0),
+                reason: Some("test".to_string()),
+            },
+            RpcRequest::UnblackholeIdentity {
+                identity_hash: vec![0; 16],
+            },
+            RpcRequest::UseDestination {
+                destination_hash: vec![0; 16],
+            },
+            RpcRequest::RetainDestination {
+                destination_hash: vec![0; 16],
+            },
+            RpcRequest::RetainIdentity {
+                identity_hash: vec![0; 16],
+            },
+            RpcRequest::UnretainDestination {
+                destination_hash: vec![0; 16],
+            },
+        ]
+    }
 
     #[tokio::test]
     async fn test_rpc_server_bind_and_shutdown() {
@@ -751,6 +875,81 @@ mod tests {
         assert!(matches!(response, RpcResponse::StringResult(None)));
 
         shutdown.trigger();
+    }
+
+    #[tokio::test]
+    async fn live_listener_returns_errors_when_transport_actor_is_closed() {
+        let shutdown = ShutdownSignal::new();
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let rpc_key = b"closed_actor_key".to_vec();
+        let port = spawn_test_rpc_server(rpc_key.clone(), tx, shutdown.clone()).await;
+
+        for request in all_rpc_requests() {
+            let response = rpc_client_request(port, &rpc_key, request).await;
+            assert!(
+                matches!(response, RpcResponse::Error(_)),
+                "closed transport actor must produce an RPC error, got {response:?}"
+            );
+        }
+
+        shutdown.trigger();
+    }
+
+    #[tokio::test]
+    async fn transport_query_reports_closed_send_and_response_channels() {
+        let (closed_tx, closed_rx) = mpsc::channel(1);
+        drop(closed_rx);
+        assert!(matches!(
+            query_transport(
+                &closed_tx,
+                rns_transport::messages::TransportQuery::GetLinkCount
+            )
+            .await,
+            Err(TransportQueryFailure::ChannelClosed)
+        ));
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let responder = tokio::spawn(async move {
+            let Some(TransportMessage::Rpc { response_tx, .. }) = rx.recv().await else {
+                panic!("expected transport RPC query");
+            };
+            drop(response_tx);
+        });
+        assert!(matches!(
+            query_transport(&tx, rns_transport::messages::TransportQuery::GetLinkCount).await,
+            Err(TransportQueryFailure::ResponseClosed)
+        ));
+        responder.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transport_query_reports_enqueue_and_response_timeouts() {
+        let (full_tx, full_rx) = mpsc::channel(1);
+        full_tx.send(TransportMessage::Shutdown).await.unwrap();
+        assert!(matches!(
+            query_transport(
+                &full_tx,
+                rns_transport::messages::TransportQuery::GetLinkCount
+            )
+            .await,
+            Err(TransportQueryFailure::SendTimedOut)
+        ));
+        drop(full_rx);
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let responder = tokio::spawn(async move {
+            let Some(TransportMessage::Rpc { response_tx, .. }) = rx.recv().await else {
+                panic!("expected transport RPC query");
+            };
+            let _response_tx = response_tx;
+            std::future::pending::<()>().await;
+        });
+        assert!(matches!(
+            query_transport(&tx, rns_transport::messages::TransportQuery::GetLinkCount).await,
+            Err(TransportQueryFailure::ResponseTimedOut)
+        ));
+        responder.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -907,66 +1106,7 @@ listener.close()
         let (actor, tx) = rns_transport::actor::TransportActor::new();
         tokio::spawn(actor.run());
 
-        let requests = vec![
-            RpcRequest::GetPathTable { max_hops: Some(5) },
-            RpcRequest::GetInterfaceStats,
-            RpcRequest::GetRateTable,
-            RpcRequest::GetNextHopIfName {
-                destination_hash: vec![0; 16],
-            },
-            RpcRequest::GetNextHop {
-                destination_hash: vec![0; 16],
-            },
-            RpcRequest::RequestPath {
-                destination_hash: vec![0; 16],
-                timeout_secs: Some(0.01),
-            },
-            RpcRequest::GetFirstHopTimeout {
-                destination_hash: vec![0; 16],
-            },
-            RpcRequest::GetLinkCount,
-            RpcRequest::GetPacketRssi {
-                packet_hash: vec![0; 32],
-            },
-            RpcRequest::GetPacketSnr {
-                packet_hash: vec![0; 32],
-            },
-            RpcRequest::GetPacketQ {
-                packet_hash: vec![0; 32],
-            },
-            RpcRequest::GetBlackholedIdentities,
-            RpcRequest::IsBlackholed {
-                identity_hash: vec![0; 16],
-            },
-            RpcRequest::DropPath {
-                destination_hash: vec![0; 16],
-            },
-            RpcRequest::DropAllVia {
-                transport_hash: vec![0; 16],
-            },
-            RpcRequest::DropPathTable,
-            RpcRequest::DropRecentAnnounces,
-            RpcRequest::DropAnnounceQueues,
-            RpcRequest::BlackholeIdentity {
-                identity_hash: vec![0; 16],
-                until: Some(99999.0),
-                reason: Some("test".to_string()),
-            },
-            RpcRequest::UnblackholeIdentity {
-                identity_hash: vec![0; 16],
-            },
-            RpcRequest::UseDestination {
-                destination_hash: vec![0; 16],
-            },
-            RpcRequest::RetainDestination {
-                destination_hash: vec![0; 16],
-            },
-            RpcRequest::UnretainDestination {
-                destination_hash: vec![0; 16],
-            },
-        ];
-
-        for req in requests {
+        for req in all_rpc_requests() {
             let resp = process_rpc_request(req, &tx).await;
             assert!(
                 !matches!(resp, RpcResponse::Error(_)),

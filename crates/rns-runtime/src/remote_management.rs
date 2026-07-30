@@ -266,6 +266,7 @@ fn interface_stats_from_rpc(e: InterfaceStatRpcEntry) -> schema::InterfaceStats 
         txs: e.tx_rate,
         announce_queue: e.announce_queue,
         clients: e.clients,
+        blocked_ips: e.blocked_ips,
         ifac_signature: None,
         ifac_size,
         ifac_netname: None,
@@ -350,6 +351,7 @@ mod tests {
                 txs: 0,
                 announce_queue: None,
                 clients: None,
+                blocked_ips: None,
                 ifac_signature: None,
                 ifac_size: None,
                 ifac_netname: None,
@@ -376,7 +378,65 @@ mod tests {
             .any(|(k, _)| k.as_str() == Some("interfaces"));
         assert!(has_interfaces, "stats dict has 'interfaces' key");
 
+        let interface_map = stats_map
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("interfaces"))
+            .and_then(|(_, value)| value.as_array())
+            .and_then(|interfaces| interfaces.first())
+            .and_then(rmpv::Value::as_map)
+            .expect("first interface is a map");
+        assert!(
+            !interface_map
+                .iter()
+                .any(|(key, _)| key.as_str() == Some("blocked_ips")),
+            "absent aggregate count is omitted"
+        );
         assert_eq!(arr[1].as_u64(), Some(5));
+    }
+
+    #[test]
+    fn status_response_serializes_only_aggregate_blocked_ip_count() {
+        let stats = schema::InterfaceStats {
+            name: "Backbone".to_string(),
+            short_name: "Backbone".to_string(),
+            hash: None,
+            type_: "Interface".to_string(),
+            rxb: 0,
+            txb: 0,
+            incoming_announce_frequency: 0.0,
+            outgoing_announce_frequency: 0.0,
+            incoming_pr_frequency: 0.0,
+            outgoing_pr_frequency: 0.0,
+            held_announces: 0,
+            burst_active: false,
+            burst_activated: 0.0,
+            pr_burst_active: false,
+            pr_burst_activated: 0.0,
+            status: true,
+            mode: 0x01,
+            bitrate: Some(1_000_000),
+            rxs: 0,
+            txs: 0,
+            announce_queue: None,
+            clients: Some(2),
+            blocked_ips: Some(3),
+            ifac_signature: None,
+            ifac_size: None,
+            ifac_netname: None,
+        };
+        let encoded = rmp_serde::to_vec_named(&stats).unwrap();
+        let decoded: rmpv::Value = rmp_serde::from_slice(&encoded).unwrap();
+        let map = decoded.as_map().expect("interface stats are a map");
+        assert_eq!(
+            map.iter()
+                .find(|(key, _)| key.as_str() == Some("blocked_ips"))
+                .and_then(|(_, value)| value.as_u64()),
+            Some(3)
+        );
+        assert!(
+            !map.iter()
+                .any(|(key, _)| key.as_str() == Some("blocked_ip_list"))
+        );
     }
 
     #[test]
@@ -484,6 +544,7 @@ mod tests {
                                 pr_burst_active: true,
                                 pr_burst_activated: 1_700_000_002.0,
                                 clients: None,
+                                blocked_ips: Some(3),
                                 announce_rate_target: None,
                                 announce_rate_grace: None,
                                 announce_rate_penalty: None,
@@ -611,6 +672,16 @@ mod tests {
             .1
             .as_bool();
         assert_eq!(pr_burst_active, Some(true));
+        let blocked_ips = iface_map
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("blocked_ips"))
+            .and_then(|(_, value)| value.as_u64());
+        assert_eq!(blocked_ips, Some(3));
+        assert!(
+            !iface_map
+                .iter()
+                .any(|(key, _)| key.as_str() == Some("blocked_ip_list"))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

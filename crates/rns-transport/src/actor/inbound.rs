@@ -28,6 +28,12 @@ impl TransportActor {
                         return;
                     }
                 }
+            } else if crate::ifac::has_ifac_flag(&packet.raw) {
+                trace!(
+                    interface_id = packet.interface_id,
+                    "IFAC packet received on clear interface, dropping packet"
+                );
+                return;
             } else {
                 packet.raw.clone()
             }
@@ -66,14 +72,12 @@ impl TransportActor {
         // repeat (keepalives, resource transfer frames, channel traffic) and
         // must bypass the check.
         let pkt_hash = rns_wire::hash::packet_hash(&raw, parsed.flags.header_type);
-        self.record_packet_metrics(
-            pkt_hash,
-            PacketMetrics {
-                rssi: packet.rssi,
-                snr: packet.snr,
-                q: packet.q,
-            },
-        );
+        let packet_metrics = PacketMetrics {
+            rssi: packet.rssi,
+            snr: packet.snr,
+            q: packet.q,
+        };
+        self.record_packet_metrics(pkt_hash, packet_metrics);
         let skip_hashlist = matches!(
             parsed.context,
             rns_wire::context::PacketContext::Keepalive
@@ -119,13 +123,13 @@ impl TransportActor {
                 self.process_announce(&raw, &parsed, data_offset, packet.interface_id);
             }
             rns_wire::flags::PacketType::LinkRequest => {
-                self.process_link_request(&raw, &parsed, packet.interface_id);
+                self.process_link_request(&raw, &parsed, packet.interface_id, packet_metrics);
             }
             rns_wire::flags::PacketType::Proof => {
-                self.process_proof(&raw, &parsed, packet.interface_id);
+                self.process_proof(&raw, &parsed, packet.interface_id, packet_metrics);
             }
             rns_wire::flags::PacketType::Data => {
-                self.process_data(&raw, &parsed, packet.interface_id);
+                self.process_data(&raw, &parsed, packet.interface_id, packet_metrics);
             }
         }
     }
@@ -581,7 +585,7 @@ impl TransportActor {
                         continue;
                     }
                 }
-                let _ = registration
+                let send_result = registration
                     .tx
                     .try_send(crate::messages::AnnounceHandlerEvent {
                         destination_hash: header.destination_hash,
@@ -594,7 +598,17 @@ impl TransportActor {
                         ratchet: announce_ratchet,
                         name_hash: announce_name_hash,
                     });
+                if matches!(
+                    send_result,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+                ) {
+                    registration
+                        .dropped_events
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
+            self.announce_handlers
+                .retain(|registration| !registration.tx.is_closed());
         }
     }
 
@@ -619,6 +633,7 @@ impl TransportActor {
         raw: &bytes::Bytes,
         header: &rns_wire::header::PacketHeader,
         interface_id: InterfaceId,
+        metrics: PacketMetrics,
     ) {
         let from_local_client = self.is_local_client_interface(interface_id);
         let for_local_client = self
@@ -727,7 +742,7 @@ impl TransportActor {
             return;
         }
 
-        tracing::info!(
+        tracing::debug!(
             dest = %hex::encode(header.destination_hash),
             is_local = self.local_destinations.contains(&header.destination_hash),
             has_channel = self.destination_channels.contains_key(&header.destination_hash),
@@ -739,6 +754,7 @@ impl TransportActor {
                 if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
                     raw: raw.clone(),
                     interface_id,
+                    metrics,
                 }) {
                     self.channel_drops += 1;
                     warn!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
@@ -780,6 +796,7 @@ impl TransportActor {
         raw: &bytes::Bytes,
         header: &rns_wire::header::PacketHeader,
         interface_id: InterfaceId,
+        metrics: PacketMetrics,
     ) {
         let from_local_client = self.is_local_client_interface(interface_id);
         let for_local_client = self
@@ -807,6 +824,7 @@ impl TransportActor {
                 if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::LinkRequest {
                     raw: raw.clone(),
                     interface_id,
+                    metrics,
                 }) {
                     self.channel_drops += 1;
                     error!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
@@ -985,6 +1003,7 @@ impl TransportActor {
         raw: &bytes::Bytes,
         header: &rns_wire::header::PacketHeader,
         _interface_id: InterfaceId,
+        metrics: PacketMetrics,
     ) {
         let from_local_client = self.is_local_client_interface(_interface_id);
         let for_local_client_link =
@@ -1000,12 +1019,56 @@ impl TransportActor {
             .is_some_and(|entry| self.is_local_client_interface(entry.receiving_interface));
 
         if header.context != rns_wire::context::PacketContext::Lrproof
-            && let Some(receipt) = self.receipt_table.get_mut(&header.destination_hash)
+            && self.receipt_table.contains_key(&header.destination_hash)
         {
-            let rtt = receipt
-                .get_rtt()
-                .or_else(|| Some(receipt.sent_at.elapsed()));
-            receipt.deliver();
+            let payload_offset = header.size();
+            let Some(proof) = raw.get(payload_offset..) else {
+                return;
+            };
+
+            // Python PacketReceipt retains the destination identity used for
+            // the send and validates every explicit or implicit proof against
+            // it. If registration preceded outbound binding, fill the key from
+            // the validated announce cache before attempting verification.
+            let destination_hash = self
+                .receipt_table
+                .get(&header.destination_hash)
+                .and_then(|receipt| receipt.destination_hash);
+            let recalled_public_key = destination_hash.and_then(|destination_hash| {
+                self.recent_announces
+                    .get(&destination_hash)
+                    .and_then(|announce| announce.public_key)
+            });
+            let (validated, rtt) = {
+                let receipt = self
+                    .receipt_table
+                    .get_mut(&header.destination_hash)
+                    .expect("receipt existence checked above");
+                if receipt.destination_public_key.is_none() {
+                    if let Some(destination_hash) = receipt.destination_hash {
+                        receipt.set_destination_identity(destination_hash, recalled_public_key);
+                    }
+                }
+                let validated = receipt.validate_proof_from_destination(proof);
+                (validated, receipt.get_rtt())
+            };
+
+            if !validated {
+                warn!(
+                    trunc = %hex::encode(header.destination_hash),
+                    proof_len = proof.len(),
+                    identity_known = recalled_public_key.is_some(),
+                    "invalid delivery proof rejected"
+                );
+                return;
+            }
+
+            if let Some(status_tx) = self.receipt_updates.remove(&header.destination_hash) {
+                let update = rtt.map_or(crate::messages::ReceiptUpdate::Failed, |rtt| {
+                    crate::messages::ReceiptUpdate::Delivered { rtt }
+                });
+                status_tx.send_replace(update);
+            }
 
             if let Some(msg_id) = self.receipt_msg_ids.remove(&header.destination_hash) {
                 debug!(
@@ -1119,6 +1182,7 @@ impl TransportActor {
                     tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
                         raw: raw.clone(),
                         interface_id: _interface_id,
+                        metrics,
                     });
                 if let Err(e) = delivered {
                     self.channel_drops += 1;
@@ -1193,6 +1257,7 @@ impl TransportActor {
             if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
                 raw: raw.clone(),
                 interface_id: _interface_id,
+                metrics,
             }) {
                 self.channel_drops += 1;
                 error!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,

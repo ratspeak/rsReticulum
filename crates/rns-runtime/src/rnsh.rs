@@ -23,9 +23,9 @@ use rns_link::link::{CloseReason, Link};
 use rns_protocol::channel::{ChannelError, LinkChannel};
 use rns_protocol::channel_message::MessageBase;
 use rns_protocol::rnsh::{
-    CommandExitedMessage, ErrorMessage, ExecuteCommandMessage, NoopMessage, PROTOCOL_VERSION,
-    RnshMessage, RnshStreamDataMessage, STREAM_ID_STDERR, STREAM_ID_STDIN, STREAM_ID_STDOUT,
-    VersionInfoMessage, WindowSizeMessage,
+    CommandExitedMessage, ErrorMessage, ExecuteCommandMessage, MESSAGE_TYPES, NoopMessage,
+    PROTOCOL_VERSION, RnshMessage, RnshStreamDataMessage, STREAM_ID_STDERR, STREAM_ID_STDIN,
+    STREAM_ID_STDOUT, VersionInfoMessage, WindowSizeMessage,
 };
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
@@ -171,6 +171,9 @@ async fn run_rnsh_listener_inner(
         RNSH_APP_NAME,
         Some(signing_key),
     );
+    for msg_type in MESSAGE_TYPES {
+        link_mgr.register_channel_message_type(msg_type)?;
+    }
 
     let announce_tx = transport_tx.clone();
     let announce_packet = build_announce_packet(&cfg.identity, RNSH_APP_NAME)?;
@@ -190,17 +193,6 @@ async fn run_rnsh_listener_inner(
     link_mgr.set_link_established_channel(established_tx);
     link_mgr.set_link_identified_channel(identified_tx);
     link_mgr.set_link_closed_channel(closed_tx);
-
-    // Defense in depth: in authenticated mode, reject unallowed identities
-    // synchronously at the link layer (as rncp does), so the manager tears the
-    // link down at identify time in addition to the handler-level allow-check
-    // below. allow_all installs no gate.
-    if !cfg.allow_all {
-        let allowed = listener_allowed_identities(&cfg);
-        link_mgr.set_link_identity_gate(move |_link_id, identity_hash| {
-            allowed.contains(&identity_hash)
-        });
-    }
 
     let manager_task = tokio::spawn(async move {
         link_mgr.run_with_commands(command_rx).await;
@@ -259,11 +251,11 @@ async fn run_rnsh_listener_inner(
                         link_id,
                         ErrorMessage::new(Some("Identity is not allowed.".into()), true, None),
                     ).await?;
-                    let _ = command_tx.send(LinkManagerCommand::CloseLink {
-                        link_id,
-                        reason: CloseReason::DestinationClosed,
-                        send_teardown: true,
-                    }).await;
+                    // Keep the already-closed session around just long enough
+                    // for the peer to receive the protocol-level denial. The
+                    // channel-message gate drops every subsequent message, so
+                    // this grace period cannot advance or run the session.
+                    close_link_after_error(command_tx.clone(), link_id);
                 }
             }
             maybe_closed = closed_rx.recv() => {
@@ -405,7 +397,9 @@ pub async fn rnsh_client_execute(
     let session_keys = link
         .session_keys()
         .ok_or_else(|| RnshError::LinkCrypto("no session keys".into()))?;
-    let mut channel = LinkChannel::new_encrypted(link_id, link.rtt_secs(), session_keys);
+    let mut channel =
+        LinkChannel::new_encrypted_with_mdu(link_id, link.rtt_secs(), link.mdu, session_keys);
+    register_rnsh_message_types(&mut channel)?;
     link.mark_channel_created();
     let mut pending_messages = VecDeque::new();
     let mut stdout = Vec::new();
@@ -513,6 +507,13 @@ pub async fn rnsh_client_execute(
         stderr,
         return_code,
     })
+}
+
+fn register_rnsh_message_types(channel: &mut LinkChannel) -> Result<(), ChannelError> {
+    for msg_type in MESSAGE_TYPES {
+        channel.register_message_type(msg_type)?;
+    }
+    Ok(())
 }
 
 fn pending_has_remote_terminal(pending_messages: &VecDeque<RnshMessage>) -> bool {
@@ -1555,6 +1556,7 @@ async fn resend_timed_out_client_channel_messages(
     link: &mut Link,
     channel: &mut LinkChannel,
 ) -> Result<(), RnshError> {
+    channel.update_rtt(link.rtt_secs());
     for sequence in channel.timed_out_sequences() {
         let Some(data) = channel.timeout(sequence)? else {
             continue;
@@ -1996,6 +1998,21 @@ fn parse_identity_hash16(input: &str) -> Option<[u8; 16]> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn rnsh_channel_registration_accepts_every_protocol_type() {
+        let mut channel = LinkChannel::new([0xA2; 16], 0.1);
+        register_rnsh_message_types(&mut channel).unwrap();
+
+        for (sequence, msg_type) in MESSAGE_TYPES.into_iter().enumerate() {
+            let mut envelope = Vec::with_capacity(6);
+            envelope.extend_from_slice(&msg_type.to_be_bytes());
+            envelope.extend_from_slice(&(sequence as u16).to_be_bytes());
+            envelope.extend_from_slice(&0u16.to_be_bytes());
+            let received = channel.receive_data(&envelope).unwrap();
+            assert_eq!(received, vec![(msg_type, Vec::new())]);
+        }
+    }
 
     fn spawn_ack_manager(
         mut rx: mpsc::Receiver<LinkManagerCommand>,

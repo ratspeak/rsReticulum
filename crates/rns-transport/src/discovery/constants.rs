@@ -23,7 +23,7 @@ pub const ANNOUNCE_JOB_INTERVAL_SECS: u64 = 60;
 /// Default stamp-value requirement used by both sender (when an interface
 /// leaves `discovery_stamp_value` unset) and receiver. Matches Python
 /// `InterfaceAnnouncer.DEFAULT_STAMP_VALUE`.
-pub const DEFAULT_STAMP_VALUE: u8 = 14;
+pub const DEFAULT_STAMP_VALUE: u8 = 16;
 
 /// Rounds used when deriving the stamp workblock. Matches Python
 /// `InterfaceAnnouncer.WORKBLOCK_EXPAND_ROUNDS`.

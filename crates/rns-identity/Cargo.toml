@@ -3,6 +3,7 @@ name = "rns-identity"
 description = "Identity, Destination, and Announce system for Reticulum"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -13,9 +14,13 @@ thiserror = { workspace = true }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }
 serde = { workspace = true }
+serde_bytes = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
 hex = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 proptest = { workspace = true }

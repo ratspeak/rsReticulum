@@ -6,16 +6,64 @@
 //! transport exclusively via `mpsc` senders and `oneshot` reply channels.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::constants::{InterfaceDirection, InterfaceMode};
 pub use crate::ingress::HeldAnnounce;
 use crate::ingress::IngressController;
 
 pub type InterfaceId = u64;
+
+/// Privacy-bounded, aggregate-only inspection values supplied by an
+/// interface driver.
+///
+/// This deliberately has no endpoint, address, name or free-form field. Keep
+/// that property when extending it: inspection snapshots cross shared-instance
+/// and authorized remote-management boundaries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InterfaceInspectionSnapshot {
+    pub active_clients: Option<u64>,
+    pub blocked_ips: Option<u64>,
+}
+
+/// A driver-owned source for a live aggregate interface snapshot.
+///
+/// The callback is invoked synchronously once for each transport stats
+/// snapshot. Implementations must therefore take only short-lived locks and
+/// must not perform I/O.
+#[derive(Clone)]
+pub struct InterfaceInspectionSource {
+    snapshot: Arc<dyn Fn() -> InterfaceInspectionSnapshot + Send + Sync>,
+}
+
+impl InterfaceInspectionSource {
+    pub fn new<F>(snapshot: F) -> Self
+    where
+        F: Fn() -> InterfaceInspectionSnapshot + Send + Sync + 'static,
+    {
+        Self {
+            snapshot: Arc::new(snapshot),
+        }
+    }
+
+    pub fn snapshot(&self) -> InterfaceInspectionSnapshot {
+        (self.snapshot)()
+    }
+}
+
+impl std::fmt::Debug for InterfaceInspectionSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InterfaceInspectionSource")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque identity for one transport announce-handler registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AnnounceHandlerId(pub(crate) u64);
 
 /// Transport-level role of an interface. Python Reticulum distinguishes
 /// ordinary network interfaces, the local shared-instance listener, accepted
@@ -57,6 +105,44 @@ pub struct OutboundRequest {
     pub destination_hash: [u8; 16],
 }
 
+/// State update for one explicitly tracked outbound packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptUpdate {
+    Sent,
+    Delivered { rtt: std::time::Duration },
+    TimedOut,
+    Failed,
+    Culled,
+}
+
+/// Receipt metadata installed atomically with an outbound packet.
+pub struct TrackedReceiptRegistration {
+    pub truncated_hash: [u8; 16],
+    pub full_hash: [u8; 32],
+    pub destination_hash: [u8; 16],
+    pub destination_public_key: [u8; 64],
+    pub timeout: Option<std::time::Duration>,
+    pub status_tx: watch::Sender<ReceiptUpdate>,
+}
+
+impl std::fmt::Debug for TrackedReceiptRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrackedReceiptRegistration")
+            .field("truncated_hash", &self.truncated_hash)
+            .field("destination_hash", &self.destination_hash)
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Immediate outcome of dispatching a packet to the interface layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundDispatchResult {
+    Sent,
+    NoInterface,
+    ReceiptCollision,
+}
+
 /// Periodic maintenance tick. Drives cache culling, retransmit scheduling,
 /// and rate-limit decay so the actor needs no internal timer.
 #[derive(Debug)]
@@ -89,6 +175,8 @@ pub struct InterfaceEntry {
     pub online: Option<Arc<AtomicBool>>,
     pub rxb: Option<Arc<std::sync::atomic::AtomicU64>>,
     pub txb: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Optional driver-owned aggregate inspection source.
+    pub inspection: Option<InterfaceInspectionSource>,
     /// Incremented when an outbound `try_send` cannot enqueue — surfaced in
     /// interface stats to flag a driver whose receiver is falling behind.
     pub tx_drops: Arc<std::sync::atomic::AtomicU64>,
@@ -143,6 +231,7 @@ impl InterfaceEntry {
             online: None,
             rxb: None,
             txb: None,
+            inspection: None,
             tx_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ingress: IngressController::new(),
             announce_queue: Vec::new(),
@@ -210,6 +299,7 @@ impl std::fmt::Debug for InterfaceEntry {
             .field("ifac_size", &self.ifac_size)
             .field("announce_cap", &self.announce_cap)
             .field("announce_allowed_at", &self.announce_allowed_at)
+            .field("has_inspection", &self.inspection.is_some())
             .field("held_announces", &self.ingress.held_count())
             .field("announce_queue", &self.announce_queue.len())
             .finish()
@@ -235,6 +325,17 @@ pub struct AnnounceHandlerEvent {
     pub name_hash: [u8; 10],
 }
 
+/// Optional routing controls for an explicit path request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathRequestOptions {
+    /// Send only on this interface. `None` broadcasts on all outbound interfaces.
+    pub on_interface: Option<InterfaceId>,
+    /// Caller-supplied request tag. At most the first 16 bytes are transmitted.
+    pub tag: Option<Vec<u8>>,
+    /// Apply recursive path-request announce-cap gating on an attached interface.
+    pub recursive: bool,
+}
+
 /// Every mutation of transport state enters through this enum — the actor
 /// dispatches on the variant, so adding a new operation is a matter of adding
 /// a variant and a match arm rather than exposing a new lock or shared type.
@@ -247,6 +348,21 @@ pub enum TransportMessage {
     OutboundAttached {
         request: OutboundRequest,
         interface_id: InterfaceId,
+    },
+    /// Dispatch an application packet and report whether an interface
+    /// accepted it. Optional receipt registration occurs in the same actor
+    /// turn, avoiding registration/send races.
+    SendPacket {
+        request: OutboundRequest,
+        attached_interface: Option<InterfaceId>,
+        receipt: Option<TrackedReceiptRegistration>,
+        result_tx: tokio::sync::oneshot::Sender<OutboundDispatchResult>,
+    },
+    /// Change the timeout of one still-pending tracked packet.
+    SetReceiptTimeout {
+        truncated_hash: [u8; 16],
+        timeout: std::time::Duration,
+        result_tx: tokio::sync::oneshot::Sender<bool>,
     },
     Tick(TimerTick),
     /// Read-only query paired with a oneshot reply channel — used for all
@@ -268,10 +384,25 @@ pub enum TransportMessage {
         receive_path_responses: bool,
         callback_tx: mpsc::Sender<AnnounceHandlerEvent>,
     },
+    /// Register one owned announce subscription and acknowledge once the actor
+    /// has installed it. `dropped_events` counts dispatches rejected by the
+    /// bounded callback channel.
+    RegisterAnnounceSubscription {
+        aspect_filter: Option<String>,
+        receive_path_responses: bool,
+        callback_tx: mpsc::Sender<AnnounceHandlerEvent>,
+        dropped_events: Arc<AtomicU64>,
+        result_tx: tokio::sync::oneshot::Sender<AnnounceHandlerId>,
+    },
     /// Remove handler(s) whose `aspect_filter` matches; `None` removes all.
     /// Handlers with closed senders are also reaped on dispatch.
     DeregisterAnnounceHandler {
         aspect_filter: Option<String>,
+    },
+    /// Remove exactly the subscription backed by `callback_tx`.
+    DeregisterAnnounceSubscription {
+        id: AnnounceHandlerId,
+        result_tx: Option<tokio::sync::oneshot::Sender<bool>>,
     },
     /// Ask the actor to satisfy a packet request: replay from its recent-
     /// announce cache when possible, otherwise emit a CacheRequest packet.
@@ -281,6 +412,10 @@ pub enum TransportMessage {
     },
     RequestPath {
         destination_hash: [u8; 16],
+    },
+    RequestPathWithOptions {
+        destination_hash: [u8; 16],
+        options: PathRequestOptions,
     },
     RegisterInterface {
         id: InterfaceId,
@@ -319,6 +454,10 @@ pub enum TransportMessage {
     RegisterReceipt {
         truncated_hash: [u8; 16],
         full_hash: [u8; 32],
+        /// Destination and validated identity used to construct the outbound
+        /// packet. Delivery proofs must verify against this exact identity.
+        destination_hash: [u8; 16],
+        destination_public_key: [u8; 64],
         msg_id: String,
         /// Override default 180s timeout when `Some`.
         timeout: Option<std::time::Duration>,
@@ -355,14 +494,19 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::Inbound(_) => "Inbound",
         TransportMessage::Outbound(_) => "Outbound",
         TransportMessage::OutboundAttached { .. } => "OutboundAttached",
+        TransportMessage::SendPacket { .. } => "SendPacket",
+        TransportMessage::SetReceiptTimeout { .. } => "SetReceiptTimeout",
         TransportMessage::Tick(_) => "Tick",
         TransportMessage::Rpc { .. } => "Rpc",
         TransportMessage::RegisterDestination { .. } => "RegisterDestination",
         TransportMessage::DeregisterDestination { .. } => "DeregisterDestination",
         TransportMessage::RegisterAnnounceHandler { .. } => "RegisterAnnounceHandler",
+        TransportMessage::RegisterAnnounceSubscription { .. } => "RegisterAnnounceSubscription",
         TransportMessage::DeregisterAnnounceHandler { .. } => "DeregisterAnnounceHandler",
+        TransportMessage::DeregisterAnnounceSubscription { .. } => "DeregisterAnnounceSubscription",
         TransportMessage::CacheRequest { .. } => "CacheRequest",
         TransportMessage::RequestPath { .. } => "RequestPath",
+        TransportMessage::RequestPathWithOptions { .. } => "RequestPathWithOptions",
         TransportMessage::RegisterInterface { .. } => "RegisterInterface",
         TransportMessage::DeregisterInterface { .. } => "DeregisterInterface",
         TransportMessage::SetStoragePaths { .. } => "SetStoragePaths",
@@ -388,6 +532,19 @@ pub enum TransportQuery {
     GetRateTable,
     GetLinkCount,
     GetRecentAnnounces,
+    /// Recall one validated announce-cache entry without mutating its
+    /// `last_used` timestamp. Python: `Identity.recall(..., _no_use=True)`.
+    RecallDestination {
+        dest: [u8; 16],
+    },
+    /// Whether a non-expired path currently exists for `dest`.
+    HasPath {
+        dest: [u8; 16],
+    },
+    /// Hop count for a non-expired path, or `PATHFINDER_M` when unknown.
+    HopsTo {
+        dest: [u8; 16],
+    },
     GetNextHop {
         dest: [u8; 16],
     },
@@ -395,6 +552,9 @@ pub enum TransportQuery {
         dest: [u8; 16],
     },
     GetNextHopBitrate {
+        dest: [u8; 16],
+    },
+    GetNextHopHardwareMtu {
         dest: [u8; 16],
     },
     GetNextHopInterfaceId {
@@ -546,6 +706,7 @@ pub enum TransportQueryResponse {
     InterfaceStats(Vec<InterfaceStatRpcEntry>),
     RateTable(Vec<RateTableRpcEntry>),
     Announces(Vec<AnnounceRpcEntry>),
+    RecalledDestination(Option<RecalledDestinationRpcEntry>),
     IntResult(i64),
     FloatResult(Option<f64>),
     StringResult(Option<String>),
@@ -599,6 +760,7 @@ pub struct InterfaceStatRpcEntry {
     pub pr_burst_active: bool,
     pub pr_burst_activated: f64,
     pub clients: Option<u64>,
+    pub blocked_ips: Option<u64>,
     pub announce_rate_target: Option<f64>,
     pub announce_rate_grace: Option<u32>,
     pub announce_rate_penalty: Option<f64>,
@@ -635,6 +797,18 @@ pub struct AnnounceRpcEntry {
     pub retained: bool,
 }
 
+/// The identity-bearing subset of a cached announce returned by
+/// [`TransportQuery::RecallDestination`].
+#[derive(Debug, Clone)]
+pub struct RecalledDestinationRpcEntry {
+    pub dest_hash: [u8; 16],
+    pub public_key: [u8; 64],
+    pub app_data: Option<Vec<u8>>,
+    pub ratchet: Option<[u8; 32]>,
+    pub hops: u8,
+    pub timestamp: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct BlackholeRpcEntry {
     pub identity_hash: [u8; 16],
@@ -664,6 +838,26 @@ impl std::fmt::Debug for TransportMessage {
                 .field("request", request)
                 .field("interface_id", interface_id)
                 .finish(),
+            Self::SendPacket {
+                request,
+                attached_interface,
+                receipt,
+                ..
+            } => f
+                .debug_struct("SendPacket")
+                .field("request", request)
+                .field("attached_interface", attached_interface)
+                .field("receipt", receipt)
+                .finish(),
+            Self::SetReceiptTimeout {
+                truncated_hash,
+                timeout,
+                ..
+            } => f
+                .debug_struct("SetReceiptTimeout")
+                .field("truncated_hash", truncated_hash)
+                .field("timeout", timeout)
+                .finish_non_exhaustive(),
             Self::Tick(t) => f.debug_tuple("Tick").field(t).finish(),
             Self::Rpc { query, .. } => f.debug_struct("Rpc").field("query", query).finish(),
             Self::RegisterDestination { hash, app_name, .. } => f
@@ -679,9 +873,17 @@ impl std::fmt::Debug for TransportMessage {
                 .debug_struct("RegisterAnnounceHandler")
                 .field("aspect_filter", aspect_filter)
                 .finish(),
+            Self::RegisterAnnounceSubscription { aspect_filter, .. } => f
+                .debug_struct("RegisterAnnounceSubscription")
+                .field("aspect_filter", aspect_filter)
+                .finish(),
             Self::DeregisterAnnounceHandler { aspect_filter } => f
                 .debug_struct("DeregisterAnnounceHandler")
                 .field("aspect_filter", aspect_filter)
+                .finish(),
+            Self::DeregisterAnnounceSubscription { id, .. } => f
+                .debug_struct("DeregisterAnnounceSubscription")
+                .field("id", id)
                 .finish(),
             Self::CacheRequest {
                 packet_hash,
@@ -694,6 +896,14 @@ impl std::fmt::Debug for TransportMessage {
             Self::RequestPath { destination_hash } => f
                 .debug_struct("RequestPath")
                 .field("destination_hash", destination_hash)
+                .finish(),
+            Self::RequestPathWithOptions {
+                destination_hash,
+                options,
+            } => f
+                .debug_struct("RequestPathWithOptions")
+                .field("destination_hash", destination_hash)
+                .field("options", options)
                 .finish(),
             Self::RegisterInterface { id, entry } => f
                 .debug_struct("RegisterInterface")

@@ -68,8 +68,10 @@ pub const PATH_REQUEST_RG: f64 = 1.5;
 /// Minimum interval between path requests (seconds).
 pub const PATH_REQUEST_MI: f64 = 20.0;
 
-/// Maximum packet hashes before rotation. Set to 2M with rotation at
-/// `maxsize/2` so effective history matches Python's 1M-no-rotation window.
+/// Maximum packet hashes retained across both generations.
+///
+/// Python retains roughly one million hashes. Rust deliberately retains up
+/// to two million for a longer bounded replay window; see RNS-D0056.
 pub const HASHLIST_MAXSIZE: usize = 2_000_000;
 
 /// Job loop period (250ms).

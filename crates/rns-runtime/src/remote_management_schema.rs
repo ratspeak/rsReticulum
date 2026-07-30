@@ -53,6 +53,8 @@ pub struct InterfaceStats {
     pub announce_queue: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clients: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_ips: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", with = "bytes_opt")]
     pub ifac_signature: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]

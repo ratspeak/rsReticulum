@@ -12,6 +12,9 @@ const RANDOM_HASH_SIZE: usize = 10;
 const SIGNATURE_SIZE: usize = 64;
 const RATCHET_SIZE: usize = 32;
 
+/// Maximum value carried in the low five bytes of an announce random hash.
+pub const ANNOUNCE_TIME_MAX: u64 = (1u64 << 40) - 1;
+
 const MIN_ANNOUNCE_SIZE: usize = PUBKEY_SIZE + NAME_HASH_SIZE + RANDOM_HASH_SIZE + SIGNATURE_SIZE;
 
 #[derive(Debug, Error)]
@@ -28,6 +31,8 @@ pub enum AnnounceError {
     InvalidPublicKey,
     #[error("hash collision detected for destination")]
     HashCollision,
+    #[error("announce wire time exceeds 40-bit field: {0}")]
+    InvalidWireTime(u64),
 }
 
 /// Parsed announce data.
@@ -52,18 +57,33 @@ impl AnnounceData {
         app_data: Option<&[u8]>,
         ratchet_pub: Option<&[u8; 32]>,
     ) -> Result<Self, AnnounceError> {
-        let public_key = identity.get_public_key();
-        let nh = name_hash(app_name);
-
-        let random_bytes = rns_crypto::random::random_bytes(5);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let ts_bytes = ts.to_be_bytes();
+        Self::create_at(identity, app_name, app_data, ratchet_pub, ts)
+    }
+
+    /// Create and sign an announce with an explicit persisted 40-bit ordering
+    /// value. Rotation and expiry clocks must be managed separately.
+    pub fn create_at(
+        identity: &Identity,
+        app_name: &str,
+        app_data: Option<&[u8]>,
+        ratchet_pub: Option<&[u8; 32]>,
+        wire_time: u64,
+    ) -> Result<Self, AnnounceError> {
+        if wire_time > ANNOUNCE_TIME_MAX {
+            return Err(AnnounceError::InvalidWireTime(wire_time));
+        }
+
+        let public_key = identity.get_public_key();
+        let nh = name_hash(app_name);
+        let random_bytes = rns_crypto::random::random_bytes(5);
+        let ts_bytes = wire_time.to_be_bytes();
         let mut random_hash = [0u8; 10];
         random_hash[..5].copy_from_slice(&random_bytes);
-        // Low 5 bytes of the u64 timestamp; wraps ~every 34 000 years.
+        // The value was range checked, so these are the complete 40 bits.
         random_hash[5..].copy_from_slice(&ts_bytes[3..8]);
 
         let dest_hash = crate::destination::Destination::hash_from_name_and_identity(
@@ -241,7 +261,7 @@ impl AnnounceData {
     }
 
     /// Validate destination-hash binding and first-seen public-key continuity
-    /// after [`verify_signature`] has succeeded.
+    /// after [`Self::verify_signature`] has succeeded.
     pub fn validate_destination_binding(
         &self,
         packet_dest_hash: &[u8; 16],
@@ -300,6 +320,21 @@ mod tests {
 
         let validated_id = announce.validate(&dest_hash).unwrap();
         assert_eq!(validated_id.hash, id.hash);
+    }
+
+    #[test]
+    fn explicit_wire_time_uses_exact_40_bit_value() {
+        let id = Identity::new();
+        let wire_time = 0x12_3456_789Au64;
+        let announce = AnnounceData::create_at(&id, "test.time", None, None, wire_time).unwrap();
+        assert_eq!(&announce.random_hash[5..], &wire_time.to_be_bytes()[3..]);
+
+        let maximum = AnnounceData::create_at(&id, "test.time", None, None, ANNOUNCE_TIME_MAX);
+        assert!(maximum.is_ok());
+        assert!(matches!(
+            AnnounceData::create_at(&id, "test.time", None, None, ANNOUNCE_TIME_MAX + 1,),
+            Err(AnnounceError::InvalidWireTime(_))
+        ));
     }
 
     #[test]

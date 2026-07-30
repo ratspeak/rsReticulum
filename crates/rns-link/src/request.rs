@@ -4,6 +4,11 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestState {
     Sent,
+    /// The request body itself is still being delivered as a Resource.
+    ///
+    /// Resource transfer watchdogs own the send timeout in this state. The
+    /// response timeout starts only after the Resource proof arrives.
+    SendingResource,
     /// Response is arriving as a resource transfer rather than a single packet.
     Receiving,
     Delivered,
@@ -59,7 +64,10 @@ impl RequestReceipt {
 
     /// Record a response payload, transition to `Delivered`, and fire the response callback.
     pub fn deliver(&mut self, response: Vec<u8>) {
-        if self.state == RequestState::Sent || self.state == RequestState::Receiving {
+        if matches!(
+            self.state,
+            RequestState::Sent | RequestState::SendingResource | RequestState::Receiving
+        ) {
             self.rtt = Some(self.sent_at.elapsed());
             self.response = Some(response);
             self.state = RequestState::Delivered;
@@ -72,7 +80,10 @@ impl RequestReceipt {
 
     /// Transition to `Failed` and fire the failure callback.
     pub fn fail(&mut self) {
-        if self.state == RequestState::Sent || self.state == RequestState::Receiving {
+        if matches!(
+            self.state,
+            RequestState::Sent | RequestState::SendingResource | RequestState::Receiving
+        ) {
             self.state = RequestState::Failed;
             if let Some(cb) = self.callbacks.failed.take() {
                 cb(self);
@@ -81,11 +92,15 @@ impl RequestReceipt {
     }
 
     pub fn is_timed_out(&self) -> bool {
-        self.state == RequestState::Sent && self.sent_at.elapsed() > self.timeout
+        matches!(self.state, RequestState::Sent | RequestState::Receiving)
+            && self.sent_at.elapsed() >= self.timeout
     }
 
     pub fn is_pending(&self) -> bool {
-        self.state == RequestState::Sent
+        matches!(
+            self.state,
+            RequestState::Sent | RequestState::SendingResource | RequestState::Receiving
+        )
     }
 
     /// Store the response payload and advance to `ResponseReceived`.
@@ -93,10 +108,20 @@ impl RequestReceipt {
     /// Distinct from `deliver()`: `receive_response` can fire after `mark_delivered()`
     /// for protocols that ack then stream the payload.
     pub fn receive_response(&mut self, data: Vec<u8>) {
-        if self.state == RequestState::Sent || self.state == RequestState::Delivered {
+        if matches!(
+            self.state,
+            RequestState::Sent
+                | RequestState::SendingResource
+                | RequestState::Receiving
+                | RequestState::Delivered
+        ) {
             self.rtt = Some(self.sent_at.elapsed());
             self.response = Some(data);
             self.state = RequestState::ResponseReceived;
+            self.progress = 1.0;
+            if let Some(cb) = self.callbacks.response.take() {
+                cb(self);
+            }
         }
     }
 
@@ -109,8 +134,27 @@ impl RequestReceipt {
 
     /// Transition to `Failed` without firing the failure callback.
     pub fn mark_failed(&mut self) {
-        if self.state == RequestState::Sent {
+        if matches!(
+            self.state,
+            RequestState::Sent | RequestState::SendingResource | RequestState::Receiving
+        ) {
             self.state = RequestState::Failed;
+        }
+    }
+
+    /// Suspend the response deadline while the request body is sent as a
+    /// Resource. The Resource transfer has its own watchdog.
+    pub fn mark_resource_sending(&mut self) {
+        if self.state == RequestState::Sent {
+            self.state = RequestState::SendingResource;
+        }
+    }
+
+    /// Start the response deadline after a request Resource is proved.
+    pub fn mark_resource_sent(&mut self) {
+        if self.state == RequestState::SendingResource {
+            self.state = RequestState::Sent;
+            self.sent_at = Instant::now();
         }
     }
 
@@ -152,10 +196,7 @@ impl RequestReceipt {
     /// Expire the request if past its deadline, firing the failure callback. Returns `true` if expired.
     pub fn check_timeout(&mut self) -> bool {
         if self.is_timed_out() {
-            self.state = RequestState::Failed;
-            if let Some(cb) = self.callbacks.failed.take() {
-                cb(self);
-            }
+            self.fail();
             true
         } else {
             false
@@ -237,6 +278,19 @@ mod tests {
     }
 
     #[test]
+    fn resource_send_suspends_and_restarts_response_timeout() {
+        let mut receipt = RequestReceipt::new([0x12; 32], [0x34; 16], Duration::ZERO);
+
+        receipt.mark_resource_sending();
+        assert_eq!(receipt.state, RequestState::SendingResource);
+        assert!(!receipt.is_timed_out());
+
+        receipt.mark_resource_sent();
+        assert_eq!(receipt.state, RequestState::Sent);
+        assert!(receipt.is_timed_out());
+    }
+
+    #[test]
     fn test_cannot_receive_response_after_fail() {
         let mut receipt = RequestReceipt::new([0x33; 32], [0x44; 16], Duration::from_secs(10));
 
@@ -244,5 +298,44 @@ mod tests {
         receipt.receive_response(b"too late".to_vec());
         assert_eq!(receipt.state, RequestState::Failed);
         assert!(receipt.response.is_none());
+    }
+
+    #[test]
+    fn test_receive_response_fires_callback_from_receiving_state() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let callback_fired = fired.clone();
+        let mut receipt = RequestReceipt::new([0x55; 32], [0x66; 16], Duration::from_secs(10));
+        receipt.state = RequestState::Receiving;
+        receipt.set_response_callback(move |receipt| {
+            assert_eq!(receipt.state, RequestState::ResponseReceived);
+            callback_fired.store(true, Ordering::SeqCst);
+        });
+
+        receipt.receive_response(b"resource response".to_vec());
+
+        assert!(fired.load(Ordering::SeqCst));
+        assert_eq!(receipt.get_progress(), 1.0);
+    }
+
+    #[test]
+    fn test_receiving_request_times_out_and_fires_failure_callback() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let callback_fired = fired.clone();
+        let mut receipt = RequestReceipt::new([0x77; 32], [0x88; 16], Duration::ZERO);
+        receipt.state = RequestState::Receiving;
+        receipt.set_failed_callback(move |receipt| {
+            assert_eq!(receipt.state, RequestState::Failed);
+            callback_fired.store(true, Ordering::SeqCst);
+        });
+
+        assert!(receipt.check_timeout());
+        assert!(fired.load(Ordering::SeqCst));
+        assert!(!receipt.is_pending());
     }
 }
