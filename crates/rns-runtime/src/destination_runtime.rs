@@ -30,6 +30,8 @@ use crate::link_manager::{
 const DEFAULT_EVENT_CAPACITY: usize = 128;
 const COMMAND_CAPACITY: usize = 256;
 
+type ResourceAcceptCallback = dyn Fn([u8; 16], &ResourceAdvertisement) -> bool + Send + Sync;
+
 #[derive(Debug, Clone)]
 pub struct DestinationRuntimeOptions {
     pub proof_strategy: ProofStrategy,
@@ -65,9 +67,7 @@ impl Default for DestinationRuntimeOptions {
 
 /// Clonable per-advertisement inbound Resource acceptance policy.
 #[derive(Clone)]
-pub struct ResourceAcceptPolicy(
-    Arc<dyn Fn([u8; 16], &ResourceAdvertisement) -> bool + Send + Sync>,
-);
+pub struct ResourceAcceptPolicy(Arc<ResourceAcceptCallback>);
 
 impl ResourceAcceptPolicy {
     pub fn new(
