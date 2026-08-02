@@ -2941,7 +2941,10 @@ pub async fn init_with_options_and_rnode_startup_options(
             let socket_path = shared_unix_socket_path(&rc.instance_name, &socket_base);
             // Probe before binding: spawn_local_server unconditionally removes
             // the socket, which would otherwise hijack a live sibling's listener.
+            #[cfg(unix)]
             let mut live_server_detected = false;
+            #[cfg(not(unix))]
+            let live_server_detected = false;
             #[cfg(unix)]
             {
                 let is_abstract = socket_path.as_bytes().first() == Some(&0);

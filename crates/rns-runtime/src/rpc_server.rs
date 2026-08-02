@@ -165,6 +165,7 @@ fn bind_abstract_unix_listener(_name: &str) -> std::io::Result<tokio::net::UnixL
     ))
 }
 
+#[cfg(unix)]
 fn display_socket_path(path: &str) -> String {
     if let Some(rest) = path.strip_prefix('\0') {
         format!("\\0{rest}")
