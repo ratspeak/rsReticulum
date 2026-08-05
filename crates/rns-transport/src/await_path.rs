@@ -2,8 +2,9 @@
 //!
 //! Mirrors Python `Transport.await_path(destination_hash, timeout=None)`
 //! (RNS/Transport.py:2524). The helper sends an [`AwaitPath`] actor
-//! message and races the oneshot reply against a caller-supplied timeout. The
-//! actor emits the upstream-compatible path request before parking the waiter.
+//! message and applies one caller-supplied deadline to both actor submission
+//! and the oneshot reply. The actor emits the upstream-compatible path request
+//! before parking the waiter.
 //!
 //! [`AwaitPath`]: crate::messages::TransportMessage::AwaitPath
 
@@ -39,20 +40,26 @@ pub async fn await_path(
     timeout: Duration,
 ) -> Result<(), AwaitPathError> {
     let (reply_tx, reply_rx) = oneshot::channel();
-    tx.send(TransportMessage::AwaitPath {
-        dest: destination_hash,
-        reply: reply_tx,
-    })
-    .await
-    .map_err(|_| AwaitPathError::TransportDown)?;
+    let operation = async {
+        tx.send(TransportMessage::AwaitPath {
+            dest: destination_hash,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| AwaitPathError::TransportDown)?;
 
-    match tokio::time::timeout(timeout, reply_rx).await {
-        Ok(Ok(true)) => Ok(()),
-        // Actor responded `false` → its own internal timer expired.
-        Ok(Ok(false)) => Err(AwaitPathError::Timeout),
-        // Actor dropped the reply sender without replying — treat as timeout.
-        Ok(Err(_)) => Err(AwaitPathError::Timeout),
-        // Caller timeout fired first.
+        match reply_rx.await {
+            Ok(true) => Ok(()),
+            // Actor responded `false` → its own internal timer expired.
+            Ok(false) => Err(AwaitPathError::Timeout),
+            // Actor dropped the reply sender without replying — treat as timeout.
+            Err(_) => Err(AwaitPathError::Timeout),
+        }
+    };
+
+    match tokio::time::timeout(timeout, operation).await {
+        Ok(result) => result,
+        // The deadline covers both actor-channel admission and the reply.
         Err(_) => Err(AwaitPathError::Timeout),
     }
 }
@@ -128,5 +135,17 @@ mod tests {
 
         let out = await_path(&tx, [0x55; 16], Duration::from_millis(200)).await;
         assert_eq!(out, Err(AwaitPathError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn timeout_includes_actor_channel_submission() {
+        let (tx, rx) = mpsc::channel::<TransportMessage>(1);
+        tx.send(TransportMessage::Shutdown)
+            .await
+            .expect("prefill actor channel");
+
+        let out = await_path(&tx, [0x66; 16], Duration::from_millis(50)).await;
+        assert_eq!(out, Err(AwaitPathError::Timeout));
+        drop(rx);
     }
 }

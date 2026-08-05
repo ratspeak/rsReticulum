@@ -1407,33 +1407,39 @@ impl ReticulumHandle {
         &self,
         query: TransportQuery,
     ) -> Result<TransportQueryResponse, ControlError> {
+        self.query_transport_result_with_timeout(query, Duration::from_secs(5))
+            .await
+    }
+
+    async fn query_transport_result_with_timeout(
+        &self,
+        query: TransportQuery,
+        timeout: Duration,
+    ) -> Result<TransportQueryResponse, ControlError> {
         let variant = format!("{query:?}");
         let started = std::time::Instant::now();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if self
-            .transport_tx
-            .send(TransportMessage::Rpc {
-                query,
-                response_tx: tx,
-            })
-            .await
-            .is_err()
-        {
-            tracing::warn!(query = %variant, "transport query channel closed");
-            return Err(ControlError::ChannelClosed);
-        }
-        let send_elapsed = started.elapsed();
-        let timeout = Duration::from_secs(5);
-        let result = match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(_)) => Err(ControlError::ChannelClosed),
+        let mut send_elapsed = None;
+        let transaction = async {
+            self.transport_tx
+                .send(TransportMessage::Rpc {
+                    query,
+                    response_tx: tx,
+                })
+                .await
+                .map_err(|_| ControlError::ChannelClosed)?;
+            send_elapsed = Some(started.elapsed());
+            rx.await.map_err(|_| ControlError::ChannelClosed)
+        };
+        let result = match tokio::time::timeout(timeout, transaction).await {
+            Ok(result) => result,
             Err(_) => Err(ControlError::Timeout(timeout)),
         };
         let total = started.elapsed();
         if result.is_err() || total > Duration::from_millis(1000) {
             tracing::warn!(
                 query = %variant,
-                send_ms = send_elapsed.as_millis() as u64,
+                send_ms = send_elapsed.unwrap_or(total).as_millis() as u64,
                 total_ms = total.as_millis() as u64,
                 timed_out = matches!(&result, Err(ControlError::Timeout(_))),
                 "transport query slow or failed"
@@ -9795,6 +9801,51 @@ loglevel = 7
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].hash, [0x61; 16]);
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_transport_query_deadline_includes_channel_submission() {
+        let timeout = Duration::from_millis(40);
+        let (transport_tx, transport_rx) = mpsc::channel::<TransportMessage>(1);
+        transport_tx
+            .send(TransportMessage::Shutdown)
+            .await
+            .expect("prefill actor channel");
+
+        let mut handle = dummy_handle();
+        handle.transport_tx = transport_tx;
+        let started = std::time::Instant::now();
+        let result = handle
+            .query_transport_result_with_timeout(TransportQuery::GetPathTable, timeout)
+            .await;
+
+        assert!(matches!(result, Err(ControlError::Timeout(t)) if t == timeout));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(transport_rx);
+    }
+
+    #[tokio::test]
+    async fn local_transport_query_deadline_includes_response_wait() {
+        let timeout = Duration::from_millis(40);
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let responder = tokio::spawn(async move {
+            let TransportMessage::Rpc { response_tx, .. } =
+                transport_rx.recv().await.expect("transport query")
+            else {
+                panic!("expected transport RPC");
+            };
+            std::future::pending::<()>().await;
+            drop(response_tx);
+        });
+
+        let mut handle = dummy_handle();
+        handle.transport_tx = transport_tx;
+        let result = handle
+            .query_transport_result_with_timeout(TransportQuery::GetPathTable, timeout)
+            .await;
+
+        assert!(matches!(result, Err(ControlError::Timeout(t)) if t == timeout));
+        responder.abort();
     }
 
     #[tokio::test]
