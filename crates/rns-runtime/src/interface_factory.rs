@@ -32,7 +32,7 @@ pub enum InterfaceConfig {
     #[cfg(feature = "serial")]
     KissSerial(KissSerialConfig),
     Auto(AutoInterfaceConfig),
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
     RNode(RNodeInterfaceConfig),
     Local(LocalInterfaceConfig),
     I2P(I2PInterfaceConfig),
@@ -94,11 +94,12 @@ pub struct AutoInterfaceConfig {
     pub mode: InterfaceMode,
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
 #[derive(Debug, Clone)]
 pub struct RNodeInterfaceConfig {
     pub name: String,
     pub port: String,
+    pub baud_rate: u32,
     pub frequency: u32,
     pub bandwidth: u32,
     pub spreading_factor: u8,
@@ -116,7 +117,7 @@ pub struct RNodeInterfaceConfig {
     pub id_callsign: Option<String>,
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
 impl RNodeInterfaceConfig {
     /// Convert runtime configuration into the lower driver type while
     /// preserving signed-value and RF-range validation.
@@ -129,6 +130,7 @@ impl RNodeInterfaceConfig {
                 message: format!("{} is outside 0..=37 dBm", self.tx_power),
             })?;
         let mut config = rns_interface::rnode::RNodeConfig::new(&self.name, &self.port);
+        config.baud_rate = self.baud_rate;
         config.frequency = self.frequency;
         config.bandwidth = self.bandwidth;
         config.spreading_factor = self.spreading_factor;
@@ -476,12 +478,20 @@ pub fn synthesize_interface(
                     )));
                 }
             }
-            // Android USB-OTG ports vanish on replug; add them at runtime after
-            // the device is present.
             if port.starts_with("androidusb://") {
-                return Err(InterfaceFactoryError::Disabled(format!(
-                    "RNodeInterface '{name}' is an Android USB-OTG entry — skipped at startup; re-add from the UI after plugging the device in"
-                )));
+                #[cfg(target_os = "android")]
+                {
+                    // Keep Android USB entries in the same persisted
+                    // RNodeInterface schema as serial, TCP and BLE. The
+                    // runtime selects the JNI transport from the URI.
+                    return synthesize_rnode(name, section, mode);
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    return Err(InterfaceFactoryError::Disabled(format!(
+                        "RNodeInterface '{name}' uses an Android USB-OTG port on a non-Android build"
+                    )));
+                }
             }
             #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
             {
@@ -769,7 +779,7 @@ fn synthesize_auto(
     }))
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
 fn synthesize_rnode(
     name: &str,
     section: &ConfigSection,
@@ -783,6 +793,11 @@ fn synthesize_rnode(
         })?
         .to_string();
 
+    let baud_rate = section
+        .get_uint("speed")
+        .or_else(|| section.get_uint("baud_rate"))
+        .unwrap_or(115200) as u32;
+
     let (frequency, bandwidth, spreading_factor, coding_rate, tx_power) =
         require_generic_rnode_radio_params(name, section)?;
 
@@ -791,6 +806,7 @@ fn synthesize_rnode(
     let config = RNodeInterfaceConfig {
         name: name.to_string(),
         port,
+        baud_rate,
         frequency,
         bandwidth,
         spreading_factor,
@@ -810,7 +826,7 @@ fn synthesize_rnode(
     Ok(InterfaceConfig::RNode(config))
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
 fn require_generic_rnode_radio_params(
     name: &str,
     section: &ConfigSection,
@@ -872,7 +888,7 @@ fn require_generic_rnode_radio_params(
     ))
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
 fn required_rnode_scalar<'a>(
     name: &str,
     section: &'a ConfigSection,
@@ -889,7 +905,7 @@ fn required_rnode_scalar<'a>(
     })
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
 fn parse_required_rnode_unsigned<T>(
     name: &str,
     section: &ConfigSection,
@@ -912,7 +928,7 @@ where
     Ok((key, value))
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
 fn parse_required_rnode_signed<T>(
     name: &str,
     section: &ConfigSection,
@@ -935,7 +951,7 @@ where
     Ok((key, value))
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
 fn validate_parsed_rnode_integer<T>(
     name: &str,
     key: &str,
@@ -956,7 +972,7 @@ where
     Ok(value)
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
 fn parse_generic_rnode_airtime(
     name: &str,
     section: &ConfigSection,
@@ -969,7 +985,7 @@ fn parse_generic_rnode_airtime(
     Ok((flow_control, st_alock, lt_alock))
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
 fn parse_generic_rnode_airtime_value(
     name: &str,
     section: &ConfigSection,
@@ -1215,13 +1231,13 @@ fn synthesize_rnode_multi(
                     name: format!("{name}/{sub_name}"),
                     field: "vport".to_string(),
                 })? as u8;
-        if vport as usize > rns_interface::rnode_multi::MAX_SUBINTERFACES {
+        if vport as usize >= rns_interface::rnode_multi::MAX_SUBINTERFACES {
             return Err(InterfaceFactoryError::InvalidValue {
                 field: format!("{sub_name}.vport"),
                 message: format!(
-                    "virtual port {} exceeds max {}",
+                    "virtual port {} is outside 0..{}",
                     vport,
-                    rns_interface::rnode_multi::MAX_SUBINTERFACES
+                    rns_interface::rnode_multi::MAX_SUBINTERFACES - 1
                 ),
             });
         }
@@ -1605,7 +1621,7 @@ pub fn default_ifac_size_for(config: &InterfaceConfig) -> usize {
         | InterfaceConfig::KissSerial(_)
         | InterfaceConfig::RNodeMulti(_)
         | InterfaceConfig::AX25KISS(_) => 8,
-        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
         InterfaceConfig::RNode(_) => 8,
         InterfaceConfig::Local(_) | InterfaceConfig::Pipe(_) => 8,
         #[cfg(feature = "ble")]
@@ -2229,6 +2245,7 @@ mod tests {
             InterfaceConfig::RNode(c) => {
                 assert_eq!(c.name, "test_rnode");
                 assert_eq!(c.port, "/dev/ttyACM0");
+                assert_eq!(c.baud_rate, 115200);
                 assert_eq!(c.frequency, 868000000);
                 assert_eq!(c.bandwidth, 125000);
                 assert_eq!(c.spreading_factor, 7);
@@ -2456,6 +2473,7 @@ mod tests {
         section.set("type", "RNodeInterface");
         section.set("port", "tcp://rnode.local");
         section.set("frequency", "915000000");
+        section.set("speed", "230400");
         set_rnode_radio_params(&mut section);
 
         let config = synthesize_interface("rnode_tcp", &section).unwrap();
@@ -2463,10 +2481,26 @@ mod tests {
             InterfaceConfig::RNode(c) => {
                 assert_eq!(c.name, "rnode_tcp");
                 assert_eq!(c.port, "tcp://rnode.local");
+                assert_eq!(c.baud_rate, 230400);
                 assert_eq!(c.frequency, 915000000);
             }
             _ => panic!("expected RNode"),
         }
+    }
+
+    #[cfg(all(
+        not(target_os = "android"),
+        any(feature = "serial", feature = "rnode-tcp")
+    ))]
+    #[test]
+    fn test_android_usb_rnode_is_not_synthesized_off_android() {
+        let mut section = complete_rnode_section();
+        section.set("port", "androidusb:///dev/bus/usb/001/002");
+        assert!(matches!(
+            synthesize_interface("android_usb", &section),
+            Err(InterfaceFactoryError::Disabled(message))
+                if message.contains("non-Android build")
+        ));
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -2576,6 +2610,7 @@ mod tests {
         let _rnode = InterfaceConfig::RNode(RNodeInterfaceConfig {
             name: "r".to_string(),
             port: "/dev/ttyACM0".to_string(),
+            baud_rate: 115200,
             frequency: 868000000,
             bandwidth: 125000,
             spreading_factor: 7,
@@ -3074,6 +3109,31 @@ mod tests {
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn test_synthesize_rnode_multi_rejects_first_out_of_range_vport() {
+        let mut section = ConfigSection::new();
+        section.set("type", "RNodeMultiInterface");
+        section.set("port", "/dev/ttyACM0");
+
+        let mut sub = ConfigSection::new();
+        sub.set(
+            "vport",
+            &rns_interface::rnode_multi::MAX_SUBINTERFACES.to_string(),
+        );
+        sub.set("frequency", "865600000");
+        sub.set("bandwidth", "125000");
+        sub.set("txpower", "14");
+        sub.set("spreadingfactor", "7");
+        sub.set("codingrate", "5");
+        section.subsections.insert("Invalid".to_string(), sub);
+
+        assert!(matches!(
+            synthesize_interface("test_rnodemulti", &section),
+            Err(InterfaceFactoryError::InvalidValue { field, .. }) if field == "Invalid.vport"
+        ));
     }
 
     #[cfg(feature = "serial")]

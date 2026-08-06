@@ -571,6 +571,18 @@ impl UsbInboundState {
             projection.publisher.stopped(reason);
         }
     }
+
+    /// Return the lifecycle publisher after one physical USB generation ends.
+    ///
+    /// Framing and protocol evidence are intentionally generation-local, but
+    /// the privacy-safe observation stream belongs to the stable logical
+    /// interface and must survive an unplug/replug cycle.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) fn into_publisher(mut self) -> Option<RNodeSnapshotPublisher> {
+        self.projection
+            .take()
+            .map(|projection| projection.publisher)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1191,11 +1203,15 @@ pub(crate) enum UsbTxPumpExit {
 /// stall writer admission, and a full writer queue cannot stall inbound
 /// forwarding in the driver task.
 pub(crate) async fn run_usb_tx_pump(
-    mut application_rx: mpsc::Receiver<Bytes>,
+    application_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>,
     writer: UsbWriterHandle,
     transmitted_bytes: Arc<AtomicU64>,
     mut stop: oneshot::Receiver<()>,
 ) -> UsbTxPumpExit {
+    // A fresh physical USB generation borrows the same application queue.
+    // The lock is released when that generation's pump exits, preserving the
+    // stable InterfaceHandle across reconnects without duplicating queues.
+    let mut application_rx = application_rx.lock().await;
     loop {
         let payload = tokio::select! {
             biased;
@@ -3134,6 +3150,7 @@ mod tests {
         });
 
         let (application_tx, application_rx) = mpsc::channel(1);
+        let application_rx = Arc::new(tokio::sync::Mutex::new(application_rx));
         let (pump_stop_tx, pump_stop_rx) = oneshot::channel();
         let transmitted = Arc::new(AtomicU64::new(0));
         let expected_frame_length = kiss::frame(&[4, 5, 6]).len() as u64;
@@ -3169,8 +3186,61 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn application_queue_survives_sequential_usb_generations() {
+        let (application_tx, application_rx) = mpsc::channel(2);
+        let application_rx = Arc::new(tokio::sync::Mutex::new(application_rx));
+        let transmitted = Arc::new(AtomicU64::new(0));
+
+        let (first_stop_tx, first_stop_rx) = oneshot::channel();
+        let first_pump = tokio::spawn(run_usb_tx_pump(
+            application_rx.clone(),
+            UsbWriterHandle {
+                queue: UsbWriteQueue::new(1),
+            },
+            transmitted.clone(),
+            first_stop_rx,
+        ));
+        first_stop_tx.send(()).expect("stop first generation");
+        assert_eq!(
+            first_pump.await.expect("first pump join"),
+            UsbTxPumpExit::StopRequested
+        );
+
+        let payload = Bytes::from_static(&[4, 2, 4, 2]);
+        let expected_frame_length = kiss::frame(&payload).len() as u64;
+        application_tx
+            .send(payload)
+            .await
+            .expect("queue payload between generations");
+
+        let (second_stop_tx, second_stop_rx) = oneshot::channel();
+        let second_pump = tokio::spawn(run_usb_tx_pump(
+            application_rx,
+            UsbWriterHandle {
+                queue: UsbWriteQueue::new(1),
+            },
+            transmitted.clone(),
+            second_stop_rx,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while transmitted.load(Ordering::Relaxed) != expected_frame_length {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second generation did not receive the queued payload");
+
+        second_stop_tx.send(()).expect("stop second generation");
+        assert_eq!(
+            second_pump.await.expect("second pump join"),
+            UsbTxPumpExit::StopRequested
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blocked_tx_admission_does_not_stall_inbound_forwarding() {
         let (application_tx, application_rx) = mpsc::channel(1);
+        let application_rx = Arc::new(tokio::sync::Mutex::new(application_rx));
         let (pump_stop_tx, pump_stop_rx) = oneshot::channel();
         let transmitted = Arc::new(AtomicU64::new(0));
         let pump = tokio::spawn(run_usb_tx_pump(

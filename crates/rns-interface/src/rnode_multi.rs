@@ -1,10 +1,13 @@
 //! Multi-radio RNode: up to 11 sub-interfaces on one serial connection.
-//! One read task demuxes by per-vport command byte; one write task prepends
-//! `CMD_SEL_INT` so the device picks the right radio.
+//! One read task demuxes canonical `CMD_DATA` frames by the most recently
+//! selected virtual port; one write task prepends `CMD_SEL_INT` so the device
+//! picks the right radio.
 
+use std::collections::HashSet;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -29,8 +32,12 @@ pub const CMD_ERROR: u8 = 0x90;
 pub const ERROR_INITRADIO: u8 = 0x01;
 pub const ERROR_TXFAILED: u8 = 0x02;
 
-/// Per-sub-interface data command bytes. NOT port-nibble; some collide
-/// (e.g. `CMD_INT5_DATA == CMD_ERROR`) — demux by vport index, not byte.
+/// Legacy per-interface constants exposed by the firmware protocol.
+///
+/// Live RNodeMulti traffic is not demultiplexed with this table. The canonical
+/// wire form selects a vport with [`CMD_SEL_INT`] and then sends one ordinary
+/// [`kiss::CMD_DATA`] frame. Treating these values as inbound data commands
+/// makes `0x90` indistinguishable from [`CMD_ERROR`].
 pub const CMD_INT_DATA: [u8; 12] = [
     0x00, 0x10, 0x20, 0x70, 0x75, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0,
 ];
@@ -83,7 +90,7 @@ impl RadioType {
 #[derive(Debug, Clone)]
 pub struct SubInterfaceConfig {
     pub name: String,
-    /// vport index on RNode (0..MAX_SUBINTERFACES).
+    /// vport index on RNode (`0..MAX_SUBINTERFACES`).
     pub vport: u8,
     pub frequency: u32,
     pub bandwidth: u32,
@@ -158,10 +165,12 @@ impl SubInterfaceConfig {
                 ));
             }
         }
-        if self.vport as usize > MAX_SUBINTERFACES {
+        if self.vport as usize >= MAX_SUBINTERFACES {
             return Err(format!(
-                "Virtual port {} exceeds max {} for sub-interface {}",
-                self.vport, MAX_SUBINTERFACES, self.name
+                "Virtual port {} is outside 0..{} for sub-interface {}",
+                self.vport,
+                MAX_SUBINTERFACES - 1,
+                self.name
             ));
         }
         Ok(())
@@ -249,6 +258,14 @@ pub fn build_subinterface_data_frame(index: u8, data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Map a legacy `CMD_INTn_DATA` constant to its nominal vport.
+///
+/// This helper is retained for protocol inspection and compatibility only.
+/// It must not be used to route live RNodeMulti input; use `CMD_SEL_INT`
+/// followed by `CMD_DATA` instead.
+#[deprecated(
+    note = "legacy constants collide with control commands; route CMD_DATA by CMD_SEL_INT"
+)]
 pub fn command_to_subinterface(cmd_byte: u8) -> Option<usize> {
     for (i, &port_cmd) in CMD_INT_DATA.iter().enumerate() {
         if cmd_byte == port_cmd {
@@ -256,6 +273,345 @@ pub fn command_to_subinterface(cmd_byte: u8) -> Option<usize> {
         }
     }
     None
+}
+
+const RNODE_HW_MTU: u32 = 508;
+const RNODE_OPEN_SETTLE: Duration = Duration::from_secs(2);
+const RNODE_SUBINTERFACE_SETTLE: Duration = Duration::from_secs(2);
+const RNODE_SUBINTERFACE_READY_SETTLE: Duration = Duration::from_millis(300);
+const RNODE_DISCOVERY_DEADLINE: Duration = Duration::from_secs(2);
+const RNODE_CONFIGURATION_DEADLINE: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RadioEvidence {
+    frequency: Option<u32>,
+    bandwidth: Option<u32>,
+    spreading_factor: Option<u8>,
+    coding_rate: Option<u8>,
+    tx_power: Option<u8>,
+    radio_state: Option<u8>,
+}
+
+impl RadioEvidence {
+    fn complete(self) -> bool {
+        self.frequency.is_some()
+            && self.bandwidth.is_some()
+            && self.spreading_factor.is_some()
+            && self.coding_rate.is_some()
+            && self.tx_power.is_some()
+            && self.radio_state.is_some()
+    }
+
+    fn validate(self, config: &SubInterfaceConfig) -> Result<(), String> {
+        let frequency = self
+            .frequency
+            .ok_or_else(|| format!("{} did not report frequency", config.name))?;
+        if frequency.abs_diff(config.frequency) > crate::rnode_protocol::FREQUENCY_TOLERANCE_HZ {
+            return Err(format!("{} reported a different frequency", config.name));
+        }
+        if self.bandwidth != Some(config.bandwidth) {
+            return Err(format!("{} reported a different bandwidth", config.name));
+        }
+        if self.spreading_factor != Some(config.spreading_factor) {
+            return Err(format!(
+                "{} reported a different spreading factor",
+                config.name
+            ));
+        }
+        if self.coding_rate != Some(config.coding_rate) {
+            return Err(format!("{} reported a different coding rate", config.name));
+        }
+        if self.tx_power != Some(config.tx_power) {
+            return Err(format!("{} reported a different TX power", config.name));
+        }
+        if self.radio_state != Some(rnode::RADIO_STATE_ON) {
+            return Err(format!("{} did not report its radio online", config.name));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct StartupEvidence {
+    detected: bool,
+    firmware: Option<(u8, u8)>,
+    interfaces: [Option<RadioType>; MAX_SUBINTERFACES],
+    selected_vport: Option<u8>,
+    radios: [RadioEvidence; MAX_SUBINTERFACES],
+}
+
+impl Default for StartupEvidence {
+    fn default() -> Self {
+        Self {
+            detected: false,
+            firmware: None,
+            interfaces: [None; MAX_SUBINTERFACES],
+            selected_vport: None,
+            radios: [RadioEvidence::default(); MAX_SUBINTERFACES],
+        }
+    }
+}
+
+impl StartupEvidence {
+    fn apply_frame(&mut self, command: u8, payload: &[u8]) -> Result<(), String> {
+        match command {
+            rnode::CMD_DETECT => {
+                if payload.len() != 1 {
+                    return Err("RNodeMulti returned malformed detection evidence".into());
+                }
+                self.detected = payload[0] == rnode::DETECT_RESP;
+            }
+            rnode::CMD_FW_VERSION => {
+                if payload.len() != 2 {
+                    return Err("RNodeMulti returned malformed firmware evidence".into());
+                }
+                self.firmware = Some((payload[0], payload[1]));
+            }
+            CMD_INTERFACES => {
+                if payload.is_empty() {
+                    return Ok(());
+                }
+                if payload.len() % 2 != 0 {
+                    return Err("RNodeMulti returned a malformed interface list".into());
+                }
+                for pair in payload.chunks_exact(2) {
+                    let vport = pair[0] as usize;
+                    if vport >= MAX_SUBINTERFACES {
+                        return Err(format!(
+                            "RNodeMulti reported unsupported virtual port {}",
+                            pair[0]
+                        ));
+                    }
+                    let radio_type = RadioType::from_u8(pair[1]).ok_or_else(|| {
+                        format!(
+                            "RNodeMulti reported unknown radio type 0x{:02X} on virtual port {}",
+                            pair[1], pair[0]
+                        )
+                    })?;
+                    if self.interfaces[vport].is_some_and(|known| known != radio_type) {
+                        return Err(format!(
+                            "RNodeMulti changed the radio type reported for virtual port {}",
+                            pair[0]
+                        ));
+                    }
+                    self.interfaces[vport] = Some(radio_type);
+                }
+            }
+            CMD_SEL_INT => {
+                if payload.len() != 1 || payload[0] as usize >= MAX_SUBINTERFACES {
+                    self.selected_vport = None;
+                    return Err("RNodeMulti returned an invalid virtual-port selection".into());
+                }
+                self.selected_vport = Some(payload[0]);
+            }
+            rnode::CMD_FREQUENCY => {
+                if payload.len() != 4 {
+                    return Err("RNodeMulti returned malformed frequency evidence".into());
+                }
+                if let Some(radio) = self.selected_radio_mut() {
+                    radio.frequency = Some(u32::from_be_bytes(
+                        payload.try_into().expect("length checked"),
+                    ));
+                }
+            }
+            rnode::CMD_BANDWIDTH => {
+                if payload.len() != 4 {
+                    return Err("RNodeMulti returned malformed bandwidth evidence".into());
+                }
+                if let Some(radio) = self.selected_radio_mut() {
+                    radio.bandwidth = Some(u32::from_be_bytes(
+                        payload.try_into().expect("length checked"),
+                    ));
+                }
+            }
+            rnode::CMD_SF => {
+                let value = one_byte(payload, "spreading factor")?;
+                if let Some(radio) = self.selected_radio_mut() {
+                    radio.spreading_factor = Some(value);
+                }
+            }
+            rnode::CMD_CR => {
+                let value = one_byte(payload, "coding rate")?;
+                if let Some(radio) = self.selected_radio_mut() {
+                    radio.coding_rate = Some(value);
+                }
+            }
+            rnode::CMD_TXPOWER => {
+                let value = one_byte(payload, "TX power")?;
+                if let Some(radio) = self.selected_radio_mut() {
+                    radio.tx_power = Some(value);
+                }
+            }
+            rnode::CMD_RADIO_STATE => {
+                let value = one_byte(payload, "radio state")?;
+                if let Some(radio) = self.selected_radio_mut() {
+                    radio.radio_state = Some(value);
+                }
+            }
+            CMD_ERROR => {
+                let class = match payload.first().copied() {
+                    Some(ERROR_INITRADIO) => "radio initialisation",
+                    Some(ERROR_TXFAILED) => "radio transmission",
+                    _ => "unknown hardware",
+                };
+                return Err(format!("RNodeMulti reported a {class} error"));
+            }
+            rnode::CMD_RESET if payload.first().copied() == Some(0xF8) => {
+                return Err("RNodeMulti reset during startup".into());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn selected_radio_mut(&mut self) -> Option<&mut RadioEvidence> {
+        self.selected_vport
+            .and_then(|vport| self.radios.get_mut(vport as usize))
+    }
+
+    fn discovery_complete(&self, config: &RNodeMultiConfig) -> bool {
+        self.detected
+            && self.firmware.is_some()
+            && config
+                .subinterfaces
+                .iter()
+                .all(|sub| self.interfaces[sub.vport as usize].is_some())
+    }
+
+    fn validate_discovery(&self, config: &RNodeMultiConfig) -> Result<(), String> {
+        if !self.detected {
+            return Err("RNodeMulti device did not answer detection".into());
+        }
+        let (major, minor) = self
+            .firmware
+            .ok_or_else(|| "RNodeMulti did not report its firmware version".to_string())?;
+        if (major, minor) < (REQUIRED_FW_VER_MAJ, REQUIRED_FW_VER_MIN) {
+            return Err(format!(
+                "RNodeMulti firmware {major}.{minor} is below required {}.{}",
+                REQUIRED_FW_VER_MAJ, REQUIRED_FW_VER_MIN
+            ));
+        }
+        for sub in &config.subinterfaces {
+            let radio_type = self.interfaces[sub.vport as usize].ok_or_else(|| {
+                format!(
+                    "virtual port {} for {} was not reported by the RNodeMulti device",
+                    sub.vport, sub.name
+                )
+            })?;
+            if !radio_type.validate_frequency(sub.frequency) {
+                return Err(format!(
+                    "frequency {} is outside the {} range reported for {}",
+                    sub.frequency,
+                    radio_type.family_name(),
+                    sub.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn reset_radio(&mut self, vport: u8) {
+        self.radios[vport as usize] = RadioEvidence::default();
+        self.selected_vport = None;
+    }
+
+    fn radio_complete(&self, vport: u8) -> bool {
+        self.radios[vport as usize].complete()
+    }
+}
+
+fn one_byte(payload: &[u8], field: &str) -> Result<u8, String> {
+    if payload.len() != 1 {
+        return Err(format!("RNodeMulti returned malformed {field} evidence"));
+    }
+    Ok(payload[0])
+}
+
+fn read_startup_until(
+    port: &mut dyn serialport::SerialPort,
+    deframer: &mut kiss::RawKissDeframer,
+    evidence: &mut StartupEvidence,
+    deadline: Instant,
+    ready: impl Fn(&StartupEvidence) -> bool,
+) -> Result<(), String> {
+    let mut buffer = [0u8; 1024];
+    while Instant::now() < deadline {
+        match port.read(&mut buffer) {
+            Ok(0) => {}
+            Ok(read) => {
+                for (command, payload) in deframer.feed(&buffer[..read]) {
+                    evidence.apply_frame(command, &payload)?;
+                    if ready(evidence) {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => return Err(format!("RNodeMulti startup read failed: {error}")),
+        }
+    }
+    Err("RNodeMulti startup validation timed out".into())
+}
+
+fn initialise_rnode_multi(
+    mut port: Box<dyn serialport::SerialPort>,
+    config: &RNodeMultiConfig,
+) -> Result<Box<dyn serialport::SerialPort>, String> {
+    std::thread::sleep(RNODE_OPEN_SETTLE);
+    let mut deframer = kiss::RawKissDeframer::new();
+    let mut evidence = StartupEvidence::default();
+
+    port.write_all(&build_detect_sequence())
+        .map_err(|error| format!("RNodeMulti detect write failed: {error}"))?;
+    port.flush()
+        .map_err(|error| format!("RNodeMulti detect flush failed: {error}"))?;
+    read_startup_until(
+        port.as_mut(),
+        &mut deframer,
+        &mut evidence,
+        Instant::now() + RNODE_DISCOVERY_DEADLINE,
+        |state| state.discovery_complete(config),
+    )?;
+    evidence.validate_discovery(config)?;
+
+    for sub in &config.subinterfaces {
+        // RNode firmware configures one physical radio at a time. Match the
+        // established RNodeMulti startup cadence and let the selected radio
+        // settle before sending its reset/init sequence.
+        std::thread::sleep(RNODE_SUBINTERFACE_SETTLE);
+        evidence.reset_radio(sub.vport);
+        port.write_all(&build_subinterface_init(sub.vport, sub))
+            .map_err(|error| format!("RNodeMulti {} init write failed: {error}", sub.name))?;
+        port.flush()
+            .map_err(|error| format!("RNodeMulti {} init flush failed: {error}", sub.name))?;
+        read_startup_until(
+            port.as_mut(),
+            &mut deframer,
+            &mut evidence,
+            Instant::now() + RNODE_CONFIGURATION_DEADLINE,
+            |state| state.radio_complete(sub.vport),
+        )?;
+        evidence.radios[sub.vport as usize].validate(sub)?;
+        // Match upstream's brief post-validation pause before exposing this
+        // radio or beginning configuration of the next physical radio.
+        std::thread::sleep(RNODE_SUBINTERFACE_READY_SETTLE);
+    }
+
+    Ok(port)
+}
+
+fn selected_data_target(
+    command: u8,
+    selected_vport: Option<u8>,
+    vport_map: &[Option<usize>; MAX_SUBINTERFACES],
+) -> Option<usize> {
+    if command != kiss::CMD_DATA {
+        return None;
+    }
+    selected_vport
+        .and_then(|vport| vport_map.get(vport as usize))
+        .copied()
+        .flatten()
 }
 
 struct WriteRequest {
@@ -334,6 +690,15 @@ pub async fn spawn_rnode_multi_interface(
         sub.validate()
             .map_err(|e| InterfaceError::SendFailed(format!("RNodeMulti config: {}", e)))?;
     }
+    let mut configured_vports = HashSet::with_capacity(config.subinterfaces.len());
+    for sub in &config.subinterfaces {
+        if !configured_vports.insert(sub.vport) {
+            return Err(InterfaceError::SendFailed(format!(
+                "RNodeMulti config: virtual port {} is configured more than once",
+                sub.vport
+            )));
+        }
+    }
 
     let port = serialport::new(&config.port, config.baud_rate)
         .timeout(Duration::from_millis(RNODE_READ_TIMEOUT_MS))
@@ -347,36 +712,13 @@ pub async fn spawn_rnode_multi_interface(
         "RNodeMulti interface opened"
     );
 
-    {
-        let mut detect_port = port
-            .try_clone()
-            .map_err(|e| InterfaceError::SendFailed(format!("RNodeMulti clone: {}", e)))?;
-        let detect_seq = build_detect_sequence();
-        use std::io::Write;
-        detect_port
-            .write_all(&detect_seq)
-            .map_err(|e| InterfaceError::SendFailed(format!("RNodeMulti detect write: {}", e)))?;
-        detect_port
-            .flush()
-            .map_err(|e| InterfaceError::SendFailed(format!("RNodeMulti detect flush: {}", e)))?;
-    }
-
-    {
-        let mut init_port = port
-            .try_clone()
-            .map_err(|e| InterfaceError::SendFailed(format!("RNodeMulti clone: {}", e)))?;
-        let mut init_seq = Vec::new();
-        for sub in &config.subinterfaces {
-            init_seq.extend_from_slice(&build_subinterface_init(sub.vport, sub));
-        }
-        use std::io::Write;
-        init_port
-            .write_all(&init_seq)
-            .map_err(|e| InterfaceError::SendFailed(format!("RNodeMulti init write: {}", e)))?;
-        init_port
-            .flush()
-            .map_err(|e| InterfaceError::SendFailed(format!("RNodeMulti init flush: {}", e)))?;
-    }
+    let startup_config = config.clone();
+    let port = tokio::task::spawn_blocking(move || initialise_rnode_multi(port, &startup_config))
+        .await
+        .map_err(|error| {
+            InterfaceError::SendFailed(format!("RNodeMulti startup worker failed: {error}"))
+        })?
+        .map_err(|error| InterfaceError::SendFailed(format!("RNodeMulti startup: {error}")))?;
 
     let online = Arc::new(AtomicBool::new(true));
 
@@ -478,7 +820,7 @@ pub async fn spawn_rnode_multi_interface(
                 repeat: false,
             },
             bitrate,
-            mtu: rns_wire::constants::MTU as u32,
+            mtu: RNODE_HW_MTU,
             online: sub_onlines[i].clone(),
             rxb: Some(rxb),
             txb: Some(txb),
@@ -602,13 +944,11 @@ pub async fn spawn_rnode_multi_interface(
     let parent_name = config.name.clone();
 
     // `vport_map[vport] -> Some(local_index)` for configured sub-interfaces.
-    let mut vport_map: [Option<usize>; 12] = [None; 12];
+    let mut vport_map: [Option<usize>; MAX_SUBINTERFACES] = [None; MAX_SUBINTERFACES];
     let mut sub_ids: Vec<InterfaceId> = Vec::with_capacity(num_subs);
     for (i, sub_cfg) in config.subinterfaces.iter().enumerate() {
         let vp = sub_cfg.vport as usize;
-        if vp < 12 {
-            vport_map[vp] = Some(i);
-        }
+        vport_map[vp] = Some(i);
         sub_ids.push(ids[i]);
     }
 
@@ -622,10 +962,8 @@ pub async fn spawn_rnode_multi_interface(
             .collect();
 
         // Which sub-interface the device is currently addressing via
-        // CMD_SEL_INT; status commands below target this index.
-        let mut selected_index: usize = 0;
-
-        let mut interfaces_buf: Vec<u8> = Vec::new();
+        // CMD_SEL_INT; status and canonical CMD_DATA frames target this vport.
+        let mut selected_vport: Option<u8> = Some(0);
 
         loop {
             if !flags_r.device_running() {
@@ -641,11 +979,13 @@ pub async fn spawn_rnode_multi_interface(
                     }
 
                     for (raw_cmd, frame) in deframer.feed(&buf[..n]) {
-                        if let Some(vport) = command_to_subinterface(raw_cmd) {
+                        if raw_cmd == kiss::CMD_DATA {
                             if frame.is_empty() {
                                 continue;
                             }
-                            if let Some(local_idx) = vport_map[vport] {
+                            if let Some(local_idx) =
+                                selected_data_target(raw_cmd, selected_vport, &vport_map)
+                            {
                                 sub_rxb[local_idx].fetch_add(frame.len() as u64, Ordering::Relaxed);
 
                                 let rssi = signals[local_idx].last_rssi.take();
@@ -669,7 +1009,7 @@ pub async fn spawn_rnode_multi_interface(
                             } else {
                                 tracing::debug!(
                                     parent = %parent_name,
-                                    vport,
+                                    vport = ?selected_vport,
                                     "data for unconfigured sub-interface, dropping"
                                 );
                             }
@@ -681,7 +1021,15 @@ pub async fn spawn_rnode_multi_interface(
                                 // Device echoes selection before emitting any
                                 // status/config responses for that sub-interface.
                                 if let Some(&idx) = frame.first() {
-                                    selected_index = idx as usize;
+                                    selected_vport =
+                                        ((idx as usize) < MAX_SUBINTERFACES).then_some(idx);
+                                    if selected_vport.is_none() {
+                                        tracing::warn!(
+                                            parent = %parent_name,
+                                            vport = idx,
+                                            "RNodeMulti selected an invalid virtual port"
+                                        );
+                                    }
                                 }
                             }
 
@@ -689,7 +1037,7 @@ pub async fn spawn_rnode_multi_interface(
                                 if !frame.is_empty() {
                                     let rssi = rnode::decode_rssi_byte(frame[0]);
                                     if let Some(local_idx) =
-                                        vport_map.get(selected_index).copied().flatten()
+                                        selected_vport.and_then(|vport| vport_map[vport as usize])
                                     {
                                         signals[local_idx].last_rssi = Some(rssi);
                                     }
@@ -699,7 +1047,7 @@ pub async fn spawn_rnode_multi_interface(
                                 if !frame.is_empty() {
                                     let snr = rnode::decode_snr_byte(frame[0]);
                                     if let Some(local_idx) =
-                                        vport_map.get(selected_index).copied().flatten()
+                                        selected_vport.and_then(|vport| vport_map[vport as usize])
                                     {
                                         signals[local_idx].last_snr = Some(snr);
                                     }
@@ -746,20 +1094,20 @@ pub async fn spawn_rnode_multi_interface(
 
                             rnode::CMD_RADIO_STATE => {
                                 if let Some(local_idx) =
-                                    vport_map.get(selected_index).copied().flatten()
+                                    selected_vport.and_then(|vport| vport_map[vport as usize])
                                 {
                                     if frame.first().copied() == Some(rnode::RADIO_STATE_ON) {
                                         tracing::info!(
                                             parent = %parent_name,
                                             subinterface = local_idx,
-                                            vport = selected_index,
+                                            vport = ?selected_vport,
                                             "RNodeMulti sub-interface radio online"
                                         );
                                     } else {
                                         tracing::warn!(
                                             parent = %parent_name,
                                             subinterface = local_idx,
-                                            vport = selected_index,
+                                            vport = ?selected_vport,
                                             "RNodeMulti sub-interface radio offline"
                                         );
                                     }
@@ -773,7 +1121,7 @@ pub async fn spawn_rnode_multi_interface(
                                     ]);
                                     tracing::debug!(
                                         parent = %parent_name,
-                                        vport = selected_index,
+                                        vport = ?selected_vport,
                                         freq_mhz = format!("{:.3}", freq as f64 / 1_000_000.0),
                                         "Radio reporting frequency"
                                     );
@@ -787,7 +1135,7 @@ pub async fn spawn_rnode_multi_interface(
                                     ]);
                                     tracing::debug!(
                                         parent = %parent_name,
-                                        vport = selected_index,
+                                        vport = ?selected_vport,
                                         bw_khz = format!("{:.1}", bw as f64 / 1000.0),
                                         "Radio reporting bandwidth"
                                     );
@@ -798,7 +1146,7 @@ pub async fn spawn_rnode_multi_interface(
                                 if !frame.is_empty() {
                                     tracing::debug!(
                                         parent = %parent_name,
-                                        vport = selected_index,
+                                        vport = ?selected_vport,
                                         sf = frame[0],
                                         "Radio reporting spreading factor"
                                     );
@@ -809,7 +1157,7 @@ pub async fn spawn_rnode_multi_interface(
                                 if !frame.is_empty() {
                                     tracing::debug!(
                                         parent = %parent_name,
-                                        vport = selected_index,
+                                        vport = ?selected_vport,
                                         cr = frame[0],
                                         "Radio reporting coding rate"
                                     );
@@ -821,7 +1169,7 @@ pub async fn spawn_rnode_multi_interface(
                                     let txp = frame[0] as i8;
                                     tracing::debug!(
                                         parent = %parent_name,
-                                        vport = selected_index,
+                                        vport = ?selected_vport,
                                         txpower_dbm = txp,
                                         "Radio reporting TX power"
                                     );
@@ -834,7 +1182,7 @@ pub async fn spawn_rnode_multi_interface(
                                     let pct = at as f32 / 100.0;
                                     tracing::debug!(
                                         parent = %parent_name,
-                                        vport = selected_index,
+                                        vport = ?selected_vport,
                                         "RNodeMulti short-term airtime limit: {:.2}%", pct,
                                     );
                                 }
@@ -846,7 +1194,7 @@ pub async fn spawn_rnode_multi_interface(
                                     let pct = at as f32 / 100.0;
                                     tracing::debug!(
                                         parent = %parent_name,
-                                        vport = selected_index,
+                                        vport = ?selected_vport,
                                         "RNodeMulti long-term airtime limit: {:.2}%", pct,
                                     );
                                 }
@@ -873,12 +1221,10 @@ pub async fn spawn_rnode_multi_interface(
                             }
 
                             CMD_INTERFACES => {
-                                // Reply is a stream of 2-byte `[vport, radio_type]`
-                                // pairs, one per radio module; accumulate then pop.
-                                interfaces_buf.extend_from_slice(&frame);
-                                if interfaces_buf.len() >= 2 {
-                                    let vp = interfaces_buf[0];
-                                    let rt = interfaces_buf[1];
+                                // Reply is one or more `[vport, radio_type]` pairs.
+                                for pair in frame.chunks_exact(2) {
+                                    let vp = pair[0];
+                                    let rt = pair[1];
                                     let rtype = RadioType::from_u8(rt)
                                         .map(|r| r.family_name().to_string())
                                         .unwrap_or_else(|| format!("unknown(0x{:02X})", rt));
@@ -888,13 +1234,30 @@ pub async fn spawn_rnode_multi_interface(
                                         radio_type = %rtype,
                                         "RNodeMulti radio module reported"
                                     );
-                                    interfaces_buf.clear();
+                                }
+                                if frame.len() % 2 != 0 {
+                                    tracing::warn!(
+                                        parent = %parent_name,
+                                        "RNodeMulti returned a malformed interface list"
+                                    );
                                 }
                             }
 
-                            // No CMD_ERROR arm: 0x90 collides with CMD_INT5_DATA
-                            // and is consumed by the vport demux above — same
-                            // collision as Python RNodeMultiInterface.
+                            CMD_ERROR => {
+                                let class = match frame.first().copied() {
+                                    Some(ERROR_INITRADIO) => "radio initialisation",
+                                    Some(ERROR_TXFAILED) => "radio transmission",
+                                    _ => "unknown hardware",
+                                };
+                                tracing::error!(
+                                    parent = %parent_name,
+                                    class,
+                                    "RNodeMulti hardware error"
+                                );
+                                flags_r.trip_device();
+                                return;
+                            }
+
                             rnode::CMD_RESET => {
                                 if frame.first().copied() == Some(0xF8) {
                                     tracing::error!(
@@ -1020,25 +1383,6 @@ mod tests {
     }
 
     #[test]
-    fn test_command_to_subinterface() {
-        assert_eq!(command_to_subinterface(0x00), Some(0));
-        assert_eq!(command_to_subinterface(0x10), Some(1));
-        assert_eq!(command_to_subinterface(0x20), Some(2));
-        assert_eq!(command_to_subinterface(0x70), Some(3));
-        assert_eq!(command_to_subinterface(0x75), Some(4));
-        assert_eq!(command_to_subinterface(0x90), Some(5));
-        assert_eq!(command_to_subinterface(0xA0), Some(6));
-        assert_eq!(command_to_subinterface(0xB0), Some(7));
-        assert_eq!(command_to_subinterface(0xC0), Some(8));
-        assert_eq!(command_to_subinterface(0xD0), Some(9));
-        assert_eq!(command_to_subinterface(0xE0), Some(10));
-        assert_eq!(command_to_subinterface(0xF0), Some(11));
-        assert_eq!(command_to_subinterface(0x55), None);
-        assert_eq!(command_to_subinterface(0xFF), None);
-        assert_eq!(command_to_subinterface(0x01), None);
-    }
-
-    #[test]
     fn test_radio_type() {
         assert_eq!(RadioType::from_u8(0x00), Some(RadioType::SX127X));
         assert_eq!(RadioType::from_u8(0x11), Some(RadioType::SX1262));
@@ -1068,7 +1412,12 @@ mod tests {
     #[test]
     fn test_max_subinterfaces() {
         assert_eq!(MAX_SUBINTERFACES, 11);
-        assert_eq!(CMD_INT_DATA.len(), 12);
+        assert_eq!(RNODE_HW_MTU, 508);
+
+        let highest = SubInterfaceConfig::new("radio10", 10, 868_000_000);
+        assert!(highest.validate().is_ok());
+        let outside = SubInterfaceConfig::new("radio11", 11, 868_000_000);
+        assert!(outside.validate().is_err());
     }
 
     #[test]
@@ -1099,9 +1448,9 @@ mod tests {
 
     #[test]
     fn test_raw_kiss_deframer_preserves_command() {
-        // CMD_INT5_DATA = 0x90 collides with CMD_ERROR after masking; the raw
-        // deframer must keep the high nibble intact.
-        let payload = b"test data";
+        // CMD_ERROR is 0x90. The raw deframer must retain that exact command
+        // so it can never be mistaken for vport-5 packet data.
+        let payload = &[ERROR_INITRADIO];
         let mut raw_frame = Vec::new();
         raw_frame.push(kiss::FEND);
         raw_frame.push(0x90);
@@ -1111,10 +1460,12 @@ mod tests {
         let mut deframer = kiss::RawKissDeframer::new();
         let frames = deframer.feed(&raw_frame);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].0, 0x90);
+        assert_eq!(frames[0].0, CMD_ERROR);
         assert_eq!(frames[0].1, payload);
 
-        assert_eq!(command_to_subinterface(0x90), Some(5));
+        let mut vport_map = [None; MAX_SUBINTERFACES];
+        vport_map[5] = Some(0);
+        assert_eq!(selected_data_target(CMD_ERROR, Some(5), &vport_map), None);
     }
 
     #[test]
@@ -1214,7 +1565,7 @@ mod tests {
         bad.st_alock = Some(101.0);
         assert!(bad.validate().is_err());
 
-        let bad = SubInterfaceConfig::new("radio0", 12, 868_000_000);
+        let bad = SubInterfaceConfig::new("radio0", 11, 868_000_000);
         assert!(bad.validate().is_err());
     }
 
@@ -1284,55 +1635,118 @@ mod tests {
     }
 
     #[test]
-    fn test_all_subinterface_data_commands_unique() {
-        for (i, lhs) in CMD_INT_DATA.iter().enumerate() {
-            for (j, rhs) in CMD_INT_DATA.iter().enumerate().skip(i + 1) {
-                assert_ne!(
-                    lhs, rhs,
-                    "CMD_INT_DATA[{}] == CMD_INT_DATA[{}] == 0x{:02X}",
-                    i, j, *lhs
-                );
-            }
-        }
+    fn canonical_data_routing_uses_selected_vport_only() {
+        let mut vport_map = [None; MAX_SUBINTERFACES];
+        vport_map[0] = Some(0);
+        vport_map[5] = Some(1);
+
+        assert_eq!(
+            selected_data_target(kiss::CMD_DATA, Some(5), &vport_map),
+            Some(1)
+        );
+        assert_eq!(
+            selected_data_target(kiss::CMD_DATA, Some(0), &vport_map),
+            Some(0)
+        );
+        assert_eq!(
+            selected_data_target(kiss::CMD_DATA, Some(4), &vport_map),
+            None
+        );
+        assert_eq!(selected_data_target(CMD_ERROR, Some(5), &vport_map), None);
+        assert_eq!(selected_data_target(0xA0, Some(5), &vport_map), None);
     }
 
     #[test]
-    fn test_data_commands_dont_collide_with_control_commands() {
-        let control_cmds = [
-            CMD_SEL_INT,
-            rnode::CMD_STAT_RSSI,
-            rnode::CMD_STAT_SNR,
-            rnode::CMD_READY,
-            rnode::CMD_DETECT,
-            rnode::CMD_FW_VERSION,
-            rnode::CMD_RADIO_STATE,
-            rnode::CMD_FREQUENCY,
-            rnode::CMD_BANDWIDTH,
-            rnode::CMD_SF,
-            rnode::CMD_CR,
-            rnode::CMD_TXPOWER,
-            rnode::CMD_ST_ALOCK,
-            rnode::CMD_LT_ALOCK,
-            rnode::CMD_PLATFORM,
-            rnode::CMD_MCU,
-            CMD_INTERFACES,
-            rnode::CMD_RESET,
-        ];
+    fn startup_discovery_validates_firmware_interface_types_and_ranges() {
+        let mut config = RNodeMultiConfig::new("multi0", "/dev/null");
+        config
+            .subinterfaces
+            .push(SubInterfaceConfig::new("low", 0, 868_000_000));
+        config
+            .subinterfaces
+            .push(SubInterfaceConfig::new("high", 3, 2_400_000_000));
 
-        for &data_cmd in &CMD_INT_DATA {
-            for &ctrl_cmd in &control_cmds {
-                // CMD_INT0_DATA == CMD_DATA (0x00) and CMD_INT5_DATA ==
-                // CMD_ERROR (0x90) are known, intentional overlaps; the read
-                // loop disambiguates by checking data commands first.
-                if data_cmd == 0x00 || data_cmd == 0x90 {
-                    continue;
-                }
-                assert_ne!(
-                    data_cmd, ctrl_cmd,
-                    "CMD_INT_DATA 0x{:02X} collides with control cmd 0x{:02X}",
-                    data_cmd, ctrl_cmd
-                );
-            }
-        }
+        let mut state = StartupEvidence::default();
+        state
+            .apply_frame(rnode::CMD_DETECT, &[rnode::DETECT_RESP])
+            .unwrap();
+        // Lexicographic comparison accepts newer major versions.
+        state.apply_frame(rnode::CMD_FW_VERSION, &[2, 0]).unwrap();
+        state
+            .apply_frame(
+                CMD_INTERFACES,
+                &[0, RadioType::SX1276 as u8, 3, RadioType::SX1280 as u8],
+            )
+            .unwrap();
+
+        assert!(state.discovery_complete(&config));
+        assert!(state.validate_discovery(&config).is_ok());
+
+        config.subinterfaces[1].frequency = 915_000_000;
+        assert!(state.validate_discovery(&config).is_err());
+    }
+
+    #[test]
+    fn startup_discovery_rejects_malformed_or_unknown_interfaces() {
+        let mut state = StartupEvidence::default();
+        assert!(state.apply_frame(CMD_INTERFACES, &[0]).is_err());
+        assert!(state.apply_frame(CMD_INTERFACES, &[0, 0xFF]).is_err());
+        assert!(
+            state
+                .apply_frame(CMD_INTERFACES, &[MAX_SUBINTERFACES as u8, 0x00])
+                .is_err()
+        );
+        assert!(state.apply_frame(CMD_ERROR, &[ERROR_INITRADIO]).is_err());
+    }
+
+    #[test]
+    fn startup_requires_matching_echoes_before_radio_is_ready() {
+        let config = SubInterfaceConfig::new("radio0", 0, 868_000_000);
+        let mut state = StartupEvidence::default();
+        state.apply_frame(CMD_SEL_INT, &[0]).unwrap();
+        state
+            .apply_frame(rnode::CMD_FREQUENCY, &config.frequency.to_be_bytes())
+            .unwrap();
+        state
+            .apply_frame(rnode::CMD_BANDWIDTH, &config.bandwidth.to_be_bytes())
+            .unwrap();
+        state
+            .apply_frame(rnode::CMD_SF, &[config.spreading_factor])
+            .unwrap();
+        state
+            .apply_frame(rnode::CMD_CR, &[config.coding_rate])
+            .unwrap();
+        state
+            .apply_frame(rnode::CMD_TXPOWER, &[config.tx_power])
+            .unwrap();
+        assert!(!state.radio_complete(0));
+        state
+            .apply_frame(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_ON])
+            .unwrap();
+
+        assert!(state.radio_complete(0));
+        assert!(state.radios[0].validate(&config).is_ok());
+
+        let mut mismatch = state.radios[0];
+        mismatch.coding_rate = Some(config.coding_rate + 1);
+        assert!(mismatch.validate(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn duplicate_vports_are_rejected_before_opening_serial() {
+        let mut config = RNodeMultiConfig::new("multi0", "/does/not/exist");
+        config
+            .subinterfaces
+            .push(SubInterfaceConfig::new("first", 0, 868_000_000));
+        config
+            .subinterfaces
+            .push(SubInterfaceConfig::new("second", 0, 915_000_000));
+        let (transport_tx, _transport_rx) = mpsc::channel(1);
+        let result = spawn_rnode_multi_interface(config, &[1, 2], transport_tx).await;
+        let error = match result {
+            Ok(_) => panic!("duplicate vports must fail before serial open"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("configured more than once"));
     }
 }

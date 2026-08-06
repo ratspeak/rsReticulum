@@ -839,7 +839,12 @@ impl RNodeSnapshotPublisher {
         });
     }
 
-    #[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+    #[cfg(any(
+        feature = "serial",
+        feature = "rnode-tcp",
+        feature = "ble",
+        target_os = "android"
+    ))]
     pub(crate) fn reconnect_started(&self) {
         self.update(|snapshot| {
             snapshot.phase = RNodeRuntimePhase::Connecting;
@@ -851,7 +856,12 @@ impl RNodeSnapshotPublisher {
         });
     }
 
-    #[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+    #[cfg(any(
+        feature = "serial",
+        feature = "rnode-tcp",
+        feature = "ble",
+        target_os = "android"
+    ))]
     pub(crate) fn connection_attempt_failed(&self) {
         self.update(|snapshot| {
             snapshot.phase = RNodeRuntimePhase::ReconnectBackoff;
@@ -861,7 +871,12 @@ impl RNodeSnapshotPublisher {
         });
     }
 
-    #[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+    #[cfg(any(
+        feature = "serial",
+        feature = "rnode-tcp",
+        feature = "ble",
+        target_os = "android"
+    ))]
     pub(crate) fn connection_lost(&self) {
         self.update(|snapshot| {
             snapshot.phase = RNodeRuntimePhase::ReconnectBackoff;

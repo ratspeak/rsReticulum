@@ -3519,8 +3519,21 @@ fn next_id(id_gen: &Arc<AtomicU64>) -> u64 {
 
 fn interface_kind_for_config(config: &interface_factory::InterfaceConfig) -> InterfaceKind {
     match config {
-        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-        interface_factory::InterfaceConfig::RNode(_) => InterfaceKind::RNode,
+        #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
+        interface_factory::InterfaceConfig::RNode(_config) => {
+            #[cfg(target_os = "android")]
+            if _config.port.starts_with("androidusb://") {
+                return InterfaceKind::AndroidUsbRNode;
+            }
+            #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+            {
+                InterfaceKind::RNode
+            }
+            #[cfg(not(any(feature = "serial", feature = "rnode-tcp")))]
+            {
+                InterfaceKind::Standard
+            }
+        }
         #[cfg(feature = "serial")]
         interface_factory::InterfaceConfig::RNodeMulti(_) => InterfaceKind::RNodeMulti,
         #[cfg(feature = "ble")]
@@ -3563,13 +3576,18 @@ impl PendingConfiguredRNodeRuntime {
     }
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp", feature = "ble"))]
+#[cfg(any(
+    feature = "serial",
+    feature = "rnode-tcp",
+    feature = "ble",
+    target_os = "android"
+))]
 fn pending_configured_rnode_runtime(
     config: &interface_factory::InterfaceConfig,
     handles: &[OwnedInterfaceHandle],
 ) -> Option<PendingConfiguredRNodeRuntime> {
     let configured_name = match config {
-        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
         interface_factory::InterfaceConfig::RNode(config) => config.name.clone(),
         #[cfg(feature = "ble")]
         interface_factory::InterfaceConfig::BleRNode(config) => config.name.clone(),
@@ -3590,7 +3608,12 @@ fn pending_configured_rnode_runtime(
     })
 }
 
-#[cfg(not(any(feature = "serial", feature = "rnode-tcp", feature = "ble")))]
+#[cfg(not(any(
+    feature = "serial",
+    feature = "rnode-tcp",
+    feature = "ble",
+    target_os = "android"
+)))]
 fn pending_configured_rnode_runtime(
     _config: &interface_factory::InterfaceConfig,
     _handles: &[OwnedInterfaceHandle],
@@ -5103,7 +5126,7 @@ fn interface_config_name(iface_config: &interface_factory::InterfaceConfig) -> &
         #[cfg(feature = "serial")]
         interface_factory::InterfaceConfig::KissSerial(c) => &c.name,
         interface_factory::InterfaceConfig::Auto(c) => &c.name,
-        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
         interface_factory::InterfaceConfig::RNode(c) => &c.name,
         interface_factory::InterfaceConfig::Local(c) => &c.name,
         interface_factory::InterfaceConfig::I2P(c) => &c.name,
@@ -5138,7 +5161,7 @@ fn interface_config_mode_mut(
         #[cfg(feature = "serial")]
         interface_factory::InterfaceConfig::KissSerial(c) => &mut c.mode,
         interface_factory::InterfaceConfig::Auto(c) => &mut c.mode,
-        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
         interface_factory::InterfaceConfig::RNode(c) => &mut c.mode,
         interface_factory::InterfaceConfig::Local(c) => &mut c.mode,
         interface_factory::InterfaceConfig::I2P(c) => &mut c.mode,
@@ -5176,7 +5199,7 @@ fn apply_discovery_mode_autocorrect(
     let is_rnode = {
         #[allow(unused_mut)]
         let mut rnode = false;
-        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
         {
             rnode |= matches!(iface_config, interface_factory::InterfaceConfig::RNode(_));
         }
@@ -5292,7 +5315,7 @@ fn discovery_config_for_interface(
                 None,
                 None,
             ),
-            #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+            #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
             interface_factory::InterfaceConfig::RNode(c) => (
                 "RNodeInterface",
                 configured_reachable_on(section),
@@ -7045,7 +7068,12 @@ async fn spawn_interface_with_rnode_startup_options(
     is_foreground: Arc<AtomicBool>,
     rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
 ) -> Result<Vec<OwnedInterfaceHandle>, String> {
-    #[cfg(not(any(feature = "serial", feature = "rnode-tcp", feature = "ble")))]
+    #[cfg(not(any(
+        feature = "serial",
+        feature = "rnode-tcp",
+        feature = "ble",
+        target_os = "android"
+    )))]
     let _ = rnode_startup_options;
 
     match iface_config {
@@ -7125,20 +7153,64 @@ async fn spawn_interface_with_rnode_startup_options(
                 .map(|h| vec![h.into()])
                 .map_err(|e| format!("Auto: {e}"))
         }
-        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
         interface_factory::InterfaceConfig::RNode(c) => {
-            let rnode_config = c
-                .to_rnode_config()
-                .map_err(|error| format!("RNode: {error}"))?;
-            rns_interface::rnode::spawn_rnode_interface_with_driver_and_options(
-                rnode_config,
-                id,
-                transport_tx,
-                rnode_startup_options,
-            )
-            .await
-            .map(|spawned| vec![spawned.into()])
-            .map_err(|e| format!("RNode: {e}"))
+            #[cfg(target_os = "android")]
+            if let Some(device_name) = c.port.strip_prefix("androidusb://") {
+                if device_name.is_empty() {
+                    return Err(format!(
+                        "Android USB RNode '{}': empty USB device name",
+                        c.name
+                    ));
+                }
+                let tx_power = u8::try_from(c.tx_power)
+                    .map_err(|_| format!("Android USB RNode '{}': invalid TX power", c.name))?;
+                let mut config =
+                    rns_interface::android_usb::AndroidUsbConfig::new(&c.name, device_name);
+                config.baud_rate = c.baud_rate;
+                config.frequency = c.frequency;
+                config.bandwidth = c.bandwidth;
+                config.spreading_factor = c.spreading_factor;
+                config.coding_rate = c.coding_rate;
+                config.tx_power = tx_power;
+                config.mode = c.mode;
+                config.flow_control = c.flow_control;
+                config.st_alock = c.st_alock;
+                config.lt_alock = c.lt_alock;
+                return rns_interface::android_usb::spawn_android_usb_rnode_interface_with_driver_and_options(
+                    config,
+                    id,
+                    transport_tx,
+                    rnode_startup_options,
+                )
+                .await
+                .map(|spawned| vec![spawned.into()])
+                .map_err(|error| format!("Android USB RNode: {error}"));
+            }
+
+            #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+            {
+                let rnode_config = c
+                    .to_rnode_config()
+                    .map_err(|error| format!("RNode: {error}"))?;
+                rns_interface::rnode::spawn_rnode_interface_with_driver_and_options(
+                    rnode_config,
+                    id,
+                    transport_tx,
+                    rnode_startup_options,
+                )
+                .await
+                .map(|spawned| vec![spawned.into()])
+                .map_err(|e| format!("RNode: {e}"))
+            }
+
+            #[cfg(not(any(feature = "serial", feature = "rnode-tcp")))]
+            {
+                Err(format!(
+                    "RNodeInterface '{}': non-Android port requires serial or rnode-tcp support",
+                    c.name
+                ))
+            }
         }
         interface_factory::InterfaceConfig::Local(c) => {
             let local_config = rns_interface::local::LocalClientConfig {
