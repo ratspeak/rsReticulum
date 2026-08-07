@@ -26,7 +26,7 @@ jobs:
           cache-bin: false
       - name: Install system deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev libpcsclite-dev pkg-config
       - name: Test (default features)
         run: cargo test --workspace --locked
       - name: Build application examples
@@ -45,7 +45,7 @@ jobs:
         with:
           components: clippy, rustfmt
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev libpcsclite-dev pkg-config
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Check public API documentation
@@ -67,6 +67,6 @@ jobs:
         with:
           cache-bin: false
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev libpcsclite-dev pkg-config
       - name: Clippy (all targets and features)
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
