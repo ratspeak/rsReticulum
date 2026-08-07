@@ -612,8 +612,8 @@ impl InboundResource {
         tracing::trace!(
             result = %format!("{:02x}{:02x}{:02x}{:02x}", mh[0], mh[1], mh[2], mh[3]),
             data_len = data.len(),
-            data_first16 = %data.iter().take(16).map(|b| format!("{:02x}", b)).collect::<String>(),
-            random_hash = %self.random_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+            data_first16 = %hex::encode(&data[..data.len().min(16)]),
+            random_hash = %hex::encode(self.random_hash),
             random_len = self.random_hash.len(),
             "resource part map hash"
         );

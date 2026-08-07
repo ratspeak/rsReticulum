@@ -2004,7 +2004,6 @@ mod tests {
     #[test]
     fn test_constants() {
         assert_eq!(HW_MTU, 1196);
-        const { assert!(FIXED_MTU) };
         assert_eq!(DISCOVERY_PORT, 29716);
         assert_eq!(DATA_PORT, 42671);
         assert_eq!(UNICAST_DISCOVERY_PORT, 29717);

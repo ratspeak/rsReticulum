@@ -849,12 +849,10 @@ impl Drop for InterfaceRegistration {
                 stop_owned_task(&mut task, &mut driver, Some(id)).await;
                 registry.mark_abandoned_pending(id, owner);
             });
-        } else {
-            if let Some(driver) = driver.take() {
-                driver.request_shutdown();
-            } else if let Some(task) = task.take() {
-                task.abort();
-            }
+        } else if let Some(driver) = driver.take() {
+            driver.request_shutdown();
+        } else if let Some(task) = task.take() {
+            task.abort();
         }
         // The exact owner remains fail-closed until the detached cleanup has
         // joined the task. During a runtime drain the coordinator claims the

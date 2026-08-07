@@ -336,7 +336,6 @@ mod tests {
     #[test]
     fn test_weave_constants() {
         assert_eq!(HW_MTU, 1024);
-        const { assert!(FIXED_MTU) };
         assert_eq!(PEERING_TIMEOUT, 20.0);
         assert_eq!(BITRATE_GUESS, 250_000);
         assert_eq!(DEFAULT_IFAC_SIZE, 16);

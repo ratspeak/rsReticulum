@@ -608,13 +608,13 @@ fn drop_worker_global_refs_attached(
 ) {
     let connection = connection.take();
     let endpoint = endpoint.take();
-    if let Some(vm) = JAVA_VM.get()
-        && let Ok(env) = vm.attach_current_thread()
-    {
-        drop(endpoint);
-        drop(connection);
-        drop(env);
-        return;
+    if let Some(vm) = JAVA_VM.get() {
+        if let Ok(env) = vm.attach_current_thread() {
+            drop(endpoint);
+            drop(connection);
+            drop(env);
+            return;
+        }
     }
     drop(endpoint);
     drop(connection);
