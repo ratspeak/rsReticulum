@@ -1661,7 +1661,7 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
                                 class = error.log_class(),
                                 "Android USB reconnect capability admission rejected"
                             );
-                            publisher.stopped(RNodeRuntimeReason::CapabilityAdmissionRejected);
+                            publisher.stopped_for_admission_rejection(error.failure_class());
                             if let Some(report) = last_report.take() {
                                 shutdown_status_tx
                                     .send_replace(AndroidUsbShutdownStatus::Complete(report));

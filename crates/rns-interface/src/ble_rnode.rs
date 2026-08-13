@@ -2253,7 +2253,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                             conn.peripheral.disconnect(),
                         )
                         .await;
-                        snapshot_publisher.stopped(RNodeRuntimeReason::CapabilityAdmissionRejected);
+                        snapshot_publisher.stopped_for_admission_rejection(error.failure_class());
                         return;
                     }
                 }
@@ -2954,7 +2954,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                             admission_failure = error.log_class(),
                             "BLE RNode native capability admission rejected"
                         );
-                        snapshot_publisher.stopped(RNodeRuntimeReason::CapabilityAdmissionRejected);
+                        snapshot_publisher.stopped_for_admission_rejection(error.failure_class());
                         return;
                     }
                 }
@@ -5329,6 +5329,10 @@ mod tests {
         assert_eq!(
             terminal.reason,
             Some(RNodeRuntimeReason::CapabilityAdmissionRejected)
+        );
+        assert_eq!(
+            terminal.capability_admission_failure,
+            Some(rnode::RNodeCapabilityAdmissionFailureClass::InvalidCapabilityImage)
         );
         assert!(!spawned.interface.online.load(Ordering::SeqCst));
         spawned

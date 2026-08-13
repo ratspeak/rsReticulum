@@ -235,7 +235,69 @@ pub enum RNodeCapabilityAdmissionError {
     RadioSettings(#[source] crate::rnode_capabilities::RNodeRadioAdmissionError),
 }
 
+/// Closed, privacy-safe classification of a capability admission failure.
+///
+/// Variants mirror [`RNodeCapabilityAdmissionError`] one-to-one but carry no
+/// limits, values, or device data, so the classification can cross the
+/// observation boundary. [`Self::log_class`] returns the stable log token for
+/// each class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RNodeCapabilityAdmissionFailureClass {
+    ResponseTimedOut,
+    ReadLimit,
+    InputLimit,
+    FrameLimit,
+    MalformedProtocol,
+    DeviceError,
+    DetectionRejected,
+    UnsupportedFirmware,
+    DuplicateEeprom,
+    InvalidCapabilityImage,
+    RadioSettingsRejected,
+}
+
+impl RNodeCapabilityAdmissionFailureClass {
+    /// Stable log token for this failure class.
+    pub const fn log_class(self) -> &'static str {
+        match self {
+            Self::ResponseTimedOut => "response_timeout",
+            Self::ReadLimit => "read_limit",
+            Self::InputLimit => "input_limit",
+            Self::FrameLimit => "frame_limit",
+            Self::MalformedProtocol => "malformed_protocol",
+            Self::DeviceError => "device_error",
+            Self::DetectionRejected => "detection_rejected",
+            Self::UnsupportedFirmware => "unsupported_firmware",
+            Self::DuplicateEeprom => "duplicate_eeprom",
+            Self::InvalidCapabilityImage => "invalid_capability_image",
+            Self::RadioSettingsRejected => "radio_settings_rejected",
+        }
+    }
+}
+
 impl RNodeCapabilityAdmissionError {
+    /// The privacy-safe classification for this admission failure.
+    pub fn failure_class(&self) -> RNodeCapabilityAdmissionFailureClass {
+        match self {
+            Self::ResponseTimedOut => RNodeCapabilityAdmissionFailureClass::ResponseTimedOut,
+            Self::ReadLimitExceeded { .. } => RNodeCapabilityAdmissionFailureClass::ReadLimit,
+            Self::InputLimitExceeded { .. } => RNodeCapabilityAdmissionFailureClass::InputLimit,
+            Self::FrameLimitExceeded { .. } => RNodeCapabilityAdmissionFailureClass::FrameLimit,
+            Self::MalformedProtocolFrame { .. } => {
+                RNodeCapabilityAdmissionFailureClass::MalformedProtocol
+            }
+            Self::DeviceError => RNodeCapabilityAdmissionFailureClass::DeviceError,
+            Self::DetectionRejected => RNodeCapabilityAdmissionFailureClass::DetectionRejected,
+            Self::UnsupportedFirmware => RNodeCapabilityAdmissionFailureClass::UnsupportedFirmware,
+            Self::DuplicateEepromResponse => RNodeCapabilityAdmissionFailureClass::DuplicateEeprom,
+            Self::CapabilityImage(_) => {
+                RNodeCapabilityAdmissionFailureClass::InvalidCapabilityImage
+            }
+            Self::RadioSettings(_) => RNodeCapabilityAdmissionFailureClass::RadioSettingsRejected,
+        }
+    }
+
     #[cfg(any(
         feature = "serial",
         feature = "rnode-tcp",
@@ -243,19 +305,7 @@ impl RNodeCapabilityAdmissionError {
         target_os = "android"
     ))]
     pub(crate) fn log_class(&self) -> &'static str {
-        match self {
-            Self::ResponseTimedOut => "response_timeout",
-            Self::ReadLimitExceeded { .. } => "read_limit",
-            Self::InputLimitExceeded { .. } => "input_limit",
-            Self::FrameLimitExceeded { .. } => "frame_limit",
-            Self::MalformedProtocolFrame { .. } => "malformed_protocol",
-            Self::DeviceError => "device_error",
-            Self::DetectionRejected => "detection_rejected",
-            Self::UnsupportedFirmware => "unsupported_firmware",
-            Self::DuplicateEepromResponse => "duplicate_eeprom",
-            Self::CapabilityImage(_) => "invalid_capability_image",
-            Self::RadioSettings(_) => "radio_settings_rejected",
-        }
+        self.failure_class().log_class()
     }
 }
 
@@ -433,6 +483,9 @@ pub struct RNodeRuntimeSnapshot {
     pub radio: RNodeObservedRadioState,
     pub transmit_flow: RNodeTransmitFlowState,
     pub reason: Option<RNodeRuntimeReason>,
+    /// Set only by a terminal capability admission rejection; identifies the
+    /// failure class without carrying any device data.
+    pub capability_admission_failure: Option<RNodeCapabilityAdmissionFailureClass>,
 }
 
 #[cfg(any(
@@ -458,6 +511,7 @@ impl RNodeRuntimeSnapshot {
             radio: RNodeObservedRadioState::Unknown,
             transmit_flow: RNodeTransmitFlowState::Unknown,
             reason: None,
+            capability_admission_failure: None,
         }
     }
 
@@ -808,6 +862,7 @@ impl RNodeSnapshotPublisher {
             snapshot.connection_generation = generation;
             snapshot.reconnect_attempt = 0;
             snapshot.reason = None;
+            snapshot.capability_admission_failure = None;
             snapshot.reset_protocol_observations();
         });
     }
@@ -830,6 +885,7 @@ impl RNodeSnapshotPublisher {
             snapshot.connection_generation = generation;
             snapshot.reconnect_attempt = 0;
             snapshot.reason = None;
+            snapshot.capability_admission_failure = None;
             snapshot.reset_protocol_observations();
             snapshot.capability = match admission {
                 crate::rnode_capabilities::RNodeRadioAdmission::Verified { .. } => {
@@ -859,6 +915,7 @@ impl RNodeSnapshotPublisher {
             snapshot.reconnect_attempt = snapshot.reconnect_attempt.saturating_add(1);
             snapshot.reconnect_total = snapshot.reconnect_total.saturating_add(1);
             snapshot.reason = None;
+            snapshot.capability_admission_failure = None;
             snapshot.reset_protocol_observations();
         });
     }
@@ -952,6 +1009,22 @@ impl RNodeSnapshotPublisher {
             snapshot.phase = RNodeRuntimePhase::Stopped;
             snapshot.connection_generation = 0;
             snapshot.reason = Some(reason);
+            snapshot.reset_protocol_observations();
+        });
+        self.terminal = true;
+    }
+
+    /// Terminal stop for a rejected capability admission, publishing the
+    /// failure class atomically with the phase and reason.
+    pub(crate) fn stopped_for_admission_rejection(
+        &mut self,
+        failure: RNodeCapabilityAdmissionFailureClass,
+    ) {
+        self.update(|snapshot| {
+            snapshot.phase = RNodeRuntimePhase::Stopped;
+            snapshot.connection_generation = 0;
+            snapshot.reason = Some(RNodeRuntimeReason::CapabilityAdmissionRejected);
+            snapshot.capability_admission_failure = Some(failure);
             snapshot.reset_protocol_observations();
         });
         self.terminal = true;
@@ -3291,7 +3364,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                                     "RNode reconnect capability admission rejected"
                                 );
                                 snapshot_publisher
-                                    .stopped(RNodeRuntimeReason::CapabilityAdmissionRejected);
+                                    .stopped_for_admission_rejection(error.failure_class());
                                 return;
                             }
                             Err(RNodeStrictPreflightError::Transport(error)) => {
@@ -3541,6 +3614,106 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_failure_classes_keep_legacy_log_tokens() {
+        let cases: &[(RNodeCapabilityAdmissionError, &str)] = &[
+            (
+                RNodeCapabilityAdmissionError::ResponseTimedOut,
+                "response_timeout",
+            ),
+            (
+                RNodeCapabilityAdmissionError::ReadLimitExceeded { limit: 1 },
+                "read_limit",
+            ),
+            (
+                RNodeCapabilityAdmissionError::InputLimitExceeded { limit: 1 },
+                "input_limit",
+            ),
+            (
+                RNodeCapabilityAdmissionError::FrameLimitExceeded { limit: 1 },
+                "frame_limit",
+            ),
+            (
+                RNodeCapabilityAdmissionError::MalformedProtocolFrame {
+                    rejection: crate::rnode_protocol::RNodeFrameRejection::UnknownCommand,
+                },
+                "malformed_protocol",
+            ),
+            (RNodeCapabilityAdmissionError::DeviceError, "device_error"),
+            (
+                RNodeCapabilityAdmissionError::DetectionRejected,
+                "detection_rejected",
+            ),
+            (
+                RNodeCapabilityAdmissionError::UnsupportedFirmware,
+                "unsupported_firmware",
+            ),
+            (
+                RNodeCapabilityAdmissionError::DuplicateEepromResponse,
+                "duplicate_eeprom",
+            ),
+            (
+                RNodeCapabilityAdmissionError::CapabilityImage(
+                    crate::rnode_capabilities::RNodeCapabilityParseError::InfoNotLocked,
+                ),
+                "invalid_capability_image",
+            ),
+            (
+                RNodeCapabilityAdmissionError::RadioSettings(
+                    crate::rnode_capabilities::RNodeRadioAdmissionError::TxPowerExceedsMaximum {
+                        requested_dbm: 23,
+                        max_dbm: 22,
+                    },
+                ),
+                "radio_settings_rejected",
+            ),
+        ];
+        for (error, token) in cases {
+            assert_eq!(error.failure_class().log_class(), *token);
+        }
+    }
+
+    #[test]
+    fn admission_rejection_stop_carries_class_and_ordinary_stops_do_not() {
+        let (mut publisher, driver) = new_rnode_driver_observation(RNodeTransportClass::Ble);
+        publisher.stopped_for_admission_rejection(
+            RNodeCapabilityAdmissionFailureClass::InvalidCapabilityImage,
+        );
+        let snapshot = driver.snapshot();
+        assert_eq!(snapshot.phase, RNodeRuntimePhase::Stopped);
+        assert_eq!(
+            snapshot.reason,
+            Some(RNodeRuntimeReason::CapabilityAdmissionRejected)
+        );
+        assert_eq!(
+            snapshot.capability_admission_failure,
+            Some(RNodeCapabilityAdmissionFailureClass::InvalidCapabilityImage)
+        );
+
+        let (mut ordinary, driver) = new_rnode_driver_observation(RNodeTransportClass::Ble);
+        ordinary.stopped(RNodeRuntimeReason::StopRequested);
+        let snapshot = driver.snapshot();
+        assert_eq!(snapshot.capability_admission_failure, None);
+    }
+
+    #[test]
+    fn new_generations_clear_a_stale_admission_failure_class() {
+        let (mut publisher, driver) = new_rnode_driver_observation(RNodeTransportClass::Ble);
+        publisher.update(|snapshot| {
+            snapshot.capability_admission_failure =
+                Some(RNodeCapabilityAdmissionFailureClass::DeviceError);
+        });
+        publisher.reconnect_started();
+        assert_eq!(driver.snapshot().capability_admission_failure, None);
+
+        publisher.update(|snapshot| {
+            snapshot.capability_admission_failure =
+                Some(RNodeCapabilityAdmissionFailureClass::DeviceError);
+        });
+        publisher.connection_established();
+        assert_eq!(driver.snapshot().capability_admission_failure, None);
+    }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[derive(Default)]

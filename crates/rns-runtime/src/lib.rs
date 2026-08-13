@@ -55,10 +55,10 @@ pub mod prelude {
     pub use rns_identity::identity::Identity;
     pub use rns_identity::ratchet::PersistentRatchetRing;
     pub use rns_interface::rnode::{
-        RNodeCapabilityAdmissionError, RNodeCapabilityState, RNodeConfigurationState,
-        RNodeDetectionState, RNodeFirmwareCompatibility, RNodeObservedRadioState,
-        RNodeRuntimePhase, RNodeRuntimeReason, RNodeRuntimeSnapshot, RNodeSpawnError,
-        RNodeStartupOptions, RNodeTransmitFlowState, RNodeTransportClass,
+        RNodeCapabilityAdmissionError, RNodeCapabilityAdmissionFailureClass, RNodeCapabilityState,
+        RNodeConfigurationState, RNodeDetectionState, RNodeFirmwareCompatibility,
+        RNodeObservedRadioState, RNodeRuntimePhase, RNodeRuntimeReason, RNodeRuntimeSnapshot,
+        RNodeSpawnError, RNodeStartupOptions, RNodeTransmitFlowState, RNodeTransportClass,
     };
     pub use rns_link::link::{CloseReason, ResourceStrategy};
 }

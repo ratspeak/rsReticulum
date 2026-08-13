@@ -698,6 +698,19 @@ impl RNodeReadinessError {
             | Self::ObservationClosed { last } => last.clone(),
         }
     }
+
+    /// The typed capability admission failure class, when the driver stopped
+    /// because a capability admission was rejected.
+    pub fn capability_admission_failure(
+        &self,
+    ) -> Option<rns_interface::rnode::RNodeCapabilityAdmissionFailureClass> {
+        match self {
+            Self::Timeout { last }
+            | Self::ShuttingDown { last }
+            | Self::Stopped { last }
+            | Self::ObservationClosed { last } => last.capability_admission_failure,
+        }
+    }
 }
 
 /// Options for [`ReticulumHandle::send_to`].
