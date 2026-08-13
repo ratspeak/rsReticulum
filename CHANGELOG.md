@@ -9,6 +9,8 @@
 - Let one-shot Link clients reuse a validated cached identity when its route is
   still live, matching Python recall behavior and avoiding redundant path
   discovery.
+- Keep completed `rncp` Links alive for Python's receiver-side Resource
+  conclusion callback before sending the authenticated teardown.
 
 ## 1.1.0 - 2026-07-26
 

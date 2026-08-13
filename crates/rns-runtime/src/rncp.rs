@@ -33,6 +33,13 @@ pub const FETCH_PATH_NAME: &str = "fetch_file";
 
 pub const DEFAULT_RNCP_APP_NAME: &str = "rncp.receive";
 
+/// Python sends the final Resource proof before it runs the receiver-side
+/// conclusion callback that materialises the file. Keep the Link alive for a
+/// short, bounded settlement window after a valid proof so an immediate
+/// teardown cannot race that callback and turn a proven Resource into
+/// `FAILED` on a loaded peer.
+const RNCP_POST_PROOF_SETTLE: Duration = Duration::from_millis(250);
+
 pub fn default_rncp_app_name() -> &'static str {
     DEFAULT_RNCP_APP_NAME
 }
@@ -637,6 +644,10 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
             break;
         }
         completed_parts += segment_parts;
+    }
+
+    if transfer_result.is_ok() {
+        tokio::time::sleep(RNCP_POST_PROOF_SETTLE).await;
     }
 
     if let Some(close_pkt) = build_link_close(&mut link) {
@@ -1564,5 +1575,10 @@ mod tests {
         let (header, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
         assert_eq!(header.context, rns_wire::context::PacketContext::LinkClose);
         assert!(responder.receive_teardown(&raw[offset..]));
+    }
+
+    #[test]
+    fn successful_rncp_send_retains_python_receiver_settlement_window() {
+        assert_eq!(RNCP_POST_PROOF_SETTLE, Duration::from_millis(250));
     }
 }
