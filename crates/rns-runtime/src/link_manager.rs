@@ -24,6 +24,8 @@ use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::{AnnounceRequest, DestinationEvent};
 use rns_transport::messages::{OutboundRequest, TransportMessage};
 
+const MAX_PENDING_DESTINATION_ANNOUNCES: usize = 256;
+
 struct ActiveLink {
     link: Link,
     _interface_id: u64,
@@ -99,6 +101,17 @@ pub struct LinkPacketProof {
 pub struct LinkResourceProof {
     pub link_id: [u8; 16],
     pub resource_hash: [u8; 32],
+}
+
+/// Valid delivery proof for a non-Link packet registered by an application.
+///
+/// The transport actor authenticates the proof before emitting this event.
+/// The message identifier is the opaque value supplied with
+/// [`TransportMessage::RegisterReceipt`].
+#[derive(Debug, Clone)]
+pub struct DestinationDeliveryProof {
+    pub msg_id: String,
+    pub rtt: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,6 +389,11 @@ struct ResourceTransferStart {
 pub struct LinkManager {
     transport_tx: mpsc::Sender<TransportMessage>,
     event_rx: mpsc::Receiver<DestinationEvent>,
+    /// Destination announces accepted while the bounded transport ingress is
+    /// momentarily full. Path responses are required to establish remote
+    /// Links, so they must survive transient traffic bursts instead of being
+    /// discarded by a best-effort `try_send`.
+    pending_destination_announces: VecDeque<TransportMessage>,
     active_links: HashMap<[u8; 16], ActiveLink>,
     /// Raw software signing key, when available. Hardware-backed identities sign
     /// through `identity` instead.
@@ -423,6 +441,10 @@ pub struct LinkManager {
     link_packet_proof_tx: Option<mpsc::Sender<LinkPacketProof>>,
     /// Valid proof for an application resource sent through this manager.
     outbound_resource_proof_tx: Option<mpsc::Sender<LinkResourceProof>>,
+    /// Valid proof for a non-Link packet registered by the owning application.
+    /// Unbounded because a validated terminal event must not be discarded after
+    /// the network has already acknowledged delivery.
+    destination_delivery_proof_tx: Option<mpsc::UnboundedSender<DestinationDeliveryProof>>,
     /// Unified inbound/outbound Resource lifecycle.
     resource_event_tx: Option<mpsc::Sender<LinkResourceEvent>>,
     /// Ordered non-progress accounting stream for owners that cannot tolerate
@@ -458,6 +480,7 @@ impl LinkManager {
         Self {
             transport_tx,
             event_rx,
+            pending_destination_announces: VecDeque::new(),
             active_links: HashMap::new(),
             identity_key,
             destination_hash,
@@ -481,6 +504,7 @@ impl LinkManager {
             link_packet_tx: None,
             link_packet_proof_tx: None,
             outbound_resource_proof_tx: None,
+            destination_delivery_proof_tx: None,
             resource_event_tx: None,
             accounting_event_tx: None,
             channel_message_tx: None,
@@ -518,6 +542,7 @@ impl LinkManager {
         Self {
             transport_tx,
             event_rx,
+            pending_destination_announces: VecDeque::new(),
             active_links: HashMap::new(),
             identity_key,
             destination_hash,
@@ -541,6 +566,7 @@ impl LinkManager {
             link_packet_tx: None,
             link_packet_proof_tx: None,
             outbound_resource_proof_tx: None,
+            destination_delivery_proof_tx: None,
             resource_event_tx: None,
             accounting_event_tx: None,
             channel_message_tx: None,
@@ -605,6 +631,7 @@ impl LinkManager {
     }
 
     pub fn try_step(&mut self) -> bool {
+        self.flush_pending_destination_announces();
         match self.event_rx.try_recv() {
             Ok(event) => {
                 self.handle_event(event);
@@ -617,6 +644,7 @@ impl LinkManager {
     }
 
     pub async fn step(&mut self) -> bool {
+        self.flush_pending_destination_announces();
         let Some(event) = self.event_rx.recv().await else {
             return false;
         };
@@ -625,6 +653,7 @@ impl LinkManager {
     }
 
     pub fn tick(&mut self) {
+        self.flush_pending_destination_announces();
         self.on_tick();
     }
 
@@ -632,6 +661,7 @@ impl LinkManager {
         let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
         loop {
+            self.flush_pending_destination_announces();
             tokio::select! {
                 event = self.event_rx.recv() => {
                     match event {
@@ -651,6 +681,7 @@ impl LinkManager {
         let mut last_tick = std::time::Instant::now();
         let mut events_closed = false;
         'run: loop {
+            self.flush_pending_destination_announces();
             while let Ok(command) = command_rx.try_recv() {
                 if !self.handle_command(command) {
                     break 'run;
@@ -874,8 +905,20 @@ impl LinkManager {
                     tracing::debug!(link_id = hex::encode(link_id), "link closed");
                 }
             }
-            DestinationEvent::DeliveryProof { msg_id, .. } => {
-                tracing::debug!(msg_id = %msg_id, "delivery proof (unhandled in link manager)");
+            DestinationEvent::DeliveryProof { msg_id, rtt } => {
+                if let Some(tx) = &self.destination_delivery_proof_tx {
+                    if tx
+                        .send(DestinationDeliveryProof {
+                            msg_id: msg_id.clone(),
+                            rtt,
+                        })
+                        .is_err()
+                    {
+                        tracing::warn!(msg_id = %msg_id, "destination delivery-proof receiver closed");
+                    }
+                } else {
+                    tracing::debug!(msg_id = %msg_id, "delivery proof has no application receiver");
+                }
             }
             DestinationEvent::AnnounceRequested(request) => {
                 if request.path_response {
@@ -951,16 +994,70 @@ impl LinkManager {
         } else {
             TransportMessage::Outbound(outbound)
         };
-        if let Err(error) = self.transport_tx.try_send(message) {
-            tracing::warn!(
-                app_name = %request.app_name,
-                path_response = request.path_response,
-                err = %error,
-                "failed to queue requested announce"
-            );
-            return Err(DestinationControlError::TransportUnavailable);
+        self.queue_destination_announce(message, &request)
+    }
+
+    fn queue_destination_announce(
+        &mut self,
+        message: TransportMessage,
+        request: &AnnounceRequest,
+    ) -> Result<(), DestinationControlError> {
+        if !self.pending_destination_announces.is_empty() {
+            if self.pending_destination_announces.len() >= MAX_PENDING_DESTINATION_ANNOUNCES {
+                tracing::warn!(
+                    app_name = %request.app_name,
+                    path_response = request.path_response,
+                    pending = self.pending_destination_announces.len(),
+                    "destination announce retry queue is full"
+                );
+                return Err(DestinationControlError::TransportUnavailable);
+            }
+            self.pending_destination_announces.push_back(message);
+            self.flush_pending_destination_announces();
+            return Ok(());
         }
-        Ok(())
+
+        match self.transport_tx.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(message)) => {
+                self.pending_destination_announces.push_back(message);
+                tracing::debug!(
+                    app_name = %request.app_name,
+                    path_response = request.path_response,
+                    "staged requested announce until transport ingress has capacity"
+                );
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!(
+                    app_name = %request.app_name,
+                    path_response = request.path_response,
+                    "failed to queue requested announce: transport channel is closed"
+                );
+                Err(DestinationControlError::TransportUnavailable)
+            }
+        }
+    }
+
+    fn flush_pending_destination_announces(&mut self) {
+        while let Some(message) = self.pending_destination_announces.pop_front() {
+            match self.transport_tx.try_send(message) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(message)) => {
+                    self.pending_destination_announces.push_front(message);
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    let discarded = self.pending_destination_announces.len() + 1;
+                    self.pending_destination_announces.clear();
+                    tracing::warn!(
+                        discarded,
+                        "discarding pending destination announces after transport shutdown"
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -3897,6 +3994,15 @@ impl LinkManager {
         self.outbound_resource_proof_tx = Some(tx);
     }
 
+    /// Install the lossless application receiver for validated non-Link packet
+    /// delivery proofs.
+    pub fn set_destination_delivery_proof_channel(
+        &mut self,
+        tx: mpsc::UnboundedSender<DestinationDeliveryProof>,
+    ) {
+        self.destination_delivery_proof_tx = Some(tx);
+    }
+
     /// Install the bounded best-effort Resource lifecycle channel.
     pub fn set_resource_event_channel(&mut self, tx: mpsc::Sender<LinkResourceEvent>) {
         self.resource_event_tx = Some(tx);
@@ -4653,6 +4759,25 @@ mod tests {
     const TEST_CHANNEL_MSG_TYPE: u16 = 0x1234;
 
     #[test]
+    fn validated_destination_delivery_proof_reaches_application_channel() {
+        let (transport_tx, _transport_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let mut manager = LinkManager::new(transport_tx, event_rx, [0xA0; 16], None);
+        let (proof_tx, mut proof_rx) = mpsc::unbounded_channel();
+        manager.set_destination_delivery_proof_channel(proof_tx);
+
+        let rtt = std::time::Duration::from_millis(275);
+        manager.handle_event(DestinationEvent::DeliveryProof {
+            msg_id: "a1b2c3".to_string(),
+            rtt: Some(rtt),
+        });
+
+        let proof = proof_rx.try_recv().expect("proof must be forwarded");
+        assert_eq!(proof.msg_id, "a1b2c3");
+        assert_eq!(proof.rtt, Some(rtt));
+    }
+
+    #[test]
     fn channel_message_registration_is_bounded_to_user_types_and_idempotent() {
         let (transport_tx, _transport_rx) = mpsc::channel(1);
         let (_event_tx, event_rx) = mpsc::channel(1);
@@ -5372,6 +5497,54 @@ mod tests {
         assert_eq!(
             second_request.raw, first_raw,
             "same path-response tag should reuse cached announce bytes"
+        );
+    }
+
+    #[test]
+    fn path_response_announce_retries_after_transport_ingress_saturation() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(TransportMessage::DeregisterDestination { hash: [0x44; 16] })
+            .unwrap();
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let identity = Identity::new();
+        let mut manager = LinkManager::with_destination(
+            tx,
+            event_rx,
+            &identity,
+            "test.path-retry",
+            identity.get_signing_key(),
+        );
+
+        manager.handle_event(DestinationEvent::AnnounceRequested(AnnounceRequest {
+            app_name: "test.path-retry".to_string(),
+            path_response: true,
+            tag: Some(vec![0xC7; 16]),
+            attached_interface: Some(17),
+        }));
+
+        assert_eq!(manager.pending_destination_announces.len(), 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TransportMessage::DeregisterDestination { .. })
+        ));
+
+        manager.tick();
+
+        assert!(manager.pending_destination_announces.is_empty());
+        let TransportMessage::OutboundAttached {
+            request,
+            interface_id,
+        } = rx
+            .try_recv()
+            .expect("staged path response should be retried")
+        else {
+            panic!("expected attached outbound path response");
+        };
+        assert_eq!(interface_id, 17);
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::PathResponse
         );
     }
 
