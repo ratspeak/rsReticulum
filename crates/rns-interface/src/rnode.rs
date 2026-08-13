@@ -3697,6 +3697,13 @@ mod tests {
         assert_eq!(snapshot.capability_admission_failure, None);
     }
 
+    // reconnect_started only exists under the transport features.
+    #[cfg(any(
+        feature = "serial",
+        feature = "rnode-tcp",
+        feature = "ble",
+        target_os = "android"
+    ))]
     #[test]
     fn new_generations_clear_a_stale_admission_failure_class() {
         let (mut publisher, driver) = new_rnode_driver_observation(RNodeTransportClass::Ble);
