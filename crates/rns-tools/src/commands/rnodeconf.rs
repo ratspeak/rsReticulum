@@ -366,8 +366,11 @@ impl MutationOutcome {
 }
 
 fn model_verification_summary(admission: RNodeRadioAdmission) -> String {
-    let product = admission.product_code();
-    let model = admission.model_code();
+    // rnodeconf admissions derive from a locked, parsed identity, so the
+    // codes are always present; the unprovisioned arm is unreachable here.
+    let (Some(product), Some(model)) = (admission.product_code(), admission.model_code()) else {
+        return "generic RF validation only; no provisioned identity".to_string();
+    };
     if admission.is_verified() {
         format!("model-specific limits verified for product 0x{product:02x}, model 0x{model:02x}")
     } else {

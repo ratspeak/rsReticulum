@@ -3435,7 +3435,16 @@ mod tests {
         bytes
     }
 
-    fn strict_capability_response(model: u8) -> Vec<u8> {
+    fn unprovisioned_capability_eeprom() -> Vec<u8> {
+        let mut bytes = capability_eeprom(0xB8);
+        bytes[0x9B] = 0xFF;
+        for byte in &mut bytes[11..27] {
+            *byte = 0x5A;
+        }
+        bytes
+    }
+
+    fn strict_capability_response_with_eeprom(eeprom: &[u8]) -> Vec<u8> {
         let mut response = kiss::frame_with_command(kiss::CMD_DATA, b"preflight-private");
         response.extend(kiss::frame_with_command(
             rnode::CMD_DETECT,
@@ -3445,11 +3454,12 @@ mod tests {
             rnode::CMD_FW_VERSION,
             &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
         ));
-        response.extend(kiss::frame_with_command(
-            rnode::CMD_ROM_READ,
-            &capability_eeprom(model),
-        ));
+        response.extend(kiss::frame_with_command(rnode::CMD_ROM_READ, eeprom));
         response
+    }
+
+    fn strict_capability_response(model: u8) -> Vec<u8> {
+        strict_capability_response_with_eeprom(&capability_eeprom(model))
     }
 
     fn capability_notifications(bytes: &[u8]) -> Vec<ValueNotification> {
@@ -4498,8 +4508,20 @@ mod tests {
 
     #[tokio::test]
     async fn strict_desktop_ble_preflight_admits_verified_and_unverified_without_data_leakage() {
-        for (model, verified) in [(0xB8, true), (0xFE, false)] {
-            let response = strict_capability_response(model);
+        for (response, expected_capability) in [
+            (
+                strict_capability_response(0xB8),
+                rnode::RNodeCapabilityState::Verified,
+            ),
+            (
+                strict_capability_response(0xFE),
+                rnode::RNodeCapabilityState::Unverified,
+            ),
+            (
+                strict_capability_response_with_eeprom(&unprovisioned_capability_eeprom()),
+                rnode::RNodeCapabilityState::Unprovisioned,
+            ),
+        ] {
             let mut queued = capability_notifications(&response);
             queued.push(ValueNotification {
                 uuid: NUS_TX_CHAR_UUID,
@@ -4526,7 +4548,11 @@ mod tests {
             };
             assert_eq!(
                 matches!(admission, RNodeRadioAdmission::Verified { .. }),
-                verified
+                expected_capability == rnode::RNodeCapabilityState::Verified
+            );
+            assert_eq!(
+                matches!(admission, RNodeRadioAdmission::Unprovisioned),
+                expected_capability == rnode::RNodeCapabilityState::Unprovisioned
             );
             let evidence = protocol_state.evidence();
             assert!(evidence.detected);
@@ -4543,14 +4569,7 @@ mod tests {
             publisher.capability_connection_established(&protocol_state, admission);
             let snapshot = driver.snapshot();
             assert_eq!(snapshot.connection_generation, 1);
-            assert_eq!(
-                snapshot.capability,
-                if verified {
-                    rnode::RNodeCapabilityState::Verified
-                } else {
-                    rnode::RNodeCapabilityState::Unverified
-                }
-            );
+            assert_eq!(snapshot.capability, expected_capability);
             assert_eq!(
                 snapshot.configuration,
                 rnode::RNodeConfigurationState::Unknown
@@ -5028,6 +5047,71 @@ mod tests {
             }),
             "strict preflight must not send radio init"
         );
+    }
+
+    #[tokio::test]
+    async fn strict_native_ble_preflight_admits_unprovisioned_eeprom() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind unprovisioned strict bridge");
+        let address = listener.local_addr().expect("unprovisioned bridge address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("accept unprovisioned bridge");
+            let mut commands = Vec::new();
+            let mut deframer = kiss::RawKissDeframer::new();
+            let mut buffer = [0u8; 1024];
+            while !commands.contains(&rnode::CMD_ROM_READ) {
+                let count = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buffer))
+                    .await
+                    .expect("unprovisioned request timeout")
+                    .expect("unprovisioned request read");
+                assert!(count > 0, "request ended before ROM read");
+                commands.extend(
+                    deframer
+                        .feed(&buffer[..count])
+                        .into_iter()
+                        .map(|(command, _)| command),
+                );
+            }
+            stream
+                .write_all(&strict_capability_response_with_eeprom(
+                    &unprovisioned_capability_eeprom(),
+                ))
+                .await
+                .expect("write unprovisioned response");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect unprovisioned bridge");
+        let (mut read, mut write) = stream.into_split();
+        let running = AtomicBool::new(true);
+        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
+        let outcome = run_native_ble_capability_preflight(
+            &mut read,
+            &mut write,
+            ble_radio_settings(&config),
+            &running,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .await;
+        let BleCapabilityPreflightOutcome::Admitted {
+            protocol_state,
+            admission,
+        } = outcome
+        else {
+            panic!("unprovisioned EEPROM must admit on the native path");
+        };
+        assert_eq!(admission, RNodeRadioAdmission::Unprovisioned);
+        assert!(protocol_state.evidence().detected);
+        server.await.expect("unprovisioned bridge server task");
     }
 
     #[tokio::test]

@@ -146,29 +146,36 @@ pub enum RNodeCapabilityParseError {
 ///
 /// `Verified` means the exact model has a reviewed capability profile.
 /// `Unverified` means the exact stored model is unknown or quarantined, so no
-/// model profile was inferred. A `Verified` classification alone does not
+/// model profile was inferred. `Unprovisioned` means the device presented no
+/// locked EEPROM identity at all, so no product or model claim exists and only
+/// generic validation was applied. A `Verified` classification alone does not
 /// admit radio settings; use [`admit_rnode_radio_settings`] for that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RNodeRadioAdmission {
     Verified { product_code: u8, model_code: u8 },
     Unverified { product_code: u8, model_code: u8 },
+    Unprovisioned,
 }
 
 impl RNodeRadioAdmission {
-    /// Validated EEPROM product code associated with this admission result.
-    pub const fn product_code(self) -> u8 {
+    /// Validated EEPROM product code, when a locked identity supplied one.
+    pub const fn product_code(self) -> Option<u8> {
         match self {
             Self::Verified { product_code, .. } | Self::Unverified { product_code, .. } => {
-                product_code
+                Some(product_code)
             }
+            Self::Unprovisioned => None,
         }
     }
 
-    /// Exact, unnormalised EEPROM model code associated with this result.
-    pub const fn model_code(self) -> u8 {
+    /// Exact, unnormalised EEPROM model code, when a locked identity supplied one.
+    pub const fn model_code(self) -> Option<u8> {
         match self {
-            Self::Verified { model_code, .. } | Self::Unverified { model_code, .. } => model_code,
+            Self::Verified { model_code, .. } | Self::Unverified { model_code, .. } => {
+                Some(model_code)
+            }
+            Self::Unprovisioned => None,
         }
     }
 
@@ -194,15 +201,31 @@ pub enum RNodeRadioAdmissionError {
     TxPowerExceedsMaximum { requested_dbm: u8, max_dbm: u8 },
 }
 
-/// Validate an EEPROM image and retain only non-identifying capability data.
+/// Bounded classification of a full-length RNode EEPROM image.
 ///
-/// Validation requires bytes through the identity-information lock at `0x9b`.
-/// The MD5 checksum is calculated over the exact stored bytes `0x00..0x0b`;
-/// model aliases are deliberately not normalised before validation. Bytes
-/// after the identity prefix, including the signature region, are ignored.
-pub fn parse_rnode_capabilities(
+/// `Provisioned` carries validated capabilities from a locked, checksummed
+/// identity. `Unprovisioned` means the info lock at `0x9b` is absent: the
+/// device carries no attested identity, so product, model, and checksum bytes
+/// are deliberately never read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RNodeEepromImage {
+    Provisioned(RNodeCapabilities),
+    Unprovisioned,
+}
+
+/// Classify an EEPROM image, admitting unprovisioned devices as a typed state.
+///
+/// The image must still span the identity-information lock at `0x9b`. An
+/// unlocked image classifies as [`RNodeEepromImage::Unprovisioned`] without
+/// consulting the checksum or identity bytes — an unattested model byte must
+/// never impose or relax model-specific limits. A locked image validates the
+/// MD5 checksum over the exact stored bytes `0x00..0x0b` (model aliases are
+/// deliberately not normalised first); bytes after the identity prefix,
+/// including the signature region, are ignored.
+pub fn classify_rnode_eeprom_image(
     eeprom: &[u8],
-) -> Result<RNodeCapabilities, RNodeCapabilityParseError> {
+) -> Result<RNodeEepromImage, RNodeCapabilityParseError> {
     if eeprom.len() < REQUIRED_EEPROM_LEN {
         return Err(RNodeCapabilityParseError::TooShort {
             required: REQUIRED_EEPROM_LEN,
@@ -210,7 +233,7 @@ pub fn parse_rnode_capabilities(
         });
     }
     if eeprom[INFO_LOCK_ADDRESS] != INFO_LOCK_BYTE {
-        return Err(RNodeCapabilityParseError::InfoNotLocked);
+        return Ok(RNodeEepromImage::Unprovisioned);
     }
 
     let calculated: [u8; 16] = Md5::digest(&eeprom[..IDENTITY_CHECKSUM_INPUT_END]).into();
@@ -222,11 +245,26 @@ pub fn parse_rnode_capabilities(
     let model_code = eeprom[MODEL_ADDRESS];
     let radio = rnode_model_capabilities(model_code);
 
-    Ok(RNodeCapabilities {
+    Ok(RNodeEepromImage::Provisioned(RNodeCapabilities {
         product_code,
         model_code,
         radio,
-    })
+    }))
+}
+
+/// Validate an EEPROM image and retain only non-identifying capability data.
+///
+/// Strict form of [`classify_rnode_eeprom_image`] for callers that require a
+/// provisioned identity (for example rnodeconf mutation preflights): an
+/// unlocked image is an [`RNodeCapabilityParseError::InfoNotLocked`] error
+/// here rather than a typed classification.
+pub fn parse_rnode_capabilities(
+    eeprom: &[u8],
+) -> Result<RNodeCapabilities, RNodeCapabilityParseError> {
+    match classify_rnode_eeprom_image(eeprom)? {
+        RNodeEepromImage::Provisioned(capabilities) => Ok(capabilities),
+        RNodeEepromImage::Unprovisioned => Err(RNodeCapabilityParseError::InfoNotLocked),
+    }
 }
 
 /// Classify a validated model without admitting radio settings.
@@ -282,6 +320,20 @@ pub fn admit_rnode_radio_settings(
     }
 
     Ok(classify_rnode_radio_capabilities(capabilities))
+}
+
+/// Admit radio settings for a device that presented no locked EEPROM identity.
+///
+/// Only generic RNode validation applies: with no attested model there are no
+/// model-specific limits to consult, matching the treatment of unknown and
+/// quarantined model codes.
+pub fn admit_unprovisioned_rnode_radio_settings(
+    settings: RNodeRadioSettings,
+) -> Result<RNodeRadioAdmission, RNodeRadioAdmissionError> {
+    settings
+        .validate()
+        .map_err(RNodeRadioAdmissionError::GenericValidation)?;
+    Ok(RNodeRadioAdmission::Unprovisioned)
 }
 
 /// Return the reviewed display name for an RNode product code.
@@ -558,6 +610,77 @@ mod tests {
             parse_rnode_capabilities(&bytes),
             Err(RNodeCapabilityParseError::InfoNotLocked)
         );
+    }
+
+    #[test]
+    fn unlocked_images_classify_unprovisioned_without_reading_identity() {
+        // Both fresh-erase (0xFF) and zeroed lock bytes count as unlocked, and
+        // neither the checksum nor the identity bytes may be consulted.
+        for lock in [0x00, 0xFF] {
+            let mut bytes = image(0x11);
+            bytes[INFO_LOCK_ADDRESS] = lock;
+            for byte in &mut bytes[CHECKSUM_ADDRESS..CHECKSUM_END] {
+                *byte = 0xA5;
+            }
+            assert_eq!(
+                classify_rnode_eeprom_image(&bytes),
+                Ok(RNodeEepromImage::Unprovisioned),
+                "lock byte {lock:#04x} must classify unprovisioned"
+            );
+        }
+    }
+
+    #[test]
+    fn classification_preserves_strict_short_and_checksum_failures() {
+        let short = &image(0xA4)[..REQUIRED_EEPROM_LEN - 1];
+        assert_eq!(
+            classify_rnode_eeprom_image(short),
+            Err(RNodeCapabilityParseError::TooShort {
+                required: 156,
+                actual: 155,
+            })
+        );
+
+        let mut corrupt = image(0xA4);
+        corrupt[CHECKSUM_ADDRESS] ^= 0x01;
+        assert_eq!(
+            classify_rnode_eeprom_image(&corrupt),
+            Err(RNodeCapabilityParseError::ChecksumMismatch)
+        );
+
+        assert_eq!(
+            classify_rnode_eeprom_image(&image(0x11)),
+            Ok(RNodeEepromImage::Provisioned(
+                parse_rnode_capabilities(&image(0x11)).expect("valid image")
+            ))
+        );
+    }
+
+    #[test]
+    fn unprovisioned_admission_applies_generic_validation_only() {
+        assert_eq!(
+            admit_unprovisioned_rnode_radio_settings(settings(868_000_000, 37)),
+            Ok(RNodeRadioAdmission::Unprovisioned)
+        );
+        assert!(matches!(
+            admit_unprovisioned_rnode_radio_settings(settings(1, 14)),
+            Err(RNodeRadioAdmissionError::GenericValidation(_))
+        ));
+    }
+
+    #[test]
+    fn admission_codes_are_present_only_for_locked_identities() {
+        let verified = RNodeRadioAdmission::Verified {
+            product_code: PRODUCT,
+            model_code: 0x11,
+        };
+        assert_eq!(verified.product_code(), Some(PRODUCT));
+        assert_eq!(verified.model_code(), Some(0x11));
+        assert!(verified.is_verified());
+
+        assert_eq!(RNodeRadioAdmission::Unprovisioned.product_code(), None);
+        assert_eq!(RNodeRadioAdmission::Unprovisioned.model_code(), None);
+        assert!(!RNodeRadioAdmission::Unprovisioned.is_verified());
     }
 
     #[test]

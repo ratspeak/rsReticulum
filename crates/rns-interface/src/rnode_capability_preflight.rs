@@ -8,7 +8,8 @@
 use crate::kiss;
 use crate::rnode::{CMD_ERROR, CMD_ROM_READ, RNodeCapabilityAdmissionError, RNodeRadioSettings};
 use crate::rnode_capabilities::{
-    RNodeRadioAdmission, admit_rnode_radio_settings, parse_rnode_capabilities,
+    RNodeEepromImage, RNodeRadioAdmission, admit_rnode_radio_settings,
+    admit_unprovisioned_rnode_radio_settings, classify_rnode_eeprom_image,
 };
 use crate::rnode_protocol::{
     RNodeFrameRejection, RNodeProtocolEffect, RNodeProtocolState, RNodeProtocolTarget,
@@ -100,12 +101,19 @@ impl RNodeCapabilityPreflight {
                 if self.admission.is_some() {
                     return Err(RNodeCapabilityAdmissionError::DuplicateEepromResponse);
                 }
-                let capabilities = parse_rnode_capabilities(&payload)
-                    .map_err(RNodeCapabilityAdmissionError::CapabilityImage)?;
-                self.admission = Some(
-                    admit_rnode_radio_settings(capabilities, self.settings)
-                        .map_err(RNodeCapabilityAdmissionError::RadioSettings)?,
-                );
+                let admission = match classify_rnode_eeprom_image(&payload)
+                    .map_err(RNodeCapabilityAdmissionError::CapabilityImage)?
+                {
+                    RNodeEepromImage::Provisioned(capabilities) => {
+                        admit_rnode_radio_settings(capabilities, self.settings)
+                            .map_err(RNodeCapabilityAdmissionError::RadioSettings)?
+                    }
+                    RNodeEepromImage::Unprovisioned => {
+                        admit_unprovisioned_rnode_radio_settings(self.settings)
+                            .map_err(RNodeCapabilityAdmissionError::RadioSettings)?
+                    }
+                };
+                self.admission = Some(admission);
                 continue;
             }
             if command == CMD_ERROR {
@@ -215,6 +223,70 @@ mod tests {
         );
         kiss::frame_with_command_into(CMD_ROM_READ, &eeprom(model), &mut frames);
         frames
+    }
+
+    fn unlocked_eeprom(model: u8) -> Vec<u8> {
+        let mut bytes = eeprom(model);
+        bytes[0x9B] = 0xFF;
+        // Corrupt the checksum region too: unlocked images must admit without
+        // consulting it.
+        for byte in &mut bytes[11..27] {
+            *byte = 0x5A;
+        }
+        bytes
+    }
+
+    fn unprovisioned_frames(model: u8) -> Vec<u8> {
+        let mut frames = Vec::new();
+        kiss::frame_with_command_into(CMD_DETECT, &[DETECT_RESP], &mut frames);
+        kiss::frame_with_command_into(
+            CMD_FW_VERSION,
+            &[REQUIRED_FW_VER_MAJ, REQUIRED_FW_VER_MIN],
+            &mut frames,
+        );
+        kiss::frame_with_command_into(CMD_ROM_READ, &unlocked_eeprom(model), &mut frames);
+        frames
+    }
+
+    #[test]
+    fn unlocked_eeprom_admits_unprovisioned_and_never_consults_model_bounds() {
+        // Model 0xB4 at 868 MHz is a typed FrequencyOutOfRange when locked
+        // (see known_model_mismatch_and_bounds_are_typed); unlocked, the model
+        // byte is unattested and must impose nothing.
+        let mut preflight = RNodeCapabilityPreflight::new(settings(868_000_000, 14));
+        let result = observe_chunked(&mut preflight, &unprovisioned_frames(0xB4)).unwrap();
+        assert_eq!(result, Some(RNodeRadioAdmission::Unprovisioned));
+
+        let seed = preflight.into_protocol_state();
+        assert!(seed.evidence().detected);
+        assert!(seed.evidence().firmware.is_some());
+    }
+
+    #[test]
+    fn unlocked_eeprom_still_fails_generic_radio_validation() {
+        let mut preflight = RNodeCapabilityPreflight::new(settings(1, 14));
+        assert!(matches!(
+            observe_chunked(&mut preflight, &unprovisioned_frames(0xB8)),
+            Err(RNodeCapabilityAdmissionError::RadioSettings(
+                crate::rnode_capabilities::RNodeRadioAdmissionError::GenericValidation(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn unlocked_then_duplicate_rom_response_remains_fatal() {
+        let mut preflight = RNodeCapabilityPreflight::new(settings(868_000_000, 14));
+        assert_eq!(
+            observe_chunked(&mut preflight, &unprovisioned_frames(0xB8)).unwrap(),
+            Some(RNodeRadioAdmission::Unprovisioned)
+        );
+        assert_eq!(
+            observe_chunked(
+                &mut preflight,
+                &kiss::frame_with_command(CMD_ROM_READ, &unlocked_eeprom(0xB8)),
+            ),
+            Err(RNodeCapabilityAdmissionError::DuplicateEepromResponse)
+        );
     }
 
     #[test]

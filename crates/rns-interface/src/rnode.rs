@@ -367,6 +367,10 @@ pub enum RNodeCapabilityState {
     /// quarantined, so only generic bounds were applied. Fresh post-init RF
     /// echoes are still required for runtime readiness.
     Unverified,
+    /// No locked EEPROM identity was present, so only generic bounds were
+    /// applied and no product or model claim exists. Fresh post-init RF
+    /// echoes are still required for runtime readiness.
+    Unprovisioned,
 }
 
 /// Radio power state observed from the active RNode connection.
@@ -833,6 +837,9 @@ impl RNodeSnapshotPublisher {
                 }
                 crate::rnode_capabilities::RNodeRadioAdmission::Unverified { .. } => {
                     RNodeCapabilityState::Unverified
+                }
+                crate::rnode_capabilities::RNodeRadioAdmission::Unprovisioned => {
+                    RNodeCapabilityState::Unprovisioned
                 }
             };
             project_rnode_protocol_state(snapshot, state);
