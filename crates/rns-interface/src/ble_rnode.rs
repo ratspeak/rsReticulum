@@ -50,9 +50,10 @@ pub const NUS_RX_CHAR_UUID: Uuid = Uuid::from_u128(0x6E400002_B5A3_F393_E0A9_E50
 /// Device notifies the host here.
 pub const NUS_TX_CHAR_UUID: Uuid = Uuid::from_u128(0x6E400003_B5A3_F393_E0A9_E50E24DCCA9E);
 
-const RECONNECT_WAIT: u64 = 5;
-/// Capped below TCP's 300s — a BLE radio is either in range or not.
-const RECONNECT_WAIT_MAX: u64 = 120;
+const RECONNECT_WAIT: u64 = 1;
+/// Fast early recovery, then indefinite low-duty retries. A two-minute cap made
+/// a reachable radio appear dead long after returning to range.
+const RECONNECT_WAIT_MAX: u64 = 30;
 /// `None` retries forever; teardown goes via `stop_ble_rnode_interface`.
 const MAX_RECONNECT_TRIES: Option<usize> = None;
 const SCAN_TIMEOUT: u64 = 3;
@@ -130,6 +131,52 @@ fn reconnect_try_exhausted(tries: &mut usize) -> bool {
         *tries >= max_tries
     } else {
         false
+    }
+}
+
+fn reconnect_delay_with_jitter(seconds: u64, random: u64) -> Duration {
+    let base = Duration::from_secs(seconds.max(1));
+    let jitter_cap_ms = seconds.max(1).saturating_mul(200); // 0..20%
+    let jitter_ms = random % jitter_cap_ms.saturating_add(1);
+    base + Duration::from_millis(jitter_ms)
+}
+
+fn ble_reconnect_delay(seconds: u64) -> Duration {
+    reconnect_delay_with_jitter(seconds, rand::rngs::OsRng.next_u64())
+}
+
+/// Claim the generation-local one-packet RNode transmit permit.
+///
+/// A valid positive `CMD_READY` replenishes the boolean permit and every data
+/// packet, including a station-ID packet, must atomically consume it.  Merely
+/// observing `true` lets multiple queued packets pass on one READY response.
+fn claim_ble_packet_permit(flow_control: bool, ready: &AtomicBool) -> bool {
+    !flow_control
+        || ready
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+}
+
+/// Packet admission becomes latched only after the physical generation has
+/// completed its startup boundary.  Later protocol evidence may degrade the
+/// observation snapshot, but cannot retroactively turn valid active-session
+/// `CMD_DATA` into startup traffic.  A reconnect constructs a fresh latch.
+#[derive(Clone, Copy, Debug, Default)]
+struct ActiveBlePacketAdmission {
+    admitted: bool,
+}
+
+impl ActiveBlePacketAdmission {
+    fn for_startup_policy(strict: bool) -> Self {
+        Self { admitted: !strict }
+    }
+
+    fn observe_readiness(&mut self, readiness: RNodeReadiness) {
+        self.admitted |= matches!(readiness, RNodeReadiness::Ready);
+    }
+
+    fn allows_packet(self) -> bool {
+        self.admitted
     }
 }
 
@@ -1843,6 +1890,21 @@ fn project_ble_rnode_frame(
     publisher.protocol_effect(protocol_state, effect);
 }
 
+/// Apply one active-session frame to both the observer and the generation's
+/// packet-admission latch. Both desktop GATT and Android's native loopback
+/// path use this exact boundary.
+fn project_active_ble_rnode_frame(
+    publisher: &RNodeSnapshotPublisher,
+    protocol_state: &mut RNodeProtocolState,
+    packet_admission: &mut ActiveBlePacketAdmission,
+    command: u8,
+    frame: &[u8],
+) -> bool {
+    project_ble_rnode_frame(publisher, protocol_state, command, frame);
+    packet_admission.observe_readiness(protocol_state.readiness());
+    packet_admission.allows_packet()
+}
+
 #[derive(Default, Debug, Eq, PartialEq)]
 struct BleStartupProjection {
     complete_frames: usize,
@@ -2465,6 +2527,10 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                 }
             };
             let mut deframer = kiss::RawKissDeframer::new();
+            let mut active_packet_admission = ActiveBlePacketAdmission::for_startup_policy(
+                options.requires_capability_admission(),
+            );
+            active_packet_admission.observe_readiness(protocol_state.readiness());
 
             let ready = Arc::new(AtomicBool::new(true));
 
@@ -2507,15 +2573,13 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                             first_tx = Some(tokio::time::Instant::now());
                         }
                     }
-                    txb_w.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    if flow_control {
-                        while !ready_w.load(Ordering::SeqCst) {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                            if !online_w.load(Ordering::SeqCst) {
-                                return;
-                            }
+                    while !claim_ble_packet_permit(flow_control, ready_w.as_ref()) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        if !online_w.load(Ordering::SeqCst) {
+                            return;
                         }
                     }
+                    txb_w.fetch_add(data.len() as u64, Ordering::Relaxed);
                     let framed = kiss::frame(&data);
                     if let Err(e) =
                         ble_write(&peripheral_write, &rx_char_write, &framed, write_mtu).await
@@ -2594,14 +2658,13 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                 match notification {
                     Some(n) if n.uuid == NUS_TX_CHAR_UUID => {
                         for (cmd, frame) in deframer.feed(&n.value) {
-                            project_ble_rnode_frame(
+                            let data_allowed = project_active_ble_rnode_frame(
                                 &snapshot_publisher,
                                 &mut protocol_state,
+                                &mut active_packet_admission,
                                 cmd,
                                 &frame,
                             );
-                            let data_allowed = !options.requires_capability_admission()
-                                || matches!(protocol_state.readiness(), RNodeReadiness::Ready);
                             match rnode::process_rnode_response(
                                 cmd,
                                 &frame,
@@ -2661,7 +2724,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                 return;
             }
             tracing::info!(name = %log_name, seconds = backoff, "BLE RNode reconnecting");
-            if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+            if wait_or_shutdown(ble_reconnect_delay(backoff), &running_task).await {
                 publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
                 return;
             }
@@ -3134,6 +3197,10 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
             }
 
             let ready = Arc::new(AtomicBool::new(true));
+            let mut active_packet_admission = ActiveBlePacketAdmission::for_startup_policy(
+                options.requires_capability_admission(),
+            );
+            active_packet_admission.observe_readiness(protocol_state.readiness());
 
             let (conn_tx, mut conn_rx) = mpsc::channel::<NativeBridgeWrite>(256);
             let conn_tx_for_stop = conn_tx.clone();
@@ -3173,15 +3240,13 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                                     first_tx = Some(tokio::time::Instant::now());
                                 }
                             }
-                            txb_w.fetch_add(data.len() as u64, Ordering::Relaxed);
-                            if flow_control {
-                                while !ready_w.load(Ordering::SeqCst) {
-                                    tokio::time::sleep(Duration::from_millis(10)).await;
-                                    if !online_w.load(Ordering::SeqCst) {
-                                        return;
-                                    }
+                            while !claim_ble_packet_permit(flow_control, ready_w.as_ref()) {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                if !online_w.load(Ordering::SeqCst) {
+                                    return;
                                 }
                             }
+                            txb_w.fetch_add(data.len() as u64, Ordering::Relaxed);
                             let framed = kiss::frame(&data);
                             if let Err(e) = tcp_write.write_all(&framed).await {
                                 tracing::warn!(error = %e, "BLE RNode native write error");
@@ -3262,9 +3327,13 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
 
                 let data = &buf[..n];
                 for (cmd, frame) in deframer.feed(data) {
-                    project_ble_rnode_frame(&snapshot_publisher, &mut protocol_state, cmd, &frame);
-                    let data_allowed = !options.requires_capability_admission()
-                        || matches!(protocol_state.readiness(), RNodeReadiness::Ready);
+                    let data_allowed = project_active_ble_rnode_frame(
+                        &snapshot_publisher,
+                        &mut protocol_state,
+                        &mut active_packet_admission,
+                        cmd,
+                        &frame,
+                    );
                     match rnode::process_rnode_response(
                         cmd,
                         &frame,
@@ -3316,7 +3385,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                 return;
             }
             tracing::info!(name = %log_name, seconds = backoff, "BLE RNode native reconnecting");
-            if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+            if wait_or_shutdown(ble_reconnect_delay(backoff), &running_task).await {
                 publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
                 return;
             }
@@ -3403,6 +3472,56 @@ mod tests {
             }
         }
         wire
+    }
+
+    #[test]
+    fn ble_flow_ready_is_a_saturating_one_packet_permit() {
+        let ready = AtomicBool::new(true);
+        assert!(claim_ble_packet_permit(true, &ready));
+        assert!(
+            !claim_ble_packet_permit(true, &ready),
+            "one positive READY must not release a second packet"
+        );
+
+        ready.store(true, Ordering::SeqCst);
+        assert!(claim_ble_packet_permit(true, &ready));
+        assert!(!ready.load(Ordering::SeqCst));
+
+        assert!(claim_ble_packet_permit(false, &ready));
+        assert!(claim_ble_packet_permit(false, &ready));
+    }
+
+    #[test]
+    fn ble_reconnect_jitter_stays_within_twenty_percent() {
+        assert_eq!(reconnect_delay_with_jitter(1, 0), Duration::from_secs(1));
+        assert!(reconnect_delay_with_jitter(1, u64::MAX) <= Duration::from_millis(1_200));
+        assert!(reconnect_delay_with_jitter(30, u64::MAX) <= Duration::from_secs(36));
+    }
+
+    #[test]
+    fn active_packet_admission_latches_for_one_physical_generation() {
+        let mut startup = ActiveBlePacketAdmission::for_startup_policy(true);
+        assert!(!startup.allows_packet());
+
+        startup.observe_readiness(RNodeReadiness::Ready);
+        assert!(startup.allows_packet());
+
+        startup.observe_readiness(RNodeReadiness::Blocked(
+            crate::rnode_protocol::RNodeReadinessBlocker::Missing(
+                crate::rnode_protocol::RNodeReadinessEvidence::Frequency,
+            ),
+        ));
+        assert!(
+            startup.allows_packet(),
+            "later evidence regression must not discard active-session packets"
+        );
+
+        let legacy = ActiveBlePacketAdmission::for_startup_policy(false);
+        assert!(legacy.allows_packet());
+
+        // A reconnect never inherits the prior generation's active boundary.
+        let reconnect = ActiveBlePacketAdmission::for_startup_policy(true);
+        assert!(!reconnect.allows_packet());
     }
 
     #[test]
@@ -4743,9 +4862,16 @@ mod tests {
         let mut last_snr = None;
         let mut packets = 0usize;
         let mut flow_ready = false;
+        let mut packet_admission = ActiveBlePacketAdmission::for_startup_policy(true);
+        packet_admission.observe_readiness(state.readiness());
         for (command, frame) in deframer.feed(&notification) {
-            project_ble_rnode_frame(&publisher, &mut state, command, &frame);
-            let data_allowed = matches!(state.readiness(), RNodeReadiness::Ready);
+            let data_allowed = project_active_ble_rnode_frame(
+                &publisher,
+                &mut state,
+                &mut packet_admission,
+                command,
+                &frame,
+            );
             match rnode::process_rnode_response(command, &frame, 1, &mut last_rssi, &mut last_snr) {
                 RNodeResponse::Packet(_) if data_allowed => packets += 1,
                 RNodeResponse::Ready(value) => flow_ready = value,
@@ -4763,6 +4889,55 @@ mod tests {
         assert!(matches!(state.readiness(), RNodeReadiness::Ready));
         assert_eq!(driver.snapshot().phase, rnode::RNodeRuntimePhase::Ready);
         publisher.stopped(RNodeRuntimeReason::StopRequested);
+    }
+
+    #[test]
+    fn strict_active_admission_survives_first_frame_readiness_regression() {
+        let target = RNodeProtocolTarget::new(915_000_000, 125_000, 8, 6, 17);
+        let mut state = RNodeProtocolState::new(target);
+        state.apply_frame(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
+        state.apply_frame(
+            rnode::CMD_FW_VERSION,
+            &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+        );
+        state.apply_frame(rnode::CMD_FREQUENCY, &target.frequency.to_be_bytes());
+        state.apply_frame(rnode::CMD_BANDWIDTH, &target.bandwidth.to_be_bytes());
+        state.apply_frame(rnode::CMD_SF, &[target.spreading_factor]);
+        state.apply_frame(rnode::CMD_CR, &[target.coding_rate]);
+        state.apply_frame(rnode::CMD_TXPOWER, &[target.tx_power]);
+        state.apply_frame(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_ON]);
+        assert_eq!(state.readiness(), RNodeReadiness::Ready);
+
+        let (publisher, _driver) = rnode::new_rnode_driver_observation(RNodeTransportClass::Ble);
+        let mut admission = ActiveBlePacketAdmission::for_startup_policy(true);
+        admission.observe_readiness(state.readiness());
+
+        let mismatched_frequency = target.frequency.saturating_add(101).to_be_bytes();
+        assert!(project_active_ble_rnode_frame(
+            &publisher,
+            &mut state,
+            &mut admission,
+            rnode::CMD_FREQUENCY,
+            &mismatched_frequency,
+        ));
+        assert_ne!(state.readiness(), RNodeReadiness::Ready);
+        assert!(project_active_ble_rnode_frame(
+            &publisher,
+            &mut state,
+            &mut admission,
+            kiss::CMD_DATA,
+            b"valid-active-packet",
+        ));
+
+        let mut reconnect = ActiveBlePacketAdmission::for_startup_policy(true);
+        let mut reconnect_state = RNodeProtocolState::new(target);
+        assert!(!project_active_ble_rnode_frame(
+            &publisher,
+            &mut reconnect_state,
+            &mut reconnect,
+            kiss::CMD_DATA,
+            b"pre-admission-packet",
+        ));
     }
 
     #[tokio::test]

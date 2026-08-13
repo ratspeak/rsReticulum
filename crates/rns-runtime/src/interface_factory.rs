@@ -99,6 +99,11 @@ pub struct AutoInterfaceConfig {
 pub struct RNodeInterfaceConfig {
     pub name: String,
     pub port: String,
+    /// Android USB stable identity. These are ignored for non-AndroidUSB
+    /// ports, and serial remains optional because Android hides it pre-grant.
+    pub usb_vendor_id: Option<u16>,
+    pub usb_product_id: Option<u16>,
+    pub usb_serial_number: Option<String>,
     pub baud_rate: u32,
     pub frequency: u32,
     pub bandwidth: u32,
@@ -802,10 +807,21 @@ fn synthesize_rnode(
         require_generic_rnode_radio_params(name, section)?;
 
     let (flow_control, st_alock, lt_alock) = parse_generic_rnode_airtime(name, section)?;
+    let usb_vendor_id = parse_optional_u16(name, section, "usb_vendor_id")?;
+    let usb_product_id = parse_optional_u16(name, section, "usb_product_id")?;
+    if usb_vendor_id.is_some() != usb_product_id.is_some() {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.usb_vendor_id/usb_product_id"),
+            message: "vendor and product IDs must be configured together".into(),
+        });
+    }
 
     let config = RNodeInterfaceConfig {
         name: name.to_string(),
         port,
+        usb_vendor_id,
+        usb_product_id,
+        usb_serial_number: section.get("usb_serial_number").map(str::to_string),
         baud_rate,
         frequency,
         bandwidth,
@@ -824,6 +840,23 @@ fn synthesize_rnode(
     // constructed runtime configurations receive the same protection.
     config.to_rnode_config()?;
     Ok(InterfaceConfig::RNode(config))
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
+fn parse_optional_u16(
+    name: &str,
+    section: &ConfigSection,
+    field: &str,
+) -> Result<Option<u16>, InterfaceFactoryError> {
+    section
+        .get_uint(field)
+        .map(|value| {
+            u16::try_from(value).map_err(|_| InterfaceFactoryError::InvalidValue {
+                field: format!("{name}.{field}"),
+                message: format!("{value} is outside 0..={}", u16::MAX),
+            })
+        })
+        .transpose()
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
@@ -2520,6 +2553,69 @@ mod tests {
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
+    fn android_usb_stable_selector_and_station_id_round_trip_through_factory() {
+        let mut section = ConfigSection::new();
+        for (key, value) in [
+            ("port", "androidusb:///dev/bus/usb/001/002"),
+            ("frequency", "915000000"),
+            ("bandwidth", "125000"),
+            ("spreadingfactor", "8"),
+            ("codingrate", "6"),
+            ("txpower", "17"),
+            ("usb_vendor_id", "12346"),
+            ("usb_product_id", "4097"),
+            ("usb_serial_number", "ABC123"),
+            ("id_interval", "900"),
+            ("id_callsign", "N0CALL"),
+        ] {
+            section.set(key, value);
+        }
+        let config = synthesize_rnode("USB RNode", &section, InterfaceMode::Roaming)
+            .expect("stable Android USB config");
+        let InterfaceConfig::RNode(config) = config else {
+            panic!("expected RNode config")
+        };
+        assert_eq!(config.usb_vendor_id, Some(0x303a));
+        assert_eq!(config.usb_product_id, Some(0x1001));
+        assert_eq!(config.usb_serial_number.as_deref(), Some("ABC123"));
+        assert_eq!(config.id_interval, Some(900));
+        assert_eq!(config.id_callsign.as_deref(), Some("N0CALL"));
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn android_usb_stable_selector_rejects_partial_or_narrowed_ids() {
+        let base = |vendor: &str, product: Option<&str>| {
+            let mut section = ConfigSection::new();
+            for (key, value) in [
+                ("port", "androidusb:///dev/bus/usb/001/002"),
+                ("frequency", "915000000"),
+                ("bandwidth", "125000"),
+                ("spreadingfactor", "8"),
+                ("codingrate", "6"),
+                ("txpower", "17"),
+                ("usb_vendor_id", vendor),
+            ] {
+                section.set(key, value);
+            }
+            if let Some(product) = product {
+                section.set("usb_product_id", product);
+            }
+            section
+        };
+        assert!(synthesize_rnode("partial", &base("12346", None), InterfaceMode::Full).is_err());
+        assert!(
+            synthesize_rnode(
+                "narrowed",
+                &base("65536", Some("4097")),
+                InterfaceMode::Full,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
     fn test_synthesize_rnode_missing_frequency() {
         let mut section = ConfigSection::new();
         section.set("type", "RNodeInterface");
@@ -2610,6 +2706,9 @@ mod tests {
         let _rnode = InterfaceConfig::RNode(RNodeInterfaceConfig {
             name: "r".to_string(),
             port: "/dev/ttyACM0".to_string(),
+            usb_vendor_id: None,
+            usb_product_id: None,
+            usb_serial_number: None,
             baud_rate: 115200,
             frequency: 868000000,
             bandwidth: 125000,

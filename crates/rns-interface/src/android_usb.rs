@@ -9,11 +9,13 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
 
 use crate::android_usb_lifecycle::{
-    OwnedUsbIo, UsbConnectionCleanup, UsbConnectionLifecycle, UsbInboundOutcome, UsbInboundState,
-    UsbIoEvent, UsbLeaseTable, UsbRNodeCapabilityAdmission, UsbRNodeCapabilityStartupError,
+    OwnedUsbIo, UsbConnectionCleanup, UsbConnectionLifecycle, UsbDeviceCandidate,
+    UsbDeviceResolutionError, UsbDeviceSelector, UsbInboundOutcome, UsbInboundState, UsbIoEvent,
+    UsbLeaseTable, UsbRNodeCapabilityAdmission, UsbRNodeCapabilityStartupError,
     UsbReadDrainOutcome, UsbReadResult, UsbReaderBackend, UsbShutdownReport, UsbTransferError,
     UsbTxPumpExit, UsbWriterBackend, drain_usb_reader_tail, forward_usb_read_chunk,
-    run_usb_rnode_capability_startup, run_usb_rnode_startup, run_usb_tx_pump, spawn_owned_usb_io,
+    resolve_usb_device, run_usb_rnode_capability_startup, run_usb_rnode_startup, run_usb_tx_pump,
+    spawn_owned_usb_io,
 };
 #[cfg(test)]
 use crate::kiss;
@@ -178,15 +180,54 @@ pub struct UsbSerialDevice {
     pub device_name: String,
     pub vid: u16,
     pub pid: u16,
+    /// Available only after Android grants permission; absent is not a match.
+    #[serde(default)]
+    pub serial_number: Option<String>,
+    #[serde(default)]
+    pub has_permission: bool,
     pub chipset: String,
     pub manufacturer: String,
     pub product: String,
 }
 
 #[derive(Debug, Clone)]
+pub struct AndroidUsbDeviceSelector {
+    pub device_name: String,
+    pub vendor_id: Option<u16>,
+    pub product_id: Option<u16>,
+    pub serial_number: Option<String>,
+}
+
+impl AndroidUsbDeviceSelector {
+    pub fn legacy(device_name: impl Into<String>) -> Self {
+        Self {
+            device_name: device_name.into(),
+            vendor_id: None,
+            product_id: None,
+            serial_number: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+pub enum AndroidUsbDeviceResolveError {
+    #[error("configured Android USB device is not attached")]
+    NotFound,
+    #[error("configured Android USB selector is ambiguous")]
+    Ambiguous,
+    #[error("Android USB permission is required")]
+    PermissionRequired,
+}
+
+#[derive(Debug, Clone)]
 pub struct AndroidUsbConfig {
     pub name: String,
     pub device_name: String,
+    /// Stable selector learned/persisted by the application. VID and PID must
+    /// either both be set or both be absent; serial further disambiguates.
+    pub device_vendor_id: Option<u16>,
+    pub device_product_id: Option<u16>,
+    pub device_serial_number: Option<String>,
     pub baud_rate: u32,
     pub frequency: u32,
     pub bandwidth: u32,
@@ -200,6 +241,9 @@ pub struct AndroidUsbConfig {
     pub st_alock: Option<f32>,
     /// Long-term airtime cap, percent (0.0..=100.0). `None` = unlimited.
     pub lt_alock: Option<f32>,
+    /// Station-ID beacon: seconds between IDs, sent only after data TX.
+    pub id_interval: Option<u64>,
+    pub id_callsign: Option<Vec<u8>>,
 }
 
 impl AndroidUsbConfig {
@@ -207,6 +251,9 @@ impl AndroidUsbConfig {
         Self {
             name: name.to_string(),
             device_name: device_name.to_string(),
+            device_vendor_id: None,
+            device_product_id: None,
+            device_serial_number: None,
             baud_rate: BAUD_RATE,
             frequency: 915_000_000,
             bandwidth: 125_000,
@@ -217,12 +264,46 @@ impl AndroidUsbConfig {
             flow_control: false,
             st_alock: None,
             lt_alock: None,
+            id_interval: None,
+            id_callsign: None,
         }
+    }
+
+    pub fn set_device_selector(&mut self, selector: AndroidUsbDeviceSelector) {
+        self.device_name = selector.device_name;
+        self.device_vendor_id = selector.vendor_id;
+        self.device_product_id = selector.product_id;
+        self.device_serial_number = selector.serial_number;
     }
 
     /// Validate RF and airtime settings before opening the physical device.
     pub fn validate(&self) -> Result<(), rnode::RNodeConfigValidationError> {
         rnode_config_from_android_usb_config(self).validate()
+    }
+
+    fn validate_device_selector(&self) -> Result<(), InterfaceError> {
+        if self.device_vendor_id.is_some() != self.device_product_id.is_some() {
+            return Err(InterfaceError::SendFailed(
+                "Android USB vendor and product IDs must be configured together".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn selector(&self) -> UsbDeviceSelector {
+        UsbDeviceSelector {
+            legacy_device_name: self.device_name.clone(),
+            vendor_id: self.device_vendor_id,
+            product_id: self.device_product_id,
+            serial_number: self.device_serial_number.clone(),
+        }
+    }
+
+    fn apply_selector(&mut self, selector: UsbDeviceSelector) {
+        self.device_name = selector.legacy_device_name;
+        self.device_vendor_id = selector.vendor_id;
+        self.device_product_id = selector.product_id;
+        self.device_serial_number = selector.serial_number;
     }
 }
 
@@ -238,6 +319,8 @@ fn rnode_config_from_android_usb_config(config: &AndroidUsbConfig) -> rnode::RNo
     rnode.flow_control = config.flow_control;
     rnode.st_alock = config.st_alock;
     rnode.lt_alock = config.lt_alock;
+    rnode.id_interval = config.id_interval;
+    rnode.id_callsign = config.id_callsign.clone();
     rnode
 }
 
@@ -298,6 +381,20 @@ fn ensure_app_context(env: &jni::JNIEnv) -> Result<&'static GlobalRef, String> {
     APP_CONTEXT
         .get()
         .ok_or_else(|| "APP_CONTEXT race".to_string())
+}
+
+fn optional_usb_string(env: &jni::JNIEnv, device: &JObject<'_>, method: &str) -> Option<String> {
+    let value = match env.call_method(*device, method, "()Ljava/lang/String;", &[]) {
+        Ok(value) => value.l().ok(),
+        Err(_) => {
+            clear_pending_jni_exception(env);
+            None
+        }
+    }?;
+    if value.is_null() {
+        return None;
+    }
+    env.get_string(value.into()).ok().map(Into::into)
 }
 
 pub async fn enumerate_usb_devices() -> Result<Vec<UsbSerialDevice>, String> {
@@ -367,6 +464,24 @@ pub async fn enumerate_usb_devices() -> Result<Vec<UsbSerialDevice>, String> {
                     .get_string(name_js.into())
                     .map(|s| s.into())
                     .unwrap_or_default();
+                let has_permission = env
+                    .call_method(
+                        usb_mgr,
+                        "hasPermission",
+                        "(Landroid/hardware/usb/UsbDevice;)Z",
+                        &[JValue::Object(device)],
+                    )
+                    .ok()
+                    .and_then(|value| value.z().ok())
+                    .unwrap_or(false);
+                clear_pending_jni_exception(env);
+                let serial_number = has_permission
+                    .then(|| optional_usb_string(env, &device, "getSerialNumber"))
+                    .flatten();
+                let manufacturer =
+                    optional_usb_string(env, &device, "getManufacturerName").unwrap_or_default();
+                let product =
+                    optional_usb_string(env, &device, "getProductName").unwrap_or_default();
 
                 let chipset = KNOWN_VIDS
                     .iter()
@@ -379,9 +494,11 @@ pub async fn enumerate_usb_devices() -> Result<Vec<UsbSerialDevice>, String> {
                         device_name: name,
                         vid,
                         pid,
+                        serial_number,
+                        has_permission,
                         chipset,
-                        manufacturer: String::new(),
-                        product: String::new(),
+                        manufacturer,
+                        product,
                     });
                 }
             }
@@ -390,6 +507,63 @@ pub async fn enumerate_usb_devices() -> Result<Vec<UsbSerialDevice>, String> {
     })
     .await
     .map_err(|e| format!("{e}"))?
+}
+
+async fn resolve_android_usb_selector(
+    selector: &UsbDeviceSelector,
+) -> Result<(String, UsbDeviceSelector), UsbDeviceResolutionError> {
+    let devices = enumerate_usb_devices()
+        .await
+        .map_err(|_| UsbDeviceResolutionError::NotFound)?;
+    let candidates: Vec<_> = devices
+        .into_iter()
+        .map(|device| UsbDeviceCandidate {
+            device_name: device.device_name,
+            vendor_id: device.vid,
+            product_id: device.pid,
+            serial_number: device.serial_number,
+            has_permission: device.has_permission,
+        })
+        .collect();
+    resolve_usb_device(selector, &candidates)
+        .map(|(candidate, learned)| (candidate.device_name, learned))
+}
+
+/// Resolve a legacy or stable selector against the current Android device
+/// inventory and return its stable identity plus the current opaque path hint.
+///
+/// Applications must persist `vendor_id`, `product_id`, and the optional
+/// `serial_number`. They may retain `device_name` only as the last-attached
+/// fallback hint needed to migrate legacy configurations; it is not durable
+/// identity and must never be displayed. Errors deliberately contain no raw
+/// path. Resolution fails closed on ambiguity and before permission is granted.
+pub async fn resolve_android_usb_device_selector(
+    selector: &AndroidUsbDeviceSelector,
+) -> Result<AndroidUsbDeviceSelector, AndroidUsbDeviceResolveError> {
+    let internal = UsbDeviceSelector {
+        legacy_device_name: selector.device_name.clone(),
+        vendor_id: selector.vendor_id,
+        product_id: selector.product_id,
+        serial_number: selector.serial_number.clone(),
+    };
+    let (_, learned) =
+        resolve_android_usb_selector(&internal)
+            .await
+            .map_err(|error| match error {
+                UsbDeviceResolutionError::NotFound => AndroidUsbDeviceResolveError::NotFound,
+                UsbDeviceResolutionError::Ambiguous { .. } => {
+                    AndroidUsbDeviceResolveError::Ambiguous
+                }
+                UsbDeviceResolutionError::PermissionRequired { .. } => {
+                    AndroidUsbDeviceResolveError::PermissionRequired
+                }
+            })?;
+    Ok(AndroidUsbDeviceSelector {
+        device_name: learned.legacy_device_name,
+        vendor_id: learned.vendor_id,
+        product_id: learned.product_id,
+        serial_number: learned.serial_number,
+    })
 }
 
 /// Return whether Android has already granted this app access to `device_name`.
@@ -432,7 +606,7 @@ pub async fn has_usb_permission(device_name: &str) -> Result<bool, String> {
                 .map_err(|e| format!("{e}"))?;
 
             if device.is_null() {
-                return Err(format!("USB device not found: {dev_name}"));
+                return Err("configured Android USB device is not attached".into());
             }
 
             env.call_method(
@@ -474,6 +648,7 @@ struct JniUsbConnectionOwner {
     interface_claimed: bool,
     device_name: String,
     lease_phase: JniUsbLeasePhase,
+    attached: Arc<AtomicBool>,
 }
 
 struct JniUsbWriter {
@@ -484,6 +659,9 @@ struct JniUsbWriter {
 struct JniUsbReader {
     connection: Option<GlobalRef>,
     endpoint: Option<GlobalRef>,
+    device_name: String,
+    attached: Arc<AtomicBool>,
+    idle_polls: u8,
 }
 
 struct PendingAndroidUsbOpen {
@@ -539,6 +717,59 @@ fn android_usb_lease_registry() -> &'static AndroidUsbLeaseRegistry {
     REGISTRY.get_or_init(|| Mutex::new(UsbLeaseTable::default()))
 }
 
+type AndroidUsbPresenceRegistry = Mutex<HashMap<String, Arc<AtomicBool>>>;
+
+fn android_usb_presence_registry() -> &'static AndroidUsbPresenceRegistry {
+    static REGISTRY: OnceLock<AndroidUsbPresenceRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn android_usb_change_sender() -> &'static watch::Sender<u64> {
+    static SENDER: OnceLock<watch::Sender<u64>> = OnceLock::new();
+    SENDER.get_or_init(|| watch::channel(0).0)
+}
+
+/// Wake configured USB reconnect loops after an Android attach or permission
+/// result. Resolution is repeated and remains unique-match/fail-closed.
+pub fn notify_android_usb_devices_changed() {
+    let sender = android_usb_change_sender();
+    let next = (*sender.borrow()).wrapping_add(1);
+    sender.send_replace(next);
+}
+
+fn register_android_usb_presence(device_name: &str, attached: Arc<AtomicBool>) {
+    android_usb_presence_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(device_name.to_string(), attached);
+}
+
+fn unregister_android_usb_presence(device_name: &str, attached: &Arc<AtomicBool>) {
+    let mut registry = android_usb_presence_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if registry
+        .get(device_name)
+        .is_some_and(|current| Arc::ptr_eq(current, attached))
+    {
+        registry.remove(device_name);
+    }
+}
+
+/// Invalidate the exact active physical generation from Android's USB detach
+/// broadcast. Unknown and stale device paths are harmless no-ops.
+pub fn notify_android_usb_device_detached(device_name: &str) {
+    if let Some(attached) = android_usb_presence_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(device_name)
+        .cloned()
+    {
+        attached.store(false, Ordering::Release);
+    }
+    notify_android_usb_devices_changed();
+}
+
 fn reserve_android_usb_opening(device_name: &str) -> Result<(), String> {
     android_usb_lease_registry()
         .lock()
@@ -578,7 +809,6 @@ fn retain_android_usb_owner(owner: JniUsbConnectionOwner, reason: String) {
             },
         );
     tracing::error!(
-        device_name = %device_name,
         reason = %reason,
         "Android USB ownership quarantined; reopen is blocked for this process"
     );
@@ -596,7 +826,6 @@ fn retain_android_usb_unproven_session(device_name: &str, reason: String) {
             },
         );
     tracing::error!(
-        device_name = %device_name,
         reason = %reason,
         "Android USB open state is unproven; device permanently quarantined"
     );
@@ -685,6 +914,9 @@ impl UsbWriterBackend for JniUsbWriter {
 
 impl UsbReaderBackend for JniUsbReader {
     fn read(&mut self) -> Result<UsbReadResult, String> {
+        if !self.attached.load(Ordering::Acquire) {
+            return Err("Android USB device detached".into());
+        }
         with_env(|env| {
             const READ_SIZE: i32 = 1_024;
             let connection = self
@@ -715,8 +947,49 @@ impl UsbReaderBackend for JniUsbReader {
                 .i()
                 .map_err(|error| jni_failure(env, "USB bulk read result", error))?;
             if read <= 0 {
+                self.idle_polls = self.idle_polls.saturating_add(1);
+                if self.idle_polls >= 10 {
+                    self.idle_polls = 0;
+                    let ctx = ensure_app_context(env)?;
+                    let usb_str = env
+                        .new_string("usb")
+                        .map_err(|error| jni_failure(env, "USB service string", error))?;
+                    let usb_mgr = env
+                        .call_method(
+                            ctx.as_obj(),
+                            "getSystemService",
+                            "(Ljava/lang/String;)Ljava/lang/Object;",
+                            &[JValue::Object(usb_str.into())],
+                        )
+                        .map_err(|error| jni_failure(env, "getSystemService(usb)", error))?
+                        .l()
+                        .map_err(|error| jni_failure(env, "USB manager object", error))?;
+                    let device_map = env
+                        .call_method(usb_mgr, "getDeviceList", "()Ljava/util/HashMap;", &[])
+                        .map_err(|error| jni_failure(env, "getDeviceList", error))?
+                        .l()
+                        .map_err(|error| jni_failure(env, "USB device map", error))?;
+                    let key = env
+                        .new_string(&self.device_name)
+                        .map_err(|error| jni_failure(env, "USB device-name string", error))?;
+                    let current = env
+                        .call_method(
+                            device_map,
+                            "get",
+                            "(Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[JValue::Object(key.into())],
+                        )
+                        .map_err(|error| jni_failure(env, "USB device lookup", error))?
+                        .l()
+                        .map_err(|error| jni_failure(env, "USB device object", error))?;
+                    if current.is_null() {
+                        self.attached.store(false, Ordering::Release);
+                        return Err("Android USB device detached".into());
+                    }
+                }
                 return Ok(UsbReadResult::Idle);
             }
+            self.idle_polls = 0;
             if read > READ_SIZE {
                 return Err(format!(
                     "USB bulk read returned invalid length {read} (capacity {READ_SIZE})"
@@ -799,6 +1072,7 @@ impl UsbConnectionLifecycle for JniUsbConnectionOwner {
             };
         }
 
+        unregister_android_usb_presence(&self.device_name, &self.attached);
         let lease_release = release_android_usb_lease(&self.device_name, self.lease_phase);
         let release_interface = match (release_interface, lease_release) {
             (Ok(()), Ok(())) => Ok(()),
@@ -894,7 +1168,7 @@ fn open_usb_serial_attached(
             .l()
             .map_err(|error| jni_failure(env, "USB device object", error))?;
         if device.is_null() {
-            return Err(format!("USB device not found: {dev_name}"));
+            return Err("configured Android USB device is not attached".into());
         }
 
         let connection = env
@@ -936,12 +1210,14 @@ fn open_usb_serial_attached(
                 }
             }
         };
+        let attached = Arc::new(AtomicBool::new(true));
         let mut owner = JniUsbConnectionOwner {
             connection: Some(connection_ref),
             data_interface: None,
             interface_claimed: false,
             device_name: dev_name.to_string(),
             lease_phase: JniUsbLeasePhase::Opening,
+            attached: attached.clone(),
         };
 
         let setup = (|| -> Result<(GlobalRef, GlobalRef), String> {
@@ -1081,6 +1357,7 @@ fn open_usb_serial_attached(
         if let Err(error) = activate_android_usb_lease(&mut owner) {
             return Err(cleanup_failed_android_usb_open(owner, error));
         }
+        register_android_usb_presence(dev_name, owner.attached.clone());
         Ok((
             owner,
             JniUsbWriter {
@@ -1090,6 +1367,9 @@ fn open_usb_serial_attached(
             JniUsbReader {
                 connection: Some(connection),
                 endpoint: Some(input_endpoint),
+                device_name: dev_name.to_string(),
+                attached,
+                idle_polls: 0,
             },
         ))
     });
@@ -1160,6 +1440,7 @@ async fn shutdown_failed_android_usb_startup(
 struct AndroidUsbGeneration {
     usb: OwnedUsbIo<JniUsbConnectionOwner>,
     protocol_state: Option<UsbRNodeCapabilityAdmission>,
+    selector: UsbDeviceSelector,
 }
 
 /// Open and initialise exactly one physical USB generation. Every failure
@@ -1169,7 +1450,12 @@ async fn start_android_usb_generation(
     config: &AndroidUsbConfig,
     options: RNodeStartupOptions,
 ) -> Result<AndroidUsbGeneration, RNodeSpawnError> {
-    let (mut usb, _worker_online) = open_usb_serial(&config.device_name, config.baud_rate).await?;
+    let (device_name, selector) = resolve_android_usb_selector(&config.selector())
+        .await
+        .map_err(|error| {
+            RNodeSpawnError::Interface(InterfaceError::SendFailed(error.to_string()))
+        })?;
+    let (mut usb, _worker_online) = open_usb_serial(&device_name, config.baud_rate).await?;
     let rnode_cfg = rnode_config_from_android_usb_config(config);
     let init_bytes = rnode::build_init_sequence(&rnode_cfg);
     let protocol_state = if options.requires_capability_admission() {
@@ -1252,6 +1538,7 @@ async fn start_android_usb_generation(
     Ok(AndroidUsbGeneration {
         usb,
         protocol_state,
+        selector,
     })
 }
 
@@ -1297,6 +1584,7 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
     transport_tx: mpsc::Sender<TransportMessage>,
     options: RNodeStartupOptions,
 ) -> Result<SpawnedRNodeInterface, RNodeSpawnError> {
+    config.validate_device_selector()?;
     config.validate().map_err(|error| {
         InterfaceError::SendFailed(format!("rnode config {}: {error}", error.field()))
     })?;
@@ -1313,6 +1601,22 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
 
     let shared_txb = Arc::new(AtomicU64::new(0));
     let shared_rxb = Arc::new(AtomicU64::new(0));
+    let beacon = config
+        .id_interval
+        .zip(config.id_callsign.clone())
+        .filter(|(_, callsign)| {
+            let valid = callsign.len() <= rnode::CALLSIGN_MAX_LEN;
+            if !valid {
+                tracing::error!(
+                    name = %config.name,
+                    len = callsign.len(),
+                    "id_callsign exceeds {} bytes, beaconing disabled",
+                    rnode::CALLSIGN_MAX_LEN
+                );
+            }
+            valid
+        })
+        .map(|(seconds, callsign)| (Duration::from_secs(seconds), Bytes::from(callsign)));
 
     // Match the serial and BLE RNode application queue. The queue is logical
     // interface state and survives physical Android USB reconnects.
@@ -1332,12 +1636,14 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
     let rxb = shared_rxb.clone();
     let online = Arc::new(AtomicBool::new(true));
     let online_task = online.clone();
-    let reconnect_config = config.clone();
+    let mut reconnect_config = config.clone();
+    reconnect_config.apply_selector(initial_generation.selector.clone());
     let read_task = tokio::spawn(async move {
         let _stop_guard = stop_guard;
         let mut snapshot_publisher = Some(snapshot_publisher);
         let mut next_generation = Some(initial_generation);
         let mut last_report: Option<Arc<UsbShutdownReport>> = None;
+        let mut usb_changes = android_usb_change_sender().subscribe();
 
         loop {
             let generation = match next_generation.take() {
@@ -1382,6 +1688,11 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
                                     return;
                                 }
                                 _ = tokio::time::sleep(USB_RECONNECT_DELAY) => {}
+                                changed = usb_changes.changed() => {
+                                    if changed.is_err() {
+                                        tokio::time::sleep(USB_RECONNECT_DELAY).await;
+                                    }
+                                }
                             }
                             continue;
                         }
@@ -1392,7 +1703,9 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
             let AndroidUsbGeneration {
                 mut usb,
                 protocol_state,
+                selector,
             } = generation;
+            reconnect_config.apply_selector(selector);
             let mut publisher = snapshot_publisher
                 .take()
                 .expect("Android USB generation publisher missing");
@@ -1416,8 +1729,11 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
             let pump_writer = usb.writer.clone();
             let pump_txb = txb.clone();
             let pump_rx = app_rx.clone();
+            let pump_beacon = beacon.clone();
             let mut tx_pump = tokio::spawn(async move {
-                let exit = run_usb_tx_pump(pump_rx, pump_writer, pump_txb, tx_pump_stop_rx).await;
+                let exit =
+                    run_usb_tx_pump(pump_rx, pump_writer, pump_txb, pump_beacon, tx_pump_stop_rx)
+                        .await;
                 let _ = tx_pump_exit_tx.send(exit);
             });
             let mut stop_requested = false;
@@ -1626,6 +1942,11 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
                     return;
                 }
                 _ = tokio::time::sleep(USB_RECONNECT_DELAY) => {}
+                changed = usb_changes.changed() => {
+                    if changed.is_err() {
+                        tokio::time::sleep(USB_RECONNECT_DELAY).await;
+                    }
+                }
             }
         }
     });

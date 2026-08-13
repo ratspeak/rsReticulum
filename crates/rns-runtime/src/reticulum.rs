@@ -381,6 +381,8 @@ pub struct ReticulumHandle {
     /// still install a stamper and start publishing.
     pub discovery: Arc<DiscoveryRuntime>,
     startup_rnode_runtimes: Vec<StartupRNodeRuntime>,
+    #[cfg(feature = "ble")]
+    deferred_android_ble_rnodes: Vec<interface_factory::BleRNodeInterfaceConfig>,
     shutdown_coordinator: RuntimeShutdownCoordinator,
     started_at: std::time::Instant,
 }
@@ -1129,6 +1131,18 @@ impl ReticulumHandle {
     /// an ownership statement, not permission to respawn hardware locally.
     pub fn startup_rnode_runtimes(&self) -> Vec<StartupRNodeRuntime> {
         self.startup_rnode_runtimes.clone()
+    }
+
+    /// Return the exact enabled BLE RNode configurations deferred to Android's
+    /// Kotlin-owned native GATT bridge during startup.
+    ///
+    /// This config-order snapshot is inventory only. It grants no registration,
+    /// reconnect, or teardown authority; the application must use the native
+    /// runtime spawn APIs and retain the returned exact owner. It is empty on
+    /// non-Android platforms and in shared-instance client mode.
+    #[cfg(feature = "ble")]
+    pub fn deferred_android_ble_rnodes(&self) -> Vec<interface_factory::BleRNodeInterfaceConfig> {
+        self.deferred_android_ble_rnodes.clone()
     }
 
     pub fn link_mtu_discovery(&self) -> bool {
@@ -3142,10 +3156,23 @@ pub async fn init_with_options_and_rnode_startup_options(
         *discovery_runtime.store.lock().await = Some(Arc::new(store));
     }
     let mut startup_rnode_runtimes = Vec::new();
+    #[cfg(feature = "ble")]
+    let deferred_android_ble_rnodes = collect_deferred_android_ble_rnodes(
+        &interfaces,
+        cfg!(target_os = "android") && instance_mode != InstanceMode::Client,
+    );
 
     // Client mode leaves hardware to the Shared sibling.
     if instance_mode != InstanceMode::Client {
         for iface_config in &interfaces {
+            #[cfg(feature = "ble")]
+            if should_defer_android_ble_rnode(iface_config, cfg!(target_os = "android")) {
+                tracing::info!(
+                    interface = %interface_config_name(iface_config),
+                    "deferring configured BLE RNode to Android native GATT owner"
+                );
+                continue;
+            }
             let spawn_permit = match interface_registry.acquire_spawn_permit() {
                 Ok(permit) => permit,
                 Err(_) => {
@@ -3258,6 +3285,8 @@ pub async fn init_with_options_and_rnode_startup_options(
         network_identity: network_identity.clone(),
         discovery: discovery_runtime,
         startup_rnode_runtimes,
+        #[cfg(feature = "ble")]
+        deferred_android_ble_rnodes,
         shutdown_coordinator: shutdown_coordinator.clone(),
         started_at,
     };
@@ -3515,6 +3544,31 @@ fn discovered_backbone_client_mode(
 
 fn next_id(id_gen: &Arc<AtomicU64>) -> u64 {
     id_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(feature = "ble")]
+fn should_defer_android_ble_rnode(
+    config: &interface_factory::InterfaceConfig,
+    android_native_gatt_owner: bool,
+) -> bool {
+    android_native_gatt_owner && matches!(config, interface_factory::InterfaceConfig::BleRNode(_))
+}
+
+#[cfg(feature = "ble")]
+fn collect_deferred_android_ble_rnodes(
+    configs: &[interface_factory::InterfaceConfig],
+    owns_android_hardware: bool,
+) -> Vec<interface_factory::BleRNodeInterfaceConfig> {
+    if !owns_android_hardware {
+        return Vec::new();
+    }
+    configs
+        .iter()
+        .filter_map(|config| match config {
+            interface_factory::InterfaceConfig::BleRNode(config) => Some(config.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn interface_kind_for_config(config: &interface_factory::InterfaceConfig) -> InterfaceKind {
@@ -6558,8 +6612,6 @@ pub async fn spawn_ble_rnode_runtime_native_observed_with_options(
     tcp_port: u16,
     rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
 ) -> Result<SpawnedRNodeRuntime, RNodeRuntimeSpawnError> {
-    let spawn_permit = ensure_runtime_interface_admission(handle)
-        .map_err(RNodeRuntimeSpawnError::RuntimeAdmission)?;
     let BleRnodeRuntimeArgs {
         name,
         port,
@@ -6574,26 +6626,77 @@ pub async fn spawn_ble_rnode_runtime_native_observed_with_options(
         flow_control,
     } = args;
 
-    let mut config = rns_interface::ble_rnode::BleRNodeConfig::new(name, port);
-    config.frequency = frequency;
-    config.bandwidth = bandwidth;
-    config.spreading_factor = spreading_factor;
-    config.coding_rate = coding_rate;
-    config.tx_power = u8::try_from(tx_power).map_err(|_| {
+    spawn_ble_rnode_runtime_native_with_config_and_options(
+        handle,
+        interface_factory::BleRNodeInterfaceConfig {
+            name: name.to_string(),
+            port: port.to_string(),
+            frequency,
+            bandwidth,
+            spreading_factor,
+            coding_rate,
+            tx_power,
+            mode,
+            flow_control,
+            st_alock,
+            lt_alock,
+            id_interval: None,
+            id_callsign: None,
+        },
+        tcp_port,
+        rnode_startup_options,
+    )
+    .await
+}
+
+#[cfg(feature = "ble")]
+fn native_ble_driver_config(
+    source: interface_factory::BleRNodeInterfaceConfig,
+) -> Result<rns_interface::ble_rnode::BleRNodeConfig, RNodeRuntimeSpawnError> {
+    let name = source.name.clone();
+    let mut config = rns_interface::ble_rnode::BleRNodeConfig::new(&source.name, &source.port);
+    config.frequency = source.frequency;
+    config.bandwidth = source.bandwidth;
+    config.spreading_factor = source.spreading_factor;
+    config.coding_rate = source.coding_rate;
+    config.tx_power = u8::try_from(source.tx_power).map_err(|_| {
         RNodeRuntimeSpawnError::InvalidConfiguration(format!(
-            "invalid value for '{name}.txpower': {tx_power} is below 0 dBm"
+            "invalid value for '{name}.txpower': {} is below 0 dBm",
+            source.tx_power
         ))
     })?;
-    config.mode = mode;
-    config.st_alock = st_alock;
-    config.lt_alock = lt_alock;
-    config.flow_control = flow_control;
+    config.mode = source.mode;
+    config.st_alock = source.st_alock;
+    config.lt_alock = source.lt_alock;
+    config.flow_control = source.flow_control;
+    config.id_interval = source.id_interval;
+    config.id_callsign = source.id_callsign.map(String::into_bytes);
     config.validate().map_err(|error| {
         RNodeRuntimeSpawnError::InvalidConfiguration(format!(
             "invalid value for '{name}.{}': {error}",
             error.field()
         ))
     })?;
+    Ok(config)
+}
+
+/// Spawn and register a native-bridge BLE RNode from the lossless typed
+/// interface configuration returned by [`ReticulumHandle::deferred_android_ble_rnodes`].
+///
+/// Kotlin remains the physical GATT owner. This entry point preserves every
+/// configured radio, airtime, flow-control, mode, and station-ID field while
+/// Rust owns the stable loopback KISS session and Reticulum registration.
+#[cfg(feature = "ble")]
+pub async fn spawn_ble_rnode_runtime_native_with_config_and_options(
+    handle: &ReticulumHandle,
+    config: interface_factory::BleRNodeInterfaceConfig,
+    tcp_port: u16,
+    rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
+) -> Result<SpawnedRNodeRuntime, RNodeRuntimeSpawnError> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)
+        .map_err(RNodeRuntimeSpawnError::RuntimeAdmission)?;
+    let name = config.name.clone();
+    let config = native_ble_driver_config(config)?;
 
     let id = handle
         .id_gen
@@ -6859,8 +6962,6 @@ pub async fn spawn_android_usb_rnode_runtime_observed_with_options(
     flow_control: bool,
     rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
 ) -> Result<SpawnedRNodeRuntime, RNodeRuntimeSpawnError> {
-    let spawn_permit = ensure_runtime_interface_admission(handle)
-        .map_err(RNodeRuntimeSpawnError::RuntimeAdmission)?;
     let mut config = rns_interface::android_usb::AndroidUsbConfig::new(name, device_name);
     config.frequency = frequency;
     config.bandwidth = bandwidth;
@@ -6875,6 +6976,24 @@ pub async fn spawn_android_usb_rnode_runtime_observed_with_options(
     config.st_alock = st_alock;
     config.lt_alock = lt_alock;
     config.flow_control = flow_control;
+    spawn_android_usb_rnode_runtime_with_config_and_options(handle, config, rnode_startup_options)
+        .await
+}
+
+/// Spawn and register Android USB from one lossless typed configuration.
+///
+/// Applications that persist stable VID/PID/serial selectors or station-ID
+/// settings should use this form. The historical argument-list facade above
+/// remains source-compatible but can only express a legacy transient path.
+#[cfg(target_os = "android")]
+pub async fn spawn_android_usb_rnode_runtime_with_config_and_options(
+    handle: &ReticulumHandle,
+    config: rns_interface::android_usb::AndroidUsbConfig,
+    rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
+) -> Result<SpawnedRNodeRuntime, RNodeRuntimeSpawnError> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)
+        .map_err(RNodeRuntimeSpawnError::RuntimeAdmission)?;
+    let name = config.name.clone();
     config.validate().map_err(|error| {
         RNodeRuntimeSpawnError::InvalidConfiguration(format!(
             "invalid value for '{name}.{}': {error}",
@@ -7167,6 +7286,9 @@ async fn spawn_interface_with_rnode_startup_options(
                     .map_err(|_| format!("Android USB RNode '{}': invalid TX power", c.name))?;
                 let mut config =
                     rns_interface::android_usb::AndroidUsbConfig::new(&c.name, device_name);
+                config.device_vendor_id = c.usb_vendor_id;
+                config.device_product_id = c.usb_product_id;
+                config.device_serial_number = c.usb_serial_number.clone();
                 config.baud_rate = c.baud_rate;
                 config.frequency = c.frequency;
                 config.bandwidth = c.bandwidth;
@@ -7177,6 +7299,11 @@ async fn spawn_interface_with_rnode_startup_options(
                 config.flow_control = c.flow_control;
                 config.st_alock = c.st_alock;
                 config.lt_alock = c.lt_alock;
+                config.id_interval = c.id_interval;
+                config.id_callsign = c
+                    .id_callsign
+                    .as_ref()
+                    .map(|callsign| callsign.as_bytes().to_vec());
                 return rns_interface::android_usb::spawn_android_usb_rnode_interface_with_driver_and_options(
                     config,
                     id,
@@ -8434,6 +8561,41 @@ mod tests {
     }
 
     #[cfg(feature = "ble")]
+    #[test]
+    fn native_ble_typed_config_preserves_every_driver_field() {
+        let config = native_ble_driver_config(interface_factory::BleRNodeInterfaceConfig {
+            name: "native-lossless".into(),
+            port: "ble://AA:BB:CC:DD:EE:FF".into(),
+            frequency: 915_125_000,
+            bandwidth: 62_500,
+            spreading_factor: 9,
+            coding_rate: 7,
+            tx_power: 17,
+            mode: rns_interface::traits::InterfaceMode::Roaming,
+            flow_control: true,
+            st_alock: Some(12.5),
+            lt_alock: Some(3.25),
+            id_interval: Some(900),
+            id_callsign: Some("N0CALL".into()),
+        })
+        .expect("valid typed native BLE config");
+
+        assert_eq!(config.name, "native-lossless");
+        assert_eq!(config.ble_uri, "ble://AA:BB:CC:DD:EE:FF");
+        assert_eq!(config.frequency, 915_125_000);
+        assert_eq!(config.bandwidth, 62_500);
+        assert_eq!(config.spreading_factor, 9);
+        assert_eq!(config.coding_rate, 7);
+        assert_eq!(config.tx_power, 17);
+        assert_eq!(config.mode, rns_interface::traits::InterfaceMode::Roaming);
+        assert!(config.flow_control);
+        assert_eq!(config.st_alock, Some(12.5));
+        assert_eq!(config.lt_alock, Some(3.25));
+        assert_eq!(config.id_interval, Some(900));
+        assert_eq!(config.id_callsign.as_deref(), Some(b"N0CALL".as_slice()));
+    }
+
+    #[cfg(feature = "ble")]
     #[tokio::test]
     async fn ble_runtime_spawns_validate_before_allocating_interface_ids() {
         let runtime = dummy_handle();
@@ -9254,6 +9416,8 @@ loglevel = 7
             network_identity: None,
             discovery: Arc::new(DiscoveryRuntime::default()),
             startup_rnode_runtimes: Vec::new(),
+            #[cfg(feature = "ble")]
+            deferred_android_ble_rnodes: Vec::new(),
             shutdown_coordinator,
             started_at: std::time::Instant::now(),
         }
@@ -12235,6 +12399,97 @@ listen_port = 5555
         let config = Config::parse(input).unwrap();
         let interfaces = synthesize_interfaces(&config, false).unwrap();
         assert_eq!(interfaces.len(), 2);
+    }
+
+    #[cfg(feature = "ble")]
+    #[test]
+    fn android_native_ble_manifest_is_ordered_lossless_and_inventory_only() {
+        let make_ble = |name: &str, port: &str, frequency: u32| {
+            interface_factory::InterfaceConfig::BleRNode(
+                interface_factory::BleRNodeInterfaceConfig {
+                    name: name.into(),
+                    port: port.into(),
+                    frequency,
+                    bandwidth: 62_500,
+                    spreading_factor: 9,
+                    coding_rate: 7,
+                    tx_power: 14,
+                    mode: rns_interface::traits::InterfaceMode::Roaming,
+                    flow_control: true,
+                    st_alock: Some(12.5),
+                    lt_alock: Some(3.25),
+                    id_interval: Some(900),
+                    id_callsign: Some("N0CALL".into()),
+                },
+            )
+        };
+        let configs = vec![
+            make_ble("first", "ble://AA:BB:CC:DD:EE:01", 915_000_000),
+            interface_factory::InterfaceConfig::TcpClient(
+                rns_interface::tcp::TcpClientConfig::new("not-rnode", "127.0.0.1", 4242),
+            ),
+            make_ble("second", "ble://Custom RNode", 868_000_000),
+        ];
+
+        let deferred = collect_deferred_android_ble_rnodes(&configs, true);
+        assert_eq!(deferred.len(), 2);
+        assert_eq!(deferred[0].name, "first");
+        assert_eq!(deferred[0].port, "ble://AA:BB:CC:DD:EE:01");
+        assert_eq!(deferred[0].frequency, 915_000_000);
+        assert_eq!(deferred[0].bandwidth, 62_500);
+        assert_eq!(deferred[0].spreading_factor, 9);
+        assert_eq!(deferred[0].coding_rate, 7);
+        assert_eq!(deferred[0].tx_power, 14);
+        assert_eq!(
+            deferred[0].mode,
+            rns_interface::traits::InterfaceMode::Roaming
+        );
+        assert!(deferred[0].flow_control);
+        assert_eq!(deferred[0].st_alock, Some(12.5));
+        assert_eq!(deferred[0].lt_alock, Some(3.25));
+        assert_eq!(deferred[0].id_interval, Some(900));
+        assert_eq!(deferred[0].id_callsign.as_deref(), Some("N0CALL"));
+        assert_eq!(deferred[1].name, "second");
+        assert_eq!(deferred[1].port, "ble://Custom RNode");
+
+        assert!(should_defer_android_ble_rnode(&configs[0], true));
+        assert!(!should_defer_android_ble_rnode(&configs[1], true));
+        assert!(!should_defer_android_ble_rnode(&configs[0], false));
+        assert!(collect_deferred_android_ble_rnodes(&configs, false).is_empty());
+    }
+
+    #[cfg(feature = "ble")]
+    #[test]
+    fn android_native_ble_manifest_excludes_disabled_sections_without_duplicates() {
+        let input = r#"
+[interfaces]
+
+[[Enabled BLE]]
+type = RNodeInterface
+enabled = yes
+port = ble://Enabled
+frequency = 915000000
+bandwidth = 125000
+spreadingfactor = 8
+codingrate = 6
+txpower = 17
+
+[[Disabled BLE]]
+type = RNodeInterface
+enabled = no
+port = ble://Disabled
+frequency = 868000000
+bandwidth = 125000
+spreadingfactor = 8
+codingrate = 6
+txpower = 17
+"#;
+        let config = Config::parse(input).unwrap();
+        let interfaces = synthesize_interfaces(&config, true).unwrap();
+        let deferred = collect_deferred_android_ble_rnodes(&interfaces, true);
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].name, "Enabled BLE");
+        assert_eq!(deferred[0].port, "ble://Enabled");
     }
 
     #[test]

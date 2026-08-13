@@ -27,6 +27,124 @@ use rns_transport::messages::TransportMessage;
 const MIN_TRANSFER_TIMEOUT: Duration = Duration::from_millis(1);
 const USB_READER_BOUNDARY_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
+/// Stable identity retained across Android's transient `/dev/bus/usb` names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UsbDeviceSelector {
+    pub(crate) legacy_device_name: String,
+    pub(crate) vendor_id: Option<u16>,
+    pub(crate) product_id: Option<u16>,
+    pub(crate) serial_number: Option<String>,
+}
+
+/// Permission-safe device facts obtained from one UsbManager enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UsbDeviceCandidate {
+    pub(crate) device_name: String,
+    pub(crate) vendor_id: u16,
+    pub(crate) product_id: u16,
+    pub(crate) serial_number: Option<String>,
+    pub(crate) has_permission: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum UsbDeviceResolutionError {
+    NotFound,
+    Ambiguous { matches: usize },
+    PermissionRequired { device_name: String },
+}
+
+impl std::fmt::Display for UsbDeviceResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("configured Android USB device is not attached"),
+            Self::Ambiguous { matches } => write!(
+                formatter,
+                "configured Android USB selector matches {matches} devices; refusing ambiguous reopen"
+            ),
+            Self::PermissionRequired { .. } => {
+                formatter.write_str("Android USB permission is required")
+            }
+        }
+    }
+}
+
+/// Resolve one physical generation without ever guessing between devices.
+/// A legacy path may identify the first generation exactly; the returned
+/// selector learns VID/PID and an accessible serial for later path changes.
+pub(crate) fn resolve_usb_device(
+    selector: &UsbDeviceSelector,
+    candidates: &[UsbDeviceCandidate],
+) -> Result<(UsbDeviceCandidate, UsbDeviceSelector), UsbDeviceResolutionError> {
+    let mut matches: Vec<&UsbDeviceCandidate> = match (selector.vendor_id, selector.product_id) {
+        (Some(vendor_id), Some(product_id)) => {
+            let product_matches: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.vendor_id == vendor_id && candidate.product_id == product_id
+                })
+                .collect();
+            if let Some(serial) = selector.serial_number.as_ref() {
+                let exact: Vec<_> = product_matches
+                    .iter()
+                    .copied()
+                    .filter(|candidate| candidate.serial_number.as_ref() == Some(serial))
+                    .collect();
+                if !exact.is_empty() {
+                    exact
+                } else {
+                    let unreadable: Vec<_> = product_matches
+                        .iter()
+                        .copied()
+                        .filter(|candidate| {
+                            !candidate.has_permission && candidate.serial_number.is_none()
+                        })
+                        .collect();
+                    match unreadable.as_slice() {
+                        [candidate] => {
+                            return Err(UsbDeviceResolutionError::PermissionRequired {
+                                device_name: candidate.device_name.clone(),
+                            });
+                        }
+                        [] => Vec::new(),
+                        candidates => {
+                            return Err(UsbDeviceResolutionError::Ambiguous {
+                                matches: candidates.len(),
+                            });
+                        }
+                    }
+                }
+            } else {
+                product_matches
+            }
+        }
+        _ => candidates
+            .iter()
+            .filter(|candidate| candidate.device_name == selector.legacy_device_name)
+            .collect(),
+    };
+    if matches.is_empty() {
+        return Err(UsbDeviceResolutionError::NotFound);
+    }
+    if matches.len() != 1 {
+        return Err(UsbDeviceResolutionError::Ambiguous {
+            matches: matches.len(),
+        });
+    }
+    let candidate = matches.pop().expect("one USB match checked").clone();
+    if !candidate.has_permission {
+        return Err(UsbDeviceResolutionError::PermissionRequired {
+            device_name: candidate.device_name,
+        });
+    }
+    let learned = UsbDeviceSelector {
+        legacy_device_name: candidate.device_name.clone(),
+        vendor_id: Some(candidate.vendor_id),
+        product_id: Some(candidate.product_id),
+        serial_number: candidate.serial_number.clone(),
+    };
+    Ok((candidate, learned))
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UsbLeaseKind {
@@ -65,7 +183,7 @@ impl<R> UsbLeaseTable<R> {
                 UsbLeaseState::Active => "already active",
                 UsbLeaseState::Quarantined(_) => "permanently quarantined",
             };
-            return Err(format!("Android USB device {device_name} is {state}"));
+            return Err(format!("Android USB device is {state}"));
         }
         self.devices
             .insert(device_name.to_string(), UsbLeaseState::Opening);
@@ -78,15 +196,11 @@ impl<R> UsbLeaseTable<R> {
                 *state = UsbLeaseState::Active;
                 Ok(())
             }
-            Some(UsbLeaseState::Active) => Err(format!(
-                "Android USB device {device_name} is already active"
-            )),
-            Some(UsbLeaseState::Quarantined(_)) => Err(format!(
-                "Android USB device {device_name} is permanently quarantined"
-            )),
-            None => Err(format!(
-                "Android USB device {device_name} has no opening reservation"
-            )),
+            Some(UsbLeaseState::Active) => Err("Android USB device is already active".into()),
+            Some(UsbLeaseState::Quarantined(_)) => {
+                Err("Android USB device is permanently quarantined".into())
+            }
+            None => Err("Android USB device has no opening reservation".into()),
         }
     }
 
@@ -96,15 +210,13 @@ impl<R> UsbLeaseTable<R> {
                 self.devices.remove(device_name);
                 Ok(())
             }
-            Some(UsbLeaseState::Active) => Err(format!(
-                "Android USB device {device_name} became active before opening release"
-            )),
-            Some(UsbLeaseState::Quarantined(_)) => Err(format!(
-                "Android USB device {device_name} is permanently quarantined"
-            )),
-            None => Err(format!(
-                "Android USB device {device_name} has no opening reservation"
-            )),
+            Some(UsbLeaseState::Active) => {
+                Err("Android USB device became active before opening release".into())
+            }
+            Some(UsbLeaseState::Quarantined(_)) => {
+                Err("Android USB device is permanently quarantined".into())
+            }
+            None => Err("Android USB device has no opening reservation".into()),
         }
     }
 
@@ -114,15 +226,11 @@ impl<R> UsbLeaseTable<R> {
                 self.devices.remove(device_name);
                 Ok(())
             }
-            Some(UsbLeaseState::Opening) => Err(format!(
-                "Android USB device {device_name} never became active"
-            )),
-            Some(UsbLeaseState::Quarantined(_)) => Err(format!(
-                "Android USB device {device_name} is permanently quarantined"
-            )),
-            None => Err(format!(
-                "Android USB device {device_name} has no active lease"
-            )),
+            Some(UsbLeaseState::Opening) => Err("Android USB device never became active".into()),
+            Some(UsbLeaseState::Quarantined(_)) => {
+                Err("Android USB device is permanently quarantined".into())
+            }
+            None => Err("Android USB device has no active lease".into()),
         }
     }
 
@@ -1206,17 +1314,34 @@ pub(crate) async fn run_usb_tx_pump(
     application_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>,
     writer: UsbWriterHandle,
     transmitted_bytes: Arc<AtomicU64>,
+    beacon: Option<(Duration, Bytes)>,
     mut stop: oneshot::Receiver<()>,
 ) -> UsbTxPumpExit {
     // A fresh physical USB generation borrows the same application queue.
     // The lock is released when that generation's pump exits, preserving the
     // stable InterfaceHandle across reconnects without duplicating queues.
     let mut application_rx = application_rx.lock().await;
+    let mut first_tx: Option<tokio::time::Instant> = None;
     loop {
-        let payload = tokio::select! {
-            biased;
-            _ = &mut stop => return UsbTxPumpExit::StopRequested,
-            payload = application_rx.recv() => payload,
+        let (payload, station_id) = if let Some((interval, ref callsign)) = beacon {
+            tokio::select! {
+                biased;
+                _ = &mut stop => return UsbTxPumpExit::StopRequested,
+                payload = application_rx.recv() => (payload, false),
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if first_tx.is_some_and(|started| started.elapsed() >= interval) {
+                        (Some(callsign.clone()), true)
+                    } else {
+                        continue;
+                    }
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = &mut stop => return UsbTxPumpExit::StopRequested,
+                payload = application_rx.recv() => (payload, false),
+            }
         };
         let Some(payload) = payload else {
             return UsbTxPumpExit::ApplicationClosed;
@@ -1229,6 +1354,11 @@ pub(crate) async fn run_usb_tx_pump(
         };
         if let Err(error) = queued {
             return UsbTxPumpExit::WriterRejected(error);
+        }
+        if station_id {
+            first_tx = None;
+        } else if first_tx.is_none() {
+            first_tx = Some(tokio::time::Instant::now());
         }
     }
 }
@@ -1597,6 +1727,81 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usb_candidate(
+        device_name: &str,
+        vendor_id: u16,
+        product_id: u16,
+        serial_number: Option<&str>,
+        has_permission: bool,
+    ) -> UsbDeviceCandidate {
+        UsbDeviceCandidate {
+            device_name: device_name.into(),
+            vendor_id,
+            product_id,
+            serial_number: serial_number.map(str::to_string),
+            has_permission,
+        }
+    }
+
+    #[test]
+    fn legacy_usb_path_learns_stable_identity_and_survives_path_change() {
+        let legacy = UsbDeviceSelector {
+            legacy_device_name: "/dev/bus/usb/001/002".into(),
+            vendor_id: None,
+            product_id: None,
+            serial_number: None,
+        };
+        let first = usb_candidate("/dev/bus/usb/001/002", 0x303a, 0x1001, Some("ABC"), true);
+        let (_, learned) = resolve_usb_device(&legacy, &[first]).expect("legacy first generation");
+        let moved = usb_candidate("/dev/bus/usb/001/009", 0x303a, 0x1001, Some("ABC"), true);
+        let (resolved, _) =
+            resolve_usb_device(&learned, &[moved]).expect("stable selector after replug");
+        assert_eq!(resolved.device_name, "/dev/bus/usb/001/009");
+    }
+
+    #[test]
+    fn usb_selector_fails_closed_on_ambiguity_and_permission_loss() {
+        let selector = UsbDeviceSelector {
+            legacy_device_name: "old".into(),
+            vendor_id: Some(0x303a),
+            product_id: Some(0x1001),
+            serial_number: None,
+        };
+        let a = usb_candidate("a", 0x303a, 0x1001, None, true);
+        let b = usb_candidate("b", 0x303a, 0x1001, None, true);
+        assert_eq!(
+            resolve_usb_device(&selector, &[a.clone(), b]),
+            Err(UsbDeviceResolutionError::Ambiguous { matches: 2 })
+        );
+        let denied = UsbDeviceCandidate {
+            has_permission: false,
+            ..a
+        };
+        assert_eq!(
+            resolve_usb_device(&selector, &[denied]),
+            Err(UsbDeviceResolutionError::PermissionRequired {
+                device_name: "a".into()
+            })
+        );
+
+        let serial_selector = UsbDeviceSelector {
+            serial_number: Some("ABC".into()),
+            ..selector
+        };
+        let moved_denied = usb_candidate("moved", 0x303a, 0x1001, None, false);
+        assert_eq!(
+            resolve_usb_device(&serial_selector, &[moved_denied]),
+            Err(UsbDeviceResolutionError::PermissionRequired {
+                device_name: "moved".into()
+            })
+        );
+        let restored = usb_candidate("moved", 0x303a, 0x1001, Some("ABC"), true);
+        let (resolved, learned) = resolve_usb_device(&serial_selector, &[restored])
+            .expect("restored permission confirms saved serial");
+        assert_eq!(resolved.device_name, "moved");
+        assert_eq!(learned.serial_number.as_deref(), Some("ABC"));
+    }
     use md5::{Digest, Md5};
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
@@ -3160,6 +3365,7 @@ mod tests {
                 queue: UsbWriteQueue::new(1),
             },
             transmitted.clone(),
+            None,
             pump_stop_rx,
         ));
         application_tx
@@ -3198,6 +3404,7 @@ mod tests {
                 queue: UsbWriteQueue::new(1),
             },
             transmitted.clone(),
+            None,
             first_stop_rx,
         ));
         first_stop_tx.send(()).expect("stop first generation");
@@ -3220,6 +3427,7 @@ mod tests {
                 queue: UsbWriteQueue::new(1),
             },
             transmitted.clone(),
+            None,
             second_stop_rx,
         ));
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -3237,6 +3445,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn android_usb_station_id_is_armed_only_after_application_tx() {
+        let (application_tx, application_rx) = mpsc::channel(1);
+        let application_rx = Arc::new(tokio::sync::Mutex::new(application_rx));
+        let transmitted = Arc::new(AtomicU64::new(0));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let payload = Bytes::from_static(b"payload");
+        let callsign = Bytes::from_static(b"N0CALL");
+        let expected = (kiss::frame(&payload).len() + kiss::frame(&callsign).len()) as u64;
+        let pump = tokio::spawn(run_usb_tx_pump(
+            application_rx,
+            UsbWriterHandle {
+                queue: UsbWriteQueue::new(2),
+            },
+            transmitted.clone(),
+            Some((Duration::ZERO, callsign)),
+            stop_rx,
+        ));
+        assert_eq!(transmitted.load(Ordering::Relaxed), 0);
+        application_tx.send(payload).await.expect("application tx");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while transmitted.load(Ordering::Relaxed) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("station ID did not follow application TX");
+        let _ = stop_tx.send(());
+        assert_eq!(pump.await.expect("pump join"), UsbTxPumpExit::StopRequested);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blocked_tx_admission_does_not_stall_inbound_forwarding() {
         let (application_tx, application_rx) = mpsc::channel(1);
@@ -3249,6 +3488,7 @@ mod tests {
                 queue: UsbWriteQueue::new(0),
             },
             transmitted.clone(),
+            None,
             pump_stop_rx,
         ));
         application_tx
