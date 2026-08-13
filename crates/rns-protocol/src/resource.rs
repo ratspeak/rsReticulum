@@ -811,6 +811,28 @@ pub struct MultiSegmentOutbound {
     pub data_size: usize,
 }
 
+/// Sender-side plan that materialises at most one split Resource segment at a
+/// time.
+///
+/// The signed/application payload remains owned by the plan, but plaintext,
+/// encrypted parts and hash maps for future segments are not allocated until
+/// [`Self::next_segment`] is called. This is the bounded primitive used by
+/// large LXMF Direct deliveries; the eager [`MultiSegmentOutbound`] facade is
+/// retained for callers that need random access to every segment.
+pub struct LazyMultiSegmentOutbound {
+    data: Vec<u8>,
+    auto_compress: bool,
+    metadata: Option<Vec<u8>>,
+    metadata_wire_size: usize,
+    request_id: Option<Vec<u8>>,
+    is_response: bool,
+    next_offset: usize,
+    next_segment_index: usize,
+    pub original_hash: [u8; 32],
+    pub total_segments: usize,
+    pub data_size: usize,
+}
+
 fn required_segment_count(data_size: usize, metadata_wire_size: usize) -> usize {
     if data_size == 0 {
         return 1;
@@ -851,69 +873,19 @@ impl MultiSegmentOutbound {
         is_response: bool,
         encrypt_fn: Option<&ResourceEncryptor<'_>>,
     ) -> Result<Self, ResourceError> {
-        if data.len() > MAX_RESOURCE_SIZE {
-            return Err(ResourceError::TooLarge);
-        }
-
-        let data_size = data.len();
-
-        // `original_hash` covers the uncompressed concatenated payload so
-        // the receiver can verify reassembly across all segments.
-        let random_hash: [u8; RANDOM_HASH_SIZE] =
-            rns_crypto::random::random_bytes(RANDOM_HASH_SIZE)
-                .try_into()
-                .unwrap();
-        let original_hash = compute_resource_hash(&data, &random_hash);
-
-        let metadata_wire_size = metadata.as_ref().map(|m| 3 + m.len()).unwrap_or(0);
-        if metadata_wire_size > MAX_EFFICIENT_SIZE {
-            return Err(ResourceError::MetadataTooLarge);
-        }
-        let planned_segments = required_segment_count(data.len(), metadata_wire_size);
-        if planned_segments > MAX_SEGMENTS {
-            return Err(ResourceError::TooLarge);
-        }
-
-        let first_payload_max = MAX_EFFICIENT_SIZE - metadata_wire_size;
-        let mut chunk_specs: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(planned_segments);
-
-        if data.is_empty() {
-            chunk_specs.push((Vec::new(), metadata.clone()));
-        } else {
-            let first_len = data.len().min(first_payload_max);
-            chunk_specs.push((data[..first_len].to_vec(), metadata.clone()));
-            let mut offset = first_len;
-
-            while offset < data.len() {
-                let end = (offset + MAX_EFFICIENT_SIZE).min(data.len());
-                chunk_specs.push((data[offset..end].to_vec(), None));
-                offset = end;
-            }
-        }
-
-        let total_segments = chunk_specs.len();
-        debug_assert_eq!(total_segments, planned_segments);
+        let mut lazy = LazyMultiSegmentOutbound::with_options(
+            data,
+            auto_compress,
+            metadata,
+            request_id,
+            is_response,
+        )?;
+        let original_hash = lazy.original_hash;
+        let total_segments = lazy.total_segments;
+        let data_size = lazy.data_size;
         let mut segments = Vec::with_capacity(total_segments);
-
-        for (i, (chunk, segment_metadata)) in chunk_specs.into_iter().enumerate() {
-            let mut resource = OutboundResource::with_options(
-                chunk,
-                auto_compress,
-                segment_metadata,
-                None,
-                encrypt_fn,
-            )?;
-            resource.flags.split = true;
-            resource.flags.is_response = is_response;
-            resource.segment_index = i + 1;
-            resource.total_segments = total_segments;
-            resource.request_id = request_id.clone();
-            resource.advertisement_data_size = data_size + metadata_wire_size;
-            // Stamps the shared `original_hash` onto each segment so the wire
-            // ADV (built later via `create_advertisement`) carries the
-            // coordinator key the receiver needs to reassemble.
-            resource.original_hash = Some(original_hash);
-            segments.push(resource);
+        while let Some(segment) = lazy.next_segment(encrypt_fn)? {
+            segments.push(segment);
         }
 
         Ok(Self {
@@ -959,6 +931,120 @@ impl MultiSegmentOutbound {
             }
         }
         cancelled
+    }
+}
+
+impl LazyMultiSegmentOutbound {
+    /// Create a sequential split-Resource plan without metadata or request
+    /// flags.
+    pub fn new(data: Vec<u8>, auto_compress: bool) -> Result<Self, ResourceError> {
+        Self::with_options(data, auto_compress, None, None, false)
+    }
+
+    /// Create a sequential split-Resource plan while preserving metadata and
+    /// request flags. Metadata is moved into the first segment when it is
+    /// materialised.
+    pub fn with_options(
+        data: Vec<u8>,
+        auto_compress: bool,
+        metadata: Option<Vec<u8>>,
+        request_id: Option<Vec<u8>>,
+        is_response: bool,
+    ) -> Result<Self, ResourceError> {
+        if data.len() > MAX_RESOURCE_SIZE {
+            return Err(ResourceError::TooLarge);
+        }
+
+        let data_size = data.len();
+        let metadata_wire_size = metadata.as_ref().map(|value| 3 + value.len()).unwrap_or(0);
+        if metadata_wire_size > MAX_EFFICIENT_SIZE {
+            return Err(ResourceError::MetadataTooLarge);
+        }
+        let total_segments = required_segment_count(data_size, metadata_wire_size);
+        if total_segments > MAX_SEGMENTS {
+            return Err(ResourceError::TooLarge);
+        }
+
+        // `original_hash` covers the uncompressed concatenated payload so the
+        // receiver can verify reassembly across all segments.
+        let random_hash: [u8; RANDOM_HASH_SIZE] =
+            rns_crypto::random::random_bytes(RANDOM_HASH_SIZE)
+                .try_into()
+                .expect("fixed random-hash length");
+        let original_hash = compute_resource_hash(&data, &random_hash);
+
+        Ok(Self {
+            data,
+            auto_compress,
+            metadata,
+            metadata_wire_size,
+            request_id,
+            is_response,
+            next_offset: 0,
+            next_segment_index: 1,
+            original_hash,
+            total_segments,
+            data_size,
+        })
+    }
+
+    /// Number of segments that have not yet been materialised.
+    pub fn remaining_segments(&self) -> usize {
+        self.total_segments
+            .saturating_sub(self.next_segment_index.saturating_sub(1))
+    }
+
+    /// Build the next standalone outbound Resource. The caller owns the
+    /// returned segment and should request another only after the current one
+    /// has completed or been terminally discarded.
+    pub fn next_segment(
+        &mut self,
+        encrypt_fn: Option<&ResourceEncryptor<'_>>,
+    ) -> Result<Option<OutboundResource>, ResourceError> {
+        if self.next_segment_index > self.total_segments {
+            return Ok(None);
+        }
+
+        let segment_index = self.next_segment_index;
+        let segment_metadata = if segment_index == 1 {
+            self.metadata.take()
+        } else {
+            None
+        };
+        let payload_limit = if segment_index == 1 {
+            MAX_EFFICIENT_SIZE - self.metadata_wire_size
+        } else {
+            MAX_EFFICIENT_SIZE
+        };
+        let end = self
+            .next_offset
+            .saturating_add(payload_limit)
+            .min(self.data.len());
+        let chunk = self.data[self.next_offset..end].to_vec();
+
+        let mut resource = OutboundResource::with_options(
+            chunk,
+            self.auto_compress,
+            segment_metadata,
+            None,
+            encrypt_fn,
+        )?;
+        resource.flags.split = true;
+        resource.flags.is_response = self.is_response;
+        resource.segment_index = segment_index;
+        resource.total_segments = self.total_segments;
+        resource.request_id = self.request_id.clone();
+        resource.advertisement_data_size = self.data_size + self.metadata_wire_size;
+        resource.original_hash = Some(self.original_hash);
+
+        self.next_offset = end;
+        self.next_segment_index += 1;
+        if self.next_segment_index > self.total_segments {
+            // The current segment now owns its bytes. Release the complete
+            // source allocation before it begins transferring.
+            self.data = Vec::new();
+        }
+        Ok(Some(resource))
     }
 }
 
@@ -3380,6 +3466,74 @@ mod tests {
         assert_eq!(multi.segments[0].data.len(), MAX_EFFICIENT_SIZE);
         // Second segment has the remainder
         assert_eq!(multi.segments[1].data.len(), 1000);
+    }
+
+    #[test]
+    fn test_lazy_multi_segment_materialises_only_on_demand() {
+        let data = vec![0xA6; MAX_EFFICIENT_SIZE * 2 + 321];
+        let mut lazy = LazyMultiSegmentOutbound::new(data.clone(), false).unwrap();
+
+        assert_eq!(lazy.total_segments, 3);
+        assert_eq!(lazy.remaining_segments(), 3);
+
+        let first = lazy.next_segment(None).unwrap().unwrap();
+        assert_eq!(first.segment_index, 1);
+        assert_eq!(first.total_segments, 3);
+        assert_eq!(first.data.len(), MAX_EFFICIENT_SIZE);
+        assert_eq!(lazy.remaining_segments(), 2);
+
+        let second = lazy.next_segment(None).unwrap().unwrap();
+        assert_eq!(second.segment_index, 2);
+        assert_eq!(second.data.len(), MAX_EFFICIENT_SIZE);
+        assert_eq!(lazy.remaining_segments(), 1);
+
+        let third = lazy.next_segment(None).unwrap().unwrap();
+        assert_eq!(third.segment_index, 3);
+        assert_eq!(third.data.len(), 321);
+        assert_eq!(lazy.remaining_segments(), 0);
+        assert!(lazy.next_segment(None).unwrap().is_none());
+
+        let rebuilt: Vec<u8> = [first, second, third]
+            .into_iter()
+            .flat_map(|segment| segment.data)
+            .collect();
+        assert_eq!(rebuilt, data);
+    }
+
+    #[test]
+    fn test_lazy_multi_segment_preserves_metadata_and_request_flags() {
+        let metadata = b"\x81\xa4name\xa8file.bin".to_vec();
+        let request_id = vec![0x42; 16];
+        let data = vec![0x5C; MAX_EFFICIENT_SIZE + 10];
+        let mut lazy = LazyMultiSegmentOutbound::with_options(
+            data,
+            false,
+            Some(metadata.clone()),
+            Some(request_id.clone()),
+            true,
+        )
+        .unwrap();
+
+        let first = lazy.next_segment(None).unwrap().unwrap();
+        let second = lazy.next_segment(None).unwrap().unwrap();
+        assert!(first.flags.has_metadata);
+        assert!(
+            first
+                .metadata
+                .as_deref()
+                .is_some_and(|wire| wire.ends_with(&metadata))
+        );
+        assert_eq!(first.metadata_size, metadata.len() + 3);
+        assert!(!second.flags.has_metadata);
+        assert_eq!(first.request_id, Some(request_id.clone()));
+        assert_eq!(second.request_id, Some(request_id));
+        assert!(first.flags.is_response);
+        assert!(second.flags.is_response);
+        assert_eq!(first.original_hash, second.original_hash);
+        assert_eq!(
+            first.advertisement_data_size,
+            second.advertisement_data_size
+        );
     }
 
     #[test]
