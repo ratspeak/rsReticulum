@@ -72,6 +72,10 @@ pub struct TransportActor {
     /// Truncated packet hash → LXMF msg_id for pairing delivery proofs back
     /// to their originating outbound message.
     pub receipt_msg_ids: HashMap<[u8; 16], String>,
+    /// Direct application proof sinks for receipt owners that cannot tolerate
+    /// loss through the legacy bounded destination-event fan-out.
+    pub receipt_proof_txs:
+        HashMap<[u8; 16], mpsc::UnboundedSender<crate::link_messages::DestinationEvent>>,
     /// Direct per-send receipt observers used by the high-level runtime API.
     pub receipt_updates:
         HashMap<[u8; 16], tokio::sync::watch::Sender<crate::messages::ReceiptUpdate>>,
@@ -321,6 +325,7 @@ impl TransportActor {
             packet_metrics_order: VecDeque::new(),
             receipt_table: HashMap::new(),
             receipt_msg_ids: HashMap::new(),
+            receipt_proof_txs: HashMap::new(),
             receipt_updates: HashMap::new(),
             interfaces: HashMap::new(),
             local_destinations: HashSet::new(),
@@ -786,9 +791,33 @@ impl TransportActor {
                 receipt.set_destination_identity(destination_hash, Some(destination_public_key));
                 self.receipt_table.insert(truncated_hash, receipt);
                 self.receipt_msg_ids.insert(truncated_hash, msg_id);
+                self.receipt_proof_txs.remove(&truncated_hash);
                 debug!(
                     trunc = hex::encode(truncated_hash),
                     "registered receipt for outbound LXMF message"
+                );
+            }
+            TransportMessage::RegisterReceiptWithProof {
+                truncated_hash,
+                full_hash,
+                destination_hash,
+                destination_public_key,
+                msg_id,
+                timeout,
+                proof_tx,
+            } => {
+                let mut receipt = PacketReceipt::new(
+                    full_hash,
+                    truncated_hash,
+                    Some(timeout.unwrap_or(std::time::Duration::from_secs(180))),
+                );
+                receipt.set_destination_identity(destination_hash, Some(destination_public_key));
+                self.receipt_table.insert(truncated_hash, receipt);
+                self.receipt_msg_ids.insert(truncated_hash, msg_id);
+                self.receipt_proof_txs.insert(truncated_hash, proof_tx);
+                debug!(
+                    trunc = hex::encode(truncated_hash),
+                    "registered receipt with direct application proof owner"
                 );
             }
             TransportMessage::RegisterLink {
@@ -981,6 +1010,7 @@ impl TransportActor {
         self.path_states.clear();
         self.packet_metrics.clear();
         self.packet_metrics_order.clear();
+        self.receipt_proof_txs.clear();
         self.discovery_path_requests.clear();
         self.pending_local_path_requests.clear();
         self.pending_discovery_prs.clear();
@@ -8221,6 +8251,57 @@ mod tests {
         });
         assert!(!actor.receipt_table.contains_key(&proof_hash));
         assert!(!actor.receipt_msg_ids.contains_key(&proof_hash));
+    }
+
+    #[test]
+    fn direct_delivery_proof_owner_bypasses_full_destination_channel() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (iface, _rx) = make_test_interface("direct-proof-owner");
+        actor.interfaces.insert(1, iface);
+
+        let destination = rns_identity::identity::Identity::new();
+        let destination_hash = [0xD3; 16];
+        let packet_hash = [0x63; 32];
+        let mut proof_hash = [0u8; 16];
+        proof_hash.copy_from_slice(&packet_hash[..16]);
+        let (proof_tx, mut proof_rx) = mpsc::unbounded_channel();
+
+        actor.handle_message(TransportMessage::RegisterReceiptWithProof {
+            truncated_hash: proof_hash,
+            full_hash: packet_hash,
+            destination_hash,
+            destination_public_key: destination.get_public_key(),
+            msg_id: "direct-owner-message".to_string(),
+            timeout: Some(Duration::from_secs(180)),
+            proof_tx,
+        });
+
+        let (legacy_tx, _legacy_rx) = mpsc::channel(1);
+        legacy_tx
+            .try_send(crate::link_messages::DestinationEvent::LinkClosed {
+                link_id: [0x64; 16],
+            })
+            .unwrap();
+        actor.destination_channels.insert([0x65; 16], legacy_tx);
+
+        let signature = destination.sign(&packet_hash).unwrap();
+        actor.on_inbound(InboundPacket {
+            raw: make_proof_packet_with_payload(proof_hash, 0, &signature),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+
+        assert!(matches!(
+            proof_rx.try_recv(),
+            Ok(crate::link_messages::DestinationEvent::DeliveryProof { msg_id, .. })
+                if msg_id == "direct-owner-message"
+        ));
+        assert!(!actor.receipt_table.contains_key(&proof_hash));
+        assert!(!actor.receipt_msg_ids.contains_key(&proof_hash));
+        assert!(!actor.receipt_proof_txs.contains_key(&proof_hash));
+        assert_eq!(actor.channel_drops, 0);
     }
 
     #[test]

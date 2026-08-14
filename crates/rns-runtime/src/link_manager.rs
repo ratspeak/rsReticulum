@@ -31,6 +31,15 @@ const MAX_PENDING_DESTINATION_ANNOUNCES: usize = 256;
 /// or flow-control that this manager already committed to sending.
 const MAX_PENDING_LINK_CONTROL: usize = 256;
 
+/// Legacy application channels are bounded for API compatibility, but these
+/// notifications represent terminal protocol facts. Retain them across local
+/// backpressure instead of silently losing a validated proof or Link close.
+enum LegacyTerminalNotification {
+    PacketProof(LinkPacketProof),
+    ResourceProof(LinkResourceProof),
+    LinkClosed([u8; 16]),
+}
+
 struct ActiveLink {
     link: Link,
     _interface_id: u64,
@@ -299,15 +308,18 @@ pub struct ResourceCompletion {
 
 /// Ordered, capacity-lossless Link accounting notifications.
 ///
-/// This opt-in stream contains Resource starts and conclusions, ordinary
-/// inbound completion payloads, and Link closure. Progress remains available
-/// only through the bounded best-effort Resource event channel. Delivery is
+/// This opt-in stream contains validated ordinary Link-packet proofs, Resource
+/// starts and conclusions, ordinary inbound completion payloads, and Link
+/// closure in manager-observation order. Progress remains available only
+/// through the bounded best-effort Resource event channel. Delivery is
 /// guaranteed while the unbounded receiver remains alive. Request Resources
 /// retain their start and conclusion events but dispatch inline and never
 /// produce a [`LinkManagerAccountingEvent::ResourceCompletion`].
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum LinkManagerAccountingEvent {
+    /// A validated proof for an ordinary application Link packet.
+    LinkPacketProof(LinkPacketProof),
     /// Resource start or terminal conclusion; progress is omitted.
     ResourceEvent(LinkResourceEvent),
     /// Complete ordinary inbound Resource data and metadata.
@@ -319,6 +331,11 @@ pub enum LinkManagerAccountingEvent {
 impl std::fmt::Debug for LinkManagerAccountingEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::LinkPacketProof(proof) => f
+                .debug_struct("LinkPacketProof")
+                .field("link_id", &hex::encode(proof.link_id))
+                .field("packet_hash", &hex::encode(proof.packet_hash))
+                .finish(),
             Self::ResourceEvent(event) => f.debug_tuple("ResourceEvent").field(event).finish(),
             Self::ResourceCompletion(completion) => f
                 .debug_struct("ResourceCompletion")
@@ -447,6 +464,7 @@ pub struct LinkManager {
     link_packet_proof_tx: Option<mpsc::Sender<LinkPacketProof>>,
     /// Valid proof for an application resource sent through this manager.
     outbound_resource_proof_tx: Option<mpsc::Sender<LinkResourceProof>>,
+    pending_legacy_terminal_events: VecDeque<LegacyTerminalNotification>,
     /// Valid proof for a non-Link packet registered by the owning application.
     /// Unbounded because a validated terminal event must not be discarded after
     /// the network has already acknowledged delivery.
@@ -511,6 +529,7 @@ impl LinkManager {
             link_packet_tx: None,
             link_packet_proof_tx: None,
             outbound_resource_proof_tx: None,
+            pending_legacy_terminal_events: VecDeque::new(),
             destination_delivery_proof_tx: None,
             resource_event_tx: None,
             accounting_event_tx: None,
@@ -574,6 +593,7 @@ impl LinkManager {
             link_packet_tx: None,
             link_packet_proof_tx: None,
             outbound_resource_proof_tx: None,
+            pending_legacy_terminal_events: VecDeque::new(),
             destination_delivery_proof_tx: None,
             resource_event_tx: None,
             accounting_event_tx: None,
@@ -641,6 +661,7 @@ impl LinkManager {
     pub fn try_step(&mut self) -> bool {
         self.flush_pending_link_control();
         self.flush_pending_destination_announces();
+        self.flush_pending_legacy_terminal_notifications();
         match self.event_rx.try_recv() {
             Ok(event) => {
                 self.handle_event(event);
@@ -655,6 +676,7 @@ impl LinkManager {
     pub async fn step(&mut self) -> bool {
         self.flush_pending_link_control();
         self.flush_pending_destination_announces();
+        self.flush_pending_legacy_terminal_notifications();
         let Some(event) = self.event_rx.recv().await else {
             return false;
         };
@@ -665,6 +687,7 @@ impl LinkManager {
     pub fn tick(&mut self) {
         self.flush_pending_link_control();
         self.flush_pending_destination_announces();
+        self.flush_pending_legacy_terminal_notifications();
         self.on_tick();
     }
 
@@ -674,6 +697,7 @@ impl LinkManager {
         loop {
             self.flush_pending_link_control();
             self.flush_pending_destination_announces();
+            self.flush_pending_legacy_terminal_notifications();
             tokio::select! {
                 event = self.event_rx.recv() => {
                     match event {
@@ -695,6 +719,7 @@ impl LinkManager {
         'run: loop {
             self.flush_pending_link_control();
             self.flush_pending_destination_announces();
+            self.flush_pending_legacy_terminal_notifications();
             while let Ok(command) = command_rx.try_recv() {
                 if !self.handle_command(command) {
                     break 'run;
@@ -1099,6 +1124,92 @@ impl LinkManager {
         }
         pending.push_back(message);
         true
+    }
+
+    fn stage_legacy_terminal_notification(
+        packet_proof_tx: &Option<mpsc::Sender<LinkPacketProof>>,
+        resource_proof_tx: &Option<mpsc::Sender<LinkResourceProof>>,
+        link_closed_tx: &Option<mpsc::Sender<[u8; 16]>>,
+        pending: &mut VecDeque<LegacyTerminalNotification>,
+        event: LegacyTerminalNotification,
+    ) {
+        pending.push_back(event);
+        Self::flush_legacy_terminal_notifications(
+            packet_proof_tx,
+            resource_proof_tx,
+            link_closed_tx,
+            pending,
+        );
+    }
+
+    fn flush_legacy_terminal_notifications(
+        packet_proof_tx: &Option<mpsc::Sender<LinkPacketProof>>,
+        resource_proof_tx: &Option<mpsc::Sender<LinkResourceProof>>,
+        link_closed_tx: &Option<mpsc::Sender<[u8; 16]>>,
+        pending: &mut VecDeque<LegacyTerminalNotification>,
+    ) {
+        while let Some(event) = pending.pop_front() {
+            let retry = match event {
+                LegacyTerminalNotification::PacketProof(proof) => {
+                    let Some(tx) = packet_proof_tx else {
+                        continue;
+                    };
+                    match tx.try_send(proof) {
+                        Ok(()) => None,
+                        Err(mpsc::error::TrySendError::Full(proof)) => {
+                            Some(LegacyTerminalNotification::PacketProof(proof))
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::debug!("legacy Link-packet proof receiver is closed");
+                            None
+                        }
+                    }
+                }
+                LegacyTerminalNotification::ResourceProof(proof) => {
+                    let Some(tx) = resource_proof_tx else {
+                        continue;
+                    };
+                    match tx.try_send(proof) {
+                        Ok(()) => None,
+                        Err(mpsc::error::TrySendError::Full(proof)) => {
+                            Some(LegacyTerminalNotification::ResourceProof(proof))
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::debug!("legacy Resource-proof receiver is closed");
+                            None
+                        }
+                    }
+                }
+                LegacyTerminalNotification::LinkClosed(link_id) => {
+                    let Some(tx) = link_closed_tx else {
+                        continue;
+                    };
+                    match tx.try_send(link_id) {
+                        Ok(()) => None,
+                        Err(mpsc::error::TrySendError::Full(link_id)) => {
+                            Some(LegacyTerminalNotification::LinkClosed(link_id))
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::debug!("legacy Link-close receiver is closed");
+                            None
+                        }
+                    }
+                }
+            };
+            if let Some(event) = retry {
+                pending.push_front(event);
+                break;
+            }
+        }
+    }
+
+    fn flush_pending_legacy_terminal_notifications(&mut self) {
+        Self::flush_legacy_terminal_notifications(
+            &self.link_packet_proof_tx,
+            &self.outbound_resource_proof_tx,
+            &self.link_closed_tx,
+            &mut self.pending_legacy_terminal_events,
+        );
     }
 
     fn flush_pending_link_control(&mut self) {
@@ -1565,28 +1676,41 @@ impl LinkManager {
                     }
 
                     let pkt_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
-                    if let Ok(proof_data) = active.link.prove_packet_with_link_key(&pkt_hash) {
-                        if Self::send_link_packet_proof(
-                            &self.transport_tx,
-                            &mut self.pending_link_control,
-                            &link_id,
-                            &proof_data,
-                            rns_wire::context::PacketContext::None,
-                        ) {
-                            // Proofs to a link count into txbytes (Link.py:388, Packet.py:291).
-                            active.link.record_tx(proof_data.len());
-                            tracing::debug!(
-                                link_id = hex::encode(link_id),
-                                proof_len = proof_data.len(),
-                                "delivery proof queued for channel packet"
-                            );
-                        } else {
-                            tracing::error!(
-                                link_id = hex::encode(link_id),
-                                proof_len = proof_data.len(),
-                                "channel delivery proof could not be retained"
-                            );
-                        }
+                    let proof_retained = active
+                        .link
+                        .prove_packet_with_link_key(&pkt_hash)
+                        .ok()
+                        .is_some_and(|proof_data| {
+                            if Self::send_link_packet_proof(
+                                &self.transport_tx,
+                                &mut self.pending_link_control,
+                                &link_id,
+                                &proof_data,
+                                rns_wire::context::PacketContext::None,
+                            ) {
+                                // Proofs to a link count into txbytes (Link.py:388, Packet.py:291).
+                                active.link.record_tx(proof_data.len());
+                                tracing::debug!(
+                                    link_id = hex::encode(link_id),
+                                    proof_len = proof_data.len(),
+                                    "delivery proof queued for channel packet"
+                                );
+                                true
+                            } else {
+                                tracing::error!(
+                                    link_id = hex::encode(link_id),
+                                    proof_len = proof_data.len(),
+                                    "channel delivery proof could not be retained"
+                                );
+                                false
+                            }
+                        });
+                    if !proof_retained {
+                        tracing::warn!(
+                            link_id = hex::encode(link_id),
+                            "channel packet withheld because its delivery proof was not retained"
+                        );
+                        return;
                     }
 
                     if let Some(ref mut channel) = active.channel {
@@ -2610,12 +2734,16 @@ impl LinkManager {
                                 }
                             }
                             if !started_next_segment && !next_segment_failed {
-                                if let Some(ref tx) = self.outbound_resource_proof_tx {
-                                    let _ = tx.try_send(LinkResourceProof {
+                                Self::stage_legacy_terminal_notification(
+                                    &self.link_packet_proof_tx,
+                                    &self.outbound_resource_proof_tx,
+                                    &self.link_closed_tx,
+                                    &mut self.pending_legacy_terminal_events,
+                                    LegacyTerminalNotification::ResourceProof(LinkResourceProof {
                                         link_id,
                                         resource_hash: completed_resource_hash,
-                                    });
-                                }
+                                    }),
+                                );
                                 Self::emit_resource_event(
                                     &self.resource_event_tx,
                                     &self.accounting_event_tx,
@@ -2687,17 +2815,6 @@ impl LinkManager {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
                     if let Ok(plaintext) = active.link.decrypt(data) {
-                        if let Some(ref cb) = active.link.packet_callback {
-                            cb(&plaintext);
-                        }
-                        if let Some(ref tx) = self.link_packet_tx {
-                            let _ = tx.send((plaintext, link_id));
-                        }
-                        tracing::debug!(
-                            link_id = hex::encode(link_id),
-                            "link data packet decrypted and forwarded"
-                        );
-
                         // Link proofs are unencrypted (Packet.py:198-200).
                         let pkt_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
                         let proof = if let Some(key_bytes) = identity_key_bytes {
@@ -2725,6 +2842,16 @@ impl LinkManager {
                                         link_id = hex::encode(link_id),
                                         proof_len = proof_data.len(),
                                         "delivery proof queued for link data packet (unencrypted)"
+                                    );
+                                    if let Some(ref cb) = active.link.packet_callback {
+                                        cb(&plaintext);
+                                    }
+                                    if let Some(ref tx) = self.link_packet_tx {
+                                        let _ = tx.send((plaintext, link_id));
+                                    }
+                                    tracing::debug!(
+                                        link_id = hex::encode(link_id),
+                                        "link data packet decrypted, proved, and forwarded"
                                     );
                                 } else {
                                     tracing::error!(
@@ -3066,9 +3193,13 @@ impl LinkManager {
                 tracing::debug!("Link accounting event receiver is closed");
             }
         }
-        if let Some(ref tx) = self.link_closed_tx {
-            let _ = tx.try_send(link_id);
-        }
+        Self::stage_legacy_terminal_notification(
+            &self.link_packet_proof_tx,
+            &self.outbound_resource_proof_tx,
+            &self.link_closed_tx,
+            &mut self.pending_legacy_terminal_events,
+            LegacyTerminalNotification::LinkClosed(link_id),
+        );
         let failure = format!("link closed: {reason:?}");
         for resource_id in inbound_resource_ids {
             Self::conclude_inbound_failure(
@@ -3685,12 +3816,25 @@ impl LinkManager {
             }
         }
         if !matched_channel_sequence {
-            if let Some(ref tx) = self.link_packet_proof_tx {
-                let _ = tx.try_send(LinkPacketProof {
-                    link_id,
-                    packet_hash,
-                });
+            let proof = LinkPacketProof {
+                link_id,
+                packet_hash,
+            };
+            if let Some(tx) = &self.accounting_event_tx {
+                if tx
+                    .send(LinkManagerAccountingEvent::LinkPacketProof(proof.clone()))
+                    .is_err()
+                {
+                    tracing::debug!("Link accounting event receiver is closed");
+                }
             }
+            Self::stage_legacy_terminal_notification(
+                &self.link_packet_proof_tx,
+                &self.outbound_resource_proof_tx,
+                &self.link_closed_tx,
+                &mut self.pending_legacy_terminal_events,
+                LegacyTerminalNotification::PacketProof(proof),
+            );
         }
     }
 
@@ -6655,6 +6799,78 @@ mod tests {
     }
 
     #[test]
+    fn responder_handshake_data_is_proved_before_local_delivery() {
+        let dest_hash = [0xB7; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut sender_link, request_data) = Link::new_initiator(dest_hash, 1);
+        let (receiver_link, link_proof) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        let _rtt_data = sender_link
+            .validate_proof(&link_proof, &identity_pub, &identity_pub.to_bytes())
+            .unwrap();
+        assert_eq!(receiver_link.state, LinkState::Handshake);
+        let link_id = receiver_link.link_id;
+
+        let encrypted = sender_link.encrypt(b"early application data").unwrap();
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&encrypted);
+        let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(4);
+        let (_event_tx, event_rx) = mpsc::channel(4);
+        let mut manager = LinkManager::new(transport_tx, event_rx, dest_hash, Some(identity_key));
+        let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
+        manager.set_link_packet_channel(packet_tx);
+        manager.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        manager.handle_inbound_packet(&raw, 1);
+
+        let TransportMessage::Outbound(proof_request) =
+            transport_rx.try_recv().expect("delivery proof queued")
+        else {
+            panic!("expected outbound delivery proof");
+        };
+        let (_, proof_offset) = rns_wire::header::PacketHeader::unpack(&proof_request.raw).unwrap();
+        assert!(
+            sender_link.validate_packet_proof(&packet_hash, &proof_request.raw[proof_offset..])
+        );
+        assert_eq!(
+            packet_rx.try_recv().unwrap(),
+            (b"early application data".to_vec(), link_id)
+        );
+        assert_eq!(
+            manager.active_links[&link_id].link.state,
+            LinkState::Handshake
+        );
+    }
+
+    #[test]
     fn link_packet_delivery_proof_survives_full_transport_ingress() {
         let (sender_link, receiver_link, identity_key) = handshaken_link_pair_with_identity();
         let link_id = receiver_link.link_id;
@@ -7040,7 +7256,9 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(16);
         let mut lm = LinkManager::new(transport_tx, event_rx, [0xC1; 16], None);
         let (proof_tx, mut proof_rx) = mpsc::channel(4);
+        let (accounting_tx, mut accounting_rx) = mpsc::unbounded_channel();
         lm.set_link_packet_proof_channel(proof_tx);
+        lm.set_accounting_event_channel(accounting_tx);
         lm.active_links.insert(
             link_id,
             ActiveLink {
@@ -7098,16 +7316,81 @@ mod tests {
         let proof = proof_rx.try_recv().expect("link packet proof event");
         assert_eq!(proof.link_id, link_id);
         assert_eq!(proof.packet_hash, receipt.packet_hash);
+        assert!(matches!(
+            accounting_rx.try_recv(),
+            Ok(LinkManagerAccountingEvent::LinkPacketProof(proof))
+                if proof.link_id == link_id && proof.packet_hash == receipt.packet_hash
+        ));
     }
 
     #[test]
-    fn inbound_link_data_delivery_is_lossless_without_draining() {
-        let (initiator_link, responder_link, _identity_key) = handshaken_link_pair_with_identity();
+    fn legacy_terminal_notifications_retry_after_local_backpressure() {
+        let (packet_tx, mut packet_rx) = mpsc::channel(1);
+        let (resource_tx, mut resource_rx) = mpsc::channel(1);
+        let (closed_tx, _closed_rx) = mpsc::channel(1);
+        packet_tx
+            .try_send(LinkPacketProof {
+                link_id: [0x01; 16],
+                packet_hash: [0x02; 32],
+            })
+            .unwrap();
+        let packet_sender = Some(packet_tx);
+        let resource_sender = Some(resource_tx);
+        let closed_sender = Some(closed_tx);
+        let mut pending = VecDeque::new();
+
+        LinkManager::stage_legacy_terminal_notification(
+            &packet_sender,
+            &resource_sender,
+            &closed_sender,
+            &mut pending,
+            LegacyTerminalNotification::PacketProof(LinkPacketProof {
+                link_id: [0x03; 16],
+                packet_hash: [0x04; 32],
+            }),
+        );
+        LinkManager::stage_legacy_terminal_notification(
+            &packet_sender,
+            &resource_sender,
+            &closed_sender,
+            &mut pending,
+            LegacyTerminalNotification::ResourceProof(LinkResourceProof {
+                link_id: [0x05; 16],
+                resource_hash: [0x06; 32],
+            }),
+        );
+        assert_eq!(pending.len(), 2);
+
+        let _prefill = packet_rx.try_recv().unwrap();
+        let packet_is_head = matches!(&pending[0], LegacyTerminalNotification::PacketProof(_));
+        assert!(packet_is_head, "packet proof remains at the ordered head");
+
+        LinkManager::flush_legacy_terminal_notifications(
+            &packet_sender,
+            &resource_sender,
+            &closed_sender,
+            &mut pending,
+        );
+
+        assert!(matches!(
+            packet_rx.try_recv(),
+            Ok(LinkPacketProof { link_id, .. }) if link_id == [0x03; 16]
+        ));
+        assert!(matches!(
+            resource_rx.try_recv(),
+            Ok(LinkResourceProof { link_id, .. }) if link_id == [0x05; 16]
+        ));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn inbound_link_data_is_published_only_while_its_proof_is_retained() {
+        let (initiator_link, responder_link, identity_key) = handshaken_link_pair_with_identity();
         let link_id = responder_link.link_id;
 
         let (transport_tx, _transport_rx) = mpsc::channel(8);
         let (_event_tx, event_rx) = mpsc::channel(16);
-        let mut lm = LinkManager::new(transport_tx, event_rx, [0xC4; 16], None);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xC4; 16], Some(identity_key));
         let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
         lm.set_link_packet_channel(packet_tx);
         lm.active_links.insert(
@@ -7138,15 +7421,17 @@ mod tests {
             context: rns_wire::context::PacketContext::None,
         };
 
-        // Burst far past any bounded capacity before a single receive; every
-        // one of these is proved to the peer, so none may drop locally.
+        // Burst beyond transport ingress plus retained Link-control capacity.
+        // Once a proof can no longer be retained, its plaintext must not be
+        // published locally as though sender confirmation were still possible.
         for i in 0..300u16 {
             let mut raw = header.pack();
             raw.extend_from_slice(&initiator_link.encrypt(&i.to_be_bytes()).unwrap());
             lm.handle_inbound_packet(&raw, 1);
         }
 
-        for i in 0..300u16 {
+        let retained = 8 + MAX_PENDING_LINK_CONTROL;
+        for i in 0..retained as u16 {
             let (payload, from) = packet_rx.try_recv().expect("lossless link data delivery");
             assert_eq!(from, link_id);
             assert_eq!(payload, i.to_be_bytes());

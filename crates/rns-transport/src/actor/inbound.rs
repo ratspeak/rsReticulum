@@ -1069,19 +1069,31 @@ impl TransportActor {
                     trunc = hex::encode(header.destination_hash),
                     "delivery proof received for outbound message"
                 );
-                // Broadcast the DeliveryProof to every destination channel —
-                // we don't know which local identity originated the outbound
-                // message, so LXMF filters by msg_id on its side.
-                for (dest_hash, tx) in &self.destination_channels {
-                    if let Err(e) =
-                        tx.try_send(crate::link_messages::DestinationEvent::DeliveryProof {
+                if let Some(proof_tx) = self.receipt_proof_txs.remove(&header.destination_hash) {
+                    if proof_tx
+                        .send(crate::link_messages::DestinationEvent::DeliveryProof {
                             msg_id: msg_id.clone(),
                             rtt,
                         })
+                        .is_err()
                     {
-                        self.channel_drops += 1;
-                        error!(dest = hex::encode(dest_hash), msg_id = %msg_id, drops = self.channel_drops, err = %e,
-                            "failed to deliver DeliveryProof; sender will not receive confirmation");
+                        error!(msg_id = %msg_id,
+                            "direct delivery-proof owner closed before confirmation");
+                    }
+                } else {
+                    // Legacy receipts predate direct proof ownership. Preserve
+                    // their broadcast behavior for compatibility.
+                    for (dest_hash, tx) in &self.destination_channels {
+                        if let Err(e) =
+                            tx.try_send(crate::link_messages::DestinationEvent::DeliveryProof {
+                                msg_id: msg_id.clone(),
+                                rtt,
+                            })
+                        {
+                            self.channel_drops += 1;
+                            error!(dest = hex::encode(dest_hash), msg_id = %msg_id, drops = self.channel_drops, err = %e,
+                                "failed to deliver legacy DeliveryProof; sender will not receive confirmation");
+                        }
                     }
                 }
             }

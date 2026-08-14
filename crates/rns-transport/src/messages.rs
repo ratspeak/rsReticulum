@@ -462,6 +462,19 @@ pub enum TransportMessage {
         /// Override default 180s timeout when `Some`.
         timeout: Option<std::time::Duration>,
     },
+    /// Register an application-owned receipt with a direct, capacity-lossless
+    /// proof sink. Unlike the legacy destination fan-out, a validated terminal
+    /// proof cannot be discarded because an unrelated destination mailbox is
+    /// full.
+    RegisterReceiptWithProof {
+        truncated_hash: [u8; 16],
+        full_hash: [u8; 32],
+        destination_hash: [u8; 16],
+        destination_public_key: [u8; 64],
+        msg_id: String,
+        timeout: Option<std::time::Duration>,
+        proof_tx: mpsc::UnboundedSender<crate::link_messages::DestinationEvent>,
+    },
     /// Record a new link in the table. `initiator=true` means we started the
     /// handshake, so the entry is pending until `ActivateLink` arrives.
     RegisterLink {
@@ -517,6 +530,7 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::SharedConnectionRestored { .. } => "SharedConnectionRestored",
         TransportMessage::SynthesizeTunnel { .. } => "SynthesizeTunnel",
         TransportMessage::RegisterReceipt { .. } => "RegisterReceipt",
+        TransportMessage::RegisterReceiptWithProof { .. } => "RegisterReceiptWithProof",
         TransportMessage::RegisterLink { .. } => "RegisterLink",
         TransportMessage::ActivateLink { .. } => "ActivateLink",
         TransportMessage::AwaitPath { .. } => "AwaitPath",
@@ -948,6 +962,15 @@ impl std::fmt::Debug for TransportMessage {
                 ..
             } => f
                 .debug_struct("RegisterReceipt")
+                .field("truncated_hash", truncated_hash)
+                .field("msg_id", msg_id)
+                .finish(),
+            Self::RegisterReceiptWithProof {
+                truncated_hash,
+                msg_id,
+                ..
+            } => f
+                .debug_struct("RegisterReceiptWithProof")
                 .field("truncated_hash", truncated_hash)
                 .field("msg_id", msg_id)
                 .finish(),

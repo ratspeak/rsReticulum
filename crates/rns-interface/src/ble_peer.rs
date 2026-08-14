@@ -14,9 +14,9 @@
 //! - RX:      `…28e5` (WRITE, WRITE_NO_RESPONSE)
 //! - TX:      `…28e4` (READ, NOTIFY, INDICATE)
 //!
-//! Peer identity binds only from signature-verified announces. There is no ID
-//! characteristic: a statically readable identity hash was a tracking vector
-//! that defeated BLE MAC rotation.
+//! Peer identity binds only from directly-originated, signature-verified LXMF
+//! delivery announces. There is no ID characteristic: a statically readable
+//! identity hash was a tracking vector that defeated BLE MAC rotation.
 //!
 //! ## Fragmentation
 //!
@@ -209,20 +209,26 @@ fn mobile_peripheral_fanout_allowed(anti_loop_allows: bool) -> bool {
     anti_loop_allows
 }
 
-/// Returns the destination-hash hex of `raw` ONLY if it is a signed announce
-/// whose Ed25519 signature verifies. Binding a peer's identity from an
-/// unverified announce let an in-range attacker claim a known contact's
-/// identity and mislabel its address-to-identity association; the signature
-/// check means a claim can't be forged without the private key.
-fn verified_announce_identity_hex(raw: &[u8]) -> Option<String> {
+/// Returns the LXMF delivery destination of a directly-originated, signed
+/// announce. Relayed announces cannot identify the adjacent BLE peer: on a
+/// multipoint interface the same packet is deliberately fanned back out to
+/// other peers, including a second central/peripheral leg to the originator.
+fn verified_direct_lxmf_announce_destination_hex(raw: &[u8]) -> Option<String> {
     let (header, payload_offset) = rns_wire::header::PacketHeader::unpack(raw).ok()?;
-    if header.flags.packet_type != rns_wire::flags::PacketType::Announce {
+    if header.flags.packet_type != rns_wire::flags::PacketType::Announce || header.hops != 0 {
         return None;
     }
     let payload = raw.get(payload_offset..)?;
     let announce =
         rns_identity::announce::AnnounceData::unpack(payload, header.flags.context_flag).ok()?;
-    announce.verify_signature(&header.destination_hash).ok()?;
+    let identity = announce.verify_signature(&header.destination_hash).ok()?;
+    let delivery_destination = rns_identity::destination::Destination::hash_from_name_and_identity(
+        "lxmf.delivery",
+        Some(&identity.hash),
+    );
+    if header.destination_hash != delivery_destination {
+        return None;
+    }
     Some(hex::encode(header.destination_hash))
 }
 
@@ -482,11 +488,10 @@ pub enum BlePeerEvent {
     SubscribeReady {
         address: String,
     },
-    /// Identity hash learned from the first signed Reticulum announce.
-    /// Used to dedup peers across central+peripheral roles where the BLE
-    /// address differs for the same physical device — notably on Apple,
-    /// where `CBPeripheral.identifier` vs `CBCentral.identifier` don't
-    /// match without bonding.
+    /// Verified LXMF delivery destination learned from a directly-originated
+    /// signed Reticulum announce. Repeated observations may be emitted so the
+    /// embedding owner can bind them to its live connection generation and
+    /// dedup central/peripheral views of the same device.
     IdentityResolved {
         address: String,
         identity_hash: String,
@@ -4991,7 +4996,6 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
 
     // Fragment reassembly buffer: maps total_count to per-sequence payload slots.
     let mut reassembly: FragmentReassembly = HashMap::new();
-    let mut identity_announced = false;
     let mut missed_keepalives: u32 = 0;
 
     loop {
@@ -5065,18 +5069,19 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
                 // Forward complete packet to transport
                 if let Some(raw) = complete_packet {
                     rxb.fetch_add(raw.len() as u64, Ordering::Relaxed);
-                    if !identity_announced {
-                        if let Some(id_hex) = verified_announce_identity_hex(&raw) {
-                            link_registry
-                                .write()
-                                .await
-                                .set_identity(conn.ble_address.clone(), id_hex.clone());
-                            dispatch_event(BlePeerEvent::IdentityResolved {
-                                address: conn.ble_address.clone(),
-                                identity_hash: id_hex,
-                            });
-                            identity_announced = true;
-                        }
+                    // Emit every directly-originated delivery announce. The
+                    // embedding owner deduplicates within its current
+                    // connection generation; repeated emission is what lets a
+                    // reconnect re-verify the same stable BLE address.
+                    if let Some(id_hex) = verified_direct_lxmf_announce_destination_hex(&raw) {
+                        link_registry
+                            .write()
+                            .await
+                            .set_identity(conn.ble_address.clone(), id_hex.clone());
+                        dispatch_event(BlePeerEvent::IdentityResolved {
+                            address: conn.ble_address.clone(),
+                            identity_hash: id_hex,
+                        });
                     }
                     // Register the source so the fan-out anti-loop filter
                     // doesn't echo this exact payload back to the peer it
@@ -5316,11 +5321,6 @@ pub async fn spawn_ble_peer_interface(
                     // can no longer corrupt each other's reassembly buffers.
                     type PeerReassembly = FragmentReassembly;
                     let mut reassembly: HashMap<String, PeerReassembly> = HashMap::new();
-                    // Identity is learned from the first signed Reticulum announce.
-                    // Emit once per peer address so callers can dedupe
-                    // central/peripheral views of the same device.
-                    let mut identity_announced: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
                     while let Some((peer, data)) = rx.recv().await {
                         if !generation_is_current(generation) {
                             break;
@@ -5360,24 +5360,23 @@ pub async fn spawn_ble_peer_interface(
                                     "BLE Peer reassembly: complete packet (parse failed)"
                                 ),
                             }
-                            // Identity learning: associate this peer address
-                            // with an identity for caller-side dedup, but only
-                            // from a signature-verified announce. Binding from
-                            // an unverified announce let an in-range attacker
-                            // claim a known contact's identity and poison the
-                            // dual-role dedup registry.
-                            if !identity_announced.contains(&peer) {
-                                if let Some(id_hex) = verified_announce_identity_hex(&raw) {
-                                    identity_announced.insert(peer.clone());
-                                    link_registry_p
-                                        .write()
-                                        .await
-                                        .set_identity(peer.clone(), id_hex.clone());
-                                    dispatch_event(BlePeerEvent::IdentityResolved {
-                                        address: peer.clone(),
-                                        identity_hash: id_hex,
-                                    });
-                                }
+                            // Direct signed delivery announces are emitted on
+                            // every observation. Address-level suppression here
+                            // used to survive disconnect/reconnect and made a
+                            // stable mobile address impossible to re-verify.
+                            // The embedding owner now deduplicates only within
+                            // its current live connection generation.
+                            if let Some(id_hex) =
+                                verified_direct_lxmf_announce_destination_hex(&raw)
+                            {
+                                link_registry_p
+                                    .write()
+                                    .await
+                                    .set_identity(peer.clone(), id_hex.clone());
+                                dispatch_event(BlePeerEvent::IdentityResolved {
+                                    address: peer.clone(),
+                                    identity_hash: id_hex,
+                                });
                             }
                             // Record this packet's source so the outbound
                             // fan-out can skip echoing it back to the same peer.
@@ -6666,6 +6665,56 @@ pub async fn spawn_ble_peer_interface(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn signed_announce_raw(
+        identity: &rns_identity::identity::Identity,
+        app_name: &str,
+        hops: u8,
+    ) -> ([u8; 16], Vec<u8>) {
+        let destination_hash = rns_identity::destination::Destination::hash_from_name_and_identity(
+            app_name,
+            Some(&identity.hash),
+        );
+        let announce =
+            rns_identity::announce::AnnounceData::create(identity, app_name, None, None).unwrap();
+        let mut raw = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Single,
+                packet_type: rns_wire::flags::PacketType::Announce,
+            },
+            hops,
+            transport_id: None,
+            destination_hash,
+            context: rns_wire::context::PacketContext::None,
+        }
+        .pack();
+        raw.extend_from_slice(&announce.pack());
+        (destination_hash, raw)
+    }
+
+    #[test]
+    fn peer_identity_accepts_only_direct_lxmf_delivery_announces() {
+        let identity = rns_identity::identity::Identity::new();
+        let (delivery_destination, direct) = signed_announce_raw(&identity, "lxmf.delivery", 0);
+        let expected_destination = hex::encode(delivery_destination);
+        assert_eq!(
+            verified_direct_lxmf_announce_destination_hex(&direct).as_deref(),
+            Some(expected_destination.as_str())
+        );
+
+        let (_, relayed) = signed_announce_raw(&identity, "lxmf.delivery", 1);
+        assert!(verified_direct_lxmf_announce_destination_hex(&relayed).is_none());
+
+        let (_, wrong_aspect) = signed_announce_raw(&identity, "lxmf.propagation", 0);
+        assert!(verified_direct_lxmf_announce_destination_hex(&wrong_aspect).is_none());
+
+        let mut tampered = direct;
+        *tampered.last_mut().unwrap() ^= 0x01;
+        assert!(verified_direct_lxmf_announce_destination_hex(&tampered).is_none());
+    }
 
     // ── Fragmentation ──
 

@@ -1090,7 +1090,13 @@ impl Link {
     where
         F: FnOnce(&[u8]) -> Option<[u8; 64]>,
     {
-        if self.state != LinkState::Active && self.state != LinkState::Stale {
+        // A responder can receive ordinary Link data immediately after its
+        // proof, before the initiator's LRRTT activates the responder side.
+        // Python proves that data in HANDSHAKE, and the session keys/signing
+        // identity are already established at this point.
+        let can_prove = matches!(self.state, LinkState::Active | LinkState::Stale)
+            || (!self.is_initiator && self.state == LinkState::Handshake);
+        if !can_prove {
             return Err(LinkCryptoError::EncryptionFailed);
         }
 
@@ -1696,6 +1702,25 @@ mod tests {
         let ct2 = responder_link.encrypt(msg2).unwrap();
         let pt2 = initiator_link.decrypt(&ct2).unwrap();
         assert_eq!(pt2, msg2);
+    }
+
+    #[test]
+    fn responder_can_prove_packet_before_lrrtt_activation() {
+        let dest_hash = [0xAB; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (responder, proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        let _rtt_data = initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .unwrap();
+
+        assert_eq!(responder.state, LinkState::Handshake);
+        assert_eq!(initiator.state, LinkState::Active);
+        let packet_hash = [0xCD; 32];
+        let packet_proof = responder.prove_packet(&packet_hash, &identity_key).unwrap();
+        assert!(initiator.validate_packet_proof(&packet_hash, &packet_proof));
     }
 
     #[test]

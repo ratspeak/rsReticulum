@@ -162,6 +162,7 @@ impl TransportActor {
             for (key, update) in concluded {
                 self.receipt_table.remove(&key);
                 self.receipt_msg_ids.remove(&key);
+                self.receipt_proof_txs.remove(&key);
                 if let Some(status_tx) = self.receipt_updates.remove(&key) {
                     status_tx.send_replace(update);
                 }
@@ -181,6 +182,7 @@ impl TransportActor {
                         receipt.cull();
                     }
                     self.receipt_msg_ids.remove(&key);
+                    self.receipt_proof_txs.remove(&key);
                     if let Some(status_tx) = self.receipt_updates.remove(&key) {
                         status_tx.send_replace(crate::messages::ReceiptUpdate::Culled);
                     }
