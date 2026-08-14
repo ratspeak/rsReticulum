@@ -4948,7 +4948,42 @@ async fn connect_mesh_peer(
 /// to transport. Linux + Windows only — Apple's notify delegate pushes
 /// directly into `apple_peripheral::INBOUND_TX` so the global per-peer
 /// reassembler handles inbound without a per-connection task.
-type PeerWriterRegistry = Arc<tokio::sync::RwLock<HashMap<String, mpsc::Sender<Bytes>>>>;
+#[derive(Clone)]
+struct PeerWriterLease {
+    id: u64,
+    sender: mpsc::Sender<Bytes>,
+    proven_healthy: Arc<AtomicBool>,
+}
+
+impl PeerWriterLease {
+    fn new(sender: mpsc::Sender<Bytes>) -> Self {
+        static NEXT_LEASE_ID: AtomicU64 = AtomicU64::new(1);
+        Self {
+            id: NEXT_LEASE_ID.fetch_add(1, Ordering::Relaxed),
+            sender,
+            // Merely queueing into the task is not proof that the native GATT
+            // write still targets a live connection. The write loop promotes
+            // this only after every fragment of a packet succeeds.
+            proven_healthy: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn can_suppress_peripheral(&self, queued_current_packet: bool) -> bool {
+        queued_current_packet && self.proven_healthy.load(Ordering::SeqCst)
+    }
+}
+
+type PeerWriterMap = HashMap<String, PeerWriterLease>;
+type PeerWriterRegistry = Arc<tokio::sync::RwLock<PeerWriterMap>>;
+
+fn remove_peer_writer_if_current(writers: &mut PeerWriterMap, key: &str, lease_id: u64) -> bool {
+    if writers.get(key).is_some_and(|writer| writer.id == lease_id) {
+        writers.remove(key);
+        true
+    } else {
+        false
+    }
+}
 
 fn central_writer_key(address: &str) -> String {
     format!("central:{address}")
@@ -4965,6 +5000,7 @@ struct PeerReadLoopCtx {
     rxb: Arc<AtomicU64>,
     peer_writers: PeerWriterRegistry,
     peer_writer_key: String,
+    peer_writer_lease_id: u64,
     recently_disconnected: RecentlyDisconnected,
     anti_loop: AntiLoopMap,
     link_registry: LinkRegistry,
@@ -4982,6 +5018,7 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
         rxb,
         peer_writers,
         peer_writer_key,
+        peer_writer_lease_id,
         recently_disconnected,
         anti_loop,
         link_registry,
@@ -5123,7 +5160,7 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
         reg.remove(&peer_address);
     }
     let mut writers = peer_writers.write().await;
-    writers.remove(&peer_writer_key);
+    remove_peer_writer_if_current(&mut writers, &peer_writer_key, peer_writer_lease_id);
     tracing::info!(address = %peer_address, "BLE mesh peer disconnected and cleaned up");
 
     // Mark this peer as a wanted-reconnect target keyed by BLE address.
@@ -5153,6 +5190,7 @@ async fn peer_write_loop(
     peer_online: Arc<AtomicBool>,
     peer_address: String,
     anti_loop: AntiLoopMap,
+    writer_health: Arc<AtomicBool>,
 ) {
     // Coarse announce-relay counter: every 5 successful writes we log enough
     // detail to diagnose drop patterns without enabling verbose logging.
@@ -5200,6 +5238,7 @@ async fn peer_write_loop(
                     Err(_) => Err("write timed out".to_string()),
                 };
             if let Err(e) = result {
+                writer_health.store(false, Ordering::SeqCst);
                 tracing::warn!(
                     target: "ble_trace",
                     step = "peer.write_fail",
@@ -5214,6 +5253,7 @@ async fn peer_write_loop(
             }
             pace_after_ble_fragment(idx, fragments.len()).await;
         }
+        writer_health.store(true, Ordering::SeqCst);
         tx_count += 1;
         if tx_count % 5 == 0 {
             tracing::info!(
@@ -5226,6 +5266,7 @@ async fn peer_write_loop(
             );
         }
     }
+    writer_health.store(false, Ordering::SeqCst);
 }
 
 // ---------------------------------------------------------------------------
@@ -5461,33 +5502,48 @@ pub async fn spawn_ble_peer_interface(
                     let readers = writers_w.read().await;
                     readers
                         .iter()
-                        .map(|(key, tx)| (key.clone(), tx.clone()))
+                        .map(|(key, writer)| (key.clone(), writer.clone()))
                         .collect::<Vec<_>>()
                 };
                 #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
-                let central_writer_keys = writer_snapshot
-                    .iter()
-                    .map(|(key, _)| key.clone())
-                    .collect::<Vec<_>>();
+                let mut central_writer_keys = Vec::new();
                 let mut closed_writers = Vec::new();
-                for (key, peer_tx) in writer_snapshot {
+                for (key, writer) in writer_snapshot {
                     // try_send, not send().await: a full per-peer channel means
                     // that peer's radio is backed up, and awaiting it would
                     // head-of-line-block the broadcast to every other peer.
                     // Drop for the slow peer (transport retransmits) and keep
                     // fanning out; only a closed channel retires the writer.
-                    match peer_tx.try_send(payload.clone()) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Closed(_)) => closed_writers.push(key),
+                    match writer.sender.try_send(payload.clone()) {
+                        Ok(()) => {
+                            // Suppress the redundant peripheral role only when
+                            // this exact lease has completed a prior native
+                            // write and accepted the current packet. A newly
+                            // reconnected or backed-up writer gets redundant
+                            // fan-out until it proves itself again.
+                            #[cfg(any(
+                                target_os = "android",
+                                target_os = "ios",
+                                target_os = "macos"
+                            ))]
+                            if writer.can_suppress_peripheral(true) {
+                                central_writer_keys.push(key.clone());
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            writer.proven_healthy.store(false, Ordering::SeqCst);
+                            closed_writers.push((key, writer.id));
+                        }
                         Err(mpsc::error::TrySendError::Full(_)) => {
+                            writer.proven_healthy.store(false, Ordering::SeqCst);
                             tracing::warn!(peer = %key, "BLE fan-out: peer write queue full, dropping");
                         }
                     }
                 }
                 if !closed_writers.is_empty() {
                     let mut writers = writers_w.write().await;
-                    for key in closed_writers {
-                        writers.remove(&key);
+                    for (key, lease_id) in closed_writers {
+                        remove_peer_writer_if_current(&mut writers, &key, lease_id);
                     }
                 }
 
@@ -5628,18 +5684,28 @@ pub async fn spawn_ble_peer_interface(
                         }
                         let addr_owned = addr.clone();
                         let frags_owned = rats_frags.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
+                        let notify_ok = tokio::task::spawn_blocking(move || {
                             let total = frags_owned.len();
                             for (idx, frag) in frags_owned.iter().enumerate() {
-                                let _ = android_peripheral::notify_tx(
+                                if !android_peripheral::notify_tx(
                                     &addr_owned,
                                     RATSPEAK_TX_UUID,
                                     frag,
-                                );
+                                ) {
+                                    return false;
+                                }
                                 sleep_after_ble_fragment_blocking(idx, total);
                             }
+                            true
                         })
-                        .await;
+                        .await
+                        .unwrap_or(false);
+                        if !notify_ok {
+                            tracing::warn!(
+                                peer = %addr,
+                                "Android BLE peripheral fan-out stopped after notification backpressure"
+                            );
+                        }
                     }
                     let col_frags = fragment_packet(&payload, col_mtu);
                     for addr in &col_subs {
@@ -5660,18 +5726,28 @@ pub async fn spawn_ble_peer_interface(
                         }
                         let addr_owned = addr.clone();
                         let frags_owned = col_frags.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
+                        let notify_ok = tokio::task::spawn_blocking(move || {
                             let total = frags_owned.len();
                             for (idx, frag) in frags_owned.iter().enumerate() {
-                                let _ = android_peripheral::notify_tx(
+                                if !android_peripheral::notify_tx(
                                     &addr_owned,
                                     COLUMBA_TX_UUID,
                                     frag,
-                                );
+                                ) {
+                                    return false;
+                                }
                                 sleep_after_ble_fragment_blocking(idx, total);
                             }
+                            true
                         })
-                        .await;
+                        .await
+                        .unwrap_or(false);
+                        if !notify_ok {
+                            tracing::warn!(
+                                peer = %addr,
+                                "Android BLE peripheral fan-out stopped after notification backpressure"
+                            );
+                        }
                     }
                 }
             }
@@ -5867,10 +5943,13 @@ pub async fn spawn_ble_peer_interface(
                                     // Per-peer write channel
                                     let (peer_write_tx, peer_write_rx) = mpsc::channel::<Bytes>(64);
                                     let peer_writer_key = central_writer_key(&peer.ble_address);
+                                    let peer_writer = PeerWriterLease::new(peer_write_tx);
+                                    let peer_writer_lease_id = peer_writer.id;
+                                    let writer_health = peer_writer.proven_healthy.clone();
                                     writers
                                         .write()
                                         .await
-                                        .insert(peer_writer_key.clone(), peer_write_tx.clone());
+                                        .insert(peer_writer_key.clone(), peer_writer);
 
                                     // Track this peer
                                     connected_addrs
@@ -5894,6 +5973,7 @@ pub async fn spawn_ble_peer_interface(
                                                 online_w,
                                                 addr_w,
                                                 anti_loop_w,
+                                                writer_health,
                                             )
                                             .await;
                                         }),
@@ -5921,6 +6001,7 @@ pub async fn spawn_ble_peer_interface(
                                                     rxb: rxb_r,
                                                     peer_writers: writers_r,
                                                     peer_writer_key,
+                                                    peer_writer_lease_id,
                                                     recently_disconnected: recently_r,
                                                     anti_loop: anti_loop_r,
                                                     link_registry: link_registry_r,
@@ -6157,10 +6238,13 @@ pub async fn spawn_ble_peer_interface(
                                     let (peer_write_tx, mut peer_write_rx) =
                                         mpsc::channel::<Bytes>(64);
                                     let peer_writer_key = central_writer_key(&peer.ble_address);
+                                    let peer_writer = PeerWriterLease::new(peer_write_tx);
+                                    let peer_writer_lease_id = peer_writer.id;
+                                    let writer_health = peer_writer.proven_healthy.clone();
                                     writers
                                         .write()
                                         .await
-                                        .insert(peer_writer_key.clone(), peer_write_tx.clone());
+                                        .insert(peer_writer_key.clone(), peer_writer);
                                     connected_addrs
                                         .insert(peer.ble_address.clone(), online.clone());
 
@@ -6233,8 +6317,10 @@ pub async fn spawn_ble_peer_interface(
                                                     pace_after_ble_fragment(idx, frags.len()).await;
                                                 }
                                                 if !all_ok {
+                                                    writer_health.store(false, Ordering::SeqCst);
                                                     break;
                                                 }
+                                                writer_health.store(true, Ordering::SeqCst);
                                                 tx_count += 1;
                                                 if tx_count % 5 == 0 {
                                                     tracing::info!(
@@ -6247,10 +6333,13 @@ pub async fn spawn_ble_peer_interface(
                                                     );
                                                 }
                                             }
-                                            writers_cleanup
-                                                .write()
-                                                .await
-                                                .remove(&writer_key_cleanup);
+                                            writer_health.store(false, Ordering::SeqCst);
+                                            let mut writers = writers_cleanup.write().await;
+                                            remove_peer_writer_if_current(
+                                                &mut writers,
+                                                &writer_key_cleanup,
+                                                peer_writer_lease_id,
+                                            );
                                         }),
                                     );
 
@@ -6497,10 +6586,13 @@ pub async fn spawn_ble_peer_interface(
 
                             let (peer_write_tx, mut peer_write_rx) = mpsc::channel::<Bytes>(64);
                             let peer_writer_key = central_writer_key(addr);
+                            let peer_writer = PeerWriterLease::new(peer_write_tx);
+                            let peer_writer_lease_id = peer_writer.id;
+                            let writer_health = peer_writer.proven_healthy.clone();
                             writers
                                 .write()
                                 .await
-                                .insert(peer_writer_key.clone(), peer_write_tx.clone());
+                                .insert(peer_writer_key.clone(), peer_writer);
                             connected_addrs.insert(addr.clone(), peer_online.clone());
 
                             // Per-peer write loop: bytes from the fan-out task
@@ -6572,6 +6664,7 @@ pub async fn spawn_ble_peer_interface(
                                         .await
                                         .unwrap_or(false);
                                         if !send_ok {
+                                            writer_health.store(false, Ordering::SeqCst);
                                             tracing::warn!(
                                                 peer = %addr_w,
                                                 "Android peer client write failed, marking offline"
@@ -6579,8 +6672,15 @@ pub async fn spawn_ble_peer_interface(
                                             online_w.store(false, Ordering::SeqCst);
                                             break;
                                         }
+                                        writer_health.store(true, Ordering::SeqCst);
                                     }
-                                    writers_cleanup.write().await.remove(&writer_key_cleanup);
+                                    writer_health.store(false, Ordering::SeqCst);
+                                    let mut writers = writers_cleanup.write().await;
+                                    remove_peer_writer_if_current(
+                                        &mut writers,
+                                        &writer_key_cleanup,
+                                        peer_writer_lease_id,
+                                    );
                                 }),
                             );
 
@@ -7083,6 +7183,46 @@ mod tests {
             "other-addr",
             &[central_writer_key("central-addr")]
         ));
+    }
+
+    #[test]
+    fn reconnect_writer_cleanup_is_exact_lease_owned() {
+        let (old_tx, _old_rx) = mpsc::channel(1);
+        let (new_tx, _new_rx) = mpsc::channel(1);
+        let old = PeerWriterLease::new(old_tx);
+        let replacement = PeerWriterLease::new(new_tx);
+        let old_id = old.id;
+        let replacement_id = replacement.id;
+        let key = central_writer_key("AA:BB:CC:DD:EE:FF");
+        let mut writers = PeerWriterMap::new();
+        writers.insert(key.clone(), old);
+        writers.insert(key.clone(), replacement);
+
+        assert!(!remove_peer_writer_if_current(&mut writers, &key, old_id));
+        assert_eq!(
+            writers.get(&key).map(|writer| writer.id),
+            Some(replacement_id)
+        );
+        assert!(remove_peer_writer_if_current(
+            &mut writers,
+            &key,
+            replacement_id
+        ));
+        assert!(!writers.contains_key(&key));
+    }
+
+    #[test]
+    fn writer_suppresses_redundant_role_only_after_native_success() {
+        let (tx, _rx) = mpsc::channel(1);
+        let writer = PeerWriterLease::new(tx);
+
+        assert!(!writer.can_suppress_peripheral(false));
+        assert!(!writer.can_suppress_peripheral(true));
+        writer.proven_healthy.store(true, Ordering::SeqCst);
+        assert!(!writer.can_suppress_peripheral(false));
+        assert!(writer.can_suppress_peripheral(true));
+        writer.proven_healthy.store(false, Ordering::SeqCst);
+        assert!(!writer.can_suppress_peripheral(true));
     }
 
     fn raw_test_packet(
