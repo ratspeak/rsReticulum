@@ -196,45 +196,24 @@ impl BlePeerLinkRegistry {
             self.identity_by_address.insert(address, identity_hash);
         }
     }
-
-    #[cfg(any(test, target_os = "android", target_os = "ios", target_os = "macos"))]
-    fn address_for_writer_key<'a>(&self, writer_key: &'a str) -> &'a str {
-        writer_key.strip_prefix("central:").unwrap_or(writer_key)
-    }
-
-    #[cfg(any(test, target_os = "android", target_os = "ios", target_os = "macos"))]
-    fn should_send_peripheral_subscriber(
-        &self,
-        subscriber_address: &str,
-        central_writer_keys: &[String],
-    ) -> bool {
-        if central_writer_keys
-            .iter()
-            .any(|key| self.address_for_writer_key(key) == subscriber_address)
-        {
-            return false;
-        }
-
-        let Some(subscriber_identity) = self.identity_by_address.get(subscriber_address) else {
-            return true;
-        };
-
-        !central_writer_keys.iter().any(|key| {
-            let writer_address = self.address_for_writer_key(key);
-            self.identity_by_address
-                .get(writer_address)
-                .is_some_and(|writer_identity| writer_identity == subscriber_identity)
-        })
-    }
 }
 
 type LinkRegistry = Arc<tokio::sync::RwLock<BlePeerLinkRegistry>>;
 
+/// Mobile peers can briefly hold both central and peripheral roles during a
+/// connection race or reconnect. Only the packet-source anti-loop may suppress
+/// the peripheral leg: native central APIs acknowledge local queue insertion,
+/// not delivery of the current packet to the peer.
+#[cfg(any(test, target_os = "android", target_os = "ios", target_os = "macos"))]
+fn mobile_peripheral_fanout_allowed(anti_loop_allows: bool) -> bool {
+    anti_loop_allows
+}
+
 /// Returns the destination-hash hex of `raw` ONLY if it is a signed announce
 /// whose Ed25519 signature verifies. Binding a peer's identity from an
 /// unverified announce let an in-range attacker claim a known contact's
-/// identity (mislabelling the peer and poisoning the dual-role dedup registry);
-/// the signature check means a claim can't be forged without the private key.
+/// identity and mislabel its address-to-identity association; the signature
+/// check means a claim can't be forged without the private key.
 fn verified_announce_identity_hex(raw: &[u8]) -> Option<String> {
     let (header, payload_offset) = rns_wire::header::PacketHeader::unpack(raw).ok()?;
     if header.flags.packet_type != rns_wire::flags::PacketType::Announce {
@@ -245,23 +224,6 @@ fn verified_announce_identity_hex(raw: &[u8]) -> Option<String> {
         rns_identity::announce::AnnounceData::unpack(payload, header.flags.context_flag).ok()?;
     announce.verify_signature(&header.destination_hash).ok()?;
     Some(hex::encode(header.destination_hash))
-}
-
-#[cfg(any(test, target_os = "android", target_os = "ios", target_os = "macos"))]
-fn payload_needs_redundant_role_fanout(payload: &[u8]) -> bool {
-    rns_wire::header::PacketHeader::unpack(payload)
-        .is_ok_and(|(header, _)| header.flags.packet_type == rns_wire::flags::PacketType::Proof)
-}
-
-#[cfg(any(test, target_os = "android", target_os = "ios", target_os = "macos"))]
-fn should_send_peripheral_payload(
-    registry: &BlePeerLinkRegistry,
-    subscriber_address: &str,
-    central_writer_keys: &[String],
-    payload: &[u8],
-) -> bool {
-    payload_needs_redundant_role_fanout(payload)
-        || registry.should_send_peripheral_subscriber(subscriber_address, central_writer_keys)
 }
 
 fn reconnect_in_backoff(map: &RecentlyDisconnected, address: &str) -> bool {
@@ -4952,7 +4914,6 @@ async fn connect_mesh_peer(
 struct PeerWriterLease {
     id: u64,
     sender: mpsc::Sender<Bytes>,
-    proven_healthy: Arc<AtomicBool>,
 }
 
 impl PeerWriterLease {
@@ -4961,15 +4922,7 @@ impl PeerWriterLease {
         Self {
             id: NEXT_LEASE_ID.fetch_add(1, Ordering::Relaxed),
             sender,
-            // Merely queueing into the task is not proof that the native GATT
-            // write still targets a live connection. The write loop promotes
-            // this only after every fragment of a packet succeeds.
-            proven_healthy: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    fn can_suppress_peripheral(&self, queued_current_packet: bool) -> bool {
-        queued_current_packet && self.proven_healthy.load(Ordering::SeqCst)
     }
 }
 
@@ -5190,7 +5143,6 @@ async fn peer_write_loop(
     peer_online: Arc<AtomicBool>,
     peer_address: String,
     anti_loop: AntiLoopMap,
-    writer_health: Arc<AtomicBool>,
 ) {
     // Coarse announce-relay counter: every 5 successful writes we log enough
     // detail to diagnose drop patterns without enabling verbose logging.
@@ -5238,7 +5190,6 @@ async fn peer_write_loop(
                     Err(_) => Err("write timed out".to_string()),
                 };
             if let Err(e) = result {
-                writer_health.store(false, Ordering::SeqCst);
                 tracing::warn!(
                     target: "ble_trace",
                     step = "peer.write_fail",
@@ -5253,7 +5204,6 @@ async fn peer_write_loop(
             }
             pace_after_ble_fragment(idx, fragments.len()).await;
         }
-        writer_health.store(true, Ordering::SeqCst);
         tx_count += 1;
         if tx_count % 5 == 0 {
             tracing::info!(
@@ -5266,7 +5216,6 @@ async fn peer_write_loop(
             );
         }
     }
-    writer_health.store(false, Ordering::SeqCst);
 }
 
 // ---------------------------------------------------------------------------
@@ -5478,8 +5427,6 @@ pub async fn spawn_ble_peer_interface(
     let txb_w = shared_txb.clone();
     let writers_w = peer_writers.clone();
     let anti_loop_fan = anti_loop.clone();
-    #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
-    let link_registry_fan = link_registry.clone();
     track_child_task(
         generation,
         tokio::spawn(async move {
@@ -5505,8 +5452,6 @@ pub async fn spawn_ble_peer_interface(
                         .map(|(key, writer)| (key.clone(), writer.clone()))
                         .collect::<Vec<_>>()
                 };
-                #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
-                let mut central_writer_keys = Vec::new();
                 let mut closed_writers = Vec::new();
                 for (key, writer) in writer_snapshot {
                     // try_send, not send().await: a full per-peer channel means
@@ -5515,27 +5460,11 @@ pub async fn spawn_ble_peer_interface(
                     // Drop for the slow peer (transport retransmits) and keep
                     // fanning out; only a closed channel retires the writer.
                     match writer.sender.try_send(payload.clone()) {
-                        Ok(()) => {
-                            // Suppress the redundant peripheral role only when
-                            // this exact lease has completed a prior native
-                            // write and accepted the current packet. A newly
-                            // reconnected or backed-up writer gets redundant
-                            // fan-out until it proves itself again.
-                            #[cfg(any(
-                                target_os = "android",
-                                target_os = "ios",
-                                target_os = "macos"
-                            ))]
-                            if writer.can_suppress_peripheral(true) {
-                                central_writer_keys.push(key.clone());
-                            }
-                        }
+                        Ok(()) => {}
                         Err(mpsc::error::TrySendError::Closed(_)) => {
-                            writer.proven_healthy.store(false, Ordering::SeqCst);
                             closed_writers.push((key, writer.id));
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            writer.proven_healthy.store(false, Ordering::SeqCst);
                             tracing::warn!(peer = %key, "BLE fan-out: peer write queue full, dropping");
                         }
                     }
@@ -5570,24 +5499,15 @@ pub async fn spawn_ble_peer_interface(
                         (COLUMBA_TX_UUID, &col_subs, "columba"),
                     ] {
                         for addr in subs {
-                            let send_on_peripheral = {
-                                let links = link_registry_fan.read().await;
-                                should_send_peripheral_payload(
-                                    &links,
-                                    addr,
-                                    &central_writer_keys,
-                                    &payload,
-                                )
-                            };
-                            if !send_on_peripheral {
-                                tracing::debug!(
-                                    peer = %addr,
-                                    char = label,
-                                    "Apple BLE fan-out: central path preferred"
-                                );
-                                continue;
-                            }
-                            if !anti_loop_should_send(&anti_loop_fan, addr, &payload) {
+                            // A central-side enqueue is not evidence that the
+                            // current packet reached a live native GATT link.
+                            // During dual-role overlap, deliver through both
+                            // roles and let Reticulum's packet hashlist dedup.
+                            if !mobile_peripheral_fanout_allowed(anti_loop_should_send(
+                                &anti_loop_fan,
+                                addr,
+                                &payload,
+                            )) {
                                 tracing::info!(peer = %addr, char = label, "Apple BLE fan-out: anti-loop skip");
                                 continue;
                             }
@@ -5667,19 +5587,14 @@ pub async fn spawn_ble_peer_interface(
                         .unwrap_or((182, 182, Vec::new(), Vec::new()));
                     let rats_frags = fragment_packet(&payload, rats_mtu);
                     for addr in &rats_subs {
-                        let send_on_peripheral = {
-                            let links = link_registry_fan.read().await;
-                            should_send_peripheral_payload(
-                                &links,
-                                addr,
-                                &central_writer_keys,
-                                &payload,
-                            )
-                        };
-                        if !send_on_peripheral {
-                            continue;
-                        }
-                        if !anti_loop_should_send(&anti_loop_fan, addr, &payload) {
+                        // See the Apple branch: both roles remain live until
+                        // native disconnect is observed, so never suppress a
+                        // current peripheral send from historical central state.
+                        if !mobile_peripheral_fanout_allowed(anti_loop_should_send(
+                            &anti_loop_fan,
+                            addr,
+                            &payload,
+                        )) {
                             continue;
                         }
                         let addr_owned = addr.clone();
@@ -5709,19 +5624,11 @@ pub async fn spawn_ble_peer_interface(
                     }
                     let col_frags = fragment_packet(&payload, col_mtu);
                     for addr in &col_subs {
-                        let send_on_peripheral = {
-                            let links = link_registry_fan.read().await;
-                            should_send_peripheral_payload(
-                                &links,
-                                addr,
-                                &central_writer_keys,
-                                &payload,
-                            )
-                        };
-                        if !send_on_peripheral {
-                            continue;
-                        }
-                        if !anti_loop_should_send(&anti_loop_fan, addr, &payload) {
+                        if !mobile_peripheral_fanout_allowed(anti_loop_should_send(
+                            &anti_loop_fan,
+                            addr,
+                            &payload,
+                        )) {
                             continue;
                         }
                         let addr_owned = addr.clone();
@@ -5945,7 +5852,6 @@ pub async fn spawn_ble_peer_interface(
                                     let peer_writer_key = central_writer_key(&peer.ble_address);
                                     let peer_writer = PeerWriterLease::new(peer_write_tx);
                                     let peer_writer_lease_id = peer_writer.id;
-                                    let writer_health = peer_writer.proven_healthy.clone();
                                     writers
                                         .write()
                                         .await
@@ -5973,7 +5879,6 @@ pub async fn spawn_ble_peer_interface(
                                                 online_w,
                                                 addr_w,
                                                 anti_loop_w,
-                                                writer_health,
                                             )
                                             .await;
                                         }),
@@ -6240,7 +6145,6 @@ pub async fn spawn_ble_peer_interface(
                                     let peer_writer_key = central_writer_key(&peer.ble_address);
                                     let peer_writer = PeerWriterLease::new(peer_write_tx);
                                     let peer_writer_lease_id = peer_writer.id;
-                                    let writer_health = peer_writer.proven_healthy.clone();
                                     writers
                                         .write()
                                         .await
@@ -6317,10 +6221,8 @@ pub async fn spawn_ble_peer_interface(
                                                     pace_after_ble_fragment(idx, frags.len()).await;
                                                 }
                                                 if !all_ok {
-                                                    writer_health.store(false, Ordering::SeqCst);
                                                     break;
                                                 }
-                                                writer_health.store(true, Ordering::SeqCst);
                                                 tx_count += 1;
                                                 if tx_count % 5 == 0 {
                                                     tracing::info!(
@@ -6333,7 +6235,6 @@ pub async fn spawn_ble_peer_interface(
                                                     );
                                                 }
                                             }
-                                            writer_health.store(false, Ordering::SeqCst);
                                             let mut writers = writers_cleanup.write().await;
                                             remove_peer_writer_if_current(
                                                 &mut writers,
@@ -6588,7 +6489,6 @@ pub async fn spawn_ble_peer_interface(
                             let peer_writer_key = central_writer_key(addr);
                             let peer_writer = PeerWriterLease::new(peer_write_tx);
                             let peer_writer_lease_id = peer_writer.id;
-                            let writer_health = peer_writer.proven_healthy.clone();
                             writers
                                 .write()
                                 .await
@@ -6664,7 +6564,6 @@ pub async fn spawn_ble_peer_interface(
                                         .await
                                         .unwrap_or(false);
                                         if !send_ok {
-                                            writer_health.store(false, Ordering::SeqCst);
                                             tracing::warn!(
                                                 peer = %addr_w,
                                                 "Android peer client write failed, marking offline"
@@ -6672,9 +6571,7 @@ pub async fn spawn_ble_peer_interface(
                                             online_w.store(false, Ordering::SeqCst);
                                             break;
                                         }
-                                        writer_health.store(true, Ordering::SeqCst);
                                     }
-                                    writer_health.store(false, Ordering::SeqCst);
                                     let mut writers = writers_cleanup.write().await;
                                     remove_peer_writer_if_current(
                                         &mut writers,
@@ -7156,36 +7053,6 @@ mod tests {
     }
 
     #[test]
-    fn link_registry_prefers_central_same_address() {
-        let registry = BlePeerLinkRegistry::default();
-        assert!(!registry.should_send_peripheral_subscriber(
-            "AA:BB:CC:DD:EE:FF",
-            &[central_writer_key("AA:BB:CC:DD:EE:FF")]
-        ));
-        assert!(registry.should_send_peripheral_subscriber(
-            "11:22:33:44:55:66",
-            &[central_writer_key("AA:BB:CC:DD:EE:FF")]
-        ));
-    }
-
-    #[test]
-    fn link_registry_prefers_central_same_identity() {
-        let mut registry = BlePeerLinkRegistry::default();
-        registry.set_identity("central-addr".into(), "identity-a".into());
-        registry.set_identity("peripheral-addr".into(), "identity-a".into());
-        registry.set_identity("other-addr".into(), "identity-b".into());
-
-        assert!(!registry.should_send_peripheral_subscriber(
-            "peripheral-addr",
-            &[central_writer_key("central-addr")]
-        ));
-        assert!(registry.should_send_peripheral_subscriber(
-            "other-addr",
-            &[central_writer_key("central-addr")]
-        ));
-    }
-
-    #[test]
     fn reconnect_writer_cleanup_is_exact_lease_owned() {
         let (old_tx, _old_rx) = mpsc::channel(1);
         let (new_tx, _new_rx) = mpsc::channel(1);
@@ -7212,84 +7079,9 @@ mod tests {
     }
 
     #[test]
-    fn writer_suppresses_redundant_role_only_after_native_success() {
-        let (tx, _rx) = mpsc::channel(1);
-        let writer = PeerWriterLease::new(tx);
-
-        assert!(!writer.can_suppress_peripheral(false));
-        assert!(!writer.can_suppress_peripheral(true));
-        writer.proven_healthy.store(true, Ordering::SeqCst);
-        assert!(!writer.can_suppress_peripheral(false));
-        assert!(writer.can_suppress_peripheral(true));
-        writer.proven_healthy.store(false, Ordering::SeqCst);
-        assert!(!writer.can_suppress_peripheral(true));
-    }
-
-    fn raw_test_packet(
-        packet_type: rns_wire::flags::PacketType,
-        context: rns_wire::context::PacketContext,
-    ) -> Vec<u8> {
-        let header = rns_wire::header::PacketHeader {
-            flags: rns_wire::flags::PacketFlags {
-                header_type: rns_wire::flags::HeaderType::Header1,
-                context_flag: false,
-                transport_type: rns_wire::flags::TransportType::Broadcast,
-                destination_type: rns_wire::flags::DestinationType::Link,
-                packet_type,
-            },
-            hops: 0,
-            transport_id: None,
-            destination_hash: [0x44; 16],
-            context,
-        };
-        let mut raw = header.pack();
-        raw.extend_from_slice(&[0xAA; 96]);
-        raw
-    }
-
-    #[test]
-    fn proof_payload_bypasses_role_preference() {
-        let registry = BlePeerLinkRegistry::default();
-        let writer_keys = [central_writer_key("AA:BB:CC:DD:EE:FF")];
-        let proof = raw_test_packet(
-            rns_wire::flags::PacketType::Proof,
-            rns_wire::context::PacketContext::LinkProof,
-        );
-        let data = raw_test_packet(
-            rns_wire::flags::PacketType::Data,
-            rns_wire::context::PacketContext::None,
-        );
-
-        assert!(payload_needs_redundant_role_fanout(&proof));
-        assert!(should_send_peripheral_payload(
-            &registry,
-            "AA:BB:CC:DD:EE:FF",
-            &writer_keys,
-            &proof,
-        ));
-        assert!(!payload_needs_redundant_role_fanout(&data));
-        assert!(!should_send_peripheral_payload(
-            &registry,
-            "AA:BB:CC:DD:EE:FF",
-            &writer_keys,
-            &data,
-        ));
-    }
-
-    #[test]
-    fn malformed_payload_uses_normal_role_preference() {
-        let registry = BlePeerLinkRegistry::default();
-        let writer_keys = [central_writer_key("AA:BB:CC:DD:EE:FF")];
-
-        assert!(!payload_needs_redundant_role_fanout(
-            b"not-a-reticulum-packet"
-        ));
-        assert!(!should_send_peripheral_payload(
-            &registry,
-            "AA:BB:CC:DD:EE:FF",
-            &writer_keys,
-            b"not-a-reticulum-packet",
-        ));
+    fn mobile_dual_role_fanout_is_gated_only_by_packet_source_anti_loop() {
+        assert!(mobile_peripheral_fanout_allowed(true));
+        assert!(!mobile_peripheral_fanout_allowed(false));
     }
 
     #[test]
