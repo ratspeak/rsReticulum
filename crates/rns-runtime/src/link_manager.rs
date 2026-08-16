@@ -3855,17 +3855,19 @@ impl LinkManager {
         }
 
         self.backchannel_links.retain(|_, lid| *lid != link_id);
-        if !endpoint_closing && let Some(ownership) = ownership {
-            if let Some(tombstone) = self.endpoint_tombstones.get_mut(&link_id) {
-                tombstone.kind = EndpointCleanupKind::Explicit;
+        if !endpoint_closing {
+            if let Some(ownership) = ownership {
+                if let Some(tombstone) = self.endpoint_tombstones.get_mut(&link_id) {
+                    tombstone.kind = EndpointCleanupKind::Explicit;
+                }
+                Self::stage_endpoint_cleanup(
+                    &self.transport_tx,
+                    &mut self.pending_link_control,
+                    &mut self.pending_endpoint_cleanups,
+                    ownership,
+                    true,
+                );
             }
-            Self::stage_endpoint_cleanup(
-                &self.transport_tx,
-                &mut self.pending_link_control,
-                &mut self.pending_endpoint_cleanups,
-                ownership,
-                true,
-            );
         }
         if let Ok(mut ids) = self.link_identities.lock() {
             ids.remove(&link_id);
