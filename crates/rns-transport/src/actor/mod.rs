@@ -26,6 +26,7 @@ use crate::tunnel::TunnelTable;
 use rns_wire::receipt::{PacketReceipt, ReceiptStatus};
 
 mod inbound;
+mod link_endpoint;
 mod maintenance;
 mod outbound;
 mod persistence;
@@ -42,6 +43,22 @@ const LOCAL_LINK_RESPONDER_INTERFACE: InterfaceId = InterfaceId::MAX - 1;
 struct LocalLinkRoute {
     initiator_tx: mpsc::Sender<crate::link_messages::DestinationEvent>,
     responder_tx: mpsc::Sender<crate::link_messages::DestinationEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterfaceSendOutcome {
+    Sent,
+    Full,
+    Missing,
+    Closed,
+    Offline,
+    NotOutbound,
+}
+
+struct LinkEndpointEntry {
+    binding: crate::messages::LinkEndpointBinding,
+    lifecycle_tx: mpsc::UnboundedSender<crate::messages::LinkEndpointLifecycleEvent>,
+    egress: VecDeque<Bytes>,
 }
 
 /// Owns every routing table and drains the `TransportMessage` channel in one
@@ -90,6 +107,10 @@ pub struct TransportActor {
     /// single `destination_channels[link_id]` slot aliasing one side over the
     /// other after the responder registers the Link.
     local_link_routes: HashMap<[u8; 16], LocalLinkRoute>,
+    /// Locally-owned established-Link endpoints. This is intentionally not
+    /// the transit `link_table`: transit forwarding and local session
+    /// ownership have different lifetimes and authority.
+    link_endpoints: HashMap<([u8; 16], crate::messages::LinkEndpointRole), LinkEndpointEntry>,
     pub path_requests: HashMap<[u8; 16], f64>,
     /// Python `discovery_path_requests`: external interfaces waiting for a
     /// matching announce while this transport recursively searches elsewhere.
@@ -331,6 +352,7 @@ impl TransportActor {
             local_destinations: HashSet::new(),
             destination_channels: HashMap::new(),
             local_link_routes: HashMap::new(),
+            link_endpoints: HashMap::new(),
             path_requests: HashMap::new(),
             discovery_path_requests: HashMap::new(),
             discovery_pr_tags: HashMap::new(),
@@ -466,6 +488,28 @@ impl TransportActor {
             } => {
                 self.on_outbound_attached(request, interface_id);
             }
+            TransportMessage::BindLinkEndpoint {
+                binding,
+                lifecycle_tx,
+                result_tx,
+            } => {
+                let _ = result_tx.send(self.bind_link_endpoint(binding, lifecycle_tx));
+            }
+            TransportMessage::UnbindLinkEndpoint {
+                link_id,
+                role,
+                result_tx,
+            } => {
+                let _ = result_tx.send(self.unbind_link_endpoint(link_id, role));
+            }
+            TransportMessage::SendLinkEndpoint {
+                link_id,
+                role,
+                request,
+                result_tx,
+            } => {
+                let _ = result_tx.send(self.send_link_endpoint(link_id, role, request));
+            }
             TransportMessage::SendPacket {
                 request,
                 attached_interface,
@@ -573,7 +617,12 @@ impl TransportActor {
             TransportMessage::DeregisterDestination { hash } => {
                 self.local_destinations.remove(&hash);
                 self.destination_channels.remove(&hash);
-                self.local_link_routes.remove(&hash);
+                if self.local_link_routes.remove(&hash).is_some() {
+                    self.terminate_link_endpoints_for_link(
+                        hash,
+                        crate::messages::LinkEndpointTerminalReason::InterfaceRemoved,
+                    );
+                }
             }
             TransportMessage::CacheRequest {
                 packet_hash,
@@ -715,12 +764,14 @@ impl TransportActor {
             }
             TransportMessage::SharedConnectionLost => {
                 tracing::warn!("shared instance connection lost — suspending transport");
+                self.terminate_shared_peer_link_endpoints();
                 self.is_shared_instance = false;
                 self.shared_instance_client_mode = true;
                 self.clear_shared_connection_state();
             }
             TransportMessage::SharedConnectionRestored { interface_id } => {
                 tracing::info!(interface_id, "shared instance connection restored");
+                self.terminate_shared_peer_link_endpoints();
                 self.shared_instance_client_mode = true;
                 self.clear_shared_connection_state();
                 self.is_shared_instance = true;
@@ -751,6 +802,12 @@ impl TransportActor {
                     return;
                 }
                 debug!(id, name = %iface_name, outbound = is_outbound, role = role.as_str(), "registering interface");
+                if self.interfaces.contains_key(&id) {
+                    self.terminate_link_endpoints_for_interface(
+                        id,
+                        crate::messages::LinkEndpointTerminalReason::InterfaceRemoved,
+                    );
+                }
                 self.interfaces.insert(id, entry);
                 if !self.startup_complete && self.startup_time == 0.0 {
                     self.startup_time = now_f64();
@@ -1250,6 +1307,18 @@ impl TransportActor {
     /// Drop `id` from the interface table and unwind tunnels + paths bound
     /// to it. Shared by `DeregisterInterface` and the `Closed`-tx auto-drop.
     fn deregister_interface(&mut self, id: InterfaceId) {
+        self.deregister_interface_with_link_reason(
+            id,
+            crate::messages::LinkEndpointTerminalReason::InterfaceRemoved,
+        );
+    }
+
+    fn deregister_interface_with_link_reason(
+        &mut self,
+        id: InterfaceId,
+        link_reason: crate::messages::LinkEndpointTerminalReason,
+    ) {
+        self.terminate_link_endpoints_for_interface(id, link_reason);
         let role = self.interfaces.get(&id).map(|entry| entry.role);
         // Flip the driver-shared online flag before dropping the entry:
         // driver tasks gated on it (Auto beacons/discovery, BLE loops) hold
@@ -1333,24 +1402,15 @@ impl TransportActor {
         skip_all,
         fields(interface_id = id, raw_len = raw.len()),
     )]
-    fn send_to_interface(&mut self, id: InterfaceId, raw: &[u8]) -> bool {
+    fn try_send_to_interface(&mut self, id: InterfaceId, raw: &[u8]) -> InterfaceSendOutcome {
         let Some(entry) = self.interfaces.get(&id) else {
-            return false;
+            return InterfaceSendOutcome::Missing;
         };
         if entry.role == InterfaceRole::LocalClient && interface_marked_offline(entry) {
-            tracing::info!(
-                interface_id = id,
-                interface_name = %entry.name,
-                "interface marked offline; auto-deregistering"
-            );
-            self.deregister_interface(id);
-            return false;
+            return InterfaceSendOutcome::Offline;
         }
-        let Some(entry) = self.interfaces.get(&id) else {
-            return false;
-        };
         if !entry.direction.outbound {
-            return false;
+            return InterfaceSendOutcome::NotOutbound;
         }
         let data: Bytes = if let Some(ref ifac_key) = entry.ifac_key {
             Bytes::from(crate::ifac::ifac_sign(raw, ifac_key, entry.ifac_size))
@@ -1358,8 +1418,19 @@ impl TransportActor {
             Bytes::copy_from_slice(raw)
         };
         match entry.tx.try_send(data) {
-            Ok(()) => true,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            Ok(()) => InterfaceSendOutcome::Sent,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => InterfaceSendOutcome::Full,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => InterfaceSendOutcome::Closed,
+        }
+    }
+
+    fn send_to_interface(&mut self, id: InterfaceId, raw: &[u8]) -> bool {
+        match self.try_send_to_interface(id, raw) {
+            InterfaceSendOutcome::Sent => true,
+            InterfaceSendOutcome::Full => {
+                let Some(entry) = self.interfaces.get(&id) else {
+                    return false;
+                };
                 let tx_drops = entry
                     .tx_drops
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1376,15 +1447,41 @@ impl TransportActor {
                 }
                 false
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            InterfaceSendOutcome::Closed => {
+                let interface_name = self
+                    .interfaces
+                    .get(&id)
+                    .map(|entry| entry.name.as_str())
+                    .unwrap_or("unknown");
                 tracing::info!(
                     interface_id = id,
-                    interface_name = %entry.name,
+                    interface_name,
                     "interface TX channel closed (downstream task exited); auto-deregistering"
                 );
-                self.deregister_interface(id);
+                self.deregister_interface_with_link_reason(
+                    id,
+                    crate::messages::LinkEndpointTerminalReason::InterfaceClosed,
+                );
                 false
             }
+            InterfaceSendOutcome::Offline => {
+                let interface_name = self
+                    .interfaces
+                    .get(&id)
+                    .map(|entry| entry.name.as_str())
+                    .unwrap_or("unknown");
+                tracing::info!(
+                    interface_id = id,
+                    interface_name,
+                    "interface marked offline; auto-deregistering"
+                );
+                self.deregister_interface_with_link_reason(
+                    id,
+                    crate::messages::LinkEndpointTerminalReason::InterfaceOffline,
+                );
+                false
+            }
+            InterfaceSendOutcome::Missing | InterfaceSendOutcome::NotOutbound => false,
         }
     }
 
@@ -1752,6 +1849,7 @@ mod tests {
     use crate::constants::{InterfaceDirection, InterfaceMode};
     use crate::messages::{
         InboundPacket, InterfaceEntry, InterfaceInspectionSnapshot, InterfaceInspectionSource,
+        LinkEndpointBinding, LinkEndpointRole, LinkEndpointSendResult, LinkEndpointTerminalReason,
         OutboundRequest, TransportQuery, TransportQueryResponse,
     };
     use crate::path_table::PathEntry;
@@ -2024,6 +2122,22 @@ mod tests {
             ingress: crate::ingress::IngressController::new(),
             announce_queue: Vec::new(),
         };
+        (entry, rx)
+    }
+
+    fn make_test_interface_with_capacity(
+        name: &str,
+        capacity: usize,
+    ) -> (InterfaceEntry, mpsc::Receiver<Bytes>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let entry = InterfaceEntry::new(
+            name.to_string(),
+            InterfaceMode::Gateway,
+            InterfaceDirection::bidirectional(),
+            115_200,
+            500,
+            tx,
+        );
         (entry, rx)
     }
 
@@ -2701,6 +2815,18 @@ mod tests {
             id: 5,
             entry: entry_old,
         });
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            actor.bind_link_endpoint(
+                LinkEndpointBinding {
+                    link_id: [0x5A; 16],
+                    interface_id: 5,
+                    role: LinkEndpointRole::Initiator,
+                },
+                lifecycle_tx,
+            ),
+            crate::messages::LinkEndpointBindResult::Bound
+        );
 
         let (entry_new, mut rx_new) = make_test_interface("new");
         actor.handle_message(TransportMessage::RegisterInterface {
@@ -2709,6 +2835,12 @@ mod tests {
         });
 
         assert_eq!(actor.interfaces.get(&5).unwrap().name, "new");
+        assert_eq!(
+            lifecycle_rx.try_recv().unwrap().reason,
+            LinkEndpointTerminalReason::InterfaceRemoved,
+            "replacing an interface id must not silently rebind its established Links"
+        );
+        assert!(lifecycle_rx.try_recv().is_err());
 
         // A send on id=5 reaches the new receiver, not the old one.
         actor.send_to_interface(5, &[0xAB]);
@@ -3743,6 +3875,383 @@ mod tests {
     }
 
     #[test]
+    fn unattached_established_link_never_broadcasts_or_requests_a_path() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (tcp, mut tcp_rx) = make_test_interface("TCP hub");
+        let (rnode, mut rnode_rx) = make_test_interface("RNode");
+        actor.interfaces.insert(1, tcp);
+        actor.interfaces.insert(2, rnode);
+
+        let link_id = [0xB1; 16];
+        assert!(!actor.on_outbound_with_receipt_policy(
+            OutboundRequest {
+                raw: make_link_data_packet(link_id, 0),
+                destination_hash: link_id,
+            },
+            true,
+        ));
+
+        assert!(tcp_rx.try_recv().is_err());
+        assert!(rnode_rx.try_recv().is_err());
+        assert!(!actor.path_requests.contains_key(&link_id));
+        assert!(
+            actor.receipt_table.is_empty(),
+            "an unattached Link packet must not leave an impossible generic receipt"
+        );
+    }
+
+    #[test]
+    fn unattached_established_link_ignores_fake_destination_path() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (tcp, mut tcp_rx) = make_test_interface("TCP hub");
+        let (rnode, mut rnode_rx) = make_test_interface("RNode");
+        actor.interfaces.insert(1, tcp);
+        actor.interfaces.insert(2, rnode);
+
+        let link_id = [0xB2; 16];
+        actor.path_table.insert(
+            link_id,
+            PathEntry::new(Some([0xC2; 16]), 1, 2, InterfaceMode::Gateway),
+        );
+        assert!(!actor.on_outbound_with_receipt_policy(
+            OutboundRequest {
+                raw: make_link_proof_packet(link_id, 0),
+                destination_hash: link_id,
+            },
+            false,
+        ));
+
+        assert!(tcp_rx.try_recv().is_err());
+        assert!(rnode_rx.try_recv().is_err());
+        assert!(!actor.path_requests.contains_key(&link_id));
+    }
+
+    #[test]
+    fn bound_link_endpoint_sends_only_on_its_immutable_interface() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (tcp, mut tcp_rx) = make_test_interface("TCP hub");
+        let (rnode, mut rnode_rx) = make_test_interface("RNode");
+        actor.interfaces.insert(1, tcp);
+        actor.interfaces.insert(2, rnode);
+
+        let link_id = [0xB3; 16];
+        let binding = LinkEndpointBinding {
+            link_id,
+            interface_id: 1,
+            role: LinkEndpointRole::Initiator,
+        };
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            actor.bind_link_endpoint(binding, lifecycle_tx),
+            crate::messages::LinkEndpointBindResult::Bound
+        );
+
+        let raw =
+            make_link_data_packet_with_context(link_id, 0, rns_wire::context::PacketContext::None);
+        assert_eq!(
+            actor.send_link_endpoint(
+                link_id,
+                LinkEndpointRole::Initiator,
+                OutboundRequest {
+                    raw: raw.clone(),
+                    destination_hash: link_id,
+                },
+            ),
+            LinkEndpointSendResult::Sent
+        );
+        assert_eq!(tcp_rx.try_recv().unwrap(), raw);
+        assert!(
+            rnode_rx.try_recv().is_err(),
+            "an unrelated RNode-shaped queue must receive no established-Link bytes"
+        );
+
+        let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            actor.bind_link_endpoint(
+                LinkEndpointBinding {
+                    interface_id: 2,
+                    ..binding
+                },
+                replacement_tx,
+            ),
+            crate::messages::LinkEndpointBindResult::Conflict {
+                interface_id: 1,
+                role: LinkEndpointRole::Initiator,
+            }
+        );
+    }
+
+    #[test]
+    fn bound_link_endpoint_retains_fifo_when_target_queue_is_full() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (target, mut target_rx) = make_test_interface_with_capacity("slow target", 1);
+        target.tx.try_send(Bytes::from_static(b"occupied")).unwrap();
+        let (rnode, mut rnode_rx) = make_test_interface_with_capacity("unrelated RNode", 1);
+        actor.interfaces.insert(7, target);
+        actor.interfaces.insert(8, rnode);
+
+        let link_id = [0xB4; 16];
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            actor.bind_link_endpoint(
+                LinkEndpointBinding {
+                    link_id,
+                    interface_id: 7,
+                    role: LinkEndpointRole::Responder,
+                },
+                lifecycle_tx,
+            ),
+            crate::messages::LinkEndpointBindResult::Bound
+        );
+
+        let first = make_link_data_packet_with_context(
+            link_id,
+            0,
+            rns_wire::context::PacketContext::Resource,
+        );
+        let second = make_link_proof_packet(link_id, 0);
+        assert_eq!(
+            actor.send_link_endpoint(
+                link_id,
+                LinkEndpointRole::Responder,
+                OutboundRequest {
+                    raw: first.clone(),
+                    destination_hash: link_id,
+                },
+            ),
+            LinkEndpointSendResult::Queued { depth: 1 }
+        );
+        assert_eq!(
+            actor.send_link_endpoint(
+                link_id,
+                LinkEndpointRole::Responder,
+                OutboundRequest {
+                    raw: second.clone(),
+                    destination_hash: link_id,
+                },
+            ),
+            LinkEndpointSendResult::Queued { depth: 2 }
+        );
+
+        assert_eq!(
+            target_rx.try_recv().unwrap(),
+            Bytes::from_static(b"occupied")
+        );
+        actor.drain_link_endpoint_egress();
+        assert_eq!(target_rx.try_recv().unwrap(), first);
+        actor.drain_link_endpoint_egress();
+        assert_eq!(target_rx.try_recv().unwrap(), second);
+        assert!(rnode_rx.try_recv().is_err());
+        assert!(lifecycle_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn interface_removal_terminates_bound_link_once() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (interface, _rx) = make_test_interface("ephemeral peer");
+        actor.interfaces.insert(9, interface);
+
+        let link_id = [0xB5; 16];
+        let binding = LinkEndpointBinding {
+            link_id,
+            interface_id: 9,
+            role: LinkEndpointRole::Initiator,
+        };
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            actor.bind_link_endpoint(binding, lifecycle_tx),
+            crate::messages::LinkEndpointBindResult::Bound
+        );
+
+        actor.deregister_interface(9);
+        let event = lifecycle_rx.try_recv().unwrap();
+        assert_eq!(event.binding, binding);
+        assert_eq!(event.reason, LinkEndpointTerminalReason::InterfaceRemoved);
+        assert_eq!(event.dropped_packets, 0);
+        actor.deregister_interface(9);
+        assert!(lifecycle_rx.try_recv().is_err());
+        assert_eq!(
+            actor.send_link_endpoint(
+                link_id,
+                LinkEndpointRole::Initiator,
+                OutboundRequest {
+                    raw: make_link_data_packet(link_id, 0),
+                    destination_hash: link_id,
+                },
+            ),
+            LinkEndpointSendResult::NotBound
+        );
+    }
+
+    #[test]
+    fn bound_link_endpoint_queue_exhaustion_is_terminal_and_bounded() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (target, _target_rx) = make_test_interface_with_capacity("blocked target", 1);
+        target.tx.try_send(Bytes::from_static(b"occupied")).unwrap();
+        actor.interfaces.insert(11, target);
+
+        let link_id = [0xB8; 16];
+        let binding = LinkEndpointBinding {
+            link_id,
+            interface_id: 11,
+            role: LinkEndpointRole::Responder,
+        };
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            actor.bind_link_endpoint(binding, lifecycle_tx),
+            crate::messages::LinkEndpointBindResult::Bound
+        );
+
+        for index in 0..LINK_ENDPOINT_EGRESS_QUEUE_CAPACITY {
+            let mut raw = make_link_data_packet(link_id, 0).to_vec();
+            *raw.last_mut().unwrap() = index as u8;
+            assert_eq!(
+                actor.send_link_endpoint(
+                    link_id,
+                    LinkEndpointRole::Responder,
+                    OutboundRequest {
+                        raw: Bytes::from(raw),
+                        destination_hash: link_id,
+                    },
+                ),
+                LinkEndpointSendResult::Queued { depth: index + 1 }
+            );
+        }
+
+        assert_eq!(
+            actor.send_link_endpoint(
+                link_id,
+                LinkEndpointRole::Responder,
+                OutboundRequest {
+                    raw: make_link_data_packet(link_id, 0),
+                    destination_hash: link_id,
+                },
+            ),
+            LinkEndpointSendResult::Terminated(LinkEndpointTerminalReason::EgressQueueExhausted)
+        );
+        let event = lifecycle_rx.try_recv().unwrap();
+        assert_eq!(event.binding, binding);
+        assert_eq!(
+            event.reason,
+            LinkEndpointTerminalReason::EgressQueueExhausted
+        );
+        assert_eq!(event.dropped_packets, LINK_ENDPOINT_EGRESS_QUEUE_CAPACITY);
+        assert!(lifecycle_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn typed_link_endpoint_commands_bind_send_and_unbind() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (interface, mut rx) = make_test_interface("typed endpoint");
+        actor.interfaces.insert(12, interface);
+        let link_id = [0xB9; 16];
+        let binding = LinkEndpointBinding {
+            link_id,
+            interface_id: 12,
+            role: LinkEndpointRole::Initiator,
+        };
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let (bind_tx, mut bind_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::BindLinkEndpoint {
+            binding,
+            lifecycle_tx,
+            result_tx: bind_tx,
+        });
+        assert_eq!(
+            bind_rx.try_recv().unwrap(),
+            crate::messages::LinkEndpointBindResult::Bound
+        );
+
+        let raw = make_link_data_packet(link_id, 0);
+        let (send_tx, mut send_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::SendLinkEndpoint {
+            link_id,
+            role: LinkEndpointRole::Initiator,
+            request: OutboundRequest {
+                raw: raw.clone(),
+                destination_hash: link_id,
+            },
+            result_tx: send_tx,
+        });
+        assert_eq!(send_rx.try_recv().unwrap(), LinkEndpointSendResult::Sent);
+        assert_eq!(rx.try_recv().unwrap(), raw);
+
+        let (unbind_tx, mut unbind_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::UnbindLinkEndpoint {
+            link_id,
+            role: LinkEndpointRole::Initiator,
+            result_tx: unbind_tx,
+        });
+        assert_eq!(
+            unbind_rx.try_recv().unwrap(),
+            crate::messages::LinkEndpointUnbindResult::Unbound
+        );
+        assert_eq!(
+            lifecycle_rx.try_recv().unwrap().reason,
+            LinkEndpointTerminalReason::Unbound
+        );
+        assert!(lifecycle_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn closed_interface_terminates_every_bound_link_once() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (interface, rx) = make_test_interface("closed peer");
+        actor.interfaces.insert(10, interface);
+
+        let first_id = [0xB6; 16];
+        let second_id = [0xB7; 16];
+        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            actor.bind_link_endpoint(
+                LinkEndpointBinding {
+                    link_id: first_id,
+                    interface_id: 10,
+                    role: LinkEndpointRole::Initiator,
+                },
+                first_tx,
+            ),
+            crate::messages::LinkEndpointBindResult::Bound
+        );
+        assert_eq!(
+            actor.bind_link_endpoint(
+                LinkEndpointBinding {
+                    link_id: second_id,
+                    interface_id: 10,
+                    role: LinkEndpointRole::Responder,
+                },
+                second_tx,
+            ),
+            crate::messages::LinkEndpointBindResult::Bound
+        );
+        drop(rx);
+
+        assert_eq!(
+            actor.send_link_endpoint(
+                first_id,
+                LinkEndpointRole::Initiator,
+                OutboundRequest {
+                    raw: make_link_data_packet(first_id, 0),
+                    destination_hash: first_id,
+                },
+            ),
+            LinkEndpointSendResult::Terminated(LinkEndpointTerminalReason::InterfaceClosed)
+        );
+        assert_eq!(
+            first_rx.try_recv().unwrap().reason,
+            LinkEndpointTerminalReason::InterfaceClosed
+        );
+        assert_eq!(
+            second_rx.try_recv().unwrap().reason,
+            LinkEndpointTerminalReason::InterfaceClosed
+        );
+        assert!(first_rx.try_recv().is_err());
+        assert!(second_rx.try_recv().is_err());
+        assert!(!actor.interfaces.contains_key(&10));
+    }
+
+    #[test]
     fn direct_link_request_pins_to_path_owner_across_interface_types() {
         let cases = [
             (
@@ -4148,8 +4657,85 @@ mod tests {
             } if raw == from_responder
         ));
 
+        let (initiator_lifecycle_tx, mut initiator_lifecycle_rx) = mpsc::unbounded_channel();
+        let (responder_lifecycle_tx, mut responder_lifecycle_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            actor.bind_link_endpoint(
+                LinkEndpointBinding {
+                    link_id,
+                    interface_id: LOCAL_LINK_INITIATOR_INTERFACE,
+                    role: LinkEndpointRole::Initiator,
+                },
+                initiator_lifecycle_tx,
+            ),
+            crate::messages::LinkEndpointBindResult::Bound
+        );
+        assert_eq!(
+            actor.bind_link_endpoint(
+                LinkEndpointBinding {
+                    link_id,
+                    interface_id: LOCAL_LINK_RESPONDER_INTERFACE,
+                    role: LinkEndpointRole::Responder,
+                },
+                responder_lifecycle_tx,
+            ),
+            crate::messages::LinkEndpointBindResult::Bound
+        );
+
+        let typed_from_initiator = make_link_proof_packet(link_id, 0);
+        assert_eq!(
+            actor.send_link_endpoint(
+                link_id,
+                LinkEndpointRole::Initiator,
+                OutboundRequest {
+                    raw: typed_from_initiator.clone(),
+                    destination_hash: link_id,
+                },
+            ),
+            LinkEndpointSendResult::Sent
+        );
+        assert!(matches!(
+            responder_rx.try_recv().unwrap(),
+            crate::link_messages::DestinationEvent::InboundPacket {
+                raw,
+                interface_id: LOCAL_LINK_RESPONDER_INTERFACE,
+                ..
+            } if raw == typed_from_initiator
+        ));
+
+        let typed_from_responder = make_link_proof_packet(link_id, 0);
+        assert_eq!(
+            actor.send_link_endpoint(
+                link_id,
+                LinkEndpointRole::Responder,
+                OutboundRequest {
+                    raw: typed_from_responder.clone(),
+                    destination_hash: link_id,
+                },
+            ),
+            LinkEndpointSendResult::Sent
+        );
+        assert!(matches!(
+            initiator_rx.try_recv().unwrap(),
+            crate::link_messages::DestinationEvent::InboundPacket {
+                raw,
+                interface_id: LOCAL_LINK_INITIATOR_INTERFACE,
+                ..
+            } if raw == typed_from_responder
+        ));
+
         actor.handle_message(TransportMessage::DeregisterDestination { hash: link_id });
         assert!(!actor.local_link_routes.contains_key(&link_id));
+        assert_eq!(
+            initiator_lifecycle_rx.try_recv().unwrap().reason,
+            LinkEndpointTerminalReason::InterfaceRemoved
+        );
+        assert_eq!(
+            responder_lifecycle_rx.try_recv().unwrap().reason,
+            LinkEndpointTerminalReason::InterfaceRemoved
+        );
+        assert!(initiator_lifecycle_rx.try_recv().is_err());
+        assert!(responder_lifecycle_rx.try_recv().is_err());
     }
 
     #[test]
@@ -10341,6 +10927,19 @@ mod tests {
         );
         actor.reverse_table.insert([0x22; 16], 1, 1);
         actor.pending_local_path_requests.insert([0x33; 16], 1);
+        let link_id = [0x34; 16];
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            actor.bind_link_endpoint(
+                LinkEndpointBinding {
+                    link_id,
+                    interface_id: 1,
+                    role: LinkEndpointRole::Initiator,
+                },
+                lifecycle_tx,
+            ),
+            crate::messages::LinkEndpointBindResult::Bound
+        );
 
         actor.handle_message(TransportMessage::SharedConnectionLost);
 
@@ -10353,6 +10952,11 @@ mod tests {
         assert!(actor.path_table.is_empty());
         assert!(actor.reverse_table.is_empty());
         assert!(actor.pending_local_path_requests.is_empty());
+        assert_eq!(
+            lifecycle_rx.try_recv().unwrap().reason,
+            LinkEndpointTerminalReason::InterfaceOffline
+        );
+        assert!(lifecycle_rx.try_recv().is_err());
     }
 
     #[test]

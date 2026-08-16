@@ -5,6 +5,10 @@ impl TransportActor {
     pub(super) fn on_tick(&mut self) {
         let now = now_f64();
 
+        // Established-Link packets that encountered temporary interface
+        // backpressure are retained per Link and retried in FIFO order.
+        self.drain_link_endpoint_egress();
+
         // Startup grace delays cache cleanup so freshly restored entries
         // aren't immediately aged out before the first traffic arrives.
         if !self.startup_complete

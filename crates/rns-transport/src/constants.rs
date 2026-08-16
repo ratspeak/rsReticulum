@@ -29,6 +29,11 @@ pub const DESTINATION_TIMEOUT: u64 = 604_800;
 /// Equals `Link::STALE_TIME (720s) * 1.25`.
 pub const LINK_TIMEOUT: f64 = 900.0;
 
+/// Maximum packets retained for one locally-owned established Link while its
+/// exact attached interface is applying backpressure. Exhaustion is terminal
+/// for that Link; transport never falls back to another interface.
+pub const LINK_ENDPOINT_EGRESS_QUEUE_CAPACITY: usize = 256;
+
 /// Reverse table entry timeout (8 minutes).
 pub const REVERSE_TIMEOUT: u64 = 480;
 

@@ -143,6 +143,84 @@ pub enum OutboundDispatchResult {
     ReceiptCollision,
 }
 
+/// Which side of an established Link owns one transport endpoint.
+///
+/// This role is immutable for the lifetime of a binding. Keeping it in the
+/// transport command prevents two local Link owners from accidentally
+/// sharing the same egress queue when an in-process Link has both endpoints
+/// on one actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LinkEndpointRole {
+    Initiator,
+    Responder,
+}
+
+/// Immutable egress attachment for one locally-owned established Link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkEndpointBinding {
+    pub link_id: [u8; 16],
+    pub interface_id: InterfaceId,
+    pub role: LinkEndpointRole,
+}
+
+/// Result of installing an established-Link endpoint binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkEndpointBindResult {
+    Bound,
+    AlreadyBound,
+    /// The same Link endpoint is already attached to different immutable
+    /// metadata. Callers must tear the old endpoint down before rebinding.
+    Conflict {
+        interface_id: InterfaceId,
+        role: LinkEndpointRole,
+    },
+    InterfaceUnavailable,
+}
+
+/// Why transport permanently removed a locally-owned Link endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkEndpointTerminalReason {
+    Unbound,
+    InterfaceRemoved,
+    InterfaceClosed,
+    InterfaceOffline,
+    InterfaceNotOutbound,
+    EgressQueueExhausted,
+    TransportShutdown,
+}
+
+/// Exactly-once terminal notification for an established-Link binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkEndpointLifecycleEvent {
+    pub binding: LinkEndpointBinding,
+    pub reason: LinkEndpointTerminalReason,
+    /// Number of accepted packets that could not be emitted before teardown.
+    pub dropped_packets: usize,
+}
+
+/// Immediate result of handing one established-Link packet to transport.
+///
+/// `Queued` is successful admission to the bounded, per-Link FIFO. It is not
+/// a claim that the interface driver has accepted the packet yet. Terminal
+/// interface failures are delivered through the lifecycle channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkEndpointSendResult {
+    Sent,
+    Queued { depth: usize },
+    NotBound,
+    RoleMismatch,
+    InvalidPacket,
+    Terminated(LinkEndpointTerminalReason),
+}
+
+/// Result of explicitly releasing one established-Link endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkEndpointUnbindResult {
+    Unbound,
+    NotBound,
+    RoleMismatch,
+}
+
 /// Periodic maintenance tick. Drives cache culling, retransmit scheduling,
 /// and rate-limit decay so the actor needs no internal timer.
 #[derive(Debug)]
@@ -349,6 +427,26 @@ pub enum TransportMessage {
         request: OutboundRequest,
         interface_id: InterfaceId,
     },
+    /// Install one immutable, locally-owned established-Link attachment.
+    /// This table is deliberately separate from the transit `LinkTable`.
+    BindLinkEndpoint {
+        binding: LinkEndpointBinding,
+        lifecycle_tx: mpsc::UnboundedSender<LinkEndpointLifecycleEvent>,
+        result_tx: tokio::sync::oneshot::Sender<LinkEndpointBindResult>,
+    },
+    /// Explicitly release a locally-owned established-Link attachment.
+    UnbindLinkEndpoint {
+        link_id: [u8; 16],
+        role: LinkEndpointRole,
+        result_tx: tokio::sync::oneshot::Sender<LinkEndpointUnbindResult>,
+    },
+    /// Reliably admit one packet into an established Link's ordered egress.
+    SendLinkEndpoint {
+        link_id: [u8; 16],
+        role: LinkEndpointRole,
+        request: OutboundRequest,
+        result_tx: tokio::sync::oneshot::Sender<LinkEndpointSendResult>,
+    },
     /// Dispatch an application packet and report whether an interface
     /// accepted it. Optional receipt registration occurs in the same actor
     /// turn, avoiding registration/send races.
@@ -507,6 +605,9 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::Inbound(_) => "Inbound",
         TransportMessage::Outbound(_) => "Outbound",
         TransportMessage::OutboundAttached { .. } => "OutboundAttached",
+        TransportMessage::BindLinkEndpoint { .. } => "BindLinkEndpoint",
+        TransportMessage::UnbindLinkEndpoint { .. } => "UnbindLinkEndpoint",
+        TransportMessage::SendLinkEndpoint { .. } => "SendLinkEndpoint",
         TransportMessage::SendPacket { .. } => "SendPacket",
         TransportMessage::SetReceiptTimeout { .. } => "SetReceiptTimeout",
         TransportMessage::Tick(_) => "Tick",
@@ -855,6 +956,26 @@ impl std::fmt::Debug for TransportMessage {
                 .field("request", request)
                 .field("interface_id", interface_id)
                 .finish(),
+            Self::BindLinkEndpoint { binding, .. } => f
+                .debug_struct("BindLinkEndpoint")
+                .field("binding", binding)
+                .finish_non_exhaustive(),
+            Self::UnbindLinkEndpoint { link_id, role, .. } => f
+                .debug_struct("UnbindLinkEndpoint")
+                .field("link_id", link_id)
+                .field("role", role)
+                .finish_non_exhaustive(),
+            Self::SendLinkEndpoint {
+                link_id,
+                role,
+                request,
+                ..
+            } => f
+                .debug_struct("SendLinkEndpoint")
+                .field("link_id", link_id)
+                .field("role", role)
+                .field("request", request)
+                .finish_non_exhaustive(),
             Self::SendPacket {
                 request,
                 attached_interface,

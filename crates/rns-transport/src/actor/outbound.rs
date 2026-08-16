@@ -49,6 +49,7 @@ impl TransportActor {
         if create_receipt
             && parsed.flags.packet_type == rns_wire::flags::PacketType::Data
             && parsed.flags.destination_type != rns_wire::flags::DestinationType::Plain
+            && parsed.flags.destination_type != rns_wire::flags::DestinationType::Link
         {
             let trunc_hash =
                 rns_wire::hash::truncated_packet_hash(&request.raw, parsed.flags.header_type);
@@ -106,7 +107,7 @@ impl TransportActor {
             rns_wire::flags::DestinationType::Plain | rns_wire::flags::DestinationType::Group => {
                 self.broadcast_on_interfaces(&request.raw, None)
             }
-            rns_wire::flags::DestinationType::Single | rns_wire::flags::DestinationType::Link => {
+            rns_wire::flags::DestinationType::Single => {
                 if let Some(path) = self.path_table.get_live(&request.destination_hash) {
                     let target_interface = path.interface_id;
                     let path_hops = path.hops;
@@ -201,6 +202,19 @@ impl TransportActor {
                     }
                     sent
                 }
+            }
+            rns_wire::flags::DestinationType::Link => {
+                // Established Links are interface-bound sessions, not
+                // ordinary destinations. Their 16-byte link id has no
+                // path-table meaning and must never trigger discovery or a
+                // broadcast fallback. In-process Links were already handled
+                // above; network owners must use SendLinkEndpoint (or the
+                // temporary OutboundAttached migration bridge).
+                warn!(
+                    link_id = %hex::encode(request.destination_hash),
+                    "dropping unattached locally-originated Link packet"
+                );
+                false
             }
         }
     }

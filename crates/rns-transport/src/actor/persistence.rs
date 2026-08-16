@@ -514,6 +514,9 @@ impl TransportActor {
     }
 
     pub(super) fn on_shutdown(&mut self) {
+        self.terminate_all_link_endpoints(
+            crate::messages::LinkEndpointTerminalReason::TransportShutdown,
+        );
         self.save_state();
     }
 
