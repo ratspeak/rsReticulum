@@ -324,13 +324,13 @@ impl Link {
             return Err(HandshakeError::InvalidSignature);
         }
 
-        // Python reads the LRPROOF mode byte before validating the exact proof
-        // length; a wrong mode closes the pending link even for otherwise odd
-        // proof lengths.
+        // LRPROOF is unauthenticated until its signature validates. Reject a
+        // mismatched mode without mutating the pending Link, otherwise any
+        // party that learns the link id could cancel establishment before the
+        // legitimate proof arrives.
         if proof_data.len() > 96 {
             let proof_mode = (proof_data[96] & MODE_BYTEMASK as u8) >> 5;
             if proof_mode != self.mode {
-                self.state = LinkState::Closed;
                 return Err(HandshakeError::InvalidSignature);
             }
         }
@@ -338,22 +338,22 @@ impl Link {
         let proof = LinkProofData::unpack(proof_data)?;
 
         if proof.signalling.mode != self.mode {
-            self.state = LinkState::Closed;
             return Err(HandshakeError::InvalidSignature);
         }
 
-        self.establishment_cost += proof_data.len();
-
         // Verify the signature before deriving session keys so we never hold keys
-        // tied to an unvalidated proof, even transiently.
+        // tied to an unvalidated proof, even transiently. Invalid proofs leave
+        // the initiator Pending so another interface can still deliver the
+        // authentic proof before the establishment timeout.
         if !proof.validate(
             identity_verify_key,
             &self.link_id,
             identity_ed25519_pub_bytes,
         ) {
-            self.state = LinkState::Closed;
             return Err(HandshakeError::InvalidSignature);
         }
+
+        self.establishment_cost += proof_data.len();
 
         self.peer_x25519_pub = Some(proof.responder_x25519_pub);
         self.peer_packet_proof_key = Some(*identity_ed25519_pub_bytes);
@@ -1864,6 +1864,7 @@ mod tests {
     fn test_wrong_proof_identity() {
         let dest_hash = [0xAA; 16];
         let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
         let wrong_identity = Ed25519PrivateKey::generate();
         let wrong_pub = wrong_identity.public_key();
 
@@ -1875,7 +1876,16 @@ mod tests {
         // Hand the initiator a mismatched public key on proof validation.
         let result = initiator.validate_proof(&proof_data, &wrong_pub, &wrong_pub.to_bytes());
         assert!(result.is_err());
-        assert_eq!(initiator.state, LinkState::Closed);
+        assert_eq!(initiator.state, LinkState::Pending);
+
+        // An unauthenticated proof must not win a race against the authentic
+        // responder proof arriving later on another candidate interface.
+        assert!(
+            initiator
+                .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+                .is_ok()
+        );
+        assert_eq!(initiator.state, LinkState::Active);
     }
 
     #[test]
@@ -1943,7 +1953,7 @@ mod tests {
         proof_data[96] = MODE_AES128_CBC << 5;
         let result = initiator.validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes());
         assert!(matches!(result, Err(HandshakeError::InvalidSignature)));
-        assert_eq!(initiator.state, LinkState::Closed);
+        assert_eq!(initiator.state, LinkState::Pending);
     }
 
     #[test]
