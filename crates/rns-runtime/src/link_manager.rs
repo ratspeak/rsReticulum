@@ -1080,6 +1080,32 @@ impl LinkManager {
             self.begin_endpoint_finalization(ownership, false, true);
             return;
         }
+        if let Some(ownership) = self
+            .pending_endpoint_binds
+            .get(&event.binding.link_id)
+            .map(|pending| pending.ownership)
+            .filter(|ownership| {
+                ownership.binding == event.binding
+                    && self.active_endpoint_generations.get(&event.binding.link_id)
+                        == Some(&ownership.generation)
+            })
+        {
+            tracing::warn!(
+                link_id = %hex::encode(event.binding.link_id),
+                interface_id = event.binding.interface_id,
+                role = ?event.binding.role,
+                generation = ownership.generation,
+                reason = ?event.reason,
+                dropped_packets = event.dropped_packets,
+                "pending responder Link endpoint became terminal before bind ownership transfer"
+            );
+            // Keep the pending Bind result receiver alive. If Bound was
+            // already sent, the next poll will observe that the candidate's
+            // generation is no longer active and release the dead endpoint
+            // without publishing RegisterLink or LRPROOF.
+            self.close_active_link(event.binding.link_id, CloseReason::DestinationClosed, false);
+            return;
+        }
         let Some(ownership) = self.owned_endpoint_bindings.get(&event.binding.link_id) else {
             return;
         };
@@ -7317,6 +7343,114 @@ mod tests {
         assert!(manager.poll_link_endpoints());
         assert_eq!(manager.active_link_count(), 0);
         assert_eq!(manager.link_interface(&initiator.link_id), None);
+    }
+
+    #[test]
+    fn terminal_lifecycle_between_bind_polls_cancels_exact_candidate() {
+        let identity = Identity::new();
+        let destination_hash = Destination::hash_from_name_and_identity(
+            "endpoint.bind-terminal-race",
+            Some(&identity.hash),
+        );
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::with_destination(
+            transport_tx,
+            event_rx,
+            &identity,
+            "endpoint.bind-terminal-race",
+            identity.get_signing_key(),
+        );
+        let (initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        let link_id = initiator.link_id;
+        manager.handle_link_request(&link_request_raw(destination_hash, &request_data), 41);
+
+        let TransportMessage::BindLinkEndpoint {
+            binding,
+            result_tx,
+            lifecycle_tx: _,
+        } = transport_rx.try_recv().expect("endpoint bind")
+        else {
+            panic!("first responder command must bind the endpoint");
+        };
+        assert_eq!(binding.link_id, link_id);
+        assert_eq!(binding.interface_id, 41);
+        assert!(
+            !manager.poll_link_endpoints(),
+            "first bind poll must be empty"
+        );
+
+        for wrong_binding in [
+            LinkEndpointBinding {
+                interface_id: 42,
+                ..binding
+            },
+            LinkEndpointBinding {
+                role: LinkEndpointRole::Initiator,
+                ..binding
+            },
+        ] {
+            manager
+                .endpoint_lifecycle_tx
+                .send(LinkEndpointLifecycleEvent {
+                    binding: wrong_binding,
+                    reason: rns_transport::messages::LinkEndpointTerminalReason::Unbound,
+                    dropped_packets: 0,
+                })
+                .unwrap();
+        }
+        assert!(manager.drain_endpoint_lifecycle());
+        assert_eq!(manager.active_link_count(), 1);
+        assert!(manager.pending_endpoint_binds.contains_key(&link_id));
+
+        // The actor resolves Bind, then immediately terminates the exact
+        // endpoint. Force the lifecycle consumer to win the cross-channel
+        // race before the next Bind-result poll.
+        let _ = result_tx.send(LinkEndpointBindResult::Bound);
+        manager
+            .endpoint_lifecycle_tx
+            .send(LinkEndpointLifecycleEvent {
+                binding,
+                reason: rns_transport::messages::LinkEndpointTerminalReason::InterfaceRemoved,
+                dropped_packets: 0,
+            })
+            .unwrap();
+        assert!(manager.drain_endpoint_lifecycle());
+        assert_eq!(manager.active_link_count(), 0);
+        assert!(manager.pending_endpoint_binds.contains_key(&link_id));
+        assert!(transport_rx.try_recv().is_err());
+
+        assert!(manager.poll_link_endpoints());
+        assert!(manager.pending_endpoint_binds.is_empty());
+        assert!(!manager.owned_endpoint_bindings.contains_key(&link_id));
+        let TransportMessage::UnbindLinkEndpoint {
+            link_id: cleanup_link_id,
+            role,
+            result_tx,
+        } = transport_rx
+            .try_recv()
+            .expect("late Bound must release the terminal endpoint")
+        else {
+            panic!("terminal pending Bind must not publish RegisterLink or LRPROOF");
+        };
+        assert_eq!(cleanup_link_id, link_id);
+        assert_eq!(role, LinkEndpointRole::Responder);
+        assert!(transport_rx.try_recv().is_err());
+
+        let _ = result_tx.send(LinkEndpointUnbindResult::NotBound);
+        assert!(manager.poll_link_endpoints());
+        let TransportMessage::Rpc { response_tx, .. } = transport_rx
+            .try_recv()
+            .expect("terminal candidate cleanup barrier")
+        else {
+            panic!("unpublished terminal candidate must finish with an actor barrier");
+        };
+        assert!(transport_rx.try_recv().is_err());
+        let _ = response_tx.send(rns_transport::messages::TransportQueryResponse::BoolResult(
+            false,
+        ));
+        assert!(manager.poll_link_endpoints());
+        assert!(!manager.endpoint_tombstones.contains_key(&link_id));
     }
 
     #[test]
