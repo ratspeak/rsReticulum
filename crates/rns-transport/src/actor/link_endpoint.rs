@@ -51,7 +51,7 @@ impl TransportActor {
 
         let key = (link_id, role);
         if let Some(entry) = self.link_endpoints.remove(&key) {
-            self.notify_link_endpoint_terminal(
+            self.finish_link_endpoint_terminal(
                 entry,
                 crate::messages::LinkEndpointTerminalReason::Unbound,
                 0,
@@ -335,7 +335,7 @@ impl TransportActor {
                     let reason = terminal_reason_for_interface_outcome(outcome)
                         .expect("non-full, non-sent interface outcome must be terminal");
                     let interface_id = entry.binding.interface_id;
-                    self.notify_link_endpoint_terminal(entry, reason, 0);
+                    self.finish_link_endpoint_terminal(entry, reason, 0);
                     if matches!(
                         outcome,
                         InterfaceSendOutcome::Closed | InterfaceSendOutcome::Offline
@@ -352,13 +352,11 @@ impl TransportActor {
         }
 
         if entry.unbind_after_drain {
-            let destination_hash = entry.binding.link_id;
-            self.notify_link_endpoint_terminal(
+            self.finish_link_endpoint_terminal(
                 entry,
                 crate::messages::LinkEndpointTerminalReason::Unbound,
                 0,
             );
-            self.deregister_destination(destination_hash);
         } else {
             self.link_endpoints.insert(key, entry);
         }
@@ -492,7 +490,26 @@ impl TransportActor {
         extra_dropped: usize,
     ) {
         if let Some(entry) = self.link_endpoints.remove(&key) {
-            self.notify_link_endpoint_terminal(entry, reason, extra_dropped);
+            self.finish_link_endpoint_terminal(entry, reason, extra_dropped);
+        }
+    }
+
+    /// Complete one endpoint owner exactly once. An accepted atomic final send
+    /// owns both the endpoint and its temporary destination registration, so a
+    /// terminal interface/FIFO outcome must release both just like a successful
+    /// drain. Ordinary endpoint termination deliberately leaves application
+    /// destinations alone.
+    fn finish_link_endpoint_terminal(
+        &mut self,
+        entry: LinkEndpointEntry,
+        reason: crate::messages::LinkEndpointTerminalReason,
+        extra_dropped: usize,
+    ) {
+        let deregister_temporary_destination = entry.unbind_after_drain;
+        let destination_hash = entry.binding.link_id;
+        self.notify_link_endpoint_terminal(entry, reason, extra_dropped);
+        if deregister_temporary_destination {
+            self.deregister_destination(destination_hash);
         }
     }
 

@@ -4283,6 +4283,102 @@ mod tests {
     }
 
     #[test]
+    fn queued_atomic_close_releases_destination_when_interface_dies_before_drain() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (target, _target_rx) = make_test_interface_with_capacity("terminal target", 1);
+        target.tx.try_send(Bytes::from_static(b"occupied")).unwrap();
+        actor.interfaces.insert(15, target);
+
+        let link_id = [0xBD; 16];
+        actor.local_destinations.insert(link_id);
+        let (destination_tx, _destination_rx) = mpsc::channel(1);
+        actor.destination_channels.insert(link_id, destination_tx);
+        let (initiator_tx, _initiator_rx) = mpsc::channel(1);
+        let (responder_tx, _responder_rx) = mpsc::channel(1);
+        actor.local_link_routes.insert(
+            link_id,
+            LocalLinkRoute {
+                initiator_tx,
+                responder_tx,
+            },
+        );
+
+        let binding = LinkEndpointBinding {
+            link_id,
+            interface_id: 15,
+            role: LinkEndpointRole::Initiator,
+        };
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            actor.bind_link_endpoint(binding, lifecycle_tx),
+            crate::messages::LinkEndpointBindResult::Bound
+        );
+
+        for index in 0..LINK_ENDPOINT_EGRESS_QUEUE_CAPACITY - 1 {
+            let mut raw = make_link_data_packet(link_id, 0).to_vec();
+            *raw.last_mut().unwrap() = index as u8;
+            assert_eq!(
+                actor.send_link_endpoint(
+                    link_id,
+                    LinkEndpointRole::Initiator,
+                    OutboundRequest {
+                        raw: Bytes::from(raw),
+                        destination_hash: link_id,
+                    },
+                ),
+                LinkEndpointSendResult::Queued { depth: index + 1 }
+            );
+        }
+
+        let close = make_link_data_packet_with_context(
+            link_id,
+            0,
+            rns_wire::context::PacketContext::LinkClose,
+        );
+        assert_eq!(
+            actor.send_link_endpoint_and_unbind(
+                link_id,
+                LinkEndpointRole::Initiator,
+                OutboundRequest {
+                    raw: close,
+                    destination_hash: link_id,
+                },
+            ),
+            LinkEndpointSendResult::Queued {
+                depth: LINK_ENDPOINT_EGRESS_QUEUE_CAPACITY
+            }
+        );
+        assert!(
+            actor
+                .link_endpoints
+                .contains_key(&(link_id, LinkEndpointRole::Initiator))
+        );
+
+        actor.deregister_interface(15);
+
+        assert!(
+            !actor
+                .link_endpoints
+                .contains_key(&(link_id, LinkEndpointRole::Initiator))
+        );
+        assert!(!actor.local_destinations.contains(&link_id));
+        assert!(!actor.destination_channels.contains_key(&link_id));
+        assert!(!actor.local_link_routes.contains_key(&link_id));
+        let terminal = lifecycle_rx.try_recv().unwrap();
+        assert_eq!(terminal.binding, binding);
+        assert_eq!(
+            terminal.reason,
+            LinkEndpointTerminalReason::InterfaceRemoved
+        );
+        assert_eq!(
+            terminal.dropped_packets,
+            LINK_ENDPOINT_EGRESS_QUEUE_CAPACITY
+        );
+        actor.deregister_interface(15);
+        assert!(lifecycle_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn interface_removal_terminates_bound_link_once() {
         let (mut actor, _tx) = TransportActor::new();
         let (interface, _rx) = make_test_interface("ephemeral peer");
