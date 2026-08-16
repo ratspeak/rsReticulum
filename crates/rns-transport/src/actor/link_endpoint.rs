@@ -30,6 +30,7 @@ impl TransportActor {
                 binding,
                 lifecycle_tx,
                 egress: VecDeque::new(),
+                unbind_after_drain: false,
             },
         );
         debug!(
@@ -87,6 +88,9 @@ impl TransportActor {
                 LinkEndpointSendResult::NotBound
             };
         }
+        if self.link_endpoints[&key].unbind_after_drain {
+            return LinkEndpointSendResult::Terminated(LinkEndpointTerminalReason::Unbound);
+        }
 
         let interface_id = self.link_endpoints[&key].binding.interface_id;
         // Give previously admitted packets first claim on newly available
@@ -137,13 +141,43 @@ impl TransportActor {
         }
     }
 
+    pub(super) fn send_link_endpoint_and_unbind(
+        &mut self,
+        link_id: [u8; 16],
+        role: crate::messages::LinkEndpointRole,
+        request: crate::messages::OutboundRequest,
+    ) -> crate::messages::LinkEndpointSendResult {
+        use crate::messages::{LinkEndpointSendResult, LinkEndpointTerminalReason};
+
+        let result = self.send_link_endpoint(link_id, role, request);
+        let key = (link_id, role);
+        match result {
+            LinkEndpointSendResult::Sent => {
+                if let Some(entry) = self.link_endpoints.remove(&key) {
+                    self.notify_link_endpoint_terminal(
+                        entry,
+                        LinkEndpointTerminalReason::Unbound,
+                        0,
+                    );
+                }
+            }
+            LinkEndpointSendResult::Queued { .. } => {
+                if let Some(entry) = self.link_endpoints.get_mut(&key) {
+                    entry.unbind_after_drain = true;
+                }
+            }
+            _ => {}
+        }
+        result
+    }
+
     pub(super) fn send_link_endpoint_best_effort(
         &mut self,
         link_id: [u8; 16],
         role: crate::messages::LinkEndpointRole,
         request: crate::messages::OutboundRequest,
     ) -> crate::messages::LinkEndpointSendResult {
-        use crate::messages::LinkEndpointSendResult;
+        use crate::messages::{LinkEndpointSendResult, LinkEndpointTerminalReason};
 
         let key = (link_id, role);
         if !self.link_endpoints.contains_key(&key) {
@@ -156,6 +190,9 @@ impl TransportActor {
             } else {
                 LinkEndpointSendResult::NotBound
             };
+        }
+        if self.link_endpoints[&key].unbind_after_drain {
+            return LinkEndpointSendResult::Terminated(LinkEndpointTerminalReason::Unbound);
         }
 
         // Realtime media must never jump ahead of retained signalling or
@@ -312,7 +349,15 @@ impl TransportActor {
             }
         }
 
-        self.link_endpoints.insert(key, entry);
+        if entry.unbind_after_drain {
+            self.notify_link_endpoint_terminal(
+                entry,
+                crate::messages::LinkEndpointTerminalReason::Unbound,
+                0,
+            );
+        } else {
+            self.link_endpoints.insert(key, entry);
+        }
         Ok(())
     }
 

@@ -452,6 +452,15 @@ pub enum TransportMessage {
         request: OutboundRequest,
         result_tx: tokio::sync::oneshot::Sender<LinkEndpointSendResult>,
     },
+    /// Reliably admit a final packet, then remove the endpoint only after its
+    /// ordered FIFO has drained. This prevents a queued LINKCLOSE from being
+    /// discarded by an immediately following unbind.
+    SendLinkEndpointAndUnbind {
+        link_id: [u8; 16],
+        role: LinkEndpointRole,
+        request: OutboundRequest,
+        result_tx: tokio::sync::oneshot::Sender<LinkEndpointSendResult>,
+    },
     /// Attempt exact-interface established-Link egress without entering the
     /// reliable per-Link FIFO. Intended for bounded realtime media only.
     SendLinkEndpointBestEffort {
@@ -621,6 +630,7 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::BindLinkEndpoint { .. } => "BindLinkEndpoint",
         TransportMessage::UnbindLinkEndpoint { .. } => "UnbindLinkEndpoint",
         TransportMessage::SendLinkEndpoint { .. } => "SendLinkEndpoint",
+        TransportMessage::SendLinkEndpointAndUnbind { .. } => "SendLinkEndpointAndUnbind",
         TransportMessage::SendLinkEndpointBestEffort { .. } => "SendLinkEndpointBestEffort",
         TransportMessage::SendPacket { .. } => "SendPacket",
         TransportMessage::SetReceiptTimeout { .. } => "SetReceiptTimeout",
@@ -986,6 +996,17 @@ impl std::fmt::Debug for TransportMessage {
                 ..
             } => f
                 .debug_struct("SendLinkEndpoint")
+                .field("link_id", link_id)
+                .field("role", role)
+                .field("request", request)
+                .finish_non_exhaustive(),
+            Self::SendLinkEndpointAndUnbind {
+                link_id,
+                role,
+                request,
+                ..
+            } => f
+                .debug_struct("SendLinkEndpointAndUnbind")
                 .field("link_id", link_id)
                 .field("role", role)
                 .field("request", request)

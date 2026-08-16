@@ -59,6 +59,7 @@ struct LinkEndpointEntry {
     binding: crate::messages::LinkEndpointBinding,
     lifecycle_tx: mpsc::UnboundedSender<crate::messages::LinkEndpointLifecycleEvent>,
     egress: VecDeque<Bytes>,
+    unbind_after_drain: bool,
 }
 
 /// Owns every routing table and drains the `TransportMessage` channel in one
@@ -509,6 +510,14 @@ impl TransportActor {
                 result_tx,
             } => {
                 let _ = result_tx.send(self.send_link_endpoint(link_id, role, request));
+            }
+            TransportMessage::SendLinkEndpointAndUnbind {
+                link_id,
+                role,
+                request,
+                result_tx,
+            } => {
+                let _ = result_tx.send(self.send_link_endpoint_and_unbind(link_id, role, request));
             }
             TransportMessage::SendLinkEndpointBestEffort {
                 link_id,
@@ -4169,6 +4178,97 @@ mod tests {
         actor.drain_link_endpoint_egress();
         assert_eq!(target_rx.try_recv().unwrap(), control);
         assert!(target_rx.try_recv().is_err());
+        assert!(lifecycle_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn final_link_packet_drains_before_endpoint_unbind() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (target, mut target_rx) = make_test_interface_with_capacity("closing target", 1);
+        target.tx.try_send(Bytes::from_static(b"occupied")).unwrap();
+        actor.interfaces.insert(14, target);
+
+        let link_id = [0xBC; 16];
+        let binding = LinkEndpointBinding {
+            link_id,
+            interface_id: 14,
+            role: LinkEndpointRole::Initiator,
+        };
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            actor.bind_link_endpoint(binding, lifecycle_tx),
+            crate::messages::LinkEndpointBindResult::Bound
+        );
+
+        let prior_control = make_link_proof_packet(link_id, 0);
+        assert_eq!(
+            actor.send_link_endpoint(
+                link_id,
+                LinkEndpointRole::Initiator,
+                OutboundRequest {
+                    raw: prior_control.clone(),
+                    destination_hash: link_id,
+                },
+            ),
+            LinkEndpointSendResult::Queued { depth: 1 }
+        );
+        let close = make_link_data_packet_with_context(
+            link_id,
+            0,
+            rns_wire::context::PacketContext::LinkClose,
+        );
+        assert_eq!(
+            actor.send_link_endpoint_and_unbind(
+                link_id,
+                LinkEndpointRole::Initiator,
+                OutboundRequest {
+                    raw: close.clone(),
+                    destination_hash: link_id,
+                },
+            ),
+            LinkEndpointSendResult::Queued { depth: 2 }
+        );
+        assert!(
+            actor
+                .link_endpoints
+                .contains_key(&(link_id, LinkEndpointRole::Initiator))
+        );
+        assert_eq!(
+            actor.send_link_endpoint(
+                link_id,
+                LinkEndpointRole::Initiator,
+                OutboundRequest {
+                    raw: make_link_data_packet(link_id, 0),
+                    destination_hash: link_id,
+                },
+            ),
+            LinkEndpointSendResult::Terminated(LinkEndpointTerminalReason::Unbound)
+        );
+
+        assert_eq!(
+            target_rx.try_recv().unwrap(),
+            Bytes::from_static(b"occupied")
+        );
+        actor.drain_link_endpoint_egress();
+        assert_eq!(target_rx.try_recv().unwrap(), prior_control);
+        assert!(
+            actor
+                .link_endpoints
+                .contains_key(&(link_id, LinkEndpointRole::Initiator))
+        );
+        assert!(lifecycle_rx.try_recv().is_err());
+
+        actor.drain_link_endpoint_egress();
+        assert_eq!(target_rx.try_recv().unwrap(), close);
+        assert!(
+            !actor
+                .link_endpoints
+                .contains_key(&(link_id, LinkEndpointRole::Initiator))
+        );
+        let terminal = lifecycle_rx.try_recv().unwrap();
+        assert_eq!(terminal.binding, binding);
+        assert_eq!(terminal.reason, LinkEndpointTerminalReason::Unbound);
+        assert_eq!(terminal.dropped_packets, 0);
         assert!(lifecycle_rx.try_recv().is_err());
     }
 
