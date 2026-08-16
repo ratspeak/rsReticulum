@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Enforce role-specific Link packet proofs: initiators sign with the transient
+  LINKREQUEST key, responders sign with the destination identity, and external
+  identity backends no longer fall back to an unrelated key.
+- Ignore unauthenticated invalid LRPROOF candidates without closing a pending
+  initiator, allowing the authentic proof to win an interface race.
+- Bind every locally owned established Link endpoint to its validated
+  interface and role, with fail-closed routing, bounded ordered control egress,
+  terminal interface-loss notification, and bounded best-effort realtime
+  egress. Typed send rejection closes only the exact owner, while final
+  LINKCLOSE and temporary-destination cleanup drain atomically in order.
+  Initial LINKREQUEST discovery remains path-routed or broadcast.
 - Forward authenticated non-Link packet delivery proofs from `LinkManager` to
   owning applications through a lossless completion channel.
 - Retain and retry destination announcements, including path responses, when

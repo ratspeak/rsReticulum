@@ -255,6 +255,21 @@ instance_control_port = 37433
 | Weave | Partial: interface driver implemented, not yet config-wired in the runtime. |
 | Bluetooth Classic RFCOMM | Not implemented. |
 
+## Established Link Routing
+
+An initial Link Request uses normal Reticulum path discovery and may be
+broadcast when no path is known. Once the responder accepts that request and
+the initiator validates its proof, each local Link endpoint is bound to the
+exact interface and role selected by the handshake. Later Link packets,
+Channels, Resources, proofs, keepalives, and teardown never fall back to a
+different path or interface; loss of the selected interface closes that Link.
+
+Reliable Link control uses a bounded ordered queue, while realtime media has a
+separate bounded best-effort path that cannot overtake retained control
+traffic. Initiator packet proofs use the temporary signing key advertised in
+the Link Request, and responder packet proofs use the accepting destination
+identity.
+
 ## Compatibility Notes
 
 Most daemon and utility flows are implemented for the public `*-rs` tools:
