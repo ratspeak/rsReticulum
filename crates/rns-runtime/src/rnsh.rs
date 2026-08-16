@@ -324,12 +324,11 @@ pub async fn rnsh_client_execute(
         })
         .await
         .map_err(|_| RnshError::TransportUnavailable)?;
-    let mut registration = RnshLinkGuard {
-        transport_tx: transport_tx.clone(),
+    let mut registration = crate::link_endpoint::LinkEndpointCleanupGuard::new(
+        transport_tx.clone(),
         link_id,
-        endpoint_bound: false,
-        cleanup_required: true,
-    };
+        LinkEndpointRole::Initiator,
+    );
 
     let link_req_pkt = build_link_request_packet(destination_hash, &request_data);
     transport_tx
@@ -363,7 +362,7 @@ pub async fn rnsh_client_execute(
     )
     .await
     .map_err(|_| RnshError::TransportUnavailable)?;
-    registration.endpoint_bound = true;
+    registration.endpoint_bound();
     let mut endpoint = ClientLinkEndpoint {
         attached_interface,
         lifecycle_rx: &mut endpoint_lifecycle_rx,
@@ -428,14 +427,12 @@ pub async fn rnsh_client_execute(
             match message {
                 RnshMessage::VersionInfo(version) => {
                     if version.protocol_version != PROTOCOL_VERSION {
-                        cleanup_destination(&transport_tx, link_id).await;
                         return Err(RnshError::Remote("incompatible rnsh protocol".into()));
                     }
                     tokio::time::sleep(Duration::from_millis(75)).await;
                     break;
                 }
                 RnshMessage::Error(err) => {
-                    cleanup_destination(&transport_tx, link_id).await;
                     return Err(RnshError::Remote(
                         err.msg.unwrap_or_else(|| "remote error".into()),
                     ));
@@ -485,7 +482,6 @@ pub async fn rnsh_client_execute(
     {
         Ok(return_code) => return_code,
         Err(error) => {
-            cleanup_destination(&transport_tx, link_id).await;
             return Err(error);
         }
     };
@@ -503,13 +499,9 @@ pub async fn rnsh_client_execute(
         false
     };
     if !endpoint_closing {
-        let _ =
-            crate::link_endpoint::unbind(&transport_tx, link_id, LinkEndpointRole::Initiator).await;
-        registration.endpoint_bound = false;
-        cleanup_destination(&transport_tx, link_id).await;
-        registration.cleanup_required = false;
+        let _ = registration.cleanup().await;
     } else {
-        registration.cleanup_required = false;
+        registration.disarm();
     }
 
     Ok(RnshClientOutcome {
@@ -517,32 +509,6 @@ pub async fn rnsh_client_execute(
         stderr,
         return_code,
     })
-}
-
-struct RnshLinkGuard {
-    transport_tx: mpsc::Sender<TransportMessage>,
-    link_id: [u8; 16],
-    endpoint_bound: bool,
-    cleanup_required: bool,
-}
-
-impl Drop for RnshLinkGuard {
-    fn drop(&mut self) {
-        if !self.cleanup_required {
-            return;
-        }
-        if self.endpoint_bound {
-            let _ = self
-                .transport_tx
-                .try_send(crate::link_endpoint::unbind_message(
-                    self.link_id,
-                    LinkEndpointRole::Initiator,
-                ));
-        }
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::DeregisterDestination { hash: self.link_id });
-    }
 }
 
 struct ClientLinkEndpoint<'a> {
@@ -1872,10 +1838,6 @@ async fn wait_for_valid_link_proof(
             RnshError::HandshakeFailed("channel closed".into())
         }
     })
-}
-
-async fn cleanup_destination(transport_tx: &mpsc::Sender<TransportMessage>, link_id: [u8; 16]) {
-    let _ = transport_tx.try_send(TransportMessage::DeregisterDestination { hash: link_id });
 }
 
 async fn send_keepalive_response(

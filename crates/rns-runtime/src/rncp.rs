@@ -41,32 +41,6 @@ pub const DEFAULT_RNCP_APP_NAME: &str = "rncp.receive";
 /// `FAILED` on a loaded peer.
 const RNCP_POST_PROOF_SETTLE: Duration = Duration::from_millis(250);
 
-struct RncpLinkGuard {
-    transport_tx: mpsc::Sender<TransportMessage>,
-    link_id: [u8; 16],
-    endpoint_bound: bool,
-    cleanup_required: bool,
-}
-
-impl Drop for RncpLinkGuard {
-    fn drop(&mut self) {
-        if !self.cleanup_required {
-            return;
-        }
-        if self.endpoint_bound {
-            let _ = self
-                .transport_tx
-                .try_send(crate::link_endpoint::unbind_message(
-                    self.link_id,
-                    LinkEndpointRole::Initiator,
-                ));
-        }
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::DeregisterDestination { hash: self.link_id });
-    }
-}
-
 async fn send_endpoint_packet(
     transport_tx: &mpsc::Sender<TransportMessage>,
     link_id: [u8; 16],
@@ -557,12 +531,11 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
         })
         .await
         .map_err(|_| RncpError::TransportUnavailable)?;
-    let mut registration = RncpLinkGuard {
-        transport_tx: transport_tx.clone(),
+    let mut registration = crate::link_endpoint::LinkEndpointCleanupGuard::new(
+        transport_tx.clone(),
         link_id,
-        endpoint_bound: false,
-        cleanup_required: true,
-    };
+        LinkEndpointRole::Initiator,
+    );
 
     let link_req_pkt = build_link_request_packet(dest_hash, &link_request_data);
     transport_tx
@@ -584,7 +557,7 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
     )
     .await
     .map_err(|_| RncpError::TransportUnavailable)?;
-    registration.endpoint_bound = true;
+    registration.endpoint_bound();
 
     let rtt_pkt = build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data);
     send_endpoint_packet(&transport_tx, link_id, rtt_pkt).await?;
@@ -685,13 +658,9 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
         false
     };
     if !endpoint_closing {
-        let _ =
-            crate::link_endpoint::unbind(&transport_tx, link_id, LinkEndpointRole::Initiator).await;
-        registration.endpoint_bound = false;
-        cleanup_destination(&transport_tx, link_id).await;
-        registration.cleanup_required = false;
+        let _ = registration.cleanup().await;
     } else {
-        registration.cleanup_required = false;
+        registration.disarm();
     }
 
     transfer_result?;
@@ -1035,10 +1004,6 @@ async fn wait_for_valid_rncp_proof(
     Ok((proof.rtt_data, proof.interface_id))
 }
 
-async fn cleanup_destination(transport_tx: &mpsc::Sender<TransportMessage>, link_id: [u8; 16]) {
-    let _ = transport_tx.try_send(TransportMessage::DeregisterDestination { hash: link_id });
-}
-
 fn build_link_request_packet(dest_hash: [u8; 16], request_data: &[u8]) -> Bytes {
     let header = rns_wire::header::PacketHeader {
         flags: rns_wire::flags::PacketFlags {
@@ -1159,12 +1124,11 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
         })
         .await
         .map_err(|_| RncpError::TransportUnavailable)?;
-    let mut registration = RncpLinkGuard {
-        transport_tx: transport_tx.clone(),
+    let mut registration = crate::link_endpoint::LinkEndpointCleanupGuard::new(
+        transport_tx.clone(),
         link_id,
-        endpoint_bound: false,
-        cleanup_required: true,
-    };
+        LinkEndpointRole::Initiator,
+    );
 
     let link_req_pkt = build_link_request_packet(dest_hash, &link_request_data);
     transport_tx
@@ -1186,7 +1150,7 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
     )
     .await
     .map_err(|_| RncpError::TransportUnavailable)?;
-    registration.endpoint_bound = true;
+    registration.endpoint_bound();
 
     let rtt_pkt = build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data);
     send_endpoint_packet(&transport_tx, link_id, rtt_pkt).await?;
@@ -1523,13 +1487,9 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
         false
     };
     if !endpoint_closing {
-        let _ =
-            crate::link_endpoint::unbind(&transport_tx, link_id, LinkEndpointRole::Initiator).await;
-        registration.endpoint_bound = false;
-        cleanup_destination(&transport_tx, link_id).await;
-        registration.cleanup_required = false;
+        let _ = registration.cleanup().await;
     } else {
-        registration.cleanup_required = false;
+        registration.disarm();
     }
 
     let (file_name, payload) = result?;

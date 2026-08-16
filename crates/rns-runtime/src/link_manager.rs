@@ -26,7 +26,8 @@ use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::{AnnounceRequest, DestinationEvent};
 use rns_transport::messages::{
     InterfaceId, LinkEndpointBindResult, LinkEndpointBinding, LinkEndpointLifecycleEvent,
-    LinkEndpointRole, LinkEndpointSendResult, OutboundRequest, TransportMessage,
+    LinkEndpointRole, LinkEndpointSendResult, LinkEndpointUnbindResult, OutboundRequest,
+    TransportMessage,
 };
 
 const MAX_PENDING_DESTINATION_ANNOUNCES: usize = 256;
@@ -58,6 +59,12 @@ struct ActiveLink {
     /// Reverse index per-segment `resource_hash` → coordinator; routes assembled
     /// bytes without re-parsing the ADV.
     segment_routing: HashMap<[u8; 32], SegmentRoute>,
+}
+
+struct PendingResponderEndpointBind {
+    result_rx: oneshot::Receiver<LinkEndpointBindResult>,
+    register_link: TransportMessage,
+    proof: TransportMessage,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -427,9 +434,11 @@ pub struct LinkManager {
     pending_destination_announces: VecDeque<TransportMessage>,
     pending_link_control: VecDeque<TransportMessage>,
     pending_endpoint_sends: Vec<crate::link_endpoint::PendingLinkEndpointSend>,
+    pending_endpoint_cleanups: Vec<crate::link_endpoint::PendingLinkEndpointCleanup>,
     endpoint_lifecycle_tx: mpsc::UnboundedSender<LinkEndpointLifecycleEvent>,
     endpoint_lifecycle_rx: mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
-    pending_endpoint_binds: HashMap<[u8; 16], oneshot::Receiver<LinkEndpointBindResult>>,
+    pending_endpoint_binds: HashMap<[u8; 16], PendingResponderEndpointBind>,
+    owned_endpoint_bindings: HashSet<[u8; 16]>,
     active_links: HashMap<[u8; 16], ActiveLink>,
     /// Raw software signing key, when available. Hardware-backed identities sign
     /// through `identity` instead.
@@ -521,9 +530,11 @@ impl LinkManager {
             pending_destination_announces: VecDeque::new(),
             pending_link_control: VecDeque::new(),
             pending_endpoint_sends: Vec::new(),
+            pending_endpoint_cleanups: Vec::new(),
             endpoint_lifecycle_tx,
             endpoint_lifecycle_rx,
             pending_endpoint_binds: HashMap::new(),
+            owned_endpoint_bindings: HashSet::new(),
             active_links: HashMap::new(),
             identity_key,
             destination_hash,
@@ -590,9 +601,11 @@ impl LinkManager {
             pending_destination_announces: VecDeque::new(),
             pending_link_control: VecDeque::new(),
             pending_endpoint_sends: Vec::new(),
+            pending_endpoint_cleanups: Vec::new(),
             endpoint_lifecycle_tx,
             endpoint_lifecycle_rx,
             pending_endpoint_binds: HashMap::new(),
+            owned_endpoint_bindings: HashSet::new(),
             active_links: HashMap::new(),
             identity_key,
             destination_hash,
@@ -750,7 +763,7 @@ impl LinkManager {
                 }
             }
         }
-        self.close_all_active_links(CloseReason::DestinationClosed);
+        self.drain_shutdown_link_ownership().await;
     }
 
     pub async fn run_with_commands(mut self, mut command_rx: mpsc::Receiver<LinkManagerCommand>) {
@@ -786,42 +799,79 @@ impl LinkManager {
 
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        self.close_all_active_links(CloseReason::DestinationClosed);
+        self.drain_shutdown_link_ownership().await;
     }
 
     fn poll_link_endpoints(&mut self) -> bool {
         let mut progressed = false;
-        let mut failed = Vec::new();
+        let mut completed_binds = Vec::new();
         let link_ids: Vec<_> = self.pending_endpoint_binds.keys().copied().collect();
         for link_id in link_ids {
-            let Some(receiver) = self.pending_endpoint_binds.get_mut(&link_id) else {
+            let Some(pending) = self.pending_endpoint_binds.get_mut(&link_id) else {
                 continue;
             };
-            match receiver.try_recv() {
-                Ok(LinkEndpointBindResult::Bound) => {
-                    self.pending_endpoint_binds.remove(&link_id);
-                    progressed = true;
+            match pending.result_rx.try_recv() {
+                Ok(result) => completed_binds.push((link_id, Some(result))),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    completed_binds.push((link_id, None));
                 }
-                Ok(result) => {
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+        for (link_id, result) in completed_binds {
+            let Some(pending) = self.pending_endpoint_binds.remove(&link_id) else {
+                continue;
+            };
+            progressed = true;
+            match result {
+                Some(LinkEndpointBindResult::Bound) if self.active_links.contains_key(&link_id) => {
+                    self.owned_endpoint_bindings.insert(link_id);
+                    // Registering the route and publishing LRPROOF are a
+                    // post-bind transaction. A conflicting owner must never
+                    // observe either side effect.
+                    Self::stage_required_link_control(
+                        &self.transport_tx,
+                        &mut self.pending_link_control,
+                        pending.register_link,
+                    );
+                    Self::stage_required_link_control(
+                        &self.transport_tx,
+                        &mut self.pending_link_control,
+                        pending.proof,
+                    );
+                }
+                Some(LinkEndpointBindResult::Bound) => {
+                    // The candidate was closed while Bind was in flight. We
+                    // own this fresh endpoint, but never published RegisterLink,
+                    // so release it without deregistering another local role.
+                    Self::stage_endpoint_cleanup(
+                        &self.transport_tx,
+                        &mut self.pending_link_control,
+                        &mut self.pending_endpoint_cleanups,
+                        link_id,
+                        LinkEndpointRole::Responder,
+                        false,
+                    );
+                }
+                Some(result) => {
                     tracing::error!(
                         link_id = %hex::encode(link_id),
                         result = ?result,
                         "responder Link endpoint binding failed"
                     );
-                    self.pending_endpoint_binds.remove(&link_id);
-                    failed.push(link_id);
-                    progressed = true;
+                    // The candidate never acquired endpoint ownership. In
+                    // particular, AlreadyBound/Conflict belong to a different
+                    // owner and must not be unbound or deregistered here.
+                    self.close_active_link(link_id, CloseReason::DestinationClosed, false);
                 }
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    self.pending_endpoint_binds.remove(&link_id);
-                    failed.push(link_id);
-                    progressed = true;
+                None => {
+                    tracing::error!(
+                        link_id = %hex::encode(link_id),
+                        "responder Link endpoint binding result channel closed"
+                    );
+                    self.close_active_link(link_id, CloseReason::DestinationClosed, false);
                 }
-                Err(oneshot::error::TryRecvError::Empty) => {}
             }
-        }
-        for link_id in failed {
-            self.close_active_link(link_id, CloseReason::DestinationClosed, false);
         }
         let mut completed_sends = Vec::new();
         let mut failed_sends = Vec::new();
@@ -868,19 +918,57 @@ impl LinkManager {
                 "established Link endpoint rejected a staged send"
             );
             if final_unbind {
-                Self::stage_link_control(
+                Self::stage_endpoint_cleanup(
                     &self.transport_tx,
                     &mut self.pending_link_control,
-                    crate::link_endpoint::unbind_message(link_id, role),
-                );
-                Self::stage_link_control(
-                    &self.transport_tx,
-                    &mut self.pending_link_control,
-                    TransportMessage::DeregisterDestination { hash: link_id },
+                    &mut self.pending_endpoint_cleanups,
+                    link_id,
+                    role,
+                    true,
                 );
             } else {
                 self.close_active_link(link_id, CloseReason::DestinationClosed, false);
             }
+        }
+        let mut completed_cleanups = Vec::new();
+        for (index, pending) in self.pending_endpoint_cleanups.iter_mut().enumerate() {
+            match pending.result_rx.try_recv() {
+                Ok(LinkEndpointUnbindResult::Unbound | LinkEndpointUnbindResult::NotBound) => {
+                    if pending.deregister_on_success {
+                        Self::stage_required_link_control(
+                            &self.transport_tx,
+                            &mut self.pending_link_control,
+                            TransportMessage::DeregisterDestination {
+                                hash: pending.link_id,
+                            },
+                        );
+                    }
+                    completed_cleanups.push(index);
+                    progressed = true;
+                }
+                Ok(LinkEndpointUnbindResult::RoleMismatch) => {
+                    tracing::error!(
+                        link_id = %hex::encode(pending.link_id),
+                        role = ?pending.role,
+                        "refusing to deregister Link destination owned by another endpoint role"
+                    );
+                    completed_cleanups.push(index);
+                    progressed = true;
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    tracing::error!(
+                        link_id = %hex::encode(pending.link_id),
+                        role = ?pending.role,
+                        "Link endpoint cleanup result channel closed"
+                    );
+                    completed_cleanups.push(index);
+                    progressed = true;
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+        for index in completed_cleanups.into_iter().rev() {
+            self.pending_endpoint_cleanups.swap_remove(index);
         }
         while let Ok(event) = self.endpoint_lifecycle_rx.try_recv() {
             self.handle_endpoint_terminal(event);
@@ -1282,6 +1370,42 @@ impl LinkManager {
         true
     }
 
+    /// Stage ownership/cleanup control without dropping it at the ordinary
+    /// protocol retry limit. These messages are finite per Link and must
+    /// survive transient ingress backpressure to preserve endpoint ordering.
+    fn stage_required_link_control(
+        transport_tx: &mpsc::Sender<TransportMessage>,
+        pending: &mut VecDeque<TransportMessage>,
+        message: TransportMessage,
+    ) -> bool {
+        if pending.is_empty() {
+            match transport_tx.try_send(message) {
+                Ok(()) => return true,
+                Err(mpsc::error::TrySendError::Full(message)) => {
+                    pending.push_back(message);
+                    return true;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+        }
+        pending.push_back(message);
+        true
+    }
+
+    fn stage_endpoint_cleanup(
+        transport_tx: &mpsc::Sender<TransportMessage>,
+        pending_link_control: &mut VecDeque<TransportMessage>,
+        pending_endpoint_cleanups: &mut Vec<crate::link_endpoint::PendingLinkEndpointCleanup>,
+        link_id: [u8; 16],
+        role: LinkEndpointRole,
+        deregister_on_success: bool,
+    ) {
+        let (message, pending) =
+            crate::link_endpoint::cleanup_message(link_id, role, deregister_on_success);
+        pending_endpoint_cleanups.push(pending);
+        let _ = Self::stage_required_link_control(transport_tx, pending_link_control, message);
+    }
+
     fn endpoint_role(role: LinkRole) -> LinkEndpointRole {
         match role {
             LinkRole::Initiator => LinkEndpointRole::Initiator,
@@ -1539,10 +1663,9 @@ impl LinkManager {
             "link proof packet built"
         );
 
-        // Reserve both transport slots before publishing either half of the
-        // handshake. Registering the Link before its proof is observable is
-        // essential: a fast initiator may answer the proof immediately, and
-        // transport must already know where to dispatch that first Link packet.
+        // Publish only the bind attempt now. RegisterLink and LRPROOF remain a
+        // private post-bind transaction until the actor confirms this manager
+        // acquired fresh endpoint ownership.
         let transport_tx = self.transport_tx.clone();
         let bind_permit = match transport_tx.try_reserve() {
             Ok(permit) => permit,
@@ -1551,28 +1674,6 @@ impl LinkManager {
                     link_id = hex::encode(link_id),
                     error = %error,
                     "link request rejected — transport queue cannot bind Link endpoint"
-                );
-                return;
-            }
-        };
-        let register_permit = match transport_tx.try_reserve() {
-            Ok(permit) => permit,
-            Err(error) => {
-                tracing::warn!(
-                    link_id = hex::encode(link_id),
-                    error = %error,
-                    "link request rejected — transport queue cannot register Link"
-                );
-                return;
-            }
-        };
-        let proof_permit = match transport_tx.try_reserve() {
-            Ok(permit) => permit,
-            Err(error) => {
-                tracing::warn!(
-                    link_id = hex::encode(link_id),
-                    error = %error,
-                    "link request rejected — transport queue cannot send proof"
                 );
                 return;
             }
@@ -1620,22 +1721,27 @@ impl LinkManager {
             lifecycle_tx: self.endpoint_lifecycle_tx.clone(),
             result_tx: bind_result_tx,
         });
-        self.pending_endpoint_binds.insert(link_id, bind_result_rx);
-        register_permit.send(TransportMessage::RegisterLink {
+        self.pending_endpoint_binds.insert(
             link_id,
-            destination_hash: self.destination_hash,
-            interface_id,
-            next_hop: None,
-            remaining_hops: 0,
-            initiator: false,
-        });
-        proof_permit.send(TransportMessage::OutboundAttached {
-            request: OutboundRequest {
-                raw: Bytes::from(proof_raw),
-                destination_hash: link_id,
+            PendingResponderEndpointBind {
+                result_rx: bind_result_rx,
+                register_link: TransportMessage::RegisterLink {
+                    link_id,
+                    destination_hash: self.destination_hash,
+                    interface_id,
+                    next_hop: None,
+                    remaining_hops: 0,
+                    initiator: false,
+                },
+                proof: TransportMessage::OutboundAttached {
+                    request: OutboundRequest {
+                        raw: Bytes::from(proof_raw),
+                        destination_hash: link_id,
+                    },
+                    interface_id,
+                },
             },
-            interface_id,
-        });
+        );
 
         tracing::info!(
             link_id = hex::encode(link_id),
@@ -3436,6 +3542,7 @@ impl LinkManager {
             return false;
         };
         let endpoint_role = Self::endpoint_role(active.link.role());
+        let owns_endpoint = self.owned_endpoint_bindings.remove(&link_id);
         // Python removes responder Links from the owning Destination when they
         // close. Keep the Rust Destination's live-link bookkeeping in sync.
         if let Some(destination) = self.destination.as_mut() {
@@ -3450,7 +3557,7 @@ impl LinkManager {
             .map(|identity| identity.0)
             .collect();
 
-        if send_teardown {
+        if send_teardown && owns_endpoint {
             if let Some(teardown_data) = active.link.teardown(reason) {
                 endpoint_closing = Self::send_link_close_packet(
                     &self.transport_tx,
@@ -3466,21 +3573,18 @@ impl LinkManager {
         }
 
         self.backchannel_links.retain(|_, lid| *lid != link_id);
-        self.pending_endpoint_binds.remove(&link_id);
-        if !endpoint_closing {
-            Self::stage_link_control(
+        if !endpoint_closing && owns_endpoint {
+            Self::stage_endpoint_cleanup(
                 &self.transport_tx,
                 &mut self.pending_link_control,
-                crate::link_endpoint::unbind_message(link_id, endpoint_role),
+                &mut self.pending_endpoint_cleanups,
+                link_id,
+                endpoint_role,
+                true,
             );
         }
         if let Ok(mut ids) = self.link_identities.lock() {
             ids.remove(&link_id);
-        }
-        if !endpoint_closing {
-            let _ = self
-                .transport_tx
-                .try_send(TransportMessage::DeregisterDestination { hash: link_id });
         }
         if let Some(ref tx) = self.accounting_event_tx {
             if tx
@@ -3543,6 +3647,39 @@ impl LinkManager {
         let link_ids: Vec<[u8; 16]> = self.active_links.keys().copied().collect();
         for link_id in link_ids {
             self.close_active_link(link_id, reason, false);
+        }
+    }
+
+    async fn drain_shutdown_link_ownership(&mut self) {
+        self.close_all_active_links(CloseReason::DestinationClosed);
+        loop {
+            self.flush_pending_link_control();
+            self.poll_link_endpoints();
+            self.flush_pending_link_control();
+
+            if self.pending_endpoint_binds.is_empty()
+                && self.pending_endpoint_sends.is_empty()
+                && self.pending_endpoint_cleanups.is_empty()
+                && self.pending_link_control.is_empty()
+            {
+                return;
+            }
+            if self.transport_tx.is_closed() {
+                tracing::warn!(
+                    pending_binds = self.pending_endpoint_binds.len(),
+                    pending_sends = self.pending_endpoint_sends.len(),
+                    pending_cleanups = self.pending_endpoint_cleanups.len(),
+                    pending_control = self.pending_link_control.len(),
+                    "transport closed before Link endpoint shutdown ownership could drain"
+                );
+                self.pending_endpoint_binds.clear();
+                self.pending_endpoint_sends.clear();
+                self.pending_endpoint_cleanups.clear();
+                self.pending_link_control.clear();
+                return;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
 
@@ -5728,18 +5865,21 @@ mod tests {
                 segment_routing: HashMap::new(),
             },
         );
+        lm.owned_endpoint_bindings.insert(link_id);
         assert_eq!(lm.active_link_count(), 1);
 
         lm.handle_event(DestinationEvent::LinkClosed { link_id });
         assert_eq!(lm.active_link_count(), 0);
         assert_eq!(closed_rx.try_recv().unwrap(), link_id);
-        assert!(
-            matches!(
-                next_transport_message(&mut rx).unwrap(),
-                TransportMessage::DeregisterDestination { hash } if hash == link_id
-            ),
-            "link manager must deregister closed link destination"
-        );
+        let TransportMessage::UnbindLinkEndpoint { result_tx, .. } = rx.try_recv().unwrap() else {
+            panic!("link manager must release its endpoint before deregistration");
+        };
+        let _ = result_tx.send(LinkEndpointUnbindResult::Unbound);
+        assert!(lm.poll_link_endpoints());
+        assert!(matches!(
+            next_transport_message(&mut rx).unwrap(),
+            TransportMessage::DeregisterDestination { hash } if hash == link_id
+        ));
 
         let _ = identity_key;
     }
@@ -5810,6 +5950,7 @@ mod tests {
                 segment_routing: HashMap::new(),
             },
         );
+        lm.owned_endpoint_bindings.insert(link_id);
 
         lm.handle_inbound_packet(&close_raw, 2);
         assert_eq!(
@@ -5827,13 +5968,17 @@ mod tests {
         assert_eq!(closed_rx.try_recv().unwrap(), link_id);
         assert!(lm.backchannel_links.is_empty());
         assert!(lm.link_identities.lock().unwrap().get(&link_id).is_none());
-        assert!(
-            matches!(
-                next_transport_message(&mut transport_rx).unwrap(),
-                TransportMessage::DeregisterDestination { hash } if hash == link_id
-            ),
-            "verified remote close must deregister link destination"
-        );
+        let TransportMessage::UnbindLinkEndpoint { result_tx, .. } =
+            transport_rx.try_recv().unwrap()
+        else {
+            panic!("verified remote close must unbind before deregistration");
+        };
+        let _ = result_tx.send(LinkEndpointUnbindResult::Unbound);
+        assert!(lm.poll_link_endpoints());
+        assert!(matches!(
+            next_transport_message(&mut transport_rx).unwrap(),
+            TransportMessage::DeregisterDestination { hash } if hash == link_id
+        ));
     }
 
     #[test]
@@ -5910,6 +6055,17 @@ mod tests {
         lm.handle_link_request(&raw, 1);
 
         assert_eq!(lm.active_link_count(), 1);
+        let TransportMessage::BindLinkEndpoint {
+            result_tx,
+            lifecycle_tx,
+            ..
+        } = rx.try_recv().expect("Link bind should be queued")
+        else {
+            panic!("expected endpoint bind before Link registration");
+        };
+        let _ = result_tx.send(LinkEndpointBindResult::Bound);
+        std::mem::forget(lifecycle_tx);
+        assert!(lm.poll_link_endpoints());
         let registration =
             next_transport_message(&mut rx).expect("Link registration should be queued");
         assert!(matches!(
@@ -6827,6 +6983,7 @@ mod tests {
         assert_eq!(binding.role, LinkEndpointRole::Responder);
         let _ = result_tx.send(LinkEndpointBindResult::Bound);
         std::mem::forget(lifecycle_tx);
+        assert!(manager.poll_link_endpoints());
 
         assert!(matches!(
             transport_rx.try_recv(),
@@ -6877,6 +7034,223 @@ mod tests {
         assert!(manager.poll_link_endpoints());
         assert_eq!(manager.active_link_count(), 0);
         assert_eq!(manager.link_interface(&initiator.link_id), None);
+    }
+
+    #[test]
+    fn responder_bind_conflict_publishes_no_handshake_or_foreign_cleanup() {
+        for result in [
+            LinkEndpointBindResult::AlreadyBound,
+            LinkEndpointBindResult::Conflict {
+                interface_id: 17,
+                role: LinkEndpointRole::Responder,
+            },
+        ] {
+            let identity = Identity::new();
+            let destination_hash = Destination::hash_from_name_and_identity(
+                "endpoint.bind-conflict",
+                Some(&identity.hash),
+            );
+            let (transport_tx, mut transport_rx) = mpsc::channel(16);
+            let (_event_tx, event_rx) = mpsc::channel(16);
+            let mut manager = LinkManager::with_destination(
+                transport_tx,
+                event_rx,
+                &identity,
+                "endpoint.bind-conflict",
+                identity.get_signing_key(),
+            );
+            let (initiator, request_data) = Link::new_initiator(destination_hash, 1);
+            manager.handle_link_request(&link_request_raw(destination_hash, &request_data), 17);
+
+            let TransportMessage::BindLinkEndpoint {
+                lifecycle_tx,
+                result_tx,
+                ..
+            } = transport_rx.try_recv().expect("endpoint bind")
+            else {
+                panic!("first command must be the isolated bind attempt");
+            };
+            let _ = result_tx.send(result);
+            drop(lifecycle_tx);
+            assert!(manager.poll_link_endpoints());
+
+            assert_eq!(manager.active_link_count(), 0);
+            assert!(!manager.owned_endpoint_bindings.contains(&initiator.link_id));
+            assert!(manager.pending_link_control.is_empty());
+            assert!(manager.pending_endpoint_cleanups.is_empty());
+            assert!(
+                transport_rx.try_recv().is_err(),
+                "conflict must emit no RegisterLink, LRPROOF, unbind, or deregistration"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn responder_conflict_leaves_preexisting_transport_endpoint_usable() {
+        let (actor, transport_tx) = rns_transport::actor::TransportActor::new();
+        let actor_task = tokio::spawn(actor.run());
+        let (interface_tx, mut interface_rx) = mpsc::channel(8);
+        transport_tx
+            .send(TransportMessage::RegisterInterface {
+                id: 17,
+                entry: rns_transport::messages::InterfaceEntry::new(
+                    "existing-link-owner".into(),
+                    rns_transport::constants::InterfaceMode::Gateway,
+                    rns_transport::constants::InterfaceDirection::bidirectional(),
+                    115_200,
+                    500,
+                    interface_tx,
+                ),
+            })
+            .await
+            .unwrap();
+
+        let identity = Identity::new();
+        let destination_hash = Destination::hash_from_name_and_identity(
+            "endpoint.actor-conflict",
+            Some(&identity.hash),
+        );
+        let (initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        let link_id = initiator.link_id;
+        let (existing_lifecycle_tx, mut existing_lifecycle_rx) = mpsc::unbounded_channel();
+        let (bind_result_tx, bind_result_rx) = oneshot::channel();
+        transport_tx
+            .send(TransportMessage::BindLinkEndpoint {
+                binding: LinkEndpointBinding {
+                    link_id,
+                    interface_id: 17,
+                    role: LinkEndpointRole::Responder,
+                },
+                lifecycle_tx: existing_lifecycle_tx,
+                result_tx: bind_result_tx,
+            })
+            .await
+            .unwrap();
+        assert_eq!(bind_result_rx.await.unwrap(), LinkEndpointBindResult::Bound);
+
+        let (_event_tx, event_rx) = mpsc::channel(8);
+        let mut manager = LinkManager::with_destination(
+            transport_tx.clone(),
+            event_rx,
+            &identity,
+            "endpoint.actor-conflict",
+            identity.get_signing_key(),
+        );
+        manager.handle_link_request(&link_request_raw(destination_hash, &request_data), 17);
+        for _ in 0..100 {
+            manager.poll_link_endpoints();
+            if manager.pending_endpoint_binds.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(manager.pending_endpoint_binds.is_empty());
+        assert_eq!(manager.active_link_count(), 0);
+        assert!(
+            interface_rx.try_recv().is_err(),
+            "conflicting manager must not publish LRPROOF"
+        );
+        assert!(matches!(
+            existing_lifecycle_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let raw = Bytes::from(LinkManager::build_link_data_packet(
+            link_id,
+            rns_wire::context::PacketContext::None,
+            b"still owned",
+        ));
+        let (send_result_tx, send_result_rx) = oneshot::channel();
+        transport_tx
+            .send(TransportMessage::SendLinkEndpoint {
+                link_id,
+                role: LinkEndpointRole::Responder,
+                request: OutboundRequest {
+                    raw: raw.clone(),
+                    destination_hash: link_id,
+                },
+                result_tx: send_result_tx,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            send_result_rx.await.unwrap(),
+            LinkEndpointSendResult::Sent | LinkEndpointSendResult::Queued { .. }
+        ));
+        assert_eq!(interface_rx.recv().await, Some(raw));
+        assert!(matches!(
+            existing_lifecycle_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let (unbind_result_tx, unbind_result_rx) = oneshot::channel();
+        transport_tx
+            .send(TransportMessage::UnbindLinkEndpoint {
+                link_id,
+                role: LinkEndpointRole::Responder,
+                result_tx: unbind_result_tx,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            unbind_result_rx.await.unwrap(),
+            LinkEndpointUnbindResult::Unbound
+        );
+        let _ = transport_tx.send(TransportMessage::Shutdown).await;
+        actor_task.await.unwrap();
+    }
+
+    #[test]
+    fn late_bound_result_releases_only_the_unpublished_endpoint() {
+        let identity = Identity::new();
+        let destination_hash =
+            Destination::hash_from_name_and_identity("endpoint.late-bound", Some(&identity.hash));
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::with_destination(
+            transport_tx,
+            event_rx,
+            &identity,
+            "endpoint.late-bound",
+            identity.get_signing_key(),
+        );
+        let (initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        manager.handle_link_request(&link_request_raw(destination_hash, &request_data), 23);
+
+        let TransportMessage::BindLinkEndpoint {
+            lifecycle_tx,
+            result_tx,
+            ..
+        } = transport_rx.try_recv().expect("endpoint bind")
+        else {
+            panic!("expected isolated endpoint bind");
+        };
+        assert!(manager.close_active_link(
+            initiator.link_id,
+            CloseReason::DestinationClosed,
+            false
+        ));
+        assert!(transport_rx.try_recv().is_err());
+
+        let _ = result_tx.send(LinkEndpointBindResult::Bound);
+        std::mem::forget(lifecycle_tx);
+        assert!(manager.poll_link_endpoints());
+        let TransportMessage::UnbindLinkEndpoint {
+            link_id,
+            role,
+            result_tx,
+        } = transport_rx.try_recv().expect("late ownership cleanup")
+        else {
+            panic!("late Bound must transfer into exact cleanup");
+        };
+        assert_eq!(link_id, initiator.link_id);
+        assert_eq!(role, LinkEndpointRole::Responder);
+        let _ = result_tx.send(LinkEndpointUnbindResult::Unbound);
+        assert!(manager.poll_link_endpoints());
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "unpublished candidate must not deregister a different local Link role"
+        );
     }
 
     #[test]
@@ -6941,6 +7315,7 @@ mod tests {
         manager
             .active_links
             .insert(link_id, active_link_entry_at(responder, 10));
+        manager.owned_endpoint_bindings.insert(link_id);
 
         manager
             .send_link_packet(&link_id, b"must fail closed")
@@ -6957,6 +7332,13 @@ mod tests {
         assert!(manager.poll_link_endpoints());
         assert_eq!(manager.active_link_count(), 0);
         assert!(manager.pending_endpoint_sends.is_empty());
+        let TransportMessage::UnbindLinkEndpoint { result_tx, .. } =
+            transport_rx.try_recv().unwrap()
+        else {
+            panic!("send rejection must release the exact endpoint first");
+        };
+        let _ = result_tx.send(LinkEndpointUnbindResult::Unbound);
+        assert!(manager.poll_link_endpoints());
         assert!(matches!(
             next_transport_message(&mut transport_rx),
             Ok(TransportMessage::DeregisterDestination { hash }) if hash == link_id
@@ -7009,6 +7391,7 @@ mod tests {
         manager
             .active_links
             .insert(link_id, active_link_entry_at(responder, 12));
+        manager.owned_endpoint_bindings.insert(link_id);
 
         assert!(manager.close_link(link_id, CloseReason::DestinationClosed, true));
         let TransportMessage::SendLinkEndpointAndUnbind {
@@ -7043,6 +7426,7 @@ mod tests {
         manager
             .active_links
             .insert(link_id, active_link_entry_at(responder, 12));
+        manager.owned_endpoint_bindings.insert(link_id);
 
         assert!(manager.close_link(link_id, CloseReason::DestinationClosed, true));
         let TransportMessage::SendLinkEndpointAndUnbind { result_tx, .. } =
@@ -7053,10 +7437,62 @@ mod tests {
         let _ = result_tx.send(LinkEndpointSendResult::NotBound);
         assert!(manager.poll_link_endpoints());
         assert!(manager.pending_endpoint_sends.is_empty());
+        let TransportMessage::UnbindLinkEndpoint { result_tx, .. } =
+            transport_rx.try_recv().unwrap()
+        else {
+            panic!("rejected atomic close must fall back to explicit unbind");
+        };
+        let _ = result_tx.send(LinkEndpointUnbindResult::NotBound);
+        assert!(manager.poll_link_endpoints());
         assert!(matches!(
             next_transport_message(&mut transport_rx),
             Ok(TransportMessage::DeregisterDestination { hash }) if hash == link_id
         ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_owned_endpoint_cleanup_after_ingress_backpressure() {
+        let (_initiator, responder) = handshaken_link_pair();
+        let link_id = responder.link_id;
+        let (transport_tx, mut transport_rx) = mpsc::channel(1);
+        transport_tx.send(TransportMessage::Shutdown).await.unwrap();
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let mut manager = LinkManager::new(transport_tx, event_rx, [0x77; 16], None);
+        manager
+            .active_links
+            .insert(link_id, active_link_entry_at(responder, 12));
+        manager.owned_endpoint_bindings.insert(link_id);
+
+        let shutdown = tokio::spawn(async move {
+            manager.drain_shutdown_link_ownership().await;
+        });
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::Shutdown)
+        ));
+        let Some(TransportMessage::UnbindLinkEndpoint {
+            link_id: unbound,
+            role,
+            result_tx,
+        }) = transport_rx.recv().await
+        else {
+            panic!("shutdown must retain the endpoint unbind while ingress is full");
+        };
+        assert_eq!(unbound, link_id);
+        assert_eq!(role, LinkEndpointRole::Responder);
+        assert!(!shutdown.is_finished());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), transport_rx.recv())
+                .await
+                .is_err(),
+            "shutdown must await unbind ownership before deregistering"
+        );
+        let _ = result_tx.send(LinkEndpointUnbindResult::Unbound);
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::DeregisterDestination { hash }) if hash == link_id
+        ));
+        shutdown.await.unwrap();
     }
 
     fn resource_advertisement_packet(sender_link: &Link, advertisement: &[u8]) -> Vec<u8> {
@@ -10310,10 +10746,24 @@ mod tests {
         let active = lm.get_link(&link_id).unwrap();
         assert_eq!(active.state, LinkState::Handshake);
 
-        let outbound = next_transport_message(&mut transport_rx);
-        assert!(
-            outbound.is_ok(),
-            "proof packet should be queued for sending"
-        );
+        let TransportMessage::BindLinkEndpoint {
+            result_tx,
+            lifecycle_tx,
+            ..
+        } = transport_rx.try_recv().expect("endpoint bind")
+        else {
+            panic!("endpoint bind must precede the responder handshake transaction");
+        };
+        let _ = result_tx.send(LinkEndpointBindResult::Bound);
+        std::mem::forget(lifecycle_tx);
+        assert!(lm.poll_link_endpoints());
+        assert!(matches!(
+            next_transport_message(&mut transport_rx),
+            Ok(TransportMessage::RegisterLink { link_id: registered, .. }) if registered == link_id
+        ));
+        assert!(matches!(
+            next_transport_message(&mut transport_rx),
+            Ok(TransportMessage::OutboundAttached { .. })
+        ));
     }
 }

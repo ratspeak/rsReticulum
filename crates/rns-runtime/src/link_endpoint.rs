@@ -18,6 +18,99 @@ pub(crate) enum LinkEndpointError {
     Bind(LinkEndpointBindResult),
     #[error("Link endpoint rejected outbound packet: {0:?}")]
     Send(LinkEndpointSendResult),
+    #[error("Link endpoint cleanup was rejected: {0:?}")]
+    Unbind(LinkEndpointUnbindResult),
+}
+
+pub(crate) struct PendingLinkEndpointCleanup {
+    pub(crate) link_id: [u8; 16],
+    pub(crate) role: LinkEndpointRole,
+    pub(crate) deregister_on_success: bool,
+    pub(crate) result_rx: oneshot::Receiver<LinkEndpointUnbindResult>,
+}
+
+/// Owns cleanup for a temporary initiator Link destination until ownership is
+/// transferred to a long-lived actor or an atomic final send succeeds.
+///
+/// Cancellation cannot use `try_send`: a full transport ingress queue is a
+/// normal transient condition. Drop therefore transfers cleanup to a retained
+/// task which waits for admission, verifies typed endpoint ownership, and only
+/// then deregisters the temporary destination.
+pub(crate) struct LinkEndpointCleanupGuard {
+    transport_tx: mpsc::Sender<TransportMessage>,
+    link_id: [u8; 16],
+    role: LinkEndpointRole,
+    endpoint_bound: bool,
+    armed: bool,
+}
+
+impl LinkEndpointCleanupGuard {
+    pub(crate) fn new(
+        transport_tx: mpsc::Sender<TransportMessage>,
+        link_id: [u8; 16],
+        role: LinkEndpointRole,
+    ) -> Self {
+        Self {
+            transport_tx,
+            link_id,
+            role,
+            endpoint_bound: false,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn endpoint_bound(&mut self) {
+        self.endpoint_bound = true;
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    pub(crate) async fn cleanup(&mut self) -> Result<(), LinkEndpointError> {
+        cleanup_registered_link(
+            &self.transport_tx,
+            self.link_id,
+            self.role,
+            self.endpoint_bound,
+        )
+        .await?;
+        self.endpoint_bound = false;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for LinkEndpointCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let transport_tx = self.transport_tx.clone();
+        let link_id = self.link_id;
+        let role = self.role;
+        let endpoint_bound = self.endpoint_bound;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                link_id = %hex::encode(link_id),
+                role = ?role,
+                "cannot retain Link endpoint cleanup without a Tokio runtime"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            if let Err(error) =
+                cleanup_registered_link(&transport_tx, link_id, role, endpoint_bound).await
+            {
+                tracing::error!(
+                    link_id = %hex::encode(link_id),
+                    role = ?role,
+                    error = %error,
+                    "retained Link endpoint cleanup failed"
+                );
+            }
+        });
+    }
 }
 
 pub(crate) struct PendingLinkEndpointSend {
@@ -25,6 +118,52 @@ pub(crate) struct PendingLinkEndpointSend {
     pub(crate) role: LinkEndpointRole,
     pub(crate) final_unbind: bool,
     pub(crate) result_rx: oneshot::Receiver<LinkEndpointSendResult>,
+}
+
+struct AtomicFinalSendGuard {
+    transport_tx: mpsc::Sender<TransportMessage>,
+    link_id: [u8; 16],
+    role: LinkEndpointRole,
+    result_rx: Option<oneshot::Receiver<LinkEndpointSendResult>>,
+}
+
+impl AtomicFinalSendGuard {
+    async fn result(&mut self) -> Result<LinkEndpointSendResult, LinkEndpointError> {
+        let result = self
+            .result_rx
+            .as_mut()
+            .expect("atomic final-send result receiver")
+            .await;
+        self.result_rx = None;
+        result.map_err(|_| LinkEndpointError::TransportUnavailable)
+    }
+}
+
+impl Drop for AtomicFinalSendGuard {
+    fn drop(&mut self) {
+        let Some(result_rx) = self.result_rx.take() else {
+            return;
+        };
+        let transport_tx = self.transport_tx.clone();
+        let link_id = self.link_id;
+        let role = self.role;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                link_id = %hex::encode(link_id),
+                role = ?role,
+                "cannot retain atomic Link close result without a Tokio runtime"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            match result_rx.await {
+                Ok(LinkEndpointSendResult::Sent | LinkEndpointSendResult::Queued { .. }) => {}
+                Ok(_) | Err(_) => {
+                    let _ = cleanup_registered_link(&transport_tx, link_id, role, true).await;
+                }
+            }
+        });
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,10 +311,16 @@ pub(crate) async fn send_and_unbind(
         })
         .await
         .map_err(|_| LinkEndpointError::TransportUnavailable)?;
-    match result_rx
-        .await
-        .map_err(|_| LinkEndpointError::TransportUnavailable)?
-    {
+    // Once admitted, retain ownership of the typed result across caller
+    // cancellation. A successful atomic operation owns the final FIFO drain;
+    // a rejected one falls back to ordered explicit cleanup.
+    let mut final_send = AtomicFinalSendGuard {
+        transport_tx: transport_tx.clone(),
+        link_id,
+        role,
+        result_rx: Some(result_rx),
+    };
+    match final_send.result().await? {
         LinkEndpointSendResult::Sent | LinkEndpointSendResult::Queued { .. } => Ok(()),
         result => Err(LinkEndpointError::Send(result)),
     }
@@ -224,6 +369,26 @@ pub(crate) async fn unbind(
         .await
         .map_err(|_| LinkEndpointError::TransportUnavailable)?;
     result_rx
+        .await
+        .map_err(|_| LinkEndpointError::TransportUnavailable)
+}
+
+async fn cleanup_registered_link(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    link_id: [u8; 16],
+    role: LinkEndpointRole,
+    endpoint_bound: bool,
+) -> Result<(), LinkEndpointError> {
+    if endpoint_bound {
+        match unbind(transport_tx, link_id, role).await? {
+            LinkEndpointUnbindResult::Unbound | LinkEndpointUnbindResult::NotBound => {}
+            result @ LinkEndpointUnbindResult::RoleMismatch => {
+                return Err(LinkEndpointError::Unbind(result));
+            }
+        }
+    }
+    transport_tx
+        .send(TransportMessage::DeregisterDestination { hash: link_id })
         .await
         .map_err(|_| LinkEndpointError::TransportUnavailable)
 }
@@ -278,13 +443,25 @@ pub(crate) fn send_and_unbind_message(
     )
 }
 
-pub(crate) fn unbind_message(link_id: [u8; 16], role: LinkEndpointRole) -> TransportMessage {
-    let (result_tx, _result_rx) = oneshot::channel();
-    TransportMessage::UnbindLinkEndpoint {
-        link_id,
-        role,
-        result_tx,
-    }
+pub(crate) fn cleanup_message(
+    link_id: [u8; 16],
+    role: LinkEndpointRole,
+    deregister_on_success: bool,
+) -> (TransportMessage, PendingLinkEndpointCleanup) {
+    let (result_tx, result_rx) = oneshot::channel();
+    (
+        TransportMessage::UnbindLinkEndpoint {
+            link_id,
+            role,
+            result_tx,
+        },
+        PendingLinkEndpointCleanup {
+            link_id,
+            role,
+            deregister_on_success,
+            result_rx,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -402,5 +579,99 @@ mod tests {
         );
         assert_eq!(initiator.state, LinkState::Pending);
         drop(event_tx);
+    }
+
+    #[tokio::test]
+    async fn dropped_cleanup_guard_survives_transport_ingress_backpressure() {
+        let link_id = [0xC1; 16];
+        let (transport_tx, mut transport_rx) = mpsc::channel(1);
+        transport_tx.send(TransportMessage::Shutdown).await.unwrap();
+
+        let mut guard =
+            LinkEndpointCleanupGuard::new(transport_tx, link_id, LinkEndpointRole::Initiator);
+        guard.endpoint_bound();
+        drop(guard);
+
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::Shutdown)
+        ));
+        let Some(TransportMessage::UnbindLinkEndpoint {
+            link_id: unbound,
+            role,
+            result_tx,
+        }) = transport_rx.recv().await
+        else {
+            panic!("retained cleanup must enqueue typed unbind after capacity returns");
+        };
+        assert_eq!(unbound, link_id);
+        assert_eq!(role, LinkEndpointRole::Initiator);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), transport_rx.recv())
+                .await
+                .is_err(),
+            "destination deregistration must wait for the typed unbind result"
+        );
+        let _ = result_tx.send(LinkEndpointUnbindResult::Unbound);
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::DeregisterDestination { hash }) if hash == link_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn role_mismatch_never_deregisters_another_endpoint_owner() {
+        let link_id = [0xC2; 16];
+        let (transport_tx, mut transport_rx) = mpsc::channel(2);
+        let cleanup = tokio::spawn(async move {
+            cleanup_registered_link(&transport_tx, link_id, LinkEndpointRole::Initiator, true).await
+        });
+        let Some(TransportMessage::UnbindLinkEndpoint { result_tx, .. }) =
+            transport_rx.recv().await
+        else {
+            panic!("expected typed unbind");
+        };
+        let _ = result_tx.send(LinkEndpointUnbindResult::RoleMismatch);
+        assert!(matches!(
+            cleanup.await.unwrap(),
+            Err(LinkEndpointError::Unbind(
+                LinkEndpointUnbindResult::RoleMismatch
+            ))
+        ));
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "role mismatch must not deregister the foreign Link destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_atomic_close_retains_queued_fifo_ownership() {
+        let link_id = [0xC3; 16];
+        let (transport_tx, mut transport_rx) = mpsc::channel(2);
+        let call_tx = transport_tx.clone();
+        let close = tokio::spawn(async move {
+            send_and_unbind(
+                &call_tx,
+                link_id,
+                LinkEndpointRole::Initiator,
+                proof_packet(link_id, b"final"),
+            )
+            .await
+        });
+        let Some(TransportMessage::SendLinkEndpointAndUnbind { result_tx, .. }) =
+            transport_rx.recv().await
+        else {
+            panic!("expected atomic final send");
+        };
+        close.abort();
+        let _ = close.await;
+        let _ = result_tx.send(LinkEndpointSendResult::Queued { depth: 1 });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "accepted atomic close owns FIFO drain; cancellation must not preempt it"
+        );
+        drop(transport_tx);
     }
 }

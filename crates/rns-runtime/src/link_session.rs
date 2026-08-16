@@ -932,51 +932,6 @@ pub struct LinkSession {
     pub resource_offers: mpsc::Receiver<LinkSessionResourceOffer>,
 }
 
-/// Ensures a cancelled or failed handshake cannot leave its temporary Link
-/// destination registered in the transport actor. Once the session actor owns
-/// cleanup, `disarm` transfers that responsibility.
-struct DestinationRegistrationGuard {
-    transport_tx: mpsc::Sender<TransportMessage>,
-    link_id: [u8; 16],
-    endpoint_bound: bool,
-    armed: bool,
-}
-
-impl DestinationRegistrationGuard {
-    fn new(transport_tx: mpsc::Sender<TransportMessage>, link_id: [u8; 16]) -> Self {
-        Self {
-            transport_tx,
-            link_id,
-            endpoint_bound: false,
-            armed: true,
-        }
-    }
-
-    fn endpoint_bound(&mut self) {
-        self.endpoint_bound = true;
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for DestinationRegistrationGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            if self.endpoint_bound {
-                let _ = self
-                    .transport_tx
-                    .try_send(crate::link_endpoint::unbind_message(
-                        self.link_id,
-                        LinkEndpointRole::Initiator,
-                    ));
-            }
-            deregister_destination(&self.transport_tx, self.link_id);
-        }
-    }
-}
-
 impl LinkSession {
     pub async fn connect(
         transport_tx: mpsc::Sender<TransportMessage>,
@@ -996,7 +951,11 @@ impl LinkSession {
             })
             .await
             .map_err(|_| LinkSessionError::TransportUnavailable)?;
-        let mut registration = DestinationRegistrationGuard::new(transport_tx.clone(), link_id);
+        let mut registration = crate::link_endpoint::LinkEndpointCleanupGuard::new(
+            transport_tx.clone(),
+            link_id,
+            LinkEndpointRole::Initiator,
+        );
 
         let request = build_link_request_packet(config.destination_hash, &request_data);
         if transport_tx
@@ -1114,8 +1073,8 @@ impl LinkSession {
                 resource_offer_tx,
                 phy_stats_tx,
             },
+            registration,
         ));
-        registration.disarm();
 
         Ok(Self {
             handle,
@@ -1180,6 +1139,7 @@ async fn run_session_actor(
     >,
     mut command_rx: mpsc::Receiver<LinkSessionCommand>,
     channels: SessionActorChannels,
+    mut registration: crate::link_endpoint::LinkEndpointCleanupGuard,
 ) {
     let SessionActorChannels {
         transport_tx,
@@ -1442,9 +1402,9 @@ async fn run_session_actor(
     fail_outbound_resources(&mut link, &mut state.resources, &event_tx);
     fail_inbound_resources(&mut link, &mut state.resources, &event_tx);
     if !endpoint_closing {
-        let _ =
-            crate::link_endpoint::unbind(&transport_tx, link_id, LinkEndpointRole::Initiator).await;
-        deregister_destination(&transport_tx, link_id);
+        let _ = registration.cleanup().await;
+    } else {
+        registration.disarm();
     }
     let _ = event_tx
         .send(LinkSessionEvent::Closed {
@@ -3947,24 +3907,6 @@ async fn send_raw(
     .map_err(|_| LinkSessionError::TransportUnavailable)
 }
 
-fn deregister_destination(transport_tx: &mpsc::Sender<TransportMessage>, link_id: [u8; 16]) {
-    let message = TransportMessage::DeregisterDestination { hash: link_id };
-    match transport_tx.try_send(message) {
-        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-        Err(mpsc::error::TrySendError::Full(message)) => {
-            // Cleanup must not be lost merely because the transport actor is
-            // momentarily busy. Handshake guards can call this from Drop, so
-            // enqueue asynchronously instead of blocking the current task.
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                let transport_tx = transport_tx.clone();
-                runtime.spawn(async move {
-                    let _ = transport_tx.send(message).await;
-                });
-            }
-        }
-    }
-}
-
 fn build_link_request_packet(destination_hash: [u8; 16], request_data: &[u8]) -> Bytes {
     let header = rns_wire::header::PacketHeader {
         flags: rns_wire::flags::PacketFlags {
@@ -4500,6 +4442,12 @@ mod tests {
             command_tx: command_tx.clone(),
             phy_stats_rx,
         };
+        let mut registration = crate::link_endpoint::LinkEndpointCleanupGuard::new(
+            transport_tx.clone(),
+            link_id,
+            LinkEndpointRole::Initiator,
+        );
+        registration.endpoint_bound();
 
         tokio::spawn(run_session_actor(
             (initiator, channel),
@@ -4514,6 +4462,7 @@ mod tests {
                 resource_offer_tx,
                 phy_stats_tx,
             },
+            registration,
         ));
 
         assert_eq!(

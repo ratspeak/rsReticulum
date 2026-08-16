@@ -48,36 +48,10 @@ pub struct LinkClient {
     identity: Arc<Identity>,
 }
 
-struct QueryLinkGuard {
-    transport_tx: mpsc::Sender<TransportMessage>,
-    link_id: [u8; 16],
-    endpoint_bound: bool,
-    cleanup_required: bool,
-}
-
 struct LinkClientEndpoint<'a> {
     delivery_rx: &'a mut mpsc::Receiver<DestinationEvent>,
     lifecycle_rx: &'a mut mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
     attached_interface: InterfaceId,
-}
-
-impl Drop for QueryLinkGuard {
-    fn drop(&mut self) {
-        if !self.cleanup_required {
-            return;
-        }
-        if self.endpoint_bound {
-            let _ = self
-                .transport_tx
-                .try_send(crate::link_endpoint::unbind_message(
-                    self.link_id,
-                    LinkEndpointRole::Initiator,
-                ));
-        }
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::DeregisterDestination { hash: self.link_id });
-    }
 }
 
 impl LinkClient {
@@ -148,12 +122,11 @@ impl LinkClient {
             delivery_tx: Some(dest_tx),
         })
         .await?;
-        let mut registration = QueryLinkGuard {
-            transport_tx: self.transport_tx.clone(),
+        let mut registration = crate::link_endpoint::LinkEndpointCleanupGuard::new(
+            self.transport_tx.clone(),
             link_id,
-            endpoint_bound: false,
-            cleanup_required: true,
-        };
+            LinkEndpointRole::Initiator,
+        );
 
         let req_pkt = build_link_request_packet(dest_hash, &request_data);
         self.send_msg(TransportMessage::Outbound(OutboundRequest {
@@ -197,7 +170,7 @@ impl LinkClient {
         )
         .await
         .map_err(|_| LinkClientError::TransportUnavailable)?;
-        registration.endpoint_bound = true;
+        registration.endpoint_bound();
         let mut endpoint = LinkClientEndpoint {
             delivery_rx: &mut dest_rx,
             lifecycle_rx: &mut endpoint_lifecycle_rx,
@@ -252,15 +225,9 @@ impl LinkClient {
         // Tear down even on failure so the remote doesn't keep link state.
         let endpoint_closing = self.send_close(&mut link).await.unwrap_or(false);
         if !endpoint_closing {
-            let _ = crate::link_endpoint::unbind(
-                &self.transport_tx,
-                link_id,
-                LinkEndpointRole::Initiator,
-            )
-            .await;
-            registration.endpoint_bound = false;
+            let _ = registration.cleanup().await;
         } else {
-            registration.cleanup_required = false;
+            registration.disarm();
         }
 
         response
