@@ -154,11 +154,13 @@ impl TransportActor {
         match result {
             LinkEndpointSendResult::Sent => {
                 if let Some(entry) = self.link_endpoints.remove(&key) {
+                    let destination_hash = entry.binding.link_id;
                     self.notify_link_endpoint_terminal(
                         entry,
                         LinkEndpointTerminalReason::Unbound,
                         0,
                     );
+                    self.deregister_destination(destination_hash);
                 }
             }
             LinkEndpointSendResult::Queued { .. } => {
@@ -350,11 +352,13 @@ impl TransportActor {
         }
 
         if entry.unbind_after_drain {
+            let destination_hash = entry.binding.link_id;
             self.notify_link_endpoint_terminal(
                 entry,
                 crate::messages::LinkEndpointTerminalReason::Unbound,
                 0,
             );
+            self.deregister_destination(destination_hash);
         } else {
             self.link_endpoints.insert(key, entry);
         }

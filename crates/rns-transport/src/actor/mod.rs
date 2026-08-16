@@ -632,14 +632,7 @@ impl TransportActor {
                 }
             }
             TransportMessage::DeregisterDestination { hash } => {
-                self.local_destinations.remove(&hash);
-                self.destination_channels.remove(&hash);
-                if self.local_link_routes.remove(&hash).is_some() {
-                    self.terminate_link_endpoints_for_link(
-                        hash,
-                        crate::messages::LinkEndpointTerminalReason::InterfaceRemoved,
-                    );
-                }
+                self.deregister_destination(hash);
             }
             TransportMessage::CacheRequest {
                 packet_hash,
@@ -1401,6 +1394,17 @@ impl TransportActor {
                 false
             }
             None => false,
+        }
+    }
+
+    fn deregister_destination(&mut self, hash: [u8; 16]) {
+        self.local_destinations.remove(&hash);
+        self.destination_channels.remove(&hash);
+        if self.local_link_routes.remove(&hash).is_some() {
+            self.terminate_link_endpoints_for_link(
+                hash,
+                crate::messages::LinkEndpointTerminalReason::InterfaceRemoved,
+            );
         }
     }
 
@@ -4189,6 +4193,9 @@ mod tests {
         actor.interfaces.insert(14, target);
 
         let link_id = [0xBC; 16];
+        actor.local_destinations.insert(link_id);
+        let (destination_tx, _destination_rx) = mpsc::channel(1);
+        actor.destination_channels.insert(link_id, destination_tx);
         let binding = LinkEndpointBinding {
             link_id,
             interface_id: 14,
@@ -4233,6 +4240,7 @@ mod tests {
                 .link_endpoints
                 .contains_key(&(link_id, LinkEndpointRole::Initiator))
         );
+        assert!(actor.local_destinations.contains(&link_id));
         assert_eq!(
             actor.send_link_endpoint(
                 link_id,
@@ -4265,6 +4273,8 @@ mod tests {
                 .link_endpoints
                 .contains_key(&(link_id, LinkEndpointRole::Initiator))
         );
+        assert!(!actor.local_destinations.contains(&link_id));
+        assert!(!actor.destination_channels.contains_key(&link_id));
         let terminal = lifecycle_rx.try_recv().unwrap();
         assert_eq!(terminal.binding, binding);
         assert_eq!(terminal.reason, LinkEndpointTerminalReason::Unbound);

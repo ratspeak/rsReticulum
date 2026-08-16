@@ -452,9 +452,10 @@ pub enum TransportMessage {
         request: OutboundRequest,
         result_tx: tokio::sync::oneshot::Sender<LinkEndpointSendResult>,
     },
-    /// Reliably admit a final packet, then remove the endpoint only after its
-    /// ordered FIFO has drained. This prevents a queued LINKCLOSE from being
-    /// discarded by an immediately following unbind.
+    /// Reliably admit a final packet, then remove the endpoint and temporary
+    /// Link destination only after its ordered FIFO has drained. This prevents
+    /// a queued LINKCLOSE from being discarded by an immediately following
+    /// unbind or destination deregistration.
     SendLinkEndpointAndUnbind {
         link_id: [u8; 16],
         role: LinkEndpointRole,
