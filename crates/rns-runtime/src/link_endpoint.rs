@@ -22,13 +22,6 @@ pub(crate) enum LinkEndpointError {
     Unbind(LinkEndpointUnbindResult),
 }
 
-pub(crate) struct PendingLinkEndpointCleanup {
-    pub(crate) link_id: [u8; 16],
-    pub(crate) role: LinkEndpointRole,
-    pub(crate) deregister_on_success: bool,
-    pub(crate) result_rx: oneshot::Receiver<LinkEndpointUnbindResult>,
-}
-
 /// Owns cleanup for a temporary initiator Link destination until ownership is
 /// transferred to a long-lived actor or an atomic final send succeeds.
 ///
@@ -438,27 +431,6 @@ pub(crate) fn send_and_unbind_message(
             link_id,
             role,
             final_unbind: true,
-            result_rx,
-        },
-    )
-}
-
-pub(crate) fn cleanup_message(
-    link_id: [u8; 16],
-    role: LinkEndpointRole,
-    deregister_on_success: bool,
-) -> (TransportMessage, PendingLinkEndpointCleanup) {
-    let (result_tx, result_rx) = oneshot::channel();
-    (
-        TransportMessage::UnbindLinkEndpoint {
-            link_id,
-            role,
-            result_tx,
-        },
-        PendingLinkEndpointCleanup {
-            link_id,
-            role,
-            deregister_on_success,
             result_rx,
         },
     )
