@@ -1928,7 +1928,7 @@ mod tests {
                 .is_err(),
             "initiator requested AES256 and must reject an AES128 proof"
         );
-        assert_eq!(request_link.state, LinkState::Closed);
+        assert_eq!(request_link.state, LinkState::Pending);
 
         let mut unsupported_request = request_data;
         unsupported_request[64] = MODE_AES256_GCM << 5;
