@@ -84,6 +84,8 @@ struct ResponderEndpointTombstone {
     ownership: ResponderEndpointOwnership,
     kind: EndpointCleanupKind,
     lifecycle_seen: bool,
+    lifecycle_required: bool,
+    barrier_acknowledged: bool,
     finalization_rx: Option<oneshot::Receiver<rns_transport::messages::TransportQueryResponse>>,
 }
 
@@ -994,8 +996,24 @@ impl LinkManager {
         let mut cleanup_finalizations = Vec::new();
         for (index, pending) in self.pending_endpoint_cleanups.iter_mut().enumerate() {
             match pending.result_rx.try_recv() {
-                Ok(LinkEndpointUnbindResult::Unbound | LinkEndpointUnbindResult::NotBound) => {
-                    cleanup_finalizations.push((pending.ownership, pending.deregister_on_success));
+                Ok(LinkEndpointUnbindResult::Unbound) => {
+                    // Transport publishes the exact endpoint lifecycle before
+                    // acknowledging an owned explicit unbind. Require that
+                    // event before retiring this generation.
+                    cleanup_finalizations.push((
+                        pending.ownership,
+                        pending.deregister_on_success,
+                        true,
+                    ));
+                    completed_cleanups.push(index);
+                    progressed = true;
+                }
+                Ok(LinkEndpointUnbindResult::NotBound) => {
+                    cleanup_finalizations.push((
+                        pending.ownership,
+                        pending.deregister_on_success,
+                        false,
+                    ));
                     completed_cleanups.push(index);
                     progressed = true;
                 }
@@ -1005,7 +1023,7 @@ impl LinkManager {
                         role = ?pending.ownership.binding.role,
                         "refusing to deregister Link destination owned by another endpoint role"
                     );
-                    cleanup_finalizations.push((pending.ownership, false));
+                    cleanup_finalizations.push((pending.ownership, false, false));
                     completed_cleanups.push(index);
                     progressed = true;
                 }
@@ -1024,14 +1042,20 @@ impl LinkManager {
         for index in completed_cleanups.into_iter().rev() {
             self.pending_endpoint_cleanups.swap_remove(index);
         }
-        for (ownership, deregister) in cleanup_finalizations {
-            self.begin_endpoint_finalization(ownership, deregister);
+        for (ownership, deregister, lifecycle_required) in cleanup_finalizations {
+            self.begin_endpoint_finalization(ownership, deregister, lifecycle_required);
         }
-        while let Ok(event) = self.endpoint_lifecycle_rx.try_recv() {
-            self.handle_endpoint_terminal(event);
+        // Poll the actor barrier before the final lifecycle drain. If the
+        // acknowledgement arrives after this poll, the tombstone survives to
+        // the next pass and another drain. If it is already ready, every
+        // causally-prior lifecycle event is now queued and drained below.
+        if self.poll_endpoint_finalizations() {
             progressed = true;
         }
-        if self.poll_endpoint_finalizations() {
+        if self.drain_endpoint_lifecycle() {
+            progressed = true;
+        }
+        if self.retire_endpoint_tombstones() {
             progressed = true;
         }
         progressed
@@ -1053,7 +1077,7 @@ impl LinkManager {
                 .then_some(tombstone.ownership)
             })
         {
-            self.begin_endpoint_finalization(ownership, false);
+            self.begin_endpoint_finalization(ownership, false, true);
             return;
         }
         let Some(ownership) = self.owned_endpoint_bindings.get(&event.binding.link_id) else {
@@ -1509,6 +1533,8 @@ impl LinkManager {
                 ownership,
                 kind,
                 lifecycle_seen: false,
+                lifecycle_required: false,
+                barrier_acknowledged: false,
                 finalization_rx: None,
             });
     }
@@ -1530,7 +1556,7 @@ impl LinkManager {
         if let Some(ownership) = ownership {
             // Atomic transport cleanup already deregisters after final FIFO
             // drain; the barrier only proves that operation is fully ordered.
-            self.begin_endpoint_finalization(ownership, false);
+            self.begin_endpoint_finalization(ownership, false, true);
         }
     }
 
@@ -1538,6 +1564,7 @@ impl LinkManager {
         &mut self,
         ownership: ResponderEndpointOwnership,
         deregister: bool,
+        lifecycle_required: bool,
     ) {
         let link_id = ownership.binding.link_id;
         let can_finalize = self
@@ -1567,19 +1594,24 @@ impl LinkManager {
         );
         if let Some(tombstone) = self.endpoint_tombstones.get_mut(&link_id) {
             if tombstone.ownership == ownership {
+                tombstone.lifecycle_required |= lifecycle_required;
                 tombstone.finalization_rx = Some(response_rx);
             }
         }
     }
 
     fn poll_endpoint_finalizations(&mut self) -> bool {
-        let mut completed = Vec::new();
+        let mut progressed = false;
         for (link_id, tombstone) in &mut self.endpoint_tombstones {
             let Some(receiver) = tombstone.finalization_rx.as_mut() else {
                 continue;
             };
             match receiver.try_recv() {
-                Ok(_) => completed.push((*link_id, tombstone.ownership.generation)),
+                Ok(_) => {
+                    tombstone.barrier_acknowledged = true;
+                    tombstone.finalization_rx = None;
+                    progressed = true;
+                }
                 Err(oneshot::error::TryRecvError::Closed) => {
                     tracing::error!(
                         link_id = %hex::encode(link_id),
@@ -1591,16 +1623,25 @@ impl LinkManager {
                 Err(oneshot::error::TryRecvError::Empty) => {}
             }
         }
-        for (link_id, generation) in &completed {
-            if self
-                .endpoint_tombstones
-                .get(link_id)
-                .is_some_and(|tombstone| tombstone.ownership.generation == *generation)
-            {
-                self.endpoint_tombstones.remove(link_id);
-            }
+        progressed
+    }
+
+    fn drain_endpoint_lifecycle(&mut self) -> bool {
+        let mut progressed = false;
+        while let Ok(event) = self.endpoint_lifecycle_rx.try_recv() {
+            self.handle_endpoint_terminal(event);
+            progressed = true;
         }
-        !completed.is_empty()
+        progressed
+    }
+
+    fn retire_endpoint_tombstones(&mut self) -> bool {
+        let before = self.endpoint_tombstones.len();
+        self.endpoint_tombstones.retain(|_, tombstone| {
+            !tombstone.barrier_acknowledged
+                || (tombstone.lifecycle_required && !tombstone.lifecycle_seen)
+        });
+        self.endpoint_tombstones.len() != before
     }
 
     fn endpoint_role(role: LinkRole) -> LinkEndpointRole {
@@ -7491,6 +7532,18 @@ mod tests {
         };
         assert_eq!(link_id, initiator.link_id);
         assert_eq!(role, LinkEndpointRole::Responder);
+        manager
+            .endpoint_lifecycle_tx
+            .send(LinkEndpointLifecycleEvent {
+                binding: LinkEndpointBinding {
+                    link_id,
+                    interface_id: 23,
+                    role,
+                },
+                reason: rns_transport::messages::LinkEndpointTerminalReason::Unbound,
+                dropped_packets: 0,
+            })
+            .unwrap();
         let _ = result_tx.send(LinkEndpointUnbindResult::Unbound);
         assert!(manager.poll_link_endpoints());
         let TransportMessage::Rpc { response_tx, .. } =
@@ -7746,6 +7799,8 @@ mod tests {
             .active_links
             .insert(link_id, active_link_entry_at(responder, 12));
         own_test_endpoint(&mut manager, link_id);
+        let old_ownership = manager.owned_endpoint_bindings[&link_id];
+        let lifecycle_tx = manager.endpoint_lifecycle_tx.clone();
 
         let shutdown = tokio::spawn(async move {
             manager.drain_shutdown_link_ownership().await;
@@ -7771,6 +7826,13 @@ mod tests {
                 .is_err(),
             "shutdown must await unbind ownership before deregistering"
         );
+        lifecycle_tx
+            .send(LinkEndpointLifecycleEvent {
+                binding: old_ownership.binding,
+                reason: rns_transport::messages::LinkEndpointTerminalReason::Unbound,
+                dropped_packets: 0,
+            })
+            .unwrap();
         let _ = result_tx.send(LinkEndpointUnbindResult::Unbound);
         assert!(matches!(
             transport_rx.recv().await,
@@ -7876,6 +7938,86 @@ mod tests {
             manager.owned_endpoint_bindings[&link_id].generation,
             old_ownership.generation
         );
+    }
+
+    #[test]
+    fn barrier_ack_waits_for_a_following_lifecycle_drain_before_replay() {
+        let destination_hash = [0xD9; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_public = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        let (mut responder, proof) =
+            Link::new_responder(&request_data, &identity_key, destination_hash, 1).unwrap();
+        let rtt = initiator
+            .validate_proof(&proof, &identity_public, &identity_public.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt).unwrap();
+        let link_id = responder.link_id;
+        let interface_id = InterfaceId::MAX - 1;
+        let replay = link_request_raw(destination_hash, &request_data);
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(8);
+        let (_event_tx, event_rx) = mpsc::channel(8);
+        let mut manager =
+            LinkManager::new(transport_tx, event_rx, destination_hash, Some(identity_key));
+        manager
+            .active_links
+            .insert(link_id, active_link_entry_at(responder, interface_id));
+        own_test_endpoint(&mut manager, link_id);
+        let old_ownership = manager.owned_endpoint_bindings[&link_id];
+
+        assert!(manager.close_active_link(link_id, CloseReason::DestinationClosed, false));
+        let TransportMessage::UnbindLinkEndpoint { result_tx, .. } =
+            transport_rx.try_recv().expect("old-generation unbind")
+        else {
+            panic!("expected exact old-generation endpoint cleanup");
+        };
+        let _ = result_tx.send(LinkEndpointUnbindResult::Unbound);
+        assert!(manager.poll_link_endpoints());
+        assert!(matches!(
+            transport_rx.try_recv(),
+            Ok(TransportMessage::DeregisterDestination { hash }) if hash == link_id
+        ));
+        let TransportMessage::Rpc { response_tx, .. } = transport_rx
+            .try_recv()
+            .expect("old-generation cleanup barrier")
+        else {
+            panic!("cleanup must end with an actor ordering barrier");
+        };
+
+        // Deterministically reproduce the cross-channel interleaving: the
+        // lifecycle drain observes empty, then the actor's causally ordered
+        // lifecycle and barrier acknowledgement both become ready.
+        assert!(!manager.drain_endpoint_lifecycle());
+        manager
+            .endpoint_lifecycle_tx
+            .send(LinkEndpointLifecycleEvent {
+                binding: old_ownership.binding,
+                reason: rns_transport::messages::LinkEndpointTerminalReason::Unbound,
+                dropped_packets: 0,
+            })
+            .unwrap();
+        let _ = response_tx.send(rns_transport::messages::TransportQueryResponse::BoolResult(
+            false,
+        ));
+
+        assert!(manager.poll_endpoint_finalizations());
+        assert!(manager.endpoint_tombstones[&link_id].barrier_acknowledged);
+        manager.handle_link_request(&replay, interface_id);
+        assert!(manager.pending_endpoint_binds.is_empty());
+        assert!(transport_rx.try_recv().is_err());
+
+        assert!(manager.drain_endpoint_lifecycle());
+        assert!(manager.endpoint_tombstones[&link_id].lifecycle_seen);
+        assert!(manager.retire_endpoint_tombstones());
+        assert!(!manager.endpoint_tombstones.contains_key(&link_id));
+
+        manager.handle_link_request(&replay, interface_id);
+        assert!(matches!(
+            transport_rx.try_recv(),
+            Ok(TransportMessage::BindLinkEndpoint { binding, .. })
+                if binding.link_id == link_id && binding.interface_id == interface_id
+        ));
     }
 
     #[test]
