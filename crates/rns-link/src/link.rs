@@ -29,6 +29,32 @@ pub enum LinkState {
     Closed = 0x04,
 }
 
+/// The local endpoint's immutable role in a Link session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkRole {
+    Initiator,
+    Responder,
+}
+
+/// Failure while generating or validating an ordinary Link packet proof.
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+pub enum PacketProofError {
+    #[error("packet proof operation is not valid for this Link role")]
+    WrongRole,
+    #[error("packet proof operation is not valid while Link is {0:?}")]
+    InvalidState(LinkState),
+    #[error("packet proof signer is unavailable")]
+    SignerUnavailable,
+    #[error("peer packet proof key is unavailable")]
+    PeerKeyUnavailable,
+    #[error("packet proof must be exactly 96 bytes")]
+    MalformedProof,
+    #[error("packet proof hash does not match")]
+    HashMismatch,
+    #[error("packet proof signature is invalid")]
+    InvalidSignature,
+}
+
 /// Reason for link closure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseReason {
@@ -123,11 +149,14 @@ pub struct Link {
 
     ephemeral_keys: Option<EphemeralKeys>,
     peer_x25519_pub: Option<[u8; 32]>,
-    /// Peer's Ed25519 identity key — used to verify the link proof signature.
-    peer_ed25519_pub: Option<[u8; 32]>,
+    /// Role-dependent peer key used to verify ordinary Link packet proofs.
+    /// Initiators store the responder destination identity key; responders
+    /// store the transient key advertised in LINKREQUEST.
+    peer_packet_proof_key: Option<[u8; 32]>,
 
-    /// Identity signing key for `Link::sign()` and local-side proofs.
-    sig_prv: Option<Ed25519PrivateKey>,
+    /// Destination identity signing key for software responder proofs.
+    /// Initiators always use the transient key in `ephemeral_keys` instead.
+    responder_identity_signing_key: Option<Ed25519PrivateKey>,
 
     session_keys: Option<LinkKeys>,
 
@@ -233,9 +262,8 @@ impl Link {
             mode: DEFAULT_MODE,
             ephemeral_keys: Some(ephemeral_keys),
             peer_x25519_pub: None,
-            peer_ed25519_pub: None,
-            // Initiator supplies its signing key later via set_signing_key().
-            sig_prv: None,
+            peer_packet_proof_key: None,
+            responder_identity_signing_key: None,
             session_keys: None,
             request_time: now,
             rtt: None,
@@ -328,7 +356,7 @@ impl Link {
         }
 
         self.peer_x25519_pub = Some(proof.responder_x25519_pub);
-        self.peer_ed25519_pub = Some(*identity_ed25519_pub_bytes);
+        self.peer_packet_proof_key = Some(*identity_ed25519_pub_bytes);
 
         let ephemeral = self
             .ephemeral_keys
@@ -495,8 +523,9 @@ impl Link {
             mode: request.signalling.mode,
             ephemeral_keys: Some(responder_keys),
             peer_x25519_pub: Some(request.peer_x25519_pub),
-            peer_ed25519_pub: Some(request.peer_ed25519_pub),
-            sig_prv: identity_signing_key.map(|key| Ed25519PrivateKey::from_bytes(&key.to_bytes())),
+            peer_packet_proof_key: Some(request.peer_ed25519_pub),
+            responder_identity_signing_key: identity_signing_key
+                .map(|key| Ed25519PrivateKey::from_bytes(&key.to_bytes())),
             session_keys: Some(session_keys),
             request_time: now,
             rtt: None,
@@ -1043,33 +1072,130 @@ impl Link {
         self.encrypt(&rtt_bytes)
     }
 
-    /// Sign a received packet hash and return a `packet_hash(32) || signature(64)` proof.
+    /// Return this endpoint's immutable Link role.
+    pub fn role(&self) -> LinkRole {
+        if self.is_initiator {
+            LinkRole::Initiator
+        } else {
+            LinkRole::Responder
+        }
+    }
+
+    fn ensure_packet_proof_state(&self) -> Result<(), PacketProofError> {
+        let allowed = matches!(self.state, LinkState::Active | LinkState::Stale)
+            || (self.role() == LinkRole::Responder && self.state == LinkState::Handshake);
+        if allowed {
+            Ok(())
+        } else {
+            Err(PacketProofError::InvalidState(self.state))
+        }
+    }
+
+    fn encode_packet_proof(
+        &self,
+        packet_hash: &[u8; 32],
+        signature: Option<[u8; 64]>,
+    ) -> Result<Vec<u8>, PacketProofError> {
+        self.ensure_packet_proof_state()?;
+        let signature = signature.ok_or(PacketProofError::SignerUnavailable)?;
+        let mut proof = Vec::with_capacity(96);
+        proof.extend_from_slice(packet_hash);
+        proof.extend_from_slice(&signature);
+        Ok(proof)
+    }
+
+    /// Prove a received packet with the one key allowed by this endpoint's role.
+    ///
+    /// Initiators use the transient Ed25519 key advertised in LINKREQUEST.
+    /// Software responders use the destination identity key retained at Link
+    /// construction. External-signing responders must instead call
+    /// [`Link::prove_responder_packet_with`]. No role-incompatible fallback is
+    /// attempted.
+    pub fn prove_packet_with_local_signer(
+        &self,
+        packet_hash: &[u8; 32],
+    ) -> Result<Vec<u8>, PacketProofError> {
+        self.ensure_packet_proof_state()?;
+        let signature = match self.role() {
+            LinkRole::Initiator => self
+                .ephemeral_keys
+                .as_ref()
+                .map(|keys| keys.ed25519_prv.sign(packet_hash)),
+            LinkRole::Responder => self
+                .responder_identity_signing_key
+                .as_ref()
+                .map(|key| key.sign(packet_hash)),
+        };
+        self.encode_packet_proof(packet_hash, signature)
+    }
+
+    /// Prove a responder-received packet with a destination identity backend.
+    ///
+    /// The role and state are checked before the callback is invoked so an
+    /// initiator cannot accidentally prompt an external identity signer.
+    pub fn prove_responder_packet_with<F>(
+        &self,
+        packet_hash: &[u8; 32],
+        sign_fn: F,
+    ) -> Result<Vec<u8>, PacketProofError>
+    where
+        F: FnOnce(&[u8]) -> Option<[u8; 64]>,
+    {
+        if self.role() != LinkRole::Responder {
+            return Err(PacketProofError::WrongRole);
+        }
+        self.ensure_packet_proof_state()?;
+        self.encode_packet_proof(packet_hash, sign_fn(packet_hash))
+    }
+
+    /// Validate an exact explicit packet proof against the role-dependent peer key.
+    pub fn validate_peer_packet_proof(
+        &self,
+        packet_hash: &[u8; 32],
+        proof_data: &[u8],
+    ) -> Result<(), PacketProofError> {
+        if proof_data.len() != 96 {
+            return Err(PacketProofError::MalformedProof);
+        }
+        if &proof_data[..32] != packet_hash {
+            return Err(PacketProofError::HashMismatch);
+        }
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&proof_data[32..]);
+        let peer_key = self
+            .peer_packet_proof_key
+            .as_ref()
+            .ok_or(PacketProofError::PeerKeyUnavailable)?;
+        let verify_key = Ed25519PublicKey::from_bytes(peer_key)
+            .map_err(|_| PacketProofError::PeerKeyUnavailable)?;
+        verify_key
+            .verify(packet_hash, &signature)
+            .map_err(|_| PacketProofError::InvalidSignature)
+    }
+
+    /// Legacy responder-only packet proof helper.
+    #[deprecated(note = "use prove_packet_with_local_signer or prove_responder_packet_with")]
     pub fn prove_packet(
         &self,
         packet_hash: &[u8; 32],
         identity_signing_key: &Ed25519PrivateKey,
     ) -> Result<Vec<u8>, LinkCryptoError> {
-        self.prove_packet_with_fallible(packet_hash, |hash| Some(identity_signing_key.sign(hash)))
+        self.prove_responder_packet_with(packet_hash, |hash| Some(identity_signing_key.sign(hash)))
+            .map_err(|_| LinkCryptoError::EncryptionFailed)
     }
 
-    /// Sign a received link packet with this link's ephemeral signing key.
-    ///
-    /// Initiators advertise an ephemeral Ed25519 public key in the LINKREQUEST;
-    /// responders validate later link-packet proofs against that key.
+    /// Legacy role-aware local packet proof helper.
+    #[deprecated(note = "use prove_packet_with_local_signer")]
     pub fn prove_packet_with_link_key(
         &self,
         packet_hash: &[u8; 32],
     ) -> Result<Vec<u8>, LinkCryptoError> {
-        self.prove_packet_with_fallible(packet_hash, |hash| {
-            self.sign(hash).or_else(|| {
-                self.ephemeral_keys
-                    .as_ref()
-                    .map(|keys| keys.ed25519_prv.sign(hash))
-            })
-        })
+        self.prove_packet_with_local_signer(packet_hash)
+            .map_err(|_| LinkCryptoError::EncryptionFailed)
     }
 
-    /// Variant of [`Link::prove_packet`] for external signers.
+    /// Legacy responder-only external signer helper.
+    #[deprecated(note = "use prove_responder_packet_with")]
     pub fn prove_packet_with<F>(
         &self,
         packet_hash: &[u8; 32],
@@ -1078,10 +1204,12 @@ impl Link {
     where
         F: FnOnce(&[u8]) -> [u8; 64],
     {
-        self.prove_packet_with_fallible(packet_hash, |hash| Some(sign_fn(hash)))
+        self.prove_responder_packet_with(packet_hash, |hash| Some(sign_fn(hash)))
+            .map_err(|_| LinkCryptoError::EncryptionFailed)
     }
 
-    /// Variant of [`Link::prove_packet_with`] for signers that can be unavailable.
+    /// Legacy responder-only fallible external signer helper.
+    #[deprecated(note = "use prove_responder_packet_with")]
     pub fn prove_packet_with_fallible<F>(
         &self,
         packet_hash: &[u8; 32],
@@ -1090,47 +1218,14 @@ impl Link {
     where
         F: FnOnce(&[u8]) -> Option<[u8; 64]>,
     {
-        // A responder can receive ordinary Link data immediately after its
-        // proof, before the initiator's LRRTT activates the responder side.
-        // Python proves that data in HANDSHAKE, and the session keys/signing
-        // identity are already established at this point.
-        let can_prove = matches!(self.state, LinkState::Active | LinkState::Stale)
-            || (!self.is_initiator && self.state == LinkState::Handshake);
-        if !can_prove {
-            return Err(LinkCryptoError::EncryptionFailed);
-        }
-
-        let signature = sign_fn(packet_hash).ok_or(LinkCryptoError::EncryptionFailed)?;
-
-        let mut proof = Vec::with_capacity(96);
-        proof.extend_from_slice(packet_hash);
-        proof.extend_from_slice(&signature);
-
-        Ok(proof)
+        self.prove_responder_packet_with(packet_hash, sign_fn)
+            .map_err(|_| LinkCryptoError::EncryptionFailed)
     }
 
-    /// Verify a `packet_hash(32) || signature(64)` proof against the peer's identity key.
+    /// Verify an exact packet proof against the role-dependent peer key.
     pub fn validate_packet_proof(&self, packet_hash: &[u8; 32], proof_data: &[u8]) -> bool {
-        if proof_data.len() < 96 {
-            return false;
-        }
-
-        let received_hash = &proof_data[..32];
-        if received_hash != packet_hash {
-            return false;
-        }
-
-        let mut signature = [0u8; 64];
-        signature.copy_from_slice(&proof_data[32..96]);
-
-        if let Some(peer_ed25519_pub) = &self.peer_ed25519_pub {
-            match Ed25519PublicKey::from_bytes(peer_ed25519_pub) {
-                Ok(verify_key) => verify_key.verify(packet_hash, &signature).is_ok(),
-                Err(_) => false,
-            }
-        } else {
-            false
-        }
+        self.validate_peer_packet_proof(packet_hash, proof_data)
+            .is_ok()
     }
 
     /// Flag that a channel has been attached.
@@ -1400,23 +1495,31 @@ impl Link {
         self.ephemeral_keys = None;
         self.session_keys = None;
         self.peer_x25519_pub = None;
-        self.peer_ed25519_pub = None;
-        self.sig_prv = None;
+        self.peer_packet_proof_key = None;
+        self.responder_identity_signing_key = None;
     }
 
-    /// Attach the initiator's identity signing key after construction.
+    /// Legacy attachment of a software responder destination identity key.
+    #[deprecated(
+        note = "construct responders with their signer; initiators use transient Link keys"
+    )]
     pub fn set_signing_key(&mut self, key: &Ed25519PrivateKey) {
-        self.sig_prv = Some(Ed25519PrivateKey::from_bytes(&key.to_bytes()));
+        if self.role() == LinkRole::Responder {
+            self.responder_identity_signing_key =
+                Some(Ed25519PrivateKey::from_bytes(&key.to_bytes()));
+        }
     }
 
-    /// Sign a message with the link's identity key, or `None` if no key is set.
+    /// Sign a message with a software responder's destination identity key.
     pub fn sign(&self, message: &[u8]) -> Option<[u8; 64]> {
-        self.sig_prv.as_ref().map(|key| key.sign(message))
+        self.responder_identity_signing_key
+            .as_ref()
+            .map(|key| key.sign(message))
     }
 
-    /// Verify a signature using the peer's Ed25519 identity key.
+    /// Verify a signature using the peer's role-dependent packet proof key.
     pub fn validate(&self, signature: &[u8], message: &[u8]) -> bool {
-        if let Some(ref peer_pub_bytes) = self.peer_ed25519_pub {
+        if let Some(ref peer_pub_bytes) = self.peer_packet_proof_key {
             if signature.len() != 64 {
                 return false;
             }
@@ -1719,7 +1822,9 @@ mod tests {
         assert_eq!(responder.state, LinkState::Handshake);
         assert_eq!(initiator.state, LinkState::Active);
         let packet_hash = [0xCD; 32];
-        let packet_proof = responder.prove_packet(&packet_hash, &identity_key).unwrap();
+        let packet_proof = responder
+            .prove_packet_with_local_signer(&packet_hash)
+            .unwrap();
         assert!(initiator.validate_packet_proof(&packet_hash, &packet_proof));
     }
 
@@ -2501,12 +2606,12 @@ mod tests {
 
     #[test]
     fn test_prove_packet_roundtrip() {
-        let (initiator, responder, dest_identity) = make_active_link();
+        let (initiator, responder, _dest_identity) = make_active_link();
 
         let packet_hash = full_hash(b"test packet data");
 
         let proof = responder
-            .prove_packet(&packet_hash, &dest_identity)
+            .prove_packet_with_local_signer(&packet_hash)
             .unwrap();
         assert_eq!(proof.len(), 96);
 
@@ -2515,15 +2620,153 @@ mod tests {
 
     #[test]
     fn test_prove_packet_wrong_hash_fails() {
-        let (initiator, responder, dest_identity) = make_active_link();
+        let (initiator, responder, _dest_identity) = make_active_link();
 
         let packet_hash = full_hash(b"test packet");
         let wrong_hash = full_hash(b"wrong packet");
 
         let proof = responder
-            .prove_packet(&packet_hash, &dest_identity)
+            .prove_packet_with_local_signer(&packet_hash)
             .unwrap();
         assert!(!initiator.validate_packet_proof(&wrong_hash, &proof));
+    }
+
+    #[test]
+    fn packet_proofs_use_only_the_role_authorized_key() {
+        let (initiator, responder, _destination_identity) = make_active_link();
+        let packet_hash = full_hash(b"role-specific Link packet proof");
+
+        let initiator_proof = initiator
+            .prove_packet_with_local_signer(&packet_hash)
+            .unwrap();
+        assert!(responder.validate_packet_proof(&packet_hash, &initiator_proof));
+
+        let unrelated_initiator_identity = Ed25519PrivateKey::generate();
+        let mut wrong_initiator_proof = packet_hash.to_vec();
+        wrong_initiator_proof.extend_from_slice(&unrelated_initiator_identity.sign(&packet_hash));
+        assert!(!responder.validate_packet_proof(&packet_hash, &wrong_initiator_proof));
+
+        let responder_proof = responder
+            .prove_packet_with_local_signer(&packet_hash)
+            .unwrap();
+        assert!(initiator.validate_packet_proof(&packet_hash, &responder_proof));
+
+        let wrong_responder_identity = Ed25519PrivateKey::generate();
+        let mut wrong_responder_proof = packet_hash.to_vec();
+        wrong_responder_proof.extend_from_slice(&wrong_responder_identity.sign(&packet_hash));
+        assert!(!initiator.validate_packet_proof(&packet_hash, &wrong_responder_proof));
+
+        let mut trailing = responder_proof;
+        trailing.push(0);
+        assert_eq!(
+            initiator.validate_peer_packet_proof(&packet_hash, &trailing),
+            Err(PacketProofError::MalformedProof)
+        );
+    }
+
+    #[test]
+    fn external_responder_packet_proofs_obey_role_and_state() {
+        let dest_hash = [0xD7; 16];
+        let destination_identity = Ed25519PrivateKey::generate();
+        let destination_public = destination_identity.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (mut responder, link_proof) = Link::new_responder_with(
+            &request_data,
+            &destination_public.to_bytes(),
+            dest_hash,
+            1,
+            |data| Some(destination_identity.sign(data)),
+        )
+        .unwrap();
+        let rtt = initiator
+            .validate_proof(
+                &link_proof,
+                &destination_public,
+                &destination_public.to_bytes(),
+            )
+            .unwrap();
+        let packet_hash = full_hash(b"external responder proof");
+
+        assert_eq!(responder.state, LinkState::Handshake);
+        let handshake_proof = responder
+            .prove_responder_packet_with(&packet_hash, |hash| Some(destination_identity.sign(hash)))
+            .unwrap();
+        assert!(initiator.validate_packet_proof(&packet_hash, &handshake_proof));
+
+        responder.receive_rtt_packet(&rtt).unwrap();
+        let active_proof = responder
+            .prove_responder_packet_with(&packet_hash, |hash| Some(destination_identity.sign(hash)))
+            .unwrap();
+        assert!(initiator.validate_packet_proof(&packet_hash, &active_proof));
+
+        responder.state = LinkState::Stale;
+        assert!(
+            responder
+                .prove_responder_packet_with(&packet_hash, |hash| {
+                    Some(destination_identity.sign(hash))
+                })
+                .is_ok()
+        );
+
+        let mut signer_called = false;
+        assert_eq!(
+            initiator.prove_responder_packet_with(&packet_hash, |_| {
+                signer_called = true;
+                Some([0u8; 64])
+            }),
+            Err(PacketProofError::WrongRole)
+        );
+        assert!(!signer_called);
+
+        assert_eq!(
+            responder.prove_responder_packet_with(&packet_hash, |_| None),
+            Err(PacketProofError::SignerUnavailable)
+        );
+    }
+
+    #[test]
+    fn packet_proof_state_matrix_rejects_pending_handshake_initiator_and_closed() {
+        let dest_hash = [0xD8; 16];
+        let (mut initiator, _) = Link::new_initiator(dest_hash, 1);
+        let packet_hash = full_hash(b"packet proof state matrix");
+        assert_eq!(
+            initiator.prove_packet_with_local_signer(&packet_hash),
+            Err(PacketProofError::InvalidState(LinkState::Pending))
+        );
+
+        initiator.state = LinkState::Handshake;
+        assert_eq!(
+            initiator.prove_packet_with_local_signer(&packet_hash),
+            Err(PacketProofError::InvalidState(LinkState::Handshake))
+        );
+
+        initiator.mark_closed(CloseReason::Timeout);
+        assert_eq!(
+            initiator.prove_packet_with_local_signer(&packet_hash),
+            Err(PacketProofError::InvalidState(LinkState::Closed))
+        );
+
+        let (mut active_initiator, mut active_responder, _) = make_active_link();
+        let initiator_proof = active_initiator
+            .prove_packet_with_local_signer(&packet_hash)
+            .unwrap();
+        let responder_proof = active_responder
+            .prove_packet_with_local_signer(&packet_hash)
+            .unwrap();
+        active_initiator.mark_closed(CloseReason::Timeout);
+        active_responder.mark_closed(CloseReason::Timeout);
+        assert_eq!(
+            active_initiator.validate_peer_packet_proof(&packet_hash, &responder_proof),
+            Err(PacketProofError::PeerKeyUnavailable)
+        );
+        assert_eq!(
+            active_responder.validate_peer_packet_proof(&packet_hash, &initiator_proof),
+            Err(PacketProofError::PeerKeyUnavailable)
+        );
+        assert_eq!(
+            active_responder.prove_packet_with_local_signer(&packet_hash),
+            Err(PacketProofError::InvalidState(LinkState::Closed))
+        );
     }
 
     #[test]
@@ -2666,7 +2909,7 @@ mod tests {
         let message = b"hello from responder";
         let sig = responder_link
             .sign(message)
-            .expect("responder should have sig_prv");
+            .expect("responder should have a destination identity signer");
         let _ = initiator_link;
         assert_eq!(sig.len(), 64);
     }
