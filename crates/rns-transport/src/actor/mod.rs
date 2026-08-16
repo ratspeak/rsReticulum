@@ -510,6 +510,14 @@ impl TransportActor {
             } => {
                 let _ = result_tx.send(self.send_link_endpoint(link_id, role, request));
             }
+            TransportMessage::SendLinkEndpointBestEffort {
+                link_id,
+                role,
+                request,
+                result_tx,
+            } => {
+                let _ = result_tx.send(self.send_link_endpoint_best_effort(link_id, role, request));
+            }
             TransportMessage::SendPacket {
                 request,
                 attached_interface,
@@ -3982,6 +3990,43 @@ mod tests {
     }
 
     #[test]
+    fn bound_link_endpoint_rejects_packets_larger_than_the_wire_mtu() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (interface, mut interface_rx) = make_test_interface("bounded endpoint");
+        actor.interfaces.insert(3, interface);
+
+        let link_id = [0xBA; 16];
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            actor.bind_link_endpoint(
+                LinkEndpointBinding {
+                    link_id,
+                    interface_id: 3,
+                    role: LinkEndpointRole::Initiator,
+                },
+                lifecycle_tx,
+            ),
+            crate::messages::LinkEndpointBindResult::Bound
+        );
+
+        let mut raw = make_link_data_packet(link_id, 0).to_vec();
+        raw.resize(rns_wire::constants::MTU + 1, 0);
+        assert_eq!(
+            actor.send_link_endpoint(
+                link_id,
+                LinkEndpointRole::Initiator,
+                OutboundRequest {
+                    raw: Bytes::from(raw),
+                    destination_hash: link_id,
+                },
+            ),
+            LinkEndpointSendResult::InvalidPacket
+        );
+        assert!(interface_rx.try_recv().is_err());
+        assert!(lifecycle_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn bound_link_endpoint_retains_fifo_when_target_queue_is_full() {
         let (mut actor, _tx) = TransportActor::new();
         let (target, mut target_rx) = make_test_interface_with_capacity("slow target", 1);
@@ -4042,6 +4087,88 @@ mod tests {
         actor.drain_link_endpoint_egress();
         assert_eq!(target_rx.try_recv().unwrap(), second);
         assert!(rnode_rx.try_recv().is_err());
+        assert!(lifecycle_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn best_effort_link_endpoint_drops_without_growing_or_overtaking_control_fifo() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (target, mut target_rx) = make_test_interface_with_capacity("media target", 1);
+        target.tx.try_send(Bytes::from_static(b"occupied")).unwrap();
+        let drop_counter = target.tx_drops.clone();
+        actor.interfaces.insert(13, target);
+
+        let link_id = [0xBB; 16];
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            actor.bind_link_endpoint(
+                LinkEndpointBinding {
+                    link_id,
+                    interface_id: 13,
+                    role: LinkEndpointRole::Responder,
+                },
+                lifecycle_tx,
+            ),
+            crate::messages::LinkEndpointBindResult::Bound
+        );
+
+        let media =
+            make_link_data_packet_with_context(link_id, 0, rns_wire::context::PacketContext::None);
+        assert_eq!(
+            actor.send_link_endpoint_best_effort(
+                link_id,
+                LinkEndpointRole::Responder,
+                OutboundRequest {
+                    raw: media.clone(),
+                    destination_hash: link_id,
+                },
+            ),
+            LinkEndpointSendResult::DroppedBackpressure
+        );
+        assert_eq!(drop_counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(
+            actor.link_endpoints[&(link_id, LinkEndpointRole::Responder)]
+                .egress
+                .is_empty()
+        );
+
+        let control = make_link_proof_packet(link_id, 0);
+        assert_eq!(
+            actor.send_link_endpoint(
+                link_id,
+                LinkEndpointRole::Responder,
+                OutboundRequest {
+                    raw: control.clone(),
+                    destination_hash: link_id,
+                },
+            ),
+            LinkEndpointSendResult::Queued { depth: 1 }
+        );
+        assert_eq!(
+            actor.send_link_endpoint_best_effort(
+                link_id,
+                LinkEndpointRole::Responder,
+                OutboundRequest {
+                    raw: media,
+                    destination_hash: link_id,
+                },
+            ),
+            LinkEndpointSendResult::DroppedBackpressure
+        );
+        assert_eq!(
+            actor.link_endpoints[&(link_id, LinkEndpointRole::Responder)]
+                .egress
+                .len(),
+            1
+        );
+
+        assert_eq!(
+            target_rx.try_recv().unwrap(),
+            Bytes::from_static(b"occupied")
+        );
+        actor.drain_link_endpoint_egress();
+        assert_eq!(target_rx.try_recv().unwrap(), control);
+        assert!(target_rx.try_recv().is_err());
         assert!(lifecycle_rx.try_recv().is_err());
     }
 

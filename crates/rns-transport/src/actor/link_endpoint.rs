@@ -137,12 +137,82 @@ impl TransportActor {
         }
     }
 
+    pub(super) fn send_link_endpoint_best_effort(
+        &mut self,
+        link_id: [u8; 16],
+        role: crate::messages::LinkEndpointRole,
+        request: crate::messages::OutboundRequest,
+    ) -> crate::messages::LinkEndpointSendResult {
+        use crate::messages::LinkEndpointSendResult;
+
+        let key = (link_id, role);
+        if !self.link_endpoints.contains_key(&key) {
+            return if self
+                .link_endpoints
+                .keys()
+                .any(|(candidate, _)| candidate == &link_id)
+            {
+                LinkEndpointSendResult::RoleMismatch
+            } else {
+                LinkEndpointSendResult::NotBound
+            };
+        }
+
+        // Realtime media must never jump ahead of retained signalling or
+        // teardown, and it must not enlarge that reliable FIFO.
+        if !self.link_endpoints[&key].egress.is_empty() {
+            return LinkEndpointSendResult::DroppedBackpressure;
+        }
+
+        let interface_id = self.link_endpoints[&key].binding.interface_id;
+        let Some(raw) = self.prepare_link_endpoint_packet(link_id, interface_id, request) else {
+            return LinkEndpointSendResult::InvalidPacket;
+        };
+        if !self.link_endpoints.contains_key(&key) {
+            return LinkEndpointSendResult::NotBound;
+        }
+
+        match self.try_send_link_endpoint_raw(interface_id, link_id, role, &raw) {
+            InterfaceSendOutcome::Sent => LinkEndpointSendResult::Sent,
+            InterfaceSendOutcome::Full => {
+                if let Some(entry) = self.interfaces.get(&interface_id) {
+                    entry
+                        .tx_drops
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                LinkEndpointSendResult::DroppedBackpressure
+            }
+            outcome => {
+                let reason = terminal_reason_for_interface_outcome(outcome)
+                    .expect("non-full, non-sent interface outcome must be terminal");
+                if matches!(
+                    outcome,
+                    InterfaceSendOutcome::Closed | InterfaceSendOutcome::Offline
+                ) && interface_id != LOCAL_LINK_INITIATOR_INTERFACE
+                    && interface_id != LOCAL_LINK_RESPONDER_INTERFACE
+                {
+                    self.deregister_interface_with_link_reason(interface_id, reason);
+                } else {
+                    self.terminate_link_endpoint(key, reason, 0);
+                }
+                LinkEndpointSendResult::Terminated(reason)
+            }
+        }
+    }
+
     fn prepare_link_endpoint_packet(
         &mut self,
         link_id: [u8; 16],
         interface_id: InterfaceId,
         request: crate::messages::OutboundRequest,
     ) -> Option<Bytes> {
+        // The packet-count FIFO is also a hard byte bound because every
+        // admitted packet must fit Reticulum's wire MTU. Do not let a caller
+        // smuggle an arbitrarily large allocation into an established-Link
+        // queue through the raw transport API.
+        if request.raw.len() > rns_wire::constants::MTU {
+            return None;
+        }
         if request.destination_hash != link_id {
             return None;
         }

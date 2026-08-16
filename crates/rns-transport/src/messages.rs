@@ -206,7 +206,12 @@ pub struct LinkEndpointLifecycleEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkEndpointSendResult {
     Sent,
-    Queued { depth: usize },
+    Queued {
+        depth: usize,
+    },
+    /// A best-effort packet was intentionally discarded because ordered
+    /// control traffic or the exact interface queue was already full.
+    DroppedBackpressure,
     NotBound,
     RoleMismatch,
     InvalidPacket,
@@ -447,6 +452,14 @@ pub enum TransportMessage {
         request: OutboundRequest,
         result_tx: tokio::sync::oneshot::Sender<LinkEndpointSendResult>,
     },
+    /// Attempt exact-interface established-Link egress without entering the
+    /// reliable per-Link FIFO. Intended for bounded realtime media only.
+    SendLinkEndpointBestEffort {
+        link_id: [u8; 16],
+        role: LinkEndpointRole,
+        request: OutboundRequest,
+        result_tx: tokio::sync::oneshot::Sender<LinkEndpointSendResult>,
+    },
     /// Dispatch an application packet and report whether an interface
     /// accepted it. Optional receipt registration occurs in the same actor
     /// turn, avoiding registration/send races.
@@ -608,6 +621,7 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::BindLinkEndpoint { .. } => "BindLinkEndpoint",
         TransportMessage::UnbindLinkEndpoint { .. } => "UnbindLinkEndpoint",
         TransportMessage::SendLinkEndpoint { .. } => "SendLinkEndpoint",
+        TransportMessage::SendLinkEndpointBestEffort { .. } => "SendLinkEndpointBestEffort",
         TransportMessage::SendPacket { .. } => "SendPacket",
         TransportMessage::SetReceiptTimeout { .. } => "SetReceiptTimeout",
         TransportMessage::Tick(_) => "Tick",
@@ -972,6 +986,17 @@ impl std::fmt::Debug for TransportMessage {
                 ..
             } => f
                 .debug_struct("SendLinkEndpoint")
+                .field("link_id", link_id)
+                .field("role", role)
+                .field("request", request)
+                .finish_non_exhaustive(),
+            Self::SendLinkEndpointBestEffort {
+                link_id,
+                role,
+                request,
+                ..
+            } => f
+                .debug_struct("SendLinkEndpointBestEffort")
                 .field("link_id", link_id)
                 .field("role", role)
                 .field("request", request)
