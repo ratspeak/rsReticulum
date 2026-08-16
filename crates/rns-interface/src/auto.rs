@@ -3,7 +3,7 @@
 //! Beacons go to a multicast group derived from `SHA-256(group_id)` every
 //! ~1.6 s; data flows over unicast UDP. Peers age out after 22 s of silence.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -161,10 +161,10 @@ impl std::fmt::Display for McastAddrType {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AutoInterfaceEvent {
-    /// `IPV6_JOIN_GROUP` was rejected by the OS. On Apple this is the
-    /// canonical signal for missing `com.apple.developer.networking.multicast`
-    /// entitlement (free dev team can't sign it). On Linux it usually means
-    /// the interface vanished between enumeration and join.
+    /// `IPV6_JOIN_GROUP` was rejected by the OS. On Apple this can indicate a
+    /// missing `com.apple.developer.networking.multicast` entitlement or Local
+    /// Network authorization that has not been granted yet. On Linux it
+    /// usually means the interface vanished between enumeration and join.
     JoinFailed {
         interface_name: String,
         ifname: String,
@@ -1021,6 +1021,17 @@ fn hex_prefix(bytes: &[u8], n: usize) -> String {
     s
 }
 
+fn multicast_join_candidates(
+    link_locals: &[(String, Ipv6Addr, u32)],
+    joined_memberships: &HashSet<(String, u32)>,
+) -> Vec<(String, Ipv6Addr, u32)> {
+    link_locals
+        .iter()
+        .filter(|(ifname, _, scope_id)| !joined_memberships.contains(&(ifname.clone(), *scope_id)))
+        .cloned()
+        .collect()
+}
+
 /// Spawn the auto-discovery interface.
 pub async fn spawn_auto_interface(
     config: AutoInterfaceConfig,
@@ -1070,6 +1081,8 @@ pub async fn spawn_auto_interface(
     })?);
     tracing::info!(name = %config.name, port = config.discovery_port, "auto discovery socket bound");
 
+    let mut joined_memberships: HashSet<(String, u32)> = HashSet::new();
+    let mut reported_join_failures: HashSet<(String, u32)> = HashSet::new();
     for (iface_name, _ll_addr, scope_id) in &initial_link_locals {
         if let Err(e) = set_multicast_if_v6(disc_sock.as_ref(), *scope_id) {
             tracing::warn!(
@@ -1080,28 +1093,33 @@ pub async fn spawn_auto_interface(
                 "failed to set IPv6 multicast outbound interface"
             );
         }
-        if let Err(e) = disc_sock.join_multicast_v6(&mcast_group, *scope_id) {
-            // PermissionDenied (EPERM/EACCES, Windows ERROR_ACCESS_DENIED) on
-            // Apple platforms is the canonical signal that the multicast
-            // networking entitlement isn't provisioned. Surfaced as an event
-            // so UIs can show pending Apple approval.
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                tracing::warn!(
-                    iface = %iface_name,
-                    error = %e,
-                    "multicast join denied by OS — entitlement / firewall / capability missing"
-                );
-                dispatch_auto_event(AutoInterfaceEvent::JoinFailed {
-                    interface_name: config.name.clone(),
-                    ifname: iface_name.clone(),
-                    reason: format!("os_permission_denied: {e}"),
-                });
-            } else {
-                tracing::debug!(
-                    iface = %iface_name,
-                    error = %e,
-                    "failed to join multicast group"
-                );
+        match disc_sock.join_multicast_v6(&mcast_group, *scope_id) {
+            Ok(()) => {
+                joined_memberships.insert((iface_name.clone(), *scope_id));
+            }
+            Err(e) => {
+                // iOS can reject the first operation while Local Network
+                // authorization is being resolved. Keep the interface alive;
+                // the jobs task retries missing memberships periodically.
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    reported_join_failures.insert((iface_name.clone(), *scope_id));
+                    tracing::warn!(
+                        iface = %iface_name,
+                        error = %e,
+                        "multicast join denied by OS — permission, entitlement, firewall, or capability missing"
+                    );
+                    dispatch_auto_event(AutoInterfaceEvent::JoinFailed {
+                        interface_name: config.name.clone(),
+                        ifname: iface_name.clone(),
+                        reason: format!("os_permission_denied: {e}"),
+                    });
+                } else {
+                    tracing::debug!(
+                        iface = %iface_name,
+                        error = %e,
+                        "failed to join multicast group"
+                    );
+                }
             }
         }
     }
@@ -1509,7 +1527,9 @@ pub async fn spawn_auto_interface(
                     "AutoInterface link-local set changed"
                 );
             }
-            for (ifname, addr, scope_id) in &added {
+            let join_candidates = multicast_join_candidates(&new_set, &joined_memberships);
+            for (ifname, addr, scope_id) in &join_candidates {
+                let membership = (ifname.clone(), *scope_id);
                 if let Err(e) = set_multicast_if_v6(jobs_disc_sock.as_ref(), *scope_id) {
                     tracing::warn!(
                         iface = %jobs_iface_name,
@@ -1522,32 +1542,50 @@ pub async fn spawn_auto_interface(
                     );
                 }
                 match jobs_disc_sock.join_multicast_v6(&jobs_mcast, *scope_id) {
-                    Ok(()) => tracing::info!(
-                        iface = %jobs_iface_name,
-                        nic = %ifname,
-                        addr = %addr,
-                        scope_id,
-                        "AutoInterface joined multicast on new NIC"
-                    ),
+                    Ok(()) => {
+                        joined_memberships.insert(membership.clone());
+                        reported_join_failures.remove(&membership);
+                        tracing::info!(
+                            iface = %jobs_iface_name,
+                            nic = %ifname,
+                            addr = %addr,
+                            scope_id,
+                            "AutoInterface joined multicast on NIC"
+                        );
+                    }
                     Err(e) => {
-                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        let first_report = reported_join_failures.insert(membership);
+                        if first_report && e.kind() == std::io::ErrorKind::PermissionDenied {
                             dispatch_auto_event(AutoInterfaceEvent::JoinFailed {
                                 interface_name: jobs_iface_name.clone(),
                                 ifname: ifname.clone(),
                                 reason: format!("os_permission_denied: {e}"),
                             });
                         }
-                        tracing::warn!(
-                            iface = %jobs_iface_name,
-                            nic = %ifname,
-                            error = %e,
-                            "AutoInterface multicast join failed on new NIC"
-                        );
+                        if first_report {
+                            tracing::warn!(
+                                iface = %jobs_iface_name,
+                                nic = %ifname,
+                                error = %e,
+                                "AutoInterface multicast join failed; will retry"
+                            );
+                        } else {
+                            tracing::debug!(
+                                iface = %jobs_iface_name,
+                                nic = %ifname,
+                                error = %e,
+                                "AutoInterface multicast join retry failed"
+                            );
+                        }
                     }
                 }
             }
             for (ifname, _addr, scope_id) in &removed {
-                let _ = jobs_disc_sock.leave_multicast_v6(&jobs_mcast, *scope_id);
+                let membership = (ifname.clone(), *scope_id);
+                if joined_memberships.remove(&membership) {
+                    let _ = jobs_disc_sock.leave_multicast_v6(&jobs_mcast, *scope_id);
+                }
+                reported_join_failures.remove(&membership);
                 jobs_echoes.lock().await.remove(ifname);
                 carrier_state.remove(ifname);
             }
@@ -1763,6 +1801,26 @@ mod tests {
         assert_eq!(group.segments()[5], 0x5e39);
         assert_eq!(group.segments()[6], 0x485e);
         assert_eq!(group.segments()[7], 0x31e1);
+    }
+
+    #[test]
+    fn multicast_join_candidates_retries_unchanged_missing_membership() {
+        let en0_addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let en1_addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+        let link_locals = vec![
+            ("en0".to_string(), en0_addr, 4),
+            ("en1".to_string(), en1_addr, 7),
+        ];
+        let joined = HashSet::from([("en0".to_string(), 4)]);
+
+        assert_eq!(
+            multicast_join_candidates(&link_locals, &joined),
+            vec![("en1".to_string(), en1_addr, 7)]
+        );
+        assert_eq!(
+            multicast_join_candidates(&link_locals, &HashSet::new()),
+            link_locals
+        );
     }
 
     #[test]
