@@ -18,7 +18,8 @@ use rns_protocol::resource::{InboundTransfer, TransferAction};
 use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
-    AnnounceHandlerEvent, OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
+    AnnounceHandlerEvent, InterfaceId, LinkEndpointLifecycleEvent, LinkEndpointRole,
+    OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +46,38 @@ pub enum LinkClientError {
 pub struct LinkClient {
     transport_tx: mpsc::Sender<TransportMessage>,
     identity: Arc<Identity>,
+}
+
+struct QueryLinkGuard {
+    transport_tx: mpsc::Sender<TransportMessage>,
+    link_id: [u8; 16],
+    endpoint_bound: bool,
+    cleanup_required: bool,
+}
+
+struct LinkClientEndpoint<'a> {
+    delivery_rx: &'a mut mpsc::Receiver<DestinationEvent>,
+    lifecycle_rx: &'a mut mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
+    attached_interface: InterfaceId,
+}
+
+impl Drop for QueryLinkGuard {
+    fn drop(&mut self) {
+        if !self.cleanup_required {
+            return;
+        }
+        if self.endpoint_bound {
+            let _ = self
+                .transport_tx
+                .try_send(crate::link_endpoint::unbind_message(
+                    self.link_id,
+                    LinkEndpointRole::Initiator,
+                ));
+        }
+        let _ = self
+            .transport_tx
+            .try_send(TransportMessage::DeregisterDestination { hash: self.link_id });
+    }
 }
 
 impl LinkClient {
@@ -115,6 +148,12 @@ impl LinkClient {
             delivery_tx: Some(dest_tx),
         })
         .await?;
+        let mut registration = QueryLinkGuard {
+            transport_tx: self.transport_tx.clone(),
+            link_id,
+            endpoint_bound: false,
+            cleanup_required: true,
+        };
 
         let req_pkt = build_link_request_packet(dest_hash, &request_data);
         self.send_msg(TransportMessage::Outbound(OutboundRequest {
@@ -123,25 +162,51 @@ impl LinkClient {
         }))
         .await?;
 
-        let proof_data = wait_for_proof(&mut dest_rx, link_id, time_remaining(deadline)?).await?;
-
         let identity_ed25519_pub: [u8; 32] = pubkey[32..64].try_into().map_err(|_| {
             LinkClientError::ProofInvalid("remote public key is not 64 bytes".into())
         })?;
         let identity_verify_key = Ed25519PublicKey::from_bytes(&identity_ed25519_pub)
             .map_err(|e| LinkClientError::ProofInvalid(format!("verify key: {e}")))?;
+        let proof = timeout(
+            time_remaining(deadline)?,
+            crate::link_endpoint::wait_for_valid_proof(
+                &mut dest_rx,
+                &mut link,
+                &identity_verify_key,
+                &identity_ed25519_pub,
+            ),
+        )
+        .await
+        .map_err(|_| LinkClientError::Timeout("link proof"))?
+        .map_err(|error| match error {
+            crate::link_endpoint::LinkProofWaitError::LinkClosed => {
+                LinkClientError::HandshakeFailed("link closed".into())
+            }
+            crate::link_endpoint::LinkProofWaitError::DeliveryClosed => {
+                LinkClientError::HandshakeFailed("destination channel closed".into())
+            }
+        })?;
+        let attached_interface = proof.interface_id;
+        let rtt_data = proof.rtt_data;
 
-        let rtt_data = link
-            .validate_proof(&proof_data, &identity_verify_key, &identity_ed25519_pub)
-            .map_err(|e| LinkClientError::ProofInvalid(format!("{e:?}")))?;
+        let mut endpoint_lifecycle_rx = crate::link_endpoint::bind(
+            &self.transport_tx,
+            link_id,
+            attached_interface,
+            LinkEndpointRole::Initiator,
+        )
+        .await
+        .map_err(|_| LinkClientError::TransportUnavailable)?;
+        registration.endpoint_bound = true;
+        let mut endpoint = LinkClientEndpoint {
+            delivery_rx: &mut dest_rx,
+            lifecycle_rx: &mut endpoint_lifecycle_rx,
+            attached_interface,
+        };
 
         let rtt_pkt =
             build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data);
-        self.send_msg(TransportMessage::Outbound(OutboundRequest {
-            raw: rtt_pkt,
-            destination_hash: link_id,
-        }))
-        .await?;
+        self.send_link_packet(link_id, rtt_pkt).await?;
 
         let our_pub = self.identity.get_public_key();
         let our_priv = self
@@ -156,11 +221,7 @@ impl LinkClient {
             rns_wire::context::PacketContext::LinkIdentify,
             &identify_data,
         );
-        self.send_msg(TransportMessage::Outbound(OutboundRequest {
-            raw: identify_pkt,
-            destination_hash: link_id,
-        }))
-        .await?;
+        self.send_link_packet(link_id, identify_pkt).await?;
 
         let req_timeout = Duration::from_secs(5);
         let (encrypted_req, request_id) = link
@@ -176,15 +237,11 @@ impl LinkClient {
             rns_wire::flags::HeaderType::Header1,
         );
         link.update_pending_request_id(&request_id, packet_request_id);
-        self.send_msg(TransportMessage::Outbound(OutboundRequest {
-            raw: request_pkt,
-            destination_hash: link_id,
-        }))
-        .await?;
+        self.send_link_packet(link_id, request_pkt).await?;
 
         let response = wait_for_response(
             &self.transport_tx,
-            &mut dest_rx,
+            &mut endpoint,
             &mut link,
             link_id,
             packet_request_id,
@@ -193,10 +250,18 @@ impl LinkClient {
         .await;
 
         // Tear down even on failure so the remote doesn't keep link state.
-        let _ = self.send_close(&mut link).await;
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::DeregisterDestination { hash: link_id });
+        let endpoint_closing = self.send_close(&mut link).await.unwrap_or(false);
+        if !endpoint_closing {
+            let _ = crate::link_endpoint::unbind(
+                &self.transport_tx,
+                link_id,
+                LinkEndpointRole::Initiator,
+            )
+            .await;
+            registration.endpoint_bound = false;
+        } else {
+            registration.cleanup_required = false;
+        }
 
         response
     }
@@ -206,6 +271,17 @@ impl LinkClient {
             .send(msg)
             .await
             .map_err(|_| LinkClientError::TransportUnavailable)
+    }
+
+    async fn send_link_packet(&self, link_id: [u8; 16], raw: Bytes) -> Result<(), LinkClientError> {
+        crate::link_endpoint::send(
+            &self.transport_tx,
+            link_id,
+            LinkEndpointRole::Initiator,
+            raw,
+        )
+        .await
+        .map_err(|_| LinkClientError::TransportUnavailable)
     }
 
     async fn recall_routable_pubkey(
@@ -260,21 +336,25 @@ impl LinkClient {
             .map_err(|_| LinkClientError::TransportUnavailable)
     }
 
-    async fn send_close(&self, link: &mut Link) -> Result<(), LinkClientError> {
+    async fn send_close(&self, link: &mut Link) -> Result<bool, LinkClientError> {
         let link_id = link.link_id;
         let Some(teardown_data) = link.teardown(CloseReason::InitiatorClosed) else {
-            return Ok(());
+            return Ok(false);
         };
         let close_pkt = build_data_packet(
             link_id,
             rns_wire::context::PacketContext::LinkClose,
             &teardown_data,
         );
-        self.send_msg(TransportMessage::Outbound(OutboundRequest {
-            raw: close_pkt,
-            destination_hash: link_id,
-        }))
+        crate::link_endpoint::send_and_unbind(
+            &self.transport_tx,
+            link_id,
+            LinkEndpointRole::Initiator,
+            close_pkt,
+        )
         .await
+        .map(|()| true)
+        .map_err(|_| LinkClientError::TransportUnavailable)
     }
 }
 
@@ -307,43 +387,9 @@ async fn wait_for_pubkey(
         .map_err(|_| LinkClientError::Timeout("path/announce discovery"))?
 }
 
-async fn wait_for_proof(
-    rx: &mut mpsc::Receiver<DestinationEvent>,
-    link_id: [u8; 16],
-    deadline: Duration,
-) -> Result<Vec<u8>, LinkClientError> {
-    let fut = async {
-        while let Some(ev) = rx.recv().await {
-            match ev {
-                DestinationEvent::LinkClosed { link_id: closed_id } if closed_id == link_id => {
-                    return Err(LinkClientError::HandshakeFailed("link closed".into()));
-                }
-                DestinationEvent::InboundPacket { raw, .. } => {
-                    let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
-                        Ok(h) => h,
-                        Err(_) => continue,
-                    };
-                    let is_proof = header.flags.packet_type == rns_wire::flags::PacketType::Proof
-                        && header.destination_hash == link_id;
-                    if is_proof && raw.len() > data_offset {
-                        return Ok(raw[data_offset..].to_vec());
-                    }
-                }
-                _ => {}
-            }
-        }
-        Err(LinkClientError::HandshakeFailed(
-            "destination channel closed".into(),
-        ))
-    };
-    timeout(deadline, fut)
-        .await
-        .map_err(|_| LinkClientError::Timeout("link proof"))?
-}
-
 async fn wait_for_response(
     transport_tx: &mpsc::Sender<TransportMessage>,
-    rx: &mut mpsc::Receiver<DestinationEvent>,
+    endpoint: &mut LinkClientEndpoint<'_>,
     link: &mut Link,
     link_id: [u8; 16],
     request_id: [u8; 16],
@@ -352,12 +398,27 @@ async fn wait_for_response(
     let fut = async {
         let mut inbound_resources: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
 
-        while let Some(ev) = rx.recv().await {
+        loop {
+            let ev = tokio::select! {
+                event = endpoint.delivery_rx.recv() => event.ok_or_else(|| LinkClientError::HandshakeFailed(
+                    "destination channel closed".into(),
+                ))?,
+                terminal = endpoint.lifecycle_rx.recv() => {
+                    return Err(LinkClientError::HandshakeFailed(format!(
+                        "link endpoint terminated: {terminal:?}"
+                    )));
+                }
+            };
             match ev {
                 DestinationEvent::LinkClosed { link_id: closed_id } if closed_id == link_id => {
                     return Err(LinkClientError::HandshakeFailed("link closed".into()));
                 }
-                DestinationEvent::InboundPacket { raw, .. } => {
+                DestinationEvent::InboundPacket {
+                    raw, interface_id, ..
+                } => {
+                    if interface_id != endpoint.attached_interface {
+                        continue;
+                    }
                     let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
                         Ok(h) => h,
                         Err(_) => continue,
@@ -428,7 +489,8 @@ async fn wait_for_response(
                                     rns_wire::context::PacketContext::ResourceReq,
                                     &req,
                                     true,
-                                )?;
+                                )
+                                .await?;
                             }
 
                             inbound_resources.insert(adv.resource_hash, transfer);
@@ -479,7 +541,8 @@ async fn wait_for_response(
                                     context,
                                     &payload,
                                     true,
-                                )?;
+                                )
+                                .await?;
                             }
 
                             if let Some(rh) = completed_rh {
@@ -509,7 +572,7 @@ async fn wait_for_response(
                                     })?
                                 };
 
-                                send_link_proof(transport_tx, link_id, &proof)?;
+                                send_link_proof(transport_tx, link_id, &proof).await?;
                                 inbound_resources.remove(&rh);
                                 match link.handle_response_plaintext(&assembled) {
                                     Ok((id, response_data)) => {
@@ -551,7 +614,8 @@ async fn wait_for_response(
                                         rns_wire::context::PacketContext::ResourceReq,
                                         &req,
                                         true,
-                                    )?;
+                                    )
+                                    .await?;
                                 }
                                 // Empty/invalid HMU cancels the transfer (RESOURCE_RCL, 1.3.9).
                                 TransferAction::SendCancel(cancel_type, resource_hash) => {
@@ -570,7 +634,8 @@ async fn wait_for_response(
                                         context,
                                         &resource_hash,
                                         true,
-                                    )?;
+                                    )
+                                    .await?;
                                 }
                                 _ => {}
                             }
@@ -588,18 +653,15 @@ async fn wait_for_response(
                 _ => {}
             }
         }
-        Err(LinkClientError::HandshakeFailed(
-            "destination channel closed".into(),
-        ))
     };
     timeout(deadline, fut)
         .await
         .map_err(|_| LinkClientError::Timeout("response"))?
 }
 
-fn send_link_data(
+async fn send_link_data(
     transport_tx: &mpsc::Sender<TransportMessage>,
-    link: &Link,
+    link: &mut Link,
     link_id: [u8; 16],
     context: rns_wire::context::PacketContext,
     body: &[u8],
@@ -612,15 +674,12 @@ fn send_link_data(
         body.to_vec()
     };
     let packet = build_data_packet(link_id, context, &payload);
-    transport_tx
-        .try_send(TransportMessage::Outbound(OutboundRequest {
-            raw: packet,
-            destination_hash: link_id,
-        }))
+    crate::link_endpoint::send(transport_tx, link_id, LinkEndpointRole::Initiator, packet)
+        .await
         .map_err(|_| LinkClientError::TransportUnavailable)
 }
 
-fn send_link_proof(
+async fn send_link_proof(
     transport_tx: &mpsc::Sender<TransportMessage>,
     link_id: [u8; 16],
     proof: &[u8],
@@ -630,11 +689,8 @@ fn send_link_proof(
         rns_wire::context::PacketContext::ResourcePrf,
         proof,
     );
-    transport_tx
-        .try_send(TransportMessage::Outbound(OutboundRequest {
-            raw: packet,
-            destination_hash: link_id,
-        }))
+    crate::link_endpoint::send(transport_tx, link_id, LinkEndpointRole::Initiator, packet)
+        .await
         .map_err(|_| LinkClientError::TransportUnavailable)
 }
 
@@ -807,13 +863,22 @@ mod tests {
 
         let (transport_tx, mut transport_rx) = mpsc::channel(4);
         let client = LinkClient::new(transport_tx, Identity::new());
-        client.send_close(&mut initiator).await.unwrap();
+        let close = tokio::spawn(async move { client.send_close(&mut initiator).await });
 
-        let TransportMessage::Outbound(request) = transport_rx.try_recv().unwrap() else {
+        let TransportMessage::SendLinkEndpointAndUnbind {
+            role,
+            request,
+            result_tx,
+            ..
+        } = transport_rx.recv().await.unwrap()
+        else {
             panic!("expected outbound close packet");
         };
+        assert_eq!(role, LinkEndpointRole::Initiator);
         let (header, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
         assert_eq!(header.context, rns_wire::context::PacketContext::LinkClose);
         assert!(responder.receive_teardown(&request.raw[offset..]));
+        let _ = result_tx.send(rns_transport::messages::LinkEndpointSendResult::Sent);
+        assert!(close.await.unwrap().unwrap());
     }
 }

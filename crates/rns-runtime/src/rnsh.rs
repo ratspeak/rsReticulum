@@ -29,7 +29,8 @@ use rns_protocol::rnsh::{
 };
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
-    AnnounceRpcEntry, OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
+    AnnounceRpcEntry, InterfaceId, LinkEndpointLifecycleEvent, LinkEndpointRole, OutboundRequest,
+    TransportMessage, TransportQuery, TransportQueryResponse,
 };
 
 use crate::lifecycle::ShutdownSignal;
@@ -323,6 +324,12 @@ pub async fn rnsh_client_execute(
         })
         .await
         .map_err(|_| RnshError::TransportUnavailable)?;
+    let mut registration = RnshLinkGuard {
+        transport_tx: transport_tx.clone(),
+        link_id,
+        endpoint_bound: false,
+        cleanup_required: true,
+    };
 
     let link_req_pkt = build_link_request_packet(destination_hash, &request_data);
     transport_tx
@@ -333,40 +340,37 @@ pub async fn rnsh_client_execute(
         .await
         .map_err(|_| RnshError::TransportUnavailable)?;
 
-    let proof_body = match tokio::time::timeout(
-        remaining(deadline),
-        wait_for_link_proof(&mut lpkt_rx, link_id),
-    )
-    .await
-    {
-        Ok(Ok(body)) => body,
-        Ok(Err(e)) => {
-            cleanup_destination(&transport_tx, link_id).await;
-            return Err(e);
-        }
-        Err(_) => {
-            cleanup_destination(&transport_tx, link_id).await;
-            return Err(RnshError::Timeout("link proof"));
-        }
-    };
-
     let identity_ed25519_pub: [u8; 32] = pubkey[32..64]
         .try_into()
         .map_err(|_| RnshError::ProofInvalid("remote public key length".into()))?;
     let verify_key = Ed25519PublicKey::from_bytes(&identity_ed25519_pub)
         .map_err(|e| RnshError::ProofInvalid(format!("verify key: {e}")))?;
-
-    let rtt_data = link
-        .validate_proof(&proof_body, &verify_key, &identity_ed25519_pub)
-        .map_err(|e| RnshError::ProofInvalid(format!("{e:?}")))?;
+    let proof = wait_for_valid_link_proof(
+        &mut lpkt_rx,
+        &mut link,
+        &verify_key,
+        &identity_ed25519_pub,
+        deadline,
+    )
+    .await?;
+    let attached_interface = proof.interface_id;
+    let rtt_data = proof.rtt_data;
+    let mut endpoint_lifecycle_rx = crate::link_endpoint::bind(
+        &transport_tx,
+        link_id,
+        attached_interface,
+        LinkEndpointRole::Initiator,
+    )
+    .await
+    .map_err(|_| RnshError::TransportUnavailable)?;
+    registration.endpoint_bound = true;
+    let mut endpoint = ClientLinkEndpoint {
+        attached_interface,
+        lifecycle_rx: &mut endpoint_lifecycle_rx,
+        packet_rx: &mut lpkt_rx,
+    };
     let rtt_pkt = build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data);
-    transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw: rtt_pkt,
-            destination_hash: link_id,
-        }))
-        .await
-        .map_err(|_| RnshError::TransportUnavailable)?;
+    send_client_endpoint_packet(&transport_tx, link_id, rtt_pkt).await?;
 
     let signing_key = cfg
         .identity
@@ -384,13 +388,7 @@ pub async fn rnsh_client_execute(
             rns_wire::context::PacketContext::LinkIdentify,
             &identify_data,
         );
-        transport_tx
-            .send(TransportMessage::Outbound(OutboundRequest {
-                raw: identify_pkt,
-                destination_hash: link_id,
-            }))
-            .await
-            .map_err(|_| RnshError::TransportUnavailable)?;
+        send_client_endpoint_packet(&transport_tx, link_id, identify_pkt).await?;
         tokio::time::sleep(Duration::from_secs_f64(post_identify_delay)).await;
     }
 
@@ -407,7 +405,7 @@ pub async fn rnsh_client_execute(
 
     send_client_message_when_ready(
         &transport_tx,
-        &mut lpkt_rx,
+        &mut endpoint,
         &mut link,
         &mut channel,
         &mut pending_messages,
@@ -419,7 +417,7 @@ pub async fn rnsh_client_execute(
     loop {
         if let Some(message) = pop_or_receive_client_message(
             &transport_tx,
-            &mut lpkt_rx,
+            &mut endpoint,
             &mut link,
             &mut channel,
             &mut pending_messages,
@@ -461,7 +459,7 @@ pub async fn rnsh_client_execute(
     );
     send_client_message_when_ready(
         &transport_tx,
-        &mut lpkt_rx,
+        &mut endpoint,
         &mut link,
         &mut channel,
         &mut pending_messages,
@@ -472,7 +470,7 @@ pub async fn rnsh_client_execute(
 
     let return_code = match run_client_io_loop(
         &transport_tx,
-        &mut lpkt_rx,
+        &mut endpoint,
         &mut link,
         &mut channel,
         &mut pending_messages,
@@ -492,21 +490,75 @@ pub async fn rnsh_client_execute(
         }
     };
 
-    if let Some(close_pkt) = build_link_close(&mut link) {
-        let _ = transport_tx
-            .send(TransportMessage::Outbound(OutboundRequest {
-                raw: close_pkt,
-                destination_hash: link_id,
-            }))
-            .await;
+    let endpoint_closing = if let Some(close_pkt) = build_link_close(&mut link) {
+        crate::link_endpoint::send_and_unbind(
+            &transport_tx,
+            link_id,
+            LinkEndpointRole::Initiator,
+            close_pkt,
+        )
+        .await
+        .is_ok()
+    } else {
+        false
+    };
+    if !endpoint_closing {
+        let _ =
+            crate::link_endpoint::unbind(&transport_tx, link_id, LinkEndpointRole::Initiator).await;
+        registration.endpoint_bound = false;
+        cleanup_destination(&transport_tx, link_id).await;
+        registration.cleanup_required = false;
+    } else {
+        registration.cleanup_required = false;
     }
-    cleanup_destination(&transport_tx, link_id).await;
 
     Ok(RnshClientOutcome {
         stdout,
         stderr,
         return_code,
     })
+}
+
+struct RnshLinkGuard {
+    transport_tx: mpsc::Sender<TransportMessage>,
+    link_id: [u8; 16],
+    endpoint_bound: bool,
+    cleanup_required: bool,
+}
+
+impl Drop for RnshLinkGuard {
+    fn drop(&mut self) {
+        if !self.cleanup_required {
+            return;
+        }
+        if self.endpoint_bound {
+            let _ = self
+                .transport_tx
+                .try_send(crate::link_endpoint::unbind_message(
+                    self.link_id,
+                    LinkEndpointRole::Initiator,
+                ));
+        }
+        let _ = self
+            .transport_tx
+            .try_send(TransportMessage::DeregisterDestination { hash: self.link_id });
+    }
+}
+
+struct ClientLinkEndpoint<'a> {
+    attached_interface: InterfaceId,
+    lifecycle_rx: &'a mut mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
+    packet_rx: &'a mut mpsc::Receiver<DestinationEvent>,
+}
+
+async fn send_client_endpoint_packet(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    link_id: [u8; 16],
+    raw: Bytes,
+) -> Result<(), RnshError> {
+    crate::link_endpoint::send(transport_tx, link_id, LinkEndpointRole::Initiator, raw)
+        .await
+        .map_err(|_| RnshError::TransportUnavailable)
 }
 
 fn register_rnsh_message_types(channel: &mut LinkChannel) -> Result<(), ChannelError> {
@@ -533,7 +585,7 @@ struct ClientIoState<'a> {
 
 async fn run_client_io_loop(
     transport_tx: &mpsc::Sender<TransportMessage>,
-    lpkt_rx: &mut mpsc::Receiver<DestinationEvent>,
+    endpoint: &mut ClientLinkEndpoint<'_>,
     link: &mut Link,
     channel: &mut LinkChannel,
     pending_messages: &mut VecDeque<RnshMessage>,
@@ -598,7 +650,7 @@ async fn run_client_io_loop(
         let deadline_wait = remaining(deadline);
 
         tokio::select! {
-            maybe_event = lpkt_rx.recv() => {
+            maybe_event = endpoint.packet_rx.recv() => {
                 let Some(event) = maybe_event else {
                     return Err(RnshError::HandshakeFailed("link channel closed".into()));
                 };
@@ -608,7 +660,13 @@ async fn run_client_io_loop(
                     channel,
                     pending_messages,
                     event,
+                    endpoint.attached_interface,
                 ).await?;
+            }
+            terminal = endpoint.lifecycle_rx.recv() => {
+                return Err(RnshError::HandshakeFailed(format!(
+                    "link endpoint terminated: {terminal:?}"
+                )));
             }
             maybe_chunk = recv_optional_stdin_chunk(&mut stdin_rx), if !stdin_eof_sent => {
                 match maybe_chunk {
@@ -619,7 +677,7 @@ async fn run_client_io_loop(
                             }
                             send_client_message_when_ready(
                                 transport_tx,
-                                lpkt_rx,
+                                endpoint,
                                 link,
                                 channel,
                                 pending_messages,
@@ -632,7 +690,7 @@ async fn run_client_io_loop(
                         if !pending_has_remote_terminal(pending_messages) {
                             drain_client_messages_before_stdin_eof(
                                 transport_tx,
-                                lpkt_rx,
+                                endpoint,
                                 link,
                                 channel,
                                 pending_messages,
@@ -643,7 +701,7 @@ async fn run_client_io_loop(
                         if !pending_has_remote_terminal(pending_messages) {
                             send_client_message_when_ready(
                                 transport_tx,
-                                lpkt_rx,
+                                endpoint,
                                 link,
                                 channel,
                                 pending_messages,
@@ -660,7 +718,7 @@ async fn run_client_io_loop(
                     Some(window) => {
                         send_client_message_when_ready(
                             transport_tx,
-                            lpkt_rx,
+                            endpoint,
                             link,
                             channel,
                             pending_messages,
@@ -1469,7 +1527,7 @@ where
 
 async fn send_client_message_when_ready<M>(
     transport_tx: &mpsc::Sender<TransportMessage>,
-    lpkt_rx: &mut mpsc::Receiver<DestinationEvent>,
+    endpoint: &mut ClientLinkEndpoint<'_>,
     link: &mut Link,
     channel: &mut LinkChannel,
     pending_messages: &mut VecDeque<RnshMessage>,
@@ -1485,7 +1543,7 @@ where
             Err(RnshError::Channel(err)) if err.contains("not ready") => {
                 let _ = receive_client_messages(
                     transport_tx,
-                    lpkt_rx,
+                    endpoint,
                     link,
                     channel,
                     pending_messages,
@@ -1542,13 +1600,7 @@ async fn send_client_channel_data(
     let packet_hash = rns_wire::hash::packet_hash(&raw, channel_header.flags.header_type);
     channel.track_outbound_packet_hash(packet_hash, sequence);
     link.record_tx(data.len());
-    transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw: Bytes::from(raw),
-            destination_hash: link_id,
-        }))
-        .await
-        .map_err(|_| RnshError::TransportUnavailable)
+    send_client_endpoint_packet(transport_tx, link_id, Bytes::from(raw)).await
 }
 
 async fn resend_timed_out_client_channel_messages(
@@ -1568,7 +1620,7 @@ async fn resend_timed_out_client_channel_messages(
 
 async fn pop_or_receive_client_message(
     transport_tx: &mpsc::Sender<TransportMessage>,
-    lpkt_rx: &mut mpsc::Receiver<DestinationEvent>,
+    endpoint: &mut ClientLinkEndpoint<'_>,
     link: &mut Link,
     channel: &mut LinkChannel,
     pending_messages: &mut VecDeque<RnshMessage>,
@@ -1579,7 +1631,7 @@ async fn pop_or_receive_client_message(
     }
     receive_client_messages(
         transport_tx,
-        lpkt_rx,
+        endpoint,
         link,
         channel,
         pending_messages,
@@ -1592,7 +1644,7 @@ async fn pop_or_receive_client_message(
 
 async fn drain_client_messages_before_stdin_eof(
     transport_tx: &mpsc::Sender<TransportMessage>,
-    lpkt_rx: &mut mpsc::Receiver<DestinationEvent>,
+    endpoint: &mut ClientLinkEndpoint<'_>,
     link: &mut Link,
     channel: &mut LinkChannel,
     pending_messages: &mut VecDeque<RnshMessage>,
@@ -1613,7 +1665,7 @@ async fn drain_client_messages_before_stdin_eof(
         }
         receive_client_messages(
             transport_tx,
-            lpkt_rx,
+            endpoint,
             link,
             channel,
             pending_messages,
@@ -1628,7 +1680,7 @@ async fn drain_client_messages_before_stdin_eof(
 
 async fn receive_client_messages(
     transport_tx: &mpsc::Sender<TransportMessage>,
-    lpkt_rx: &mut mpsc::Receiver<DestinationEvent>,
+    endpoint: &mut ClientLinkEndpoint<'_>,
     link: &mut Link,
     channel: &mut LinkChannel,
     pending_messages: &mut VecDeque<RnshMessage>,
@@ -1642,16 +1694,35 @@ async fn receive_client_messages(
     let wait = wait
         .min(channel.next_timeout_duration().unwrap_or(wait))
         .min(remaining(deadline));
-    let event = match tokio::time::timeout(wait, lpkt_rx.recv()).await {
-        Ok(Some(event)) => event,
-        Ok(None) => return Err(RnshError::HandshakeFailed("link channel closed".into())),
+    let event = match tokio::time::timeout(wait, async {
+        tokio::select! {
+            event = endpoint.packet_rx.recv() => event.ok_or_else(|| {
+                RnshError::HandshakeFailed("link channel closed".into())
+            }),
+            terminal = endpoint.lifecycle_rx.recv() => Err(RnshError::HandshakeFailed(
+                format!("link endpoint terminated: {terminal:?}")
+            )),
+        }
+    })
+    .await
+    {
+        Ok(Ok(event)) => event,
+        Ok(Err(error)) => return Err(error),
         Err(_) => {
             resend_timed_out_client_channel_messages(transport_tx, link, channel).await?;
             return Ok(false);
         }
     };
 
-    process_client_destination_event(transport_tx, link, channel, pending_messages, event).await
+    process_client_destination_event(
+        transport_tx,
+        link,
+        channel,
+        pending_messages,
+        event,
+        endpoint.attached_interface,
+    )
+    .await
 }
 
 async fn process_client_destination_event(
@@ -1660,10 +1731,17 @@ async fn process_client_destination_event(
     channel: &mut LinkChannel,
     pending_messages: &mut VecDeque<RnshMessage>,
     event: DestinationEvent,
+    attached_interface: InterfaceId,
 ) -> Result<bool, RnshError> {
-    let DestinationEvent::InboundPacket { raw, .. } = event else {
+    let DestinationEvent::InboundPacket {
+        raw, interface_id, ..
+    } = event
+    else {
         return Ok(false);
     };
+    if interface_id != attached_interface {
+        return Ok(false);
+    }
     let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
         Ok(parsed) => parsed,
         Err(_) => return Ok(false),
@@ -1676,7 +1754,7 @@ async fn process_client_destination_event(
         rns_wire::flags::PacketType::Proof if body.len() >= 96 => {
             let mut packet_hash = [0u8; 32];
             packet_hash.copy_from_slice(&body[..32]);
-            if link.validate_packet_proof(&packet_hash, body) {
+            if link.validate_peer_packet_proof(&packet_hash, body).is_ok() {
                 channel.delivered_by_packet_hash(&packet_hash, link.rtt_secs());
             }
         }
@@ -1692,7 +1770,7 @@ async fn process_client_destination_event(
             rns_wire::context::PacketContext::Channel => {
                 link.record_inbound();
                 let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
-                if let Ok(proof_data) = link.prove_packet_with_link_key(&packet_hash) {
+                if let Ok(proof_data) = link.prove_packet_with_local_signer(&packet_hash) {
                     send_link_packet_proof(
                         transport_tx,
                         *channel.link_id(),
@@ -1773,25 +1851,27 @@ async fn lookup_pubkey(
         .and_then(|a| a.public_key))
 }
 
-async fn wait_for_link_proof(
+async fn wait_for_valid_link_proof(
     rx: &mut mpsc::Receiver<DestinationEvent>,
-    link_id: [u8; 16],
-) -> Result<Vec<u8>, RnshError> {
-    while let Some(event) = rx.recv().await {
-        let DestinationEvent::InboundPacket { raw, .. } = event else {
-            continue;
-        };
-        let Ok((header, data_offset)) = rns_wire::header::PacketHeader::unpack(&raw) else {
-            continue;
-        };
-        if header.flags.packet_type == rns_wire::flags::PacketType::Proof
-            && header.destination_hash == link_id
-            && raw.len() > data_offset
-        {
-            return Ok(raw[data_offset..].to_vec());
+    link: &mut Link,
+    verify_key: &Ed25519PublicKey,
+    identity_ed25519_pub: &[u8; 32],
+    deadline: Instant,
+) -> Result<crate::link_endpoint::ValidatedLinkProof, RnshError> {
+    tokio::time::timeout(
+        remaining(deadline),
+        crate::link_endpoint::wait_for_valid_proof(rx, link, verify_key, identity_ed25519_pub),
+    )
+    .await
+    .map_err(|_| RnshError::Timeout("link proof"))?
+    .map_err(|error| match error {
+        crate::link_endpoint::LinkProofWaitError::LinkClosed => {
+            RnshError::HandshakeFailed("link closed".into())
         }
-    }
-    Err(RnshError::HandshakeFailed("channel closed".into()))
+        crate::link_endpoint::LinkProofWaitError::DeliveryClosed => {
+            RnshError::HandshakeFailed("channel closed".into())
+        }
+    })
 }
 
 async fn cleanup_destination(transport_tx: &mpsc::Sender<TransportMessage>, link_id: [u8; 16]) {
@@ -1807,13 +1887,7 @@ async fn send_keepalive_response(
         rns_wire::context::PacketContext::Keepalive,
         &[rns_link::constants::KEEPALIVE_RESPONSE],
     );
-    transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw,
-            destination_hash: link_id,
-        }))
-        .await
-        .map_err(|_| RnshError::TransportUnavailable)
+    send_client_endpoint_packet(transport_tx, link_id, raw).await
 }
 
 async fn send_link_packet_proof(
@@ -1837,13 +1911,7 @@ async fn send_link_packet_proof(
     };
     let mut raw = header.pack();
     raw.extend_from_slice(proof_data);
-    transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw: Bytes::from(raw),
-            destination_hash: link_id,
-        }))
-        .await
-        .map_err(|_| RnshError::TransportUnavailable)
+    send_client_endpoint_packet(transport_tx, link_id, Bytes::from(raw)).await
 }
 
 fn build_link_close(link: &mut Link) -> Option<Bytes> {

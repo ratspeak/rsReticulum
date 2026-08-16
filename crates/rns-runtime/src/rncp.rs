@@ -20,7 +20,8 @@ use rns_protocol::resource::{
 };
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
-    AnnounceRpcEntry, OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
+    AnnounceRpcEntry, InterfaceId, LinkEndpointLifecycleEvent, LinkEndpointRole, OutboundRequest,
+    TransportMessage, TransportQuery, TransportQueryResponse,
 };
 use tokio::sync::oneshot;
 
@@ -39,6 +40,42 @@ pub const DEFAULT_RNCP_APP_NAME: &str = "rncp.receive";
 /// teardown cannot race that callback and turn a proven Resource into
 /// `FAILED` on a loaded peer.
 const RNCP_POST_PROOF_SETTLE: Duration = Duration::from_millis(250);
+
+struct RncpLinkGuard {
+    transport_tx: mpsc::Sender<TransportMessage>,
+    link_id: [u8; 16],
+    endpoint_bound: bool,
+    cleanup_required: bool,
+}
+
+impl Drop for RncpLinkGuard {
+    fn drop(&mut self) {
+        if !self.cleanup_required {
+            return;
+        }
+        if self.endpoint_bound {
+            let _ = self
+                .transport_tx
+                .try_send(crate::link_endpoint::unbind_message(
+                    self.link_id,
+                    LinkEndpointRole::Initiator,
+                ));
+        }
+        let _ = self
+            .transport_tx
+            .try_send(TransportMessage::DeregisterDestination { hash: self.link_id });
+    }
+}
+
+async fn send_endpoint_packet(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    link_id: [u8; 16],
+    raw: Bytes,
+) -> Result<(), RncpError> {
+    crate::link_endpoint::send(transport_tx, link_id, LinkEndpointRole::Initiator, raw)
+        .await
+        .map_err(|_| RncpError::TransportUnavailable)
+}
 
 pub fn default_rncp_app_name() -> &'static str {
     DEFAULT_RNCP_APP_NAME
@@ -236,7 +273,6 @@ pub async fn spawn_rncp_listener(
         })
         .await
         .map_err(|_| RncpError::TransportUnavailable)?;
-
     let mut link_mgr = LinkManager::with_destination(
         transport_tx.clone(),
         dest_rx,
@@ -521,6 +557,12 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
         })
         .await
         .map_err(|_| RncpError::TransportUnavailable)?;
+    let mut registration = RncpLinkGuard {
+        transport_tx: transport_tx.clone(),
+        link_id,
+        endpoint_bound: false,
+        cleanup_required: true,
+    };
 
     let link_req_pkt = build_link_request_packet(dest_hash, &link_request_data);
     transport_tx
@@ -531,37 +573,21 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
         .await
         .map_err(|_| RncpError::TransportUnavailable)?;
 
-    let proof_body = match timeout(remaining(deadline), wait_for_proof(&mut lpkt_rx, link_id)).await
-    {
-        Ok(Ok(body)) => body,
-        Ok(Err(e)) => {
-            cleanup_destination(&transport_tx, link_id).await;
-            return Err(e);
-        }
-        Err(_) => {
-            cleanup_destination(&transport_tx, link_id).await;
-            return Err(RncpError::Timeout("link proof"));
-        }
-    };
+    let (rtt_data, attached_interface) =
+        wait_for_valid_rncp_proof(&mut lpkt_rx, &mut link, &pubkey, deadline).await?;
 
-    let identity_ed25519_pub: [u8; 32] = pubkey[32..64]
-        .try_into()
-        .map_err(|_| RncpError::ProofInvalid("remote pub key length".into()))?;
-    let verify_key = Ed25519PublicKey::from_bytes(&identity_ed25519_pub)
-        .map_err(|e| RncpError::ProofInvalid(format!("verify key: {e}")))?;
-
-    let rtt_data = link
-        .validate_proof(&proof_body, &verify_key, &identity_ed25519_pub)
-        .map_err(|e| RncpError::ProofInvalid(format!("{e:?}")))?;
+    let mut endpoint_lifecycle_rx = crate::link_endpoint::bind(
+        &transport_tx,
+        link_id,
+        attached_interface,
+        LinkEndpointRole::Initiator,
+    )
+    .await
+    .map_err(|_| RncpError::TransportUnavailable)?;
+    registration.endpoint_bound = true;
 
     let rtt_pkt = build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data);
-    transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw: rtt_pkt,
-            destination_hash: link_id,
-        }))
-        .await
-        .map_err(|_| RncpError::TransportUnavailable)?;
+    send_endpoint_packet(&transport_tx, link_id, rtt_pkt).await?;
 
     let our_pub = identity.get_public_key();
     let our_priv = identity.get_signing_key().ok_or(RncpError::NoSigningKey)?;
@@ -573,13 +599,7 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
         rns_wire::context::PacketContext::LinkIdentify,
         &ident_data,
     );
-    transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw: ident_pkt,
-            destination_hash: link_id,
-        }))
-        .await
-        .map_err(|_| RncpError::TransportUnavailable)?;
+    send_endpoint_packet(&transport_tx, link_id, ident_pkt).await?;
 
     // Encrypt full payload BEFORE chunking (Resource.py:424).
     let session_keys = link
@@ -634,6 +654,8 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
             link_id,
             resource,
             lpkt_rx: &mut lpkt_rx,
+            endpoint_lifecycle_rx: &mut endpoint_lifecycle_rx,
+            attached_interface,
             progress_tx: progress_tx.clone(),
             progress_base: completed_parts as f32 / total_parts_nonzero as f32,
             progress_span: segment_parts as f32 / total_parts_nonzero as f32,
@@ -650,15 +672,27 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
         tokio::time::sleep(RNCP_POST_PROOF_SETTLE).await;
     }
 
-    if let Some(close_pkt) = build_link_close(&mut link) {
-        let _ = transport_tx
-            .send(TransportMessage::Outbound(OutboundRequest {
-                raw: close_pkt,
-                destination_hash: link_id,
-            }))
-            .await;
+    let endpoint_closing = if let Some(close_pkt) = build_link_close(&mut link) {
+        crate::link_endpoint::send_and_unbind(
+            &transport_tx,
+            link_id,
+            LinkEndpointRole::Initiator,
+            close_pkt,
+        )
+        .await
+        .is_ok()
+    } else {
+        false
+    };
+    if !endpoint_closing {
+        let _ =
+            crate::link_endpoint::unbind(&transport_tx, link_id, LinkEndpointRole::Initiator).await;
+        registration.endpoint_bound = false;
+        cleanup_destination(&transport_tx, link_id).await;
+        registration.cleanup_required = false;
+    } else {
+        registration.cleanup_required = false;
     }
-    cleanup_destination(&transport_tx, link_id).await;
 
     transfer_result?;
 
@@ -695,6 +729,8 @@ struct OutboundDrive<'a> {
     link_id: [u8; 16],
     resource: OutboundResource,
     lpkt_rx: &'a mut mpsc::Receiver<DestinationEvent>,
+    endpoint_lifecycle_rx: &'a mut mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
+    attached_interface: InterfaceId,
     progress_tx: Option<mpsc::Sender<f32>>,
     progress_base: f32,
     progress_span: f32,
@@ -708,6 +744,8 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
         link_id,
         resource,
         lpkt_rx,
+        endpoint_lifecycle_rx,
+        attached_interface,
         progress_tx,
         progress_base,
         progress_span,
@@ -740,15 +778,32 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
         }
 
         let recv_timeout = remaining(deadline).min(Duration::from_secs(5));
-        let ev = match tokio::time::timeout(recv_timeout, lpkt_rx.recv()).await {
-            Ok(Some(ev)) => ev,
-            Ok(None) => return Err(RncpError::ResourceFailed("link channel closed".into())),
+        let ev = match tokio::time::timeout(recv_timeout, async {
+            tokio::select! {
+                event = lpkt_rx.recv() => event.ok_or_else(|| {
+                    RncpError::ResourceFailed("link channel closed".into())
+                }),
+                terminal = endpoint_lifecycle_rx.recv() => Err(RncpError::ResourceFailed(
+                    format!("link endpoint terminated: {terminal:?}")
+                )),
+            }
+        })
+        .await
+        {
+            Ok(Ok(ev)) => ev,
+            Ok(Err(error)) => return Err(error),
             Err(_) => continue,
         };
 
-        let DestinationEvent::InboundPacket { raw, .. } = ev else {
+        let DestinationEvent::InboundPacket {
+            raw, interface_id, ..
+        } = ev
+        else {
             continue;
         };
+        if interface_id != attached_interface {
+            continue;
+        }
         let (header, off) = match rns_wire::header::PacketHeader::unpack(&raw) {
             Ok(h) => h,
             Err(_) => continue,
@@ -819,13 +874,7 @@ async fn send_keepalive_response(
         rns_wire::context::PacketContext::Keepalive,
         &[rns_link::constants::KEEPALIVE_RESPONSE],
     );
-    transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw,
-            destination_hash: link_id,
-        }))
-        .await
-        .map_err(|_| RncpError::TransportUnavailable)
+    send_endpoint_packet(transport_tx, link_id, raw).await
 }
 
 async fn send_transfer_action(
@@ -836,13 +885,7 @@ async fn send_transfer_action(
 ) -> Result<(), RncpError> {
     if let TransferAction::SendProof(proof) = action {
         let raw = build_resource_proof_packet(link_id, &proof);
-        transport_tx
-            .send(TransportMessage::Outbound(OutboundRequest {
-                raw,
-                destination_hash: link_id,
-            }))
-            .await
-            .map_err(|_| RncpError::TransportUnavailable)?;
+        send_endpoint_packet(transport_tx, link_id, raw).await?;
         return Ok(());
     }
 
@@ -897,13 +940,7 @@ async fn send_transfer_action(
         TransferAction::Failed(reason) => return Err(RncpError::ResourceFailed(reason)),
     };
     let raw = build_data_packet(link_id, context, &body);
-    transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw,
-            destination_hash: link_id,
-        }))
-        .await
-        .map_err(|_| RncpError::TransportUnavailable)
+    send_endpoint_packet(transport_tx, link_id, raw).await
 }
 
 fn remaining(deadline: Instant) -> Duration {
@@ -970,25 +1007,32 @@ async fn lookup_pubkey(
         .and_then(|a| a.public_key))
 }
 
-async fn wait_for_proof(
+async fn wait_for_valid_rncp_proof(
     rx: &mut mpsc::Receiver<DestinationEvent>,
-    link_id: [u8; 16],
-) -> Result<Vec<u8>, RncpError> {
-    while let Some(ev) = rx.recv().await {
-        let DestinationEvent::InboundPacket { raw, .. } = ev else {
-            continue;
-        };
-        let Ok((header, off)) = rns_wire::header::PacketHeader::unpack(&raw) else {
-            continue;
-        };
-        if header.flags.packet_type == rns_wire::flags::PacketType::Proof
-            && header.destination_hash == link_id
-            && raw.len() > off
-        {
-            return Ok(raw[off..].to_vec());
+    link: &mut Link,
+    public_key: &[u8; 64],
+    deadline: Instant,
+) -> Result<(Vec<u8>, InterfaceId), RncpError> {
+    let identity_ed25519_pub: [u8; 32] = public_key[32..64]
+        .try_into()
+        .map_err(|_| RncpError::ProofInvalid("remote pub key length".into()))?;
+    let verify_key = Ed25519PublicKey::from_bytes(&identity_ed25519_pub)
+        .map_err(|e| RncpError::ProofInvalid(format!("verify key: {e}")))?;
+    let proof = timeout(
+        remaining(deadline),
+        crate::link_endpoint::wait_for_valid_proof(rx, link, &verify_key, &identity_ed25519_pub),
+    )
+    .await
+    .map_err(|_| RncpError::Timeout("link proof"))?
+    .map_err(|error| match error {
+        crate::link_endpoint::LinkProofWaitError::LinkClosed => {
+            RncpError::HandshakeFailed("link closed".into())
         }
-    }
-    Err(RncpError::HandshakeFailed("channel closed".into()))
+        crate::link_endpoint::LinkProofWaitError::DeliveryClosed => {
+            RncpError::HandshakeFailed("channel closed".into())
+        }
+    })?;
+    Ok((proof.rtt_data, proof.interface_id))
 }
 
 async fn cleanup_destination(transport_tx: &mpsc::Sender<TransportMessage>, link_id: [u8; 16]) {
@@ -1115,6 +1159,12 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
         })
         .await
         .map_err(|_| RncpError::TransportUnavailable)?;
+    let mut registration = RncpLinkGuard {
+        transport_tx: transport_tx.clone(),
+        link_id,
+        endpoint_bound: false,
+        cleanup_required: true,
+    };
 
     let link_req_pkt = build_link_request_packet(dest_hash, &link_request_data);
     transport_tx
@@ -1125,37 +1175,21 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
         .await
         .map_err(|_| RncpError::TransportUnavailable)?;
 
-    let proof_body = match timeout(remaining(deadline), wait_for_proof(&mut lpkt_rx, link_id)).await
-    {
-        Ok(Ok(body)) => body,
-        Ok(Err(e)) => {
-            cleanup_destination(&transport_tx, link_id).await;
-            return Err(e);
-        }
-        Err(_) => {
-            cleanup_destination(&transport_tx, link_id).await;
-            return Err(RncpError::Timeout("link proof"));
-        }
-    };
+    let (rtt_data, attached_interface) =
+        wait_for_valid_rncp_proof(&mut lpkt_rx, &mut link, &pubkey, deadline).await?;
 
-    let identity_ed25519_pub: [u8; 32] = pubkey[32..64]
-        .try_into()
-        .map_err(|_| RncpError::ProofInvalid("remote pub key length".into()))?;
-    let verify_key = Ed25519PublicKey::from_bytes(&identity_ed25519_pub)
-        .map_err(|e| RncpError::ProofInvalid(format!("verify key: {e}")))?;
-
-    let rtt_data = link
-        .validate_proof(&proof_body, &verify_key, &identity_ed25519_pub)
-        .map_err(|e| RncpError::ProofInvalid(format!("{e:?}")))?;
+    let mut endpoint_lifecycle_rx = crate::link_endpoint::bind(
+        &transport_tx,
+        link_id,
+        attached_interface,
+        LinkEndpointRole::Initiator,
+    )
+    .await
+    .map_err(|_| RncpError::TransportUnavailable)?;
+    registration.endpoint_bound = true;
 
     let rtt_pkt = build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data);
-    transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw: rtt_pkt,
-            destination_hash: link_id,
-        }))
-        .await
-        .map_err(|_| RncpError::TransportUnavailable)?;
+    send_endpoint_packet(&transport_tx, link_id, rtt_pkt).await?;
 
     let our_pub = identity.get_public_key();
     let our_priv = identity.get_signing_key().ok_or(RncpError::NoSigningKey)?;
@@ -1167,13 +1201,7 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
         rns_wire::context::PacketContext::LinkIdentify,
         &ident_data,
     );
-    transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw: ident_pkt,
-            destination_hash: link_id,
-        }))
-        .await
-        .map_err(|_| RncpError::TransportUnavailable)?;
+    send_endpoint_packet(&transport_tx, link_id, ident_pkt).await?;
 
     let (req_encrypted, _req_id) = link
         .request_str(FETCH_PATH_NAME, remote_path, remaining(deadline))
@@ -1186,13 +1214,7 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
     let packet_request_id =
         rns_wire::hash::truncated_packet_hash(&req_pkt, rns_wire::flags::HeaderType::Header1);
     link.update_pending_request_id(&_req_id, packet_request_id);
-    transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw: req_pkt,
-            destination_hash: link_id,
-        }))
-        .await
-        .map_err(|_| RncpError::TransportUnavailable)?;
+    send_endpoint_packet(&transport_tx, link_id, req_pkt).await?;
 
     let session_keys = link
         .session_keys()
@@ -1218,15 +1240,32 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
             break Err(RncpError::Timeout("fetch"));
         }
         let recv_timeout = remaining(deadline).min(Duration::from_secs(5));
-        let ev = match tokio::time::timeout(recv_timeout, lpkt_rx.recv()).await {
-            Ok(Some(ev)) => ev,
-            Ok(None) => break Err(RncpError::ResourceFailed("link channel closed".into())),
+        let ev = match tokio::time::timeout(recv_timeout, async {
+            tokio::select! {
+                event = lpkt_rx.recv() => event.ok_or_else(|| {
+                    RncpError::ResourceFailed("link channel closed".into())
+                }),
+                terminal = endpoint_lifecycle_rx.recv() => Err(RncpError::ResourceFailed(
+                    format!("link endpoint terminated: {terminal:?}")
+                )),
+            }
+        })
+        .await
+        {
+            Ok(Ok(ev)) => ev,
+            Ok(Err(error)) => break Err(error),
             Err(_) => continue,
         };
 
-        let DestinationEvent::InboundPacket { raw, .. } = ev else {
+        let DestinationEvent::InboundPacket {
+            raw, interface_id, ..
+        } = ev
+        else {
             continue;
         };
+        if interface_id != attached_interface {
+            continue;
+        }
         let (header, off) = match rns_wire::header::PacketHeader::unpack(&raw) {
             Ok(h) => h,
             Err(_) => continue,
@@ -1311,13 +1350,7 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                             rns_wire::context::PacketContext::ResourceReq,
                             &encrypted,
                         );
-                        transport_tx
-                            .send(TransportMessage::Outbound(OutboundRequest {
-                                raw: req_raw,
-                                destination_hash: link_id,
-                            }))
-                            .await
-                            .map_err(|_| RncpError::TransportUnavailable)?;
+                        send_endpoint_packet(&transport_tx, link_id, req_raw).await?;
                     }
                 }
                 transfers.insert(adv.resource_hash, t);
@@ -1359,13 +1392,7 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                     };
                     if let Ok(encrypted) = link.encrypt(&payload) {
                         let raw = build_data_packet(link_id, context, &encrypted);
-                        transport_tx
-                            .send(TransportMessage::Outbound(OutboundRequest {
-                                raw,
-                                destination_hash: link_id,
-                            }))
-                            .await
-                            .map_err(|_| RncpError::TransportUnavailable)?;
+                        send_endpoint_packet(&transport_tx, link_id, raw).await?;
                     }
                 }
 
@@ -1397,12 +1424,12 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                         }
                     };
                     let prf_raw = build_resource_proof_packet(link_id, &proof);
-                    let _ = transport_tx
-                        .send(TransportMessage::Outbound(OutboundRequest {
-                            raw: prf_raw,
-                            destination_hash: link_id,
-                        }))
-                        .await;
+                    // The received file is not locally concluded until its
+                    // Resource proof has been admitted on the exact Link
+                    // endpoint. Otherwise a stale or lost binding could make
+                    // the receiver publish success that the sender can never
+                    // observe.
+                    send_endpoint_packet(&transport_tx, link_id, prf_raw).await?;
 
                     transfers.remove(&rh);
 
@@ -1472,13 +1499,7 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                             rns_wire::context::PacketContext::ResourceReq,
                             &encrypted,
                         );
-                        transport_tx
-                            .send(TransportMessage::Outbound(OutboundRequest {
-                                raw: req_raw,
-                                destination_hash: link_id,
-                            }))
-                            .await
-                            .map_err(|_| RncpError::TransportUnavailable)?;
+                        send_endpoint_packet(&transport_tx, link_id, req_raw).await?;
                     }
                 }
             }
@@ -1489,15 +1510,27 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
         }
     };
 
-    if let Some(close_pkt) = build_link_close(&mut link) {
-        let _ = transport_tx
-            .send(TransportMessage::Outbound(OutboundRequest {
-                raw: close_pkt,
-                destination_hash: link_id,
-            }))
-            .await;
+    let endpoint_closing = if let Some(close_pkt) = build_link_close(&mut link) {
+        crate::link_endpoint::send_and_unbind(
+            &transport_tx,
+            link_id,
+            LinkEndpointRole::Initiator,
+            close_pkt,
+        )
+        .await
+        .is_ok()
+    } else {
+        false
+    };
+    if !endpoint_closing {
+        let _ =
+            crate::link_endpoint::unbind(&transport_tx, link_id, LinkEndpointRole::Initiator).await;
+        registration.endpoint_bound = false;
+        cleanup_destination(&transport_tx, link_id).await;
+        registration.cleanup_required = false;
+    } else {
+        registration.cleanup_required = false;
     }
-    cleanup_destination(&transport_tx, link_id).await;
 
     let (file_name, payload) = result?;
     let bytes = payload.len();
@@ -1556,6 +1589,43 @@ mod tests {
             rns_wire::context::PacketContext::ResourcePrf
         );
         assert_eq!(&raw[off..], &[0x22; 64]);
+    }
+
+    #[tokio::test]
+    async fn resource_proof_rejection_is_not_a_successful_send() {
+        let link_id = [0x12; 16];
+        let (transport_tx, mut transport_rx) = mpsc::channel(1);
+        let send = tokio::spawn(async move {
+            send_endpoint_packet(
+                &transport_tx,
+                link_id,
+                build_resource_proof_packet(link_id, &[0x34; 64]),
+            )
+            .await
+        });
+        let TransportMessage::SendLinkEndpoint {
+            role,
+            request,
+            result_tx,
+            ..
+        } = transport_rx
+            .recv()
+            .await
+            .expect("typed Resource proof send")
+        else {
+            panic!("Resource proof must use the established-Link endpoint");
+        };
+        assert_eq!(role, LinkEndpointRole::Initiator);
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourcePrf
+        );
+        let _ = result_tx.send(rns_transport::messages::LinkEndpointSendResult::NotBound);
+        assert!(matches!(
+            send.await.unwrap(),
+            Err(RncpError::TransportUnavailable)
+        ));
     }
 
     #[test]

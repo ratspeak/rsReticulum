@@ -24,8 +24,8 @@ use rns_protocol::resource::{
 use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::{DestinationEvent, PacketMetrics};
 use rns_transport::messages::{
-    AnnounceRpcEntry, InterfaceId, OutboundRequest, TransportMessage, TransportQuery,
-    TransportQueryResponse,
+    AnnounceRpcEntry, InterfaceId, LinkEndpointRole, OutboundRequest, TransportMessage,
+    TransportQuery, TransportQueryResponse,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -609,7 +609,6 @@ struct SessionActorChannels {
 struct DestinationEventContext<'a> {
     transport_tx: &'a mpsc::Sender<TransportMessage>,
     attached_interface: InterfaceId,
-    identity: &'a Identity,
     sinks: InboundResourceSinks<'a>,
     phy_stats_tx: &'a watch::Sender<LinkPhyStats>,
 }
@@ -939,6 +938,7 @@ pub struct LinkSession {
 struct DestinationRegistrationGuard {
     transport_tx: mpsc::Sender<TransportMessage>,
     link_id: [u8; 16],
+    endpoint_bound: bool,
     armed: bool,
 }
 
@@ -947,8 +947,13 @@ impl DestinationRegistrationGuard {
         Self {
             transport_tx,
             link_id,
+            endpoint_bound: false,
             armed: true,
         }
+    }
+
+    fn endpoint_bound(&mut self) {
+        self.endpoint_bound = true;
     }
 
     fn disarm(&mut self) {
@@ -959,6 +964,14 @@ impl DestinationRegistrationGuard {
 impl Drop for DestinationRegistrationGuard {
     fn drop(&mut self) {
         if self.armed {
+            if self.endpoint_bound {
+                let _ = self
+                    .transport_tx
+                    .try_send(crate::link_endpoint::unbind_message(
+                        self.link_id,
+                        LinkEndpointRole::Initiator,
+                    ));
+            }
             deregister_destination(&self.transport_tx, self.link_id);
         }
     }
@@ -997,29 +1010,49 @@ impl LinkSession {
             return Err(LinkSessionError::TransportUnavailable);
         }
 
-        let proof = match tokio::time::timeout(
-            config.establishment_timeout,
-            wait_for_link_proof(&mut delivery_rx, link_id),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(LinkSessionError::Timeout("link proof")),
-        };
-        let (proof, attached_interface, proof_metrics) = match proof {
-            Ok(proof) => proof,
-            Err(error) => return Err(error),
-        };
-        update_link_phy_stats(&mut link, proof_metrics);
-
         let peer_signing_key: [u8; 32] = config.remote_public_key[32..]
             .try_into()
             .map_err(|_| LinkSessionError::ProofInvalid("invalid public-key length".into()))?;
         let verify_key = Ed25519PublicKey::from_bytes(&peer_signing_key)
             .map_err(|error| LinkSessionError::ProofInvalid(error.to_string()))?;
-        let rtt_data = link
-            .validate_proof(&proof, &verify_key, &peer_signing_key)
-            .map_err(|error| LinkSessionError::ProofInvalid(format!("{error:?}")))?;
+        let proof = match tokio::time::timeout(
+            config.establishment_timeout,
+            crate::link_endpoint::wait_for_valid_proof(
+                &mut delivery_rx,
+                &mut link,
+                &verify_key,
+                &peer_signing_key,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(proof)) => proof,
+            Ok(Err(crate::link_endpoint::LinkProofWaitError::LinkClosed)) => {
+                return Err(LinkSessionError::HandshakeFailed("Link closed".into()));
+            }
+            Ok(Err(crate::link_endpoint::LinkProofWaitError::DeliveryClosed)) => {
+                return Err(LinkSessionError::HandshakeFailed(
+                    "destination event stream closed".into(),
+                ));
+            }
+            Err(_) => return Err(LinkSessionError::Timeout("link proof")),
+        };
+        let attached_interface = proof.interface_id;
+        let rtt_data = proof.rtt_data;
+        update_link_phy_stats(&mut link, proof.metrics);
+
+        // The cryptographically valid LRPROOF's receiving interface is the
+        // immutable egress attachment for this initiator endpoint. Install it
+        // before LRRTT or any other established-Link packet can be emitted.
+        let endpoint_lifecycle_rx = crate::link_endpoint::bind(
+            &transport_tx,
+            link_id,
+            attached_interface,
+            LinkEndpointRole::Initiator,
+        )
+        .await
+        .map_err(|_| LinkSessionError::TransportUnavailable)?;
+        registration.endpoint_bound();
 
         send_raw(
             &transport_tx,
@@ -1069,10 +1102,10 @@ impl LinkSession {
             phy_stats_rx,
         };
         tokio::spawn(run_session_actor(
-            identity,
             (link, channel),
             attached_interface,
             delivery_rx,
+            endpoint_lifecycle_rx,
             command_rx,
             SessionActorChannels {
                 transport_tx,
@@ -1139,10 +1172,12 @@ pub async fn lookup_destination(
 }
 
 async fn run_session_actor(
-    identity: Identity,
     link_and_channel: (Link, LinkChannel),
     attached_interface: InterfaceId,
     mut delivery_rx: mpsc::Receiver<DestinationEvent>,
+    mut endpoint_lifecycle_rx: mpsc::UnboundedReceiver<
+        rns_transport::messages::LinkEndpointLifecycleEvent,
+    >,
     mut command_rx: mpsc::Receiver<LinkSessionCommand>,
     channels: SessionActorChannels,
 ) {
@@ -1162,6 +1197,7 @@ async fn run_session_actor(
         resources: SessionResources::default(),
     };
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    let mut endpoint_closing = false;
     let close_reason = loop {
         tokio::select! {
             command = command_rx.recv() => {
@@ -1276,7 +1312,8 @@ async fn run_session_actor(
                         }
                     }
                     Some(LinkSessionCommand::Close) | None => {
-                        send_local_teardown(&transport_tx, attached_interface, &mut link).await;
+                        endpoint_closing =
+                            send_local_teardown(&transport_tx, attached_interface, &mut link).await;
                         break LinkSessionCloseReason::Local;
                     }
                 }
@@ -1289,7 +1326,6 @@ async fn run_session_actor(
                     DestinationEventContext {
                         transport_tx: &transport_tx,
                         attached_interface,
-                        identity: &identity,
                         sinks: InboundResourceSinks {
                             event_tx: &event_tx,
                             command_tx: &command_tx,
@@ -1306,6 +1342,21 @@ async fn run_session_actor(
                     Err(_) => break LinkSessionCloseReason::TransportUnavailable,
                 }
             }
+            lifecycle = endpoint_lifecycle_rx.recv() => {
+                match lifecycle {
+                    Some(event) => {
+                        tracing::warn!(
+                            link_id = %hex::encode(event.binding.link_id),
+                            interface_id = event.binding.interface_id,
+                            reason = ?event.reason,
+                            dropped_packets = event.dropped_packets,
+                            "established Link endpoint became terminal"
+                        );
+                        break LinkSessionCloseReason::TransportUnavailable;
+                    }
+                    None => break LinkSessionCloseReason::TransportUnavailable,
+                }
+            }
             _ = ticker.tick() => {
                 state.channel.update_rtt(link.rtt_secs());
                 if let Err(error) = resend_timed_out_channel_messages(
@@ -1316,7 +1367,12 @@ async fn run_session_actor(
                 ).await {
                     match error {
                         LinkSessionChannelError::Channel(ChannelError::MaxRetriesExceeded) => {
-                            send_local_teardown(&transport_tx, attached_interface, &mut link).await;
+                            endpoint_closing = send_local_teardown(
+                                &transport_tx,
+                                attached_interface,
+                                &mut link,
+                            )
+                            .await;
                             break LinkSessionCloseReason::Timeout;
                         }
                         _ => break LinkSessionCloseReason::TransportUnavailable,
@@ -1366,12 +1422,12 @@ async fn run_session_actor(
                         }
                     }
                     LinkAction::SendTeardownAndClose(data) => {
-                        let _ = send_raw(
+                        endpoint_closing = crate::link_endpoint::send_and_unbind(
                             &transport_tx,
-                            attached_interface,
                             link_id,
+                            LinkEndpointRole::Initiator,
                             build_data_packet(link_id, rns_wire::context::PacketContext::LinkClose, &data),
-                        ).await;
+                        ).await.is_ok();
                         break LinkSessionCloseReason::Timeout;
                     }
                     LinkAction::Closed(_) => break LinkSessionCloseReason::Timeout,
@@ -1385,7 +1441,11 @@ async fn run_session_actor(
     fail_pending_requests(&mut state.requests, &event_tx);
     fail_outbound_resources(&mut link, &mut state.resources, &event_tx);
     fail_inbound_resources(&mut link, &mut state.resources, &event_tx);
-    deregister_destination(&transport_tx, link_id);
+    if !endpoint_closing {
+        let _ =
+            crate::link_endpoint::unbind(&transport_tx, link_id, LinkEndpointRole::Initiator).await;
+        deregister_destination(&transport_tx, link_id);
+    }
     let _ = event_tx
         .send(LinkSessionEvent::Closed {
             reason: close_reason,
@@ -3542,7 +3602,6 @@ async fn process_destination_event(
     let DestinationEventContext {
         transport_tx,
         attached_interface,
-        identity,
         sinks,
         phy_stats_tx,
     } = context;
@@ -3610,7 +3669,7 @@ async fn process_destination_event(
                 if body.len() >= 32 {
                     let mut packet_hash = [0u8; 32];
                     packet_hash.copy_from_slice(&body[..32]);
-                    if link.validate_packet_proof(&packet_hash, body) {
+                    if link.validate_peer_packet_proof(&packet_hash, body).is_ok() {
                         let delivered_packet = state.packets.remove(&packet_hash);
                         let delivered_channel = if delivered_packet {
                             false
@@ -3680,14 +3739,7 @@ async fn process_destination_event(
                         return Ok(None);
                     };
                     let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
-                    send_packet_proof(
-                        transport_tx,
-                        attached_interface,
-                        identity,
-                        link,
-                        &packet_hash,
-                    )
-                    .await?;
+                    send_packet_proof(transport_tx, attached_interface, link, &packet_hash).await?;
                     event_tx
                         .send(LinkSessionEvent::Packet {
                             data: plaintext,
@@ -3700,14 +3752,7 @@ async fn process_destination_event(
                     link.record_inbound();
                     link.record_rx(body.len());
                     let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
-                    send_packet_proof(
-                        transport_tx,
-                        attached_interface,
-                        identity,
-                        link,
-                        &packet_hash,
-                    )
-                    .await?;
+                    send_packet_proof(transport_tx, attached_interface, link, &packet_hash).await?;
                     let _ = state.channel.receive_data(body);
                 }
                 rns_wire::context::PacketContext::ResourceReq => {
@@ -3816,11 +3861,10 @@ async fn process_destination_event(
 async fn send_packet_proof(
     transport_tx: &mpsc::Sender<TransportMessage>,
     attached_interface: InterfaceId,
-    identity: &Identity,
     link: &mut Link,
     packet_hash: &[u8; 32],
 ) -> Result<(), LinkSessionError> {
-    let Ok(proof) = link.prove_packet_with_fallible(packet_hash, |hash| identity.sign(hash)) else {
+    let Ok(proof) = link.prove_packet_with_local_signer(packet_hash) else {
         return Ok(());
     };
     let proof_raw = build_proof_packet(
@@ -3831,38 +3875,6 @@ async fn send_packet_proof(
     send_raw(transport_tx, attached_interface, link.link_id, proof_raw).await?;
     link.record_tx(proof.len());
     Ok(())
-}
-
-async fn wait_for_link_proof(
-    delivery_rx: &mut mpsc::Receiver<DestinationEvent>,
-    link_id: [u8; 16],
-) -> Result<(Vec<u8>, InterfaceId, PacketMetrics), LinkSessionError> {
-    while let Some(event) = delivery_rx.recv().await {
-        match event {
-            DestinationEvent::LinkClosed { link_id: closed } if closed == link_id => {
-                return Err(LinkSessionError::HandshakeFailed("Link closed".into()));
-            }
-            DestinationEvent::InboundPacket {
-                raw,
-                interface_id,
-                metrics,
-            } => {
-                let Ok((header, data_offset)) = rns_wire::header::PacketHeader::unpack(&raw) else {
-                    continue;
-                };
-                if header.destination_hash == link_id
-                    && header.flags.packet_type == rns_wire::flags::PacketType::Proof
-                    && raw.len() > data_offset
-                {
-                    return Ok((raw[data_offset..].to_vec(), interface_id, metrics));
-                }
-            }
-            _ => {}
-        }
-    }
-    Err(LinkSessionError::HandshakeFailed(
-        "destination event stream closed".into(),
-    ))
 }
 
 fn update_link_phy_stats(link: &mut Link, metrics: PacketMetrics) {
@@ -3902,38 +3914,37 @@ async fn send_keepalive(
 
 async fn send_local_teardown(
     transport_tx: &mpsc::Sender<TransportMessage>,
-    attached_interface: InterfaceId,
+    _attached_interface: InterfaceId,
     link: &mut Link,
-) {
+) -> bool {
     let link_id = link.link_id;
     let Some(data) = link.teardown(CloseReason::InitiatorClosed) else {
-        return;
+        return false;
     };
-    let _ = send_raw(
+    crate::link_endpoint::send_and_unbind(
         transport_tx,
-        attached_interface,
         link_id,
+        LinkEndpointRole::Initiator,
         build_data_packet(link_id, rns_wire::context::PacketContext::LinkClose, &data),
     )
-    .await;
+    .await
+    .is_ok()
 }
 
 async fn send_raw(
     transport_tx: &mpsc::Sender<TransportMessage>,
-    attached_interface: InterfaceId,
+    _attached_interface: InterfaceId,
     destination_hash: [u8; 16],
     raw: Bytes,
 ) -> Result<(), LinkSessionError> {
-    transport_tx
-        .send(TransportMessage::OutboundAttached {
-            request: OutboundRequest {
-                raw,
-                destination_hash,
-            },
-            interface_id: attached_interface,
-        })
-        .await
-        .map_err(|_| LinkSessionError::TransportUnavailable)
+    crate::link_endpoint::send(
+        transport_tx,
+        destination_hash,
+        LinkEndpointRole::Initiator,
+        raw,
+    )
+    .await
+    .map_err(|_| LinkSessionError::TransportUnavailable)
 }
 
 fn deregister_destination(transport_tx: &mpsc::Sender<TransportMessage>, link_id: [u8; 16]) {
@@ -4020,6 +4031,106 @@ mod tests {
     use rns_protocol::channel_message::{MessageBase, SMT_STREAM_DATA};
     use rns_protocol::stream_data::StreamDataMessage;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_transport_channel(
+        capacity: usize,
+    ) -> (
+        mpsc::Sender<TransportMessage>,
+        mpsc::Receiver<TransportMessage>,
+    ) {
+        let (transport_tx, mut transport_rx) = mpsc::channel(capacity);
+        let (observed_tx, observed_rx) = mpsc::channel(capacity);
+        tokio::spawn(async move {
+            while let Some(message) = transport_rx.recv().await {
+                let observed = match message {
+                    TransportMessage::SendLinkEndpoint {
+                        link_id,
+                        role,
+                        request,
+                        result_tx,
+                    } => {
+                        let _ =
+                            result_tx.send(rns_transport::messages::LinkEndpointSendResult::Sent);
+                        let (result_tx, _result_rx) = oneshot::channel();
+                        TransportMessage::SendLinkEndpoint {
+                            link_id,
+                            role,
+                            request,
+                            result_tx,
+                        }
+                    }
+                    TransportMessage::SendLinkEndpointAndUnbind {
+                        link_id,
+                        role,
+                        request,
+                        result_tx,
+                    } => {
+                        let _ =
+                            result_tx.send(rns_transport::messages::LinkEndpointSendResult::Sent);
+                        let (result_tx, _result_rx) = oneshot::channel();
+                        TransportMessage::SendLinkEndpointAndUnbind {
+                            link_id,
+                            role,
+                            request,
+                            result_tx,
+                        }
+                    }
+                    TransportMessage::UnbindLinkEndpoint {
+                        link_id,
+                        role,
+                        result_tx,
+                    } => {
+                        let _ = result_tx
+                            .send(rns_transport::messages::LinkEndpointUnbindResult::Unbound);
+                        let (result_tx, _result_rx) = oneshot::channel();
+                        TransportMessage::UnbindLinkEndpoint {
+                            link_id,
+                            role,
+                            result_tx,
+                        }
+                    }
+                    message => message,
+                };
+                if observed_tx.send(observed).await.is_err() {
+                    break;
+                }
+            }
+        });
+        (transport_tx, observed_rx)
+    }
+
+    async fn next_initiator_endpoint(rx: &mut mpsc::Receiver<TransportMessage>) -> OutboundRequest {
+        loop {
+            match rx.recv().await.expect("transport channel closed") {
+                TransportMessage::BindLinkEndpoint {
+                    binding,
+                    lifecycle_tx,
+                    result_tx,
+                } => {
+                    assert_eq!(binding.role, LinkEndpointRole::Initiator);
+                    let _ = result_tx.send(rns_transport::messages::LinkEndpointBindResult::Bound);
+                    std::mem::forget(lifecycle_tx);
+                }
+                TransportMessage::SendLinkEndpoint {
+                    role,
+                    request,
+                    result_tx,
+                    ..
+                }
+                | TransportMessage::SendLinkEndpointAndUnbind {
+                    role,
+                    request,
+                    result_tx,
+                    ..
+                } => {
+                    assert_eq!(role, LinkEndpointRole::Initiator);
+                    let _ = result_tx.send(rns_transport::messages::LinkEndpointSendResult::Sent);
+                    return request;
+                }
+                message => panic!("unexpected transport message: {message:?}"),
+            }
+        }
+    }
 
     #[test]
     fn application_packets_use_link_destination_and_none_context() {
@@ -4111,7 +4222,7 @@ mod tests {
                 offered_at: Instant::now() - RESOURCE_OFFER_TIMEOUT,
             },
         );
-        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let (transport_tx, mut transport_rx) = test_transport_channel(1);
         let (event_tx, _event_rx) = mpsc::channel::<LinkSessionEvent>(1);
 
         assert!(
@@ -4121,13 +4232,7 @@ mod tests {
         assert!(resources.pending_inbound.is_empty());
         assert!(resources.rejected_inbound.contains_key(&resource_id));
 
-        let rejection = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 7,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let rejection = next_initiator_endpoint(&mut transport_rx).await;
         let (header, offset) = rns_wire::header::PacketHeader::unpack(&rejection.raw).unwrap();
         assert_eq!(
             header.context,
@@ -4153,7 +4258,7 @@ mod tests {
         responder.receive_rtt_packet(&rtt_data).unwrap();
         initiator.state = LinkState::Stale;
 
-        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let (transport_tx, mut transport_rx) = test_transport_channel(1);
         let mut pending_packets = HashSet::new();
         let receipt = send_application_packet(
             &transport_tx,
@@ -4165,13 +4270,7 @@ mod tests {
         .await
         .expect("a stale Link must still be able to answer its peer");
 
-        let sent = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 7,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let sent = next_initiator_endpoint(&mut transport_rx).await;
         let (header, offset) = rns_wire::header::PacketHeader::unpack(&sent.raw).unwrap();
         assert_eq!(header.destination_hash, initiator.link_id);
         assert_eq!(responder.decrypt(&sent.raw[offset..]).unwrap(), b"pong");
@@ -4195,7 +4294,7 @@ mod tests {
         responder.receive_rtt_packet(&rtt_data).unwrap();
         let mdu = initiator.mdu;
         let payload = vec![0u8; mdu];
-        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
+        let (transport_tx, mut transport_rx) = test_transport_channel(1);
         let (event_tx, _event_rx) = mpsc::channel::<LinkSessionEvent>(4);
         let (command_tx, _command_rx) = mpsc::channel::<LinkSessionCommand>(4);
         let mut resources = SessionResources::default();
@@ -4221,13 +4320,7 @@ mod tests {
             rns_link::request::RequestState::SendingResource
         );
 
-        let advertisement = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let advertisement = next_initiator_endpoint(&mut transport_rx).await;
         let (header, offset) = rns_wire::header::PacketHeader::unpack(&advertisement.raw).unwrap();
         assert_eq!(
             header.context,
@@ -4284,7 +4377,7 @@ mod tests {
         };
 
         let mut resources = SessionResources::default();
-        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let (transport_tx, mut transport_rx) = test_transport_channel(8);
         let (command_tx, mut command_rx) = mpsc::channel::<LinkSessionCommand>(8);
         let (event_tx, _event_rx) = mpsc::channel::<LinkSessionEvent>(8);
         let (offer_tx, mut offer_rx) = mpsc::channel::<LinkSessionResourceOffer>(1);
@@ -4309,13 +4402,7 @@ mod tests {
             "response Resources must not be surfaced as application offers"
         );
 
-        let request = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let request = next_initiator_endpoint(&mut transport_rx).await;
         let (request_header, request_offset) =
             rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
         assert_eq!(
@@ -4377,7 +4464,7 @@ mod tests {
         let destination_hash = [0xBD; 16];
         let server_signing = Ed25519PrivateKey::generate();
         let server_public = server_signing.public_key();
-        let client_identity = Identity::new();
+        let _client_identity = Identity::new();
         let (mut initiator, request_data) = Link::new_initiator(destination_hash, 1);
         let (mut responder, proof_data) =
             Link::new_responder(&request_data, &server_signing, destination_hash, 1).unwrap();
@@ -4400,8 +4487,9 @@ mod tests {
             mdu,
             initiator.session_keys().unwrap(),
         );
-        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(16);
+        let (transport_tx, mut transport_rx) = test_transport_channel(16);
         let (delivery_tx, delivery_rx) = mpsc::channel::<DestinationEvent>(16);
+        let (endpoint_lifecycle_tx, endpoint_lifecycle_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::channel::<LinkSessionCommand>(16);
         let (event_tx, mut event_rx) = mpsc::channel::<LinkSessionEvent>(16);
         let (resource_offer_tx, _resource_offer_rx) = mpsc::channel::<LinkSessionResourceOffer>(1);
@@ -4414,10 +4502,10 @@ mod tests {
         };
 
         tokio::spawn(run_session_actor(
-            client_identity,
             (initiator, channel),
             7,
             delivery_rx,
+            endpoint_lifecycle_rx,
             command_rx,
             SessionActorChannels {
                 transport_tx,
@@ -4434,37 +4522,40 @@ mod tests {
                 .unwrap(),
             Some(LinkSessionEvent::Stale)
         );
-        let stale_keepalive = transport_rx.recv().await.unwrap();
-        assert!(matches!(
-            stale_keepalive,
-            TransportMessage::OutboundAttached {
-                interface_id: 7,
-                ..
-            }
-        ));
+        let _stale_keepalive = next_initiator_endpoint(&mut transport_rx).await;
 
         let inbound_ciphertext = responder.encrypt(b"ping").unwrap();
+        let inbound_packet = build_data_packet(
+            responder.link_id,
+            rns_wire::context::PacketContext::None,
+            &inbound_ciphertext,
+        );
         delivery_tx
             .send(DestinationEvent::InboundPacket {
-                raw: build_data_packet(
-                    responder.link_id,
-                    rns_wire::context::PacketContext::None,
-                    &inbound_ciphertext,
-                ),
+                raw: inbound_packet.clone(),
+                interface_id: 8,
+                metrics: Default::default(),
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(transport_rx.try_recv().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), event_rx.recv())
+                .await
+                .is_err(),
+            "wrong-interface ingress must not mutate Link state or emit plaintext"
+        );
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: inbound_packet,
                 interface_id: 7,
                 metrics: Default::default(),
             })
             .await
             .unwrap();
 
-        let inbound_proof = transport_rx.recv().await.unwrap();
-        assert!(matches!(
-            inbound_proof,
-            TransportMessage::OutboundAttached {
-                interface_id: 7,
-                ..
-            }
-        ));
+        let _inbound_proof = next_initiator_endpoint(&mut transport_rx).await;
         assert!(matches!(
             event_rx.recv().await,
             Some(LinkSessionEvent::Packet { ref data, .. }) if data == b"ping"
@@ -4475,24 +4566,44 @@ mod tests {
             .send_packet(b"pong".to_vec())
             .await
             .expect("the recovered actor must accept the heartbeat response");
-        let response = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 7,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let response = next_initiator_endpoint(&mut transport_rx).await;
         let (_, offset) = rns_wire::header::PacketHeader::unpack(&response.raw).unwrap();
         assert_eq!(responder.decrypt(&response.raw[offset..]).unwrap(), b"pong");
 
-        handle.close().await;
+        endpoint_lifecycle_tx
+            .send(rns_transport::messages::LinkEndpointLifecycleEvent {
+                binding: rns_transport::messages::LinkEndpointBinding {
+                    link_id,
+                    interface_id: 7,
+                    role: LinkEndpointRole::Initiator,
+                },
+                reason: rns_transport::messages::LinkEndpointTerminalReason::InterfaceRemoved,
+                dropped_packets: 1,
+            })
+            .unwrap();
+        let TransportMessage::UnbindLinkEndpoint { result_tx, .. } =
+            transport_rx.recv().await.unwrap()
+        else {
+            panic!("terminal endpoint cleanup must explicitly unbind");
+        };
+        let _ = result_tx.send(rns_transport::messages::LinkEndpointUnbindResult::Unbound);
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::DeregisterDestination { hash }) if hash == link_id
+        ));
+        assert_eq!(
+            event_rx.recv().await,
+            Some(LinkSessionEvent::Closed {
+                reason: LinkSessionCloseReason::TransportUnavailable,
+            })
+        );
     }
 
     #[tokio::test]
     async fn cancelled_handshake_deregisters_temporary_link_destination() {
         let destination_hash = [0x33; 16];
         let remote_identity = Identity::new();
-        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let (transport_tx, mut transport_rx) = test_transport_channel(8);
 
         let connect = tokio::spawn(LinkSession::connect(
             transport_tx,
@@ -4530,13 +4641,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_bind_send_failure_unbinds_before_deregistering_destination() {
+        let destination_hash = [0x34; 16];
+        let remote_identity = Identity::new();
+        let remote_signing = remote_identity.get_signing_key().unwrap();
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(16);
+
+        let connect = tokio::spawn(LinkSession::connect(
+            transport_tx,
+            Identity::new(),
+            LinkSessionConfig {
+                destination_hash,
+                remote_public_key: remote_identity.get_public_key(),
+                hops: 1,
+                establishment_timeout: Duration::from_secs(2),
+                client_label: "test.post-bind-failure".into(),
+                identify: false,
+                track_phy_stats: false,
+            },
+        ));
+
+        let (link_id, delivery_tx) = match transport_rx.recv().await.unwrap() {
+            TransportMessage::RegisterDestination {
+                hash,
+                delivery_tx: Some(delivery_tx),
+                ..
+            } => (hash, delivery_tx),
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let request = match transport_rx.recv().await.unwrap() {
+            TransportMessage::Outbound(request) => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (_, request_offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        let (_responder, proof) = Link::new_responder(
+            &request.raw[request_offset..],
+            &remote_signing,
+            destination_hash,
+            1,
+        )
+        .unwrap();
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: build_proof_packet(link_id, rns_wire::context::PacketContext::None, &proof),
+                interface_id: 23,
+                metrics: Default::default(),
+            })
+            .await
+            .unwrap();
+
+        let TransportMessage::BindLinkEndpoint {
+            binding,
+            lifecycle_tx,
+            result_tx,
+        } = transport_rx.recv().await.unwrap()
+        else {
+            panic!("valid LRPROOF must bind before LRRTT");
+        };
+        assert_eq!(binding.link_id, link_id);
+        assert_eq!(binding.interface_id, 23);
+        assert_eq!(binding.role, LinkEndpointRole::Initiator);
+        let _ = result_tx.send(rns_transport::messages::LinkEndpointBindResult::Bound);
+        std::mem::forget(lifecycle_tx);
+
+        let TransportMessage::SendLinkEndpoint {
+            role,
+            request,
+            result_tx,
+            ..
+        } = transport_rx.recv().await.unwrap()
+        else {
+            panic!("LRRTT must use the bound endpoint");
+        };
+        assert_eq!(role, LinkEndpointRole::Initiator);
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(header.context, rns_wire::context::PacketContext::Lrrtt);
+        let _ = result_tx.send(rns_transport::messages::LinkEndpointSendResult::NotBound);
+        assert!(matches!(
+            connect.await.unwrap(),
+            Err(LinkSessionError::TransportUnavailable)
+        ));
+
+        let TransportMessage::UnbindLinkEndpoint {
+            link_id: unbound,
+            role,
+            result_tx,
+        } = transport_rx.recv().await.unwrap()
+        else {
+            panic!("post-bind failure must unbind before deregistration");
+        };
+        assert_eq!(unbound, link_id);
+        assert_eq!(role, LinkEndpointRole::Initiator);
+        let _ = result_tx.send(rns_transport::messages::LinkEndpointUnbindResult::Unbound);
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::DeregisterDestination { hash }) if hash == link_id
+        ));
+    }
+
+    #[tokio::test]
     async fn persistent_session_identifies_and_exchanges_link_packets() {
         let destination_hash = [0x44; 16];
         let server_identity = Identity::new();
         let server_public = server_identity.get_public_key();
         let server_signing = server_identity.get_signing_key().unwrap();
         let client_identity = Identity::new();
-        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(64);
+        let (transport_tx, mut transport_rx) = test_transport_channel(64);
 
         let connect = tokio::spawn(LinkSession::connect(
             transport_tx.clone(),
@@ -4599,26 +4809,28 @@ mod tests {
             .await
             .unwrap();
 
-        let rtt = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
+        let TransportMessage::BindLinkEndpoint {
+            binding,
+            lifecycle_tx,
+            result_tx,
+        } = transport_rx.recv().await.unwrap()
+        else {
+            panic!("valid LRPROOF must bind the initiator endpoint before LRRTT");
         };
+        assert_eq!(binding.link_id, responder.link_id);
+        assert_eq!(binding.interface_id, 1);
+        assert_eq!(binding.role, LinkEndpointRole::Initiator);
+        let _ = result_tx.send(rns_transport::messages::LinkEndpointBindResult::Bound);
+        std::mem::forget(lifecycle_tx);
+
+        let rtt = next_initiator_endpoint(&mut transport_rx).await;
         let (rtt_header, rtt_offset) = rns_wire::header::PacketHeader::unpack(&rtt.raw).unwrap();
         assert_eq!(rtt_header.context, rns_wire::context::PacketContext::Lrrtt);
         responder
             .receive_rtt_packet(&rtt.raw[rtt_offset..])
             .unwrap();
 
-        let identify = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let identify = next_initiator_endpoint(&mut transport_rx).await;
         let (identify_header, identify_offset) =
             rns_wire::header::PacketHeader::unpack(&identify.raw).unwrap();
         assert_eq!(
@@ -4645,13 +4857,7 @@ mod tests {
             .send_packet(b"hello hub".to_vec())
             .await
             .unwrap();
-        let sent = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let sent = next_initiator_endpoint(&mut transport_rx).await;
         let (sent_header, sent_offset) = rns_wire::header::PacketHeader::unpack(&sent.raw).unwrap();
         assert_eq!(sent_header.context, rns_wire::context::PacketContext::None);
         assert_eq!(
@@ -4669,13 +4875,7 @@ mod tests {
                 .request("/echo", b"request body", Some(Duration::from_secs(2)))
                 .await
         });
-        let request = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let request = next_initiator_endpoint(&mut transport_rx).await;
         let (request_header, request_offset) =
             rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
         assert_eq!(
@@ -4737,13 +4937,7 @@ mod tests {
                 .request("/timeout", b"", Some(Duration::ZERO))
                 .await
         });
-        let timed_out_request = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let timed_out_request = next_initiator_endpoint(&mut transport_rx).await;
         let (timed_out_header, _) =
             rns_wire::header::PacketHeader::unpack(&timed_out_request.raw).unwrap();
         let timed_out_id = rns_wire::hash::truncated_packet_hash(
@@ -4792,13 +4986,7 @@ mod tests {
             .send_raw(0x0042, b"first channel frame")
             .await
             .unwrap();
-        let first_channel_packet = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let first_channel_packet = next_initiator_endpoint(&mut transport_rx).await;
         let (first_channel_header, first_channel_offset) =
             rns_wire::header::PacketHeader::unpack(&first_channel_packet.raw).unwrap();
         assert_eq!(
@@ -4816,13 +5004,7 @@ mod tests {
             .send_raw(0x0042, b"second channel frame")
             .await
             .unwrap();
-        let second_channel_packet = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let second_channel_packet = next_initiator_endpoint(&mut transport_rx).await;
         let (_, second_channel_offset) =
             rns_wire::header::PacketHeader::unpack(&second_channel_packet.raw).unwrap();
         assert_eq!(
@@ -4834,7 +5016,7 @@ mod tests {
         assert!(!channel.is_ready_to_send().await.unwrap());
 
         let first_proof = responder
-            .prove_packet_with_fallible(&first_receipt.packet_hash, |hash| {
+            .prove_responder_packet_with(&first_receipt.packet_hash, |hash| {
                 server_identity.sign(hash)
             })
             .unwrap();
@@ -4862,7 +5044,7 @@ mod tests {
         .expect("channel proof should reopen the send window");
 
         let second_proof = responder
-            .prove_packet_with_fallible(&second_receipt.packet_hash, |hash| {
+            .prove_responder_packet_with(&second_receipt.packet_hash, |hash| {
                 server_identity.sign(hash)
             })
             .unwrap();
@@ -4900,6 +5082,12 @@ mod tests {
             rns_wire::context::PacketContext::Channel,
             &inbound_prepared.data,
         );
+        let (inbound_channel_header, _) =
+            rns_wire::header::PacketHeader::unpack(&inbound_channel_packet).unwrap();
+        let inbound_channel_hash = rns_wire::hash::packet_hash(
+            &inbound_channel_packet,
+            inbound_channel_header.flags.header_type,
+        );
         delivery_tx
             .send(DestinationEvent::InboundPacket {
                 raw: inbound_channel_packet,
@@ -4914,18 +5102,31 @@ mod tests {
                 .unwrap(),
             Some((0x0042, b"inbound channel frame".to_vec()))
         );
-        let inbound_proof = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
-        let (inbound_proof_header, _) =
+        let inbound_proof = next_initiator_endpoint(&mut transport_rx).await;
+        let (inbound_proof_header, inbound_proof_offset) =
             rns_wire::header::PacketHeader::unpack(&inbound_proof.raw).unwrap();
         assert_eq!(
             inbound_proof_header.flags.packet_type,
             rns_wire::flags::PacketType::Proof
+        );
+        responder
+            .validate_peer_packet_proof(
+                &inbound_channel_hash,
+                &inbound_proof.raw[inbound_proof_offset..],
+            )
+            .expect("initiator Channel proof must use the LINKREQUEST transient key");
+        let mut identity_signed_channel_proof = Vec::with_capacity(96);
+        identity_signed_channel_proof.extend_from_slice(&inbound_channel_hash);
+        identity_signed_channel_proof.extend_from_slice(
+            &client_identity
+                .sign(&inbound_channel_hash)
+                .expect("application identity can sign the negative-control proof"),
+        );
+        assert!(
+            responder
+                .validate_peer_packet_proof(&inbound_channel_hash, &identity_signed_channel_proof,)
+                .is_err(),
+            "the unrelated application identity must not authenticate an initiator proof"
         );
         responder_channel.delivered(inbound_prepared.sequence, responder.rtt_secs());
 
@@ -4953,7 +5154,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let _ignored_proof = transport_rx.recv().await.unwrap();
+        let _ignored_proof = next_initiator_endpoint(&mut transport_rx).await;
         responder_channel.delivered(ignored_prepared.sequence, responder.rtt_secs());
 
         responder_channel.register_system_type(SMT_STREAM_DATA);
@@ -4985,17 +5186,11 @@ mod tests {
         .expect("Buffer reader should wake for its stream")
         .unwrap();
         assert_eq!(inbound_buffer, b"buffer inbound");
-        let _inbound_stream_proof = transport_rx.recv().await.unwrap();
+        let _inbound_stream_proof = next_initiator_endpoint(&mut transport_rx).await;
         responder_channel.delivered(inbound_stream_prepared.sequence, responder.rtt_secs());
 
         buffer.write_all(b"buffer outbound").await.unwrap();
-        let outbound_stream_packet = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let outbound_stream_packet = next_initiator_endpoint(&mut transport_rx).await;
         let (outbound_stream_header, outbound_stream_offset) =
             rns_wire::header::PacketHeader::unpack(&outbound_stream_packet.raw).unwrap();
         let outbound_stream_messages = responder_channel
@@ -5016,7 +5211,7 @@ mod tests {
             outbound_stream_header.flags.header_type,
         );
         let outbound_stream_proof = responder
-            .prove_packet_with_fallible(&outbound_stream_hash, |hash| server_identity.sign(hash))
+            .prove_responder_packet_with(&outbound_stream_hash, |hash| server_identity.sign(hash))
             .unwrap();
         delivery_tx
             .send(DestinationEvent::InboundPacket {
@@ -5032,13 +5227,7 @@ mod tests {
             .unwrap();
 
         buffer.shutdown().await.unwrap();
-        let eof_packet = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let eof_packet = next_initiator_endpoint(&mut transport_rx).await;
         let (eof_header, eof_offset) =
             rns_wire::header::PacketHeader::unpack(&eof_packet.raw).unwrap();
         let eof_messages = responder_channel
@@ -5053,7 +5242,7 @@ mod tests {
 
         let eof_hash = rns_wire::hash::packet_hash(&eof_packet.raw, eof_header.flags.header_type);
         let eof_proof = responder
-            .prove_packet_with_fallible(&eof_hash, |hash| server_identity.sign(hash))
+            .prove_responder_packet_with(&eof_hash, |hash| server_identity.sign(hash))
             .unwrap();
         delivery_tx
             .send(DestinationEvent::InboundPacket {
@@ -5075,6 +5264,8 @@ mod tests {
             rns_wire::context::PacketContext::None,
             &inbound_ciphertext,
         );
+        let (inbound_header, _) = rns_wire::header::PacketHeader::unpack(&inbound).unwrap();
+        let inbound_hash = rns_wire::hash::packet_hash(&inbound, inbound_header.flags.header_type);
         delivery_tx
             .send(DestinationEvent::InboundPacket {
                 raw: inbound.clone(),
@@ -5106,14 +5297,9 @@ mod tests {
             event,
             LinkSessionEvent::Packet { ref data, .. } if data == b"hello client"
         ));
-        let proof = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
-        let (proof_header, _) = rns_wire::header::PacketHeader::unpack(&proof.raw).unwrap();
+        let proof = next_initiator_endpoint(&mut transport_rx).await;
+        let (proof_header, proof_offset) =
+            rns_wire::header::PacketHeader::unpack(&proof.raw).unwrap();
         assert_eq!(
             proof_header.flags.packet_type,
             rns_wire::flags::PacketType::Proof
@@ -5122,6 +5308,9 @@ mod tests {
             proof_header.context,
             rns_wire::context::PacketContext::LinkProof
         );
+        responder
+            .validate_peer_packet_proof(&inbound_hash, &proof.raw[proof_offset..])
+            .expect("initiator ordinary proof must use the LINKREQUEST transient key");
 
         let resource_payload = b"resource payload over the persistent Link".to_vec();
         let resource = session
@@ -5141,13 +5330,7 @@ mod tests {
             })
         );
 
-        let advertisement = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let advertisement = next_initiator_endpoint(&mut transport_rx).await;
         let (advertisement_header, advertisement_offset) =
             rns_wire::header::PacketHeader::unpack(&advertisement.raw).unwrap();
         assert_eq!(
@@ -5195,13 +5378,7 @@ mod tests {
             .await
             .unwrap();
 
-        let part = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let part = next_initiator_endpoint(&mut transport_rx).await;
         let (part_header, part_offset) = rns_wire::header::PacketHeader::unpack(&part.raw).unwrap();
         assert_eq!(
             part_header.context,
@@ -5272,13 +5449,7 @@ mod tests {
                 total_segments: 1,
             })
         );
-        let active_advertisement = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let active_advertisement = next_initiator_endpoint(&mut transport_rx).await;
         let (active_advertisement_header, _) =
             rns_wire::header::PacketHeader::unpack(&active_advertisement.raw).unwrap();
         assert_eq!(
@@ -5311,13 +5482,7 @@ mod tests {
         );
 
         assert!(active_resource.cancel().await.unwrap());
-        let cancellation = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let cancellation = next_initiator_endpoint(&mut transport_rx).await;
         let (cancellation_header, cancellation_offset) =
             rns_wire::header::PacketHeader::unpack(&cancellation.raw).unwrap();
         assert_eq!(
@@ -5385,13 +5550,7 @@ mod tests {
                 total_segments: 1,
             })
         );
-        let inbound_request = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let inbound_request = next_initiator_endpoint(&mut transport_rx).await;
         let (inbound_request_header, inbound_request_offset) =
             rns_wire::header::PacketHeader::unpack(&inbound_request.raw).unwrap();
         assert_eq!(
@@ -5426,13 +5585,7 @@ mod tests {
                 .unwrap();
         }
 
-        let inbound_proof = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let inbound_proof = next_initiator_endpoint(&mut transport_rx).await;
         let (inbound_proof_header, inbound_proof_offset) =
             rns_wire::header::PacketHeader::unpack(&inbound_proof.raw).unwrap();
         assert_eq!(
@@ -5494,13 +5647,7 @@ mod tests {
             .unwrap();
         let rejected_offer = session.resource_offers.recv().await.unwrap();
         assert!(rejected_offer.reject().await.unwrap());
-        let rejection = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let rejection = next_initiator_endpoint(&mut transport_rx).await;
         let (rejection_header, rejection_offset) =
             rns_wire::header::PacketHeader::unpack(&rejection.raw).unwrap();
         assert_eq!(
@@ -5549,15 +5696,9 @@ mod tests {
                 total_segments: 1,
             })
         );
-        let _cancelled_request = transport_rx.recv().await.unwrap();
+        let _cancelled_request = next_initiator_endpoint(&mut transport_rx).await;
         assert!(cancelled_inbound.cancel().await.unwrap());
-        let cancellation = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let cancellation = next_initiator_endpoint(&mut transport_rx).await;
         let (cancellation_header, cancellation_offset) =
             rns_wire::header::PacketHeader::unpack(&cancellation.raw).unwrap();
         assert_eq!(
@@ -5584,13 +5725,7 @@ mod tests {
         );
 
         session.handle.close().await;
-        let close = match transport_rx.recv().await.unwrap() {
-            TransportMessage::OutboundAttached {
-                request,
-                interface_id: 1,
-            } => request,
-            other => panic!("unexpected transport message: {other:?}"),
-        };
+        let close = next_initiator_endpoint(&mut transport_rx).await;
         let (close_header, close_offset) =
             rns_wire::header::PacketHeader::unpack(&close.raw).unwrap();
         assert_eq!(

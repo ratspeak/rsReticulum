@@ -10,6 +10,7 @@ mod interface_registry;
 pub mod jobs;
 pub mod lifecycle;
 pub mod link_client;
+mod link_endpoint;
 pub mod link_manager;
 pub mod link_session;
 pub mod platform;
