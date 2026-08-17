@@ -57,14 +57,27 @@ def check_packages(document: dict[str, object]) -> str:
     return str(versions.pop())
 
 
+def check_workflow_actions() -> None:
+    workflows = ROOT / ".github/workflows"
+    for workflow_path in sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")]):
+        workflow = workflow_path.read_text()
+        action_uses = re.findall(
+            r"^\s*(?:-\s+)?uses:\s+([^\s#]+)", workflow, re.MULTILINE
+        )
+        for action in action_uses:
+            if action.startswith("./"):
+                continue
+            if "@" not in action or not SHA_PATTERN.fullmatch(
+                action.rsplit("@", 1)[1]
+            ):
+                fail(
+                    f"workflow action is not pinned to a commit "
+                    f"({workflow_path.name}): {action}"
+                )
+
+
 def check_release_workflow() -> None:
     workflow = (ROOT / ".github/workflows/release.yml").read_text()
-    action_uses = re.findall(r"^\s*-\s+uses:\s+([^\s#]+)", workflow, re.MULTILINE)
-    for action in action_uses:
-        if action.startswith("./"):
-            continue
-        if "@" not in action or not SHA_PATTERN.fullmatch(action.rsplit("@", 1)[1]):
-            fail(f"release action is not pinned to a commit: {action}")
 
     if not re.search(r"^\s*toolchain:\s*1\.85\.0\s*$", workflow, re.MULTILINE):
         fail("release workflow does not select Rust 1.85.0")
@@ -126,6 +139,7 @@ def main() -> None:
     args = parser.parse_args()
 
     version = check_packages(metadata())
+    check_workflow_actions()
     check_release_workflow()
     check_documentation(version)
     if args.release_tag:
