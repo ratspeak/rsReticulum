@@ -6,7 +6,8 @@ pub mod hash;
 /// rsReticulum package version printed by CLI `--version` output.
 pub const RS_RETICULUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Python Reticulum version these tools track for CLI/protocol parity.
+/// Python Reticulum compatibility floor used by version-specific CLI fixtures.
+/// Current protocol behavior is additionally checked against newer upstream.
 pub const RETICULUM_COMPAT_VERSION: &str = "1.3.8";
 
 /// Python 1.3.2 `[logging] logtimestamps` (Reticulum.py:459-461,

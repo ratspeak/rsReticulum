@@ -7,7 +7,8 @@
 
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![Reticulum 1.3.8](https://img.shields.io/badge/target-Reticulum%201.3.8-success.svg)](https://reticulum.network/)
+[![Compatibility floor: Reticulum 1.3.8](https://img.shields.io/badge/compatibility%20floor-Reticulum%201.3.8-success.svg)](https://reticulum.network/)
+[![Current reference: Reticulum 1.4.2](https://img.shields.io/badge/current%20reference-Reticulum%201.4.2-blue.svg)](https://github.com/markqvist/Reticulum)
 [![Status](https://img.shields.io/badge/status-experimental-yellow.svg)](#feature-status)
 
 [Reticulum Manual](https://reticulum.network/manual/) |
@@ -276,9 +277,13 @@ Most daemon and utility flows are implemented for the public `*-rs` tools:
 `rnsd-rs`, `rnstatus-rs`, `rnpath-rs`, `rnid-rs`, `rnprobe-rs`, `rncp-rs`,
 `rnsh-rs`, and `rnodeconf-rs`.
 
-The current compatibility target is Reticulum 1.3.8 where the matching Rust
-surface is implemented and tested. `rnid-rs` has explicit 1.3.8 coverage for
-the normal identity utility flow.
+The compatibility floor is Reticulum 1.3.8 where the matching Rust surface is
+implemented and tested, including version-specific utility and byte-exact
+fixtures. Current protocol and daemon behavior is also audited and
+interoperability-tested against Reticulum 1.4.2. The older corpus remains
+deliberate backward-compatibility evidence rather than a claim that 1.3.8 is
+the newest upstream. `rnid-rs` has explicit 1.3.8 coverage for the normal
+identity utility flow.
 
 Known gaps and intentional limits:
 
