@@ -4,7 +4,7 @@
 
 - Made source releases reproducible from an existing immutable component tag:
   packages are non-publishable by default, release builds use the committed
-  lockfile and Rust 1.85.0, actions are commit-pinned, and CI verifies the
+  lockfile and Rust 1.87.0, actions are commit-pinned, and CI verifies the
   manifest, changelog, tag, and checkout contract.
 - Isolate exact announce subscriptions from legacy aspect-wide deregistration,
   and resolve finite destination identities through validated recall plus

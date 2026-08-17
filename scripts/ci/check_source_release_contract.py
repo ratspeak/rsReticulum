@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RUST_VERSION = "1.85"
+EXPECTED_RUST_VERSION = "1.87"
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -79,8 +79,8 @@ def check_workflow_actions() -> None:
 def check_release_workflow() -> None:
     workflow = (ROOT / ".github/workflows/release.yml").read_text()
 
-    if not re.search(r"^\s*toolchain:\s*1\.85\.0\s*$", workflow, re.MULTILINE):
-        fail("release workflow does not select Rust 1.85.0")
+    if not re.search(r"^\s*toolchain:\s*1\.87\.0\s*$", workflow, re.MULTILINE):
+        fail("release workflow does not select Rust 1.87.0")
     if "ref: ${{ env.RELEASE_TAG }}" not in workflow:
         fail("release workflow does not check out RELEASE_TAG")
 

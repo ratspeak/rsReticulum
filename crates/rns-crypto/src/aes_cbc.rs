@@ -10,8 +10,7 @@ use thiserror::Error;
 
 const AES_BLOCK_SIZE: usize = 16;
 
-/// Rust 1.85-compatible block alignment check. Newer Clippy suggests
-/// `usize::is_multiple_of`, but that API is not available on our MSRV.
+/// Block alignment check kept explicit at this cryptographic boundary.
 #[inline]
 pub(crate) fn is_nonzero_block_aligned(len: usize) -> bool {
     len != 0 && len % AES_BLOCK_SIZE == 0

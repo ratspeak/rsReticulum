@@ -1,2 +1,2 @@
 # Keep Clippy suggestions aligned with the public MSRV in Cargo.toml.
-msrv = "1.85"
+msrv = "1.87"
