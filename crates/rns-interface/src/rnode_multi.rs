@@ -371,7 +371,7 @@ impl StartupEvidence {
                 if payload.is_empty() {
                     return Ok(());
                 }
-                if payload.len() % 2 != 0 {
+                if !payload.len().is_multiple_of(2) {
                     return Err("RNodeMulti returned a malformed interface list".into());
                 }
                 for pair in payload.chunks_exact(2) {
@@ -1235,7 +1235,7 @@ pub async fn spawn_rnode_multi_interface(
                                         "RNodeMulti radio module reported"
                                     );
                                 }
-                                if frame.len() % 2 != 0 {
+                                if !frame.len().is_multiple_of(2) {
                                     tracing::warn!(
                                         parent = %parent_name,
                                         "RNodeMulti returned a malformed interface list"

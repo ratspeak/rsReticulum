@@ -319,12 +319,12 @@ mod tests {
 
     #[test]
     fn test_jitter_desynchronizes_keepalives() {
-        let links: Vec<KeepaliveState> = (0..20)
+        let links: Vec<KeepaliveState> = (0usize..20)
             .map(|i| {
                 let mut ks = KeepaliveState::new(true);
                 ks.keepalive_interval = Duration::from_secs_f64(KEEPALIVE_MIN);
                 ks.jitter_offset = Duration::from_millis(500);
-                ks.jitter_negative = i % 2 == 0;
+                ks.jitter_negative = i.is_multiple_of(2);
                 // Push last_inbound just past the interval boundary.
                 ks.last_inbound = instant_before_now(ks.keepalive_interval);
                 ks
@@ -333,12 +333,12 @@ mod tests {
 
         let firing: usize = links.iter().filter(|ks| ks.should_send_keepalive()).count();
 
-        let links_past: Vec<KeepaliveState> = (0..20)
+        let links_past: Vec<KeepaliveState> = (0usize..20)
             .map(|i| {
                 let mut ks = KeepaliveState::new(true);
                 ks.keepalive_interval = Duration::from_secs_f64(KEEPALIVE_MIN);
                 ks.jitter_offset = Duration::from_millis(500);
-                ks.jitter_negative = i % 2 == 0;
+                ks.jitter_negative = i.is_multiple_of(2);
                 ks.last_inbound = instant_before_now(Duration::from_secs(6));
                 ks
             })

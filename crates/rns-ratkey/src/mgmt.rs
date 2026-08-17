@@ -44,7 +44,7 @@ fn check(alg: u8, key: &[u8], data: &[u8]) -> Result<(), RatkeyError> {
         )));
     }
     let block = block_len(alg).expect("supported alg has a block size");
-    if data.is_empty() || data.len() % block != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(block) {
         return Err(RatkeyError::InvalidHwid(format!(
             "management-key ECB input not block-aligned: {} bytes (block {block})",
             data.len()

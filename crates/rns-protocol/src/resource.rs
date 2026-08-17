@@ -1736,7 +1736,7 @@ impl OutboundTransfer {
 
             // Python cancels if an exhausted request cursor is not aligned to
             // a hashmap segment boundary.
-            if hashmap_max_len > 0 && part_index % hashmap_max_len != 0 {
+            if hashmap_max_len > 0 && !part_index.is_multiple_of(hashmap_max_len) {
                 self.resource.state = ResourceState::Failed;
                 actions.push(TransferAction::SendCancel(
                     CancelType::Icl,

@@ -13,7 +13,7 @@ const AES_BLOCK_SIZE: usize = 16;
 /// Block alignment check kept explicit at this cryptographic boundary.
 #[inline]
 pub(crate) fn is_nonzero_block_aligned(len: usize) -> bool {
-    len != 0 && len % AES_BLOCK_SIZE == 0
+    len != 0 && len.is_multiple_of(AES_BLOCK_SIZE)
 }
 
 /// Errors surfaced by [`encrypt`] and [`decrypt`].

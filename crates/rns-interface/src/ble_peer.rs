@@ -5210,7 +5210,7 @@ async fn peer_write_loop(
             pace_after_ble_fragment(idx, fragments.len()).await;
         }
         tx_count += 1;
-        if tx_count % 5 == 0 {
+        if tx_count.is_multiple_of(5) {
             tracing::info!(
                 target: "ble_trace",
                 step = "peer.tx_progress",
@@ -6223,7 +6223,7 @@ pub async fn spawn_ble_peer_interface(
                                                     break;
                                                 }
                                                 tx_count += 1;
-                                                if tx_count % 5 == 0 {
+                                                if tx_count.is_multiple_of(5) {
                                                     tracing::info!(
                                                         target: "ble_trace",
                                                         step = "peer.tx_progress",

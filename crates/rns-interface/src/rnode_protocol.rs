@@ -565,7 +565,7 @@ mod tests {
 
         for_each_permutation(values, size - 1, callback);
         for index in 0..(size - 1) {
-            let swap_index = if size % 2 == 0 { index } else { 0 };
+            let swap_index = if size.is_multiple_of(2) { index } else { 0 };
             values.swap(swap_index, size - 1);
             for_each_permutation(values, size - 1, callback);
         }

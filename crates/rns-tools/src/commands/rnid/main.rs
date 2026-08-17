@@ -1882,7 +1882,7 @@ fn encode_base32(bytes: &[u8]) -> String {
         let index = ((buffer << (5 - bits)) & 0x1f) as usize;
         out.push(ALPHABET[index] as char);
     }
-    while out.len() % 8 != 0 {
+    while !out.len().is_multiple_of(8) {
         out.push('=');
     }
     out

@@ -1182,7 +1182,7 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9));
 
         for index in 0..=policy.grace {
-            let listener = if index % 2 == 0 {
+            let listener = if index.is_multiple_of(2) {
                 &first_listener
             } else {
                 &second_listener
