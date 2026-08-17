@@ -11,4 +11,4 @@ default = []
 all = ["rns-runtime/ble", "rns-runtime/rnode-tcp", "rns-runtime/serial"]
 
 [dependencies]
-rns-runtime = { path = "../crates/rns-runtime", default-features = false }
+rns-runtime = { path = "../../crates/rns-runtime", default-features = false }

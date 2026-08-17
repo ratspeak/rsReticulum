@@ -21,7 +21,29 @@
   "snapshotSource": {
     "commit": "51763a97dcd3d348ce3e3c44c86da089cc895ea6",
     "capturedOn": "2026-08-17",
-    "changeRecord": "api-reviews/wave-c-application-prelude.json"
+    "review": {
+      "areas": [
+        "runtime application facade",
+        "identity and destination construction",
+        "announces and destination resolution",
+        "packets, receipts, Links, requests, Channels, and Resources",
+        "interface lifecycle and RNode observation"
+      ],
+      "canonicalPath": "rns_runtime::prelude",
+      "classification": "existing candidate application facade",
+      "publicApiDiff": {
+        "added": 0,
+        "removed": 0
+      },
+      "semver": "no version consequence; documentation, fixtures, and compatibility tooling only",
+      "deprecations": "none",
+      "wirePersistenceRuntimeImpact": "none",
+      "platformEvidence": [
+        "compiled application examples and external canonical and legacy fixtures",
+        "stable and Rust 1.87 strict Clippy",
+        "downstream desktop and mobile product gates"
+      ]
+    }
   },
   "packages": [
     {
@@ -29,7 +51,7 @@
       "manifestPath": "Cargo.toml",
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
-      "snapshot": "api-baseline/rns-crypto.txt",
+      "snapshot": "api/snapshots/rns-crypto.txt",
       "itemCount": 91,
       "sha256": "4d1e3c0a13e48a84f2510c6586024b3d8f5781b367459bc17d714ca485f1aa63"
     },
@@ -38,7 +60,7 @@
       "manifestPath": "Cargo.toml",
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
-      "snapshot": "api-baseline/rns-wire.txt",
+      "snapshot": "api/snapshots/rns-wire.txt",
       "itemCount": 369,
       "sha256": "e82cf03eeed3f13ccde7fda8d87e58de0a9403a98860f8c576d84922ef2336c9"
     },
@@ -47,7 +69,7 @@
       "manifestPath": "Cargo.toml",
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
-      "snapshot": "api-baseline/rns-identity.txt",
+      "snapshot": "api/snapshots/rns-identity.txt",
       "itemCount": 374,
       "sha256": "f2b692070a3fa1a2cc98edbb40bc75d205daadfa9da9d9994ee194e8436e00c9"
     },
@@ -56,7 +78,7 @@
       "manifestPath": "Cargo.toml",
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
-      "snapshot": "api-baseline/rns-transport.txt",
+      "snapshot": "api/snapshots/rns-transport.txt",
       "itemCount": 1574,
       "sha256": "d4377c893fe8a140a6c3d154f4a4f1004756856ccf462127c8bcc7c096b406ec"
     },
@@ -65,7 +87,7 @@
       "manifestPath": "Cargo.toml",
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
-      "snapshot": "api-baseline/rns-link.txt",
+      "snapshot": "api/snapshots/rns-link.txt",
       "itemCount": 358,
       "sha256": "9fe7901e33a3c5b4adc6492751187cdb48cd31f564a425a249d6f8831319b3ca"
     },
@@ -74,7 +96,7 @@
       "manifestPath": "Cargo.toml",
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
-      "snapshot": "api-baseline/rns-protocol.txt",
+      "snapshot": "api/snapshots/rns-protocol.txt",
       "itemCount": 623,
       "sha256": "fc12a8e4a0b457f2391308573c194b4633a2041d10ec9ae03247491b5b162aa1"
     },
@@ -83,7 +105,7 @@
       "manifestPath": "Cargo.toml",
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
-      "snapshot": "api-baseline/rns-interface.txt",
+      "snapshot": "api/snapshots/rns-interface.txt",
       "itemCount": 1405,
       "sha256": "362144086c716b98383543912e7bed1e8281709de07957aeb89af1c40eb371e7"
     },
@@ -92,7 +114,7 @@
       "manifestPath": "Cargo.toml",
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
-      "snapshot": "api-baseline/rns-runtime.txt",
+      "snapshot": "api/snapshots/rns-runtime.txt",
       "itemCount": 1994,
       "sha256": "8bcad2034f13b8edd6fa0d3583988674765eb0b12ff9ec6b6863f72f2f18cf6c"
     },
@@ -101,7 +123,7 @@
       "manifestPath": "Cargo.toml",
       "tier": "tool-internal",
       "compatibility": "reviewed-snapshot",
-      "snapshot": "api-baseline/rns-tools.txt",
+      "snapshot": "api/snapshots/rns-tools.txt",
       "itemCount": 15,
       "sha256": "662566afbf8a21928529a33dcec4a23b0a4686e9b2d94a7721b111738a5b4a6b"
     },
@@ -110,7 +132,7 @@
       "manifestPath": "Cargo.toml",
       "tier": "experimental",
       "compatibility": "reviewed-snapshot",
-      "snapshot": "api-baseline/rns-ratkey.txt",
+      "snapshot": "api/snapshots/rns-ratkey.txt",
       "itemCount": 618,
       "sha256": "f2ab796d37f18d7d5d7a515e4b6c28900f6f1c214aec4142fed069275793fdfd"
     }

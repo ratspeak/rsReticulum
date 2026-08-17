@@ -30,7 +30,7 @@ rsReticulum can live beside other Reticulum tools on `PATH` without worry.
 ## Contents
 
 - [Build It](#build-it)
-- [Application API](APPLICATION_API.md)
+- [Rust API](api/README.md)
 - [Tool Usage](#tool-usage)
 - [Configuration](#configuration)
 - [Interface Support](#interface-support)

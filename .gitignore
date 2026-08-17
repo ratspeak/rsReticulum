@@ -9,4 +9,4 @@ proptest-regressions/
 /tools/*
 !/tools/check-api-manifest.py
 !/tools/check-api-compatibility.py
-/api-fixtures/target/
+/api/fixtures/target/
