@@ -51,7 +51,7 @@ Build the tools:
 
 ```bash
 cd rsReticulum
-cargo build --release
+cargo build --release --locked
 ```
 
 ### Linux, Raspberry Pi, and VPS Hosts
@@ -81,7 +81,7 @@ sudo pacman -S --needed base-devel pkgconf
 
 ```bash
 cd rsReticulum
-cargo build --release
+cargo build --release --locked
 ```
 
 ### Windows
@@ -93,7 +93,7 @@ Build from PowerShell:
 
 ```powershell
 cd rsReticulum
-cargo build --release
+cargo build --release --locked
 ```
 
 After the build, use the commands below with `./target/release/<tool>` on

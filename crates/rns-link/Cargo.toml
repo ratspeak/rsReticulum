@@ -1,6 +1,7 @@
 [package]
 name = "rns-link"
 description = "Link layer and encrypted channel for Reticulum"
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

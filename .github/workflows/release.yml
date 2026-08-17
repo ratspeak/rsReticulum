@@ -19,8 +19,22 @@ env:
   RETICULUM_BINS: rnsd-rs rnstatus-rs rnpath-rs rnid-rs rnprobe-rs rncp-rs rnsh-rs rnodeconf-rs
 
 jobs:
+  verify:
+    name: Verify release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.85.0
+      - run: python3 scripts/ci/check_source_release_contract.py --release-tag "${RELEASE_TAG}"
+
   build:
     name: Build ${{ matrix.artifact_suffix }}
+    needs: verify
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -39,18 +53,20 @@ jobs:
     env:
       ARCHIVE_NAME: rsReticulum-${{ github.event.inputs.tag_name || github.ref_name }}-${{ matrix.artifact_suffix }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ env.RELEASE_TAG }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.85.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: false
       - name: Install system deps (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config
       - name: Build release binaries
-        run: cargo build -p rns-tools --release --bins
+        run: cargo build -p rns-tools --release --bins --locked
       - name: Stage archive contents
         shell: bash
         run: |
@@ -63,7 +79,7 @@ jobs:
               cp "target/release/${bin}" "dist/${PACKAGE_ROOT}/bin/${bin}"
             fi
           done
-          cp README.md LICENSE "dist/${PACKAGE_ROOT}/"
+          cp README.md LICENSE CHANGELOG.md RELEASING.md "dist/${PACKAGE_ROOT}/"
       - name: Create tar archive
         if: runner.os != 'Windows'
         shell: bash
@@ -72,7 +88,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: Compress-Archive -Path "dist/${env:PACKAGE_ROOT}" -DestinationPath "${env:ARCHIVE_NAME}.zip" -Force
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: |
@@ -87,14 +103,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: release-assets
           merge-multiple: true
       - name: Generate checksums
         working-directory: release-assets
         run: sha256sum * > SHA256SUMS
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           prerelease: ${{ contains(env.RELEASE_TAG, '-') }}

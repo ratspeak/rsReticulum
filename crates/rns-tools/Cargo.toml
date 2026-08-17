@@ -1,6 +1,7 @@
 [package]
 name = "rns-tools"
 description = "Rust CLI utilities for Reticulum (rnsd-rs, rnstatus-rs, etc.)"
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

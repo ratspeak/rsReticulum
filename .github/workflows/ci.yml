@@ -46,6 +46,8 @@ jobs:
           components: clippy, rustfmt
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev libpcsclite-dev pkg-config
+      - name: Check source-release contract
+        run: python3 scripts/ci/check_source_release_contract.py
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Check public API documentation
