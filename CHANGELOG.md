@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.2.0 - 2026-08-17
+
 - Designated the existing `rns_runtime::prelude` and compiled examples as the
   canonical application spine while retaining every module-qualified path,
   and added external-consumer, manifest/feature, and additions-only API
@@ -39,6 +41,8 @@
   discovery.
 - Keep completed `rncp` Links alive for Python's receiver-side Resource
   conclusion callback before sending the authenticated teardown.
+- This source line includes application and runtime API evolution since 1.1.0;
+  downstream integrations should qualify against the 1.2 dependency line.
 
 ## 1.1.0 - 2026-07-26
 
