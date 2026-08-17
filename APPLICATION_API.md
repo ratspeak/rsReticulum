@@ -11,17 +11,28 @@ announces, packets and receipts, persistent Links, requests, Channels, Buffer
 streams, Resources, and RNode observation.
 
 ```rust
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use rns_runtime::prelude::*;
 
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let runtime = init().await?;
-let identity = Identity::new();
+#[tokio::main]
+async fn main() -> Result<(), ReticulumError> {
+    let shutdown = ShutdownSignal::new();
+    let runtime = init(
+        None,
+        None,
+        shutdown,
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await?;
+    let identity = Identity::new();
 
-// Application work owns `runtime`; shutdown is explicit and awaitable.
-runtime.shutdown().await;
-# let _ = identity;
-# Ok(())
-# }
+    // Application work owns `runtime`; shutdown is explicit and awaitable.
+    runtime.shutdown_and_wait().await;
+    drop(identity);
+    Ok(())
+}
 ```
 
 Finite destination discovery uses `resolve_destination_on_transport` with one
