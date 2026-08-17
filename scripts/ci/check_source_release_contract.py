@@ -142,6 +142,11 @@ def main() -> None:
     check_workflow_actions()
     check_release_workflow()
     check_documentation(version)
+    subprocess.run(
+        ["python3", "tools/check-api-baseline.py", "--metadata-only"],
+        cwd=ROOT,
+        check=True,
+    )
     if args.release_tag:
         check_release_tag(args.release_tag, version)
     print(f"source-release contract passed for rsReticulum {version}")

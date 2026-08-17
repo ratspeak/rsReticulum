@@ -1,0 +1,15 @@
+pub mod rns_tools
+pub mod rns_tools::format
+pub fn rns_tools::format::hex_rep(&[u8]) -> alloc::string::String
+pub fn rns_tools::format::pretty_frequency(f64) -> alloc::string::String
+pub fn rns_tools::format::pretty_hex_rep(&[u8]) -> alloc::string::String
+pub fn rns_tools::format::pretty_size(u64) -> alloc::string::String
+pub fn rns_tools::format::pretty_speed(u64) -> alloc::string::String
+pub fn rns_tools::format::pretty_time(f64) -> alloc::string::String
+pub mod rns_tools::hash
+pub fn rns_tools::hash::format_dest_hash(&[u8; 16]) -> alloc::string::String
+pub fn rns_tools::hash::parse_dest_hash(&str) -> core::result::Result<[u8; 16], alloc::string::String>
+pub const rns_tools::RETICULUM_COMPAT_VERSION: &str
+pub const rns_tools::RS_RETICULUM_VERSION: &str
+pub fn rns_tools::config_log_timestamps(&std::path::Path) -> bool
+pub fn rns_tools::init_tracing<W>(tracing_core::metadata::Level, bool, bool, W) where W: for<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> + core::marker::Send + core::marker::Sync + 'static

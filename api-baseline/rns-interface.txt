@@ -1,0 +1,1405 @@
+pub mod rns_interface
+pub mod rns_interface::auto
+pub enum rns_interface::auto::AutoInterfaceEvent
+pub rns_interface::auto::AutoInterfaceEvent::CarrierState
+pub rns_interface::auto::AutoInterfaceEvent::CarrierState::ifname: alloc::string::String
+pub rns_interface::auto::AutoInterfaceEvent::CarrierState::interface_name: alloc::string::String
+pub rns_interface::auto::AutoInterfaceEvent::CarrierState::ok: bool
+pub rns_interface::auto::AutoInterfaceEvent::CarrierState::reason: alloc::string::String
+pub rns_interface::auto::AutoInterfaceEvent::JoinFailed
+pub rns_interface::auto::AutoInterfaceEvent::JoinFailed::ifname: alloc::string::String
+pub rns_interface::auto::AutoInterfaceEvent::JoinFailed::interface_name: alloc::string::String
+pub rns_interface::auto::AutoInterfaceEvent::JoinFailed::reason: alloc::string::String
+pub enum rns_interface::auto::DiscoveryScope
+pub rns_interface::auto::DiscoveryScope::Admin
+pub rns_interface::auto::DiscoveryScope::Global
+pub rns_interface::auto::DiscoveryScope::Link
+pub rns_interface::auto::DiscoveryScope::Organisation
+pub rns_interface::auto::DiscoveryScope::Site
+impl rns_interface::auto::DiscoveryScope
+pub const fn rns_interface::auto::DiscoveryScope::as_hex_nibble(self) -> u8
+impl core::fmt::Display for rns_interface::auto::DiscoveryScope
+pub fn rns_interface::auto::DiscoveryScope::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for rns_interface::auto::DiscoveryScope
+pub type rns_interface::auto::DiscoveryScope::Err = alloc::string::String
+pub fn rns_interface::auto::DiscoveryScope::from_str(&str) -> core::result::Result<Self, Self::Err>
+pub enum rns_interface::auto::McastAddrType
+pub rns_interface::auto::McastAddrType::Permanent
+pub rns_interface::auto::McastAddrType::Temporary
+impl rns_interface::auto::McastAddrType
+pub const fn rns_interface::auto::McastAddrType::as_hex_nibble(self) -> u8
+impl core::fmt::Display for rns_interface::auto::McastAddrType
+pub fn rns_interface::auto::McastAddrType::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for rns_interface::auto::McastAddrType
+pub type rns_interface::auto::McastAddrType::Err = alloc::string::String
+pub fn rns_interface::auto::McastAddrType::from_str(&str) -> core::result::Result<Self, Self::Err>
+pub struct rns_interface::auto::AutoInterfaceConfig
+pub rns_interface::auto::AutoInterfaceConfig::configured_bitrate: core::option::Option<u64>
+pub rns_interface::auto::AutoInterfaceConfig::data_port: u16
+pub rns_interface::auto::AutoInterfaceConfig::devices: core::option::Option<alloc::vec::Vec<alloc::string::String>>
+pub rns_interface::auto::AutoInterfaceConfig::discovery_port: u16
+pub rns_interface::auto::AutoInterfaceConfig::discovery_scope: rns_interface::auto::DiscoveryScope
+pub rns_interface::auto::AutoInterfaceConfig::group_id: alloc::string::String
+pub rns_interface::auto::AutoInterfaceConfig::ignored_devices: alloc::vec::Vec<alloc::string::String>
+pub rns_interface::auto::AutoInterfaceConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::auto::AutoInterfaceConfig::multicast_address_type: rns_interface::auto::McastAddrType
+pub rns_interface::auto::AutoInterfaceConfig::name: alloc::string::String
+impl core::default::Default for rns_interface::auto::AutoInterfaceConfig
+pub fn rns_interface::auto::AutoInterfaceConfig::default() -> Self
+pub struct rns_interface::auto::MultiIfDedup
+impl rns_interface::auto::MultiIfDedup
+pub fn rns_interface::auto::MultiIfDedup::is_duplicate(&mut self, &[u8]) -> bool
+pub fn rns_interface::auto::MultiIfDedup::new() -> Self
+impl core::default::Default for rns_interface::auto::MultiIfDedup
+pub fn rns_interface::auto::MultiIfDedup::default() -> Self
+pub struct rns_interface::auto::NetworkInterfaceInfo
+pub rns_interface::auto::NetworkInterfaceInfo::addr_v4: core::option::Option<alloc::string::String>
+pub rns_interface::auto::NetworkInterfaceInfo::addr_v6_link_local: core::option::Option<alloc::string::String>
+pub rns_interface::auto::NetworkInterfaceInfo::is_loopback: bool
+pub rns_interface::auto::NetworkInterfaceInfo::is_up: bool
+pub rns_interface::auto::NetworkInterfaceInfo::name: alloc::string::String
+pub const rns_interface::auto::BEACON_INTERVAL: f64
+pub const rns_interface::auto::BEACON_INTERVAL_BG: f64
+pub const rns_interface::auto::DATA_PORT: u16
+pub const rns_interface::auto::DEFAULT_GROUP_ID: &str
+pub const rns_interface::auto::DISCOVERY_PORT: u16
+pub const rns_interface::auto::FIXED_MTU: bool
+pub const rns_interface::auto::HW_MTU: u32
+pub const rns_interface::auto::MCAST_ECHO_TIMEOUT: f64
+pub const rns_interface::auto::MULTI_IF_DEQUE_LEN: usize
+pub const rns_interface::auto::MULTI_IF_DEQUE_TTL: f64
+pub const rns_interface::auto::PEER_EXPIRY: f64
+pub const rns_interface::auto::PEER_JOB_INTERVAL: f64
+pub const rns_interface::auto::REVERSE_PEERING_INTERVAL: f64
+pub const rns_interface::auto::UNICAST_DISCOVERY_PORT: u16
+pub fn rns_interface::auto::derive_multicast_address(&str, rns_interface::auto::DiscoveryScope, rns_interface::auto::McastAddrType) -> core::net::ip_addr::Ipv6Addr
+pub fn rns_interface::auto::list_network_interfaces() -> core::result::Result<alloc::vec::Vec<rns_interface::auto::NetworkInterfaceInfo>, alloc::string::String>
+pub fn rns_interface::auto::multicast_group_for(&str) -> core::net::ip_addr::Ipv6Addr
+pub async fn rns_interface::auto::spawn_auto_interface(rns_interface::auto::AutoInterfaceConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, alloc::sync::Arc<core::sync::atomic::AtomicBool>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub fn rns_interface::auto::subscribe_auto_events() -> tokio::sync::broadcast::Receiver<rns_interface::auto::AutoInterfaceEvent>
+pub fn rns_interface::auto::verify_beacon(&[u8], &str, &core::net::ip_addr::Ipv6Addr) -> bool
+pub mod rns_interface::ax25kiss
+pub struct rns_interface::ax25kiss::AX25KISSConfig
+pub rns_interface::ax25kiss::AX25KISSConfig::baud_rate: u32
+pub rns_interface::ax25kiss::AX25KISSConfig::data_bits: u8
+pub rns_interface::ax25kiss::AX25KISSConfig::dst_call: alloc::string::String
+pub rns_interface::ax25kiss::AX25KISSConfig::dst_ssid: u8
+pub rns_interface::ax25kiss::AX25KISSConfig::flow_control: bool
+pub rns_interface::ax25kiss::AX25KISSConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::ax25kiss::AX25KISSConfig::name: alloc::string::String
+pub rns_interface::ax25kiss::AX25KISSConfig::parity: alloc::string::String
+pub rns_interface::ax25kiss::AX25KISSConfig::persistence: u8
+pub rns_interface::ax25kiss::AX25KISSConfig::port: alloc::string::String
+pub rns_interface::ax25kiss::AX25KISSConfig::preamble: u16
+pub rns_interface::ax25kiss::AX25KISSConfig::slottime: u16
+pub rns_interface::ax25kiss::AX25KISSConfig::src_call: alloc::string::String
+pub rns_interface::ax25kiss::AX25KISSConfig::src_ssid: u8
+pub rns_interface::ax25kiss::AX25KISSConfig::stop_bits: u8
+pub rns_interface::ax25kiss::AX25KISSConfig::txtail: u16
+impl rns_interface::ax25kiss::AX25KISSConfig
+pub fn rns_interface::ax25kiss::AX25KISSConfig::new(&str, &str, &str, u8) -> Self
+pub fn rns_interface::ax25kiss::AX25KISSConfig::validate(&self) -> core::result::Result<(), alloc::string::String>
+pub const rns_interface::ax25kiss::AX25_CTRL_UI: u8
+pub const rns_interface::ax25kiss::AX25_HEADER_SIZE: usize
+pub const rns_interface::ax25kiss::AX25_PID_NOLAYER3: u8
+pub const rns_interface::ax25kiss::BITRATE_GUESS: u64
+pub const rns_interface::ax25kiss::DEFAULT_DST_CALL: &[u8]
+pub const rns_interface::ax25kiss::DEFAULT_DST_SSID: u8
+pub const rns_interface::ax25kiss::HW_MTU: u16
+pub fn rns_interface::ax25kiss::build_ax25_header(&[u8], u8, &[u8], u8) -> [u8; 16]
+pub fn rns_interface::ax25kiss::build_ax25_kiss_init(&rns_interface::ax25kiss::AX25KISSConfig) -> alloc::vec::Vec<u8>
+pub fn rns_interface::ax25kiss::frame_ax25_kiss(&[u8], &[u8], u8, &[u8], u8) -> alloc::vec::Vec<u8>
+pub fn rns_interface::ax25kiss::parse_callsign_ssid(&str) -> core::result::Result<(alloc::string::String, u8), alloc::string::String>
+pub async fn rns_interface::ax25kiss::spawn_ax25kiss_interface(rns_interface::ax25kiss::AX25KISSConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub fn rns_interface::ax25kiss::strip_ax25_header(&[u8]) -> core::option::Option<&[u8]>
+pub mod rns_interface::backbone
+pub struct rns_interface::backbone::BackboneClientConfig
+pub rns_interface::backbone::BackboneClientConfig::connect_timeout_secs: u64
+pub rns_interface::backbone::BackboneClientConfig::max_reconnect_tries: core::option::Option<usize>
+pub rns_interface::backbone::BackboneClientConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::backbone::BackboneClientConfig::name: alloc::string::String
+pub rns_interface::backbone::BackboneClientConfig::prefer_ipv6: bool
+pub rns_interface::backbone::BackboneClientConfig::target_host: alloc::string::String
+pub rns_interface::backbone::BackboneClientConfig::target_port: u16
+impl rns_interface::backbone::BackboneClientConfig
+pub fn rns_interface::backbone::BackboneClientConfig::new(&str, &str, u16) -> Self
+pub struct rns_interface::backbone::BackboneServerConfig
+pub rns_interface::backbone::BackboneServerConfig::block_fast_flapping: bool
+pub rns_interface::backbone::BackboneServerConfig::device: core::option::Option<alloc::string::String>
+pub rns_interface::backbone::BackboneServerConfig::fast_flapping_block_time: core::time::Duration
+pub rns_interface::backbone::BackboneServerConfig::fast_flapping_grace: u64
+pub rns_interface::backbone::BackboneServerConfig::fast_flapping_threshold: core::time::Duration
+pub rns_interface::backbone::BackboneServerConfig::listen_ip: alloc::string::String
+pub rns_interface::backbone::BackboneServerConfig::listen_port: u16
+pub rns_interface::backbone::BackboneServerConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::backbone::BackboneServerConfig::name: alloc::string::String
+pub rns_interface::backbone::BackboneServerConfig::prefer_ipv6: bool
+impl rns_interface::backbone::BackboneServerConfig
+pub fn rns_interface::backbone::BackboneServerConfig::new(&str, &str, u16) -> Self
+pub const rns_interface::backbone::BITRATE_GUESS: u64
+pub const rns_interface::backbone::BLOCK_FAST_FLAPPING: bool
+pub const rns_interface::backbone::CHILD_BITRATE_GUESS: u64
+pub const rns_interface::backbone::FAST_FLAPPING_BLOCK_TIME: core::time::Duration
+pub const rns_interface::backbone::FAST_FLAPPING_GRACE: u64
+pub const rns_interface::backbone::FAST_FLAPPING_THRESHOLD: core::time::Duration
+pub const rns_interface::backbone::HW_MTU: u32
+pub const rns_interface::backbone::INITIAL_CONNECT_TIMEOUT: u64
+pub const rns_interface::backbone::RECONNECT_WAIT: u64
+pub const rns_interface::backbone::TCP_PROBES: u32
+pub const rns_interface::backbone::TCP_PROBE_AFTER: u32
+pub const rns_interface::backbone::TCP_PROBE_INTERVAL: u32
+pub const rns_interface::backbone::TCP_USER_TIMEOUT: u32
+pub async fn rns_interface::backbone::spawn_backbone_client(rns_interface::backbone::BackboneClientConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub async fn rns_interface::backbone::spawn_backbone_server(rns_interface::backbone::BackboneServerConfig, rns_interface::traits::InterfaceId, alloc::sync::Arc<core::sync::atomic::AtomicU64>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Sender<rns_interface::traits::InterfaceHandle>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub mod rns_interface::ble_central_apple
+pub fn rns_interface::ble_central_apple::central_manager_ptr() -> core::option::Option<*mut objc2::runtime::AnyObject>
+pub fn rns_interface::ble_central_apple::current_state() -> rns_interface::ble_central_lifecycle::CentralState
+pub async fn rns_interface::ble_central_apple::start_scan(alloc::vec::Vec<uuid::Uuid>) -> core::result::Result<tokio::sync::mpsc::unbounded::UnboundedReceiver<rns_interface::ble_central_lifecycle::DiscoveryEvent>, alloc::string::String>
+pub async fn rns_interface::ble_central_apple::stop_scan() -> core::result::Result<(), alloc::string::String>
+pub async fn rns_interface::ble_central_apple::teardown_central() -> core::result::Result<(), alloc::string::String>
+pub mod rns_interface::ble_central_apple_connect
+pub enum rns_interface::ble_central_apple_connect::DisconnectReason
+pub rns_interface::ble_central_apple_connect::DisconnectReason::OtherError
+pub rns_interface::ble_central_apple_connect::DisconnectReason::Rotation
+pub struct rns_interface::ble_central_apple_connect::ConnectedPeer
+pub rns_interface::ble_central_apple_connect::ConnectedPeer::address: alloc::string::String
+pub rns_interface::ble_central_apple_connect::ConnectedPeer::online: alloc::sync::Arc<core::sync::atomic::AtomicBool>
+pub rns_interface::ble_central_apple_connect::ConnectedPeer::protocol: rns_interface::ble_peer::PeerProtocol
+pub rns_interface::ble_central_apple_connect::ConnectedPeer::write_mtu: usize
+impl core::ops::drop::Drop for rns_interface::ble_central_apple_connect::ConnectedPeer
+pub fn rns_interface::ble_central_apple_connect::ConnectedPeer::drop(&mut self)
+pub const rns_interface::ble_central_apple_connect::CONNECT_TIMEOUT: core::time::Duration
+pub const rns_interface::ble_central_apple_connect::DISCOVERY_TIMEOUT: core::time::Duration
+pub unsafe fn rns_interface::ble_central_apple_connect::adopt_restored_peer(alloc::string::String, *mut objc2::runtime::AnyObject) -> core::result::Result<(), alloc::string::String>
+pub async fn rns_interface::ble_central_apple_connect::connect_peer(alloc::string::String, rns_interface::ble_peer::PeerProtocol) -> core::result::Result<alloc::sync::Arc<rns_interface::ble_central_apple_connect::ConnectedPeer>, alloc::string::String>
+pub fn rns_interface::ble_central_apple_connect::disconnect_all()
+pub fn rns_interface::ble_central_apple_connect::disconnect_peer(&str)
+pub fn rns_interface::ble_central_apple_connect::is_connected(&str) -> bool
+pub fn rns_interface::ble_central_apple_connect::on_app_did_become_active()
+pub fn rns_interface::ble_central_apple_connect::on_app_will_resign_active()
+pub fn rns_interface::ble_central_apple_connect::on_did_connect(&str)
+pub fn rns_interface::ble_central_apple_connect::on_did_disconnect(&str, core::option::Option<alloc::string::String>)
+pub fn rns_interface::ble_central_apple_connect::on_did_fail_connect(&str, alloc::string::String)
+pub fn rns_interface::ble_central_apple_connect::prune_discovered()
+pub unsafe fn rns_interface::ble_central_apple_connect::record_discovered(alloc::string::String, *mut objc2::runtime::AnyObject)
+pub fn rns_interface::ble_central_apple_connect::take_last_disconnect_reason(&str) -> core::option::Option<rns_interface::ble_central_apple_connect::DisconnectReason>
+pub fn rns_interface::ble_central_apple_connect::write_peer(&str, &[u8]) -> core::result::Result<(), alloc::string::String>
+pub mod rns_interface::ble_central_lifecycle
+pub enum rns_interface::ble_central_lifecycle::AdvertisedProtocol
+pub rns_interface::ble_central_lifecycle::AdvertisedProtocol::Columba
+pub rns_interface::ble_central_lifecycle::AdvertisedProtocol::Ratspeak
+pub enum rns_interface::ble_central_lifecycle::CentralEvent
+pub rns_interface::ble_central_lifecycle::CentralEvent::FatalError
+pub rns_interface::ble_central_lifecycle::CentralEvent::FatalError::reason: alloc::string::String
+pub rns_interface::ble_central_lifecycle::CentralEvent::PlatformReady
+pub rns_interface::ble_central_lifecycle::CentralEvent::PlatformUnavailable
+pub rns_interface::ble_central_lifecycle::CentralEvent::PlatformUnavailable::reason: alloc::string::String
+pub rns_interface::ble_central_lifecycle::CentralEvent::Reset
+pub rns_interface::ble_central_lifecycle::CentralEvent::ScanStopped
+pub rns_interface::ble_central_lifecycle::CentralEvent::StartRequested
+pub rns_interface::ble_central_lifecycle::CentralEvent::StopRequested
+pub enum rns_interface::ble_central_lifecycle::CentralState
+pub rns_interface::ble_central_lifecycle::CentralState::Failed
+pub rns_interface::ble_central_lifecycle::CentralState::Idle
+pub rns_interface::ble_central_lifecycle::CentralState::Scanning
+pub rns_interface::ble_central_lifecycle::CentralState::StartingWaitingPlatform
+pub rns_interface::ble_central_lifecycle::CentralState::Stopped
+pub rns_interface::ble_central_lifecycle::CentralState::StoppingScan
+impl rns_interface::ble_central_lifecycle::CentralState
+pub fn rns_interface::ble_central_lifecycle::CentralState::is_active(self) -> bool
+pub fn rns_interface::ble_central_lifecycle::CentralState::is_scanning(self) -> bool
+pub fn rns_interface::ble_central_lifecycle::CentralState::is_starting(self) -> bool
+pub fn rns_interface::ble_central_lifecycle::CentralState::is_stopping(self) -> bool
+pub struct rns_interface::ble_central_lifecycle::CentralLifecycle
+impl rns_interface::ble_central_lifecycle::CentralLifecycle
+pub fn rns_interface::ble_central_lifecycle::CentralLifecycle::apply(&self, rns_interface::ble_central_lifecycle::CentralEvent) -> core::result::Result<rns_interface::ble_central_lifecycle::CentralState, rns_interface::ble_central_lifecycle::CentralTransitionError>
+pub fn rns_interface::ble_central_lifecycle::CentralLifecycle::current(&self) -> rns_interface::ble_central_lifecycle::CentralState
+pub fn rns_interface::ble_central_lifecycle::CentralLifecycle::is_scanning(&self) -> bool
+pub fn rns_interface::ble_central_lifecycle::CentralLifecycle::new() -> Self
+impl core::default::Default for rns_interface::ble_central_lifecycle::CentralLifecycle
+pub fn rns_interface::ble_central_lifecycle::CentralLifecycle::default() -> Self
+impl core::fmt::Debug for rns_interface::ble_central_lifecycle::CentralLifecycle
+pub fn rns_interface::ble_central_lifecycle::CentralLifecycle::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct rns_interface::ble_central_lifecycle::CentralTransitionError
+pub rns_interface::ble_central_lifecycle::CentralTransitionError::event: rns_interface::ble_central_lifecycle::CentralEvent
+pub rns_interface::ble_central_lifecycle::CentralTransitionError::from: rns_interface::ble_central_lifecycle::CentralState
+impl core::error::Error for rns_interface::ble_central_lifecycle::CentralTransitionError
+impl core::fmt::Display for rns_interface::ble_central_lifecycle::CentralTransitionError
+pub fn rns_interface::ble_central_lifecycle::CentralTransitionError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct rns_interface::ble_central_lifecycle::DiscoveryEvent
+pub rns_interface::ble_central_lifecycle::DiscoveryEvent::identifier: alloc::string::String
+pub rns_interface::ble_central_lifecycle::DiscoveryEvent::protocol: rns_interface::ble_central_lifecycle::AdvertisedProtocol
+pub rns_interface::ble_central_lifecycle::DiscoveryEvent::rssi: i16
+pub rns_interface::ble_central_lifecycle::DiscoveryEvent::seen_at: std::time::Instant
+pub rns_interface::ble_central_lifecycle::DiscoveryEvent::services: alloc::vec::Vec<uuid::Uuid>
+pub fn rns_interface::ble_central_lifecycle::classify_protocol(&[uuid::Uuid], uuid::Uuid, uuid::Uuid) -> core::option::Option<rns_interface::ble_central_lifecycle::AdvertisedProtocol>
+pub fn rns_interface::ble_central_lifecycle::transition(rns_interface::ble_central_lifecycle::CentralState, &rns_interface::ble_central_lifecycle::CentralEvent) -> core::result::Result<rns_interface::ble_central_lifecycle::CentralState, rns_interface::ble_central_lifecycle::CentralTransitionError>
+pub mod rns_interface::ble_peer
+pub enum rns_interface::ble_peer::BlePeerEvent
+pub rns_interface::ble_peer::BlePeerEvent::Connected
+pub rns_interface::ble_peer::BlePeerEvent::Connected::address: alloc::string::String
+pub rns_interface::ble_peer::BlePeerEvent::Connected::identity_hash: alloc::string::String
+pub rns_interface::ble_peer::BlePeerEvent::Connected::protocol: rns_interface::ble_peer::PeerProtocol
+pub rns_interface::ble_peer::BlePeerEvent::Disconnected
+pub rns_interface::ble_peer::BlePeerEvent::Disconnected::address: alloc::string::String
+pub rns_interface::ble_peer::BlePeerEvent::Disconnected::reason: alloc::string::String
+pub rns_interface::ble_peer::BlePeerEvent::Discovered
+pub rns_interface::ble_peer::BlePeerEvent::Discovered::address: alloc::string::String
+pub rns_interface::ble_peer::BlePeerEvent::Discovered::protocol: rns_interface::ble_peer::PeerProtocol
+pub rns_interface::ble_peer::BlePeerEvent::Discovered::rssi: i16
+pub rns_interface::ble_peer::BlePeerEvent::IdentityResolved
+pub rns_interface::ble_peer::BlePeerEvent::IdentityResolved::address: alloc::string::String
+pub rns_interface::ble_peer::BlePeerEvent::IdentityResolved::identity_hash: alloc::string::String
+pub rns_interface::ble_peer::BlePeerEvent::PeripheralUnavailable
+pub rns_interface::ble_peer::BlePeerEvent::PeripheralUnavailable::reason: alloc::string::String
+pub rns_interface::ble_peer::BlePeerEvent::RssiUpdate
+pub rns_interface::ble_peer::BlePeerEvent::RssiUpdate::address: alloc::string::String
+pub rns_interface::ble_peer::BlePeerEvent::RssiUpdate::rssi: i16
+pub rns_interface::ble_peer::BlePeerEvent::StatusChanged
+pub rns_interface::ble_peer::BlePeerEvent::StatusChanged::peer_count: usize
+pub rns_interface::ble_peer::BlePeerEvent::StatusChanged::state: rns_interface::ble_peer::PeerState
+pub rns_interface::ble_peer::BlePeerEvent::SubscribeReady
+pub rns_interface::ble_peer::BlePeerEvent::SubscribeReady::address: alloc::string::String
+#[repr(u8)] pub enum rns_interface::ble_peer::FragmentType
+pub rns_interface::ble_peer::FragmentType::Continue = 2
+pub rns_interface::ble_peer::FragmentType::End = 3
+pub rns_interface::ble_peer::FragmentType::Lone = 0
+pub rns_interface::ble_peer::FragmentType::Start = 1
+pub enum rns_interface::ble_peer::PeerProtocol
+pub rns_interface::ble_peer::PeerProtocol::Columba
+pub rns_interface::ble_peer::PeerProtocol::Ratspeak
+pub enum rns_interface::ble_peer::PeerState
+pub rns_interface::ble_peer::PeerState::BluetoothOff
+pub rns_interface::ble_peer::PeerState::Off
+pub rns_interface::ble_peer::PeerState::On
+pub rns_interface::ble_peer::PeerState::PermissionNeeded
+pub rns_interface::ble_peer::PeerState::Starting
+pub rns_interface::ble_peer::PeerState::Unavailable
+pub struct rns_interface::ble_peer::BlePeer
+pub rns_interface::ble_peer::BlePeer::ble_address: alloc::string::String
+pub rns_interface::ble_peer::BlePeer::connected: bool
+pub rns_interface::ble_peer::BlePeer::identity_hash: alloc::string::String
+pub rns_interface::ble_peer::BlePeer::protocol: rns_interface::ble_peer::PeerProtocol
+pub rns_interface::ble_peer::BlePeer::rssi: i16
+pub struct rns_interface::ble_peer::BlePeerConfig
+pub rns_interface::ble_peer::BlePeerConfig::identity_hash: alloc::vec::Vec<u8>
+pub rns_interface::ble_peer::BlePeerConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::ble_peer::BlePeerConfig::name: alloc::string::String
+impl rns_interface::ble_peer::BlePeerConfig
+pub fn rns_interface::ble_peer::BlePeerConfig::new(&str, alloc::vec::Vec<u8>) -> Self
+pub const rns_interface::ble_peer::ANTI_LOOP_TTL: core::time::Duration
+pub const rns_interface::ble_peer::BLE_FRAGMENT_PACING: core::time::Duration
+pub const rns_interface::ble_peer::COLUMBA_ID_UUID: uuid::Uuid
+pub const rns_interface::ble_peer::COLUMBA_RX_UUID: uuid::Uuid
+pub const rns_interface::ble_peer::COLUMBA_SERVICE_UUID: uuid::Uuid
+pub const rns_interface::ble_peer::COLUMBA_TX_UUID: uuid::Uuid
+pub const rns_interface::ble_peer::FRAGMENT_TIMEOUT: core::time::Duration
+pub const rns_interface::ble_peer::KEEPALIVE_INTERVAL: core::time::Duration
+pub const rns_interface::ble_peer::KEEPALIVE_MAX_MISSES: u32
+pub const rns_interface::ble_peer::MAX_FRAGMENTS: u16
+pub const rns_interface::ble_peer::MAX_PEERS: usize
+pub const rns_interface::ble_peer::MIN_RSSI: i16
+pub const rns_interface::ble_peer::PEER_WRITE_TIMEOUT: core::time::Duration
+pub const rns_interface::ble_peer::RATSPEAK_ID_UUID: uuid::Uuid
+pub const rns_interface::ble_peer::RATSPEAK_RX_UUID: uuid::Uuid
+pub const rns_interface::ble_peer::RATSPEAK_SERVICE_UUID: uuid::Uuid
+pub const rns_interface::ble_peer::RATSPEAK_TX_UUID: uuid::Uuid
+pub const rns_interface::ble_peer::RECONNECT_BACKOFF_DURATION: core::time::Duration
+pub const rns_interface::ble_peer::RECONNECT_BACKOFF_FAILURES: u32
+pub const rns_interface::ble_peer::RECONNECT_PRUNE_AFTER: core::time::Duration
+pub const rns_interface::ble_peer::SCAN_ACTIVE_INTERVAL: core::time::Duration
+pub const rns_interface::ble_peer::SCAN_BACKGROUND_INTERVAL: core::time::Duration
+pub const rns_interface::ble_peer::SCAN_IDLE_INTERVAL: core::time::Duration
+pub const rns_interface::ble_peer::TARGET_MTU: u16
+pub fn rns_interface::ble_peer::anti_loop_prune(&rns_interface::ble_peer::AntiLoopMap)
+pub fn rns_interface::ble_peer::anti_loop_record(&rns_interface::ble_peer::AntiLoopMap, alloc::string::String, &[u8])
+pub fn rns_interface::ble_peer::anti_loop_should_send(&rns_interface::ble_peer::AntiLoopMap, &str, &[u8]) -> bool
+pub fn rns_interface::ble_peer::clear_event_dispatcher()
+pub async fn rns_interface::ble_peer::disconnect_mesh_peer(&str)
+pub fn rns_interface::ble_peer::fragment_packet(&[u8], usize) -> alloc::vec::Vec<alloc::vec::Vec<u8>>
+pub fn rns_interface::ble_peer::install_event_dispatcher(tokio::sync::mpsc::bounded::Sender<rns_interface::ble_peer::BlePeerEvent>)
+pub fn rns_interface::ble_peer::is_valid_identity_hash(&[u8]) -> bool
+pub fn rns_interface::ble_peer::new_anti_loop_map() -> rns_interface::ble_peer::AntiLoopMap
+pub fn rns_interface::ble_peer::new_recently_disconnected() -> rns_interface::ble_peer::RecentlyDisconnected
+pub fn rns_interface::ble_peer::reassemble_fragments(&[alloc::vec::Vec<u8>]) -> core::option::Option<alloc::vec::Vec<u8>>
+pub async fn rns_interface::ble_peer::scan_mesh_peers(u64) -> core::result::Result<alloc::vec::Vec<rns_interface::ble_peer::BlePeer>, alloc::string::String>
+pub fn rns_interface::ble_peer::seed_recently_disconnected(&rns_interface::ble_peer::RecentlyDisconnected, alloc::vec::Vec<alloc::string::String>)
+pub async fn rns_interface::ble_peer::spawn_ble_peer_interface(rns_interface::ble_peer::BlePeerConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, alloc::sync::Arc<core::sync::atomic::AtomicBool>, alloc::sync::Arc<tokio::sync::notify::Notify>, alloc::vec::Vec<alloc::string::String>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub async fn rns_interface::ble_peer::start_peripheral(&[u8]) -> core::result::Result<(), alloc::string::String>
+pub async fn rns_interface::ble_peer::stop_ble_peer_interface()
+pub async fn rns_interface::ble_peer::stop_peripheral() -> core::result::Result<(), alloc::string::String>
+pub type rns_interface::ble_peer::AntiLoopMap = alloc::sync::Arc<std::sync::poison::mutex::Mutex<std::collections::hash::map::HashMap<u64, (std::collections::hash::set::HashSet<alloc::string::String>, std::time::Instant)>>>
+pub type rns_interface::ble_peer::RecentlyDisconnected = alloc::sync::Arc<std::sync::poison::mutex::Mutex<std::collections::hash::map::HashMap<alloc::string::String, (std::time::Instant, u32)>>>
+pub mod rns_interface::ble_peer_lifecycle
+pub enum rns_interface::ble_peer_lifecycle::LifecycleEvent
+pub rns_interface::ble_peer_lifecycle::LifecycleEvent::AdvertiseStarted
+pub rns_interface::ble_peer_lifecycle::LifecycleEvent::AdvertiseStopped
+pub rns_interface::ble_peer_lifecycle::LifecycleEvent::FatalError
+pub rns_interface::ble_peer_lifecycle::LifecycleEvent::FatalError::reason: alloc::string::String
+pub rns_interface::ble_peer_lifecycle::LifecycleEvent::PlatformReady
+pub rns_interface::ble_peer_lifecycle::LifecycleEvent::PlatformUnavailable
+pub rns_interface::ble_peer_lifecycle::LifecycleEvent::PlatformUnavailable::reason: alloc::string::String
+pub rns_interface::ble_peer_lifecycle::LifecycleEvent::Reset
+pub rns_interface::ble_peer_lifecycle::LifecycleEvent::ServicesAdded
+pub rns_interface::ble_peer_lifecycle::LifecycleEvent::ServicesRemoved
+pub rns_interface::ble_peer_lifecycle::LifecycleEvent::StartRequested
+pub rns_interface::ble_peer_lifecycle::LifecycleEvent::StopRequested
+pub enum rns_interface::ble_peer_lifecycle::PeripheralState
+pub rns_interface::ble_peer_lifecycle::PeripheralState::Advertising
+pub rns_interface::ble_peer_lifecycle::PeripheralState::Failed
+pub rns_interface::ble_peer_lifecycle::PeripheralState::Idle
+pub rns_interface::ble_peer_lifecycle::PeripheralState::StartingAdvertising
+pub rns_interface::ble_peer_lifecycle::PeripheralState::StartingRegisteringServices
+pub rns_interface::ble_peer_lifecycle::PeripheralState::StartingWaitingPlatform
+pub rns_interface::ble_peer_lifecycle::PeripheralState::Stopped
+pub rns_interface::ble_peer_lifecycle::PeripheralState::StoppingAdvertisement
+pub rns_interface::ble_peer_lifecycle::PeripheralState::StoppingRemovingServices
+impl rns_interface::ble_peer_lifecycle::PeripheralState
+pub fn rns_interface::ble_peer_lifecycle::PeripheralState::is_active(self) -> bool
+pub fn rns_interface::ble_peer_lifecycle::PeripheralState::is_starting(self) -> bool
+pub fn rns_interface::ble_peer_lifecycle::PeripheralState::is_stopping(self) -> bool
+pub struct rns_interface::ble_peer_lifecycle::PeripheralLifecycle
+impl rns_interface::ble_peer_lifecycle::PeripheralLifecycle
+pub fn rns_interface::ble_peer_lifecycle::PeripheralLifecycle::apply(&self, rns_interface::ble_peer_lifecycle::LifecycleEvent) -> core::result::Result<rns_interface::ble_peer_lifecycle::PeripheralState, rns_interface::ble_peer_lifecycle::TransitionError>
+pub fn rns_interface::ble_peer_lifecycle::PeripheralLifecycle::current(&self) -> rns_interface::ble_peer_lifecycle::PeripheralState
+pub fn rns_interface::ble_peer_lifecycle::PeripheralLifecycle::is_advertising(&self) -> bool
+pub fn rns_interface::ble_peer_lifecycle::PeripheralLifecycle::new() -> Self
+impl core::default::Default for rns_interface::ble_peer_lifecycle::PeripheralLifecycle
+pub fn rns_interface::ble_peer_lifecycle::PeripheralLifecycle::default() -> Self
+impl core::fmt::Debug for rns_interface::ble_peer_lifecycle::PeripheralLifecycle
+pub fn rns_interface::ble_peer_lifecycle::PeripheralLifecycle::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct rns_interface::ble_peer_lifecycle::TransitionError
+pub rns_interface::ble_peer_lifecycle::TransitionError::event: rns_interface::ble_peer_lifecycle::LifecycleEvent
+pub rns_interface::ble_peer_lifecycle::TransitionError::from: rns_interface::ble_peer_lifecycle::PeripheralState
+impl core::error::Error for rns_interface::ble_peer_lifecycle::TransitionError
+impl core::fmt::Display for rns_interface::ble_peer_lifecycle::TransitionError
+pub fn rns_interface::ble_peer_lifecycle::TransitionError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn rns_interface::ble_peer_lifecycle::transition(rns_interface::ble_peer_lifecycle::PeripheralState, &rns_interface::ble_peer_lifecycle::LifecycleEvent) -> core::result::Result<rns_interface::ble_peer_lifecycle::PeripheralState, rns_interface::ble_peer_lifecycle::TransitionError>
+pub mod rns_interface::ble_rnode
+pub enum rns_interface::ble_rnode::BleDeviceType
+pub rns_interface::ble_rnode::BleDeviceType::RNode
+pub rns_interface::ble_rnode::BleDeviceType::Unknown
+pub struct rns_interface::ble_rnode::BleDevice
+pub rns_interface::ble_rnode::BleDevice::address: alloc::string::String
+pub rns_interface::ble_rnode::BleDevice::bonded: bool
+pub rns_interface::ble_rnode::BleDevice::device_type: rns_interface::ble_rnode::BleDeviceType
+pub rns_interface::ble_rnode::BleDevice::name: alloc::string::String
+pub rns_interface::ble_rnode::BleDevice::rssi: core::option::Option<i16>
+pub struct rns_interface::ble_rnode::BleRNodeConfig
+pub rns_interface::ble_rnode::BleRNodeConfig::bandwidth: u32
+pub rns_interface::ble_rnode::BleRNodeConfig::ble_uri: alloc::string::String
+pub rns_interface::ble_rnode::BleRNodeConfig::coding_rate: u8
+pub rns_interface::ble_rnode::BleRNodeConfig::flow_control: bool
+pub rns_interface::ble_rnode::BleRNodeConfig::frequency: u32
+pub rns_interface::ble_rnode::BleRNodeConfig::id_callsign: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_interface::ble_rnode::BleRNodeConfig::id_interval: core::option::Option<u64>
+pub rns_interface::ble_rnode::BleRNodeConfig::lt_alock: core::option::Option<f32>
+pub rns_interface::ble_rnode::BleRNodeConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::ble_rnode::BleRNodeConfig::name: alloc::string::String
+pub rns_interface::ble_rnode::BleRNodeConfig::spreading_factor: u8
+pub rns_interface::ble_rnode::BleRNodeConfig::st_alock: core::option::Option<f32>
+pub rns_interface::ble_rnode::BleRNodeConfig::tx_power: u8
+impl rns_interface::ble_rnode::BleRNodeConfig
+pub fn rns_interface::ble_rnode::BleRNodeConfig::new(&str, &str) -> Self
+pub fn rns_interface::ble_rnode::BleRNodeConfig::validate(&self) -> core::result::Result<(), rns_interface::rnode::RNodeConfigValidationError>
+pub struct rns_interface::ble_rnode::LinuxPairingFinished
+pub rns_interface::ble_rnode::LinuxPairingFinished::attempt_id: u64
+pub rns_interface::ble_rnode::LinuxPairingFinished::status: alloc::string::String
+pub struct rns_interface::ble_rnode::LinuxPairingPrompt
+pub rns_interface::ble_rnode::LinuxPairingPrompt::attempt_id: u64
+pub rns_interface::ble_rnode::LinuxPairingPrompt::device: alloc::string::String
+pub const rns_interface::ble_rnode::NUS_RX_CHAR_UUID: uuid::Uuid
+pub const rns_interface::ble_rnode::NUS_SERVICE_UUID: uuid::Uuid
+pub const rns_interface::ble_rnode::NUS_TX_CHAR_UUID: uuid::Uuid
+pub async fn rns_interface::ble_rnode::ble_adapter_present() -> core::result::Result<bool, alloc::string::String>
+pub async fn rns_interface::ble_rnode::scan_ble_devices(u64) -> core::result::Result<alloc::vec::Vec<rns_interface::ble_rnode::BleDevice>, alloc::string::String>
+pub async fn rns_interface::ble_rnode::spawn_ble_rnode_interface(rns_interface::ble_rnode::BleRNodeConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub async fn rns_interface::ble_rnode::spawn_ble_rnode_interface_native(rns_interface::ble_rnode::BleRNodeConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, u16) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub async fn rns_interface::ble_rnode::spawn_ble_rnode_interface_native_with_driver(rns_interface::ble_rnode::BleRNodeConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, u16) -> core::result::Result<rns_interface::rnode::SpawnedRNodeInterface, rns_interface::traits::InterfaceError>
+pub async fn rns_interface::ble_rnode::spawn_ble_rnode_interface_native_with_driver_and_options(rns_interface::ble_rnode::BleRNodeConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, u16, rns_interface::rnode::RNodeStartupOptions) -> core::result::Result<rns_interface::rnode::SpawnedRNodeInterface, rns_interface::rnode::RNodeSpawnError>
+pub async fn rns_interface::ble_rnode::spawn_ble_rnode_interface_with_driver(rns_interface::ble_rnode::BleRNodeConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::rnode::SpawnedRNodeInterface, rns_interface::traits::InterfaceError>
+pub async fn rns_interface::ble_rnode::spawn_ble_rnode_interface_with_driver_and_options(rns_interface::ble_rnode::BleRNodeConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, rns_interface::rnode::RNodeStartupOptions) -> core::result::Result<rns_interface::rnode::SpawnedRNodeInterface, rns_interface::rnode::RNodeSpawnError>
+pub fn rns_interface::ble_rnode::stop_ble_rnode_interface(rns_interface::traits::InterfaceId)
+pub fn rns_interface::ble_rnode::subscribe_ble_diag() -> tokio::sync::broadcast::Receiver<alloc::string::String>
+pub mod rns_interface::hdlc
+pub struct rns_interface::hdlc::HdlcDeframer
+impl rns_interface::hdlc::HdlcDeframer
+pub fn rns_interface::hdlc::HdlcDeframer::feed(&mut self, &[u8]) -> alloc::vec::Vec<alloc::vec::Vec<u8>>
+pub fn rns_interface::hdlc::HdlcDeframer::new() -> Self
+pub fn rns_interface::hdlc::HdlcDeframer::reset(&mut self)
+impl core::default::Default for rns_interface::hdlc::HdlcDeframer
+pub fn rns_interface::hdlc::HdlcDeframer::default() -> Self
+pub const rns_interface::hdlc::ESC: u8
+pub const rns_interface::hdlc::ESC_MASK: u8
+pub const rns_interface::hdlc::FLAG: u8
+pub fn rns_interface::hdlc::escape(&[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_interface::hdlc::escape_into(&[u8], &mut alloc::vec::Vec<u8>)
+pub fn rns_interface::hdlc::frame(&[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_interface::hdlc::frame_into(&[u8], &mut alloc::vec::Vec<u8>)
+pub fn rns_interface::hdlc::unescape(&[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_interface::hdlc::unescape_into(&[u8], &mut alloc::vec::Vec<u8>)
+pub mod rns_interface::i2p
+pub enum rns_interface::i2p::SamError
+pub rns_interface::i2p::SamError::AcceptFailed(alloc::string::String)
+pub rns_interface::i2p::SamError::HandshakeFailed(alloc::string::String)
+pub rns_interface::i2p::SamError::Io(core::io::error::Error)
+pub rns_interface::i2p::SamError::SessionFailed(alloc::string::String)
+pub rns_interface::i2p::SamError::StreamFailed(alloc::string::String)
+pub rns_interface::i2p::SamError::UnexpectedReply(alloc::string::String)
+pub struct rns_interface::i2p::I2PClientConfig
+pub rns_interface::i2p::I2PClientConfig::max_reconnect_tries: core::option::Option<usize>
+pub rns_interface::i2p::I2PClientConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::i2p::I2PClientConfig::name: alloc::string::String
+pub rns_interface::i2p::I2PClientConfig::peer_destination: alloc::string::String
+pub rns_interface::i2p::I2PClientConfig::reconnect_delay: u64
+pub rns_interface::i2p::I2PClientConfig::sam_host: alloc::string::String
+pub rns_interface::i2p::I2PClientConfig::sam_port: u16
+impl rns_interface::i2p::I2PClientConfig
+pub fn rns_interface::i2p::I2PClientConfig::new(&str, &str) -> Self
+pub struct rns_interface::i2p::I2PServerConfig
+pub rns_interface::i2p::I2PServerConfig::keyfile: core::option::Option<alloc::string::String>
+pub rns_interface::i2p::I2PServerConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::i2p::I2PServerConfig::name: alloc::string::String
+pub rns_interface::i2p::I2PServerConfig::reconnect_delay: u64
+pub rns_interface::i2p::I2PServerConfig::sam_host: alloc::string::String
+pub rns_interface::i2p::I2PServerConfig::sam_port: u16
+impl rns_interface::i2p::I2PServerConfig
+pub fn rns_interface::i2p::I2PServerConfig::new(&str) -> Self
+pub const rns_interface::i2p::BITRATE_GUESS: u64
+pub const rns_interface::i2p::DEFAULT_SAM_ADDRESS: &str
+pub const rns_interface::i2p::DEFAULT_SAM_PORT: u16
+pub const rns_interface::i2p::HW_MTU: u32
+pub const rns_interface::i2p::I2P_PROBES: u64
+pub const rns_interface::i2p::I2P_PROBE_AFTER: u64
+pub const rns_interface::i2p::I2P_PROBE_INTERVAL: u64
+pub const rns_interface::i2p::I2P_READ_TIMEOUT: u64
+pub const rns_interface::i2p::I2P_TCP_USER_TIMEOUT: u32
+pub const rns_interface::i2p::RECONNECT_WAIT: u64
+pub const rns_interface::i2p::RECONNECT_WAIT_MAX: u64
+pub const rns_interface::i2p::SAM_VERSION: &str
+pub const rns_interface::i2p::TUNNEL_KEEPALIVE: u64
+pub fn rns_interface::i2p::parse_sam_reply(&str) -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)>
+pub fn rns_interface::i2p::sam_reply_get<'a>(&'a [(alloc::string::String, alloc::string::String)], &str) -> core::option::Option<&'a str>
+pub fn rns_interface::i2p::sam_reply_has_token(&[(alloc::string::String, alloc::string::String)], &str) -> bool
+pub async fn rns_interface::i2p::spawn_i2p_client(rns_interface::i2p::I2PClientConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub async fn rns_interface::i2p::spawn_i2p_server(rns_interface::i2p::I2PServerConfig, alloc::sync::Arc<core::sync::atomic::AtomicU64>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Sender<rns_interface::traits::InterfaceHandle>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub mod rns_interface::kiss
+pub struct rns_interface::kiss::KissDeframer
+impl rns_interface::kiss::KissDeframer
+pub fn rns_interface::kiss::KissDeframer::feed(&mut self, &[u8]) -> alloc::vec::Vec<(u8, alloc::vec::Vec<u8>)>
+pub fn rns_interface::kiss::KissDeframer::new() -> Self
+pub fn rns_interface::kiss::KissDeframer::reset(&mut self)
+impl core::default::Default for rns_interface::kiss::KissDeframer
+pub fn rns_interface::kiss::KissDeframer::default() -> Self
+pub struct rns_interface::kiss::RawKissDeframer
+impl rns_interface::kiss::RawKissDeframer
+pub fn rns_interface::kiss::RawKissDeframer::feed(&mut self, &[u8]) -> alloc::vec::Vec<(u8, alloc::vec::Vec<u8>)>
+pub fn rns_interface::kiss::RawKissDeframer::new() -> Self
+pub fn rns_interface::kiss::RawKissDeframer::reset(&mut self)
+impl core::default::Default for rns_interface::kiss::RawKissDeframer
+pub fn rns_interface::kiss::RawKissDeframer::default() -> Self
+pub const rns_interface::kiss::CMD_DATA: u8
+pub const rns_interface::kiss::CMD_FULLDUPLEX: u8
+pub const rns_interface::kiss::CMD_MASK: u8
+pub const rns_interface::kiss::CMD_P: u8
+pub const rns_interface::kiss::CMD_READY: u8
+pub const rns_interface::kiss::CMD_RETURN: u8
+pub const rns_interface::kiss::CMD_SETHARDWARE: u8
+pub const rns_interface::kiss::CMD_SLOTTIME: u8
+pub const rns_interface::kiss::CMD_TXDELAY: u8
+pub const rns_interface::kiss::CMD_TXTAIL: u8
+pub const rns_interface::kiss::CMD_UNKNOWN: u8
+pub const rns_interface::kiss::FEND: u8
+pub const rns_interface::kiss::FESC: u8
+pub const rns_interface::kiss::PORT_MASK: u8
+pub const rns_interface::kiss::TFEND: u8
+pub const rns_interface::kiss::TFESC: u8
+pub fn rns_interface::kiss::escape(&[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_interface::kiss::escape_into(&[u8], &mut alloc::vec::Vec<u8>)
+pub fn rns_interface::kiss::frame(&[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_interface::kiss::frame_into(&[u8], &mut alloc::vec::Vec<u8>)
+pub fn rns_interface::kiss::frame_with_command(u8, &[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_interface::kiss::frame_with_command_into(u8, &[u8], &mut alloc::vec::Vec<u8>)
+pub fn rns_interface::kiss::unescape(&[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_interface::kiss::unescape_into(&[u8], &mut alloc::vec::Vec<u8>)
+pub mod rns_interface::kiss_iface
+pub struct rns_interface::kiss_iface::KissInterfaceConfig
+pub rns_interface::kiss_iface::KissInterfaceConfig::baud_rate: u32
+pub rns_interface::kiss_iface::KissInterfaceConfig::data_bits: serialport::DataBits
+pub rns_interface::kiss_iface::KissInterfaceConfig::flow_control: bool
+pub rns_interface::kiss_iface::KissInterfaceConfig::id_callsign: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_interface::kiss_iface::KissInterfaceConfig::id_interval: core::option::Option<u64>
+pub rns_interface::kiss_iface::KissInterfaceConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::kiss_iface::KissInterfaceConfig::name: alloc::string::String
+pub rns_interface::kiss_iface::KissInterfaceConfig::parity: serialport::Parity
+pub rns_interface::kiss_iface::KissInterfaceConfig::persistence: core::option::Option<u8>
+pub rns_interface::kiss_iface::KissInterfaceConfig::port: alloc::string::String
+pub rns_interface::kiss_iface::KissInterfaceConfig::slottime: core::option::Option<u8>
+pub rns_interface::kiss_iface::KissInterfaceConfig::stop_bits: serialport::StopBits
+pub rns_interface::kiss_iface::KissInterfaceConfig::txdelay: core::option::Option<u8>
+pub rns_interface::kiss_iface::KissInterfaceConfig::txtail: core::option::Option<u8>
+impl rns_interface::kiss_iface::KissInterfaceConfig
+pub fn rns_interface::kiss_iface::KissInterfaceConfig::new(&str, &str, u32) -> Self
+pub fn rns_interface::kiss_iface::beacon_frame_payload(&[u8]) -> alloc::vec::Vec<u8>
+pub async fn rns_interface::kiss_iface::spawn_kiss_interface(rns_interface::kiss_iface::KissInterfaceConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub mod rns_interface::local
+pub struct rns_interface::local::LocalClientConfig
+pub rns_interface::local::LocalClientConfig::name: alloc::string::String
+pub rns_interface::local::LocalClientConfig::socket_path: alloc::string::String
+impl core::default::Default for rns_interface::local::LocalClientConfig
+pub fn rns_interface::local::LocalClientConfig::default() -> Self
+pub struct rns_interface::local::LocalServerConfig
+pub rns_interface::local::LocalServerConfig::name: alloc::string::String
+pub rns_interface::local::LocalServerConfig::socket_path: alloc::string::String
+impl core::default::Default for rns_interface::local::LocalServerConfig
+pub fn rns_interface::local::LocalServerConfig::default() -> Self
+pub const rns_interface::local::DEFAULT_SOCKET_PATH: &str
+pub const rns_interface::local::FALLBACK_TCP_PORT: u16
+pub const rns_interface::local::LOCAL_MTU: u32
+pub fn rns_interface::local::python_shared_socket_name(&str) -> alloc::string::String
+pub fn rns_interface::local::socket_path(core::option::Option<&std::path::Path>) -> std::path::PathBuf
+pub fn rns_interface::local::socket_path_for(&str) -> alloc::string::String
+pub async fn rns_interface::local::spawn_local_client(rns_interface::local::LocalClientConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub async fn rns_interface::local::spawn_local_server(rns_interface::local::LocalServerConfig, alloc::sync::Arc<core::sync::atomic::AtomicU64>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Sender<rns_interface::traits::InterfaceHandle>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub mod rns_interface::pipe
+pub struct rns_interface::pipe::PipeInterfaceConfig
+pub rns_interface::pipe::PipeInterfaceConfig::command: alloc::string::String
+pub rns_interface::pipe::PipeInterfaceConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::pipe::PipeInterfaceConfig::name: alloc::string::String
+pub rns_interface::pipe::PipeInterfaceConfig::respawn_delay: f64
+impl rns_interface::pipe::PipeInterfaceConfig
+pub fn rns_interface::pipe::PipeInterfaceConfig::new(&str, &str) -> Self
+pub const rns_interface::pipe::BITRATE_GUESS: u64
+pub const rns_interface::pipe::DEFAULT_RESPAWN_DELAY: f64
+pub const rns_interface::pipe::HW_MTU: u32
+pub async fn rns_interface::pipe::spawn_pipe_interface(rns_interface::pipe::PipeInterfaceConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub mod rns_interface::rnode
+pub enum rns_interface::rnode::PortConfig
+pub rns_interface::rnode::PortConfig::Serial
+pub rns_interface::rnode::PortConfig::Serial::baud: u32
+pub rns_interface::rnode::PortConfig::Serial::path: alloc::string::String
+pub rns_interface::rnode::PortConfig::Tcp
+pub rns_interface::rnode::PortConfig::Tcp::addr: alloc::string::String
+impl rns_interface::rnode::PortConfig
+pub fn rns_interface::rnode::PortConfig::parse(&str, u32) -> core::result::Result<Self, alloc::string::String>
+#[non_exhaustive] pub enum rns_interface::rnode::RNodeCapabilityAdmissionError
+pub rns_interface::rnode::RNodeCapabilityAdmissionError::CapabilityImage(rns_interface::rnode_capabilities::RNodeCapabilityParseError)
+pub rns_interface::rnode::RNodeCapabilityAdmissionError::DetectionRejected
+pub rns_interface::rnode::RNodeCapabilityAdmissionError::DeviceError
+pub rns_interface::rnode::RNodeCapabilityAdmissionError::DuplicateEepromResponse
+pub rns_interface::rnode::RNodeCapabilityAdmissionError::FrameLimitExceeded
+pub rns_interface::rnode::RNodeCapabilityAdmissionError::FrameLimitExceeded::limit: usize
+pub rns_interface::rnode::RNodeCapabilityAdmissionError::InputLimitExceeded
+pub rns_interface::rnode::RNodeCapabilityAdmissionError::InputLimitExceeded::limit: usize
+pub rns_interface::rnode::RNodeCapabilityAdmissionError::MalformedProtocolFrame
+pub rns_interface::rnode::RNodeCapabilityAdmissionError::MalformedProtocolFrame::rejection: rns_interface::rnode_protocol::RNodeFrameRejection
+pub rns_interface::rnode::RNodeCapabilityAdmissionError::RadioSettings(rns_interface::rnode_capabilities::RNodeRadioAdmissionError)
+pub rns_interface::rnode::RNodeCapabilityAdmissionError::ReadLimitExceeded
+pub rns_interface::rnode::RNodeCapabilityAdmissionError::ReadLimitExceeded::limit: usize
+pub rns_interface::rnode::RNodeCapabilityAdmissionError::ResponseTimedOut
+pub rns_interface::rnode::RNodeCapabilityAdmissionError::UnsupportedFirmware
+impl rns_interface::rnode::RNodeCapabilityAdmissionError
+pub fn rns_interface::rnode::RNodeCapabilityAdmissionError::failure_class(&self) -> rns_interface::rnode::RNodeCapabilityAdmissionFailureClass
+#[non_exhaustive] pub enum rns_interface::rnode::RNodeCapabilityAdmissionFailureClass
+pub rns_interface::rnode::RNodeCapabilityAdmissionFailureClass::DetectionRejected
+pub rns_interface::rnode::RNodeCapabilityAdmissionFailureClass::DeviceError
+pub rns_interface::rnode::RNodeCapabilityAdmissionFailureClass::DuplicateEeprom
+pub rns_interface::rnode::RNodeCapabilityAdmissionFailureClass::FrameLimit
+pub rns_interface::rnode::RNodeCapabilityAdmissionFailureClass::InputLimit
+pub rns_interface::rnode::RNodeCapabilityAdmissionFailureClass::InvalidCapabilityImage
+pub rns_interface::rnode::RNodeCapabilityAdmissionFailureClass::MalformedProtocol
+pub rns_interface::rnode::RNodeCapabilityAdmissionFailureClass::RadioSettingsRejected
+pub rns_interface::rnode::RNodeCapabilityAdmissionFailureClass::ReadLimit
+pub rns_interface::rnode::RNodeCapabilityAdmissionFailureClass::ResponseTimedOut
+pub rns_interface::rnode::RNodeCapabilityAdmissionFailureClass::UnsupportedFirmware
+impl rns_interface::rnode::RNodeCapabilityAdmissionFailureClass
+pub const fn rns_interface::rnode::RNodeCapabilityAdmissionFailureClass::log_class(self) -> &'static str
+#[non_exhaustive] pub enum rns_interface::rnode::RNodeCapabilityState
+pub rns_interface::rnode::RNodeCapabilityState::NotRequested
+pub rns_interface::rnode::RNodeCapabilityState::Unprovisioned
+pub rns_interface::rnode::RNodeCapabilityState::Unverified
+pub rns_interface::rnode::RNodeCapabilityState::Verified
+pub enum rns_interface::rnode::RNodeConfigField
+pub rns_interface::rnode::RNodeConfigField::Bandwidth
+pub rns_interface::rnode::RNodeConfigField::CodingRate
+pub rns_interface::rnode::RNodeConfigField::Frequency
+pub rns_interface::rnode::RNodeConfigField::LongTermAirtime
+pub rns_interface::rnode::RNodeConfigField::ShortTermAirtime
+pub rns_interface::rnode::RNodeConfigField::SpreadingFactor
+pub rns_interface::rnode::RNodeConfigField::TxPower
+impl rns_interface::rnode::RNodeConfigField
+pub const fn rns_interface::rnode::RNodeConfigField::as_str(self) -> &'static str
+impl core::fmt::Display for rns_interface::rnode::RNodeConfigField
+pub fn rns_interface::rnode::RNodeConfigField::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum rns_interface::rnode::RNodeConfigValidationError
+pub rns_interface::rnode::RNodeConfigValidationError::NonFinite
+pub rns_interface::rnode::RNodeConfigValidationError::NonFinite::field: rns_interface::rnode::RNodeConfigField
+pub rns_interface::rnode::RNodeConfigValidationError::NonFinite::value: f32
+pub rns_interface::rnode::RNodeConfigValidationError::OutOfRange
+pub rns_interface::rnode::RNodeConfigValidationError::OutOfRange::field: rns_interface::rnode::RNodeConfigField
+pub rns_interface::rnode::RNodeConfigValidationError::OutOfRange::maximum: f64
+pub rns_interface::rnode::RNodeConfigValidationError::OutOfRange::minimum: f64
+pub rns_interface::rnode::RNodeConfigValidationError::OutOfRange::value: f64
+impl rns_interface::rnode::RNodeConfigValidationError
+pub const fn rns_interface::rnode::RNodeConfigValidationError::field(&self) -> rns_interface::rnode::RNodeConfigField
+#[non_exhaustive] pub enum rns_interface::rnode::RNodeConfigurationState
+pub rns_interface::rnode::RNodeConfigurationState::Mismatch
+pub rns_interface::rnode::RNodeConfigurationState::Unknown
+pub rns_interface::rnode::RNodeConfigurationState::Verified
+#[non_exhaustive] pub enum rns_interface::rnode::RNodeDetectionState
+pub rns_interface::rnode::RNodeDetectionState::Confirmed
+pub rns_interface::rnode::RNodeDetectionState::Unconfirmed
+pub rns_interface::rnode::RNodeDetectionState::Unknown
+#[non_exhaustive] pub enum rns_interface::rnode::RNodeFirmwareCompatibility
+pub rns_interface::rnode::RNodeFirmwareCompatibility::Supported
+pub rns_interface::rnode::RNodeFirmwareCompatibility::Unknown
+pub rns_interface::rnode::RNodeFirmwareCompatibility::Unsupported
+#[non_exhaustive] pub enum rns_interface::rnode::RNodeObservedRadioState
+pub rns_interface::rnode::RNodeObservedRadioState::Off
+pub rns_interface::rnode::RNodeObservedRadioState::On
+pub rns_interface::rnode::RNodeObservedRadioState::Unknown
+pub enum rns_interface::rnode::RNodeResponse
+pub rns_interface::rnode::RNodeResponse::None
+pub rns_interface::rnode::RNodeResponse::Packet(rns_transport::messages::TransportMessage)
+pub rns_interface::rnode::RNodeResponse::Ready(bool)
+#[non_exhaustive] pub enum rns_interface::rnode::RNodeRuntimePhase
+pub rns_interface::rnode::RNodeRuntimePhase::AwaitingReadiness
+pub rns_interface::rnode::RNodeRuntimePhase::Connecting
+pub rns_interface::rnode::RNodeRuntimePhase::Ready
+pub rns_interface::rnode::RNodeRuntimePhase::ReconnectBackoff
+pub rns_interface::rnode::RNodeRuntimePhase::ShuttingDown
+pub rns_interface::rnode::RNodeRuntimePhase::Stopped
+#[non_exhaustive] pub enum rns_interface::rnode::RNodeRuntimeReason
+pub rns_interface::rnode::RNodeRuntimeReason::CapabilityAdmissionRejected
+pub rns_interface::rnode::RNodeRuntimeReason::ConnectionAttemptFailed
+pub rns_interface::rnode::RNodeRuntimeReason::ConnectionLost
+pub rns_interface::rnode::RNodeRuntimeReason::DeviceReset
+pub rns_interface::rnode::RNodeRuntimeReason::DriverTerminated
+pub rns_interface::rnode::RNodeRuntimeReason::RadioInitialisationFault
+pub rns_interface::rnode::RNodeRuntimeReason::StopRequested
+pub rns_interface::rnode::RNodeRuntimeReason::TransportConsumerClosed
+#[non_exhaustive] pub enum rns_interface::rnode::RNodeSpawnError
+pub rns_interface::rnode::RNodeSpawnError::CapabilityAdmission(rns_interface::rnode::RNodeCapabilityAdmissionError)
+pub rns_interface::rnode::RNodeSpawnError::Interface(rns_interface::traits::InterfaceError)
+pub enum rns_interface::rnode::RNodeStream
+pub rns_interface::rnode::RNodeStream::Serial(alloc::boxed::Box<dyn serialport::SerialPort>)
+pub rns_interface::rnode::RNodeStream::Tcp(std::net::tcp::TcpStream)
+impl rns_interface::rnode::RNodeStream
+pub fn rns_interface::rnode::RNodeStream::connect_tcp(&str) -> core::io::error::Result<Self>
+pub fn rns_interface::rnode::RNodeStream::description(&self) -> alloc::string::String
+pub fn rns_interface::rnode::RNodeStream::open_serial(&str, u32) -> core::io::error::Result<Self>
+pub fn rns_interface::rnode::RNodeStream::try_clone(&self) -> core::io::error::Result<Self>
+impl alloc::io::read::Read for rns_interface::rnode::RNodeStream
+pub fn rns_interface::rnode::RNodeStream::read(&mut self, &mut [u8]) -> core::io::error::Result<usize>
+impl core::io::write::Write for rns_interface::rnode::RNodeStream
+pub fn rns_interface::rnode::RNodeStream::flush(&mut self) -> core::io::error::Result<()>
+pub fn rns_interface::rnode::RNodeStream::write(&mut self, &[u8]) -> core::io::error::Result<usize>
+#[non_exhaustive] pub enum rns_interface::rnode::RNodeTransmitFlowState
+pub rns_interface::rnode::RNodeTransmitFlowState::Blocked
+pub rns_interface::rnode::RNodeTransmitFlowState::Permitted
+pub rns_interface::rnode::RNodeTransmitFlowState::Unknown
+#[non_exhaustive] pub enum rns_interface::rnode::RNodeTransportClass
+pub rns_interface::rnode::RNodeTransportClass::Ble
+pub rns_interface::rnode::RNodeTransportClass::Serial
+pub rns_interface::rnode::RNodeTransportClass::Tcp
+pub rns_interface::rnode::RNodeTransportClass::Usb
+pub struct rns_interface::rnode::RNodeConfig
+pub rns_interface::rnode::RNodeConfig::bandwidth: u32
+pub rns_interface::rnode::RNodeConfig::baud_rate: u32
+pub rns_interface::rnode::RNodeConfig::coding_rate: u8
+pub rns_interface::rnode::RNodeConfig::flow_control: bool
+pub rns_interface::rnode::RNodeConfig::frequency: u32
+pub rns_interface::rnode::RNodeConfig::id_callsign: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_interface::rnode::RNodeConfig::id_interval: core::option::Option<u64>
+pub rns_interface::rnode::RNodeConfig::lt_alock: core::option::Option<f32>
+pub rns_interface::rnode::RNodeConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::rnode::RNodeConfig::name: alloc::string::String
+pub rns_interface::rnode::RNodeConfig::port: alloc::string::String
+pub rns_interface::rnode::RNodeConfig::spreading_factor: u8
+pub rns_interface::rnode::RNodeConfig::st_alock: core::option::Option<f32>
+pub rns_interface::rnode::RNodeConfig::tx_power: u8
+impl rns_interface::rnode::RNodeConfig
+pub fn rns_interface::rnode::RNodeConfig::new(&str, &str) -> Self
+pub fn rns_interface::rnode::RNodeConfig::validate(&self) -> core::result::Result<(), rns_interface::rnode::RNodeConfigValidationError>
+impl core::convert::From<&rns_interface::rnode::RNodeConfig> for rns_interface::rnode::RNodeRadioSettings
+pub fn rns_interface::rnode::RNodeRadioSettings::from(&rns_interface::rnode::RNodeConfig) -> Self
+pub struct rns_interface::rnode::RNodeDriverHandle
+impl rns_interface::rnode::RNodeDriverHandle
+pub fn rns_interface::rnode::RNodeDriverHandle::request_shutdown(&self)
+pub fn rns_interface::rnode::RNodeDriverHandle::snapshot(&self) -> alloc::sync::Arc<rns_interface::rnode::RNodeRuntimeSnapshot>
+pub fn rns_interface::rnode::RNodeDriverHandle::watch(&self) -> rns_interface::rnode::RNodeDriverSubscription
+impl core::fmt::Debug for rns_interface::rnode::RNodeDriverHandle
+pub fn rns_interface::rnode::RNodeDriverHandle::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct rns_interface::rnode::RNodeDriverSubscription
+impl rns_interface::rnode::RNodeDriverSubscription
+pub async fn rns_interface::rnode::RNodeDriverSubscription::changed(&mut self) -> core::option::Option<alloc::sync::Arc<rns_interface::rnode::RNodeRuntimeSnapshot>>
+pub fn rns_interface::rnode::RNodeDriverSubscription::snapshot(&self) -> alloc::sync::Arc<rns_interface::rnode::RNodeRuntimeSnapshot>
+impl core::fmt::Debug for rns_interface::rnode::RNodeDriverSubscription
+pub fn rns_interface::rnode::RNodeDriverSubscription::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct rns_interface::rnode::RNodeRadioSettings
+pub rns_interface::rnode::RNodeRadioSettings::bandwidth: u32
+pub rns_interface::rnode::RNodeRadioSettings::coding_rate: u8
+pub rns_interface::rnode::RNodeRadioSettings::frequency: u32
+pub rns_interface::rnode::RNodeRadioSettings::spreading_factor: u8
+pub rns_interface::rnode::RNodeRadioSettings::tx_power: u8
+impl rns_interface::rnode::RNodeRadioSettings
+pub const fn rns_interface::rnode::RNodeRadioSettings::new(u32, u32, u8, u8, u8) -> Self
+pub fn rns_interface::rnode::RNodeRadioSettings::validate(&self) -> core::result::Result<(), rns_interface::rnode::RNodeConfigValidationError>
+impl core::convert::From<&rns_interface::rnode::RNodeConfig> for rns_interface::rnode::RNodeRadioSettings
+pub fn rns_interface::rnode::RNodeRadioSettings::from(&rns_interface::rnode::RNodeConfig) -> Self
+#[non_exhaustive] pub struct rns_interface::rnode::RNodeRuntimeSnapshot
+pub rns_interface::rnode::RNodeRuntimeSnapshot::capability: rns_interface::rnode::RNodeCapabilityState
+pub rns_interface::rnode::RNodeRuntimeSnapshot::capability_admission_failure: core::option::Option<rns_interface::rnode::RNodeCapabilityAdmissionFailureClass>
+pub rns_interface::rnode::RNodeRuntimeSnapshot::configuration: rns_interface::rnode::RNodeConfigurationState
+pub rns_interface::rnode::RNodeRuntimeSnapshot::connection_generation: u64
+pub rns_interface::rnode::RNodeRuntimeSnapshot::detection: rns_interface::rnode::RNodeDetectionState
+pub rns_interface::rnode::RNodeRuntimeSnapshot::disconnect_total: u64
+pub rns_interface::rnode::RNodeRuntimeSnapshot::firmware_compatibility: rns_interface::rnode::RNodeFirmwareCompatibility
+pub rns_interface::rnode::RNodeRuntimeSnapshot::phase: rns_interface::rnode::RNodeRuntimePhase
+pub rns_interface::rnode::RNodeRuntimeSnapshot::radio: rns_interface::rnode::RNodeObservedRadioState
+pub rns_interface::rnode::RNodeRuntimeSnapshot::reason: core::option::Option<rns_interface::rnode::RNodeRuntimeReason>
+pub rns_interface::rnode::RNodeRuntimeSnapshot::reconnect_attempt: u64
+pub rns_interface::rnode::RNodeRuntimeSnapshot::reconnect_total: u64
+pub rns_interface::rnode::RNodeRuntimeSnapshot::transmit_flow: rns_interface::rnode::RNodeTransmitFlowState
+pub rns_interface::rnode::RNodeRuntimeSnapshot::transport: rns_interface::rnode::RNodeTransportClass
+pub struct rns_interface::rnode::RNodeStartupOptions
+impl rns_interface::rnode::RNodeStartupOptions
+pub const fn rns_interface::rnode::RNodeStartupOptions::require_capability_admission() -> Self
+impl core::default::Default for rns_interface::rnode::RNodeStartupOptions
+pub fn rns_interface::rnode::RNodeStartupOptions::default() -> Self
+#[non_exhaustive] pub struct rns_interface::rnode::SpawnedRNodeInterface
+pub rns_interface::rnode::SpawnedRNodeInterface::driver: rns_interface::rnode::RNodeDriverHandle
+pub rns_interface::rnode::SpawnedRNodeInterface::interface: rns_interface::traits::InterfaceHandle
+pub const rns_interface::rnode::CALLSIGN_MAX_LEN: usize
+pub const rns_interface::rnode::CMD_BANDWIDTH: u8
+pub const rns_interface::rnode::CMD_BLINK: u8
+pub const rns_interface::rnode::CMD_BOARD: u8
+pub const rns_interface::rnode::CMD_BT_CTRL: u8
+pub const rns_interface::rnode::CMD_BT_PIN: u8
+pub const rns_interface::rnode::CMD_CFG_READ: u8
+pub const rns_interface::rnode::CMD_CONF_DELETE: u8
+pub const rns_interface::rnode::CMD_CONF_SAVE: u8
+pub const rns_interface::rnode::CMD_CR: u8
+pub const rns_interface::rnode::CMD_DETECT: u8
+pub const rns_interface::rnode::CMD_DEV_HASH: u8
+pub const rns_interface::rnode::CMD_DEV_SIG: u8
+pub const rns_interface::rnode::CMD_DISP_ADR: u8
+pub const rns_interface::rnode::CMD_DISP_BLNK: u8
+pub const rns_interface::rnode::CMD_DISP_INT: u8
+pub const rns_interface::rnode::CMD_DISP_RCND: u8
+pub const rns_interface::rnode::CMD_DISP_ROT: u8
+pub const rns_interface::rnode::CMD_DIS_IA: u8
+pub const rns_interface::rnode::CMD_ERROR: u8
+pub const rns_interface::rnode::CMD_FB_EXT: u8
+pub const rns_interface::rnode::CMD_FB_READ: u8
+pub const rns_interface::rnode::CMD_FB_WRITE: u8
+pub const rns_interface::rnode::CMD_FREQUENCY: u8
+pub const rns_interface::rnode::CMD_FW_HASH: u8
+pub const rns_interface::rnode::CMD_FW_UPD: u8
+pub const rns_interface::rnode::CMD_FW_VERSION: u8
+pub const rns_interface::rnode::CMD_HASHES: u8
+pub const rns_interface::rnode::CMD_IMPLICIT: u8
+pub const rns_interface::rnode::CMD_LEAVE: u8
+pub const rns_interface::rnode::CMD_LT_ALOCK: u8
+pub const rns_interface::rnode::CMD_MCU: u8
+pub const rns_interface::rnode::CMD_NP_INT: u8
+pub const rns_interface::rnode::CMD_PLATFORM: u8
+pub const rns_interface::rnode::CMD_PROMISC: u8
+pub const rns_interface::rnode::CMD_RADIO_LOCK: u8
+pub const rns_interface::rnode::CMD_RADIO_STATE: u8
+pub const rns_interface::rnode::CMD_RANDOM: u8
+pub const rns_interface::rnode::CMD_READY: u8
+pub const rns_interface::rnode::CMD_RESET: u8
+pub const rns_interface::rnode::CMD_ROM_READ: u8
+pub const rns_interface::rnode::CMD_ROM_WIPE: u8
+pub const rns_interface::rnode::CMD_ROM_WRITE: u8
+pub const rns_interface::rnode::CMD_SF: u8
+pub const rns_interface::rnode::CMD_STAT_BAT: u8
+pub const rns_interface::rnode::CMD_STAT_CHTM: u8
+pub const rns_interface::rnode::CMD_STAT_EDROP: u8
+pub const rns_interface::rnode::CMD_STAT_PHYPRM: u8
+pub const rns_interface::rnode::CMD_STAT_RSSI: u8
+pub const rns_interface::rnode::CMD_STAT_RX: u8
+pub const rns_interface::rnode::CMD_STAT_SNR: u8
+pub const rns_interface::rnode::CMD_STAT_TEMP: u8
+pub const rns_interface::rnode::CMD_STAT_TX: u8
+pub const rns_interface::rnode::CMD_ST_ALOCK: u8
+pub const rns_interface::rnode::CMD_TXPOWER: u8
+pub const rns_interface::rnode::CMD_WIFI_CHN: u8
+pub const rns_interface::rnode::CMD_WIFI_IP: u8
+pub const rns_interface::rnode::CMD_WIFI_MODE: u8
+pub const rns_interface::rnode::CMD_WIFI_NM: u8
+pub const rns_interface::rnode::CMD_WIFI_PSK: u8
+pub const rns_interface::rnode::CMD_WIFI_SSID: u8
+pub const rns_interface::rnode::DEFAULT_TCP_PORT: u16
+pub const rns_interface::rnode::DETECT_REQ: u8
+pub const rns_interface::rnode::DETECT_RESP: u8
+pub const rns_interface::rnode::RADIO_STATE_OFF: u8
+pub const rns_interface::rnode::RADIO_STATE_ON: u8
+pub const rns_interface::rnode::RECONNECT_WAIT: u64
+pub const rns_interface::rnode::REQUIRED_FW_VER_MAJ: u8
+pub const rns_interface::rnode::REQUIRED_FW_VER_MIN: u8
+pub const rns_interface::rnode::RNODE_BANDWIDTH_MAX_HZ: u32
+pub const rns_interface::rnode::RNODE_BANDWIDTH_MIN_HZ: u32
+pub const rns_interface::rnode::RNODE_CODING_RATE_MAX: u8
+pub const rns_interface::rnode::RNODE_CODING_RATE_MIN: u8
+pub const rns_interface::rnode::RNODE_FREQUENCY_MAX_HZ: u32
+pub const rns_interface::rnode::RNODE_FREQUENCY_MIN_HZ: u32
+pub const rns_interface::rnode::RNODE_SPREADING_FACTOR_MAX: u8
+pub const rns_interface::rnode::RNODE_SPREADING_FACTOR_MIN: u8
+pub const rns_interface::rnode::RNODE_TX_POWER_MAX_DBM: u8
+pub const rns_interface::rnode::RNODE_TX_POWER_MIN_DBM: u8
+pub const rns_interface::rnode::RSSI_OFFSET: i32
+pub fn rns_interface::rnode::build_airtime_sequence(&rns_interface::rnode::RNodeConfig) -> alloc::vec::Vec<u8>
+pub fn rns_interface::rnode::build_detach_sequence() -> alloc::vec::Vec<u8>
+pub fn rns_interface::rnode::build_detect_sequence() -> alloc::vec::Vec<u8>
+pub fn rns_interface::rnode::build_init_sequence(&rns_interface::rnode::RNodeConfig) -> alloc::vec::Vec<u8>
+pub fn rns_interface::rnode::build_radio_configuration_sequence(&rns_interface::rnode::RNodeRadioSettings) -> alloc::vec::Vec<u8>
+pub fn rns_interface::rnode::build_radio_off_sequence() -> alloc::vec::Vec<u8>
+pub fn rns_interface::rnode::calculate_bitrate(u8, u8, u32) -> u64
+pub fn rns_interface::rnode::decode_battery_status(&[u8]) -> core::option::Option<(u8, u8)>
+pub fn rns_interface::rnode::decode_rssi_byte(u8) -> f32
+pub fn rns_interface::rnode::decode_snr_byte(u8) -> f32
+pub fn rns_interface::rnode::decode_temperature_byte(u8) -> core::option::Option<i8>
+pub fn rns_interface::rnode::process_rnode_response(u8, &[u8], rns_interface::traits::InterfaceId, &mut core::option::Option<f32>, &mut core::option::Option<f32>) -> rns_interface::rnode::RNodeResponse
+pub async fn rns_interface::rnode::spawn_rnode_interface(rns_interface::rnode::RNodeConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub async fn rns_interface::rnode::spawn_rnode_interface_with_driver(rns_interface::rnode::RNodeConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::rnode::SpawnedRNodeInterface, rns_interface::traits::InterfaceError>
+pub async fn rns_interface::rnode::spawn_rnode_interface_with_driver_and_options(rns_interface::rnode::RNodeConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, rns_interface::rnode::RNodeStartupOptions) -> core::result::Result<rns_interface::rnode::SpawnedRNodeInterface, rns_interface::rnode::RNodeSpawnError>
+pub fn rns_interface::rnode::stop_rnode_interface(rns_interface::traits::InterfaceId)
+pub mod rns_interface::rnode_admin
+#[repr(u8)] pub enum rns_interface::rnode_admin::WifiMode
+pub rns_interface::rnode_admin::WifiMode::AccessPoint = 2
+pub rns_interface::rnode_admin::WifiMode::Off = 0
+pub rns_interface::rnode_admin::WifiMode::Station = 1
+impl rns_interface::rnode_admin::WifiMode
+pub fn rns_interface::rnode_admin::WifiMode::payload(self) -> [u8; 1]
+pub struct rns_interface::rnode_admin::AdminFrame
+pub rns_interface::rnode_admin::AdminFrame::command: u8
+pub rns_interface::rnode_admin::AdminFrame::payload: alloc::vec::Vec<u8>
+pub fn rns_interface::rnode_admin::bool_payload(bool) -> [u8; 1]
+pub fn rns_interface::rnode_admin::decode_frames(&[u8]) -> alloc::vec::Vec<rns_interface::rnode_admin::AdminFrame>
+pub fn rns_interface::rnode_admin::detect_sequence() -> alloc::vec::Vec<rns_interface::rnode_admin::AdminFrame>
+pub fn rns_interface::rnode_admin::device_signature_frame(&[u8; 64]) -> rns_interface::rnode_admin::AdminFrame
+pub fn rns_interface::rnode_admin::eeprom_read_frame() -> rns_interface::rnode_admin::AdminFrame
+pub fn rns_interface::rnode_admin::eeprom_wipe_frame() -> rns_interface::rnode_admin::AdminFrame
+pub fn rns_interface::rnode_admin::eeprom_write_frame(u8, u8) -> rns_interface::rnode_admin::AdminFrame
+pub fn rns_interface::rnode_admin::encode_frame(u8, &[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_interface::rnode_admin::firmware_hash_frame(&[u8; 32]) -> rns_interface::rnode_admin::AdminFrame
+pub fn rns_interface::rnode_admin::firmware_update_frame() -> rns_interface::rnode_admin::AdminFrame
+pub fn rns_interface::rnode_admin::frame(u8, &[u8]) -> rns_interface::rnode_admin::AdminFrame
+pub fn rns_interface::rnode_admin::ipv4_payload(core::net::ip_addr::Ipv4Addr) -> [u8; 4]
+pub fn rns_interface::rnode_admin::nullable_string_payload(core::option::Option<&str>) -> alloc::vec::Vec<u8>
+pub fn rns_interface::rnode_admin::parse_bt_pin(&rns_interface::rnode_admin::AdminFrame) -> core::option::Option<u32>
+pub fn rns_interface::rnode_admin::parse_u32(&[u8]) -> core::option::Option<u32>
+pub fn rns_interface::rnode_admin::reset_frame() -> rns_interface::rnode_admin::AdminFrame
+pub fn rns_interface::rnode_admin::u32_payload(u32) -> [u8; 4]
+pub mod rns_interface::rnode_capabilities
+#[non_exhaustive] pub enum rns_interface::rnode_capabilities::RNodeCapabilityParseError
+pub rns_interface::rnode_capabilities::RNodeCapabilityParseError::ChecksumMismatch
+pub rns_interface::rnode_capabilities::RNodeCapabilityParseError::InfoNotLocked
+pub rns_interface::rnode_capabilities::RNodeCapabilityParseError::TooShort
+pub rns_interface::rnode_capabilities::RNodeCapabilityParseError::TooShort::actual: usize
+pub rns_interface::rnode_capabilities::RNodeCapabilityParseError::TooShort::required: usize
+#[non_exhaustive] pub enum rns_interface::rnode_capabilities::RNodeEepromImage
+pub rns_interface::rnode_capabilities::RNodeEepromImage::Provisioned(rns_interface::rnode_capabilities::RNodeCapabilities)
+pub rns_interface::rnode_capabilities::RNodeEepromImage::Unprovisioned
+#[non_exhaustive] pub enum rns_interface::rnode_capabilities::RNodeRadioAdmission
+pub rns_interface::rnode_capabilities::RNodeRadioAdmission::Unprovisioned
+pub rns_interface::rnode_capabilities::RNodeRadioAdmission::Unverified
+pub rns_interface::rnode_capabilities::RNodeRadioAdmission::Unverified::model_code: u8
+pub rns_interface::rnode_capabilities::RNodeRadioAdmission::Unverified::product_code: u8
+pub rns_interface::rnode_capabilities::RNodeRadioAdmission::Verified
+pub rns_interface::rnode_capabilities::RNodeRadioAdmission::Verified::model_code: u8
+pub rns_interface::rnode_capabilities::RNodeRadioAdmission::Verified::product_code: u8
+impl rns_interface::rnode_capabilities::RNodeRadioAdmission
+pub const fn rns_interface::rnode_capabilities::RNodeRadioAdmission::is_verified(self) -> bool
+pub const fn rns_interface::rnode_capabilities::RNodeRadioAdmission::model_code(self) -> core::option::Option<u8>
+pub const fn rns_interface::rnode_capabilities::RNodeRadioAdmission::product_code(self) -> core::option::Option<u8>
+#[non_exhaustive] pub enum rns_interface::rnode_capabilities::RNodeRadioAdmissionError
+pub rns_interface::rnode_capabilities::RNodeRadioAdmissionError::FrequencyOutOfRange
+pub rns_interface::rnode_capabilities::RNodeRadioAdmissionError::FrequencyOutOfRange::max_hz: u32
+pub rns_interface::rnode_capabilities::RNodeRadioAdmissionError::FrequencyOutOfRange::min_hz: u32
+pub rns_interface::rnode_capabilities::RNodeRadioAdmissionError::FrequencyOutOfRange::requested_hz: u32
+pub rns_interface::rnode_capabilities::RNodeRadioAdmissionError::GenericValidation(rns_interface::rnode::RNodeConfigValidationError)
+pub rns_interface::rnode_capabilities::RNodeRadioAdmissionError::TxPowerExceedsMaximum
+pub rns_interface::rnode_capabilities::RNodeRadioAdmissionError::TxPowerExceedsMaximum::max_dbm: u8
+pub rns_interface::rnode_capabilities::RNodeRadioAdmissionError::TxPowerExceedsMaximum::requested_dbm: u8
+#[non_exhaustive] pub enum rns_interface::rnode_capabilities::RNodeRadioCapabilities
+pub rns_interface::rnode_capabilities::RNodeRadioCapabilities::Known(rns_interface::rnode_capabilities::RNodeKnownRadioCapabilities)
+pub rns_interface::rnode_capabilities::RNodeRadioCapabilities::Unknown
+#[non_exhaustive] pub enum rns_interface::rnode_capabilities::RNodeRadioFamily
+pub rns_interface::rnode_capabilities::RNodeRadioFamily::Sx1262
+pub rns_interface::rnode_capabilities::RNodeRadioFamily::Sx1262AndSx1280
+pub rns_interface::rnode_capabilities::RNodeRadioFamily::Sx1268
+pub rns_interface::rnode_capabilities::RNodeRadioFamily::Sx1276
+pub rns_interface::rnode_capabilities::RNodeRadioFamily::Sx1278
+pub rns_interface::rnode_capabilities::RNodeRadioFamily::Sx1280
+#[non_exhaustive] pub struct rns_interface::rnode_capabilities::RNodeCapabilities
+impl rns_interface::rnode_capabilities::RNodeCapabilities
+pub const fn rns_interface::rnode_capabilities::RNodeCapabilities::model_code(self) -> u8
+pub const fn rns_interface::rnode_capabilities::RNodeCapabilities::product_code(self) -> u8
+pub const fn rns_interface::rnode_capabilities::RNodeCapabilities::product_name(self) -> core::option::Option<&'static str>
+pub const fn rns_interface::rnode_capabilities::RNodeCapabilities::radio(self) -> rns_interface::rnode_capabilities::RNodeRadioCapabilities
+#[non_exhaustive] pub struct rns_interface::rnode_capabilities::RNodeKnownRadioCapabilities
+impl rns_interface::rnode_capabilities::RNodeKnownRadioCapabilities
+pub const fn rns_interface::rnode_capabilities::RNodeKnownRadioCapabilities::family(self) -> rns_interface::rnode_capabilities::RNodeRadioFamily
+pub const fn rns_interface::rnode_capabilities::RNodeKnownRadioCapabilities::max_frequency_hz(self) -> u32
+pub const fn rns_interface::rnode_capabilities::RNodeKnownRadioCapabilities::max_tx_power_dbm(self) -> u8
+pub const fn rns_interface::rnode_capabilities::RNodeKnownRadioCapabilities::min_frequency_hz(self) -> u32
+pub const fn rns_interface::rnode_capabilities::RNodeKnownRadioCapabilities::supports_frequency(self, u32) -> bool
+pub const fn rns_interface::rnode_capabilities::RNodeKnownRadioCapabilities::supports_tx_power(self, u8) -> bool
+pub fn rns_interface::rnode_capabilities::admit_rnode_radio_settings(rns_interface::rnode_capabilities::RNodeCapabilities, rns_interface::rnode::RNodeRadioSettings) -> core::result::Result<rns_interface::rnode_capabilities::RNodeRadioAdmission, rns_interface::rnode_capabilities::RNodeRadioAdmissionError>
+pub fn rns_interface::rnode_capabilities::admit_unprovisioned_rnode_radio_settings(rns_interface::rnode::RNodeRadioSettings) -> core::result::Result<rns_interface::rnode_capabilities::RNodeRadioAdmission, rns_interface::rnode_capabilities::RNodeRadioAdmissionError>
+pub fn rns_interface::rnode_capabilities::classify_rnode_eeprom_image(&[u8]) -> core::result::Result<rns_interface::rnode_capabilities::RNodeEepromImage, rns_interface::rnode_capabilities::RNodeCapabilityParseError>
+pub fn rns_interface::rnode_capabilities::classify_rnode_radio_capabilities(rns_interface::rnode_capabilities::RNodeCapabilities) -> rns_interface::rnode_capabilities::RNodeRadioAdmission
+pub fn rns_interface::rnode_capabilities::parse_rnode_capabilities(&[u8]) -> core::result::Result<rns_interface::rnode_capabilities::RNodeCapabilities, rns_interface::rnode_capabilities::RNodeCapabilityParseError>
+pub fn rns_interface::rnode_capabilities::rnode_model_capabilities(u8) -> rns_interface::rnode_capabilities::RNodeRadioCapabilities
+pub const fn rns_interface::rnode_capabilities::rnode_product_name(u8) -> core::option::Option<&'static str>
+pub mod rns_interface::rnode_multi
+#[repr(u8)] pub enum rns_interface::rnode_multi::RadioType
+pub rns_interface::rnode_multi::RadioType::SX1262 = 17
+pub rns_interface::rnode_multi::RadioType::SX126X = 16
+pub rns_interface::rnode_multi::RadioType::SX1276 = 1
+pub rns_interface::rnode_multi::RadioType::SX1278 = 2
+pub rns_interface::rnode_multi::RadioType::SX127X = 0
+pub rns_interface::rnode_multi::RadioType::SX1280 = 33
+pub rns_interface::rnode_multi::RadioType::SX128X = 32
+impl rns_interface::rnode_multi::RadioType
+pub fn rns_interface::rnode_multi::RadioType::family_name(&self) -> &'static str
+pub fn rns_interface::rnode_multi::RadioType::from_u8(u8) -> core::option::Option<Self>
+pub fn rns_interface::rnode_multi::RadioType::validate_frequency(&self, u32) -> bool
+pub struct rns_interface::rnode_multi::RNodeMultiConfig
+pub rns_interface::rnode_multi::RNodeMultiConfig::baud_rate: u32
+pub rns_interface::rnode_multi::RNodeMultiConfig::flow_control: bool
+pub rns_interface::rnode_multi::RNodeMultiConfig::id_callsign: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_interface::rnode_multi::RNodeMultiConfig::id_interval: core::option::Option<u64>
+pub rns_interface::rnode_multi::RNodeMultiConfig::name: alloc::string::String
+pub rns_interface::rnode_multi::RNodeMultiConfig::port: alloc::string::String
+pub rns_interface::rnode_multi::RNodeMultiConfig::subinterfaces: alloc::vec::Vec<rns_interface::rnode_multi::SubInterfaceConfig>
+impl rns_interface::rnode_multi::RNodeMultiConfig
+pub fn rns_interface::rnode_multi::RNodeMultiConfig::new(&str, &str) -> Self
+pub struct rns_interface::rnode_multi::SubInterfaceConfig
+pub rns_interface::rnode_multi::SubInterfaceConfig::bandwidth: u32
+pub rns_interface::rnode_multi::SubInterfaceConfig::coding_rate: u8
+pub rns_interface::rnode_multi::SubInterfaceConfig::flow_control: bool
+pub rns_interface::rnode_multi::SubInterfaceConfig::frequency: u32
+pub rns_interface::rnode_multi::SubInterfaceConfig::lt_alock: core::option::Option<f32>
+pub rns_interface::rnode_multi::SubInterfaceConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::rnode_multi::SubInterfaceConfig::name: alloc::string::String
+pub rns_interface::rnode_multi::SubInterfaceConfig::outgoing: bool
+pub rns_interface::rnode_multi::SubInterfaceConfig::spreading_factor: u8
+pub rns_interface::rnode_multi::SubInterfaceConfig::st_alock: core::option::Option<f32>
+pub rns_interface::rnode_multi::SubInterfaceConfig::tx_power: u8
+pub rns_interface::rnode_multi::SubInterfaceConfig::vport: u8
+impl rns_interface::rnode_multi::SubInterfaceConfig
+pub fn rns_interface::rnode_multi::SubInterfaceConfig::new(&str, u8, u32) -> Self
+pub fn rns_interface::rnode_multi::SubInterfaceConfig::validate(&self) -> core::result::Result<(), alloc::string::String>
+pub const rns_interface::rnode_multi::CMD_ERROR: u8
+pub const rns_interface::rnode_multi::CMD_INTERFACES: u8
+pub const rns_interface::rnode_multi::CMD_INT_DATA: [u8; 12]
+pub const rns_interface::rnode_multi::CMD_SEL_INT: u8
+pub const rns_interface::rnode_multi::ERROR_INITRADIO: u8
+pub const rns_interface::rnode_multi::ERROR_TXFAILED: u8
+pub const rns_interface::rnode_multi::MAX_SUBINTERFACES: usize
+pub const rns_interface::rnode_multi::REQUIRED_FW_VER_MAJ: u8
+pub const rns_interface::rnode_multi::REQUIRED_FW_VER_MIN: u8
+pub fn rns_interface::rnode_multi::build_detect_sequence() -> alloc::vec::Vec<u8>
+pub fn rns_interface::rnode_multi::build_subinterface_data_frame(u8, &[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_interface::rnode_multi::build_subinterface_init(u8, &rns_interface::rnode_multi::SubInterfaceConfig) -> alloc::vec::Vec<u8>
+pub fn rns_interface::rnode_multi::command_to_subinterface(u8) -> core::option::Option<usize>
+pub async fn rns_interface::rnode_multi::spawn_rnode_multi_interface(rns_interface::rnode_multi::RNodeMultiConfig, &[rns_interface::traits::InterfaceId], tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<alloc::vec::Vec<rns_interface::traits::InterfaceHandle>, rns_interface::traits::InterfaceError>
+pub mod rns_interface::rnode_protocol
+pub enum rns_interface::rnode_protocol::RNodeDetection
+pub rns_interface::rnode_protocol::RNodeDetection::Confirmed
+pub rns_interface::rnode_protocol::RNodeDetection::Unconfirmed
+pub enum rns_interface::rnode_protocol::RNodeFrameRejection
+pub rns_interface::rnode_protocol::RNodeFrameRejection::InvalidLength
+pub rns_interface::rnode_protocol::RNodeFrameRejection::InvalidLength::actual: usize
+pub rns_interface::rnode_protocol::RNodeFrameRejection::InvalidLength::command: rns_interface::rnode_protocol::RNodeProtocolCommand
+pub rns_interface::rnode_protocol::RNodeFrameRejection::InvalidLength::expected: usize
+pub rns_interface::rnode_protocol::RNodeFrameRejection::InvalidValue
+pub rns_interface::rnode_protocol::RNodeFrameRejection::InvalidValue::command: rns_interface::rnode_protocol::RNodeProtocolCommand
+pub rns_interface::rnode_protocol::RNodeFrameRejection::UnknownCommand
+pub enum rns_interface::rnode_protocol::RNodeProtocolCommand
+pub rns_interface::rnode_protocol::RNodeProtocolCommand::Bandwidth
+pub rns_interface::rnode_protocol::RNodeProtocolCommand::CodingRate
+pub rns_interface::rnode_protocol::RNodeProtocolCommand::Detect
+pub rns_interface::rnode_protocol::RNodeProtocolCommand::DeviceError
+pub rns_interface::rnode_protocol::RNodeProtocolCommand::FirmwareVersion
+pub rns_interface::rnode_protocol::RNodeProtocolCommand::FlowReady
+pub rns_interface::rnode_protocol::RNodeProtocolCommand::Frequency
+pub rns_interface::rnode_protocol::RNodeProtocolCommand::RadioState
+pub rns_interface::rnode_protocol::RNodeProtocolCommand::Reset
+pub rns_interface::rnode_protocol::RNodeProtocolCommand::SpreadingFactor
+pub rns_interface::rnode_protocol::RNodeProtocolCommand::TransmitPower
+impl core::convert::TryFrom<u8> for rns_interface::rnode_protocol::RNodeProtocolCommand
+pub type rns_interface::rnode_protocol::RNodeProtocolCommand::Error = rns_interface::rnode_protocol::RNodeFrameRejection
+pub fn rns_interface::rnode_protocol::RNodeProtocolCommand::try_from(u8) -> core::result::Result<Self, Self::Error>
+pub enum rns_interface::rnode_protocol::RNodeProtocolEffect
+pub rns_interface::rnode_protocol::RNodeProtocolEffect::EvidenceChanged(rns_interface::rnode_protocol::RNodeReadinessEvidence)
+pub rns_interface::rnode_protocol::RNodeProtocolEffect::FlowPermissionChanged(bool)
+pub rns_interface::rnode_protocol::RNodeProtocolEffect::NoChange
+pub rns_interface::rnode_protocol::RNodeProtocolEffect::RadioInitialisationFault
+pub rns_interface::rnode_protocol::RNodeProtocolEffect::Rejected(rns_interface::rnode_protocol::RNodeFrameRejection)
+pub rns_interface::rnode_protocol::RNodeProtocolEffect::Reset
+pub enum rns_interface::rnode_protocol::RNodeProtocolFrame
+pub rns_interface::rnode_protocol::RNodeProtocolFrame::Bandwidth(u32)
+pub rns_interface::rnode_protocol::RNodeProtocolFrame::CodingRate(u8)
+pub rns_interface::rnode_protocol::RNodeProtocolFrame::Detection(rns_interface::rnode_protocol::RNodeDetection)
+pub rns_interface::rnode_protocol::RNodeProtocolFrame::FirmwareVersion(rns_interface::rnode_protocol::RNodeFirmwareVersion)
+pub rns_interface::rnode_protocol::RNodeProtocolFrame::FlowPermission(bool)
+pub rns_interface::rnode_protocol::RNodeProtocolFrame::Frequency(u32)
+pub rns_interface::rnode_protocol::RNodeProtocolFrame::RadioInitialisationError
+pub rns_interface::rnode_protocol::RNodeProtocolFrame::RadioState(rns_interface::rnode_protocol::RNodeRadioState)
+pub rns_interface::rnode_protocol::RNodeProtocolFrame::Reset
+pub rns_interface::rnode_protocol::RNodeProtocolFrame::SpreadingFactor(u8)
+pub rns_interface::rnode_protocol::RNodeProtocolFrame::TransmitPower(u8)
+impl rns_interface::rnode_protocol::RNodeProtocolFrame
+pub fn rns_interface::rnode_protocol::RNodeProtocolFrame::decode(u8, &[u8]) -> core::result::Result<Self, rns_interface::rnode_protocol::RNodeFrameRejection>
+pub enum rns_interface::rnode_protocol::RNodeRadioState
+pub rns_interface::rnode_protocol::RNodeRadioState::Off
+pub rns_interface::rnode_protocol::RNodeRadioState::On
+pub enum rns_interface::rnode_protocol::RNodeReadiness
+pub rns_interface::rnode_protocol::RNodeReadiness::Blocked(rns_interface::rnode_protocol::RNodeReadinessBlocker)
+pub rns_interface::rnode_protocol::RNodeReadiness::Ready
+pub enum rns_interface::rnode_protocol::RNodeReadinessBlocker
+pub rns_interface::rnode_protocol::RNodeReadinessBlocker::Mismatch(rns_interface::rnode_protocol::RNodeReadinessEvidence)
+pub rns_interface::rnode_protocol::RNodeReadinessBlocker::Missing(rns_interface::rnode_protocol::RNodeReadinessEvidence)
+pub rns_interface::rnode_protocol::RNodeReadinessBlocker::RadioInitialisationFault
+pub rns_interface::rnode_protocol::RNodeReadinessBlocker::UnsupportedFirmware
+pub rns_interface::rnode_protocol::RNodeReadinessBlocker::UnsupportedFirmware::minimum: rns_interface::rnode_protocol::RNodeFirmwareVersion
+pub rns_interface::rnode_protocol::RNodeReadinessBlocker::UnsupportedFirmware::observed: rns_interface::rnode_protocol::RNodeFirmwareVersion
+pub enum rns_interface::rnode_protocol::RNodeReadinessEvidence
+pub rns_interface::rnode_protocol::RNodeReadinessEvidence::Bandwidth
+pub rns_interface::rnode_protocol::RNodeReadinessEvidence::CodingRate
+pub rns_interface::rnode_protocol::RNodeReadinessEvidence::Detection
+pub rns_interface::rnode_protocol::RNodeReadinessEvidence::Firmware
+pub rns_interface::rnode_protocol::RNodeReadinessEvidence::Frequency
+pub rns_interface::rnode_protocol::RNodeReadinessEvidence::RadioState
+pub rns_interface::rnode_protocol::RNodeReadinessEvidence::SpreadingFactor
+pub rns_interface::rnode_protocol::RNodeReadinessEvidence::TransmitPower
+pub struct rns_interface::rnode_protocol::RNodeFirmwareVersion
+pub rns_interface::rnode_protocol::RNodeFirmwareVersion::major: u8
+pub rns_interface::rnode_protocol::RNodeFirmwareVersion::minor: u8
+impl rns_interface::rnode_protocol::RNodeFirmwareVersion
+pub const rns_interface::rnode_protocol::RNodeFirmwareVersion::MINIMUM_SUPPORTED: Self
+pub fn rns_interface::rnode_protocol::RNodeFirmwareVersion::is_supported(self) -> bool
+pub const fn rns_interface::rnode_protocol::RNodeFirmwareVersion::new(u8, u8) -> Self
+pub struct rns_interface::rnode_protocol::RNodeProtocolEvidence
+pub rns_interface::rnode_protocol::RNodeProtocolEvidence::bandwidth: core::option::Option<u32>
+pub rns_interface::rnode_protocol::RNodeProtocolEvidence::coding_rate: core::option::Option<u8>
+pub rns_interface::rnode_protocol::RNodeProtocolEvidence::detected: bool
+pub rns_interface::rnode_protocol::RNodeProtocolEvidence::firmware: core::option::Option<rns_interface::rnode_protocol::RNodeFirmwareVersion>
+pub rns_interface::rnode_protocol::RNodeProtocolEvidence::flow_permitted: bool
+pub rns_interface::rnode_protocol::RNodeProtocolEvidence::frequency: core::option::Option<u32>
+pub rns_interface::rnode_protocol::RNodeProtocolEvidence::radio_initialisation_fault: bool
+pub rns_interface::rnode_protocol::RNodeProtocolEvidence::radio_state: core::option::Option<rns_interface::rnode_protocol::RNodeRadioState>
+pub rns_interface::rnode_protocol::RNodeProtocolEvidence::spreading_factor: core::option::Option<u8>
+pub rns_interface::rnode_protocol::RNodeProtocolEvidence::tx_power: core::option::Option<u8>
+pub struct rns_interface::rnode_protocol::RNodeProtocolState
+impl rns_interface::rnode_protocol::RNodeProtocolState
+pub fn rns_interface::rnode_protocol::RNodeProtocolState::apply_frame(&mut self, u8, &[u8]) -> rns_interface::rnode_protocol::RNodeProtocolEffect
+pub const fn rns_interface::rnode_protocol::RNodeProtocolState::detection_observed(&self) -> bool
+pub const fn rns_interface::rnode_protocol::RNodeProtocolState::evidence(&self) -> rns_interface::rnode_protocol::RNodeProtocolEvidence
+pub const fn rns_interface::rnode_protocol::RNodeProtocolState::flow_permission_observed(&self) -> bool
+pub const fn rns_interface::rnode_protocol::RNodeProtocolState::new(rns_interface::rnode_protocol::RNodeProtocolTarget) -> Self
+pub fn rns_interface::rnode_protocol::RNodeProtocolState::readiness(&self) -> rns_interface::rnode_protocol::RNodeReadiness
+pub const fn rns_interface::rnode_protocol::RNodeProtocolState::target(&self) -> rns_interface::rnode_protocol::RNodeProtocolTarget
+pub struct rns_interface::rnode_protocol::RNodeProtocolTarget
+pub rns_interface::rnode_protocol::RNodeProtocolTarget::bandwidth: u32
+pub rns_interface::rnode_protocol::RNodeProtocolTarget::coding_rate: u8
+pub rns_interface::rnode_protocol::RNodeProtocolTarget::frequency: u32
+pub rns_interface::rnode_protocol::RNodeProtocolTarget::spreading_factor: u8
+pub rns_interface::rnode_protocol::RNodeProtocolTarget::tx_power: u8
+impl rns_interface::rnode_protocol::RNodeProtocolTarget
+pub const fn rns_interface::rnode_protocol::RNodeProtocolTarget::new(u32, u32, u8, u8, u8) -> Self
+pub const rns_interface::rnode_protocol::FREQUENCY_TOLERANCE_HZ: u32
+pub mod rns_interface::serial
+pub struct rns_interface::serial::SerialConfig
+pub rns_interface::serial::SerialConfig::baud_rate: u32
+pub rns_interface::serial::SerialConfig::data_bits: serialport::DataBits
+pub rns_interface::serial::SerialConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::serial::SerialConfig::name: alloc::string::String
+pub rns_interface::serial::SerialConfig::parity: serialport::Parity
+pub rns_interface::serial::SerialConfig::port: alloc::string::String
+pub rns_interface::serial::SerialConfig::stop_bits: serialport::StopBits
+impl rns_interface::serial::SerialConfig
+pub fn rns_interface::serial::SerialConfig::baud(self, u32) -> Self
+pub fn rns_interface::serial::SerialConfig::new(&str, &str) -> Self
+pub const rns_interface::serial::DEFAULT_BAUD: u32
+pub fn rns_interface::serial::serial_params_from(u8, &str, u8) -> (serialport::DataBits, serialport::Parity, serialport::StopBits)
+pub async fn rns_interface::serial::spawn_serial_interface(rns_interface::serial::SerialConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub mod rns_interface::socket_tuning
+pub trait rns_interface::socket_tuning::RawStream: std::os::fd::raw::AsRawFd
+impl<T: std::os::fd::raw::AsRawFd> rns_interface::socket_tuning::RawStream for T
+pub fn rns_interface::socket_tuning::iface_addr_for(&str, bool) -> core::option::Option<core::net::ip_addr::IpAddr>
+pub fn rns_interface::socket_tuning::iface_broadcast_for(&str) -> core::option::Option<core::net::ip_addr::Ipv4Addr>
+pub fn rns_interface::socket_tuning::set_keepalive<S: rns_interface::socket_tuning::RawStream>(&S) -> core::io::error::Result<()>
+pub fn rns_interface::socket_tuning::set_keepalive_tuned<S: rns_interface::socket_tuning::RawStream>(&S, core::time::Duration, core::time::Duration, u32, core::time::Duration)
+pub fn rns_interface::socket_tuning::set_socket_buffers<S: rns_interface::socket_tuning::RawStream>(&S, usize)
+pub mod rns_interface::tcp
+pub struct rns_interface::tcp::TcpClientConfig
+pub rns_interface::tcp::TcpClientConfig::connect_timeout_secs: u64
+pub rns_interface::tcp::TcpClientConfig::fixed_mtu: core::option::Option<u32>
+pub rns_interface::tcp::TcpClientConfig::kiss_framing: bool
+pub rns_interface::tcp::TcpClientConfig::max_reconnect_tries: core::option::Option<usize>
+pub rns_interface::tcp::TcpClientConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::tcp::TcpClientConfig::name: alloc::string::String
+pub rns_interface::tcp::TcpClientConfig::target_host: alloc::string::String
+pub rns_interface::tcp::TcpClientConfig::target_port: u16
+impl rns_interface::tcp::TcpClientConfig
+pub fn rns_interface::tcp::TcpClientConfig::new(&str, &str, u16) -> Self
+pub struct rns_interface::tcp::TcpInterfaceState
+pub rns_interface::tcp::TcpInterfaceState::detached: core::sync::atomic::AtomicBool
+pub rns_interface::tcp::TcpInterfaceState::online: core::sync::atomic::AtomicBool
+pub rns_interface::tcp::TcpInterfaceState::rx_bytes: core::sync::atomic::AtomicU64
+pub rns_interface::tcp::TcpInterfaceState::rx_packets: core::sync::atomic::AtomicU64
+pub rns_interface::tcp::TcpInterfaceState::shared_rxb: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>>
+pub rns_interface::tcp::TcpInterfaceState::shared_txb: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>>
+pub rns_interface::tcp::TcpInterfaceState::tx_bytes: core::sync::atomic::AtomicU64
+pub rns_interface::tcp::TcpInterfaceState::tx_packets: core::sync::atomic::AtomicU64
+impl rns_interface::tcp::TcpInterfaceState
+pub fn rns_interface::tcp::TcpInterfaceState::new() -> alloc::sync::Arc<Self>
+pub fn rns_interface::tcp::TcpInterfaceState::record_rx(&self, usize)
+pub fn rns_interface::tcp::TcpInterfaceState::record_tx(&self, usize)
+pub fn rns_interface::tcp::TcpInterfaceState::with_shared_counters(alloc::sync::Arc<core::sync::atomic::AtomicU64>, alloc::sync::Arc<core::sync::atomic::AtomicU64>) -> alloc::sync::Arc<Self>
+impl core::default::Default for rns_interface::tcp::TcpInterfaceState
+pub fn rns_interface::tcp::TcpInterfaceState::default() -> Self
+pub struct rns_interface::tcp::TcpServerConfig
+pub rns_interface::tcp::TcpServerConfig::device: core::option::Option<alloc::string::String>
+pub rns_interface::tcp::TcpServerConfig::kiss_framing: bool
+pub rns_interface::tcp::TcpServerConfig::listen_ip: alloc::string::String
+pub rns_interface::tcp::TcpServerConfig::listen_port: u16
+pub rns_interface::tcp::TcpServerConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::tcp::TcpServerConfig::name: alloc::string::String
+pub rns_interface::tcp::TcpServerConfig::prefer_ipv6: bool
+impl rns_interface::tcp::TcpServerConfig
+pub fn rns_interface::tcp::TcpServerConfig::new(&str, &str, u16) -> Self
+pub const rns_interface::tcp::DEFAULT_CONNECT_TIMEOUT: u64
+pub const rns_interface::tcp::DEFAULT_TCP_USER_TIMEOUT: u32
+pub const rns_interface::tcp::RECONNECT_WAIT_INITIAL: u64
+pub const rns_interface::tcp::RECONNECT_WAIT_MAX: u64
+pub const rns_interface::tcp::TCP_HW_MTU: u32
+pub const rns_interface::tcp::TCP_KEEPCNT: u32
+pub const rns_interface::tcp::TCP_KEEPIDLE: u32
+pub const rns_interface::tcp::TCP_KEEPINTVL: u32
+pub fn rns_interface::tcp::frame_for_tcp(&[u8], bool) -> alloc::vec::Vec<u8>
+pub async fn rns_interface::tcp::spawn_tcp_client(rns_interface::tcp::TcpClientConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub async fn rns_interface::tcp::spawn_tcp_server(rns_interface::tcp::TcpServerConfig, rns_interface::traits::InterfaceId, alloc::sync::Arc<core::sync::atomic::AtomicU64>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Sender<rns_interface::traits::InterfaceHandle>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub mod rns_interface::traits
+pub enum rns_interface::traits::InterfaceError
+pub rns_interface::traits::InterfaceError::Detached
+pub rns_interface::traits::InterfaceError::Io(core::io::error::Error)
+pub rns_interface::traits::InterfaceError::Offline
+pub rns_interface::traits::InterfaceError::SendFailed(alloc::string::String)
+#[repr(u8)] pub enum rns_interface::traits::InterfaceMode
+pub rns_interface::traits::InterfaceMode::AccessPoint = 3
+pub rns_interface::traits::InterfaceMode::Boundary = 5
+pub rns_interface::traits::InterfaceMode::Full = 1
+pub rns_interface::traits::InterfaceMode::Gateway = 6
+pub rns_interface::traits::InterfaceMode::Internal = 7
+pub rns_interface::traits::InterfaceMode::PointToPoint = 2
+pub rns_interface::traits::InterfaceMode::Roaming = 4
+impl rns_interface::traits::InterfaceMode
+pub fn rns_interface::traits::InterfaceMode::from_u8(u8) -> core::option::Option<Self>
+pub struct rns_interface::traits::InterfaceDirection
+pub rns_interface::traits::InterfaceDirection::forward: bool
+pub rns_interface::traits::InterfaceDirection::inbound: bool
+pub rns_interface::traits::InterfaceDirection::outbound: bool
+pub rns_interface::traits::InterfaceDirection::repeat: bool
+pub struct rns_interface::traits::InterfaceHandle
+pub rns_interface::traits::InterfaceHandle::bitrate: u64
+pub rns_interface::traits::InterfaceHandle::direction: rns_interface::traits::InterfaceDirection
+pub rns_interface::traits::InterfaceHandle::id: rns_interface::traits::InterfaceId
+pub rns_interface::traits::InterfaceHandle::inspection: core::option::Option<rns_transport::messages::InterfaceInspectionSource>
+pub rns_interface::traits::InterfaceHandle::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::traits::InterfaceHandle::mtu: u32
+pub rns_interface::traits::InterfaceHandle::name: alloc::string::String
+pub rns_interface::traits::InterfaceHandle::online: alloc::sync::Arc<core::sync::atomic::AtomicBool>
+pub rns_interface::traits::InterfaceHandle::parent_id: core::option::Option<rns_interface::traits::InterfaceId>
+pub rns_interface::traits::InterfaceHandle::read_task: tokio::runtime::task::join::JoinHandle<()>
+pub rns_interface::traits::InterfaceHandle::rxb: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>>
+pub rns_interface::traits::InterfaceHandle::tx: tokio::sync::mpsc::bounded::Sender<bytes::bytes::Bytes>
+pub rns_interface::traits::InterfaceHandle::txb: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>>
+pub const rns_interface::traits::AR_FREQ_DECAY: f64
+pub const rns_interface::traits::AR_MINFREQ_HZ: f64
+pub const rns_interface::traits::DEFAULT_AR_GRACE: u32
+pub const rns_interface::traits::DEFAULT_AR_PENALTY: u64
+pub const rns_interface::traits::DEFAULT_AR_TARGET: u64
+pub const rns_interface::traits::DISCOVER_PATHS_FOR: &[rns_interface::traits::InterfaceMode]
+pub const rns_interface::traits::EC_PR_FREQ: f64
+pub const rns_interface::traits::EGRESS_CONTROL: bool
+pub const rns_interface::traits::IA_FREQ_SAMPLES: usize
+pub const rns_interface::traits::IC_BURST_FREQ: f64
+pub const rns_interface::traits::IC_BURST_FREQ_NEW: f64
+pub const rns_interface::traits::IC_BURST_HOLD: f64
+pub const rns_interface::traits::IC_BURST_MIN_SAMPLES: usize
+pub const rns_interface::traits::IC_BURST_PENALTY: f64
+pub const rns_interface::traits::IC_DEQUE_MIN_SAMPLE: usize
+pub const rns_interface::traits::IC_HELD_RELEASE_INTERVAL: f64
+pub const rns_interface::traits::IC_NEW_TIME: f64
+pub const rns_interface::traits::IC_PR_BURST_FREQ: f64
+pub const rns_interface::traits::IC_PR_BURST_FREQ_NEW: f64
+pub const rns_interface::traits::IP_FREQ_SAMPLES: usize
+pub const rns_interface::traits::MAX_HELD_ANNOUNCES: usize
+pub const rns_interface::traits::MODE_FULL: rns_interface::traits::InterfaceMode
+pub const rns_interface::traits::MODE_POINT_TO_POINT: rns_interface::traits::InterfaceMode
+pub const rns_interface::traits::NAME_HASH_LENGTH: usize
+pub const rns_interface::traits::OA_FREQ_SAMPLES: usize
+pub const rns_interface::traits::OP_FREQ_SAMPLES: usize
+pub const rns_interface::traits::PR_FREQ_DECAY: f64
+pub const rns_interface::traits::PR_MINFREQ_HZ: f64
+pub fn rns_interface::traits::optimise_mtu(u64) -> core::option::Option<u32>
+pub type rns_interface::traits::InterfaceId = u64
+pub mod rns_interface::udp
+pub struct rns_interface::udp::UdpInterfaceConfig
+pub rns_interface::udp::UdpInterfaceConfig::device: core::option::Option<alloc::string::String>
+pub rns_interface::udp::UdpInterfaceConfig::forward_ip: core::option::Option<alloc::string::String>
+pub rns_interface::udp::UdpInterfaceConfig::forward_port: core::option::Option<u16>
+pub rns_interface::udp::UdpInterfaceConfig::listen_ip: core::option::Option<alloc::string::String>
+pub rns_interface::udp::UdpInterfaceConfig::listen_port: core::option::Option<u16>
+pub rns_interface::udp::UdpInterfaceConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::udp::UdpInterfaceConfig::name: alloc::string::String
+impl rns_interface::udp::UdpInterfaceConfig
+pub fn rns_interface::udp::UdpInterfaceConfig::forward(self, &str, u16) -> Self
+pub fn rns_interface::udp::UdpInterfaceConfig::listen(self, &str, u16) -> Self
+pub fn rns_interface::udp::UdpInterfaceConfig::new(&str) -> Self
+pub const rns_interface::udp::HW_MTU: u32
+pub async fn rns_interface::udp::spawn_udp_interface(rns_interface::udp::UdpInterfaceConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub mod rns_interface::weave
+#[repr(u8)] pub enum rns_interface::weave::DeviceLogLevel
+pub rns_interface::weave::DeviceLogLevel::Critical = 1
+pub rns_interface::weave::DeviceLogLevel::Debug = 7
+pub rns_interface::weave::DeviceLogLevel::Error = 2
+pub rns_interface::weave::DeviceLogLevel::Extreme = 8
+pub rns_interface::weave::DeviceLogLevel::Force = 0
+pub rns_interface::weave::DeviceLogLevel::Info = 5
+pub rns_interface::weave::DeviceLogLevel::Notice = 4
+pub rns_interface::weave::DeviceLogLevel::System = 9
+pub rns_interface::weave::DeviceLogLevel::Verbose = 6
+pub rns_interface::weave::DeviceLogLevel::Warning = 3
+impl rns_interface::weave::DeviceLogLevel
+pub fn rns_interface::weave::DeviceLogLevel::from_u8(u8) -> core::option::Option<Self>
+#[repr(u8)] pub enum rns_interface::weave::PhysicalMedium
+pub rns_interface::weave::PhysicalMedium::Afsk = 11
+pub rns_interface::weave::PhysicalMedium::Ble = 4
+pub rns_interface::weave::PhysicalMedium::Can = 15
+pub rns_interface::weave::PhysicalMedium::Dma = 16
+pub rns_interface::weave::PhysicalMedium::Ethernet = 6
+pub rns_interface::weave::PhysicalMedium::Gpio = 12
+pub rns_interface::weave::PhysicalMedium::I2c = 14
+pub rns_interface::weave::PhysicalMedium::Ir = 10
+pub rns_interface::weave::PhysicalMedium::Lora = 5
+pub rns_interface::weave::PhysicalMedium::Spi = 13
+pub rns_interface::weave::PhysicalMedium::Tcp = 8
+pub rns_interface::weave::PhysicalMedium::Uart = 2
+pub rns_interface::weave::PhysicalMedium::Udp = 9
+pub rns_interface::weave::PhysicalMedium::Usb = 1
+pub rns_interface::weave::PhysicalMedium::W80211 = 3
+pub rns_interface::weave::PhysicalMedium::Wifi = 7
+impl rns_interface::weave::PhysicalMedium
+pub fn rns_interface::weave::PhysicalMedium::from_u8(u8) -> core::option::Option<Self>
+pub fn rns_interface::weave::PhysicalMedium::short_name(self) -> &'static str
+pub struct rns_interface::weave::LogFrame
+pub rns_interface::weave::LogFrame::data: alloc::vec::Vec<u8>
+pub rns_interface::weave::LogFrame::event: u16
+pub rns_interface::weave::LogFrame::level: u8
+pub rns_interface::weave::LogFrame::timestamp_ms: u32
+pub struct rns_interface::weave::WdclFrame
+pub rns_interface::weave::WdclFrame::addr: [u8; 4]
+pub rns_interface::weave::WdclFrame::msg_type: u8
+pub rns_interface::weave::WdclFrame::payload: alloc::vec::Vec<u8>
+pub struct rns_interface::weave::WeaveInterfaceConfig
+pub rns_interface::weave::WeaveInterfaceConfig::configured_bitrate: core::option::Option<u64>
+pub rns_interface::weave::WeaveInterfaceConfig::mode: rns_interface::traits::InterfaceMode
+pub rns_interface::weave::WeaveInterfaceConfig::name: alloc::string::String
+pub rns_interface::weave::WeaveInterfaceConfig::port: alloc::string::String
+impl rns_interface::weave::WeaveInterfaceConfig
+pub fn rns_interface::weave::WeaveInterfaceConfig::new(&str, &str) -> Self
+pub const rns_interface::weave::AUTH_LEN: usize
+pub const rns_interface::weave::BITRATE_GUESS: u64
+pub const rns_interface::weave::CMD_ENDPOINTS_LIST: u16
+pub const rns_interface::weave::CMD_ENDPOINT_PKT: u16
+pub const rns_interface::weave::CMD_REMOTE_DISPLAY: u16
+pub const rns_interface::weave::CMD_REMOTE_INPUT: u16
+pub const rns_interface::weave::DEFAULT_IFAC_SIZE: usize
+pub const rns_interface::weave::ENDPOINT_ID_LEN: usize
+pub const rns_interface::weave::ENDPOINT_QUEUE_LEN: usize
+pub const rns_interface::weave::EVT_BOARD_INIT: u16
+pub const rns_interface::weave::EVT_CORE_INIT: u16
+pub const rns_interface::weave::EVT_DRV_CRYPTO_INIT: u16
+pub const rns_interface::weave::EVT_DRV_DISPLAY_BUS_AVAILABLE: u16
+pub const rns_interface::weave::EVT_DRV_DISPLAY_INIT: u16
+pub const rns_interface::weave::EVT_DRV_DISPLAY_IO_CONFIGURED: u16
+pub const rns_interface::weave::EVT_DRV_DISPLAY_PANEL_CREATED: u16
+pub const rns_interface::weave::EVT_DRV_DISPLAY_PANEL_ENABLE: u16
+pub const rns_interface::weave::EVT_DRV_DISPLAY_PANEL_INIT: u16
+pub const rns_interface::weave::EVT_DRV_DISPLAY_PANEL_RESET: u16
+pub const rns_interface::weave::EVT_DRV_DISPLAY_REMOTE_ENABLE: u16
+pub const rns_interface::weave::EVT_DRV_I2C_INIT: u16
+pub const rns_interface::weave::EVT_DRV_NVS_ERASE: u16
+pub const rns_interface::weave::EVT_DRV_NVS_INIT: u16
+pub const rns_interface::weave::EVT_DRV_UART_INIT: u16
+pub const rns_interface::weave::EVT_DRV_USB_CDC_CONNECTED: u16
+pub const rns_interface::weave::EVT_DRV_USB_CDC_DROPPED: u16
+pub const rns_interface::weave::EVT_DRV_USB_CDC_HOST_AVAIL: u16
+pub const rns_interface::weave::EVT_DRV_USB_CDC_HOST_RESUME: u16
+pub const rns_interface::weave::EVT_DRV_USB_CDC_HOST_SUSPEND: u16
+pub const rns_interface::weave::EVT_DRV_USB_CDC_INIT: u16
+pub const rns_interface::weave::EVT_DRV_USB_CDC_OVERFLOW: u16
+pub const rns_interface::weave::EVT_DRV_USB_CDC_READ_ERR: u16
+pub const rns_interface::weave::EVT_DRV_USB_CDC_TX_TIMEOUT: u16
+pub const rns_interface::weave::EVT_DRV_W80211_CHANNEL: u16
+pub const rns_interface::weave::EVT_DRV_W80211_INIT: u16
+pub const rns_interface::weave::EVT_DRV_W80211_POWER: u16
+pub const rns_interface::weave::EVT_INTERFACE_REGISTERED: u16
+pub const rns_interface::weave::EVT_KRN_LOGGER_INIT: u16
+pub const rns_interface::weave::EVT_KRN_LOGGER_OUTPUT: u16
+pub const rns_interface::weave::EVT_KRN_UI_INIT: u16
+pub const rns_interface::weave::EVT_MSG: u16
+pub const rns_interface::weave::EVT_PROTO_WDCL_CONNECTION: u16
+pub const rns_interface::weave::EVT_PROTO_WDCL_HOST_ENDPOINT: u16
+pub const rns_interface::weave::EVT_PROTO_WDCL_INIT: u16
+pub const rns_interface::weave::EVT_PROTO_WDCL_RUNNING: u16
+pub const rns_interface::weave::EVT_PROTO_WEAVE_EP_ALIVE: u16
+pub const rns_interface::weave::EVT_PROTO_WEAVE_EP_TIMEOUT: u16
+pub const rns_interface::weave::EVT_PROTO_WEAVE_EP_VIA: u16
+pub const rns_interface::weave::EVT_PROTO_WEAVE_INIT: u16
+pub const rns_interface::weave::EVT_PROTO_WEAVE_RUNNING: u16
+pub const rns_interface::weave::EVT_SRVCTL_REMOTE_DISPLAY: u16
+pub const rns_interface::weave::EVT_STAT_CPU: u16
+pub const rns_interface::weave::EVT_STAT_MEMORY: u16
+pub const rns_interface::weave::EVT_STAT_STATE: u16
+pub const rns_interface::weave::EVT_STAT_STORAGE: u16
+pub const rns_interface::weave::EVT_STAT_TASK_CPU: u16
+pub const rns_interface::weave::EVT_STAT_TIMEBASE: u16
+pub const rns_interface::weave::EVT_STAT_UPTIME: u16
+pub const rns_interface::weave::EVT_SYSERR_MEM_EXHAUSTED: u16
+pub const rns_interface::weave::EVT_SYSTEM_BOOT: u16
+pub const rns_interface::weave::FIXED_MTU: bool
+pub const rns_interface::weave::FLOWSEQ_LEN: usize
+pub const rns_interface::weave::HEADER_MINSIZE: usize
+pub const rns_interface::weave::HMAC_LEN: usize
+pub const rns_interface::weave::HW_MTU: u32
+pub const rns_interface::weave::MULTI_IF_DEQUE_LEN: usize
+pub const rns_interface::weave::MULTI_IF_DEQUE_TTL: f64
+pub const rns_interface::weave::PEERING_TIMEOUT: f64
+pub const rns_interface::weave::PRVKEY_SIZE: usize
+pub const rns_interface::weave::PUBKEY_SIZE: usize
+pub const rns_interface::weave::SIGNATURE_LEN: usize
+pub const rns_interface::weave::STATLEN_MAX: usize
+pub const rns_interface::weave::STAT_UPDATE_THROTTLE: f64
+pub const rns_interface::weave::SWITCH_ID_LEN: usize
+pub const rns_interface::weave::WDCL_BROADCAST: [u8; 4]
+pub const rns_interface::weave::WDCL_HANDSHAKE_TIMEOUT: f64
+pub const rns_interface::weave::WDCL_T_CMD: u8
+pub const rns_interface::weave::WDCL_T_CONNECT: u8
+pub const rns_interface::weave::WDCL_T_DISCOVER: u8
+pub const rns_interface::weave::WDCL_T_DISP: u8
+pub const rns_interface::weave::WDCL_T_ENCAP_PROTO: u8
+pub const rns_interface::weave::WDCL_T_ENDPOINT_PKT: u8
+pub const rns_interface::weave::WDCL_T_LOG: u8
+pub fn rns_interface::weave::parse_log_frame(&[u8]) -> core::option::Option<rns_interface::weave::LogFrame>
+pub fn rns_interface::weave::wdcl_command([u8; 4], u16, &[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_interface::weave::wdcl_frame([u8; 4], u8, &[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_interface::weave::wdcl_parse(&[u8]) -> core::option::Option<rns_interface::weave::WdclFrame>

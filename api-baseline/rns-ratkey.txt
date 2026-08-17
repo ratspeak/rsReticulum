@@ -1,0 +1,618 @@
+pub mod rns_ratkey
+pub mod rns_ratkey::apdu
+pub const rns_ratkey::apdu::ALG_ECCP256: u8
+pub const rns_ratkey::apdu::ALG_ECCP384: u8
+pub const rns_ratkey::apdu::ALG_ED25519: u8
+pub const rns_ratkey::apdu::ALG_X25519: u8
+pub const rns_ratkey::apdu::INS_ATTEST: u8
+pub const rns_ratkey::apdu::INS_CHANGE_REFERENCE: u8
+pub const rns_ratkey::apdu::INS_GENERAL_AUTHENTICATE: u8
+pub const rns_ratkey::apdu::INS_GENERATE_ASYMMETRIC: u8
+pub const rns_ratkey::apdu::INS_GET_DATA: u8
+pub const rns_ratkey::apdu::INS_GET_METADATA: u8
+pub const rns_ratkey::apdu::INS_GET_SERIAL: u8
+pub const rns_ratkey::apdu::INS_GET_VERSION: u8
+pub const rns_ratkey::apdu::INS_IMPORT_KEY: u8
+pub const rns_ratkey::apdu::INS_RESET_PIV: u8
+pub const rns_ratkey::apdu::INS_RESET_RETRY: u8
+pub const rns_ratkey::apdu::INS_SELECT: u8
+pub const rns_ratkey::apdu::INS_VERIFY: u8
+pub const rns_ratkey::apdu::MGMT_ALG_AES128: u8
+pub const rns_ratkey::apdu::MGMT_ALG_AES192: u8
+pub const rns_ratkey::apdu::MGMT_ALG_AES256: u8
+pub const rns_ratkey::apdu::MGMT_ALG_TDES: u8
+pub const rns_ratkey::apdu::OBJ_ID_9A: &[u8]
+pub const rns_ratkey::apdu::OBJ_ID_9D: &[u8]
+pub const rns_ratkey::apdu::OBJ_ID_F9: &[u8]
+pub const rns_ratkey::apdu::PIN_POLICY_ALWAYS: u8
+pub const rns_ratkey::apdu::PIN_POLICY_NEVER: u8
+pub const rns_ratkey::apdu::PIN_POLICY_ONCE: u8
+pub const rns_ratkey::apdu::PIV_AID: &[u8]
+pub const rns_ratkey::apdu::SLOT_ATTESTATION: u8
+pub const rns_ratkey::apdu::SLOT_AUTHENTICATION: u8
+pub const rns_ratkey::apdu::SLOT_CARD_AUTH: u8
+pub const rns_ratkey::apdu::SLOT_CARD_MANAGEMENT: u8
+pub const rns_ratkey::apdu::SLOT_KEY_MANAGEMENT: u8
+pub const rns_ratkey::apdu::SLOT_SIGNATURE: u8
+pub const rns_ratkey::apdu::TOUCH_POLICY_ALWAYS: u8
+pub const rns_ratkey::apdu::TOUCH_POLICY_CACHED: u8
+pub const rns_ratkey::apdu::TOUCH_POLICY_NEVER: u8
+pub fn rns_ratkey::apdu::attest_key(u8) -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::auth_witness_request(u8) -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::auth_witness_response(u8, &[u8], &[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::change_pin(&str, &str) -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::check_response(&[u8]) -> core::result::Result<&[u8], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::apdu::ecdh_x25519(u8, &[u8; 32]) -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::generate_key(u8, u8, core::option::Option<u8>, core::option::Option<u8>) -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::get_data(u8) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_ratkey::apdu::get_metadata(u8) -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::get_serial() -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::get_version() -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::import_ed25519(u8, &[u8; 32], core::option::Option<u8>, core::option::Option<u8>) -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::import_x25519(u8, &[u8; 32], core::option::Option<u8>, core::option::Option<u8>) -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::parse_auth_response(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::apdu::parse_auth_witness(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::apdu::parse_certificate_object(&[u8]) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_ratkey::apdu::parse_ecdh_response(&[u8]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::apdu::parse_generate_response(&[u8]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::apdu::parse_metadata_algorithm(&[u8]) -> core::result::Result<u8, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::apdu::parse_metadata_public_key(&[u8]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::apdu::parse_serial_response(&[u8]) -> core::result::Result<u32, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::apdu::parse_sign_response(&[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::apdu::parse_version_response(&[u8]) -> core::result::Result<(u8, u8, u8), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::apdu::reset_piv() -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::reset_retry(&str, &str) -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::select_piv() -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::sign_ed25519(u8, &[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::slot_to_object_id(u8) -> core::option::Option<&'static [u8]>
+pub fn rns_ratkey::apdu::verify_pin(&str) -> alloc::vec::Vec<u8>
+pub mod rns_ratkey::attestation
+pub struct rns_ratkey::attestation::AttestationInfo
+pub rns_ratkey::attestation::AttestationInfo::attestation_cert_der: alloc::vec::Vec<u8>
+pub rns_ratkey::attestation::AttestationInfo::device_cert_der: alloc::vec::Vec<u8>
+pub rns_ratkey::attestation::AttestationInfo::firmware_version: core::option::Option<(u8, u8, u8)>
+pub rns_ratkey::attestation::AttestationInfo::form_factor: core::option::Option<u8>
+pub rns_ratkey::attestation::AttestationInfo::pin_policy: core::option::Option<u8>
+pub rns_ratkey::attestation::AttestationInfo::serial_number: core::option::Option<u32>
+pub rns_ratkey::attestation::AttestationInfo::touch_policy: core::option::Option<u8>
+pub struct rns_ratkey::attestation::AttestationVerification
+pub rns_ratkey::attestation::AttestationVerification::chain_verified: bool
+pub rns_ratkey::attestation::AttestationVerification::description: alloc::string::String
+pub rns_ratkey::attestation::AttestationVerification::info: rns_ratkey::attestation::AttestationInfo
+pub rns_ratkey::attestation::AttestationVerification::metadata_extracted: bool
+pub rns_ratkey::attestation::AttestationVerification::root_ca: alloc::string::String
+pub rns_ratkey::attestation::AttestationVerification::verified: bool
+pub const rns_ratkey::attestation::OID_FIRMWARE_VERSION: &[u8]
+pub const rns_ratkey::attestation::OID_FORM_FACTOR: &[u8]
+pub const rns_ratkey::attestation::OID_SERIAL_NUMBER: &[u8]
+pub const rns_ratkey::attestation::OID_USAGE_POLICY: &[u8]
+pub const rns_ratkey::attestation::YUBICO_ATTESTATION_ROOT_1_PEM: &str
+pub const rns_ratkey::attestation::YUBICO_LEGACY_ROOT_SHA256: &str
+pub const rns_ratkey::attestation::YUBICO_NEW_ROOT_SHA256: &str
+pub const rns_ratkey::attestation::YUBICO_PIV_ROOT_CA_LEGACY_PEM: &str
+pub fn rns_ratkey::attestation::pem_to_der(&str) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_ratkey::attestation::supports_attestation(&str) -> bool
+pub fn rns_ratkey::attestation::verify_attestation(&[u8], &[u8]) -> core::result::Result<rns_ratkey::attestation::AttestationVerification, rns_ratkey::error::RatkeyError>
+pub mod rns_ratkey::backend
+pub struct rns_ratkey::backend::HardwareBackend
+impl rns_identity::identity::LocalKeyBackend for rns_ratkey::backend::HardwareBackend
+pub fn rns_ratkey::backend::HardwareBackend::ecdh(&self, &[u8; 32]) -> core::option::Option<[u8; 32]>
+pub fn rns_ratkey::backend::HardwareBackend::lock(&self)
+pub fn rns_ratkey::backend::HardwareBackend::sign_ed25519(&self, &[u8]) -> core::option::Option<[u8; 64]>
+pub fn rns_ratkey::backend::load_hardware_identity(&rns_ratkey::hwid::HwidConfig, &str) -> core::result::Result<rns_identity::identity::Identity, rns_ratkey::error::RatkeyError>
+pub mod rns_ratkey::detect
+pub enum rns_ratkey::detect::DeviceType
+pub rns_ratkey::detect::DeviceType::Nitrokey3
+pub rns_ratkey::detect::DeviceType::Unknown
+pub rns_ratkey::detect::DeviceType::YubiKey5
+impl rns_ratkey::detect::DeviceType
+pub fn rns_ratkey::detect::DeviceType::as_str(&self) -> &'static str
+pub struct rns_ratkey::detect::DeviceInfo
+pub rns_ratkey::detect::DeviceInfo::device_type: alloc::string::String
+pub rns_ratkey::detect::DeviceInfo::firmware: core::option::Option<alloc::string::String>
+pub rns_ratkey::detect::DeviceInfo::has_encryption_key: bool
+pub rns_ratkey::detect::DeviceInfo::has_signing_key: bool
+pub rns_ratkey::detect::DeviceInfo::reader_name: alloc::string::String
+pub rns_ratkey::detect::DeviceInfo::serial: core::option::Option<u32>
+pub fn rns_ratkey::detect::detect_device_type(&str) -> rns_ratkey::detect::DeviceType
+pub fn rns_ratkey::detect::detect_devices() -> core::result::Result<alloc::vec::Vec<rns_ratkey::detect::DeviceInfo>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::detect::list_readers() -> core::result::Result<alloc::vec::Vec<alloc::string::String>, rns_ratkey::error::RatkeyError>
+pub mod rns_ratkey::error
+pub enum rns_ratkey::error::RatkeyError
+pub rns_ratkey::error::RatkeyError::Apdu
+pub rns_ratkey::error::RatkeyError::Apdu::sw1: u8
+pub rns_ratkey::error::RatkeyError::Apdu::sw2: u8
+pub rns_ratkey::error::RatkeyError::Disconnected
+pub rns_ratkey::error::RatkeyError::EcdhFailed(alloc::string::String)
+pub rns_ratkey::error::RatkeyError::EmptySlot
+pub rns_ratkey::error::RatkeyError::EmptySlot::slot: u8
+pub rns_ratkey::error::RatkeyError::FirmwareVersion
+pub rns_ratkey::error::RatkeyError::FirmwareVersion::found: alloc::string::String
+pub rns_ratkey::error::RatkeyError::FirmwareVersion::required: alloc::string::String
+pub rns_ratkey::error::RatkeyError::InvalidHwid(alloc::string::String)
+pub rns_ratkey::error::RatkeyError::Io(core::io::error::Error)
+pub rns_ratkey::error::RatkeyError::KeyMismatch
+pub rns_ratkey::error::RatkeyError::ManagementAuthFailed
+pub rns_ratkey::error::RatkeyError::NoDevice
+pub rns_ratkey::error::RatkeyError::Pcsc(pcsc::Error)
+pub rns_ratkey::error::RatkeyError::PinFailed
+pub rns_ratkey::error::RatkeyError::PinFailed::remaining: u8
+pub rns_ratkey::error::RatkeyError::PinLocked
+pub rns_ratkey::error::RatkeyError::PinRequired
+pub rns_ratkey::error::RatkeyError::PukFailed
+pub rns_ratkey::error::RatkeyError::PukFailed::remaining: u8
+pub rns_ratkey::error::RatkeyError::PukLocked
+pub rns_ratkey::error::RatkeyError::ResetRequiresBlockedPinAndPuk
+pub rns_ratkey::error::RatkeyError::SigningFailed(alloc::string::String)
+pub rns_ratkey::error::RatkeyError::SlotOccupied
+pub rns_ratkey::error::RatkeyError::SlotOccupied::slot: u8
+pub rns_ratkey::error::RatkeyError::TouchRequired
+pub rns_ratkey::error::RatkeyError::UnsupportedDevice(alloc::string::String)
+pub mod rns_ratkey::hardware
+pub struct rns_ratkey::hardware::HardwareIdentity
+pub rns_ratkey::hardware::HardwareIdentity::config: rns_ratkey::hwid::HwidConfig
+pub rns_ratkey::hardware::HardwareIdentity::identity: rns_identity::identity::Identity
+impl rns_ratkey::hardware::HardwareIdentity
+pub fn rns_ratkey::hardware::HardwareIdentity::as_identity(&self) -> &rns_identity::identity::Identity
+pub fn rns_ratkey::hardware::HardwareIdentity::decrypt(&mut self, &[u8], core::option::Option<&[&[u8; 32]]>, bool) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::HardwareIdentity::ecdh(&mut self, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::HardwareIdentity::ed25519_public(&self) -> &[u8; 32]
+pub fn rns_ratkey::hardware::HardwareIdentity::from_file(&std::path::Path, alloc::boxed::Box<dyn rns_ratkey::hardware::IdentityBackend>) -> core::result::Result<Self, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::HardwareIdentity::from_hwid(rns_ratkey::hwid::HwidConfig, alloc::boxed::Box<dyn rns_ratkey::hardware::IdentityBackend>) -> core::result::Result<Self, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::HardwareIdentity::from_keys([u8; 32], [u8; 32], alloc::boxed::Box<dyn rns_ratkey::hardware::IdentityBackend>) -> core::result::Result<Self, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::HardwareIdentity::get_public_key(&self) -> [u8; 64]
+pub fn rns_ratkey::hardware::HardwareIdentity::hash(&self) -> &[u8; 16]
+pub fn rns_ratkey::hardware::HardwareIdentity::hash_hex(&self) -> alloc::string::String
+pub fn rns_ratkey::hardware::HardwareIdentity::is_connected(&self) -> bool
+pub fn rns_ratkey::hardware::HardwareIdentity::lock(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::HardwareIdentity::sign(&mut self, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::HardwareIdentity::verify(&self, &[u8], &[u8; 64]) -> bool
+pub fn rns_ratkey::hardware::HardwareIdentity::x25519_public(&self) -> &[u8; 32]
+pub trait rns_ratkey::hardware::IdentityBackend
+pub fn rns_ratkey::hardware::IdentityBackend::ecdh_x25519(&mut self, u8, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::IdentityBackend::is_connected(&self) -> bool
+pub fn rns_ratkey::hardware::IdentityBackend::lock(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::IdentityBackend::read_ed25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::IdentityBackend::read_x25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::IdentityBackend::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+impl rns_ratkey::hardware::IdentityBackend for rns_ratkey::mock::MockPivSession
+pub fn rns_ratkey::mock::MockPivSession::ecdh_x25519(&mut self, u8, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::is_connected(&self) -> bool
+pub fn rns_ratkey::mock::MockPivSession::lock(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::read_ed25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::read_x25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+impl<T: rns_ratkey::transport::PivTransport> rns_ratkey::hardware::IdentityBackend for rns_ratkey::session::PivSession<T>
+pub fn rns_ratkey::session::PivSession<T>::ecdh_x25519(&mut self, u8, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::is_connected(&self) -> bool
+pub fn rns_ratkey::session::PivSession<T>::lock(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::read_ed25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::read_x25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+pub mod rns_ratkey::hwid
+pub struct rns_ratkey::hwid::HwidApp
+pub rns_ratkey::hwid::HwidApp::app_hash: alloc::string::String
+pub struct rns_ratkey::hwid::HwidAttestation
+pub rns_ratkey::hwid::HwidAttestation::ed25519_cert: alloc::string::String
+pub rns_ratkey::hwid::HwidAttestation::verified: bool
+pub rns_ratkey::hwid::HwidAttestation::x25519_cert: alloc::string::String
+pub struct rns_ratkey::hwid::HwidBackup
+pub rns_ratkey::hwid::HwidBackup::backup_serial: core::option::Option<u32>
+pub rns_ratkey::hwid::HwidBackup::encrypted_backup_hash: core::option::Option<alloc::string::String>
+pub rns_ratkey::hwid::HwidBackup::tier: u8
+pub struct rns_ratkey::hwid::HwidConfig
+pub rns_ratkey::hwid::HwidConfig::app: rns_ratkey::hwid::HwidApp
+pub rns_ratkey::hwid::HwidConfig::attestation: rns_ratkey::hwid::HwidAttestation
+pub rns_ratkey::hwid::HwidConfig::backup: rns_ratkey::hwid::HwidBackup
+pub rns_ratkey::hwid::HwidConfig::device: rns_ratkey::hwid::HwidDevice
+pub rns_ratkey::hwid::HwidConfig::identity: rns_ratkey::hwid::HwidIdentity
+pub rns_ratkey::hwid::HwidConfig::keys: rns_ratkey::hwid::HwidKeys
+pub rns_ratkey::hwid::HwidConfig::policy: rns_ratkey::hwid::HwidPolicy
+pub rns_ratkey::hwid::HwidConfig::slots: rns_ratkey::hwid::HwidSlots
+impl rns_ratkey::hwid::HwidConfig
+pub fn rns_ratkey::hwid::HwidConfig::ed25519_pub_bytes(&self) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hwid::HwidConfig::encryption_slot(&self) -> core::result::Result<u8, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hwid::HwidConfig::from_file(&std::path::Path) -> core::result::Result<Self, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hwid::HwidConfig::signing_slot(&self) -> core::result::Result<u8, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hwid::HwidConfig::to_file(&self, &std::path::Path) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hwid::HwidConfig::to_string(&self) -> core::result::Result<alloc::string::String, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hwid::HwidConfig::x25519_pub_bytes(&self) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+impl core::str::traits::FromStr for rns_ratkey::hwid::HwidConfig
+pub type rns_ratkey::hwid::HwidConfig::Err = rns_ratkey::error::RatkeyError
+pub fn rns_ratkey::hwid::HwidConfig::from_str(&str) -> core::result::Result<Self, Self::Err>
+pub struct rns_ratkey::hwid::HwidDevice
+pub rns_ratkey::hwid::HwidDevice::device_type: alloc::string::String
+pub rns_ratkey::hwid::HwidDevice::firmware: alloc::string::String
+pub rns_ratkey::hwid::HwidDevice::serial: u32
+pub struct rns_ratkey::hwid::HwidIdentity
+pub rns_ratkey::hwid::HwidIdentity::created_at: u64
+pub rns_ratkey::hwid::HwidIdentity::hash: alloc::string::String
+pub rns_ratkey::hwid::HwidIdentity::nickname: alloc::string::String
+pub struct rns_ratkey::hwid::HwidKeys
+pub rns_ratkey::hwid::HwidKeys::ed25519_pub: alloc::string::String
+pub rns_ratkey::hwid::HwidKeys::x25519_pub: alloc::string::String
+pub struct rns_ratkey::hwid::HwidPolicy
+pub rns_ratkey::hwid::HwidPolicy::pin_cache_timeout: u64
+pub rns_ratkey::hwid::HwidPolicy::touch_encryption: alloc::string::String
+pub rns_ratkey::hwid::HwidPolicy::touch_signing: alloc::string::String
+pub struct rns_ratkey::hwid::HwidSlots
+pub rns_ratkey::hwid::HwidSlots::encryption: alloc::string::String
+pub rns_ratkey::hwid::HwidSlots::signing: alloc::string::String
+pub mod rns_ratkey::mgmt
+pub fn rns_ratkey::mgmt::block_len(u8) -> core::option::Option<usize>
+pub fn rns_ratkey::mgmt::ecb_decrypt(u8, &[u8], &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mgmt::ecb_encrypt(u8, &[u8], &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mgmt::key_len(u8) -> core::option::Option<usize>
+pub mod rns_ratkey::mock
+pub enum rns_ratkey::mock::MockOperation
+pub rns_ratkey::mock::MockOperation::EcdhX25519
+pub rns_ratkey::mock::MockOperation::EcdhX25519::slot: u8
+pub rns_ratkey::mock::MockOperation::GenerateEd25519
+pub rns_ratkey::mock::MockOperation::GenerateEd25519::slot: u8
+pub rns_ratkey::mock::MockOperation::GenerateX25519
+pub rns_ratkey::mock::MockOperation::GenerateX25519::slot: u8
+pub rns_ratkey::mock::MockOperation::PinUnblock
+pub rns_ratkey::mock::MockOperation::PinUnblock::success: bool
+pub rns_ratkey::mock::MockOperation::PinVerify
+pub rns_ratkey::mock::MockOperation::PinVerify::success: bool
+pub rns_ratkey::mock::MockOperation::ReadPublicKey
+pub rns_ratkey::mock::MockOperation::ReadPublicKey::slot: u8
+pub rns_ratkey::mock::MockOperation::ResetPiv
+pub rns_ratkey::mock::MockOperation::ResetPiv::success: bool
+pub rns_ratkey::mock::MockOperation::SignEd25519
+pub rns_ratkey::mock::MockOperation::SignEd25519::data_len: usize
+pub rns_ratkey::mock::MockOperation::SignEd25519::slot: u8
+pub enum rns_ratkey::mock::TouchPolicy
+pub rns_ratkey::mock::TouchPolicy::Always
+pub rns_ratkey::mock::TouchPolicy::Cached
+pub rns_ratkey::mock::TouchPolicy::Never
+pub struct rns_ratkey::mock::MockPivSession
+pub rns_ratkey::mock::MockPivSession::device_type: alloc::string::String
+pub rns_ratkey::mock::MockPivSession::firmware: alloc::string::String
+pub rns_ratkey::mock::MockPivSession::operations: alloc::vec::Vec<rns_ratkey::mock::MockOperation>
+pub rns_ratkey::mock::MockPivSession::serial: u32
+impl rns_ratkey::mock::MockPivSession
+pub fn rns_ratkey::mock::MockPivSession::disconnect(&mut self)
+pub fn rns_ratkey::mock::MockPivSession::ecdh_x25519(&mut self, u8, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::generate_ed25519(&mut self, u8, rns_ratkey::mock::TouchPolicy) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::generate_x25519(&mut self, u8, rns_ratkey::mock::TouchPolicy) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::is_connected(&self) -> bool
+pub fn rns_ratkey::mock::MockPivSession::lock(&mut self)
+pub fn rns_ratkey::mock::MockPivSession::new() -> Self
+pub fn rns_ratkey::mock::MockPivSession::read_ed25519_public(&self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::read_x25519_public(&self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::reconnect(&mut self)
+pub fn rns_ratkey::mock::MockPivSession::require_touch(&mut self)
+pub fn rns_ratkey::mock::MockPivSession::reset_piv(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::set_pin(&mut self, &str)
+pub fn rns_ratkey::mock::MockPivSession::set_puk(&mut self, &str)
+pub fn rns_ratkey::mock::MockPivSession::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::simulate_touch(&mut self)
+pub fn rns_ratkey::mock::MockPivSession::unblock_pin(&mut self, &str, &str) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::verify_pin(&mut self, &str) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::with_key_bytes(&[u8; 32], &[u8; 32]) -> Self
+pub fn rns_ratkey::mock::MockPivSession::with_keys() -> Self
+impl core::default::Default for rns_ratkey::mock::MockPivSession
+pub fn rns_ratkey::mock::MockPivSession::default() -> Self
+impl core::ops::drop::Drop for rns_ratkey::mock::MockPivSession
+pub fn rns_ratkey::mock::MockPivSession::drop(&mut self)
+impl rns_ratkey::hardware::IdentityBackend for rns_ratkey::mock::MockPivSession
+pub fn rns_ratkey::mock::MockPivSession::ecdh_x25519(&mut self, u8, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::is_connected(&self) -> bool
+pub fn rns_ratkey::mock::MockPivSession::lock(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::read_ed25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::read_x25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+pub const rns_ratkey::mock::SLOT_9A: u8
+pub const rns_ratkey::mock::SLOT_9D: u8
+pub mod rns_ratkey::pin
+pub struct rns_ratkey::pin::PinCache
+impl rns_ratkey::pin::PinCache
+pub fn rns_ratkey::pin::PinCache::cache(&mut self, &str)
+pub fn rns_ratkey::pin::PinCache::clear(&mut self)
+pub fn rns_ratkey::pin::PinCache::default_timeout() -> Self
+pub fn rns_ratkey::pin::PinCache::get(&self) -> core::option::Option<&str>
+pub fn rns_ratkey::pin::PinCache::is_cached(&self) -> bool
+pub fn rns_ratkey::pin::PinCache::new(core::time::Duration) -> Self
+pub fn rns_ratkey::pin::PinCache::remaining(&self) -> core::option::Option<core::time::Duration>
+impl core::ops::drop::Drop for rns_ratkey::pin::PinCache
+pub fn rns_ratkey::pin::PinCache::drop(&mut self)
+pub mod rns_ratkey::provision
+pub struct rns_ratkey::provision::ProvisionConfig
+pub rns_ratkey::provision::ProvisionConfig::identities_dir: core::option::Option<std::path::PathBuf>
+pub rns_ratkey::provision::ProvisionConfig::nickname: alloc::string::String
+pub rns_ratkey::provision::ProvisionConfig::pin: alloc::string::String
+pub rns_ratkey::provision::ProvisionConfig::touch_encryption: rns_ratkey::mock::TouchPolicy
+pub rns_ratkey::provision::ProvisionConfig::touch_signing: rns_ratkey::mock::TouchPolicy
+impl core::default::Default for rns_ratkey::provision::ProvisionConfig
+pub fn rns_ratkey::provision::ProvisionConfig::default() -> Self
+pub struct rns_ratkey::provision::ProvisionResult
+pub rns_ratkey::provision::ProvisionResult::config: rns_ratkey::hwid::HwidConfig
+pub rns_ratkey::provision::ProvisionResult::ed25519_pub: [u8; 32]
+pub rns_ratkey::provision::ProvisionResult::hwid_path: core::option::Option<std::path::PathBuf>
+pub rns_ratkey::provision::ProvisionResult::identity_hash: [u8; 16]
+pub rns_ratkey::provision::ProvisionResult::identity_hash_hex: alloc::string::String
+pub rns_ratkey::provision::ProvisionResult::x25519_pub: [u8; 32]
+pub fn rns_ratkey::provision::compute_identity_hash(&[u8; 32], &[u8; 32]) -> [u8; 16]
+pub fn rns_ratkey::provision::import_recoverable_identity<T: rns_ratkey::transport::PivTransport>(&mut rns_ratkey::session::PivSession<T>, &[u8], &rns_ratkey::provision::ProvisionConfig, &str) -> core::result::Result<rns_ratkey::provision::ProvisionResult, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::provision::provision_hardware_only<T: rns_ratkey::transport::PivTransport>(&mut rns_ratkey::session::PivSession<T>, &[u8], &rns_ratkey::provision::ProvisionConfig) -> core::result::Result<rns_ratkey::provision::ProvisionResult, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::provision::provision_mock(&mut rns_ratkey::mock::MockPivSession, &rns_ratkey::provision::ProvisionConfig) -> core::result::Result<rns_ratkey::provision::ProvisionResult, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::provision::provision_recoverable<T: rns_ratkey::transport::PivTransport>(&mut rns_ratkey::session::PivSession<T>, &[u8], &rns_ratkey::provision::ProvisionConfig) -> core::result::Result<(rns_ratkey::provision::ProvisionResult, alloc::string::String), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::provision::read_existing<T: rns_ratkey::transport::PivTransport>(&mut rns_ratkey::session::PivSession<T>, &rns_ratkey::provision::ProvisionConfig) -> core::result::Result<rns_ratkey::provision::ProvisionResult, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::provision::restore<T: rns_ratkey::transport::PivTransport>(&mut rns_ratkey::session::PivSession<T>, &[u8], &rns_ratkey::provision::ProvisionConfig, &str) -> core::result::Result<rns_ratkey::provision::ProvisionResult, rns_ratkey::error::RatkeyError>
+pub mod rns_ratkey::seed
+pub struct rns_ratkey::seed::DerivedIdentity
+pub rns_ratkey::seed::DerivedIdentity::ed25519_pub: [u8; 32]
+pub rns_ratkey::seed::DerivedIdentity::ed25519_seed: [u8; 32]
+pub rns_ratkey::seed::DerivedIdentity::x25519_pub: [u8; 32]
+pub rns_ratkey::seed::DerivedIdentity::x25519_secret: [u8; 32]
+impl core::ops::drop::Drop for rns_ratkey::seed::DerivedIdentity
+pub fn rns_ratkey::seed::DerivedIdentity::drop(&mut self)
+pub fn rns_ratkey::seed::derive_identity(&str) -> core::result::Result<rns_ratkey::seed::DerivedIdentity, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::seed::generate_mnemonic() -> core::result::Result<alloc::string::String, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::seed::validate_mnemonic(&str) -> bool
+pub mod rns_ratkey::session
+pub struct rns_ratkey::session::DeviceMeta
+pub rns_ratkey::session::DeviceMeta::device_type: rns_ratkey::detect::DeviceType
+pub rns_ratkey::session::DeviceMeta::firmware: core::option::Option<alloc::string::String>
+pub rns_ratkey::session::DeviceMeta::serial: core::option::Option<u32>
+pub struct rns_ratkey::session::PivSession<T: rns_ratkey::transport::PivTransport>
+impl rns_ratkey::session::PivSession<rns_ratkey::PcscTransport>
+pub fn rns_ratkey::session::PivSession<rns_ratkey::PcscTransport>::connect() -> core::result::Result<Self, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<rns_ratkey::PcscTransport>::connect_reader(&str) -> core::result::Result<Self, rns_ratkey::error::RatkeyError>
+impl<T: rns_ratkey::transport::PivTransport> rns_ratkey::session::PivSession<T>
+pub fn rns_ratkey::session::PivSession<T>::attest_key(&mut self, u8) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::authenticate_management_key(&mut self, &[u8]) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::change_pin(&mut self, &str, &str) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::device_type(&self) -> rns_ratkey::detect::DeviceType
+pub fn rns_ratkey::session::PivSession<T>::ecdh_x25519(&mut self, u8, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::firmware(&self) -> core::option::Option<&str>
+pub fn rns_ratkey::session::PivSession<T>::generate_ed25519(&mut self, u8, core::option::Option<u8>, core::option::Option<u8>) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::generate_x25519(&mut self, u8, core::option::Option<u8>, core::option::Option<u8>) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::import_ed25519(&mut self, u8, &[u8; 32], core::option::Option<u8>, core::option::Option<u8>) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::import_x25519(&mut self, u8, &[u8; 32], core::option::Option<u8>, core::option::Option<u8>) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::is_connected(&self) -> bool
+pub fn rns_ratkey::session::PivSession<T>::lock(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::new(T, rns_ratkey::session::DeviceMeta) -> Self
+pub fn rns_ratkey::session::PivSession<T>::read_attestation_cert(&mut self) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::read_certificate(&mut self, u8) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::read_metadata(&mut self, u8) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::read_public_key(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::reset_piv(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::serial(&self) -> core::option::Option<u32>
+pub fn rns_ratkey::session::PivSession<T>::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::unblock_pin(&mut self, &str, &str) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::verify_pin(&mut self, &str) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+impl<T: rns_ratkey::transport::PivTransport> rns_ratkey::hardware::IdentityBackend for rns_ratkey::session::PivSession<T>
+pub fn rns_ratkey::session::PivSession<T>::ecdh_x25519(&mut self, u8, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::is_connected(&self) -> bool
+pub fn rns_ratkey::session::PivSession<T>::lock(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::read_ed25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::read_x25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+pub type rns_ratkey::session::PcscPivSession = rns_ratkey::session::PivSession<rns_ratkey::PcscTransport>
+pub mod rns_ratkey::transport
+pub struct rns_ratkey::transport::PcscTransport
+impl rns_ratkey::PcscTransport
+pub fn rns_ratkey::PcscTransport::connect() -> core::result::Result<(Self, rns_ratkey::session::DeviceMeta), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::PcscTransport::connect_reader(&str) -> core::result::Result<(Self, rns_ratkey::session::DeviceMeta), rns_ratkey::error::RatkeyError>
+impl rns_ratkey::transport::PivTransport for rns_ratkey::PcscTransport
+pub fn rns_ratkey::PcscTransport::is_connected(&self) -> bool
+pub fn rns_ratkey::PcscTransport::transmit(&mut self, &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub trait rns_ratkey::transport::PivTransport
+pub fn rns_ratkey::transport::PivTransport::is_connected(&self) -> bool
+pub fn rns_ratkey::transport::PivTransport::transmit(&mut self, &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+impl rns_ratkey::transport::PivTransport for rns_ratkey::PcscTransport
+pub fn rns_ratkey::PcscTransport::is_connected(&self) -> bool
+pub fn rns_ratkey::PcscTransport::transmit(&mut self, &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub enum rns_ratkey::RatkeyError
+pub rns_ratkey::RatkeyError::Apdu
+pub rns_ratkey::RatkeyError::Apdu::sw1: u8
+pub rns_ratkey::RatkeyError::Apdu::sw2: u8
+pub rns_ratkey::RatkeyError::Disconnected
+pub rns_ratkey::RatkeyError::EcdhFailed(alloc::string::String)
+pub rns_ratkey::RatkeyError::EmptySlot
+pub rns_ratkey::RatkeyError::EmptySlot::slot: u8
+pub rns_ratkey::RatkeyError::FirmwareVersion
+pub rns_ratkey::RatkeyError::FirmwareVersion::found: alloc::string::String
+pub rns_ratkey::RatkeyError::FirmwareVersion::required: alloc::string::String
+pub rns_ratkey::RatkeyError::InvalidHwid(alloc::string::String)
+pub rns_ratkey::RatkeyError::Io(core::io::error::Error)
+pub rns_ratkey::RatkeyError::KeyMismatch
+pub rns_ratkey::RatkeyError::ManagementAuthFailed
+pub rns_ratkey::RatkeyError::NoDevice
+pub rns_ratkey::RatkeyError::Pcsc(pcsc::Error)
+pub rns_ratkey::RatkeyError::PinFailed
+pub rns_ratkey::RatkeyError::PinFailed::remaining: u8
+pub rns_ratkey::RatkeyError::PinLocked
+pub rns_ratkey::RatkeyError::PinRequired
+pub rns_ratkey::RatkeyError::PukFailed
+pub rns_ratkey::RatkeyError::PukFailed::remaining: u8
+pub rns_ratkey::RatkeyError::PukLocked
+pub rns_ratkey::RatkeyError::ResetRequiresBlockedPinAndPuk
+pub rns_ratkey::RatkeyError::SigningFailed(alloc::string::String)
+pub rns_ratkey::RatkeyError::SlotOccupied
+pub rns_ratkey::RatkeyError::SlotOccupied::slot: u8
+pub rns_ratkey::RatkeyError::TouchRequired
+pub rns_ratkey::RatkeyError::UnsupportedDevice(alloc::string::String)
+pub struct rns_ratkey::DeviceMeta
+pub rns_ratkey::DeviceMeta::device_type: rns_ratkey::detect::DeviceType
+pub rns_ratkey::DeviceMeta::firmware: core::option::Option<alloc::string::String>
+pub rns_ratkey::DeviceMeta::serial: core::option::Option<u32>
+pub struct rns_ratkey::HardwareBackend
+impl rns_identity::identity::LocalKeyBackend for rns_ratkey::backend::HardwareBackend
+pub fn rns_ratkey::backend::HardwareBackend::ecdh(&self, &[u8; 32]) -> core::option::Option<[u8; 32]>
+pub fn rns_ratkey::backend::HardwareBackend::lock(&self)
+pub fn rns_ratkey::backend::HardwareBackend::sign_ed25519(&self, &[u8]) -> core::option::Option<[u8; 64]>
+pub struct rns_ratkey::HardwareIdentity
+pub rns_ratkey::HardwareIdentity::config: rns_ratkey::hwid::HwidConfig
+pub rns_ratkey::HardwareIdentity::identity: rns_identity::identity::Identity
+impl rns_ratkey::hardware::HardwareIdentity
+pub fn rns_ratkey::hardware::HardwareIdentity::as_identity(&self) -> &rns_identity::identity::Identity
+pub fn rns_ratkey::hardware::HardwareIdentity::decrypt(&mut self, &[u8], core::option::Option<&[&[u8; 32]]>, bool) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::HardwareIdentity::ecdh(&mut self, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::HardwareIdentity::ed25519_public(&self) -> &[u8; 32]
+pub fn rns_ratkey::hardware::HardwareIdentity::from_file(&std::path::Path, alloc::boxed::Box<dyn rns_ratkey::hardware::IdentityBackend>) -> core::result::Result<Self, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::HardwareIdentity::from_hwid(rns_ratkey::hwid::HwidConfig, alloc::boxed::Box<dyn rns_ratkey::hardware::IdentityBackend>) -> core::result::Result<Self, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::HardwareIdentity::from_keys([u8; 32], [u8; 32], alloc::boxed::Box<dyn rns_ratkey::hardware::IdentityBackend>) -> core::result::Result<Self, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::HardwareIdentity::get_public_key(&self) -> [u8; 64]
+pub fn rns_ratkey::hardware::HardwareIdentity::hash(&self) -> &[u8; 16]
+pub fn rns_ratkey::hardware::HardwareIdentity::hash_hex(&self) -> alloc::string::String
+pub fn rns_ratkey::hardware::HardwareIdentity::is_connected(&self) -> bool
+pub fn rns_ratkey::hardware::HardwareIdentity::lock(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::HardwareIdentity::sign(&mut self, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hardware::HardwareIdentity::verify(&self, &[u8], &[u8; 64]) -> bool
+pub fn rns_ratkey::hardware::HardwareIdentity::x25519_public(&self) -> &[u8; 32]
+pub struct rns_ratkey::HwidConfig
+pub rns_ratkey::HwidConfig::app: rns_ratkey::hwid::HwidApp
+pub rns_ratkey::HwidConfig::attestation: rns_ratkey::hwid::HwidAttestation
+pub rns_ratkey::HwidConfig::backup: rns_ratkey::hwid::HwidBackup
+pub rns_ratkey::HwidConfig::device: rns_ratkey::hwid::HwidDevice
+pub rns_ratkey::HwidConfig::identity: rns_ratkey::hwid::HwidIdentity
+pub rns_ratkey::HwidConfig::keys: rns_ratkey::hwid::HwidKeys
+pub rns_ratkey::HwidConfig::policy: rns_ratkey::hwid::HwidPolicy
+pub rns_ratkey::HwidConfig::slots: rns_ratkey::hwid::HwidSlots
+impl rns_ratkey::hwid::HwidConfig
+pub fn rns_ratkey::hwid::HwidConfig::ed25519_pub_bytes(&self) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hwid::HwidConfig::encryption_slot(&self) -> core::result::Result<u8, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hwid::HwidConfig::from_file(&std::path::Path) -> core::result::Result<Self, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hwid::HwidConfig::signing_slot(&self) -> core::result::Result<u8, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hwid::HwidConfig::to_file(&self, &std::path::Path) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hwid::HwidConfig::to_string(&self) -> core::result::Result<alloc::string::String, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::hwid::HwidConfig::x25519_pub_bytes(&self) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+impl core::str::traits::FromStr for rns_ratkey::hwid::HwidConfig
+pub type rns_ratkey::hwid::HwidConfig::Err = rns_ratkey::error::RatkeyError
+pub fn rns_ratkey::hwid::HwidConfig::from_str(&str) -> core::result::Result<Self, Self::Err>
+pub struct rns_ratkey::MockPivSession
+pub rns_ratkey::MockPivSession::device_type: alloc::string::String
+pub rns_ratkey::MockPivSession::firmware: alloc::string::String
+pub rns_ratkey::MockPivSession::operations: alloc::vec::Vec<rns_ratkey::mock::MockOperation>
+pub rns_ratkey::MockPivSession::serial: u32
+impl rns_ratkey::mock::MockPivSession
+pub fn rns_ratkey::mock::MockPivSession::disconnect(&mut self)
+pub fn rns_ratkey::mock::MockPivSession::ecdh_x25519(&mut self, u8, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::generate_ed25519(&mut self, u8, rns_ratkey::mock::TouchPolicy) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::generate_x25519(&mut self, u8, rns_ratkey::mock::TouchPolicy) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::is_connected(&self) -> bool
+pub fn rns_ratkey::mock::MockPivSession::lock(&mut self)
+pub fn rns_ratkey::mock::MockPivSession::new() -> Self
+pub fn rns_ratkey::mock::MockPivSession::read_ed25519_public(&self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::read_x25519_public(&self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::reconnect(&mut self)
+pub fn rns_ratkey::mock::MockPivSession::require_touch(&mut self)
+pub fn rns_ratkey::mock::MockPivSession::reset_piv(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::set_pin(&mut self, &str)
+pub fn rns_ratkey::mock::MockPivSession::set_puk(&mut self, &str)
+pub fn rns_ratkey::mock::MockPivSession::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::simulate_touch(&mut self)
+pub fn rns_ratkey::mock::MockPivSession::unblock_pin(&mut self, &str, &str) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::verify_pin(&mut self, &str) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::with_key_bytes(&[u8; 32], &[u8; 32]) -> Self
+pub fn rns_ratkey::mock::MockPivSession::with_keys() -> Self
+impl core::default::Default for rns_ratkey::mock::MockPivSession
+pub fn rns_ratkey::mock::MockPivSession::default() -> Self
+impl core::ops::drop::Drop for rns_ratkey::mock::MockPivSession
+pub fn rns_ratkey::mock::MockPivSession::drop(&mut self)
+impl rns_ratkey::hardware::IdentityBackend for rns_ratkey::mock::MockPivSession
+pub fn rns_ratkey::mock::MockPivSession::ecdh_x25519(&mut self, u8, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::is_connected(&self) -> bool
+pub fn rns_ratkey::mock::MockPivSession::lock(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::read_ed25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::read_x25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+pub struct rns_ratkey::PcscTransport
+impl rns_ratkey::PcscTransport
+pub fn rns_ratkey::PcscTransport::connect() -> core::result::Result<(Self, rns_ratkey::session::DeviceMeta), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::PcscTransport::connect_reader(&str) -> core::result::Result<(Self, rns_ratkey::session::DeviceMeta), rns_ratkey::error::RatkeyError>
+impl rns_ratkey::transport::PivTransport for rns_ratkey::PcscTransport
+pub fn rns_ratkey::PcscTransport::is_connected(&self) -> bool
+pub fn rns_ratkey::PcscTransport::transmit(&mut self, &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub struct rns_ratkey::PinCache
+impl rns_ratkey::pin::PinCache
+pub fn rns_ratkey::pin::PinCache::cache(&mut self, &str)
+pub fn rns_ratkey::pin::PinCache::clear(&mut self)
+pub fn rns_ratkey::pin::PinCache::default_timeout() -> Self
+pub fn rns_ratkey::pin::PinCache::get(&self) -> core::option::Option<&str>
+pub fn rns_ratkey::pin::PinCache::is_cached(&self) -> bool
+pub fn rns_ratkey::pin::PinCache::new(core::time::Duration) -> Self
+pub fn rns_ratkey::pin::PinCache::remaining(&self) -> core::option::Option<core::time::Duration>
+impl core::ops::drop::Drop for rns_ratkey::pin::PinCache
+pub fn rns_ratkey::pin::PinCache::drop(&mut self)
+pub struct rns_ratkey::PivSession<T: rns_ratkey::transport::PivTransport>
+impl rns_ratkey::session::PivSession<rns_ratkey::PcscTransport>
+pub fn rns_ratkey::session::PivSession<rns_ratkey::PcscTransport>::connect() -> core::result::Result<Self, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<rns_ratkey::PcscTransport>::connect_reader(&str) -> core::result::Result<Self, rns_ratkey::error::RatkeyError>
+impl<T: rns_ratkey::transport::PivTransport> rns_ratkey::session::PivSession<T>
+pub fn rns_ratkey::session::PivSession<T>::attest_key(&mut self, u8) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::authenticate_management_key(&mut self, &[u8]) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::change_pin(&mut self, &str, &str) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::device_type(&self) -> rns_ratkey::detect::DeviceType
+pub fn rns_ratkey::session::PivSession<T>::ecdh_x25519(&mut self, u8, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::firmware(&self) -> core::option::Option<&str>
+pub fn rns_ratkey::session::PivSession<T>::generate_ed25519(&mut self, u8, core::option::Option<u8>, core::option::Option<u8>) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::generate_x25519(&mut self, u8, core::option::Option<u8>, core::option::Option<u8>) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::import_ed25519(&mut self, u8, &[u8; 32], core::option::Option<u8>, core::option::Option<u8>) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::import_x25519(&mut self, u8, &[u8; 32], core::option::Option<u8>, core::option::Option<u8>) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::is_connected(&self) -> bool
+pub fn rns_ratkey::session::PivSession<T>::lock(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::new(T, rns_ratkey::session::DeviceMeta) -> Self
+pub fn rns_ratkey::session::PivSession<T>::read_attestation_cert(&mut self) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::read_certificate(&mut self, u8) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::read_metadata(&mut self, u8) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::read_public_key(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::reset_piv(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::serial(&self) -> core::option::Option<u32>
+pub fn rns_ratkey::session::PivSession<T>::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::unblock_pin(&mut self, &str, &str) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::verify_pin(&mut self, &str) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+impl<T: rns_ratkey::transport::PivTransport> rns_ratkey::hardware::IdentityBackend for rns_ratkey::session::PivSession<T>
+pub fn rns_ratkey::session::PivSession<T>::ecdh_x25519(&mut self, u8, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::is_connected(&self) -> bool
+pub fn rns_ratkey::session::PivSession<T>::lock(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::read_ed25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::read_x25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+pub struct rns_ratkey::ProvisionConfig
+pub rns_ratkey::ProvisionConfig::identities_dir: core::option::Option<std::path::PathBuf>
+pub rns_ratkey::ProvisionConfig::nickname: alloc::string::String
+pub rns_ratkey::ProvisionConfig::pin: alloc::string::String
+pub rns_ratkey::ProvisionConfig::touch_encryption: rns_ratkey::mock::TouchPolicy
+pub rns_ratkey::ProvisionConfig::touch_signing: rns_ratkey::mock::TouchPolicy
+impl core::default::Default for rns_ratkey::provision::ProvisionConfig
+pub fn rns_ratkey::provision::ProvisionConfig::default() -> Self
+pub struct rns_ratkey::ProvisionResult
+pub rns_ratkey::ProvisionResult::config: rns_ratkey::hwid::HwidConfig
+pub rns_ratkey::ProvisionResult::ed25519_pub: [u8; 32]
+pub rns_ratkey::ProvisionResult::hwid_path: core::option::Option<std::path::PathBuf>
+pub rns_ratkey::ProvisionResult::identity_hash: [u8; 16]
+pub rns_ratkey::ProvisionResult::identity_hash_hex: alloc::string::String
+pub rns_ratkey::ProvisionResult::x25519_pub: [u8; 32]
+pub trait rns_ratkey::IdentityBackend
+pub fn rns_ratkey::IdentityBackend::ecdh_x25519(&mut self, u8, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::IdentityBackend::is_connected(&self) -> bool
+pub fn rns_ratkey::IdentityBackend::lock(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::IdentityBackend::read_ed25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::IdentityBackend::read_x25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::IdentityBackend::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+impl rns_ratkey::hardware::IdentityBackend for rns_ratkey::mock::MockPivSession
+pub fn rns_ratkey::mock::MockPivSession::ecdh_x25519(&mut self, u8, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::is_connected(&self) -> bool
+pub fn rns_ratkey::mock::MockPivSession::lock(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::read_ed25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::read_x25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::mock::MockPivSession::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+impl<T: rns_ratkey::transport::PivTransport> rns_ratkey::hardware::IdentityBackend for rns_ratkey::session::PivSession<T>
+pub fn rns_ratkey::session::PivSession<T>::ecdh_x25519(&mut self, u8, &[u8; 32]) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::is_connected(&self) -> bool
+pub fn rns_ratkey::session::PivSession<T>::lock(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::read_ed25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::read_x25519_public(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
+pub trait rns_ratkey::PivTransport
+pub fn rns_ratkey::PivTransport::is_connected(&self) -> bool
+pub fn rns_ratkey::PivTransport::transmit(&mut self, &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+impl rns_ratkey::transport::PivTransport for rns_ratkey::PcscTransport
+pub fn rns_ratkey::PcscTransport::is_connected(&self) -> bool
+pub fn rns_ratkey::PcscTransport::transmit(&mut self, &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::load_hardware_identity(&rns_ratkey::hwid::HwidConfig, &str) -> core::result::Result<rns_identity::identity::Identity, rns_ratkey::error::RatkeyError>
+pub type rns_ratkey::PcscPivSession = rns_ratkey::session::PivSession<rns_ratkey::PcscTransport>

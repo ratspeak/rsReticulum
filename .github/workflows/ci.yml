@@ -10,6 +10,26 @@ permissions:
   contents: read
 
 jobs:
+  api-compat:
+    name: Public API baseline
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-08-01
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-bin: true
+      - name: Install API snapshot tool
+        run: cargo install cargo-public-api --version 0.52.0 --locked
+      - name: Check reviewed public API baseline
+        run: python3 tools/check-api-baseline.py
+
   test:
     name: Test (${{ matrix.os }})
     timeout-minutes: 30

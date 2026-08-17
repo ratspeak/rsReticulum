@@ -1,0 +1,374 @@
+pub mod rns_identity
+pub mod rns_identity::announce
+pub enum rns_identity::announce::AnnounceError
+pub rns_identity::announce::AnnounceError::HashCollision
+pub rns_identity::announce::AnnounceError::HashMismatch
+pub rns_identity::announce::AnnounceError::InvalidPublicKey
+pub rns_identity::announce::AnnounceError::InvalidWireTime(u64)
+pub rns_identity::announce::AnnounceError::NoPrivateKey
+pub rns_identity::announce::AnnounceError::SignatureInvalid
+pub rns_identity::announce::AnnounceError::TooShort(usize)
+pub struct rns_identity::announce::AnnounceData
+pub rns_identity::announce::AnnounceData::app_data: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_identity::announce::AnnounceData::name_hash: [u8; 10]
+pub rns_identity::announce::AnnounceData::public_key: [u8; 64]
+pub rns_identity::announce::AnnounceData::random_hash: [u8; 10]
+pub rns_identity::announce::AnnounceData::ratchet: core::option::Option<[u8; 32]>
+pub rns_identity::announce::AnnounceData::signature: [u8; 64]
+impl rns_identity::announce::AnnounceData
+pub fn rns_identity::announce::AnnounceData::create(&rns_identity::identity::Identity, &str, core::option::Option<&[u8]>, core::option::Option<&[u8; 32]>) -> core::result::Result<Self, rns_identity::announce::AnnounceError>
+pub fn rns_identity::announce::AnnounceData::create_at(&rns_identity::identity::Identity, &str, core::option::Option<&[u8]>, core::option::Option<&[u8; 32]>, u64) -> core::result::Result<Self, rns_identity::announce::AnnounceError>
+pub fn rns_identity::announce::AnnounceData::pack(&self) -> alloc::vec::Vec<u8>
+pub fn rns_identity::announce::AnnounceData::unpack(&[u8], bool) -> core::result::Result<Self, rns_identity::announce::AnnounceError>
+pub fn rns_identity::announce::AnnounceData::validate(&self, &[u8; 16]) -> core::result::Result<rns_identity::identity::Identity, rns_identity::announce::AnnounceError>
+pub fn rns_identity::announce::AnnounceData::validate_destination_binding(&self, &[u8; 16], &rns_identity::identity::Identity, core::option::Option<&[u8; 64]>) -> core::result::Result<(), rns_identity::announce::AnnounceError>
+pub fn rns_identity::announce::AnnounceData::validate_with_known_key(&self, &[u8; 16], core::option::Option<&[u8; 64]>) -> core::result::Result<rns_identity::identity::Identity, rns_identity::announce::AnnounceError>
+pub fn rns_identity::announce::AnnounceData::verify_signature(&self, &[u8; 16]) -> core::result::Result<rns_identity::identity::Identity, rns_identity::announce::AnnounceError>
+pub const rns_identity::announce::ANNOUNCE_TIME_MAX: u64
+pub mod rns_identity::announce_state
+pub struct rns_identity::announce_state::RatchetControlState
+impl rns_identity::announce_state::RatchetControlState
+pub fn rns_identity::announce_state::RatchetControlState::anchor_rotation_if_unknown(&mut self, u64)
+pub fn rns_identity::announce_state::RatchetControlState::destination_hash(&self) -> [u8; 16]
+pub fn rns_identity::announce_state::RatchetControlState::identity_hash(&self) -> [u8; 16]
+pub fn rns_identity::announce_state::RatchetControlState::last_announce_wire(&self) -> core::option::Option<u64>
+pub fn rns_identity::announce_state::RatchetControlState::last_rotation_wall(&self) -> core::option::Option<u64>
+pub fn rns_identity::announce_state::RatchetControlState::load_verified(&std::path::Path, &rns_identity::identity::Identity, [u8; 16]) -> core::io::error::Result<Self>
+pub fn rns_identity::announce_state::RatchetControlState::new([u8; 16], [u8; 16]) -> Self
+pub fn rns_identity::announce_state::RatchetControlState::prepare_announce(&self, u64) -> core::io::error::Result<core::option::Option<Self>>
+pub fn rns_identity::announce_state::RatchetControlState::rotation_due(&self, u64, u64) -> bool
+pub fn rns_identity::announce_state::RatchetControlState::save_verified(&self, &std::path::Path, &rns_identity::identity::Identity) -> core::io::error::Result<()>
+pub fn rns_identity::announce_state::RatchetControlState::with_rotation_at(&self, u64) -> Self
+pub mod rns_identity::destination
+#[repr(u8)] pub enum rns_identity::destination::AllowPolicy
+pub rns_identity::destination::AllowPolicy::AllowAll = 1
+pub rns_identity::destination::AllowPolicy::AllowList = 2
+pub rns_identity::destination::AllowPolicy::AllowNone = 0
+pub enum rns_identity::destination::DefaultAppData
+pub rns_identity::destination::DefaultAppData::Dynamic(alloc::boxed::Box<(dyn core::ops::function::Fn() -> core::option::Option<alloc::vec::Vec<u8>> + core::marker::Send + core::marker::Sync)>)
+pub rns_identity::destination::DefaultAppData::Static(alloc::vec::Vec<u8>)
+#[repr(u8)] pub enum rns_identity::destination::DestType
+pub rns_identity::destination::DestType::Group = 1
+pub rns_identity::destination::DestType::Link = 3
+pub rns_identity::destination::DestType::Plain = 2
+pub rns_identity::destination::DestType::Single = 0
+pub enum rns_identity::destination::DestinationError
+pub rns_identity::destination::DestinationError::DecryptionFailed
+pub rns_identity::destination::DestinationError::EncryptionUnavailable
+pub rns_identity::destination::DestinationError::Identity(rns_identity::identity::IdentityError)
+pub rns_identity::destination::DestinationError::IdentityMismatch
+pub rns_identity::destination::DestinationError::InvalidAnnounceTime(f64)
+pub rns_identity::destination::DestinationError::InvalidGroupKeyLength(usize)
+pub rns_identity::destination::DestinationError::InvalidNameComponent(alloc::string::String)
+pub rns_identity::destination::DestinationError::MissingIdentity
+pub rns_identity::destination::DestinationError::NotGroup
+pub rns_identity::destination::DestinationError::NotInbound
+pub rns_identity::destination::DestinationError::NotSingle
+pub rns_identity::destination::DestinationError::OutboundMissingIdentity
+pub rns_identity::destination::DestinationError::PlainWithIdentity
+pub rns_identity::destination::DestinationError::ProveNotSingle
+pub rns_identity::destination::DestinationError::SigningUnavailable
+pub enum rns_identity::destination::DestinationPacketError
+pub rns_identity::destination::DestinationPacketError::Destination(rns_identity::destination::DestinationError)
+pub rns_identity::destination::DestinationPacketError::LinkRuntimeRequired
+pub rns_identity::destination::DestinationPacketError::LrproofRequiresLink
+pub rns_identity::destination::DestinationPacketError::MissingIdentity
+pub rns_identity::destination::DestinationPacketError::MissingTransportId
+pub rns_identity::destination::DestinationPacketError::Packet(rns_wire::packet::PacketError)
+pub enum rns_identity::destination::Direction
+pub rns_identity::destination::Direction::In
+pub rns_identity::destination::Direction::Out
+#[repr(u8)] pub enum rns_identity::destination::ProofStrategy
+pub rns_identity::destination::ProofStrategy::ProveAll = 35
+pub rns_identity::destination::ProofStrategy::ProveApp = 34
+pub rns_identity::destination::ProofStrategy::ProveNone = 33
+pub struct rns_identity::destination::AnnounceTime
+pub rns_identity::destination::AnnounceTime::cache: f64
+pub rns_identity::destination::AnnounceTime::wire: u64
+impl rns_identity::destination::AnnounceTime
+pub fn rns_identity::destination::AnnounceTime::new(u64, f64) -> core::result::Result<Self, rns_identity::destination::DestinationError>
+pub struct rns_identity::destination::Destination
+pub rns_identity::destination::Destination::accept_link_requests: bool
+pub rns_identity::destination::Destination::app_name: alloc::string::String
+pub rns_identity::destination::Destination::dest_type: rns_identity::destination::DestType
+pub rns_identity::destination::Destination::direction: rns_identity::destination::Direction
+pub rns_identity::destination::Destination::hash: [u8; 16]
+pub rns_identity::destination::Destination::identity_hash: core::option::Option<[u8; 16]>
+pub rns_identity::destination::Destination::links: alloc::vec::Vec<[u8; 16]>
+pub rns_identity::destination::Destination::local_ratchet_pub: core::option::Option<[u8; 32]>
+pub rns_identity::destination::Destination::name: alloc::string::String
+pub rns_identity::destination::Destination::name_hash: [u8; 10]
+pub rns_identity::destination::Destination::only_validate_signature: bool
+pub rns_identity::destination::Destination::proof_strategy: rns_identity::destination::ProofStrategy
+pub rns_identity::destination::Destination::ratchets_enabled: bool
+pub rns_identity::destination::Destination::ratchets_enforced: bool
+pub rns_identity::destination::Destination::remote_ratchet_pub: core::option::Option<[u8; 32]>
+impl rns_identity::destination::Destination
+pub const rns_identity::destination::Destination::PR_TAG_WINDOW: f64
+pub const rns_identity::destination::Destination::RATCHET_COUNT: usize
+pub const rns_identity::destination::Destination::RATCHET_INTERVAL: u64
+pub fn rns_identity::destination::Destination::accepts_links(&self) -> bool
+pub fn rns_identity::destination::Destination::announce_packet(&mut self, &rns_identity::identity::Identity, core::option::Option<&[u8]>, core::option::Option<&[u8; 32]>, bool, core::option::Option<&[u8]>, f64) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::announce_packet_at(&mut self, &rns_identity::identity::Identity, core::option::Option<&[u8]>, core::option::Option<&[u8; 32]>, bool, core::option::Option<&[u8]>, rns_identity::destination::AnnounceTime) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::app_and_aspects_from_name(&str) -> (&str, alloc::vec::Vec<&str>)
+pub fn rns_identity::destination::Destination::auto_identity(&self) -> core::option::Option<&rns_identity::identity::Identity>
+pub fn rns_identity::destination::Destination::cached_path_response_packet(&mut self, &[u8], f64) -> core::result::Result<core::option::Option<alloc::vec::Vec<u8>>, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::check_request_allowed(&self, &[u8; 16], core::option::Option<&[u8; 16]>) -> bool
+pub fn rns_identity::destination::Destination::clear_default_app_data(&mut self)
+pub fn rns_identity::destination::Destination::compute_hash(&[u8; 10], core::option::Option<&[u8; 16]>) -> [u8; 16]
+pub fn rns_identity::destination::Destination::create_announce(&mut self, &rns_identity::identity::Identity, core::option::Option<&[u8]>, core::option::Option<&[u8; 32]>, core::option::Option<&[u8]>, f64) -> core::result::Result<(alloc::vec::Vec<u8>, bool), rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::create_announce_at(&mut self, &rns_identity::identity::Identity, core::option::Option<&[u8]>, core::option::Option<&[u8; 32]>, core::option::Option<&[u8]>, rns_identity::destination::AnnounceTime) -> core::result::Result<(alloc::vec::Vec<u8>, bool), rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::decrypt(&self, &[u8], &rns_identity::identity::Identity) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::decrypt_with_ratchet_id(&self, &[u8], &rns_identity::identity::Identity, core::option::Option<&[[u8; 32]]>) -> core::result::Result<rns_identity::identity::DecryptionResult, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::decrypt_with_ratchets(&self, &[u8], &rns_identity::identity::Identity, core::option::Option<&[[u8; 32]]>) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::deregister_request_handler(&mut self, &str) -> bool
+pub fn rns_identity::destination::Destination::disable_ratchets(&mut self)
+pub fn rns_identity::destination::Destination::enable_ratchets(&mut self, bool)
+pub fn rns_identity::destination::Destination::encrypt(&self, &[u8], &rns_identity::identity::Identity, core::option::Option<&[u8; 32]>) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::expand_name(core::option::Option<&rns_identity::identity::Identity>, &str, &[&str]) -> core::result::Result<alloc::string::String, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::generate_group_key(&mut self) -> core::result::Result<(), rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::get_ratchet_for_announce(&self) -> core::option::Option<[u8; 32]>
+pub fn rns_identity::destination::Destination::get_request_handler(&self, &[u8; 16]) -> core::option::Option<&rns_identity::destination::RequestHandler>
+pub fn rns_identity::destination::Destination::group_key(&self) -> core::result::Result<&[u8], rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::hash_from_name_and_identity(&str, core::option::Option<&[u8; 16]>) -> [u8; 16]
+pub fn rns_identity::destination::Destination::hex_hash(&self) -> alloc::string::String
+pub fn rns_identity::destination::Destination::hexhash(&self) -> alloc::string::String
+pub fn rns_identity::destination::Destination::incoming_link_request(&mut self, [u8; 16]) -> bool
+pub fn rns_identity::destination::Destination::link_count(&self) -> usize
+pub fn rns_identity::destination::Destination::load_group_key(&mut self, &[u8]) -> core::result::Result<(), rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::new(core::option::Option<&rns_identity::identity::Identity>, rns_identity::destination::Direction, rns_identity::destination::DestType, &str) -> core::result::Result<Self, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::new_with_aspects(core::option::Option<&rns_identity::identity::Identity>, rns_identity::destination::Direction, rns_identity::destination::DestType, &str, &[&str]) -> core::result::Result<Self, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::on_link_established(&self, [u8; 16])
+pub fn rns_identity::destination::Destination::pack_packet(&self, &[u8], core::option::Option<&rns_identity::identity::Identity>, core::option::Option<&[u8; 32]>, rns_identity::destination::DestinationPacketOptions) -> core::result::Result<rns_identity::destination::PackedDestinationPacket, rns_identity::destination::DestinationPacketError>
+pub fn rns_identity::destination::Destination::prove(&self, &[u8], &rns_identity::identity::Identity, bool) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::ratchets_active(&self) -> bool
+pub fn rns_identity::destination::Destination::receive(&self, u8, &[u8], &rns_identity::identity::Identity) -> core::result::Result<core::option::Option<alloc::vec::Vec<u8>>, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::receive_packet(&self, u8, &[u8], &[u8], &rns_identity::identity::Identity) -> core::result::Result<core::option::Option<alloc::vec::Vec<u8>>, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::receive_packet_with_ratchets(&self, u8, &[u8], &[u8], &rns_identity::identity::Identity, core::option::Option<&[[u8; 32]]>) -> core::result::Result<core::option::Option<alloc::vec::Vec<u8>>, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::register_request_handler(&mut self, &str, rns_identity::destination::AllowPolicy, core::option::Option<alloc::vec::Vec<[u8; 16]>>, bool) -> bool
+pub fn rns_identity::destination::Destination::remove_link(&mut self, &[u8; 16])
+pub fn rns_identity::destination::Destination::resolve_app_data(&self) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_identity::destination::Destination::set_accepts_links(&mut self, bool)
+pub fn rns_identity::destination::Destination::set_default_app_data(&mut self, rns_identity::destination::DefaultAppData)
+pub fn rns_identity::destination::Destination::set_group_key(&mut self, alloc::vec::Vec<u8>)
+pub fn rns_identity::destination::Destination::set_link_established_callback(&mut self, rns_identity::destination::LinkEstablishedCallback)
+pub fn rns_identity::destination::Destination::set_local_ratchet(&mut self, [u8; 32])
+pub fn rns_identity::destination::Destination::set_only_validate_signature(&mut self, bool)
+pub fn rns_identity::destination::Destination::set_packet_callback(&mut self, rns_identity::destination::PacketCallback)
+pub fn rns_identity::destination::Destination::set_proof_requested_callback(&mut self, rns_identity::destination::ProofRequestedCallback)
+pub fn rns_identity::destination::Destination::set_proof_strategy(&mut self, rns_identity::destination::ProofStrategy)
+pub fn rns_identity::destination::Destination::set_remote_ratchet(&mut self, [u8; 32])
+pub fn rns_identity::destination::Destination::should_prove(&self, &[u8]) -> bool
+pub fn rns_identity::destination::Destination::sign(&self, &[u8], &rns_identity::identity::Identity) -> core::result::Result<[u8; 64], rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::take_auto_identity(&mut self) -> core::option::Option<rns_identity::identity::Identity>
+impl core::fmt::Display for rns_identity::destination::Destination
+pub fn rns_identity::destination::Destination::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct rns_identity::destination::DestinationPacketOptions
+pub rns_identity::destination::DestinationPacketOptions::context: rns_wire::context::PacketContext
+pub rns_identity::destination::DestinationPacketOptions::context_flag: bool
+pub rns_identity::destination::DestinationPacketOptions::header_type: rns_wire::flags::HeaderType
+pub rns_identity::destination::DestinationPacketOptions::packet_type: rns_wire::flags::PacketType
+pub rns_identity::destination::DestinationPacketOptions::transport_id: core::option::Option<[u8; 16]>
+pub rns_identity::destination::DestinationPacketOptions::transport_type: rns_wire::flags::TransportType
+impl core::default::Default for rns_identity::destination::DestinationPacketOptions
+pub fn rns_identity::destination::DestinationPacketOptions::default() -> Self
+pub struct rns_identity::destination::PackedDestinationPacket
+pub rns_identity::destination::PackedDestinationPacket::packet: rns_wire::packet::Packet
+pub rns_identity::destination::PackedDestinationPacket::ratchet_id: core::option::Option<[u8; 10]>
+pub struct rns_identity::destination::RequestHandler
+pub rns_identity::destination::RequestHandler::allow: rns_identity::destination::AllowPolicy
+pub rns_identity::destination::RequestHandler::allowed_list: alloc::vec::Vec<[u8; 16]>
+pub rns_identity::destination::RequestHandler::auto_compress: bool
+pub rns_identity::destination::RequestHandler::path: alloc::string::String
+pub const rns_identity::destination::GROUP_KEY_LENGTH: usize
+pub const rns_identity::destination::PR_TAG_WINDOW: f64
+pub type rns_identity::destination::LinkEstablishedCallback = alloc::boxed::Box<(dyn core::ops::function::Fn([u8; 16]) + core::marker::Send + core::marker::Sync)>
+pub type rns_identity::destination::PacketCallback = alloc::boxed::Box<(dyn core::ops::function::Fn(&[u8], &[u8]) + core::marker::Send + core::marker::Sync)>
+pub type rns_identity::destination::ProofRequestedCallback = alloc::boxed::Box<(dyn core::ops::function::Fn(&[u8]) -> bool + core::marker::Send + core::marker::Sync)>
+pub mod rns_identity::identity
+pub enum rns_identity::identity::IdentityError
+pub rns_identity::identity::IdentityError::DecryptionFailed
+pub rns_identity::identity::IdentityError::Ed25519(rns_crypto::ed25519::Ed25519Error)
+pub rns_identity::identity::IdentityError::InvalidPrivateKeyLength(usize)
+pub rns_identity::identity::IdentityError::InvalidPublicKeyLength(usize)
+pub rns_identity::identity::IdentityError::Io(core::io::error::Error)
+pub rns_identity::identity::IdentityError::VerificationFailed
+pub struct rns_identity::identity::DecryptionResult
+pub rns_identity::identity::DecryptionResult::plaintext: alloc::vec::Vec<u8>
+pub rns_identity::identity::DecryptionResult::ratchet_id: core::option::Option<[u8; 10]>
+pub struct rns_identity::identity::Identity
+pub rns_identity::identity::Identity::hash: [u8; 16]
+impl rns_identity::identity::Identity
+pub const rns_identity::identity::Identity::CURVE: &'static str
+pub const rns_identity::identity::Identity::HASH_LENGTH_BITS: usize
+pub const rns_identity::identity::Identity::KEY_SIZE_BITS: usize
+pub const rns_identity::identity::Identity::RATCHETSIZE: usize
+pub const rns_identity::identity::Identity::RATCHET_SIZE_BITS: usize
+pub fn rns_identity::identity::Identity::decrypt(&self, &[u8], core::option::Option<&[&[u8; 32]]>, bool) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::identity::IdentityError>
+pub fn rns_identity::identity::Identity::decrypt_with_ratchet_id(&self, &[u8], core::option::Option<&[&[u8; 32]]>, bool) -> core::result::Result<rns_identity::identity::DecryptionResult, rns_identity::identity::IdentityError>
+pub fn rns_identity::identity::Identity::encrypt(&self, &[u8], core::option::Option<&[u8; 32]>) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::identity::IdentityError>
+pub fn rns_identity::identity::Identity::from_backend(&[u8], alloc::sync::Arc<dyn rns_identity::identity::LocalKeyBackend>) -> core::result::Result<Self, rns_identity::identity::IdentityError>
+pub fn rns_identity::identity::Identity::from_file(&std::path::Path) -> core::result::Result<Self, rns_identity::identity::IdentityError>
+pub fn rns_identity::identity::Identity::from_private_key(&[u8]) -> core::result::Result<Self, rns_identity::identity::IdentityError>
+pub fn rns_identity::identity::Identity::from_public_key(&[u8]) -> core::result::Result<Self, rns_identity::identity::IdentityError>
+pub fn rns_identity::identity::Identity::get_private_key(&self) -> core::option::Option<zeroize::Zeroizing<[u8; 64]>>
+pub fn rns_identity::identity::Identity::get_public_key(&self) -> [u8; 64]
+pub fn rns_identity::identity::Identity::get_signing_key(&self) -> core::option::Option<rns_crypto::ed25519::Ed25519PrivateKey>
+pub fn rns_identity::identity::Identity::has_backend(&self) -> bool
+pub fn rns_identity::identity::Identity::has_private_key(&self) -> bool
+pub fn rns_identity::identity::Identity::hexhash(&self) -> alloc::string::String
+pub fn rns_identity::identity::Identity::lock(&self)
+pub fn rns_identity::identity::Identity::new() -> Self
+pub fn rns_identity::identity::Identity::prove(&self, &[u8], bool) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::identity::IdentityError>
+pub fn rns_identity::identity::Identity::pub_to_file(&self, &std::path::Path) -> core::result::Result<(), rns_identity::identity::IdentityError>
+pub fn rns_identity::identity::Identity::ratchet_id(&[u8; 32]) -> [u8; 10]
+pub fn rns_identity::identity::Identity::sign(&self, &[u8]) -> core::option::Option<[u8; 64]>
+pub fn rns_identity::identity::Identity::to_file(&self, &std::path::Path) -> core::result::Result<(), rns_identity::identity::IdentityError>
+pub fn rns_identity::identity::Identity::verify(&self, &[u8], &[u8; 64]) -> bool
+impl core::clone::Clone for rns_identity::identity::Identity
+pub fn rns_identity::identity::Identity::clone(&self) -> Self
+impl core::default::Default for rns_identity::identity::Identity
+pub fn rns_identity::identity::Identity::default() -> Self
+impl core::fmt::Display for rns_identity::identity::Identity
+pub fn rns_identity::identity::Identity::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub const rns_identity::identity::CURVE: &str
+pub const rns_identity::identity::DERIVED_KEY_LENGTH: usize
+pub const rns_identity::identity::HASH_LENGTH_BITS: usize
+pub const rns_identity::identity::IDENTITY_OVERHEAD: usize
+pub const rns_identity::identity::KEY_SIZE_BITS: usize
+pub const rns_identity::identity::RATCHETSIZE: usize
+pub const rns_identity::identity::RATCHET_ID_LENGTH: usize
+pub const rns_identity::identity::RATCHET_SIZE_BITS: usize
+pub trait rns_identity::identity::LocalKeyBackend: core::marker::Send + core::marker::Sync
+pub fn rns_identity::identity::LocalKeyBackend::ecdh(&self, &[u8; 32]) -> core::option::Option<[u8; 32]>
+pub fn rns_identity::identity::LocalKeyBackend::lock(&self)
+pub fn rns_identity::identity::LocalKeyBackend::sign_ed25519(&self, &[u8]) -> core::option::Option<[u8; 64]>
+pub mod rns_identity::ifac
+pub enum rns_identity::ifac::IfacError
+pub rns_identity::ifac::IfacError::HkdfFailed(rns_crypto::hkdf::HkdfError)
+pub rns_identity::ifac::IfacError::InvalidSalt
+pub const rns_identity::ifac::IFAC_SALT: &str
+pub fn rns_identity::ifac::derive_ifac_identity(core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<(rns_identity::identity::Identity, [u8; 64], [u8; 64]), rns_identity::ifac::IfacError>
+pub fn rns_identity::ifac::derive_ifac_key(core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<[u8; 64], rns_identity::ifac::IfacError>
+pub fn rns_identity::ifac::split_ifac_key(&[u8; 64]) -> (&[u8], &[u8])
+pub mod rns_identity::known_destinations
+pub struct rns_identity::known_destinations::KnownDestination
+pub rns_identity::known_destinations::KnownDestination::app_data: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_identity::known_destinations::KnownDestination::packet_hash: [u8; 32]
+pub rns_identity::known_destinations::KnownDestination::public_key: [u8; 64]
+pub rns_identity::known_destinations::KnownDestination::retained: bool
+pub rns_identity::known_destinations::KnownDestination::timestamp: f64
+pub struct rns_identity::known_destinations::KnownDestinations
+impl rns_identity::known_destinations::KnownDestinations
+pub fn rns_identity::known_destinations::KnownDestinations::cleanup(&mut self, f64, f64, impl core::ops::function::Fn(&[u8; 16]) -> bool) -> alloc::vec::Vec<[u8; 16]>
+pub fn rns_identity::known_destinations::KnownDestinations::contains(&self, &[u8; 16]) -> bool
+pub fn rns_identity::known_destinations::KnownDestinations::get(&self, &[u8; 16]) -> core::option::Option<&rns_identity::known_destinations::KnownDestination>
+pub fn rns_identity::known_destinations::KnownDestinations::is_empty(&self) -> bool
+pub fn rns_identity::known_destinations::KnownDestinations::is_known_or_registered(&self, &[u8; 16], &std::collections::hash::set::HashSet<[u8; 16]>) -> bool
+pub fn rns_identity::known_destinations::KnownDestinations::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&[u8; 16], &rns_identity::known_destinations::KnownDestination)>
+pub fn rns_identity::known_destinations::KnownDestinations::len(&self) -> usize
+pub fn rns_identity::known_destinations::KnownDestinations::load(&std::path::Path) -> core::io::error::Result<Self>
+pub fn rns_identity::known_destinations::KnownDestinations::merge(&mut self, &rns_identity::known_destinations::KnownDestinations)
+pub fn rns_identity::known_destinations::KnownDestinations::new() -> Self
+pub fn rns_identity::known_destinations::KnownDestinations::recall_app_data(&self, &[u8; 16]) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_identity::known_destinations::KnownDestinations::recall_by_identity(&self, &[u8; 16]) -> core::option::Option<(&[u8; 16], &rns_identity::known_destinations::KnownDestination)>
+pub fn rns_identity::known_destinations::KnownDestinations::remember(&mut self, [u8; 16], f64, [u8; 32], [u8; 64], core::option::Option<alloc::vec::Vec<u8>>)
+pub fn rns_identity::known_destinations::KnownDestinations::remove(&mut self, &[u8; 16]) -> core::option::Option<rns_identity::known_destinations::KnownDestination>
+pub fn rns_identity::known_destinations::KnownDestinations::retain(&mut self, &[u8; 16])
+pub fn rns_identity::known_destinations::KnownDestinations::retain_identity(&mut self, &[u8; 16]) -> usize
+pub fn rns_identity::known_destinations::KnownDestinations::save(&self, &std::path::Path) -> core::io::error::Result<()>
+pub fn rns_identity::known_destinations::KnownDestinations::unretain(&mut self, &[u8; 16])
+impl core::default::Default for rns_identity::known_destinations::KnownDestinations
+pub fn rns_identity::known_destinations::KnownDestinations::default() -> Self
+pub mod rns_identity::name_hash
+pub fn rns_identity::name_hash::name_hash(&str) -> [u8; 10]
+pub mod rns_identity::persistence
+pub fn rns_identity::persistence::atomic_write(&std::path::Path, &[u8]) -> core::io::error::Result<()>
+pub fn rns_identity::persistence::read_file(&std::path::Path) -> core::io::error::Result<core::option::Option<alloc::vec::Vec<u8>>>
+pub fn rns_identity::persistence::read_file_bounded(&std::path::Path, usize) -> core::io::error::Result<core::option::Option<alloc::vec::Vec<u8>>>
+pub mod rns_identity::ratchet
+pub enum rns_identity::ratchet::RatchetRingFormat
+pub rns_identity::ratchet::RatchetRingFormat::Canonical
+pub rns_identity::ratchet::RatchetRingFormat::LegacyRust
+pub struct rns_identity::ratchet::LoadedRatchetRing
+impl rns_identity::ratchet::LoadedRatchetRing
+pub fn rns_identity::ratchet::LoadedRatchetRing::format(&self) -> rns_identity::ratchet::RatchetRingFormat
+pub fn rns_identity::ratchet::LoadedRatchetRing::into_ring(self) -> rns_identity::ratchet::RatchetRing
+pub fn rns_identity::ratchet::LoadedRatchetRing::ring(&self) -> &rns_identity::ratchet::RatchetRing
+pub struct rns_identity::ratchet::PersistentRatchetRing
+impl rns_identity::ratchet::PersistentRatchetRing
+pub fn rns_identity::ratchet::PersistentRatchetRing::current_public_key(&self) -> core::option::Option<[u8; 32]>
+pub fn rns_identity::ratchet::PersistentRatchetRing::ensure_current(&mut self, &rns_identity::identity::Identity) -> core::io::error::Result<[u8; 32]>
+pub fn rns_identity::ratchet::PersistentRatchetRing::ensure_current_at(&mut self, &rns_identity::identity::Identity, f64) -> core::io::error::Result<[u8; 32]>
+pub fn rns_identity::ratchet::PersistentRatchetRing::is_empty(&self) -> bool
+pub fn rns_identity::ratchet::PersistentRatchetRing::len(&self) -> usize
+pub fn rns_identity::ratchet::PersistentRatchetRing::open(impl core::convert::AsRef<std::path::Path>, &rns_identity::identity::Identity) -> core::io::error::Result<Self>
+pub fn rns_identity::ratchet::PersistentRatchetRing::path(&self) -> &std::path::Path
+pub fn rns_identity::ratchet::PersistentRatchetRing::private_keys(&self) -> &[[u8; 32]]
+pub fn rns_identity::ratchet::PersistentRatchetRing::ring(&self) -> &rns_identity::ratchet::RatchetRing
+pub fn rns_identity::ratchet::PersistentRatchetRing::rotate(&mut self, &rns_identity::identity::Identity) -> core::io::error::Result<[u8; 32]>
+pub fn rns_identity::ratchet::PersistentRatchetRing::rotate_at(&mut self, &rns_identity::identity::Identity, f64) -> core::io::error::Result<[u8; 32]>
+impl core::fmt::Debug for rns_identity::ratchet::PersistentRatchetRing
+pub fn rns_identity::ratchet::PersistentRatchetRing::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct rns_identity::ratchet::PreparedRatchetRotation
+impl rns_identity::ratchet::PreparedRatchetRotation
+pub fn rns_identity::ratchet::PreparedRatchetRotation::public_key(&self) -> [u8; 32]
+pub fn rns_identity::ratchet::PreparedRatchetRotation::ring(&self) -> &rns_identity::ratchet::RatchetRing
+pub struct rns_identity::ratchet::RatchetRing
+impl rns_identity::ratchet::RatchetRing
+pub fn rns_identity::ratchet::RatchetRing::anchor_rotation_at(&mut self, f64) -> bool
+pub fn rns_identity::ratchet::RatchetRing::commit_prepared_rotation(&mut self, rns_identity::ratchet::PreparedRatchetRotation) -> [u8; 32]
+pub fn rns_identity::ratchet::RatchetRing::current_public_key(&self) -> core::option::Option<[u8; 32]>
+pub fn rns_identity::ratchet::RatchetRing::is_empty(&self) -> bool
+pub fn rns_identity::ratchet::RatchetRing::last_rotation(&self) -> f64
+pub fn rns_identity::ratchet::RatchetRing::len(&self) -> usize
+pub fn rns_identity::ratchet::RatchetRing::load(&std::path::Path) -> core::io::error::Result<(Self, [u8; 64])>
+pub fn rns_identity::ratchet::RatchetRing::load_verified(&std::path::Path, &rns_identity::identity::Identity) -> core::io::error::Result<rns_identity::ratchet::LoadedRatchetRing>
+pub fn rns_identity::ratchet::RatchetRing::needs_rotation(&self) -> bool
+pub fn rns_identity::ratchet::RatchetRing::needs_rotation_at(&self, f64) -> bool
+pub fn rns_identity::ratchet::RatchetRing::new() -> Self
+pub fn rns_identity::ratchet::RatchetRing::prepare_rotation_at(&self, f64) -> rns_identity::ratchet::PreparedRatchetRotation
+pub fn rns_identity::ratchet::RatchetRing::private_keys(&self) -> &[[u8; 32]]
+pub fn rns_identity::ratchet::RatchetRing::ratchet_interval(&self) -> u64
+pub fn rns_identity::ratchet::RatchetRing::retained_ratchets(&self) -> usize
+pub fn rns_identity::ratchet::RatchetRing::rotate(&mut self) -> [u8; 32]
+pub fn rns_identity::ratchet::RatchetRing::rotate_at(&mut self, f64) -> [u8; 32]
+pub fn rns_identity::ratchet::RatchetRing::save(&self, &std::path::Path, &[u8; 64]) -> core::io::error::Result<()>
+pub fn rns_identity::ratchet::RatchetRing::save_verified(&self, &std::path::Path, &rns_identity::identity::Identity) -> core::io::error::Result<()>
+pub fn rns_identity::ratchet::RatchetRing::set_ratchet_interval(&mut self, u64) -> bool
+pub fn rns_identity::ratchet::RatchetRing::set_retained_ratchets(&mut self, usize) -> bool
+impl core::default::Default for rns_identity::ratchet::RatchetRing
+pub fn rns_identity::ratchet::RatchetRing::default() -> Self
+impl core::ops::drop::Drop for rns_identity::ratchet::RatchetRing
+pub fn rns_identity::ratchet::RatchetRing::drop(&mut self)
+impl zeroize::Zeroize for rns_identity::ratchet::RatchetRing
+pub fn rns_identity::ratchet::RatchetRing::zeroize(&mut self)
+pub struct rns_identity::ratchet::ReceivedRatchet
+pub rns_identity::ratchet::ReceivedRatchet::ratchet_pub: [u8; 32]
+pub rns_identity::ratchet::ReceivedRatchet::received_at: f64
+impl rns_identity::ratchet::ReceivedRatchet
+pub fn rns_identity::ratchet::ReceivedRatchet::is_expired(&self) -> bool
+pub fn rns_identity::ratchet::ReceivedRatchet::is_expired_at(&self, f64) -> bool
+pub fn rns_identity::ratchet::ReceivedRatchet::load(&std::path::Path) -> core::io::error::Result<Self>
+pub fn rns_identity::ratchet::ReceivedRatchet::new([u8; 32]) -> Self
+pub fn rns_identity::ratchet::ReceivedRatchet::new_at([u8; 32], f64) -> Self
+pub fn rns_identity::ratchet::ReceivedRatchet::ratchet_id(&self) -> alloc::vec::Vec<u8>
+pub fn rns_identity::ratchet::ReceivedRatchet::save(&self, &std::path::Path) -> core::io::error::Result<()>
+pub struct rns_identity::ratchet::ReceivedRatchetStore
+impl rns_identity::ratchet::ReceivedRatchetStore
+pub fn rns_identity::ratchet::ReceivedRatchetStore::clean_expired(&mut self)
+pub fn rns_identity::ratchet::ReceivedRatchetStore::current_ratchet_id(&mut self, &[u8; 16]) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_identity::ratchet::ReceivedRatchetStore::get(&mut self, &[u8; 16]) -> core::option::Option<[u8; 32]>
+pub fn rns_identity::ratchet::ReceivedRatchetStore::get_at(&mut self, &[u8; 16], f64) -> core::option::Option<[u8; 32]>
+pub fn rns_identity::ratchet::ReceivedRatchetStore::is_empty(&self) -> bool
+pub fn rns_identity::ratchet::ReceivedRatchetStore::len(&self) -> usize
+pub fn rns_identity::ratchet::ReceivedRatchetStore::new() -> Self
+pub fn rns_identity::ratchet::ReceivedRatchetStore::remember(&mut self, [u8; 16], [u8; 32])
+pub fn rns_identity::ratchet::ReceivedRatchetStore::remember_at(&mut self, [u8; 16], [u8; 32], f64)
+pub fn rns_identity::ratchet::ReceivedRatchetStore::with_storage(std::path::PathBuf) -> Self
+impl core::default::Default for rns_identity::ratchet::ReceivedRatchetStore
+pub fn rns_identity::ratchet::ReceivedRatchetStore::default() -> Self
+pub fn rns_identity::ratchet::clean_received_ratchets_dir(&std::path::Path) -> usize
+pub fn rns_identity::ratchet::get_ratchet_id(&[u8; 32]) -> alloc::vec::Vec<u8>
+pub fn rns_identity::ratchet::purge_expired_ratchets_in_memory<K: core::cmp::Eq + core::hash::Hash>(&mut std::collections::hash::map::HashMap<K, rns_identity::ratchet::ReceivedRatchet>) -> usize
+pub fn rns_identity::ratchet::ratchet_public_bytes(&[u8; 32]) -> [u8; 32]

@@ -1,0 +1,369 @@
+pub mod rns_wire
+pub mod rns_wire::constants
+pub const rns_wire::constants::AES128_BLOCKSIZE: usize
+pub const rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT: f64
+pub const rns_wire::constants::ENCRYPTED_MDU: usize
+pub const rns_wire::constants::EXPL_LENGTH: usize
+pub const rns_wire::constants::HASHLENGTH: usize
+pub const rns_wire::constants::HEADER_MAXSIZE: usize
+pub const rns_wire::constants::HEADER_MINSIZE: usize
+pub const rns_wire::constants::IMPL_LENGTH: usize
+pub const rns_wire::constants::KEYSIZE: usize
+pub const rns_wire::constants::LINK_MDU: usize
+pub const rns_wire::constants::MDU: usize
+pub const rns_wire::constants::MTU: usize
+pub const rns_wire::constants::NAME_HASH_LENGTH: usize
+pub const rns_wire::constants::PLAIN_MDU: usize
+pub const rns_wire::constants::RATCHETSIZE: usize
+pub const rns_wire::constants::RATCHET_COUNT: usize
+pub const rns_wire::constants::RATCHET_EXPIRY: u64
+pub const rns_wire::constants::RATCHET_INTERVAL: u64
+pub const rns_wire::constants::SIGLENGTH: usize
+pub const rns_wire::constants::SINGLE_PACKET_ENCRYPTED_MDU: usize
+pub const rns_wire::constants::TOKEN_OVERHEAD: usize
+pub const rns_wire::constants::TRUNCATED_HASHLENGTH: usize
+pub mod rns_wire::context
+pub enum rns_wire::context::PacketContext
+pub rns_wire::context::PacketContext::CacheRequest
+pub rns_wire::context::PacketContext::Channel
+pub rns_wire::context::PacketContext::Command
+pub rns_wire::context::PacketContext::CommandStatus
+pub rns_wire::context::PacketContext::Keepalive
+pub rns_wire::context::PacketContext::LinkClose
+pub rns_wire::context::PacketContext::LinkIdentify
+pub rns_wire::context::PacketContext::LinkProof
+pub rns_wire::context::PacketContext::Lrproof
+pub rns_wire::context::PacketContext::Lrrtt
+pub rns_wire::context::PacketContext::None
+pub rns_wire::context::PacketContext::PathResponse
+pub rns_wire::context::PacketContext::Request
+pub rns_wire::context::PacketContext::Resource
+pub rns_wire::context::PacketContext::ResourceAdv
+pub rns_wire::context::PacketContext::ResourceHmu
+pub rns_wire::context::PacketContext::ResourceIcl
+pub rns_wire::context::PacketContext::ResourcePrf
+pub rns_wire::context::PacketContext::ResourceRcl
+pub rns_wire::context::PacketContext::ResourceReq
+pub rns_wire::context::PacketContext::Response
+pub rns_wire::context::PacketContext::Unknown(u8)
+impl rns_wire::context::PacketContext
+pub fn rns_wire::context::PacketContext::from_byte(u8) -> Self
+pub fn rns_wire::context::PacketContext::is_plaintext_context(self) -> bool
+pub fn rns_wire::context::PacketContext::to_byte(self) -> u8
+pub mod rns_wire::flags
+#[repr(u8)] pub enum rns_wire::flags::DestinationType
+pub rns_wire::flags::DestinationType::Group = 1
+pub rns_wire::flags::DestinationType::Link = 3
+pub rns_wire::flags::DestinationType::Plain = 2
+pub rns_wire::flags::DestinationType::Single = 0
+#[repr(u8)] pub enum rns_wire::flags::HeaderType
+pub rns_wire::flags::HeaderType::Header1 = 0
+pub rns_wire::flags::HeaderType::Header2 = 1
+#[repr(u8)] pub enum rns_wire::flags::PacketType
+pub rns_wire::flags::PacketType::Announce = 1
+pub rns_wire::flags::PacketType::Data = 0
+pub rns_wire::flags::PacketType::LinkRequest = 2
+pub rns_wire::flags::PacketType::Proof = 3
+#[repr(u8)] pub enum rns_wire::flags::TransportType
+pub rns_wire::flags::TransportType::Broadcast = 0
+pub rns_wire::flags::TransportType::Transport = 1
+pub struct rns_wire::flags::PacketFlags
+pub rns_wire::flags::PacketFlags::context_flag: bool
+pub rns_wire::flags::PacketFlags::destination_type: rns_wire::flags::DestinationType
+pub rns_wire::flags::PacketFlags::header_type: rns_wire::flags::HeaderType
+pub rns_wire::flags::PacketFlags::packet_type: rns_wire::flags::PacketType
+pub rns_wire::flags::PacketFlags::transport_type: rns_wire::flags::TransportType
+impl rns_wire::flags::PacketFlags
+pub fn rns_wire::flags::PacketFlags::pack(&self) -> u8
+pub fn rns_wire::flags::PacketFlags::unpack(u8) -> core::option::Option<Self>
+pub mod rns_wire::hash
+pub fn rns_wire::hash::get_hashable_part(&[u8], rns_wire::flags::HeaderType) -> alloc::vec::Vec<u8>
+pub fn rns_wire::hash::link_id_from_raw(&[u8], rns_wire::flags::HeaderType) -> [u8; 16]
+pub fn rns_wire::hash::packet_hash(&[u8], rns_wire::flags::HeaderType) -> [u8; 32]
+pub fn rns_wire::hash::packet_hash_pair(&[u8], rns_wire::flags::HeaderType) -> ([u8; 32], [u8; 16])
+pub fn rns_wire::hash::truncated_packet_hash(&[u8], rns_wire::flags::HeaderType) -> [u8; 16]
+pub mod rns_wire::header
+pub enum rns_wire::header::HeaderError
+pub rns_wire::header::HeaderError::TooShort(usize)
+pub struct rns_wire::header::PacketHeader
+pub rns_wire::header::PacketHeader::context: rns_wire::context::PacketContext
+pub rns_wire::header::PacketHeader::destination_hash: [u8; 16]
+pub rns_wire::header::PacketHeader::flags: rns_wire::flags::PacketFlags
+pub rns_wire::header::PacketHeader::hops: u8
+pub rns_wire::header::PacketHeader::transport_id: core::option::Option<[u8; 16]>
+impl rns_wire::header::PacketHeader
+pub fn rns_wire::header::PacketHeader::pack(&self) -> alloc::vec::Vec<u8>
+pub fn rns_wire::header::PacketHeader::size(&self) -> usize
+pub fn rns_wire::header::PacketHeader::unpack(&[u8]) -> core::result::Result<(Self, usize), rns_wire::header::HeaderError>
+pub mod rns_wire::packet
+pub enum rns_wire::packet::PacketError
+pub rns_wire::packet::PacketError::ExceedsMtu(usize)
+pub rns_wire::packet::PacketError::Header(rns_wire::header::HeaderError)
+pub rns_wire::packet::PacketError::TooShort
+pub struct rns_wire::packet::Packet
+pub rns_wire::packet::Packet::header: rns_wire::header::PacketHeader
+pub rns_wire::packet::Packet::packet_hash: [u8; 32]
+pub rns_wire::packet::Packet::raw: alloc::vec::Vec<u8>
+pub rns_wire::packet::Packet::truncated_hash: [u8; 16]
+impl rns_wire::packet::Packet
+pub fn rns_wire::packet::Packet::data(&self) -> &[u8]
+pub fn rns_wire::packet::Packet::from_raw(&[u8]) -> core::result::Result<Self, rns_wire::packet::PacketError>
+pub fn rns_wire::packet::Packet::from_raw_owned(alloc::vec::Vec<u8>) -> core::result::Result<Self, rns_wire::packet::PacketError>
+pub fn rns_wire::packet::Packet::increment_hops(&mut self)
+pub fn rns_wire::packet::Packet::new(rns_wire::header::PacketHeader, alloc::vec::Vec<u8>) -> core::result::Result<Self, rns_wire::packet::PacketError>
+pub mod rns_wire::proof
+pub enum rns_wire::proof::ProofData
+pub rns_wire::proof::ProofData::Explicit
+pub rns_wire::proof::ProofData::Explicit::packet_hash: [u8; 32]
+pub rns_wire::proof::ProofData::Explicit::signature: [u8; 64]
+pub rns_wire::proof::ProofData::Implicit
+pub rns_wire::proof::ProofData::Implicit::signature: [u8; 64]
+impl rns_wire::proof::ProofData
+pub fn rns_wire::proof::ProofData::from_bytes(&[u8]) -> core::option::Option<Self>
+pub fn rns_wire::proof::ProofData::signature(&self) -> &[u8; 64]
+pub fn rns_wire::proof::ProofData::to_bytes(&self) -> alloc::vec::Vec<u8>
+pub mod rns_wire::receipt
+#[repr(u8)] pub enum rns_wire::receipt::ReceiptStatus
+pub rns_wire::receipt::ReceiptStatus::Culled = 255
+pub rns_wire::receipt::ReceiptStatus::Delivered = 2
+pub rns_wire::receipt::ReceiptStatus::Failed = 0
+pub rns_wire::receipt::ReceiptStatus::Receiving = 6
+pub rns_wire::receipt::ReceiptStatus::Sent = 1
+pub struct rns_wire::receipt::PacketReceipt
+pub rns_wire::receipt::PacketReceipt::callbacks: rns_wire::receipt::ReceiptCallbacks
+pub rns_wire::receipt::PacketReceipt::concluded_at: core::option::Option<std::time::Instant>
+pub rns_wire::receipt::PacketReceipt::destination_hash: core::option::Option<[u8; 16]>
+pub rns_wire::receipt::PacketReceipt::destination_public_key: core::option::Option<[u8; 64]>
+pub rns_wire::receipt::PacketReceipt::hash: [u8; 32]
+pub rns_wire::receipt::PacketReceipt::sent_at: std::time::Instant
+pub rns_wire::receipt::PacketReceipt::status: rns_wire::receipt::ReceiptStatus
+pub rns_wire::receipt::PacketReceipt::timeout: core::option::Option<core::time::Duration>
+pub rns_wire::receipt::PacketReceipt::truncated_hash: [u8; 16]
+impl rns_wire::receipt::PacketReceipt
+pub fn rns_wire::receipt::PacketReceipt::check_timeout(&mut self) -> bool
+pub fn rns_wire::receipt::PacketReceipt::cull(&mut self)
+pub fn rns_wire::receipt::PacketReceipt::deliver(&mut self)
+pub fn rns_wire::receipt::PacketReceipt::fail(&mut self)
+pub fn rns_wire::receipt::PacketReceipt::get_rtt(&self) -> core::option::Option<core::time::Duration>
+pub fn rns_wire::receipt::PacketReceipt::is_timed_out(&self) -> bool
+pub fn rns_wire::receipt::PacketReceipt::new([u8; 32], [u8; 16], core::option::Option<core::time::Duration>) -> Self
+pub fn rns_wire::receipt::PacketReceipt::set_delivery_callback(&mut self, impl core::ops::function::FnOnce(&rns_wire::receipt::PacketReceipt) + core::marker::Send + 'static)
+pub fn rns_wire::receipt::PacketReceipt::set_destination_identity(&mut self, [u8; 16], core::option::Option<[u8; 64]>)
+pub fn rns_wire::receipt::PacketReceipt::set_timeout_callback(&mut self, impl core::ops::function::FnOnce(&rns_wire::receipt::PacketReceipt) + core::marker::Send + 'static)
+pub fn rns_wire::receipt::PacketReceipt::validate_proof<F>(&mut self, &[u8], F) -> bool where F: core::ops::function::FnOnce(&[u8], &[u8]) -> bool
+pub fn rns_wire::receipt::PacketReceipt::validate_proof_from_destination(&mut self, &[u8]) -> bool
+pub struct rns_wire::receipt::ReceiptCallbacks
+pub rns_wire::receipt::ReceiptCallbacks::delivery: core::option::Option<rns_wire::receipt::ReceiptCallback>
+pub rns_wire::receipt::ReceiptCallbacks::timeout: core::option::Option<rns_wire::receipt::ReceiptCallback>
+pub const rns_wire::receipt::EXPL_LENGTH: usize
+pub const rns_wire::receipt::IMPL_LENGTH: usize
+pub type rns_wire::receipt::ReceiptCallback = alloc::boxed::Box<(dyn core::ops::function::FnOnce(&rns_wire::receipt::PacketReceipt) + core::marker::Send)>
+pub mod rns_wire::types
+#[repr(transparent)] pub struct rns_wire::types::DestHash(_)
+impl rns_wire::types::DestHash
+pub const rns_wire::types::DestHash::LEN: usize
+pub const fn rns_wire::types::DestHash::as_bytes(&self) -> &[u8; 16]
+pub fn rns_wire::types::DestHash::from_slice(&[u8]) -> core::option::Option<Self>
+pub const fn rns_wire::types::DestHash::into_bytes(self) -> [u8; 16]
+pub const fn rns_wire::types::DestHash::new([u8; 16]) -> Self
+impl core::borrow::Borrow<[u8; 16]> for rns_wire::types::DestHash
+pub fn rns_wire::types::DestHash::borrow(&self) -> &[u8; 16]
+impl core::convert::AsRef<[u8; 16]> for rns_wire::types::DestHash
+pub fn rns_wire::types::DestHash::as_ref(&self) -> &[u8; 16]
+impl core::convert::AsRef<[u8]> for rns_wire::types::DestHash
+pub fn rns_wire::types::DestHash::as_ref(&self) -> &[u8]
+impl core::convert::From<&[u8; 16]> for rns_wire::types::DestHash
+pub fn rns_wire::types::DestHash::from(&[u8; 16]) -> Self
+impl core::convert::From<[u8; 16]> for rns_wire::types::DestHash
+pub fn rns_wire::types::DestHash::from([u8; 16]) -> Self
+impl core::convert::From<rns_wire::types::DestHash> for [u8; 16]
+pub fn [u8; 16]::from(rns_wire::types::DestHash) -> [u8; 16]
+impl core::fmt::Debug for rns_wire::types::DestHash
+pub fn rns_wire::types::DestHash::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rns_wire::types::DestHash
+pub fn rns_wire::types::DestHash::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::deref::Deref for rns_wire::types::DestHash
+pub type rns_wire::types::DestHash::Target = [u8; 16]
+pub fn rns_wire::types::DestHash::deref(&self) -> &[u8; 16]
+#[repr(transparent)] pub struct rns_wire::types::FullHash(_)
+impl rns_wire::types::FullHash
+pub const rns_wire::types::FullHash::LEN: usize
+pub const fn rns_wire::types::FullHash::as_bytes(&self) -> &[u8; 32]
+pub fn rns_wire::types::FullHash::from_slice(&[u8]) -> core::option::Option<Self>
+pub const fn rns_wire::types::FullHash::into_bytes(self) -> [u8; 32]
+pub const fn rns_wire::types::FullHash::new([u8; 32]) -> Self
+impl core::borrow::Borrow<[u8; 32]> for rns_wire::types::FullHash
+pub fn rns_wire::types::FullHash::borrow(&self) -> &[u8; 32]
+impl core::convert::AsRef<[u8; 32]> for rns_wire::types::FullHash
+pub fn rns_wire::types::FullHash::as_ref(&self) -> &[u8; 32]
+impl core::convert::AsRef<[u8]> for rns_wire::types::FullHash
+pub fn rns_wire::types::FullHash::as_ref(&self) -> &[u8]
+impl core::convert::From<&[u8; 32]> for rns_wire::types::FullHash
+pub fn rns_wire::types::FullHash::from(&[u8; 32]) -> Self
+impl core::convert::From<[u8; 32]> for rns_wire::types::FullHash
+pub fn rns_wire::types::FullHash::from([u8; 32]) -> Self
+impl core::convert::From<rns_wire::types::FullHash> for [u8; 32]
+pub fn [u8; 32]::from(rns_wire::types::FullHash) -> [u8; 32]
+impl core::fmt::Debug for rns_wire::types::FullHash
+pub fn rns_wire::types::FullHash::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rns_wire::types::FullHash
+pub fn rns_wire::types::FullHash::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::deref::Deref for rns_wire::types::FullHash
+pub type rns_wire::types::FullHash::Target = [u8; 32]
+pub fn rns_wire::types::FullHash::deref(&self) -> &[u8; 32]
+#[repr(transparent)] pub struct rns_wire::types::IdentityHash(_)
+impl rns_wire::types::IdentityHash
+pub const rns_wire::types::IdentityHash::LEN: usize
+pub const fn rns_wire::types::IdentityHash::as_bytes(&self) -> &[u8; 16]
+pub fn rns_wire::types::IdentityHash::from_slice(&[u8]) -> core::option::Option<Self>
+pub const fn rns_wire::types::IdentityHash::into_bytes(self) -> [u8; 16]
+pub const fn rns_wire::types::IdentityHash::new([u8; 16]) -> Self
+impl core::borrow::Borrow<[u8; 16]> for rns_wire::types::IdentityHash
+pub fn rns_wire::types::IdentityHash::borrow(&self) -> &[u8; 16]
+impl core::convert::AsRef<[u8; 16]> for rns_wire::types::IdentityHash
+pub fn rns_wire::types::IdentityHash::as_ref(&self) -> &[u8; 16]
+impl core::convert::AsRef<[u8]> for rns_wire::types::IdentityHash
+pub fn rns_wire::types::IdentityHash::as_ref(&self) -> &[u8]
+impl core::convert::From<&[u8; 16]> for rns_wire::types::IdentityHash
+pub fn rns_wire::types::IdentityHash::from(&[u8; 16]) -> Self
+impl core::convert::From<[u8; 16]> for rns_wire::types::IdentityHash
+pub fn rns_wire::types::IdentityHash::from([u8; 16]) -> Self
+impl core::convert::From<rns_wire::types::IdentityHash> for [u8; 16]
+pub fn [u8; 16]::from(rns_wire::types::IdentityHash) -> [u8; 16]
+impl core::fmt::Debug for rns_wire::types::IdentityHash
+pub fn rns_wire::types::IdentityHash::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rns_wire::types::IdentityHash
+pub fn rns_wire::types::IdentityHash::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::deref::Deref for rns_wire::types::IdentityHash
+pub type rns_wire::types::IdentityHash::Target = [u8; 16]
+pub fn rns_wire::types::IdentityHash::deref(&self) -> &[u8; 16]
+#[repr(transparent)] pub struct rns_wire::types::LinkId(_)
+impl rns_wire::types::LinkId
+pub const rns_wire::types::LinkId::LEN: usize
+pub const fn rns_wire::types::LinkId::as_bytes(&self) -> &[u8; 16]
+pub fn rns_wire::types::LinkId::from_slice(&[u8]) -> core::option::Option<Self>
+pub const fn rns_wire::types::LinkId::into_bytes(self) -> [u8; 16]
+pub const fn rns_wire::types::LinkId::new([u8; 16]) -> Self
+impl core::borrow::Borrow<[u8; 16]> for rns_wire::types::LinkId
+pub fn rns_wire::types::LinkId::borrow(&self) -> &[u8; 16]
+impl core::convert::AsRef<[u8; 16]> for rns_wire::types::LinkId
+pub fn rns_wire::types::LinkId::as_ref(&self) -> &[u8; 16]
+impl core::convert::AsRef<[u8]> for rns_wire::types::LinkId
+pub fn rns_wire::types::LinkId::as_ref(&self) -> &[u8]
+impl core::convert::From<&[u8; 16]> for rns_wire::types::LinkId
+pub fn rns_wire::types::LinkId::from(&[u8; 16]) -> Self
+impl core::convert::From<[u8; 16]> for rns_wire::types::LinkId
+pub fn rns_wire::types::LinkId::from([u8; 16]) -> Self
+impl core::convert::From<rns_wire::types::LinkId> for [u8; 16]
+pub fn [u8; 16]::from(rns_wire::types::LinkId) -> [u8; 16]
+impl core::fmt::Debug for rns_wire::types::LinkId
+pub fn rns_wire::types::LinkId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rns_wire::types::LinkId
+pub fn rns_wire::types::LinkId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::deref::Deref for rns_wire::types::LinkId
+pub type rns_wire::types::LinkId::Target = [u8; 16]
+pub fn rns_wire::types::LinkId::deref(&self) -> &[u8; 16]
+#[repr(transparent)] pub struct rns_wire::types::MessageHash(_)
+impl rns_wire::types::MessageHash
+pub const rns_wire::types::MessageHash::LEN: usize
+pub const fn rns_wire::types::MessageHash::as_bytes(&self) -> &[u8; 32]
+pub fn rns_wire::types::MessageHash::from_slice(&[u8]) -> core::option::Option<Self>
+pub const fn rns_wire::types::MessageHash::into_bytes(self) -> [u8; 32]
+pub const fn rns_wire::types::MessageHash::new([u8; 32]) -> Self
+impl core::borrow::Borrow<[u8; 32]> for rns_wire::types::MessageHash
+pub fn rns_wire::types::MessageHash::borrow(&self) -> &[u8; 32]
+impl core::convert::AsRef<[u8; 32]> for rns_wire::types::MessageHash
+pub fn rns_wire::types::MessageHash::as_ref(&self) -> &[u8; 32]
+impl core::convert::AsRef<[u8]> for rns_wire::types::MessageHash
+pub fn rns_wire::types::MessageHash::as_ref(&self) -> &[u8]
+impl core::convert::From<&[u8; 32]> for rns_wire::types::MessageHash
+pub fn rns_wire::types::MessageHash::from(&[u8; 32]) -> Self
+impl core::convert::From<[u8; 32]> for rns_wire::types::MessageHash
+pub fn rns_wire::types::MessageHash::from([u8; 32]) -> Self
+impl core::convert::From<rns_wire::types::MessageHash> for [u8; 32]
+pub fn [u8; 32]::from(rns_wire::types::MessageHash) -> [u8; 32]
+impl core::fmt::Debug for rns_wire::types::MessageHash
+pub fn rns_wire::types::MessageHash::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rns_wire::types::MessageHash
+pub fn rns_wire::types::MessageHash::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::deref::Deref for rns_wire::types::MessageHash
+pub type rns_wire::types::MessageHash::Target = [u8; 32]
+pub fn rns_wire::types::MessageHash::deref(&self) -> &[u8; 32]
+#[repr(transparent)] pub struct rns_wire::types::NameHash(_)
+impl rns_wire::types::NameHash
+pub const rns_wire::types::NameHash::LEN: usize
+pub const fn rns_wire::types::NameHash::as_bytes(&self) -> &[u8; 10]
+pub fn rns_wire::types::NameHash::from_slice(&[u8]) -> core::option::Option<Self>
+pub const fn rns_wire::types::NameHash::into_bytes(self) -> [u8; 10]
+pub const fn rns_wire::types::NameHash::new([u8; 10]) -> Self
+impl core::borrow::Borrow<[u8; 10]> for rns_wire::types::NameHash
+pub fn rns_wire::types::NameHash::borrow(&self) -> &[u8; 10]
+impl core::convert::AsRef<[u8; 10]> for rns_wire::types::NameHash
+pub fn rns_wire::types::NameHash::as_ref(&self) -> &[u8; 10]
+impl core::convert::AsRef<[u8]> for rns_wire::types::NameHash
+pub fn rns_wire::types::NameHash::as_ref(&self) -> &[u8]
+impl core::convert::From<&[u8; 10]> for rns_wire::types::NameHash
+pub fn rns_wire::types::NameHash::from(&[u8; 10]) -> Self
+impl core::convert::From<[u8; 10]> for rns_wire::types::NameHash
+pub fn rns_wire::types::NameHash::from([u8; 10]) -> Self
+impl core::convert::From<rns_wire::types::NameHash> for [u8; 10]
+pub fn [u8; 10]::from(rns_wire::types::NameHash) -> [u8; 10]
+impl core::fmt::Debug for rns_wire::types::NameHash
+pub fn rns_wire::types::NameHash::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rns_wire::types::NameHash
+pub fn rns_wire::types::NameHash::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::deref::Deref for rns_wire::types::NameHash
+pub type rns_wire::types::NameHash::Target = [u8; 10]
+pub fn rns_wire::types::NameHash::deref(&self) -> &[u8; 10]
+#[repr(transparent)] pub struct rns_wire::types::TransportId(_)
+impl rns_wire::types::TransportId
+pub const rns_wire::types::TransportId::LEN: usize
+pub const fn rns_wire::types::TransportId::as_bytes(&self) -> &[u8; 16]
+pub fn rns_wire::types::TransportId::from_slice(&[u8]) -> core::option::Option<Self>
+pub const fn rns_wire::types::TransportId::into_bytes(self) -> [u8; 16]
+pub const fn rns_wire::types::TransportId::new([u8; 16]) -> Self
+impl core::borrow::Borrow<[u8; 16]> for rns_wire::types::TransportId
+pub fn rns_wire::types::TransportId::borrow(&self) -> &[u8; 16]
+impl core::convert::AsRef<[u8; 16]> for rns_wire::types::TransportId
+pub fn rns_wire::types::TransportId::as_ref(&self) -> &[u8; 16]
+impl core::convert::AsRef<[u8]> for rns_wire::types::TransportId
+pub fn rns_wire::types::TransportId::as_ref(&self) -> &[u8]
+impl core::convert::From<&[u8; 16]> for rns_wire::types::TransportId
+pub fn rns_wire::types::TransportId::from(&[u8; 16]) -> Self
+impl core::convert::From<[u8; 16]> for rns_wire::types::TransportId
+pub fn rns_wire::types::TransportId::from([u8; 16]) -> Self
+impl core::convert::From<rns_wire::types::TransportId> for [u8; 16]
+pub fn [u8; 16]::from(rns_wire::types::TransportId) -> [u8; 16]
+impl core::fmt::Debug for rns_wire::types::TransportId
+pub fn rns_wire::types::TransportId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rns_wire::types::TransportId
+pub fn rns_wire::types::TransportId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::deref::Deref for rns_wire::types::TransportId
+pub type rns_wire::types::TransportId::Target = [u8; 16]
+pub fn rns_wire::types::TransportId::deref(&self) -> &[u8; 16]
+#[repr(transparent)] pub struct rns_wire::types::TruncatedHash(_)
+impl rns_wire::types::TruncatedHash
+pub const rns_wire::types::TruncatedHash::LEN: usize
+pub const fn rns_wire::types::TruncatedHash::as_bytes(&self) -> &[u8; 16]
+pub fn rns_wire::types::TruncatedHash::from_slice(&[u8]) -> core::option::Option<Self>
+pub const fn rns_wire::types::TruncatedHash::into_bytes(self) -> [u8; 16]
+pub const fn rns_wire::types::TruncatedHash::new([u8; 16]) -> Self
+impl core::borrow::Borrow<[u8; 16]> for rns_wire::types::TruncatedHash
+pub fn rns_wire::types::TruncatedHash::borrow(&self) -> &[u8; 16]
+impl core::convert::AsRef<[u8; 16]> for rns_wire::types::TruncatedHash
+pub fn rns_wire::types::TruncatedHash::as_ref(&self) -> &[u8; 16]
+impl core::convert::AsRef<[u8]> for rns_wire::types::TruncatedHash
+pub fn rns_wire::types::TruncatedHash::as_ref(&self) -> &[u8]
+impl core::convert::From<&[u8; 16]> for rns_wire::types::TruncatedHash
+pub fn rns_wire::types::TruncatedHash::from(&[u8; 16]) -> Self
+impl core::convert::From<[u8; 16]> for rns_wire::types::TruncatedHash
+pub fn rns_wire::types::TruncatedHash::from([u8; 16]) -> Self
+impl core::convert::From<rns_wire::types::TruncatedHash> for [u8; 16]
+pub fn [u8; 16]::from(rns_wire::types::TruncatedHash) -> [u8; 16]
+impl core::fmt::Debug for rns_wire::types::TruncatedHash
+pub fn rns_wire::types::TruncatedHash::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rns_wire::types::TruncatedHash
+pub fn rns_wire::types::TruncatedHash::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::deref::Deref for rns_wire::types::TruncatedHash
+pub type rns_wire::types::TruncatedHash::Target = [u8; 16]
+pub fn rns_wire::types::TruncatedHash::deref(&self) -> &[u8; 16]

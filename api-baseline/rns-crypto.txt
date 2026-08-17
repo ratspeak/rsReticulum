@@ -1,0 +1,91 @@
+pub mod rns_crypto
+pub mod rns_crypto::aes_cbc
+pub enum rns_crypto::aes_cbc::AesCbcError
+pub rns_crypto::aes_cbc::AesCbcError::DecryptionFailed
+pub rns_crypto::aes_cbc::AesCbcError::EncryptionFailed
+pub rns_crypto::aes_cbc::AesCbcError::InvalidIvLength(usize)
+pub rns_crypto::aes_cbc::AesCbcError::InvalidKeyLength(usize)
+pub rns_crypto::aes_cbc::AesCbcError::NotBlockAligned
+pub fn rns_crypto::aes_cbc::decrypt(&[u8], &[u8], &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_crypto::aes_cbc::AesCbcError>
+pub fn rns_crypto::aes_cbc::encrypt(&[u8], &[u8], &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_crypto::aes_cbc::AesCbcError>
+pub mod rns_crypto::ed25519
+pub enum rns_crypto::ed25519::Ed25519Error
+pub rns_crypto::ed25519::Ed25519Error::InvalidPublicKey
+pub rns_crypto::ed25519::Ed25519Error::InvalidSignature
+pub rns_crypto::ed25519::Ed25519Error::VerificationFailed
+pub struct rns_crypto::ed25519::Ed25519PrivateKey
+impl rns_crypto::ed25519::Ed25519PrivateKey
+pub fn rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(&[u8; 32]) -> Self
+pub fn rns_crypto::ed25519::Ed25519PrivateKey::generate() -> Self
+pub fn rns_crypto::ed25519::Ed25519PrivateKey::public_key(&self) -> rns_crypto::ed25519::Ed25519PublicKey
+pub fn rns_crypto::ed25519::Ed25519PrivateKey::sign(&self, &[u8]) -> [u8; 64]
+pub fn rns_crypto::ed25519::Ed25519PrivateKey::to_bytes(&self) -> [u8; 32]
+impl core::ops::drop::Drop for rns_crypto::ed25519::Ed25519PrivateKey
+pub fn rns_crypto::ed25519::Ed25519PrivateKey::drop(&mut self)
+impl zeroize::Zeroize for rns_crypto::ed25519::Ed25519PrivateKey
+pub fn rns_crypto::ed25519::Ed25519PrivateKey::zeroize(&mut self)
+pub struct rns_crypto::ed25519::Ed25519PublicKey
+impl rns_crypto::ed25519::Ed25519PublicKey
+pub fn rns_crypto::ed25519::Ed25519PublicKey::from_bytes(&[u8; 32]) -> core::result::Result<Self, rns_crypto::ed25519::Ed25519Error>
+pub fn rns_crypto::ed25519::Ed25519PublicKey::to_bytes(&self) -> [u8; 32]
+pub fn rns_crypto::ed25519::Ed25519PublicKey::verify(&self, &[u8], &[u8; 64]) -> core::result::Result<(), rns_crypto::ed25519::Ed25519Error>
+pub mod rns_crypto::hkdf
+pub enum rns_crypto::hkdf::HkdfError
+pub rns_crypto::hkdf::HkdfError::ExpansionFailed
+pub rns_crypto::hkdf::HkdfError::OutputTooLong(usize)
+pub fn rns_crypto::hkdf::derive_key_64(&[u8], &[u8]) -> core::result::Result<[u8; 64], rns_crypto::hkdf::HkdfError>
+pub fn rns_crypto::hkdf::hkdf_sha256(usize, &[u8], core::option::Option<&[u8]>, core::option::Option<&[u8]>) -> core::result::Result<alloc::vec::Vec<u8>, rns_crypto::hkdf::HkdfError>
+pub mod rns_crypto::hmac
+pub fn rns_crypto::hmac::hmac_sha256(&[u8], &[u8]) -> [u8; 32]
+pub fn rns_crypto::hmac::hmac_verify(&[u8], &[u8], &[u8; 32]) -> bool
+pub mod rns_crypto::pkcs7
+pub enum rns_crypto::pkcs7::Pkcs7Error
+pub rns_crypto::pkcs7::Pkcs7Error::EmptyInput
+pub rns_crypto::pkcs7::Pkcs7Error::InconsistentPadding
+pub rns_crypto::pkcs7::Pkcs7Error::InvalidPaddingValue(u8)
+pub fn rns_crypto::pkcs7::pad(&[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_crypto::pkcs7::unpad(&[u8]) -> core::result::Result<&[u8], rns_crypto::pkcs7::Pkcs7Error>
+pub mod rns_crypto::random
+pub fn rns_crypto::random::random_16() -> [u8; 16]
+pub fn rns_crypto::random::random_32() -> [u8; 32]
+pub fn rns_crypto::random::random_bytes(usize) -> alloc::vec::Vec<u8>
+pub mod rns_crypto::sha
+pub fn rns_crypto::sha::full_hash(&[u8]) -> [u8; 32]
+pub fn rns_crypto::sha::name_hash(&str) -> [u8; 10]
+pub fn rns_crypto::sha::sha256(&[u8]) -> [u8; 32]
+pub fn rns_crypto::sha::sha512(&[u8]) -> [u8; 64]
+pub fn rns_crypto::sha::truncated_hash(&[u8]) -> [u8; 16]
+pub mod rns_crypto::token
+pub enum rns_crypto::token::TokenError
+pub rns_crypto::token::TokenError::AuthenticationFailed
+pub rns_crypto::token::TokenError::DecryptionFailed
+pub rns_crypto::token::TokenError::EncryptionFailed
+pub rns_crypto::token::TokenError::InvalidKeyLength(usize)
+pub rns_crypto::token::TokenError::TooShort
+pub const rns_crypto::token::AES128_BLOCKSIZE: usize
+pub const rns_crypto::token::AES256_BLOCKSIZE: usize
+pub const rns_crypto::token::DERIVED_KEY_LENGTH_LEGACY: usize
+pub const rns_crypto::token::KEY_LENGTH: usize
+pub const rns_crypto::token::LEGACY_KEY_LENGTH: usize
+pub const rns_crypto::token::TOKEN_OVERHEAD: usize
+pub fn rns_crypto::token::decrypt(&[u8], &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_crypto::token::TokenError>
+pub fn rns_crypto::token::encrypt(&[u8], &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_crypto::token::TokenError>
+pub fn rns_crypto::token::generate_key() -> zeroize::Zeroizing<alloc::vec::Vec<u8>>
+pub mod rns_crypto::x25519
+pub struct rns_crypto::x25519::X25519PrivateKey
+impl rns_crypto::x25519::X25519PrivateKey
+pub fn rns_crypto::x25519::X25519PrivateKey::exchange(&self, &rns_crypto::x25519::X25519PublicKey) -> [u8; 32]
+pub fn rns_crypto::x25519::X25519PrivateKey::from_bytes(&[u8; 32]) -> Self
+pub fn rns_crypto::x25519::X25519PrivateKey::generate() -> Self
+pub fn rns_crypto::x25519::X25519PrivateKey::public_key(&self) -> rns_crypto::x25519::X25519PublicKey
+pub fn rns_crypto::x25519::X25519PrivateKey::to_bytes(&self) -> [u8; 32]
+impl core::ops::drop::Drop for rns_crypto::x25519::X25519PrivateKey
+pub fn rns_crypto::x25519::X25519PrivateKey::drop(&mut self)
+impl zeroize::Zeroize for rns_crypto::x25519::X25519PrivateKey
+pub fn rns_crypto::x25519::X25519PrivateKey::zeroize(&mut self)
+pub struct rns_crypto::x25519::X25519PublicKey
+impl rns_crypto::x25519::X25519PublicKey
+pub fn rns_crypto::x25519::X25519PublicKey::from_bytes(&[u8; 32]) -> Self
+pub fn rns_crypto::x25519::X25519PublicKey::to_bytes(&self) -> [u8; 32]
+pub const rns_crypto::TOKEN_OVERHEAD: usize
+pub fn rns_crypto::hex_encode(&[u8]) -> alloc::string::String

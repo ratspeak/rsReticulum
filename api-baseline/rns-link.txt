@@ -1,0 +1,358 @@
+pub mod rns_link
+pub mod rns_link::constants
+pub const rns_link::constants::ACCEPT_ALL: u8
+pub const rns_link::constants::ACCEPT_APP: u8
+pub const rns_link::constants::ACCEPT_NONE: u8
+pub const rns_link::constants::AES128_DERIVED_KEY_LENGTH: usize
+pub const rns_link::constants::AES256_DERIVED_KEY_LENGTH: usize
+pub const rns_link::constants::DEFAULT_MODE: u8
+pub const rns_link::constants::DESTINATION_CLOSED: u8
+pub const rns_link::constants::ECPUBSIZE: usize
+pub const rns_link::constants::ENABLED_MODES: &[u8]
+pub const rns_link::constants::ESTABLISHMENT_TIMEOUT_PER_HOP: f64
+pub const rns_link::constants::INITIATOR_CLOSED: u8
+pub const rns_link::constants::KEEPALIVE_DEFAULT: f64
+pub const rns_link::constants::KEEPALIVE_MAX: f64
+pub const rns_link::constants::KEEPALIVE_MAX_RTT: f64
+pub const rns_link::constants::KEEPALIVE_MIN: f64
+pub const rns_link::constants::KEEPALIVE_REQUEST: u8
+pub const rns_link::constants::KEEPALIVE_RESPONSE: u8
+pub const rns_link::constants::KEEPALIVE_TIMEOUT_FACTOR: f64
+pub const rns_link::constants::KEYSIZE: usize
+pub const rns_link::constants::LINK_MTU_SIZE: usize
+pub const rns_link::constants::MODE_AES128_CBC: u8
+pub const rns_link::constants::MODE_AES256_CBC: u8
+pub const rns_link::constants::MODE_AES256_GCM: u8
+pub const rns_link::constants::MODE_BYTEMASK: u32
+pub const rns_link::constants::MODE_OTP_RESERVED: u8
+pub const rns_link::constants::MODE_PQ_RESERVED_1: u8
+pub const rns_link::constants::MODE_PQ_RESERVED_2: u8
+pub const rns_link::constants::MODE_PQ_RESERVED_3: u8
+pub const rns_link::constants::MODE_PQ_RESERVED_4: u8
+pub const rns_link::constants::MTU_BYTEMASK: u32
+pub const rns_link::constants::RESPONSE_MAX_GRACE_TIME: f64
+pub const rns_link::constants::STALE_FACTOR: f64
+pub const rns_link::constants::STALE_GRACE: f64
+pub const rns_link::constants::STALE_TIME_DEFAULT: f64
+pub const rns_link::constants::TIMEOUT: u8
+pub const rns_link::constants::TRAFFIC_TIMEOUT_FACTOR: f64
+pub const rns_link::constants::TRAFFIC_TIMEOUT_FLOOR_MS: u64
+pub const rns_link::constants::WATCHDOG_MAX_SLEEP: f64
+pub mod rns_link::encryption
+pub enum rns_link::encryption::LinkCryptoError
+pub rns_link::encryption::LinkCryptoError::DecryptionFailed
+pub rns_link::encryption::LinkCryptoError::EncryptionFailed
+pub fn rns_link::encryption::link_decrypt(&rns_link::key_derivation::LinkKeys, &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::encryption::LinkCryptoError>
+pub fn rns_link::encryption::link_encrypt(&rns_link::key_derivation::LinkKeys, &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::encryption::LinkCryptoError>
+pub mod rns_link::handshake
+pub enum rns_link::handshake::HandshakeError
+pub rns_link::handshake::HandshakeError::InvalidLength(usize)
+pub rns_link::handshake::HandshakeError::InvalidSignature
+pub rns_link::handshake::HandshakeError::KeyDerivation(rns_link::key_derivation::LinkKeyError)
+pub rns_link::handshake::HandshakeError::TooShort
+pub rns_link::handshake::HandshakeError::UnsupportedMode(u8)
+pub struct rns_link::handshake::EphemeralKeys
+pub rns_link::handshake::EphemeralKeys::ed25519_prv: rns_crypto::ed25519::Ed25519PrivateKey
+pub rns_link::handshake::EphemeralKeys::ed25519_pub: rns_crypto::ed25519::Ed25519PublicKey
+pub rns_link::handshake::EphemeralKeys::x25519_prv: rns_crypto::x25519::X25519PrivateKey
+pub rns_link::handshake::EphemeralKeys::x25519_pub: rns_crypto::x25519::X25519PublicKey
+impl rns_link::handshake::EphemeralKeys
+pub fn rns_link::handshake::EphemeralKeys::generate() -> Self
+impl core::ops::drop::Drop for rns_link::handshake::EphemeralKeys
+pub fn rns_link::handshake::EphemeralKeys::drop(&mut self)
+impl zeroize::Zeroize for rns_link::handshake::EphemeralKeys
+pub fn rns_link::handshake::EphemeralKeys::zeroize(&mut self)
+pub struct rns_link::handshake::LinkProofData
+pub rns_link::handshake::LinkProofData::responder_x25519_pub: [u8; 32]
+pub rns_link::handshake::LinkProofData::signalling: rns_link::mtu_discovery::SignallingData
+pub rns_link::handshake::LinkProofData::signature: [u8; 64]
+impl rns_link::handshake::LinkProofData
+pub fn rns_link::handshake::LinkProofData::create(&rns_crypto::ed25519::Ed25519PrivateKey, &[u8; 32], &[u8; 32], &[u8; 16], rns_link::mtu_discovery::SignallingData) -> Self
+pub fn rns_link::handshake::LinkProofData::create_with<F>(F, &[u8; 32], &[u8; 32], &[u8; 16], rns_link::mtu_discovery::SignallingData) -> Self where F: core::ops::function::FnOnce(&[u8]) -> [u8; 64]
+pub fn rns_link::handshake::LinkProofData::pack(&self) -> alloc::vec::Vec<u8>
+pub fn rns_link::handshake::LinkProofData::unpack(&[u8]) -> core::result::Result<Self, rns_link::handshake::HandshakeError>
+pub fn rns_link::handshake::LinkProofData::validate(&self, &rns_crypto::ed25519::Ed25519PublicKey, &[u8; 16], &[u8; 32]) -> bool
+pub struct rns_link::handshake::LinkRequestData
+pub rns_link::handshake::LinkRequestData::peer_ed25519_pub: [u8; 32]
+pub rns_link::handshake::LinkRequestData::peer_x25519_pub: [u8; 32]
+pub rns_link::handshake::LinkRequestData::signalling: rns_link::mtu_discovery::SignallingData
+impl rns_link::handshake::LinkRequestData
+pub fn rns_link::handshake::LinkRequestData::pack(&rns_link::handshake::EphemeralKeys, rns_link::mtu_discovery::SignallingData) -> alloc::vec::Vec<u8>
+pub fn rns_link::handshake::LinkRequestData::unpack(&[u8]) -> core::result::Result<Self, rns_link::handshake::HandshakeError>
+pub fn rns_link::handshake::compute_link_id(&[u8; 16], &[u8]) -> [u8; 16]
+pub fn rns_link::handshake::compute_link_id_from_raw(&[u8], rns_wire::flags::HeaderType) -> [u8; 16]
+pub fn rns_link::handshake::perform_handshake(&rns_crypto::x25519::X25519PrivateKey, &[u8; 32], &[u8; 16], u8) -> core::result::Result<rns_link::key_derivation::LinkKeys, rns_link::key_derivation::LinkKeyError>
+pub mod rns_link::keepalive
+pub struct rns_link::keepalive::KeepaliveState
+pub rns_link::keepalive::KeepaliveState::activated_at: core::option::Option<std::time::Instant>
+pub rns_link::keepalive::KeepaliveState::is_initiator: bool
+pub rns_link::keepalive::KeepaliveState::keepalive_interval: core::time::Duration
+pub rns_link::keepalive::KeepaliveState::last_data: std::time::Instant
+pub rns_link::keepalive::KeepaliveState::last_inbound: std::time::Instant
+pub rns_link::keepalive::KeepaliveState::last_keepalive_sent: core::option::Option<std::time::Instant>
+pub rns_link::keepalive::KeepaliveState::last_outbound: core::option::Option<std::time::Instant>
+pub rns_link::keepalive::KeepaliveState::last_proof: core::option::Option<std::time::Instant>
+pub rns_link::keepalive::KeepaliveState::stale_time: core::time::Duration
+impl rns_link::keepalive::KeepaliveState
+pub fn rns_link::keepalive::KeepaliveState::is_stale(&self) -> bool
+pub fn rns_link::keepalive::KeepaliveState::mark_activated(&mut self)
+pub fn rns_link::keepalive::KeepaliveState::mark_keepalive_sent(&mut self)
+pub fn rns_link::keepalive::KeepaliveState::new(bool) -> Self
+pub fn rns_link::keepalive::KeepaliveState::record_data(&mut self)
+pub fn rns_link::keepalive::KeepaliveState::record_inbound(&mut self)
+pub fn rns_link::keepalive::KeepaliveState::record_outbound(&mut self)
+pub fn rns_link::keepalive::KeepaliveState::record_proof(&mut self)
+pub fn rns_link::keepalive::KeepaliveState::should_send_keepalive(&self) -> bool
+pub fn rns_link::keepalive::KeepaliveState::since_inbound(&self) -> core::time::Duration
+pub fn rns_link::keepalive::KeepaliveState::stale_grace_timeout(&self, core::time::Duration) -> core::time::Duration
+pub fn rns_link::keepalive::KeepaliveState::update_from_rtt(&mut self, core::time::Duration)
+pub mod rns_link::key_derivation
+pub enum rns_link::key_derivation::LinkKeyError
+pub rns_link::key_derivation::LinkKeyError::HkdfFailed
+pub rns_link::key_derivation::LinkKeyError::UnsupportedMode(u8)
+pub struct rns_link::key_derivation::LinkKeys
+pub rns_link::key_derivation::LinkKeys::encryption_key: alloc::vec::Vec<u8>
+pub rns_link::key_derivation::LinkKeys::signing_key: alloc::vec::Vec<u8>
+impl rns_link::key_derivation::LinkKeys
+pub fn rns_link::key_derivation::LinkKeys::derive(&rns_crypto::x25519::X25519PrivateKey, &rns_crypto::x25519::X25519PublicKey, &[u8; 16], u8) -> core::result::Result<Self, rns_link::key_derivation::LinkKeyError>
+impl core::ops::drop::Drop for rns_link::key_derivation::LinkKeys
+pub fn rns_link::key_derivation::LinkKeys::drop(&mut self)
+pub mod rns_link::link
+pub enum rns_link::link::CloseReason
+pub rns_link::link::CloseReason::DestinationClosed
+pub rns_link::link::CloseReason::InitiatorClosed
+pub rns_link::link::CloseReason::Timeout
+pub enum rns_link::link::LinkAction
+pub rns_link::link::LinkAction::Closed(rns_link::link::CloseReason)
+pub rns_link::link::LinkAction::None
+pub rns_link::link::LinkAction::SendKeepalive
+pub rns_link::link::LinkAction::SendTeardownAndClose(alloc::vec::Vec<u8>)
+pub rns_link::link::LinkAction::TransitionedToStale
+pub enum rns_link::link::LinkRole
+pub rns_link::link::LinkRole::Initiator
+pub rns_link::link::LinkRole::Responder
+pub enum rns_link::link::LinkState
+pub rns_link::link::LinkState::Active = 2
+pub rns_link::link::LinkState::Closed = 4
+pub rns_link::link::LinkState::Handshake = 1
+pub rns_link::link::LinkState::Pending = 0
+pub rns_link::link::LinkState::Stale = 3
+pub enum rns_link::link::OutboundResourceState
+pub rns_link::link::OutboundResourceState::AwaitingProof
+pub rns_link::link::OutboundResourceState::Complete
+pub rns_link::link::OutboundResourceState::Failed
+pub rns_link::link::OutboundResourceState::Transferring
+pub enum rns_link::link::PacketProofError
+pub rns_link::link::PacketProofError::HashMismatch
+pub rns_link::link::PacketProofError::InvalidSignature
+pub rns_link::link::PacketProofError::InvalidState(rns_link::link::LinkState)
+pub rns_link::link::PacketProofError::MalformedProof
+pub rns_link::link::PacketProofError::PeerKeyUnavailable
+pub rns_link::link::PacketProofError::SignerUnavailable
+pub rns_link::link::PacketProofError::WrongRole
+pub enum rns_link::link::RequestSendMode
+pub rns_link::link::RequestSendMode::Packet(alloc::vec::Vec<u8>)
+pub rns_link::link::RequestSendMode::Resource(alloc::vec::Vec<u8>)
+pub enum rns_link::link::ResourceAcceptance
+pub rns_link::link::ResourceAcceptance::Accept
+pub rns_link::link::ResourceAcceptance::AskApp
+pub rns_link::link::ResourceAcceptance::Reject
+pub enum rns_link::link::ResourceStrategy
+pub rns_link::link::ResourceStrategy::AcceptAll
+pub rns_link::link::ResourceStrategy::AcceptApp
+pub rns_link::link::ResourceStrategy::AcceptNone
+pub struct rns_link::link::Link
+pub rns_link::link::Link::activated_at: core::option::Option<std::time::Instant>
+pub rns_link::link::Link::destination_hash: [u8; 16]
+pub rns_link::link::Link::establishment_cost: usize
+pub rns_link::link::Link::establishment_rate: core::option::Option<f64>
+pub rns_link::link::Link::establishment_timeout: core::time::Duration
+pub rns_link::link::Link::expected_hops: core::option::Option<u8>
+pub rns_link::link::Link::expected_rate: core::option::Option<f64>
+pub rns_link::link::Link::has_channel: bool
+pub rns_link::link::Link::identified: bool
+pub rns_link::link::Link::incoming_resource_count: usize
+pub rns_link::link::Link::incoming_resources: alloc::vec::Vec<[u8; 32]>
+pub rns_link::link::Link::is_initiator: bool
+pub rns_link::link::Link::keepalive: rns_link::keepalive::KeepaliveState
+pub rns_link::link::Link::link_closed_callback: core::option::Option<rns_link::link::LinkCallback>
+pub rns_link::link::Link::link_established_callback: core::option::Option<rns_link::link::LinkCallback>
+pub rns_link::link::Link::link_id: [u8; 16]
+pub rns_link::link::Link::mdu: usize
+pub rns_link::link::Link::mode: u8
+pub rns_link::link::Link::mtu: u32
+pub rns_link::link::Link::outgoing_resource_states: alloc::vec::Vec<rns_link::link::OutboundResourceState>
+pub rns_link::link::Link::outgoing_resources: alloc::vec::Vec<[u8; 32]>
+pub rns_link::link::Link::packet_callback: core::option::Option<rns_link::link::PacketCallback>
+pub rns_link::link::Link::pending_requests: alloc::vec::Vec<rns_link::request::RequestReceipt>
+pub rns_link::link::Link::q: core::option::Option<f64>
+pub rns_link::link::Link::remote_identified_callback: core::option::Option<rns_link::link::RemoteIdentifiedCallback>
+pub rns_link::link::Link::request_time: std::time::Instant
+pub rns_link::link::Link::resource_callback: core::option::Option<rns_link::link::ResourceCallback>
+pub rns_link::link::Link::resource_strategy: rns_link::link::ResourceStrategy
+pub rns_link::link::Link::rssi: core::option::Option<f64>
+pub rns_link::link::Link::rtt: core::option::Option<core::time::Duration>
+pub rns_link::link::Link::rx_bytes: u64
+pub rns_link::link::Link::rx_count: u64
+pub rns_link::link::Link::snr: core::option::Option<f64>
+pub rns_link::link::Link::stale_since: core::option::Option<std::time::Instant>
+pub rns_link::link::Link::state: rns_link::link::LinkState
+pub rns_link::link::Link::teardown_reason: core::option::Option<rns_link::link::CloseReason>
+pub rns_link::link::Link::tx_bytes: u64
+pub rns_link::link::Link::tx_count: u64
+impl rns_link::link::Link
+pub fn rns_link::link::Link::add_establishment_cost(&mut self, usize)
+pub fn rns_link::link::Link::age(&self) -> core::option::Option<core::time::Duration>
+pub fn rns_link::link::Link::classify_request(&self, alloc::vec::Vec<u8>) -> rns_link::link::RequestSendMode
+pub fn rns_link::link::Link::create_response(&self, &[u8; 16], &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::create_rtt_packet(&self) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::decrypt(&self, &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::default_request_timeout(&self) -> core::time::Duration
+pub fn rns_link::link::Link::deliver_response_data(&mut self, &[u8; 16], alloc::vec::Vec<u8>) -> bool
+pub fn rns_link::link::Link::encrypt(&self, &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::extend_establishment_timeout(&mut self, f64)
+pub fn rns_link::link::Link::fail_pending_request(&mut self, &[u8; 16]) -> bool
+pub fn rns_link::link::Link::get_age(&self) -> core::option::Option<f64>
+pub fn rns_link::link::Link::get_establishment_rate(&self) -> core::option::Option<f64>
+pub fn rns_link::link::Link::get_expected_rate(&self) -> core::option::Option<f64>
+pub fn rns_link::link::Link::get_mdu(&self) -> core::option::Option<usize>
+pub const fn rns_link::link::Link::get_mode(&self) -> u8
+pub fn rns_link::link::Link::get_mtu(&self) -> core::option::Option<u32>
+pub fn rns_link::link::Link::get_q(&self) -> core::option::Option<f64>
+pub fn rns_link::link::Link::get_rssi(&self) -> core::option::Option<f64>
+pub fn rns_link::link::Link::get_snr(&self) -> core::option::Option<f64>
+pub fn rns_link::link::Link::handle_identification(&mut self, &[u8]) -> core::result::Result<[u8; 64], rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::handle_request(&self, &[u8]) -> core::result::Result<rns_link::link::ParsedRequestData, rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::handle_response(&mut self, &[u8]) -> core::result::Result<([u8; 16], alloc::vec::Vec<u8>), rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::handle_response_plaintext(&mut self, &[u8]) -> core::result::Result<([u8; 16], alloc::vec::Vec<u8>), rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::has_keys(&self) -> bool
+pub fn rns_link::link::Link::identify(&self, &[u8; 64], &rns_crypto::ed25519::Ed25519PrivateKey) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::identify_with<F>(&self, &[u8; 64], F) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::encryption::LinkCryptoError> where F: core::ops::function::FnOnce(&[u8]) -> [u8; 64]
+pub fn rns_link::link::Link::identify_with_fallible<F>(&self, &[u8; 64], F) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::encryption::LinkCryptoError> where F: core::ops::function::FnOnce(&[u8]) -> core::option::Option<[u8; 64]>
+pub fn rns_link::link::Link::inactive_for(&self) -> core::time::Duration
+pub fn rns_link::link::Link::is_active(&self) -> bool
+pub fn rns_link::link::Link::mark_channel_created(&mut self)
+pub fn rns_link::link::Link::mark_closed(&mut self, rns_link::link::CloseReason)
+pub fn rns_link::link::Link::mark_request_resource_sending(&mut self, &[u8; 16]) -> bool
+pub fn rns_link::link::Link::mark_request_resource_sent(&mut self, &[u8; 16]) -> bool
+pub fn rns_link::link::Link::new_initiator([u8; 16], u8) -> (Self, alloc::vec::Vec<u8>)
+pub fn rns_link::link::Link::new_responder(&[u8], &rns_crypto::ed25519::Ed25519PrivateKey, [u8; 16], u8) -> core::result::Result<(Self, alloc::vec::Vec<u8>), rns_link::handshake::HandshakeError>
+pub fn rns_link::link::Link::new_responder_with<F>(&[u8], &[u8; 32], [u8; 16], u8, F) -> core::result::Result<(Self, alloc::vec::Vec<u8>), rns_link::handshake::HandshakeError> where F: core::ops::function::FnOnce(&[u8]) -> core::option::Option<[u8; 64]>
+pub fn rns_link::link::Link::no_data_for(&self) -> core::time::Duration
+pub fn rns_link::link::Link::no_inbound_for(&self) -> core::time::Duration
+pub fn rns_link::link::Link::no_outbound_for(&self) -> core::time::Duration
+pub fn rns_link::link::Link::pack_response(&[u8; 16], &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::parse_request(&[u8]) -> core::result::Result<rns_link::link::ParsedRequestData, rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::parse_response_plaintext(&[u8]) -> core::result::Result<([u8; 16], alloc::vec::Vec<u8>), rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::phy_stats(&self) -> (core::option::Option<f64>, core::option::Option<f64>, core::option::Option<f64>)
+pub fn rns_link::link::Link::phy_stats_snapshot(&self) -> rns_link::link::LinkPhyStats
+pub fn rns_link::link::Link::phy_stats_tracking_enabled(&self) -> bool
+pub fn rns_link::link::Link::prepare_request(&mut self, &str, core::option::Option<&[u8]>, core::time::Duration) -> core::result::Result<(alloc::vec::Vec<u8>, [u8; 16]), rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::prove_packet(&self, &[u8; 32], &rns_crypto::ed25519::Ed25519PrivateKey) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::prove_packet_with<F>(&self, &[u8; 32], F) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::encryption::LinkCryptoError> where F: core::ops::function::FnOnce(&[u8]) -> [u8; 64]
+pub fn rns_link::link::Link::prove_packet_with_fallible<F>(&self, &[u8; 32], F) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::encryption::LinkCryptoError> where F: core::ops::function::FnOnce(&[u8]) -> core::option::Option<[u8; 64]>
+pub fn rns_link::link::Link::prove_packet_with_link_key(&self, &[u8; 32]) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::prove_packet_with_local_signer(&self, &[u8; 32]) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::link::PacketProofError>
+pub fn rns_link::link::Link::prove_responder_packet_with<F>(&self, &[u8; 32], F) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::link::PacketProofError> where F: core::ops::function::FnOnce(&[u8]) -> core::option::Option<[u8; 64]>
+pub fn rns_link::link::Link::ready_for_new_resource(&self) -> bool
+pub fn rns_link::link::Link::receive_rtt_packet(&mut self, &[u8]) -> core::result::Result<(), rns_link::handshake::HandshakeError>
+pub fn rns_link::link::Link::receive_teardown(&mut self, &[u8]) -> bool
+pub fn rns_link::link::Link::record_inbound(&mut self)
+pub fn rns_link::link::Link::record_rx(&mut self, usize)
+pub fn rns_link::link::Link::record_tx(&mut self, usize)
+pub fn rns_link::link::Link::record_tx_keepalive(&mut self, usize)
+pub fn rns_link::link::Link::register_incoming_resource(&mut self)
+pub fn rns_link::link::Link::register_outgoing_resource(&mut self)
+pub fn rns_link::link::Link::remote_identity(&self) -> core::option::Option<&[u8; 64]>
+pub fn rns_link::link::Link::request(&mut self, &str, core::option::Option<&[u8]>, core::time::Duration) -> core::result::Result<(alloc::vec::Vec<u8>, [u8; 16]), rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::request_str(&mut self, &str, &str, core::time::Duration) -> core::result::Result<(alloc::vec::Vec<u8>, [u8; 16]), rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::resource_concluded(&mut self, usize, f64, bool)
+pub fn rns_link::link::Link::role(&self) -> rns_link::link::LinkRole
+pub fn rns_link::link::Link::rtt_secs(&self) -> f64
+pub fn rns_link::link::Link::session_keys(&self) -> core::option::Option<rns_link::key_derivation::LinkKeys>
+pub fn rns_link::link::Link::set_link_closed_callback(&mut self, impl core::ops::function::Fn(&rns_link::link::Link) + core::marker::Send + core::marker::Sync + 'static)
+pub fn rns_link::link::Link::set_link_established_callback(&mut self, impl core::ops::function::Fn(&rns_link::link::Link) + core::marker::Send + core::marker::Sync + 'static)
+pub fn rns_link::link::Link::set_packet_callback(&mut self, impl core::ops::function::Fn(&[u8]) + core::marker::Send + core::marker::Sync + 'static)
+pub fn rns_link::link::Link::set_remote_identified_callback(&mut self, impl core::ops::function::Fn(&rns_link::link::Link, &[u8; 64]) + core::marker::Send + core::marker::Sync + 'static)
+pub fn rns_link::link::Link::set_resource_callback(&mut self, impl core::ops::function::Fn(bool) -> bool + core::marker::Send + core::marker::Sync + 'static)
+pub fn rns_link::link::Link::set_resource_strategy(&mut self, rns_link::link::ResourceStrategy)
+pub fn rns_link::link::Link::set_signing_key(&mut self, &rns_crypto::ed25519::Ed25519PrivateKey)
+pub fn rns_link::link::Link::should_accept_resource(&self) -> rns_link::link::ResourceAcceptance
+pub fn rns_link::link::Link::should_respond_to_keepalive(&self) -> bool
+pub fn rns_link::link::Link::sign(&self, &[u8]) -> core::option::Option<[u8; 64]>
+pub fn rns_link::link::Link::teardown(&mut self, rns_link::link::CloseReason) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_link::link::Link::tick(&mut self) -> rns_link::link::LinkAction
+pub fn rns_link::link::Link::track_incoming_resource(&mut self, [u8; 32])
+pub fn rns_link::link::Link::track_outgoing_resource(&mut self, [u8; 32])
+pub fn rns_link::link::Link::track_phy_stats(&mut self, bool)
+pub fn rns_link::link::Link::traffic_stats(&self) -> (u64, u64, u64, u64)
+pub fn rns_link::link::Link::untrack_resource(&mut self, &[u8; 32])
+pub fn rns_link::link::Link::update_outgoing_resource_state(&mut self, usize, rns_link::link::OutboundResourceState)
+pub fn rns_link::link::Link::update_pending_request_id(&mut self, &[u8; 16], [u8; 16]) -> bool
+pub fn rns_link::link::Link::update_phy_stats(&mut self, core::option::Option<f64>, core::option::Option<f64>, core::option::Option<f64>)
+pub fn rns_link::link::Link::update_phy_stats_force(&mut self, core::option::Option<f64>, core::option::Option<f64>, core::option::Option<f64>)
+pub fn rns_link::link::Link::update_rtt_from_packet(&mut self, &[u8]) -> core::result::Result<core::time::Duration, rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::validate(&self, &[u8], &[u8]) -> bool
+pub fn rns_link::link::Link::validate_packet_proof(&self, &[u8; 32], &[u8]) -> bool
+pub fn rns_link::link::Link::validate_peer_packet_proof(&self, &[u8; 32], &[u8]) -> core::result::Result<(), rns_link::link::PacketProofError>
+pub fn rns_link::link::Link::validate_proof(&mut self, &[u8], &rns_crypto::ed25519::Ed25519PublicKey, &[u8; 32]) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::handshake::HandshakeError>
+pub struct rns_link::link::LinkPhyStats
+pub rns_link::link::LinkPhyStats::q: core::option::Option<f64>
+pub rns_link::link::LinkPhyStats::rssi: core::option::Option<f64>
+pub rns_link::link::LinkPhyStats::snr: core::option::Option<f64>
+pub type rns_link::link::LinkCallback = alloc::boxed::Box<(dyn core::ops::function::Fn(&rns_link::link::Link) + core::marker::Send + core::marker::Sync)>
+pub type rns_link::link::PacketCallback = alloc::boxed::Box<(dyn core::ops::function::Fn(&[u8]) + core::marker::Send + core::marker::Sync)>
+pub type rns_link::link::ParsedRequestData = ([u8; 16], [u8; 16], f64, alloc::vec::Vec<u8>)
+pub type rns_link::link::RemoteIdentifiedCallback = alloc::boxed::Box<(dyn core::ops::function::Fn(&rns_link::link::Link, &[u8; 64]) + core::marker::Send + core::marker::Sync)>
+pub type rns_link::link::ResourceCallback = alloc::boxed::Box<(dyn core::ops::function::Fn(bool) -> bool + core::marker::Send + core::marker::Sync)>
+pub mod rns_link::mtu_discovery
+pub struct rns_link::mtu_discovery::SignallingData
+pub rns_link::mtu_discovery::SignallingData::mode: u8
+pub rns_link::mtu_discovery::SignallingData::mtu: u32
+impl rns_link::mtu_discovery::SignallingData
+pub fn rns_link::mtu_discovery::SignallingData::new(u8, u32) -> Self
+pub fn rns_link::mtu_discovery::SignallingData::pack(&self) -> [u8; 3]
+pub fn rns_link::mtu_discovery::SignallingData::unpack(&[u8]) -> core::option::Option<Self>
+pub mod rns_link::request
+pub enum rns_link::request::RequestState
+pub rns_link::request::RequestState::Delivered
+pub rns_link::request::RequestState::Failed
+pub rns_link::request::RequestState::Receiving
+pub rns_link::request::RequestState::ResponseReceived
+pub rns_link::request::RequestState::SendingResource
+pub rns_link::request::RequestState::Sent
+pub struct rns_link::request::RequestCallbacks
+pub rns_link::request::RequestCallbacks::failed: core::option::Option<rns_link::request::RequestCallback>
+pub rns_link::request::RequestCallbacks::progress: core::option::Option<rns_link::request::ProgressCallback>
+pub rns_link::request::RequestCallbacks::response: core::option::Option<rns_link::request::RequestCallback>
+pub struct rns_link::request::RequestReceipt
+pub rns_link::request::RequestReceipt::callbacks: rns_link::request::RequestCallbacks
+pub rns_link::request::RequestReceipt::link_id: [u8; 16]
+pub rns_link::request::RequestReceipt::progress: f32
+pub rns_link::request::RequestReceipt::request_id: [u8; 32]
+pub rns_link::request::RequestReceipt::response: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_link::request::RequestReceipt::rtt: core::option::Option<core::time::Duration>
+pub rns_link::request::RequestReceipt::sent_at: std::time::Instant
+pub rns_link::request::RequestReceipt::state: rns_link::request::RequestState
+pub rns_link::request::RequestReceipt::timeout: core::time::Duration
+impl rns_link::request::RequestReceipt
+pub fn rns_link::request::RequestReceipt::check_timeout(&mut self) -> bool
+pub fn rns_link::request::RequestReceipt::concluded(&self) -> bool
+pub fn rns_link::request::RequestReceipt::deliver(&mut self, alloc::vec::Vec<u8>)
+pub fn rns_link::request::RequestReceipt::fail(&mut self)
+pub fn rns_link::request::RequestReceipt::get_progress(&self) -> f32
+pub fn rns_link::request::RequestReceipt::get_response_time(&self) -> core::option::Option<core::time::Duration>
+pub fn rns_link::request::RequestReceipt::is_pending(&self) -> bool
+pub fn rns_link::request::RequestReceipt::is_timed_out(&self) -> bool
+pub fn rns_link::request::RequestReceipt::mark_delivered(&mut self)
+pub fn rns_link::request::RequestReceipt::mark_failed(&mut self)
+pub fn rns_link::request::RequestReceipt::mark_resource_sending(&mut self)
+pub fn rns_link::request::RequestReceipt::mark_resource_sent(&mut self)
+pub fn rns_link::request::RequestReceipt::new([u8; 32], [u8; 16], core::time::Duration) -> Self
+pub fn rns_link::request::RequestReceipt::receive_response(&mut self, alloc::vec::Vec<u8>)
+pub fn rns_link::request::RequestReceipt::set_failed_callback(&mut self, impl core::ops::function::FnOnce(&rns_link::request::RequestReceipt) + core::marker::Send + 'static)
+pub fn rns_link::request::RequestReceipt::set_progress_callback(&mut self, impl core::ops::function::Fn(f32) + core::marker::Send + core::marker::Sync + 'static)
+pub fn rns_link::request::RequestReceipt::set_response_callback(&mut self, impl core::ops::function::FnOnce(&rns_link::request::RequestReceipt) + core::marker::Send + 'static)
+pub fn rns_link::request::RequestReceipt::update_progress(&mut self, f32)
+pub type rns_link::request::ProgressCallback = alloc::boxed::Box<(dyn core::ops::function::Fn(f32) + core::marker::Send + core::marker::Sync)>
+pub type rns_link::request::RequestCallback = alloc::boxed::Box<(dyn core::ops::function::FnOnce(&rns_link::request::RequestReceipt) + core::marker::Send)>

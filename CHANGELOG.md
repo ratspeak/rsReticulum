@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Classified every library package and added pinned, CI-enforced public API
+  snapshots so compatibility drift is reviewed before any boundary change;
+  no visibility or signature changed in this baseline.
 - Made source releases reproducible from an existing immutable component tag:
   packages are non-publishable by default, release builds use the committed
   lockfile and Rust 1.87.0, actions are commit-pinned, and CI verifies the
