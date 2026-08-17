@@ -1089,15 +1089,25 @@ pub async fn discover_destination(
     destination_hash: [u8; 16],
     timeout: Duration,
 ) -> Result<AnnounceRpcEntry, LinkSessionError> {
-    if let Some(entry) = lookup_destination(transport_tx, destination_hash).await? {
-        if entry.public_key.is_some() {
-            return Ok(entry);
+    crate::destination_resolver::resolve_destination_on_transport(
+        transport_tx,
+        destination_hash,
+        crate::destination_resolver::DestinationResolveOptions::new(timeout),
+    )
+    .await
+    .map_err(|error| match error {
+        crate::destination_resolver::DestinationResolveError::Timeout => {
+            LinkSessionError::Timeout("destination identity")
         }
-    }
-
-    rns_transport::await_path::await_path(transport_tx, destination_hash, timeout)
-        .await
-        .map_err(|_| LinkSessionError::Timeout("destination path"))?;
+        crate::destination_resolver::DestinationResolveError::TransportUnavailable => {
+            LinkSessionError::TransportUnavailable
+        }
+        crate::destination_resolver::DestinationResolveError::UnexpectedResponse(operation) => {
+            LinkSessionError::HandshakeFailed(format!(
+                "unexpected transport response during {operation}"
+            ))
+        }
+    })?;
     let entry = lookup_destination(transport_tx, destination_hash)
         .await?
         .ok_or(LinkSessionError::PublicKeyUnavailable)?;

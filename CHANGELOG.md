@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Isolate exact announce subscriptions from legacy aspect-wide deregistration,
+  and resolve finite destination identities through validated recall plus
+  deadline-bounded path discovery instead of temporary announce handlers.
 - Distinguished the Reticulum 1.3.8 compatibility-floor corpus from the
   current 1.4.2 behavior reference instead of presenting the old oracle as the
   newest upstream target.

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use rns_crypto::ed25519::Ed25519PublicKey;
@@ -18,8 +18,11 @@ use rns_protocol::resource::{InboundTransfer, TransferAction};
 use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
-    AnnounceHandlerEvent, InterfaceId, LinkEndpointLifecycleEvent, LinkEndpointRole,
-    OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
+    InterfaceId, LinkEndpointLifecycleEvent, LinkEndpointRole, OutboundRequest, TransportMessage,
+};
+
+use crate::destination_resolver::{
+    DestinationResolveError, DestinationResolveOptions, resolve_destination_on_transport,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -79,36 +82,14 @@ impl LinkClient {
         let dest_hash =
             Destination::hash_from_name_and_identity(app_name, Some(&remote_transport_hash));
 
-        let pubkey =
-            if let Some(public_key) = self.recall_routable_pubkey(dest_hash, deadline).await? {
-                public_key
-            } else {
-                // Register the handler before the path request so the answering
-                // announce (carrying the pubkey) is observed.
-                let (ann_tx, mut ann_rx) = mpsc::channel::<AnnounceHandlerEvent>(64);
-                self.send_msg(TransportMessage::RegisterAnnounceHandler {
-                    aspect_filter: Some(app_name.to_string()),
-                    receive_path_responses: true,
-                    callback_tx: ann_tx,
-                })
-                .await?;
-
-                self.send_msg(TransportMessage::RequestPath {
-                    destination_hash: dest_hash,
-                })
-                .await?;
-
-                let public_key = match time_remaining(deadline) {
-                    Ok(remaining) => wait_for_pubkey(&mut ann_rx, dest_hash, remaining).await,
-                    Err(error) => Err(error),
-                };
-                let _ = self
-                    .transport_tx
-                    .try_send(TransportMessage::DeregisterAnnounceHandler {
-                        aspect_filter: Some(app_name.to_string()),
-                    });
-                public_key?
-            };
+        let pubkey = resolve_destination_on_transport(
+            &self.transport_tx,
+            dest_hash,
+            DestinationResolveOptions::new(time_remaining(deadline)?),
+        )
+        .await
+        .map_err(map_destination_resolve_error)?
+        .public_key;
 
         let (mut link, request_data) = Link::new_initiator(dest_hash, hops);
         let link_id = link.link_id;
@@ -251,58 +232,6 @@ impl LinkClient {
         .map_err(|_| LinkClientError::TransportUnavailable)
     }
 
-    async fn recall_routable_pubkey(
-        &self,
-        destination_hash: [u8; 16],
-        deadline: Instant,
-    ) -> Result<Option<[u8; 64]>, LinkClientError> {
-        let has_path = self
-            .transport_query(
-                TransportQuery::HasPath {
-                    dest: destination_hash,
-                },
-                deadline,
-            )
-            .await?;
-        if !matches!(has_path, TransportQueryResponse::BoolResult(true)) {
-            return Ok(None);
-        }
-
-        match self
-            .transport_query(
-                TransportQuery::RecallDestination {
-                    dest: destination_hash,
-                },
-                deadline,
-            )
-            .await?
-        {
-            TransportQueryResponse::RecalledDestination(Some(destination))
-                if destination.dest_hash == destination_hash =>
-            {
-                Ok(Some(destination.public_key))
-            }
-            TransportQueryResponse::RecalledDestination(None) => Ok(None),
-            response => Err(LinkClientError::UnexpectedResponse(format!(
-                "destination recall returned {response:?}"
-            ))),
-        }
-    }
-
-    async fn transport_query(
-        &self,
-        query: TransportQuery,
-        deadline: Instant,
-    ) -> Result<TransportQueryResponse, LinkClientError> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_msg(TransportMessage::Rpc { query, response_tx })
-            .await?;
-        timeout(time_remaining(deadline)?, response_rx)
-            .await
-            .map_err(|_| LinkClientError::Timeout("transport query"))?
-            .map_err(|_| LinkClientError::TransportUnavailable)
-    }
-
     async fn send_close(&self, link: &mut Link) -> Result<bool, LinkClientError> {
         let link_id = link.link_id;
         let Some(teardown_data) = link.teardown(CloseReason::InitiatorClosed) else {
@@ -334,24 +263,14 @@ fn time_remaining(deadline: Instant) -> Result<Duration, LinkClientError> {
     }
 }
 
-async fn wait_for_pubkey(
-    rx: &mut mpsc::Receiver<AnnounceHandlerEvent>,
-    target_dest_hash: [u8; 16],
-    deadline: Duration,
-) -> Result<[u8; 64], LinkClientError> {
-    let fut = async {
-        while let Some(ev) = rx.recv().await {
-            if ev.destination_hash == target_dest_hash {
-                if let Some(pk) = ev.public_key {
-                    return Ok(pk);
-                }
-            }
+fn map_destination_resolve_error(error: DestinationResolveError) -> LinkClientError {
+    match error {
+        DestinationResolveError::Timeout => LinkClientError::Timeout("destination resolution"),
+        DestinationResolveError::TransportUnavailable => LinkClientError::TransportUnavailable,
+        DestinationResolveError::UnexpectedResponse(operation) => {
+            LinkClientError::UnexpectedResponse(operation.to_string())
         }
-        Err(LinkClientError::PubkeyNotDiscovered)
-    };
-    timeout(deadline, fut)
-        .await
-        .map_err(|_| LinkClientError::Timeout("path/announce discovery"))?
+    }
 }
 
 async fn wait_for_response(
@@ -757,62 +676,6 @@ mod tests {
             time_remaining(past),
             Err(LinkClientError::Timeout(_))
         ));
-    }
-
-    #[tokio::test]
-    async fn validated_cached_identity_and_live_path_skip_network_discovery() {
-        let destination_hash = [0xD4; 16];
-        let remote_identity = Identity::new();
-        let public_key = remote_identity.get_public_key();
-        let (transport_tx, mut transport_rx) = mpsc::channel(4);
-        let responder = tokio::spawn(async move {
-            let Some(TransportMessage::Rpc { query, response_tx }) = transport_rx.recv().await
-            else {
-                panic!("expected path query");
-            };
-            assert!(matches!(
-                query,
-                TransportQuery::HasPath { dest } if dest == destination_hash
-            ));
-            response_tx
-                .send(TransportQueryResponse::BoolResult(true))
-                .unwrap();
-
-            let Some(TransportMessage::Rpc { query, response_tx }) = transport_rx.recv().await
-            else {
-                panic!("expected destination recall");
-            };
-            assert!(matches!(
-                query,
-                TransportQuery::RecallDestination { dest } if dest == destination_hash
-            ));
-            response_tx
-                .send(TransportQueryResponse::RecalledDestination(Some(
-                    rns_transport::messages::RecalledDestinationRpcEntry {
-                        dest_hash: destination_hash,
-                        public_key,
-                        app_data: None,
-                        ratchet: None,
-                        hops: 1,
-                        timestamp: 1.0,
-                    },
-                )))
-                .unwrap();
-            assert!(
-                transport_rx.try_recv().is_err(),
-                "cache hit must not emit a path request"
-            );
-        });
-
-        let client = LinkClient::new(transport_tx, Identity::new());
-        assert_eq!(
-            client
-                .recall_routable_pubkey(destination_hash, Instant::now() + Duration::from_secs(1),)
-                .await
-                .unwrap(),
-            Some(public_key)
-        );
-        responder.await.unwrap();
     }
 
     #[tokio::test]

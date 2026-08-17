@@ -4,6 +4,7 @@
 pub mod buffer_stream;
 pub mod config;
 pub mod constants;
+pub mod destination_resolver;
 pub mod destination_runtime;
 pub mod interface_factory;
 mod interface_registry;
@@ -28,6 +29,9 @@ pub mod rpc_server;
 ///
 /// This is additive convenience; module-qualified paths remain supported.
 pub mod prelude {
+    pub use crate::destination_resolver::{
+        DestinationResolveError, DestinationResolveOptions, resolve_destination_on_transport,
+    };
     pub use crate::destination_runtime::{
         DestinationEvents, DestinationHandle, DestinationPacket, DestinationRatchetOptions,
         DestinationRuntimeError, DestinationRuntimeOptions, IdentityGatePolicy,

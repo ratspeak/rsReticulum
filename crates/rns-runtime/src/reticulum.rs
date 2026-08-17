@@ -957,6 +957,8 @@ pub enum LinkConnectError {
     Control(#[from] ControlError),
     #[error("path discovery failed: {0}")]
     Path(#[from] AwaitPathError),
+    #[error("destination resolution failed: {0}")]
+    Resolve(#[from] crate::destination_resolver::DestinationResolveError),
     #[error("no validated identity is known for destination {0}")]
     IdentityUnavailable(String),
     #[error("Link session failed: {0}")]
@@ -1204,14 +1206,13 @@ impl ReticulumHandle {
         destination_hash: [u8; 16],
         options: &LinkConnectOptions,
     ) -> Result<LinkSessionConfig, LinkConnectError> {
-        let mut recalled = self.recall(destination_hash).await?;
-        if recalled.is_none() {
-            self.await_path(destination_hash, options.path_timeout)
-                .await?;
-            recalled = self.recall(destination_hash).await?;
-        }
-        let recalled = recalled
-            .ok_or_else(|| LinkConnectError::IdentityUnavailable(hex::encode(destination_hash)))?;
+        let recalled = crate::destination_resolver::resolve_destination_on_transport(
+            &self.transport_tx,
+            destination_hash,
+            crate::destination_resolver::DestinationResolveOptions::new(options.path_timeout),
+        )
+        .await?;
+        let recalled = recalled_destination_from_rpc(recalled)?;
         let (establishment_timeout, hops) = match options.establishment_timeout {
             Some(timeout) => (timeout, recalled.hops),
             None => {
@@ -5563,17 +5564,33 @@ async fn start_on_network_discovery(handle: ReticulumHandle) {
                 decryptor,
                 observer: observer_tx,
             };
-            let (_join, callback_tx) = rns_transport::discovery::receiver::spawn(receiver_config);
-            let _ = handle
-                .transport_tx
-                .send(TransportMessage::RegisterAnnounceHandler {
-                    aspect_filter: Some(
-                        rns_transport::discovery::DISCOVERY_ASPECT_FILTER.to_string(),
-                    ),
-                    receive_path_responses: false,
-                    callback_tx,
-                })
+            let subscription = handle
+                .subscribe_announces_with_capacity(
+                    Some(rns_transport::discovery::DISCOVERY_ASPECT_FILTER.to_string()),
+                    false,
+                    128,
+                )
                 .await;
+            match subscription {
+                Ok(subscription) => {
+                    let (receiver_join, callback_tx) =
+                        rns_transport::discovery::receiver::spawn(receiver_config);
+                    let shutdown = handle.shutdown.clone();
+                    tokio::spawn(run_discovery_subscription(
+                        subscription,
+                        callback_tx,
+                        receiver_join,
+                        shutdown,
+                    ));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to install exact interface-discovery announce subscription"
+                    );
+                    *handle.discovery.receiver_started.lock().await = false;
+                }
+            }
 
             if let Some(rx) = observer_rx {
                 let observer_handle = handle.clone();
@@ -5594,6 +5611,39 @@ async fn start_on_network_discovery(handle: ReticulumHandle) {
                 run_discovery_announcer(handle, stamper, locals).await;
             });
         }
+    }
+}
+
+async fn run_discovery_subscription(
+    mut subscription: AnnounceSubscription,
+    callback_tx: mpsc::Sender<AnnounceHandlerEvent>,
+    receiver_join: tokio::task::JoinHandle<()>,
+    shutdown: ShutdownSignal,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.wait() => break,
+            event = subscription.recv() => match event {
+                Some(event) => {
+                    if callback_tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+        }
+    }
+    let dropped_events = subscription.dropped_events();
+    if let Err(error) = subscription.close().await {
+        tracing::debug!(error = %error, "interface-discovery subscription close failed");
+    }
+    drop(callback_tx);
+    let _ = receiver_join.await;
+    if dropped_events > 0 {
+        tracing::warn!(
+            dropped_events,
+            "interface-discovery announces dropped by bounded subscription"
+        );
     }
 }
 
@@ -9813,13 +9863,13 @@ loglevel = 7
                 .send(TransportQueryResponse::RecalledDestination(None))
                 .expect("first recall response");
 
-            let TransportMessage::AwaitPath { dest, reply } =
-                transport_rx.recv().await.expect("path discovery")
+            let TransportMessage::RequestPath {
+                destination_hash: dest,
+            } = transport_rx.recv().await.expect("path discovery")
             else {
-                panic!("expected path discovery");
+                panic!("expected explicit path request");
             };
             assert_eq!(dest, destination_hash);
-            reply.send(true).expect("path waiter");
 
             let TransportMessage::Rpc { response_tx, .. } =
                 transport_rx.recv().await.expect("second recall")
