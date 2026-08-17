@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 import hashlib
 import json
 import os
@@ -57,6 +58,40 @@ def load_config() -> dict[str, object]:
     if config.get("schemaVersion") != 1:
         fail("unsupported api-stability schema")
     return config
+
+
+def validate_change_record(path: str, snapshot_commit: str) -> None:
+    record_path = ROOT / path
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"cannot read snapshot change record {path}: {error}")
+    required = {
+        "schemaVersion",
+        "snapshotSourceCommit",
+        "capabilities",
+        "classification",
+        "publicApiDiff",
+        "semver",
+        "deprecations",
+        "platformEvidence",
+    }
+    if not required.issubset(record) or record.get("schemaVersion") != 1:
+        fail("snapshot change record is incomplete")
+    if record.get("snapshotSourceCommit") != snapshot_commit:
+        fail("snapshot change record does not match the snapshot source commit")
+    if not isinstance(record.get("capabilities"), list) or not record["capabilities"]:
+        fail("snapshot change record must name capability IDs")
+    diff = record.get("publicApiDiff")
+    if not isinstance(diff, dict) or set(diff) != {"added", "removed"}:
+        fail("snapshot change record must classify added and removed API lines")
+    if not all(isinstance(diff[key], int) and diff[key] >= 0 for key in diff):
+        fail("snapshot change record API counts must be non-negative integers")
+    if not isinstance(record.get("platformEvidence"), list) or not record["platformEvidence"]:
+        fail("snapshot change record must name platform evidence")
+    for key in ("classification", "semver", "deprecations"):
+        if not isinstance(record.get(key), str) or not record[key]:
+            fail(f"snapshot change record must name {key}")
 
 
 def public_packages(manifest_path: str) -> set[str]:
@@ -154,6 +189,10 @@ def validate_metadata(
     )
     if snapshot_ancestor.returncode != 0:
         fail(f"snapshot source commit {snapshot_commit} is not an ancestor of HEAD")
+    change_record = snapshot_source.get("changeRecord")
+    if not isinstance(change_record, str) or not change_record.startswith("api-reviews/"):
+        fail("snapshot source must name a reviewed change record")
+    validate_change_record(change_record, snapshot_commit)
 
     packages = config.get("packages")
     if not isinstance(packages, list) or not packages:
@@ -258,11 +297,26 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--metadata-only", action="store_true")
     parser.add_argument("--update", action="store_true")
+    parser.add_argument("--snapshot-source-commit")
+    parser.add_argument("--change-record")
     args = parser.parse_args()
     if args.metadata_only and args.update:
         fail("--metadata-only and --update are mutually exclusive")
 
     config = load_config()
+    if args.update:
+        if not args.snapshot_source_commit or not args.change_record:
+            fail("--update requires --snapshot-source-commit and --change-record")
+        head = run(["git", "rev-parse", "HEAD"]).strip()
+        if args.snapshot_source_commit != head:
+            fail("snapshot source must be the clean source commit at HEAD")
+        if not args.change_record.startswith("api-reviews/"):
+            fail("change record must be stored below api-reviews/")
+        config["snapshotSource"] = {
+            "commit": args.snapshot_source_commit,
+            "capturedOn": date.today().isoformat(),
+            "changeRecord": args.change_record,
+        }
     packages = validate_metadata(config, updating=args.update)
     if args.metadata_only:
         print("api baseline metadata: ok")

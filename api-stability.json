@@ -19,9 +19,9 @@
     "sourceCommit": "47dbbf1febc0a9d3259f179a0512d9b56bb2320d"
   },
   "snapshotSource": {
-    "commit": "47dbbf1febc0a9d3259f179a0512d9b56bb2320d",
+    "commit": "51763a97dcd3d348ce3e3c44c86da089cc895ea6",
     "capturedOn": "2026-08-17",
-    "changeRecord": null
+    "changeRecord": "api-reviews/wave-c-application-prelude.json"
   },
   "packages": [
     {
