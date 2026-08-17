@@ -80,7 +80,7 @@ jobs:
               cp "target/release/${bin}" "dist/${PACKAGE_ROOT}/bin/${bin}"
             fi
           done
-          cp README.md LICENSE CHANGELOG.md RELEASING.md "dist/${PACKAGE_ROOT}/"
+          cp README.md LICENSE CHANGELOG.md "dist/${PACKAGE_ROOT}/"
       - name: Create tar archive
         if: runner.os != 'Windows'
         shell: bash
