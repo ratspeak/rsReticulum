@@ -31,6 +31,12 @@ facade (`rns_runtime::prelude`, lifecycle handles, destination resolution, and
 Link sessions) with broad actor, RPC, manager, and command modules. `rns-ratkey`
 is experimental, and the `rns-tools` library target is tool internal.
 
+The existing [`rns_runtime::prelude`](APPLICATION_API.md) is the canonical
+application spine. It re-exports the original type identities, and all current
+module-qualified paths remain supported. Actor, mailbox, RPC, transport-table,
+concrete-driver, and endpoint-ownership modules remain provisional SPI; their
+reachability in a snapshot does not promote them.
+
 No existing module is hidden, moved, or made private by this baseline. That
 work requires the next explicit API-boundary checkpoint, downstream migration
 evidence from rsLXMF/rsLXST/Ratspeak, and a versioning decision.
@@ -49,7 +55,17 @@ To verify the baseline:
 cargo install cargo-public-api --version 0.52.0 --locked
 rustup toolchain install nightly-2026-08-01 --profile minimal
 python3 tools/check-api-baseline.py
+python3 tools/check-api-manifest.py
+python3 tools/check-api-compatibility.py
+cargo check --manifest-path api-fixtures/Cargo.toml --locked
+cargo check --manifest-path api-fixtures/Cargo.toml --all-features --locked
 ```
+
+The immutable floor and current captured snapshot source are separate
+identities in `api-stability.json`. The compatibility check currently enforces
+an additions-only Wave C policy. Snapshot equality remains only one layer of
+SemVer evidence: feature/cfg contracts, external fixtures, platform builds,
+and behavioral tests remain mandatory.
 
 Use `--update` only after reviewing the generated API diff and recording the
 compatibility/version decision. Snapshot updates do not by themselves make a

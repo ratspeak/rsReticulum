@@ -1,0 +1,14 @@
+[package]
+name = "rns-application-api-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+all = ["rns-runtime/ble", "rns-runtime/rnode-tcp", "rns-runtime/serial"]
+
+[dependencies]
+rns-runtime = { path = "../crates/rns-runtime", default-features = false }

@@ -29,6 +29,14 @@ jobs:
         run: cargo install cargo-public-api --version 0.52.0 --locked
       - name: Check reviewed public API baseline
         run: python3 tools/check-api-baseline.py
+      - name: Check manifest and feature contract
+        run: python3 tools/check-api-manifest.py
+      - name: Check additions-only compatibility floor
+        run: python3 tools/check-api-compatibility.py
+      - name: Check canonical and legacy external consumer
+        run: |
+          cargo check --manifest-path api-fixtures/Cargo.toml --locked
+          cargo check --manifest-path api-fixtures/Cargo.toml --all-features --locked
 
   test:
     name: Test (${{ matrix.os }})

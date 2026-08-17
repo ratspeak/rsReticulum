@@ -14,6 +14,15 @@
     "commit": "47dbbf1febc0a9d3259f179a0512d9b56bb2320d",
     "capturedOn": "2026-08-17"
   },
+  "compatibilityFloor": {
+    "evidenceCommit": "c9b210a52b139ac9754b46c5c2639c4113e7ae53",
+    "sourceCommit": "47dbbf1febc0a9d3259f179a0512d9b56bb2320d"
+  },
+  "snapshotSource": {
+    "commit": "47dbbf1febc0a9d3259f179a0512d9b56bb2320d",
+    "capturedOn": "2026-08-17",
+    "changeRecord": null
+  },
   "packages": [
     {
       "name": "rns-crypto",

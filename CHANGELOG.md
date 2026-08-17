@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Designated the existing `rns_runtime::prelude` and compiled examples as the
+  canonical application spine while retaining every module-qualified path,
+  and added external-consumer, manifest/feature, and additions-only API
+  compatibility gates without changing runtime behavior or public signatures.
 - Classified every library package and added pinned, CI-enforced public API
   snapshots so compatibility drift is reviewed before any boundary change;
   no visibility or signature changed in this baseline.
