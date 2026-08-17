@@ -515,8 +515,9 @@ pub enum TransportMessage {
         dropped_events: Arc<AtomicU64>,
         result_tx: tokio::sync::oneshot::Sender<AnnounceHandlerId>,
     },
-    /// Remove handler(s) whose `aspect_filter` matches; `None` removes all.
-    /// Handlers with closed senders are also reaped on dispatch.
+    /// Remove legacy handler(s) whose `aspect_filter` matches; `None` removes
+    /// every legacy handler. Exact subscriptions are never affected. Handlers
+    /// with closed senders are also reaped on dispatch.
     DeregisterAnnounceHandler {
         aspect_filter: Option<String>,
     },

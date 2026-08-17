@@ -291,10 +291,19 @@ pub struct PendingDiscoveryPathRequest {
 
 struct AnnounceHandlerRegistration {
     id: crate::messages::AnnounceHandlerId,
+    ownership: AnnounceHandlerOwnership,
     aspect_filter: Option<String>,
     receive_path_responses: bool,
     tx: tokio::sync::mpsc::Sender<crate::messages::AnnounceHandlerEvent>,
     dropped_events: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnounceHandlerOwnership {
+    /// Compatibility registration addressed only by its aspect filter.
+    Legacy,
+    /// Exact registration addressed by its opaque owner token.
+    Subscription,
 }
 
 /// Dedicated trigger for scheduled full-state persistence.
@@ -696,10 +705,10 @@ impl TransportActor {
                 receive_path_responses,
                 callback_tx,
             } => {
-                let id = crate::messages::AnnounceHandlerId(self.next_announce_handler_id);
-                self.next_announce_handler_id = self.next_announce_handler_id.wrapping_add(1);
+                let id = self.allocate_announce_handler_id();
                 self.announce_handlers.push(AnnounceHandlerRegistration {
                     id,
+                    ownership: AnnounceHandlerOwnership::Legacy,
                     aspect_filter,
                     receive_path_responses,
                     tx: callback_tx,
@@ -713,16 +722,19 @@ impl TransportActor {
                 dropped_events,
                 result_tx,
             } => {
-                let id = crate::messages::AnnounceHandlerId(self.next_announce_handler_id);
-                self.next_announce_handler_id = self.next_announce_handler_id.wrapping_add(1);
+                let id = self.allocate_announce_handler_id();
                 self.announce_handlers.push(AnnounceHandlerRegistration {
                     id,
+                    ownership: AnnounceHandlerOwnership::Subscription,
                     aspect_filter,
                     receive_path_responses,
                     tx: callback_tx,
                     dropped_events,
                 });
-                let _ = result_tx.send(id);
+                if result_tx.send(id).is_err() {
+                    self.announce_handlers
+                        .retain(|registration| registration.id != id);
+                }
             }
             TransportMessage::DeregisterAnnounceHandler { aspect_filter } => {
                 // Also sweep closed channels here so deregister doubles as
@@ -732,11 +744,12 @@ impl TransportActor {
                     if registration.tx.is_closed() {
                         return false;
                     }
-                    if let Some(ref target) = aspect_filter {
-                        registration.aspect_filter.as_ref() != Some(target)
-                    } else {
-                        false
+                    if registration.ownership == AnnounceHandlerOwnership::Subscription {
+                        return true;
                     }
+                    aspect_filter
+                        .as_ref()
+                        .is_some_and(|target| registration.aspect_filter.as_ref() != Some(target))
                 });
             }
             TransportMessage::DeregisterAnnounceSubscription { id, result_tx } => {
@@ -969,6 +982,20 @@ impl TransportActor {
         self.interfaces
             .get(&id)
             .is_some_and(|entry| entry.role == InterfaceRole::LocalClient)
+    }
+
+    fn allocate_announce_handler_id(&mut self) -> crate::messages::AnnounceHandlerId {
+        loop {
+            let id = crate::messages::AnnounceHandlerId(self.next_announce_handler_id);
+            self.next_announce_handler_id = self.next_announce_handler_id.wrapping_add(1);
+            if self
+                .announce_handlers
+                .iter()
+                .all(|registration| registration.id != id)
+            {
+                return id;
+            }
+        }
     }
 
     fn is_shared_instance_peer_interface(&self, id: InterfaceId) -> bool {
@@ -1301,6 +1328,9 @@ impl TransportActor {
             if let Some(waiters) = self.path_waiters.remove(&dest) {
                 let mut kept = Vec::new();
                 for (reply, created_at) in waiters {
+                    if reply.is_closed() {
+                        continue;
+                    }
                     if now - created_at >= PATH_WAITER_TIMEOUT {
                         let _ = reply.send(false);
                     } else {
@@ -2271,6 +2301,76 @@ mod tests {
         assert!(removed_rx.try_recv().unwrap());
         assert_eq!(actor.announce_handlers.len(), 1);
         assert_eq!(actor.announce_handlers[0].id, second_id);
+    }
+
+    #[test]
+    fn legacy_deregistration_never_removes_exact_subscription() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (legacy_tx, _legacy_rx) = mpsc::channel(1);
+        let (subscription_tx, _subscription_rx) = mpsc::channel(1);
+        actor.handle_message(TransportMessage::RegisterAnnounceHandler {
+            aspect_filter: Some("same.aspect".into()),
+            receive_path_responses: true,
+            callback_tx: legacy_tx,
+        });
+        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::RegisterAnnounceSubscription {
+            aspect_filter: Some("same.aspect".into()),
+            receive_path_responses: true,
+            callback_tx: subscription_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
+            result_tx,
+        });
+        let subscription_id = result_rx.try_recv().unwrap();
+
+        actor.handle_message(TransportMessage::DeregisterAnnounceHandler {
+            aspect_filter: Some("same.aspect".into()),
+        });
+
+        assert_eq!(actor.announce_handlers.len(), 1);
+        assert_eq!(actor.announce_handlers[0].id, subscription_id);
+        assert_eq!(
+            actor.announce_handlers[0].ownership,
+            AnnounceHandlerOwnership::Subscription
+        );
+    }
+
+    #[test]
+    fn cancelled_subscription_ack_rolls_back_registration() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (callback_tx, _callback_rx) = mpsc::channel(1);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        drop(result_rx);
+
+        actor.handle_message(TransportMessage::RegisterAnnounceSubscription {
+            aspect_filter: Some("cancelled.aspect".into()),
+            receive_path_responses: false,
+            callback_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
+            result_tx,
+        });
+
+        assert!(actor.announce_handlers.is_empty());
+    }
+
+    #[test]
+    fn announce_handler_ids_skip_live_wraparound_collision() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (callback_tx, _callback_rx) = mpsc::channel(1);
+        actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(0),
+            ownership: AnnounceHandlerOwnership::Subscription,
+            aspect_filter: None,
+            receive_path_responses: false,
+            tx: callback_tx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
+        });
+        actor.next_announce_handler_id = 0;
+
+        assert_eq!(
+            actor.allocate_announce_handler_id(),
+            crate::messages::AnnounceHandlerId(1)
+        );
     }
 
     #[tokio::test]
@@ -5304,6 +5404,7 @@ mod tests {
         let (htx, mut hrx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
             id: crate::messages::AnnounceHandlerId(0),
+            ownership: AnnounceHandlerOwnership::Subscription,
             aspect_filter: None,
             receive_path_responses: false,
             tx: htx,
@@ -11373,6 +11474,7 @@ mod tests {
         let (htx, mut hrx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
             id: crate::messages::AnnounceHandlerId(0),
+            ownership: AnnounceHandlerOwnership::Subscription,
             aspect_filter: None,
             receive_path_responses: false,
             tx: htx,
@@ -11453,6 +11555,7 @@ mod tests {
         let (htx, mut hrx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
             id: crate::messages::AnnounceHandlerId(0),
+            ownership: AnnounceHandlerOwnership::Subscription,
             aspect_filter: Some("lxmf.delivery".to_string()),
             receive_path_responses: false,
             tx: htx,
@@ -11500,6 +11603,7 @@ mod tests {
         let (h_prop_tx, mut h_prop_rx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
             id: crate::messages::AnnounceHandlerId(0),
+            ownership: AnnounceHandlerOwnership::Subscription,
             aspect_filter: Some("lxmf.delivery".to_string()),
             receive_path_responses: false,
             tx: h_del_tx,
@@ -11507,6 +11611,7 @@ mod tests {
         });
         actor.announce_handlers.push(AnnounceHandlerRegistration {
             id: crate::messages::AnnounceHandlerId(1),
+            ownership: AnnounceHandlerOwnership::Subscription,
             aspect_filter: Some("lxmf.propagation".to_string()),
             receive_path_responses: false,
             tx: h_prop_tx,
@@ -11545,6 +11650,7 @@ mod tests {
         let (default_tx, mut default_rx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
             id: crate::messages::AnnounceHandlerId(0),
+            ownership: AnnounceHandlerOwnership::Subscription,
             aspect_filter: None,
             receive_path_responses: false,
             tx: default_tx,
@@ -11553,6 +11659,7 @@ mod tests {
         let (opt_in_tx, mut opt_in_rx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
             id: crate::messages::AnnounceHandlerId(1),
+            ownership: AnnounceHandlerOwnership::Subscription,
             aspect_filter: None,
             receive_path_responses: true,
             tx: opt_in_tx,
@@ -11601,6 +11708,7 @@ mod tests {
         let (handler_tx, mut handler_rx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
             id: crate::messages::AnnounceHandlerId(0),
+            ownership: AnnounceHandlerOwnership::Subscription,
             aspect_filter: None,
             receive_path_responses: true,
             tx: handler_tx,
