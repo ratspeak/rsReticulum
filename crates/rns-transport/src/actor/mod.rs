@@ -1699,13 +1699,15 @@ impl TransportActor {
     /// Enqueue an announce on every eligible outbound interface (except
     /// optionally one). Eligibility mirrors Python's AP/roaming/boundary mode
     /// gates. Enqueueing lets `process_announce_queues` apply ANNOUNCE_CAP
-    /// spacing and hop priority.
+    /// spacing and hop priority. Python retains at most one queued entry per
+    /// destination, replacing it only when a newer announce is emitted.
     fn broadcast_announce_on_interfaces(&mut self, raw: &[u8], except: Option<InterfaceId>) {
         let destination_hash = rns_wire::header::PacketHeader::unpack(raw)
             .ok()
             .map(|(h, _)| h.destination_hash)
             .unwrap_or([0u8; 16]);
         let hops = raw.get(1).copied().unwrap_or(0);
+        let emitted = announce_emitted_from_raw(raw);
         let now = now_f64();
         // One copy at the boundary; per-interface queue entries clone the
         // shared Arc for free.
@@ -1722,6 +1724,22 @@ impl TransportActor {
             let Some(entry) = self.interfaces.get_mut(&id) else {
                 continue;
             };
+            if let Some(existing) = entry
+                .announce_queue
+                .iter_mut()
+                .find(|queued| queued.destination_hash == destination_hash)
+            {
+                let existing_emitted = announce_emitted_from_raw(&existing.raw);
+                if emitted
+                    .zip(existing_emitted)
+                    .is_some_and(|(new, old)| new > old)
+                {
+                    existing.time = now;
+                    existing.hops = hops;
+                    existing.raw = shared.clone();
+                }
+                continue;
+            }
             entry.announce_queue.push(crate::messages::QueuedAnnounce {
                 destination_hash,
                 time: now,
@@ -1867,6 +1885,20 @@ fn announce_timebase(random_blob: &[u8; 10]) -> u64 {
     let mut emitted = [0u8; 8];
     emitted[3..].copy_from_slice(&random_blob[5..10]);
     u64::from_be_bytes(emitted)
+}
+
+fn announce_emitted_from_raw(raw: &[u8]) -> Option<u64> {
+    let (header, data_offset) = rns_wire::header::PacketHeader::unpack(raw).ok()?;
+    if header.flags.packet_type != rns_wire::flags::PacketType::Announce || data_offset >= raw.len()
+    {
+        return None;
+    }
+    let announce = rns_identity::announce::AnnounceData::unpack(
+        &raw[data_offset..],
+        header.flags.context_flag,
+    )
+    .ok()?;
+    Some(announce_timebase(&announce.random_hash))
 }
 
 fn path_timebase_from_random_blobs<'a>(random_blobs: impl Iterator<Item = &'a [u8; 10]>) -> u64 {
@@ -7402,6 +7434,54 @@ mod tests {
             rx.try_recv().is_err(),
             "second drain before announce_allowed_at must not release the next entry"
         );
+    }
+
+    /// Python 1.3.8 Transport.py:1286-1308 keeps one queued announce per
+    /// destination and replaces it only when the wire emission time advances.
+    #[test]
+    fn rebroadcast_queue_coalesces_destination_to_freshest_announce() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (entry, _rx) = make_test_interface("coalesced_iface");
+        actor.interfaces.insert(1, entry);
+
+        let identity = rns_identity::identity::Identity::new();
+        let (initial, dest) = make_announce_for_with_random_blob(
+            &identity,
+            "test.queue.coalesce",
+            4,
+            random_blob(1, 20),
+        );
+        actor.local_destinations.insert(dest);
+        actor.broadcast_announce_on_interfaces(&initial, None);
+
+        let (older, older_dest) = make_announce_for_with_random_blob(
+            &identity,
+            "test.queue.coalesce",
+            2,
+            random_blob(2, 19),
+        );
+        assert_eq!(older_dest, dest);
+        actor.broadcast_announce_on_interfaces(&older, None);
+
+        let queue = &actor.interfaces.get(&1).unwrap().announce_queue;
+        assert_eq!(queue.len(), 1, "older re-announce must not grow the queue");
+        assert_eq!(queue[0].raw, initial);
+        assert_eq!(queue[0].hops, 4);
+
+        let (newer, newer_dest) = make_announce_for_with_random_blob(
+            &identity,
+            "test.queue.coalesce",
+            1,
+            random_blob(3, 21),
+        );
+        assert_eq!(newer_dest, dest);
+        actor.broadcast_announce_on_interfaces(&newer, None);
+
+        let queue = &actor.interfaces.get(&1).unwrap().announce_queue;
+        assert_eq!(queue.len(), 1, "newer re-announce must replace in place");
+        assert_eq!(queue[0].raw, newer);
+        assert_eq!(queue[0].hops, 1);
+        assert_eq!(announce_emitted_from_raw(&queue[0].raw), Some(21));
     }
 
     #[test]
