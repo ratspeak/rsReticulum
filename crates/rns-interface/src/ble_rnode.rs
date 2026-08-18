@@ -74,10 +74,6 @@ const RNODE_BLE_CAPABILITY_PREFLIGHT_TIMEOUT: Duration = Duration::from_millis(5
 const RNODE_BLE_STARTUP_QUIET: Duration = Duration::from_millis(100);
 #[cfg(test)]
 const RNODE_BLE_STARTUP_QUIET: Duration = Duration::from_millis(5);
-#[cfg(not(test))]
-const RNODE_BLE_RADIO_OFF_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const RNODE_BLE_RADIO_OFF_RESPONSE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// `stop_ble_rnode_interface` flips false; the read_task removes the entry
 /// on its way out.
@@ -311,7 +307,6 @@ enum BleCapabilityRetry {
     TransportIo,
     BoundaryOverflow,
     BoundaryTimedOut,
-    RadioOffResponseTimedOut,
 }
 
 impl BleCapabilityRetry {
@@ -322,7 +317,6 @@ impl BleCapabilityRetry {
             Self::TransportIo => "transport_io",
             Self::BoundaryOverflow => "boundary_overflow",
             Self::BoundaryTimedOut => "boundary_timeout",
-            Self::RadioOffResponseTimedOut => "radio_off_response_timeout",
         }
     }
 }
@@ -453,214 +447,6 @@ async fn drain_native_ble_preinit(
         preflight
             .observe_read(&buffer[..count])
             .map_err(BlePreflightBoundaryError::Rejected)?;
-    }
-}
-
-const BLE_RADIO_OFF_CHALLENGE_BITS: usize = 64;
-
-fn build_ble_radio_off_challenge(challenge: u64) -> Vec<u8> {
-    let mut wire = Vec::with_capacity(BLE_RADIO_OFF_CHALLENGE_BITS * 4);
-    for bit in 0..BLE_RADIO_OFF_CHALLENGE_BITS {
-        let command = if challenge & (1_u64 << bit) == 0 {
-            rnode::CMD_READY
-        } else {
-            rnode::CMD_STAT_TX
-        };
-        // These request payloads match official RNode firmware. READY ignores
-        // the byte value; STAT_TX treats it only as a request marker.
-        kiss::frame_with_command_into(
-            command,
-            &[if command == rnode::CMD_READY { 1 } else { 0 }],
-            &mut wire,
-        );
-    }
-    wire
-}
-
-fn new_ble_radio_off_challenge() -> u64 {
-    rand::rngs::OsRng.next_u64()
-}
-
-/// Tracks the receive half of the strict standalone RADIO_STATE=OFF
-/// transaction. Official RNode firmware from the supported 1.52 minimum
-/// exposes READY and STAT_TX as non-mutating, request-only controls whose
-/// responses are emitted synchronously in request order. A fresh 64-bit OS
-/// random sequence of those commands therefore binds the preceding OFF write
-/// to this connection generation without retaining or logging the challenge.
-/// Third-party firmware that claims compatibility but lacks these controls
-/// safely times out and reconnects.
-struct BleRadioOffBoundary {
-    deframer: kiss::RawKissDeframer,
-    items: usize,
-    bytes: usize,
-    challenge: u64,
-    saw_off: bool,
-    matched_bits: usize,
-}
-
-impl BleRadioOffBoundary {
-    fn new(challenge: u64) -> Self {
-        Self {
-            deframer: kiss::RawKissDeframer::new(),
-            items: 0,
-            bytes: 0,
-            challenge,
-            saw_off: false,
-            matched_bits: 0,
-        }
-    }
-
-    fn observe(&mut self, bytes: &[u8]) -> Result<(), BleCapabilityRetry> {
-        self.items = self.items.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(bytes.len());
-        if self.items > BLE_PREFLIGHT_BOUNDARY_MAX_ITEMS
-            || self.bytes > BLE_PREFLIGHT_BOUNDARY_MAX_BYTES
-        {
-            return Err(BleCapabilityRetry::BoundaryOverflow);
-        }
-
-        for (command, payload) in self.deframer.feed(bytes) {
-            if command == rnode::CMD_RADIO_STATE && payload.as_slice() == [rnode::RADIO_STATE_OFF] {
-                self.saw_off = true;
-                self.matched_bits = 0;
-                continue;
-            }
-            if !self.saw_off || self.matched_bits == BLE_RADIO_OFF_CHALLENGE_BITS {
-                continue;
-            }
-
-            let expected = if self.challenge & (1_u64 << self.matched_bits) == 0 {
-                rnode::CMD_READY
-            } else {
-                rnode::CMD_STAT_TX
-            };
-            let width_matches = match expected {
-                rnode::CMD_READY => payload.len() == 1,
-                rnode::CMD_STAT_TX => payload.len() == 4,
-                _ => unreachable!("strict BLE challenge uses known request-only controls"),
-            };
-            if command == expected && width_matches {
-                self.matched_bits += 1;
-            } else if matches!(command, rnode::CMD_READY | rnode::CMD_STAT_TX) {
-                // A stale replay or malformed marker-alphabet response cannot
-                // contribute to this challenge. Wait for a later OFF boundary;
-                // continuous ambiguity remains bounded by item/byte/time caps.
-                self.saw_off = false;
-                self.matched_bits = 0;
-            }
-        }
-        Ok(())
-    }
-
-    const fn is_confirmed(&self) -> bool {
-        self.saw_off && self.matched_bits == BLE_RADIO_OFF_CHALLENGE_BITS
-    }
-}
-
-enum BleRadioOffBoundaryOutcome {
-    Confirmed,
-    Stopped,
-    Retry(BleCapabilityRetry),
-}
-
-async fn await_desktop_ble_radio_off_boundary<S>(
-    notification_stream: &mut S,
-    running: &AtomicBool,
-    challenge: u64,
-    timeout: Duration,
-    quiet: Duration,
-) -> BleRadioOffBoundaryOutcome
-where
-    S: futures::Stream<Item = ValueNotification> + Unpin,
-{
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut candidate_deadline = None;
-    let mut boundary = BleRadioOffBoundary::new(challenge);
-
-    loop {
-        if !running.load(Ordering::SeqCst) {
-            return BleRadioOffBoundaryOutcome::Stopped;
-        }
-        let now = tokio::time::Instant::now();
-        if candidate_deadline.is_some_and(|candidate| now >= candidate) {
-            return BleRadioOffBoundaryOutcome::Confirmed;
-        }
-        if now >= deadline {
-            return BleRadioOffBoundaryOutcome::Retry(BleCapabilityRetry::RadioOffResponseTimedOut);
-        }
-        let wake = candidate_deadline
-            .unwrap_or(deadline)
-            .min(deadline)
-            .min(now + RUNNING_POLL);
-        let notification = tokio::select! {
-            biased;
-            notification = notification_stream.next() => Some(notification),
-            _ = tokio::time::sleep_until(wake) => None,
-        };
-        let Some(notification) = notification else {
-            continue;
-        };
-        let Some(notification) = notification else {
-            return BleRadioOffBoundaryOutcome::Retry(BleCapabilityRetry::TransportEnded);
-        };
-        if notification.uuid != NUS_TX_CHAR_UUID {
-            continue;
-        }
-        if let Err(reason) = boundary.observe(&notification.value) {
-            return BleRadioOffBoundaryOutcome::Retry(reason);
-        }
-        candidate_deadline = boundary
-            .is_confirmed()
-            .then(|| tokio::time::Instant::now() + quiet);
-    }
-}
-
-async fn await_native_ble_radio_off_boundary(
-    tcp_read: &mut tokio::net::tcp::OwnedReadHalf,
-    running: &AtomicBool,
-    challenge: u64,
-    timeout: Duration,
-    quiet: Duration,
-) -> BleRadioOffBoundaryOutcome {
-    use tokio::io::AsyncReadExt;
-
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut candidate_deadline = None;
-    let mut boundary = BleRadioOffBoundary::new(challenge);
-    let mut buffer = [0u8; crate::rnode_capability_preflight::RNODE_CAPABILITY_READ_BUFFER_BYTES];
-
-    loop {
-        if !running.load(Ordering::SeqCst) {
-            return BleRadioOffBoundaryOutcome::Stopped;
-        }
-        let now = tokio::time::Instant::now();
-        if candidate_deadline.is_some_and(|candidate| now >= candidate) {
-            return BleRadioOffBoundaryOutcome::Confirmed;
-        }
-        if now >= deadline {
-            return BleRadioOffBoundaryOutcome::Retry(BleCapabilityRetry::RadioOffResponseTimedOut);
-        }
-        let wake = candidate_deadline
-            .unwrap_or(deadline)
-            .min(deadline)
-            .min(now + RUNNING_POLL);
-        let read = tokio::time::timeout_at(wake, tcp_read.read(&mut buffer)).await;
-        let count = match read {
-            Ok(Ok(0)) => {
-                return BleRadioOffBoundaryOutcome::Retry(BleCapabilityRetry::TransportEnded);
-            }
-            Ok(Ok(count)) => count,
-            Ok(Err(_)) => {
-                return BleRadioOffBoundaryOutcome::Retry(BleCapabilityRetry::TransportIo);
-            }
-            Err(_) => continue,
-        };
-        if let Err(reason) = boundary.observe(&buffer[..count]) {
-            return BleRadioOffBoundaryOutcome::Retry(reason);
-        }
-        candidate_deadline = boundary
-            .is_confirmed()
-            .then(|| tokio::time::Instant::now() + quiet);
     }
 }
 
@@ -1104,23 +890,10 @@ fn build_ble_rnode_init_sequence(config: &BleRNodeConfig) -> Vec<u8> {
     rnode::build_init_sequence(&rnode_config_from_ble_config(config))
 }
 
-/// Strict BLE sends OFF as its own ordered transaction. This is the exact
-/// historical init sequence with only that first frame removed.
-fn build_ble_rnode_init_after_radio_off(config: &BleRNodeConfig) -> Vec<u8> {
-    let mut sequence = build_ble_rnode_init_sequence(config);
-    let radio_off = rnode::build_radio_off_sequence();
-    assert!(
-        sequence.starts_with(&radio_off),
-        "RNode init must begin with RADIO_STATE=OFF"
-    );
-    sequence.drain(..radio_off.len());
-    sequence
-}
-
 /// Native legacy admission deliberately discards handshake deframer state, so
-/// re-request detection/firmware evidence after radio init. Strict admission
-/// instead uses RADIO_STATE=OFF as its ordered response fence and does not need
-/// this refresh marker.
+/// re-request detection/firmware evidence after radio init. Explicit capability
+/// admission retains its private detect/firmware evidence and uses the ordinary
+/// RNode init sequence without this refresh marker.
 fn build_native_rnode_init_sequence(config: &BleRNodeConfig) -> Vec<u8> {
     let mut sequence = build_ble_rnode_init_sequence(config);
     sequence.extend(rnode::build_detect_sequence());
@@ -2152,7 +1925,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             }
             ble_diag("[ble] detect sent ok");
 
-            let mut capability_admission = if options.requires_capability_admission() {
+            let capability_admission = if options.requires_capability_admission() {
                 if !running_task.load(Ordering::SeqCst) {
                     let _ =
                         tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
@@ -2272,144 +2045,6 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
 
             ble_diag("[ble] sending init sequence");
             if options.requires_capability_admission() {
-                // OFF is a standalone transaction. The same task owns the
-                // only notification stream from preflight through this
-                // boundary, so ordered stale output remains private.
-                let radio_off = rnode::build_radio_off_sequence();
-                if let Err(error) =
-                    ble_write(&conn.peripheral, &conn.rx_char, &radio_off, conn.write_mtu).await
-                {
-                    ble_send_radio_off(&conn).await;
-                    if !running_task.load(Ordering::SeqCst) {
-                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(3),
-                            conn.peripheral.disconnect(),
-                        )
-                        .await;
-                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
-                        return;
-                    }
-                    snapshot_publisher.connection_attempt_failed();
-                    tracing::warn!(error = %error, "BLE RNode standalone radio-off write failed");
-                    ble_diag(format!("[ble] standalone radio-off write failed: {error}"));
-                    let _ =
-                        tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
-                            .await;
-                    if reconnect_try_exhausted(&mut tries) {
-                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
-                        return;
-                    }
-                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
-                        publish_ble_stopped(
-                            &mut snapshot_publisher,
-                            RNodeRuntimeReason::StopRequested,
-                        );
-                        return;
-                    }
-                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
-                    continue;
-                }
-
-                let challenge = new_ble_radio_off_challenge();
-                let challenge_wire = build_ble_radio_off_challenge(challenge);
-                if let Err(error) = ble_write(
-                    &conn.peripheral,
-                    &conn.rx_char,
-                    &challenge_wire,
-                    conn.write_mtu,
-                )
-                .await
-                {
-                    ble_send_radio_off(&conn).await;
-                    if !running_task.load(Ordering::SeqCst) {
-                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(3),
-                            conn.peripheral.disconnect(),
-                        )
-                        .await;
-                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
-                        return;
-                    }
-                    snapshot_publisher.connection_attempt_failed();
-                    tracing::warn!(error = %error, "BLE RNode radio-off challenge write failed");
-                    let _ =
-                        tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
-                            .await;
-                    if reconnect_try_exhausted(&mut tries) {
-                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
-                        return;
-                    }
-                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
-                        publish_ble_stopped(
-                            &mut snapshot_publisher,
-                            RNodeRuntimeReason::StopRequested,
-                        );
-                        return;
-                    }
-                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
-                    continue;
-                }
-
-                match await_desktop_ble_radio_off_boundary(
-                    &mut notification_stream,
-                    &running_task,
-                    challenge,
-                    RNODE_BLE_RADIO_OFF_RESPONSE_TIMEOUT,
-                    RNODE_BLE_STARTUP_QUIET,
-                )
-                .await
-                {
-                    BleRadioOffBoundaryOutcome::Confirmed => {
-                        let Some((protocol_state, _)) = capability_admission.as_mut() else {
-                            unreachable!("strict BLE init requires admitted protocol state")
-                        };
-                        // `into_protocol_state` already stripped every stale RF
-                        // observation. Apply only the causally fenced OFF echo.
-                        protocol_state
-                            .apply_frame(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]);
-                    }
-                    BleRadioOffBoundaryOutcome::Stopped => {
-                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                        ble_send_radio_off(&conn).await;
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(3),
-                            conn.peripheral.disconnect(),
-                        )
-                        .await;
-                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
-                        return;
-                    }
-                    BleRadioOffBoundaryOutcome::Retry(reason) => {
-                        ble_send_radio_off(&conn).await;
-                        snapshot_publisher.connection_attempt_failed();
-                        tracing::warn!(
-                            name = %log_name,
-                            startup_failure = reason.log_class(),
-                            "BLE RNode radio-off boundary will retry"
-                        );
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(3),
-                            conn.peripheral.disconnect(),
-                        )
-                        .await;
-                        if reconnect_try_exhausted(&mut tries) {
-                            snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
-                            return;
-                        }
-                        if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
-                            publish_ble_stopped(
-                                &mut snapshot_publisher,
-                                RNodeRuntimeReason::StopRequested,
-                            );
-                            return;
-                        }
-                        backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
-                        continue;
-                    }
-                }
-
                 if !running_task.load(Ordering::SeqCst) {
                     snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
                     ble_send_radio_off(&conn).await;
@@ -2420,14 +2055,9 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                     return;
                 }
 
-                let init_after_off = build_ble_rnode_init_after_radio_off(&config);
-                if let Err(error) = ble_write(
-                    &conn.peripheral,
-                    &conn.rx_char,
-                    &init_after_off,
-                    conn.write_mtu,
-                )
-                .await
+                let init_seq = init_seq_template.clone();
+                if let Err(error) =
+                    ble_write(&conn.peripheral, &conn.rx_char, &init_seq, conn.write_mtu).await
                 {
                     // A chunked write can fail after a mutating prefix. Always
                     // return the radio to detached/off before retrying.
@@ -2443,8 +2073,8 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                         return;
                     }
                     snapshot_publisher.connection_attempt_failed();
-                    tracing::warn!(error = %error, "BLE RNode init remainder write failed");
-                    ble_diag(format!("[ble] init remainder write failed: {error}"));
+                    tracing::warn!(error = %error, "BLE RNode init write failed");
+                    ble_diag(format!("[ble] init write failed: {error}"));
                     let _ =
                         tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
                             .await;
@@ -2606,9 +2236,9 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             let mut transport_closed = false;
 
             // Preserve the historical immediate startup drain only for the
-            // legacy policy. Strict startup already established an ordered
-            // OFF boundary; every queued post-init notification now belongs to
-            // the single normal handler below.
+            // default policy. Explicit admission already drained its private
+            // preflight tail; every queued post-init notification now belongs
+            // to the single normal handler below.
             if !options.requires_capability_admission() {
                 loop {
                     match notification_stream.next().now_or_never() {
@@ -3008,108 +2638,6 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
             }
 
             if options.requires_capability_admission() {
-                let radio_off = rnode::build_radio_off_sequence();
-                if tcp_write.write_all(&radio_off).await.is_err()
-                    || tcp_write.flush().await.is_err()
-                {
-                    let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
-                    let _ = tcp_write.flush().await;
-                    if !running_task.load(Ordering::SeqCst) {
-                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
-                        return;
-                    }
-                    snapshot_publisher.connection_attempt_failed();
-                    tracing::warn!("BLE RNode native standalone radio-off write failed");
-                    if reconnect_try_exhausted(&mut tries) {
-                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
-                        return;
-                    }
-                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
-                        publish_ble_stopped(
-                            &mut snapshot_publisher,
-                            RNodeRuntimeReason::StopRequested,
-                        );
-                        return;
-                    }
-                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
-                    continue;
-                }
-
-                let challenge = new_ble_radio_off_challenge();
-                let challenge_wire = build_ble_radio_off_challenge(challenge);
-                if tcp_write.write_all(&challenge_wire).await.is_err()
-                    || tcp_write.flush().await.is_err()
-                {
-                    let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
-                    let _ = tcp_write.flush().await;
-                    if !running_task.load(Ordering::SeqCst) {
-                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
-                        return;
-                    }
-                    snapshot_publisher.connection_attempt_failed();
-                    tracing::warn!("BLE RNode native radio-off challenge write failed");
-                    if reconnect_try_exhausted(&mut tries) {
-                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
-                        return;
-                    }
-                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
-                        publish_ble_stopped(
-                            &mut snapshot_publisher,
-                            RNodeRuntimeReason::StopRequested,
-                        );
-                        return;
-                    }
-                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
-                    continue;
-                }
-
-                match await_native_ble_radio_off_boundary(
-                    &mut tcp_read,
-                    &running_task,
-                    challenge,
-                    RNODE_BLE_RADIO_OFF_RESPONSE_TIMEOUT,
-                    RNODE_BLE_STARTUP_QUIET,
-                )
-                .await
-                {
-                    BleRadioOffBoundaryOutcome::Confirmed => {
-                        protocol_state
-                            .apply_frame(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]);
-                    }
-                    BleRadioOffBoundaryOutcome::Stopped => {
-                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                        let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
-                        let _ = tcp_write.flush().await;
-                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
-                        return;
-                    }
-                    BleRadioOffBoundaryOutcome::Retry(reason) => {
-                        let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
-                        let _ = tcp_write.flush().await;
-                        snapshot_publisher.connection_attempt_failed();
-                        tracing::warn!(
-                            name = %log_name,
-                            startup_failure = reason.log_class(),
-                            "BLE RNode native radio-off boundary will retry"
-                        );
-                        if reconnect_try_exhausted(&mut tries) {
-                            snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
-                            return;
-                        }
-                        if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
-                            publish_ble_stopped(
-                                &mut snapshot_publisher,
-                                RNodeRuntimeReason::StopRequested,
-                            );
-                            return;
-                        }
-                        backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
-                        continue;
-                    }
-                }
-
                 if !running_task.load(Ordering::SeqCst) {
                     snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
                     let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
@@ -3118,8 +2646,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                     return;
                 }
 
-                let init_after_off = build_ble_rnode_init_after_radio_off(&config);
-                if tcp_write.write_all(&init_after_off).await.is_err()
+                if tcp_write.write_all(&init_seq_template).await.is_err()
                     || tcp_write.flush().await.is_err()
                 {
                     let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
@@ -3130,7 +2657,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                         return;
                     }
                     snapshot_publisher.connection_attempt_failed();
-                    tracing::warn!("BLE RNode native init remainder write failed");
+                    tracing::warn!("BLE RNode native init write failed");
                     if reconnect_try_exhausted(&mut tries) {
                         snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
                         return;
@@ -3470,18 +2997,6 @@ mod tests {
                 value: chunk.to_vec(),
             })
             .collect()
-    }
-
-    fn radio_off_challenge_responses(challenge: u64) -> Vec<u8> {
-        let mut wire = Vec::new();
-        for bit in 0..BLE_RADIO_OFF_CHALLENGE_BITS {
-            if challenge & (1_u64 << bit) == 0 {
-                kiss::frame_with_command_into(rnode::CMD_READY, &[1], &mut wire);
-            } else {
-                kiss::frame_with_command_into(rnode::CMD_STAT_TX, &[0, 0, 0, 1], &mut wire);
-            }
-        }
-        wire
     }
 
     #[test]
@@ -4197,43 +3712,6 @@ mod tests {
     }
 
     #[test]
-    fn strict_radio_off_boundary_requires_a_complete_clean_off_frame() {
-        let challenge = 0xA5A5_5A5A_F00F_0FF0;
-        let mut boundary = BleRadioOffBoundary::new(challenge);
-        let off = kiss::frame_with_command(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]);
-        let split = off.len() - 1;
-
-        boundary.observe(&off[..split]).expect("bounded prefix");
-        assert!(!boundary.is_confirmed());
-        boundary.observe(&off[split..]).expect("bounded tail");
-        assert!(!boundary.is_confirmed(), "OFF alone is not causal proof");
-
-        let responses = radio_off_challenge_responses(challenge);
-        let response_split = responses.len() - 1;
-        boundary
-            .observe(&responses[..response_split])
-            .expect("bounded response prefix");
-        assert!(!boundary.is_confirmed());
-        boundary
-            .observe(&responses[response_split..])
-            .expect("bounded response tail");
-        assert!(boundary.is_confirmed());
-
-        let mut mismatched = BleRadioOffBoundary::new(0);
-        mismatched.observe(&off).expect("bounded OFF");
-        mismatched
-            .observe(&kiss::frame_with_command(rnode::CMD_READY, &[1, 0]))
-            .expect("bounded wrong-width READY");
-        mismatched
-            .observe(&radio_off_challenge_responses(0))
-            .expect("bounded responses after mismatch");
-        assert!(
-            !mismatched.is_confirmed(),
-            "a command or width mismatch requires a new OFF boundary"
-        );
-    }
-
-    #[test]
     fn test_native_ble_handshake_reduces_full_accepted_batch_before_publication() {
         let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
         let target = RNodeProtocolTarget::new(
@@ -4298,16 +3776,10 @@ mod tests {
     }
 
     #[test]
-    fn strict_ble_init_uses_radio_off_fence_without_legacy_refresh() {
+    fn ble_init_sequence_uses_no_probe_controls() {
         let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
-        let strict_init = build_ble_rnode_init_sequence(&config);
-        let init_after_off = build_ble_rnode_init_after_radio_off(&config);
-        let mut split_init = rnode::build_radio_off_sequence();
-        split_init.extend_from_slice(&init_after_off);
-        assert_eq!(split_init, strict_init);
-
         let mut deframer = kiss::RawKissDeframer::new();
-        let frames = deframer.feed(&strict_init);
+        let frames = deframer.feed(&build_ble_rnode_init_sequence(&config));
 
         assert_eq!(
             frames.first(),
@@ -4317,42 +3789,12 @@ mod tests {
             frames.last(),
             Some(&(rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_ON]))
         );
-        assert!(
-            frames
-                .iter()
-                .all(|(command, _)| *command != rnode::CMD_DETECT)
-        );
-
-        let mut tail_deframer = kiss::RawKissDeframer::new();
-        let tail_frames = tail_deframer.feed(&init_after_off);
-        assert_eq!(
-            tail_frames.first().map(|frame| frame.0),
-            Some(rnode::CMD_FREQUENCY)
-        );
-        assert_eq!(
-            frame_command_count(&tail_frames, rnode::CMD_RADIO_STATE),
-            1,
-            "strict init tail contains only RADIO_STATE=ON"
-        );
-    }
-
-    #[test]
-    fn strict_ble_radio_off_challenge_uses_only_request_only_controls() {
-        let challenge = 0x8000_0000_0000_0001;
-        let wire = build_ble_radio_off_challenge(challenge);
-        let mut deframer = kiss::RawKissDeframer::new();
-        let frames = deframer.feed(&wire);
-        assert_eq!(frames.len(), BLE_RADIO_OFF_CHALLENGE_BITS);
-        for (bit, (command, payload)) in frames.into_iter().enumerate() {
-            let expected = if challenge & (1_u64 << bit) == 0 {
-                rnode::CMD_READY
-            } else {
-                rnode::CMD_STAT_TX
-            };
-            assert_eq!(command, expected);
-            assert_eq!(payload.len(), 1);
-            assert!(matches!(command, rnode::CMD_READY | rnode::CMD_STAT_TX));
-        }
+        assert!(frames.iter().all(|(command, _)| {
+            !matches!(
+                *command,
+                rnode::CMD_READY | rnode::CMD_STAT_TX | rnode::CMD_ROM_READ
+            )
+        }));
     }
 
     #[test]
@@ -4644,180 +4086,6 @@ mod tests {
             .await,
             BleCapabilityPreflightOutcome::Retry(BleCapabilityRetry::ResponseTimedOut)
         ));
-    }
-
-    #[tokio::test]
-    async fn strict_desktop_radio_off_boundary_stop_and_timeout_are_bounded() {
-        let stopped = AtomicBool::new(false);
-        let mut pending = futures::stream::pending::<ValueNotification>();
-        assert!(matches!(
-            await_desktop_ble_radio_off_boundary(
-                &mut pending,
-                &stopped,
-                0xCAFE_BABE_DEAD_BEEF,
-                Duration::from_secs(1),
-                Duration::from_millis(1),
-            )
-            .await,
-            BleRadioOffBoundaryOutcome::Stopped
-        ));
-
-        let running = AtomicBool::new(true);
-        let started = tokio::time::Instant::now();
-        assert!(matches!(
-            await_desktop_ble_radio_off_boundary(
-                &mut pending,
-                &running,
-                0xCAFE_BABE_DEAD_BEEF,
-                Duration::from_millis(5),
-                Duration::from_millis(1),
-            )
-            .await,
-            BleRadioOffBoundaryOutcome::Retry(BleCapabilityRetry::RadioOffResponseTimedOut)
-        ));
-        assert!(started.elapsed() < Duration::from_millis(100));
-
-        let off = ValueNotification {
-            uuid: NUS_TX_CHAR_UUID,
-            value: kiss::frame_with_command(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]),
-        };
-        let noise = ValueNotification {
-            uuid: NUS_TX_CHAR_UUID,
-            value: kiss::frame_with_command(rnode::CMD_READY, &[1, 0]),
-        };
-        let mut continuous = futures::stream::iter([off]).chain(futures::stream::repeat(noise));
-        assert!(matches!(
-            await_desktop_ble_radio_off_boundary(
-                &mut continuous,
-                &running,
-                0,
-                Duration::from_secs(1),
-                Duration::from_millis(1),
-            )
-            .await,
-            BleRadioOffBoundaryOutcome::Retry(BleCapabilityRetry::BoundaryOverflow)
-        ));
-    }
-
-    #[tokio::test]
-    async fn strict_desktop_radio_off_boundary_drains_post_challenge_tail_before_success() {
-        let challenge = 0x5AA5_F00F_1234_5678;
-        let notifications = [
-            ValueNotification {
-                uuid: NUS_TX_CHAR_UUID,
-                value: kiss::frame_with_command(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]),
-            },
-            ValueNotification {
-                uuid: NUS_TX_CHAR_UUID,
-                value: radio_off_challenge_responses(challenge),
-            },
-            ValueNotification {
-                uuid: NUS_TX_CHAR_UUID,
-                value: kiss::frame(b"post-challenge-pre-init"),
-            },
-        ];
-        let mut notifications = futures::stream::iter(notifications)
-            .chain(futures::stream::pending::<ValueNotification>());
-        let running = AtomicBool::new(true);
-        assert!(matches!(
-            await_desktop_ble_radio_off_boundary(
-                &mut notifications,
-                &running,
-                challenge,
-                Duration::from_secs(1),
-                Duration::from_millis(5),
-            )
-            .await,
-            BleRadioOffBoundaryOutcome::Confirmed
-        ));
-        assert!(
-            notifications.next().now_or_never().is_none(),
-            "post-challenge pre-init traffic must be consumed before activation"
-        );
-    }
-
-    #[test]
-    fn strict_ble_off_transaction_ignores_delayed_stale_off_and_rf_until_final_off() {
-        let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
-        let target = RNodeProtocolTarget::new(
-            config.frequency,
-            config.bandwidth,
-            config.spreading_factor,
-            config.coding_rate,
-            config.tx_power,
-        );
-        let mut state = RNodeProtocolState::new(target);
-        state.apply_frame(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
-        state.apply_frame(
-            rnode::CMD_FW_VERSION,
-            &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
-        );
-        let admitted_seed = state.clone();
-        let challenge = 0x0123_4567_89AB_CDEF;
-        let mut boundary = BleRadioOffBoundary::new(challenge);
-        let mut stale = kiss::frame_with_command(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]);
-        stale.extend(radio_off_challenge_responses(!challenge));
-        stale.extend(kiss::frame_with_command(
-            rnode::CMD_FREQUENCY,
-            &target.frequency.to_be_bytes(),
-        ));
-        stale.extend(kiss::frame_with_command(
-            rnode::CMD_BANDWIDTH,
-            &target.bandwidth.to_be_bytes(),
-        ));
-        stale.extend(kiss::frame_with_command(
-            rnode::CMD_SF,
-            &[target.spreading_factor],
-        ));
-        stale.extend(kiss::frame_with_command(
-            rnode::CMD_CR,
-            &[target.coding_rate],
-        ));
-        stale.extend(kiss::frame_with_command(
-            rnode::CMD_TXPOWER,
-            &[target.tx_power],
-        ));
-        stale.extend(kiss::frame_with_command(
-            rnode::CMD_RADIO_STATE,
-            &[rnode::RADIO_STATE_ON],
-        ));
-        stale.extend(kiss::frame(b"late-preinit"));
-        stale.extend(kiss::frame_with_command(rnode::CMD_READY, &[1]));
-        stale.extend(kiss::frame_with_command(rnode::CMD_STAT_RSSI, &[67]));
-
-        boundary.observe(&stale).expect("bounded stale batch");
-        assert!(
-            !boundary.is_confirmed(),
-            "stale OFF/challenge replay followed by RF cannot arm the boundary"
-        );
-        assert_eq!(
-            state, admitted_seed,
-            "private stale output cannot mutate state"
-        );
-
-        boundary
-            .observe(&kiss::frame_with_command(
-                rnode::CMD_RADIO_STATE,
-                &[rnode::RADIO_STATE_OFF],
-            ))
-            .expect("bounded genuine OFF");
-        assert!(!boundary.is_confirmed());
-        boundary
-            .observe(&radio_off_challenge_responses(challenge))
-            .expect("bounded genuine challenge");
-        assert!(boundary.is_confirmed());
-
-        // Confirmation resets to the admitted detect/FW seed and applies only
-        // the genuine standalone OFF response. Remaining init is still needed
-        // before readiness can become true.
-        state = admitted_seed;
-        state.apply_frame(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]);
-        assert_eq!(state.evidence().frequency, None);
-        assert_eq!(
-            state.evidence().radio_state,
-            Some(crate::rnode_protocol::RNodeRadioState::Off)
-        );
-        assert!(!matches!(state.readiness(), RNodeReadiness::Ready));
     }
 
     #[test]
