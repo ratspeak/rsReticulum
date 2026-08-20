@@ -1,19 +1,30 @@
 //! RNode over BLE via the Nordic UART Service. Same KISS command set as
 //! serial RNode, tunnelled through GATT notify/write.
 
+mod generation;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use btleplug::api::{
-    Central, Manager as _, Peripheral as _, ScanFilter, ValueNotification, WriteType,
+    Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, ValueNotification, WriteType,
 };
-use btleplug::platform::{Adapter, Manager, Peripheral};
+use btleplug::platform::{Adapter, Manager, Peripheral, PeripheralId};
 use bytes::Bytes;
-use futures::{FutureExt, StreamExt};
+#[cfg(test)]
+use futures::FutureExt;
+use futures::StreamExt;
 use rand::RngCore;
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+use generation::{
+    BleGenerationExit, BleGenerationId, BleOperationStage, PendingOutbound,
+    run_generation_operation,
+};
+
+type BleCentralEventStream = std::pin::Pin<Box<dyn futures::Stream<Item = CentralEvent> + Send>>;
 
 #[cfg(target_os = "android")]
 static BTLEPLUG_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -59,10 +70,26 @@ const MAX_RECONNECT_TRIES: Option<usize> = None;
 const SCAN_TIMEOUT: u64 = 3;
 /// Bounds disable-while-offline teardown latency to ~1s.
 const RUNNING_POLL: Duration = Duration::from_secs(1);
+/// No CoreBluetooth or GATT operation may hold the generation owner forever.
+const BLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upstream Android RNode BLE applies each RF control independently.
+const BLE_CONTROL_STAGE_SETTLE: Duration = Duration::from_millis(150);
+const BLE_POST_INIT_SETTLE: Duration = Duration::from_secs(1);
+/// ATT's mandatory 23-byte baseline MTU leaves 20 bytes for a characteristic
+/// value. CoreBluetooth exposes the negotiated per-peripheral limit through
+/// `maximumWriteValueLength(for:)`, but btleplug 0.11.8 neither calls nor
+/// exposes it. Its no-response write path also reports success immediately,
+/// even when CoreBluetooth cannot deliver the value. Upstream Reticulum avoids
+/// this by reading Bleak's `max_write_without_response_size` for every link.
+/// Stay at the guaranteed baseline on Apple until btleplug exposes that value.
+const BLE_DEFAULT_ATT_WRITE_PAYLOAD: usize = 20;
+/// RNode's reviewed high-throughput ATT MTU is 247 (247 - 3 ATT bytes).
+const BLE_RNODE_ATT_WRITE_PAYLOAD: usize = 244;
 #[cfg(target_os = "linux")]
 const RNODE_POST_BOND_SETTLE: Duration = Duration::from_millis(2600);
 const RNODE_NATIVE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(6);
 const RNODE_NATIVE_HANDSHAKE_PROBE: Duration = Duration::from_millis(650);
+const RNODE_BLE_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(test))]
 const RNODE_BLE_CAPABILITY_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -139,6 +166,56 @@ fn reconnect_delay_with_jitter(seconds: u64, random: u64) -> Duration {
 
 fn ble_reconnect_delay(seconds: u64) -> Duration {
     reconnect_delay_with_jitter(seconds, rand::rngs::OsRng.next_u64())
+}
+
+const fn ble_write_chunk_size() -> usize {
+    if cfg!(any(target_os = "ios", target_os = "macos")) {
+        BLE_DEFAULT_ATT_WRITE_PAYLOAD
+    } else {
+        BLE_RNODE_ATT_WRITE_PAYLOAD
+    }
+}
+
+const fn ble_write_type() -> WriteType {
+    if cfg!(any(target_os = "ios", target_os = "macos")) {
+        // btleplug 0.11.8's CoreBluetooth no-response path returns before the
+        // controller accepts the value and does not observe
+        // canSendWriteWithoutResponse. Ordered response writes are the only
+        // acknowledgement boundary this driver can safely own on Apple.
+        WriteType::WithResponse
+    } else {
+        WriteType::WithoutResponse
+    }
+}
+
+fn ble_scan_filter() -> ScanFilter {
+    if cfg!(any(target_os = "ios", target_os = "macos")) {
+        // An explicit service filter is required for CoreBluetooth background
+        // rediscovery. The target resolver still validates identity/name.
+        ScanFilter {
+            services: vec![NUS_SERVICE_UUID],
+        }
+    } else {
+        ScanFilter::default()
+    }
+}
+
+async fn bounded_ble_operation<T, E>(
+    operation: &'static str,
+    future: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, InterfaceError>
+where
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(BLE_OPERATION_TIMEOUT, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(InterfaceError::SendFailed(format!(
+            "BLE {operation}: {error}"
+        ))),
+        Err(_) => Err(InterfaceError::SendFailed(format!(
+            "BLE {operation} timed out"
+        ))),
+    }
 }
 
 /// Claim the generation-local one-packet RNode transmit permit.
@@ -334,8 +411,10 @@ enum BlePreflightBoundaryError {
 /// quiet for `quiet`. The already-admitted preflight remains authoritative:
 /// deterministic evidence such as a duplicate EEPROM response, CMD_ERROR, or
 /// malformed control still rejects this connection generation.
-async fn drain_desktop_ble_preinit<S>(
+async fn drain_desktop_ble_preinit<S, E, I, P>(
     notification_stream: &mut S,
+    adapter_events: &mut E,
+    is_target_disconnect: &mut P,
     preflight: &mut RNodeCapabilityPreflight,
     running: &AtomicBool,
     timeout: Duration,
@@ -343,6 +422,8 @@ async fn drain_desktop_ble_preinit<S>(
 ) -> Result<(), BlePreflightBoundaryError>
 where
     S: futures::Stream<Item = ValueNotification> + Unpin,
+    E: futures::Stream<Item = I> + Unpin,
+    P: FnMut(&I) -> bool,
 {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut quiet_deadline = tokio::time::Instant::now() + quiet;
@@ -366,6 +447,19 @@ where
         let notification = tokio::select! {
             biased;
             notification = notification_stream.next() => Some(notification),
+            event = adapter_events.next() => match event {
+                Some(event) if is_target_disconnect(&event) => {
+                    return Err(BlePreflightBoundaryError::Retry(
+                        BleCapabilityRetry::TransportEnded,
+                    ));
+                }
+                Some(_) => None,
+                None => {
+                    return Err(BlePreflightBoundaryError::Retry(
+                        BleCapabilityRetry::TransportEnded,
+                    ));
+                }
+            },
             _ = tokio::time::sleep_until(wake) => None,
         };
         let Some(notification) = notification else {
@@ -460,14 +554,18 @@ fn ble_radio_settings(config: &BleRNodeConfig) -> RNodeRadioSettings {
     )
 }
 
-async fn observe_desktop_ble_capability<S>(
+async fn observe_desktop_ble_capability<S, E, I, P>(
     notification_stream: &mut S,
+    adapter_events: &mut E,
+    mut is_target_disconnect: P,
     settings: RNodeRadioSettings,
     running: &AtomicBool,
     timeout: Duration,
 ) -> BleCapabilityPreflightOutcome
 where
     S: futures::Stream<Item = ValueNotification> + Unpin,
+    E: futures::Stream<Item = I> + Unpin,
+    P: FnMut(&I) -> bool,
 {
     let mut preflight = RNodeCapabilityPreflight::new(settings);
     let deadline = tokio::time::Instant::now() + timeout;
@@ -483,6 +581,19 @@ where
         let wait = deadline.saturating_duration_since(now).min(RUNNING_POLL);
         let notification = tokio::select! {
             notification = notification_stream.next() => Some(notification),
+            event = adapter_events.next() => match event {
+                Some(event) if is_target_disconnect(&event) => {
+                    return BleCapabilityPreflightOutcome::Retry(
+                        BleCapabilityRetry::TransportEnded,
+                    );
+                }
+                Some(_) => None,
+                None => {
+                    return BleCapabilityPreflightOutcome::Retry(
+                        BleCapabilityRetry::TransportEnded,
+                    );
+                }
+            },
             _ = tokio::time::sleep(wait) => None,
         };
         let Some(notification) = notification else {
@@ -498,6 +609,8 @@ where
             Ok(Some(admission)) => {
                 if let Err(error) = drain_desktop_ble_preinit(
                     notification_stream,
+                    adapter_events,
+                    &mut is_target_disconnect,
                     &mut preflight,
                     running,
                     timeout,
@@ -887,7 +1000,11 @@ fn rnode_config_from_ble_config(config: &BleRNodeConfig) -> rnode::RNodeConfig {
 }
 
 fn build_ble_rnode_init_sequence(config: &BleRNodeConfig) -> Vec<u8> {
-    rnode::build_init_sequence(&rnode_config_from_ble_config(config))
+    build_ble_rnode_init_stages(config).concat()
+}
+
+fn build_ble_rnode_init_stages(config: &BleRNodeConfig) -> Vec<Vec<u8>> {
+    rnode::build_ble_radio_reassertion_stages(&rnode_config_from_ble_config(config))
 }
 
 /// Native legacy admission deliberately discards handshake deframer state, so
@@ -910,13 +1027,8 @@ pub(crate) async fn get_adapter() -> Result<Adapter, InterfaceError> {
         ));
     }
 
-    let manager = Manager::new()
-        .await
-        .map_err(|e| InterfaceError::SendFailed(format!("BLE manager init: {e}")))?;
-    let adapters = manager
-        .adapters()
-        .await
-        .map_err(|e| InterfaceError::SendFailed(format!("No BLE adapters: {e}")))?;
+    let manager = bounded_ble_operation("manager init", Manager::new()).await?;
+    let adapters = bounded_ble_operation("adapter enumeration", manager.adapters()).await?;
     adapters
         .into_iter()
         .next()
@@ -957,17 +1069,17 @@ pub async fn scan_ble_devices(timeout_secs: u64) -> Result<Vec<BleDevice>, Strin
     let adapter = get_adapter().await.map_err(|e| format!("{e}"))?;
 
     tracing::info!("[BLE scan] adapter acquired, starting scan (timeout={timeout_secs}s)");
-    if let Err(e) = adapter.start_scan(ScanFilter::default()).await {
+    if let Err(e) = bounded_ble_operation("scan start", adapter.start_scan(ble_scan_filter())).await
+    {
         tracing::error!("[BLE scan] start_scan failed: {e:?}");
         return Err(format!("Scan start failed: {e}"));
     }
 
     tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
 
-    let peripherals = adapter
-        .peripherals()
+    let peripherals = bounded_ble_operation("peripheral list", adapter.peripherals())
         .await
-        .map_err(|e| format!("Peripheral list failed: {e}"))?;
+        .map_err(|e| format!("{e}"))?;
 
     // On Linux, get a bluer adapter handle once so we can query bond state
     // per peripheral without paying the D-Bus session setup repeatedly.
@@ -992,7 +1104,7 @@ pub async fn scan_ble_devices(timeout_secs: u64) -> Result<Vec<BleDevice>, Strin
 
     let mut devices = Vec::new();
     for p in peripherals {
-        if let Ok(Some(props)) = p.properties().await {
+        if let Ok(Some(props)) = bounded_ble_operation("properties", p.properties()).await {
             let name = props.local_name.clone().unwrap_or_default();
             if name.is_empty() {
                 continue;
@@ -1033,7 +1145,9 @@ pub async fn scan_ble_devices(timeout_secs: u64) -> Result<Vec<BleDevice>, Strin
         }
     }
 
-    adapter.stop_scan().await.ok();
+    bounded_ble_operation("scan stop", adapter.stop_scan())
+        .await
+        .ok();
     Ok(devices)
 }
 
@@ -1046,20 +1160,15 @@ async fn resolve_ble_target(
     let target = ble_uri.strip_prefix("ble://").unwrap_or(ble_uri);
     ble_diag(format!("[ble] resolve_ble_target target='{target}'"));
 
-    adapter
-        .start_scan(ScanFilter::default())
+    bounded_ble_operation("scan start", adapter.start_scan(ble_scan_filter()))
         .await
-        .map_err(|e| {
-            ble_diag(format!("[ble] start_scan err: {e}"));
-            InterfaceError::SendFailed(format!("BLE scan: {e}"))
-        })?;
+        .inspect_err(|error| ble_diag(format!("[ble] start_scan err: {error}")))?;
     tokio::time::sleep(Duration::from_secs(SCAN_TIMEOUT)).await;
-    adapter.stop_scan().await.ok();
-
-    let peripherals = adapter
-        .peripherals()
+    bounded_ble_operation("scan stop", adapter.stop_scan())
         .await
-        .map_err(|e| InterfaceError::SendFailed(format!("Peripheral list: {e}")))?;
+        .ok();
+
+    let peripherals = bounded_ble_operation("peripheral list", adapter.peripherals()).await?;
     ble_diag(format!(
         "[ble] scan found {} peripherals",
         peripherals.len()
@@ -1067,7 +1176,7 @@ async fn resolve_ble_target(
 
     if target.is_empty() {
         for p in &peripherals {
-            if let Ok(Some(props)) = p.properties().await {
+            if let Ok(Some(props)) = bounded_ble_operation("properties", p.properties()).await {
                 if props.services.contains(&NUS_SERVICE_UUID) {
                     return Ok(p.clone());
                 }
@@ -1099,7 +1208,7 @@ async fn resolve_ble_target(
 
     // Fallback for UIs that pass a friendly name instead of platform id.
     for p in &peripherals {
-        if let Ok(Some(props)) = p.properties().await {
+        if let Ok(Some(props)) = bounded_ble_operation("properties", p.properties()).await {
             if let Some(ref name) = props.local_name {
                 if name == target {
                     ble_diag(format!("[ble] resolve matched by name: {name}"));
@@ -1118,7 +1227,9 @@ async fn resolve_ble_target(
 }
 
 struct BleRNodeConnection {
+    generation_id: BleGenerationId,
     peripheral: Peripheral,
+    adapter_events: BleCentralEventStream,
     rx_char: btleplug::api::Characteristic,
     // Retained so the resolved write characteristic remains part of the
     // connection state even though writes currently go through `peripheral`.
@@ -1135,10 +1246,18 @@ enum NativeBridgeWrite {
 async fn connect_rnode(
     adapter: &Adapter,
     ble_uri: &str,
+    running: &AtomicBool,
+    generation_id: BleGenerationId,
 ) -> Result<BleRNodeConnection, InterfaceError> {
     ble_diag(format!("[ble] connect_rnode start uri={ble_uri}"));
     let peripheral = resolve_ble_target(adapter, ble_uri).await?;
     ble_diag(format!("[ble] resolved peripheral id={}", peripheral.id()));
+    let target_id = peripheral.id();
+    // The exact target event receiver is installed before any connection
+    // future. CoreBluetooth can otherwise remove a peripheral while btleplug
+    // leaves connect/read/subscribe pending forever.
+    let mut adapter_events =
+        bounded_ble_operation("adapter event stream", adapter.events()).await?;
 
     #[cfg(target_os = "linux")]
     {
@@ -1154,7 +1273,15 @@ async fn connect_rnode(
 
     let mut last_err = String::new();
     for attempt in 1..=3 {
-        match peripheral.connect().await {
+        match run_generation_operation(
+            BleOperationStage::Connect,
+            peripheral.connect(),
+            &mut adapter_events,
+            running,
+            |event| matches!(event, CentralEvent::DeviceDisconnected(id) if id == &target_id),
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::info!(address = %peripheral.id(), attempt, "BLE RNode connected");
                 ble_diag(format!(
@@ -1162,12 +1289,19 @@ async fn connect_rnode(
                 ));
                 break;
             }
-            Err(e) => {
-                last_err = format!("{e}");
-                tracing::warn!(attempt, error = %e, "BLE RNode connect attempt failed");
+            Err(error) => {
+                last_err = error.to_string();
+                tracing::warn!(attempt, error = %error, "BLE RNode connect attempt failed");
                 ble_diag(format!(
-                    "[ble] peripheral.connect() err on attempt {attempt}: {e}"
+                    "[ble] peripheral.connect() err on attempt {attempt}: {error}"
                 ));
+                if matches!(
+                    error,
+                    BleGenerationExit::StopRequested { .. }
+                        | BleGenerationExit::EventStreamEnded { .. }
+                ) {
+                    return Err(InterfaceError::SendFailed(error.to_string()));
+                }
                 if attempt < 3 {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
@@ -1175,7 +1309,16 @@ async fn connect_rnode(
         }
     }
 
-    if !peripheral.is_connected().await.unwrap_or(false) {
+    let connected = run_generation_operation(
+        BleOperationStage::ConnectedCheck,
+        peripheral.is_connected(),
+        &mut adapter_events,
+        running,
+        |event| matches!(event, CentralEvent::DeviceDisconnected(id) if id == &target_id),
+    )
+    .await
+    .map_err(|error| InterfaceError::SendFailed(error.to_string()))?;
+    if !connected {
         ble_diag(format!(
             "[ble] is_connected=false after retries: {last_err}"
         ));
@@ -1185,9 +1328,17 @@ async fn connect_rnode(
     }
 
     ble_diag("[ble] discover_services start");
-    peripheral.discover_services().await.map_err(|e| {
-        ble_diag(format!("[ble] discover_services err: {e}"));
-        InterfaceError::SendFailed(format!("Service discovery: {e}"))
+    run_generation_operation(
+        BleOperationStage::Discovery,
+        peripheral.discover_services(),
+        &mut adapter_events,
+        running,
+        |event| matches!(event, CentralEvent::DeviceDisconnected(id) if id == &target_id),
+    )
+    .await
+    .map_err(|error| {
+        ble_diag(format!("[ble] discover_services err: {error}"));
+        InterfaceError::SendFailed(error.to_string())
     })?;
     ble_diag("[ble] discover_services ok");
 
@@ -1225,25 +1376,43 @@ async fn connect_rnode(
         target_os = "windows",
         target_os = "android"
     ))]
-    desktop_trigger_pairing(&peripheral, &tx_char).await?;
+    desktop_trigger_pairing(
+        &peripheral,
+        &tx_char,
+        &mut adapter_events,
+        running,
+        &target_id,
+    )
+    .await?;
 
     ble_diag("[ble] subscribe TX start");
-    peripheral.subscribe(&tx_char).await.map_err(|e| {
-        ble_diag(format!("[ble] subscribe TX err: {e}"));
-        InterfaceError::SendFailed(format!("BLE subscribe TX: {e}"))
+    run_generation_operation(
+        BleOperationStage::Subscribe,
+        peripheral.subscribe(&tx_char),
+        &mut adapter_events,
+        running,
+        |event| matches!(event, CentralEvent::DeviceDisconnected(id) if id == &target_id),
+    )
+    .await
+    .map_err(|error| {
+        ble_diag(format!("[ble] subscribe TX err: {error}"));
+        let detail = if matches!(error, BleGenerationExit::TargetDisconnected { .. }) {
+            format!("BLE pairing in progress: {error}")
+        } else {
+            error.to_string()
+        };
+        InterfaceError::SendFailed(detail)
     })?;
     ble_diag("[ble] subscribe TX ok");
 
-    // 244 = ATT MTU 247 - 3-byte header. Larger writes silently drop on
-    // peripherals with smaller negotiated MTU; 512 (GATT ceiling) isn't
-    // usable OTA on most stacks.
-    // btleplug does not currently expose the negotiated MTU; use the largest
-    // payload that is broadly safe for ATT MTU 247.
-    let write_mtu: usize = 244;
+    let write_mtu = ble_write_chunk_size();
     tracing::info!(write_mtu, "BLE RNode write chunk size");
+    ble_diag(format!("[ble] write chunk size={write_mtu}"));
 
     Ok(BleRNodeConnection {
+        generation_id,
         peripheral,
+        adapter_events,
         rx_char,
         tx_char,
         write_mtu,
@@ -1282,37 +1451,64 @@ async fn connect_rnode(
 async fn desktop_trigger_pairing(
     peripheral: &Peripheral,
     tx_char: &btleplug::api::Characteristic,
+    adapter_events: &mut BleCentralEventStream,
+    running: &AtomicBool,
+    target_id: &PeripheralId,
 ) -> Result<(), InterfaceError> {
     ble_diag(format!(
         "[pair] reading TX char — triggers SMP if unbonded: props={:?}",
         tx_char.properties
     ));
 
-    // 60s budget for the user to read the OLED passkey and type it.
-    match tokio::time::timeout(Duration::from_secs(60), peripheral.read(tx_char)).await {
-        Ok(Ok(bytes)) => {
+    // Observe before issuing the encrypted read. The nRF RNode deliberately
+    // disconnects after it has durably stored a fresh bond. On CoreBluetooth,
+    // btleplug's characteristic callback ignores ATT read errors, so its read
+    // future is not guaranteed to wake even though the adapter publishes the
+    // disconnect. Race both signals and route either one through the existing
+    // generation-local reconnect loop.
+    let pairing_result = run_generation_operation(
+        BleOperationStage::PairingRead,
+        peripheral.read(tx_char),
+        adapter_events,
+        running,
+        |event| matches!(event, CentralEvent::DeviceDisconnected(id) if id == target_id),
+    )
+    .await;
+
+    match pairing_result {
+        Ok(bytes) => {
             ble_diag(format!(
                 "[pair] TX read ok ({} bytes) — bonded",
                 bytes.len()
             ));
             Ok(())
         }
-        Ok(Err(e)) => {
+        Err(BleGenerationExit::StageFailed { reason, .. }) => {
             // SMP just ran or is in progress — outer loop must retry with
             // a fresh peripheral.
             ble_diag(format!(
-                "[pair] TX read err ({e}) — surfacing to reconnect loop"
+                "[pair] TX read err ({reason}) — surfacing to reconnect loop"
             ));
             Err(InterfaceError::SendFailed(format!(
-                "BLE pairing in progress: {e}"
+                "BLE pairing in progress: {reason}"
             )))
         }
-        Err(_) => {
+        Err(BleGenerationExit::TargetDisconnected { .. }) => {
+            ble_diag(
+                "[pair] target disconnected after encrypted read — fresh bond transition; reconnecting",
+            );
+            Err(InterfaceError::SendFailed(
+                "BLE pairing in progress: RNode completed fresh bond and disconnected; reconnecting"
+                    .into(),
+            ))
+        }
+        Err(BleGenerationExit::DeadlineElapsed { .. }) => {
             ble_diag("[pair] TX read timed out after 60s — passkey not entered?");
             Err(InterfaceError::SendFailed(
                 "BLE pairing timed out. Did you enter the 6-digit passkey shown on the RNode when the system prompted?".into(),
             ))
         }
+        Err(error) => Err(InterfaceError::SendFailed(error.to_string())),
     }
 }
 
@@ -1623,29 +1819,96 @@ async fn linux_trigger_pairing(bluer_addr: bluer::Address) -> Result<bool, Inter
     outcome.map(|()| true)
 }
 
-/// WithoutResponse is fire-and-forget at the ATT layer; the radio still
-/// flow-controls underneath.
+/// Write one complete extended-KISS frame/burst through a bounded GATT
+/// acknowledgement boundary. Apple uses ordered response writes; other
+/// platforms retain their qualified no-response policy.
 pub(crate) async fn ble_write(
     peripheral: &Peripheral,
     rx_char: &btleplug::api::Characteristic,
     data: &[u8],
     mtu: usize,
 ) -> Result<(), InterfaceError> {
-    for chunk in data.chunks(mtu) {
-        peripheral
-            .write(rx_char, chunk, WriteType::WithoutResponse)
-            .await
-            .map_err(|e| InterfaceError::SendFailed(format!("BLE write: {e}")))?;
+    if mtu == 0 {
+        return Err(InterfaceError::SendFailed(
+            "BLE write chunk size cannot be zero".into(),
+        ));
+    }
+    let write_type = ble_write_type();
+    tokio::time::timeout(BLE_OPERATION_TIMEOUT, async {
+        for chunk in data.chunks(mtu) {
+            peripheral
+                .write(rx_char, chunk, write_type)
+                .await
+                .map_err(|e| InterfaceError::SendFailed(format!("BLE write: {e}")))?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| InterfaceError::SendFailed("BLE write timed out".into()))?
+}
+
+async fn ble_write_for_generation(
+    conn: &mut BleRNodeConnection,
+    data: &[u8],
+    stage: BleOperationStage,
+    running: &AtomicBool,
+) -> Result<(), InterfaceError> {
+    if conn.write_mtu == 0 {
+        return Err(InterfaceError::SendFailed(
+            "BLE write chunk size cannot be zero".into(),
+        ));
+    }
+    let target_id = conn.peripheral.id();
+    let chunk_count = data.len().div_ceil(conn.write_mtu);
+    for (chunk_index, chunk) in data.chunks(conn.write_mtu).enumerate() {
+        run_generation_operation(
+            stage,
+            conn.peripheral
+                .write(&conn.rx_char, chunk, ble_write_type()),
+            &mut conn.adapter_events,
+            running,
+            |event| matches!(event, CentralEvent::DeviceDisconnected(id) if id == &target_id),
+        )
+        .await
+        .map_err(|error| {
+            InterfaceError::SendFailed(format!(
+                "BLE generation {} {stage} chunk {}/{}: {error}",
+                conn.generation_id.get(),
+                chunk_index + 1,
+                chunk_count,
+            ))
+        })?;
     }
     Ok(())
 }
 
-async fn ble_send_radio_off(conn: &BleRNodeConnection) {
+async fn ble_reassert_radio(
+    conn: &mut BleRNodeConnection,
+    stages: &[Vec<u8>],
+    running: &AtomicBool,
+) -> Result<(), InterfaceError> {
+    for stage in stages {
+        ble_write_for_generation(conn, stage, BleOperationStage::Configure, running).await?;
+        tokio::time::sleep(BLE_CONTROL_STAGE_SETTLE).await;
+    }
+    tokio::time::sleep(BLE_POST_INIT_SETTLE).await;
+    Ok(())
+}
+
+async fn ble_send_radio_off(conn: &mut BleRNodeConnection) {
     let seq = rnode::build_detach_sequence();
     match ble_write(&conn.peripheral, &conn.rx_char, &seq, conn.write_mtu).await {
         Ok(()) => ble_diag("[ble] detach sent before disconnect"),
         Err(e) => ble_diag(format!("[ble] detach before disconnect failed: {e}")),
     }
+}
+
+async fn bounded_ble_disconnect(peripheral: &Peripheral) {
+    let _ = tokio::time::timeout(
+        BleOperationStage::Disconnect.deadline(),
+        peripheral.disconnect(),
+    )
+    .await;
 }
 
 fn publish_ble_stopped(publisher: &mut RNodeSnapshotPublisher, reason: RNodeRuntimeReason) {
@@ -1678,12 +1941,85 @@ fn project_active_ble_rnode_frame(
     packet_admission.allows_packet()
 }
 
+enum BleHandshakeOutcome {
+    Observed,
+    Retry(&'static str),
+    Stopped,
+}
+
+async fn observe_desktop_ble_handshake<S, E>(
+    notification_stream: &mut S,
+    adapter_events: &mut E,
+    target_id: &PeripheralId,
+    running: &AtomicBool,
+    protocol_state: &mut RNodeProtocolState,
+    deframer: &mut kiss::RawKissDeframer,
+) -> BleHandshakeOutcome
+where
+    S: futures::Stream<Item = ValueNotification> + Unpin,
+    E: futures::Stream<Item = CentralEvent> + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + BleOperationStage::Detect.deadline();
+    loop {
+        let evidence = protocol_state.evidence();
+        if evidence.detected {
+            if let Some(firmware) = evidence.firmware {
+                return if firmware.is_supported() {
+                    BleHandshakeOutcome::Observed
+                } else {
+                    BleHandshakeOutcome::Retry("RNode firmware is unsupported")
+                };
+            }
+        }
+        if evidence.radio_initialisation_fault {
+            return BleHandshakeOutcome::Retry("RNode reported a radio initialisation fault");
+        }
+
+        tokio::select! {
+            notification = notification_stream.next() => match notification {
+                Some(notification) if notification.uuid == NUS_TX_CHAR_UUID => {
+                    for (command, frame) in deframer.feed(&notification.value) {
+                        protocol_state.apply_frame(command, &frame);
+                    }
+                }
+                Some(_) => {}
+                None => return BleHandshakeOutcome::Retry(
+                    "notification stream ended before detect evidence",
+                ),
+            },
+            event = adapter_events.next() => match event {
+                Some(CentralEvent::DeviceDisconnected(peripheral_id))
+                    if &peripheral_id == target_id =>
+                {
+                    return BleHandshakeOutcome::Retry(
+                        "target disconnected before detect evidence",
+                    );
+                }
+                Some(_) => {}
+                None => return BleHandshakeOutcome::Retry(
+                    "adapter event stream ended before detect evidence",
+                ),
+            },
+            _ = tokio::time::sleep(RUNNING_POLL) => {
+                if !running.load(Ordering::SeqCst) {
+                    return BleHandshakeOutcome::Stopped;
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return BleHandshakeOutcome::Retry("detect evidence timed out");
+            }
+        }
+    }
+}
+
 #[derive(Default, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct BleStartupProjection {
     complete_frames: usize,
     legacy_packets_suppressed: usize,
 }
 
+#[cfg(test)]
 fn project_ble_rnode_startup_bytes(
     publisher: &RNodeSnapshotPublisher,
     protocol_state: &mut RNodeProtocolState,
@@ -1765,8 +2101,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
     let shared_txb = Arc::new(AtomicU64::new(0));
     let task_rxb = shared_rxb.clone();
     let task_txb = shared_txb.clone();
-    let (tx, rx) = mpsc::channel::<Bytes>(256);
-    let rx = Arc::new(tokio::sync::Mutex::new(rx));
+    let (tx, mut outbound_rx) = mpsc::channel::<Bytes>(256);
     let running = register_running(id);
     let (snapshot_publisher, driver) = rnode::new_rnode_driver_observation_with_shutdown(
         RNodeTransportClass::Ble,
@@ -1779,7 +2114,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
         config.bandwidth,
     );
 
-    let init_seq_template = build_ble_rnode_init_sequence(&config);
+    let init_stage_template = build_ble_rnode_init_stages(&config);
 
     let name = config.name.clone();
     let mode = config.mode;
@@ -1794,6 +2129,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
         let mut tries: usize = 0;
         let mut backoff = RECONNECT_WAIT;
         let mut initial_attempt = true;
+        let mut generation_counter = BleGenerationId::default();
 
         // Drop guard: every early return must clear the running-flag map
         // entry, or stale entries confuse later spawns reusing the id.
@@ -1804,6 +2140,9 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             }
         }
         let _cleanup = Cleanup(id, running_task.clone());
+
+        let mut pending_outbound: Option<PendingOutbound> = None;
+        let mut first_tx: Option<tokio::time::Instant> = None;
 
         loop {
             if !running_task.load(Ordering::SeqCst) {
@@ -1840,7 +2179,10 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                 }
             };
 
-            let conn = match connect_rnode(&adapter, &ble_uri).await {
+            let generation_id = generation_counter.next();
+            let mut conn = match connect_rnode(&adapter, &ble_uri, &running_task, generation_id)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     let pairing_transition = is_pairing_transition_error(&e);
@@ -1876,7 +2218,16 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             // btleplug creates a fresh event/broadcast receiver when
             // `notifications()` is called. Acquire it before detect/init so
             // startup evidence cannot race ahead of the observation stream.
-            let mut notification_stream = match conn.peripheral.notifications().await {
+            let target_peripheral_id = conn.peripheral.id();
+            let mut notification_stream = match run_generation_operation(
+                BleOperationStage::NotificationAcquisition,
+                conn.peripheral.notifications(),
+                &mut conn.adapter_events,
+                &running_task,
+                |event| matches!(event, CentralEvent::DeviceDisconnected(id) if id == &target_peripheral_id),
+            )
+            .await
+            {
                 Ok(stream) => stream,
                 Err(e) => {
                     snapshot_publisher.connection_attempt_failed();
@@ -1900,11 +2251,17 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                     continue;
                 }
             };
-
+            let mut protocol_state = RNodeProtocolState::new(protocol_target);
+            let mut deframer = kiss::RawKissDeframer::new();
             ble_diag("[ble] sending detect sequence");
             let detect_seq = rnode::build_detect_sequence();
-            if let Err(e) =
-                ble_write(&conn.peripheral, &conn.rx_char, &detect_seq, conn.write_mtu).await
+            if let Err(e) = ble_write_for_generation(
+                &mut conn,
+                &detect_seq,
+                BleOperationStage::Detect,
+                &running_task,
+            )
+            .await
             {
                 snapshot_publisher.connection_attempt_failed();
                 tracing::warn!(error = %e, "BLE RNode detect write failed");
@@ -1933,11 +2290,11 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                     publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
                     return;
                 }
-                if let Err(error) = ble_write(
-                    &conn.peripheral,
-                    &conn.rx_char,
+                if let Err(error) = ble_write_for_generation(
+                    &mut conn,
                     &build_rnode_capability_request(),
-                    conn.write_mtu,
+                    BleOperationStage::Capability,
+                    &running_task,
                 )
                 .await
                 {
@@ -1967,6 +2324,8 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
 
                 match observe_desktop_ble_capability(
                     &mut notification_stream,
+                    &mut conn.adapter_events,
+                    |event| matches!(event, CentralEvent::DeviceDisconnected(id) if id == &target_peripheral_id),
                     ble_radio_settings(&config),
                     &running_task,
                     RNODE_BLE_CAPABILITY_PREFLIGHT_TIMEOUT,
@@ -2031,11 +2390,57 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                     }
                 }
             } else {
-                None
+                match observe_desktop_ble_handshake(
+                    &mut notification_stream,
+                    &mut conn.adapter_events,
+                    &target_peripheral_id,
+                    &running_task,
+                    &mut protocol_state,
+                    &mut deframer,
+                )
+                .await
+                {
+                    BleHandshakeOutcome::Observed => None,
+                    BleHandshakeOutcome::Stopped => {
+                        bounded_ble_disconnect(&conn.peripheral).await;
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    BleHandshakeOutcome::Retry(reason) => {
+                        snapshot_publisher.connection_attempt_failed();
+                        tracing::warn!(
+                            name = %log_name,
+                            reason,
+                            "BLE RNode detect handshake will retry"
+                        );
+                        bounded_ble_disconnect(&conn.peripheral).await;
+                        if reconnect_try_exhausted(&mut tries) {
+                            snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                            return;
+                        }
+                        if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                            publish_ble_stopped(
+                                &mut snapshot_publisher,
+                                RNodeRuntimeReason::StopRequested,
+                            );
+                            return;
+                        }
+                        backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                        continue;
+                    }
+                }
             };
 
-            // A strict preflight stop cannot mutate the radio. The legacy path
-            // intentionally retains its historical detect/init sequence.
+            let admitted_capability = capability_admission.map(|(state, admission)| {
+                protocol_state = state;
+                admission
+            });
+
+            // A strict preflight stop cannot mutate the radio. Both policies
+            // have now observed detect/firmware evidence before this boundary.
             if options.requires_capability_admission() && !running_task.load(Ordering::SeqCst) {
                 let _ = tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
                     .await;
@@ -2043,38 +2448,96 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                 return;
             }
 
-            ble_diag("[ble] sending init sequence");
-            if options.requires_capability_admission() {
-                if !running_task.load(Ordering::SeqCst) {
+            ble_diag("[ble] reasserting radio without RADIO_OFF");
+            if let Err(error) =
+                ble_reassert_radio(&mut conn, &init_stage_template, &running_task).await
+            {
+                // A failed BLE generation is abandoned without sending OFF.
+                // The RNode keeps the last complete radio state online while
+                // this client reconnects and reasserts the full desired set.
+                snapshot_publisher.connection_attempt_failed();
+                tracing::warn!(error = %error, "BLE RNode radio reassertion failed");
+                ble_diag(format!("[ble] radio reassertion failed: {error}"));
+                let _ = tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
+                    .await;
+                if reconnect_try_exhausted(&mut tries) {
+                    snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                    return;
+                }
+                if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                    publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
+                    return;
+                }
+                backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                continue;
+            }
+            ble_diag("[ble] radio reassertion sent ok — awaiting typed readiness");
+
+            enum StartupReadinessOutcome {
+                Ready,
+                Retry(&'static str),
+                Stopped,
+            }
+            let readiness_deadline = tokio::time::Instant::now() + RNODE_BLE_READINESS_TIMEOUT;
+            let startup_outcome = loop {
+                if matches!(protocol_state.readiness(), RNodeReadiness::Ready) {
+                    break StartupReadinessOutcome::Ready;
+                }
+                tokio::select! {
+                    notification = notification_stream.next() => match notification {
+                        Some(notification) if notification.uuid == NUS_TX_CHAR_UUID => {
+                            for (command, frame) in deframer.feed(&notification.value) {
+                                // Startup owns control evidence only. Data is
+                                // discarded until the complete typed target is
+                                // Ready, so no application traffic crosses an
+                                // unvalidated generation boundary.
+                                protocol_state.apply_frame(command, &frame);
+                            }
+                        }
+                        Some(_) => {}
+                        None => break StartupReadinessOutcome::Retry(
+                            "notification stream ended before Ready",
+                        ),
+                    },
+                    event = conn.adapter_events.next() => match event {
+                        Some(CentralEvent::DeviceDisconnected(peripheral_id))
+                            if peripheral_id == target_peripheral_id =>
+                        {
+                            break StartupReadinessOutcome::Retry(
+                                "target disconnected before Ready",
+                            );
+                        }
+                        Some(_) => {}
+                        None => break StartupReadinessOutcome::Retry(
+                            "adapter event stream ended before Ready",
+                        ),
+                    },
+                    _ = tokio::time::sleep(RUNNING_POLL) => {
+                        if !running_task.load(Ordering::SeqCst) {
+                            break StartupReadinessOutcome::Stopped;
+                        }
+                    }
+                    _ = tokio::time::sleep_until(readiness_deadline) => {
+                        break StartupReadinessOutcome::Retry("typed readiness timed out");
+                    }
+                }
+            };
+
+            match startup_outcome {
+                StartupReadinessOutcome::Ready => {}
+                StartupReadinessOutcome::Stopped => {
                     snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                    ble_send_radio_off(&conn).await;
+                    ble_send_radio_off(&mut conn).await;
                     let _ =
                         tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
                             .await;
                     snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
                     return;
                 }
-
-                let init_seq = init_seq_template.clone();
-                if let Err(error) =
-                    ble_write(&conn.peripheral, &conn.rx_char, &init_seq, conn.write_mtu).await
-                {
-                    // A chunked write can fail after a mutating prefix. Always
-                    // return the radio to detached/off before retrying.
-                    ble_send_radio_off(&conn).await;
-                    if !running_task.load(Ordering::SeqCst) {
-                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(3),
-                            conn.peripheral.disconnect(),
-                        )
-                        .await;
-                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
-                        return;
-                    }
+                StartupReadinessOutcome::Retry(reason) => {
                     snapshot_publisher.connection_attempt_failed();
-                    tracing::warn!(error = %error, "BLE RNode init write failed");
-                    ble_diag(format!("[ble] init write failed: {error}"));
+                    tracing::warn!(name = %log_name, reason, "BLE RNode did not reach Ready");
+                    ble_diag(format!("[ble] readiness retry: {reason}"));
                     let _ =
                         tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
                             .await;
@@ -2092,169 +2555,42 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                     backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
                     continue;
                 }
+            }
+
+            // Never carry a partial startup frame into the admitted session.
+            deframer.reset();
+            if let Some(admission) = admitted_capability {
+                snapshot_publisher.capability_connection_established(&protocol_state, admission);
             } else {
-                // Preserve the legacy single-write init exactly.
-                let init_seq = init_seq_template.clone();
-                if let Err(e) =
-                    ble_write(&conn.peripheral, &conn.rx_char, &init_seq, conn.write_mtu).await
-                {
-                    snapshot_publisher.connection_attempt_failed();
-                    tracing::warn!(error = %e, "BLE RNode init write failed");
-                    ble_diag(format!("[ble] init write failed: {e}"));
-                    let _ =
-                        tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
-                            .await;
-                    if reconnect_try_exhausted(&mut tries) {
-                        tracing::warn!(name = %log_name, "BLE RNode: max reconnect tries reached");
-                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
-                        return;
-                    }
-                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
-                        publish_ble_stopped(
-                            &mut snapshot_publisher,
-                            RNodeRuntimeReason::StopRequested,
-                        );
-                        return;
-                    }
-                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
-                    continue;
-                }
+                snapshot_publisher.connection_established();
+                snapshot_publisher.sync_protocol_state(&protocol_state);
             }
-            ble_diag("[ble] init sent ok — marking online");
-
-            // Once init has been attempted, shutdown must make a best-effort
-            // radio-off/detach before releasing the BLE owner.
-            if options.requires_capability_admission() && !running_task.load(Ordering::SeqCst) {
-                snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                ble_send_radio_off(&conn).await;
-                let _ = tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect())
-                    .await;
-                snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
-                return;
-            }
-
+            online_handle.store(true, Ordering::SeqCst);
+            tries = 0;
+            backoff = RECONNECT_WAIT;
             tracing::info!(
                 name = %log_name,
                 ble_uri = %ble_uri,
                 bitrate_bps = bitrate,
-                "BLE RNode connection established"
+                "BLE RNode typed Ready"
             );
 
-            tries = 0;
-            backoff = RECONNECT_WAIT;
-            let mut protocol_state = match capability_admission {
-                Some((protocol_state, admission)) => {
-                    snapshot_publisher
-                        .capability_connection_established(&protocol_state, admission);
-                    online_handle.store(true, Ordering::SeqCst);
-                    protocol_state
-                }
-                None => {
-                    // Preserve the legacy publication order exactly.
-                    online_handle.store(true, Ordering::SeqCst);
-                    snapshot_publisher.connection_established();
-                    RNodeProtocolState::new(protocol_target)
-                }
-            };
-            let mut deframer = kiss::RawKissDeframer::new();
             let mut active_packet_admission = ActiveBlePacketAdmission::for_startup_policy(
                 options.requires_capability_admission(),
             );
             active_packet_admission.observe_readiness(protocol_state.readiness());
 
-            let ready = Arc::new(AtomicBool::new(true));
-
-            let peripheral_write = conn.peripheral.clone();
-            let rx_char_write = conn.rx_char.clone();
-            let write_mtu = conn.write_mtu;
-            let (conn_tx, mut conn_rx) = mpsc::channel::<Bytes>(256);
-
-            let online_w = online_handle.clone();
-            let ready_w = ready.clone();
-            let txb_w = task_txb.clone();
-            let beacon_w = beacon.clone();
-            let write_handle = tokio::spawn(async move {
-                // Python first_tx semantics: armed by data TX, cleared when
-                // the callsign beacon goes out (RNodeInterface.py:712-718).
-                let mut first_tx: Option<tokio::time::Instant> = None;
-                loop {
-                    let data = if let Some((interval, ref callsign)) = beacon_w {
-                        match tokio::time::timeout(Duration::from_secs(1), conn_rx.recv()).await {
-                            Ok(Some(data)) => data,
-                            Ok(None) => break,
-                            Err(_) => {
-                                if first_tx.is_none_or(|t| t.elapsed() < interval) {
-                                    continue;
-                                }
-                                tracing::debug!("BLE RNode transmitting station-ID beacon");
-                                callsign.clone()
-                            }
-                        }
-                    } else {
-                        match conn_rx.recv().await {
-                            Some(data) => data,
-                            None => break,
-                        }
-                    };
-                    if let Some((_, ref callsign)) = beacon_w {
-                        if data == *callsign {
-                            first_tx = None;
-                        } else if first_tx.is_none() {
-                            first_tx = Some(tokio::time::Instant::now());
-                        }
-                    }
-                    while !claim_ble_packet_permit(flow_control, ready_w.as_ref()) {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        if !online_w.load(Ordering::SeqCst) {
-                            return;
-                        }
-                    }
-                    txb_w.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    let framed = kiss::frame(&data);
-                    if let Err(e) =
-                        ble_write(&peripheral_write, &rx_char_write, &framed, write_mtu).await
-                    {
-                        tracing::warn!(error = %e, "BLE RNode write error");
-                        online_w.store(false, Ordering::SeqCst);
-                        return;
-                    }
-                }
-            });
-
-            let rx_ref = rx.clone();
-            let fwd_handle = tokio::spawn(async move {
-                let mut guard = rx_ref.lock().await;
-                while let Some(data) = guard.recv().await {
-                    if conn_tx.send(data).await.is_err() {
-                        break;
-                    }
-                }
-            });
+            let ready = AtomicBool::new(true);
 
             let mut last_rssi: Option<f32> = None;
             let mut last_snr: Option<f32> = None;
             let mut transport_closed = false;
 
-            // Preserve the historical immediate startup drain only for the
-            // default policy. Explicit admission already drained its private
-            // preflight tail; every queued post-init notification now belongs
-            // to the single normal handler below.
-            if !options.requires_capability_admission() {
-                loop {
-                    match notification_stream.next().now_or_never() {
-                        Some(Some(notification)) if notification.uuid == NUS_TX_CHAR_UUID => {
-                            let _projection = project_ble_rnode_startup_bytes(
-                                &snapshot_publisher,
-                                &mut protocol_state,
-                                &mut deframer,
-                                &notification.value,
-                            );
-                        }
-                        Some(Some(_)) => {}
-                        Some(None) | None => break,
-                    }
-                }
-                deframer.reset();
+            enum GenerationEvent {
+                Notification(Option<ValueNotification>),
+                Adapter(Option<CentralEvent>),
+                Outbound(Option<Bytes>),
+                Poll,
             }
 
             'read: loop {
@@ -2263,30 +2599,21 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                 }
                 if !running_task.load(Ordering::SeqCst) {
                     snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                    ble_send_radio_off(&conn).await;
+                    ble_send_radio_off(&mut conn).await;
                     break 'read;
                 }
 
-                let notification = tokio::select! {
-                    n = notification_stream.next() => n,
-                    _ = tokio::time::sleep(RUNNING_POLL) => {
-                        // Polling slice — bounds disable-while-connected
-                        // teardown latency.
-                        if !running_task.load(Ordering::SeqCst) {
-                            snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                            ble_send_radio_off(&conn).await;
-                            break 'read;
-                        }
-                        if conn.peripheral.is_connected().await.unwrap_or(false) {
-                            continue;
-                        }
-                        tracing::warn!("BLE RNode connection lost (notification timeout)");
-                        break 'read;
+                let event = tokio::select! {
+                    n = notification_stream.next() => GenerationEvent::Notification(n),
+                    e = conn.adapter_events.next() => GenerationEvent::Adapter(e),
+                    data = outbound_rx.recv(), if pending_outbound.is_none() => {
+                        GenerationEvent::Outbound(data)
                     }
+                    _ = tokio::time::sleep(RUNNING_POLL) => GenerationEvent::Poll,
                 };
 
-                match notification {
-                    Some(n) if n.uuid == NUS_TX_CHAR_UUID => {
+                match event {
+                    GenerationEvent::Notification(Some(n)) if n.uuid == NUS_TX_CHAR_UUID => {
                         for (cmd, frame) in deframer.feed(&n.value) {
                             let data_allowed = project_active_ble_rnode_frame(
                                 &snapshot_publisher,
@@ -2319,21 +2646,84 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                             }
                         }
                     }
-                    Some(_) => {}
-                    None => {
+                    GenerationEvent::Notification(Some(_)) => {}
+                    GenerationEvent::Notification(None) => {
                         tracing::warn!("BLE RNode notification stream ended");
                         break 'read;
+                    }
+                    GenerationEvent::Adapter(Some(CentralEvent::DeviceDisconnected(
+                        peripheral_id,
+                    ))) if peripheral_id == target_peripheral_id => {
+                        tracing::warn!("BLE RNode disconnected; ending connection generation");
+                        ble_diag("[ble] target DeviceDisconnected — reconnecting");
+                        break 'read;
+                    }
+                    GenerationEvent::Adapter(Some(_)) => {}
+                    GenerationEvent::Adapter(None) => {
+                        tracing::warn!("BLE adapter event stream ended");
+                        break 'read;
+                    }
+                    GenerationEvent::Outbound(Some(data)) => {
+                        pending_outbound = Some(PendingOutbound::new(data, false));
+                    }
+                    GenerationEvent::Outbound(None) => {
+                        tracing::warn!(id, "BLE RNode outbound channel closed");
+                        transport_closed = true;
+                        break 'read;
+                    }
+                    GenerationEvent::Poll => {
+                        if pending_outbound.is_none() {
+                            if let (Some((interval, callsign)), Some(first)) =
+                                (beacon.as_ref(), first_tx)
+                            {
+                                if first.elapsed() >= *interval {
+                                    tracing::debug!("BLE RNode scheduling station-ID beacon");
+                                    pending_outbound =
+                                        Some(PendingOutbound::new(callsign.clone(), true));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if pending_outbound.is_some() && claim_ble_packet_permit(flow_control, &ready) {
+                    let pending = pending_outbound
+                        .as_ref()
+                        .expect("pending BLE outbound checked above");
+                    let framed = kiss::frame(pending.payload());
+                    match ble_write_for_generation(
+                        &mut conn,
+                        &framed,
+                        BleOperationStage::ActiveWrite,
+                        &running_task,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            // Count only a complete acknowledged frame. If the
+                            // generation fails before this boundary, retain the
+                            // original payload and retry its full KISS frame.
+                            task_txb.fetch_add(pending.payload().len() as u64, Ordering::Relaxed);
+                            if pending.is_station_id() {
+                                first_tx = None;
+                            } else if first_tx.is_none() {
+                                first_tx = Some(tokio::time::Instant::now());
+                            }
+                            pending_outbound = None;
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "BLE RNode write failed; retaining payload");
+                            ble_diag(format!(
+                                "[ble] outbound write failed; payload retained: {error}"
+                            ));
+                            break 'read;
+                        }
                     }
                 }
             }
 
             online_handle.store(false, Ordering::SeqCst);
-            fwd_handle.abort();
-            let _ = fwd_handle.await;
-            write_handle.abort();
-            let _ = write_handle.await;
-            let _ =
-                tokio::time::timeout(Duration::from_secs(3), conn.peripheral.disconnect()).await;
+            bounded_ble_disconnect(&conn.peripheral).await;
 
             if transport_closed {
                 publish_ble_stopped(
@@ -3024,6 +3414,52 @@ mod tests {
     }
 
     #[test]
+    fn ble_write_chunk_size_matches_platform_transport_guarantee() {
+        #[cfg(any(target_os = "ios", target_os = "macos"))]
+        {
+            assert_eq!(ble_write_chunk_size(), BLE_DEFAULT_ATT_WRITE_PAYLOAD);
+            assert!(matches!(ble_write_type(), WriteType::WithResponse));
+        }
+
+        #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+        {
+            assert_eq!(ble_write_chunk_size(), BLE_RNODE_ATT_WRITE_PAYLOAD);
+            assert!(matches!(ble_write_type(), WriteType::WithoutResponse));
+        }
+    }
+
+    #[test]
+    fn ble_init_stages_fit_the_apple_baseline_and_never_turn_radio_off() {
+        let stages = build_ble_rnode_init_stages(&BleRNodeConfig::new("ble0", "ble://RNode"));
+        assert!(
+            stages
+                .iter()
+                .all(|stage| stage.len() <= BLE_DEFAULT_ATT_WRITE_PAYLOAD)
+        );
+        let mut deframer = kiss::RawKissDeframer::new();
+        let frames: Vec<_> = stages
+            .iter()
+            .flat_map(|stage| deframer.feed(stage))
+            .collect();
+        assert!(frames.iter().all(|(command, payload)| {
+            *command != rnode::CMD_RADIO_STATE || payload.as_slice() != [rnode::RADIO_STATE_OFF]
+        }));
+    }
+
+    #[test]
+    fn fresh_bond_disconnect_uses_fast_pairing_transition_retry() {
+        let transition = InterfaceError::SendFailed(
+            "BLE pairing in progress: RNode completed fresh bond and disconnected; reconnecting"
+                .into(),
+        );
+        assert!(is_pairing_transition_error(&transition));
+
+        let ordinary_disconnect =
+            InterfaceError::SendFailed("BLE connect failed: device disconnected".into());
+        assert!(!is_pairing_transition_error(&ordinary_disconnect));
+    }
+
+    #[test]
     fn active_packet_admission_latches_for_one_physical_generation() {
         let mut startup = ActiveBlePacketAdmission::for_startup_policy(true);
         assert!(!startup.allows_packet());
@@ -3444,14 +3880,20 @@ mod tests {
         let rnode_cfg = rnode_config_from_ble_config(&ble_cfg);
         let seq = build_ble_rnode_init_sequence(&ble_cfg);
         assert!(!seq.is_empty());
-        assert_eq!(seq, rnode::build_init_sequence(&rnode_cfg));
+        assert_eq!(
+            seq,
+            rnode::build_ble_radio_reassertion_stages(&rnode_cfg).concat()
+        );
 
         let mut deframer = kiss::RawKissDeframer::new();
         let frames = deframer.feed(&seq);
-        assert_eq!(frames.len(), 7);
+        assert_eq!(frames.len(), 6);
         assert_eq!(
             frames[0],
-            (rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_OFF])
+            (
+                rnode::CMD_FREQUENCY,
+                ble_cfg.frequency.to_be_bytes().to_vec()
+            )
         );
         assert_eq!(
             frames.last().unwrap(),
@@ -3477,10 +3919,10 @@ mod tests {
 
         let mut deframer = kiss::RawKissDeframer::new();
         let frames = deframer.feed(&seq);
-        assert_eq!(frames.len(), 9);
+        assert_eq!(frames.len(), 8);
         assert_eq!(
             frames[0],
-            (rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_OFF])
+            (rnode::CMD_FREQUENCY, cfg.frequency.to_be_bytes().to_vec())
         );
         assert_eq!(
             frames.last().unwrap(),
@@ -3783,7 +4225,10 @@ mod tests {
 
         assert_eq!(
             frames.first(),
-            Some(&(rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_OFF]))
+            Some(&(
+                rnode::CMD_FREQUENCY,
+                config.frequency.to_be_bytes().to_vec()
+            ))
         );
         assert_eq!(
             frames.last(),
@@ -3794,6 +4239,9 @@ mod tests {
                 *command,
                 rnode::CMD_READY | rnode::CMD_STAT_TX | rnode::CMD_ROM_READ
             )
+        }));
+        assert!(frames.iter().all(|(command, payload)| {
+            *command != rnode::CMD_RADIO_STATE || payload.as_slice() != [rnode::RADIO_STATE_OFF]
         }));
     }
 
@@ -3971,10 +4419,13 @@ mod tests {
             });
             let mut notifications = futures::stream::iter(queued.into_iter())
                 .chain(futures::stream::pending::<ValueNotification>());
+            let mut events = futures::stream::pending::<()>();
             let running = AtomicBool::new(true);
             let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
             let outcome = observe_desktop_ble_capability(
                 &mut notifications,
+                &mut events,
+                |_| false,
                 ble_radio_settings(&config),
                 &running,
                 Duration::from_secs(1),
@@ -4026,6 +4477,7 @@ mod tests {
         let config = BleRNodeConfig::new("ble0", "ble://RNode 1234");
         let settings = ble_radio_settings(&config);
         let running = AtomicBool::new(true);
+        let mut events = futures::stream::pending::<()>();
 
         let mut invalid_bytes = kiss::frame_with_command(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
         invalid_bytes.extend(kiss::frame_with_command(
@@ -4037,6 +4489,8 @@ mod tests {
         assert!(matches!(
             observe_desktop_ble_capability(
                 &mut invalid,
+                &mut events,
+                |_| false,
                 settings,
                 &running,
                 Duration::from_secs(1)
@@ -4058,6 +4512,8 @@ mod tests {
         assert!(matches!(
             observe_desktop_ble_capability(
                 &mut duplicate_tail,
+                &mut events,
+                |_| false,
                 settings,
                 &running,
                 Duration::from_secs(1),
@@ -4070,8 +4526,15 @@ mod tests {
 
         let mut ended = futures::stream::empty::<ValueNotification>();
         assert!(matches!(
-            observe_desktop_ble_capability(&mut ended, settings, &running, Duration::from_secs(1))
-                .await,
+            observe_desktop_ble_capability(
+                &mut ended,
+                &mut events,
+                |_| false,
+                settings,
+                &running,
+                Duration::from_secs(1),
+            )
+            .await,
             BleCapabilityPreflightOutcome::Retry(BleCapabilityRetry::TransportEnded)
         ));
 
@@ -4079,6 +4542,8 @@ mod tests {
         assert!(matches!(
             observe_desktop_ble_capability(
                 &mut pending,
+                &mut events,
+                |_| false,
                 settings,
                 &running,
                 Duration::from_millis(5)
@@ -4955,9 +5420,15 @@ mod tests {
     #[ignore]
     async fn test_ble_connect_to_rnode() {
         let adapter = get_adapter().await.expect("No BLE adapter");
-        let conn = connect_rnode(&adapter, "ble://")
-            .await
-            .expect("No RNode found. Pair an RNode first.");
+        let running = AtomicBool::new(true);
+        let conn = connect_rnode(
+            &adapter,
+            "ble://",
+            &running,
+            BleGenerationId::default().next(),
+        )
+        .await
+        .expect("No RNode found. Pair an RNode first.");
         assert!(conn.peripheral.is_connected().await.unwrap_or(false));
         conn.peripheral.disconnect().await.ok();
     }
