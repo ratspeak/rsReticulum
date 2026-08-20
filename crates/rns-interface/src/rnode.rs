@@ -605,6 +605,14 @@ fn project_rnode_protocol_state(
     *snapshot != before
 }
 
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn sync_rnode_interface_online(online: &AtomicBool, state: &RNodeProtocolState) {
+    online.store(
+        matches!(state.readiness(), RNodeReadiness::Ready),
+        Ordering::SeqCst,
+    );
+}
+
 #[cfg(any(
     feature = "serial",
     feature = "rnode-tcp",
@@ -1253,7 +1261,7 @@ struct RNodeControlWriteRequest {
 enum RNodeWriterExit {
     Detached,
     Cancelled,
-    Offline,
+    CarrierOffline,
     LanesClosed,
 }
 
@@ -1269,7 +1277,15 @@ struct RNodeWriterContext {
     id: InterfaceId,
     flow_control: bool,
     ready: Arc<AtomicBool>,
-    online: Arc<AtomicBool>,
+    /// Physical stream liveness for the active connection generation.
+    ///
+    /// This deliberately remains separate from `interface_online`: startup
+    /// controls must be writable while the public interface is still waiting
+    /// for complete protocol evidence.
+    carrier_online: Arc<AtomicBool>,
+    /// Public/protocol readiness. Packet writes are held until the exact
+    /// reducer state is ready, matching upstream's `interface_ready` gate.
+    interface_online: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     txb: Arc<AtomicU64>,
     beacon: Option<(Duration, Bytes)>,
@@ -1613,6 +1629,8 @@ where
         }
 
         let packet_permitted = pending_packet.is_some()
+            && context.carrier_online.load(Ordering::SeqCst)
+            && context.interface_online.load(Ordering::SeqCst)
             && (!context.flow_control
                 || context
                     .ready
@@ -1637,8 +1655,8 @@ where
             continue;
         }
 
-        if pending_packet.is_some() && !context.online.load(Ordering::SeqCst) {
-            return Ok(RNodeWriterExit::Offline);
+        if pending_packet.is_some() && !context.carrier_online.load(Ordering::SeqCst) {
+            return Ok(RNodeWriterExit::CarrierOffline);
         }
         if !packet_lane_open && !control_lane_open && pending_packet.is_none() {
             return Ok(RNodeWriterExit::LanesClosed);
@@ -1752,7 +1770,8 @@ where
     let ready = context.ready.clone();
     let cancelled = context.cancelled.clone();
     let idle_probes_enabled = context.idle_probes_enabled.clone();
-    let online = context.online.clone();
+    let carrier_online = context.carrier_online.clone();
+    let interface_online = context.interface_online.clone();
     let id = context.id;
     let task = tokio::spawn(async move {
         let result = run_rnode_writer(writer, packet_rx, control_rx, context).await;
@@ -1763,7 +1782,8 @@ where
                 failure = ?failure.kind,
                 "RNode writer failed"
             );
-            online.store(false, Ordering::SeqCst);
+            carrier_online.store(false, Ordering::SeqCst);
+            interface_online.store(false, Ordering::SeqCst);
         }
         result
     });
@@ -1783,7 +1803,8 @@ fn spawn_rnode_generation_writer(
     port: &RNodeStream,
     config: &RNodeConfig,
     id: InterfaceId,
-    online: Arc<AtomicBool>,
+    carrier_online: Arc<AtomicBool>,
+    interface_online: Arc<AtomicBool>,
     txb: Arc<AtomicU64>,
     beacon: Option<(Duration, Bytes)>,
     idle_probes_enabled: bool,
@@ -1797,9 +1818,10 @@ fn spawn_rnode_generation_writer(
             flow_control: config.flow_control,
             // Upstream flow control starts with one permissive packet token;
             // exact-width CMD_READY frames replenish or revoke that token.
-            // Reducer readiness remains observational.
+            // This token is independent of the exact protocol-readiness gate.
             ready: Arc::new(AtomicBool::new(true)),
-            online,
+            carrier_online,
+            interface_online,
             cancelled: Arc::new(AtomicBool::new(false)),
             txb,
             beacon,
@@ -2310,7 +2332,8 @@ async fn start_rnode_generation(
     port: RNodeStream,
     config: &RNodeConfig,
     id: InterfaceId,
-    online: &Arc<AtomicBool>,
+    carrier_online: &Arc<AtomicBool>,
+    interface_online: &Arc<AtomicBool>,
     txb: &Arc<AtomicU64>,
     beacon: &Option<(Duration, Bytes)>,
 ) -> Result<(RNodeStream, RNodeGenerationWriter), crate::traits::InterfaceError> {
@@ -2318,7 +2341,8 @@ async fn start_rnode_generation(
         &port,
         config,
         id,
-        online.clone(),
+        carrier_online.clone(),
+        interface_online.clone(),
         txb.clone(),
         beacon.clone(),
         true,
@@ -2328,7 +2352,8 @@ async fn start_rnode_generation(
     })?;
 
     if let Err(failure) = initialise_rnode_writer(&writer, config).await {
-        online.store(false, Ordering::SeqCst);
+        carrier_online.store(false, Ordering::SeqCst);
+        interface_online.store(false, Ordering::SeqCst);
         finish_rnode_writer(writer).await;
         return Err(crate::traits::InterfaceError::SendFailed(format!(
             "rnode writer startup: {failure}"
@@ -2504,7 +2529,8 @@ async fn start_strict_rnode_generation(
     port: RNodeStream,
     config: &RNodeConfig,
     id: InterfaceId,
-    online: &Arc<AtomicBool>,
+    carrier_online: &Arc<AtomicBool>,
+    interface_online: &Arc<AtomicBool>,
     txb: &Arc<AtomicU64>,
     beacon: &Option<(Duration, Bytes)>,
 ) -> Result<(RNodeStrictAdmission, RNodeGenerationWriter), RNodeSpawnError> {
@@ -2512,7 +2538,8 @@ async fn start_strict_rnode_generation(
         &port,
         config,
         id,
-        online.clone(),
+        carrier_online.clone(),
+        interface_online.clone(),
         txb.clone(),
         beacon.clone(),
         false,
@@ -2524,7 +2551,8 @@ async fn start_strict_rnode_generation(
     match run_rnode_capability_preflight(port, &writer, config, None).await {
         Ok(admission) => Ok((admission, writer)),
         Err(error) => {
-            online.store(false, Ordering::SeqCst);
+            carrier_online.store(false, Ordering::SeqCst);
+            interface_online.store(false, Ordering::SeqCst);
             let _ = finish_rnode_writer(writer).await;
             Err(match error {
                 RNodeStrictPreflightError::Transport(error) => RNodeSpawnError::Interface(error),
@@ -3193,7 +3221,11 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
         "RNode on-air bitrate calculated"
     );
 
-    let online = Arc::new(AtomicBool::new(true));
+    // The physical stream is already open, but upstream does not expose an
+    // RNode as online until detection, firmware, configuration and radio state
+    // have all been validated. Keep those two states independent.
+    let carrier_online = Arc::new(AtomicBool::new(true));
+    let online = Arc::new(AtomicBool::new(false));
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
     let (tx, rx) = mpsc::channel::<Bytes>(256);
@@ -3221,8 +3253,16 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
     // detect/init write+flush stages; strict mode inserts bounded capability
     // admission after detect and before any init bytes.
     let (port, initial_writer, initial_protocol_seed) = if options.requires_capability_admission() {
-        let (admitted, writer) =
-            start_strict_rnode_generation(port, &config, id, &online, &shared_txb, &beacon).await?;
+        let (admitted, writer) = start_strict_rnode_generation(
+            port,
+            &config,
+            id,
+            &carrier_online,
+            &online,
+            &shared_txb,
+            &beacon,
+        )
+        .await?;
         (
             admitted.port,
             writer,
@@ -3232,8 +3272,16 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
             },
         )
     } else {
-        let (port, writer) =
-            start_rnode_generation(port, &config, id, &online, &shared_txb, &beacon).await?;
+        let (port, writer) = start_rnode_generation(
+            port,
+            &config,
+            id,
+            &carrier_online,
+            &online,
+            &shared_txb,
+            &beacon,
+        )
+        .await?;
         (port, writer, RNodeGenerationProtocolSeed::Legacy)
     };
 
@@ -3244,6 +3292,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
     );
     let stop_guard = register_rnode_stop(id, stop_tx);
     let online_r = online.clone();
+    let carrier_online_r = carrier_online.clone();
     let rxb_r = shared_rxb.clone();
     let txb_r = shared_txb.clone();
     let task_config = config.clone();
@@ -3278,6 +3327,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                     let opened = match open_result {
                         Ok(port) => port,
                         Err(e) => {
+                            carrier_online_r.store(false, Ordering::SeqCst);
                             online_r.store(false, Ordering::SeqCst);
                             snapshot_publisher.connection_attempt_failed();
                             tracing::warn!(
@@ -3302,6 +3352,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                         &opened,
                         &task_config,
                         id,
+                        carrier_online_r.clone(),
                         online_r.clone(),
                         txb_r.clone(),
                         beacon.clone(),
@@ -3309,6 +3360,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                     ) {
                         Ok(writer) => writer,
                         Err(e) => {
+                            carrier_online_r.store(false, Ordering::SeqCst);
                             online_r.store(false, Ordering::SeqCst);
                             snapshot_publisher.connection_attempt_failed();
                             tracing::warn!(
@@ -3372,6 +3424,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                             Err(RNodeStrictPreflightError::Capability(
                                 RNodeCapabilityAdmissionError::ResponseTimedOut,
                             )) => {
+                                carrier_online_r.store(false, Ordering::SeqCst);
                                 online_r.store(false, Ordering::SeqCst);
                                 reconnect_writer.cancel();
                                 let writer_finish = finish_rnode_writer(reconnect_writer).await;
@@ -3398,6 +3451,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                                 continue;
                             }
                             Err(RNodeStrictPreflightError::Capability(error)) => {
+                                carrier_online_r.store(false, Ordering::SeqCst);
                                 online_r.store(false, Ordering::SeqCst);
                                 reconnect_writer.cancel();
                                 let writer_finish = finish_rnode_writer(reconnect_writer).await;
@@ -3416,6 +3470,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                                 return;
                             }
                             Err(RNodeStrictPreflightError::Transport(error)) => {
+                                carrier_online_r.store(false, Ordering::SeqCst);
                                 online_r.store(false, Ordering::SeqCst);
                                 reconnect_writer.cancel();
                                 let writer_finish = finish_rnode_writer(reconnect_writer).await;
@@ -3468,6 +3523,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                                 return;
                             }
                             Err(failure) => {
+                                carrier_online_r.store(false, Ordering::SeqCst);
                                 online_r.store(false, Ordering::SeqCst);
                                 reconnect_writer.cancel();
                                 let writer_finish = finish_rnode_writer(reconnect_writer).await;
@@ -3498,10 +3554,12 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                 }
             };
 
-            online_r.store(true, Ordering::SeqCst);
+            carrier_online_r.store(true, Ordering::SeqCst);
+            online_r.store(false, Ordering::SeqCst);
             let mut protocol_state = match protocol_seed {
                 RNodeGenerationProtocolSeed::Legacy => {
                     let state = RNodeProtocolState::new(protocol_target);
+                    sync_rnode_interface_online(&online_r, &state);
                     snapshot_publisher.connection_established();
                     state
                 }
@@ -3509,6 +3567,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                     protocol_state,
                     admission,
                 } => {
+                    sync_rnode_interface_online(&online_r, &protocol_state);
                     snapshot_publisher
                         .capability_connection_established(&protocol_state, admission);
                     protocol_state
@@ -3541,12 +3600,14 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
             loop {
                 if stop_rx.try_recv().is_ok() {
                     tracing::info!(name = %task_name, "RNode stop requested");
+                    online_r.store(false, Ordering::SeqCst);
                     snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
                     let _ = send_detach_request(&control_tx, id).await;
                     stop_requested = true;
                     break;
                 }
-                if generation_writer.task.is_finished() || !online_r.load(Ordering::SeqCst) {
+                if generation_writer.task.is_finished() || !carrier_online_r.load(Ordering::SeqCst)
+                {
                     break;
                 }
                 let result =
@@ -3559,6 +3620,9 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                         if n > 0 {
                             for (cmd, frame) in deframer.feed(&buf[..n]) {
                                 let effect = protocol_state.apply_frame(cmd, &frame);
+                                // Publish Ready only after the public handle and
+                                // packet gate reflect the same reducer state.
+                                sync_rnode_interface_online(&online_r, &protocol_state);
                                 snapshot_publisher.protocol_effect(&protocol_state, effect);
                                 match process_rnode_response(
                                     cmd,
@@ -3602,8 +3666,10 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
             }
 
             if transport_closed {
+                online_r.store(false, Ordering::SeqCst);
                 snapshot_publisher.shutting_down(RNodeRuntimeReason::TransportConsumerClosed);
             }
+            carrier_online_r.store(false, Ordering::SeqCst);
             online_r.store(false, Ordering::SeqCst);
             generation_writer.cancel();
             fwd_handle.abort_and_wait().await;
@@ -3879,7 +3945,7 @@ mod tests {
     fn scripted_writer_context(
         flow_control: bool,
         ready: Arc<AtomicBool>,
-        online: Arc<AtomicBool>,
+        carrier_online: Arc<AtomicBool>,
         txb: Arc<AtomicU64>,
         beacon: Option<(Duration, Bytes)>,
         beacon_poll_interval: Duration,
@@ -3888,7 +3954,8 @@ mod tests {
             id: 0x5C71,
             flow_control,
             ready,
-            online,
+            carrier_online,
+            interface_online: Arc::new(AtomicBool::new(true)),
             cancelled: Arc::new(AtomicBool::new(false)),
             txb,
             beacon,
@@ -7089,6 +7156,39 @@ mod tests {
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn test_rnode_public_online_tracks_exact_ready_and_reset() {
+        let mut state = RNodeProtocolState::new(TEST_PROTOCOL_TARGET);
+        let online = AtomicBool::new(true);
+
+        sync_rnode_interface_online(&online, &state);
+        assert!(
+            !online.load(Ordering::SeqCst),
+            "an open carrier without protocol evidence is not publicly online"
+        );
+
+        for (position, (command, payload)) in protocol_required_frames(TEST_PROTOCOL_TARGET)
+            .into_iter()
+            .enumerate()
+        {
+            state.apply_frame(command, &payload);
+            sync_rnode_interface_online(&online, &state);
+            assert_eq!(
+                online.load(Ordering::SeqCst),
+                position == 7,
+                "public online may change only with exact reducer readiness"
+            );
+        }
+
+        state.apply_frame(CMD_RESET, &[0xF8]);
+        sync_rnode_interface_online(&online, &state);
+        assert!(
+            !online.load(Ordering::SeqCst),
+            "reset must revoke public readiness while the carrier remains open"
+        );
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     async fn wait_for_rnode_snapshot(
         state: &mut RNodeDriverSubscription,
         predicate: impl Fn(&RNodeRuntimeSnapshot) -> bool,
@@ -7204,16 +7304,25 @@ mod tests {
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[tokio::test]
-    async fn test_rnode_driver_transmits_while_lifecycle_awaits_readiness() {
+    async fn test_rnode_driver_holds_outbound_until_exact_protocol_readiness() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let config = RNodeConfig::new("rnode-awaiting-traffic", &format!("tcp://{addr}"));
+        let target = RNodeProtocolTarget::new(
+            config.frequency,
+            config.bandwidth,
+            config.spreading_factor,
+            config.coding_rate,
+            config.tx_power,
+        );
         let expected_startup = tcp_startup_bytes(&config);
         let payload = Bytes::from_static(b"traffic-before-protocol-readiness");
         let expected_packet = kiss::frame(&payload);
         let server_expected_packet = expected_packet.clone();
         let expected_detach = build_detach_sequence();
         let (packet_tx, mut packet_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (blocked_tx, mut blocked_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -7224,6 +7333,30 @@ mod tests {
                 read_exact_tcp(&mut stream, expected_startup.len()),
                 expected_startup
             );
+
+            stream
+                .set_read_timeout(Some(Duration::from_millis(150)))
+                .unwrap();
+            let mut premature = [0u8; 1];
+            match std::io::Read::read(&mut stream, &mut premature) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                result => panic!("RNode wrote application data before protocol Ready: {result:?}"),
+            }
+            blocked_tx.send(()).unwrap();
+
+            ready_rx.recv().unwrap();
+            let mut readiness = Vec::new();
+            for (command, payload) in protocol_required_frames(target) {
+                kiss::frame_with_command_into(command, &payload, &mut readiness);
+            }
+            std::io::Write::write_all(&mut stream, &readiness).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             packet_tx
                 .send(read_exact_tcp(&mut stream, server_expected_packet.len()))
                 .unwrap();
@@ -7246,6 +7379,28 @@ mod tests {
         .await;
 
         spawned.interface.tx.send(payload.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), blocked_rx.recv())
+            .await
+            .expect("pre-readiness packet gate check timed out")
+            .expect("pre-readiness packet gate server ended");
+        assert!(!spawned.interface.online.load(Ordering::SeqCst));
+        assert_eq!(
+            spawned
+                .interface
+                .txb
+                .as_ref()
+                .expect("RNode TX counter")
+                .load(Ordering::Relaxed),
+            0,
+            "queued data must not be physically written or accounted before Ready"
+        );
+
+        ready_tx.send(()).unwrap();
+        wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.connection_generation == 1 && snapshot.phase == RNodeRuntimePhase::Ready
+        })
+        .await;
+        assert!(spawned.interface.online.load(Ordering::SeqCst));
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), packet_rx.recv())
                 .await
@@ -7253,7 +7408,6 @@ mod tests {
                 .expect("outbound RNode server ended"),
             expected_packet
         );
-        assert_eq!(state.snapshot().phase, RNodeRuntimePhase::AwaitingReadiness);
         assert_eq!(
             spawned
                 .interface
@@ -7271,8 +7425,8 @@ mod tests {
         .await;
         tokio::time::timeout(Duration::from_secs(2), spawned.interface.read_task)
             .await
-            .expect("awaiting-readiness read task timed out")
-            .expect("awaiting-readiness read task panicked");
+            .expect("readiness-gated read task timed out")
+            .expect("readiness-gated read task panicked");
         server.join().unwrap();
     }
 
@@ -7872,6 +8026,13 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let config = RNodeConfig::new("rnode-tcp", &format!("tcp://{addr}"));
+        let target = RNodeProtocolTarget::new(
+            config.frequency,
+            config.bandwidth,
+            config.spreading_factor,
+            config.coding_rate,
+            config.tx_power,
+        );
         let expected_init_len = build_detect_sequence().len()
             + build_init_sequence(&config).len()
             + build_airtime_sequence(&config).len();
@@ -7894,6 +8055,11 @@ mod tests {
                     }
                 }
                 if attempt == 2 {
+                    let mut readiness = Vec::new();
+                    for (command, payload) in protocol_required_frames(target) {
+                        kiss::frame_with_command_into(command, &payload, &mut readiness);
+                    }
+                    std::io::Write::write_all(&mut stream, &readiness).unwrap();
                     accepted_tx.send(attempt).unwrap();
                     std::thread::sleep(Duration::from_millis(500));
                 } else {

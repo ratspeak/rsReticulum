@@ -496,10 +496,11 @@ pub struct RNodeRuntimeObserver {
 
 /// Exact observation returned atomically with a newly registered RNode.
 ///
-/// `online` is the legacy shared online/enabled flag retained for compatibility.
-/// It is not authoritative physical state or protocol readiness. Use `observer`
-/// for protocol state and [`RNodeRuntimeObserver::await_ready`] when readiness
-/// is required.
+/// `online` is the shared interface projection retained for compatibility.
+/// Serial/TCP drivers publish exact protocol readiness through it; other
+/// transports may expose a narrower transport-specific state. Use `observer`
+/// and [`RNodeRuntimeObserver::await_ready`] whenever exact cross-transport
+/// protocol readiness is required.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct SpawnedRNodeRuntime {
