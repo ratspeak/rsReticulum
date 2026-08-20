@@ -1662,7 +1662,13 @@ impl TransportActor {
         }
     }
 
-    fn broadcast_local_announce_on_interfaces(&mut self, raw: &[u8], except: Option<InterfaceId>) {
+    /// Broadcast an instance-local announce and report whether at least one
+    /// eligible interface queue actually accepted the packet.
+    fn broadcast_local_announce_on_interfaces(
+        &mut self,
+        raw: &[u8],
+        except: Option<InterfaceId>,
+    ) -> bool {
         let header = rns_wire::header::PacketHeader::unpack(raw)
             .ok()
             .map(|(h, _)| h);
@@ -1676,6 +1682,7 @@ impl TransportActor {
             .copied()
             .filter(|id| self.interface_allows_announce(*id, &destination_hash, except))
             .collect();
+        let mut accepted = false;
         for id in ids {
             // Python 1.3.8 Transport.py:1345: delta-mangled HEADER_1 announces
             // are re-framed as HEADER_2|TRANSPORT with our transport identity.
@@ -1693,7 +1700,9 @@ impl TransportActor {
                     entry.ingress.sent_announce();
                 }
             }
+            accepted |= sent;
         }
+        accepted
     }
 
     /// Enqueue an announce on every eligible outbound interface (except
@@ -2222,6 +2231,24 @@ mod tests {
             tx,
         );
         (entry, rx)
+    }
+
+    fn dispatch_untracked_packet(
+        actor: &mut TransportActor,
+        raw: Bytes,
+        destination_hash: [u8; 16],
+    ) -> crate::messages::OutboundDispatchResult {
+        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+        actor.handle_message(TransportMessage::SendPacket {
+            request: OutboundRequest {
+                raw,
+                destination_hash,
+            },
+            attached_interface: None,
+            receipt: None,
+            result_tx,
+        });
+        result_rx.try_recv().unwrap()
     }
 
     #[test]
@@ -9550,6 +9577,73 @@ mod tests {
         );
         assert!(!actor.receipt_table.contains_key(&truncated_hash));
         assert!(!actor.receipt_updates.contains_key(&truncated_hash));
+    }
+
+    #[test]
+    fn local_announce_reports_no_interface_when_only_eligible_queue_is_full() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (full, mut full_rx) = make_test_interface_with_capacity("full announce", 1);
+        full.tx.try_send(Bytes::from_static(b"occupied")).unwrap();
+        actor.interfaces.insert(1, full);
+        let (raw, destination_hash) = make_valid_announce("test.dispatch.full", 0);
+        actor.local_destinations.insert(destination_hash);
+
+        let result = dispatch_untracked_packet(&mut actor, raw, destination_hash);
+
+        assert_eq!(result, crate::messages::OutboundDispatchResult::NoInterface);
+        assert_eq!(full_rx.try_recv().unwrap(), Bytes::from_static(b"occupied"));
+        assert!(full_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn local_announce_reports_no_interface_when_only_eligible_queue_is_closed() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (closed, closed_rx) = make_test_interface("closed announce");
+        drop(closed_rx);
+        actor.interfaces.insert(1, closed);
+        let (raw, destination_hash) = make_valid_announce("test.dispatch.closed", 0);
+        actor.local_destinations.insert(destination_hash);
+
+        let result = dispatch_untracked_packet(&mut actor, raw, destination_hash);
+
+        assert_eq!(result, crate::messages::OutboundDispatchResult::NoInterface);
+        assert!(!actor.interfaces.contains_key(&1));
+    }
+
+    #[test]
+    fn local_announce_reports_no_interface_when_only_eligible_queue_is_offline() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut offline, mut offline_rx) = make_test_interface("offline announce");
+        offline.role = InterfaceRole::LocalClient;
+        offline.online = Some(Arc::new(AtomicBool::new(false)));
+        actor.interfaces.insert(1, offline);
+        let (raw, destination_hash) = make_valid_announce("test.dispatch.offline", 0);
+        actor.local_destinations.insert(destination_hash);
+
+        let result = dispatch_untracked_packet(&mut actor, raw, destination_hash);
+
+        assert_eq!(result, crate::messages::OutboundDispatchResult::NoInterface);
+        assert!(!actor.interfaces.contains_key(&1));
+        assert!(offline_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn local_announce_reports_sent_when_any_eligible_queue_accepts() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (full, mut full_rx) = make_test_interface_with_capacity("full announce", 1);
+        full.tx.try_send(Bytes::from_static(b"occupied")).unwrap();
+        let (accepted, mut accepted_rx) = make_test_interface("accepted announce");
+        actor.interfaces.insert(1, full);
+        actor.interfaces.insert(2, accepted);
+        let (raw, destination_hash) = make_valid_announce("test.dispatch.accepted", 0);
+        actor.local_destinations.insert(destination_hash);
+
+        let result = dispatch_untracked_packet(&mut actor, raw.clone(), destination_hash);
+
+        assert_eq!(result, crate::messages::OutboundDispatchResult::Sent);
+        assert_eq!(accepted_rx.try_recv().unwrap(), raw);
+        assert_eq!(full_rx.try_recv().unwrap(), Bytes::from_static(b"occupied"));
+        assert!(full_rx.try_recv().is_err());
     }
 
     #[test]

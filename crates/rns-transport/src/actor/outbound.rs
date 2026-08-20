@@ -95,12 +95,7 @@ impl TransportActor {
         );
 
         if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce {
-            let has_outbound_interface = self
-                .interfaces
-                .values()
-                .any(|interface| interface.direction.outbound);
-            self.broadcast_local_announce_on_interfaces(&request.raw, None);
-            return has_outbound_interface;
+            return self.broadcast_local_announce_on_interfaces(&request.raw, None);
         }
 
         match parsed.flags.destination_type {
