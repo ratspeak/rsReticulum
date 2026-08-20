@@ -2879,6 +2879,54 @@ pub fn build_init_sequence(config: &RNodeConfig) -> Vec<u8> {
     build_radio_configuration_sequence_before_on(&settings, &airtime)
 }
 
+#[cfg(any(feature = "ble", test))]
+fn build_command_stage(command: u8, payload: &[u8]) -> Vec<u8> {
+    let mut stage = Vec::with_capacity(payload.len() + 4);
+    kiss::frame_with_command_into(command, payload, &mut stage);
+    stage
+}
+
+/// Build the independently paced radio-control stages used after a BLE
+/// connection becomes usable.
+///
+/// Unlike [`build_init_sequence`], this sequence deliberately never emits
+/// `RADIO_STATE_OFF`. A BLE client can therefore reconnect and reassert the
+/// desired RF parameters without tearing down the radio session that remained
+/// active while Bluetooth was out of range. The command order mirrors the
+/// upstream Android RNode BLE initialization path; callers are responsible for
+/// validation and pacing each returned stage.
+#[cfg(any(feature = "ble", test))]
+pub(crate) fn build_ble_radio_reassertion_stages(config: &RNodeConfig) -> Vec<Vec<u8>> {
+    let mut stages = Vec::with_capacity(8);
+    stages.push(build_command_stage(
+        CMD_FREQUENCY,
+        &u32_to_bytes(config.frequency),
+    ));
+    stages.push(build_command_stage(
+        CMD_BANDWIDTH,
+        &u32_to_bytes(config.bandwidth),
+    ));
+    stages.push(build_command_stage(CMD_TXPOWER, &[config.tx_power]));
+    stages.push(build_command_stage(CMD_SF, &[config.spreading_factor]));
+    stages.push(build_command_stage(CMD_CR, &[config.coding_rate]));
+
+    if let Some(st) = config.st_alock {
+        stages.push(build_command_stage(
+            CMD_ST_ALOCK,
+            &((st * 100.0) as u16).to_be_bytes(),
+        ));
+    }
+    if let Some(lt) = config.lt_alock {
+        stages.push(build_command_stage(
+            CMD_LT_ALOCK,
+            &((lt * 100.0) as u16).to_be_bytes(),
+        ));
+    }
+
+    stages.push(build_command_stage(CMD_RADIO_STATE, &[RADIO_STATE_ON]));
+    stages
+}
+
 /// KISS sequence for returning an RNode radio to idle before disconnecting.
 pub fn build_radio_off_sequence() -> Vec<u8> {
     let mut out = Vec::with_capacity(4);
@@ -4266,6 +4314,71 @@ mod tests {
                 (CMD_CR, vec![settings.coding_rate]),
                 (CMD_TXPOWER, vec![settings.tx_power]),
                 (CMD_RADIO_STATE, vec![RADIO_STATE_ON]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ble_radio_reassertion_stages_match_upstream_order_without_radio_off() {
+        let mut config = RNodeConfig::new("rnode0", "ble://RNode Test");
+        config.frequency = 915_000_000;
+        config.bandwidth = 250_000;
+        config.spreading_factor = 9;
+        config.coding_rate = 5;
+        config.tx_power = 17;
+        config.st_alock = Some(10.0);
+        config.lt_alock = Some(1.0);
+
+        let stages = build_ble_radio_reassertion_stages(&config);
+        let mut deframer = kiss::RawKissDeframer::new();
+        let frames: Vec<_> = stages
+            .iter()
+            .flat_map(|stage| deframer.feed(stage))
+            .collect();
+
+        assert_eq!(
+            frames,
+            vec![
+                (CMD_FREQUENCY, config.frequency.to_be_bytes().to_vec()),
+                (CMD_BANDWIDTH, config.bandwidth.to_be_bytes().to_vec()),
+                (CMD_TXPOWER, vec![config.tx_power]),
+                (CMD_SF, vec![config.spreading_factor]),
+                (CMD_CR, vec![config.coding_rate]),
+                (CMD_ST_ALOCK, 1_000u16.to_be_bytes().to_vec()),
+                (CMD_LT_ALOCK, 100u16.to_be_bytes().to_vec()),
+                (CMD_RADIO_STATE, vec![RADIO_STATE_ON]),
+            ]
+        );
+        assert!(frames.iter().all(|(command, payload)| {
+            *command != CMD_RADIO_STATE || payload.as_slice() != [RADIO_STATE_OFF]
+        }));
+        assert_eq!(
+            stages.len(),
+            frames.len(),
+            "each BLE control command must remain an independently paced stage"
+        );
+    }
+
+    #[test]
+    fn test_ble_radio_reassertion_omits_unconfigured_airtime_stages() {
+        let config = RNodeConfig::new("rnode0", "ble://RNode Test");
+        let stages = build_ble_radio_reassertion_stages(&config);
+        let mut deframer = kiss::RawKissDeframer::new();
+        let commands: Vec<_> = stages
+            .iter()
+            .flat_map(|stage| deframer.feed(stage))
+            .map(|(command, _)| command)
+            .collect();
+
+        assert_eq!(
+            commands,
+            vec![
+                CMD_FREQUENCY,
+                CMD_BANDWIDTH,
+                CMD_TXPOWER,
+                CMD_SF,
+                CMD_CR,
+                CMD_RADIO_STATE,
             ]
         );
     }
