@@ -1799,35 +1799,40 @@ where
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-fn spawn_rnode_generation_writer(
-    port: &RNodeStream,
-    config: &RNodeConfig,
+struct RNodeGenerationWriterOptions {
     id: InterfaceId,
     carrier_online: Arc<AtomicBool>,
     interface_online: Arc<AtomicBool>,
     txb: Arc<AtomicU64>,
     beacon: Option<(Duration, Bytes)>,
     idle_probes_enabled: bool,
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn spawn_rnode_generation_writer(
+    port: &RNodeStream,
+    config: &RNodeConfig,
+    options: RNodeGenerationWriterOptions,
 ) -> std::io::Result<RNodeGenerationWriter> {
     let interrupt = RNodeWriteInterrupt::from_stream(port)?;
     let write_stream = port.try_clone()?;
     let mut writer = spawn_rnode_writer(
         write_stream,
         RNodeWriterContext {
-            id,
+            id: options.id,
             flow_control: config.flow_control,
             // Upstream flow control starts with one permissive packet token;
             // exact-width CMD_READY frames replenish or revoke that token.
             // This token is independent of the exact protocol-readiness gate.
             ready: Arc::new(AtomicBool::new(true)),
-            carrier_online,
-            interface_online,
+            carrier_online: options.carrier_online,
+            interface_online: options.interface_online,
             cancelled: Arc::new(AtomicBool::new(false)),
-            txb,
-            beacon,
+            txb: options.txb,
+            beacon: options.beacon,
             beacon_poll_interval: RNODE_BEACON_POLL_INTERVAL,
             idle_probe_interval: port.is_tcp().then_some(RNODE_TCP_IDLE_PROBE_INTERVAL),
-            idle_probes_enabled: Arc::new(AtomicBool::new(idle_probes_enabled)),
+            idle_probes_enabled: Arc::new(AtomicBool::new(options.idle_probes_enabled)),
         },
     );
     writer.interrupt = interrupt;
@@ -2340,12 +2345,14 @@ async fn start_rnode_generation(
     let writer = spawn_rnode_generation_writer(
         &port,
         config,
-        id,
-        carrier_online.clone(),
-        interface_online.clone(),
-        txb.clone(),
-        beacon.clone(),
-        true,
+        RNodeGenerationWriterOptions {
+            id,
+            carrier_online: carrier_online.clone(),
+            interface_online: interface_online.clone(),
+            txb: txb.clone(),
+            beacon: beacon.clone(),
+            idle_probes_enabled: true,
+        },
     )
     .map_err(|error| {
         crate::traits::InterfaceError::SendFailed(format!("rnode writer clone: {error}"))
@@ -2537,12 +2544,14 @@ async fn start_strict_rnode_generation(
     let writer = spawn_rnode_generation_writer(
         &port,
         config,
-        id,
-        carrier_online.clone(),
-        interface_online.clone(),
-        txb.clone(),
-        beacon.clone(),
-        false,
+        RNodeGenerationWriterOptions {
+            id,
+            carrier_online: carrier_online.clone(),
+            interface_online: interface_online.clone(),
+            txb: txb.clone(),
+            beacon: beacon.clone(),
+            idle_probes_enabled: false,
+        },
     )
     .map_err(|error| {
         crate::traits::InterfaceError::SendFailed(format!("rnode writer clone: {error}"))
@@ -3351,12 +3360,14 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                     let reconnect_writer = match spawn_rnode_generation_writer(
                         &opened,
                         &task_config,
-                        id,
-                        carrier_online_r.clone(),
-                        online_r.clone(),
-                        txb_r.clone(),
-                        beacon.clone(),
-                        !options.requires_capability_admission(),
+                        RNodeGenerationWriterOptions {
+                            id,
+                            carrier_online: carrier_online_r.clone(),
+                            interface_online: online_r.clone(),
+                            txb: txb_r.clone(),
+                            beacon: beacon.clone(),
+                            idle_probes_enabled: !options.requires_capability_admission(),
+                        },
                     ) {
                         Ok(writer) => writer,
                         Err(e) => {

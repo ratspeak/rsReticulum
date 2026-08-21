@@ -390,15 +390,14 @@ async fn wait_for_ble_retry(adapter: &Adapter, total: Duration, flag: &AtomicBoo
                 AdapterWaitEvent::Event(Some(_)) | AdapterWaitEvent::Tick => {}
                 AdapterWaitEvent::Event(None) => events = None,
             }
-            if saw_powered_off {
-                if tokio::time::timeout(RUNNING_POLL, adapter.adapter_state())
+            if saw_powered_off
+                && tokio::time::timeout(RUNNING_POLL, adapter.adapter_state())
                     .await
                     .ok()
                     .and_then(Result::ok)
                     .is_some_and(|state| state == CentralState::PoweredOn)
-                {
-                    return false;
-                }
+            {
+                return false;
             }
         }
     }
@@ -603,16 +602,20 @@ fn ble_name_resolution_class(
 /// rsCardputer's RNode BLE stack is still settling. Probe detect a few times
 /// inside one connection attempt so a single dropped early frame does not cost
 /// a full reconnect backoff.
+struct NativeHandshakeState<'a> {
+    protocol_state: &'a mut RNodeProtocolState,
+    deframer: &'a mut kiss::RawKissDeframer,
+    running_task: &'a AtomicBool,
+    pre_ready_data: &'a mut Vec<Vec<u8>>,
+    pre_ready_data_bytes: &'a mut usize,
+}
+
 async fn probe_native_rnode_handshake(
     tcp_read: &mut tokio::net::tcp::OwnedReadHalf,
     tcp_write: &mut tokio::net::tcp::OwnedWriteHalf,
-    protocol_state: &mut RNodeProtocolState,
-    deframer: &mut kiss::RawKissDeframer,
     timeout: Duration,
     probe_interval: Duration,
-    running_task: &AtomicBool,
-    pre_ready_data: &mut Vec<Vec<u8>>,
-    pre_ready_data_bytes: &mut usize,
+    state: NativeHandshakeState<'_>,
 ) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -622,7 +625,7 @@ async fn probe_native_rnode_handshake(
     let mut next_probe = std::time::Instant::now();
 
     while std::time::Instant::now() < deadline {
-        if !running_task.load(Ordering::SeqCst) {
+        if !state.running_task.load(Ordering::SeqCst) {
             return false;
         }
 
@@ -655,11 +658,11 @@ async fn probe_native_rnode_handshake(
         };
 
         match reduce_native_handshake_bytes_preserving_data(
-            protocol_state,
-            deframer,
+            state.protocol_state,
+            state.deframer,
             &buf[..n],
-            pre_ready_data,
-            pre_ready_data_bytes,
+            state.pre_ready_data,
+            state.pre_ready_data_bytes,
         ) {
             Ok(true) => return true,
             Ok(false) => {}
@@ -1632,14 +1635,12 @@ fn reduce_native_startup_bytes(
                 active_frames.clear();
                 *active_bytes = 0;
             }
-        } else {
-            if command == kiss::CMD_DATA {
-                if !hold_native_pre_ready_data(frame, pre_ready_data, pre_ready_data_bytes) {
-                    return Err(NativeStartupReductionError::PreReadyDataOverflow);
-                }
-            } else {
-                protocol_state.apply_frame(command, &frame);
+        } else if command == kiss::CMD_DATA {
+            if !hold_native_pre_ready_data(frame, pre_ready_data, pre_ready_data_bytes) {
+                return Err(NativeStartupReductionError::PreReadyDataOverflow);
             }
+        } else {
+            protocol_state.apply_frame(command, &frame);
         }
     }
     Ok(())
@@ -3717,13 +3718,15 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                 let detected = probe_native_rnode_handshake(
                     &mut tcp_read,
                     &mut tcp_write,
-                    &mut protocol_state,
-                    &mut startup_deframer,
                     RNODE_NATIVE_HANDSHAKE_TIMEOUT,
                     RNODE_NATIVE_HANDSHAKE_PROBE,
-                    &running_task,
-                    &mut startup_pre_ready_data,
-                    &mut startup_pre_ready_data_bytes,
+                    NativeHandshakeState {
+                        protocol_state: &mut protocol_state,
+                        deframer: &mut startup_deframer,
+                        running_task: &running_task,
+                        pre_ready_data: &mut startup_pre_ready_data,
+                        pre_ready_data_bytes: &mut startup_pre_ready_data_bytes,
+                    },
                 )
                 .await;
                 if !detected {
@@ -4147,15 +4150,19 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                             );
                             break 'read;
                         }
-                        if pending_outbound.is_none()
-                            && let (Some((interval, callsign)), Some(first)) =
+                        if pending_outbound.is_none() {
+                            if let (Some((interval, callsign)), Some(first)) =
                                 (beacon.as_ref(), first_tx)
-                            && first.elapsed() >= *interval
-                        {
-                            tracing::debug!("BLE RNode (native) scheduling station-ID beacon");
-                            pending_outbound = Some(NativePendingOutbound::new(
-                                PendingOutbound::new(callsign.clone(), true),
-                            ));
+                            {
+                                if first.elapsed() >= *interval {
+                                    tracing::debug!(
+                                        "BLE RNode (native) scheduling station-ID beacon"
+                                    );
+                                    pending_outbound = Some(NativePendingOutbound::new(
+                                        PendingOutbound::new(callsign.clone(), true),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -5677,13 +5684,15 @@ mod tests {
             probe_native_rnode_handshake(
                 &mut read,
                 &mut write,
-                &mut protocol_state,
-                &mut handshake_deframer,
                 Duration::from_secs(1),
                 Duration::from_millis(100),
-                &running,
-                &mut pre_ready_data,
-                &mut pre_ready_data_bytes,
+                NativeHandshakeState {
+                    protocol_state: &mut protocol_state,
+                    deframer: &mut handshake_deframer,
+                    running_task: &running,
+                    pre_ready_data: &mut pre_ready_data,
+                    pre_ready_data_bytes: &mut pre_ready_data_bytes,
+                },
             )
             .await
         );
