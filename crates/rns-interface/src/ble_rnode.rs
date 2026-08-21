@@ -16,7 +16,8 @@ use std::time::Duration;
 ))]
 use btleplug::api::CharPropFlags;
 use btleplug::api::{
-    Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, ValueNotification, WriteType,
+    Central, CentralEvent, CentralState, Manager as _, Peripheral as _, ScanFilter,
+    ValueNotification, WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral, PeripheralId};
 use bytes::Bytes;
@@ -280,6 +281,92 @@ async fn wait_or_shutdown(total: Duration, flag: &AtomicBool) -> bool {
         tokio::time::sleep(remaining.min(RUNNING_POLL)).await;
     }
     !flag.load(Ordering::SeqCst)
+}
+
+#[cfg(any(test, target_os = "ios", target_os = "macos"))]
+fn adapter_power_transition_wakes(saw_powered_off: &mut bool, state: CentralState) -> bool {
+    match state {
+        CentralState::PoweredOff => {
+            *saw_powered_off = true;
+            false
+        }
+        CentralState::PoweredOn => *saw_powered_off,
+        CentralState::Unknown => false,
+    }
+}
+
+/// Wait for the ordinary reconnect cadence, but on Apple treat adapter power
+/// as state rather than repeated connection failure. CoreBluetooth publishes
+/// `StateUpdate`; a bounded state poll covers a missed or ended event stream.
+/// Other platforms retain their already-qualified reconnect behavior.
+async fn wait_for_ble_retry(adapter: &Adapter, total: Duration, flag: &AtomicBool) -> bool {
+    #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+    {
+        let _ = adapter;
+        return wait_or_shutdown(total, flag).await;
+    }
+
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    {
+        let deadline = tokio::time::Instant::now() + total;
+        let setup_timeout = total.min(RUNNING_POLL);
+        let mut events = tokio::time::timeout(setup_timeout, adapter.events())
+            .await
+            .ok()
+            .and_then(Result::ok);
+        let mut saw_powered_off = tokio::time::timeout(setup_timeout, adapter.adapter_state())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some_and(|state| state == CentralState::PoweredOff);
+
+        loop {
+            if !flag.load(Ordering::SeqCst) {
+                return true;
+            }
+            let now = tokio::time::Instant::now();
+            if !saw_powered_off && now >= deadline {
+                return false;
+            }
+            let wake = if saw_powered_off {
+                RUNNING_POLL
+            } else {
+                (deadline - now).min(RUNNING_POLL)
+            };
+            enum AdapterWaitEvent {
+                Event(Option<CentralEvent>),
+                Tick,
+            }
+            let event = if let Some(events) = events.as_mut() {
+                tokio::select! {
+                    event = events.next() => AdapterWaitEvent::Event(event),
+                    _ = tokio::time::sleep(wake) => AdapterWaitEvent::Tick,
+                }
+            } else {
+                tokio::time::sleep(wake).await;
+                AdapterWaitEvent::Tick
+            };
+            match event {
+                AdapterWaitEvent::Event(Some(CentralEvent::StateUpdate(state))) => {
+                    if adapter_power_transition_wakes(&mut saw_powered_off, state) {
+                        return false;
+                    }
+                }
+                AdapterWaitEvent::Event(Some(_)) | AdapterWaitEvent::Tick => {}
+                AdapterWaitEvent::Event(None) => events = None,
+            }
+            if saw_powered_off {
+                if tokio::time::timeout(RUNNING_POLL, adapter.adapter_state())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .is_some_and(|state| state == CentralState::PoweredOn)
+                {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 fn is_rnode_handshake_frame(cmd: u8, frame: &[u8]) -> bool {
@@ -2513,7 +2600,9 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                         snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
                         return;
                     }
-                    if wait_or_shutdown(Duration::from_secs(retry_wait), &running_task).await {
+                    if wait_for_ble_retry(&adapter, Duration::from_secs(retry_wait), &running_task)
+                        .await
+                    {
                         publish_ble_stopped(
                             &mut snapshot_publisher,
                             RNodeRuntimeReason::StopRequested,
@@ -2577,7 +2666,13 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                         snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
                         return;
                     }
-                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                    if wait_for_ble_retry(
+                        &adapter,
+                        Duration::from_secs(backoff),
+                        &running_task,
+                    )
+                    .await
+                    {
                         publish_ble_stopped(
                             &mut snapshot_publisher,
                             RNodeRuntimeReason::StopRequested,
@@ -2612,7 +2707,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                     snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
                     return;
                 }
-                if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                if wait_for_ble_retry(&adapter, Duration::from_secs(backoff), &running_task).await {
                     publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
                     return;
                 }
@@ -2651,7 +2746,9 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                         snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
                         return;
                     }
-                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                    if wait_for_ble_retry(&adapter, Duration::from_secs(backoff), &running_task)
+                        .await
+                    {
                         publish_ble_stopped(
                             &mut snapshot_publisher,
                             RNodeRuntimeReason::StopRequested,
@@ -2704,7 +2801,13 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                             snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
                             return;
                         }
-                        if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        if wait_for_ble_retry(
+                            &adapter,
+                            Duration::from_secs(backoff),
+                            &running_task,
+                        )
+                        .await
+                        {
                             publish_ble_stopped(
                                 &mut snapshot_publisher,
                                 RNodeRuntimeReason::StopRequested,
@@ -2778,7 +2881,9 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                             snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
                             return;
                         }
-                        if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        if wait_for_ble_retry(&adapter, Duration::from_secs(backoff), &running_task)
+                            .await
+                        {
                             publish_ble_stopped(
                                 &mut snapshot_publisher,
                                 RNodeRuntimeReason::StopRequested,
@@ -2823,7 +2928,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                     snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
                     return;
                 }
-                if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                if wait_for_ble_retry(&adapter, Duration::from_secs(backoff), &running_task).await {
                     publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
                     return;
                 }
@@ -2922,7 +3027,9 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                         snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
                         return;
                     }
-                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                    if wait_for_ble_retry(&adapter, Duration::from_secs(backoff), &running_task)
+                        .await
+                    {
                         publish_ble_stopped(
                             &mut snapshot_publisher,
                             RNodeRuntimeReason::StopRequested,
@@ -3070,6 +3177,19 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                         ble_diag("[ble] target DeviceDisconnected — reconnecting");
                         break 'read;
                     }
+                    GenerationEvent::Adapter(Some(CentralEvent::StateUpdate(
+                        CentralState::PoweredOff,
+                    ))) => {
+                        trace_ble_lifecycle(
+                            generation_id,
+                            "active_generation",
+                            "adapter_powered_off",
+                            None,
+                            None,
+                        );
+                        tracing::info!("BLE adapter powered off; waiting for adapter recovery");
+                        break 'read;
+                    }
                     GenerationEvent::Adapter(Some(_)) => {}
                     GenerationEvent::Adapter(None) => {
                         trace_ble_lifecycle(
@@ -3178,7 +3298,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                 return;
             }
             tracing::info!(name = %log_name, seconds = backoff, "BLE RNode reconnecting");
-            if wait_or_shutdown(ble_reconnect_delay(backoff), &running_task).await {
+            if wait_for_ble_retry(&adapter, ble_reconnect_delay(backoff), &running_task).await {
                 publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
                 return;
             }
@@ -3845,6 +3965,28 @@ mod tests {
         assert_eq!(reconnect_delay_with_jitter(1, 0), Duration::from_secs(1));
         assert!(reconnect_delay_with_jitter(1, u64::MAX) <= Duration::from_millis(1_200));
         assert!(reconnect_delay_with_jitter(30, u64::MAX) <= Duration::from_secs(36));
+    }
+
+    #[test]
+    fn adapter_power_recovery_wakes_only_after_observed_off_state() {
+        let mut saw_powered_off = false;
+        assert!(!adapter_power_transition_wakes(
+            &mut saw_powered_off,
+            CentralState::PoweredOn,
+        ));
+        assert!(!adapter_power_transition_wakes(
+            &mut saw_powered_off,
+            CentralState::Unknown,
+        ));
+        assert!(!adapter_power_transition_wakes(
+            &mut saw_powered_off,
+            CentralState::PoweredOff,
+        ));
+        assert!(saw_powered_off);
+        assert!(adapter_power_transition_wakes(
+            &mut saw_powered_off,
+            CentralState::PoweredOn,
+        ));
     }
 
     #[test]
