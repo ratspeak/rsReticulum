@@ -758,9 +758,7 @@ impl InboundResource {
     /// memory for a transfer that will never complete.
     pub fn handle_cancel(&mut self) {
         self.state = ResourceState::Failed;
-        for part in &mut self.parts {
-            *part = None;
-        }
+        self.parts.fill(None);
     }
 }
 
