@@ -7,6 +7,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+#[cfg(any(
+    test,
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "android"
+))]
+use btleplug::api::CharPropFlags;
 use btleplug::api::{
     Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, ValueNotification, WriteType,
 };
@@ -304,6 +312,129 @@ fn is_pairing_transition_error(error: &InterfaceError) -> bool {
         error,
         InterfaceError::SendFailed(message) if message.starts_with("BLE pairing in progress:")
     )
+}
+
+/// The GATT operation that establishes authenticated access before normal NUS
+/// traffic begins.
+///
+/// ESP RNodes advertise their encrypted TX value as readable, while the
+/// Bluefruit NUS used by nRF RNodes advertises TX as notification-only and
+/// secures its CCCD. CoreBluetooth must not be asked to read a characteristic
+/// that does not advertise `READ`; subscribing to the secured CCCD is the
+/// authentication trigger for that shape instead.
+#[cfg(any(
+    test,
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "android"
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DesktopPairingTrigger {
+    EncryptedRead,
+    SecuredSubscribe,
+}
+
+#[cfg(any(
+    test,
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "android"
+))]
+impl DesktopPairingTrigger {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::EncryptedRead => "encrypted_read",
+            Self::SecuredSubscribe => "secured_subscribe",
+        }
+    }
+}
+
+#[cfg(any(
+    test,
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "android"
+))]
+fn desktop_pairing_trigger_for_properties(
+    properties: CharPropFlags,
+    apple_core_bluetooth: bool,
+) -> DesktopPairingTrigger {
+    let notification_only =
+        properties.contains(CharPropFlags::NOTIFY) && !properties.contains(CharPropFlags::READ);
+    if apple_core_bluetooth && notification_only {
+        DesktopPairingTrigger::SecuredSubscribe
+    } else {
+        DesktopPairingTrigger::EncryptedRead
+    }
+}
+
+const BLE_LIFECYCLE_TRACE_TARGET: &str = "rns_interface::ble_rnode::lifecycle";
+
+/// Privacy-safe generation trace. This target deliberately excludes device
+/// identifiers, names, UUIDs, platform error strings, values, and packet data,
+/// so qualification builds can enable it without enabling raw `ble_diag`.
+fn trace_ble_lifecycle(
+    generation_id: BleGenerationId,
+    stage: &'static str,
+    result_class: &'static str,
+    tx_read: Option<bool>,
+    tx_notify: Option<bool>,
+) {
+    tracing::info!(
+        target: BLE_LIFECYCLE_TRACE_TARGET,
+        generation = generation_id.get(),
+        stage,
+        result_class,
+        tx_read,
+        tx_notify,
+        "BLE RNode generation lifecycle"
+    );
+}
+
+fn generation_exit_result_class(error: &BleGenerationExit) -> &'static str {
+    match error {
+        BleGenerationExit::TargetDisconnected { .. } => "target_disconnected",
+        BleGenerationExit::DeadlineElapsed { .. } => "deadline_elapsed",
+        BleGenerationExit::StopRequested { .. } => "stop_requested",
+        BleGenerationExit::EventStreamEnded { .. } => "event_stream_ended",
+        BleGenerationExit::StageFailed { .. } => "stage_failed",
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BleTargetResolutionClass {
+    FirstRnode,
+    PrimaryId,
+    PrimaryName,
+    GenerationStableName,
+}
+
+impl BleTargetResolutionClass {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::FirstRnode => "first_rnode",
+            Self::PrimaryId => "primary_id",
+            Self::PrimaryName => "primary_name",
+            Self::GenerationStableName => "generation_stable_name",
+        }
+    }
+}
+
+fn ble_name_resolution_class(
+    primary_target: &str,
+    generation_stable_name: Option<&str>,
+    advertised_name: &str,
+) -> Option<BleTargetResolutionClass> {
+    if advertised_name == primary_target {
+        Some(BleTargetResolutionClass::PrimaryName)
+    } else if generation_stable_name == Some(advertised_name) {
+        Some(BleTargetResolutionClass::GenerationStableName)
+    } else {
+        None
+    }
 }
 
 /// Android's native bridge can come up immediately after SMP completes, while
@@ -1156,7 +1287,8 @@ pub async fn scan_ble_devices(timeout_secs: u64) -> Result<Vec<BleDevice>, Strin
 async fn resolve_ble_target(
     adapter: &Adapter,
     ble_uri: &str,
-) -> Result<Peripheral, InterfaceError> {
+    generation_stable_name: Option<&str>,
+) -> Result<(Peripheral, BleTargetResolutionClass), InterfaceError> {
     let target = ble_uri.strip_prefix("ble://").unwrap_or(ble_uri);
     ble_diag(format!("[ble] resolve_ble_target target='{target}'"));
 
@@ -1178,14 +1310,14 @@ async fn resolve_ble_target(
         for p in &peripherals {
             if let Ok(Some(props)) = bounded_ble_operation("properties", p.properties()).await {
                 if props.services.contains(&NUS_SERVICE_UUID) {
-                    return Ok(p.clone());
+                    return Ok((p.clone(), BleTargetResolutionClass::FirstRnode));
                 }
                 // A populated list without NUS means a different device;
                 // only fall back to the name on empty service lists.
                 if props.services.is_empty() {
                     if let Some(ref name) = props.local_name {
                         if name.starts_with("RNode ") {
-                            return Ok(p.clone());
+                            return Ok((p.clone(), BleTargetResolutionClass::FirstRnode));
                         }
                     }
                 }
@@ -1202,17 +1334,26 @@ async fn resolve_ble_target(
         let addr = p.id().to_string();
         if addr.eq_ignore_ascii_case(target) {
             ble_diag(format!("[ble] resolve matched by address: {addr}"));
-            return Ok(p.clone());
+            return Ok((p.clone(), BleTargetResolutionClass::PrimaryId));
         }
     }
 
-    // Fallback for UIs that pass a friendly name instead of platform id.
+    // Friendly-name resolution remains a fallback behind the configured
+    // platform ID. After an exact first generation, its verified RNode name is
+    // retained in memory so a post-bond CoreBluetooth handle replacement can
+    // be resolved without changing the public/configured identity.
     for p in &peripherals {
         if let Ok(Some(props)) = bounded_ble_operation("properties", p.properties()).await {
             if let Some(ref name) = props.local_name {
-                if name == target {
-                    ble_diag(format!("[ble] resolve matched by name: {name}"));
-                    return Ok(p.clone());
+                if let Some(resolution_class) =
+                    ble_name_resolution_class(target, generation_stable_name, name)
+                {
+                    if resolution_class == BleTargetResolutionClass::PrimaryName {
+                        ble_diag(format!("[ble] resolve matched by name: {name}"));
+                    } else {
+                        ble_diag("[ble] resolve matched by generation-stable advertised name");
+                    }
+                    return Ok((p.clone(), resolution_class));
                 }
             }
         }
@@ -1246,11 +1387,31 @@ enum NativeBridgeWrite {
 async fn connect_rnode(
     adapter: &Adapter,
     ble_uri: &str,
+    generation_stable_name: &mut Option<String>,
     running: &AtomicBool,
     generation_id: BleGenerationId,
 ) -> Result<BleRNodeConnection, InterfaceError> {
     ble_diag(format!("[ble] connect_rnode start uri={ble_uri}"));
-    let peripheral = resolve_ble_target(adapter, ble_uri).await?;
+    let alternate_name = if cfg!(any(target_os = "ios", target_os = "macos")) {
+        generation_stable_name.as_deref()
+    } else {
+        None
+    };
+    let (peripheral, resolution_class) =
+        match resolve_ble_target(adapter, ble_uri, alternate_name).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                trace_ble_lifecycle(generation_id, "target_resolution", "failed", None, None);
+                return Err(error);
+            }
+        };
+    trace_ble_lifecycle(
+        generation_id,
+        "target_resolution",
+        resolution_class.label(),
+        None,
+        None,
+    );
     ble_diag(format!("[ble] resolved peripheral id={}", peripheral.id()));
     let target_id = peripheral.id();
     // The exact target event receiver is installed before any connection
@@ -1273,6 +1434,7 @@ async fn connect_rnode(
 
     let mut last_err = String::new();
     for attempt in 1..=3 {
+        trace_ble_lifecycle(generation_id, "connect", "started", None, None);
         match run_generation_operation(
             BleOperationStage::Connect,
             peripheral.connect(),
@@ -1283,6 +1445,7 @@ async fn connect_rnode(
         .await
         {
             Ok(()) => {
+                trace_ble_lifecycle(generation_id, "connect", "accepted", None, None);
                 tracing::info!(address = %peripheral.id(), attempt, "BLE RNode connected");
                 ble_diag(format!(
                     "[ble] peripheral.connect() ok on attempt {attempt}"
@@ -1290,6 +1453,13 @@ async fn connect_rnode(
                 break;
             }
             Err(error) => {
+                trace_ble_lifecycle(
+                    generation_id,
+                    "connect",
+                    generation_exit_result_class(&error),
+                    None,
+                    None,
+                );
                 last_err = error.to_string();
                 tracing::warn!(attempt, error = %error, "BLE RNode connect attempt failed");
                 ble_diag(format!(
@@ -1317,8 +1487,24 @@ async fn connect_rnode(
         |event| matches!(event, CentralEvent::DeviceDisconnected(id) if id == &target_id),
     )
     .await
-    .map_err(|error| InterfaceError::SendFailed(error.to_string()))?;
+    .map_err(|error| {
+        trace_ble_lifecycle(
+            generation_id,
+            "connected_check",
+            generation_exit_result_class(&error),
+            None,
+            None,
+        );
+        InterfaceError::SendFailed(error.to_string())
+    })?;
     if !connected {
+        trace_ble_lifecycle(
+            generation_id,
+            "connected_check",
+            "not_connected",
+            None,
+            None,
+        );
         ble_diag(format!(
             "[ble] is_connected=false after retries: {last_err}"
         ));
@@ -1326,8 +1512,10 @@ async fn connect_rnode(
             "BLE connect failed after 3 attempts: {last_err}"
         )));
     }
+    trace_ble_lifecycle(generation_id, "connected_check", "accepted", None, None);
 
     ble_diag("[ble] discover_services start");
+    trace_ble_lifecycle(generation_id, "discovery", "started", None, None);
     run_generation_operation(
         BleOperationStage::Discovery,
         peripheral.discover_services(),
@@ -1337,9 +1525,17 @@ async fn connect_rnode(
     )
     .await
     .map_err(|error| {
+        trace_ble_lifecycle(
+            generation_id,
+            "discovery",
+            generation_exit_result_class(&error),
+            None,
+            None,
+        );
         ble_diag(format!("[ble] discover_services err: {error}"));
         InterfaceError::SendFailed(error.to_string())
     })?;
+    trace_ble_lifecycle(generation_id, "discovery", "accepted", None, None);
     ble_diag("[ble] discover_services ok");
 
     let chars = peripheral.characteristics();
@@ -1348,6 +1544,7 @@ async fn connect_rnode(
         .iter()
         .find(|c| c.uuid == NUS_RX_CHAR_UUID)
         .ok_or_else(|| {
+            trace_ble_lifecycle(generation_id, "discovery", "nus_rx_missing", None, None);
             ble_diag("[ble] NUS RX char not found");
             InterfaceError::SendFailed("NUS RX characteristic not found. Is this an RNode?".into())
         })?
@@ -1356,53 +1553,105 @@ async fn connect_rnode(
         .iter()
         .find(|c| c.uuid == NUS_TX_CHAR_UUID)
         .ok_or_else(|| {
+            trace_ble_lifecycle(generation_id, "discovery", "nus_tx_missing", None, None);
             ble_diag("[ble] NUS TX char not found");
             InterfaceError::SendFailed("NUS TX characteristic not found. Is this an RNode?".into())
         })?
         .clone();
+    if generation_stable_name.is_none() {
+        if let Ok(Some(properties)) =
+            bounded_ble_operation("resolved target properties", peripheral.properties()).await
+        {
+            if let Some(name) = properties
+                .local_name
+                .filter(|name| name.starts_with("RNode "))
+            {
+                *generation_stable_name = Some(name);
+            }
+        }
+    }
     ble_diag(format!(
         "[ble] RX/TX chars found; RX props={:?} TX props={:?}",
         rx_char.properties, tx_char.properties
     ));
 
-    // SMP must run BEFORE subscribe on desktop / Apple / Android platforms —
-    // reading the encrypted TX char kicks off SMP and drops L2CAP, which
-    // kills any pending subscribe. iOS/macOS share CoreBluetooth; Windows
-    // (WinRT) and Android auto-prompt and retry on encrypted-char reads.
-    // Linux used explicit BlueZ pairing before `connect()`, above.
+    // Select one authentication trigger from the discovered GATT contract.
+    // ESP RNodes expose an encrypted readable TX value, so the established
+    // read-before-subscribe sequence remains authoritative. Bluefruit nRF
+    // RNodes expose TX as notification-only and secure the CCCD; on Apple the
+    // subscription itself must trigger SMP. The exact generation owner below
+    // fences either operation against the intentional post-bond disconnect.
+    // Windows and Android retain their reviewed encrypted-read behavior, and
+    // Linux uses explicit BlueZ pairing before `connect()`, above.
     #[cfg(any(
         target_os = "ios",
         target_os = "macos",
         target_os = "windows",
         target_os = "android"
     ))]
-    desktop_trigger_pairing(
-        &peripheral,
-        &tx_char,
-        &mut adapter_events,
-        running,
-        &target_id,
-    )
-    .await?;
+    let pairing_trigger = desktop_pairing_trigger_for_properties(
+        tx_char.properties,
+        cfg!(any(target_os = "ios", target_os = "macos")),
+    );
+    #[cfg(any(
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    ))]
+    {
+        trace_ble_lifecycle(
+            generation_id,
+            "pairing_trigger",
+            pairing_trigger.label(),
+            Some(tx_char.properties.contains(CharPropFlags::READ)),
+            Some(tx_char.properties.contains(CharPropFlags::NOTIFY)),
+        );
+        ble_diag(format!(
+            "[pair] trigger={} tx_read={} tx_notify={}",
+            pairing_trigger.label(),
+            tx_char.properties.contains(CharPropFlags::READ),
+            tx_char.properties.contains(CharPropFlags::NOTIFY),
+        ));
+
+        if pairing_trigger == DesktopPairingTrigger::EncryptedRead {
+            desktop_trigger_pairing(
+                &peripheral,
+                &tx_char,
+                &mut adapter_events,
+                running,
+                &target_id,
+                generation_id,
+            )
+            .await?;
+        }
+    }
+
+    // A notification-only secured CCCD is an interactive pairing operation on
+    // Apple. Give the system prompt the same human-entry deadline as the
+    // encrypted read path. Once bonded, this subscription completes normally
+    // and is not repeated within the accepted generation.
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    let subscribe_stage = if pairing_trigger == DesktopPairingTrigger::SecuredSubscribe {
+        BleOperationStage::PairingSubscribe
+    } else {
+        BleOperationStage::Subscribe
+    };
+    #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+    let subscribe_stage = BleOperationStage::Subscribe;
 
     ble_diag("[ble] subscribe TX start");
+    trace_ble_lifecycle(generation_id, "subscribe", "started", None, None);
     run_generation_operation(
-        BleOperationStage::Subscribe,
+        subscribe_stage,
         peripheral.subscribe(&tx_char),
         &mut adapter_events,
         running,
         |event| matches!(event, CentralEvent::DeviceDisconnected(id) if id == &target_id),
     )
     .await
-    .map_err(|error| {
-        ble_diag(format!("[ble] subscribe TX err: {error}"));
-        let detail = if matches!(error, BleGenerationExit::TargetDisconnected { .. }) {
-            format!("BLE pairing in progress: {error}")
-        } else {
-            error.to_string()
-        };
-        InterfaceError::SendFailed(detail)
-    })?;
+    .map_err(|error| map_subscribe_generation_error(generation_id, error))?;
+    trace_ble_lifecycle(generation_id, "subscribe", "accepted", None, None);
     ble_diag("[ble] subscribe TX ok");
 
     let write_mtu = ble_write_chunk_size();
@@ -1419,14 +1668,38 @@ async fn connect_rnode(
     })
 }
 
-/// Desktop / Apple quirk: `WithoutResponse` writes never surface ATT auth
-/// errors, so the OS won't prompt for pairing on its own. Reading the
-/// encrypted TX char forces SMP; the system shows its passkey dialog
-/// (code on the RNode OLED) and briefly drops L2CAP. Caller MUST NOT
-/// recover in-place — on Apple the post-SMP CBPeripheral enters a zombie
-/// state where `connect()` / `is_connected()` hang; on Windows btleplug
-/// returns the read error and we bubble it so the reconnect loop
-/// re-resolves with a fresh handle.
+fn map_subscribe_generation_error(
+    generation_id: BleGenerationId,
+    error: BleGenerationExit,
+) -> InterfaceError {
+    trace_ble_lifecycle(
+        generation_id,
+        "subscribe",
+        generation_exit_result_class(&error),
+        None,
+        None,
+    );
+    ble_diag(format!("[ble] subscribe TX err: {error}"));
+    let detail = match &error {
+        BleGenerationExit::TargetDisconnected { .. }
+        | BleGenerationExit::StageFailed {
+            stage: BleOperationStage::PairingSubscribe,
+            ..
+        } => format!("BLE pairing in progress: {error}"),
+        BleGenerationExit::DeadlineElapsed {
+            stage: BleOperationStage::PairingSubscribe,
+        } => "BLE pairing timed out while enabling secured notifications. Did you enter the 6-digit passkey shown on the RNode when the system prompted?".into(),
+        _ => error.to_string(),
+    };
+    InterfaceError::SendFailed(detail)
+}
+
+/// Trigger authentication through a TX value that advertises encrypted reads.
+/// The system shows its passkey dialog (code on the RNode display) and may
+/// briefly drop L2CAP. Caller MUST NOT recover in-place — on Apple the post-SMP
+/// CBPeripheral can enter a zombie state where `connect()` / `is_connected()`
+/// hang; on Windows btleplug returns the read error and we bubble it so the
+/// reconnect loop re-resolves with a fresh handle.
 ///
 /// Works on iOS + macOS (CoreBluetooth) and Windows 10/11 (WinRT GATT —
 /// `GattCharacteristic::ReadValueAsync` triggers Windows' built-in
@@ -1434,7 +1707,7 @@ async fn connect_rnode(
 /// uses `linux_trigger_pairing` instead — BlueZ requires an explicit
 /// `Device::pair()` plus a registered Agent for the passkey callback.
 ///
-/// Android behaves like Windows: a GATT op on an auth-required char makes
+/// Android behaves like Windows: a GATT op on an auth-required readable char makes
 /// the platform start bonding (system passkey dialog) and retry the op
 /// internally once bonded. Without this read-first step the subscribe()
 /// CCCD write fails instantly with insufficient-auth while the bond is
@@ -1442,6 +1715,9 @@ async fn connect_rnode(
 /// errors instead of blocking, the error maps to "BLE pairing in
 /// progress" and the reconnect loop retries on a 1s cadence until the
 /// bond lands.
+///
+/// Apple notification-only TX characteristics do not enter this function;
+/// their secured CCCD subscription is the authentication trigger.
 #[cfg(any(
     target_os = "ios",
     target_os = "macos",
@@ -1454,11 +1730,13 @@ async fn desktop_trigger_pairing(
     adapter_events: &mut BleCentralEventStream,
     running: &AtomicBool,
     target_id: &PeripheralId,
+    generation_id: BleGenerationId,
 ) -> Result<(), InterfaceError> {
     ble_diag(format!(
         "[pair] reading TX char — triggers SMP if unbonded: props={:?}",
         tx_char.properties
     ));
+    trace_ble_lifecycle(generation_id, "pairing_read", "started", None, None);
 
     // Observe before issuing the encrypted read. The nRF RNode deliberately
     // disconnects after it has durably stored a fresh bond. On CoreBluetooth,
@@ -1477,6 +1755,7 @@ async fn desktop_trigger_pairing(
 
     match pairing_result {
         Ok(bytes) => {
+            trace_ble_lifecycle(generation_id, "pairing_read", "accepted", None, None);
             ble_diag(format!(
                 "[pair] TX read ok ({} bytes) — bonded",
                 bytes.len()
@@ -1484,6 +1763,7 @@ async fn desktop_trigger_pairing(
             Ok(())
         }
         Err(BleGenerationExit::StageFailed { reason, .. }) => {
+            trace_ble_lifecycle(generation_id, "pairing_read", "stage_failed", None, None);
             // SMP just ran or is in progress — outer loop must retry with
             // a fresh peripheral.
             ble_diag(format!(
@@ -1494,6 +1774,13 @@ async fn desktop_trigger_pairing(
             )))
         }
         Err(BleGenerationExit::TargetDisconnected { .. }) => {
+            trace_ble_lifecycle(
+                generation_id,
+                "pairing_read",
+                "target_disconnected",
+                None,
+                None,
+            );
             ble_diag(
                 "[pair] target disconnected after encrypted read — fresh bond transition; reconnecting",
             );
@@ -1503,12 +1790,28 @@ async fn desktop_trigger_pairing(
             ))
         }
         Err(BleGenerationExit::DeadlineElapsed { .. }) => {
+            trace_ble_lifecycle(
+                generation_id,
+                "pairing_read",
+                "deadline_elapsed",
+                None,
+                None,
+            );
             ble_diag("[pair] TX read timed out after 60s — passkey not entered?");
             Err(InterfaceError::SendFailed(
                 "BLE pairing timed out. Did you enter the 6-digit passkey shown on the RNode when the system prompted?".into(),
             ))
         }
-        Err(error) => Err(InterfaceError::SendFailed(error.to_string())),
+        Err(error) => {
+            trace_ble_lifecycle(
+                generation_id,
+                "pairing_read",
+                generation_exit_result_class(&error),
+                None,
+                None,
+            );
+            Err(InterfaceError::SendFailed(error.to_string()))
+        }
     }
 }
 
@@ -2130,6 +2433,11 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
         let mut backoff = RECONNECT_WAIT;
         let mut initial_attempt = true;
         let mut generation_counter = BleGenerationId::default();
+        // CoreBluetooth can replace/evict the peripheral handle during the
+        // intentional nRF post-bond disconnect. Preserve the first verified
+        // RNode advertised name only inside this runtime as a secondary
+        // generation selector; the configured URI remains authoritative.
+        let mut generation_stable_target_name: Option<String> = None;
 
         // Drop guard: every early return must clear the running-flag map
         // entry, or stale entries confuse later spawns reusing the id.
@@ -2180,8 +2488,14 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             };
 
             let generation_id = generation_counter.next();
-            let mut conn = match connect_rnode(&adapter, &ble_uri, &running_task, generation_id)
-                .await
+            let mut conn = match connect_rnode(
+                &adapter,
+                &ble_uri,
+                &mut generation_stable_target_name,
+                &running_task,
+                generation_id,
+            )
+            .await
             {
                 Ok(c) => c,
                 Err(e) => {
@@ -2219,6 +2533,13 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             // `notifications()` is called. Acquire it before detect/init so
             // startup evidence cannot race ahead of the observation stream.
             let target_peripheral_id = conn.peripheral.id();
+            trace_ble_lifecycle(
+                generation_id,
+                "notification_acquisition",
+                "started",
+                None,
+                None,
+            );
             let mut notification_stream = match run_generation_operation(
                 BleOperationStage::NotificationAcquisition,
                 conn.peripheral.notifications(),
@@ -2228,8 +2549,24 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             )
             .await
             {
-                Ok(stream) => stream,
+                Ok(stream) => {
+                    trace_ble_lifecycle(
+                        generation_id,
+                        "notification_acquisition",
+                        "accepted",
+                        None,
+                        None,
+                    );
+                    stream
+                }
                 Err(e) => {
+                    trace_ble_lifecycle(
+                        generation_id,
+                        "notification_acquisition",
+                        generation_exit_result_class(&e),
+                        None,
+                        None,
+                    );
                     snapshot_publisher.connection_attempt_failed();
                     tracing::warn!(error = %e, "BLE RNode notification stream failed");
                     let _ =
@@ -2254,6 +2591,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             let mut protocol_state = RNodeProtocolState::new(protocol_target);
             let mut deframer = kiss::RawKissDeframer::new();
             ble_diag("[ble] sending detect sequence");
+            trace_ble_lifecycle(generation_id, "detect_write", "started", None, None);
             let detect_seq = rnode::build_detect_sequence();
             if let Err(e) = ble_write_for_generation(
                 &mut conn,
@@ -2263,6 +2601,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             )
             .await
             {
+                trace_ble_lifecycle(generation_id, "detect_write", "failed", None, None);
                 snapshot_publisher.connection_attempt_failed();
                 tracing::warn!(error = %e, "BLE RNode detect write failed");
                 ble_diag(format!("[ble] detect write failed: {e}"));
@@ -2280,6 +2619,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                 backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
                 continue;
             }
+            trace_ble_lifecycle(generation_id, "detect_write", "accepted", None, None);
             ble_diag("[ble] detect sent ok");
 
             let capability_admission = if options.requires_capability_admission() {
@@ -2400,8 +2740,24 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                 )
                 .await
                 {
-                    BleHandshakeOutcome::Observed => None,
+                    BleHandshakeOutcome::Observed => {
+                        trace_ble_lifecycle(
+                            generation_id,
+                            "detect_handshake",
+                            "observed",
+                            None,
+                            None,
+                        );
+                        None
+                    }
                     BleHandshakeOutcome::Stopped => {
+                        trace_ble_lifecycle(
+                            generation_id,
+                            "detect_handshake",
+                            "stop_requested",
+                            None,
+                            None,
+                        );
                         bounded_ble_disconnect(&conn.peripheral).await;
                         publish_ble_stopped(
                             &mut snapshot_publisher,
@@ -2410,6 +2766,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                         return;
                     }
                     BleHandshakeOutcome::Retry(reason) => {
+                        trace_ble_lifecycle(generation_id, "detect_handshake", "retry", None, None);
                         snapshot_publisher.connection_attempt_failed();
                         tracing::warn!(
                             name = %log_name,
@@ -2449,9 +2806,11 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             }
 
             ble_diag("[ble] reasserting radio without RADIO_OFF");
+            trace_ble_lifecycle(generation_id, "radio_reassertion", "started", None, None);
             if let Err(error) =
                 ble_reassert_radio(&mut conn, &init_stage_template, &running_task).await
             {
+                trace_ble_lifecycle(generation_id, "radio_reassertion", "failed", None, None);
                 // A failed BLE generation is abandoned without sending OFF.
                 // The RNode keeps the last complete radio state online while
                 // this client reconnects and reasserts the full desired set.
@@ -2471,6 +2830,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                 backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
                 continue;
             }
+            trace_ble_lifecycle(generation_id, "radio_reassertion", "accepted", None, None);
             ble_diag("[ble] radio reassertion sent ok — awaiting typed readiness");
 
             enum StartupReadinessOutcome {
@@ -2524,8 +2884,17 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             };
 
             match startup_outcome {
-                StartupReadinessOutcome::Ready => {}
+                StartupReadinessOutcome::Ready => {
+                    trace_ble_lifecycle(generation_id, "typed_readiness", "ready", None, None);
+                }
                 StartupReadinessOutcome::Stopped => {
+                    trace_ble_lifecycle(
+                        generation_id,
+                        "typed_readiness",
+                        "stop_requested",
+                        None,
+                        None,
+                    );
                     snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
                     ble_send_radio_off(&mut conn).await;
                     let _ =
@@ -2535,6 +2904,14 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                     return;
                 }
                 StartupReadinessOutcome::Retry(reason) => {
+                    let result_class = match reason {
+                        "notification stream ended before Ready" => "notification_stream_ended",
+                        "target disconnected before Ready" => "target_disconnected",
+                        "adapter event stream ended before Ready" => "event_stream_ended",
+                        "typed readiness timed out" => "deadline_elapsed",
+                        _ => "retry",
+                    };
+                    trace_ble_lifecycle(generation_id, "typed_readiness", result_class, None, None);
                     snapshot_publisher.connection_attempt_failed();
                     tracing::warn!(name = %log_name, reason, "BLE RNode did not reach Ready");
                     ble_diag(format!("[ble] readiness retry: {reason}"));
@@ -2595,9 +2972,23 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
 
             'read: loop {
                 if !online_handle.load(Ordering::SeqCst) {
+                    trace_ble_lifecycle(
+                        generation_id,
+                        "active_generation",
+                        "online_cleared",
+                        None,
+                        None,
+                    );
                     break 'read;
                 }
                 if !running_task.load(Ordering::SeqCst) {
+                    trace_ble_lifecycle(
+                        generation_id,
+                        "active_generation",
+                        "stop_requested",
+                        None,
+                        None,
+                    );
                     snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
                     ble_send_radio_off(&mut conn).await;
                     break 'read;
@@ -2633,6 +3024,13 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                                     if data_allowed {
                                         task_rxb.fetch_add(frame.len() as u64, Ordering::Relaxed);
                                         if transport_tx.send(msg).await.is_err() {
+                                            trace_ble_lifecycle(
+                                                generation_id,
+                                                "active_generation",
+                                                "transport_consumer_closed",
+                                                None,
+                                                None,
+                                            );
                                             tracing::warn!(id, "transport channel closed");
                                             transport_closed = true;
                                             break 'read;
@@ -2648,18 +3046,39 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                     }
                     GenerationEvent::Notification(Some(_)) => {}
                     GenerationEvent::Notification(None) => {
+                        trace_ble_lifecycle(
+                            generation_id,
+                            "active_generation",
+                            "notification_stream_ended",
+                            None,
+                            None,
+                        );
                         tracing::warn!("BLE RNode notification stream ended");
                         break 'read;
                     }
                     GenerationEvent::Adapter(Some(CentralEvent::DeviceDisconnected(
                         peripheral_id,
                     ))) if peripheral_id == target_peripheral_id => {
+                        trace_ble_lifecycle(
+                            generation_id,
+                            "active_generation",
+                            "target_disconnected",
+                            None,
+                            None,
+                        );
                         tracing::warn!("BLE RNode disconnected; ending connection generation");
                         ble_diag("[ble] target DeviceDisconnected — reconnecting");
                         break 'read;
                     }
                     GenerationEvent::Adapter(Some(_)) => {}
                     GenerationEvent::Adapter(None) => {
+                        trace_ble_lifecycle(
+                            generation_id,
+                            "active_generation",
+                            "event_stream_ended",
+                            None,
+                            None,
+                        );
                         tracing::warn!("BLE adapter event stream ended");
                         break 'read;
                     }
@@ -2667,6 +3086,13 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                         pending_outbound = Some(PendingOutbound::new(data, false));
                     }
                     GenerationEvent::Outbound(None) => {
+                        trace_ble_lifecycle(
+                            generation_id,
+                            "active_generation",
+                            "outbound_channel_closed",
+                            None,
+                            None,
+                        );
                         tracing::warn!(id, "BLE RNode outbound channel closed");
                         transport_closed = true;
                         break 'read;
@@ -2712,6 +3138,13 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                             pending_outbound = None;
                         }
                         Err(error) => {
+                            trace_ble_lifecycle(
+                                generation_id,
+                                "active_generation",
+                                "write_failed",
+                                None,
+                                None,
+                            );
                             tracing::warn!(%error, "BLE RNode write failed; retaining payload");
                             ble_diag(format!(
                                 "[ble] outbound write failed; payload retained: {error}"
@@ -2738,6 +3171,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             }
 
             snapshot_publisher.connection_lost();
+            trace_ble_lifecycle(generation_id, "reconnect", "scheduled", None, None);
             if reconnect_try_exhausted(&mut tries) {
                 tracing::warn!(name = %log_name, "BLE RNode: max reconnect tries reached");
                 snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
@@ -3457,6 +3891,124 @@ mod tests {
         let ordinary_disconnect =
             InterfaceError::SendFailed("BLE connect failed: device disconnected".into());
         assert!(!is_pairing_transition_error(&ordinary_disconnect));
+    }
+
+    #[test]
+    fn apple_pairing_trigger_follows_discovered_tx_properties() {
+        let esp_tx = CharPropFlags::READ | CharPropFlags::NOTIFY;
+        assert_eq!(
+            desktop_pairing_trigger_for_properties(esp_tx, true),
+            DesktopPairingTrigger::EncryptedRead,
+            "Apple must retain the reviewed encrypted-read trigger for ESP TX"
+        );
+
+        let nrf_tx = CharPropFlags::NOTIFY;
+        assert_eq!(
+            desktop_pairing_trigger_for_properties(nrf_tx, true),
+            DesktopPairingTrigger::SecuredSubscribe,
+            "Apple must authenticate a Bluefruit notify-only TX through its CCCD"
+        );
+        assert_eq!(
+            desktop_pairing_trigger_for_properties(nrf_tx, false),
+            DesktopPairingTrigger::EncryptedRead,
+            "Android and Windows retain their existing encrypted-read behavior"
+        );
+    }
+
+    #[test]
+    fn corebluetooth_uuid_primary_uses_verified_name_for_post_bond_resolution() {
+        let configured_uuid = "64F6A7A3-7349-4D15-92B7-AEAE9D2A0E61";
+        let verified_name = "RNode 0544";
+
+        assert_eq!(
+            ble_name_resolution_class(configured_uuid, None, verified_name),
+            None,
+            "an unverified name must not replace the configured UUID"
+        );
+        assert_eq!(
+            ble_name_resolution_class(configured_uuid, Some(verified_name), verified_name),
+            Some(BleTargetResolutionClass::GenerationStableName),
+            "the first exact RNode name must survive a post-bond CB handle replacement"
+        );
+        assert_eq!(
+            ble_name_resolution_class(configured_uuid, Some(verified_name), "RNode 9999"),
+            None,
+            "a different advertised RNode name must not satisfy the fallback"
+        );
+    }
+
+    #[test]
+    fn apple_nrf_fresh_bond_disconnect_retries_without_invalid_read_and_reaches_ready() {
+        let nrf_tx = CharPropFlags::NOTIFY;
+
+        // Generation one authenticates through the secured CCCD. Official nRF
+        // RNode firmware then disconnects intentionally after storing the bond.
+        assert_eq!(
+            desktop_pairing_trigger_for_properties(nrf_tx, true),
+            DesktopPairingTrigger::SecuredSubscribe
+        );
+        let mut generations = BleGenerationId::default();
+        let first_generation = generations.next();
+        let transition = map_subscribe_generation_error(
+            first_generation,
+            BleGenerationExit::TargetDisconnected {
+                stage: BleOperationStage::PairingSubscribe,
+            },
+        );
+        assert!(is_pairing_transition_error(&transition));
+        assert_eq!(
+            BleOperationStage::PairingSubscribe.deadline(),
+            Duration::from_secs(60),
+            "the secured CCCD trigger must leave time for human PIN entry"
+        );
+        assert_eq!(
+            BleOperationStage::Subscribe.deadline(),
+            Duration::from_secs(10),
+            "ordinary notification subscription retains its bounded deadline"
+        );
+
+        let immediate_auth_error = map_subscribe_generation_error(
+            first_generation,
+            BleGenerationExit::StageFailed {
+                stage: BleOperationStage::PairingSubscribe,
+                reason: "redacted platform error".into(),
+            },
+        );
+        assert!(is_pairing_transition_error(&immediate_auth_error));
+
+        // The outer owner re-resolves a fresh peripheral for generation two.
+        // Its GATT contract still selects subscribe directly; after the stored
+        // bond admits that CCCD write, normal protocol evidence reaches Ready.
+        assert_eq!(
+            desktop_pairing_trigger_for_properties(nrf_tx, true),
+            DesktopPairingTrigger::SecuredSubscribe
+        );
+        let second_generation = generations.next();
+        assert_ne!(first_generation, second_generation);
+        let target = RNodeProtocolTarget::new(915_000_000, 250_000, 9, 5, 17);
+        let mut protocol_state = RNodeProtocolState::new(target);
+        for (command, frame) in [
+            (rnode::CMD_DETECT, vec![rnode::DETECT_RESP]),
+            (
+                rnode::CMD_FW_VERSION,
+                vec![rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+            ),
+            (
+                rnode::CMD_FREQUENCY,
+                target.frequency.to_be_bytes().to_vec(),
+            ),
+            (
+                rnode::CMD_BANDWIDTH,
+                target.bandwidth.to_be_bytes().to_vec(),
+            ),
+            (rnode::CMD_SF, vec![target.spreading_factor]),
+            (rnode::CMD_CR, vec![target.coding_rate]),
+            (rnode::CMD_TXPOWER, vec![target.tx_power]),
+            (rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_ON]),
+        ] {
+            protocol_state.apply_frame(command, &frame);
+        }
+        assert_eq!(protocol_state.readiness(), RNodeReadiness::Ready);
     }
 
     #[test]
@@ -5421,9 +5973,11 @@ mod tests {
     async fn test_ble_connect_to_rnode() {
         let adapter = get_adapter().await.expect("No BLE adapter");
         let running = AtomicBool::new(true);
+        let mut generation_stable_name = None;
         let conn = connect_rnode(
             &adapter,
             "ble://",
+            &mut generation_stable_name,
             &running,
             BleGenerationId::default().next(),
         )

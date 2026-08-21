@@ -29,6 +29,7 @@ pub(super) enum BleOperationStage {
     ConnectedCheck,
     Discovery,
     PairingRead,
+    PairingSubscribe,
     Subscribe,
     NotificationAcquisition,
     Detect,
@@ -41,7 +42,7 @@ pub(super) enum BleOperationStage {
 impl BleOperationStage {
     pub(super) const fn deadline(self) -> Duration {
         match self {
-            Self::PairingRead => Duration::from_secs(60),
+            Self::PairingRead | Self::PairingSubscribe => Duration::from_secs(60),
             Self::ActiveWrite => Duration::from_secs(5),
             Self::Disconnect => Duration::from_secs(3),
             Self::Connect
@@ -63,6 +64,7 @@ impl fmt::Display for BleOperationStage {
             Self::ConnectedCheck => "connected check",
             Self::Discovery => "service discovery",
             Self::PairingRead => "pairing read",
+            Self::PairingSubscribe => "pairing notification subscribe",
             Self::Subscribe => "notification subscribe",
             Self::NotificationAcquisition => "notification acquisition",
             Self::Detect => "detect write",
@@ -213,6 +215,7 @@ mod tests {
             BleOperationStage::ConnectedCheck,
             BleOperationStage::Discovery,
             BleOperationStage::PairingRead,
+            BleOperationStage::PairingSubscribe,
             BleOperationStage::Subscribe,
             BleOperationStage::NotificationAcquisition,
             BleOperationStage::Detect,
@@ -261,6 +264,7 @@ mod tests {
             BleOperationStage::ConnectedCheck,
             BleOperationStage::Discovery,
             BleOperationStage::PairingRead,
+            BleOperationStage::PairingSubscribe,
             BleOperationStage::Subscribe,
             BleOperationStage::NotificationAcquisition,
             BleOperationStage::Detect,
