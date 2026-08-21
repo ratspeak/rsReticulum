@@ -99,6 +99,41 @@ const RNODE_POST_BOND_SETTLE: Duration = Duration::from_millis(2600);
 const RNODE_NATIVE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(6);
 const RNODE_NATIVE_HANDSHAKE_PROBE: Duration = Duration::from_millis(650);
 const RNODE_BLE_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+/// Closed localhost-only command emitted by Ratspeak's Android GATT owner after
+/// one complete KISS data frame crosses its generation-fenced write boundary.
+/// It is consumed inside the native bridge and never reaches RNode protocol or
+/// Reticulum transport processing.
+const RNODE_NATIVE_BRIDGE_ACK_COMMAND: u8 = 0xA0;
+const RNODE_NATIVE_BRIDGE_ACK_MAGIC: &[u8; 5] = b"RSBA\x01";
+const RNODE_NATIVE_BRIDGE_ACK_PAYLOAD_LEN: usize = RNODE_NATIVE_BRIDGE_ACK_MAGIC.len() + 8;
+const RNODE_NATIVE_MAX_PACKET: usize = 508;
+const RNODE_NATIVE_MAX_ESCAPED_FRAME: usize = RNODE_NATIVE_MAX_PACKET * 2 + 3;
+const RNODE_NATIVE_ACK_MIN_WRITE_CHUNK: usize = BLE_DEFAULT_ATT_WRITE_PAYLOAD;
+const RNODE_NATIVE_ACK_WORST_CASE_CHUNKS: u64 =
+    RNODE_NATIVE_MAX_ESCAPED_FRAME.div_ceil(RNODE_NATIVE_ACK_MIN_WRITE_CHUNK) as u64;
+// Shared with RatspeakBleGatt's exact write loop: every chunk can spend 1.2s
+// being accepted, 5s awaiting its GATT callback, and 12ms pacing before the
+// next chunk. MTU negotiation may legally retain the 20-byte ATT baseline, so
+// derive from that 51-chunk case and add two seconds after its 316.8s bound.
+const RNODE_NATIVE_ACK_ENQUEUE_RETRY_MS: u64 = 1_200;
+const RNODE_NATIVE_ACK_CALLBACK_MS: u64 = 5_000;
+const RNODE_NATIVE_ACK_PACING_MS: u64 = 12;
+const RNODE_NATIVE_ACK_MARGIN_MS: u64 = 2_000;
+const RNODE_NATIVE_BRIDGE_ACK_TIMEOUT_MS: u64 = RNODE_NATIVE_ACK_WORST_CASE_CHUNKS
+    * (RNODE_NATIVE_ACK_ENQUEUE_RETRY_MS + RNODE_NATIVE_ACK_CALLBACK_MS)
+    + (RNODE_NATIVE_ACK_WORST_CASE_CHUNKS - 1) * RNODE_NATIVE_ACK_PACING_MS
+    + RNODE_NATIVE_ACK_MARGIN_MS;
+const RNODE_NATIVE_BRIDGE_ACK_TIMEOUT: Duration =
+    Duration::from_millis(RNODE_NATIVE_BRIDGE_ACK_TIMEOUT_MS);
+/// Only complete frames following the final Ready-producing echo in its same
+/// TCP read cross the startup boundary; this keeps that carry explicitly bound.
+const RNODE_NATIVE_STARTUP_ACTIVE_CARRY_MAX: usize = 4096;
+/// Android's physical GATT owner may finish a trusted radio DATA record while
+/// Rust replaces its localhost TCP generation. Hold those complete records
+/// until this generation independently proves typed Ready; 64 KiB is well
+/// above the RNode's 6,144-byte receive buffer without becoming unbounded.
+const RNODE_NATIVE_STARTUP_PRE_READY_DATA_MAX_BYTES: usize = 64 * 1024;
+const RNODE_NATIVE_STARTUP_PRE_READY_DATA_MAX_RECORDS: usize = 256;
 #[cfg(not(test))]
 const RNODE_BLE_CAPABILITY_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -374,6 +409,7 @@ fn is_rnode_handshake_frame(cmd: u8, frame: &[u8]) -> bool {
         || (cmd == rnode::CMD_FW_VERSION && !frame.is_empty())
 }
 
+#[cfg(test)]
 fn reduce_native_handshake_bytes(
     protocol_state: &mut RNodeProtocolState,
     deframer: &mut kiss::RawKissDeframer,
@@ -392,6 +428,45 @@ fn reduce_native_handshake_bytes(
     }
 
     accepted
+}
+
+fn hold_native_pre_ready_data(
+    frame: Vec<u8>,
+    pre_ready_data: &mut Vec<Vec<u8>>,
+    pre_ready_data_bytes: &mut usize,
+) -> bool {
+    let next_bytes = pre_ready_data_bytes.saturating_add(frame.len());
+    if pre_ready_data.len() >= RNODE_NATIVE_STARTUP_PRE_READY_DATA_MAX_RECORDS
+        || next_bytes > RNODE_NATIVE_STARTUP_PRE_READY_DATA_MAX_BYTES
+    {
+        return false;
+    }
+    pre_ready_data.push(frame);
+    *pre_ready_data_bytes = next_bytes;
+    true
+}
+
+fn reduce_native_handshake_bytes_preserving_data(
+    protocol_state: &mut RNodeProtocolState,
+    deframer: &mut kiss::RawKissDeframer,
+    bytes: &[u8],
+    pre_ready_data: &mut Vec<Vec<u8>>,
+    pre_ready_data_bytes: &mut usize,
+) -> Result<bool, ()> {
+    let frames = deframer.feed(bytes);
+    let accepted = frames
+        .iter()
+        .any(|(command, frame)| is_rnode_handshake_frame(*command, frame));
+    for (command, frame) in frames {
+        if command == kiss::CMD_DATA {
+            if !hold_native_pre_ready_data(frame, pre_ready_data, pre_ready_data_bytes) {
+                return Err(());
+            }
+        } else {
+            protocol_state.apply_frame(command, &frame);
+        }
+    }
+    Ok(accepted)
 }
 
 fn is_pairing_transition_error(error: &InterfaceError) -> bool {
@@ -532,14 +607,16 @@ async fn probe_native_rnode_handshake(
     tcp_read: &mut tokio::net::tcp::OwnedReadHalf,
     tcp_write: &mut tokio::net::tcp::OwnedWriteHalf,
     protocol_state: &mut RNodeProtocolState,
+    deframer: &mut kiss::RawKissDeframer,
     timeout: Duration,
     probe_interval: Duration,
     running_task: &AtomicBool,
+    pre_ready_data: &mut Vec<Vec<u8>>,
+    pre_ready_data_bytes: &mut usize,
 ) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let detect_seq = rnode::build_detect_sequence();
-    let mut deframer = kiss::RawKissDeframer::new();
     let mut buf = [0u8; 1024];
     let deadline = std::time::Instant::now() + timeout;
     let mut next_probe = std::time::Instant::now();
@@ -577,8 +654,19 @@ async fn probe_native_rnode_handshake(
             Err(_) => continue,
         };
 
-        if reduce_native_handshake_bytes(protocol_state, &mut deframer, &buf[..n]) {
-            return true;
+        match reduce_native_handshake_bytes_preserving_data(
+            protocol_state,
+            deframer,
+            &buf[..n],
+            pre_ready_data,
+            pre_ready_data_bytes,
+        ) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(()) => {
+                tracing::warn!("native BLE pre-Ready DATA carry exceeded bound during handshake");
+                return false;
+            }
         }
     }
 
@@ -1466,9 +1554,95 @@ struct BleRNodeConnection {
     write_mtu: usize,
 }
 
-enum NativeBridgeWrite {
-    Packet(Bytes),
-    Raw(Vec<u8>),
+struct NativePendingOutbound {
+    outbound: PendingOutbound,
+    expected_ack: Option<u64>,
+    sent_at: Option<tokio::time::Instant>,
+}
+
+impl NativePendingOutbound {
+    fn new(outbound: PendingOutbound) -> Self {
+        Self {
+            outbound,
+            expected_ack: None,
+            sent_at: None,
+        }
+    }
+
+    fn reset_for_generation(&mut self) {
+        self.expected_ack = None;
+        self.sent_at = None;
+    }
+
+    fn acknowledgement_timed_out(&self, now: tokio::time::Instant) -> bool {
+        self.sent_at
+            .is_some_and(|sent_at| now.duration_since(sent_at) >= RNODE_NATIVE_BRIDGE_ACK_TIMEOUT)
+    }
+}
+
+fn native_bridge_acknowledged_data_frames(command: u8, payload: &[u8]) -> Option<u64> {
+    if command != RNODE_NATIVE_BRIDGE_ACK_COMMAND
+        || payload.len() != RNODE_NATIVE_BRIDGE_ACK_PAYLOAD_LEN
+        || &payload[..RNODE_NATIVE_BRIDGE_ACK_MAGIC.len()] != RNODE_NATIVE_BRIDGE_ACK_MAGIC
+    {
+        return None;
+    }
+    Some(u64::from_be_bytes(
+        payload[RNODE_NATIVE_BRIDGE_ACK_MAGIC.len()..]
+            .try_into()
+            .expect("native bridge acknowledgement width checked"),
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeStartupReductionError {
+    MalformedBridgeAck,
+    ActiveCarryOverflow,
+    PreReadyDataOverflow,
+}
+
+fn reduce_native_startup_bytes(
+    protocol_state: &mut RNodeProtocolState,
+    deframer: &mut kiss::RawKissDeframer,
+    bytes: &[u8],
+    pre_ready_data: &mut Vec<Vec<u8>>,
+    pre_ready_data_bytes: &mut usize,
+    active_frames: &mut Vec<(u8, Vec<u8>)>,
+    active_bytes: &mut usize,
+) -> Result<(), NativeStartupReductionError> {
+    for (command, frame) in deframer.feed(bytes) {
+        if command == RNODE_NATIVE_BRIDGE_ACK_COMMAND {
+            if native_bridge_acknowledged_data_frames(command, &frame).is_none() {
+                return Err(NativeStartupReductionError::MalformedBridgeAck);
+            }
+            // No application data is emitted during startup, so an exact ACK
+            // is consumed without becoming RNode evidence or transport data.
+            continue;
+        }
+        if matches!(protocol_state.readiness(), RNodeReadiness::Ready) {
+            if command != kiss::CMD_DATA {
+                protocol_state.apply_frame(command, &frame);
+            }
+            *active_bytes = active_bytes.saturating_add(frame.len().saturating_add(1));
+            if *active_bytes > RNODE_NATIVE_STARTUP_ACTIVE_CARRY_MAX {
+                return Err(NativeStartupReductionError::ActiveCarryOverflow);
+            }
+            active_frames.push((command, frame));
+            if !matches!(protocol_state.readiness(), RNodeReadiness::Ready) {
+                active_frames.clear();
+                *active_bytes = 0;
+            }
+        } else {
+            if command == kiss::CMD_DATA {
+                if !hold_native_pre_ready_data(frame, pre_ready_data, pre_ready_data_bytes) {
+                    return Err(NativeStartupReductionError::PreReadyDataOverflow);
+                }
+            } else {
+                protocol_state.apply_frame(command, &frame);
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn connect_rnode(
@@ -3402,8 +3576,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
     let shared_txb = Arc::new(AtomicU64::new(0));
     let task_rxb = shared_rxb.clone();
     let task_txb = shared_txb.clone();
-    let (tx, rx) = mpsc::channel::<Bytes>(256);
-    let rx = Arc::new(tokio::sync::Mutex::new(rx));
+    let (tx, mut outbound_rx) = mpsc::channel::<Bytes>(256);
 
     let bitrate = rnode::calculate_bitrate(
         config.spreading_factor,
@@ -3431,6 +3604,8 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
         let mut tries: usize = 0;
         let mut backoff = RECONNECT_WAIT;
         let mut initial_attempt = true;
+        let mut pending_outbound: Option<NativePendingOutbound> = None;
+        let mut first_tx: Option<tokio::time::Instant> = None;
 
         struct Cleanup(InterfaceId, Arc<AtomicBool>);
         impl Drop for Cleanup {
@@ -3476,6 +3651,9 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
 
             let (mut tcp_read, mut tcp_write) = stream.into_split();
             let mut protocol_state = RNodeProtocolState::new(protocol_target);
+            let mut startup_deframer = kiss::RawKissDeframer::new();
+            let mut startup_pre_ready_data: Vec<Vec<u8>> = Vec::new();
+            let mut startup_pre_ready_data_bytes = 0usize;
             let capability_admission = if options.requires_capability_admission() {
                 match run_native_ble_capability_preflight(
                     &mut tcp_read,
@@ -3540,9 +3718,12 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                     &mut tcp_read,
                     &mut tcp_write,
                     &mut protocol_state,
+                    &mut startup_deframer,
                     RNODE_NATIVE_HANDSHAKE_TIMEOUT,
                     RNODE_NATIVE_HANDSHAKE_PROBE,
                     &running_task,
+                    &mut startup_pre_ready_data,
+                    &mut startup_pre_ready_data_bytes,
                 )
                 .await;
                 if !detected {
@@ -3647,112 +3828,202 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                 return;
             }
 
+            // Match desktop BLE and serial/TCP: a carrier plus accepted init
+            // writes are not public readiness. Hold both `online` and queued
+            // application packets until fresh post-init echoes prove the exact
+            // configured radio target and RADIO_STATE_ON for this TCP generation.
+            enum NativeStartupOutcome {
+                Ready,
+                Retry(&'static str),
+                Stopped,
+            }
+            let mut startup_buf = [0u8; 4096];
+            let mut startup_active_frames: Vec<(u8, Vec<u8>)> = Vec::new();
+            let mut startup_active_bytes = 0usize;
+            let readiness_deadline = tokio::time::Instant::now() + RNODE_BLE_READINESS_TIMEOUT;
+            let startup_outcome = loop {
+                if matches!(protocol_state.readiness(), RNodeReadiness::Ready) {
+                    break NativeStartupOutcome::Ready;
+                }
+                tokio::select! {
+                    result = tcp_read.read(&mut startup_buf) => match result {
+                        Ok(0) => break NativeStartupOutcome::Retry(
+                            "native bridge closed before typed Ready",
+                        ),
+                        Ok(count) => {
+                            match reduce_native_startup_bytes(
+                                &mut protocol_state,
+                                &mut startup_deframer,
+                                &startup_buf[..count],
+                                &mut startup_pre_ready_data,
+                                &mut startup_pre_ready_data_bytes,
+                                &mut startup_active_frames,
+                                &mut startup_active_bytes,
+                            ) {
+                                Ok(()) => {}
+                                Err(NativeStartupReductionError::MalformedBridgeAck) => {
+                                    break NativeStartupOutcome::Retry(
+                                        "malformed native bridge acknowledgement",
+                                    );
+                                }
+                                Err(NativeStartupReductionError::ActiveCarryOverflow) => {
+                                    break NativeStartupOutcome::Retry(
+                                        "post-readiness startup carry exceeded bound",
+                                    );
+                                }
+                                Err(NativeStartupReductionError::PreReadyDataOverflow) => {
+                                    break NativeStartupOutcome::Retry(
+                                        "pre-readiness native DATA carry exceeded bound",
+                                    );
+                                }
+                            }
+                        }
+                        Err(_) => break NativeStartupOutcome::Retry(
+                            "native bridge read failed before typed Ready",
+                        ),
+                    },
+                    _ = tokio::time::sleep(RUNNING_POLL) => {
+                        if !running_task.load(Ordering::SeqCst) {
+                            break NativeStartupOutcome::Stopped;
+                        }
+                    }
+                    _ = tokio::time::sleep_until(readiness_deadline) => {
+                        break NativeStartupOutcome::Retry("typed readiness timed out");
+                    }
+                }
+            };
+
+            match startup_outcome {
+                NativeStartupOutcome::Ready => {}
+                NativeStartupOutcome::Stopped => {
+                    snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                    let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
+                    let _ = tcp_write.flush().await;
+                    snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                    return;
+                }
+                NativeStartupOutcome::Retry(reason) => {
+                    snapshot_publisher.connection_attempt_failed();
+                    tracing::warn!(name = %log_name, reason, "BLE RNode native did not reach Ready");
+                    if reconnect_try_exhausted(&mut tries) {
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
+                    drop(tcp_read);
+                    drop(tcp_write);
+                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    continue;
+                }
+            }
+
+            if !running_task.load(Ordering::SeqCst) {
+                snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
+                let _ = tcp_write.flush().await;
+                snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                return;
+            }
+
             tracing::info!(
                 name = %log_name,
                 ble_uri = %ble_uri,
                 tcp_port,
                 bitrate_bps = bitrate,
-                "BLE RNode native bridge established (handshake confirmed)"
+                "BLE RNode native typed Ready"
             );
 
             tries = 0;
             backoff = RECONNECT_WAIT;
+            // The protocol state above is already exact Ready. Publish the raw
+            // online bit before the driver snapshot so no observer can consume
+            // a Ready event while the corresponding interface row remains red.
+            online_handle.store(true, Ordering::SeqCst);
             if let Some(admission) = capability_admission {
                 snapshot_publisher.capability_connection_established(&protocol_state, admission);
-                online_handle.store(true, Ordering::SeqCst);
             } else {
-                // Preserve the legacy publication order exactly.
-                online_handle.store(true, Ordering::SeqCst);
                 snapshot_publisher.connection_established();
                 snapshot_publisher.sync_protocol_state(&protocol_state);
             }
 
-            let ready = Arc::new(AtomicBool::new(true));
+            let ready = AtomicBool::new(true);
             let mut active_packet_admission = ActiveBlePacketAdmission::for_startup_policy(
                 options.requires_capability_admission(),
             );
             active_packet_admission.observe_readiness(protocol_state.readiness());
+            if let Some(pending) = pending_outbound.as_mut() {
+                pending.reset_for_generation();
+            }
 
-            let (conn_tx, mut conn_rx) = mpsc::channel::<NativeBridgeWrite>(256);
-            let conn_tx_for_stop = conn_tx.clone();
-            let online_w = online_handle.clone();
-            let ready_w = ready.clone();
-            let txb_w = task_txb.clone();
-            let beacon_w = beacon.clone();
-            let write_handle = tokio::spawn(async move {
-                let mut first_tx: Option<tokio::time::Instant> = None;
-                loop {
-                    let msg = if let Some((interval, ref callsign)) = beacon_w {
-                        match tokio::time::timeout(Duration::from_secs(1), conn_rx.recv()).await {
-                            Ok(Some(msg)) => msg,
-                            Ok(None) => break,
-                            Err(_) => {
-                                if first_tx.is_none_or(|t| t.elapsed() < interval) {
-                                    continue;
-                                }
-                                tracing::debug!(
-                                    "BLE RNode (native) transmitting station-ID beacon"
-                                );
-                                NativeBridgeWrite::Packet(callsign.clone())
-                            }
-                        }
-                    } else {
-                        match conn_rx.recv().await {
-                            Some(msg) => msg,
-                            None => break,
-                        }
-                    };
-                    match msg {
-                        NativeBridgeWrite::Packet(data) => {
-                            if let Some((_, ref callsign)) = beacon_w {
-                                if data == *callsign {
-                                    first_tx = None;
-                                } else if first_tx.is_none() {
-                                    first_tx = Some(tokio::time::Instant::now());
-                                }
-                            }
-                            while !claim_ble_packet_permit(flow_control, ready_w.as_ref()) {
-                                tokio::time::sleep(Duration::from_millis(10)).await;
-                                if !online_w.load(Ordering::SeqCst) {
-                                    return;
-                                }
-                            }
-                            txb_w.fetch_add(data.len() as u64, Ordering::Relaxed);
-                            let framed = kiss::frame(&data);
-                            if let Err(e) = tcp_write.write_all(&framed).await {
-                                tracing::warn!(error = %e, "BLE RNode native write error");
-                                online_w.store(false, Ordering::SeqCst);
-                                return;
-                            }
-                        }
-                        NativeBridgeWrite::Raw(data) => {
-                            if let Err(e) = tcp_write.write_all(&data).await {
-                                tracing::warn!(error = %e, "BLE RNode native raw write error");
-                            }
-                            let _ = tcp_write.flush().await;
-                            return;
-                        }
-                    }
-                }
-            });
-
-            // Outer rx is persistent across reconnects; conn_tx is rebuilt
-            // each cycle.
-            let rx_ref = rx.clone();
-            let fwd_handle = tokio::spawn(async move {
-                let mut guard = rx_ref.lock().await;
-                while let Some(data) = guard.recv().await {
-                    if conn_tx.send(NativeBridgeWrite::Packet(data)).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            let mut deframer = kiss::RawKissDeframer::new();
+            // `startup_deframer` begins after init/preflight and reaches Ready
+            // only on a complete control frame. Any partial frame remaining at
+            // that point therefore began after the exact Ready boundary and
+            // belongs to this active TCP generation.
+            let mut deframer = startup_deframer;
             let mut last_rssi: Option<f32> = None;
             let mut last_snr: Option<f32> = None;
             let mut buf = [0u8; 4096];
             let mut transport_closed = false;
+            let mut bridge_acknowledged = 0u64;
+
+            // Complete frames after the exact Ready boundary are projected
+            // before any outbound payload can be selected.
+            let startup_ready_frames = startup_pre_ready_data
+                .drain(..)
+                .map(|frame| (kiss::CMD_DATA, frame))
+                .chain(startup_active_frames.drain(..));
+            for (command, frame) in startup_ready_frames {
+                let data_allowed = project_active_ble_rnode_frame(
+                    &snapshot_publisher,
+                    &mut protocol_state,
+                    &mut active_packet_admission,
+                    command,
+                    &frame,
+                );
+                match rnode::process_rnode_response(
+                    command,
+                    &frame,
+                    id,
+                    &mut last_rssi,
+                    &mut last_snr,
+                ) {
+                    RNodeResponse::Packet(msg) => {
+                        if data_allowed {
+                            task_rxb.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                            if transport_tx.send(msg).await.is_err() {
+                                transport_closed = true;
+                                break;
+                            }
+                        }
+                    }
+                    RNodeResponse::Ready(is_ready) => {
+                        ready.store(is_ready, Ordering::SeqCst);
+                    }
+                    RNodeResponse::None => {}
+                }
+            }
+            if transport_closed {
+                online_handle.store(false, Ordering::SeqCst);
+                drop(tcp_read);
+                drop(tcp_write);
+                publish_ble_stopped(
+                    &mut snapshot_publisher,
+                    RNodeRuntimeReason::TransportConsumerClosed,
+                );
+                return;
+            }
+
+            enum NativeGenerationEvent {
+                Read(std::io::Result<usize>),
+                Outbound(Option<Bytes>),
+                Poll,
+            }
 
             'read: loop {
                 if !online_handle.load(Ordering::SeqCst) {
@@ -3760,81 +4031,172 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                 }
                 if !running_task.load(Ordering::SeqCst) {
                     snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                    let _ = conn_tx_for_stop
-                        .send(NativeBridgeWrite::Raw(rnode::build_detach_sequence()))
-                        .await;
+                    let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
+                    let _ = tcp_write.flush().await;
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     break 'read;
                 }
 
-                let n = tokio::select! {
-                    result = tcp_read.read(&mut buf) => {
-                        match result {
-                            Ok(0) => {
-                                tracing::warn!("BLE RNode native bridge closed (EOF)");
-                                break 'read;
-                            }
-                            Ok(n) => n,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "BLE RNode native read error");
-                                break 'read;
-                            }
-                        }
+                let event = tokio::select! {
+                    result = tcp_read.read(&mut buf) => NativeGenerationEvent::Read(result),
+                    outbound = outbound_rx.recv(), if pending_outbound.is_none() => {
+                        NativeGenerationEvent::Outbound(outbound)
                     }
-                    _ = tokio::time::sleep(RUNNING_POLL) => {
-                        // Idle LoRa silence is normal — only break if
-                        // shutdown flag cleared.
-                        if !running_task.load(Ordering::SeqCst) {
-                            snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                            let _ = conn_tx_for_stop
-                                .send(NativeBridgeWrite::Raw(rnode::build_detach_sequence()))
-                                .await;
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                            break 'read;
-                        }
-                        continue;
-                    }
+                    _ = tokio::time::sleep(RUNNING_POLL) => NativeGenerationEvent::Poll,
                 };
 
-                let data = &buf[..n];
-                for (cmd, frame) in deframer.feed(data) {
-                    let data_allowed = project_active_ble_rnode_frame(
-                        &snapshot_publisher,
-                        &mut protocol_state,
-                        &mut active_packet_admission,
-                        cmd,
-                        &frame,
-                    );
-                    match rnode::process_rnode_response(
-                        cmd,
-                        &frame,
-                        id,
-                        &mut last_rssi,
-                        &mut last_snr,
-                    ) {
-                        RNodeResponse::Packet(msg) => {
-                            if data_allowed {
-                                task_rxb.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                                if transport_tx.send(msg).await.is_err() {
-                                    tracing::warn!(id, "transport channel closed");
-                                    transport_closed = true;
+                match event {
+                    NativeGenerationEvent::Read(Ok(0)) => {
+                        tracing::warn!("BLE RNode native bridge closed (EOF)");
+                        break 'read;
+                    }
+                    NativeGenerationEvent::Read(Err(error)) => {
+                        tracing::warn!(%error, "BLE RNode native read error");
+                        break 'read;
+                    }
+                    NativeGenerationEvent::Read(Ok(count)) => {
+                        for (command, frame) in deframer.feed(&buf[..count]) {
+                            if command == RNODE_NATIVE_BRIDGE_ACK_COMMAND {
+                                let Some(acknowledged) =
+                                    native_bridge_acknowledged_data_frames(command, &frame)
+                                else {
+                                    tracing::warn!(
+                                        "BLE RNode native bridge emitted a malformed acknowledgement"
+                                    );
+                                    break 'read;
+                                };
+                                if acknowledged <= bridge_acknowledged {
+                                    // Duplicate callbacks are harmless and cannot release a
+                                    // later payload because counters are monotonic per socket.
+                                    continue;
+                                }
+                                let expected = pending_outbound
+                                    .as_ref()
+                                    .and_then(|pending| pending.expected_ack);
+                                if expected != Some(acknowledged)
+                                    || acknowledged != bridge_acknowledged.saturating_add(1)
+                                {
+                                    tracing::warn!(
+                                        "BLE RNode native bridge acknowledgement was out of sequence"
+                                    );
                                     break 'read;
                                 }
+                                let completed = pending_outbound.take().expect(
+                                    "matching bridge acknowledgement requires pending data",
+                                );
+                                task_txb.fetch_add(
+                                    completed.outbound.payload().len() as u64,
+                                    Ordering::Relaxed,
+                                );
+                                if completed.outbound.is_station_id() {
+                                    first_tx = None;
+                                } else if first_tx.is_none() {
+                                    first_tx = Some(tokio::time::Instant::now());
+                                }
+                                bridge_acknowledged = acknowledged;
+                                continue;
+                            }
+
+                            let data_allowed = project_active_ble_rnode_frame(
+                                &snapshot_publisher,
+                                &mut protocol_state,
+                                &mut active_packet_admission,
+                                command,
+                                &frame,
+                            );
+                            match rnode::process_rnode_response(
+                                command,
+                                &frame,
+                                id,
+                                &mut last_rssi,
+                                &mut last_snr,
+                            ) {
+                                RNodeResponse::Packet(msg) => {
+                                    if data_allowed {
+                                        task_rxb.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                                        if transport_tx.send(msg).await.is_err() {
+                                            tracing::warn!(id, "transport channel closed");
+                                            transport_closed = true;
+                                            break 'read;
+                                        }
+                                    }
+                                }
+                                RNodeResponse::Ready(is_ready) => {
+                                    ready.store(is_ready, Ordering::SeqCst);
+                                }
+                                RNodeResponse::None => {}
                             }
                         }
-                        RNodeResponse::Ready(is_ready) => {
-                            ready.store(is_ready, Ordering::SeqCst);
-                        }
-                        RNodeResponse::None => {}
                     }
+                    NativeGenerationEvent::Outbound(Some(data)) => {
+                        pending_outbound = Some(NativePendingOutbound::new(PendingOutbound::new(
+                            data, false,
+                        )));
+                    }
+                    NativeGenerationEvent::Outbound(None) => {
+                        tracing::warn!(id, "BLE RNode native outbound channel closed");
+                        transport_closed = true;
+                        break 'read;
+                    }
+                    NativeGenerationEvent::Poll => {
+                        if pending_outbound.as_ref().is_some_and(|pending| {
+                            pending.acknowledgement_timed_out(tokio::time::Instant::now())
+                        }) {
+                            tracing::warn!(
+                                "BLE RNode native bridge acknowledgement timed out; retaining payload"
+                            );
+                            break 'read;
+                        }
+                        if pending_outbound.is_none()
+                            && let (Some((interval, callsign)), Some(first)) =
+                                (beacon.as_ref(), first_tx)
+                            && first.elapsed() >= *interval
+                        {
+                            tracing::debug!("BLE RNode (native) scheduling station-ID beacon");
+                            pending_outbound = Some(NativePendingOutbound::new(
+                                PendingOutbound::new(callsign.clone(), true),
+                            ));
+                        }
+                    }
+                }
+
+                let should_write = pending_outbound
+                    .as_ref()
+                    .is_some_and(|pending| pending.expected_ack.is_none());
+                if should_write && claim_ble_packet_permit(flow_control, &ready) {
+                    let pending = pending_outbound
+                        .as_ref()
+                        .expect("native pending outbound checked above");
+                    let framed = kiss::frame(pending.outbound.payload());
+                    if let Err(error) = tcp_write.write_all(&framed).await {
+                        tracing::warn!(%error, "BLE RNode native write error; retaining payload");
+                        break 'read;
+                    }
+                    if let Err(error) = tcp_write.flush().await {
+                        tracing::warn!(%error, "BLE RNode native flush error; retaining payload");
+                        break 'read;
+                    }
+                    let expected_ack = bridge_acknowledged.saturating_add(1);
+                    pending_outbound
+                        .as_mut()
+                        .expect("native pending outbound checked above")
+                        .expected_ack = Some(expected_ack);
+                    pending_outbound
+                        .as_mut()
+                        .expect("native pending outbound checked above")
+                        .sent_at = Some(tokio::time::Instant::now());
                 }
             }
 
             online_handle.store(false, Ordering::SeqCst);
-            fwd_handle.abort();
-            let _ = fwd_handle.await;
-            write_handle.abort();
-            let _ = write_handle.await;
+            if let Some(pending) = pending_outbound.as_mut() {
+                // TCP completion without the exact bridge ACK is ambiguous.
+                // Retain and retry the complete packet on the next generation;
+                // Reticulum packet deduplication makes this safer than loss.
+                pending.reset_for_generation();
+            }
+            drop(tcp_read);
+            drop(tcp_write);
 
             if transport_closed {
                 publish_ble_stopped(
@@ -3958,6 +4320,247 @@ mod tests {
 
         assert!(claim_ble_packet_permit(false, &ready));
         assert!(claim_ble_packet_permit(false, &ready));
+    }
+
+    #[test]
+    fn native_bridge_ack_is_closed_exact_and_generation_local() {
+        let wire = [
+            kiss::FEND,
+            RNODE_NATIVE_BRIDGE_ACK_COMMAND,
+            0x52,
+            0x53,
+            0x42,
+            0x41,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            kiss::FEND,
+        ];
+        let mut deframer = kiss::RawKissDeframer::new();
+        let frames = deframer.feed(&wire);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            native_bridge_acknowledged_data_frames(frames[0].0, &frames[0].1),
+            Some(1),
+            "the Android and Rust bridge share one exact wire contract"
+        );
+
+        let mut payload = RNODE_NATIVE_BRIDGE_ACK_MAGIC.to_vec();
+        payload.extend_from_slice(&7u64.to_be_bytes());
+        assert_eq!(
+            native_bridge_acknowledged_data_frames(RNODE_NATIVE_BRIDGE_ACK_COMMAND, &payload),
+            Some(7)
+        );
+        assert_eq!(
+            native_bridge_acknowledged_data_frames(kiss::CMD_DATA, &payload),
+            None,
+            "ordinary RNode data can never be interpreted as a bridge ACK"
+        );
+
+        let mut wrong_magic = payload.clone();
+        wrong_magic[0] ^= 0x01;
+        assert_eq!(
+            native_bridge_acknowledged_data_frames(RNODE_NATIVE_BRIDGE_ACK_COMMAND, &wrong_magic,),
+            None
+        );
+        assert_eq!(
+            native_bridge_acknowledged_data_frames(
+                RNODE_NATIVE_BRIDGE_ACK_COMMAND,
+                &payload[..payload.len() - 1],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn native_bridge_ack_timeout_exceeds_the_shared_android_write_bound() {
+        assert_eq!(RNODE_NATIVE_ACK_WORST_CASE_CHUNKS, 51);
+        let write_bound_ms = RNODE_NATIVE_ACK_WORST_CASE_CHUNKS
+            * (RNODE_NATIVE_ACK_ENQUEUE_RETRY_MS + RNODE_NATIVE_ACK_CALLBACK_MS)
+            + (RNODE_NATIVE_ACK_WORST_CASE_CHUNKS - 1) * RNODE_NATIVE_ACK_PACING_MS;
+        assert_eq!(write_bound_ms, 316_800);
+        assert_eq!(RNODE_NATIVE_BRIDGE_ACK_TIMEOUT_MS, 318_800);
+        assert!(RNODE_NATIVE_BRIDGE_ACK_TIMEOUT_MS > write_bound_ms);
+    }
+
+    #[test]
+    fn native_startup_holds_pre_ready_data_and_preserves_post_ready_order() {
+        let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
+        let mut state = RNodeProtocolState::new(target);
+        for (command, frame) in [
+            (rnode::CMD_DETECT, vec![rnode::DETECT_RESP]),
+            (
+                rnode::CMD_FW_VERSION,
+                vec![rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+            ),
+            (
+                rnode::CMD_FREQUENCY,
+                target.frequency.to_be_bytes().to_vec(),
+            ),
+            (
+                rnode::CMD_BANDWIDTH,
+                target.bandwidth.to_be_bytes().to_vec(),
+            ),
+            (rnode::CMD_SF, vec![target.spreading_factor]),
+            (rnode::CMD_CR, vec![target.coding_rate]),
+            (rnode::CMD_TXPOWER, vec![target.tx_power]),
+        ] {
+            state.apply_frame(command, &frame);
+        }
+        assert!(!matches!(state.readiness(), RNodeReadiness::Ready));
+
+        let held = b"pre-ready";
+        let retained = b"post-ready";
+        let mut same_read = kiss::frame(held);
+        same_read.extend(kiss::frame_with_command(
+            rnode::CMD_RADIO_STATE,
+            &[rnode::RADIO_STATE_ON],
+        ));
+        same_read.extend(kiss::frame(retained));
+        let mut deframer = kiss::RawKissDeframer::new();
+        let mut pre_ready_data = Vec::new();
+        let mut pre_ready_data_bytes = 0;
+        let mut active_frames = Vec::new();
+        let mut active_bytes = 0;
+        assert_eq!(
+            reduce_native_startup_bytes(
+                &mut state,
+                &mut deframer,
+                &same_read,
+                &mut pre_ready_data,
+                &mut pre_ready_data_bytes,
+                &mut active_frames,
+                &mut active_bytes,
+            ),
+            Ok(())
+        );
+        assert_eq!(state.readiness(), RNodeReadiness::Ready);
+        assert_eq!(pre_ready_data, vec![held.to_vec()]);
+        assert_eq!(pre_ready_data_bytes, held.len());
+        assert_eq!(active_frames, vec![(kiss::CMD_DATA, retained.to_vec())]);
+        assert_eq!(active_bytes, retained.len() + 1);
+    }
+
+    #[test]
+    fn native_startup_carries_partial_data_begun_after_ready_into_active_read() {
+        let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
+        let mut state = RNodeProtocolState::new(target);
+        for (command, frame) in [
+            (rnode::CMD_DETECT, vec![rnode::DETECT_RESP]),
+            (
+                rnode::CMD_FW_VERSION,
+                vec![rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+            ),
+            (
+                rnode::CMD_FREQUENCY,
+                target.frequency.to_be_bytes().to_vec(),
+            ),
+            (
+                rnode::CMD_BANDWIDTH,
+                target.bandwidth.to_be_bytes().to_vec(),
+            ),
+            (rnode::CMD_SF, vec![target.spreading_factor]),
+            (rnode::CMD_CR, vec![target.coding_rate]),
+            (rnode::CMD_TXPOWER, vec![target.tx_power]),
+        ] {
+            state.apply_frame(command, &frame);
+        }
+
+        let retained = b"post-ready-split-across-reads";
+        let framed = kiss::frame(retained);
+        let split = framed.len() / 2;
+        let mut first_read =
+            kiss::frame_with_command(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_ON]);
+        first_read.extend_from_slice(&framed[..split]);
+
+        let mut startup_deframer = kiss::RawKissDeframer::new();
+        let mut pre_ready_data = Vec::new();
+        let mut pre_ready_data_bytes = 0;
+        let mut active_frames = Vec::new();
+        let mut active_bytes = 0;
+        assert_eq!(
+            reduce_native_startup_bytes(
+                &mut state,
+                &mut startup_deframer,
+                &first_read,
+                &mut pre_ready_data,
+                &mut pre_ready_data_bytes,
+                &mut active_frames,
+                &mut active_bytes,
+            ),
+            Ok(())
+        );
+        assert_eq!(state.readiness(), RNodeReadiness::Ready);
+        assert!(pre_ready_data.is_empty());
+        assert!(active_frames.is_empty());
+
+        let mut active_deframer = startup_deframer;
+        assert_eq!(
+            active_deframer.feed(&framed[split..]),
+            vec![(kiss::CMD_DATA, retained.to_vec())]
+        );
+        assert!(active_deframer.feed(&[]).is_empty());
+    }
+
+    #[test]
+    fn native_startup_pre_ready_data_bound_exceeds_rnode_receive_buffer_and_fails_explicitly() {
+        let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
+        let mut state = RNodeProtocolState::new(target);
+        let mut deframer = kiss::RawKissDeframer::new();
+        let mut pre_ready_data = Vec::new();
+        let mut pre_ready_data_bytes = 0;
+        let mut active_frames = Vec::new();
+        let mut active_bytes = 0;
+        let record = vec![0x41; RNODE_NATIVE_MAX_PACKET];
+
+        for _ in 0..129 {
+            assert_eq!(
+                reduce_native_startup_bytes(
+                    &mut state,
+                    &mut deframer,
+                    &kiss::frame(&record),
+                    &mut pre_ready_data,
+                    &mut pre_ready_data_bytes,
+                    &mut active_frames,
+                    &mut active_bytes,
+                ),
+                Ok(())
+            );
+        }
+        assert!(pre_ready_data_bytes > 6_144);
+        assert!(pre_ready_data_bytes <= RNODE_NATIVE_STARTUP_PRE_READY_DATA_MAX_BYTES);
+        assert_eq!(
+            reduce_native_startup_bytes(
+                &mut state,
+                &mut deframer,
+                &kiss::frame(&record),
+                &mut pre_ready_data,
+                &mut pre_ready_data_bytes,
+                &mut active_frames,
+                &mut active_bytes,
+            ),
+            Err(NativeStartupReductionError::PreReadyDataOverflow)
+        );
+    }
+
+    #[test]
+    fn native_pending_payload_survives_generation_reset_without_old_ack_state() {
+        let payload = Bytes::from_static(b"retain-across-generation");
+        let mut pending = NativePendingOutbound::new(PendingOutbound::new(payload.clone(), false));
+        pending.expected_ack = Some(9);
+        pending.sent_at = Some(tokio::time::Instant::now());
+
+        pending.reset_for_generation();
+
+        assert_eq!(pending.outbound.payload(), &payload);
+        assert_eq!(pending.expected_ack, None);
+        assert_eq!(pending.sent_at, None);
     }
 
     #[test]
@@ -5065,19 +5668,26 @@ mod tests {
         let (mut read, mut write) = stream.into_split();
         let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
         let mut protocol_state = RNodeProtocolState::new(target);
+        let mut handshake_deframer = kiss::RawKissDeframer::new();
         let running = AtomicBool::new(true);
+        let mut pre_ready_data = Vec::new();
+        let mut pre_ready_data_bytes = 0;
 
         assert!(
             probe_native_rnode_handshake(
                 &mut read,
                 &mut write,
                 &mut protocol_state,
+                &mut handshake_deframer,
                 Duration::from_secs(1),
                 Duration::from_millis(100),
                 &running,
+                &mut pre_ready_data,
+                &mut pre_ready_data_bytes,
             )
             .await
         );
+        assert!(pre_ready_data.is_empty());
         let legacy_request = server.await.expect("native bridge server task");
         assert_eq!(legacy_request, rnode::build_detect_sequence());
         assert!(
@@ -5088,6 +5698,300 @@ mod tests {
         let evidence = protocol_state.evidence();
         assert!(evidence.detected);
         assert!(evidence.firmware.is_some());
+    }
+
+    fn native_ready_response(config: &BleRNodeConfig) -> Vec<u8> {
+        let mut response = kiss::frame_with_command(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
+        response.extend(kiss::frame_with_command(
+            rnode::CMD_FW_VERSION,
+            &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+        ));
+        response.extend(kiss::frame_with_command(
+            rnode::CMD_FREQUENCY,
+            &config.frequency.to_be_bytes(),
+        ));
+        response.extend(kiss::frame_with_command(
+            rnode::CMD_BANDWIDTH,
+            &config.bandwidth.to_be_bytes(),
+        ));
+        response.extend(kiss::frame_with_command(
+            rnode::CMD_SF,
+            &[config.spreading_factor],
+        ));
+        response.extend(kiss::frame_with_command(
+            rnode::CMD_CR,
+            &[config.coding_rate],
+        ));
+        response.extend(kiss::frame_with_command(
+            rnode::CMD_TXPOWER,
+            &[config.tx_power],
+        ));
+        response.extend(kiss::frame_with_command(
+            rnode::CMD_RADIO_STATE,
+            &[rnode::RADIO_STATE_ON],
+        ));
+        response
+    }
+
+    async fn native_test_read_through_command(
+        stream: &mut tokio::net::TcpStream,
+        terminal_command: u8,
+    ) -> Vec<(u8, Vec<u8>)> {
+        use tokio::io::AsyncReadExt;
+
+        let mut deframer = kiss::RawKissDeframer::new();
+        let mut frames = Vec::new();
+        let mut buffer = [0u8; 2048];
+        while !frames
+            .iter()
+            .any(|(command, _)| *command == terminal_command)
+        {
+            let count = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buffer))
+                .await
+                .expect("native bridge request timed out")
+                .expect("native bridge request read");
+            assert!(count > 0, "native bridge closed before expected command");
+            frames.extend(deframer.feed(&buffer[..count]));
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn native_ble_waits_for_ready_and_retries_unacknowledged_payload_next_generation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind native reliability bridge");
+        let port = listener
+            .local_addr()
+            .expect("native reliability bridge address")
+            .port();
+        let config = BleRNodeConfig::new("native-reliability", "ble://RNode 0544");
+        let server_config = config.clone();
+        let payload = Bytes::from_static(b"queued-before-physical-reconnect");
+        let server_payload = payload.clone();
+        let post_ready_inbound = Bytes::from_static(b"same-read-post-ready-inbound");
+        let server_post_ready_inbound = post_ready_inbound.clone();
+        let pre_ready_reconnect_inbound =
+            Bytes::from_static(b"physical-data-completed-across-tcp-replacement");
+        let server_pre_ready_reconnect_inbound = pre_ready_reconnect_inbound.clone();
+        let (awaiting_ready_tx, awaiting_ready_rx) = tokio::sync::oneshot::channel();
+        let (first_unacknowledged_tx, first_unacknowledged_rx) = tokio::sync::oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let mut awaiting_ready_tx = Some(awaiting_ready_tx);
+            let mut first_unacknowledged_tx = Some(first_unacknowledged_tx);
+            for generation in 1..=2 {
+                let (mut stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept native reliability generation");
+
+                let probe = native_test_read_through_command(&mut stream, rnode::CMD_MCU).await;
+                assert!(
+                    probe.iter().all(|(command, _)| *command != kiss::CMD_DATA),
+                    "application data must not precede handshake"
+                );
+                let mut handshake = Vec::new();
+                if generation == 2 {
+                    // Android's physical GATT assembler may finish this record
+                    // across the old/new localhost socket boundary and write it
+                    // before the replacement generation's handshake response.
+                    handshake.extend(kiss::frame(&server_pre_ready_reconnect_inbound));
+                }
+                handshake.extend(kiss::frame_with_command(
+                    rnode::CMD_DETECT,
+                    &[rnode::DETECT_RESP],
+                ));
+                handshake.extend(kiss::frame_with_command(
+                    rnode::CMD_FW_VERSION,
+                    &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+                ));
+                stream
+                    .write_all(&handshake)
+                    .await
+                    .expect("write native handshake");
+
+                let init = native_test_read_through_command(&mut stream, rnode::CMD_MCU).await;
+                assert!(
+                    init.iter().any(|(command, frame)| {
+                        *command == rnode::CMD_RADIO_STATE
+                            && frame.as_slice() == [rnode::RADIO_STATE_ON]
+                    }),
+                    "native generation must request radio-on before readiness"
+                );
+                assert!(
+                    init.iter().all(|(command, _)| *command != kiss::CMD_DATA),
+                    "queued payload must remain behind exact Ready"
+                );
+
+                if generation == 1 {
+                    let _ = awaiting_ready_tx.take().expect("first Ready gate").send(());
+                    let mut unexpected = [0u8; 64];
+                    assert!(
+                        tokio::time::timeout(
+                            Duration::from_millis(120),
+                            stream.read(&mut unexpected),
+                        )
+                        .await
+                        .is_err(),
+                        "Rust must not write queued application data before typed Ready"
+                    );
+                }
+
+                let mut ready_response = native_ready_response(&server_config);
+                if generation == 1 {
+                    ready_response.extend(kiss::frame(&server_post_ready_inbound));
+                }
+                stream
+                    .write_all(&ready_response)
+                    .await
+                    .expect("write native Ready evidence");
+                let application =
+                    native_test_read_through_command(&mut stream, kiss::CMD_DATA).await;
+                let observed = application
+                    .iter()
+                    .find_map(|(command, frame)| (*command == kiss::CMD_DATA).then_some(frame));
+                assert_eq!(observed.map(Vec::as_slice), Some(server_payload.as_ref()));
+
+                if generation == 1 {
+                    let _ = first_unacknowledged_tx
+                        .take()
+                        .expect("first unacknowledged gate")
+                        .send(());
+                    // Simulate adapter loss after Android accepted the Rust TCP
+                    // write but before an acknowledged GATT callback existed.
+                    continue;
+                }
+
+                let mut acknowledgement = RNODE_NATIVE_BRIDGE_ACK_MAGIC.to_vec();
+                acknowledgement.extend_from_slice(&1u64.to_be_bytes());
+                stream
+                    .write_all(&kiss::frame_with_command(
+                        RNODE_NATIVE_BRIDGE_ACK_COMMAND,
+                        &acknowledgement,
+                    ))
+                    .await
+                    .expect("write generation-fenced bridge ACK");
+
+                let mut detach = [0u8; 64];
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(3), stream.read(&mut detach)).await;
+            }
+        });
+
+        let id = 0xB1E0_A11C;
+        let (transport_tx, mut transport_rx) = mpsc::channel(8);
+        let spawned = spawn_ble_rnode_interface_native_with_driver(config, id, transport_tx, port)
+            .await
+            .expect("spawn native reliability interface");
+        let tx = spawned.interface.tx.clone();
+        let online = spawned.interface.online.clone();
+        let txb = spawned
+            .interface
+            .txb
+            .as_ref()
+            .expect("native TXB counter")
+            .clone();
+        let mut snapshots = spawned.driver.watch();
+
+        tx.send(payload.clone())
+            .await
+            .expect("queue payload before reconnect readiness");
+        awaiting_ready_rx
+            .await
+            .expect("first generation reached pre-Ready gate");
+        assert!(
+            !online.load(Ordering::SeqCst),
+            "physical bridge plus accepted init must remain publicly offline"
+        );
+
+        let ready = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let snapshot = snapshots
+                    .changed()
+                    .await
+                    .expect("native reliability publisher closed");
+                if snapshot.phase == rnode::RNodeRuntimePhase::Ready {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .expect("native typed Ready publication timeout");
+        assert_eq!(ready.connection_generation, 1);
+        assert!(
+            online.load(Ordering::SeqCst),
+            "Ready publication must observe the corresponding raw online bit"
+        );
+        let inbound = tokio::time::timeout(Duration::from_secs(1), transport_rx.recv())
+            .await
+            .expect("same-read post-Ready inbound timeout")
+            .expect("same-read post-Ready transport message");
+        let TransportMessage::Inbound(inbound) = inbound else {
+            panic!("expected inbound transport packet after Ready");
+        };
+        assert_eq!(inbound.raw, post_ready_inbound);
+
+        first_unacknowledged_rx
+            .await
+            .expect("first generation received queued payload");
+        assert_eq!(
+            txb.load(Ordering::Relaxed),
+            0,
+            "TCP write alone must neither clear nor count payload"
+        );
+
+        let second_ready = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let snapshot = snapshots
+                    .changed()
+                    .await
+                    .expect("native reliability publisher closed before reconnect Ready");
+                if snapshot.phase == rnode::RNodeRuntimePhase::Ready
+                    && snapshot.connection_generation == 2
+                {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .expect("replacement generation fresh Ready timeout");
+        assert_eq!(second_ready.connection_generation, 2);
+        let held_inbound = tokio::time::timeout(Duration::from_secs(1), transport_rx.recv())
+            .await
+            .expect("pre-Ready physical DATA release timeout")
+            .expect("pre-Ready physical DATA transport message");
+        let TransportMessage::Inbound(held_inbound) = held_inbound else {
+            panic!("expected held inbound transport packet after reconnect Ready");
+        };
+        assert_eq!(held_inbound.raw, pre_ready_reconnect_inbound);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if txb.load(Ordering::Relaxed) == payload.len() as u64 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("second-generation acknowledged payload timeout");
+        assert!(
+            matches!(
+                transport_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the internal bridge acknowledgement must never reach Reticulum transport"
+        );
+
+        spawned.driver.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(3), spawned.interface.read_task)
+            .await
+            .expect("native reliability shutdown timeout")
+            .expect("native reliability task join");
+        server.await.expect("native reliability bridge task");
     }
 
     #[tokio::test]
