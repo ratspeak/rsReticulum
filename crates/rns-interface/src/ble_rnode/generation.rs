@@ -28,21 +28,25 @@ pub(super) enum BleOperationStage {
     Connect,
     ConnectedCheck,
     Discovery,
-    #[cfg(any(
-        test,
-        target_os = "ios",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ))]
+    #[cfg_attr(
+        not(any(
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "android"
+        )),
+        allow(dead_code)
+    )]
     PairingRead,
-    #[cfg(any(
-        test,
-        target_os = "ios",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ))]
+    #[cfg_attr(
+        not(any(
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "android"
+        )),
+        allow(dead_code)
+    )]
     PairingSubscribe,
     Subscribe,
     NotificationAcquisition,
@@ -56,13 +60,6 @@ pub(super) enum BleOperationStage {
 impl BleOperationStage {
     pub(super) const fn deadline(self) -> Duration {
         match self {
-            #[cfg(any(
-                test,
-                target_os = "ios",
-                target_os = "macos",
-                target_os = "windows",
-                target_os = "android"
-            ))]
             Self::PairingRead | Self::PairingSubscribe => Duration::from_secs(60),
             Self::ActiveWrite => Duration::from_secs(5),
             Self::Disconnect => Duration::from_secs(3),
@@ -84,21 +81,7 @@ impl fmt::Display for BleOperationStage {
             Self::Connect => "connect",
             Self::ConnectedCheck => "connected check",
             Self::Discovery => "service discovery",
-            #[cfg(any(
-                test,
-                target_os = "ios",
-                target_os = "macos",
-                target_os = "windows",
-                target_os = "android"
-            ))]
             Self::PairingRead => "pairing read",
-            #[cfg(any(
-                test,
-                target_os = "ios",
-                target_os = "macos",
-                target_os = "windows",
-                target_os = "android"
-            ))]
             Self::PairingSubscribe => "pairing notification subscribe",
             Self::Subscribe => "notification subscribe",
             Self::NotificationAcquisition => "notification acquisition",

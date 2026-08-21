@@ -504,12 +504,15 @@ enum DesktopPairingTrigger {
     target_os = "android"
 ))]
 impl DesktopPairingTrigger {
-    #[cfg(any(
-        target_os = "ios",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ))]
+    #[cfg_attr(
+        not(any(
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "android"
+        )),
+        allow(dead_code)
+    )]
     const fn label(self) -> &'static str {
         match self {
             Self::EncryptedRead => "encrypted_read",
