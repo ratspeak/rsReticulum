@@ -19,29 +19,26 @@
     "sourceCommit": "47dbbf1febc0a9d3259f179a0512d9b56bb2320d"
   },
   "snapshotSource": {
-    "commit": "51763a97dcd3d348ce3e3c44c86da089cc895ea6",
-    "capturedOn": "2026-08-17",
+    "commit": "8fac96aed87bf4ffff9b284879c5872365445bdf",
+    "capturedOn": "2026-08-23",
     "review": {
       "areas": [
-        "runtime application facade",
-        "identity and destination construction",
-        "announces and destination resolution",
-        "packets, receipts, Links, requests, Channels, and Resources",
-        "interface lifecycle and RNode observation"
+        "RNode startup policy and BLE lifecycle"
       ],
-      "canonicalPath": "rns_runtime::prelude",
-      "classification": "existing candidate application facade",
+      "canonicalPath": "rns_interface::rnode::RNodeStartupOptions",
+      "classification": "compatible additive opt-in BLE startup policy",
       "publicApiDiff": {
-        "added": 0,
+        "added": 1,
         "removed": 0
       },
-      "semver": "no version consequence; documentation, fixtures, and compatibility tooling only",
+      "semver": "additive compatible API; no major-version consequence",
       "deprecations": "none",
-      "wirePersistenceRuntimeImpact": "none",
+      "wirePersistenceRuntimeImpact": "default startup is byte-identical; the explicit policy emits one acknowledged CMD_BT_CTRL=0x01 before radio reassertion and persists the firmware Bluetooth-enabled byte after successful BLE admission",
       "platformEvidence": [
-        "compiled application examples and external canonical and legacy fixtures",
-        "stable and Rust 1.87 strict Clippy",
-        "downstream desktop and mobile product gates"
+        "all-feature Apple ARM64 public API snapshot",
+        "focused exact-command and composable-policy unit tests",
+        "two-generation Android native bridge readiness and retained-payload regression",
+        "BLE and default-feature compile checks"
       ]
     }
   },
@@ -106,8 +103,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-interface.txt",
-      "itemCount": 1405,
-      "sha256": "362144086c716b98383543912e7bed1e8281709de07957aeb89af1c40eb371e7"
+      "itemCount": 1406,
+      "sha256": "b097f01fc5eac53ed0ce5b6150c47c12f69fb63072ac31789a3995167123af3a"
     },
     {
       "name": "rns-runtime",

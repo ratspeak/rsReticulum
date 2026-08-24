@@ -765,6 +765,7 @@ pub rns_interface::rnode::RNodeRuntimeSnapshot::transport: rns_interface::rnode:
 pub struct rns_interface::rnode::RNodeStartupOptions
 impl rns_interface::rnode::RNodeStartupOptions
 pub const fn rns_interface::rnode::RNodeStartupOptions::require_capability_admission() -> Self
+pub const fn rns_interface::rnode::RNodeStartupOptions::with_persisted_bluetooth_enabled(self) -> Self
 impl core::default::Default for rns_interface::rnode::RNodeStartupOptions
 pub fn rns_interface::rnode::RNodeStartupOptions::default() -> Self
 #[non_exhaustive] pub struct rns_interface::rnode::SpawnedRNodeInterface
