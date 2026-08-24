@@ -2427,6 +2427,16 @@ async fn ble_write_for_generation(
     stage: BleOperationStage,
     running: &AtomicBool,
 ) -> Result<(), InterfaceError> {
+    ble_write_for_generation_with_type(conn, data, stage, running, ble_write_type()).await
+}
+
+async fn ble_write_for_generation_with_type(
+    conn: &mut BleRNodeConnection,
+    data: &[u8],
+    stage: BleOperationStage,
+    running: &AtomicBool,
+    write_type: WriteType,
+) -> Result<(), InterfaceError> {
     if conn.write_mtu == 0 {
         return Err(InterfaceError::SendFailed(
             "BLE write chunk size cannot be zero".into(),
@@ -2437,8 +2447,7 @@ async fn ble_write_for_generation(
     for (chunk_index, chunk) in data.chunks(conn.write_mtu).enumerate() {
         run_generation_operation(
             stage,
-            conn.peripheral
-                .write(&conn.rx_char, chunk, ble_write_type()),
+            conn.peripheral.write(&conn.rx_char, chunk, write_type),
             &mut conn.adapter_events,
             running,
             |event| matches!(event, CentralEvent::DeviceDisconnected(id) if id == &target_id),
@@ -2709,6 +2718,11 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
         // RNode advertised name only inside this runtime as a secondary
         // generation selector; the configured URI remains authoritative.
         let mut generation_stable_target_name: Option<String> = None;
+        // A successful typed-Ready generation proves the preceding ordered
+        // persistence write and radio reassertion traversed this BLE session.
+        // Retry after a failed generation, but never rewrite on ordinary
+        // reconnects during the same driver runtime.
+        let mut bluetooth_persistence_completed = false;
 
         // Drop guard: every early return must clear the running-flag map
         // entry, or stale entries confuse later spawns reusing the id.
@@ -3094,6 +3108,71 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                 return;
             }
 
+            if options.persists_bluetooth_enabled()
+                && !bluetooth_persistence_completed
+                && !running_task.load(Ordering::SeqCst)
+            {
+                bounded_ble_disconnect(&conn.peripheral).await;
+                publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
+                return;
+            }
+
+            if options.persists_bluetooth_enabled() && !bluetooth_persistence_completed {
+                trace_ble_lifecycle(
+                    generation_id,
+                    "bluetooth_persistence",
+                    "started",
+                    None,
+                    None,
+                );
+                if let Err(error) = ble_write_for_generation_with_type(
+                    &mut conn,
+                    &rnode::build_persist_bluetooth_enabled_sequence(),
+                    BleOperationStage::Configure,
+                    &running_task,
+                    WriteType::WithResponse,
+                )
+                .await
+                {
+                    trace_ble_lifecycle(
+                        generation_id,
+                        "bluetooth_persistence",
+                        "failed",
+                        None,
+                        None,
+                    );
+                    snapshot_publisher.connection_attempt_failed();
+                    tracing::warn!(
+                        name = %log_name,
+                        error = %error,
+                        "BLE RNode Bluetooth persistence write failed"
+                    );
+                    bounded_ble_disconnect(&conn.peripheral).await;
+                    if reconnect_try_exhausted(&mut tries) {
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
+                    if wait_for_ble_retry(&adapter, Duration::from_secs(backoff), &running_task)
+                        .await
+                    {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    continue;
+                }
+                trace_ble_lifecycle(
+                    generation_id,
+                    "bluetooth_persistence",
+                    "accepted",
+                    None,
+                    None,
+                );
+            }
+
             ble_diag("[ble] reasserting radio without RADIO_OFF");
             trace_ble_lifecycle(generation_id, "radio_reassertion", "started", None, None);
             if let Err(error) =
@@ -3174,6 +3253,9 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
 
             match startup_outcome {
                 StartupReadinessOutcome::Ready => {
+                    if options.persists_bluetooth_enabled() {
+                        bluetooth_persistence_completed = true;
+                    }
                     trace_ble_lifecycle(generation_id, "typed_readiness", "ready", None, None);
                 }
                 StartupReadinessOutcome::Stopped => {
@@ -3616,6 +3698,10 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
         let mut initial_attempt = true;
         let mut pending_outbound: Option<NativePendingOutbound> = None;
         let mut first_tx: Option<tokio::time::Instant> = None;
+        // Retain this acknowledgement boundary across native TCP/GATT
+        // generations. A failed generation retries; a Ready generation makes
+        // later reconnects read-only with respect to persistent Bluetooth.
+        let mut bluetooth_persistence_completed = false;
 
         struct Cleanup(InterfaceId, Arc<AtomicBool>);
         impl Drop for Cleanup {
@@ -3774,6 +3860,42 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                 return;
             }
 
+            if options.persists_bluetooth_enabled()
+                && !bluetooth_persistence_completed
+                && !running_task.load(Ordering::SeqCst)
+            {
+                publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
+                return;
+            }
+
+            if options.persists_bluetooth_enabled() && !bluetooth_persistence_completed {
+                let persistence = rnode::build_persist_bluetooth_enabled_sequence();
+                if tcp_write.write_all(&persistence).await.is_err()
+                    || tcp_write.flush().await.is_err()
+                {
+                    if !running_task.load(Ordering::SeqCst) {
+                        snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                        snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                        return;
+                    }
+                    snapshot_publisher.connection_attempt_failed();
+                    tracing::warn!("BLE RNode native Bluetooth persistence write failed");
+                    if reconnect_try_exhausted(&mut tries) {
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
+                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    continue;
+                }
+            }
+
             if options.requires_capability_admission() {
                 if !running_task.load(Ordering::SeqCst) {
                     snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
@@ -3906,7 +4028,11 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
             };
 
             match startup_outcome {
-                NativeStartupOutcome::Ready => {}
+                NativeStartupOutcome::Ready => {
+                    if options.persists_bluetooth_enabled() {
+                        bluetooth_persistence_completed = true;
+                    }
+                }
                 NativeStartupOutcome::Stopped => {
                     snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
                     let _ = tcp_write.write_all(&rnode::build_detach_sequence()).await;
@@ -5775,7 +5901,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_ble_waits_for_ready_and_retries_unacknowledged_payload_next_generation() {
+    async fn native_ble_waits_for_ready_retries_payload_and_persists_bluetooth_once() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -5832,6 +5958,30 @@ mod tests {
                     .expect("write native handshake");
 
                 let init = native_test_read_through_command(&mut stream, rnode::CMD_MCU).await;
+                let persistence_positions: Vec<_> = init
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, (command, frame))| {
+                        (*command == rnode::CMD_BT_CTRL && frame.as_slice() == [0x01])
+                            .then_some(index)
+                    })
+                    .collect();
+                if generation == 1 {
+                    assert_eq!(persistence_positions.len(), 1);
+                    let radio_on = init
+                        .iter()
+                        .position(|(command, frame)| {
+                            *command == rnode::CMD_RADIO_STATE
+                                && frame.as_slice() == [rnode::RADIO_STATE_ON]
+                        })
+                        .expect("native generation radio-on request");
+                    assert!(persistence_positions[0] < radio_on);
+                } else {
+                    assert!(
+                        persistence_positions.is_empty(),
+                        "a Ready runtime must not rewrite persistent Bluetooth on reconnect"
+                    );
+                }
                 assert!(
                     init.iter().any(|(command, frame)| {
                         *command == rnode::CMD_RADIO_STATE
@@ -5901,9 +6051,15 @@ mod tests {
 
         let id = 0xB1E0_A11C;
         let (transport_tx, mut transport_rx) = mpsc::channel(8);
-        let spawned = spawn_ble_rnode_interface_native_with_driver(config, id, transport_tx, port)
-            .await
-            .expect("spawn native reliability interface");
+        let spawned = spawn_ble_rnode_interface_native_with_driver_and_options(
+            config,
+            id,
+            transport_tx,
+            port,
+            RNodeStartupOptions::default().with_persisted_bluetooth_enabled(),
+        )
+        .await
+        .expect("spawn native reliability interface");
         let tx = spawned.interface.tx.clone();
         let online = spawned.interface.online.clone();
         let txb = spawned

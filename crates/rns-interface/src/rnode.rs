@@ -150,6 +150,7 @@ pub const DEFAULT_TCP_PORT: u16 = 7633;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RNodeStartupOptions {
     capability_policy: RNodeCapabilityPolicy,
+    persist_bluetooth_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -177,7 +178,19 @@ impl RNodeStartupOptions {
     pub const fn require_capability_admission() -> Self {
         Self {
             capability_policy: RNodeCapabilityPolicy::RequireValidatedAdmission,
+            persist_bluetooth_enabled: false,
         }
+    }
+
+    /// Ask BLE transports to persist Bluetooth as enabled on the RNode after
+    /// the device has been admitted successfully.
+    ///
+    /// This is an opt-in product policy. Generic rsReticulum callers retain
+    /// the historical byte sequence unless they select it explicitly, and
+    /// non-BLE RNode transports never emit the Bluetooth control command.
+    pub const fn with_persisted_bluetooth_enabled(mut self) -> Self {
+        self.persist_bluetooth_enabled = true;
+        self
     }
 
     #[cfg(any(
@@ -192,12 +205,18 @@ impl RNodeStartupOptions {
             RNodeCapabilityPolicy::RequireValidatedAdmission
         )
     }
+
+    #[cfg(any(feature = "ble", target_os = "android", test))]
+    pub(crate) const fn persists_bluetooth_enabled(self) -> bool {
+        self.persist_bluetooth_enabled
+    }
 }
 
 impl Default for RNodeStartupOptions {
     fn default() -> Self {
         Self {
             capability_policy: RNodeCapabilityPolicy::Legacy,
+            persist_bluetooth_enabled: false,
         }
     }
 }
@@ -2858,6 +2877,17 @@ pub fn build_detect_sequence() -> Vec<u8> {
     out
 }
 
+/// Build the firmware command that enables Bluetooth and persists that choice
+/// for future RNode boots without opening pairing mode or changing bonds.
+///
+/// BLE drivers send this only after admitting the device and treat the later
+/// exact typed-Ready state from the same connection generation as the durable
+/// startup boundary. Serial, USB, and RNode-over-TCP never call this helper.
+#[cfg(any(feature = "ble", test))]
+pub(crate) fn build_persist_bluetooth_enabled_sequence() -> Vec<u8> {
+    build_command_stage(CMD_BT_CTRL, &[0x01])
+}
+
 /// Airtime-lock commands. Percent is encoded as `(percent * 100)` big-endian u16.
 pub fn build_airtime_sequence(config: &RNodeConfig) -> Vec<u8> {
     let mut out = Vec::with_capacity(16);
@@ -3739,6 +3769,30 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_bluetooth_policy_is_explicit_and_composable() {
+        let default = RNodeStartupOptions::default();
+        assert!(!default.persists_bluetooth_enabled());
+        assert!(!default.requires_capability_admission());
+
+        let persisted = default.with_persisted_bluetooth_enabled();
+        assert!(persisted.persists_bluetooth_enabled());
+        assert!(!persisted.requires_capability_admission());
+
+        let strict_persisted =
+            RNodeStartupOptions::require_capability_admission().with_persisted_bluetooth_enabled();
+        assert!(strict_persisted.persists_bluetooth_enabled());
+        assert!(strict_persisted.requires_capability_admission());
+    }
+
+    #[test]
+    fn persisted_bluetooth_command_is_exact_and_does_not_open_pairing() {
+        assert_eq!(
+            build_persist_bluetooth_enabled_sequence(),
+            vec![kiss::FEND, CMD_BT_CTRL, 0x01, kiss::FEND]
+        );
+    }
 
     #[test]
     fn admission_failure_classes_keep_legacy_log_tokens() {
