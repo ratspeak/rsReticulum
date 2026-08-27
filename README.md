@@ -7,8 +7,7 @@
 
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust 1.87+](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
-[![Compatibility floor: Reticulum 1.3.8](https://img.shields.io/badge/compatibility%20floor-Reticulum%201.3.8-success.svg)](https://reticulum.network/)
-[![Current reference: Reticulum 1.4.2](https://img.shields.io/badge/current%20reference-Reticulum%201.4.2-blue.svg)](https://github.com/markqvist/Reticulum)
+[![Release baseline: Reticulum 1.4.2](https://img.shields.io/badge/release%20baseline-Reticulum%201.4.2-success.svg)](https://reticulum.network/)
 [![Status](https://img.shields.io/badge/status-experimental-yellow.svg)](#feature-status)
 
 [Reticulum Manual](https://reticulum.network/manual/) |
@@ -152,7 +151,7 @@ intentional.
 `rnodeconf-rs` in the current build only covers safe inspection/device setting paths, EEPROM
 dump/backup, and trusted-key storage.
 
-`rnid-rs` tracks the Reticulum 1.3.8 identity utility surface for normal
+`rnid-rs` tracks the Reticulum 1.4.2 identity utility surface for normal
 software identities: public/private import and export, destination hashing,
 `.pub` public identity files, and signed `.rsg` signature files. The
 hardware-backed `rnid-rs hw` path is a Rust extension behind the `hardware`
@@ -176,7 +175,7 @@ rnid-rs -i ~/.rsReticulum/identities/mgmt -X -w mgmt.rid
 rnid-rs -m <public_identity_data> -w peer.pub
 rnid-rs -M <private_identity_data> -X -w restored_identity
 
-# Sign and validate. New signatures are Reticulum 1.3.8 .rsg envelopes.
+# Sign and validate. New signatures are Reticulum 1.4.2-compatible .rsg envelopes.
 rnid-rs -i ~/.rsReticulum/identities/mgmt -s message.txt
 rnid-rs -V message.txt.rsg
 rnid-rs -i <signer_hash> -N -V message.txt.rsg
@@ -188,7 +187,7 @@ rnid-rs -i ~/.rsReticulum/identities/mgmt -d message.txt.rfe
 
 Use `--raw -s <file>` only when a workflow intentionally needs the legacy raw
 64-byte signature form. Normal `rnid-rs -s <file>` produces a `.rsg` file that
-embeds the signer metadata needed for 1.3.8 validation.
+embeds the signer metadata needed for current and retained compatibility.
 
 ## Configuration
 
@@ -278,13 +277,11 @@ Most daemon and utility flows are implemented for the public `*-rs` tools:
 `rnsd-rs`, `rnstatus-rs`, `rnpath-rs`, `rnid-rs`, `rnprobe-rs`, `rncp-rs`,
 `rnsh-rs`, and `rnodeconf-rs`.
 
-The compatibility floor is Reticulum 1.3.8 where the matching Rust surface is
-implemented and tested, including version-specific utility and byte-exact
-fixtures. Current protocol and daemon behavior is also audited and
-interoperability-tested against Reticulum 1.4.2. The older corpus remains
-deliberate backward-compatibility evidence rather than a claim that 1.3.8 is
-the newest upstream. `rnid-rs` has explicit 1.3.8 coverage for the normal
-identity utility flow.
+The release baseline is Reticulum 1.4.2. The complete byte-exact corpus,
+utility vectors, source-truth oracles, and live Python interoperability matrix
+are pinned to its exact source commit. Historical 1.3.8 audits and fixtures
+retain their original provenance as backward-compatibility evidence. RNS 1.5.0
+is intentionally deferred and is not a current support claim.
 
 Known gaps and intentional limits:
 

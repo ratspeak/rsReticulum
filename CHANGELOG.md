@@ -4,6 +4,9 @@
 
 - Match Python RNS 1.4.2 Channel receive-window admission by dropping sequence
   numbers more than 48 slots ahead until a retry falls inside the window.
+- Promote exact Python RNS 1.4.2 from a selected current-reference lane to the
+  complete release baseline, including live interop, source oracles, utility
+  vectors, and regenerated corpus provenance; RNS 1.5.0 remains deferred.
 
 ## 1.2.0 - 2026-08-17
 
