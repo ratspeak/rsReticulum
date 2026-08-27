@@ -39,7 +39,7 @@ use crate::link_manager::{
 };
 
 pub const RNSH_APP_NAME: &str = "rnsh";
-pub const RNSH_SOFTWARE_VERSION: &str = "0.2.0";
+pub const RNSH_SOFTWARE_VERSION: &str = "0.3.0";
 const CLIENT_CHUNK_LEN: usize = 240;
 const CHANNEL_SEND_RETRY: Duration = Duration::from_millis(20);
 const CLIENT_PRE_EOF_DRAIN_MIN: Duration = Duration::from_secs(3);

@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 
 use rns_tools::RS_RETICULUM_VERSION;
 
-const RNSH_PROTOCOL_VERSION: &str = "0.2.0";
+const RNSH_PROTOCOL_VERSION: &str = "0.3.0";
 const APP_NAME: &str = "rnsh";
 const DEFAULT_SERVICE_NAME: &str = "default";
 const IDENTITY_HASH_HEX_LEN: usize = 32;
@@ -883,7 +883,7 @@ mod tests {
     fn version_string_uses_rust_command_name() {
         assert_eq!(
             format!("rnsh-rs {RS_RETICULUM_VERSION} (protocol {RNSH_PROTOCOL_VERSION})"),
-            format!("rnsh-rs {} (protocol 0.2.0)", env!("CARGO_PKG_VERSION"))
+            format!("rnsh-rs {} (protocol 0.3.0)", env!("CARGO_PKG_VERSION"))
         );
     }
 

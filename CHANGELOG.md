@@ -4,6 +4,11 @@
 
 - Match Python RNS 1.4.2 Channel receive-window admission by dropping sequence
   numbers more than 48 slots ahead until a retry falls inside the window.
+- Report the bundled `rnsh` compatibility level as 0.3.0, matching RNS 1.4.2;
+  the wire protocol remains version 1 and the authenticated session hardening
+  was already implemented.
+- Report RNS 1.4.2 from the `rnsd-rs` interactive compatibility console instead
+  of the superseded 1.3.8 floor.
 - Promote exact Python RNS 1.4.2 from a selected current-reference lane to the
   complete release baseline, including live interop, source oracles, utility
   vectors, and regenerated corpus provenance; RNS 1.5.0 remains deferred.
