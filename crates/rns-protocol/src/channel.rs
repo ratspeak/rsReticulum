@@ -482,12 +482,12 @@ impl Channel {
         Ok(delivered)
     }
 
-    /// Match Python's receive guard: future sequence numbers are buffered
-    /// without a window-distance cap, while old sequence numbers are only
-    /// accepted when the current receive window wraps past zero.
+    /// Match Python RNS 1.4.2's receive guard: future sequence numbers are
+    /// accepted only through `WINDOW_MAX`, while old sequence numbers are
+    /// accepted only when the current receive window wraps past zero.
     fn is_acceptable_sequence(&self, seq: u16) -> bool {
         if seq >= self.next_rx_sequence {
-            return true;
+            return (seq as u32) <= self.next_rx_sequence as u32 + WINDOW_MAX as u32;
         }
 
         let window_overflow =
@@ -889,6 +889,34 @@ mod tests {
         let d3 = rx.receive(&raw3).unwrap();
         assert_eq!(d3.len(), 1);
         assert_eq!(d3[0].1, b"third");
+    }
+
+    #[test]
+    fn test_channel_drops_far_future_sequence_until_window_reaches_it() {
+        let mut rx = Channel::new(0.1);
+        rx.register_message_type(0x0001).unwrap();
+
+        let raw = |sequence: u16, payload: &[u8]| {
+            let mut raw = Vec::with_capacity(ENVELOPE_HEADER_SIZE + payload.len());
+            raw.extend_from_slice(&0x0001u16.to_be_bytes());
+            raw.extend_from_slice(&sequence.to_be_bytes());
+            raw.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            raw.extend_from_slice(payload);
+            raw
+        };
+
+        let far_future = (WINDOW_MAX + 1) as u16;
+        assert!(rx.receive(&raw(far_future, b"future")).unwrap().is_empty());
+
+        let mut delivered = Vec::new();
+        for sequence in 0..=WINDOW_MAX as u16 {
+            delivered.extend(rx.receive(&raw(sequence, b"in-window")).unwrap());
+        }
+        assert_eq!(delivered.len(), WINDOW_MAX + 1);
+
+        let retried = rx.receive(&raw(far_future, b"future")).unwrap();
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].1, b"future");
     }
 
     #[test]

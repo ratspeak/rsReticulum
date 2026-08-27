@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Match Python RNS 1.4.2 Channel receive-window admission by dropping sequence
+  numbers more than 48 slots ahead until a retry falls inside the window.
+
 ## 1.2.0 - 2026-08-17
 
 - Designated the existing `rns_runtime::prelude` and compiled examples as the
