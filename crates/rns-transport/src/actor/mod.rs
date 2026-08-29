@@ -9808,6 +9808,93 @@ mod tests {
         );
     }
 
+    /// Local discovery announces use `on_outbound` → `broadcast_local_announce_on_interfaces`.
+    /// Without RegisterDestination (and with no path), every interface is gated off —
+    /// the wire never sees TX even though outbound routing logs ran.
+    #[test]
+    fn outbound_discovery_announce_silent_without_local_destination() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (mut boundary, mut boundary_rx) = make_test_interface("RMAP World");
+        boundary.mode = InterfaceMode::Boundary;
+        actor.interfaces.insert(1, boundary);
+
+        let (mut full, mut full_rx) = make_test_interface("full");
+        full.mode = InterfaceMode::Full;
+        actor.interfaces.insert(2, full);
+
+        let (mut ap, mut ap_rx) = make_test_interface("RNode");
+        ap.mode = InterfaceMode::AccessPoint;
+        actor.interfaces.insert(3, ap);
+
+        let (raw, dest) = make_valid_announce("rnstransport.discovery.interface", 0);
+        actor.on_outbound(OutboundRequest {
+            raw,
+            destination_hash: dest,
+        });
+
+        assert!(
+            boundary_rx.try_recv().is_err(),
+            "non-local discovery announce must not TX on Boundary"
+        );
+        assert!(
+            full_rx.try_recv().is_err(),
+            "non-local discovery announce must not TX on Full"
+        );
+        assert!(
+            ap_rx.try_recv().is_err(),
+            "AccessPoint must never receive announces"
+        );
+    }
+
+    /// After RegisterDestination, locally originated discovery announces egress
+    /// Boundary + Full (e.g. rmap.world hub) but never AccessPoint (discoverable
+    /// RNode mode autocorrect).
+    #[test]
+    fn outbound_discovery_announce_egresses_boundary_and_full_when_local() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+
+        let (mut boundary, mut boundary_rx) = make_test_interface("RMAP World");
+        boundary.mode = InterfaceMode::Boundary;
+        actor.interfaces.insert(1, boundary);
+
+        let (mut full, mut full_rx) = make_test_interface("full");
+        full.mode = InterfaceMode::Full;
+        actor.interfaces.insert(2, full);
+
+        let (mut ap, mut ap_rx) = make_test_interface("RNode");
+        ap.mode = InterfaceMode::AccessPoint;
+        actor.interfaces.insert(3, ap);
+
+        let (raw, dest) = make_valid_announce("rnstransport.discovery.interface", 0);
+        actor.handle_message(TransportMessage::RegisterDestination {
+            hash: dest,
+            app_name: "rnstransport.discovery.interface".to_string(),
+            delivery_tx: None,
+        });
+        assert!(actor.local_destinations.contains(&dest));
+
+        actor.on_outbound(OutboundRequest {
+            raw,
+            destination_hash: dest,
+        });
+
+        assert!(
+            boundary_rx.try_recv().is_ok(),
+            "local discovery announce must TX on Boundary (RMAP hub)"
+        );
+        assert!(
+            full_rx.try_recv().is_ok(),
+            "local discovery announce must TX on Full"
+        );
+        assert!(
+            ap_rx.try_recv().is_err(),
+            "AccessPoint must not receive local or relayed announces"
+        );
+    }
+
     /// Python 1.3.8 Transport.py:1220-1236: internal-mode egress and
     /// announces_from_internal origin gating.
     #[test]

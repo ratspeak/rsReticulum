@@ -562,4 +562,35 @@ mod tests {
         assert_eq!(second[0].interface_id, 2);
         assert!(matches!(skips[0].1, SkipReason::RateLimited { .. }));
     }
+
+    /// Document why the runtime must defer `Announcer::register` until the
+    /// discoverable interface is online: `tick` stamps `last_announce_at` as
+    /// soon as it emits a request, even if the caller never puts the packet
+    /// on the wire (e.g. BLE RNode still coming up). The next attempt is then
+    /// RateLimited for the full announce_interval (often hours).
+    #[test]
+    fn discarding_tick_request_still_rate_limits() {
+        let mut a = Announcer::new(static_stamper());
+        let mut cfg = sample_backbone();
+        cfg.announce_interval_secs = 3600;
+        a.register(1, [0x11; 16], cfg);
+
+        let (requests, skips) = a.tick(1_000.0, None);
+        assert_eq!(requests.len(), 1);
+        assert!(skips.is_empty());
+        drop(requests); // simulate "queued" then never TX'd
+
+        let (requests, skips) = a.tick(1_060.0, None);
+        assert!(requests.is_empty(), "must not re-emit within interval");
+        assert_eq!(skips.len(), 1);
+        match &skips[0].1 {
+            SkipReason::RateLimited { remaining_secs } => {
+                assert!(
+                    *remaining_secs > 3000,
+                    "discarded request must still burn nearly the full interval, got {remaining_secs}"
+                );
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
 }
