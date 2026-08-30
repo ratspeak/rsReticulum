@@ -19,12 +19,13 @@
     "sourceCommit": "47dbbf1febc0a9d3259f179a0512d9b56bb2320d"
   },
   "snapshotSource": {
-    "commit": "795058e5bf5fa4082525a5dca00f6654470f433a",
+    "commit": "67b60362aa24cd94ac55f59ab980930a7a3a5cee",
     "capturedOn": "2026-08-30",
     "review": {
       "areas": [
         "Explicit shared-instance ownership and authenticated reconnect",
         "Non-fatal configured-interface startup observations",
+        "Direct zero-hop shared-client packet addressing",
         "Retained RNode startup policy and BLE lifecycle"
       ],
       "canonicalPath": "rns_runtime::reticulum::init_with_policy",
@@ -35,12 +36,12 @@
       },
       "semver": "additive compatible API; no major-version consequence",
       "deprecations": "none",
-      "wirePersistenceRuntimeImpact": "No packet or RPC wire change. Strict clients require authenticated control on admission and reconnect; strict owners never join another owner. Client dynamic local spawns are rejected. Owned RPC tasks are drained at shutdown and sessions bounded. AutoInterface ports and generic automatic startup remain unchanged. The previously reviewed opt-in BLE firmware persistence policy remains intact.",
+      "wirePersistenceRuntimeImpact": "No packet or RPC format change. Zero-hop paths now retain direct Header1 addressing instead of incorrectly inserting the shared owner's transport identity; positive-hop forwarding is unchanged. Strict clients require authenticated control on admission and reconnect; strict owners never join another owner. Client dynamic local spawns are rejected. Owned RPC tasks are drained at shutdown and sessions bounded. AutoInterface ports and generic automatic startup remain unchanged. The previously reviewed opt-in BLE firmware persistence policy remains intact.",
       "platformEvidence": [
         "all-feature Apple ARM64 public API snapshot",
-        "379 macOS runtime tests plus explicit-owner selector regression",
+        "380 macOS runtime tests passed, one pre-existing ignored; 450 transport actor tests passed",
         "10 native Android emulator shared-instance tests, including abstract Unix and TCP",
-        "live Python RNS 1.4.2 strict authentication and no-fallback test",
+        "live Python RNS 1.4.2 strict authentication, no fallback, path discovery, encrypted two-way Link data and verified 65000-byte Resource",
         "Windows GNU runtime compile check; Ratspeak iOS and Android compile checks",
         "external consumer fixtures with default and all features"
       ]
