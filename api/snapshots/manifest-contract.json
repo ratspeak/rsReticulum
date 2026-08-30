@@ -1441,6 +1441,19 @@
           "defaultFeatures": true,
           "features": [],
           "sourceKind": "registry"
+        },
+        {
+          "name": "zeroize",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [
+            "derive"
+          ],
+          "sourceKind": "registry"
         }
       ]
     },

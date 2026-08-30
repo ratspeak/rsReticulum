@@ -19,26 +19,30 @@
     "sourceCommit": "47dbbf1febc0a9d3259f179a0512d9b56bb2320d"
   },
   "snapshotSource": {
-    "commit": "8fac96aed87bf4ffff9b284879c5872365445bdf",
-    "capturedOn": "2026-08-23",
+    "commit": "795058e5bf5fa4082525a5dca00f6654470f433a",
+    "capturedOn": "2026-08-30",
     "review": {
       "areas": [
-        "RNode startup policy and BLE lifecycle"
+        "Explicit shared-instance ownership and authenticated reconnect",
+        "Non-fatal configured-interface startup observations",
+        "Retained RNode startup policy and BLE lifecycle"
       ],
-      "canonicalPath": "rns_interface::rnode::RNodeStartupOptions",
-      "classification": "compatible additive opt-in BLE startup policy",
+      "canonicalPath": "rns_runtime::reticulum::init_with_policy",
+      "classification": "compatible additive opt-in shared ownership policy; generic automatic startup retained",
       "publicApiDiff": {
-        "added": 1,
+        "added": 48,
         "removed": 0
       },
       "semver": "additive compatible API; no major-version consequence",
       "deprecations": "none",
-      "wirePersistenceRuntimeImpact": "default startup is byte-identical; the explicit policy emits one acknowledged CMD_BT_CTRL=0x01 before radio reassertion and persists the firmware Bluetooth-enabled byte after successful BLE admission",
+      "wirePersistenceRuntimeImpact": "No packet or RPC wire change. Strict clients require authenticated control on admission and reconnect; strict owners never join another owner. Client dynamic local spawns are rejected. Owned RPC tasks are drained at shutdown and sessions bounded. AutoInterface ports and generic automatic startup remain unchanged. The previously reviewed opt-in BLE firmware persistence policy remains intact.",
       "platformEvidence": [
         "all-feature Apple ARM64 public API snapshot",
-        "focused exact-command and composable-policy unit tests",
-        "two-generation Android native bridge readiness and retained-payload regression",
-        "BLE and default-feature compile checks"
+        "379 macOS runtime tests plus explicit-owner selector regression",
+        "10 native Android emulator shared-instance tests, including abstract Unix and TCP",
+        "live Python RNS 1.4.2 strict authentication and no-fallback test",
+        "Windows GNU runtime compile check; Ratspeak iOS and Android compile checks",
+        "external consumer fixtures with default and all features"
       ]
     }
   },
@@ -112,8 +116,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-runtime.txt",
-      "itemCount": 1994,
-      "sha256": "8bcad2034f13b8edd6fa0d3583988674765eb0b12ff9ec6b6863f72f2f18cf6c"
+      "itemCount": 2044,
+      "sha256": "8d17ed5f0dc54462a0b2db50aaaba15f3cabdca32c2b66c3485549ddfc6451f3"
     },
     {
       "name": "rns-tools",

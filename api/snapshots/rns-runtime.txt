@@ -1251,6 +1251,7 @@ pub fn rns_runtime::reticulum::ReticulumHandle::outbound_packet<'a>(&'a self, &'
 pub async fn rns_runtime::reticulum::ReticulumHandle::path_table(&self, core::option::Option<u8>) -> core::result::Result<alloc::vec::Vec<rns_transport::messages::PathTableRpcEntry>, rns_runtime::reticulum::ControlError>
 pub fn rns_runtime::reticulum::ReticulumHandle::publish_blackhole_enabled(&self) -> bool
 pub async fn rns_runtime::reticulum::ReticulumHandle::query_control(&self, rns_transport::messages::TransportQuery) -> core::option::Option<rns_transport::messages::TransportQueryResponse>
+pub async fn rns_runtime::reticulum::ReticulumHandle::query_control_result(&self, rns_transport::messages::TransportQuery) -> core::result::Result<rns_transport::messages::TransportQueryResponse, rns_runtime::reticulum::ControlError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::query_transport(&self, rns_transport::messages::TransportQuery) -> core::option::Option<rns_transport::messages::TransportQueryResponse>
 pub async fn rns_runtime::reticulum::ReticulumHandle::recall(&self, [u8; 16]) -> core::result::Result<core::option::Option<rns_runtime::reticulum::RecalledDestination>, rns_runtime::reticulum::ControlError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::register_destination(&self, rns_identity::identity::Identity, impl core::convert::Into<alloc::string::String>, rns_runtime::destination_runtime::DestinationRuntimeOptions) -> core::result::Result<rns_runtime::destination_runtime::RegisteredDestination, rns_runtime::destination_runtime::DestinationRuntimeError>
@@ -1259,8 +1260,10 @@ pub fn rns_runtime::reticulum::ReticulumHandle::remote_management_enabled(&self)
 pub async fn rns_runtime::reticulum::ReticulumHandle::request_path(&self, [u8; 16], rns_transport::messages::PathRequestOptions) -> core::result::Result<(), rns_runtime::reticulum::ControlError>
 pub fn rns_runtime::reticulum::ReticulumHandle::rnode_runtime(&self, rns_interface::traits::InterfaceId) -> core::result::Result<rns_runtime::reticulum::RNodeRuntimeObserver, rns_runtime::reticulum::RNodeRuntimeLookupError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::send_to(&self, &rns_identity::destination::Destination, &[u8], rns_runtime::reticulum::SendOptions) -> core::result::Result<rns_runtime::reticulum::SendResult, rns_runtime::reticulum::SendError>
+pub fn rns_runtime::reticulum::ReticulumHandle::shared_instance_state(&self) -> core::option::Option<rns_runtime::shared_instance::SharedInstanceState>
 pub fn rns_runtime::reticulum::ReticulumHandle::should_use_implicit_proof(&self) -> bool
 pub async fn rns_runtime::reticulum::ReticulumHandle::shutdown_and_wait(&self)
+pub fn rns_runtime::reticulum::ReticulumHandle::startup_interface_failures(&self) -> &[(alloc::string::String, alloc::string::String)]
 pub fn rns_runtime::reticulum::ReticulumHandle::startup_rnode_runtimes(&self) -> alloc::vec::Vec<rns_runtime::reticulum::StartupRNodeRuntime>
 pub async fn rns_runtime::reticulum::ReticulumHandle::subscribe_announces(&self, core::option::Option<alloc::string::String>, bool) -> core::result::Result<rns_runtime::reticulum::AnnounceSubscription, rns_runtime::reticulum::AnnounceSubscriptionError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::subscribe_announces_with_capacity(&self, core::option::Option<alloc::string::String>, bool, usize) -> core::result::Result<rns_runtime::reticulum::AnnounceSubscription, rns_runtime::reticulum::AnnounceSubscriptionError>
@@ -1619,6 +1622,7 @@ pub fn rns_runtime::reticulum::ReticulumHandle::outbound_packet<'a>(&'a self, &'
 pub async fn rns_runtime::reticulum::ReticulumHandle::path_table(&self, core::option::Option<u8>) -> core::result::Result<alloc::vec::Vec<rns_transport::messages::PathTableRpcEntry>, rns_runtime::reticulum::ControlError>
 pub fn rns_runtime::reticulum::ReticulumHandle::publish_blackhole_enabled(&self) -> bool
 pub async fn rns_runtime::reticulum::ReticulumHandle::query_control(&self, rns_transport::messages::TransportQuery) -> core::option::Option<rns_transport::messages::TransportQueryResponse>
+pub async fn rns_runtime::reticulum::ReticulumHandle::query_control_result(&self, rns_transport::messages::TransportQuery) -> core::result::Result<rns_transport::messages::TransportQueryResponse, rns_runtime::reticulum::ControlError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::query_transport(&self, rns_transport::messages::TransportQuery) -> core::option::Option<rns_transport::messages::TransportQueryResponse>
 pub async fn rns_runtime::reticulum::ReticulumHandle::recall(&self, [u8; 16]) -> core::result::Result<core::option::Option<rns_runtime::reticulum::RecalledDestination>, rns_runtime::reticulum::ControlError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::register_destination(&self, rns_identity::identity::Identity, impl core::convert::Into<alloc::string::String>, rns_runtime::destination_runtime::DestinationRuntimeOptions) -> core::result::Result<rns_runtime::destination_runtime::RegisteredDestination, rns_runtime::destination_runtime::DestinationRuntimeError>
@@ -1627,8 +1631,10 @@ pub fn rns_runtime::reticulum::ReticulumHandle::remote_management_enabled(&self)
 pub async fn rns_runtime::reticulum::ReticulumHandle::request_path(&self, [u8; 16], rns_transport::messages::PathRequestOptions) -> core::result::Result<(), rns_runtime::reticulum::ControlError>
 pub fn rns_runtime::reticulum::ReticulumHandle::rnode_runtime(&self, rns_interface::traits::InterfaceId) -> core::result::Result<rns_runtime::reticulum::RNodeRuntimeObserver, rns_runtime::reticulum::RNodeRuntimeLookupError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::send_to(&self, &rns_identity::destination::Destination, &[u8], rns_runtime::reticulum::SendOptions) -> core::result::Result<rns_runtime::reticulum::SendResult, rns_runtime::reticulum::SendError>
+pub fn rns_runtime::reticulum::ReticulumHandle::shared_instance_state(&self) -> core::option::Option<rns_runtime::shared_instance::SharedInstanceState>
 pub fn rns_runtime::reticulum::ReticulumHandle::should_use_implicit_proof(&self) -> bool
 pub async fn rns_runtime::reticulum::ReticulumHandle::shutdown_and_wait(&self)
+pub fn rns_runtime::reticulum::ReticulumHandle::startup_interface_failures(&self) -> &[(alloc::string::String, alloc::string::String)]
 pub fn rns_runtime::reticulum::ReticulumHandle::startup_rnode_runtimes(&self) -> alloc::vec::Vec<rns_runtime::reticulum::StartupRNodeRuntime>
 pub async fn rns_runtime::reticulum::ReticulumHandle::subscribe_announces(&self, core::option::Option<alloc::string::String>, bool) -> core::result::Result<rns_runtime::reticulum::AnnounceSubscription, rns_runtime::reticulum::AnnounceSubscriptionError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::subscribe_announces_with_capacity(&self, core::option::Option<alloc::string::String>, bool, usize) -> core::result::Result<rns_runtime::reticulum::AnnounceSubscription, rns_runtime::reticulum::AnnounceSubscriptionError>
@@ -1679,6 +1685,7 @@ pub fn rns_runtime::reticulum::get_instance() -> core::option::Option<&'static r
 pub async fn rns_runtime::reticulum::init(core::option::Option<&str>, core::option::Option<std::path::PathBuf>, rns_runtime::lifecycle::ShutdownSignal, alloc::sync::Arc<core::sync::atomic::AtomicBool>) -> core::result::Result<rns_runtime::reticulum::ReticulumHandle, rns_runtime::reticulum::ReticulumError>
 pub async fn rns_runtime::reticulum::init_with_options(core::option::Option<&str>, core::option::Option<std::path::PathBuf>, rns_runtime::lifecycle::ShutdownSignal, alloc::sync::Arc<core::sync::atomic::AtomicBool>, rns_runtime::reticulum::InitOptions) -> core::result::Result<rns_runtime::reticulum::ReticulumHandle, rns_runtime::reticulum::ReticulumError>
 pub async fn rns_runtime::reticulum::init_with_options_and_rnode_startup_options(core::option::Option<&str>, core::option::Option<std::path::PathBuf>, rns_runtime::lifecycle::ShutdownSignal, alloc::sync::Arc<core::sync::atomic::AtomicBool>, rns_runtime::reticulum::InitOptions, rns_interface::rnode::RNodeStartupOptions) -> core::result::Result<rns_runtime::reticulum::ReticulumHandle, rns_runtime::reticulum::ReticulumError>
+pub async fn rns_runtime::reticulum::init_with_policy(core::option::Option<&str>, core::option::Option<std::path::PathBuf>, rns_runtime::lifecycle::ShutdownSignal, alloc::sync::Arc<core::sync::atomic::AtomicBool>, rns_runtime::reticulum::InitOptions, rns_interface::rnode::RNodeStartupOptions, rns_runtime::shared_instance::InstancePolicy) -> core::result::Result<rns_runtime::reticulum::ReticulumHandle, rns_runtime::shared_instance::InstanceStartupError>
 pub fn rns_runtime::reticulum::shared_instance_rpc_socket_path(&str, &std::path::Path) -> alloc::string::String
 pub async fn rns_runtime::reticulum::spawn_auto_interface_runtime(&rns_runtime::reticulum::ReticulumHandle, &str, &str, u16, u16) -> core::result::Result<u64, alloc::string::String>
 pub async fn rns_runtime::reticulum::spawn_auto_interface_runtime_with_config(&rns_runtime::reticulum::ReticulumHandle, rns_interface::auto::AutoInterfaceConfig) -> core::result::Result<u64, alloc::string::String>
@@ -1992,3 +1999,46 @@ pub async fn rns_runtime::rpc::write_mp_frame<S>(&mut S, &[u8]) -> core::result:
 pub mod rns_runtime::rpc_server
 pub async fn rns_runtime::rpc_server::run_rpc_server(u16, alloc::vec::Vec<u8>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, rns_runtime::lifecycle::ShutdownSignal) -> core::result::Result<(), rns_runtime::rpc::RpcError>
 pub async fn rns_runtime::rpc_server::run_unix_rpc_server(&str, alloc::vec::Vec<u8>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, rns_runtime::lifecycle::ShutdownSignal) -> core::result::Result<(), rns_runtime::rpc::RpcError>
+pub mod rns_runtime::shared_instance
+pub enum rns_runtime::shared_instance::InstancePolicy
+pub rns_runtime::shared_instance::InstancePolicy::Configured
+pub rns_runtime::shared_instance::InstancePolicy::SharedClient(rns_runtime::shared_instance::SharedInstanceCredentials)
+pub rns_runtime::shared_instance::InstancePolicy::SharedOwner
+pub rns_runtime::shared_instance::InstancePolicy::SharedOwnerAt(rns_runtime::shared_instance::SharedInstanceEndpoint)
+pub rns_runtime::shared_instance::InstancePolicy::Standalone
+pub enum rns_runtime::shared_instance::InstanceStartupError
+pub rns_runtime::shared_instance::InstanceStartupError::Runtime(rns_runtime::reticulum::ReticulumError)
+pub rns_runtime::shared_instance::InstanceStartupError::Shared(rns_runtime::shared_instance::SharedInstanceError)
+pub enum rns_runtime::shared_instance::SharedInstanceEndpoint
+pub rns_runtime::shared_instance::SharedInstanceEndpoint::Tcp
+pub rns_runtime::shared_instance::SharedInstanceEndpoint::Tcp::control_port: u16
+pub rns_runtime::shared_instance::SharedInstanceEndpoint::Tcp::packet_port: u16
+pub rns_runtime::shared_instance::SharedInstanceEndpoint::Unix
+pub rns_runtime::shared_instance::SharedInstanceEndpoint::Unix::instance_name: alloc::string::String
+impl rns_runtime::shared_instance::SharedInstanceEndpoint
+pub fn rns_runtime::shared_instance::SharedInstanceEndpoint::validate(&self) -> core::result::Result<(), rns_runtime::shared_instance::SharedInstanceError>
+pub enum rns_runtime::shared_instance::SharedInstanceError
+pub rns_runtime::shared_instance::SharedInstanceError::AuthenticationRejected
+pub rns_runtime::shared_instance::SharedInstanceError::Cancelled
+pub rns_runtime::shared_instance::SharedInstanceError::ControlBindFailed
+pub rns_runtime::shared_instance::SharedInstanceError::ControlUnavailable
+pub rns_runtime::shared_instance::SharedInstanceError::InvalidEndpoint
+pub rns_runtime::shared_instance::SharedInstanceError::InvalidKey
+pub rns_runtime::shared_instance::SharedInstanceError::PacketBindFailed
+pub rns_runtime::shared_instance::SharedInstanceError::PacketUnavailable
+pub rns_runtime::shared_instance::SharedInstanceError::TimedOut
+pub rns_runtime::shared_instance::SharedInstanceError::UnsupportedCarrier
+pub rns_runtime::shared_instance::SharedInstanceError::UnsupportedControl
+pub enum rns_runtime::shared_instance::SharedInstanceState
+pub rns_runtime::shared_instance::SharedInstanceState::AuthenticationRejected
+pub rns_runtime::shared_instance::SharedInstanceState::ControlUnavailable
+pub rns_runtime::shared_instance::SharedInstanceState::Ready
+pub rns_runtime::shared_instance::SharedInstanceState::Reconnecting
+pub rns_runtime::shared_instance::SharedInstanceState::Stopped
+pub struct rns_runtime::shared_instance::SharedInstanceCredentials
+impl rns_runtime::shared_instance::SharedInstanceCredentials
+pub fn rns_runtime::shared_instance::SharedInstanceCredentials::endpoint(&self) -> &rns_runtime::shared_instance::SharedInstanceEndpoint
+pub fn rns_runtime::shared_instance::SharedInstanceCredentials::new(rns_runtime::shared_instance::SharedInstanceEndpoint, alloc::vec::Vec<u8>) -> core::result::Result<Self, rns_runtime::shared_instance::SharedInstanceError>
+pub async fn rns_runtime::shared_instance::SharedInstanceCredentials::test(&self) -> core::result::Result<(), rns_runtime::shared_instance::SharedInstanceError>
+impl core::fmt::Debug for rns_runtime::shared_instance::SharedInstanceCredentials
+pub fn rns_runtime::shared_instance::SharedInstanceCredentials::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
