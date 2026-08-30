@@ -39,6 +39,36 @@ deadline and validated identity recall. Long-lived announce observation uses
 owns exactly one registration. Finite lookups do not install or remove
 announce handlers.
 
+## Explicit shared-instance ownership
+
+Applications that require authenticated shared control can opt into
+`reticulum::init_with_policy` and `shared_instance::InstancePolicy`:
+
+- `Configured` retains the normal config-driven automatic owner/client behavior.
+- `Standalone` owns local interfaces without exposing shared IPC.
+- `SharedOwner` binds both configured shared endpoints or fails; it never joins
+  another owner. `SharedOwnerAt(endpoint)` selects them in memory without
+  rewriting the configuration file.
+- `SharedClient(credentials)` requires the selected packet endpoint and
+  authenticated interface-status RPC before becoming ready. It reauthenticates
+  on reconnect and never falls back to local interfaces.
+
+`SharedInstanceEndpoint::Tcp` is loopback-only. Explicit Unix endpoints use
+Linux/Android abstract instance names. Keys are opaque HMAC bytes, supplied via
+`SharedInstanceCredentials::new`; its debug representation redacts the key.
+`credentials.test().await` checks availability without starting a runtime.
+
+Observe reconnect/authentication state through `shared_instance_state()` and
+typed control failures through `query_control_result()`. Client runtimes reject
+dynamic local interface spawns. Non-fatal configured-interface startup failures
+are available through `startup_interface_failures()`; other interfaces can
+remain usable.
+
+Upstream packet IPC is unauthenticated: successful RPC authenticates the control
+endpoint, not the identity of the packet socket. Selecting a trustworthy matching
+pair remains the application's responsibility. These policies do not move
+AutoInterface's interoperable UDP ports or alter Reticulum wire formats.
+
 ## Stability
 
 The application prelude is the recommended integration path, but the workspace

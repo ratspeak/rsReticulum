@@ -222,6 +222,8 @@ pub enum InstancePolicy {
     Standalone,
     /// Bind both configured local listeners or fail; never become a client.
     SharedOwner,
+    /// Bind an explicitly selected local endpoint pair, without rewriting config.
+    SharedOwnerAt(SharedInstanceEndpoint),
     /// Require both selected endpoints; never start local interfaces.
     SharedClient(SharedInstanceCredentials),
 }
@@ -724,5 +726,144 @@ mod tests {
         let _control = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, control))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_or_silent_rpc_drops_unauthenticated_packet_connection() {
+        let packet = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_, control_port) = ports();
+        let credentials = credentials(packet.local_addr().unwrap().port(), control_port, 1);
+        assert_eq!(
+            credentials.test().await,
+            Err(SharedInstanceError::ControlUnavailable)
+        );
+        let (mut stream, _) = packet.accept().await.unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+
+        let control = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, control_port))
+            .await
+            .unwrap();
+        let test = tokio::spawn(async move { credentials.test().await });
+        let (mut stream, _) = packet.accept().await.unwrap();
+        let (mut silent_control, _) = control.accept().await.unwrap();
+        assert!(matches!(
+            test.await.unwrap(),
+            Err(SharedInstanceError::TimedOut | SharedInstanceError::ControlUnavailable)
+        ));
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+        assert_eq!(silent_control.read(&mut [0]).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_closes_both_connections() {
+        let packet = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let credentials = credentials(
+            packet.local_addr().unwrap().port(),
+            control.local_addr().unwrap().port(),
+            1,
+        );
+        let shutdown = ShutdownSignal::new();
+        let task_shutdown = shutdown.clone();
+        let (tx, _rx) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            spawn_authenticated_client(credentials, 1, tx, task_shutdown).await
+        });
+        let (mut packet, _) = packet.accept().await.unwrap();
+        let (mut control, _) = control.accept().await.unwrap();
+        shutdown.trigger();
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(SharedInstanceError::Cancelled)
+        ));
+        assert_eq!(packet.read(&mut [0]).await.unwrap(), 0);
+        assert_eq!(control.read(&mut [0]).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_owner_selectors_are_in_memory_and_reusable_after_shutdown() {
+        let (packet_port, control_port) = ports();
+        let config = TestConfig::new(1, 2, 1);
+        let original = std::fs::read(config.0.join("config")).unwrap();
+        let endpoint = SharedInstanceEndpoint::Tcp {
+            packet_port,
+            control_port,
+        };
+        let owner = config
+            .start(InstancePolicy::SharedOwnerAt(endpoint.clone()))
+            .await
+            .unwrap();
+        SharedInstanceCredentials::new(endpoint, vec![1; 32])
+            .unwrap()
+            .test()
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(config.0.join("config")).unwrap(), original);
+        owner.shutdown_and_wait().await;
+        let _packet = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, packet_port))
+            .await
+            .unwrap();
+        let _control = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, control_port))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn abstract_unix_owner_and_authenticated_client_roundtrip() {
+        let config = TestConfig::new(1, 2, 1);
+        let endpoint = SharedInstanceEndpoint::Unix {
+            instance_name: format!(
+                "strict-test-{}",
+                hex::encode(rns_crypto::random::random_bytes(12))
+            ),
+        };
+        let owner = config
+            .start(InstancePolicy::SharedOwnerAt(endpoint.clone()))
+            .await
+            .unwrap();
+        let client_config = TestConfig::new(3, 4, 9);
+        let credentials = SharedInstanceCredentials::new(endpoint, vec![1; 32]).unwrap();
+        credentials.test().await.unwrap();
+        let client = client_config
+            .start(InstancePolicy::SharedClient(credentials))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.shared_instance_state(),
+            Some(SharedInstanceState::Ready)
+        );
+        assert!(matches!(
+            client
+                .query_control_result(TransportQuery::GetInterfaceStats)
+                .await,
+            Ok(TransportQueryResponse::InterfaceStats(_))
+        ));
+        client.shutdown_and_wait().await;
+        owner.shutdown_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn occupied_auto_port_is_reported_without_breaking_tcp() {
+        let auto = std::net::UdpSocket::bind("[::]:0").unwrap();
+        let data_port = auto.local_addr().unwrap().port();
+        let (tcp_port, _) = ports();
+        let config = TestConfig::new(1, 2, 1);
+        std::fs::write(config.0.join("config"), format!(
+            "[reticulum]\nshare_instance = No\n[interfaces]\n[[LAN]]\ntype = AutoInterface\nenabled = Yes\ndata_port = {data_port}\n[[TCP]]\ntype = TCPServerInterface\nenabled = Yes\nlisten_ip = 127.0.0.1\nlisten_port = {tcp_port}\n"
+        )).unwrap();
+        let runtime = config.start(InstancePolicy::Standalone).await.unwrap();
+        assert_eq!(runtime.startup_interface_failures().len(), 1);
+        assert_eq!(runtime.startup_interface_failures()[0].0, "LAN");
+        assert!(
+            runtime.startup_interface_failures()[0]
+                .1
+                .contains("socket bind")
+        );
+        let _tcp = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, tcp_port))
+            .await
+            .unwrap();
+        assert_eq!(auto.local_addr().unwrap().port(), data_port);
+        runtime.shutdown_and_wait().await;
     }
 }

@@ -407,6 +407,7 @@ pub struct ReticulumHandle {
     /// still install a stamper and start publishing.
     pub discovery: Arc<DiscoveryRuntime>,
     startup_rnode_runtimes: Vec<StartupRNodeRuntime>,
+    startup_interface_failures: Vec<(String, String)>,
     #[cfg(feature = "ble")]
     deferred_android_ble_rnodes: Vec<interface_factory::BleRNodeInterfaceConfig>,
     shutdown_coordinator: RuntimeShutdownCoordinator,
@@ -1080,6 +1081,13 @@ struct LocalDiscoveryInterface {
 }
 
 impl ReticulumHandle {
+    /// Non-fatal configured-interface startup failures, as `(name, reason)`.
+    /// Other interfaces remain usable. Empty for shared clients, which do not
+    /// start the caller's configured interfaces.
+    pub fn startup_interface_failures(&self) -> &[(String, String)] {
+        &self.startup_interface_failures
+    }
+
     /// Last authenticated shared-client state. Generic automatic clients do
     /// not opt into this policy and return `None`.
     pub fn shared_instance_state(&self) -> Option<SharedInstanceState> {
@@ -2819,6 +2827,10 @@ pub async fn init_with_policy(
         InstancePolicy::Configured => {}
         InstancePolicy::Standalone => rc.share_instance = false,
         InstancePolicy::SharedOwner => rc.share_instance = true,
+        InstancePolicy::SharedOwnerAt(endpoint) => {
+            endpoint.validate()?;
+            endpoint.apply(&mut rc);
+        }
         InstancePolicy::SharedClient(credentials) => credentials.apply(&mut rc),
     }
 
@@ -2948,7 +2960,9 @@ pub async fn init_with_policy(
     let configured_policy = matches!(policy, InstancePolicy::Configured);
     let instance_mode = if matches!(
         policy,
-        InstancePolicy::SharedOwner | InstancePolicy::SharedClient(_)
+        InstancePolicy::SharedOwner
+            | InstancePolicy::SharedOwnerAt(_)
+            | InstancePolicy::SharedClient(_)
     ) {
         // This extra permit covers control-listener installation after packet
         // registration consumes its own permit.
@@ -3340,6 +3354,7 @@ pub async fn init_with_policy(
         *discovery_runtime.store.lock().await = Some(Arc::new(store));
     }
     let mut startup_rnode_runtimes = Vec::new();
+    let mut startup_interface_failures = Vec::new();
     #[cfg(feature = "ble")]
     let deferred_android_ble_rnodes = collect_deferred_android_ble_rnodes(
         &interfaces,
@@ -3435,6 +3450,10 @@ pub async fn init_with_policy(
                             return Err(ReticulumError::Interface(error.to_string()).into());
                         }
                         Err(error) => {
+                            startup_interface_failures.push((
+                                interface_config_name(iface_config).to_string(),
+                                error.to_string(),
+                            ));
                             tracing::warn!("failed to register interface: {error}");
                         }
                     }
@@ -3446,6 +3465,8 @@ pub async fn init_with_policy(
                         return Err(ReticulumError::Interface(e).into());
                     } else {
                         drop(spawn_permit);
+                        startup_interface_failures
+                            .push((interface_config_name(iface_config).to_string(), e.clone()));
                         tracing::warn!("failed to spawn interface: {}", e);
                     }
                 }
@@ -3470,6 +3491,7 @@ pub async fn init_with_policy(
         network_identity: network_identity.clone(),
         discovery: discovery_runtime,
         startup_rnode_runtimes,
+        startup_interface_failures,
         #[cfg(feature = "ble")]
         deferred_android_ble_rnodes,
         shutdown_coordinator: shutdown_coordinator.clone(),
@@ -9655,6 +9677,7 @@ loglevel = 7
             network_identity: None,
             discovery: Arc::new(DiscoveryRuntime::default()),
             startup_rnode_runtimes: Vec::new(),
+            startup_interface_failures: Vec::new(),
             #[cfg(feature = "ble")]
             deferred_android_ble_rnodes: Vec::new(),
             shutdown_coordinator,
