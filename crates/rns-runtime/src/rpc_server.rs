@@ -11,6 +11,8 @@ use crate::lifecycle::ShutdownSignal;
 use crate::rpc::{self, RpcError, RpcRequest, RpcResponse};
 
 const MAX_REQUEST_SIZE: usize = 1_048_576;
+const MAX_CONTROL_CLIENTS: usize = 64;
+const CONTROL_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub async fn run_rpc_server(
     port: u16,
@@ -55,7 +57,7 @@ pub async fn run_unix_rpc_server(
     )))
 }
 
-async fn run_rpc_server_with_listener(
+pub(crate) async fn run_rpc_server_with_listener(
     listener: TcpListener,
     rpc_key: Vec<u8>,
     _transport_tx: mpsc::Sender<TransportMessage>,
@@ -63,19 +65,24 @@ async fn run_rpc_server_with_listener(
 ) -> Result<(), RpcError> {
     let port = listener.local_addr().map_err(RpcError::Io)?.port();
     tracing::info!("RPC server listening on 127.0.0.1:{}", port);
+    let rpc_key = zeroize::Zeroizing::new(rpc_key);
+    let mut clients = tokio::task::JoinSet::new();
 
     loop {
         tokio::select! {
+            biased;
+            _ = shutdown.wait() => break,
+            _ = clients.join_next(), if !clients.is_empty() => {},
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, addr)) => {
+                        if clients.len() >= MAX_CONTROL_CLIENTS { continue; }
                         tracing::debug!("RPC connection from {}", addr);
                         let key = rpc_key.clone();
                         let tx = _transport_tx.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_rpc_client(stream, &key, tx).await {
-                                tracing::debug!("RPC client error: {}", e);
-                            }
+                        clients.spawn(async move {
+                            let _ = tokio::time::timeout(CONTROL_SESSION_TIMEOUT,
+                                handle_rpc_client(stream, &key, tx)).await;
                         });
                     }
                     Err(e) => {
@@ -83,18 +90,14 @@ async fn run_rpc_server_with_listener(
                     }
                 }
             }
-            _ = shutdown.wait() => {
-                tracing::info!("RPC server shutting down");
-                break;
-            }
         }
     }
-
+    clients.shutdown().await;
     Ok(())
 }
 
 #[cfg(unix)]
-async fn run_unix_rpc_server_with_listener(
+pub(crate) async fn run_unix_rpc_server_with_listener(
     listener: tokio::net::UnixListener,
     display_path: String,
     rpc_key: Vec<u8>,
@@ -102,19 +105,24 @@ async fn run_unix_rpc_server_with_listener(
     shutdown: ShutdownSignal,
 ) -> Result<(), RpcError> {
     tracing::info!("RPC server listening on {}", display_path);
+    let rpc_key = zeroize::Zeroizing::new(rpc_key);
+    let mut clients = tokio::task::JoinSet::new();
 
     loop {
         tokio::select! {
+            biased;
+            _ = shutdown.wait() => break,
+            _ = clients.join_next(), if !clients.is_empty() => {},
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _addr)) => {
+                        if clients.len() >= MAX_CONTROL_CLIENTS { continue; }
                         tracing::debug!("Unix RPC connection accepted");
                         let key = rpc_key.clone();
                         let tx = transport_tx.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_rpc_client(stream, &key, tx).await {
-                                tracing::debug!("Unix RPC client error: {}", e);
-                            }
+                        clients.spawn(async move {
+                            let _ = tokio::time::timeout(CONTROL_SESSION_TIMEOUT,
+                                handle_rpc_client(stream, &key, tx)).await;
                         });
                     }
                     Err(e) => {
@@ -122,18 +130,16 @@ async fn run_unix_rpc_server_with_listener(
                     }
                 }
             }
-            _ = shutdown.wait() => {
-                tracing::info!("Unix RPC server shutting down");
-                break;
-            }
         }
     }
-
+    clients.shutdown().await;
     Ok(())
 }
 
 #[cfg(unix)]
-fn bind_unix_rpc_listener(socket_path: &str) -> std::io::Result<tokio::net::UnixListener> {
+pub(crate) fn bind_unix_rpc_listener(
+    socket_path: &str,
+) -> std::io::Result<tokio::net::UnixListener> {
     if let Some(abstract_name) = socket_path.strip_prefix('\0') {
         return bind_abstract_unix_listener(abstract_name);
     }

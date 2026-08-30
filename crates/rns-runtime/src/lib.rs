@@ -24,6 +24,7 @@ pub mod rncp;
 pub mod rnsh;
 pub mod rpc;
 pub mod rpc_server;
+pub mod shared_instance;
 
 /// Common application-facing types for Reticulum programs.
 ///

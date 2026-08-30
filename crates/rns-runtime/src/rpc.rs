@@ -1530,7 +1530,9 @@ pub async fn connect_unix_and_request(
 }
 
 #[cfg(unix)]
-async fn connect_unix_stream(socket_path: &str) -> std::io::Result<tokio::net::UnixStream> {
+pub(crate) async fn connect_unix_stream(
+    socket_path: &str,
+) -> std::io::Result<tokio::net::UnixStream> {
     if let Some(abstract_name) = socket_path.strip_prefix('\0') {
         return connect_abstract_unix_stream(abstract_name);
     }

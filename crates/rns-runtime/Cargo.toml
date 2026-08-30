@@ -34,6 +34,7 @@ serde = { workspace = true }
 subtle = { workspace = true }
 hex = { workspace = true }
 nix = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

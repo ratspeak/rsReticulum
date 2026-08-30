@@ -28,6 +28,10 @@ use crate::link_client::LinkClient;
 use crate::link_manager::LinkManager;
 use crate::link_session::{LinkSession, LinkSessionConfig, LinkSessionError};
 use crate::platform::{StoragePaths, resolve_config_dir};
+use crate::shared_instance::{
+    BoundControlListener, InstancePolicy, InstanceStartupError, SharedInstanceError,
+    SharedInstanceState, spawn_authenticated_client,
+};
 use rns_identity::destination::{
     DestType, Destination, DestinationError, DestinationPacketError, DestinationPacketOptions,
     Direction,
@@ -89,6 +93,7 @@ struct RuntimeShutdownInner {
     interface_controls: InterfaceControlMap,
     interface_registry: InterfaceRegistry,
     accepted_child_pump: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    owned_control_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl RuntimeShutdownCoordinator {
@@ -110,6 +115,7 @@ impl RuntimeShutdownCoordinator {
                 interface_controls,
                 interface_registry,
                 accepted_child_pump: std::sync::Mutex::new(None),
+                owned_control_task: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -126,6 +132,16 @@ impl RuntimeShutdownCoordinator {
 
     fn is_started(&self) -> bool {
         self.inner.started.load(Ordering::Acquire)
+    }
+
+    // Strict startup holds a spawn permit through installation, so shutdown
+    // cannot pass wait_for_spawn_permits before this listener is retained.
+    fn install_owned_control_task(&self, task: tokio::task::JoinHandle<()>) {
+        *self
+            .inner
+            .owned_control_task
+            .lock()
+            .expect("control task mutex poisoned") = Some(task);
     }
 
     fn start(&self) {
@@ -189,6 +205,16 @@ impl RuntimeShutdownCoordinator {
         // rejection cleanup, so shutdown cannot complete ahead of a late
         // spawned interface.
         self.inner.interface_registry.wait_for_spawn_permits().await;
+
+        let control = self
+            .inner
+            .owned_control_task
+            .lock()
+            .expect("control task mutex poisoned")
+            .take();
+        if let Some(control) = control {
+            let _ = control.await;
+        }
 
         let (mut shutdowns, waiters, mut abandoned_registrations) = drain.into_parts();
         // Exact device owners are all signalled before any sequential join,
@@ -384,6 +410,7 @@ pub struct ReticulumHandle {
     #[cfg(feature = "ble")]
     deferred_android_ble_rnodes: Vec<interface_factory::BleRNodeInterfaceConfig>,
     shutdown_coordinator: RuntimeShutdownCoordinator,
+    shared_instance_status: Option<watch::Receiver<SharedInstanceState>>,
     started_at: std::time::Instant,
 }
 
@@ -1053,6 +1080,18 @@ struct LocalDiscoveryInterface {
 }
 
 impl ReticulumHandle {
+    /// Last authenticated shared-client state. Generic automatic clients do
+    /// not opt into this policy and return `None`.
+    pub fn shared_instance_state(&self) -> Option<SharedInstanceState> {
+        self.shared_instance_status.as_ref().map(|status| {
+            if self.shutdown_coordinator.is_started() || status.has_changed().is_err() {
+                SharedInstanceState::Stopped
+            } else {
+                *status.borrow()
+            }
+        })
+    }
+
     /// Register and own an inbound SINGLE destination on this runtime.
     pub async fn register_destination(
         &self,
@@ -1821,7 +1860,7 @@ impl ReticulumHandle {
     ///
     /// In client mode, a failed or unsupported shared-instance request never
     /// falls back to this process' local actor.
-    async fn query_control_result(
+    pub async fn query_control_result(
         &self,
         query: TransportQuery,
     ) -> Result<TransportQueryResponse, ControlError> {
@@ -2729,6 +2768,35 @@ pub async fn init_with_options_and_rnode_startup_options(
     options: InitOptions,
     rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
 ) -> Result<ReticulumHandle, ReticulumError> {
+    init_with_policy(
+        configdir,
+        socket_dir,
+        shutdown,
+        is_foreground,
+        options,
+        rnode_startup_options,
+        InstancePolicy::Configured,
+    )
+    .await
+    .map_err(|error| match error {
+        InstanceStartupError::Runtime(error) => error,
+        InstanceStartupError::Shared(error) => ReticulumError::Interface(error.to_string()),
+    })
+}
+
+/// Bring up Reticulum with an explicit ownership policy. Existing init entry
+/// points retain config-driven automatic sharing. Strict clients authenticate
+/// before admission and every reconnect; strict owners never adopt a listener
+/// that they failed to bind. This does not authenticate the packet IPC protocol.
+pub async fn init_with_policy(
+    configdir: Option<&str>,
+    socket_dir: Option<PathBuf>,
+    shutdown: ShutdownSignal,
+    is_foreground: Arc<AtomicBool>,
+    options: InitOptions,
+    rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
+    policy: InstancePolicy,
+) -> Result<ReticulumHandle, InstanceStartupError> {
     let started_at = std::time::Instant::now();
     let config_dir = resolve_config_dir(configdir);
     let paths = StoragePaths::from_config_dir(&config_dir);
@@ -2746,6 +2814,12 @@ pub async fn init_with_options_and_rnode_startup_options(
     let mut rc = ReticulumConfig::try_from_config(&config).map_err(ReticulumError::Config)?;
     if let Some(shared_instance_type) = options.shared_instance_type {
         rc.shared_instance_type = shared_instance_type;
+    }
+    match &policy {
+        InstancePolicy::Configured => {}
+        InstancePolicy::Standalone => rc.share_instance = false,
+        InstancePolicy::SharedOwner => rc.share_instance = true,
+        InstancePolicy::SharedClient(credentials) => credentials.apply(&mut rc),
     }
 
     let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new();
@@ -2866,10 +2940,104 @@ pub async fn init_with_options_and_rnode_startup_options(
             shutdown_coordinator.wait().await;
             return Err(ReticulumError::Interface(
                 "runtime shutdown during interface initialization".to_string(),
-            ));
+            )
+            .into());
         }
     });
-    let instance_mode = if rc.share_instance {
+    let mut shared_instance_status = None;
+    let configured_policy = matches!(policy, InstancePolicy::Configured);
+    let instance_mode = if matches!(
+        policy,
+        InstancePolicy::SharedOwner | InstancePolicy::SharedClient(_)
+    ) {
+        // This extra permit covers control-listener installation after packet
+        // registration consumes its own permit.
+        let control_permit = interface_registry.acquire_spawn_permit();
+        let result: Result<InstanceMode, InstanceStartupError> = async {
+            if control_permit.is_err() {
+                return Err(SharedInstanceError::Cancelled.into());
+            }
+            if let InstancePolicy::SharedClient(credentials) = policy {
+                let (client, status) = spawn_authenticated_client(
+                    credentials,
+                    next_id(&id_gen),
+                    transport_tx.clone(),
+                    shutdown.clone(),
+                )
+                .await?;
+                let mode = adopt_shared_instance_client(
+                    client,
+                    &transport_tx,
+                    &interface_controls,
+                    &interface_registry,
+                    &shutdown,
+                    rc.force_shared_instance_bitrate,
+                    shared_spawn_permit.take(),
+                )
+                .await;
+                if mode != InstanceMode::Client {
+                    return Err(SharedInstanceError::Cancelled.into());
+                }
+                shared_instance_status = Some(status);
+                return Ok(mode);
+            }
+            let control = BoundControlListener::bind(&rc, &socket_base).await?;
+            let mut server = if rc.shared_instance_type == SharedInstanceType::Tcp {
+                rns_interface::tcp::spawn_tcp_server(
+                    rns_interface::tcp::TcpServerConfig::new(
+                        "SharedInstanceServer",
+                        "127.0.0.1",
+                        rc.shared_instance_port,
+                    ),
+                    next_id(&id_gen),
+                    id_gen.clone(),
+                    transport_tx.clone(),
+                    handle_tx.clone(),
+                )
+                .await
+            } else {
+                rns_interface::local::spawn_local_server(
+                    rns_interface::local::LocalServerConfig {
+                        socket_path: shared_unix_socket_path(&rc.instance_name, &socket_base),
+                        name: "SharedInstanceServer".to_string(),
+                    },
+                    id_gen.clone(),
+                    transport_tx.clone(),
+                    handle_tx.clone(),
+                )
+                .await
+            }
+            .map_err(|_| SharedInstanceError::PacketBindFailed)?;
+            apply_forced_shared_instance_bitrate(&mut server, rc.force_shared_instance_bitrate);
+            register_interface_handle_with_role_and_spawn_permit(
+                &transport_tx,
+                server,
+                rns_transport::messages::InterfaceRole::SharedServer,
+                &interface_controls,
+                &interface_registry,
+                shared_spawn_permit.take(),
+            )
+            .await
+            .map_err(|_| SharedInstanceError::Cancelled)?;
+            let rpc_key = rc.rpc_key.clone().ok_or(SharedInstanceError::InvalidKey)?;
+            shutdown_coordinator.install_owned_control_task(tokio::spawn(control.run(
+                rpc_key,
+                transport_tx.clone(),
+                shutdown.clone(),
+            )));
+            Ok(InstanceMode::Shared)
+        }
+        .await;
+        drop(control_permit);
+        match result {
+            Ok(mode) => mode,
+            Err(error) => {
+                drop(shared_spawn_permit);
+                shutdown_coordinator.start_and_wait().await;
+                return Err(error);
+            }
+        }
+    } else if rc.share_instance {
         if rc.shared_instance_type == SharedInstanceType::Tcp {
             let live_server_detected = detect_shared_tcp_server(rc.shared_instance_port).await;
 
@@ -3113,12 +3281,13 @@ pub async fn init_with_options_and_rnode_startup_options(
         shutdown_coordinator.wait().await;
         return Err(ReticulumError::Interface(
             "runtime shutdown during interface initialization".to_string(),
-        ));
+        )
+        .into());
     }
 
     if options.require_shared_instance && instance_mode != InstanceMode::Client {
         shutdown_coordinator.start_and_wait().await;
-        return Err(ReticulumError::RequiredSharedInstanceUnavailable);
+        return Err(ReticulumError::RequiredSharedInstanceUnavailable.into());
     }
 
     if instance_mode == InstanceMode::Client {
@@ -3155,7 +3324,7 @@ pub async fn init_with_options_and_rnode_startup_options(
         Ok(interfaces) => interfaces,
         Err(e) => {
             shutdown_coordinator.start_and_wait().await;
-            return Err(e);
+            return Err(e.into());
         }
     };
     if !interfaces.is_empty() {
@@ -3194,7 +3363,8 @@ pub async fn init_with_options_and_rnode_startup_options(
                     shutdown_coordinator.wait().await;
                     return Err(ReticulumError::Interface(
                         "runtime shutdown during interface initialization".to_string(),
-                    ));
+                    )
+                    .into());
                 }
             };
             let iface_id = next_id(&id_gen);
@@ -3262,7 +3432,7 @@ pub async fn init_with_options_and_rnode_startup_options(
                         }
                         Err(error) if rc.panic_on_interface_error => {
                             shutdown_coordinator.start_and_wait().await;
-                            return Err(ReticulumError::Interface(error.to_string()));
+                            return Err(ReticulumError::Interface(error.to_string()).into());
                         }
                         Err(error) => {
                             tracing::warn!("failed to register interface: {error}");
@@ -3273,7 +3443,7 @@ pub async fn init_with_options_and_rnode_startup_options(
                     if rc.panic_on_interface_error {
                         drop(spawn_permit);
                         shutdown_coordinator.start_and_wait().await;
-                        return Err(ReticulumError::Interface(e));
+                        return Err(ReticulumError::Interface(e).into());
                     } else {
                         drop(spawn_permit);
                         tracing::warn!("failed to spawn interface: {}", e);
@@ -3303,6 +3473,7 @@ pub async fn init_with_options_and_rnode_startup_options(
         #[cfg(feature = "ble")]
         deferred_android_ble_rnodes,
         shutdown_coordinator: shutdown_coordinator.clone(),
+        shared_instance_status,
         started_at,
     };
 
@@ -3310,7 +3481,8 @@ pub async fn init_with_options_and_rnode_startup_options(
         shutdown_coordinator.wait().await;
         return Err(ReticulumError::Interface(
             "runtime shutdown during interface initialization".to_string(),
-        ));
+        )
+        .into());
     }
 
     if instance_mode != InstanceMode::Client && rc.publish_blackhole {
@@ -3333,7 +3505,7 @@ pub async fn init_with_options_and_rnode_startup_options(
     }
 
     // RPC server runs only on Shared; CLI clients authenticate against `rpc_key`.
-    if instance_mode == InstanceMode::Shared {
+    if instance_mode == InstanceMode::Shared && configured_policy {
         if let Some(rpc_key) = rc.rpc_key.clone() {
             let rpc_tx = transport_tx.clone();
             let rpc_shutdown = shutdown.clone();
@@ -6078,6 +6250,9 @@ fn blocking_transport_query(
 fn ensure_runtime_interface_admission(
     handle: &ReticulumHandle,
 ) -> Result<InterfaceSpawnPermit, String> {
+    if handle.instance_mode == InstanceMode::Client {
+        return Err("interfaces are owned by the existing shared instance; switch to managed mode to add local interfaces".to_string());
+    }
     handle
         .interface_registry
         .acquire_spawn_permit()
@@ -9483,6 +9658,7 @@ loglevel = 7
             #[cfg(feature = "ble")]
             deferred_android_ble_rnodes: Vec::new(),
             shutdown_coordinator,
+            shared_instance_status: None,
             started_at: std::time::Instant::now(),
         }
     }
