@@ -125,10 +125,12 @@ impl TransportActor {
                     // replaces the zero hops byte on the way out.
                     let apply_delta = self.should_apply_delta(&parsed, target_interface);
 
-                    // Transport nodes only forward Header2 packets whose transport_id
-                    // matches their identity — Python hubs silently drop Header1 —
-                    // so every directed send through a relay must be wrapped.
-                    let sent = if let Some(next_hop) = path_next_hop {
+                    // A shared owner's announces may include its next-hop ID
+                    // even for a zero-hop local client. That client is directly
+                    // reachable: wrapping would leave the owner's transport ID
+                    // on the delivered Link request, which the client rejects.
+                    // Preserve directed-relay wrapping for positive-hop paths.
+                    let sent = if let Some(next_hop) = path_next_hop.filter(|_| path_hops > 0) {
                         if parsed.flags.header_type == rns_wire::flags::HeaderType::Header1 {
                             let new_flags = rns_wire::flags::PacketFlags {
                                 header_type: rns_wire::flags::HeaderType::Header2,

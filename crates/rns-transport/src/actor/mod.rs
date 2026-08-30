@@ -6485,6 +6485,55 @@ mod tests {
     }
 
     #[test]
+    fn zero_hop_shared_client_paths_do_not_inherit_owner_transport_header() {
+        use rns_wire::flags::{HeaderType, PacketType};
+        for client_mode in [false, true] {
+            for hops in [0, 1, 2] {
+                for packet_type in [PacketType::Data, PacketType::LinkRequest] {
+                    let (mut actor, _) = TransportActor::new();
+                    actor.shared_instance_client_mode = client_mode;
+                    let (entry, mut rx) = make_test_interface("shared-peer");
+                    actor.interfaces.insert(1, entry);
+                    let destination = [0x55; 16];
+                    actor.path_table.insert(
+                        destination,
+                        crate::path_table::PathEntry::new(
+                            Some([0x66; 16]),
+                            hops,
+                            1,
+                            InterfaceMode::Full,
+                        ),
+                    );
+                    let original = make_data_packet(destination, 0);
+                    let (mut header, offset) =
+                        rns_wire::header::PacketHeader::unpack(&original).unwrap();
+                    header.flags.packet_type = packet_type;
+                    let mut raw = header.pack();
+                    raw.extend_from_slice(&original[offset..]);
+                    actor.on_outbound(OutboundRequest {
+                        raw: Bytes::from(raw),
+                        destination_hash: destination,
+                    });
+                    let sent = rx.try_recv().unwrap();
+                    let (header, _) = rns_wire::header::PacketHeader::unpack(&sent).unwrap();
+                    assert_eq!(
+                        header.flags.header_type,
+                        if hops == 0 {
+                            HeaderType::Header1
+                        } else {
+                            HeaderType::Header2
+                        }
+                    );
+                    assert_eq!(
+                        header.transport_id,
+                        if hops == 0 { None } else { Some([0x66; 16]) }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_peer_hub_client_full_relay_chain() {
         let (mut peer, _peer_tx) = TransportActor::new();
         let (mut hub, _hub_tx) = TransportActor::new();
