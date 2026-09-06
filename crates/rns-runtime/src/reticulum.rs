@@ -9063,7 +9063,7 @@ mod tests {
 
     #[cfg(feature = "rnode-tcp")]
     #[tokio::test]
-    async fn legacy_rnode_spawn_preserves_id_and_online_result() {
+    async fn legacy_rnode_spawn_preserves_id_and_reports_unready_radio() {
         let (port, closed_rx, peer) = test_rnode_tcp_peer();
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
         let mut runtime = dummy_handle();
@@ -9074,7 +9074,10 @@ mod tests {
                 .await
                 .expect("legacy RNode spawn");
         assert_eq!(id, 0);
-        assert!(online.load(Ordering::SeqCst));
+        assert!(
+            !online.load(Ordering::SeqCst),
+            "an open socket without typed radio Ready is not an online RNode"
+        );
         assert!(
             runtime.rnode_runtime(id).is_ok(),
             "legacy spawn must still register an observable RNode"
