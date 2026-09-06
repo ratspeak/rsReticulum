@@ -19,31 +19,35 @@
     "sourceCommit": "47dbbf1febc0a9d3259f179a0512d9b56bb2320d"
   },
   "snapshotSource": {
-    "commit": "67b60362aa24cd94ac55f59ab980930a7a3a5cee",
-    "capturedOn": "2026-08-30",
+    "commit": "f6523fd5c5c9784f5b6aa9cb8ca1485baf02ecf1",
+    "capturedOn": "2026-09-05",
     "review": {
       "areas": [
         "Explicit shared-instance ownership and authenticated reconnect",
         "Non-fatal configured-interface startup observations",
         "Direct zero-hop shared-client packet addressing",
-        "Retained RNode startup policy and BLE lifecycle"
+        "Retained RNode startup policy and BLE lifecycle",
+        "Bounded exact local Link and packet route recovery",
+        "Canonical route-aware packet receipt timing"
       ],
-      "canonicalPath": "rns_runtime::reticulum::init_with_policy",
-      "classification": "compatible additive opt-in shared ownership policy; generic automatic startup retained",
+      "canonicalPath": "rns_runtime::reticulum::ReticulumHandle::path_recovery_handle",
+      "classification": "compatible additive opt-in route recovery and receipt timing; retained shared ownership and exhaustive mailbox APIs",
       "publicApiDiff": {
-        "added": 48,
+        "added": 71,
         "removed": 0
       },
       "semver": "additive compatible API; no major-version consequence",
       "deprecations": "none",
-      "wirePersistenceRuntimeImpact": "No packet or RPC format change. Zero-hop paths now retain direct Header1 addressing instead of incorrectly inserting the shared owner's transport identity; positive-hop forwarding is unchanged. Strict clients require authenticated control on admission and reconnect; strict owners never join another owner. Client dynamic local spawns are rejected. Owned RPC tasks are drained at shutdown and sessions bounded. AutoInterface ports and generic automatic startup remain unchanged. The previously reviewed opt-in BLE firmware persistence policy remains intact.",
+      "wirePersistenceRuntimeImpact": "No packet or RPC format change. Zero-hop paths now retain direct Header1 addressing instead of incorrectly inserting the shared owner's transport identity; positive-hop forwarding is unchanged. Strict clients require authenticated control on admission and reconnect; strict owners never join another owner. Client dynamic local spawns are rejected. Owned RPC tasks are drained at shutdown and sessions bounded. AutoInterface ports and generic automatic startup remain unchanged. The previously reviewed opt-in BLE firmware persistence policy remains intact. Route recovery observes bounded local dispatch versions and invalidates only the unchanged attempted route, without receive-interface suppression. Link and packet ownership are separate. Ordinary packet timeout calculation is consolidated without changing its formula. Shared clients recover only their local actor; no new shared RPC or wire messages.",
       "platformEvidence": [
         "all-feature Apple ARM64 public API snapshot",
         "380 macOS runtime tests passed, one pre-existing ignored; 450 transport actor tests passed",
         "10 native Android emulator shared-instance tests, including abstract Unix and TCP",
         "live Python RNS 1.4.2 strict authentication, no fallback, path discovery, encrypted two-way Link data and verified 65000-byte Resource",
         "Windows GNU runtime compile check; Ratspeak iOS and Android compile checks",
-        "external consumer fixtures with default and all features"
+        "external consumer fixtures with default and all features",
+        "September 5 checkpoint: 441 all-feature runtime tests passed, one existing skip; 458 combined-tree transport tests and 48 wire tests passed",
+        "strict wire/transport/runtime Clippy; 7 exact-route unit regressions; real signed same-radio and alternate-route ingress regressions"
       ]
     }
   },
@@ -63,8 +67,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-wire.txt",
-      "itemCount": 369,
-      "sha256": "e82cf03eeed3f13ccde7fda8d87e58de0a9403a98860f8c576d84922ef2336c9"
+      "itemCount": 370,
+      "sha256": "7ce9011e531c1642912512d9d975b8a7def0bb41f691b6b16177eddecf5bef6d"
     },
     {
       "name": "rns-identity",
@@ -81,8 +85,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-transport.txt",
-      "itemCount": 1574,
-      "sha256": "d4377c893fe8a140a6c3d154f4a4f1004756856ccf462127c8bcc7c096b406ec"
+      "itemCount": 1591,
+      "sha256": "984126dc9ec551d8c679386150b4bd8ab4a49a733eb952b6b1660748cbeaec26"
     },
     {
       "name": "rns-link",
@@ -117,8 +121,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-runtime.txt",
-      "itemCount": 2044,
-      "sha256": "8d17ed5f0dc54462a0b2db50aaaba15f3cabdca32c2b66c3485549ddfc6451f3"
+      "itemCount": 2049,
+      "sha256": "0f8a2c64f336de0d9b5f2ac55d8df6072108e771e789ea1a855a84798aa10cbc"
     },
     {
       "name": "rns-tools",

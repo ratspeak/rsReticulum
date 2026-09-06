@@ -80,6 +80,8 @@ pub fn rns_transport::actor::TransportActor::new() -> (Self, tokio::sync::mpsc::
 pub fn rns_transport::actor::TransportActor::new_with_capacity(usize, usize) -> (Self, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>)
 pub fn rns_transport::actor::TransportActor::persistence_trigger(&self) -> rns_transport::actor::PersistenceTrigger
 pub async fn rns_transport::actor::TransportActor::run(self)
+impl rns_transport::actor::TransportActor
+pub fn rns_transport::actor::TransportActor::path_recovery_handle(&mut self) -> rns_transport::path_recovery::PathRecoveryHandle
 pub mod rns_transport::announce
 pub struct rns_transport::announce::AnnounceEntry
 pub rns_transport::announce::AnnounceEntry::attached_interface: core::option::Option<rns_transport::messages::InterfaceId>
@@ -1272,6 +1274,21 @@ impl core::fmt::Debug for rns_transport::messages::TrackedReceiptRegistration
 pub fn rns_transport::messages::TrackedReceiptRegistration::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub fn rns_transport::messages::msg_variant_name(&rns_transport::messages::TransportMessage) -> &'static str
 pub type rns_transport::messages::InterfaceId = u64
+pub mod rns_transport::path_recovery
+#[non_exhaustive] pub enum rns_transport::path_recovery::PathRecoveryError
+pub rns_transport::path_recovery::PathRecoveryError::Closed
+pub rns_transport::path_recovery::PathRecoveryError::Full
+impl core::error::Error for rns_transport::path_recovery::PathRecoveryError
+impl core::fmt::Display for rns_transport::path_recovery::PathRecoveryError
+pub fn rns_transport::path_recovery::PathRecoveryError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct rns_transport::path_recovery::PathRecoveryHandle
+impl rns_transport::path_recovery::PathRecoveryHandle
+pub fn rns_transport::path_recovery::PathRecoveryHandle::try_recover(&self, [u8; 16], core::option::Option<[u8; 16]>) -> core::result::Result<tokio::sync::oneshot::Receiver<rns_transport::path_recovery::PathRecoveryOutcome>, rns_transport::path_recovery::PathRecoveryError>
+pub fn rns_transport::path_recovery::PathRecoveryHandle::try_recover_packet(&self, [u8; 16], [u8; 32]) -> core::result::Result<tokio::sync::oneshot::Receiver<rns_transport::path_recovery::PathRecoveryOutcome>, rns_transport::path_recovery::PathRecoveryError>
+#[non_exhaustive] pub struct rns_transport::path_recovery::PathRecoveryOutcome
+pub rns_transport::path_recovery::PathRecoveryOutcome::has_path: bool
+pub rns_transport::path_recovery::PathRecoveryOutcome::path_dropped: bool
+pub rns_transport::path_recovery::PathRecoveryOutcome::request_scheduled: bool
 pub mod rns_transport::path_table
 pub struct rns_transport::path_table::PathEntry
 pub rns_transport::path_table::PathEntry::expires: f64

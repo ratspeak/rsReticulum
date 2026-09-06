@@ -836,6 +836,9 @@ pub use rns_runtime::prelude::DestinationPacketOptions
 pub use rns_runtime::prelude::Direction
 pub use rns_runtime::prelude::Identity
 pub use rns_runtime::prelude::PackedDestinationPacket
+pub use rns_runtime::prelude::PathRecoveryError
+pub use rns_runtime::prelude::PathRecoveryHandle
+pub use rns_runtime::prelude::PathRecoveryOutcome
 pub use rns_runtime::prelude::PersistentRatchetRing
 pub use rns_runtime::prelude::ProofStrategy
 pub use rns_runtime::prelude::RNodeCapabilityAdmissionError
@@ -1248,6 +1251,7 @@ pub async fn rns_runtime::reticulum::ReticulumHandle::next_hop_hardware_mtu(&sel
 pub async fn rns_runtime::reticulum::ReticulumHandle::next_hop_per_bit_latency(&self, [u8; 16]) -> core::result::Result<core::option::Option<f64>, rns_runtime::reticulum::ControlError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::next_hop_per_byte_latency(&self, [u8; 16]) -> core::result::Result<core::option::Option<f64>, rns_runtime::reticulum::ControlError>
 pub fn rns_runtime::reticulum::ReticulumHandle::outbound_packet<'a>(&'a self, &'a rns_identity::destination::Destination, &'a [u8], rns_runtime::reticulum::SendOptions) -> rns_runtime::reticulum::OutboundPacket<'a>
+pub fn rns_runtime::reticulum::ReticulumHandle::path_recovery_handle(&self) -> rns_transport::path_recovery::PathRecoveryHandle
 pub async fn rns_runtime::reticulum::ReticulumHandle::path_table(&self, core::option::Option<u8>) -> core::result::Result<alloc::vec::Vec<rns_transport::messages::PathTableRpcEntry>, rns_runtime::reticulum::ControlError>
 pub fn rns_runtime::reticulum::ReticulumHandle::publish_blackhole_enabled(&self) -> bool
 pub async fn rns_runtime::reticulum::ReticulumHandle::query_control(&self, rns_transport::messages::TransportQuery) -> core::option::Option<rns_transport::messages::TransportQueryResponse>
@@ -1619,6 +1623,7 @@ pub async fn rns_runtime::reticulum::ReticulumHandle::next_hop_hardware_mtu(&sel
 pub async fn rns_runtime::reticulum::ReticulumHandle::next_hop_per_bit_latency(&self, [u8; 16]) -> core::result::Result<core::option::Option<f64>, rns_runtime::reticulum::ControlError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::next_hop_per_byte_latency(&self, [u8; 16]) -> core::result::Result<core::option::Option<f64>, rns_runtime::reticulum::ControlError>
 pub fn rns_runtime::reticulum::ReticulumHandle::outbound_packet<'a>(&'a self, &'a rns_identity::destination::Destination, &'a [u8], rns_runtime::reticulum::SendOptions) -> rns_runtime::reticulum::OutboundPacket<'a>
+pub fn rns_runtime::reticulum::ReticulumHandle::path_recovery_handle(&self) -> rns_transport::path_recovery::PathRecoveryHandle
 pub async fn rns_runtime::reticulum::ReticulumHandle::path_table(&self, core::option::Option<u8>) -> core::result::Result<alloc::vec::Vec<rns_transport::messages::PathTableRpcEntry>, rns_runtime::reticulum::ControlError>
 pub fn rns_runtime::reticulum::ReticulumHandle::publish_blackhole_enabled(&self) -> bool
 pub async fn rns_runtime::reticulum::ReticulumHandle::query_control(&self, rns_transport::messages::TransportQuery) -> core::option::Option<rns_transport::messages::TransportQueryResponse>

@@ -157,6 +157,7 @@ pub rns_wire::receipt::ReceiptCallbacks::delivery: core::option::Option<rns_wire
 pub rns_wire::receipt::ReceiptCallbacks::timeout: core::option::Option<rns_wire::receipt::ReceiptCallback>
 pub const rns_wire::receipt::EXPL_LENGTH: usize
 pub const rns_wire::receipt::IMPL_LENGTH: usize
+pub fn rns_wire::receipt::receipt_timeout_for_route(core::time::Duration, u8) -> core::time::Duration
 pub type rns_wire::receipt::ReceiptCallback = alloc::boxed::Box<(dyn core::ops::function::FnOnce(&rns_wire::receipt::PacketReceipt) + core::marker::Send)>
 pub mod rns_wire::types
 #[repr(transparent)] pub struct rns_wire::types::DestHash(_)
