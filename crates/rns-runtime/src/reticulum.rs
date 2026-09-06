@@ -383,6 +383,7 @@ impl Drop for TransportActorCompletionGuard {
 #[derive(Clone)]
 pub struct ReticulumHandle {
     pub transport_tx: mpsc::Sender<TransportMessage>,
+    path_recovery: rns_transport::path_recovery::PathRecoveryHandle,
     pub config_dir: PathBuf,
     pub instance_mode: InstanceMode,
     pub interface_configs: Vec<interface_factory::InterfaceConfig>,
@@ -1081,6 +1082,14 @@ struct LocalDiscoveryInterface {
 }
 
 impl ReticulumHandle {
+    /// Obtain bounded failed-Link route recovery for this local transport
+    /// generation. Shared clients recover only their local actor's route;
+    /// discovery traverses normal shared packet IPC, never a private owner-RPC
+    /// extension or permission to mutate the owner's interfaces.
+    pub fn path_recovery_handle(&self) -> rns_transport::path_recovery::PathRecoveryHandle {
+        self.path_recovery.clone()
+    }
+
     /// Non-fatal configured-interface startup failures, as `(name, reason)`.
     /// Other interfaces remain usable. Empty for shared clients, which do not
     /// start the caller's configured interfaces.
@@ -2836,6 +2845,7 @@ pub async fn init_with_policy(
 
     let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new();
     let persistence_trigger = actor.persistence_trigger();
+    let path_recovery = actor.path_recovery_handle();
     actor.is_foreground = is_foreground.clone();
     actor.initialize_storage(paths.storage_dir.clone());
     // Python 1.3.8 Transport.py:234-238: non-transport nodes get a fresh
@@ -3476,6 +3486,7 @@ pub async fn init_with_policy(
 
     let handle = ReticulumHandle {
         transport_tx: transport_tx.clone(),
+        path_recovery,
         config_dir: config_dir.clone(),
         instance_mode,
         interface_configs: interfaces,
@@ -9662,6 +9673,9 @@ loglevel = 7
         );
         ReticulumHandle {
             transport_tx: tx,
+            path_recovery: rns_transport::actor::TransportActor::new()
+                .0
+                .path_recovery_handle(),
             config_dir: PathBuf::from("/tmp/dummy"),
             instance_mode: InstanceMode::Standalone,
             interface_configs: Vec::new(),

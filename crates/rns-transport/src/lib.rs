@@ -25,6 +25,7 @@ pub mod ingress;
 pub mod link_messages;
 pub mod link_table;
 pub mod messages;
+pub mod path_recovery;
 pub mod path_table;
 pub mod persistence;
 pub mod rate_limit;

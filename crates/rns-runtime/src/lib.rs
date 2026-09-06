@@ -67,4 +67,7 @@ pub mod prelude {
         RNodeSpawnError, RNodeStartupOptions, RNodeTransmitFlowState, RNodeTransportClass,
     };
     pub use rns_link::link::{CloseReason, ResourceStrategy};
+    pub use rns_transport::path_recovery::{
+        PathRecoveryError, PathRecoveryHandle, PathRecoveryOutcome,
+    };
 }

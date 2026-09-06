@@ -71,6 +71,18 @@ AutoInterface's interoperable UDP ports or alter Reticulum wire formats.
 
 ## Stability
 
+Applications that own retry policy can obtain
+`ReticulumHandle::path_recovery_handle()` (also available from the application
+prelude). `try_recover(destination, Some(failed_link_id))` requests an atomic
+comparison with the route actually used by that locally originated Link. Only
+the unchanged route can be invalidated; fresh routes on the same interface are
+not suppressed. `None` requests bounded discovery without route invalidation.
+The 64-operation admission queue reports backpressure; callers retain ownership
+and bound their reply wait. Discovery is coalesced per destination, and the
+result is not proof of radio transmission or delivery. Old or unobserved Link
+attempts cannot delete routes. Shared clients only affect their own local
+transport state and use normal packet IPC for discovery.
+
 The application prelude is the recommended integration path, but the workspace
 is not yet a blanket stability promise for every public Rust item.
 

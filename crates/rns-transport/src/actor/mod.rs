@@ -29,6 +29,7 @@ mod inbound;
 mod link_endpoint;
 mod maintenance;
 mod outbound;
+mod path_recovery;
 mod persistence;
 mod rpc;
 
@@ -70,6 +71,10 @@ pub struct TransportActor {
     rx: mpsc::Receiver<TransportMessage>,
     persistence_tx: mpsc::Sender<()>,
     persistence_rx: mpsc::Receiver<()>,
+    path_recovery_tx: mpsc::Sender<crate::path_recovery::PathRecoveryRequest>,
+    path_recovery_rx: mpsc::Receiver<crate::path_recovery::PathRecoveryRequest>,
+    observe_local_link_routes: bool,
+    local_link_route_attempts: HashMap<[u8; 16], path_recovery::LocalLinkRouteAttempt>,
 
     pub path_table: PathTable,
     pub link_table: LinkTable,
@@ -337,11 +342,17 @@ impl TransportActor {
     ) -> (Self, mpsc::Sender<TransportMessage>) {
         let (tx, rx) = mpsc::channel(channel_cap);
         let (persistence_tx, persistence_rx) = mpsc::channel(1);
+        let (path_recovery_tx, path_recovery_rx) =
+            mpsc::channel(crate::path_recovery::RECOVERY_QUEUE_CAPACITY);
 
         let actor = Self {
             rx,
             persistence_tx,
             persistence_rx,
+            path_recovery_tx,
+            path_recovery_rx,
+            observe_local_link_routes: false,
+            local_link_route_attempts: HashMap::new(),
             path_table: PathTable::new(),
             link_table: LinkTable::new(),
             announce_table: AnnounceTable::new(),
@@ -455,6 +466,9 @@ impl TransportActor {
                 Some(()) = self.persistence_rx.recv() => {
                     self.save_state_async();
                 }
+                Some(request) = self.path_recovery_rx.recv() => {
+                    self.recover_local_link_path(request);
+                }
                 _ = tick_interval.tick() => {
                     let is_fg = self.is_foreground.load(std::sync::atomic::Ordering::Relaxed);
                     if is_fg != was_foreground {
@@ -490,13 +504,25 @@ impl TransportActor {
                 self.on_inbound(packet);
             }
             TransportMessage::Outbound(request) => {
-                self.on_outbound(request);
+                let attempt = self.local_link_attempt(&request);
+                if attempt.is_some() {
+                    let sent = self.on_outbound_with_receipt_policy(request, true);
+                    self.record_local_link_attempt(attempt, sent);
+                } else {
+                    self.on_outbound(request);
+                }
             }
             TransportMessage::OutboundAttached {
                 request,
                 interface_id,
             } => {
-                self.on_outbound_attached(request, interface_id);
+                let attempt = self.local_link_attempt(&request).filter(|(_, dest)| {
+                    self.path_table
+                        .get_live(dest)
+                        .is_some_and(|path| path.interface_id == interface_id)
+                });
+                let sent = self.on_outbound_attached(request, interface_id);
+                self.record_local_link_attempt(attempt, sent);
             }
             TransportMessage::BindLinkEndpoint {
                 binding,
@@ -542,6 +568,13 @@ impl TransportActor {
                 receipt,
                 result_tx,
             } => {
+                let attempt = self.local_link_attempt(&request).filter(|(_, dest)| {
+                    attached_interface.is_none_or(|id| {
+                        self.path_table
+                            .get_live(dest)
+                            .is_some_and(|path| path.interface_id == id)
+                    })
+                });
                 let receipt_hash = receipt
                     .as_ref()
                     .map(|registration| registration.truncated_hash);
@@ -573,6 +606,7 @@ impl TransportActor {
                         Some(interface_id) => self.on_outbound_attached(request, interface_id),
                         None => self.on_outbound_with_receipt_policy(request, false),
                     };
+                    self.record_local_link_attempt(attempt, sent);
                     let result = if sent {
                         crate::messages::OutboundDispatchResult::Sent
                     } else {

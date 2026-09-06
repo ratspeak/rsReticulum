@@ -16,6 +16,10 @@ pub mod canonical {
         let _ = std::mem::size_of::<AnnounceSubscription>();
         let _ = std::mem::size_of::<PacketReceiptHandle>();
         let _ = std::mem::size_of::<LinkSessionHandle>();
+        let _ = ReticulumHandle::path_recovery_handle;
+        let _ = std::mem::size_of::<rns_runtime::prelude::PathRecoveryHandle>();
+        let _ = std::mem::size_of::<rns_runtime::prelude::PathRecoveryOutcome>();
+        let _ = std::mem::size_of::<rns_runtime::prelude::PathRecoveryError>();
     }
 }
 
