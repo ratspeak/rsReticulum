@@ -74,7 +74,8 @@ pub struct TransportActor {
     path_recovery_tx: mpsc::Sender<crate::path_recovery::PathRecoveryRequest>,
     path_recovery_rx: mpsc::Receiver<crate::path_recovery::PathRecoveryRequest>,
     observe_local_link_routes: bool,
-    local_link_route_attempts: HashMap<[u8; 16], path_recovery::LocalLinkRouteAttempt>,
+    local_link_route_attempts:
+        HashMap<crate::path_recovery::FailedRouteAttempt, path_recovery::LocalLinkRouteAttempt>,
 
     pub path_table: PathTable,
     pub link_table: LinkTable,
@@ -568,6 +569,18 @@ impl TransportActor {
                 receipt,
                 result_tx,
             } => {
+                let packet_attempt = receipt
+                    .as_ref()
+                    .filter(|registration| {
+                        self.observe_local_link_routes
+                            && registration.destination_hash == request.destination_hash
+                            && attached_interface.is_none_or(|id| {
+                                self.path_table
+                                    .get_live(&request.destination_hash)
+                                    .is_some_and(|path| path.interface_id == id)
+                            })
+                    })
+                    .map(|registration| (registration.full_hash, request.destination_hash));
                 let attempt = self.local_link_attempt(&request).filter(|(_, dest)| {
                     attached_interface.is_none_or(|id| {
                         self.path_table
@@ -607,6 +620,12 @@ impl TransportActor {
                         None => self.on_outbound_with_receipt_policy(request, false),
                     };
                     self.record_local_link_attempt(attempt, sent);
+                    if let Some((hash, dest)) = packet_attempt.filter(|_| sent) {
+                        self.record_route_attempt(
+                            crate::path_recovery::FailedRouteAttempt::Packet(hash),
+                            dest,
+                        );
+                    }
                     let result = if sent {
                         crate::messages::OutboundDispatchResult::Sent
                     } else {

@@ -1470,17 +1470,14 @@ impl ReticulumHandle {
 
     async fn default_packet_receipt_timeout(&self, destination_hash: [u8; 16]) -> Duration {
         let first_hop = match self.first_hop_timeout(destination_hash).await {
-            Ok(timeout) => timeout.as_secs_f64(),
+            Ok(timeout) => timeout,
             Err(_) => return Duration::from_secs(180),
         };
         let hops = match self.hops_to(destination_hash).await {
             Ok(hops) => hops,
             Err(_) => return Duration::from_secs(180),
         };
-        Duration::try_from_secs_f64(
-            first_hop + f64::from(hops) * rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT,
-        )
-        .unwrap_or(Duration::from_secs(180))
+        rns_wire::receipt::receipt_timeout_for_route(first_hop, hops)
     }
 
     /// Query this process' transport actor directly.

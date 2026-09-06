@@ -1,5 +1,5 @@
 use super::*;
-use crate::path_recovery::{PathRecoveryOutcome, PathRecoveryRequest};
+use crate::path_recovery::{FailedRouteAttempt, PathRecoveryOutcome, PathRecoveryRequest};
 
 const MAX_LOCAL_LINK_ROUTES: usize = 1024;
 const LOCAL_LINK_ROUTE_LIFETIME: f64 = 3600.0;
@@ -81,6 +81,14 @@ impl TransportActor {
         let Some((link_id, destination_hash)) = attempt.filter(|_| sent) else {
             return;
         };
+        self.record_route_attempt(FailedRouteAttempt::Link(link_id), destination_hash);
+    }
+
+    pub(super) fn record_route_attempt(
+        &mut self,
+        link_id: FailedRouteAttempt,
+        destination_hash: [u8; 16],
+    ) {
         let now = now_f64();
         self.cull_local_link_route_attempts(now);
         // Never refresh an old attempt with the route used by a replay.
@@ -118,7 +126,7 @@ impl TransportActor {
         let now = now_f64();
         let mut path_dropped = false;
         let mut observed = false;
-        if let Some(attempt) = request.failed_link.and_then(|link_id| {
+        if let Some(attempt) = request.failed_attempt.and_then(|link_id| {
             // A mismatched destination must not consume another attempt's
             // ownership. Records survive destination deregistration so the
             // Link manager can tear down before reporting the failed attempt.
@@ -285,7 +293,11 @@ mod tests {
         let link = dispatch(&mut actor);
         let wrong = recover(&mut actor, &handle, [0xCC; 16], Some(link));
         assert!(!wrong.path_dropped);
-        assert!(actor.local_link_route_attempts.contains_key(&link));
+        assert!(
+            actor
+                .local_link_route_attempts
+                .contains_key(&FailedRouteAttempt::Link(link))
+        );
         drop(handle.try_recover([0xDD; 16], Some(link)).unwrap());
         let request = actor.path_recovery_rx.try_recv().unwrap();
         actor.recover_local_link_path(request);
@@ -321,7 +333,11 @@ mod tests {
         let (mut actor, handle, radio) = fixture();
         drop(radio);
         let link = dispatch(&mut actor);
-        assert!(!actor.local_link_route_attempts.contains_key(&link));
+        assert!(
+            !actor
+                .local_link_route_attempts
+                .contains_key(&FailedRouteAttempt::Link(link))
+        );
         // Reinstall a route after the dead interface was removed.
         actor.path_table.insert([0xDD; 16], path(1, 2));
         assert!(!recover(&mut actor, &handle, [0xDD; 16], Some(link)).path_dropped);
@@ -342,6 +358,67 @@ mod tests {
             .get_mut(&link)
             .unwrap()
             .observed_at = now_f64() - LOCAL_LINK_ROUTE_LIFETIME;
+        let FailedRouteAttempt::Link(link) = link else {
+            panic!("expected Link attempt")
+        };
         assert!(!recover(&mut actor, &handle, [0xDD; 16], Some(link)).path_dropped);
+    }
+
+    #[test]
+    fn tracked_packet_recovery_preserves_replacement_and_is_separate_from_links() {
+        for replace in [false, true] {
+            let (mut actor, handle, mut radio) = fixture();
+            use rns_wire::flags::*;
+            let raw = rns_wire::header::PacketHeader {
+                flags: PacketFlags {
+                    header_type: HeaderType::Header1,
+                    context_flag: false,
+                    transport_type: TransportType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: [0xDD; 16],
+                context: rns_wire::context::PacketContext::None,
+            }
+            .pack();
+            let (full_hash, truncated_hash) =
+                rns_wire::hash::packet_hash_pair(&raw, HeaderType::Header1);
+            let (status_tx, _status) =
+                tokio::sync::watch::channel(crate::messages::ReceiptUpdate::Sent);
+            let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+            actor.handle_message(TransportMessage::SendPacket {
+                request: OutboundRequest {
+                    raw: Bytes::from(raw),
+                    destination_hash: [0xDD; 16],
+                },
+                attached_interface: None,
+                receipt: Some(crate::messages::TrackedReceiptRegistration {
+                    truncated_hash,
+                    full_hash,
+                    destination_hash: [0xDD; 16],
+                    destination_public_key: [0; 64],
+                    timeout: Some(Duration::from_secs(120)),
+                    status_tx,
+                }),
+                result_tx,
+            });
+            assert_eq!(
+                result_rx.try_recv().unwrap(),
+                crate::messages::OutboundDispatchResult::Sent
+            );
+            radio.try_recv().unwrap();
+            // A Link-id collision cannot consume a packet's route owner.
+            assert!(!recover(&mut actor, &handle, [0xDD; 16], Some(truncated_hash)).path_dropped);
+            if replace {
+                actor.path_table.insert([0xDD; 16], path(1, 2));
+            }
+            let mut reply = handle.try_recover_packet([0xDD; 16], full_hash).unwrap();
+            let request = actor.path_recovery_rx.try_recv().unwrap();
+            actor.recover_local_link_path(request);
+            assert_eq!(reply.try_recv().unwrap().path_dropped, !replace);
+            assert!(actor.path_interface_suppressions.is_empty());
+        }
     }
 }

@@ -83,6 +83,12 @@ result is not proof of radio transmission or delivery. Old or unobserved Link
 attempts cannot delete routes. Shared clients only affect their own local
 transport state and use normal packet IPC for discovery.
 
+`try_recover_packet(destination, packet_hash)` provides the same comparison for
+an atomically tracked local `SendPacket` attempt. Packet and Link ownership are
+separate; failures cannot consume another kind of attempt. Packet receipt
+windows can use `rns_wire::receipt::receipt_timeout_for_route`, also used by the
+runtime's automatic packet receipt policy.
+
 The application prelude is the recommended integration path, but the workspace
 is not yet a blanket stability promise for every public Rust item.
 

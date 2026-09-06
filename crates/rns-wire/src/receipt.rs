@@ -4,6 +4,14 @@ use std::time::{Duration, Instant};
 
 pub use crate::constants::{EXPL_LENGTH, IMPL_LENGTH};
 
+/// Canonical non-Link receipt window: first-hop transmission allowance plus
+/// the Reticulum per-hop timeout for every known hop (including zero hops).
+pub fn receipt_timeout_for_route(first_hop: Duration, hops: u8) -> Duration {
+    first_hop.saturating_add(Duration::from_secs_f64(
+        f64::from(hops) * crate::constants::DEFAULT_PER_HOP_TIMEOUT,
+    ))
+}
+
 /// Lifecycle state of a tracked packet.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

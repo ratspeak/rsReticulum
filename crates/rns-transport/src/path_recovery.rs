@@ -40,8 +40,14 @@ impl std::error::Error for PathRecoveryError {}
 
 pub(crate) struct PathRecoveryRequest {
     pub destination_hash: [u8; 16],
-    pub failed_link: Option<[u8; 16]>,
+    pub failed_attempt: Option<FailedRouteAttempt>,
     pub result_tx: oneshot::Sender<PathRecoveryOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FailedRouteAttempt {
+    Link([u8; 16]),
+    Packet([u8; 32]),
 }
 
 /// Cloneable, transport-generation-owned admission handle. Obtain it before
@@ -65,11 +71,32 @@ impl PathRecoveryHandle {
         destination_hash: [u8; 16],
         failed_link: Option<[u8; 16]>,
     ) -> Result<oneshot::Receiver<PathRecoveryOutcome>, PathRecoveryError> {
+        self.try_recover_attempt(destination_hash, failed_link.map(FailedRouteAttempt::Link))
+    }
+
+    /// Recover only the unchanged route used by an atomically tracked local
+    /// `SendPacket` dispatch. An unobserved packet cannot invalidate a route.
+    pub fn try_recover_packet(
+        &self,
+        destination_hash: [u8; 16],
+        packet_hash: [u8; 32],
+    ) -> Result<oneshot::Receiver<PathRecoveryOutcome>, PathRecoveryError> {
+        self.try_recover_attempt(
+            destination_hash,
+            Some(FailedRouteAttempt::Packet(packet_hash)),
+        )
+    }
+
+    fn try_recover_attempt(
+        &self,
+        destination_hash: [u8; 16],
+        failed_attempt: Option<FailedRouteAttempt>,
+    ) -> Result<oneshot::Receiver<PathRecoveryOutcome>, PathRecoveryError> {
         let (result_tx, result_rx) = oneshot::channel();
         self.tx
             .try_send(PathRecoveryRequest {
                 destination_hash,
-                failed_link,
+                failed_attempt,
                 result_tx,
             })
             .map_err(|error| match error {
