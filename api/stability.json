@@ -33,7 +33,7 @@
       "canonicalPath": "rns_runtime::reticulum::ReticulumHandle::path_recovery_handle",
       "classification": "compatible additive opt-in route recovery and receipt timing; retained shared ownership and exhaustive mailbox APIs",
       "publicApiDiff": {
-        "added": 71,
+        "added": 69,
         "removed": 0
       },
       "semver": "additive compatible API; no major-version consequence",
