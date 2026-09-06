@@ -728,6 +728,39 @@ mod tests {
             .unwrap();
     }
 
+    fn read_reports_closed_connection(result: std::io::Result<usize>) -> bool {
+        match result {
+            Ok(0) => true,
+            // Windows can report abortive peer closure as WSAECONNRESET rather
+            // than EOF. Both prove closure; data, timeouts and other errors do not.
+            Err(error) => error.kind() == std::io::ErrorKind::ConnectionReset,
+            Ok(_) => false,
+        }
+    }
+
+    async fn assert_connection_closed(stream: &mut tokio::net::TcpStream) {
+        let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut [0]))
+            .await
+            .expect("unauthenticated connection must close promptly");
+        assert!(read_reports_closed_connection(result));
+    }
+
+    #[test]
+    fn connection_closure_assertion_rejects_data_and_unrelated_errors() {
+        assert!(read_reports_closed_connection(Ok(0)));
+        assert!(read_reports_closed_connection(Err(
+            std::io::ErrorKind::ConnectionReset.into()
+        )));
+        assert!(!read_reports_closed_connection(Ok(1)));
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            assert!(!read_reports_closed_connection(Err(kind.into())));
+        }
+    }
+
     #[tokio::test]
     async fn missing_or_silent_rpc_drops_unauthenticated_packet_connection() {
         let packet = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -738,7 +771,7 @@ mod tests {
             Err(SharedInstanceError::ControlUnavailable)
         );
         let (mut stream, _) = packet.accept().await.unwrap();
-        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+        assert_connection_closed(&mut stream).await;
 
         let control = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, control_port))
             .await
@@ -750,8 +783,8 @@ mod tests {
             test.await.unwrap(),
             Err(SharedInstanceError::TimedOut | SharedInstanceError::ControlUnavailable)
         ));
-        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
-        assert_eq!(silent_control.read(&mut [0]).await.unwrap(), 0);
+        assert_connection_closed(&mut stream).await;
+        assert_connection_closed(&mut silent_control).await;
     }
 
     #[tokio::test]
@@ -776,8 +809,8 @@ mod tests {
             task.await.unwrap(),
             Err(SharedInstanceError::Cancelled)
         ));
-        assert_eq!(packet.read(&mut [0]).await.unwrap(), 0);
-        assert_eq!(control.read(&mut [0]).await.unwrap(), 0);
+        assert_connection_closed(&mut packet).await;
+        assert_connection_closed(&mut control).await;
     }
 
     #[tokio::test]
