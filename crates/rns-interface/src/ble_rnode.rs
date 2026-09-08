@@ -475,6 +475,14 @@ fn is_pairing_transition_error(error: &InterfaceError) -> bool {
     )
 }
 
+/// CoreBluetooth / WinRT: peripheral cleared LTK while the OS still shows Paired.
+fn is_bond_removed_error(error: &InterfaceError) -> bool {
+    matches!(
+        error,
+        InterfaceError::SendFailed(message) if message.contains("Peer removed pairing information")
+    )
+}
+
 /// The GATT operation that establishes authenticated access before normal NUS
 /// traffic begins.
 ///
@@ -1661,6 +1669,7 @@ async fn connect_rnode(
     generation_stable_name: &mut Option<String>,
     running: &AtomicBool,
     generation_id: BleGenerationId,
+    session_already_bonded: bool,
 ) -> Result<BleRNodeConnection, InterfaceError> {
     ble_diag(format!("[ble] connect_rnode start uri={ble_uri}"));
     let alternate_name = if cfg!(any(target_os = "ios", target_os = "macos")) {
@@ -1886,15 +1895,21 @@ async fn connect_rnode(
         ));
 
         if pairing_trigger == DesktopPairingTrigger::EncryptedRead {
-            desktop_trigger_pairing(
-                &peripheral,
-                &tx_char,
-                &mut adapter_events,
-                running,
-                &target_id,
-                generation_id,
-            )
-            .await?;
+            // When this process already completed a successful bond/session,
+            // skip the TX-char SMP probe on reconnect so we do not re-fire the
+            // OS passkey dialog (or stress fragile bonds). Fall back to pairing
+            // if subscribe fails with an auth/encryption error below.
+            if !session_already_bonded {
+                desktop_trigger_pairing(
+                    &peripheral,
+                    &tx_char,
+                    &mut adapter_events,
+                    running,
+                    &target_id,
+                    generation_id,
+                )
+                .await?;
+            }
         }
     }
 
@@ -1913,7 +1928,7 @@ async fn connect_rnode(
 
     ble_diag("[ble] subscribe TX start");
     trace_ble_lifecycle(generation_id, "subscribe", "started", None, None);
-    run_generation_operation(
+    match run_generation_operation(
         subscribe_stage,
         peripheral.subscribe(&tx_char),
         &mut adapter_events,
@@ -1921,9 +1936,67 @@ async fn connect_rnode(
         |event| matches!(event, CentralEvent::DeviceDisconnected(id) if id == &target_id),
     )
     .await
-    .map_err(|error| map_subscribe_generation_error(generation_id, error))?;
-    trace_ble_lifecycle(generation_id, "subscribe", "accepted", None, None);
-    ble_diag("[ble] subscribe TX ok");
+    {
+        Ok(()) => {
+            trace_ble_lifecycle(generation_id, "subscribe", "accepted", None, None);
+            ble_diag("[ble] subscribe TX ok");
+        }
+        Err(error) => {
+            // Bond-aware fallback: if we already completed a successful
+            // GATT+SMP session, a subscribe auth/encrypt failure means the
+            // bond was lost mid-generation; re-trigger SMP and retry once.
+            #[cfg(any(
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "windows",
+                target_os = "android"
+            ))]
+            if session_already_bonded {
+                let detail = error.to_string().to_lowercase();
+                let needs_pair = detail.contains("auth")
+                    || detail.contains("encrypt")
+                    || detail.contains("insufficient");
+                if needs_pair {
+                    ble_diag(format!(
+                        "[ble] subscribe TX err after bonded session ({error}) — re-triggering SMP"
+                    ));
+                    desktop_trigger_pairing(
+                        &peripheral,
+                        &tx_char,
+                        &mut adapter_events,
+                        running,
+                        &target_id,
+                        generation_id,
+                    )
+                    .await?;
+                    run_generation_operation(
+                        subscribe_stage,
+                        peripheral.subscribe(&tx_char),
+                        &mut adapter_events,
+                        running,
+                        |event| matches!(event, CentralEvent::DeviceDisconnected(id) if id == &target_id),
+                    )
+                    .await
+                    .map_err(|e2| map_subscribe_generation_error(generation_id, e2))?;
+                    trace_ble_lifecycle(generation_id, "subscribe", "accepted", None, None);
+                    ble_diag("[ble] subscribe TX ok after re-pair");
+                } else {
+                    return Err(map_subscribe_generation_error(generation_id, error));
+                }
+            } else {
+                return Err(map_subscribe_generation_error(generation_id, error));
+            }
+            #[cfg(not(any(
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "windows",
+                target_os = "android"
+            )))]
+            {
+                return Err(map_subscribe_generation_error(generation_id, error));
+            }
+        }
+    }
 
     let write_mtu = ble_write_chunk_size();
     tracing::info!(write_mtu, "BLE RNode write chunk size");
@@ -2723,6 +2796,9 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
         // Retry after a failed generation, but never rewrite on ordinary
         // reconnects during the same driver runtime.
         let mut bluetooth_persistence_completed = false;
+        // After one successful GATT+SMP session, skip TX-char pairing probe on
+        // reconnect unless subscribe fails with auth (desktop bond-aware path).
+        let mut session_already_bonded = false;
 
         // Drop guard: every early return must clear the running-flag map
         // entry, or stale entries confuse later spawns reusing the id.
@@ -2779,11 +2855,28 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                 &mut generation_stable_target_name,
                 &running_task,
                 generation_id,
+                session_already_bonded,
             )
             .await
             {
-                Ok(c) => c,
+                Ok(c) => {
+                    session_already_bonded = true;
+                    c
+                }
                 Err(e) => {
+                    if is_bond_removed_error(&e) {
+                        snapshot_publisher.connection_attempt_failed();
+                        tracing::warn!(
+                            name = %log_name,
+                            error = %e,
+                            "BLE RNode bond removed — stopping reconnect until stack restart (Forget OS bond + re-pair)"
+                        );
+                        ble_diag(format!(
+                            "[ble] connect_rnode bond-removed: {e} — exiting reconnect loop"
+                        ));
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
                     let pairing_transition = is_pairing_transition_error(&e);
                     let retry_wait = if pairing_transition { 1 } else { backoff };
                     snapshot_publisher.connection_attempt_failed();
@@ -4922,6 +5015,17 @@ mod tests {
         // A reconnect never inherits the prior generation's active boundary.
         let reconnect = ActiveBlePacketAdmission::for_startup_policy(true);
         assert!(!reconnect.allows_packet());
+    }
+
+    #[test]
+    fn test_bond_removed_error_detected() {
+        assert!(is_bond_removed_error(&InterfaceError::SendFailed(
+            "BLE connect failed after 3 attempts: Runtime Error: Peer removed pairing information"
+                .into()
+        )));
+        assert!(!is_bond_removed_error(&InterfaceError::SendFailed(
+            "BLE pairing in progress: Authentication required".into()
+        )));
     }
 
     #[test]
@@ -7200,6 +7304,7 @@ mod tests {
             &mut generation_stable_name,
             &running,
             BleGenerationId::default().next(),
+            false,
         )
         .await
         .expect("No RNode found. Pair an RNode first.");
