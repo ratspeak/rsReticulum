@@ -419,6 +419,71 @@ pub struct PathRequestOptions {
     pub recursive: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketTapDirection {
+    Rx,
+    Tx,
+}
+
+/// Wire-level packet observation event for debug/sniffer UIs.
+#[derive(Debug, Clone)]
+pub struct PacketTapEvent {
+    pub direction: PacketTapDirection,
+    pub interface_id: InterfaceId,
+    pub interface_name: String,
+    pub raw: Vec<u8>,
+    pub rssi: Option<f32>,
+    pub snr: Option<f32>,
+    pub q: Option<f32>,
+    pub packet_type: Option<String>,
+    pub header_type: Option<String>,
+    pub destination_hash: Option<[u8; 16]>,
+    pub transport_type: Option<String>,
+    pub context: Option<String>,
+}
+
+const PACKET_TAP_RAW_CAP: usize = 4096;
+
+impl PacketTapEvent {
+    pub fn from_wire(
+        direction: PacketTapDirection,
+        interface_id: InterfaceId,
+        interface_name: String,
+        raw: &[u8],
+        rssi: Option<f32>,
+        snr: Option<f32>,
+        q: Option<f32>,
+    ) -> Self {
+        let capped = if raw.len() > PACKET_TAP_RAW_CAP {
+            raw[..PACKET_TAP_RAW_CAP].to_vec()
+        } else {
+            raw.to_vec()
+        };
+        let mut event = Self {
+            direction,
+            interface_id,
+            interface_name,
+            raw: capped,
+            rssi,
+            snr,
+            q,
+            packet_type: None,
+            header_type: None,
+            destination_hash: None,
+            transport_type: None,
+            context: None,
+        };
+        if let Ok((header, _)) = rns_wire::header::PacketHeader::unpack(&event.raw) {
+            event.packet_type = Some(format!("{:?}", header.flags.packet_type));
+            event.header_type = Some(format!("{:?}", header.flags.header_type));
+            event.destination_hash = Some(header.destination_hash);
+            event.transport_type = Some(format!("{:?}", header.flags.transport_type));
+            event.context = Some(format!("{:?}", header.context));
+        }
+        event
+    }
+}
+
 /// Every mutation of transport state enters through this enum — the actor
 /// dispatches on the variant, so adding a new operation is a matter of adding
 /// a variant and a match arm rather than exposing a new lock or shared type.
@@ -618,6 +683,10 @@ pub enum TransportMessage {
         dest: [u8; 16],
         reply: tokio::sync::oneshot::Sender<bool>,
     },
+    /// Optional wire packet tap for debug/sniffer consumers.
+    SetPacketTap {
+        tap_tx: tokio::sync::broadcast::Sender<PacketTapEvent>,
+    },
     Shutdown,
 }
 
@@ -661,6 +730,7 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::RegisterLink { .. } => "RegisterLink",
         TransportMessage::ActivateLink { .. } => "ActivateLink",
         TransportMessage::AwaitPath { .. } => "AwaitPath",
+        TransportMessage::SetPacketTap { .. } => "SetPacketTap",
         TransportMessage::Shutdown => "Shutdown",
     }
 }
@@ -1161,6 +1231,7 @@ impl std::fmt::Debug for TransportMessage {
             Self::AwaitPath { dest, .. } => {
                 f.debug_struct("AwaitPath").field("dest", dest).finish()
             }
+            Self::SetPacketTap { .. } => f.debug_struct("SetPacketTap").finish(),
             Self::Shutdown => write!(f, "Shutdown"),
         }
     }

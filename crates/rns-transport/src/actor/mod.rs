@@ -251,6 +251,9 @@ pub struct TransportActor {
     /// background switches the maintenance tick to the long interval so the
     /// actor stops burning CPU (and battery) while the app is suspended.
     pub is_foreground: Arc<AtomicBool>,
+
+    /// Optional wire packet tap — emits RX/TX frames for sniffer UIs.
+    packet_tap: Option<tokio::sync::broadcast::Sender<crate::messages::PacketTapEvent>>,
 }
 
 /// Cached announce metadata for diagnostics + CacheRequest replay. Raw
@@ -423,6 +426,7 @@ impl TransportActor {
             announce_handlers: Vec::new(),
             next_announce_handler_id: 0,
             is_foreground: Arc::new(AtomicBool::new(true)),
+            packet_tap: None,
         };
 
         (actor, tx)
@@ -1027,6 +1031,9 @@ impl TransportActor {
                     debug!(dest = hex::encode(dest), "registered path waiter");
                 }
             }
+            TransportMessage::SetPacketTap { tap_tx } => {
+                self.packet_tap = Some(tap_tx);
+            }
             TransportMessage::Shutdown => unreachable!(),
         }
     }
@@ -1500,6 +1507,35 @@ impl TransportActor {
     ///
     /// `try_send` failures: `Full` bumps `tx_drops`; `Closed` auto-deregisters
     /// (zombie interface — receiver dropped without DeregisterInterface).
+    fn emit_packet_tap(
+        &self,
+        direction: crate::messages::PacketTapDirection,
+        interface_id: InterfaceId,
+        raw: &[u8],
+        rssi: Option<f32>,
+        snr: Option<f32>,
+        q: Option<f32>,
+    ) {
+        let Some(tap) = self.packet_tap.as_ref() else {
+            return;
+        };
+        let interface_name = self
+            .interfaces
+            .get(&interface_id)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| format!("interface_{interface_id}"));
+        let event = crate::messages::PacketTapEvent::from_wire(
+            direction,
+            interface_id,
+            interface_name,
+            raw,
+            rssi,
+            snr,
+            q,
+        );
+        let _ = tap.send(event);
+    }
+
     #[tracing::instrument(
         level = "trace",
         name = "actor.send_to_interface",
@@ -1521,8 +1557,18 @@ impl TransportActor {
         } else {
             Bytes::copy_from_slice(raw)
         };
-        match entry.tx.try_send(data) {
-            Ok(()) => InterfaceSendOutcome::Sent,
+        match entry.tx.try_send(data.clone()) {
+            Ok(()) => {
+                self.emit_packet_tap(
+                    crate::messages::PacketTapDirection::Tx,
+                    id,
+                    &data,
+                    None,
+                    None,
+                    None,
+                );
+                InterfaceSendOutcome::Sent
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => InterfaceSendOutcome::Full,
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => InterfaceSendOutcome::Closed,
         }
