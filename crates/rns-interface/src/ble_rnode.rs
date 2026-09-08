@@ -74,6 +74,10 @@ const RECONNECT_WAIT: u64 = 1;
 /// Fast early recovery, then indefinite low-duty retries. A two-minute cap made
 /// a reachable radio appear dead long after returning to range.
 const RECONNECT_WAIT_MAX: u64 = 30;
+/// After a mid-SMP disconnect (`BLE pairing in progress`), wait before
+/// reconnecting so the OS passkey dialog is not re-fired every second while
+/// the user is typing the PIN (desktop BLE pairing UX).
+const PAIRING_TRANSITION_RETRY_WAIT: u64 = 30;
 /// `None` retries forever; teardown goes via `stop_ble_rnode_interface`.
 const MAX_RECONNECT_TRIES: Option<usize> = None;
 const SCAN_TIMEOUT: u64 = 3;
@@ -2785,7 +2789,11 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                 Ok(c) => c,
                 Err(e) => {
                     let pairing_transition = is_pairing_transition_error(&e);
-                    let retry_wait = if pairing_transition { 1 } else { backoff };
+                    let retry_wait = if pairing_transition {
+                        PAIRING_TRANSITION_RETRY_WAIT
+                    } else {
+                        backoff
+                    };
                     snapshot_publisher.connection_attempt_failed();
                     tracing::warn!(name = %log_name, error = %e, "BLE RNode connect failed");
                     ble_diag(format!(
@@ -4922,6 +4930,17 @@ mod tests {
         // A reconnect never inherits the prior generation's active boundary.
         let reconnect = ActiveBlePacketAdmission::for_startup_policy(true);
         assert!(!reconnect.allows_packet());
+    }
+
+    #[test]
+    fn test_pairing_transition_uses_long_retry_wait() {
+        assert_eq!(PAIRING_TRANSITION_RETRY_WAIT, 30);
+        assert!(is_pairing_transition_error(&InterfaceError::SendFailed(
+            "BLE pairing in progress: Authentication required".into()
+        )));
+        assert!(!is_pairing_transition_error(&InterfaceError::SendFailed(
+            "BLE device not found: RNode".into()
+        )));
     }
 
     #[test]
