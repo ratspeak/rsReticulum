@@ -1434,7 +1434,7 @@ pub async fn scan_ble_devices(timeout_secs: u64) -> Result<Vec<BleDevice>, Strin
             // name-only fallback covers iOS scan-response quirks where
             // service UUIDs are missing from the initial advert.
             let has_nus = service_uuids.contains(&NUS_SERVICE_UUID);
-            let name_match = name.starts_with("RNode");
+            let name_match = name.contains("RNode");
             let is_rnode = name_match && (has_nus || service_uuids.is_empty());
             if !is_rnode {
                 continue;
@@ -1503,7 +1503,7 @@ async fn resolve_ble_target(
                 // only fall back to the name on empty service lists.
                 if props.services.is_empty() {
                     if let Some(ref name) = props.local_name {
-                        if name.starts_with("RNode ") {
+                        if name.contains("RNode ") {
                             return Ok((p.clone(), BleTargetResolutionClass::FirstRnode));
                         }
                     }
@@ -1835,7 +1835,7 @@ async fn connect_rnode(
         {
             if let Some(name) = properties
                 .local_name
-                .filter(|name| name.starts_with("RNode "))
+                .filter(|name| name.contains("RNode "))
             {
                 *generation_stable_name = Some(name);
             }
