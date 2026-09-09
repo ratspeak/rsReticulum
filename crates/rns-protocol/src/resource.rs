@@ -1371,6 +1371,10 @@ pub struct OutboundTransfer {
     pub sent_parts: usize,
     sent_part_indices: HashSet<usize>,
     req_hashlist: HashSet<[u8; 32]>,
+    // Only newly requested parts advance this clock. Link keepalives, duplicate
+    // requests and local polling are not Resource progress.
+    last_progress: Instant,
+    last_request_parts: usize,
 }
 
 impl OutboundTransfer {
@@ -1420,95 +1424,79 @@ impl OutboundTransfer {
             sent_parts: 0,
             sent_part_indices: HashSet::new(),
             req_hashlist: HashSet::new(),
+            last_progress: Instant::now(),
+            last_request_parts: 0,
         }
     }
 
-    /// Advance the transfer state machine one step and emit the side-effect
-    /// the caller should perform. Safe to poll idle.
+    /// Advertise and drive bounded phase timeouts. Parts are emitted only in
+    /// response to the receiver's [`Self::handle_request`] (or
+    /// [`Self::handle_request_packet`]); polling never sends unsolicited parts.
     pub fn tick(&mut self) -> TransferAction {
         if self.resource.state == ResourceState::Complete {
             return TransferAction::Complete;
         }
-        if self.resource.state == ResourceState::Failed {
+        if matches!(
+            self.resource.state,
+            ResourceState::Failed | ResourceState::Rejected | ResourceState::Corrupt
+        ) {
             return TransferAction::Failed("transfer failed".to_string());
         }
 
         if !self.advertised {
             self.advertised = true;
+            self.started_at = Instant::now();
             self.resource.state = ResourceState::Advertised;
             return TransferAction::SendAdvertisement(self.create_advertisement());
         }
 
-        if self.awaiting_hmu {
-            if let Some(last) = self.last_part_sent {
-                let timeout = self.part_timeout();
-                if last.elapsed() > timeout {
-                    self.retries += 1;
-                    if self.retries > MAX_RETRIES {
-                        self.resource.state = ResourceState::Failed;
-                        return TransferAction::Failed("max retries exceeded".to_string());
-                    }
-                    // Back off before resending the window.
-                    self.awaiting_hmu = false;
-                    self.resource.window.shrink();
-                }
-            }
-            return TransferAction::None;
-        }
-
-        if self.cursor < self.resource.num_parts() {
-            let window_end =
-                (self.cursor + self.resource.window.window).min(self.resource.num_parts());
-
-            if self.window_cursor < window_end {
-                let part_idx = self.window_cursor;
-                self.window_cursor += 1;
-
-                if !self.confirmed_parts[part_idx] {
-                    let part_data = self.resource.get_part(part_idx).map(|p| p.to_vec());
-                    if let Some(part_data) = part_data {
-                        self.last_part_sent = Some(Instant::now());
-                        self.resource.state = ResourceState::Transferring;
-                        if self.sent_part_indices.insert(part_idx) {
-                            self.sent_parts += 1;
-                        }
-
-                        if self.window_cursor >= window_end {
-                            // Last part in the window is now in flight; stop
-                            // sending and wait for the receiver's HMU.
-                            self.awaiting_hmu = true;
-                            self.window_max_sent = window_end;
-                        }
-
-                        return TransferAction::SendPart(part_idx, part_data);
-                    }
-                } else {
-                    return self.tick();
-                }
-            }
-        }
-
-        if self.all_confirmed() {
-            self.resource.state = ResourceState::AwaitingProof;
-        }
-
-        TransferAction::None
+        self.check_timeout()
     }
 
-    /// Sender-side advertisement watchdog for request-driven runtimes.
+    /// Sender-side watchdog for every request-driven phase.
     ///
     /// An outbound transfer remains `Advertised` until the receiver's first
     /// `RESOURCE_REQ` arrives. If that advertisement is lost, resend it up to
     /// the Python-compatible retry limit instead of leaving the transfer
-    /// dormant forever.
+    /// dormant forever. After acceptance the receiver owns part/HMU retries;
+    /// the sender allows that bounded retry envelope, then fails if no new
+    /// parts were requested. A missing final proof likewise fails rather than
+    /// retaining the transfer forever. This does not imply delivery failure at
+    /// the receiver, and does not add a generic network proof cache.
     pub fn check_timeout(&mut self) -> TransferAction {
+        if matches!(
+            self.resource.state,
+            ResourceState::Failed | ResourceState::Rejected | ResourceState::Corrupt
+        ) {
+            // Some owners send a request-handler's cancel action first and
+            // conclude on their next poll. Do not leave that failed owner
+            // dormant merely because it is no longer Advertised.
+            return TransferAction::Failed("transfer failed".to_string());
+        }
+        if matches!(
+            self.resource.state,
+            ResourceState::Transferring | ResourceState::AwaitingProof
+        ) {
+            let timeout = self.progress_timeout();
+            if self.last_progress.elapsed() > timeout {
+                let reason = if self.resource.state == ResourceState::AwaitingProof {
+                    "resource proof timed out"
+                } else {
+                    "resource part requests timed out"
+                };
+                self.resource.state = ResourceState::Failed;
+                return TransferAction::Failed(reason.to_string());
+            }
+            return TransferAction::None;
+        }
         if self.resource.state != ResourceState::Advertised {
             return TransferAction::None;
         }
 
-        let timeout = Duration::from_secs_f64(
-            self.rtt.as_secs_f64() * rns_link::constants::TRAFFIC_TIMEOUT_FACTOR + PROCESSING_GRACE,
-        );
+        let timeout = self
+            .rtt
+            .saturating_mul(rns_link::constants::TRAFFIC_TIMEOUT_FACTOR as u32)
+            .saturating_add(Duration::from_secs_f64(PROCESSING_GRACE));
         if self.started_at.elapsed() <= timeout {
             return TransferAction::None;
         }
@@ -1534,7 +1522,15 @@ impl OutboundTransfer {
     /// When not exhausted, parts in the sent window whose hash is *not* in
     /// the requested set are marked confirmed.
     pub fn handle_hmu(&mut self, hmu_data: &[u8]) {
-        if hmu_data.is_empty() {
+        if hmu_data.is_empty()
+            || matches!(
+                self.resource.state,
+                ResourceState::Complete
+                    | ResourceState::Failed
+                    | ResourceState::Rejected
+                    | ResourceState::Corrupt
+            )
+        {
             return;
         }
 
@@ -1546,9 +1542,12 @@ impl OutboundTransfer {
             offset += MAPHASH_LEN;
         }
 
-        // Skip resource_hash(32) — we already know which resource this is
+        // Do not allow another Resource's control frame to change this owner.
         if hmu_data.len() < offset + 32 {
             // Malformed HMU, not enough data for resource_hash
+            return;
+        }
+        if hmu_data[offset..offset + 32] != self.resource.resource_hash {
             return;
         }
         offset += 32;
@@ -1642,21 +1641,23 @@ impl OutboundTransfer {
     }
 
     pub fn handle_request(&mut self, request_data: &[u8]) -> Vec<TransferAction> {
-        if request_data.is_empty() || self.resource.state == ResourceState::Failed {
+        if request_data.is_empty()
+            || matches!(
+                self.resource.state,
+                ResourceState::Complete
+                    | ResourceState::Failed
+                    | ResourceState::Rejected
+                    | ResourceState::Corrupt
+            )
+        {
             return Vec::new();
         }
-
-        // Refine the RTT estimate using the elapsed time since startup.
-        let elapsed = self.started_at.elapsed();
-        if self.rtt == Duration::ZERO || elapsed < self.rtt {
-            self.rtt = elapsed;
+        if !matches!(
+            request_data[0],
+            HASHMAP_IS_NOT_EXHAUSTED | HASHMAP_IS_EXHAUSTED
+        ) {
+            return Vec::new();
         }
-
-        if self.resource.state != ResourceState::Transferring {
-            self.resource.state = ResourceState::Transferring;
-        }
-
-        self.retries = 0;
 
         let wants_more_hashmap = request_data[0] == HASHMAP_IS_EXHAUSTED;
         let pad = if wants_more_hashmap {
@@ -1668,6 +1669,11 @@ impl OutboundTransfer {
         // Skip past the flag (+ optional last_map_hash) and the 32-byte resource_hash.
         let hash_offset = pad + 32;
         if request_data.len() < hash_offset {
+            return Vec::new();
+        }
+        if request_data[pad..hash_offset] != self.resource.resource_hash
+            || !(request_data.len() - hash_offset).is_multiple_of(MAPHASH_LEN)
+        {
             return Vec::new();
         }
 
@@ -1689,6 +1695,7 @@ impl OutboundTransfer {
 
         let mut actions: Vec<TransferAction> = Vec::new();
         let mut sent_count = 0;
+        let previously_sent = self.sent_parts;
 
         for i in search_start..search_end {
             if i < self.resource.map_hashes.len()
@@ -1703,8 +1710,6 @@ impl OutboundTransfer {
                 }
             }
         }
-
-        self.last_part_sent = Some(Instant::now());
 
         if wants_more_hashmap && request_data.len() > MAPHASH_LEN {
             let mut last_map_hash = [0u8; MAPHASH_LEN];
@@ -1784,10 +1789,23 @@ impl OutboundTransfer {
         }
 
         if sent_count > 0 {
-            let total_sent = self.confirmed_parts.iter().filter(|&&c| c).count() + sent_count;
-            if total_sent >= self.resource.num_parts() {
-                self.resource.state = ResourceState::AwaitingProof;
+            let now = Instant::now();
+            if self.resource.state == ResourceState::Advertised && self.rtt == Duration::ZERO {
+                // A later window's request is not a new handshake sample, and
+                // must not collapse a known slow-Link RTT to a local tick.
+                self.rtt = now.duration_since(self.started_at);
             }
+            self.last_part_sent = Some(now);
+            if self.sent_parts > previously_sent {
+                self.last_progress = now;
+                self.last_request_parts = sent_count;
+                self.retries = 0;
+            }
+            self.resource.state = if self.sent_parts == self.resource.num_parts() {
+                ResourceState::AwaitingProof
+            } else {
+                ResourceState::Transferring
+            };
         }
 
         actions
@@ -1799,6 +1817,17 @@ impl OutboundTransfer {
 
     /// Check a delivery proof; transitions to `Complete` on match.
     pub fn handle_proof(&mut self, proof_data: &[u8]) -> bool {
+        if matches!(
+            self.resource.state,
+            ResourceState::Complete
+                | ResourceState::Failed
+                | ResourceState::Rejected
+                | ResourceState::Corrupt
+        ) || proof_data.len() != 64
+            || proof_data[..32] != self.resource.resource_hash
+        {
+            return false;
+        }
         self.resource.validate_proof(proof_data)
     }
 
@@ -1806,12 +1835,21 @@ impl OutboundTransfer {
         self.confirmed_parts.iter().all(|&c| c)
     }
 
-    /// Retransmit timeout, scaled by retry count and capped at 30s to keep
-    /// a pathologically slow link from stalling a transfer forever.
-    fn part_timeout(&self) -> Duration {
-        let base = self.rtt.as_secs_f64() * PART_TIMEOUT_FACTOR_AFTER_RTT;
-        let timeout = base.max(0.025) * (self.retries as f64 + 1.5);
-        Duration::from_secs_f64(timeout.min(30.0))
+    fn progress_timeout(&self) -> Duration {
+        // Preserve the receiver's retry budget (including its increasing
+        // per-retry delay), and allow a whole requested window to traverse the
+        // slow link. No fixed 30-second cap: an individual LoRa packet can
+        // legitimately take longer than that. Only new parts restart this
+        // envelope, so repeated requests cannot keep a dead transfer alive.
+        let retry_wait = PER_RETRY_DELAY * (MAX_RETRIES * (MAX_RETRIES + 1) / 2) as f64;
+        let request_count = MAX_RETRIES
+            .saturating_add(self.last_request_parts)
+            .try_into()
+            .unwrap_or(u32::MAX);
+        self.rtt
+            .saturating_mul(PART_TIMEOUT_FACTOR as u32)
+            .saturating_mul(request_count)
+            .saturating_add(Duration::from_secs_f64(SENDER_GRACE_TIME + retry_wait))
     }
 
     /// Build the msgpack-encoded advertisement that precedes the transfer.
@@ -2050,12 +2088,17 @@ impl InboundTransfer {
         ),
     )]
     pub fn receive_part(&mut self, data: Vec<u8>) -> TransferAction {
+        if self.resource.state != ResourceState::Transferring {
+            return TransferAction::None;
+        }
+        let payload_len = data.len();
+        if !self.resource.receive_part(data) {
+            // Malformed, irrelevant and duplicate parts are not progress and
+            // must not refill the receiver's retry budget.
+            return TransferAction::None;
+        }
         self.last_activity = Instant::now();
         self.retries_left = MAX_RETRIES;
-
-        // Track cumulative received bytes so update_eifr can compute a
-        // measured rate over each completed request round.
-        let payload_len = data.len();
 
         // The first reply after a request gives us an RTT sample; once we
         // have it we can relax the initial timeout multiplier.
@@ -2068,48 +2111,46 @@ impl InboundTransfer {
             }
         }
 
-        if self.resource.receive_part(data) {
-            self.parts_since_hmu += 1;
-            self.rtt_rxd_bytes = self.rtt_rxd_bytes.saturating_add(payload_len);
+        self.parts_since_hmu += 1;
+        // Count accepted bytes only when measuring a completed window.
+        self.rtt_rxd_bytes = self.rtt_rxd_bytes.saturating_add(payload_len);
 
-            if self.outstanding_parts > 0 {
-                self.outstanding_parts -= 1;
-            }
-
-            if self.resource.is_complete() {
-                self.parts_since_hmu = 0;
-                return TransferAction::Complete;
-            }
-
-            if self.outstanding_parts == 0 {
-                // Window drained — compute req_data_rtt_rate from the byte
-                // delta since last request, refresh EIFR, then grow the
-                // window. Mirrors Python Resource.py:896-903.
-                if let Some(sent_at) = self.req_sent {
-                    let rtt = self.last_activity.duration_since(sent_at).as_secs_f64();
-                    if rtt > 0.0 {
-                        let req_transferred = self
-                            .rtt_rxd_bytes
-                            .saturating_sub(self.rtt_rxd_bytes_at_part_req);
-                        self.req_data_rtt_rate = req_transferred as f64 / rtt;
-                        self.update_eifr();
-                        self.rtt_rxd_bytes_at_part_req = self.rtt_rxd_bytes;
-                    }
-                }
-
-                let elapsed = self.started_at.elapsed().as_secs_f64();
-                let received = self.resource.received_count();
-                let rate = if elapsed > 0.0 {
-                    (received * SDU) as f64 / elapsed
-                } else {
-                    0.0
-                };
-                self.resource.window.grow(rate as usize);
-
-                return self.request_next();
-            }
+        if self.outstanding_parts > 0 {
+            self.outstanding_parts -= 1;
         }
 
+        if self.resource.is_complete() {
+            self.parts_since_hmu = 0;
+            return TransferAction::Complete;
+        }
+
+        if self.outstanding_parts == 0 {
+            // Window drained — compute req_data_rtt_rate from the byte
+            // delta since last request, refresh EIFR, then grow the
+            // window. Mirrors Python Resource.py:896-903.
+            if let Some(sent_at) = self.req_sent {
+                let rtt = self.last_activity.duration_since(sent_at).as_secs_f64();
+                if rtt > 0.0 {
+                    let req_transferred = self
+                        .rtt_rxd_bytes
+                        .saturating_sub(self.rtt_rxd_bytes_at_part_req);
+                    self.req_data_rtt_rate = req_transferred as f64 / rtt;
+                    self.update_eifr();
+                    self.rtt_rxd_bytes_at_part_req = self.rtt_rxd_bytes;
+                }
+            }
+
+            let elapsed = self.started_at.elapsed().as_secs_f64();
+            let received = self.resource.received_count();
+            let rate = if elapsed > 0.0 {
+                (received * SDU) as f64 / elapsed
+            } else {
+                0.0
+            };
+            self.resource.window.grow(rate as usize);
+
+            return self.request_next();
+        }
         TransferAction::None
     }
 
@@ -2118,7 +2159,7 @@ impl InboundTransfer {
     /// an HMU refreshes the hashmap. See `handle_request` on the sender for
     /// the wire layout.
     pub fn request_next(&mut self) -> TransferAction {
-        if self.resource.state == ResourceState::Failed {
+        if self.resource.state != ResourceState::Transferring || self.resource.is_complete() {
             return TransferAction::None;
         }
 
@@ -2258,7 +2299,7 @@ impl InboundTransfer {
     /// Wire layout:
     ///   resource_hash(32) || msgpack([segment_index, hashmap_bytes])
     pub fn hashmap_update(&mut self, segment: usize, hashmap_data: &[u8]) -> TransferAction {
-        if self.resource.state == ResourceState::Failed {
+        if self.resource.state != ResourceState::Transferring {
             return TransferAction::None;
         }
 
@@ -2271,7 +2312,7 @@ impl InboundTransfer {
 
         // An empty/degenerate HMU carries no hashes and is invalid — cancel the
         // transfer rather than spinning on an unsatisfiable request (1.3.9).
-        if hashmap_data.len() < MAPHASH_LEN {
+        if hashmap_data.len() < MAPHASH_LEN || !hashmap_data.len().is_multiple_of(MAPHASH_LEN) {
             return self.cancel();
         }
 
@@ -2282,6 +2323,18 @@ impl InboundTransfer {
         if segment_start >= self.resource.total_parts {
             return self.cancel();
         }
+        let hashes_count = hashmap_data.len() / MAPHASH_LEN;
+        if segment_start > self.hashmap_height {
+            // The receiver requested the next contiguous map, not a gap that
+            // would fill unknown entries with zero hashes.
+            return self.cancel();
+        }
+        if segment_start.saturating_add(hashes_count) <= self.hashmap_height {
+            // A delayed copy of the previous HMU can arrive during the next
+            // HMU wait. It is not progress and must not refill retries or
+            // clear the current outstanding request.
+            return TransferAction::None;
+        }
 
         self.resource.state = ResourceState::Transferring;
         self.last_activity = Instant::now();
@@ -2291,7 +2344,6 @@ impl InboundTransfer {
         // `segment` is wire-supplied: indices are bounded by total_parts
         // (Python preallocates hashmap to total_parts, so out-of-range
         // writes are impossible there) — anything beyond is hostile.
-        let hashes_count = hashmap_data.len() / MAPHASH_LEN;
         for i in 0..hashes_count {
             let idx = match segment_start.checked_add(i) {
                 Some(idx) if idx < self.resource.total_parts => idx,
@@ -2887,7 +2939,7 @@ mod tests {
     }
 
     #[test]
-    fn test_outbound_transfer_advertise_then_send() {
+    fn test_outbound_transfer_waits_for_receiver_request() {
         let mut transfer = OutboundTransfer::new(
             b"hello transfer".to_vec(),
             false,
@@ -2900,9 +2952,18 @@ mod tests {
         assert!(matches!(action, TransferAction::SendAdvertisement(_)));
         assert!(transfer.advertised);
 
-        // Subsequent ticks should send parts
-        let action = transfer.tick();
-        assert!(matches!(action, TransferAction::SendPart(0, _)));
+        for _ in 0..100 {
+            assert_eq!(transfer.tick(), TransferAction::None);
+        }
+        assert_eq!(transfer.resource.state, ResourceState::Advertised);
+        assert_eq!(transfer.sent_parts, 0);
+        let mut request = vec![HASHMAP_IS_NOT_EXHAUSTED];
+        request.extend_from_slice(&transfer.resource.resource_hash);
+        request.extend_from_slice(&transfer.resource.map_hashes[0]);
+        assert!(matches!(
+            transfer.handle_request(&request).as_slice(),
+            [TransferAction::SendPart(0, _)]
+        ));
     }
 
     #[test]
@@ -3147,10 +3208,14 @@ mod tests {
             TransferAction::SendAdvertisement(_)
         ));
 
-        let first_progress = match sender.tick() {
-            TransferAction::SendPart(_, _) => sender.progress(),
-            other => panic!("expected first part, got {other:?}"),
-        };
+        let mut first_request = vec![HASHMAP_IS_NOT_EXHAUSTED];
+        first_request.extend_from_slice(&sender.resource.resource_hash);
+        first_request.extend_from_slice(&sender.resource.map_hashes[0]);
+        assert!(matches!(
+            sender.handle_request(&first_request).as_slice(),
+            [TransferAction::SendPart(0, _)]
+        ));
+        let first_progress = sender.progress();
         assert!(first_progress > 0.0);
         assert!(first_progress < 1.0);
 
@@ -3212,19 +3277,8 @@ mod tests {
         )
         .unwrap();
 
-        // Step 3: Sender sends parts, receiver receives them
-        let num_parts = sender.resource.num_parts();
-        for _ in 0..num_parts {
-            let action = sender.tick();
-            if let TransferAction::SendPart(_idx, part_data) = action {
-                let recv_action = receiver.receive_part(part_data);
-
-                // If receiver sends HMU, sender processes it
-                if let TransferAction::SendHmu(hmu) = recv_action {
-                    sender.handle_hmu(&hmu);
-                }
-            }
-        }
+        // Step 3: Receiver requests parts; sender never pushes unrequested data.
+        drive_requested_transfer(&mut sender, &mut receiver);
 
         // Step 4: Receiver completes and sends proof
         assert!(receiver.resource.is_complete());
@@ -3262,36 +3316,7 @@ mod tests {
         )
         .unwrap();
 
-        // Transfer loop: send parts, handle HMUs
-        let mut iterations = 0;
-        let max_iterations = sender.resource.num_parts() * 3 + 10;
-        while !receiver.resource.is_complete() && iterations < max_iterations {
-            let action = sender.tick();
-            match action {
-                TransferAction::SendPart(_idx, part_data) => {
-                    let recv_action = receiver.receive_part(part_data);
-                    if let TransferAction::SendHmu(hmu) = recv_action {
-                        sender.handle_hmu(&hmu);
-                    }
-                }
-                // Sender is waiting for HMU; generate one if receiver has progress.
-                TransferAction::None if receiver.resource.consecutive_completed > 0 => {
-                    let hmu = receiver.create_hmu();
-                    sender.handle_hmu(&hmu);
-                }
-                _ => {}
-            }
-            iterations += 1;
-        }
-
-        assert!(
-            receiver.resource.is_complete(),
-            "transfer incomplete after {} iterations ({} of {} parts received for {} byte payload)",
-            iterations,
-            receiver.resource.received_count(),
-            receiver.resource.total_parts,
-            data_len,
-        );
+        drive_requested_transfer(&mut sender, &mut receiver);
 
         // Assemble and verify
         let (assembled, proof) = receiver.complete(None).unwrap();
@@ -3301,6 +3326,305 @@ mod tests {
         // Validate proof
         assert!(sender.handle_proof(&proof));
         assert_eq!(sender.resource.state, ResourceState::Complete);
+    }
+
+    fn drive_requested_transfer(sender: &mut OutboundTransfer, receiver: &mut InboundTransfer) {
+        let mut pending = receiver.request_next();
+        for _ in 0..sender.resource.num_parts() * 4 + 10 {
+            let TransferAction::SendRequest(request) = pending else {
+                panic!("expected receiver-owned request, got {pending:?}");
+            };
+            pending = TransferAction::None;
+            for action in sender.handle_request(&request) {
+                let reply = match action {
+                    TransferAction::SendPart(_, data) => receiver.receive_part(data),
+                    TransferAction::SendHmu(data) => {
+                        let (_, segment, hashes) = parse_hashmap_update(&data).unwrap();
+                        receiver.hashmap_update(segment, &hashes)
+                    }
+                    other => panic!("unexpected sender action: {other:?}"),
+                };
+                if matches!(reply, TransferAction::SendRequest(_)) {
+                    pending = reply;
+                }
+            }
+            if receiver.resource.is_complete() {
+                return;
+            }
+        }
+        panic!("receiver did not complete the requested transfer");
+    }
+
+    fn loss_test_pair(size: usize, rtt: Duration) -> (Vec<u8>, OutboundTransfer, InboundTransfer) {
+        let data = rns_crypto::random::random_bytes(size);
+        let mut sender = OutboundTransfer::new(data.clone(), false, rtt).unwrap();
+        let TransferAction::SendAdvertisement(bytes) = sender.tick() else {
+            panic!("missing advertisement");
+        };
+        let adv = crate::resource_adv::ResourceAdvertisement::unpack(&bytes).unwrap();
+        let map_hashes = adv.get_map_hashes();
+        let receiver = InboundTransfer::from_advertisement(
+            adv.num_parts,
+            adv.transfer_size,
+            adv.data_size,
+            sender.resource.random_hash,
+            adv.resource_hash,
+            adv.flags,
+            map_hashes,
+            rtt,
+        )
+        .unwrap();
+        (data, sender, receiver)
+    }
+
+    #[test]
+    fn resource_loss_advertisement_and_initial_request_recover_without_unsolicited_parts() {
+        let (data, mut sender, mut receiver) = loss_test_pair(8192, Duration::from_secs(2));
+        // Lose the first advertisement, then the first receiver request. The
+        // sender remains Advertised through arbitrary local polling.
+        sender.started_at = Instant::now() - Duration::from_secs(60);
+        assert!(matches!(
+            sender.tick(),
+            TransferAction::SendAdvertisement(_)
+        ));
+        assert!(matches!(
+            receiver.request_next(),
+            TransferAction::SendRequest(_)
+        ));
+        for _ in 0..100 {
+            assert_eq!(sender.tick(), TransferAction::None);
+        }
+        assert_eq!(sender.resource.state, ResourceState::Advertised);
+        receiver.last_activity = Instant::now() - Duration::from_secs(60);
+        assert!(matches!(
+            receiver.check_timeout(),
+            TransferAction::SendRequest(_)
+        ));
+        drive_requested_transfer(&mut sender, &mut receiver);
+        let (received, proof) = receiver.complete(None).unwrap();
+        assert_eq!(received, data);
+        assert!(sender.handle_proof(&proof));
+        assert!(
+            !sender.handle_proof(&proof),
+            "proof completion is claimed once"
+        );
+        assert!(sender.handle_request(&[0; 33]).is_empty());
+    }
+
+    #[test]
+    fn resource_loss_window_and_hashmap_recover_via_receiver_retries() {
+        let (data, mut sender, mut receiver) = loss_test_pair(100_000, Duration::from_secs(2));
+        let mut pending = receiver.request_next();
+        let mut lost_part = false;
+        let mut lost_request = false;
+        let mut lost_hmu = false;
+        for _ in 0..1000 {
+            if matches!(pending, TransferAction::None) {
+                receiver.last_activity = Instant::now() - Duration::from_secs(600);
+                pending = receiver.check_timeout();
+            }
+            let TransferAction::SendRequest(request) = pending else {
+                panic!("receiver did not rearm a lost request/window: {pending:?}");
+            };
+            pending = TransferAction::None;
+            if !lost_request && lost_part && receiver.resource.received_count() > 4 {
+                lost_request = true;
+                continue;
+            }
+            for action in sender.handle_request(&request) {
+                let reply = match action {
+                    TransferAction::SendPart(_, _) if !lost_part => {
+                        lost_part = true;
+                        continue;
+                    }
+                    TransferAction::SendPart(_, part) => receiver.receive_part(part),
+                    TransferAction::SendHmu(_) if !lost_hmu => {
+                        lost_hmu = true;
+                        continue;
+                    }
+                    TransferAction::SendHmu(hmu) => {
+                        let (_, segment, map) = parse_hashmap_update(&hmu).unwrap();
+                        receiver.hashmap_update(segment, &map)
+                    }
+                    other => panic!("unexpected sender action: {other:?}"),
+                };
+                if matches!(reply, TransferAction::SendRequest(_)) {
+                    pending = reply;
+                }
+            }
+            if receiver.resource.is_complete() {
+                break;
+            }
+        }
+        assert!(lost_part && lost_request && lost_hmu);
+        let (received, proof) = receiver.complete(None).unwrap();
+        assert_eq!(received, data);
+        assert_eq!(sender.sent_parts, sender.resource.num_parts());
+        assert_eq!(sender.resource.state, ResourceState::AwaitingProof);
+        assert!(sender.handle_proof(&proof));
+    }
+
+    #[test]
+    fn resource_loss_all_feedback_has_bounded_sender_and_receiver_owners() {
+        let (_, mut sender, mut receiver) = loss_test_pair(8192, Duration::from_secs(2));
+        let TransferAction::SendRequest(request) = receiver.request_next() else {
+            panic!()
+        };
+        assert!(!sender.handle_request(&request).is_empty());
+        assert_eq!(sender.resource.state, ResourceState::Transferring);
+        let progress_at = sender.last_progress;
+        // Repeating a valid request can recover loss but is not new progress.
+        for _ in 0..20 {
+            sender.handle_request(&request);
+        }
+        assert_eq!(sender.last_progress, progress_at);
+        sender.last_progress = Instant::now() - sender.progress_timeout() - Duration::from_secs(1);
+        assert_eq!(
+            sender.tick(),
+            TransferAction::Failed("resource part requests timed out".to_string())
+        );
+        assert!(sender.handle_request(&request).is_empty());
+
+        for _ in 0..MAX_RETRIES {
+            receiver.last_activity = Instant::now() - Duration::from_secs(600);
+            assert!(matches!(
+                receiver.check_timeout(),
+                TransferAction::SendRequest(_)
+            ));
+        }
+        receiver.last_activity = Instant::now() - Duration::from_secs(600);
+        assert!(matches!(
+            receiver.check_timeout(),
+            TransferAction::Failed(_)
+        ));
+        assert_eq!(
+            receiver.receive_part(sender.resource.parts[0].clone()),
+            TransferAction::None
+        );
+    }
+
+    #[test]
+    fn resource_loss_final_proof_terminates_without_false_success_or_resurrection() {
+        let (data, mut sender, mut receiver) = loss_test_pair(8192, Duration::from_secs(2));
+        drive_requested_transfer(&mut sender, &mut receiver);
+        let (received, proof) = receiver.complete(None).unwrap();
+        assert_eq!(received, data);
+        assert_eq!(sender.resource.state, ResourceState::AwaitingProof);
+        // Receiver has delivered, but its proof is lost. Sender must release
+        // ownership as failed, never infer success from all parts being sent.
+        sender.last_progress = Instant::now() - sender.progress_timeout() - Duration::from_secs(1);
+        assert_eq!(
+            sender.tick(),
+            TransferAction::Failed("resource proof timed out".to_string())
+        );
+        assert!(!sender.handle_proof(&proof));
+        assert_eq!(
+            receiver.receive_part(sender.resource.parts[0].clone()),
+            TransferAction::None
+        );
+        assert_eq!(receiver.resource.state, ResourceState::Complete);
+    }
+
+    #[test]
+    fn resource_loss_slow_window_progress_can_exceed_three_minutes() {
+        let (_, mut sender, mut receiver) = loss_test_pair(100_000, Duration::from_secs(30));
+        let TransferAction::SendRequest(request) = receiver.request_next() else {
+            panic!()
+        };
+        sender.handle_request(&request);
+        assert_eq!(
+            sender.rtt,
+            Duration::from_secs(30),
+            "do not replace the slow RTT with local scheduling time"
+        );
+        assert!(sender.progress_timeout() > Duration::from_secs(180));
+        sender.last_progress = Instant::now() - Duration::from_secs(180);
+        assert_eq!(sender.check_timeout(), TransferAction::None);
+        // No absolute transfer deadline: requesting new parts restarts the
+        // bounded no-progress owner even after a long healthy transfer.
+        let mut next = vec![HASHMAP_IS_NOT_EXHAUSTED];
+        next.extend_from_slice(&sender.resource.resource_hash);
+        next.extend_from_slice(&sender.resource.map_hashes[4]);
+        sender.started_at = Instant::now() - Duration::from_secs(3600);
+        sender.handle_request(&next);
+        assert!(sender.last_progress.elapsed() < Duration::from_secs(1));
+        assert_eq!(sender.check_timeout(), TransferAction::None);
+    }
+
+    #[test]
+    fn resource_loss_invalid_or_duplicate_input_does_not_rearm_liveness() {
+        let (_, mut sender, mut receiver) = loss_test_pair(8192, Duration::from_secs(2));
+        let TransferAction::SendRequest(mut request) = receiver.request_next() else {
+            panic!()
+        };
+        request[1] ^= 1;
+        assert!(sender.handle_request(&request).is_empty());
+        assert_eq!(sender.resource.state, ResourceState::Advertised);
+        request[1] ^= 1;
+        request.push(0);
+        assert!(sender.handle_request(&request).is_empty());
+        assert_eq!(sender.resource.state, ResourceState::Advertised);
+        receiver.receive_part(sender.resource.parts[0].clone());
+        let progress_at = receiver.last_activity;
+        receiver.retries_left = 3;
+        receiver.receive_part(sender.resource.parts[0].clone());
+        receiver.receive_part(vec![0; 5]);
+        assert_eq!(receiver.last_activity, progress_at);
+        assert_eq!(receiver.retries_left, 3);
+        sender.handle_cancel();
+        let mut proof = sender.resource.resource_hash.to_vec();
+        proof.extend_from_slice(&sender.resource.expected_proof);
+        assert!(!sender.handle_proof(&proof));
+    }
+
+    #[test]
+    fn resource_watchdog_saturates_extreme_public_rtt_without_panicking() {
+        let (_, mut sender, mut receiver) = loss_test_pair(8192, Duration::MAX);
+        assert_eq!(sender.check_timeout(), TransferAction::None);
+        let TransferAction::SendRequest(request) = receiver.request_next() else {
+            panic!()
+        };
+        sender.handle_request(&request);
+        assert_eq!(sender.progress_timeout(), Duration::MAX);
+        assert_eq!(sender.check_timeout(), TransferAction::None);
+        assert_eq!(sender.tick(), TransferAction::None);
+    }
+
+    #[test]
+    fn resource_request_cancel_is_visible_to_poll_only_owners() {
+        let (_, mut sender, _) = loss_test_pair(20_000, Duration::from_secs(1));
+        let mut request = vec![HASHMAP_IS_EXHAUSTED];
+        request.extend_from_slice(&sender.resource.map_hashes[0]);
+        request.extend_from_slice(&sender.resource.resource_hash);
+        assert!(matches!(
+            sender.handle_request(&request).as_slice(),
+            [TransferAction::SendCancel(CancelType::Icl, _)]
+        ));
+        assert!(matches!(sender.check_timeout(), TransferAction::Failed(_)));
+    }
+
+    #[test]
+    fn resource_loss_delayed_hashmap_does_not_refill_retry_budget() {
+        let (_, sender, mut receiver) = loss_test_pair(100_000, Duration::from_secs(2));
+        let mut old_map = Vec::new();
+        for hash in sender
+            .resource
+            .map_hashes
+            .iter()
+            .take(receiver.hashmap_height)
+        {
+            old_map.extend_from_slice(hash);
+        }
+        receiver.waiting_for_hmu = true;
+        receiver.retries_left = 2;
+        let activity = receiver.last_activity;
+        assert_eq!(receiver.hashmap_update(0, &old_map), TransferAction::None);
+        assert!(receiver.waiting_for_hmu);
+        assert_eq!(receiver.retries_left, 2);
+        assert_eq!(receiver.last_activity, activity);
+        receiver.handle_cancel();
+        assert_eq!(receiver.request_next(), TransferAction::None);
+        assert_eq!(receiver.hashmap_update(1, &old_map), TransferAction::None);
     }
 
     #[test]
