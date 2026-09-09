@@ -2581,6 +2581,124 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn usb_coverage_review_recovered_gate_outlives_an_already_ready_stale_timer() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(Bytes::from_static(b"held until new flow grant"))
+            .await
+            .unwrap();
+        let queue = Arc::new(tokio::sync::Mutex::new(UsbApplicationQueue::new(rx)));
+        let online = Arc::new(AtomicBool::new(false));
+        let gate = UsbTxGate::new(true, online.clone());
+        let (mut inbound, _driver) = projected_inbound();
+        inbound.attach_tx_gate(gate.clone());
+        inbound.project_frame(rnode::CMD_READY, &[0]);
+        let counter = Arc::new(AtomicU64::new(0));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let mut pump = Box::pin(run_usb_tx_pump(
+            queue.clone(),
+            UsbWriterHandle {
+                queue: UsbWriteQueue::new(1),
+            },
+            counter.clone(),
+            None,
+            gate.clone(),
+            stop_rx,
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(pump.as_mut().poll(&mut context).is_pending());
+
+        // Poll the real pump ourselves so both its previously captured timer
+        // and a new readiness notification are ready at the next actor turn.
+        // No sleep/scheduler race decides which state this regression tests.
+        tokio::time::advance(USB_PROTOCOL_READINESS_DEADLINE).await;
+        for (command, frame) in required_protocol_frames(USB_TEST_TARGET) {
+            inbound.project_frame(command, &frame);
+        }
+        assert!(gate.is_ready());
+        assert!(online.load(Ordering::Acquire));
+        // Recovery without a flow grant must neither write nor terminate.
+        assert!(
+            !gate.can_send(),
+            "protocol recovery cannot invent a flow grant"
+        );
+        assert!(
+            pump.as_mut().poll(&mut context).is_pending(),
+            "an expired timer snapshot must re-check current protocol readiness"
+        );
+        tokio::time::advance(USB_PROTOCOL_READINESS_DEADLINE * 2).await;
+        assert!(
+            pump.as_mut().poll(&mut context).is_pending(),
+            "flow-only waiting has no protocol readiness deadline"
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        stop_tx.send(()).unwrap();
+        assert_eq!(
+            pump.as_mut().poll(&mut context),
+            Poll::Ready(UsbTxPumpExit::StopRequested)
+        );
+        drop(pump);
+        assert!(!online.load(Ordering::Acquire));
+        assert_eq!(
+            queue.lock().await.receiver.try_recv().unwrap(),
+            Bytes::from_static(b"held until new flow grant")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn usb_coverage_review_stop_wins_simultaneous_timer_and_invalid_frame_notification() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        for stop_at_boundary in [false, true] {
+            let (tx, rx) = mpsc::channel(1);
+            tx.send(Bytes::from_static(b"never admitted"))
+                .await
+                .unwrap();
+            let queue = Arc::new(tokio::sync::Mutex::new(UsbApplicationQueue::new(rx)));
+            let gate = UsbTxGate::new(false, Arc::new(AtomicBool::new(false)));
+            let (mut inbound, _driver) = projected_inbound();
+            inbound.attach_tx_gate(gate.clone());
+            let counter = Arc::new(AtomicU64::new(0));
+            let (stop_tx, stop_rx) = oneshot::channel();
+            let mut pump = Box::pin(run_usb_tx_pump(
+                queue.clone(),
+                UsbWriterHandle {
+                    queue: UsbWriteQueue::new(1),
+                },
+                counter.clone(),
+                None,
+                gate.clone(),
+                stop_rx,
+            ));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(pump.as_mut().poll(&mut context).is_pending());
+            let deadline = gate.readiness_deadline().unwrap();
+            tokio::time::advance(USB_PROTOCOL_READINESS_DEADLINE).await;
+            inbound.project_frame(rnode::CMD_FREQUENCY, &[1]);
+            assert_eq!(gate.readiness_deadline(), Some(deadline));
+            if stop_at_boundary {
+                stop_tx.send(()).unwrap();
+            }
+            let expected = if stop_at_boundary {
+                UsbTxPumpExit::StopRequested
+            } else {
+                UsbTxPumpExit::ReadinessTimedOut
+            };
+            assert_eq!(pump.as_mut().poll(&mut context), Poll::Ready(expected));
+            drop(pump);
+            assert_eq!(counter.load(Ordering::Relaxed), 0);
+            assert!(!gate.can_send());
+            assert_eq!(
+                queue.lock().await.receiver.try_recv().unwrap(),
+                Bytes::from_static(b"never admitted")
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn usb_readiness_recovers_after_long_idle_without_reusing_a_flow_grant() {
         for fault in [rnode::CMD_RESET, rnode::CMD_FREQUENCY] {
             let (_tx, rx) = mpsc::channel(1);

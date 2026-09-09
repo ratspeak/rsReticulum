@@ -207,6 +207,76 @@ fn recursive_primary_replacement_keeps_other_waiters_and_legacy_records_retire()
 }
 
 #[test]
+fn recursive_coverage_review_failed_response_target_does_not_block_other_waiter_or_keep_fanout() {
+    for close_first in [false, true] {
+        let start = now_f64();
+        let _clock = crate::test_clock::Clock::at(start);
+        let mut actor = relay();
+        let (first, first_rx) = make_test_interface_with_capacity("first requester", 1);
+        let (healthy, mut healthy_rx) = make_test_interface("healthy requester");
+        let (upstream, mut upstream_rx) = make_test_interface_with_capacity("full upstream", 1);
+        upstream
+            .tx
+            .try_send(Bytes::from_static(b"upstream occupied"))
+            .unwrap();
+        actor.interfaces.insert(1, first);
+        actor.interfaces.insert(2, healthy);
+        actor.interfaces.insert(3, upstream);
+        let (announce, dest) = make_valid_announce("test.discovery.partial-response", 0);
+        request(&mut actor, dest, 1, 1);
+        healthy_rx.try_recv().unwrap(); // The original recursive fanout.
+        request(&mut actor, dest, 2, 2);
+        assert!(actor.has_pending_path_request_admission(dest));
+        actor.interfaces[&1]
+            .tx
+            .try_send(Bytes::from_static(b"requester occupied"))
+            .unwrap();
+        let mut first_rx = if close_first {
+            drop(first_rx);
+            None
+        } else {
+            Some(first_rx)
+        };
+
+        // A valid incoming response can arrive even while that interface's
+        // outbound queue is blocked. Failure to answer the first requester
+        // must not steal the healthy waiter's response or retain its owner.
+        inbound(&mut actor, announce.clone(), 3);
+        assert_response(healthy_rx.try_recv().unwrap(), dest);
+        assert!(actor.path_table.has_path(&dest));
+        assert!(!actor.discovery_path_requests.contains_key(&dest));
+        assert!(!actor.recursive_discovery_waiters.contains_key(&dest));
+        assert_eq!(
+            upstream_rx.try_recv().unwrap(),
+            Bytes::from_static(b"upstream occupied")
+        );
+        actor.process_pending_path_request_admissions(start + 1.0);
+        assert!(!actor.has_pending_path_request_admission(dest));
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "completed discovery cannot later emit its queued request"
+        );
+
+        if let Some(rx) = &mut first_rx {
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                Bytes::from_static(b"requester occupied")
+            );
+        }
+        inbound(&mut actor, announce, 3);
+        actor.process_pending_path_request_admissions(start + 2.0);
+        assert!(
+            healthy_rx.try_recv().is_err(),
+            "response ownership is consumed once"
+        );
+        assert!(
+            first_rx.as_mut().is_none_or(|rx| rx.try_recv().is_err()),
+            "this owner does not invent a response retransmission queue"
+        );
+    }
+}
+
+#[test]
 fn recursive_surviving_requester_retains_refused_egress_until_its_original_deadline() {
     let mut actor = relay();
     let (first, _first_rx) = make_test_interface("first");

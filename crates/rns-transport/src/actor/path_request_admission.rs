@@ -288,6 +288,194 @@ mod tests {
         assert!(actor.path_requests.is_empty());
         assert!(actor.pending_path_request_admissions.is_empty());
     }
+
+    #[test]
+    fn admission_review_round_robin_reaches_recovered_interface_behind_full_slice() {
+        let start = now_f64();
+        let _clock = crate::test_clock::Clock::at(start);
+        let (mut actor, _) = TransportActor::new();
+        let _blocked = interface(&mut actor, 1, 1);
+        let mut recovering = interface(&mut actor, 2, 1);
+        fill(&actor, 1);
+        fill(&actor, 2);
+        for index in 0..MAX_PENDING_ADMISSIONS {
+            let mut dest = [0xE2; 16];
+            dest[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            let target = if index == MAX_PENDING_ADMISSIONS - 1 {
+                2
+            } else {
+                1
+            };
+            actor.send_path_request(dest, target, Some(&[0x51; 16]), false);
+        }
+        let last = actor.pending_path_request_admissions.back().unwrap();
+        let recovered_dest = last.destination;
+        let recovered_raw = last.raw.clone();
+        let due = last.next_try;
+        let deadline = last.deadline;
+        recovering.try_recv().unwrap();
+
+        // The maintenance budget is per poll, not an immortal head-of-line
+        // block. All earlier targets remain Full throughout this sequence.
+        for poll in 1..=MAX_PENDING_ADMISSIONS.div_ceil(MAX_ADMISSION_POLL) {
+            actor.process_pending_path_request_admissions(due);
+            if poll == 1 {
+                assert_eq!(
+                    actor
+                        .pending_path_request_admissions
+                        .iter()
+                        .filter(|pending| pending.next_try > due)
+                        .count(),
+                    MAX_ADMISSION_POLL,
+                    "one actor poll must retain its bounded work slice"
+                );
+            }
+            assert!(
+                actor
+                    .pending_path_request_admissions
+                    .iter()
+                    .all(|pending| pending.deadline == deadline)
+            );
+            if poll * MAX_ADMISSION_POLL < MAX_PENDING_ADMISSIONS {
+                assert!(recovering.try_recv().is_err());
+                assert!(actor.path_requests.is_empty());
+            }
+        }
+        assert_eq!(
+            recovering.try_recv().unwrap().as_ref(),
+            recovered_raw.as_slice()
+        );
+        assert_eq!(actor.path_requests.len(), 1);
+        assert_eq!(actor.path_requests[&recovered_dest], due);
+        assert_eq!(
+            actor.pending_path_request_admissions.len(),
+            MAX_PENDING_ADMISSIONS - 1
+        );
+        assert_eq!(actor.interfaces[&1].ingress.outgoing_pr_frequency(), 0.0);
+        actor.process_pending_path_request_admissions(due + DISCOVERY_PR_TX_THROTTLE);
+        assert!(
+            recovering.try_recv().is_err(),
+            "successful targets are not replayed"
+        );
+    }
+
+    #[test]
+    fn admission_review_policy_change_neither_spends_budget_nor_renews_expiry() {
+        for release_at_deadline in [false, true] {
+            let start = now_f64();
+            let clock = crate::test_clock::Clock::at(start);
+            let (mut actor, _) = TransportActor::new();
+            let mut radio = interface(&mut actor, 1, 1);
+            fill(&actor, 1);
+            let dest = [0xE3; 16];
+            actor.discovery_path_requests.insert(
+                dest,
+                DiscoveryPathRequest {
+                    requesting_interface: 2,
+                    timeout: start + 10.0,
+                },
+            );
+            actor.send_path_request(dest, 1, Some(&[0x52; 16]), true);
+            let original = &actor.pending_path_request_admissions[0];
+            let raw = original.raw.clone();
+            let deadline = original.deadline;
+            let first_due = original.next_try;
+            radio.try_recv().unwrap();
+            // Capacity recovers, but a newly active announce cap now prevents
+            // recursive egress. Retry must re-check policy without new bytes.
+            actor.interfaces.get_mut(&1).unwrap().announce_allowed_at = deadline + 1.0;
+            for now in [
+                first_due,
+                first_due + 1.0,
+                deadline - 2.0 * DISCOVERY_PR_TX_THROTTLE,
+            ] {
+                clock.set(now);
+                actor.process_pending_path_request_admissions(now);
+                assert!(radio.try_recv().is_err());
+                assert!(actor.path_requests.is_empty());
+                assert_eq!(actor.interfaces[&1].ingress.outgoing_pr_frequency(), 0.0);
+                assert_eq!(actor.pending_path_request_admissions[0].raw, raw);
+                assert_eq!(actor.pending_path_request_admissions[0].deadline, deadline);
+                assert_eq!(actor.interfaces[&1].announce_allowed_at, deadline + 1.0);
+            }
+            let now = if release_at_deadline {
+                deadline
+            } else {
+                deadline - 0.1
+            };
+            clock.set(now);
+            actor.interfaces.get_mut(&1).unwrap().announce_allowed_at = 0.0;
+            actor.process_pending_path_request_admissions(now);
+            assert!(actor.pending_path_request_admissions.is_empty());
+            if release_at_deadline {
+                assert!(
+                    radio.try_recv().is_err(),
+                    "expiry wins over recovered capacity/policy"
+                );
+                assert!(actor.path_requests.is_empty());
+                assert_eq!(actor.interfaces[&1].announce_allowed_at, 0.0);
+            } else {
+                assert_eq!(radio.try_recv().unwrap().as_ref(), raw.as_slice());
+                assert_eq!(actor.path_requests[&dest], now);
+                assert!(actor.interfaces[&1].announce_allowed_at > now);
+            }
+        }
+    }
+
+    #[test]
+    fn admission_review_signed_route_touch_is_not_replacement_but_each_version_axis_is() {
+        // Initial None -> Some was already covered. Here a queued PR records
+        // an existing signed route, and each possible replacement axis must
+        // retire it while ordinary traffic touches must not do so.
+        for change in 0..=5 {
+            let start = now_f64();
+            let clock = crate::test_clock::Clock::at(start);
+            let (mut actor, _) = TransportActor::new();
+            let mut radio = interface(&mut actor, 1, 1);
+            fill(&actor, 1);
+            let dest = [0xE4; 16];
+            let mut path =
+                crate::path_table::PathEntry::new(Some([1; 16]), 2, 1, InterfaceMode::Full);
+            path.packet_hash = Some([0x41; 32]);
+            path.add_random_blob([0x11; 10]);
+            actor.path_table.insert(dest, path);
+            actor.send_path_request(dest, 1, Some(&[0x53; 16]), false);
+            let raw = actor.pending_path_request_admissions[0].raw.clone();
+            let due = actor.pending_path_request_admissions[0].next_try;
+            clock.set(due);
+            let path = actor.path_table.get_mut(&dest).unwrap();
+            // Positive control: traffic updates both clocks without replacing
+            // the signed provenance or the forwarding choice.
+            path.touch();
+            assert!(path.timestamp > start);
+            match change {
+                0 => {}
+                1 => path.packet_hash = Some([0x42; 32]),
+                2 => path.add_random_blob([0x12; 10]),
+                3 => path.next_hop = Some([2; 16]),
+                4 => path.hops += 1,
+                5 => path.interface_id = 2,
+                _ => unreachable!(),
+            }
+            radio.try_recv().unwrap();
+            actor.process_pending_path_request_admissions(due);
+            assert!(actor.pending_path_request_admissions.is_empty());
+            assert!(
+                actor.path_table.has_path(&dest),
+                "admission cleanup cannot delete the route"
+            );
+            if change == 0 {
+                assert_eq!(radio.try_recv().unwrap().as_ref(), raw.as_slice());
+                assert_eq!(actor.path_requests[&dest], due);
+            } else {
+                assert!(
+                    radio.try_recv().is_err(),
+                    "replacement axis {change} must retire queued bytes"
+                );
+                assert!(actor.path_requests.is_empty());
+            }
+        }
+    }
 }
 
 #[derive(PartialEq, Eq)]
