@@ -1374,6 +1374,19 @@ impl Link {
         self.rtt.map(|r| r.as_secs_f64()).unwrap_or(0.0)
     }
 
+    /// Proof window for an ordinary packet on this established Link.
+    ///
+    /// Link traffic uses measured round-trip time times
+    /// [`TRAFFIC_TIMEOUT_FACTOR`], with a five-millisecond minimum. This is
+    /// neither Link establishment timing nor the idle keepalive interval.
+    /// A missing RTT uses a conservative half-second RTT fallback.
+    pub fn packet_proof_timeout(&self) -> Duration {
+        self.rtt
+            .unwrap_or(Duration::from_millis(500))
+            .saturating_mul(TRAFFIC_TIMEOUT_FACTOR as u32)
+            .max(Duration::from_millis(5))
+    }
+
     /// Drive the link state machine forward; call periodically from the owning actor.
     #[tracing::instrument(
         level = "trace",
@@ -1761,6 +1774,21 @@ mod tests {
     use super::*;
     use rns_crypto::ed25519::Ed25519PrivateKey;
     use rns_crypto::sha::full_hash;
+
+    #[test]
+    fn packet_proof_clock_uses_rtt_not_link_keepalive() {
+        let (mut link, _) = Link::new_initiator([0x61; 16], 1);
+        assert_eq!(link.packet_proof_timeout(), Duration::from_secs(3));
+        for (rtt, expected) in [
+            (Duration::ZERO, Duration::from_millis(5)),
+            (Duration::from_millis(200), Duration::from_millis(1200)),
+            (Duration::from_secs(90), Duration::from_secs(540)),
+            (Duration::MAX, Duration::MAX),
+        ] {
+            link.rtt = Some(rtt);
+            assert_eq!(link.packet_proof_timeout(), expected);
+        }
+    }
 
     #[test]
     fn test_initiator_creation() {

@@ -1511,6 +1511,37 @@ impl OutboundTransfer {
         }
     }
 
+    /// Exact finite wait owned by this sender, as `(started_at, timeout)`.
+    ///
+    /// Embedders can mirror this deadline without imposing an absolute age
+    /// limit on a healthy Resource. Advertisement retries are included in the
+    /// returned envelope; transferring/proof waits advance only when the
+    /// receiver requests new parts. A delayed observation must retain its
+    /// original `started_at`, not restart the timeout on receipt. Terminal or
+    /// not-yet-advertised transfers have no active wait.
+    pub fn timeout_window(&self) -> Option<(Instant, Duration)> {
+        match self.resource.state {
+            ResourceState::Advertised => {
+                let attempt = self
+                    .rtt
+                    .saturating_mul(rns_link::constants::TRAFFIC_TIMEOUT_FACTOR as u32)
+                    .saturating_add(Duration::from_secs_f64(PROCESSING_GRACE));
+                Some((
+                    self.started_at,
+                    attempt.saturating_mul(
+                        MAX_ADV_RETRIES
+                            .saturating_sub(self.retries)
+                            .saturating_add(1) as u32,
+                    ),
+                ))
+            }
+            ResourceState::Transferring | ResourceState::AwaitingProof => {
+                Some((self.last_progress, self.progress_timeout()))
+            }
+            _ => None,
+        }
+    }
+
     /// Consume a hashmap-update frame from the receiver.
     ///
     /// Wire layout:
@@ -3580,14 +3611,39 @@ mod tests {
     #[test]
     fn resource_watchdog_saturates_extreme_public_rtt_without_panicking() {
         let (_, mut sender, mut receiver) = loss_test_pair(8192, Duration::MAX);
+        assert_eq!(sender.timeout_window().unwrap().1, Duration::MAX);
         assert_eq!(sender.check_timeout(), TransferAction::None);
         let TransferAction::SendRequest(request) = receiver.request_next() else {
             panic!()
         };
         sender.handle_request(&request);
         assert_eq!(sender.progress_timeout(), Duration::MAX);
+        assert_eq!(sender.timeout_window().unwrap().1, Duration::MAX);
         assert_eq!(sender.check_timeout(), TransferAction::None);
         assert_eq!(sender.tick(), TransferAction::None);
+    }
+
+    #[test]
+    fn resource_timeout_observation_tracks_only_owned_bounded_phases() {
+        let mut sender =
+            OutboundTransfer::new(vec![0x81; 8192], false, Duration::from_secs(2)).unwrap();
+        assert!(sender.timeout_window().is_none());
+        assert!(matches!(
+            sender.tick(),
+            TransferAction::SendAdvertisement(_)
+        ));
+        let first = sender.timeout_window().unwrap();
+        assert_eq!(first.1, Duration::from_secs(65));
+        sender.started_at = Instant::now() - Duration::from_secs(14);
+        assert!(matches!(
+            sender.check_timeout(),
+            TransferAction::SendAdvertisement(_)
+        ));
+        let retry = sender.timeout_window().unwrap();
+        assert_eq!(retry.1, Duration::from_secs(52));
+        assert!(retry.0 >= first.0);
+        sender.handle_cancel();
+        assert!(sender.timeout_window().is_none());
     }
 
     #[test]
