@@ -45,6 +45,17 @@ pub enum LinkClientError {
     UnexpectedResponse(String),
 }
 
+/// Successful Link request response.
+///
+/// Ordinary replies carry packed response bytes in [`Self::data`] with
+/// [`Self::metadata`] unset. NomadNet `/file/...` replies are response Resources
+/// whose payload is raw file bytes plus optional msgpack filename metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkQueryResponse {
+    pub data: Vec<u8>,
+    pub metadata: Option<Vec<u8>>,
+}
+
 #[derive(Clone)]
 pub struct LinkClient {
     transport_tx: mpsc::Sender<TransportMessage>,
@@ -66,7 +77,7 @@ impl LinkClient {
     }
 
     /// Open a Link to `app_name` on `remote_transport_hash`, send one
-    /// request, return the response.
+    /// request, return the response (and optional Resource metadata).
     pub async fn query(
         &self,
         remote_transport_hash: [u8; 16],
@@ -75,7 +86,7 @@ impl LinkClient {
         payload: Vec<u8>,
         hops: u8,
         overall_timeout: Duration,
-    ) -> Result<Vec<u8>, LinkClientError> {
+    ) -> Result<LinkQueryResponse, LinkClientError> {
         let started = Instant::now();
         let deadline = started + overall_timeout;
 
@@ -280,7 +291,7 @@ async fn wait_for_response(
     link_id: [u8; 16],
     request_id: [u8; 16],
     deadline: Duration,
-) -> Result<Vec<u8>, LinkClientError> {
+) -> Result<LinkQueryResponse, LinkClientError> {
     let fut = async {
         let mut inbound_resources: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
 
@@ -318,7 +329,10 @@ async fn wait_for_response(
                             match link.handle_response(body) {
                                 Ok((id, response_data)) => {
                                     if id == request_id {
-                                        return Ok(response_data);
+                                        return Ok(LinkQueryResponse {
+                                            data: response_data,
+                                            metadata: None,
+                                        });
                                     }
                                 }
                                 Err(e) => {
@@ -432,7 +446,7 @@ async fn wait_for_response(
                             }
 
                             if let Some(rh) = completed_rh {
-                                let (assembled, proof) = {
+                                let (assembled, proof, metadata) = {
                                     let transfer =
                                         inbound_resources.get_mut(&rh).ok_or_else(|| {
                                             LinkClientError::UnexpectedResponse(
@@ -451,19 +465,32 @@ async fn wait_for_response(
                                             },
                                         )
                                     };
-                                    transfer.complete(Some(&decrypt_fn)).map_err(|e| {
-                                        LinkClientError::UnexpectedResponse(format!(
-                                            "resource assemble: {e:?}"
-                                        ))
-                                    })?
+                                    let (assembled, proof) =
+                                        transfer.complete(Some(&decrypt_fn)).map_err(|e| {
+                                            LinkClientError::UnexpectedResponse(format!(
+                                                "resource assemble: {e:?}"
+                                            ))
+                                        })?;
+                                    let metadata = transfer.resource.metadata.clone();
+                                    (assembled, proof, metadata)
                                 };
 
                                 send_link_proof(transport_tx, link_id, &proof).await?;
                                 inbound_resources.remove(&rh);
+                                if metadata.is_some() {
+                                    // NomadNet file response: raw payload + Resource metadata.
+                                    return Ok(LinkQueryResponse {
+                                        data: assembled,
+                                        metadata,
+                                    });
+                                }
                                 match link.handle_response_plaintext(&assembled) {
                                     Ok((id, response_data)) => {
                                         if id == request_id {
-                                            return Ok(response_data);
+                                            return Ok(LinkQueryResponse {
+                                                data: response_data,
+                                                metadata: None,
+                                            });
                                         }
                                     }
                                     Err(e) => {

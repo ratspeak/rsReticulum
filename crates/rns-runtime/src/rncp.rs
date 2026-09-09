@@ -279,7 +279,7 @@ pub async fn spawn_rncp_listener(
         let link_identities = link_mgr.link_identities_handle();
         let fetch_events = events_tx.clone();
         let fetch_path_hash = truncated_hash(FETCH_PATH_NAME.as_bytes());
-        link_mgr.set_request_handler_ex(move |link_id, path_hash, data| {
+        link_mgr.set_request_handler_ex(move |link_id, path_hash, data, _remote_identity| {
             if path_hash != fetch_path_hash {
                 return RequestOutcome::Drop;
             }
@@ -683,13 +683,7 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
 }
 
 fn pack_metadata(file_name: &str) -> Vec<u8> {
-    let entries = vec![(
-        rmpv::Value::String(rmpv::Utf8String::from("name")),
-        rmpv::Value::Binary(file_name.as_bytes().to_vec()),
-    )];
-    let mut buf = Vec::new();
-    let _ = rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(entries));
-    buf
+    crate::link_manager::pack_file_name_metadata(file_name)
 }
 
 struct OutboundDrive<'a> {

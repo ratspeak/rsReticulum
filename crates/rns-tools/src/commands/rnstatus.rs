@@ -1006,7 +1006,7 @@ impl RemoteSession {
             )
             .await
         {
-            Ok(b) => b,
+            Ok(b) => b.data,
             Err(e) => {
                 eprintln!("rnstatus-rs: remote query failed: {}", remote_err(&e));
                 return match e {

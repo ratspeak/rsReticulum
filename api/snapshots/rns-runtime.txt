@@ -587,7 +587,7 @@ pub fn rns_runtime::link_manager::LinkManager::set_link_packet_channel(&mut self
 pub fn rns_runtime::link_manager::LinkManager::set_link_packet_proof_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::LinkPacketProof>)
 pub fn rns_runtime::link_manager::LinkManager::set_outbound_resource_proof_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::LinkResourceProof>)
 pub fn rns_runtime::link_manager::LinkManager::set_request_handler<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], [u8; 16], alloc::vec::Vec<u8>) -> core::option::Option<alloc::vec::Vec<u8>> + core::marker::Send + 'static
-pub fn rns_runtime::link_manager::LinkManager::set_request_handler_ex<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], [u8; 16], alloc::vec::Vec<u8>) -> rns_runtime::link_manager::RequestOutcome + core::marker::Send + 'static
+pub fn rns_runtime::link_manager::LinkManager::set_request_handler_ex<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], [u8; 16], alloc::vec::Vec<u8>, core::option::Option<rns_identity::identity::Identity>) -> rns_runtime::link_manager::RequestOutcome + core::marker::Send + 'static
 pub fn rns_runtime::link_manager::LinkManager::set_resource_accept_handler<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], &rns_protocol::resource_adv::ResourceAdvertisement) -> bool + core::marker::Send + 'static
 pub fn rns_runtime::link_manager::LinkManager::set_resource_completed_channel(&mut self, tokio::sync::mpsc::bounded::Sender<(alloc::vec::Vec<u8>, [u8; 16])>)
 pub fn rns_runtime::link_manager::LinkManager::set_resource_completion_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::ResourceCompletion>)

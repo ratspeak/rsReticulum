@@ -402,6 +402,8 @@ impl std::fmt::Debug for LinkManagerAccountingEvent {
 /// Result of an extended request handler. `Reply` is the ordinary response;
 /// `ReplyWithResource` sends an inline ack followed by a resource transfer
 /// (rncp --fetch). Python: `RNS.Resource(..., target_link=link)`.
+/// `ReplyFile` sends a **response** Resource with raw file bytes and optional
+/// msgpack metadata (NomadNet `/file/...`: `{"name": <path bytes>}`).
 #[derive(Debug, Clone)]
 pub enum RequestOutcome {
     Reply(Vec<u8>),
@@ -412,8 +414,30 @@ pub enum RequestOutcome {
         metadata: Option<Vec<u8>>,
         auto_compress: bool,
     },
+    /// Response Resource with raw payload (not packed `[request_id, body]`).
+    ///
+    /// Python NomadNet `serve_file` returns `[file_handle, {"name": ...}]`,
+    /// which becomes `RNS.Resource(..., metadata=..., is_response=True)`.
+    ReplyFile {
+        data: Vec<u8>,
+        /// Optional msgpack-encoded metadata (e.g. from [`pack_file_name_metadata`]).
+        metadata: Option<Vec<u8>>,
+        auto_compress: bool,
+    },
     /// Silently drop; caller sees a timeout. Useful for ACL denies.
     Drop,
+}
+
+/// Pack NomadNet / rncp-compatible Resource filename metadata:
+/// msgpack map `{"name": <utf-8 path as Binary>}`.
+pub fn pack_file_name_metadata(file_name: &str) -> Vec<u8> {
+    let entries = vec![(
+        rmpv::Value::String(rmpv::Utf8String::from("name")),
+        rmpv::Value::Binary(file_name.as_bytes().to_vec()),
+    )];
+    let mut buf = Vec::new();
+    let _ = rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(entries));
+    buf
 }
 
 /// Python-compatible context supplied to a per-path Destination request handler.
@@ -431,7 +455,10 @@ pub type DestinationRequestHandler =
     Box<dyn Fn(DestinationRequest) -> RequestOutcome + Send + 'static>;
 
 type RequestHandler = Box<dyn Fn([u8; 16], [u8; 16], Vec<u8>) -> Option<Vec<u8>> + Send>;
-type RequestHandlerEx = Box<dyn Fn([u8; 16], [u8; 16], Vec<u8>) -> RequestOutcome + Send>;
+/// Extended catch-all handler: link id, path hash, request body, remote identity
+/// (when the peer identified on the Link).
+type RequestHandlerEx =
+    Box<dyn Fn([u8; 16], [u8; 16], Vec<u8>, Option<Identity>) -> RequestOutcome + Send>;
 type LinkIdentityGate = Box<dyn Fn([u8; 16], [u8; 16]) -> bool + Send>;
 type ResourceAcceptHandler = Box<dyn Fn([u8; 16], &ResourceAdvertisement) -> bool + Send>;
 
@@ -4675,7 +4702,7 @@ impl LinkManager {
                 RequestOutcome::Drop
             }
         } else if let Some(ref handler) = self.request_handler_ex {
-            handler(link_id, path_hash, data.clone())
+            handler(link_id, path_hash, data.clone(), remote_identity)
         } else if let Some(ref handler) = self.request_handler {
             match handler(link_id, path_hash, data) {
                 Some(response) => RequestOutcome::Reply(response),
@@ -4685,15 +4712,20 @@ impl LinkManager {
             RequestOutcome::Drop
         };
 
-        let (response, fetch_spec) = match outcome {
-            RequestOutcome::Reply(response) => (Some(response), None),
+        let (response, fetch_spec, file_spec) = match outcome {
+            RequestOutcome::Reply(response) => (Some(response), None, None),
             RequestOutcome::ReplyWithResource {
                 ack,
                 data,
                 metadata,
                 auto_compress,
-            } => (Some(ack), Some((data, metadata, auto_compress))),
-            RequestOutcome::Drop => (None, None),
+            } => (Some(ack), Some((data, metadata, auto_compress)), None),
+            RequestOutcome::ReplyFile {
+                data,
+                metadata,
+                auto_compress,
+            } => (None, None, Some((data, metadata, auto_compress))),
+            RequestOutcome::Drop => (None, None, None),
         };
 
         if let Some(response) = response {
@@ -4768,13 +4800,42 @@ impl LinkManager {
                     );
                 }
             }
-        } else {
+        } else if file_spec.is_none() && fetch_spec.is_none() {
             tracing::debug!(
                 link_id = hex::encode(link_id),
                 request_id = hex::encode(request_id),
                 path = hex::encode(path_hash),
                 "link request received — no handler response"
             );
+        }
+
+        if let Some((data, metadata, auto_compress)) = file_spec {
+            if self
+                .start_resource_transfer_inner(
+                    &link_id,
+                    ResourceTransferStart {
+                        data,
+                        metadata,
+                        auto_compress,
+                        request_id: Some(request_id.to_vec()),
+                        is_response: true,
+                        allow_handshake: true,
+                    },
+                )
+                .is_none()
+            {
+                tracing::warn!(
+                    link_id = hex::encode(link_id),
+                    request_id = hex::encode(request_id),
+                    "link request file response Resource could not be started"
+                );
+            } else {
+                tracing::debug!(
+                    link_id = hex::encode(link_id),
+                    request_id = hex::encode(request_id),
+                    "link request handled — file response Resource started"
+                );
+            }
         }
 
         if let Some((data, metadata, auto_compress)) = fetch_spec {
@@ -4809,9 +4870,12 @@ impl LinkManager {
 
     /// Handler that may schedule a follow-up resource transfer (rncp --fetch).
     /// Takes precedence over [`Self::set_request_handler`].
+    ///
+    /// The fourth argument is the authenticated remote identity when the peer
+    /// identified on the Link (needed for NomadNet `.allowed` ACLs).
     pub fn set_request_handler_ex<F>(&mut self, handler: F)
     where
-        F: Fn([u8; 16], [u8; 16], Vec<u8>) -> RequestOutcome + Send + 'static,
+        F: Fn([u8; 16], [u8; 16], Vec<u8>, Option<Identity>) -> RequestOutcome + Send + 'static,
     {
         self.request_handler_ex = Some(Box::new(handler));
     }
@@ -7160,6 +7224,137 @@ mod tests {
             .unwrap();
         assert_eq!(response_id, packet_request_id);
         assert_eq!(response_data, b"ready");
+    }
+
+    #[test]
+    fn pack_file_name_metadata_uses_binary_name() {
+        let packed = pack_file_name_metadata("photos/pic.png");
+        let value = rmpv::decode::read_value(&mut &packed[..]).unwrap();
+        let map = value.as_map().expect("metadata map");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].0.as_str(), Some("name"));
+        assert_eq!(map[0].1.as_slice(), Some(b"photos/pic.png".as_slice()));
+    }
+
+    #[test]
+    fn reply_file_starts_response_resource_with_filename_metadata() {
+        let dest_hash = [0x42; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (responder, proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        let _rtt_data = initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .unwrap();
+        let link_id = responder.link_id;
+        assert_eq!(responder.state, LinkState::Handshake);
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+        manager.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let file_bytes = b"PNG-BYTES".to_vec();
+        let metadata = pack_file_name_metadata("photos/pic.png");
+        assert!(manager.register_request_handler(
+            "/file/photos/pic.png",
+            AllowPolicy::AllowAll,
+            None,
+            true,
+            {
+                let file_bytes = file_bytes.clone();
+                let metadata = metadata.clone();
+                move |_| RequestOutcome::ReplyFile {
+                    data: file_bytes.clone(),
+                    metadata: Some(metadata.clone()),
+                    auto_compress: true,
+                }
+            },
+        ));
+
+        let (encrypted_request, _) = initiator
+            .request(
+                "/file/photos/pic.png",
+                None,
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+        let request_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Request,
+        };
+        let mut raw = request_header.pack();
+        raw.extend_from_slice(&encrypted_request);
+
+        manager.handle_inbound_packet(&raw, 1);
+
+        let active = manager.active_links.get(&link_id).unwrap();
+        assert_eq!(
+            active.outbound_resources.len(),
+            1,
+            "ReplyFile must start one outbound response Resource"
+        );
+        let transfer = active.outbound_resources.values().next().unwrap();
+        assert!(transfer.resource.flags.is_response);
+        assert!(transfer.resource.flags.has_metadata);
+        let stored = transfer.resource.metadata.as_deref().expect("metadata");
+        // OutboundResource frames metadata as `length(3 BE) || msgpack`.
+        assert!(
+            stored
+                .windows(metadata.len())
+                .any(|w| w == metadata.as_slice()),
+            "stored metadata should contain packed name map"
+        );
+        assert_eq!(
+            transfer.resource.request_id.as_deref(),
+            Some(
+                rns_wire::hash::truncated_packet_hash(&raw, request_header.flags.header_type)
+                    .as_slice()
+            )
+        );
+
+        let TransportMessage::Outbound(adv_msg) =
+            next_transport_message(&mut transport_rx).expect("resource advertisement")
+        else {
+            panic!("expected outbound advertisement");
+        };
+        let (adv_header, _) = rns_wire::header::PacketHeader::unpack(&adv_msg.raw).unwrap();
+        assert_eq!(
+            adv_header.context,
+            rns_wire::context::PacketContext::ResourceAdv
+        );
+        // Drain any follow-up Resource parts; none should be an inline RESPONSE.
+        while let Ok(TransportMessage::Outbound(msg)) = next_transport_message(&mut transport_rx) {
+            let (header, _) = rns_wire::header::PacketHeader::unpack(&msg.raw).unwrap();
+            assert_ne!(
+                header.context,
+                rns_wire::context::PacketContext::Response,
+                "ReplyFile must not emit a packed inline response"
+            );
+        }
+        let _ = file_bytes;
     }
 
     #[test]

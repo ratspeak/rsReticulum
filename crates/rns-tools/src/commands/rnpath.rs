@@ -951,7 +951,7 @@ async fn run_remote_blackhole_list(args: Args) -> ExitCode {
         )
         .await
     {
-        Ok(b) => b,
+        Ok(b) => b.data,
         Err(e) => {
             eprintln!(
                 "rnpath-rs: remote blackhole query failed: {}",
@@ -1183,7 +1183,7 @@ async fn run_remote(args: Args) -> ExitCode {
         )
         .await
     {
-        Ok(b) => b,
+        Ok(b) => b.data,
         Err(e) => {
             eprintln!("rnpath-rs: remote query failed: {}", remote_err(&e));
             shutdown.trigger();
