@@ -76,6 +76,7 @@ impl rns_transport::actor::TransportActor
 pub fn rns_transport::actor::TransportActor::has_path(&self, &[u8; 16]) -> bool
 pub fn rns_transport::actor::TransportActor::hops_to(&self, &[u8; 16]) -> core::option::Option<u8>
 pub fn rns_transport::actor::TransportActor::initialize_storage(&mut self, std::path::PathBuf)
+pub fn rns_transport::actor::TransportActor::link_endpoint_dispatch_handle(&self) -> rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle
 pub fn rns_transport::actor::TransportActor::new() -> (Self, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>)
 pub fn rns_transport::actor::TransportActor::new_with_capacity(usize, usize) -> (Self, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>)
 pub fn rns_transport::actor::TransportActor::persistence_trigger(&self) -> rns_transport::actor::PersistenceTrigger
@@ -752,6 +753,41 @@ pub rns_transport::ingress::IngressOverrides::pr_burst_freq: core::option::Optio
 pub rns_transport::ingress::IngressOverrides::pr_burst_freq_new: core::option::Option<f64>
 impl rns_transport::ingress::IngressOverrides
 pub fn rns_transport::ingress::IngressOverrides::is_empty(&self) -> bool
+pub mod rns_transport::link_endpoint_dispatch
+#[non_exhaustive] pub enum rns_transport::link_endpoint_dispatch::LinkEndpointDispatchError
+pub rns_transport::link_endpoint_dispatch::LinkEndpointDispatchError::Closed
+pub rns_transport::link_endpoint_dispatch::LinkEndpointDispatchError::Full
+pub rns_transport::link_endpoint_dispatch::LinkEndpointDispatchError::InvalidDeadline
+impl core::error::Error for rns_transport::link_endpoint_dispatch::LinkEndpointDispatchError
+impl core::fmt::Display for rns_transport::link_endpoint_dispatch::LinkEndpointDispatchError
+pub fn rns_transport::link_endpoint_dispatch::LinkEndpointDispatchError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum rns_transport::link_endpoint_dispatch::LinkEndpointDispatchOutcome
+pub rns_transport::link_endpoint_dispatch::LinkEndpointDispatchOutcome::Cancelled
+pub rns_transport::link_endpoint_dispatch::LinkEndpointDispatchOutcome::Expired
+pub rns_transport::link_endpoint_dispatch::LinkEndpointDispatchOutcome::Rejected(rns_transport::messages::LinkEndpointSendResult)
+pub rns_transport::link_endpoint_dispatch::LinkEndpointDispatchOutcome::Sent
+pub rns_transport::link_endpoint_dispatch::LinkEndpointDispatchOutcome::Sent::dispatched_at: std::time::Instant
+pub rns_transport::link_endpoint_dispatch::LinkEndpointDispatchOutcome::Sent::packet_hash: [u8; 32]
+pub struct rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt
+impl rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt
+pub fn rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt::try_recv(&mut self) -> core::result::Result<core::result::Result<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchToken, rns_transport::messages::LinkEndpointBindResult>, tokio::sync::oneshot::error::TryRecvError>
+impl core::future::future::Future for rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt
+pub type rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt::Output = core::result::Result<core::result::Result<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchToken, rns_transport::messages::LinkEndpointBindResult>, tokio::sync::oneshot::error::RecvError>
+pub fn rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+impl core::ops::drop::Drop for rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt
+pub fn rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt::drop(&mut self)
+pub struct rns_transport::link_endpoint_dispatch::LinkEndpointDispatchCancellation
+impl rns_transport::link_endpoint_dispatch::LinkEndpointDispatchCancellation
+pub fn rns_transport::link_endpoint_dispatch::LinkEndpointDispatchCancellation::cancel(&self)
+pub struct rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle
+impl rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle
+pub fn rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle::try_bind(&self, rns_transport::messages::LinkEndpointBinding, tokio::sync::mpsc::unbounded::UnboundedSender<rns_transport::messages::LinkEndpointLifecycleEvent>) -> core::result::Result<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt, rns_transport::link_endpoint_dispatch::LinkEndpointDispatchError>
+pub struct rns_transport::link_endpoint_dispatch::LinkEndpointDispatchToken
+impl rns_transport::link_endpoint_dispatch::LinkEndpointDispatchToken
+pub fn rns_transport::link_endpoint_dispatch::LinkEndpointDispatchToken::binding(&self) -> rns_transport::messages::LinkEndpointBinding
+pub fn rns_transport::link_endpoint_dispatch::LinkEndpointDispatchToken::try_send(&self, rns_transport::messages::OutboundRequest, std::time::Instant) -> core::result::Result<tokio::sync::oneshot::Receiver<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchOutcome>, rns_transport::link_endpoint_dispatch::LinkEndpointDispatchError>
+pub fn rns_transport::link_endpoint_dispatch::LinkEndpointDispatchToken::try_send_cancellable(&self, rns_transport::messages::OutboundRequest, std::time::Instant) -> core::result::Result<(tokio::sync::oneshot::Receiver<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchOutcome>, rns_transport::link_endpoint_dispatch::LinkEndpointDispatchCancellation), rns_transport::link_endpoint_dispatch::LinkEndpointDispatchError>
+pub const rns_transport::link_endpoint_dispatch::LINK_ENDPOINT_ADMISSION_TIMEOUT_MAX: core::time::Duration
 pub mod rns_transport::link_messages
 pub enum rns_transport::link_messages::DestinationEvent
 pub rns_transport::link_messages::DestinationEvent::AnnounceRequested(rns_transport::link_messages::AnnounceRequest)
@@ -1283,6 +1319,8 @@ impl core::fmt::Display for rns_transport::path_recovery::PathRecoveryError
 pub fn rns_transport::path_recovery::PathRecoveryError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct rns_transport::path_recovery::PathRecoveryHandle
 impl rns_transport::path_recovery::PathRecoveryHandle
+pub fn rns_transport::path_recovery::PathRecoveryHandle::try_invalidate_link(&self, [u8; 16], [u8; 16]) -> core::result::Result<tokio::sync::oneshot::Receiver<rns_transport::path_recovery::PathRecoveryOutcome>, rns_transport::path_recovery::PathRecoveryError>
+pub fn rns_transport::path_recovery::PathRecoveryHandle::try_invalidate_packet(&self, [u8; 16], [u8; 32]) -> core::result::Result<tokio::sync::oneshot::Receiver<rns_transport::path_recovery::PathRecoveryOutcome>, rns_transport::path_recovery::PathRecoveryError>
 pub fn rns_transport::path_recovery::PathRecoveryHandle::try_recover(&self, [u8; 16], core::option::Option<[u8; 16]>) -> core::result::Result<tokio::sync::oneshot::Receiver<rns_transport::path_recovery::PathRecoveryOutcome>, rns_transport::path_recovery::PathRecoveryError>
 pub fn rns_transport::path_recovery::PathRecoveryHandle::try_recover_packet(&self, [u8; 16], [u8; 32]) -> core::result::Result<tokio::sync::oneshot::Receiver<rns_transport::path_recovery::PathRecoveryOutcome>, rns_transport::path_recovery::PathRecoveryError>
 #[non_exhaustive] pub struct rns_transport::path_recovery::PathRecoveryOutcome

@@ -407,6 +407,7 @@ pub fn rns_protocol::resource::OutboundTransfer::new(alloc::vec::Vec<u8>, bool, 
 pub fn rns_protocol::resource::OutboundTransfer::new_encrypted(alloc::vec::Vec<u8>, bool, core::time::Duration, rns_link::key_derivation::LinkKeys) -> core::result::Result<Self, rns_protocol::resource::ResourceError>
 pub fn rns_protocol::resource::OutboundTransfer::progress(&self) -> f64
 pub fn rns_protocol::resource::OutboundTransfer::tick(&mut self) -> rns_protocol::resource::TransferAction
+pub fn rns_protocol::resource::OutboundTransfer::timeout_window(&self) -> core::option::Option<(std::time::Instant, core::time::Duration)>
 pub struct rns_protocol::resource::ResourceFlags
 pub rns_protocol::resource::ResourceFlags::compressed: bool
 pub rns_protocol::resource::ResourceFlags::encrypted: bool

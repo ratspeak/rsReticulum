@@ -242,6 +242,7 @@ pub fn rns_link::link::Link::no_data_for(&self) -> core::time::Duration
 pub fn rns_link::link::Link::no_inbound_for(&self) -> core::time::Duration
 pub fn rns_link::link::Link::no_outbound_for(&self) -> core::time::Duration
 pub fn rns_link::link::Link::pack_response(&[u8; 16], &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_link::encryption::LinkCryptoError>
+pub fn rns_link::link::Link::packet_proof_timeout(&self) -> core::time::Duration
 pub fn rns_link::link::Link::parse_request(&[u8]) -> core::result::Result<rns_link::link::ParsedRequestData, rns_link::encryption::LinkCryptoError>
 pub fn rns_link::link::Link::parse_response_plaintext(&[u8]) -> core::result::Result<([u8; 16], alloc::vec::Vec<u8>), rns_link::encryption::LinkCryptoError>
 pub fn rns_link::link::Link::phy_stats(&self) -> (core::option::Option<f64>, core::option::Option<f64>, core::option::Option<f64>)

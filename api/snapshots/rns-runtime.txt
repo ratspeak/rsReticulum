@@ -422,6 +422,17 @@ pub rns_runtime::link_manager::DestinationControlError::TransportUnavailable
 pub rns_runtime::link_manager::LinkManagerAccountingEvent::LinkClosed
 pub rns_runtime::link_manager::LinkManagerAccountingEvent::LinkClosed::link_id: [u8; 16]
 pub rns_runtime::link_manager::LinkManagerAccountingEvent::LinkPacketProof(rns_runtime::link_manager::LinkPacketProof)
+pub rns_runtime::link_manager::LinkManagerAccountingEvent::OutboundPacketWait
+pub rns_runtime::link_manager::LinkManagerAccountingEvent::OutboundPacketWait::awaiting_admission: bool
+pub rns_runtime::link_manager::LinkManagerAccountingEvent::OutboundPacketWait::cancellation: core::option::Option<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchCancellation>
+pub rns_runtime::link_manager::LinkManagerAccountingEvent::OutboundPacketWait::receipt: rns_runtime::link_manager::LinkPacketSendReceipt
+pub rns_runtime::link_manager::LinkManagerAccountingEvent::OutboundPacketWait::started_at: std::time::Instant
+pub rns_runtime::link_manager::LinkManagerAccountingEvent::OutboundPacketWait::timeout: core::time::Duration
+pub rns_runtime::link_manager::LinkManagerAccountingEvent::OutboundResourceWait
+pub rns_runtime::link_manager::LinkManagerAccountingEvent::OutboundResourceWait::link_id: [u8; 16]
+pub rns_runtime::link_manager::LinkManagerAccountingEvent::OutboundResourceWait::resource_id: [u8; 32]
+pub rns_runtime::link_manager::LinkManagerAccountingEvent::OutboundResourceWait::started_at: std::time::Instant
+pub rns_runtime::link_manager::LinkManagerAccountingEvent::OutboundResourceWait::timeout: core::time::Duration
 pub rns_runtime::link_manager::LinkManagerAccountingEvent::ResourceCompletion(rns_runtime::link_manager::ResourceCompletion)
 pub rns_runtime::link_manager::LinkManagerAccountingEvent::ResourceEvent(rns_runtime::link_manager::LinkResourceEvent)
 impl core::fmt::Debug for rns_runtime::link_manager::LinkManagerAccountingEvent
@@ -580,6 +591,7 @@ pub fn rns_runtime::link_manager::LinkManager::set_channel_message_channel(&mut 
 pub fn rns_runtime::link_manager::LinkManager::set_destination_delivery_proof_channel(&mut self, tokio::sync::mpsc::unbounded::UnboundedSender<rns_runtime::link_manager::DestinationDeliveryProof>)
 pub fn rns_runtime::link_manager::LinkManager::set_inbound_raw_channel(&mut self, tokio::sync::mpsc::bounded::Sender<alloc::vec::Vec<u8>>)
 pub fn rns_runtime::link_manager::LinkManager::set_link_closed_channel(&mut self, tokio::sync::mpsc::bounded::Sender<[u8; 16]>)
+pub fn rns_runtime::link_manager::LinkManager::set_link_endpoint_dispatch_handle(&mut self, rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle)
 pub fn rns_runtime::link_manager::LinkManager::set_link_established_channel(&mut self, tokio::sync::mpsc::bounded::Sender<[u8; 16]>)
 pub fn rns_runtime::link_manager::LinkManager::set_link_identified_channel(&mut self, tokio::sync::mpsc::bounded::Sender<([u8; 16], [u8; 16])>)
 pub fn rns_runtime::link_manager::LinkManager::set_link_identity_gate<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], [u8; 16]) -> bool + core::marker::Send + 'static
@@ -1245,6 +1257,7 @@ pub async fn rns_runtime::reticulum::ReticulumHandle::first_hop_timeout(&self, [
 pub async fn rns_runtime::reticulum::ReticulumHandle::has_path(&self, [u8; 16]) -> core::result::Result<bool, rns_runtime::reticulum::ControlError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::hops_to(&self, [u8; 16]) -> core::result::Result<u8, rns_runtime::reticulum::ControlError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::interface_stats(&self) -> core::result::Result<rns_runtime::reticulum::InterfaceStats, rns_runtime::reticulum::ControlError>
+pub fn rns_runtime::reticulum::ReticulumHandle::link_endpoint_dispatch_handle(&self) -> rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle
 pub fn rns_runtime::reticulum::ReticulumHandle::link_mtu_discovery(&self) -> bool
 pub async fn rns_runtime::reticulum::ReticulumHandle::next_hop_bitrate(&self, [u8; 16]) -> core::result::Result<core::option::Option<u64>, rns_runtime::reticulum::ControlError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::next_hop_hardware_mtu(&self, [u8; 16]) -> core::result::Result<core::option::Option<u32>, rns_runtime::reticulum::ControlError>
@@ -1617,6 +1630,7 @@ pub async fn rns_runtime::reticulum::ReticulumHandle::first_hop_timeout(&self, [
 pub async fn rns_runtime::reticulum::ReticulumHandle::has_path(&self, [u8; 16]) -> core::result::Result<bool, rns_runtime::reticulum::ControlError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::hops_to(&self, [u8; 16]) -> core::result::Result<u8, rns_runtime::reticulum::ControlError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::interface_stats(&self) -> core::result::Result<rns_runtime::reticulum::InterfaceStats, rns_runtime::reticulum::ControlError>
+pub fn rns_runtime::reticulum::ReticulumHandle::link_endpoint_dispatch_handle(&self) -> rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle
 pub fn rns_runtime::reticulum::ReticulumHandle::link_mtu_discovery(&self) -> bool
 pub async fn rns_runtime::reticulum::ReticulumHandle::next_hop_bitrate(&self, [u8; 16]) -> core::result::Result<core::option::Option<u64>, rns_runtime::reticulum::ControlError>
 pub async fn rns_runtime::reticulum::ReticulumHandle::next_hop_hardware_mtu(&self, [u8; 16]) -> core::result::Result<core::option::Option<u32>, rns_runtime::reticulum::ControlError>

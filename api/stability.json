@@ -19,35 +19,34 @@
     "sourceCommit": "47dbbf1febc0a9d3259f179a0512d9b56bb2320d"
   },
   "snapshotSource": {
-    "commit": "f6523fd5c5c9784f5b6aa9cb8ca1485baf02ecf1",
-    "capturedOn": "2026-09-05",
+    "commit": "61f9573bc1500fcfb8baf1947ee30d133bb40c74",
+    "capturedOn": "2026-09-08",
     "review": {
       "areas": [
-        "Explicit shared-instance ownership and authenticated reconnect",
-        "Non-fatal configured-interface startup observations",
-        "Direct zero-hop shared-client packet addressing",
-        "Retained RNode startup policy and BLE lifecycle",
-        "Bounded exact local Link and packet route recovery",
-        "Canonical route-aware packet receipt timing"
+        "Generation-bound established-Link packet dispatch and cancellation",
+        "Exact failed-packet and Link invalidation without premature discovery",
+        "Finite original Link and Resource wait observations",
+        "Ownership-before-dedup and same-radio relay admission",
+        "Bounded slow-media discovery, transit and USB readiness",
+        "Actor-applied shared-client startup and bounded rollback"
       ],
-      "canonicalPath": "rns_runtime::reticulum::ReticulumHandle::path_recovery_handle",
-      "classification": "compatible additive opt-in route recovery and receipt timing; retained shared ownership and exhaustive mailbox APIs",
+      "canonicalPath": "rns_runtime::reticulum::ReticulumHandle::link_endpoint_dispatch_handle",
+      "classification": "compatible opt-in ownership capabilities and protocol wait accessors; existing public signatures, struct fields and exhaustive mailbox/result APIs retained",
       "publicApiDiff": {
-        "added": 69,
+        "added": 122,
         "removed": 0
       },
       "semver": "additive compatible API; no major-version consequence",
       "deprecations": "none",
-      "wirePersistenceRuntimeImpact": "No packet or RPC format change. Zero-hop paths now retain direct Header1 addressing instead of incorrectly inserting the shared owner's transport identity; positive-hop forwarding is unchanged. Strict clients require authenticated control on admission and reconnect; strict owners never join another owner. Client dynamic local spawns are rejected. Owned RPC tasks are drained at shutdown and sessions bounded. AutoInterface ports and generic automatic startup remain unchanged. The previously reviewed opt-in BLE firmware persistence policy remains intact. Route recovery observes bounded local dispatch versions and invalidates only the unchanged attempted route, without receive-interface suppression. Link and packet ownership are separate. Ordinary packet timeout calculation is consolidated without changing its formula. Shared clients recover only their local actor; no new shared RPC or wire messages.",
+      "wirePersistenceRuntimeImpact": "No packet/RPC encoding, cryptography, persisted format or AutoInterface port changes. Exact Link dispatch separates bounded local admission from the original RTT proof wait; cancellation cannot recall admitted bytes. Failed-attempt invalidation can be sequenced before an application's authenticated legacy shared-owner recovery without claiming remote atomic route safety. Resource transfer is receiver-request-driven with finite progress/proof waits. Ingress ownership precedes deduplication, eligible same-radio relay traffic is forwarded, and slow-media discovery/transit ownership is bounded. USB readiness and completion ownership are corrected without changing radio defaults. Shared-client initialization waits for actor-applied attachment. Existing exhaustive commands/results and DiscoveryPathRequest fields/Copy remain unchanged.",
       "platformEvidence": [
-        "all-feature Apple ARM64 public API snapshot",
-        "380 macOS runtime tests passed, one pre-existing ignored; 450 transport actor tests passed",
-        "10 native Android emulator shared-instance tests, including abstract Unix and TCP",
-        "live Python RNS 1.4.2 strict authentication, no fallback, path discovery, encrypted two-way Link data and verified 65000-byte Resource",
-        "Windows GNU runtime compile check; Ratspeak iOS and Android compile checks",
-        "external consumer fixtures with default and all features",
-        "September 5 checkpoint: 441 all-feature runtime tests passed, one existing skip; 458 combined-tree transport tests and 48 wire tests passed",
-        "strict wire/transport/runtime Clippy; 7 exact-route unit regressions; real signed same-radio and alternate-route ingress regressions"
+        "clean committed-source all-feature Apple ARM64 snapshot: 54 added lines (53 unique) since the previous snapshot, zero removed; cumulative compatibility-floor diff is 122 unique additions and zero removals; independently reviewed source API inventory",
+        "focused working-source checkpoints: 500 transport, 391 runtime, 110 Link and 194 protocol tests passed; one pre-existing runtime public-peer test ignored",
+        "49 serial USB tests; strict stable and Rust 1.87 scoped Clippy; three Android serial ABI compile checks on both compilers",
+        "six live Python RNS 1.4.2 shared-owner tests passed twice, including forwarding/non-forwarding failed Links, authenticated data/proofs, reset tombstone, authentication failure and immediate client restart",
+        "default/all-feature external consumer fixtures passed; app shared recovery, packet ownership, accounting and completion-lease controls passed",
+        "private signed same-radio relay, admission retry, slow proof and Resource-loss controls passed; live Python RNCP push/fetch Resource controls passed",
+        "final combined-source host, downstream, native package and physical qualification remain separate release gates; these focused receipts do not claim hardware readiness"
       ]
     }
   },
@@ -85,8 +84,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-transport.txt",
-      "itemCount": 1591,
-      "sha256": "984126dc9ec551d8c679386150b4bd8ab4a49a733eb952b6b1660748cbeaec26"
+      "itemCount": 1629,
+      "sha256": "38caacda033578146bda4581e6631a4720b44a81a826d2cd05e197cf801fb4df"
     },
     {
       "name": "rns-link",
@@ -94,8 +93,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-link.txt",
-      "itemCount": 358,
-      "sha256": "9fe7901e33a3c5b4adc6492751187cdb48cd31f564a425a249d6f8831319b3ca"
+      "itemCount": 359,
+      "sha256": "59d2f211857314e044bf31e5b78e4460483411c9b26c08904f8996295b189984"
     },
     {
       "name": "rns-protocol",
@@ -103,8 +102,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-protocol.txt",
-      "itemCount": 623,
-      "sha256": "fc12a8e4a0b457f2391308573c194b4633a2041d10ec9ae03247491b5b162aa1"
+      "itemCount": 624,
+      "sha256": "9fd1968c43d3a80b5da65416f43a805e3bfd3420c91acc8ad63a7a3ca58b359c"
     },
     {
       "name": "rns-interface",
@@ -121,8 +120,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-runtime.txt",
-      "itemCount": 2049,
-      "sha256": "0f8a2c64f336de0d9b5f2ac55d8df6072108e771e789ea1a855a84798aa10cbc"
+      "itemCount": 2063,
+      "sha256": "ca162e9ddb542f0daf5817ac26d32be80346d36bdadd70673bf2cdc2535e4e29"
     },
     {
       "name": "rns-tools",
