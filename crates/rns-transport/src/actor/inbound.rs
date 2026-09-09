@@ -244,7 +244,8 @@ impl TransportActor {
         let answers_path_request = self.path_requests.contains_key(&header.destination_hash)
             || self
                 .discovery_path_requests
-                .contains_key(&header.destination_hash);
+                .get(&header.destination_hash)
+                .is_some_and(|request| now_f64() < request.timeout);
         if let Some(entry) = self.interfaces.get_mut(&interface_id) {
             entry.ingress.received_announce();
             if !is_from_local_client
@@ -485,17 +486,21 @@ impl TransportActor {
             // Wake any callers waiting on a path for this destination.
             self.fire_path_waiters(&header.destination_hash);
 
-            if let Some(request) = self
+            if self
                 .discovery_path_requests
-                .get(&header.destination_hash)
-                .copied()
+                .contains_key(&header.destination_hash)
             {
                 if let Some(response) = self.path_response_from_cached_announce(
                     raw,
                     header.destination_hash,
                     header.hops,
                 ) {
-                    self.send_to_interface(request.requesting_interface, &response);
+                    self.finish_recursive_discovery(
+                        header.destination_hash,
+                        &response,
+                        interface_id,
+                        now_f64(),
+                    );
                 }
             }
 
@@ -858,18 +863,37 @@ impl TransportActor {
             };
             let remaining_hops = path.hops;
             let next_hop = path.next_hop;
-            self.send_to_interface(target_interface, &forwarded);
+            let link_id = rns_wire::hash::link_id_from_raw(raw, header.flags.header_type);
+            // Optional signalling is excluded from Link IDs but included in
+            // packet hashes. Changing it cannot renew or downgrade the same
+            // already-owned Link, even when ordinary packet dedup admits it.
+            if self.link_table.contains(&link_id) {
+                trace!("Link request already has a transport owner");
+                return;
+            }
+            if self.link_table.len() >= crate::link_table::MAX_TRANSIT_LINK_TABLE_ENTRIES {
+                debug!("transit Link table capacity exhausted; request not forwarded");
+                return;
+            }
+            let bitrate = self
+                .interfaces
+                .get(&target_interface)
+                .filter(|entry| !interface_marked_offline(entry))
+                .map(|entry| entry.bitrate);
+            if !self.send_to_interface(target_interface, &forwarded) {
+                return;
+            }
             if let Some(path) = self.path_table.get_live_mut(&header.destination_hash) {
                 path.touch();
             }
 
             // Cache the relay so the matching LRPROOF can be routed back to
             // the initiator without a fresh path lookup. The transport table
-            // uses the canonical bounded per-hop proof window; Link session
-            // policy owns any interface-specific establishment allowance.
-            let link_id = rns_wire::hash::link_id_from_raw(raw, header.flags.header_type);
+            // adds a bounded MTU round trip on this outbound medium to its
+            // per-hop proof window; it never renews for unvalidated traffic.
             let now = now_f64();
-            let proof_timeout = crate::link_table::pending_link_proof_deadline(now, remaining_hops);
+            let proof_timeout =
+                crate::link_table::transit_link_proof_deadline(now, remaining_hops, bitrate);
             let link_entry = crate::link_table::LinkEntry {
                 timestamp: now,
                 next_hop,
@@ -1122,6 +1146,13 @@ impl TransportActor {
         if header.context == rns_wire::context::PacketContext::Lrproof {
             if self.is_transport_enabled || from_local_client || for_local_client_link {
                 if let Some(link_entry) = self.link_table.get(&header.destination_hash) {
+                    if !link_entry.validated
+                        && (now_f64() >= link_entry.proof_timeout
+                            || !link_entry.proof_timeout.is_finite())
+                    {
+                        trace!("expired pending transit Link cannot accept a late proof");
+                        return;
+                    }
                     let expected_hops = link_entry.remaining_hops;
                     let outbound_interface = link_entry.interface_id;
                     let target_interface = link_entry.receiving_interface;
@@ -1298,6 +1329,12 @@ impl TransportActor {
         let Some(entry) = self.link_table.get(&header.destination_hash).cloned() else {
             return false;
         };
+        if !entry.validated
+            && (now_f64() >= entry.proof_timeout || !entry.proof_timeout.is_finite())
+        {
+            trace!("expired pending transit Link cannot forward traffic");
+            return true;
+        }
 
         let from_local_client = self.is_local_client_interface(interface_id);
         // Python 1.3.8 Transport.py:1548-1553 (the 1.3.7 eacff56f fix): links

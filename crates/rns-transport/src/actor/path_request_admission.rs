@@ -299,12 +299,17 @@ enum Admission {
 }
 
 impl TransportActor {
+    pub(super) fn retire_recursive_path_request_admissions(&mut self) {
+        self.pending_path_request_admissions
+            .retain(|pending| pending.discovery_owner.is_none());
+    }
+
     pub(super) fn retire_path_request_admissions(&mut self, interface: InterfaceId) {
         self.pending_path_request_admissions.retain(|pending| {
+            // The original requester may retire while other coalesced
+            // requesters still own the same operation. Its validity is
+            // checked against discovery_path_requests on the next poll.
             pending.interface != interface
-                && pending
-                    .discovery_owner
-                    .is_none_or(|owner| owner.requesting_interface != interface)
         });
     }
 

@@ -51,12 +51,35 @@ impl From<&LinkEntry> for ExpiredLink {
 
 /// Absolute deadline for transport bookkeeping that is waiting on a Link proof.
 ///
-/// The Link state machine owns interface-specific establishment allowances.
-/// Transport entries stay bounded to the canonical per-hop proof window so a
-/// slow or adversarial interface cannot extend unvalidated routing state.
+/// Retained compatibility helper for local endpoint bookkeeping. Locally owned
+/// Link establishment is still governed by the endpoint state machine.
 pub(crate) fn pending_link_proof_deadline(now: f64, remaining_hops: u8) -> f64 {
     now + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT * f64::from(remaining_hops.max(1))
 }
+
+/// Known rates are bounded below so no reported bitrate grants infinite
+/// unvalidated state. Zero/unknown rates retain the existing per-hop base.
+/// This is an MTU round-trip allowance, not an exact modem airtime prediction.
+pub(crate) fn interface_round_trip_allowance(bitrate: Option<u64>) -> f64 {
+    bitrate.filter(|rate| *rate > 0).map_or(0.0, |rate| {
+        2.0 * (rns_wire::constants::MTU * 8) as f64 / rate.max(5) as f64
+    })
+}
+
+/// A relay has received the request, but still has to serialize its outbound
+/// request and receive the proof. Sample the local outbound medium once; queue
+/// retries, unauthenticated traffic and later rate changes cannot renew it.
+pub(crate) fn transit_link_proof_deadline(
+    now: f64,
+    remaining_hops: u8,
+    bitrate: Option<u64>,
+) -> f64 {
+    pending_link_proof_deadline(now, remaining_hops) + interface_round_trip_allowance(bitrate)
+}
+
+/// Peer-created transit entries cannot grow the actor's table past this bound.
+/// Privileged callers retain the existing explicit LinkTable::insert API.
+pub(crate) const MAX_TRANSIT_LINK_TABLE_ENTRIES: usize = 4096;
 
 pub struct LinkTable {
     entries: HashMap<LinkId, LinkEntry>,
@@ -118,7 +141,7 @@ impl LinkTable {
         self.entries.retain(|_, entry| {
             if entry.validated {
                 entry.timestamp > cutoff
-            } else if now > entry.proof_timeout {
+            } else if now >= entry.proof_timeout || !entry.proof_timeout.is_finite() {
                 unvalidated_expired.push(ExpiredLink::from(&*entry));
                 false
             } else {
@@ -161,6 +184,29 @@ mod tests {
         assert_eq!(pending_link_proof_deadline(now, 1), 1_006.25);
         assert_eq!(pending_link_proof_deadline(now, 3), 1_018.25);
         assert_eq!(pending_link_proof_deadline(now, u8::MAX), 2_530.25);
+    }
+
+    #[test]
+    fn transit_proof_deadline_has_finite_known_rate_and_hop_bounds() {
+        let now = 1000.25;
+        for rate in [None, Some(0)] {
+            assert_eq!(transit_link_proof_deadline(now, 1, rate), now + 6.0);
+        }
+        for rate in [1, 5] {
+            assert_eq!(
+                transit_link_proof_deadline(now, 1, Some(rate)),
+                now + 1606.0
+            );
+        }
+        assert_eq!(
+            transit_link_proof_deadline(now, u8::MAX, Some(1)),
+            now + 3130.0
+        );
+        assert!(
+            (transit_link_proof_deadline(now, 1, Some(61)) - now - (8000.0 / 61.0 + 6.0)).abs()
+                < 1e-8
+        );
+        assert!(transit_link_proof_deadline(now, 1, Some(u64::MAX)).is_finite());
     }
 
     #[test]

@@ -7,6 +7,10 @@
 /// Unix time as f64 seconds — Python `time.time()` equivalent, the timebase
 /// used across path/reverse/rate/blackhole/tunnel tables.
 pub fn now_f64() -> f64 {
+    #[cfg(test)]
+    if let Some(now) = test_clock::NOW.with(std::cell::Cell::get) {
+        return now;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -32,3 +36,25 @@ pub mod rate_limit;
 pub mod reverse_table;
 pub mod traffic;
 pub mod tunnel;
+
+#[cfg(test)]
+pub(crate) mod test_clock {
+    use std::cell::Cell;
+    thread_local! { pub(super) static NOW: Cell<Option<f64>> = const { Cell::new(None) }; }
+
+    /// Synchronous actor tests have independent clocks under parallel runners.
+    pub(crate) struct Clock(Option<f64>);
+    impl Clock {
+        pub(crate) fn at(now: f64) -> Self {
+            Self(NOW.with(|clock| clock.replace(Some(now))))
+        }
+        pub(crate) fn set(&self, now: f64) {
+            NOW.with(|clock| clock.set(Some(now)));
+        }
+    }
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            NOW.with(|clock| clock.set(self.0));
+        }
+    }
+}

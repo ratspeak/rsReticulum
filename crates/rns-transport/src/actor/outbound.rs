@@ -648,14 +648,6 @@ impl TransportActor {
             );
             self.forward_path_request(requested_dest, Some(interface_id), tag_bytes, false);
         } else if self.is_transport_enabled && should_search_unknown {
-            if self.discovery_path_requests.contains_key(&requested_dest) {
-                debug!(
-                    dest = %hex::encode(requested_dest),
-                    "not forwarding path request — discovery request is already waiting"
-                );
-                return;
-            }
-
             let ingress_limited = self
                 .interfaces
                 .get_mut(&interface_id)
@@ -669,18 +661,9 @@ impl TransportActor {
                 return;
             }
 
-            debug!(
-                dest = %hex::encode(requested_dest),
-                "forwarding path request on other interfaces"
-            );
-            self.discovery_path_requests.insert(
-                requested_dest,
-                DiscoveryPathRequest {
-                    requesting_interface: interface_id,
-                    timeout: now + PATH_REQUEST_TIMEOUT,
-                },
-            );
-            self.forward_path_request(requested_dest, Some(interface_id), tag_bytes, true);
+            if self.begin_or_join_recursive_discovery(requested_dest, interface_id, now) {
+                self.forward_path_request(requested_dest, Some(interface_id), tag_bytes, true);
+            }
         } else if self.has_local_client_interfaces() {
             pr_log!(
                 self,

@@ -32,6 +32,7 @@ mod outbound;
 mod path_recovery;
 mod path_request_admission;
 mod persistence;
+mod recursive_discovery;
 mod rpc;
 
 // In-process Links need two distinguishable ingress edges even though both
@@ -123,6 +124,9 @@ pub struct TransportActor {
     /// Python `discovery_path_requests`: external interfaces waiting for a
     /// matching announce while this transport recursively searches elsewhere.
     pub discovery_path_requests: HashMap<[u8; 16], DiscoveryPathRequest>,
+    // The public Copy record retains the original requester; this private
+    // ledger owns all currently live requester/channel generations.
+    recursive_discovery_waiters: HashMap<[u8; 16], recursive_discovery::RecursiveDiscoveryWaiters>,
     /// Python `discovery_pr_tags`: destination hash plus truncated path-request tag.
     pub discovery_pr_tags: HashMap<Vec<u8>, f64>,
     /// Python `pending_discovery_prs`: failed-link rediscovery requests queued
@@ -382,6 +386,7 @@ impl TransportActor {
             link_endpoints: HashMap::new(),
             path_requests: HashMap::new(),
             discovery_path_requests: HashMap::new(),
+            recursive_discovery_waiters: HashMap::new(),
             discovery_pr_tags: HashMap::new(),
             pending_discovery_prs: VecDeque::new(),
             pending_path_request_admissions: VecDeque::new(),
@@ -825,6 +830,9 @@ impl TransportActor {
             TransportMessage::SetTransportEnabled { enabled } => {
                 debug!(enabled, "setting transport enabled");
                 self.is_transport_enabled = enabled;
+                if !enabled {
+                    self.cancel_recursive_discovery();
+                }
                 // The runtime sends the identity before the enable flag, so
                 // the swap decision must be re-evaluated here.
                 self.apply_transport_identity_policy();
@@ -885,6 +893,7 @@ impl TransportActor {
                 }
                 debug!(id, name = %iface_name, outbound = is_outbound, role = role.as_str(), "registering interface");
                 if self.interfaces.contains_key(&id) {
+                    self.retire_recursive_discovery_interface(id);
                     self.retire_path_request_admissions(id);
                     self.terminate_link_endpoints_for_interface(
                         id,
@@ -1166,6 +1175,7 @@ impl TransportActor {
         self.packet_metrics_order.clear();
         self.receipt_proof_txs.clear();
         self.discovery_path_requests.clear();
+        self.recursive_discovery_waiters.clear();
         self.pending_local_path_requests.clear();
         self.pending_discovery_prs.clear();
         self.pending_path_request_admissions.clear();
@@ -1436,8 +1446,7 @@ impl TransportActor {
             .retain(|(_, interface_id), _| *interface_id != id);
         self.pending_local_path_requests
             .retain(|_, waiting_interface| *waiting_interface != id);
-        self.discovery_path_requests
-            .retain(|_, request| request.requesting_interface != id);
+        self.retire_recursive_discovery_interface(id);
         self.retire_path_request_admissions(id);
         self.interfaces.remove(&id);
         if role == Some(InterfaceRole::SharedInstancePeer) {
@@ -1999,6 +2008,7 @@ fn mode_discovers_unknown_paths(mode: InterfaceMode) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod slow_media_discovery;
     use super::*;
     use crate::constants::{InterfaceDirection, InterfaceMode};
     use crate::messages::{
@@ -2537,7 +2547,10 @@ mod tests {
             "multipoint interface must relay an announce back to its other peers"
         );
 
-        for role in [InterfaceRole::LocalClient, InterfaceRole::SharedInstancePeer] {
+        for role in [
+            InterfaceRole::LocalClient,
+            InterfaceRole::SharedInstancePeer,
+        ] {
             actor.interfaces.get_mut(&1).unwrap().role = role;
             assert!(
                 !actor.interface_allows_announce(1, &dest, Some(1)),
@@ -3399,11 +3412,12 @@ mod tests {
         let link_entry = actor.link_table.get(&link_id).unwrap();
         assert_eq!(
             link_entry.proof_timeout,
-            crate::link_table::pending_link_proof_deadline(
+            crate::link_table::transit_link_proof_deadline(
                 link_entry.timestamp,
                 link_entry.remaining_hops,
+                Some(5),
             ),
-            "relay proof lifetime must not grow with interface serialization time"
+            "relay proof lifetime includes a bounded outbound MTU round trip"
         );
     }
 
@@ -11002,8 +11016,8 @@ mod tests {
             &announce_raw[announce_offset..]
         );
         assert!(
-            actor.discovery_path_requests.contains_key(&dest),
-            "Python leaves discovery_path_requests in place until timeout cleanup"
+            !actor.discovery_path_requests.contains_key(&dest),
+            "a validated discovery response consumes its live requesters once"
         );
     }
 
