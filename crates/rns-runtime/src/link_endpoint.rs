@@ -110,6 +110,8 @@ pub(crate) struct PendingLinkEndpointSend {
     pub(crate) link_id: [u8; 16],
     pub(crate) role: LinkEndpointRole,
     pub(crate) final_unbind: bool,
+    /// Ordinary packet proof clock to arm only after endpoint acceptance.
+    pub(crate) packet_proof_hash: Option<[u8; 32]>,
     pub(crate) result_rx: oneshot::Receiver<LinkEndpointSendResult>,
 }
 
@@ -406,6 +408,7 @@ pub(crate) fn send_message(
             link_id,
             role,
             final_unbind: false,
+            packet_proof_hash: None,
             result_rx,
         },
     )
@@ -431,6 +434,7 @@ pub(crate) fn send_and_unbind_message(
             link_id,
             role,
             final_unbind: true,
+            packet_proof_hash: None,
             result_rx,
         },
     )

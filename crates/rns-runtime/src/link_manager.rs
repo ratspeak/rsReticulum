@@ -23,6 +23,9 @@ use rns_protocol::resource::{
     OutboundTransfer, TransferAction,
 };
 use rns_protocol::resource_adv::ResourceAdvertisement;
+use rns_transport::link_endpoint_dispatch::{
+    LINK_ENDPOINT_ADMISSION_TIMEOUT_MAX, LinkEndpointDispatchCancellation,
+};
 use rns_transport::link_messages::{AnnounceRequest, DestinationEvent};
 use rns_transport::messages::{
     InterfaceId, LinkEndpointBindResult, LinkEndpointBinding, LinkEndpointLifecycleEvent,
@@ -63,9 +66,43 @@ struct ActiveLink {
 
 struct PendingResponderEndpointBind {
     ownership: ResponderEndpointOwnership,
-    result_rx: oneshot::Receiver<LinkEndpointBindResult>,
+    result_rx: ResponderBindReceiver,
     register_link: TransportMessage,
     proof: TransportMessage,
+}
+
+enum ResponderBindReceiver {
+    Legacy(oneshot::Receiver<LinkEndpointBindResult>),
+    Exact(rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt),
+}
+
+impl ResponderBindReceiver {
+    fn try_recv(
+        &mut self,
+    ) -> Result<
+        (
+            LinkEndpointBindResult,
+            Option<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchToken>,
+        ),
+        oneshot::error::TryRecvError,
+    > {
+        match self {
+            Self::Legacy(rx) => rx.try_recv().map(|result| (result, None)),
+            Self::Exact(rx) => rx.try_recv().map(|result| match result {
+                Ok(token) => (LinkEndpointBindResult::Bound, Some(token)),
+                Err(result) => (result, None),
+            }),
+        }
+    }
+}
+
+struct PendingPacketDispatch {
+    receipt: LinkPacketSendReceipt,
+    generation: Option<u64>,
+    started_at: std::time::Instant,
+    cancellation: LinkEndpointDispatchCancellation,
+    result_rx:
+        oneshot::Receiver<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchOutcome>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,14 +391,34 @@ pub struct ResourceCompletion {
 ///
 /// This opt-in stream contains validated ordinary Link-packet proofs, Resource
 /// starts and conclusions, ordinary inbound completion payloads, and Link
-/// closure in manager-observation order. Progress remains available only
-/// through the bounded best-effort Resource event channel. Delivery is
+/// closure in manager-observation order. It also observes exact bounded
+/// outbound wait windows. UI progress remains available only through the
+/// bounded best-effort Resource event channel. Delivery is
 /// guaranteed while the unbounded receiver remains alive. Request Resources
 /// retain their start and conclusion events but dispatch inline and never
 /// produce a [`LinkManagerAccountingEvent::ResourceCompletion`].
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum LinkManagerAccountingEvent {
+    /// Exact bounded wait for an ordinary outbound packet: local command
+    /// admission first, then the Link RTT proof window on endpoint acceptance.
+    /// Endpoint acceptance is not radio transmission or remote delivery.
+    OutboundPacketWait {
+        receipt: LinkPacketSendReceipt,
+        started_at: std::time::Instant,
+        timeout: std::time::Duration,
+        awaiting_admission: bool,
+        cancellation: Option<LinkEndpointDispatchCancellation>,
+    },
+    /// Exact bounded wait currently owned by an outbound logical Resource.
+    /// Emitted only when its protocol deadline changes. Delayed consumers
+    /// must retain `started_at` rather than restarting the clock on receipt.
+    OutboundResourceWait {
+        link_id: [u8; 16],
+        resource_id: [u8; 32],
+        started_at: std::time::Instant,
+        timeout: std::time::Duration,
+    },
     /// A validated proof for an ordinary application Link packet.
     LinkPacketProof(LinkPacketProof),
     /// Resource start or terminal conclusion; progress is omitted.
@@ -375,6 +432,32 @@ pub enum LinkManagerAccountingEvent {
 impl std::fmt::Debug for LinkManagerAccountingEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::OutboundPacketWait {
+                receipt,
+                started_at,
+                timeout,
+                awaiting_admission,
+                cancellation,
+            } => f
+                .debug_struct("OutboundPacketWait")
+                .field("awaiting_admission", awaiting_admission)
+                .field("cancellable", &cancellation.is_some())
+                .field("receipt", receipt)
+                .field("started_at", started_at)
+                .field("timeout", timeout)
+                .finish(),
+            Self::OutboundResourceWait {
+                link_id,
+                resource_id,
+                started_at,
+                timeout,
+            } => f
+                .debug_struct("OutboundResourceWait")
+                .field("link_id", &hex::encode(link_id))
+                .field("resource_id", &hex::encode(resource_id))
+                .field("started_at", started_at)
+                .field("timeout", timeout)
+                .finish(),
             Self::LinkPacketProof(proof) => f
                 .debug_struct("LinkPacketProof")
                 .field("link_id", &hex::encode(proof.link_id))
@@ -453,6 +536,10 @@ struct ResourceTransferStart {
 }
 
 pub struct LinkManager {
+    endpoint_dispatch: Option<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle>,
+    endpoint_dispatch_tokens:
+        HashMap<[u8; 16], rns_transport::link_endpoint_dispatch::LinkEndpointDispatchToken>,
+    pending_packet_dispatches: Vec<PendingPacketDispatch>,
     transport_tx: mpsc::Sender<TransportMessage>,
     event_rx: mpsc::Receiver<DestinationEvent>,
     /// Destination announces accepted while the bounded transport ingress is
@@ -527,6 +614,10 @@ pub struct LinkManager {
     /// Ordered non-progress accounting stream for owners that cannot tolerate
     /// capacity loss.
     accounting_event_tx: Option<mpsc::UnboundedSender<LinkManagerAccountingEvent>>,
+    /// At most one entry per active outbound logical Resource; pruned each
+    /// tick. Deadline changes, not tick frequency, produce observations.
+    outbound_resource_waits:
+        HashMap<([u8; 16], [u8; 32]), (std::time::Instant, std::time::Duration)>,
     /// Decrypted channel envelopes as `(link_id, msg_type, payload)`.
     channel_message_tx: Option<mpsc::Sender<LinkChannelMessage>>,
     /// User message types accepted by channels owned by this manager.
@@ -548,6 +639,15 @@ pub struct LinkManager {
 }
 
 impl LinkManager {
+    /// Use exact generation-bound driver-admission receipts for subsequently
+    /// accepted Links. The handle must belong to this manager's transport.
+    pub fn set_link_endpoint_dispatch_handle(
+        &mut self,
+        handle: rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle,
+    ) {
+        self.endpoint_dispatch = Some(handle);
+    }
+
     pub fn new(
         transport_tx: mpsc::Sender<TransportMessage>,
         event_rx: mpsc::Receiver<DestinationEvent>,
@@ -556,6 +656,9 @@ impl LinkManager {
     ) -> Self {
         let (endpoint_lifecycle_tx, endpoint_lifecycle_rx) = mpsc::unbounded_channel();
         Self {
+            endpoint_dispatch: None,
+            endpoint_dispatch_tokens: HashMap::new(),
+            pending_packet_dispatches: Vec::new(),
             transport_tx,
             event_rx,
             pending_destination_announces: VecDeque::new(),
@@ -596,6 +699,7 @@ impl LinkManager {
             destination_delivery_proof_tx: None,
             resource_event_tx: None,
             accounting_event_tx: None,
+            outbound_resource_waits: HashMap::new(),
             channel_message_tx: None,
             channel_message_types: Vec::new(),
             link_closed_tx: None,
@@ -630,6 +734,9 @@ impl LinkManager {
         let (endpoint_lifecycle_tx, endpoint_lifecycle_rx) = mpsc::unbounded_channel();
 
         Self {
+            endpoint_dispatch: None,
+            endpoint_dispatch_tokens: HashMap::new(),
+            pending_packet_dispatches: Vec::new(),
             transport_tx,
             event_rx,
             pending_destination_announces: VecDeque::new(),
@@ -670,6 +777,7 @@ impl LinkManager {
             destination_delivery_proof_tx: None,
             resource_event_tx: None,
             accounting_event_tx: None,
+            outbound_resource_waits: HashMap::new(),
             channel_message_tx: None,
             channel_message_types: Vec::new(),
             link_closed_tx: None,
@@ -773,6 +881,31 @@ impl LinkManager {
         self.flush_pending_destination_announces();
         self.flush_pending_legacy_terminal_notifications();
         self.on_tick();
+        self.observe_outbound_resource_waits();
+    }
+
+    fn observe_outbound_resource_waits(&mut self) {
+        let mut current = HashMap::new();
+        for (link_id, active) in &self.active_links {
+            for transfer in active.outbound_resources.values() {
+                let Some(window) = transfer.timeout_window() else {
+                    continue;
+                };
+                let key = (*link_id, Self::outbound_resource_identity(transfer).0);
+                if self.outbound_resource_waits.get(&key) != Some(&window) {
+                    if let Some(tx) = &self.accounting_event_tx {
+                        let _ = tx.send(LinkManagerAccountingEvent::OutboundResourceWait {
+                            link_id: key.0,
+                            resource_id: key.1,
+                            started_at: window.0,
+                            timeout: window.1,
+                        });
+                    }
+                }
+                current.insert(key, window);
+            }
+        }
+        self.outbound_resource_waits = current;
     }
 
     pub async fn run(mut self) {
@@ -839,8 +972,65 @@ impl LinkManager {
         self.drain_shutdown_link_ownership().await;
     }
 
-    fn poll_link_endpoints(&mut self) -> bool {
+    fn poll_packet_dispatches(&mut self) -> bool {
+        use rns_transport::link_endpoint_dispatch::LinkEndpointDispatchOutcome;
         let mut progressed = false;
+        let mut waiting = Vec::new();
+        let mut failed_links = Vec::new();
+        for mut pending in std::mem::take(&mut self.pending_packet_dispatches) {
+            let link_id = pending.receipt.link_id;
+            if self.active_endpoint_generations.get(&link_id).copied() != pending.generation {
+                continue;
+            }
+            let Some(active) = self.active_links.get(&link_id) else {
+                continue;
+            };
+            let window = match pending.result_rx.try_recv() {
+                Ok(LinkEndpointDispatchOutcome::Sent {
+                    packet_hash,
+                    dispatched_at,
+                }) if packet_hash == pending.receipt.packet_hash => {
+                    Some((dispatched_at, active.link.packet_proof_timeout(), false))
+                }
+                Ok(LinkEndpointDispatchOutcome::Expired) => Some((
+                    pending.started_at,
+                    LINK_ENDPOINT_ADMISSION_TIMEOUT_MAX,
+                    true,
+                )),
+                Ok(LinkEndpointDispatchOutcome::Cancelled) => {
+                    Some((pending.started_at, std::time::Duration::ZERO, true))
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    waiting.push(pending);
+                    continue;
+                }
+                Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
+                    failed_links.push(link_id);
+                    None
+                }
+            };
+            progressed = true;
+            if let Some((started_at, timeout, awaiting_admission)) = window {
+                if let Some(tx) = &self.accounting_event_tx {
+                    let _ = tx.send(LinkManagerAccountingEvent::OutboundPacketWait {
+                        receipt: pending.receipt,
+                        started_at,
+                        timeout,
+                        awaiting_admission,
+                        cancellation: None,
+                    });
+                }
+            }
+        }
+        self.pending_packet_dispatches = waiting;
+        for link_id in failed_links {
+            self.close_active_link(link_id, CloseReason::DestinationClosed, false);
+        }
+        progressed
+    }
+
+    fn poll_link_endpoints(&mut self) -> bool {
+        let mut progressed = self.poll_packet_dispatches();
         let mut completed_binds = Vec::new();
         let link_ids: Vec<_> = self.pending_endpoint_binds.keys().copied().collect();
         for link_id in link_ids {
@@ -861,11 +1051,14 @@ impl LinkManager {
             };
             progressed = true;
             match result {
-                Some(LinkEndpointBindResult::Bound)
+                Some((LinkEndpointBindResult::Bound, token))
                     if self.active_links.contains_key(&link_id)
                         && self.active_endpoint_generations.get(&link_id)
                             == Some(&pending.ownership.generation) =>
                 {
+                    if let Some(token) = token {
+                        self.endpoint_dispatch_tokens.insert(link_id, token);
+                    }
                     self.owned_endpoint_bindings
                         .insert(link_id, pending.ownership);
                     // Registering the route and publishing LRPROOF are a
@@ -882,7 +1075,7 @@ impl LinkManager {
                         pending.proof,
                     );
                 }
-                Some(LinkEndpointBindResult::Bound) => {
+                Some((LinkEndpointBindResult::Bound, _)) => {
                     // The candidate was closed while Bind was in flight. We
                     // own this fresh endpoint, but never published RegisterLink,
                     // so release it without deregistering another local role.
@@ -898,7 +1091,7 @@ impl LinkManager {
                         false,
                     );
                 }
-                Some(result) => {
+                Some((result, _)) => {
                     tracing::error!(
                         link_id = %hex::encode(link_id),
                         result = ?result,
@@ -923,7 +1116,34 @@ impl LinkManager {
         let mut failed_sends = Vec::new();
         for (index, pending) in self.pending_endpoint_sends.iter_mut().enumerate() {
             match pending.result_rx.try_recv() {
-                Ok(LinkEndpointSendResult::Sent | LinkEndpointSendResult::Queued { .. }) => {
+                Ok(
+                    result @ (LinkEndpointSendResult::Sent | LinkEndpointSendResult::Queued { .. }),
+                ) => {
+                    if let Some(packet_hash) = pending.packet_proof_hash {
+                        if let Some(active) = self.active_links.get(&pending.link_id) {
+                            if let Some(tx) = &self.accounting_event_tx {
+                                let _ = tx.send(LinkManagerAccountingEvent::OutboundPacketWait {
+                                    receipt: LinkPacketSendReceipt {
+                                        link_id: pending.link_id,
+                                        packet_hash,
+                                    },
+                                    started_at: std::time::Instant::now(),
+                                    timeout: active.link.packet_proof_timeout().saturating_add(
+                                        if matches!(result, LinkEndpointSendResult::Queued { .. }) {
+                                            std::time::Duration::from_secs(10)
+                                        } else {
+                                            std::time::Duration::ZERO
+                                        },
+                                    ),
+                                    awaiting_admission: matches!(
+                                        result,
+                                        LinkEndpointSendResult::Queued { .. }
+                                    ),
+                                    cancellation: None,
+                                });
+                            }
+                        }
+                    }
                     if pending.final_unbind {
                         accepted_final_sends.push((pending.link_id, pending.role));
                     }
@@ -1145,9 +1365,14 @@ impl LinkManager {
                 payload,
                 result_tx,
             } => {
+                if result_tx.as_ref().is_some_and(oneshot::Sender::is_closed) {
+                    return true;
+                }
                 let result = self.send_link_packet(&link_id, &payload);
                 if let Some(tx) = result_tx {
-                    let _ = tx.send(result);
+                    if let Err(Ok(receipt)) = tx.send(result) {
+                        self.cancel_unadmitted_packet(&receipt);
+                    }
                 }
                 true
             }
@@ -1169,9 +1394,12 @@ impl LinkManager {
                 auto_compress,
                 result_tx,
             } => {
+                if result_tx.as_ref().is_some_and(oneshot::Sender::is_closed) {
+                    return true;
+                }
                 let result = self.send_link_payload(&link_id, payload, auto_compress);
                 if let Some(tx) = result_tx {
-                    let _ = tx.send(result);
+                    self.publish_link_payload_receipt(tx, result);
                 }
                 true
             }
@@ -1935,16 +2163,20 @@ impl LinkManager {
         // private post-bind transaction until the actor confirms this manager
         // acquired fresh endpoint ownership.
         let transport_tx = self.transport_tx.clone();
-        let bind_permit = match transport_tx.try_reserve() {
-            Ok(permit) => permit,
-            Err(error) => {
-                tracing::warn!(
-                    link_id = hex::encode(link_id),
-                    error = %error,
-                    "link request rejected — transport queue cannot bind Link endpoint"
-                );
-                return;
-            }
+        let bind_permit = if self.endpoint_dispatch.is_some() {
+            None
+        } else {
+            Some(match transport_tx.try_reserve() {
+                Ok(permit) => permit,
+                Err(error) => {
+                    tracing::warn!(
+                        link_id = hex::encode(link_id),
+                        error = %error,
+                        "link request rejected — transport queue cannot bind Link endpoint"
+                    );
+                    return;
+                }
+            })
         };
 
         // LXMF DIRECT uses resource transfer past `LINK_PACKET_MAX_CONTENT`;
@@ -1982,17 +2214,30 @@ impl LinkManager {
         // Required: transport drops link-addressed packets (LRRTT, Resource,
         // Keepalive...) as unroutable without this registration. The proof is
         // pinned to the ingress interface, matching Python responder Links.
-        let (bind_result_tx, bind_result_rx) = oneshot::channel();
         let binding = LinkEndpointBinding {
             link_id,
             interface_id,
             role: LinkEndpointRole::Responder,
         };
-        bind_permit.send(TransportMessage::BindLinkEndpoint {
-            binding,
-            lifecycle_tx: self.endpoint_lifecycle_tx.clone(),
-            result_tx: bind_result_tx,
-        });
+        let bind_result_rx = if let Some(handle) = &self.endpoint_dispatch {
+            match handle.try_bind(binding, self.endpoint_lifecycle_tx.clone()) {
+                Ok(receipt) => ResponderBindReceiver::Exact(receipt),
+                Err(_) => {
+                    self.close_active_link(link_id, CloseReason::DestinationClosed, false);
+                    return;
+                }
+            }
+        } else {
+            let (result_tx, result_rx) = oneshot::channel();
+            bind_permit
+                .unwrap()
+                .send(TransportMessage::BindLinkEndpoint {
+                    binding,
+                    lifecycle_tx: self.endpoint_lifecycle_tx.clone(),
+                    result_tx,
+                });
+            ResponderBindReceiver::Legacy(result_rx)
+        };
         self.pending_endpoint_binds.insert(
             link_id,
             PendingResponderEndpointBind {
@@ -3818,6 +4063,9 @@ impl LinkManager {
             return false;
         };
         self.active_endpoint_generations.remove(&link_id);
+        self.endpoint_dispatch_tokens.remove(&link_id);
+        self.pending_packet_dispatches
+            .retain(|pending| pending.receipt.link_id != link_id);
         let ownership = self.owned_endpoint_bindings.remove(&link_id);
         if let Some(ownership) = ownership {
             self.install_endpoint_tombstone(ownership, EndpointCleanupKind::Explicit);
@@ -4978,16 +5226,19 @@ impl LinkManager {
         self.resource_event_tx = Some(tx);
     }
 
-    /// Install one ordered, capacity-lossless non-progress accounting stream.
+    /// Install one ordered, capacity-lossless accounting stream.
     ///
     /// The receiver must be drained for the manager's lifetime. Existing
     /// bounded completion, Resource-event, and Link-close channels remain
     /// independent compatibility notifications.
+    /// Protocol deadline observations are coalesced to at most one changed
+    /// window per active Resource per tick; UI progress is not sent here.
     pub fn set_accounting_event_channel(
         &mut self,
         tx: mpsc::UnboundedSender<LinkManagerAccountingEvent>,
     ) {
         self.accounting_event_tx = Some(tx);
+        self.outbound_resource_waits.clear();
     }
 
     pub fn set_channel_message_channel(&mut self, tx: mpsc::Sender<LinkChannelMessage>) {
@@ -5196,9 +5447,15 @@ impl LinkManager {
             .encrypt(payload)
             .map_err(|_| LinkSendError::NoSessionKeys)?;
         let transport_tx = self.transport_tx.clone();
-        let permit = transport_tx
-            .try_reserve()
-            .map_err(|_| LinkSendError::TransportUnavailable)?;
+        let permit = if self.endpoint_dispatch_tokens.contains_key(link_id) {
+            None
+        } else {
+            Some(
+                transport_tx
+                    .try_reserve()
+                    .map_err(|_| LinkSendError::TransportUnavailable)?,
+            )
+        };
 
         let header = rns_wire::header::PacketHeader {
             flags: rns_wire::flags::PacketFlags {
@@ -5221,18 +5478,85 @@ impl LinkManager {
             .active_links
             .get_mut(link_id)
             .ok_or(LinkSendError::LinkNotFound)?;
-        active.link.record_tx(encrypted.len());
-        permit.send(Self::endpoint_send_message(
-            &mut self.pending_endpoint_sends,
-            *link_id,
-            active.link.role(),
-            Bytes::from(raw),
-        ));
-
-        Ok(LinkPacketSendReceipt {
+        let receipt = LinkPacketSendReceipt {
             link_id: *link_id,
             packet_hash,
-        })
+        };
+        let started_at = std::time::Instant::now();
+        let mut cancellation = None;
+        let timeout = if let Some(token) = self.endpoint_dispatch_tokens.get(link_id) {
+            let timeout = LINK_ENDPOINT_ADMISSION_TIMEOUT_MAX;
+            let (result_rx, cancel) = token
+                .try_send_cancellable(
+                    OutboundRequest {
+                        raw: Bytes::from(raw),
+                        destination_hash: *link_id,
+                    },
+                    started_at + timeout,
+                )
+                .map_err(|_| LinkSendError::TransportUnavailable)?;
+            cancellation = Some(cancel.clone());
+            self.pending_packet_dispatches.push(PendingPacketDispatch {
+                receipt: receipt.clone(),
+                generation: self.active_endpoint_generations.get(link_id).copied(),
+                started_at,
+                cancellation: cancel,
+                result_rx,
+            });
+            timeout
+        } else {
+            let (message, mut pending) = crate::link_endpoint::send_message(
+                *link_id,
+                Self::endpoint_role(active.link.role()),
+                Bytes::from(raw),
+            );
+            pending.packet_proof_hash = Some(packet_hash);
+            self.pending_endpoint_sends.push(pending);
+            permit.unwrap().send(message);
+            std::time::Duration::from_secs(10)
+        };
+        active.link.record_tx(encrypted.len());
+        if let Some(tx) = &self.accounting_event_tx {
+            let _ = tx.send(LinkManagerAccountingEvent::OutboundPacketWait {
+                receipt: receipt.clone(),
+                started_at,
+                // Bound local command admission separately from the ordinary
+                // packet proof clock, which starts on endpoint acceptance.
+                timeout,
+                awaiting_admission: true,
+                cancellation,
+            });
+        }
+        Ok(receipt)
+    }
+
+    fn cancel_unadmitted_packet(&mut self, receipt: &LinkPacketSendReceipt) {
+        for pending in &self.pending_packet_dispatches {
+            if pending.receipt.link_id == receipt.link_id
+                && pending.receipt.packet_hash == receipt.packet_hash
+            {
+                pending.cancellation.cancel();
+            }
+        }
+    }
+
+    fn publish_link_payload_receipt(
+        &mut self,
+        tx: oneshot::Sender<Result<LinkPayloadSendReceipt, LinkSendError>>,
+        result: Result<LinkPayloadSendReceipt, LinkSendError>,
+    ) {
+        if let Err(Ok(receipt)) = tx.send(result) {
+            match receipt {
+                LinkPayloadSendReceipt::Packet(receipt) => self.cancel_unadmitted_packet(&receipt),
+                LinkPayloadSendReceipt::Resource(receipt) => {
+                    self.cancel_link_resource(
+                        &receipt.link_id,
+                        &receipt.resource_hash,
+                        LinkResourceDirection::Outbound,
+                    );
+                }
+            }
+        }
     }
 
     /// Send realtime Link data on the Link's exact bound interface without
@@ -9435,7 +9759,18 @@ mod tests {
         let receipt = lm
             .send_link_packet(&link_id, b"backchannel payload")
             .expect("link packet queued");
+        assert!(
+            matches!(accounting_rx.try_recv(), Ok(LinkManagerAccountingEvent::OutboundPacketWait {
+            receipt: observed, timeout, awaiting_admission: true, ..
+        }) if observed.packet_hash == receipt.packet_hash && timeout == std::time::Duration::from_secs(10))
+        );
         let outbound = next_transport_message(&mut transport_rx).expect("link packet outbound");
+        lm.poll_link_endpoints();
+        assert!(
+            matches!(accounting_rx.try_recv(), Ok(LinkManagerAccountingEvent::OutboundPacketWait {
+            receipt: observed, timeout, awaiting_admission: false, ..
+        }) if observed.packet_hash == receipt.packet_hash && timeout == lm.active_links[&link_id].link.packet_proof_timeout())
+        );
         let TransportMessage::Outbound(request) = outbound else {
             panic!("expected outbound link packet");
         };
@@ -9480,6 +9815,257 @@ mod tests {
             Ok(LinkManagerAccountingEvent::LinkPacketProof(proof))
                 if proof.link_id == link_id && proof.packet_hash == receipt.packet_hash
         ));
+    }
+
+    #[tokio::test]
+    async fn canonical_packet_accounting_waits_for_driver_and_preserves_timestamp() {
+        canonical_packet_accounting_fixture(0).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_packet_close_cancels_queued_dispatch_before_driver() {
+        canonical_packet_accounting_fixture(1).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_packet_explicit_cancel_preserves_healthy_link() {
+        canonical_packet_accounting_fixture(2).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_packet_failed_receipt_publication_cancels_only_its_packet() {
+        canonical_packet_accounting_fixture(3).await;
+    }
+
+    async fn canonical_packet_accounting_fixture(mode: u8) {
+        use rns_transport::actor::TransportActor;
+        use rns_transport::constants::{InterfaceDirection, InterfaceMode};
+        use rns_transport::messages::{InterfaceEntry, TimerTick};
+        use std::time::{Duration, Instant};
+
+        let (initiator, mut responder) = handshaken_link_pair();
+        responder.rtt = Some(Duration::from_millis(1));
+        let link_id = responder.link_id;
+        let (mut actor, transport_tx) = TransportActor::new();
+        let (driver_tx, mut driver_rx) = mpsc::channel(1);
+        driver_tx.try_send(Bytes::from_static(b"occupied")).unwrap();
+        actor.interfaces.insert(
+            7,
+            InterfaceEntry::new(
+                "bounded runtime test driver".to_string(),
+                InterfaceMode::Full,
+                InterfaceDirection::bidirectional(),
+                3_515,
+                500,
+                driver_tx,
+            ),
+        );
+        let dispatch = actor.link_endpoint_dispatch_handle();
+        let actor_task = tokio::spawn(actor.run());
+        let (_, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::new(transport_tx.clone(), event_rx, [0xCA; 16], None);
+        manager.set_link_endpoint_dispatch_handle(dispatch.clone());
+        manager
+            .active_links
+            .insert(link_id, active_link_entry_at(responder, 7));
+        own_test_endpoint(&mut manager, link_id);
+        let token = dispatch
+            .try_bind(
+                manager.owned_endpoint_bindings[&link_id].binding,
+                manager.endpoint_lifecycle_tx.clone(),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        manager.endpoint_dispatch_tokens.insert(link_id, token);
+        let (accounting_tx, mut accounting_rx) = mpsc::unbounded_channel();
+        manager.set_accounting_event_channel(accounting_tx);
+        let (expired_reply_tx, mut expired_reply_rx) = oneshot::channel();
+        expired_reply_rx.close();
+        manager.handle_command(LinkManagerCommand::SendLinkPayload {
+            link_id,
+            payload: b"expired before command execution".to_vec(),
+            auto_compress: false,
+            result_tx: Some(expired_reply_tx),
+        });
+        assert!(manager.pending_packet_dispatches.is_empty());
+        assert!(accounting_rx.try_recv().is_err());
+        let receipt = manager
+            .send_link_packet(&link_id, b"bounded packet")
+            .unwrap();
+        let cancellation = match accounting_rx.try_recv().unwrap() {
+            LinkManagerAccountingEvent::OutboundPacketWait {
+                receipt: observed,
+                timeout,
+                awaiting_admission: true,
+                cancellation: Some(cancel),
+                ..
+            } if observed.packet_hash == receipt.packet_hash
+                && timeout == Duration::from_secs(120) =>
+            {
+                cancel
+            }
+            _ => panic!("canonical initial wait must carry exact cancellation authority"),
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        manager.poll_link_endpoints();
+        assert!(
+            accounting_rx.try_recv().is_err(),
+            "no proof clock before driver admission"
+        );
+        if mode == 1 {
+            manager.close_active_link(link_id, CloseReason::DestinationClosed, false);
+            assert!(manager.pending_packet_dispatches.is_empty());
+            while accounting_rx.try_recv().is_ok() {}
+        } else if mode == 2 {
+            cancellation.cancel();
+        } else if mode == 3 {
+            let (reply_tx, mut reply_rx) = oneshot::channel();
+            reply_rx.close();
+            manager.publish_link_payload_receipt(
+                reply_tx,
+                Ok(LinkPayloadSendReceipt::Packet(receipt.clone())),
+            );
+        }
+        assert_eq!(driver_rx.recv().await.unwrap(), b"occupied"[..]);
+        transport_tx
+            .send(TransportMessage::Tick(TimerTick {
+                timestamp: unix_now(),
+            }))
+            .await
+            .unwrap();
+        if mode != 0 {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), driver_rx.recv())
+                    .await
+                    .is_err()
+            );
+            manager.poll_link_endpoints();
+            if mode == 1 {
+                assert!(accounting_rx.try_recv().is_err());
+            } else {
+                assert!(matches!(
+                    accounting_rx.try_recv(),
+                    Ok(LinkManagerAccountingEvent::OutboundPacketWait {
+                        timeout: Duration::ZERO,
+                        awaiting_admission: true,
+                        cancellation: None,
+                        ..
+                    })
+                ));
+                assert!(manager.active_links[&link_id].link.is_active());
+                manager
+                    .send_link_packet(&link_id, b"next packet survives")
+                    .unwrap();
+                let raw = tokio::time::timeout(Duration::from_secs(2), driver_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+                assert_eq!(
+                    initiator.decrypt(&raw[offset..]).unwrap(),
+                    b"next packet survives"
+                );
+            }
+        } else {
+            let raw = tokio::time::timeout(Duration::from_secs(2), driver_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+            assert_eq!(
+                initiator.decrypt(&raw[offset..]).unwrap(),
+                b"bounded packet"
+            );
+            let before_observation = Instant::now();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            manager.poll_link_endpoints();
+            assert!(
+                matches!(accounting_rx.try_recv(), Ok(LinkManagerAccountingEvent::OutboundPacketWait {
+                receipt: observed, started_at, timeout, awaiting_admission: false, cancellation: None,
+            }) if observed.packet_hash == receipt.packet_hash && started_at <= before_observation && timeout == Duration::from_millis(6))
+            );
+            manager.poll_link_endpoints();
+            assert!(accounting_rx.try_recv().is_err());
+        }
+        transport_tx.send(TransportMessage::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), actor_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn resource_wait_accounting_coalesces_and_replays_current_owner_for_new_subscriber() {
+        let (_, mut local_link, _) = handshaken_link_pair_with_identity();
+        local_link.rtt = Some(std::time::Duration::from_secs(90));
+        let link_id = local_link.link_id;
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::new(transport_tx, event_rx, [0xC9; 16], None);
+        let (accounting_tx, mut accounting_rx) = mpsc::unbounded_channel();
+        manager.set_accounting_event_channel(accounting_tx);
+        manager.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: local_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+        let receipt = manager
+            .send_link_resource(&link_id, vec![0xAF; 4096], false)
+            .unwrap();
+        next_transport_message(&mut transport_rx).unwrap();
+        assert!(matches!(
+            accounting_rx.try_recv(),
+            Ok(LinkManagerAccountingEvent::ResourceEvent(
+                LinkResourceEvent::Started { .. }
+            ))
+        ));
+        manager.tick();
+        let Ok(LinkManagerAccountingEvent::OutboundResourceWait {
+            link_id: observed_link,
+            resource_id,
+            started_at,
+            timeout,
+        }) = accounting_rx.try_recv()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (observed_link, resource_id),
+            (link_id, receipt.resource_hash)
+        );
+        assert!(timeout > std::time::Duration::from_secs(360));
+        manager.tick();
+        assert!(
+            accounting_rx.try_recv().is_err(),
+            "tick/keepalive is not Resource progress"
+        );
+        let (next_tx, mut next_rx) = mpsc::unbounded_channel();
+        manager.set_accounting_event_channel(next_tx);
+        manager.tick();
+        assert!(
+            matches!(next_rx.try_recv(), Ok(LinkManagerAccountingEvent::OutboundResourceWait {
+            started_at: original, timeout: original_timeout, ..
+        }) if original == started_at && original_timeout == timeout)
+        );
+        manager
+            .active_links
+            .get_mut(&link_id)
+            .unwrap()
+            .outbound_resources
+            .clear();
+        manager.tick();
+        assert!(manager.outbound_resource_waits.is_empty());
+        assert!(next_rx.try_recv().is_err());
     }
 
     #[test]

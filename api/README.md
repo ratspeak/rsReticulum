@@ -89,6 +89,39 @@ separate; failures cannot consume another kind of attempt. Packet receipt
 windows can use `rns_wire::receipt::receipt_timeout_for_route`, also used by the
 runtime's automatic packet receipt policy.
 
+`try_invalidate_packet(destination, packet_hash)` and
+`try_invalidate_link(destination, link_id)` perform only the exact
+failed-attempt route comparison and invalidation, without starting a new path
+request. A shared-client application can use this result to sequence its own
+authenticated owner recovery before ordinary discovery. This does not make
+legacy Python's destination-only owner reset an atomic route comparison or
+cancel other callers' pre-existing discovery.
+
+### Established-Link delivery clocks
+
+Advanced Link owners can obtain `ReticulumHandle::link_endpoint_dispatch_handle()`.
+Its opt-in bind receipt publishes an opaque token for one exact endpoint
+generation. `token.try_send(request, deadline)` retains the ordinary packet in
+the existing ordered endpoint FIFO until driver/local-peer admission, local
+expiry, cancellation, or an exact terminal failure. The deadline includes
+mailbox wait and is limited to 120 seconds. `Sent` contains the original local
+dispatch time and packet hash; it is not physical transmission or delivery.
+Dropping an unread bind receipt retires only its unpublished binding; published
+bindings still require the normal explicit cleanup.
+
+`try_send_cancellable` additionally returns an exact cancellation capability.
+It requests removal while the packet is still awaiting local admission; it
+cannot recall bytes already admitted to a driver or affect another binding.
+The actor's final pre-admission check is the concurrent cancellation boundary.
+
+`LinkManager::set_link_endpoint_dispatch_handle` enables these observations for
+ordinary packet sends. Legacy mailbox `Queued` still means only FIFO acceptance.
+`Link::packet_proof_timeout()` provides the measured-RTT proof budget, distinct
+from local queue residence. The accounting stream's outbound wait events retain
+the owner's original start time and finite timeout; delayed consumers must not
+restart those clocks. `OutboundTransfer::timeout_window()` similarly describes
+the current bounded Resource phase. Only genuine protocol progress renews it.
+
 The application prelude is the recommended integration path, but the workspace
 is not yet a blanket stability promise for every public Rust item.
 

@@ -17,9 +17,52 @@ pub mod canonical {
         let _ = std::mem::size_of::<PacketReceiptHandle>();
         let _ = std::mem::size_of::<LinkSessionHandle>();
         let _ = ReticulumHandle::path_recovery_handle;
+        let _ = ReticulumHandle::link_endpoint_dispatch_handle;
+        let _ = rns_runtime::prelude::PathRecoveryHandle::try_invalidate_packet;
+        let _ = rns_runtime::prelude::PathRecoveryHandle::try_invalidate_link;
         let _ = std::mem::size_of::<rns_runtime::prelude::PathRecoveryHandle>();
         let _ = std::mem::size_of::<rns_runtime::prelude::PathRecoveryOutcome>();
         let _ = std::mem::size_of::<rns_runtime::prelude::PathRecoveryError>();
+    }
+}
+
+/// Advanced ownership remains opt-in and module-qualified.
+pub mod delivery_ownership {
+    use rns_runtime::link_manager::{LinkManager, LinkManagerAccountingEvent};
+    use rns_runtime::prelude::ReticulumHandle;
+
+    pub fn install_dispatch(runtime: &ReticulumHandle, manager: &mut LinkManager) {
+        manager.set_link_endpoint_dispatch_handle(runtime.link_endpoint_dispatch_handle());
+    }
+
+    pub fn observe_wait(event: &LinkManagerAccountingEvent) {
+        match event {
+            LinkManagerAccountingEvent::OutboundPacketWait {
+                receipt,
+                started_at,
+                timeout,
+                awaiting_admission,
+                cancellation,
+            } => {
+                let _ = (
+                    receipt.link_id,
+                    receipt.packet_hash,
+                    started_at,
+                    timeout,
+                    awaiting_admission,
+                    cancellation,
+                );
+            }
+            LinkManagerAccountingEvent::OutboundResourceWait {
+                link_id,
+                resource_id,
+                started_at,
+                timeout,
+            } => {
+                let _ = (link_id, resource_id, started_at, timeout);
+            }
+            _ => {}
+        }
     }
 }
 
