@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,26 @@ pub enum LinkEndpointDispatchOutcome {
     },
     Rejected(LinkEndpointSendResult),
     Expired,
+    /// Explicit or receiver cancellation was observed before local admission.
+    Cancelled,
+}
+
+/// Cloneable cancellation request for one exact queued packet operation.
+/// Calling [`Self::cancel`] does not unbind a Link or recall bytes already
+/// admitted to its driver. Dropping this handle has no effect.
+#[derive(Debug, Clone)]
+pub struct LinkEndpointDispatchCancellation {
+    requested: Arc<AtomicBool>,
+}
+
+impl LinkEndpointDispatchCancellation {
+    /// Request cancellation. The actor's final pre-admission check is the
+    /// cancellation/admission boundary: a request arriving after that check
+    /// cannot retract accepted bytes. The receipt, not this method, confirms
+    /// whether the result was Cancelled or already Sent.
+    pub fn cancel(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
 }
 
 pub(crate) enum LinkEndpointDispatchRequest {
@@ -73,6 +93,19 @@ pub(crate) enum LinkEndpointDispatchRequest {
 pub(crate) struct LinkEndpointDispatchCompletion {
     pub deadline: Instant,
     pub result_tx: oneshot::Sender<LinkEndpointDispatchOutcome>,
+    cancellation: LinkEndpointDispatchCancellation,
+}
+
+impl LinkEndpointDispatchCompletion {
+    pub(crate) fn terminal_before_admission(&self) -> Option<LinkEndpointDispatchOutcome> {
+        if self.result_tx.is_closed() || self.cancellation.requested.load(Ordering::Acquire) {
+            Some(LinkEndpointDispatchOutcome::Cancelled)
+        } else if Instant::now() >= self.deadline {
+            Some(LinkEndpointDispatchOutcome::Expired)
+        } else {
+            None
+        }
+    }
 }
 
 /// Cloneable control lane belonging to one transport actor generation.
@@ -175,18 +208,40 @@ impl LinkEndpointDispatchToken {
         request: OutboundRequest,
         deadline: Instant,
     ) -> Result<oneshot::Receiver<LinkEndpointDispatchOutcome>, LinkEndpointDispatchError> {
+        self.try_send_cancellable(request, deadline)
+            .map(|(receipt, _cancellation)| receipt)
+    }
+
+    /// As [`Self::try_send`], with a separate explicit cancellation handle for
+    /// an owner that does not hold the receipt (for example a backchannel
+    /// message coordinator). The immutable deadline and exact operation are
+    /// shared; the handle cannot select another packet by hash or Link ID.
+    pub fn try_send_cancellable(
+        &self,
+        request: OutboundRequest,
+        deadline: Instant,
+    ) -> Result<
+        (
+            oneshot::Receiver<LinkEndpointDispatchOutcome>,
+            LinkEndpointDispatchCancellation,
+        ),
+        LinkEndpointDispatchError,
+    > {
         if deadline.saturating_duration_since(Instant::now()) > LINK_ENDPOINT_ADMISSION_TIMEOUT_MAX
         {
             return Err(LinkEndpointDispatchError::InvalidDeadline);
         }
         let (result_tx, result_rx) = oneshot::channel();
+        let cancellation = LinkEndpointDispatchCancellation {
+            requested: Arc::new(AtomicBool::new(false)),
+        };
         // Bound bytes before admitting the private control lane, not only
         // after the actor dequeues and validates the packet.
         if request.raw.len() > rns_wire::constants::MTU {
             let _ = result_tx.send(LinkEndpointDispatchOutcome::Rejected(
                 LinkEndpointSendResult::InvalidPacket,
             ));
-            return Ok(result_rx);
+            return Ok((result_rx, cancellation));
         }
         self.handle
             .tx
@@ -197,10 +252,11 @@ impl LinkEndpointDispatchToken {
                 completion: LinkEndpointDispatchCompletion {
                     deadline,
                     result_tx,
+                    cancellation: cancellation.clone(),
                 },
             })
             .map_err(admission_error)?;
-        Ok(result_rx)
+        Ok((result_rx, cancellation))
     }
 }
 

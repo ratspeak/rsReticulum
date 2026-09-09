@@ -345,14 +345,9 @@ impl TransportActor {
             let Some(completion) = packet.completion.as_ref() else {
                 return true;
             };
-            if completion.result_tx.is_closed() {
-                return false;
-            }
-            if std::time::Instant::now() >= completion.deadline {
+            if let Some(outcome) = completion.terminal_before_admission() {
                 let completion = packet.completion.take().expect("checked completion");
-                let _ = completion
-                    .result_tx
-                    .send(crate::link_endpoint_dispatch::LinkEndpointDispatchOutcome::Expired);
+                let _ = completion.result_tx.send(outcome);
                 return false;
             }
             true
@@ -361,13 +356,13 @@ impl TransportActor {
         while let Some(packet) = entry.egress.front() {
             // Recheck immediately before admission: draining a long FIFO may
             // cross a later packet's deadline after the initial prune.
-            if packet.completion.as_ref().is_some_and(|completion| {
-                completion.result_tx.is_closed() || std::time::Instant::now() >= completion.deadline
-            }) {
+            if let Some(outcome) = packet
+                .completion
+                .as_ref()
+                .and_then(|completion| completion.terminal_before_admission())
+            {
                 if let Some(completion) = entry.egress.pop_front().and_then(|p| p.completion) {
-                    let _ = completion
-                        .result_tx
-                        .send(crate::link_endpoint_dispatch::LinkEndpointDispatchOutcome::Expired);
+                    let _ = completion.result_tx.send(outcome);
                 }
                 continue;
             }
@@ -673,13 +668,8 @@ impl TransportActor {
                 request,
                 completion,
             } => {
-                if completion.result_tx.is_closed() {
-                    return;
-                }
-                if std::time::Instant::now() >= completion.deadline {
-                    let _ = completion
-                        .result_tx
-                        .send(LinkEndpointDispatchOutcome::Expired);
+                if let Some(outcome) = completion.terminal_before_admission() {
+                    let _ = completion.result_tx.send(outcome);
                     return;
                 }
                 let key = (binding.link_id, binding.role);

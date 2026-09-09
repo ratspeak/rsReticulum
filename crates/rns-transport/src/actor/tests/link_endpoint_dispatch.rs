@@ -486,3 +486,217 @@ fn dispatch_local_peer_admission_and_transport_shutdown_have_exact_outcomes() {
     );
     assert!(initiator_rx.try_recv().is_err());
 }
+
+#[test]
+fn dispatch_explicit_cancellation_before_execution_and_handle_drop_are_distinct() {
+    let (mut actor, mut rx) = fixture();
+    let token = bind(&mut actor);
+    let (mut cancelled, cancel) = token
+        .try_send_cancellable(packet(1), Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    cancel.clone().cancel();
+    cancel.cancel(); // Idempotent; no command queue or Link-wide side effect.
+    execute(&mut actor);
+    assert_eq!(
+        cancelled.try_recv().unwrap(),
+        LinkEndpointDispatchOutcome::Cancelled
+    );
+    assert!(rx.try_recv().is_err());
+    let (mut retained, dropped_handle) = token
+        .try_send_cancellable(packet(2), Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    drop(dropped_handle);
+    execute(&mut actor);
+    assert!(matches!(
+        retained.try_recv().unwrap(),
+        LinkEndpointDispatchOutcome::Sent { .. }
+    ));
+    assert_eq!(rx.try_recv().unwrap(), packet(2).raw);
+}
+
+#[test]
+fn dispatch_explicit_cancel_and_expiry_behind_legacy_head_preserve_other_packet() {
+    let (mut actor, mut rx) = fixture();
+    let token = bind(&mut actor);
+    actor.interfaces[&7]
+        .tx
+        .try_send(Bytes::from_static(b"occupied"))
+        .unwrap();
+    actor.send_link_endpoint(binding().link_id, binding().role, packet(1));
+    let (mut cancelled, cancel) = token
+        .try_send_cancellable(packet(2), Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    execute(&mut actor);
+    let (mut expired, _expiry_cancel) = token
+        .try_send_cancellable(packet(3), Instant::now() + Duration::from_millis(5))
+        .unwrap();
+    execute(&mut actor);
+    let (mut retained, _retained_cancel) = token
+        .try_send_cancellable(packet(4), Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    execute(&mut actor);
+    cancel.cancel();
+    std::thread::sleep(Duration::from_millis(10));
+    actor.drain_link_endpoint_egress();
+    assert_eq!(
+        cancelled.try_recv().unwrap(),
+        LinkEndpointDispatchOutcome::Cancelled
+    );
+    assert_eq!(
+        expired.try_recv().unwrap(),
+        LinkEndpointDispatchOutcome::Expired
+    );
+    assert!(matches!(
+        retained.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        actor.link_endpoints[&(binding().link_id, binding().role)]
+            .egress
+            .len(),
+        2
+    );
+    rx.try_recv().unwrap();
+    actor.drain_link_endpoint_egress();
+    assert_eq!(rx.try_recv().unwrap(), packet(1).raw);
+    actor.drain_link_endpoint_egress();
+    assert_eq!(rx.try_recv().unwrap(), packet(4).raw);
+    assert!(matches!(
+        retained.try_recv().unwrap(),
+        LinkEndpointDispatchOutcome::Sent { .. }
+    ));
+    assert!(
+        actor
+            .link_endpoints
+            .contains_key(&(binding().link_id, binding().role))
+    );
+}
+
+#[test]
+fn dispatch_old_generation_cancel_cannot_retract_sent_or_cancel_identical_replacement_packet() {
+    let (mut actor, mut rx) = fixture();
+    let token = bind(&mut actor);
+    let (mut first, old_cancel) = token
+        .try_send_cancellable(packet(1), Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    execute(&mut actor);
+    // Cancel after driver admission, before consuming its receipt. Already
+    // accepted bytes and the Sent outcome remain, not a fabricated recall.
+    old_cancel.cancel();
+    assert!(matches!(
+        first.try_recv().unwrap(),
+        LinkEndpointDispatchOutcome::Sent { .. }
+    ));
+    actor.unbind_link_endpoint(binding().link_id, binding().role);
+    let replacement = bind(&mut actor);
+    let (mut second, _new_cancel) = replacement
+        .try_send_cancellable(packet(1), Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    execute(&mut actor);
+    old_cancel.cancel();
+    actor.drain_link_endpoint_egress();
+    assert!(matches!(
+        second.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(rx.try_recv().unwrap(), packet(1).raw);
+    actor.drain_link_endpoint_egress();
+    assert!(matches!(
+        second.try_recv().unwrap(),
+        LinkEndpointDispatchOutcome::Sent { .. }
+    ));
+    assert_eq!(rx.try_recv().unwrap(), packet(1).raw);
+}
+
+#[test]
+fn dispatch_cancelled_packet_does_not_close_or_block_another_link() {
+    let (mut actor, mut rx) = fixture();
+    let token = bind(&mut actor);
+    let other_binding = LinkEndpointBinding {
+        link_id: [0xd4; 16],
+        ..binding()
+    };
+    let (lifecycle_tx, _lifecycle_rx) = mpsc::unbounded_channel();
+    let mut bound = actor
+        .link_endpoint_dispatch_handle()
+        .try_bind(other_binding, lifecycle_tx)
+        .unwrap();
+    execute(&mut actor);
+    let other = bound.try_recv().unwrap().unwrap();
+    let (mut cancelled, cancel) = token
+        .try_send_cancellable(packet(1), Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    cancel.cancel();
+    execute(&mut actor);
+    let raw = make_link_data_packet_with_context(
+        other_binding.link_id,
+        0,
+        rns_wire::context::PacketContext::None,
+    );
+    let (mut other_sent, _other_cancel) = other
+        .try_send_cancellable(
+            OutboundRequest {
+                raw: raw.clone(),
+                destination_hash: other_binding.link_id,
+            },
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+    execute(&mut actor);
+    assert_eq!(
+        cancelled.try_recv().unwrap(),
+        LinkEndpointDispatchOutcome::Cancelled
+    );
+    assert!(matches!(
+        other_sent.try_recv().unwrap(),
+        LinkEndpointDispatchOutcome::Sent { .. }
+    ));
+    assert_eq!(rx.try_recv().unwrap(), raw);
+    assert_eq!(actor.link_endpoints.len(), 2);
+}
+
+#[tokio::test]
+async fn dispatch_real_actor_explicit_cancel_prunes_full_driver_without_closing_link() {
+    let (mut actor, transport_tx) = TransportActor::new();
+    let (target, mut rx) = make_test_interface_with_capacity("real canceled target", 1);
+    target.tx.try_send(Bytes::from_static(b"occupied")).unwrap();
+    actor.interfaces.insert(7, target);
+    let dispatch = actor.link_endpoint_dispatch_handle();
+    let owner = tokio::spawn(actor.run());
+    let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+    let token = dispatch
+        .try_bind(binding(), lifecycle_tx)
+        .unwrap()
+        .await
+        .unwrap()
+        .unwrap();
+    let (mut receipt, cancellation) = token
+        .try_send_cancellable(packet(1), Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut receipt)
+            .await
+            .is_err()
+    );
+    cancellation.cancel();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), receipt)
+            .await
+            .unwrap()
+            .unwrap(),
+        LinkEndpointDispatchOutcome::Cancelled
+    );
+    assert!(lifecycle_rx.try_recv().is_err());
+    assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"occupied"));
+    let following = token
+        .try_send(packet(2), Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    assert!(matches!(
+        following.await.unwrap(),
+        LinkEndpointDispatchOutcome::Sent { .. }
+    ));
+    assert_eq!(rx.try_recv().unwrap(), packet(2).raw);
+    assert!(rx.try_recv().is_err());
+    transport_tx.send(TransportMessage::Shutdown).await.unwrap();
+    owner.await.unwrap();
+}
