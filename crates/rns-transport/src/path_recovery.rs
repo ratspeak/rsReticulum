@@ -41,6 +41,7 @@ impl std::error::Error for PathRecoveryError {}
 pub(crate) struct PathRecoveryRequest {
     pub destination_hash: [u8; 16],
     pub failed_attempt: Option<FailedRouteAttempt>,
+    pub schedule_discovery: bool,
     pub result_tx: oneshot::Sender<PathRecoveryOutcome>,
 }
 
@@ -71,7 +72,11 @@ impl PathRecoveryHandle {
         destination_hash: [u8; 16],
         failed_link: Option<[u8; 16]>,
     ) -> Result<oneshot::Receiver<PathRecoveryOutcome>, PathRecoveryError> {
-        self.try_recover_attempt(destination_hash, failed_link.map(FailedRouteAttempt::Link))
+        self.try_recover_attempt(
+            destination_hash,
+            failed_link.map(FailedRouteAttempt::Link),
+            true,
+        )
     }
 
     /// Recover only the unchanged route used by an atomically tracked local
@@ -84,6 +89,30 @@ impl PathRecoveryHandle {
         self.try_recover_attempt(
             destination_hash,
             Some(FailedRouteAttempt::Packet(packet_hash)),
+            true,
+        )
+    }
+
+    /// Invalidate only the unchanged local route used by a tracked packet,
+    /// without scheduling discovery. Unknown, consumed, cancelled or replaced
+    /// attempts cannot invalidate a route. The returned `path_dropped` flag is
+    /// evidence of this local comparison, not permission or an atomic guarantee
+    /// for another process' route table.
+    ///
+    /// Shared-client coordinators can use this before an authenticated owner
+    /// reset, then call [`Self::try_recover`] with no failed Link to discover.
+    /// Separating these steps avoids querying a stale owner cache before its
+    /// reset. Callers must bound the intervening work and handle reset failure;
+    /// this method neither contacts the owner nor implicitly retries discovery.
+    pub fn try_invalidate_packet(
+        &self,
+        destination_hash: [u8; 16],
+        packet_hash: [u8; 32],
+    ) -> Result<oneshot::Receiver<PathRecoveryOutcome>, PathRecoveryError> {
+        self.try_recover_attempt(
+            destination_hash,
+            Some(FailedRouteAttempt::Packet(packet_hash)),
+            false,
         )
     }
 
@@ -91,12 +120,14 @@ impl PathRecoveryHandle {
         &self,
         destination_hash: [u8; 16],
         failed_attempt: Option<FailedRouteAttempt>,
+        schedule_discovery: bool,
     ) -> Result<oneshot::Receiver<PathRecoveryOutcome>, PathRecoveryError> {
         let (result_tx, result_rx) = oneshot::channel();
         self.tx
             .try_send(PathRecoveryRequest {
                 destination_hash,
                 failed_attempt,
+                schedule_discovery,
                 result_tx,
             })
             .map_err(|error| match error {

@@ -168,7 +168,8 @@ impl TransportActor {
         // extend an already-admitted interface's ordinary discovery cooldown.
         // Once that cooldown expires, enqueue the new intent; per-interface
         // admission coalesces still-refused targets without replaying them.
-        let request_scheduled = should_request
+        let request_scheduled = request.schedule_discovery
+            && should_request
             && (queued
                 || (!recent
                     && self.queue_discovery_path_request(request.destination_hash, None, now))
@@ -424,6 +425,40 @@ mod tests {
             actor.recover_local_link_path(request);
             assert_eq!(reply.try_recv().unwrap().path_dropped, !replace);
             assert!(actor.path_interface_suppressions.is_empty());
+        }
+    }
+
+    #[test]
+    fn packet_invalidation_requires_exact_live_attempt_and_never_discovers() {
+        for changed in [false, true] {
+            let (mut actor, handle, mut radio) = fixture();
+            let dest = [0xDD; 16];
+            let packet = [0x73; 32];
+            actor.record_route_attempt(FailedRouteAttempt::Packet(packet), dest);
+            if changed {
+                actor.path_table.insert(dest, path(1, 2));
+            }
+            // Wrong destination cannot consume the original attempt.
+            let mut wrong = handle.try_invalidate_packet([0xCC; 16], packet).unwrap();
+            let request = actor.path_recovery_rx.try_recv().unwrap();
+            actor.recover_local_link_path(request);
+            assert!(!wrong.try_recv().unwrap().path_dropped);
+            // Cancelling before actor execution cannot consume it either.
+            drop(handle.try_invalidate_packet(dest, packet).unwrap());
+            let request = actor.path_recovery_rx.try_recv().unwrap();
+            actor.recover_local_link_path(request);
+            for consumed in [false, true] {
+                let mut reply = handle.try_invalidate_packet(dest, packet).unwrap();
+                let request = actor.path_recovery_rx.try_recv().unwrap();
+                actor.recover_local_link_path(request);
+                let outcome = reply.try_recv().unwrap();
+                assert_eq!(outcome.path_dropped, !changed && !consumed);
+                assert_eq!(outcome.has_path, changed);
+                assert!(!outcome.request_scheduled);
+                assert!(actor.pending_discovery_prs.is_empty());
+                assert!(actor.pending_path_request_admissions.is_empty());
+                assert!(radio.try_recv().is_err());
+            }
         }
     }
 }
