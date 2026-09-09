@@ -116,6 +116,24 @@ impl PathRecoveryHandle {
         )
     }
 
+    /// Invalidate only the unchanged local route used by an observed local
+    /// LinkRequest, without scheduling discovery. This is the Link analogue
+    /// of [`Self::try_invalidate_packet`]; it neither contacts a shared owner
+    /// nor authorizes an unobserved, consumed or replaced attempt to drop a
+    /// route. A shared coordinator can reset its authenticated external owner
+    /// only after a positive local comparison, then discover normally.
+    pub fn try_invalidate_link(
+        &self,
+        destination_hash: [u8; 16],
+        link_id: [u8; 16],
+    ) -> Result<oneshot::Receiver<PathRecoveryOutcome>, PathRecoveryError> {
+        self.try_recover_attempt(
+            destination_hash,
+            Some(FailedRouteAttempt::Link(link_id)),
+            false,
+        )
+    }
+
     fn try_recover_attempt(
         &self,
         destination_hash: [u8; 16],

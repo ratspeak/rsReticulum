@@ -461,4 +461,85 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn link_invalidation_requires_exact_live_attempt_and_never_discovers() {
+        for changed in [false, true] {
+            let (mut actor, handle, mut radio) = fixture();
+            let dest = [0xDD; 16];
+            let link = dispatch(&mut actor);
+            radio.try_recv().unwrap();
+            // Real Link teardown may precede delivery failure reporting.
+            actor.handle_message(TransportMessage::DeregisterDestination { hash: link });
+            if changed {
+                actor.path_table.insert(dest, path(1, 2));
+            }
+            for (requested_dest, requested_link) in [(dest, [0xC1; 16]), ([0xCC; 16], link)] {
+                let mut invalid = handle
+                    .try_invalidate_link(requested_dest, requested_link)
+                    .unwrap();
+                let request = actor.path_recovery_rx.try_recv().unwrap();
+                actor.recover_local_link_path(request);
+                let result = invalid.try_recv().unwrap();
+                assert!(!result.path_dropped && !result.request_scheduled);
+                assert!(
+                    actor
+                        .local_link_route_attempts
+                        .contains_key(&FailedRouteAttempt::Link(link))
+                );
+            }
+            drop(handle.try_invalidate_link(dest, link).unwrap());
+            let request = actor.path_recovery_rx.try_recv().unwrap();
+            actor.recover_local_link_path(request);
+            for consumed in [false, true] {
+                let mut reply = handle.try_invalidate_link(dest, link).unwrap();
+                let request = actor.path_recovery_rx.try_recv().unwrap();
+                actor.recover_local_link_path(request);
+                let result = reply.try_recv().unwrap();
+                assert_eq!(result.path_dropped, !changed && !consumed);
+                assert_eq!(result.has_path, changed);
+                assert!(!result.request_scheduled);
+                assert!(actor.pending_discovery_prs.is_empty());
+                assert!(actor.pending_path_request_admissions.is_empty());
+                assert!(radio.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn link_and_packet_invalidation_do_not_consume_cross_kind_attempts() {
+        for observed_link in [false, true] {
+            let (mut actor, handle, mut radio) = fixture();
+            let dest = [0xDD; 16];
+            let link = [0x72; 16];
+            let packet = [0x72; 32];
+            let attempt = if observed_link {
+                FailedRouteAttempt::Link(link)
+            } else {
+                FailedRouteAttempt::Packet(packet)
+            };
+            actor.record_route_attempt(attempt, dest);
+            let mut wrong_kind = if observed_link {
+                handle.try_invalidate_packet(dest, packet)
+            } else {
+                handle.try_invalidate_link(dest, link)
+            }
+            .unwrap();
+            let request = actor.path_recovery_rx.try_recv().unwrap();
+            actor.recover_local_link_path(request);
+            assert!(!wrong_kind.try_recv().unwrap().path_dropped);
+            assert!(actor.local_link_route_attempts.contains_key(&attempt));
+            let mut correct = if observed_link {
+                handle.try_invalidate_link(dest, link)
+            } else {
+                handle.try_invalidate_packet(dest, packet)
+            }
+            .unwrap();
+            let request = actor.path_recovery_rx.try_recv().unwrap();
+            actor.recover_local_link_path(request);
+            assert!(correct.try_recv().unwrap().path_dropped);
+            assert!(actor.pending_discovery_prs.is_empty());
+            assert!(radio.try_recv().is_err());
+        }
+    }
 }
