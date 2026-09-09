@@ -98,8 +98,9 @@ impl TransportActor {
                     entry.retries += 1;
                     entry.retransmit_timeout = now + PATHFINDER_G + rand_window();
                 }
-                // Never retransmit back out the interface the announce came
-                // in on — that's just loopback and will cause dedup churn.
+                // The helper excludes an exact shared IPC peer and applies
+                // mode policy. A broadcast radio may need same-interface
+                // retransmission to reach a different physical neighbor.
                 if let Some((raw, source_iface, _, _)) = send_info {
                     self.broadcast_announce_on_interfaces(&raw, source_iface);
                 }

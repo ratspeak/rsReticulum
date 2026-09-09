@@ -1640,13 +1640,13 @@ impl TransportActor {
         if !entry.direction.outbound {
             return false;
         }
-        // Normally an announce is never sent back out its source interface
-        // (loopback / dedup churn on a shared medium). A multipoint interface
-        // (e.g. BLE Peer) is the exception: its peers can't hear each other, so
-        // relaying back out reaches the ones the source peer couldn't. The
-        // driver's per-peer anti-loop filter keeps it off the source peer, and
-        // the announce-table dedup + hop cap bound propagation.
-        if except == Some(id) && !entry.multipoint {
+        // A physical broadcast interface can have hidden neighbors, so an
+        // announce may need to leave through the same radio it arrived on.
+        // Announce scheduling/rebroadcast observation bounds propagation;
+        // the mode gates below still exclude AP and same-Roaming relaying.
+        // Shared IPC edges, unlike a radio, each name one peer and must not
+        // echo that peer's announce straight back to it.
+        if except == Some(id) && entry.role != InterfaceRole::Normal {
             return false;
         }
 
@@ -2503,13 +2503,12 @@ mod tests {
     }
 
     #[test]
-    fn test_multipoint_interface_relays_announce_to_source() {
+    fn test_broadcast_interface_relays_announce_to_hidden_neighbors() {
         let (mut actor, _tx) = TransportActor::new();
         let dest = [0xAB; 16];
 
-        // Point-to-multipoint medium whose peers can't hear each other:
-        // an announce arriving here must be allowed back out the same
-        // interface. A normal interface must still exclude its source.
+        // A normal radio and a driver with per-peer fan-out can both have
+        // neighbors that cannot hear each other.
         let (normal, _rx) = make_test_interface("normal");
         actor.interfaces.insert(1, normal);
         let (mut mp, _rx2) = make_test_interface("ble");
@@ -2521,13 +2520,21 @@ mod tests {
             .insert(dest, PathEntry::new(None, 1, 2, InterfaceMode::Gateway));
 
         assert!(
-            !actor.interface_allows_announce(1, &dest, Some(1)),
-            "normal interface must not relay an announce back to its source"
+            actor.interface_allows_announce(1, &dest, Some(1)),
+            "normal broadcast interface must reach hidden neighbors"
         );
         assert!(
             actor.interface_allows_announce(2, &dest, Some(2)),
             "multipoint interface must relay an announce back to its other peers"
         );
+
+        for role in [InterfaceRole::LocalClient, InterfaceRole::SharedInstancePeer] {
+            actor.interfaces.get_mut(&1).unwrap().role = role;
+            assert!(
+                !actor.interface_allows_announce(1, &dest, Some(1)),
+                "a shared IPC edge must not echo to its only peer"
+            );
+        }
     }
 
     #[test]
@@ -5874,6 +5881,7 @@ mod tests {
         actor.interfaces.insert(1, entry1);
 
         let transport_id = [0xAA; 16];
+        actor.transport_identity_hash = Some(transport_id);
         let dest_hash = [0xBB; 16];
         actor.local_destinations.insert(dest_hash);
 
@@ -6665,9 +6673,12 @@ mod tests {
         // Flush deferred announces (rebroadcast is now deferred via announce table)
         hub.flush_pending_announces();
 
-        // Hub rebroadcasts announce on other interfaces.
+        // Hub rebroadcasts on both normal interfaces: the source interface
+        // may also have neighbors that could not hear the original sender.
         let rebroadcast = hub_rx1.try_recv().unwrap();
         assert_eq!(rebroadcast[1], 1); // hub's inbound-adjusted announce hops
+        let source_rebroadcast = hub_rx2.try_recv().unwrap();
+        assert_eq!(source_rebroadcast, rebroadcast);
 
         // Peer receives the rebroadcast.
         peer.on_inbound(InboundPacket {

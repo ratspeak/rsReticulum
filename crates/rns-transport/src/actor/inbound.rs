@@ -68,6 +68,27 @@ impl TransportActor {
             return;
         }
 
+        // The canonical packet hash excludes the next-hop transport address
+        // and survives final-hop H2-to-H1 rewriting. An overheard packet for
+        // another transport must therefore not enter our accepted hashlist:
+        // its later, correctly routed copy has exactly the same hash. Keep
+        // this admission before repeat-context and known-Link exceptions too.
+        // Only ingress from our attached shared owner delegates this filter;
+        // a local client or an unrelated radio is not that trust boundary.
+        let from_shared_owner =
+            self.is_shared_instance && self.is_shared_instance_peer_interface(packet.interface_id);
+        if parsed.flags.packet_type != rns_wire::flags::PacketType::Announce
+            && parsed.transport_id.is_some()
+            && parsed.transport_id != self.transport_identity_hash
+            && !from_shared_owner
+        {
+            trace!(
+                interface_id = packet.interface_id,
+                "packet for another transport dropped before hash admission"
+            );
+            return;
+        }
+
         // Dedup via the packet hashlist. A handful of contexts legitimately
         // repeat (keepalives, resource transfer frames, channel traffic) and
         // must bypass the check.
@@ -767,7 +788,6 @@ impl TransportActor {
         if let Some((target_interface, forwarded)) = self.transport_forward_candidate(
             raw,
             header,
-            interface_id,
             from_local_client,
             for_local_client,
             to_local_client,
@@ -809,17 +829,9 @@ impl TransportActor {
             .is_some_and(|entry| self.is_local_client_interface(entry.receiving_interface));
         let to_local_client = for_local_client || proof_for_local_client;
 
-        let link_request_for_this_instance = header.transport_id.is_none()
-            || header
-                .transport_id
-                .zip(self.transport_identity_hash)
-                .is_some_and(|(packet_transport_id, our_transport_id)| {
-                    packet_transport_id == our_transport_id
-                });
-
-        if self.local_destinations.contains(&header.destination_hash)
-            && link_request_for_this_instance
-        {
+        // on_inbound already established transport ownership (or the exact
+        // attached shared-owner ingress) before admitting this packet's hash.
+        if self.local_destinations.contains(&header.destination_hash) {
             if let Some(tx) = self.destination_channels.get(&header.destination_hash) {
                 if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::LinkRequest {
                     raw: raw.clone(),
@@ -837,7 +849,6 @@ impl TransportActor {
         if let Some((target_interface, forwarded)) = self.transport_forward_candidate(
             raw,
             header,
-            interface_id,
             from_local_client,
             for_local_client,
             to_local_client,
@@ -894,15 +905,11 @@ impl TransportActor {
         &self,
         raw: &[u8],
         header: &rns_wire::header::PacketHeader,
-        interface_id: InterfaceId,
         from_local_client: bool,
         for_local_client: bool,
         to_local_client: bool,
     ) -> Option<(InterfaceId, Vec<u8>)> {
         let path = self.path_table.get_live(&header.destination_hash)?;
-        if path.interface_id == interface_id && !for_local_client {
-            return None;
-        }
 
         let may_forward_for_shared_client = from_local_client || for_local_client;
         let addressed_to_us = header
@@ -924,6 +931,10 @@ impl TransportActor {
             return None;
         }
 
+        // One broadcast interface can reach multiple neighbors that cannot
+        // hear each other. Once routing ownership is established, the next
+        // hop may legitimately use the ingress radio. Deduplication and the
+        // next-hop address, not interface inequality, prevent packet loops.
         let mut forwarded =
             self.rewrite_forwarded_transport_packet(raw, header, path, to_local_client)?;
         // Python 1.3.8 Transport.py:1687: substitute the delta for
