@@ -384,6 +384,7 @@ impl Drop for TransportActorCompletionGuard {
 pub struct ReticulumHandle {
     pub transport_tx: mpsc::Sender<TransportMessage>,
     path_recovery: rns_transport::path_recovery::PathRecoveryHandle,
+    link_endpoint_dispatch: rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle,
     pub config_dir: PathBuf,
     pub instance_mode: InstanceMode,
     pub interface_configs: Vec<interface_factory::InterfaceConfig>,
@@ -1088,6 +1089,15 @@ impl ReticulumHandle {
     /// extension or permission to mutate the owner's interfaces.
     pub fn path_recovery_handle(&self) -> rns_transport::path_recovery::PathRecoveryHandle {
         self.path_recovery.clone()
+    }
+
+    /// Obtain bounded generation-bound Link packet dispatch on this runtime's
+    /// local actor. Completion reports interface-driver or shared-IPC admission,
+    /// not radio transmission or remote delivery.
+    pub fn link_endpoint_dispatch_handle(
+        &self,
+    ) -> rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle {
+        self.link_endpoint_dispatch.clone()
     }
 
     /// Non-fatal configured-interface startup failures, as `(name, reason)`.
@@ -2843,6 +2853,7 @@ pub async fn init_with_policy(
     let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new();
     let persistence_trigger = actor.persistence_trigger();
     let path_recovery = actor.path_recovery_handle();
+    let link_endpoint_dispatch = actor.link_endpoint_dispatch_handle();
     actor.is_foreground = is_foreground.clone();
     actor.initialize_storage(paths.storage_dir.clone());
     // Python 1.3.8 Transport.py:234-238: non-transport nodes get a fresh
@@ -2995,7 +3006,7 @@ pub async fn init_with_policy(
                     rc.force_shared_instance_bitrate,
                     shared_spawn_permit.take(),
                 )
-                .await;
+                .await?;
                 if mode != InstanceMode::Client {
                     return Err(SharedInstanceError::Cancelled.into());
                 }
@@ -3082,7 +3093,7 @@ pub async fn init_with_policy(
                             rc.force_shared_instance_bitrate,
                             shared_spawn_permit.take(),
                         )
-                        .await
+                        .await?
                     }
                     Err(_) => InstanceMode::Standalone,
                 }
@@ -3151,7 +3162,7 @@ pub async fn init_with_policy(
                                         rc.force_shared_instance_bitrate,
                                         shared_spawn_permit.take(),
                                     )
-                                    .await
+                                    .await?
                                 }
                                 Err(_) => InstanceMode::Standalone,
                             }
@@ -3217,7 +3228,7 @@ pub async fn init_with_policy(
                             rc.force_shared_instance_bitrate,
                             shared_spawn_permit.take(),
                         )
-                        .await
+                        .await?
                     }
                     Err(_) => InstanceMode::Standalone,
                 }
@@ -3285,7 +3296,7 @@ pub async fn init_with_policy(
                                     rc.force_shared_instance_bitrate,
                                     shared_spawn_permit.take(),
                                 )
-                                .await
+                                .await?
                             }
                             Err(_) => InstanceMode::Standalone,
                         }
@@ -3484,6 +3495,7 @@ pub async fn init_with_policy(
     let handle = ReticulumHandle {
         transport_tx: transport_tx.clone(),
         path_recovery,
+        link_endpoint_dispatch,
         config_dir: config_dir.clone(),
         instance_mode,
         interface_configs: interfaces,
@@ -3932,40 +3944,140 @@ async fn adopt_shared_instance_client(
     shutdown: &ShutdownSignal,
     forced_bitrate: Option<u64>,
     spawn_permit: Option<InterfaceSpawnPermit>,
-) -> InstanceMode {
+) -> Result<InstanceMode, ReticulumError> {
     apply_forced_shared_instance_bitrate(&mut client_handle, forced_bitrate);
     let client_iface_id = client_handle.id;
     let client_online = client_handle.online.clone();
-    if let Err(error) = register_interface_handle_with_role_and_spawn_permit(
-        transport_tx,
-        client_handle,
-        rns_transport::messages::InterfaceRole::SharedInstancePeer,
-        interface_controls,
-        interface_registry,
+    // Retain the registration's exact owner for rollback if initial actor
+    // attachment fails; looking up an ID later could select a replacement.
+    let registered = run_single_registration_worker(
+        transport_tx.clone(),
+        interface_controls.clone(),
+        interface_registry.clone(),
+        SingleRegistrationSpec::Direct {
+            owned: client_handle.into(),
+            role: rns_transport::messages::InterfaceRole::SharedInstancePeer,
+            ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
+            ifac_key: None,
+            ifac_size: 0,
+            kind: InterfaceKind::Standard,
+            multipoint: false,
+        },
         spawn_permit,
     )
-    .await
-    {
-        tracing::warn!(error = %error, "failed to register shared-instance client");
-        return InstanceMode::Standalone;
+    .await;
+    let token = match registered {
+        Ok(tokens) => tokens[0],
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to register shared-instance client");
+            return Ok(InstanceMode::Standalone);
+        }
+    };
+    let initial_online = client_online.load(Ordering::SeqCst);
+    let owner = [(token.id, token.registry_owner)];
+    let attachment = tokio::select! {
+        biased;
+        _ = interface_registry.wait_for_any_cancel_requested(&owner) => {
+            Err("shared-instance registration owner retired")
+        }
+        result = apply_initial_shared_peer_state(
+            transport_tx,
+            client_iface_id,
+            initial_online,
+            shutdown,
+        ) => result,
+    };
+    if let Err(error) = attachment {
+        tracing::warn!(
+            error,
+            "failed to attach shared-instance client to transport"
+        );
+        let rollback = teardown_interface_exact_transaction(
+            transport_tx,
+            interface_controls,
+            interface_registry,
+            token,
+        );
+        if tokio::time::timeout(Duration::from_secs(5), rollback)
+            .await
+            .is_err()
+        {
+            // Exact teardown has already stopped this client's task before
+            // its ordered deregistration send. If that send is wedged, Drop
+            // retains the registry tombstone. Stop this initializing runtime;
+            // never publish a configured Standalone fallback for it. The
+            // enclosing InitShutdownGuard retains whole-runtime cleanup.
+            shutdown.trigger();
+            return Err(ReticulumError::Interface(
+                "shared-instance attachment rollback timed out; runtime shutting down".into(),
+            ));
+        }
+        return Ok(InstanceMode::Standalone);
     }
     spawn_shared_peer_monitor(
         transport_tx.clone(),
         client_iface_id,
         client_online,
+        initial_online,
         shutdown.clone(),
     );
-    InstanceMode::Client
+    Ok(InstanceMode::Client)
+}
+
+/// Publish Client only after its initial attachment has actually been applied
+/// by this actor. Merely queueing Restored permits a caller's separate recovery
+/// lane to run first and then be erased by this initial state reset.
+async fn apply_initial_shared_peer_state(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    interface_id: u64,
+    initial_online: bool,
+    shutdown: &ShutdownSignal,
+) -> Result<(), &'static str> {
+    let attach = async {
+        let initial_state = if initial_online {
+            TransportMessage::SharedConnectionRestored { interface_id }
+        } else {
+            TransportMessage::SharedConnectionLost
+        };
+        transport_tx
+            .send(initial_state)
+            .await
+            .map_err(|_| "transport closed before initial shared attachment")?;
+        // An existing cheap read-only query is a same-mailbox FIFO barrier.
+        // No new exhaustive mailbox variant or public startup API is needed.
+        let (response_tx, response_rx) = oneshot::channel();
+        transport_tx
+            .send(TransportMessage::Rpc {
+                query: TransportQuery::GetLinkCount,
+                response_tx,
+            })
+            .await
+            .map_err(|_| "transport closed before shared attachment barrier")?;
+        response_rx
+            .await
+            .map_err(|_| "transport closed during shared attachment barrier")?;
+        Ok(())
+    };
+    tokio::select! {
+        biased;
+        _ = shutdown.wait() => Err("runtime shut down during shared attachment"),
+        result = tokio::time::timeout(Duration::from_secs(5), attach) => {
+            result.map_err(|_| "shared attachment barrier timed out")?
+        }
+    }
 }
 
 fn spawn_shared_peer_monitor(
     transport_tx: mpsc::Sender<TransportMessage>,
     interface_id: u64,
     online: Arc<AtomicBool>,
+    initial_online: bool,
     shutdown: ShutdownSignal,
 ) {
     tokio::spawn(async move {
-        let mut was_online = false;
+        // Initial state was applied before Client was published. The monitor
+        // owns only later edges, not a delayed duplicate initialization.
+        let mut was_online = initial_online;
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
             tokio::select! {
@@ -4714,7 +4826,7 @@ async fn run_single_registration_worker(
     interface_registry: InterfaceRegistry,
     spec: SingleRegistrationSpec,
     spawn_permit: Option<InterfaceSpawnPermit>,
-) -> Result<Vec<u64>, InterfaceRegistrationError> {
+) -> Result<Vec<CommittedInterfaceToken>, InterfaceRegistrationError> {
     let id = spec.id();
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let cancel_guard = RegistrationCancelGuard {
@@ -4742,7 +4854,7 @@ async fn run_single_registration_worker(
         let _ = acknowledgement.send(());
     }
     cancel_guard.disarm();
-    result.map(|tokens| tokens.into_iter().map(|token| token.id).collect())
+    result
 }
 
 async fn single_registration_worker(
@@ -8305,7 +8417,7 @@ mod tests {
         let online = Arc::new(AtomicBool::new(false));
         let shutdown = ShutdownSignal::new();
 
-        spawn_shared_peer_monitor(tx, 7, online.clone(), shutdown.clone());
+        spawn_shared_peer_monitor(tx, 7, online.clone(), false, shutdown.clone());
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         assert!(
             rx.try_recv().is_err(),
@@ -8335,6 +8447,241 @@ mod tests {
         }
 
         shutdown.trigger();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_peer_initial_attachment_waits_for_actor_applied_barrier() {
+        for initial_online in [false, true] {
+            let (tx, mut rx) = mpsc::channel(4);
+            let shutdown = ShutdownSignal::new();
+            let caller = tokio::spawn(async move {
+                apply_initial_shared_peer_state(&tx, 7, initial_online, &shutdown).await
+            });
+            let event = rx.recv().await.unwrap();
+            assert!(matches!(
+                (initial_online, event),
+                (
+                    true,
+                    TransportMessage::SharedConnectionRestored { interface_id: 7 }
+                ) | (false, TransportMessage::SharedConnectionLost)
+            ));
+            let TransportMessage::Rpc { query, response_tx } = rx.recv().await.unwrap() else {
+                panic!("expected same-mailbox actor barrier");
+            };
+            assert!(matches!(query, TransportQuery::GetLinkCount));
+            tokio::task::yield_now().await;
+            assert!(
+                !caller.is_finished(),
+                "queueing the initial state is not completion"
+            );
+            response_tx
+                .send(TransportQueryResponse::IntResult(0))
+                .unwrap();
+            assert_eq!(caller.await.unwrap(), Ok(()));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_peer_seeded_monitor_emits_only_later_connection_edges() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let online = Arc::new(AtomicBool::new(true));
+        let shutdown = ShutdownSignal::new();
+        spawn_shared_peer_monitor(tx, 7, online.clone(), true, shutdown.clone());
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(120)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "initial attached state must not be replayed"
+        );
+        online.store(false, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            TransportMessage::SharedConnectionLost
+        ));
+        online.store(true, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            TransportMessage::SharedConnectionRestored { interface_id: 7 }
+        ));
+        shutdown.trigger();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_peer_initial_attachment_timeout_rolls_back_exact_registration() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registry = InterfaceRegistry::default();
+        let handle = test_interface_handle(7, None, "unresponsive attachment");
+        let online = handle.online.clone();
+        let caller_controls = controls.clone();
+        let caller_registry = registry.clone();
+        let caller = tokio::spawn(async move {
+            adopt_shared_instance_client(
+                handle,
+                &tx,
+                &caller_controls,
+                &caller_registry,
+                &ShutdownSignal::new(),
+                None,
+                None,
+            )
+            .await
+        });
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            TransportMessage::RegisterInterface { id: 7, .. }
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            TransportMessage::SharedConnectionRestored { interface_id: 7 }
+        ));
+        let TransportMessage::Rpc {
+            response_tx: held_barrier,
+            ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected attachment barrier");
+        };
+        assert_eq!(registry.len(), 1);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(caller.await.unwrap().unwrap(), InstanceMode::Standalone);
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            TransportMessage::DeregisterInterface { id: 7 }
+        ));
+        assert_eq!(registry.len(), 0);
+        assert!(controls.lock().unwrap().is_empty());
+        assert!(!online.load(Ordering::SeqCst));
+        assert!(
+            held_barrier
+                .send(TransportQueryResponse::IntResult(0))
+                .is_err()
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a failed attachment must not start a monitor"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_peer_initial_attachment_closed_actor_and_shutdown_fail_closed() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        assert!(
+            apply_initial_shared_peer_state(&tx, 7, true, &ShutdownSignal::new())
+                .await
+                .is_err()
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        let shutdown = ShutdownSignal::new();
+        shutdown.trigger();
+        assert!(
+            apply_initial_shared_peer_state(&tx, 7, true, &shutdown)
+                .await
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_peer_initial_attachment_full_mailbox_rollback_is_bounded_and_fail_closed() {
+        struct TaskStopped(Arc<AtomicBool>);
+        impl Drop for TaskStopped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registry = InterfaceRegistry::default();
+        let shutdown = ShutdownSignal::new();
+        let mut handle = test_interface_handle(7, None, "wedged attachment");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_guard = TaskStopped(stopped.clone());
+        handle.read_task = tokio::spawn(async move {
+            let _stopped_guard = stopped_guard;
+            std::future::pending::<()>().await;
+        });
+        let online = handle.online.clone();
+        let caller_controls = controls.clone();
+        let caller_registry = registry.clone();
+        let caller_shutdown = shutdown.clone();
+        let caller_tx = tx.clone();
+        let started = tokio::time::Instant::now();
+        let caller = tokio::spawn(async move {
+            adopt_shared_instance_client(
+                handle,
+                &caller_tx,
+                &caller_controls,
+                &caller_registry,
+                &caller_shutdown,
+                None,
+                None,
+            )
+            .await
+        });
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            TransportMessage::RegisterInterface { id: 7, .. }
+        ));
+        // Leave initial Restored occupying the only slot: both the actor
+        // barrier and later exact DeregisterInterface must wait on this queue.
+        while tx.capacity() != 0 {
+            tokio::task::yield_now().await;
+        }
+        let registry_owner = controls.lock().unwrap()[&7].registry_owner;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !caller.is_finished(),
+            "exact rollback owns the second bounded wait"
+        );
+        // Let the stop-and-join complete and reach its blocked deregistration.
+        while !controls.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        assert!(stopped.load(Ordering::SeqCst));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let error = caller
+            .await
+            .unwrap()
+            .expect_err("wedged rollback must not return Standalone");
+        assert!(error.to_string().contains("rollback timed out"));
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+        assert!(shutdown.is_triggered());
+        assert!(!online.load(Ordering::SeqCst));
+        assert_eq!(
+            registry.len(),
+            1,
+            "exact tombstone remains until runtime drain"
+        );
+        assert!(controls.lock().unwrap().is_empty());
+
+        let replacement = test_interface_handle(7, None, "must not replace tombstone");
+        assert!(matches!(
+            register_interface_handle(&tx, replacement, &controls, &registry).await,
+            Err(InterfaceRegistrationError::Duplicate { id: 7 })
+        ));
+        assert_eq!(registry.len(), 1);
+        assert!(controls.lock().unwrap().is_empty());
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            TransportMessage::SharedConnectionRestored { interface_id: 7 }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "no blind deregistration or replacement was admitted"
+        );
+        // Confirm this is the original generation, not a newly admitted owner.
+        assert_eq!(
+            registry.wait_or_claim_abandoned(7, registry_owner).await,
+            Some((7, registry_owner))
+        );
+        registry.finish_abandoned(7, registry_owner);
     }
 
     fn write_stale_python_destination_table(storage_dir: &Path, entries: usize) {
@@ -9676,6 +10023,9 @@ loglevel = 7
             path_recovery: rns_transport::actor::TransportActor::new()
                 .0
                 .path_recovery_handle(),
+            link_endpoint_dispatch: rns_transport::actor::TransportActor::new()
+                .0
+                .link_endpoint_dispatch_handle(),
             config_dir: PathBuf::from("/tmp/dummy"),
             instance_mode: InstanceMode::Standalone,
             interface_configs: Vec::new(),
