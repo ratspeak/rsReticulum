@@ -974,9 +974,10 @@ fn recent_ratspeak_prune() {
 /// Scan for BLE mesh peers advertising Ratspeak or Columba.
 ///
 /// Creates a fresh btleplug adapter, so use this only for scan-only callers.
-/// Scan-then-connect flows must use [`scan_mesh_peers_shared`] with the same
-/// adapter they later pass to `connect_mesh_peer`; btleplug adapter instances
-/// do not share peripheral registries.
+/// On non-Apple platforms, scan-then-connect flows must use
+/// `scan_mesh_peers_shared` with the same adapter they later pass to
+/// `connect_mesh_peer`; btleplug adapter instances do not share peripheral
+/// registries.
 ///
 /// Safe entry point for one-off scan-only callers and the Apple branch
 /// (which uses the native CoreBluetooth path).

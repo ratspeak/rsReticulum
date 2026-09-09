@@ -408,7 +408,7 @@ pub async fn connect_peer(
     Ok(peer)
 }
 
-/// Queues into [`PENDING_WRITE`] when `canSendWriteWithoutResponse` is
+/// Queues into the pending-write buffer when `canSendWriteWithoutResponse` is
 /// false — without queueing, fragmented LXMF messages silently lose every
 /// fragment past the first on a loaded radio.
 pub fn write_peer(address: &str, data: &[u8]) -> Result<(), String> {
@@ -684,7 +684,7 @@ pub fn on_app_will_resign_active() {
     );
 }
 
-/// Prune discovered pointers older than [`DISCOVERED_TTL`] — after a long
+/// Prune discovered pointers older than the discovery TTL — after a long
 /// background those are RPA-rotated ghosts.
 pub fn on_app_did_become_active() {
     prune_discovered();
