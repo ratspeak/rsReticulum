@@ -26,6 +26,7 @@ pub mod discovery;
 pub mod hashlist;
 pub mod ifac;
 pub mod ingress;
+pub mod link_endpoint_dispatch;
 pub mod link_messages;
 pub mod link_table;
 pub mod messages;

@@ -60,9 +60,16 @@ enum InterfaceSendOutcome {
 
 struct LinkEndpointEntry {
     binding: crate::messages::LinkEndpointBinding,
+    generation: Arc<()>,
+    publication: Option<Arc<std::sync::atomic::AtomicU8>>,
     lifecycle_tx: mpsc::UnboundedSender<crate::messages::LinkEndpointLifecycleEvent>,
-    egress: VecDeque<Bytes>,
+    egress: VecDeque<LinkEndpointQueuedPacket>,
     unbind_after_drain: bool,
+}
+
+struct LinkEndpointQueuedPacket {
+    raw: Bytes,
+    completion: Option<crate::link_endpoint_dispatch::LinkEndpointDispatchCompletion>,
 }
 
 /// Owns every routing table and drains the `TransportMessage` channel in one
@@ -75,6 +82,10 @@ pub struct TransportActor {
     persistence_rx: mpsc::Receiver<()>,
     path_recovery_tx: mpsc::Sender<crate::path_recovery::PathRecoveryRequest>,
     path_recovery_rx: mpsc::Receiver<crate::path_recovery::PathRecoveryRequest>,
+    link_endpoint_dispatch_tx:
+        mpsc::Sender<crate::link_endpoint_dispatch::LinkEndpointDispatchRequest>,
+    link_endpoint_dispatch_rx:
+        mpsc::Receiver<crate::link_endpoint_dispatch::LinkEndpointDispatchRequest>,
     observe_local_link_routes: bool,
     local_link_route_attempts:
         HashMap<crate::path_recovery::FailedRouteAttempt, path_recovery::LocalLinkRouteAttempt>,
@@ -354,6 +365,8 @@ impl TransportActor {
         let (persistence_tx, persistence_rx) = mpsc::channel(1);
         let (path_recovery_tx, path_recovery_rx) =
             mpsc::channel(crate::path_recovery::RECOVERY_QUEUE_CAPACITY);
+        let (link_endpoint_dispatch_tx, link_endpoint_dispatch_rx) =
+            mpsc::channel(crate::link_endpoint_dispatch::DISPATCH_QUEUE_CAPACITY);
 
         let actor = Self {
             rx,
@@ -361,6 +374,8 @@ impl TransportActor {
             persistence_rx,
             path_recovery_tx,
             path_recovery_rx,
+            link_endpoint_dispatch_tx,
+            link_endpoint_dispatch_rx,
             observe_local_link_routes: false,
             local_link_route_attempts: HashMap::new(),
             path_table: PathTable::new(),
@@ -446,6 +461,16 @@ impl TransportActor {
         }
     }
 
+    /// Obtain exact established-Link binding and local dispatch receipts.
+    /// The existing raw mailbox remains available with its legacy semantics.
+    pub fn link_endpoint_dispatch_handle(
+        &self,
+    ) -> crate::link_endpoint_dispatch::LinkEndpointDispatchHandle {
+        crate::link_endpoint_dispatch::LinkEndpointDispatchHandle {
+            tx: self.link_endpoint_dispatch_tx.clone(),
+        }
+    }
+
     /// Load persisted state before the actor starts draining live traffic.
     ///
     /// Startup restore can touch thousands of Python cache files on slow
@@ -480,6 +505,9 @@ impl TransportActor {
                 }
                 Some(request) = self.path_recovery_rx.recv() => {
                     self.recover_local_link_path(request);
+                }
+                Some(request) = self.link_endpoint_dispatch_rx.recv() => {
+                    self.handle_link_endpoint_dispatch(request);
                 }
                 _ = tick_interval.tick() => {
                     let is_fg = self.is_foreground.load(std::sync::atomic::Ordering::Relaxed);
@@ -2008,6 +2036,7 @@ fn mode_discovers_unknown_paths(mode: InterfaceMode) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod link_endpoint_dispatch;
     mod slow_media_discovery;
     use super::*;
     use crate::constants::{InterfaceDirection, InterfaceMode};

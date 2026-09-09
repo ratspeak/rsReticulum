@@ -9,6 +9,7 @@ impl TransportActor {
         use crate::messages::LinkEndpointBindResult;
 
         let key = (binding.link_id, binding.role);
+        self.retire_unpublished_link_endpoint(key);
         if let Some(existing) = self.link_endpoints.get(&key) {
             return if existing.binding == binding {
                 LinkEndpointBindResult::AlreadyBound
@@ -28,6 +29,8 @@ impl TransportActor {
             key,
             LinkEndpointEntry {
                 binding,
+                generation: Arc::new(()),
+                publication: None,
                 lifecycle_tx,
                 egress: VecDeque::new(),
                 unbind_after_drain: false,
@@ -77,6 +80,7 @@ impl TransportActor {
         use crate::messages::{LinkEndpointSendResult, LinkEndpointTerminalReason};
 
         let key = (link_id, role);
+        self.retire_unpublished_link_endpoint(key);
         if !self.link_endpoints.contains_key(&key) {
             return if self
                 .link_endpoints
@@ -182,6 +186,7 @@ impl TransportActor {
         use crate::messages::{LinkEndpointSendResult, LinkEndpointTerminalReason};
 
         let key = (link_id, role);
+        self.retire_unpublished_link_endpoint(key);
         if !self.link_endpoints.contains_key(&key) {
             return if self
                 .link_endpoints
@@ -293,7 +298,10 @@ impl TransportActor {
                 LinkEndpointTerminalReason::EgressQueueExhausted,
             );
         }
-        entry.egress.push_back(raw);
+        entry.egress.push_back(LinkEndpointQueuedPacket {
+            raw,
+            completion: None,
+        });
         LinkEndpointSendResult::Queued {
             depth: entry.egress.len(),
         }
@@ -317,15 +325,73 @@ impl TransportActor {
             return Err(crate::messages::LinkEndpointTerminalReason::InterfaceRemoved);
         };
 
-        while let Some(raw) = entry.egress.front() {
+        if entry
+            .publication
+            .as_ref()
+            .is_some_and(|publication| publication.load(std::sync::atomic::Ordering::Acquire) == 2)
+        {
+            self.finish_link_endpoint_terminal(
+                entry,
+                crate::messages::LinkEndpointTerminalReason::Unbound,
+                0,
+            );
+            return Err(crate::messages::LinkEndpointTerminalReason::Unbound);
+        }
+
+        // Expiry/cancellation applies to every tracked packet, including those
+        // behind a legacy packet blocked on a full driver queue. It never
+        // removes other owners' bytes or renews the original deadline.
+        entry.egress.retain_mut(|packet| {
+            let Some(completion) = packet.completion.as_ref() else {
+                return true;
+            };
+            if completion.result_tx.is_closed() {
+                return false;
+            }
+            if std::time::Instant::now() >= completion.deadline {
+                let completion = packet.completion.take().expect("checked completion");
+                let _ = completion
+                    .result_tx
+                    .send(crate::link_endpoint_dispatch::LinkEndpointDispatchOutcome::Expired);
+                return false;
+            }
+            true
+        });
+
+        while let Some(packet) = entry.egress.front() {
+            // Recheck immediately before admission: draining a long FIFO may
+            // cross a later packet's deadline after the initial prune.
+            if packet.completion.as_ref().is_some_and(|completion| {
+                completion.result_tx.is_closed() || std::time::Instant::now() >= completion.deadline
+            }) {
+                if let Some(completion) = entry.egress.pop_front().and_then(|p| p.completion) {
+                    let _ = completion
+                        .result_tx
+                        .send(crate::link_endpoint_dispatch::LinkEndpointDispatchOutcome::Expired);
+                }
+                continue;
+            }
             match self.try_send_link_endpoint_raw(
                 entry.binding.interface_id,
                 entry.binding.link_id,
                 entry.binding.role,
-                raw,
+                &packet.raw,
             ) {
                 InterfaceSendOutcome::Sent => {
-                    entry.egress.pop_front();
+                    let dispatched_at = std::time::Instant::now();
+                    let packet = entry.egress.pop_front().expect("admitted FIFO head");
+                    if let Some(completion) = packet.completion {
+                        let (header, _) = rns_wire::header::PacketHeader::unpack(&packet.raw)
+                            .expect("only validated packets enter the endpoint FIFO");
+                        let packet_hash =
+                            rns_wire::hash::packet_hash(&packet.raw, header.flags.header_type);
+                        let _ = completion.result_tx.send(
+                            crate::link_endpoint_dispatch::LinkEndpointDispatchOutcome::Sent {
+                                packet_hash,
+                                dispatched_at,
+                            },
+                        );
+                    }
                 }
                 InterfaceSendOutcome::Full => {
                     self.link_endpoints.insert(key, entry);
@@ -524,6 +590,15 @@ impl TransportActor {
             reason,
             dropped_packets: entry.egress.len().saturating_add(extra_dropped),
         };
+        for packet in entry.egress {
+            if let Some(completion) = packet.completion {
+                let _ = completion.result_tx.send(
+                    crate::link_endpoint_dispatch::LinkEndpointDispatchOutcome::Rejected(
+                        crate::messages::LinkEndpointSendResult::Terminated(reason),
+                    ),
+                );
+            }
+        }
         let _ = entry.lifecycle_tx.send(event);
         debug!(
             link_id = %hex::encode(entry.binding.link_id),
@@ -533,6 +608,149 @@ impl TransportActor {
             dropped_packets = event.dropped_packets,
             "terminated established Link endpoint"
         );
+    }
+
+    fn retire_unpublished_link_endpoint(
+        &mut self,
+        key: ([u8; 16], crate::messages::LinkEndpointRole),
+    ) {
+        if self.link_endpoints.get(&key).is_some_and(|entry| {
+            entry.publication.as_ref().is_some_and(|publication| {
+                publication.load(std::sync::atomic::Ordering::Acquire) == 2
+            })
+        }) {
+            self.terminate_link_endpoint(
+                key,
+                crate::messages::LinkEndpointTerminalReason::Unbound,
+                0,
+            );
+        }
+    }
+
+    pub(super) fn handle_link_endpoint_dispatch(
+        &mut self,
+        operation: crate::link_endpoint_dispatch::LinkEndpointDispatchRequest,
+    ) {
+        use crate::link_endpoint_dispatch::{
+            LinkEndpointDispatchOutcome, LinkEndpointDispatchRequest, LinkEndpointDispatchToken,
+        };
+        use crate::messages::{LinkEndpointBindResult, LinkEndpointSendResult};
+
+        match operation {
+            LinkEndpointDispatchRequest::Bind {
+                binding,
+                lifecycle_tx,
+                publication,
+                result_tx,
+            } => {
+                if result_tx.is_closed()
+                    || publication.load(std::sync::atomic::Ordering::Acquire) == 2
+                {
+                    return;
+                }
+                let result = self.bind_link_endpoint(binding, lifecycle_tx);
+                if result != LinkEndpointBindResult::Bound {
+                    let _ = result_tx.send(Err(result));
+                    return;
+                }
+                let handle = self.link_endpoint_dispatch_handle();
+                let entry = self
+                    .link_endpoints
+                    .get_mut(&(binding.link_id, binding.role))
+                    .expect("freshly bound endpoint");
+                entry.publication = Some(publication);
+                let token = LinkEndpointDispatchToken {
+                    handle,
+                    binding,
+                    generation: entry.generation.clone(),
+                };
+                let _ = result_tx.send(Ok(token));
+                self.retire_unpublished_link_endpoint((binding.link_id, binding.role));
+            }
+            LinkEndpointDispatchRequest::Send {
+                binding,
+                generation,
+                request,
+                completion,
+            } => {
+                if completion.result_tx.is_closed() {
+                    return;
+                }
+                if std::time::Instant::now() >= completion.deadline {
+                    let _ = completion
+                        .result_tx
+                        .send(LinkEndpointDispatchOutcome::Expired);
+                    return;
+                }
+                let key = (binding.link_id, binding.role);
+                self.retire_unpublished_link_endpoint(key);
+                let Some(entry) = self.link_endpoints.get(&key) else {
+                    let _ = completion
+                        .result_tx
+                        .send(LinkEndpointDispatchOutcome::Rejected(
+                            LinkEndpointSendResult::NotBound,
+                        ));
+                    return;
+                };
+                if entry.binding != binding || !Arc::ptr_eq(&entry.generation, &generation) {
+                    let _ = completion
+                        .result_tx
+                        .send(LinkEndpointDispatchOutcome::Rejected(
+                            LinkEndpointSendResult::NotBound,
+                        ));
+                    return;
+                }
+                if entry.unbind_after_drain {
+                    let _ = completion
+                        .result_tx
+                        .send(LinkEndpointDispatchOutcome::Rejected(
+                            LinkEndpointSendResult::Terminated(
+                                crate::messages::LinkEndpointTerminalReason::Unbound,
+                            ),
+                        ));
+                    return;
+                }
+                if let Err(reason) = self.drain_one_link_endpoint(key) {
+                    let _ = completion
+                        .result_tx
+                        .send(LinkEndpointDispatchOutcome::Rejected(
+                            LinkEndpointSendResult::Terminated(reason),
+                        ));
+                    return;
+                }
+                if self.link_endpoints[&key].egress.len() >= LINK_ENDPOINT_EGRESS_QUEUE_CAPACITY {
+                    let reason = crate::messages::LinkEndpointTerminalReason::EgressQueueExhausted;
+                    self.terminate_link_endpoint(key, reason, 0);
+                    let _ = completion
+                        .result_tx
+                        .send(LinkEndpointDispatchOutcome::Rejected(
+                            LinkEndpointSendResult::Terminated(reason),
+                        ));
+                    return;
+                }
+                let Some(raw) = self.prepare_link_endpoint_packet(
+                    binding.link_id,
+                    binding.interface_id,
+                    request,
+                ) else {
+                    let _ = completion
+                        .result_tx
+                        .send(LinkEndpointDispatchOutcome::Rejected(
+                            LinkEndpointSendResult::InvalidPacket,
+                        ));
+                    return;
+                };
+                self.link_endpoints
+                    .get_mut(&key)
+                    .expect("validated endpoint generation")
+                    .egress
+                    .push_back(LinkEndpointQueuedPacket {
+                        raw,
+                        completion: Some(completion),
+                    });
+                let _ = self.drain_one_link_endpoint(key);
+            }
+        }
     }
 }
 
