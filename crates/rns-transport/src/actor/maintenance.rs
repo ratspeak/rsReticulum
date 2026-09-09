@@ -241,6 +241,7 @@ impl TransportActor {
         }
 
         self.process_pending_discovery_path_requests(now);
+        self.process_pending_path_request_admissions(now);
         self.process_announce_queues(now);
     }
 

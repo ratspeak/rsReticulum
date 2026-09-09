@@ -30,6 +30,7 @@ mod link_endpoint;
 mod maintenance;
 mod outbound;
 mod path_recovery;
+mod path_request_admission;
 mod persistence;
 mod rpc;
 
@@ -127,6 +128,10 @@ pub struct TransportActor {
     /// Python `pending_discovery_prs`: failed-link rediscovery requests queued
     /// for throttled emission.
     pub pending_discovery_prs: VecDeque<PendingDiscoveryPathRequest>,
+    // Only rejected driver admissions live here; successfully admitted targets
+    // are never replayed by this owner. The public discovery records stay ABI/API
+    // compatible and continue to describe operation scheduling, not radio TX.
+    pending_path_request_admissions: VecDeque<path_request_admission::PendingAdmission>,
     /// Destination/interface pairs temporarily barred from installing paths.
     /// Used when a Direct LinkRequest timed out on one route, so the next
     /// path request can discover alternates instead of instantly reusing it.
@@ -379,6 +384,7 @@ impl TransportActor {
             discovery_path_requests: HashMap::new(),
             discovery_pr_tags: HashMap::new(),
             pending_discovery_prs: VecDeque::new(),
+            pending_path_request_admissions: VecDeque::new(),
             path_interface_suppressions: HashMap::new(),
             last_discovery_pr_tx: 0.0,
             pending_local_path_requests: HashMap::new(),
@@ -879,6 +885,7 @@ impl TransportActor {
                 }
                 debug!(id, name = %iface_name, outbound = is_outbound, role = role.as_str(), "registering interface");
                 if self.interfaces.contains_key(&id) {
+                    self.retire_path_request_admissions(id);
                     self.terminate_link_endpoints_for_interface(
                         id,
                         crate::messages::LinkEndpointTerminalReason::InterfaceRemoved,
@@ -1161,6 +1168,7 @@ impl TransportActor {
         self.discovery_path_requests.clear();
         self.pending_local_path_requests.clear();
         self.pending_discovery_prs.clear();
+        self.pending_path_request_admissions.clear();
         self.last_discovery_pr_tx = 0.0;
         self.state_dirty = true;
     }
@@ -1430,6 +1438,7 @@ impl TransportActor {
             .retain(|_, waiting_interface| *waiting_interface != id);
         self.discovery_path_requests
             .retain(|_, request| request.requesting_interface != id);
+        self.retire_path_request_admissions(id);
         self.interfaces.remove(&id);
         if role == Some(InterfaceRole::SharedInstancePeer) {
             tracing::warn!(

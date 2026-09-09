@@ -7,7 +7,7 @@ const LOCAL_LINK_ROUTE_LIFETIME: f64 = 3600.0;
 /// The signed announce version plus forwarding choice, not the path's traffic
 /// touch time. A locally admitted packet must not make its own route look new.
 #[derive(Clone, PartialEq)]
-struct RouteVersion {
+pub(super) struct RouteVersion {
     interface_id: InterfaceId,
     next_hop: Option<[u8; 16]>,
     hops: u8,
@@ -19,7 +19,7 @@ struct RouteVersion {
 }
 
 impl RouteVersion {
-    fn from_path(path: &crate::path_table::PathEntry) -> Self {
+    pub(super) fn from_path(path: &crate::path_table::PathEntry) -> Self {
         Self {
             interface_id: path.interface_id,
             next_hop: path.next_hop,
@@ -164,10 +164,15 @@ impl TransportActor {
             pending.destination_hash == request.destination_hash
                 && pending.blocked_interface.is_none()
         });
+        // A refused target retains its own bytes and deadline, but cannot
+        // extend an already-admitted interface's ordinary discovery cooldown.
+        // Once that cooldown expires, enqueue the new intent; per-interface
+        // admission coalesces still-refused targets without replaying them.
         let request_scheduled = should_request
             && (queued
                 || (!recent
-                    && self.queue_discovery_path_request(request.destination_hash, None, now)));
+                    && self.queue_discovery_path_request(request.destination_hash, None, now))
+                || self.has_pending_path_request_admission(request.destination_hash));
         let _ = request.result_tx.send(PathRecoveryOutcome {
             path_dropped,
             has_path,

@@ -745,53 +745,7 @@ impl TransportActor {
         recursive: bool,
     ) {
         let raw = self.build_path_request_packet(destination_hash, tag);
-        let now = now_f64();
-        {
-            let Some(entry) = self.interfaces.get_mut(&interface_id) else {
-                return;
-            };
-            if !entry.direction.outbound {
-                return;
-            }
-
-            if recursive {
-                if entry.ingress.should_egress_limit_pr() {
-                    trace!(
-                        dest = %hex::encode(destination_hash),
-                        interface_id,
-                        "skipping recursive path request — egress PR limit active"
-                    );
-                    return;
-                }
-                if !entry.announce_queue.is_empty() {
-                    trace!(
-                        dest = %hex::encode(destination_hash),
-                        interface_id,
-                        "skipping recursive path request — announce queue is not empty"
-                    );
-                    return;
-                }
-                if now < entry.announce_allowed_at {
-                    trace!(
-                        dest = %hex::encode(destination_hash),
-                        interface_id,
-                        "skipping recursive path request — announce cap window active"
-                    );
-                    return;
-                }
-
-                let bitrate = entry.bitrate.max(1) as f64;
-                let tx_time = (raw.len() as f64 * 8.0) / bitrate;
-                let wait_time = tx_time / entry.announce_cap.max(0.001);
-                entry.announce_allowed_at = now + wait_time;
-            }
-        }
-
-        self.send_to_interface(interface_id, &raw);
-        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
-            entry.ingress.sent_path_request();
-        }
-        self.path_requests.insert(destination_hash, now);
+        self.admit_path_request(destination_hash, interface_id, raw, recursive);
     }
 
     fn forward_path_request(
@@ -845,7 +799,7 @@ impl TransportActor {
             dest = hex::encode(destination_hash),
             interface = ?options.on_interface,
             recursive = options.recursive,
-            "explicit path request sent"
+            "explicit path request processed for driver admission"
         );
     }
 
