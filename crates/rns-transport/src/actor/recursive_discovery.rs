@@ -1,31 +1,145 @@
-//! Compatible, bounded ownership for coalesced recursive path discovery.
-//!
-//! The public Copy record retains the first requester for compatibility. This
-//! private ledger owns the actual live requester generations; coalescing never
-//! changes the original operation's deadline or emits another recursive fanout.
+//! One bounded owner for recursive discovery and its exact requester tokens.
 use super::*;
+use crate::path_discovery::{DiscoveryAdmission, DiscoveryError, DiscoveryRequester};
 
 const MAX_DISCOVERY_DESTINATIONS: usize = 1024;
 const MAX_DISCOVERY_REQUESTERS: usize = 64;
 
-pub(super) struct RecursiveDiscoveryWaiters {
-    owner: DiscoveryPathRequest,
-    interfaces: Vec<(InterfaceId, mpsc::Sender<Bytes>)>,
+pub(super) struct DiscoveryOperation {
+    pub(super) id: Arc<()>,
+    pub(super) timeout: f64,
+    requesters: Vec<Waiter>,
 }
 
-fn same_owner(left: DiscoveryPathRequest, right: DiscoveryPathRequest) -> bool {
-    left.requesting_interface == right.requesting_interface && left.timeout == right.timeout
+struct Waiter {
+    token: DiscoveryRequester,
+    channel: mpsc::Sender<Bytes>,
 }
 
 impl TransportActor {
+    /// Detached snapshot of one unexpired operation. No maintenance tick is
+    /// required to exclude expired operations or replaced requester channels.
+    pub fn discovery_path_request(&self, destination: &[u8; 16]) -> Option<DiscoveryPathRequest> {
+        let operation = self.discovery_path_requests.get(destination)?;
+        let now = now_f64();
+        if !now.is_finite() || now >= operation.timeout {
+            return None;
+        }
+        let requesters: Vec<_> = operation
+            .requesters
+            .iter()
+            .filter(|waiter| self.discovery_waiter_registered(waiter))
+            .map(|waiter| waiter.token.clone())
+            .collect();
+        if requesters.is_empty() {
+            return None;
+        }
+        Some(DiscoveryPathRequest {
+            destination: *destination,
+            timeout: operation.timeout,
+            requesters,
+        })
+    }
+
+    /// Detached snapshots ordered by destination hash. Admission is bounded to
+    /// 1,024 operations and 64 requester registrations per operation.
+    pub fn discovery_path_requests(&self) -> Vec<DiscoveryPathRequest> {
+        let mut snapshots: Vec<_> = self
+            .discovery_path_requests
+            .keys()
+            .filter_map(|destination| self.discovery_path_request(destination))
+            .collect();
+        snapshots.sort_by_key(DiscoveryPathRequest::destination_hash);
+        snapshots
+    }
+
+    /// Start/join discovery on behalf of an eligible network interface.
+    ///
+    /// For advanced synchronous actor owners, not normal application lookups.
+    /// Validates transport, unknown destination, interface role/mode and ingress
+    /// policy. Native inbound requests keep their existing wire-tag loop checks;
+    /// this method generates a fresh tag for the one new fanout. Joining neither
+    /// refans out nor renews the deadline. Admission is not proof of transmission
+    /// or delivery. Cancellation is explicit using the returned requester token.
+    pub fn request_recursive_discovery(
+        &mut self,
+        destination: [u8; 16],
+        requester: InterfaceId,
+    ) -> Result<DiscoveryAdmission, DiscoveryError> {
+        let now = now_f64();
+        if !now.is_finite() || now + PATH_REQUEST_TIMEOUT <= now {
+            return Err(DiscoveryError::InvalidClock);
+        }
+        if !self.is_transport_enabled {
+            return Err(DiscoveryError::TransportDisabled);
+        }
+        if self.local_destinations.contains(&destination) || self.path_table.has_path(&destination)
+        {
+            return Err(DiscoveryError::KnownDestination);
+        }
+        let entry = self
+            .interfaces
+            .get_mut(&requester)
+            .ok_or(DiscoveryError::UnknownInterface)?;
+        if !entry.direction.outbound || entry.tx.is_closed() || interface_marked_offline(entry) {
+            return Err(DiscoveryError::InterfaceUnavailable);
+        }
+        entry.ingress.received_path_request();
+        if entry.role != InterfaceRole::Normal
+            || !(entry.recursive_prs || mode_discovers_unknown_paths(entry.mode))
+            || entry.ingress.should_ingress_limit_pr()
+        {
+            return Err(DiscoveryError::PolicyDenied);
+        }
+        let admission = self.admit_discovery_requester(destination, requester, now)?;
+        if admission.started {
+            let tag = rns_crypto::random::random_bytes(16);
+            let mut unique_tag = destination.to_vec();
+            unique_tag.extend_from_slice(&tag);
+            self.discovery_pr_tags.insert(unique_tag, now);
+            self.forward_path_request(destination, Some(requester), Some(&tag), true);
+        }
+        Ok(admission)
+    }
+
+    /// Cancel only the exact live requester. False means stale, expired,
+    /// replaced or foreign-actor ownership. Other requesters retain the original
+    /// deadline/fanout. Last-owner cancellation retires unadmitted search bytes,
+    /// never bytes already sent. Dropping a token alone does not cancel it.
+    pub fn cancel_discovery_requester(&mut self, token: &DiscoveryRequester) -> bool {
+        self.cull_recursive_discovery(now_f64());
+        let Some(operation) = self.discovery_path_requests.get_mut(&token.destination) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&operation.id, &token.operation) {
+            return false;
+        }
+        let old_len = operation.requesters.len();
+        operation.requesters.retain(|waiter| waiter.token != *token);
+        let removed = old_len != operation.requesters.len();
+        if operation.requesters.is_empty() {
+            self.discovery_path_requests.remove(&token.destination);
+            self.retire_orphaned_discovery_admissions();
+        }
+        removed
+    }
+
+    fn discovery_waiter_registered(&self, waiter: &Waiter) -> bool {
+        self.interfaces
+            .get(&waiter.token.interface)
+            .is_some_and(|entry| {
+                entry.direction.outbound
+                    && !entry.tx.is_closed()
+                    && entry.tx.same_channel(&waiter.channel)
+            })
+    }
+
     pub(super) fn cancel_recursive_discovery(&mut self) {
         self.discovery_path_requests.clear();
-        self.recursive_discovery_waiters.clear();
         self.retire_recursive_path_request_admissions();
     }
 
-    /// This clock covers the request/response on a useful outbound medium, not
-    /// caller timeout, queued frame age, or a promised multi-hop RF duration.
+    /// Useful first-hop request/response allowance, not arbitrary multi-hop RF.
     pub(super) fn recursive_discovery_timeout(&self, requester: InterfaceId) -> f64 {
         let slowest = self
             .interfaces
@@ -44,95 +158,102 @@ impl TransportActor {
             .max(PATH_REQUEST_TIMEOUT)
     }
 
-    /// Return true only for a new admitted operation that needs its one fanout.
     pub(super) fn begin_or_join_recursive_discovery(
         &mut self,
         destination: [u8; 16],
         requester: InterfaceId,
         now: f64,
     ) -> bool {
+        self.admit_discovery_requester(destination, requester, now)
+            .is_ok_and(|admission| admission.started)
+    }
+
+    fn admit_discovery_requester(
+        &mut self,
+        destination: [u8; 16],
+        requester: InterfaceId,
+        now: f64,
+    ) -> Result<DiscoveryAdmission, DiscoveryError> {
+        if !now.is_finite() {
+            return Err(DiscoveryError::InvalidClock);
+        }
+        // Normal ingress only examines this destination's <=64 registrations;
+        // do not scan the whole inventory for every received request.
         if self
             .discovery_path_requests
-            .get(&destination)
-            .is_some_and(|owner| now >= owner.timeout || !owner.timeout.is_finite())
+            .get_mut(&destination)
+            .is_some_and(|operation| !retain_live_requesters(operation, &self.interfaces, now))
         {
             self.discovery_path_requests.remove(&destination);
-            self.recursive_discovery_waiters.remove(&destination);
+            self.retire_orphaned_discovery_admissions();
         }
-        let Some(requester_tx) = self
+        let entry = self
             .interfaces
             .get(&requester)
-            .filter(|entry| entry.direction.outbound && !entry.tx.is_closed())
-            .map(|entry| entry.tx.clone())
-        else {
-            return false;
-        };
-        if let Some(owner) = self.discovery_path_requests.get(&destination).copied() {
-            if !self.recursive_discovery_waiters.contains_key(&destination)
-                && self.recursive_discovery_waiters.len() >= MAX_DISCOVERY_DESTINATIONS
-            {
-                self.cull_recursive_discovery(now);
-                if self.recursive_discovery_waiters.len() >= MAX_DISCOVERY_DESTINATIONS {
-                    debug!("recursive discovery private requester inventory exhausted");
-                    return false;
-                }
+            .ok_or(DiscoveryError::UnknownInterface)?;
+        if !entry.direction.outbound || entry.tx.is_closed() || interface_marked_offline(entry) {
+            return Err(DiscoveryError::InterfaceUnavailable);
+        }
+        let channel = entry.tx.clone();
+        if let Some(operation) = self.discovery_path_requests.get_mut(&destination) {
+            if let Some(waiter) = operation.requesters.iter().find(|waiter| {
+                waiter.token.interface == requester && waiter.channel.same_channel(&channel)
+            }) {
+                return Ok(DiscoveryAdmission {
+                    requester: waiter.token.clone(),
+                    started: false,
+                });
             }
-            // Externally inserted legacy records remain usable. Their first
-            // requester is adopted only from the currently registered channel;
-            // replacement/removal hooks retire legacy records before ID reuse.
-            if self
-                .recursive_discovery_waiters
-                .get(&destination)
-                .is_none_or(|waiters| !same_owner(waiters.owner, owner))
-            {
-                let interfaces = self
-                    .interfaces
-                    .get(&owner.requesting_interface)
-                    .map(|entry| vec![(owner.requesting_interface, entry.tx.clone())])
-                    .unwrap_or_default();
-                self.recursive_discovery_waiters
-                    .insert(destination, RecursiveDiscoveryWaiters { owner, interfaces });
+            if operation.requesters.len() >= MAX_DISCOVERY_REQUESTERS {
+                return Err(DiscoveryError::Capacity);
             }
-            let waiters = self
-                .recursive_discovery_waiters
-                .get_mut(&destination)
-                .unwrap();
-            if !waiters
-                .interfaces
-                .iter()
-                .any(|(id, tx)| *id == requester && tx.same_channel(&requester_tx))
-            {
-                if waiters.interfaces.len() < MAX_DISCOVERY_REQUESTERS {
-                    waiters.interfaces.push((requester, requester_tx));
-                } else {
-                    debug!(
-                        requester,
-                        "recursive discovery requester capacity exhausted"
-                    );
-                }
-            }
-            return false;
+            let token = DiscoveryRequester {
+                destination,
+                interface: requester,
+                operation: operation.id.clone(),
+                registration: Arc::new(()),
+            };
+            operation.requesters.push(Waiter {
+                token: token.clone(),
+                channel,
+            });
+            return Ok(DiscoveryAdmission {
+                requester: token,
+                started: false,
+            });
         }
         if self.discovery_path_requests.len() >= MAX_DISCOVERY_DESTINATIONS {
             self.cull_recursive_discovery(now);
             if self.discovery_path_requests.len() >= MAX_DISCOVERY_DESTINATIONS {
-                debug!("recursive discovery destination capacity exhausted");
-                return false;
+                return Err(DiscoveryError::Capacity);
             }
         }
-        let owner = DiscoveryPathRequest {
-            requesting_interface: requester,
-            timeout: now + self.recursive_discovery_timeout(requester),
-        };
-        self.discovery_path_requests.insert(destination, owner);
-        self.recursive_discovery_waiters.insert(
+        let timeout = now + self.recursive_discovery_timeout(requester);
+        if !timeout.is_finite() || timeout <= now {
+            return Err(DiscoveryError::InvalidClock);
+        }
+        let id = Arc::new(());
+        let token = DiscoveryRequester {
             destination,
-            RecursiveDiscoveryWaiters {
-                owner,
-                interfaces: vec![(requester, requester_tx)],
+            interface: requester,
+            operation: id.clone(),
+            registration: Arc::new(()),
+        };
+        self.discovery_path_requests.insert(
+            destination,
+            DiscoveryOperation {
+                id,
+                timeout,
+                requesters: vec![Waiter {
+                    token: token.clone(),
+                    channel,
+                }],
             },
         );
-        true
+        Ok(DiscoveryAdmission {
+            requester: token,
+            started: true,
+        })
     }
 
     pub(super) fn finish_recursive_discovery(
@@ -142,31 +263,22 @@ impl TransportActor {
         incoming: InterfaceId,
         now: f64,
     ) {
-        let Some(owner) = self.discovery_path_requests.remove(&destination) else {
-            self.recursive_discovery_waiters.remove(&destination);
+        let Some(operation) = self.discovery_path_requests.remove(&destination) else {
             return;
         };
-        let waiters = self.recursive_discovery_waiters.remove(&destination);
-        if now >= owner.timeout || !owner.timeout.is_finite() {
+        self.retire_orphaned_discovery_admissions();
+        if !now.is_finite() || now >= operation.timeout {
             return;
         }
-        let interfaces = match waiters {
-            Some(waiters) if same_owner(waiters.owner, owner) => waiters.interfaces,
-            _ => self
-                .interfaces
-                .get(&owner.requesting_interface)
-                .map(|entry| vec![(owner.requesting_interface, entry.tx.clone())])
-                .unwrap_or_default(),
-        };
-        for (id, generation) in interfaces {
-            let eligible = self.interfaces.get(&id).is_some_and(|entry| {
-                entry.direction.outbound && !interface_marked_offline(entry)
-                    && entry.tx.same_channel(&generation)
-                    // An IPC edge names one peer. A radio can name hidden
-                    // neighbors; retain only the explicit same-Roaming veto.
-                    && (id != incoming || (entry.role == InterfaceRole::Normal
-                        && entry.mode != InterfaceMode::Roaming))
-            });
+        for waiter in operation.requesters {
+            let id = waiter.token.interface;
+            let eligible = self.discovery_waiter_registered(&waiter)
+                && self.interfaces.get(&id).is_some_and(|entry| {
+                    !interface_marked_offline(entry)
+                        // A radio can serve hidden peers; an IPC edge is one peer.
+                        && (id != incoming || (entry.role == InterfaceRole::Normal
+                            && entry.mode != InterfaceMode::Roaming))
+                });
             if eligible {
                 self.send_to_interface(id, response);
             }
@@ -174,33 +286,36 @@ impl TransportActor {
     }
 
     pub(super) fn retire_recursive_discovery_interface(&mut self, interface: InterfaceId) {
-        let mut retired = Vec::new();
-        for (destination, owner) in &self.discovery_path_requests {
-            match self.recursive_discovery_waiters.get_mut(destination) {
-                Some(waiters) if same_owner(waiters.owner, *owner) => {
-                    waiters.interfaces.retain(|(id, _)| *id != interface);
-                    if waiters.interfaces.is_empty() {
-                        retired.push(*destination);
-                    }
-                }
-                _ if owner.requesting_interface == interface => retired.push(*destination),
-                _ => {}
-            }
-        }
-        for destination in retired {
-            self.discovery_path_requests.remove(&destination);
-            self.recursive_discovery_waiters.remove(&destination);
-        }
+        self.discovery_path_requests.retain(|_, operation| {
+            operation
+                .requesters
+                .retain(|waiter| waiter.token.interface != interface);
+            !operation.requesters.is_empty()
+        });
+        self.retire_orphaned_discovery_admissions();
     }
 
     pub(super) fn cull_recursive_discovery(&mut self, now: f64) {
+        let interfaces = &self.interfaces;
         self.discovery_path_requests
-            .retain(|_, owner| owner.timeout.is_finite() && now < owner.timeout);
-        self.recursive_discovery_waiters
-            .retain(|destination, waiters| {
-                self.discovery_path_requests
-                    .get(destination)
-                    .is_some_and(|owner| same_owner(waiters.owner, *owner))
-            });
+            .retain(|_, operation| retain_live_requesters(operation, interfaces, now));
+        self.retire_orphaned_discovery_admissions();
     }
+}
+
+fn retain_live_requesters(
+    operation: &mut DiscoveryOperation,
+    interfaces: &HashMap<InterfaceId, InterfaceEntry>,
+    now: f64,
+) -> bool {
+    operation.requesters.retain(|waiter| {
+        interfaces
+            .get(&waiter.token.interface)
+            .is_some_and(|entry| {
+                entry.direction.outbound
+                    && !entry.tx.is_closed()
+                    && entry.tx.same_channel(&waiter.channel)
+            })
+    });
+    now.is_finite() && now < operation.timeout && !operation.requesters.is_empty()
 }

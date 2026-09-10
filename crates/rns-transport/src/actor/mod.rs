@@ -18,6 +18,7 @@ use crate::link_table::LinkTable;
 use crate::messages::{
     InterfaceEntry, InterfaceId, InterfaceRole, TransportMessage, msg_variant_name,
 };
+pub use crate::path_discovery::DiscoveryPathRequest;
 use crate::path_table::PathTable;
 use crate::rate_limit::RateTable;
 use crate::reverse_table::ReverseTable;
@@ -132,12 +133,8 @@ pub struct TransportActor {
     /// ownership have different lifetimes and authority.
     link_endpoints: HashMap<([u8; 16], crate::messages::LinkEndpointRole), LinkEndpointEntry>,
     pub path_requests: HashMap<[u8; 16], f64>,
-    /// Python `discovery_path_requests`: external interfaces waiting for a
-    /// matching announce while this transport recursively searches elsewhere.
-    pub discovery_path_requests: HashMap<[u8; 16], DiscoveryPathRequest>,
-    // The public Copy record retains the original requester; this private
-    // ledger owns all currently live requester/channel generations.
-    recursive_discovery_waiters: HashMap<[u8; 16], recursive_discovery::RecursiveDiscoveryWaiters>,
+    // One canonical owner; detached public snapshots cannot mutate registrations.
+    discovery_path_requests: HashMap<[u8; 16], recursive_discovery::DiscoveryOperation>,
     /// Python `discovery_pr_tags`: destination hash plus truncated path-request tag.
     pub discovery_pr_tags: HashMap<Vec<u8>, f64>,
     /// Python `pending_discovery_prs`: failed-link rediscovery requests queued
@@ -303,12 +300,6 @@ pub struct RecentAnnounce {
     pub name_hash: [u8; 10],
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct DiscoveryPathRequest {
-    pub requesting_interface: InterfaceId,
-    pub timeout: f64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingDiscoveryPathRequest {
     pub destination_hash: [u8; 16],
@@ -401,7 +392,6 @@ impl TransportActor {
             link_endpoints: HashMap::new(),
             path_requests: HashMap::new(),
             discovery_path_requests: HashMap::new(),
-            recursive_discovery_waiters: HashMap::new(),
             discovery_pr_tags: HashMap::new(),
             pending_discovery_prs: VecDeque::new(),
             pending_path_request_admissions: VecDeque::new(),
@@ -1203,7 +1193,6 @@ impl TransportActor {
         self.packet_metrics_order.clear();
         self.receipt_proof_txs.clear();
         self.discovery_path_requests.clear();
-        self.recursive_discovery_waiters.clear();
         self.pending_local_path_requests.clear();
         self.pending_discovery_prs.clear();
         self.pending_path_request_admissions.clear();
@@ -2036,6 +2025,7 @@ fn mode_discovers_unknown_paths(mode: InterfaceMode) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod discovery_api;
     mod link_endpoint_dispatch;
     mod slow_media_discovery;
     use super::*;
@@ -7364,13 +7354,7 @@ mod tests {
 
         // Discovery requests on behalf of another peer use the same bypass.
         let (raw_discovery, dest_discovery) = make_valid_announce("test.path_req.discovery", 1);
-        actor.discovery_path_requests.insert(
-            dest_discovery,
-            DiscoveryPathRequest {
-                requesting_interface: 1,
-                timeout: now_f64() + PATH_REQUEST_TIMEOUT,
-            },
-        );
+        assert!(actor.begin_or_join_recursive_discovery(dest_discovery, 1, now_f64()));
         actor.on_inbound(crate::messages::InboundPacket {
             raw: raw_discovery,
             interface_id: 1,
@@ -11054,13 +11038,11 @@ mod tests {
     fn discovery_path_requests_expire_on_maintenance_tick() {
         let (mut actor, _tx) = TransportActor::new();
         let requested = [0xD9; 16];
-        actor.discovery_path_requests.insert(
-            requested,
-            DiscoveryPathRequest {
-                requesting_interface: 1,
-                timeout: 0.0,
-            },
-        );
+        let (interface, _rx) = make_test_interface("expired requester");
+        actor.interfaces.insert(1, interface);
+        let clock = crate::test_clock::Clock::at(now_f64());
+        assert!(actor.begin_or_join_recursive_discovery(requested, 1, now_f64()));
+        clock.set(actor.discovery_path_request(&requested).unwrap().deadline());
 
         actor.on_tick();
 

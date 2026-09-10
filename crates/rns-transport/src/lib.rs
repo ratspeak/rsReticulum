@@ -30,6 +30,7 @@ pub mod link_endpoint_dispatch;
 pub mod link_messages;
 pub mod link_table;
 pub mod messages;
+pub mod path_discovery;
 pub mod path_recovery;
 pub mod path_table;
 pub mod persistence;

@@ -17,7 +17,7 @@ pub(super) struct PendingAdmission {
     deadline: f64,
     next_try: f64,
     initial_route: Option<RouteVersion>,
-    discovery_owner: Option<DiscoveryPathRequest>,
+    discovery_owner: Option<Arc<()>>,
 }
 
 #[cfg(test)]
@@ -240,16 +240,12 @@ mod tests {
         let mut radio = interface(&mut actor, 1, 1);
         fill(&actor, 1);
         let dest = [0xD5; 16];
-        actor.discovery_path_requests.insert(
-            dest,
-            DiscoveryPathRequest {
-                requesting_interface: 2,
-                timeout: now_f64() + 10.0,
-            },
-        );
+        let _requester_rx = interface(&mut actor, 2, 8);
+        assert!(actor.begin_or_join_recursive_discovery(dest, 2, now_f64()));
         actor.send_path_request(dest, 1, Some(&[0x55; 16]), true);
         let due = actor.pending_path_request_admissions[0].next_try;
-        actor.discovery_path_requests.remove(&dest);
+        let token = actor.discovery_path_request(&dest).unwrap().requesters()[0].clone();
+        assert!(actor.cancel_discovery_requester(&token));
         radio.try_recv().unwrap();
         actor.process_pending_path_request_admissions(due);
         assert!(radio.try_recv().is_err());
@@ -368,13 +364,8 @@ mod tests {
             let mut radio = interface(&mut actor, 1, 1);
             fill(&actor, 1);
             let dest = [0xE3; 16];
-            actor.discovery_path_requests.insert(
-                dest,
-                DiscoveryPathRequest {
-                    requesting_interface: 2,
-                    timeout: start + 10.0,
-                },
-            );
+            let _requester_rx = interface(&mut actor, 2, 8);
+            assert!(actor.begin_or_join_recursive_discovery(dest, 2, start));
             actor.send_path_request(dest, 1, Some(&[0x52; 16]), true);
             let original = &actor.pending_path_request_admissions[0];
             let raw = original.raw.clone();
@@ -487,6 +478,16 @@ enum Admission {
 }
 
 impl TransportActor {
+    pub(super) fn retire_orphaned_discovery_admissions(&mut self) {
+        self.pending_path_request_admissions.retain(|pending| {
+            pending.discovery_owner.as_ref().is_none_or(|owner| {
+                self.discovery_path_requests
+                    .get(&pending.destination)
+                    .is_some_and(|current| Arc::ptr_eq(&current.id, owner))
+            })
+        });
+    }
+
     pub(super) fn retire_recursive_path_request_admissions(&mut self) {
         self.pending_path_request_admissions
             .retain(|pending| pending.discovery_owner.is_none());
@@ -538,12 +539,13 @@ impl TransportActor {
         let Some(entry) = self.interfaces.get(&interface) else {
             return;
         };
-        let discovery_owner = recursive
-            .then(|| self.discovery_path_requests.get(&destination).copied())
+        let discovery = recursive
+            .then(|| self.discovery_path_requests.get(&destination))
             .flatten();
-        let deadline = discovery_owner.map_or(now + PATH_REQUEST_GATE_TIMEOUT, |owner| {
+        let deadline = discovery.map_or(now + PATH_REQUEST_GATE_TIMEOUT, |owner| {
             owner.timeout.min(now + PATH_REQUEST_GATE_TIMEOUT)
         });
+        let discovery_owner = discovery.map(|owner| owner.id.clone());
         self.pending_path_request_admissions
             .push_back(PendingAdmission {
                 destination,
@@ -631,14 +633,10 @@ impl TransportActor {
                 .is_some_and(|entry| {
                     entry.direction.outbound && entry.tx.same_channel(&pending.generation)
                 });
-            let same_discovery = pending.discovery_owner.is_none_or(|owner| {
+            let same_discovery = pending.discovery_owner.as_ref().is_none_or(|owner| {
                 self.discovery_path_requests
                     .get(&pending.destination)
-                    .is_some_and(|current| {
-                        current.requesting_interface == owner.requesting_interface
-                            && current.timeout == owner.timeout
-                            && now < current.timeout
-                    })
+                    .is_some_and(|current| Arc::ptr_eq(&current.id, owner) && now < current.timeout)
             });
             let fresh_path = self
                 .path_table

@@ -67,7 +67,7 @@ fn recursive_slow_discovery_retains_authenticated_response_after_fifteen_seconds
         assert_response(response_rx.try_recv().unwrap(), dest);
         assert!(actor.path_table.has_path(&dest));
         assert!(!actor.discovery_path_requests.contains_key(&dest));
-        assert!(!actor.recursive_discovery_waiters.contains_key(&dest));
+        assert!(actor.discovery_path_request(&dest).is_none());
     }
 }
 
@@ -120,15 +120,23 @@ fn recursive_requesters_share_one_fanout_and_response_reaches_same_radio() {
         let (announce, dest) = make_valid_announce("test.discovery.waiters", 0);
         request(&mut actor, dest, 1, 1);
         second_rx.try_recv().unwrap();
-        let owner = actor.discovery_path_requests[&dest];
+        let owner = actor.discovery_path_request(&dest).unwrap();
         request(&mut actor, dest, 1, 2); // Same tag is a loop, not a new waiter.
         request(&mut actor, dest, 2, 2);
         assert!(first_rx.try_recv().is_err() && second_rx.try_recv().is_err());
         clock.set(start + PATH_REQUEST_GATE_TIMEOUT + 0.001);
         actor.on_tick();
         request(&mut actor, dest, 3, 2);
-        assert_eq!(actor.discovery_path_requests[&dest].timeout, owner.timeout);
-        assert_eq!(actor.discovery_path_requests[&dest].requesting_interface, 1);
+        let current = actor.discovery_path_request(&dest).unwrap();
+        assert_eq!(current.deadline(), owner.deadline());
+        assert_eq!(
+            current
+                .requesters()
+                .iter()
+                .map(|r| r.interface_id())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         assert!(second_rx.try_recv().is_err());
         inbound(&mut actor, announce.clone(), 2);
         assert_response(first_rx.try_recv().unwrap(), dest);
@@ -173,7 +181,7 @@ fn recursive_expiry_and_signature_are_admission_boundaries_without_tick() {
 }
 
 #[test]
-fn recursive_primary_replacement_keeps_other_waiters_and_legacy_records_retire() {
+fn recursive_primary_replacement_keeps_other_waiters_and_single_requesters_retire() {
     let mut actor = relay();
     let (first, _first_rx) = make_test_interface("old first requester");
     let (second, mut second_rx) = make_test_interface("other requester");
@@ -186,13 +194,7 @@ fn recursive_primary_replacement_keeps_other_waiters_and_legacy_records_retire()
     second_rx.try_recv().unwrap();
     request(&mut actor, dest, 2, 2);
     let deadline = actor.discovery_path_requests[&dest].timeout;
-    actor.discovery_path_requests.insert(
-        [0xEF; 16],
-        DiscoveryPathRequest {
-            requesting_interface: 1,
-            timeout: deadline,
-        },
-    );
+    assert!(actor.begin_or_join_recursive_discovery([0xEF; 16], 1, now_f64()));
     let (replacement, mut replacement_rx) = make_test_interface("new first requester");
     actor.handle_message(TransportMessage::RegisterInterface {
         id: 1,
@@ -245,7 +247,7 @@ fn recursive_coverage_review_failed_response_target_does_not_block_other_waiter_
         assert_response(healthy_rx.try_recv().unwrap(), dest);
         assert!(actor.path_table.has_path(&dest));
         assert!(!actor.discovery_path_requests.contains_key(&dest));
-        assert!(!actor.recursive_discovery_waiters.contains_key(&dest));
+        assert!(actor.discovery_path_request(&dest).is_none());
         assert_eq!(
             upstream_rx.try_recv().unwrap(),
             Bytes::from_static(b"upstream occupied")
@@ -334,15 +336,13 @@ fn recursive_capacity_is_bounded_without_evicting_or_renewing_owners() {
     }
     assert!(!actor.begin_or_join_recursive_discovery([0xFF; 16], 1, now));
     assert_eq!(actor.discovery_path_requests.len(), 1024);
-    assert_eq!(actor.recursive_discovery_waiters.len(), 1024);
+    assert_eq!(actor.discovery_path_requests().len(), 1024);
     actor.cull_recursive_discovery(now + 1607.0);
-    assert!(
-        actor.discovery_path_requests.is_empty() && actor.recursive_discovery_waiters.is_empty()
-    );
+    assert!(actor.discovery_path_requests.is_empty() && actor.discovery_path_requests().is_empty());
 }
 
 #[test]
-fn recursive_reset_retires_public_private_and_unadmitted_work_together() {
+fn recursive_reset_retires_snapshots_and_unadmitted_work_together() {
     for shared_reset in [false, true] {
         let mut actor = relay();
         let (first, _first_rx) = make_test_interface("first");
@@ -355,7 +355,7 @@ fn recursive_reset_retires_public_private_and_unadmitted_work_together() {
         actor.interfaces.insert(2, blocked);
         let dest = [0xE6; 16];
         request(&mut actor, dest, 1, 1);
-        assert!(!actor.recursive_discovery_waiters.is_empty());
+        assert!(!actor.discovery_path_requests().is_empty());
         assert!(actor.has_pending_path_request_admission(dest));
         if shared_reset {
             actor.clear_shared_connection_state();
@@ -363,7 +363,7 @@ fn recursive_reset_retires_public_private_and_unadmitted_work_together() {
             actor.handle_query(crate::messages::TransportQuery::DropPathTable);
         }
         assert!(actor.discovery_path_requests.is_empty());
-        assert!(actor.recursive_discovery_waiters.is_empty());
+        assert!(actor.discovery_path_requests().is_empty());
         assert!(!actor.has_pending_path_request_admission(dest));
         blocked_rx.try_recv().unwrap();
         actor.process_pending_path_request_admissions(now_f64() + 1.0);
@@ -399,9 +399,7 @@ fn disabling_transport_revokes_recursive_work_but_preserves_leaf_discovery() {
     assert!(actor.has_pending_path_request_admission(remote));
     assert!(actor.has_pending_path_request_admission(local));
     actor.handle_message(TransportMessage::SetTransportEnabled { enabled: false });
-    assert!(
-        actor.discovery_path_requests.is_empty() && actor.recursive_discovery_waiters.is_empty()
-    );
+    assert!(actor.discovery_path_requests.is_empty() && actor.discovery_path_requests().is_empty());
     assert!(!actor.has_pending_path_request_admission(remote));
     assert!(actor.has_pending_path_request_admission(local));
     assert_eq!(actor.pending_discovery_prs.len(), 1);

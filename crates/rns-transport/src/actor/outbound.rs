@@ -731,7 +731,7 @@ impl TransportActor {
         self.admit_path_request(destination_hash, interface_id, raw, recursive);
     }
 
-    fn forward_path_request(
+    pub(super) fn forward_path_request(
         &mut self,
         destination_hash: [u8; 16],
         except: Option<InterfaceId>,

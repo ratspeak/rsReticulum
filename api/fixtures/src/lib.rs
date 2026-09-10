@@ -1,5 +1,32 @@
 //! External-consumer compile contract for canonical and retained Reticulum paths.
 
+/// Advanced actor ownership uses detached discovery snapshots, never map edits.
+pub mod recursive_discovery {
+    use rns_transport::actor::{DiscoveryPathRequest, TransportActor};
+    use rns_transport::messages::InterfaceId;
+    use rns_transport::path_discovery::{DiscoveryAdmission, DiscoveryError};
+
+    pub fn request(
+        actor: &mut TransportActor,
+        destination: [u8; 16],
+        interface: InterfaceId,
+    ) -> Result<DiscoveryAdmission, DiscoveryError> {
+        actor.request_recursive_discovery(destination, interface)
+    }
+
+    pub fn observe_and_cancel(actor: &mut TransportActor, destination: &[u8; 16]) {
+        if let Some(snapshot) = actor.discovery_path_request(destination) {
+            let _: DiscoveryPathRequest = snapshot.clone(); // retained import
+            let _ = (snapshot.destination_hash(), snapshot.deadline());
+            for requester in snapshot.requesters() {
+                let _ = (requester.interface_id(), requester.destination_hash());
+                actor.cancel_discovery_requester(requester);
+            }
+        }
+        let _ = actor.discovery_path_requests();
+    }
+}
+
 pub mod canonical {
     use rns_runtime::prelude::{
         AnnounceSubscription, DestinationResolveError, DestinationResolveOptions,

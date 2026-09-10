@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 1.3.0 - 2026-09-10
+
+- Breaking Rust API: recursive discovery now has one private operation owner.
+  `DiscoveryPathRequest` is a detached snapshot with all live requester
+  registrations, not a mutable single-requester record. Advanced actor owners
+  use validated request/join and exact cancellation methods. See
+  [the 1.3 migration guide](api/migrations/1.3.md).
+- Preserve bounded multi-requester discovery, slow-radio deadlines, interface
+  replacement safety and hidden-peer same-radio responses. Cancellation cannot
+  affect another requester or revive queued bytes from a retired operation.
+- Project minor versions may include breaking APIs. First-party dependencies
+  select the 1.3 line explicitly; immutable source pins remain authoritative.
+
 - Match Python RNS 1.4.2 Channel receive-window admission by dropping sequence
   numbers more than 48 slots ahead until a retry falls inside the window.
 - Report the bundled `rnsh` compatibility level as 0.3.0, matching RNS 1.4.2;

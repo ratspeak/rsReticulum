@@ -273,7 +273,6 @@ impl TransportActor {
                 self.path_table = crate::path_table::PathTable::new();
                 self.pending_path_entries.clear();
                 self.discovery_path_requests.clear();
-                self.recursive_discovery_waiters.clear();
                 self.pending_local_path_requests.clear();
                 self.pending_discovery_prs.clear();
                 self.pending_path_request_admissions.clear();
