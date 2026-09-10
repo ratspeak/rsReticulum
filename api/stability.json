@@ -19,34 +19,28 @@
     "sourceCommit": "47dbbf1febc0a9d3259f179a0512d9b56bb2320d"
   },
   "snapshotSource": {
-    "commit": "61f9573bc1500fcfb8baf1947ee30d133bb40c74",
-    "capturedOn": "2026-09-08",
+    "commit": "92b91d6ba35df43f589d8f327446ed3669f3eaa6",
+    "capturedOn": "2026-09-10",
     "review": {
       "areas": [
-        "Generation-bound established-Link packet dispatch and cancellation",
-        "Exact failed-packet and Link invalidation without premature discovery",
-        "Finite original Link and Resource wait observations",
-        "Ownership-before-dedup and same-radio relay admission",
-        "Bounded slow-media discovery, transit and USB readiness",
-        "Actor-applied shared-client startup and bounded rollback"
+        "RET-09 bounded multi-requester discovery observations and cancellation",
+        "RET-13 advanced actor control with exact operation/interface registration ownership",
+        "Retained previously reviewed Link dispatch, failed-attempt recovery and finite protocol-wait additions"
       ],
-      "canonicalPath": "rns_runtime::reticulum::ReticulumHandle::link_endpoint_dispatch_handle",
-      "classification": "compatible opt-in ownership capabilities and protocol wait accessors; existing public signatures, struct fields and exhaustive mailbox/result APIs retained",
+      "canonicalPath": "rns_transport::actor::TransportActor::discovery_path_request",
+      "classification": "deliberate discovery API break; one private canonical ledger, detached snapshots and generation-specific requester cancellation; other capability paths retained",
       "publicApiDiff": {
-        "added": 122,
-        "removed": 0
+        "added": 154,
+        "removed": 3
       },
-      "semver": "additive compatible API; no major-version consequence",
-      "deprecations": "none",
-      "wirePersistenceRuntimeImpact": "No packet/RPC encoding, cryptography, persisted format or AutoInterface port changes. Exact Link dispatch separates bounded local admission from the original RTT proof wait; cancellation cannot recall admitted bytes. Failed-attempt invalidation can be sequenced before an application's authenticated legacy shared-owner recovery without claiming remote atomic route safety. Resource transfer is receiver-request-driven with finite progress/proof waits. Ingress ownership precedes deduplication, eligible same-radio relay traffic is forwarded, and slow-media discovery/transit ownership is bounded. USB readiness and completion ownership are corrected without changing radio defaults. Shared-client initialization waits for actor-applied attachment. Existing exhaustive commands/results and DiscoveryPathRequest fields/Copy remain unchanged.",
+      "semver": "Owner-approved project version 1.3.0 for a breaking API release. Cargo caret compatibility differs; first-party RNS requirements select ~1.3.0. Package tiers unchanged.",
+      "deprecations": "The actor::DiscoveryPathRequest import is retained, but public fields/Copy and the mutable actor map are removed. Exact approved removals have a public 1.3 migration guide; no blanket compatibility waiver.",
+      "wirePersistenceRuntimeImpact": "No encoding, signatures, persisted formats, shared RPC, JNI, UI, AutoInterface ports or radio defaults change. Discovery deadlines, bounded coalescing and same-radio/Roaming/IPC response policy remain. Tokens cannot cancel other requesters, replacement channels, later operations or foreign actors. Last-owner retirement immediately removes related unadmitted bytes. Normal runtime lookup and recovery remain unchanged.",
       "platformEvidence": [
-        "clean committed-source all-feature Apple ARM64 snapshot: 54 added lines (53 unique) since the previous snapshot, zero removed; cumulative compatibility-floor diff is 122 unique additions and zero removals; independently reviewed source API inventory",
-        "focused working-source checkpoints: 500 transport, 391 runtime, 110 Link and 194 protocol tests passed; one pre-existing runtime public-peer test ignored",
-        "49 serial USB tests; strict stable and Rust 1.87 scoped Clippy; three Android serial ABI compile checks on both compilers",
-        "six live Python RNS 1.4.2 shared-owner tests passed twice, including forwarding/non-forwarding failed Links, authenticated data/proofs, reset tombstone, authentication failure and immediate client restart",
-        "default/all-feature external consumer fixtures passed; app shared recovery, packet ownership, accounting and completion-lease controls passed",
-        "private signed same-radio relay, admission retry, slow proof and Resource-loss controls passed; live Python RNCP push/fetch Resource controls passed",
-        "final combined-source host, downstream, native package and physical qualification remain separate release gates; these focused receipts do not claim hardware readiness"
+        "Reviewed generated Apple ARM64 all-feature discovery delta: 32 unique additions, exactly three public field/map removals; cumulative floor diff +154/-3. Historical floor retained. Copy removal additionally protected by a compile-fail consumer.",
+        "Working-source focused gates: all 510 transport tests including one unrelated retained test passed; five new public-only private consumer tests passed; stable/MSRV transport all-target/all-feature strict lint and external fixtures passed.",
+        "Ratspeak, rsLXMF and rsLXST host workspace checks passed against 1.3.0; only RNS workspace versions/requirements changed in the manifest contract. Full clean-source, native and live interop receipts belong to the release handoff.",
+        "Exact final-source remote CI, Nix/source-consumer, signed packages and physical acceptance remain separate step-5-and-later gates. No hardware or fully green NomadNet claim."
       ]
     }
   },
@@ -84,8 +78,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-transport.txt",
-      "itemCount": 1629,
-      "sha256": "38caacda033578146bda4581e6631a4720b44a81a826d2cd05e197cf801fb4df"
+      "itemCount": 1663,
+      "sha256": "67d164bc1ffac458b9d896e100605883a44693ed734f6d4b7bf407ebc02a9ab9"
     },
     {
       "name": "rns-link",
@@ -141,5 +135,16 @@
       "itemCount": 618,
       "sha256": "f2ab796d37f18d7d5d7a515e4b6c28900f6f1c214aec4142fed069275793fdfd"
     }
-  ]
+  ],
+  "approvedBreakingChanges": {
+    "releaseLine": "1.3",
+    "migrationGuide": "api/migrations/1.3.md",
+    "removed": {
+      "rns-transport": [
+        "pub rns_transport::actor::DiscoveryPathRequest::requesting_interface: rns_transport::messages::InterfaceId",
+        "pub rns_transport::actor::DiscoveryPathRequest::timeout: f64",
+        "pub rns_transport::actor::TransportActor::discovery_path_requests: std::collections::hash::map::HashMap<[u8; 16], rns_transport::actor::DiscoveryPathRequest>"
+      ]
+    }
+  }
 }

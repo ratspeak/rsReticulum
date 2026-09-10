@@ -1,8 +1,10 @@
 pub mod rns_transport
 pub mod rns_transport::actor
 pub struct rns_transport::actor::DiscoveryPathRequest
-pub rns_transport::actor::DiscoveryPathRequest::requesting_interface: rns_transport::messages::InterfaceId
-pub rns_transport::actor::DiscoveryPathRequest::timeout: f64
+impl rns_transport::path_discovery::DiscoveryPathRequest
+pub fn rns_transport::path_discovery::DiscoveryPathRequest::deadline(&self) -> f64
+pub fn rns_transport::path_discovery::DiscoveryPathRequest::destination_hash(&self) -> [u8; 16]
+pub fn rns_transport::path_discovery::DiscoveryPathRequest::requesters(&self) -> &[rns_transport::path_discovery::DiscoveryRequester]
 pub struct rns_transport::actor::PendingDiscoveryPathRequest
 pub rns_transport::actor::PendingDiscoveryPathRequest::blocked_interface: core::option::Option<rns_transport::messages::InterfaceId>
 pub rns_transport::actor::PendingDiscoveryPathRequest::destination_hash: [u8; 16]
@@ -29,7 +31,6 @@ pub rns_transport::actor::TransportActor::blackhole_table: rns_transport::blackh
 pub rns_transport::actor::TransportActor::blackholed_snapshot: alloc::sync::Arc<std::sync::poison::rwlock::RwLock<std::collections::hash::set::HashSet<[u8; 16]>>>
 pub rns_transport::actor::TransportActor::channel_drops: u64
 pub rns_transport::actor::TransportActor::destination_channels: std::collections::hash::map::HashMap<[u8; 16], tokio::sync::mpsc::bounded::Sender<rns_transport::link_messages::DestinationEvent>>
-pub rns_transport::actor::TransportActor::discovery_path_requests: std::collections::hash::map::HashMap<[u8; 16], rns_transport::actor::DiscoveryPathRequest>
 pub rns_transport::actor::TransportActor::discovery_pr_tags: std::collections::hash::map::HashMap<alloc::vec::Vec<u8>, f64>
 pub rns_transport::actor::TransportActor::ephemeral_identity_hash: core::option::Option<[u8; 16]>
 pub rns_transport::actor::TransportActor::hashlist_save_in_flight: alloc::sync::Arc<core::sync::atomic::AtomicBool>
@@ -72,6 +73,11 @@ pub rns_transport::actor::TransportActor::storage_dir: core::option::Option<std:
 pub rns_transport::actor::TransportActor::traffic: rns_transport::traffic::TrafficCounter
 pub rns_transport::actor::TransportActor::transport_identity_hash: core::option::Option<[u8; 16]>
 pub rns_transport::actor::TransportActor::tunnel_table: rns_transport::tunnel::TunnelTable
+impl rns_transport::actor::TransportActor
+pub fn rns_transport::actor::TransportActor::cancel_discovery_requester(&mut self, &rns_transport::path_discovery::DiscoveryRequester) -> bool
+pub fn rns_transport::actor::TransportActor::discovery_path_request(&self, &[u8; 16]) -> core::option::Option<rns_transport::path_discovery::DiscoveryPathRequest>
+pub fn rns_transport::actor::TransportActor::discovery_path_requests(&self) -> alloc::vec::Vec<rns_transport::path_discovery::DiscoveryPathRequest>
+pub fn rns_transport::actor::TransportActor::request_recursive_discovery(&mut self, [u8; 16], rns_transport::messages::InterfaceId) -> core::result::Result<rns_transport::path_discovery::DiscoveryAdmission, rns_transport::path_discovery::DiscoveryError>
 impl rns_transport::actor::TransportActor
 pub fn rns_transport::actor::TransportActor::has_path(&self, &[u8; 16]) -> bool
 pub fn rns_transport::actor::TransportActor::hops_to(&self, &[u8; 16]) -> core::option::Option<u8>
@@ -1310,6 +1316,34 @@ impl core::fmt::Debug for rns_transport::messages::TrackedReceiptRegistration
 pub fn rns_transport::messages::TrackedReceiptRegistration::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub fn rns_transport::messages::msg_variant_name(&rns_transport::messages::TransportMessage) -> &'static str
 pub type rns_transport::messages::InterfaceId = u64
+pub mod rns_transport::path_discovery
+#[non_exhaustive] pub enum rns_transport::path_discovery::DiscoveryError
+pub rns_transport::path_discovery::DiscoveryError::Capacity
+pub rns_transport::path_discovery::DiscoveryError::InterfaceUnavailable
+pub rns_transport::path_discovery::DiscoveryError::InvalidClock
+pub rns_transport::path_discovery::DiscoveryError::KnownDestination
+pub rns_transport::path_discovery::DiscoveryError::PolicyDenied
+pub rns_transport::path_discovery::DiscoveryError::TransportDisabled
+pub rns_transport::path_discovery::DiscoveryError::UnknownInterface
+impl core::error::Error for rns_transport::path_discovery::DiscoveryError
+impl core::fmt::Display for rns_transport::path_discovery::DiscoveryError
+pub fn rns_transport::path_discovery::DiscoveryError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct rns_transport::path_discovery::DiscoveryAdmission
+impl rns_transport::path_discovery::DiscoveryAdmission
+pub fn rns_transport::path_discovery::DiscoveryAdmission::requester(&self) -> &rns_transport::path_discovery::DiscoveryRequester
+pub fn rns_transport::path_discovery::DiscoveryAdmission::started(&self) -> bool
+pub struct rns_transport::path_discovery::DiscoveryPathRequest
+impl rns_transport::path_discovery::DiscoveryPathRequest
+pub fn rns_transport::path_discovery::DiscoveryPathRequest::deadline(&self) -> f64
+pub fn rns_transport::path_discovery::DiscoveryPathRequest::destination_hash(&self) -> [u8; 16]
+pub fn rns_transport::path_discovery::DiscoveryPathRequest::requesters(&self) -> &[rns_transport::path_discovery::DiscoveryRequester]
+pub struct rns_transport::path_discovery::DiscoveryRequester
+impl rns_transport::path_discovery::DiscoveryRequester
+pub fn rns_transport::path_discovery::DiscoveryRequester::destination_hash(&self) -> [u8; 16]
+pub fn rns_transport::path_discovery::DiscoveryRequester::interface_id(&self) -> rns_transport::messages::InterfaceId
+impl core::cmp::Eq for rns_transport::path_discovery::DiscoveryRequester
+impl core::cmp::PartialEq for rns_transport::path_discovery::DiscoveryRequester
+pub fn rns_transport::path_discovery::DiscoveryRequester::eq(&self, &Self) -> bool
 pub mod rns_transport::path_recovery
 #[non_exhaustive] pub enum rns_transport::path_recovery::PathRecoveryError
 pub rns_transport::path_recovery::PathRecoveryError::Closed
