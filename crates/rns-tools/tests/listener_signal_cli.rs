@@ -65,7 +65,29 @@ fn wait_until_running(child: &mut Child, settle: Duration) -> bool {
     true
 }
 
-/// Sends a process signal after a settle period and asserts a clean exit. Retries once
+/// Being alive does not mean runtime initialization has finished. In particular,
+/// rnsd can already handle SIGTERM while it is still admitting interfaces.
+#[cfg(unix)]
+fn wait_for_ready_log(child: &mut Child, log: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("poll child readiness").is_some() {
+            return false;
+        }
+        if fs::read_to_string(log)
+            .is_ok_and(|text| text.contains("reticulum started in Standalone mode"))
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Sends a process signal after observed readiness (or a settle period for the
+/// interactive listeners) and asserts a clean exit. The settle-only path retries once
 /// with a longer settle if the child died from the raw signal (exit by signal
 /// number): under full-workspace load the child can still be booting when the
 /// first signal lands, before its handler is registered. A real handler
@@ -76,6 +98,7 @@ fn assert_signal_exits(
     name: &str,
     signal_name: &str,
     signal_number: i32,
+    ready_log: Option<&Path>,
 ) {
     use std::os::unix::process::ExitStatusExt;
 
@@ -83,13 +106,21 @@ fn assert_signal_exits(
     let last_attempt = settles.len() - 1;
     for (attempt, settle) in settles.into_iter().enumerate() {
         let mut child = spawn();
-        if !wait_until_running(&mut child, settle) {
+        let ready = match ready_log {
+            Some(log) => wait_for_ready_log(&mut child, log, Duration::from_secs(20)),
+            None => wait_until_running(&mut child, settle),
+        };
+        if !ready {
+            let _ = child.kill();
             let output = child.wait_with_output().expect("collect child output");
             panic!(
-                "{name} exited before {signal_name}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+                "{name} did not become ready before {signal_name}\nstatus: {}\nstdout:\n{}\nstderr:\n{}\nreadiness log:\n{}",
                 output.status,
                 String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr),
+                ready_log
+                    .and_then(|log| fs::read_to_string(log).ok())
+                    .unwrap_or_default(),
             );
         }
 
@@ -113,16 +144,23 @@ fn assert_signal_exits(
 
         match exit_status {
             Some(status) if status.success() => return,
-            Some(status) if attempt < last_attempt && status.signal() == Some(signal_number) => {
+            Some(status)
+                if ready_log.is_none()
+                    && attempt < last_attempt
+                    && status.signal() == Some(signal_number) =>
+            {
                 let _ = child.wait_with_output();
                 continue;
             }
             Some(status) => {
                 let output = child.wait_with_output().expect("collect child output");
                 panic!(
-                    "{name} exited unsuccessfully after {signal_name}: {status}\nstdout:\n{}\nstderr:\n{}",
+                    "{name} exited unsuccessfully after {signal_name}: {status}\nstdout:\n{}\nstderr:\n{}\nreadiness log:\n{}",
                     String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
+                    String::from_utf8_lossy(&output.stderr),
+                    ready_log
+                        .and_then(|log| fs::read_to_string(log).ok())
+                        .unwrap_or_default(),
                 );
             }
             None => {
@@ -131,9 +169,12 @@ fn assert_signal_exits(
                     .wait_with_output()
                     .expect("collect killed child output");
                 panic!(
-                    "{name} did not exit after {signal_name}\nstdout:\n{}\nstderr:\n{}",
+                    "{name} did not exit after {signal_name}\nstdout:\n{}\nstderr:\n{}\nreadiness log:\n{}",
                     String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
+                    String::from_utf8_lossy(&output.stderr),
+                    ready_log
+                        .and_then(|log| fs::read_to_string(log).ok())
+                        .unwrap_or_default(),
                 );
             }
         }
@@ -162,6 +203,7 @@ fn rncp_listener_exits_on_sigint() {
         "rncp-rs",
         "INT",
         2,
+        None,
     );
 }
 
@@ -185,6 +227,7 @@ fn rnsh_listener_exits_on_sigint() {
         "rnsh-rs",
         "INT",
         2,
+        None,
     );
 }
 
@@ -193,11 +236,13 @@ fn rnsh_listener_exits_on_sigint() {
 fn rnsd_flushes_state_and_exits_on_sigterm() {
     let tmp = TempDir::new("rnsd-sigterm");
     write_config(&tmp, true);
+    let ready_log = tmp.path().join("logfile");
     assert_signal_exits(
         || {
             Command::new(env!("CARGO_BIN_EXE_rnsd-rs"))
                 .arg("--config")
                 .arg(tmp.path())
+                .arg("--service")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -206,9 +251,32 @@ fn rnsd_flushes_state_and_exits_on_sigterm() {
         "rnsd-rs",
         "TERM",
         15,
+        Some(&ready_log),
     );
     assert!(
         tmp.path().join("storage/packet_hashlist.raw").is_file(),
         "orderly SIGTERM shutdown must flush transport state"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_readiness_requires_completed_initialization_and_a_live_child() {
+    let tmp = TempDir::new("rnsd-readiness");
+    let log = tmp.path().join("logfile");
+    let mut child = Command::new("sleep")
+        .arg("10")
+        .spawn()
+        .expect("spawn control");
+
+    assert!(!wait_for_ready_log(&mut child, &log, Duration::ZERO));
+    // The starting message is not a promise of completed runtime initialization.
+    fs::write(&log, "rnsd-rs 1.3.0 starting\n").expect("write starting log");
+    assert!(!wait_for_ready_log(&mut child, &log, Duration::ZERO));
+    fs::write(&log, "reticulum started in Standalone mode\n").expect("write ready log");
+    assert!(wait_for_ready_log(&mut child, &log, Duration::ZERO));
+
+    child.kill().expect("stop control");
+    child.wait().expect("reap control");
+    assert!(!wait_for_ready_log(&mut child, &log, Duration::ZERO));
 }
