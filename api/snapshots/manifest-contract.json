@@ -658,6 +658,17 @@
           "sourceKind": "registry"
         },
         {
+          "name": "mio",
+          "rename": null,
+          "kind": null,
+          "target": "cfg(target_os = \"windows\")",
+          "requirement": "^1.2.3",
+          "optional": false,
+          "defaultFeatures": false,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
           "name": "windows",
           "rename": null,
           "kind": null,
