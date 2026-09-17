@@ -14,6 +14,8 @@
   affect another requester or revive queued bytes from a retired operation.
 - Project minor versions may include breaking APIs. First-party dependencies
   select the 1.3 line explicitly; immutable source pins remain authoritative.
+- Require the corrected Windows socket backend so spawned helper processes
+  cannot keep network listeners alive after the owning runtime shuts down.
 
 - Match Python RNS 1.4.2 Channel receive-window admission by dropping sequence
   numbers more than 48 slots ahead until a retry falls inside the window.

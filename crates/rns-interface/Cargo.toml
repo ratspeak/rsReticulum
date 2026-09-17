@@ -77,6 +77,11 @@ bluer = { version = "0.17", features = ["bluetoothd"], optional = true }
 # unavailable event so embedding UIs can direct users to an MSIX build for
 # discoverability.
 [target.'cfg(target_os = "windows")'.dependencies]
+# Resolution floor for Tokio's socket backend: older Mio lets child processes
+# inherit sockets and keep shared/network listeners alive after shutdown.
+# 1.2.3 includes the no-inheritance fix and its Wine compatibility follow-up.
+# https://github.com/tokio-rs/mio/pull/1946
+mio = { version = "1.2.3", default-features = false }
 windows = { version = "0.58", features = [
     "Devices_Bluetooth",
     "Devices_Bluetooth_Advertisement",
