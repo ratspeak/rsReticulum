@@ -721,6 +721,55 @@ fn packet_hash_to_array(hash: &[u8]) -> Option<[u8; 32]> {
 mod tests {
     use super::*;
 
+    // These are cross-process compatibility checks, not latency benchmarks.
+    // Keep one finite wall-clock budget even on oversubscribed Windows runners;
+    // no production RPC or admission timeout is changed by this fixture budget.
+    const PYTHON_FIXTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    async fn python_multiprocessing_available() -> bool {
+        let result = tokio::time::timeout(
+            PYTHON_FIXTURE_TIMEOUT,
+            tokio::process::Command::new("python3")
+                .kill_on_drop(true)
+                .args(["-c", "import multiprocessing.connection"])
+                .status(),
+        )
+        .await
+        .expect("Python availability check timed out");
+        match result {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            result => {
+                assert!(result.expect("start Python availability check").success());
+                true
+            }
+        }
+    }
+
+    fn python_listener_port(line: &str) -> Option<u16> {
+        line.trim_end()
+            .strip_prefix("READY ")?
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+    }
+
+    #[test]
+    fn python_listener_readiness_requires_an_actual_bound_port() {
+        assert_eq!(python_listener_port("READY 12345\n"), Some(12345));
+        assert_eq!(python_listener_port("READY 65535\r\n"), Some(65535));
+        for invalid in [
+            "",
+            "READY",
+            "READY 0",
+            "READY 65536",
+            "READY -1",
+            "READY 1\nREADY 2",
+            "ERROR 12",
+        ] {
+            assert_eq!(python_listener_port(invalid), None, "{invalid:?}");
+        }
+    }
+
     fn all_rpc_requests() -> Vec<RpcRequest> {
         vec![
             RpcRequest::GetPathTable { max_hops: Some(5) },
@@ -961,12 +1010,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_rpc_server_accepts_python_multiprocessing_client() {
-        if std::process::Command::new("python3")
-            .arg("-c")
-            .arg("import multiprocessing.connection")
-            .status()
-            .is_err()
-        {
+        if !python_multiprocessing_available().await {
             return;
         }
 
@@ -1000,13 +1044,19 @@ conn.close()
 if b"\xaainterfaces" not in resp:
     raise SystemExit(f"unexpected interface_stats response: {resp.hex()}")
 "#;
-        let output = std::process::Command::new("python3")
-            .arg("-c")
-            .arg(script)
-            .arg(port.to_string())
-            .arg(hex::encode(&rpc_key))
-            .output()
-            .expect("python3 should run");
+        let output = tokio::time::timeout(
+            PYTHON_FIXTURE_TIMEOUT,
+            tokio::process::Command::new("python3")
+                .kill_on_drop(true)
+                .arg("-c")
+                .arg(script)
+                .arg(port.to_string())
+                .arg(hex::encode(&rpc_key))
+                .output(),
+        )
+        .await
+        .expect("Python client fixture timed out")
+        .expect("python3 should run");
 
         shutdown.trigger();
 
@@ -1020,16 +1070,10 @@ if b"\xaainterfaces" not in resp:
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_rust_client_accepts_python_multiprocessing_listener() {
-        if std::process::Command::new("python3")
-            .arg("-c")
-            .arg("import multiprocessing.connection")
-            .status()
-            .is_err()
-        {
+        if !python_multiprocessing_available().await {
             return;
         }
 
-        let port = portpicker_ephemeral();
         let rpc_key = b"python_listener_key".to_vec();
         // umsgpack frames over send_bytes/recv_bytes, matching a >=1.3.4
         // Python rpc_loop (commit a2ef9782); hardcoded so no msgpack module
@@ -1038,10 +1082,9 @@ if b"\xaainterfaces" not in resp:
 import multiprocessing.connection
 import sys
 
-port = int(sys.argv[1])
-authkey = bytes.fromhex(sys.argv[2])
-listener = multiprocessing.connection.Listener(("127.0.0.1", port), authkey=authkey)
-print("READY", flush=True)
+authkey = bytes.fromhex(sys.argv[1])
+listener = multiprocessing.connection.Listener(("127.0.0.1", 0), authkey=authkey)
+print(f"READY {listener.address[1]}", flush=True)
 conn = listener.accept()
 call = conn.recv_bytes()
 if call != bytes.fromhex("81a3676574aa6c696e6b5f636f756e74"):  # {"get": "link_count"}
@@ -1050,62 +1093,57 @@ conn.send_bytes(b"\x07")  # 7
 conn.close()
 listener.close()
 "#;
-        let mut child = std::process::Command::new("python3")
+        let mut child = tokio::process::Command::new("python3")
+            .kill_on_drop(true)
             .arg("-c")
             .arg(script)
-            .arg(port.to_string())
             .arg(hex::encode(&rpc_key))
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("python3 should start");
 
-        let stdout = child.stdout.take().expect("python listener stdout");
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            use std::io::BufRead as _;
+        // Python owns port zero's listener continuously: never select and
+        // release a "free" port before another process gets a chance to bind.
+        let result = tokio::time::timeout(PYTHON_FIXTURE_TIMEOUT, async {
+            use tokio::io::AsyncBufReadExt as _;
+            let stdout = child.stdout.take().expect("python listener stdout");
             let mut line = String::new();
-            let result = std::io::BufReader::new(stdout)
+            tokio::io::BufReader::new(stdout)
                 .read_line(&mut line)
-                .map(|_| line);
-            let _ = ready_tx.send(result);
-        });
-        match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(Ok(line)) if line.trim() == "READY" => {}
-            Ok(Ok(line)) => {
-                let _ = child.kill();
-                panic!("unexpected Python listener readiness line: {line:?}");
+                .await
+                .map_err(|error| format!("Python readiness read: {error}"))?;
+            let port = python_listener_port(&line)
+                .ok_or_else(|| format!("invalid Python readiness: {line:?}"))?;
+            let response = rpc::connect_and_request(
+                port,
+                &rpc_key,
+                &RpcRequest::GetLinkCount,
+                PYTHON_FIXTURE_TIMEOUT,
+            )
+            .await
+            .map_err(|error| format!("Python listener RPC: {error}"))?;
+            if !matches!(response, RpcResponse::IntResult(7)) {
+                return Err(format!("unexpected Python listener response: {response:?}"));
             }
-            Ok(Err(e)) => {
-                let _ = child.kill();
-                panic!("failed to read Python listener readiness: {e}");
+            let status = child
+                .wait()
+                .await
+                .map_err(|error| format!("Python exit: {error}"))?;
+            if !status.success() {
+                return Err(format!("Python listener exited with {status}"));
             }
-            Err(e) => {
-                let _ = child.kill();
-                panic!("timed out waiting for Python listener readiness: {e}");
-            }
+            Ok(())
+        })
+        .await;
+        // Also reap on failure; a killed-but-unwaited Python fixture must not
+        // leave process/socket cleanup behind for another concurrent test.
+        if !matches!(result, Ok(Ok(()))) {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
         }
-
-        match rpc::connect_and_request(
-            port,
-            &rpc_key,
-            &RpcRequest::GetLinkCount,
-            std::time::Duration::from_secs(5),
-        )
-        .await
-        {
-            Ok(RpcResponse::IntResult(7)) => {
-                let status = child.wait().expect("python listener should exit");
-                assert!(status.success(), "python listener exited with {status}");
-            }
-            Ok(other) => {
-                let _ = child.kill();
-                panic!("unexpected Python listener response: {other:?}");
-            }
-            Err(e) => {
-                let _ = child.kill();
-                panic!("Rust client could not connect to Python multiprocessing listener: {e}");
-            }
-        }
+        result
+            .expect("Python listener fixture timed out")
+            .expect("Python listener compatibility");
     }
 
     #[tokio::test]
@@ -1160,11 +1198,6 @@ listener.close()
             handle.await.unwrap(),
             RpcResponse::BoolResult(true)
         ));
-    }
-
-    fn portpicker_ephemeral() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
     }
 
     async fn rpc_client_request(port: u16, rpc_key: &[u8], request: RpcRequest) -> RpcResponse {
