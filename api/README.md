@@ -115,6 +115,12 @@ dispatch time and packet hash; it is not physical transmission or delivery.
 Dropping an unread bind receipt retires only its unpublished binding; published
 bindings still require the normal explicit cleanup.
 
+`LinkEndpointDispatchBindReceipt::poll_ready` registers a task waker without
+publishing the binding. It retains a ready result until `try_recv` or awaiting
+consumes it; cancellation between readiness and consumption still retires the
+unpublished endpoint. This supports event-driven delivery owners without
+changing existing periodic consumers or proof timing.
+
 `try_send_cancellable` additionally returns an exact cancellation capability.
 It requests removal while the packet is still awaiting local admission; it
 cannot recall bytes already admitted to a driver or affect another binding.

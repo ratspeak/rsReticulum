@@ -136,6 +136,7 @@ impl LinkEndpointDispatchHandle {
         Ok(LinkEndpointDispatchBindReceipt {
             result_rx,
             publication,
+            ready: None,
         })
     }
 }
@@ -146,16 +147,42 @@ impl LinkEndpointDispatchHandle {
 pub struct LinkEndpointDispatchBindReceipt {
     result_rx: oneshot::Receiver<Result<LinkEndpointDispatchToken, LinkEndpointBindResult>>,
     publication: Arc<AtomicU8>,
+    ready: Option<
+        Result<
+            Result<LinkEndpointDispatchToken, LinkEndpointBindResult>,
+            oneshot::error::RecvError,
+        >,
+    >,
 }
 
 impl LinkEndpointDispatchBindReceipt {
+    /// Register a readiness waker without publishing endpoint ownership.
+    /// A ready result stays owned by this receipt until `try_recv` or awaiting
+    /// consumes it. Dropping even a ready receipt still retires an unpublished
+    /// binding, so cancellation between readiness and processing is safe.
+    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.ready.is_none() {
+            if let Poll::Ready(result) = Pin::new(&mut self.result_rx).poll(cx) {
+                self.ready = Some(result);
+            }
+        }
+        if self.ready.is_some() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
     pub fn try_recv(
         &mut self,
     ) -> Result<
         Result<LinkEndpointDispatchToken, LinkEndpointBindResult>,
         oneshot::error::TryRecvError,
     > {
-        let result = self.result_rx.try_recv()?;
+        let result = match self.ready.take() {
+            Some(result) => result.map_err(|_| oneshot::error::TryRecvError::Closed)?,
+            None => self.result_rx.try_recv()?,
+        };
         self.publication.store(1, Ordering::Release);
         Ok(result)
     }
@@ -168,7 +195,10 @@ impl Future for LinkEndpointDispatchBindReceipt {
     >;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let result = Pin::new(&mut self.result_rx).poll(cx);
+        let result = match self.ready.take() {
+            Some(result) => Poll::Ready(result),
+            None => Pin::new(&mut self.result_rx).poll(cx),
+        };
         if result.is_ready() {
             self.publication.store(1, Ordering::Release);
         }

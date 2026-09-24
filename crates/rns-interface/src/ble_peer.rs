@@ -136,11 +136,12 @@ fn parse_newline_addresses(raw: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(any(test, not(any(target_os = "ios", target_os = "macos"))))]
 fn should_pace_after_fragment(index: usize, total: usize) -> bool {
     index < total.saturating_sub(1)
 }
 
-#[cfg(any(test, not(target_os = "android")))]
+#[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
 async fn pace_after_ble_fragment(index: usize, total: usize) {
     if should_pace_after_fragment(index, total) {
         tokio::time::sleep(BLE_FRAGMENT_PACING).await;
@@ -920,6 +921,20 @@ fn consume_ble_frame(data: Vec<u8>, reassembly: &mut FragmentReassembly) -> Opti
     Some(result)
 }
 
+type PeerReassembly = HashMap<(String, bool), FragmentReassembly>;
+
+fn consume_peer_ble_frame(
+    peer: &str,
+    central: bool,
+    data: Vec<u8>,
+    streams: &mut PeerReassembly,
+) -> Option<Vec<u8>> {
+    consume_ble_frame(
+        data,
+        streams.entry((peer.to_string(), central)).or_default(),
+    )
+}
+
 fn prune_reassembly(reassembly: &mut FragmentReassembly) {
     reassembly.retain(|_, (_, started)| started.elapsed() < FRAGMENT_TIMEOUT);
 }
@@ -1474,7 +1489,7 @@ pub async fn stop_peripheral() -> Result<(), String> {
 // macOS doesn't suspend processes the same way, so cold-rescan works there.
 
 /// Funnels into the GATT-server reassembler so both directions share
-/// reassembly state.
+/// the receive task while retaining separate GATT-role reassembly state.
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 pub(crate) fn try_push_apple_inbound(peer: String, data: Vec<u8>) -> bool {
     apple_peripheral::try_push_inbound(peer, data)
@@ -1491,7 +1506,7 @@ mod apple_peripheral {
     /// 256 × ~200B ≈ 50KB — absorbs an LXMF burst (~40 frags) without OOM.
     const INBOUND_CAPACITY: usize = 256;
 
-    type InboundFrame = (String, Vec<u8>);
+    type InboundFrame = (String, bool, Vec<u8>);
     type InboundSender = tokio::sync::mpsc::Sender<InboundFrame>;
     type InboundReceiver = tokio::sync::mpsc::Receiver<InboundFrame>;
 
@@ -1533,12 +1548,12 @@ mod apple_peripheral {
             .and_then(|slot| slot.as_ref().cloned())
     }
 
-    pub fn take_inbound_rx() -> Option<tokio::sync::mpsc::Receiver<(String, Vec<u8>)>> {
+    pub fn take_inbound_rx() -> Option<tokio::sync::mpsc::Receiver<(String, bool, Vec<u8>)>> {
         inbound_rx_slot().lock().ok().and_then(|mut opt| opt.take())
     }
 
     pub(super) fn try_push_inbound(peer: String, data: Vec<u8>) -> bool {
-        inbound_sender().is_some_and(|tx| tx.try_send((peer, data)).is_ok())
+        inbound_sender().is_some_and(|tx| tx.try_send((peer, true, data)).is_ok())
     }
 
     struct SendPtr(*mut AnyObject);
@@ -1558,6 +1573,10 @@ mod apple_peripheral {
     /// that was never stopped (an enable without an intervening disable) so it
     /// can't keep advertising after we've replaced it.
     fn set_manager_ptr(mgr_raw: *mut AnyObject) {
+        let mut pending = pending_notify_queue().lock().unwrap();
+        pending.queues.clear();
+        pending.schedule.clear();
+        pending.accepting = true;
         let mut guard = manager_ptr_slot().lock().unwrap_or_else(|e| e.into_inner());
         let prev = guard.0;
         *guard = SendPtr(mgr_raw);
@@ -1639,6 +1658,9 @@ mod apple_peripheral {
     /// CB disconnects all centrals on PoweredOff but `didUnsubscribe`
     /// doesn't fire reliably across the transition — drain defensively.
     fn clear_subscribed_centrals_for_recovery() {
+        let mut pending = pending_notify_queue().lock().unwrap();
+        pending.queues.clear();
+        pending.schedule.clear();
         if let Ok(mut map) = subscribed_centrals_map().lock() {
             for (_, ptr) in map.drain() {
                 if !ptr.0.is_null() {
@@ -1728,19 +1750,61 @@ mod apple_peripheral {
         }
     }
 
-    /// Drained by `peripheralManagerIsReadyToUpdateSubscribers:`.
-    struct PendingNotify {
-        peer: String,
-        char_uuid: Uuid,
-        data: Vec<u8>,
+    #[derive(Default)]
+    struct NotifyState {
+        accepting: bool,
+        queues: HashMap<(String, Uuid), crate::ble_tx_queue::PacketQueue>,
+        schedule: std::collections::VecDeque<(String, Uuid)>,
     }
-    const PENDING_NOTIFY_CAP: usize = 128;
-    static PENDING_NOTIFY: OnceLock<std::sync::Mutex<std::collections::VecDeque<PendingNotify>>> =
-        OnceLock::new();
+    static PENDING_NOTIFY: OnceLock<std::sync::Mutex<NotifyState>> = OnceLock::new();
 
-    fn pending_notify_queue() -> &'static std::sync::Mutex<std::collections::VecDeque<PendingNotify>>
-    {
-        PENDING_NOTIFY.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+    fn pending_notify_queue() -> &'static std::sync::Mutex<NotifyState> {
+        PENDING_NOTIFY.get_or_init(|| std::sync::Mutex::new(NotifyState::default()))
+    }
+
+    fn current_manager(ptr: *mut AnyObject) -> bool {
+        !ptr.is_null() && manager_ptr_slot().lock().is_ok_and(|g| g.0 == ptr)
+    }
+
+    fn notification_capacity(peer: &str) -> Option<usize> {
+        let map = subscribed_centrals_map().lock().ok()?;
+        let central = map.get(peer)?;
+        let value: usize = unsafe { msg_send![central.0, maximumUpdateValueLength] };
+        Some(value.clamp(20, TARGET_MTU as usize))
+    }
+
+    // Round-robin complete packets. Keep a partially sent packet at the head
+    // across readiness callbacks: two subscribed characteristics can belong to
+    // one peer and must not interleave fragment envelopes.
+    fn drain_notifications(state: &mut NotifyState) {
+        drain_notifications_with(state, |peer, characteristic, data| {
+            notify_tx_inner(Some(peer), characteristic, data)
+        });
+    }
+
+    fn drain_notifications_with(
+        state: &mut NotifyState,
+        mut send: impl FnMut(&str, Uuid, &[u8]) -> bool,
+    ) {
+        if !state.accepting {
+            return;
+        }
+        while let Some(key) = state.schedule.front().cloned() {
+            let Some(q) = state.queues.get_mut(&key) else {
+                state.schedule.pop_front();
+                continue;
+            };
+            let before = q.len();
+            if !q.drain_one(|data| send(&key.0, key.1, data)) {
+                break;
+            }
+            if q.len() < before {
+                state.schedule.pop_front();
+                if q.len() > 0 {
+                    state.schedule.push_back(key);
+                }
+            }
+        }
     }
 
     /// Returns empty string if input is null or extraction fails.
@@ -2048,7 +2112,7 @@ mod apple_peripheral {
                             if let Some(tx) = inbound_sender() {
                                 // CB dispatch queue is synchronous, so try_send +
                                 // drop-on-full instead of blocking the callback.
-                                if let Err(e) = tx.try_send((peer_id, data)) {
+                                if let Err(e) = tx.try_send((peer_id, false, data)) {
                                     tracing::warn!(
                                         "Apple BLE inbound channel full, dropping frame: {e}"
                                     );
@@ -2068,7 +2132,8 @@ mod apple_peripheral {
                 central: *mut AnyObject,
                 characteristic: *mut AnyObject,
             ) {
-                if central.is_null() {
+                let mut pending = pending_notify_queue().lock().unwrap();
+                if !pending.accepting || !current_manager(_peripheral) || central.is_null() {
                     return;
                 }
                 unsafe {
@@ -2082,6 +2147,8 @@ mod apple_peripheral {
                         return;
                     }
                     let char_uuid = uuid_for_characteristic(characteristic);
+                    let Some(uuid) = char_uuid else { return; };
+                    pending.queues.entry((id.clone(), uuid)).or_default();
                     // First-ever subscribe per central also takes the +1
                     // retain that pairs with the release in did_unsubscribe.
                     let first_ever_sub_for_central = {
@@ -2099,6 +2166,7 @@ mod apple_peripheral {
                         let _: *mut AnyObject = msg_send![&*central, retain];
                         map.insert(id.clone(), SendPtr(central));
                     }
+                    drop(pending);
                     tracing::info!(peer = %id, ?char_uuid, "Apple BLE: central subscribed");
                     if first_ever_sub_for_central && !already_subscribed {
                         drop(map);
@@ -2125,7 +2193,8 @@ mod apple_peripheral {
                 central: *mut AnyObject,
                 characteristic: *mut AnyObject,
             ) {
-                if central.is_null() {
+                let mut pending = pending_notify_queue().lock().unwrap();
+                if !current_manager(_peripheral) || central.is_null() {
                     return;
                 }
                 unsafe {
@@ -2139,6 +2208,9 @@ mod apple_peripheral {
                         return;
                     }
                     let char_uuid = uuid_for_characteristic(characteristic);
+                    let Some(uuid) = char_uuid else { return; };
+                    pending.queues.remove(&(id.clone(), uuid));
+                    pending.schedule.retain(|key| key != &(id.clone(), uuid));
                     let all_gone = {
                         let mut chars_map = central_subscribed_chars_map().lock().unwrap();
                         if let Some(u) = char_uuid {
@@ -2161,6 +2233,7 @@ mod apple_peripheral {
                         });
                         if was_subscribed {
                             drop(map);
+                            drop(pending);
                             super::dispatch_event(BlePeerEvent::Disconnected {
                                 address: id,
                                 reason: "central unsubscribed".into(),
@@ -2170,27 +2243,14 @@ mod apple_peripheral {
                 }
             }
 
-            // Without retrying here, fragmented LXMF messages silently
-            // lose every fragment past the first because the queue isn't
-            // ready between writes.
             extern "C" fn is_ready_to_update(
                 _this: *mut AnyObject,
                 _sel: Sel,
-                _peripheral: *mut AnyObject,
+                peripheral: *mut AnyObject,
             ) {
-                loop {
-                    let entry = {
-                        let mut q = pending_notify_queue().lock().unwrap();
-                        q.pop_front()
-                    };
-                    let Some(entry) = entry else { break };
-                    if !notify_tx_inner(Some(&entry.peer), entry.char_uuid, &entry.data) {
-                        // Still full — requeue at front and wait for the
-                        // next ready-to-update callback.
-                        let mut q = pending_notify_queue().lock().unwrap();
-                        q.push_front(entry);
-                        break;
-                    }
+                let mut state = pending_notify_queue().lock().unwrap();
+                if current_manager(peripheral) {
+                    drain_notifications(&mut state);
                 }
             }
 
@@ -2372,27 +2432,31 @@ mod apple_peripheral {
         })
     }
 
-    /// Push `data` on the TX characteristic matching `char_uuid`; targets
-    /// `to_peer` if set, all subscribed centrals otherwise. Targeted writes
-    /// queue onto PENDING_NOTIFY on backpressure; broadcasts can't be
-    /// replayed coherently without per-central addressing, so they don't.
-    pub fn notify_tx(to_peer: Option<&str>, char_uuid: Uuid, data: &[u8]) -> bool {
-        let ok = notify_tx_inner(to_peer, char_uuid, data);
-        if !ok {
-            if let Some(peer_id) = to_peer {
-                let mut q = pending_notify_queue().lock().unwrap();
-                if q.len() >= PENDING_NOTIFY_CAP {
-                    q.pop_front();
-                }
-                q.push_back(PendingNotify {
-                    peer: peer_id.to_string(),
-                    char_uuid,
-                    data: data.to_vec(),
-                });
-                tracing::warn!(%char_uuid, bytes = data.len(), peer = %peer_id, depth = q.len(), "Apple BLE notify_tx: queued for retry (radio queue full)");
-            }
+    /// Atomically admit a complete packet for one live subscription. A full
+    /// queue refuses this packet without evicting any previously accepted frame.
+    pub fn notify_packet(peer: &str, char_uuid: Uuid, data: &[u8], generation: u64) -> bool {
+        let mut state = pending_notify_queue().lock().unwrap();
+        if !state.accepting || !generation_is_current(generation) {
+            return false;
         }
-        ok
+        let Some(capacity) = notification_capacity(peer) else {
+            return false;
+        };
+        let Some(queue) = state.queues.get_mut(&(peer.to_string(), char_uuid)) else {
+            return false;
+        };
+        let was_empty = queue.len() == 0;
+        let admitted = queue.enqueue(fragment_packet(data, capacity));
+        if admitted && was_empty {
+            state.schedule.push_back((peer.to_string(), char_uuid));
+        }
+        drain_notifications(&mut state);
+        state
+            .queues
+            .get_mut(&(peer.to_string(), char_uuid))
+            .unwrap()
+            .report("apple_peripheral", capacity);
+        admitted
     }
 
     /// Returns the raw `updateValue:` result without touching the retry
@@ -2690,6 +2754,12 @@ mod apple_peripheral {
     /// "fast path" of just calling stopAdvertising + removeAllServices and
     /// returning leaves CB in a dirty state that breaks subsequent enables.
     pub async fn stop_advertising() -> Result<(), String> {
+        {
+            let mut pending = pending_notify_queue().lock().unwrap();
+            pending.accepting = false;
+            pending.queues.clear();
+            pending.schedule.clear();
+        }
         apply_event(crate::ble_peer_lifecycle::LifecycleEvent::StopRequested);
         clear_inbound_channel();
 
@@ -2836,13 +2906,49 @@ mod apple_peripheral {
         // drop them rather than let a later flush dereference a dead ptr.
         {
             let mut q = pending_notify_queue().lock().unwrap();
-            q.clear();
+            q.queues.clear();
+            q.schedule.clear();
         }
 
         apply_event(crate::ble_peer_lifecycle::LifecycleEvent::Reset);
 
         tracing::info!("iOS BLE Peripheral: teardown complete");
         Ok(())
+    }
+    #[cfg(test)]
+    mod notify_tests {
+        use super::*;
+        #[test]
+        fn readiness_keeps_partial_packet_first_across_characteristics() {
+            let mut state = NotifyState {
+                accepting: true,
+                ..Default::default()
+            };
+            for (uuid, first) in [(RATSPEAK_TX_UUID, 0), (COLUMBA_TX_UUID, 3)] {
+                let key = ("synthetic".to_string(), uuid);
+                let mut q = crate::ble_tx_queue::PacketQueue::default();
+                assert!(q.enqueue(vec![vec![first], vec![first + 1], vec![first + 2]]));
+                state.queues.insert(key.clone(), q);
+                state.schedule.push_back(key);
+            }
+            let mut sent = Vec::new();
+            drain_notifications_with(&mut state, |_, _, frame| {
+                if frame == [1] {
+                    return false;
+                }
+                sent.push(frame[0]);
+                true
+            });
+            assert_eq!(sent, [0]);
+            drain_notifications_with(&mut state, |_, _, frame| {
+                sent.push(frame[0]);
+                true
+            });
+            assert_eq!(sent, [0, 1, 2, 3, 4, 5]);
+            assert!(state.schedule.is_empty());
+            state.accepting = false;
+            drain_notifications_with(&mut state, |_, _, _| panic!("retired notification"));
+        }
     }
 }
 
@@ -2923,7 +3029,7 @@ mod android_peripheral {
     /// is the source BluetoothDevice MAC string passed from RatspeakGattCallback.kt.
     /// See apple_peripheral::INBOUND_TX for the same shape on Apple platforms —
     /// the consumer in spawn_ble_peer_interface keys per-peer reassembly off this.
-    type InboundFrame = (String, Vec<u8>);
+    type InboundFrame = (String, bool, Vec<u8>);
     type InboundSender = tokio::sync::mpsc::Sender<InboundFrame>;
     type InboundReceiver = tokio::sync::mpsc::Receiver<InboundFrame>;
 
@@ -2958,13 +3064,17 @@ mod android_peripheral {
     }
 
     /// Take the inbound receiver (call once from spawn_ble_peer_interface).
-    pub fn take_inbound_rx() -> Option<tokio::sync::mpsc::Receiver<(String, Vec<u8>)>> {
+    pub fn take_inbound_rx() -> Option<tokio::sync::mpsc::Receiver<(String, bool, Vec<u8>)>> {
         inbound_rx_slot().lock().ok().and_then(|mut opt| opt.take())
     }
 
     /// Called from JNI native method when the GATT server receives data from a peer.
     /// `peer_address` is the source BluetoothDevice MAC (or random rotating addr).
     pub fn on_gatt_data_received(peer_address: String, data: Vec<u8>) {
+        on_role_data_received(peer_address, false, data);
+    }
+
+    fn on_role_data_received(peer_address: String, central: bool, data: Vec<u8>) {
         let tx = inbound_tx_slot()
             .lock()
             .ok()
@@ -2972,7 +3082,7 @@ mod android_peripheral {
         if let Some(tx) = tx {
             // JNI callback is synchronous on the binder thread; try_send + drop-on-full
             // is preferred over blocking the Android GATT stack when the reassembler stalls.
-            if let Err(e) = tx.try_send((peer_address, data)) {
+            if let Err(e) = tx.try_send((peer_address, central, data)) {
                 tracing::warn!("Android BLE inbound channel full, dropping frame: {e}");
             }
         }
@@ -3563,7 +3673,7 @@ mod android_peripheral {
     ) {
         let addr = jstring_to_owned(&env, address);
         if let Ok(bytes) = env.convert_byte_array(data) {
-            on_gatt_data_received(addr, bytes);
+            on_role_data_received(addr, true, bytes);
         }
     }
 
@@ -3652,9 +3762,9 @@ mod android_peripheral {
     /// Minimum negotiated ATT payload across every central subscribed to
     /// `char_uuid` on our GATT server. Used by the peripheral broadcast
     /// fan-out to size fragments so a single notify reaches everyone.
-    /// Falls back to 244 bytes when no subscribers.
+    /// Falls back to the ATT minimum (20 bytes) when no subscribers.
     pub fn min_subscribed_payload(char_uuid: Uuid) -> usize {
-        const FALLBACK: usize = 244;
+        const FALLBACK: usize = 20;
         let v = with_env(|env| {
             let cls = find_app_class(env, "org.ratspeak.android.RatspeakBleServer")
                 .map_err(|e| format!("RatspeakBleServer class: {e}"))?;
@@ -3678,11 +3788,11 @@ mod android_peripheral {
     }
 
     /// Negotiated payload size (MTU - 3) for the Central-side peer client at
-    /// `address`. Returns the conservative 244-byte default if the bridge is
+    /// `address`. Returns the conservative 20-byte default if the bridge is
     /// unavailable, the address has no live client, or MTU negotiation hasn't
     /// completed. Used by the per-peer write loop to size fragments.
     pub fn peer_client_mtu(address: &str) -> usize {
-        const FALLBACK: usize = 244;
+        const FALLBACK: usize = 20;
         let v = with_env(|env| {
             let cls = find_app_class(env, "org.ratspeak.android.RatspeakBlePeerClient")
                 .map_err(|e| format!("RatspeakBlePeerClient class: {e}"))?;
@@ -3830,7 +3940,7 @@ mod linux_peripheral {
 
     /// Per-process inbound channel — write callbacks push (peer_address, data)
     /// pairs that the spawn function's per-peer reassembler consumes.
-    type InboundFrame = (String, Vec<u8>);
+    type InboundFrame = (String, bool, Vec<u8>);
     type InboundSender = mpsc::Sender<InboundFrame>;
     type InboundReceiver = mpsc::Receiver<InboundFrame>;
     type InboundSenderSlot = std::sync::Mutex<Option<InboundSender>>;
@@ -4098,7 +4208,7 @@ mod linux_peripheral {
                     let byte_len = new_value.len();
                     Box::pin(async move {
                         if let Some(tx) = inbound_sender() {
-                            if let Err(e) = tx.try_send((addr.clone(), new_value)) {
+                            if let Err(e) = tx.try_send((addr.clone(), false, new_value)) {
                                 // Channel full — log so operators see the
                                 // backpressure signal instead of finding
                                 // silent fragment loss.
@@ -4224,11 +4334,12 @@ mod windows_peripheral {
     /// Per-process inbound channel. `GattLocalCharacteristic` write events
     /// push `(session_id_string, data)` pairs on the sender; the spawn
     /// function's reassembler consumes them via `take_inbound_rx`.
-    type InboundFrame = (String, Vec<u8>);
+    type InboundFrame = (String, bool, Vec<u8>);
     type InboundSender = mpsc::Sender<InboundFrame>;
     type InboundReceiver = mpsc::Receiver<InboundFrame>;
     static INBOUND_TX: OnceLock<Mutex<Option<InboundSender>>> = OnceLock::new();
-    static INBOUND_RX: OnceLock<Mutex<Option<mpsc::Receiver<(String, Vec<u8>)>>>> = OnceLock::new();
+    static INBOUND_RX: OnceLock<Mutex<Option<mpsc::Receiver<(String, bool, Vec<u8>)>>>> =
+        OnceLock::new();
 
     /// Held state across a single start/stop cycle. `_provider` keeps the
     /// service registration alive; `_tx_chars` keeps the notifiable
@@ -4284,7 +4395,7 @@ mod windows_peripheral {
             .and_then(|slot| slot.as_ref().cloned())
     }
 
-    pub fn take_inbound_rx() -> Option<mpsc::Receiver<(String, Vec<u8>)>> {
+    pub fn take_inbound_rx() -> Option<mpsc::Receiver<(String, bool, Vec<u8>)>> {
         inbound_rx_slot().lock().ok().and_then(|mut opt| opt.take())
     }
 
@@ -4382,7 +4493,7 @@ mod windows_peripheral {
             let mut bytes = vec![0u8; len];
             reader.ReadBytes(&mut bytes)?;
             if let Some(tx) = inbound_sender() {
-                if let Err(e) = tx.try_send((device_id.clone(), bytes)) {
+                if let Err(e) = tx.try_send((device_id.clone(), false, bytes)) {
                     tracing::warn!(
                         target: "ble_trace",
                         step = "windows_rx.channel_full",
@@ -5308,7 +5419,7 @@ pub async fn spawn_ble_peer_interface(
                 // No peripheral support on this platform (e.g. BSDs).
                 // Central-only mode continues to work; just no inbound
                 // channel for peripheral writes to consume.
-                None::<tokio::sync::mpsc::Receiver<(String, Vec<u8>)>>
+                None::<tokio::sync::mpsc::Receiver<(String, bool, Vec<u8>)>>
             }
         };
         if let Some(mut rx) = periph_rx {
@@ -5320,9 +5431,8 @@ pub async fn spawn_ble_peer_interface(
                     // (BluetoothDevice MAC on Android; CBCentral.identifier UUID
                     // string on Apple). Two peers writing fragments concurrently
                     // can no longer corrupt each other's reassembly buffers.
-                    type PeerReassembly = FragmentReassembly;
-                    let mut reassembly: HashMap<String, PeerReassembly> = HashMap::new();
-                    while let Some((peer, data)) = rx.recv().await {
+                    let mut reassembly: PeerReassembly = HashMap::new();
+                    while let Some((peer, central, data)) = rx.recv().await {
                         if !generation_is_current(generation) {
                             break;
                         }
@@ -5337,8 +5447,8 @@ pub async fn spawn_ble_peer_interface(
                         if data.is_empty() || (data.len() == 1 && data[0] == 0x00) {
                             continue; // Empty or keepalive
                         }
-                        let per_peer = reassembly.entry(peer.clone()).or_default();
-                        let complete = consume_ble_frame(data, per_peer);
+                        let complete =
+                            consume_peer_ble_frame(&peer, central, data, &mut reassembly);
 
                         if let Some(raw) = complete {
                             rxb.fetch_add(raw.len() as u64, Ordering::Relaxed);
@@ -5421,22 +5531,14 @@ pub async fn spawn_ble_peer_interface(
     // the mesh is one-way for any pair where only one side initiated as
     // Central, which is exactly half of the symmetric-mesh promise.
     //
-    // Per-peer MTU is queried before fragmenting on Android; Apple
-    // platforms rely on CoreBluetooth's auto-negotiated min and a safe
-    // 182-byte cap (iOS default ATT MTU 185 minus 3 ATT header bytes).
+    // Per-peer value capacity is queried before fragmentation on Android
+    // and Apple; Apple native queues own ordering and readiness-based pacing.
     let txb_w = shared_txb.clone();
     let writers_w = peer_writers.clone();
     let anti_loop_fan = anti_loop.clone();
     track_child_task(
         generation,
         tokio::spawn(async move {
-            // Apple-side fallback (no per-central API exposed up to us yet).
-            // Gated to Apple because the only consumer is the Apple-cfg
-            // fragmentation block below — on Linux/Windows the const would
-            // be dead.
-            #[cfg(any(target_os = "ios", target_os = "macos"))]
-            const APPLE_NOTIFY_MTU: usize = 182;
-
             while let Some(payload) = app_rx.recv().await {
                 if !generation_is_current(generation) {
                     break;
@@ -5486,12 +5588,10 @@ pub async fn spawn_ble_peer_interface(
                     let rats_subs =
                         apple_peripheral::subscribed_centrals_for_char(RATSPEAK_TX_UUID);
                     let col_subs = apple_peripheral::subscribed_centrals_for_char(COLUMBA_TX_UUID);
-                    let frags = fragment_packet(&payload, APPLE_NOTIFY_MTU);
                     tracing::info!(
                         rats_subs = rats_subs.len(),
                         col_subs = col_subs.len(),
                         payload_bytes = payload.len(),
-                        frags = frags.len(),
                         "Apple BLE peripheral fan-out: writing outbound"
                     );
                     for (char_uuid, subs, label) in [
@@ -5511,20 +5611,7 @@ pub async fn spawn_ble_peer_interface(
                                 tracing::info!(peer = %addr, char = label, "Apple BLE fan-out: anti-loop skip");
                                 continue;
                             }
-                            let mut ok_frags = 0usize;
-                            for (idx, frag) in frags.iter().enumerate() {
-                                if apple_peripheral::notify_tx(Some(addr), char_uuid, frag) {
-                                    ok_frags += 1;
-                                }
-                                pace_after_ble_fragment(idx, frags.len()).await;
-                            }
-                            tracing::info!(
-                                peer = %addr,
-                                total_frags = frags.len(),
-                                ok_frags,
-                                char = label,
-                                "Apple BLE fan-out: notify_tx results"
-                            );
+                            apple_peripheral::notify_packet(addr, char_uuid, &payload, generation);
                         }
                     }
                 }
@@ -5584,7 +5671,7 @@ pub async fn spawn_ble_peer_interface(
                             )
                         })
                         .await
-                        .unwrap_or((182, 182, Vec::new(), Vec::new()));
+                        .unwrap_or((20, 20, Vec::new(), Vec::new()));
                     let rats_frags = fragment_packet(&payload, rats_mtu);
                     for addr in &rats_subs {
                         // See the Apple branch: both roles remain live until
@@ -6162,7 +6249,7 @@ pub async fn spawn_ble_peer_interface(
                                     let anti_loop_w = anti_loop.clone();
                                     let writers_cleanup = writers.clone();
                                     let writer_key_cleanup = peer_writer_key.clone();
-                                    let mtu = cp.write_mtu;
+                                    let native_peer = cp.clone();
                                     track_child_task(
                                         generation,
                                         tokio::spawn(async move {
@@ -6197,31 +6284,17 @@ pub async fn spawn_ble_peer_interface(
                                                 ) {
                                                     continue;
                                                 }
-                                                let frags = fragment_packet(&data, mtu);
-                                                let mut all_ok = true;
-                                                for (idx, frag) in frags.iter().enumerate() {
-                                                    if let Err(e) =
-                                                        crate::ble_central_apple_connect::write_peer(
-                                                            &addr_w, frag,
-                                                        )
-                                                    {
-                                                        tracing::warn!(
-                                                            target: "ble_trace",
-                                                            step = "peer.write_fail",
-                                                            peer = %addr_w,
-                                                            tx_count = tx_count,
-                                                            frag_len = frag.len(),
-                                                            err = %e,
-                                                            "Apple BLE mesh peer write failed"
-                                                        );
+                                                match crate::ble_central_apple_connect::write_packet(
+                                                    &native_peer,
+                                                    &data,
+                                                ) {
+                                                    Ok(true) => {}
+                                                    // Reject the complete packet; upper-layer recovery owns retry.
+                                                    Ok(false) => continue,
+                                                    Err(_) => {
                                                         online_w.store(false, Ordering::SeqCst);
-                                                        all_ok = false;
                                                         break;
                                                     }
-                                                    pace_after_ble_fragment(idx, frags.len()).await;
-                                                }
-                                                if !all_ok {
-                                                    break;
                                                 }
                                                 tx_count += 1;
                                                 if tx_count.is_multiple_of(5) {
@@ -6546,7 +6619,7 @@ pub async fn spawn_ble_peer_interface(
                                             android_peripheral::peer_client_mtu(&addr_mtu)
                                         })
                                         .await
-                                        .unwrap_or(244);
+                                        .unwrap_or(20);
                                         let frags = fragment_packet(&data, mtu);
                                         let addr_w2 = addr_w.clone();
                                         let send_ok = tokio::task::spawn_blocking(move || {
@@ -6665,6 +6738,52 @@ pub async fn spawn_ble_peer_interface(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn simultaneous_roles_keep_fragment_streams_separate() {
+        let left = vec![0x55; 483];
+        let right = vec![0x66; 483];
+        let mut streams = PeerReassembly::new();
+        let mut completed = Vec::new();
+        for (a, b) in fragment_packet(&left, 182)
+            .into_iter()
+            .zip(fragment_packet(&right, 182))
+        {
+            for (role, frame) in [(false, a), (true, b)] {
+                if let Some(packet) =
+                    consume_peer_ble_frame("same-address", role, frame, &mut streams)
+                {
+                    completed.push(packet);
+                }
+            }
+        }
+        assert_eq!(completed, [left, right]);
+    }
+
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    #[test]
+    fn native_queue_backpressure_preserves_actual_fragment_reassembly() {
+        let payload = vec![0x55; 483];
+        let mut queue = crate::ble_tx_queue::PacketQueue::default();
+        assert!(queue.enqueue(fragment_packet(&payload, 182)));
+        let mut delivered = Vec::new();
+        assert!(queue.drain_one(|f| {
+            delivered.push(f.to_vec());
+            true
+        }));
+        assert!(!queue.drain_one(|_| false));
+        assert!(queue.enqueue(fragment_packet(&payload, 182)));
+        while queue.drain_one(|f| {
+            delivered.push(f.to_vec());
+            true
+        }) {}
+        let mut reassembly = FragmentReassembly::new();
+        let packets: Vec<_> = delivered
+            .into_iter()
+            .filter_map(|f| consume_ble_frame(f, &mut reassembly))
+            .collect();
+        assert_eq!(packets, [payload.clone(), payload]);
+    }
+
     use super::*;
 
     fn signed_announce_raw(

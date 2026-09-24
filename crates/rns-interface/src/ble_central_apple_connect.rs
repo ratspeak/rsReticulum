@@ -7,10 +7,11 @@
 
 #![cfg(any(target_os = "ios", target_os = "macos"))]
 
+use crate::ble_tx_queue::PacketQueue;
 use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Sel};
 use objc2::{msg_send, sel};
 use objc2_foundation::NSString;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -32,10 +33,6 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 const DISCOVERED_TTL: Duration = Duration::from_secs(60);
-
-/// Sized to absorb an LXMF fragment burst (~40 × 244B) without unbounded
-/// growth on a stuck peer. FIFO drop-oldest.
-const PENDING_WRITE_CAP: usize = 128;
 
 struct SendPtr(*mut AnyObject);
 unsafe impl Send for SendPtr {}
@@ -65,9 +62,6 @@ static ONLINE_FLAGS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLoc
 /// [`take_last_disconnect_reason`] so the scan loop can distinguish
 /// transient RPA-rotation drops from genuine peer failures.
 static LAST_DISCONNECT_REASON: OnceLock<Mutex<HashMap<String, DisconnectReason>>> = OnceLock::new();
-
-/// Drained by `peripheralIsReadyToSendWriteWithoutResponse:`.
-static PENDING_WRITE: OnceLock<Mutex<HashMap<String, VecDeque<Vec<u8>>>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisconnectReason {
@@ -121,10 +115,6 @@ fn last_disconnect_reason() -> &'static Mutex<HashMap<String, DisconnectReason>>
     LAST_DISCONNECT_REASON.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn pending_write() -> &'static Mutex<HashMap<String, VecDeque<Vec<u8>>>> {
-    PENDING_WRITE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 pub fn take_last_disconnect_reason(address: &str) -> Option<DisconnectReason> {
     last_disconnect_reason()
         .lock()
@@ -144,6 +134,7 @@ pub struct ConnectedPeer {
     delegate: SendPtr,
     rx_char: SendPtr,
     tx_char: SendPtr,
+    pending_write: Mutex<PacketQueue>,
 }
 
 impl Drop for ConnectedPeer {
@@ -152,8 +143,13 @@ impl Drop for ConnectedPeer {
             // Clear the (weakly-retained) delegate first so a late callback
             // can't fire into freed memory after the release below.
             if !self.peripheral.0.is_null() {
-                let _: () =
-                    msg_send![self.peripheral.0, setDelegate: std::ptr::null::<AnyObject>()];
+                // A retired write task can outlive reconnect. Do not detach
+                // a replacement delegate on the same peripheral object.
+                let current: *mut AnyObject = msg_send![self.peripheral.0, delegate];
+                if current == self.delegate.0 {
+                    let _: () =
+                        msg_send![self.peripheral.0, setDelegate: std::ptr::null::<AnyObject>()];
+                }
             }
             for p in [
                 &self.delegate,
@@ -400,6 +396,7 @@ pub async fn connect_peer(
         delegate,
         rx_char,
         tx_char,
+        pending_write: Mutex::new(PacketQueue::default()),
     });
     {
         let mut g = connected_peers().lock().expect("connected_peers lock");
@@ -408,88 +405,53 @@ pub async fn connect_peer(
     Ok(peer)
 }
 
-/// Queues into the pending-write buffer when `canSendWriteWithoutResponse` is
-/// false — without queueing, fragmented LXMF messages silently lose every
-/// fragment past the first on a loaded radio.
+/// Queue a single already-fragmented value. Full queues refuse the new value;
+/// accepted values are never evicted. Packet producers should use the internal
+/// complete-packet admission path so overload cannot admit a partial packet.
 pub fn write_peer(address: &str, data: &[u8]) -> Result<(), String> {
-    let peer = {
-        let g = connected_peers().lock().expect("connected_peers lock");
-        g.get(address).cloned()
-    };
-    let peer = peer.ok_or_else(|| format!("peer {address} not connected"))?;
-    if !peer.online.load(Ordering::SeqCst) {
-        return Err(format!("peer {address} marked offline"));
+    let peer = connected_peers()
+        .lock()
+        .expect("connected_peers lock")
+        .get(address)
+        .cloned()
+        .ok_or_else(|| "peer not connected".to_string())?;
+    if enqueue_packet(&peer, vec![data.to_vec()])? {
+        Ok(())
+    } else {
+        Err("native write queue full".into())
     }
-
-    // Always enqueue, then drain, so every fragment leaves through the single
-    // FIFO path. Issuing directly on a "ready" radio would let a later
-    // fragment jump ahead of ones already queued from when it was busy, and
-    // the receiver would misparse the out-of-order envelope as a raw packet.
-    {
-        let mut g = pending_write().lock().expect("pending_write lock");
-        let q = g.entry(address.to_owned()).or_default();
-        if q.len() >= PENDING_WRITE_CAP {
-            q.pop_front();
-            tracing::warn!(
-                target: "ble_trace",
-                step = "central.write_overflow_drop",
-                peer = %address,
-                cap = PENDING_WRITE_CAP,
-                "Apple BLE central: pending-write ring overflowed, dropping oldest"
-            );
-        }
-        q.push_back(data.to_vec());
-    }
-    unsafe { drain_pending_writes(address) };
-    Ok(())
 }
 
-/// Drains queued writes in FIFO order while the radio can accept them. Holds
-/// the pending-write lock across the whole loop so a concurrent drain (or a
-/// [`write_peer`] enqueue) can't interleave and reorder fragments — an
-/// out-of-order envelope makes the receiver misparse the frame as a raw packet.
-unsafe fn drain_pending_writes(address: &str) {
-    let peer = {
-        let g = connected_peers().lock().expect("connected_peers lock");
-        match g.get(address) {
-            Some(p) => p.clone(),
-            None => return,
-        }
-    };
+pub(crate) fn write_packet(peer: &Arc<ConnectedPeer>, data: &[u8]) -> Result<bool, String> {
+    enqueue_packet(peer, crate::ble_peer::fragment_packet(data, peer.write_mtu))
+}
+
+fn enqueue_packet(peer: &ConnectedPeer, frames: Vec<Vec<u8>>) -> Result<bool, String> {
+    let mut q = peer.pending_write.lock().expect("pending_write lock");
     if !peer.online.load(Ordering::SeqCst) {
-        return;
+        return Err("peer offline".into());
     }
-    let mut drained = 0usize;
-    let mut g = pending_write().lock().expect("pending_write lock");
-    let Some(q) = g.get_mut(address) else {
-        return;
-    };
-    loop {
-        // Peek before popping: leave the fragment queued if the radio can't
-        // take it, so ordering is preserved for the next drain.
-        if q.front().is_none() {
-            break;
+    if frames.iter().any(|frame| frame.len() > peer.write_mtu) {
+        return Err("frame exceeds native value limit".into());
+    }
+    let admitted = q.enqueue(frames);
+    drain_peer_queue(peer, &mut q);
+    q.report("apple_central", peer.write_mtu);
+    Ok(admitted)
+}
+
+fn drain_peer_queue(peer: &ConnectedPeer, q: &mut PacketQueue) {
+    while q.drain_one(|data| {
+        if !peer.online.load(Ordering::SeqCst) {
+            return false;
         }
         let ready: bool = unsafe { msg_send![peer.peripheral.0, canSendWriteWithoutResponse] };
         if !ready {
-            break;
+            return false;
         }
-        let Some(data) = q.pop_front() else {
-            break;
-        };
-        unsafe { issue_write(&peer, &data) };
-        drained += 1;
-    }
-    drop(g);
-    if drained > 0 {
-        tracing::debug!(
-            target: "ble_trace",
-            step = "central.write_drained",
-            peer = %address,
-            drained,
-            "Apple BLE central: pending writes drained"
-        );
-    }
+        unsafe { issue_write(peer, data) };
+        true
+    }) {}
 }
 
 /// Caller must have either confirmed `canSendWriteWithoutResponse` or be
@@ -498,7 +460,7 @@ unsafe fn drain_pending_writes(address: &str) {
 /// # Safety
 /// `peer.peripheral.0` and `peer.rx_char.0` must be retained, valid CB
 /// pointers.
-unsafe fn issue_write(peer: &Arc<ConnectedPeer>, data: &[u8]) {
+unsafe fn issue_write(peer: &ConnectedPeer, data: &[u8]) {
     unsafe {
         let nsdata = nsdata_from_slice(data);
         const WRITE_WITHOUT_RESPONSE: i64 = 1;
@@ -519,8 +481,8 @@ pub fn disconnect_peer(address: &str) {
         return;
     };
     peer.online.store(false, Ordering::SeqCst);
-    if let Ok(mut g) = pending_write().lock() {
-        g.remove(address);
+    if let Ok(mut q) = peer.pending_write.lock() {
+        *q = PacketQueue::default();
     }
     if let Some(manager_ptr) = crate::ble_central_apple::central_manager_ptr() {
         unsafe {
@@ -646,12 +608,16 @@ pub unsafe fn adopt_restored_peer(
     let peer = Arc::new(ConnectedPeer {
         address: address.clone(),
         protocol,
-        write_mtu: 244,
+        write_mtu: unsafe {
+            let value: usize = msg_send![peripheral, maximumWriteValueLengthForType: 1usize];
+            value.clamp(20, crate::ble_peer::TARGET_MTU as usize)
+        },
         online,
         peripheral: SendPtr(peripheral),
         delegate,
         rx_char,
         tx_char,
+        pending_write: Mutex::new(PacketQueue::default()),
     });
     {
         let mut g = connected_peers().lock().expect("connected_peers lock");
@@ -671,9 +637,13 @@ pub unsafe fn adopt_restored_peer(
 /// UIBackgroundMode + restore-identifier; this just logs inventory.
 pub fn on_app_will_resign_active() {
     let connected = connected_peers().lock().map(|g| g.len()).unwrap_or(0);
-    let pending = pending_write()
+    let pending = connected_peers()
         .lock()
-        .map(|g| g.values().map(|q| q.len()).sum::<usize>())
+        .map(|g| {
+            g.values()
+                .map(|p| p.pending_write.lock().map(|q| q.len()).unwrap_or(0))
+                .sum::<usize>()
+        })
         .unwrap_or(0);
     tracing::info!(
         target: "ble_trace",
@@ -971,7 +941,18 @@ fn peripheral_delegate_class() -> &'static AnyClass {
             if address.is_empty() {
                 return;
             }
-            unsafe { drain_pending_writes(&address) };
+            let peer = connected_peers()
+                .lock()
+                .ok()
+                .and_then(|g| g.get(&address).cloned());
+            if let Some(peer) = peer {
+                // Old delegates cannot drain a replacement connection's queue.
+                if peer.peripheral.0 != peripheral || peer.delegate.0 != _this {
+                    return;
+                }
+                let mut q = peer.pending_write.lock().expect("pending_write lock");
+                drain_peer_queue(&peer, &mut q);
+            }
         }
 
         unsafe {

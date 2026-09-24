@@ -196,9 +196,12 @@ fn dispatch_unpublished_bind_cancellation_does_not_leak_or_retire_replacement() 
     execute(&mut actor);
     assert!(actor.link_endpoints.is_empty());
 
-    let after_execution = begin_bind(&actor);
+    let mut after_execution = begin_bind(&actor);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(after_execution.poll_ready(&mut cx).is_pending());
     execute(&mut actor);
     assert_eq!(actor.link_endpoints.len(), 1);
+    assert!(after_execution.poll_ready(&mut cx).is_ready());
     drop(after_execution);
     // Even a legacy send cannot use the canceled unpublished binding before
     // periodic maintenance gets a chance to retire it.
@@ -236,6 +239,26 @@ fn dispatch_published_token_drop_keeps_explicit_endpoint_lifetime() {
         actor.send_link_endpoint(binding().link_id, binding().role, packet(1)),
         LinkEndpointSendResult::Sent
     );
+    assert!(rx.try_recv().is_ok());
+}
+
+#[test]
+fn dispatch_ready_receipt_can_be_consumed_once_without_early_publication() {
+    let (mut actor, mut rx) = fixture();
+    let mut receipt = begin_bind(&actor);
+    execute(&mut actor);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(receipt.poll_ready(&mut cx).is_ready());
+    assert!(receipt.poll_ready(&mut cx).is_ready());
+    let token = receipt.try_recv().unwrap().unwrap();
+    let mut sent = token
+        .try_send(packet(9), Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    execute(&mut actor);
+    assert!(matches!(
+        sent.try_recv().unwrap(),
+        LinkEndpointDispatchOutcome::Sent { .. }
+    ));
     assert!(rx.try_recv().is_ok());
 }
 
