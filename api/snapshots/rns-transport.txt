@@ -776,6 +776,7 @@ pub rns_transport::link_endpoint_dispatch::LinkEndpointDispatchOutcome::Sent::di
 pub rns_transport::link_endpoint_dispatch::LinkEndpointDispatchOutcome::Sent::packet_hash: [u8; 32]
 pub struct rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt
 impl rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt
+pub fn rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt::poll_ready(&mut self, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<()>
 pub fn rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt::try_recv(&mut self) -> core::result::Result<core::result::Result<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchToken, rns_transport::messages::LinkEndpointBindResult>, tokio::sync::oneshot::error::TryRecvError>
 impl core::future::future::Future for rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt
 pub type rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt::Output = core::result::Result<core::result::Result<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchToken, rns_transport::messages::LinkEndpointBindResult>, tokio::sync::oneshot::error::RecvError>
