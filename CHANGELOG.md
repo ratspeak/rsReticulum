@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- Added Link bind-readiness polling so applications can start sending as soon as the transport is ready.
+
+### Fixed and improved
+
+- Improved Bluetooth Peer packet sizing and flow control, including Apple write handling and queued sends.
+
+
 ## 1.3.0 - 2026-09-10
 
 - Breaking Rust API: recursive discovery now has one private operation owner.
