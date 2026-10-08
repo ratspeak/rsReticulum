@@ -84,6 +84,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reports_admission_milestones_and_spaced_refusals() {
+        let mut q = PacketQueue::default();
+        assert!(q.enqueue(vec![vec![1]]));
+        q.report("test", 20);
+        assert_eq!(q.reported, (1, 0));
+        for _ in 1..63 {
+            assert!(q.enqueue(vec![vec![1]]));
+            q.report("test", 20);
+        }
+        assert_eq!(q.reported, (1, 0));
+        assert!(q.enqueue(vec![vec![1]]));
+        q.report("test", 20);
+        assert_eq!(q.reported, (64, 0));
+        for rejected in 1u64..=4 {
+            assert!(!q.enqueue(vec![]));
+            q.report("test", 20);
+            assert_eq!(q.reported.1, if rejected == 3 { 2 } else { rejected });
+        }
+        assert_eq!(q.len(), 64);
+    }
+
+    #[test]
     fn backpressure_keeps_middle_frame_ahead_of_later_packets() {
         let mut q = PacketQueue::default();
         assert!(q.enqueue(vec![vec![0], vec![1], vec![2]]));
