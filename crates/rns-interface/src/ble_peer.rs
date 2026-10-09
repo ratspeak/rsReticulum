@@ -685,13 +685,12 @@ pub async fn disconnect_mesh_peer(address: &str) {
         not(any(target_os = "android", target_os = "ios", target_os = "macos"))
     ))]
     {
-        use btleplug::api::Peripheral as _;
-        let peripheral = central_peripherals()
+        let connection_id = central_peripherals()
             .lock()
             .ok()
-            .and_then(|mut reg| reg.remove(address));
-        if let Some((_, p)) = peripheral {
-            let _ = crate::ble_connect::operation("Disconnect peer", p.disconnect()).await;
+            .and_then(|reg| reg.get(address).map(|entry| entry.connection_id));
+        if let Some(connection_id) = connection_id {
+            disconnect_central_peripheral(address, connection_id).await;
         }
     }
     #[cfg(not(any(
@@ -4833,6 +4832,63 @@ struct MeshPeerConnection {
     ble_address: String,
 }
 
+#[cfg(any(test, target_os = "linux", target_os = "windows"))]
+struct CentralPeripheral<P> {
+    connection_id: u64,
+    peripheral: P,
+    closing: bool,
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "windows"))]
+fn reserve_central_peripheral<P>(
+    registry: &mut HashMap<String, CentralPeripheral<P>>,
+    address: String,
+    connection_id: u64,
+    peripheral: P,
+) -> Result<(), String> {
+    match registry.entry(address) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(CentralPeripheral {
+                connection_id,
+                peripheral,
+                closing: false,
+            });
+            Ok(())
+        }
+        std::collections::hash_map::Entry::Occupied(_) => {
+            Err("Previous BLE connection has not finished closing".into())
+        }
+    }
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "windows"))]
+fn claim_central_disconnect<P: Clone>(
+    registry: &mut HashMap<String, CentralPeripheral<P>>,
+    address: &str,
+    connection_id: u64,
+) -> Option<P> {
+    let entry = registry.get_mut(address)?;
+    if entry.connection_id != connection_id || entry.closing {
+        return None;
+    }
+    entry.closing = true;
+    Some(entry.peripheral.clone())
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "windows"))]
+fn finish_central_disconnect<P>(
+    registry: &mut HashMap<String, CentralPeripheral<P>>,
+    address: &str,
+    connection_id: u64,
+) {
+    if registry
+        .get(address)
+        .is_some_and(|entry| entry.connection_id == connection_id)
+    {
+        registry.remove(address);
+    }
+}
+
 /// Connected btleplug peripherals keyed by BLE address. `peer_read_loop`
 /// disconnects on graceful exit, but interface teardown aborts that task
 /// before its cleanup runs, so hold clones here to disconnect explicitly —
@@ -4842,9 +4898,9 @@ struct MeshPeerConnection {
     not(any(target_os = "android", target_os = "ios", target_os = "macos"))
 ))]
 fn central_peripherals()
--> &'static std::sync::Mutex<HashMap<String, (u64, btleplug::platform::Peripheral)>> {
+-> &'static std::sync::Mutex<HashMap<String, CentralPeripheral<btleplug::platform::Peripheral>>> {
     static REG: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<String, (u64, btleplug::platform::Peripheral)>>,
+        std::sync::Mutex<HashMap<String, CentralPeripheral<btleplug::platform::Peripheral>>>,
     > = std::sync::OnceLock::new();
     REG.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
@@ -4856,7 +4912,7 @@ fn central_peripherals()
 async fn disconnect_central_peripherals() {
     use btleplug::api::Peripheral as _;
     let peripherals: Vec<btleplug::platform::Peripheral> = match central_peripherals().lock() {
-        Ok(mut m) => m.drain().map(|(_, (_, p))| p).collect(),
+        Ok(mut m) => m.drain().map(|(_, entry)| entry.peripheral).collect(),
         Err(_) => return,
     };
     for p in peripherals {
@@ -4921,10 +4977,12 @@ async fn connect_mesh_peer(
         if !generation_is_current(generation) {
             return Err("BLE connection cancelled".into());
         }
-        reg.insert(
+        reserve_central_peripheral(
+            &mut reg,
             peer.ble_address.clone(),
-            (connection_id, peripheral.clone()),
-        );
+            connection_id,
+            peripheral.clone(),
+        )?;
     }
 
     let result = while_current(
@@ -4979,14 +5037,7 @@ async fn connect_mesh_peer(
     if result.is_err() {
         // Retain the entry during disconnect so an abort here is also cleaned
         // up by teardown. A later generation owns its own entry and cleanup.
-        let owned = central_peripherals().lock().ok().is_some_and(|reg| {
-            reg.get(&peer.ble_address)
-                .is_some_and(|(owner, _)| *owner == connection_id)
-        });
-        if owned {
-            let _ = operation("Failed peer cleanup", peripheral.disconnect()).await;
-            remove_central_peripheral(&peer.ble_address, connection_id);
-        }
+        disconnect_central_peripheral(&peer.ble_address, connection_id).await;
     }
     result
 }
@@ -4995,14 +5046,23 @@ async fn connect_mesh_peer(
     feature = "ble",
     not(any(target_os = "android", target_os = "ios", target_os = "macos"))
 ))]
-fn remove_central_peripheral(address: &str, connection_id: u64) {
-    if let Ok(mut reg) = central_peripherals().lock()
-        && reg
-            .get(address)
-            .is_some_and(|(owner, _)| *owner == connection_id)
-    {
-        reg.remove(address);
+async fn disconnect_central_peripheral(address: &str, connection_id: u64) -> bool {
+    use btleplug::api::Peripheral as _;
+    // Keep the address reserved while GATT disconnect is pending. Read-loop,
+    // explicit-disconnect and failed-setup cleanup must not race each other or
+    // let the scan loop reconnect a peripheral still being closed.
+    let peripheral = central_peripherals()
+        .lock()
+        .ok()
+        .and_then(|mut registry| claim_central_disconnect(&mut registry, address, connection_id));
+    let Some(peripheral) = peripheral else {
+        return false;
+    };
+    let _ = crate::ble_connect::operation("Disconnect peer", peripheral.disconnect()).await;
+    if let Ok(mut registry) = central_peripherals().lock() {
+        finish_central_disconnect(&mut registry, address, connection_id);
     }
+    true
 }
 
 /// A remembered address has no trustworthy advertisement protocol hint.
@@ -5283,15 +5343,7 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
     }
 
     // Cleanup: disconnect and remove writer
-    let owned = central_peripherals().lock().ok().is_some_and(|reg| {
-        reg.get(&peer_address)
-            .is_some_and(|(owner, _)| *owner == conn.connection_id)
-    });
-    if owned {
-        let _ =
-            crate::ble_connect::operation("Disconnect peer", conn.peripheral.disconnect()).await;
-        remove_central_peripheral(&peer_address, conn.connection_id);
-    }
+    let owned = disconnect_central_peripheral(&peer_address, conn.connection_id).await;
     let mut writers = peer_writers.write().await;
     remove_peer_writer_if_current(&mut writers, &peer_writer_key, peer_writer_lease_id);
     tracing::info!(address = %peer_address, "BLE mesh peer disconnected and cleaned up");
@@ -7429,6 +7481,43 @@ mod tests {
             replacement_id
         ));
         assert!(!writers.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn reconnect_waits_for_the_only_disconnect_owner() {
+        let address = "AA:BB:CC:DD:EE:01";
+        let registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        reserve_central_peripheral(&mut registry.lock().unwrap(), address.into(), 1, "old")
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let closing_registry = registry.clone();
+        let teardown = tokio::spawn(async move {
+            assert_eq!(
+                claim_central_disconnect(&mut closing_registry.lock().unwrap(), address, 1),
+                Some("old")
+            );
+            started_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
+            finish_central_disconnect(&mut closing_registry.lock().unwrap(), address, 1);
+        });
+        started_rx.await.unwrap();
+        {
+            let mut entries = registry.lock().unwrap();
+            // A simultaneous explicit disconnect cannot become a second
+            // closer, and a scan cannot replace the pending GATT session.
+            assert_eq!(claim_central_disconnect(&mut entries, address, 1), None);
+            assert!(reserve_central_peripheral(&mut entries, address.into(), 2, "new").is_err());
+            assert_eq!(entries[address].peripheral, "old");
+        }
+        finish_tx.send(()).unwrap();
+        teardown.await.unwrap();
+        let mut entries = registry.lock().unwrap();
+        reserve_central_peripheral(&mut entries, address.into(), 2, "new").unwrap();
+        assert_eq!(claim_central_disconnect(&mut entries, address, 1), None);
+        finish_central_disconnect(&mut entries, address, 1);
+        assert_eq!(entries[address].peripheral, "new");
+        assert!(!entries[address].closing);
     }
 
     #[test]
