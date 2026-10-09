@@ -6301,7 +6301,9 @@ async fn start_blackhole_subscriber(handle: ReticulumHandle) {
                 {
                     Ok(payload) => {
                         match handle
-                            .query_transport(TransportQuery::ApplyBlackholeManifest { payload })
+                            .query_transport(TransportQuery::ApplyBlackholeManifest {
+                                payload: payload.data,
+                            })
                             .await
                         {
                             Some(TransportQueryResponse::IntResult(applied)) => {
