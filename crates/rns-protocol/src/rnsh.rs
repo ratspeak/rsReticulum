@@ -552,10 +552,10 @@ fn value_to_u64(value: &Value, field: &'static str) -> Result<u64, RnshCodecErro
     if let Some(number) = value.as_u64() {
         return Ok(number);
     }
-    if let Some(number) = value.as_i64() {
-        if number >= 0 {
-            return Ok(number as u64);
-        }
+    if let Some(number) = value.as_i64()
+        && number >= 0
+    {
+        return Ok(number as u64);
     }
     Err(RnshCodecError::InvalidShape(field))
 }
@@ -564,10 +564,10 @@ fn value_to_i64(value: &Value, field: &'static str) -> Result<i64, RnshCodecErro
     if let Some(number) = value.as_i64() {
         return Ok(number);
     }
-    if let Some(number) = value.as_u64() {
-        if number <= i64::MAX as u64 {
-            return Ok(number as i64);
-        }
+    if let Some(number) = value.as_u64()
+        && number <= i64::MAX as u64
+    {
+        return Ok(number as i64);
     }
     Err(RnshCodecError::InvalidShape(field))
 }

@@ -991,10 +991,10 @@ mod tests {
 
     impl FrameSession for ScriptedSession {
         fn send(&mut self, frame: &rnode_admin::AdminFrame) -> Result<(), String> {
-            if let Some((index, message)) = self.fail_send_at {
-                if self.sent.len() == index {
-                    return Err(message.to_string());
-                }
+            if let Some((index, message)) = self.fail_send_at
+                && self.sent.len() == index
+            {
+                return Err(message.to_string());
             }
             self.sent.push(frame.clone());
             Ok(())

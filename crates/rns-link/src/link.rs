@@ -581,14 +581,14 @@ impl Link {
             .map_err(|_| HandshakeError::InvalidSignature)?;
 
         // RTT is a msgpack f64 — see matching encode in validate_proof().
-        if let Ok(value) = rmpv::decode::read_value(&mut &plaintext[..]) {
-            if let Some(peer_rtt) = value.as_f64() {
-                let local_rtt = self.request_time.elapsed().as_secs_f64();
-                let rtt = local_rtt.max(peer_rtt);
-                let rtt_dur = Duration::from_secs_f64(rtt);
-                self.rtt = Some(rtt_dur);
-                self.keepalive.update_from_rtt(rtt_dur);
-            }
+        if let Ok(value) = rmpv::decode::read_value(&mut &plaintext[..])
+            && let Some(peer_rtt) = value.as_f64()
+        {
+            let local_rtt = self.request_time.elapsed().as_secs_f64();
+            let rtt = local_rtt.max(peer_rtt);
+            let rtt_dur = Duration::from_secs_f64(rtt);
+            self.rtt = Some(rtt_dur);
+            self.keepalive.update_from_rtt(rtt_dur);
         }
 
         self.state = LinkState::Active;
@@ -1432,12 +1432,12 @@ impl Link {
                 // otherwise we'd have nothing to sign the teardown with.
                 let rtt = self.rtt.unwrap_or(Duration::from_secs(1));
                 let grace = self.keepalive.stale_grace_timeout(rtt);
-                if let Some(stale_since) = self.stale_since {
-                    if now.saturating_duration_since(stale_since) >= grace {
-                        let teardown_data = self.encrypt(&self.link_id).unwrap_or_default();
-                        self.close(CloseReason::Timeout);
-                        return LinkAction::SendTeardownAndClose(teardown_data);
-                    }
+                if let Some(stale_since) = self.stale_since
+                    && now.saturating_duration_since(stale_since) >= grace
+                {
+                    let teardown_data = self.encrypt(&self.link_id).unwrap_or_default();
+                    self.close(CloseReason::Timeout);
+                    return LinkAction::SendTeardownAndClose(teardown_data);
                 }
                 LinkAction::None
             }

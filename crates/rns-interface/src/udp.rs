@@ -59,19 +59,19 @@ pub async fn spawn_udp_interface(
     // config error, not a silent fallback to wildcard.
     let mut listen_ip_cfg = config.listen_ip.clone();
     let mut forward_ip_cfg = config.forward_ip.clone();
-    if let Some(device) = config.device.as_deref() {
-        if listen_ip_cfg.is_none() || forward_ip_cfg.is_none() {
-            let bcast = crate::socket_tuning::iface_broadcast_for(device).ok_or_else(|| {
-                crate::traits::InterfaceError::SendFailed(format!(
-                    "UDP device '{device}' not found or has no IPv4 broadcast address"
-                ))
-            })?;
-            if listen_ip_cfg.is_none() {
-                listen_ip_cfg = Some(bcast.to_string());
-            }
-            if forward_ip_cfg.is_none() {
-                forward_ip_cfg = Some(bcast.to_string());
-            }
+    if let Some(device) = config.device.as_deref()
+        && (listen_ip_cfg.is_none() || forward_ip_cfg.is_none())
+    {
+        let bcast = crate::socket_tuning::iface_broadcast_for(device).ok_or_else(|| {
+            crate::traits::InterfaceError::SendFailed(format!(
+                "UDP device '{device}' not found or has no IPv4 broadcast address"
+            ))
+        })?;
+        if listen_ip_cfg.is_none() {
+            listen_ip_cfg = Some(bcast.to_string());
+        }
+        if forward_ip_cfg.is_none() {
+            forward_ip_cfg = Some(bcast.to_string());
         }
     }
 

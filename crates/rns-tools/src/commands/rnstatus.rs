@@ -535,13 +535,13 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
                 println!("    IFAC     : {} bits", entry.ifac_size * 8);
             }
             if args.announce_stats {
-                if let Some(queued) = entry.announce_queue {
-                    if queued > 0 {
-                        println!(
-                            "    Queued   : {queued} announce{}",
-                            if queued == 1 { "" } else { "s" }
-                        );
-                    }
+                if let Some(queued) = entry.announce_queue
+                    && queued > 0
+                {
+                    println!(
+                        "    Queued   : {queued} announce{}",
+                        if queued == 1 { "" } else { "s" }
+                    );
                 }
                 if entry.held_announces > 0 {
                     println!(
@@ -1199,13 +1199,13 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 println!("    Blocked  : {blocked}");
             }
             if args.announce_stats {
-                if let Some(queued) = iface.announce_queue {
-                    if queued > 0 {
-                        println!(
-                            "    Queued   : {queued} announce{}",
-                            if queued == 1 { "" } else { "s" }
-                        );
-                    }
+                if let Some(queued) = iface.announce_queue
+                    && queued > 0
+                {
+                    println!(
+                        "    Queued   : {queued} announce{}",
+                        if queued == 1 { "" } else { "s" }
+                    );
                 }
                 if iface.held_announces > 0 {
                     println!(

@@ -892,15 +892,15 @@ impl LinkManager {
                     continue;
                 };
                 let key = (*link_id, Self::outbound_resource_identity(transfer).0);
-                if self.outbound_resource_waits.get(&key) != Some(&window) {
-                    if let Some(tx) = &self.accounting_event_tx {
-                        let _ = tx.send(LinkManagerAccountingEvent::OutboundResourceWait {
-                            link_id: key.0,
-                            resource_id: key.1,
-                            started_at: window.0,
-                            timeout: window.1,
-                        });
-                    }
+                if self.outbound_resource_waits.get(&key) != Some(&window)
+                    && let Some(tx) = &self.accounting_event_tx
+                {
+                    let _ = tx.send(LinkManagerAccountingEvent::OutboundResourceWait {
+                        link_id: key.0,
+                        resource_id: key.1,
+                        started_at: window.0,
+                        timeout: window.1,
+                    });
                 }
                 current.insert(key, window);
             }
@@ -1010,16 +1010,16 @@ impl LinkManager {
                 }
             };
             progressed = true;
-            if let Some((started_at, timeout, awaiting_admission)) = window {
-                if let Some(tx) = &self.accounting_event_tx {
-                    let _ = tx.send(LinkManagerAccountingEvent::OutboundPacketWait {
-                        receipt: pending.receipt,
-                        started_at,
-                        timeout,
-                        awaiting_admission,
-                        cancellation: None,
-                    });
-                }
+            if let Some((started_at, timeout, awaiting_admission)) = window
+                && let Some(tx) = &self.accounting_event_tx
+            {
+                let _ = tx.send(LinkManagerAccountingEvent::OutboundPacketWait {
+                    receipt: pending.receipt,
+                    started_at,
+                    timeout,
+                    awaiting_admission,
+                    cancellation: None,
+                });
             }
         }
         self.pending_packet_dispatches = waiting;
@@ -1119,30 +1119,29 @@ impl LinkManager {
                 Ok(
                     result @ (LinkEndpointSendResult::Sent | LinkEndpointSendResult::Queued { .. }),
                 ) => {
-                    if let Some(packet_hash) = pending.packet_proof_hash {
-                        if let Some(active) = self.active_links.get(&pending.link_id) {
-                            if let Some(tx) = &self.accounting_event_tx {
-                                let _ = tx.send(LinkManagerAccountingEvent::OutboundPacketWait {
-                                    receipt: LinkPacketSendReceipt {
-                                        link_id: pending.link_id,
-                                        packet_hash,
-                                    },
-                                    started_at: std::time::Instant::now(),
-                                    timeout: active.link.packet_proof_timeout().saturating_add(
-                                        if matches!(result, LinkEndpointSendResult::Queued { .. }) {
-                                            std::time::Duration::from_secs(10)
-                                        } else {
-                                            std::time::Duration::ZERO
-                                        },
-                                    ),
-                                    awaiting_admission: matches!(
-                                        result,
-                                        LinkEndpointSendResult::Queued { .. }
-                                    ),
-                                    cancellation: None,
-                                });
-                            }
-                        }
+                    if let Some(packet_hash) = pending.packet_proof_hash
+                        && let Some(active) = self.active_links.get(&pending.link_id)
+                        && let Some(tx) = &self.accounting_event_tx
+                    {
+                        let _ = tx.send(LinkManagerAccountingEvent::OutboundPacketWait {
+                            receipt: LinkPacketSendReceipt {
+                                link_id: pending.link_id,
+                                packet_hash,
+                            },
+                            started_at: std::time::Instant::now(),
+                            timeout: active.link.packet_proof_timeout().saturating_add(
+                                if matches!(result, LinkEndpointSendResult::Queued { .. }) {
+                                    std::time::Duration::from_secs(10)
+                                } else {
+                                    std::time::Duration::ZERO
+                                },
+                            ),
+                            awaiting_admission: matches!(
+                                result,
+                                LinkEndpointSendResult::Queued { .. }
+                            ),
+                            cancellation: None,
+                        });
                     }
                     if pending.final_unbind {
                         accepted_final_sends.push((pending.link_id, pending.role));
@@ -1369,10 +1368,10 @@ impl LinkManager {
                     return true;
                 }
                 let result = self.send_link_packet(&link_id, &payload);
-                if let Some(tx) = result_tx {
-                    if let Err(Ok(receipt)) = tx.send(result) {
-                        self.cancel_unadmitted_packet(&receipt);
-                    }
+                if let Some(tx) = result_tx
+                    && let Err(Ok(receipt)) = tx.send(result)
+                {
+                    self.cancel_unadmitted_packet(&receipt);
                 }
                 true
             }
@@ -1846,11 +1845,11 @@ impl LinkManager {
                 response_tx,
             },
         );
-        if let Some(tombstone) = self.endpoint_tombstones.get_mut(&link_id) {
-            if tombstone.ownership == ownership {
-                tombstone.lifecycle_required |= lifecycle_required;
-                tombstone.finalization_rx = Some(response_rx);
-            }
+        if let Some(tombstone) = self.endpoint_tombstones.get_mut(&link_id)
+            && tombstone.ownership == ownership
+        {
+            tombstone.lifecycle_required |= lifecycle_required;
+            tombstone.finalization_rx = Some(response_rx);
         }
     }
 
@@ -2083,11 +2082,11 @@ impl LinkManager {
 
         let hops = header.hops;
 
-        if let Some(ref dest) = self.destination {
-            if !dest.accept_link_requests {
-                tracing::debug!("link request rejected — destination not accepting links");
-                return;
-            }
+        if let Some(ref dest) = self.destination
+            && !dest.accept_link_requests
+        {
+            tracing::debug!("link request rejected — destination not accepting links");
+            return;
         }
 
         let responder = match (&self.identity_key, &self.identity) {
@@ -3082,20 +3081,20 @@ impl LinkManager {
                             );
                         }
 
-                        if let Some(action) = resource_action_to_send {
-                            if !Self::send_resource_action(
+                        if let Some(action) = resource_action_to_send
+                            && !Self::send_resource_action(
                                 &self.transport_tx,
                                 &mut self.pending_link_control,
                                 &mut self.pending_endpoint_sends,
                                 active,
                                 &link_id,
                                 action,
-                            ) {
-                                tracing::error!(
-                                    link_id = hex::encode(link_id),
-                                    "Resource flow-control packet could not be retained"
-                                );
-                            }
+                            )
+                        {
+                            tracing::error!(
+                                link_id = hex::encode(link_id),
+                                "Resource flow-control packet could not be retained"
+                            );
                         }
 
                         if let Some(rh) = completed_rh {
@@ -3355,65 +3354,65 @@ impl LinkManager {
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
-                    if let Ok(plaintext) = active.link.decrypt(data) {
-                        if plaintext.len() > 32 {
-                            // Exhaustion flag shifts the resource hash by MAPHASH_LEN.
-                            let resource_hash_start =
-                                if plaintext[0] == rns_protocol::resource::HASHMAP_IS_EXHAUSTED {
-                                    1 + rns_protocol::resource::MAPHASH_LEN
-                                } else {
-                                    1
-                                };
-                            if plaintext.len() >= resource_hash_start + 32 {
-                                let mut rh = [0u8; 32];
-                                rh.copy_from_slice(
-                                    &plaintext[resource_hash_start..resource_hash_start + 32],
-                                );
-                                let packet_hash =
-                                    rns_wire::hash::packet_hash(raw, header.flags.header_type);
-                                let (actions, progressed) = active
-                                    .outbound_resources
-                                    .get_mut(&rh)
-                                    .map(|transfer| {
-                                        let before = transfer.progress();
-                                        let actions =
-                                            transfer.handle_request_packet(packet_hash, &plaintext);
-                                        (actions, transfer.progress() > before)
-                                    })
-                                    .unwrap_or_default();
-                                for action in actions {
-                                    if let TransferAction::SendPart(idx, _) = &action {
-                                        tracing::trace!(
-                                            link_id = hex::encode(link_id),
-                                            part = idx,
-                                            "sent resource part (request response)"
-                                        );
-                                    }
-                                    if !Self::send_resource_action(
-                                        &self.transport_tx,
-                                        &mut self.pending_link_control,
-                                        &mut self.pending_endpoint_sends,
-                                        active,
-                                        &link_id,
-                                        action,
-                                    ) {
-                                        tracing::error!(
-                                            link_id = hex::encode(link_id),
-                                            resource = hex::encode(&rh[..8]),
-                                            "Resource response packet could not be retained"
-                                        );
-                                        break;
-                                    }
-                                }
-                                if progressed {
-                                    Self::emit_outbound_resource_progress(
-                                        &self.resource_event_tx,
-                                        &self.accounting_event_tx,
-                                        active,
-                                        link_id,
-                                        rh,
+                    if let Ok(plaintext) = active.link.decrypt(data)
+                        && plaintext.len() > 32
+                    {
+                        // Exhaustion flag shifts the resource hash by MAPHASH_LEN.
+                        let resource_hash_start =
+                            if plaintext[0] == rns_protocol::resource::HASHMAP_IS_EXHAUSTED {
+                                1 + rns_protocol::resource::MAPHASH_LEN
+                            } else {
+                                1
+                            };
+                        if plaintext.len() >= resource_hash_start + 32 {
+                            let mut rh = [0u8; 32];
+                            rh.copy_from_slice(
+                                &plaintext[resource_hash_start..resource_hash_start + 32],
+                            );
+                            let packet_hash =
+                                rns_wire::hash::packet_hash(raw, header.flags.header_type);
+                            let (actions, progressed) = active
+                                .outbound_resources
+                                .get_mut(&rh)
+                                .map(|transfer| {
+                                    let before = transfer.progress();
+                                    let actions =
+                                        transfer.handle_request_packet(packet_hash, &plaintext);
+                                    (actions, transfer.progress() > before)
+                                })
+                                .unwrap_or_default();
+                            for action in actions {
+                                if let TransferAction::SendPart(idx, _) = &action {
+                                    tracing::trace!(
+                                        link_id = hex::encode(link_id),
+                                        part = idx,
+                                        "sent resource part (request response)"
                                     );
                                 }
+                                if !Self::send_resource_action(
+                                    &self.transport_tx,
+                                    &mut self.pending_link_control,
+                                    &mut self.pending_endpoint_sends,
+                                    active,
+                                    &link_id,
+                                    action,
+                                ) {
+                                    tracing::error!(
+                                        link_id = hex::encode(link_id),
+                                        resource = hex::encode(&rh[..8]),
+                                        "Resource response packet could not be retained"
+                                    );
+                                    break;
+                                }
+                            }
+                            if progressed {
+                                Self::emit_outbound_resource_progress(
+                                    &self.resource_event_tx,
+                                    &self.accounting_event_tx,
+                                    active,
+                                    link_id,
+                                    rh,
+                                );
                             }
                         }
                     }
@@ -3424,38 +3423,38 @@ impl LinkManager {
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
-                    if let Ok(plaintext) = active.link.decrypt(data) {
-                        if plaintext.len() >= 32 {
-                            let mut rh = [0u8; 32];
-                            rh.copy_from_slice(&plaintext[..32]);
-                            let resource_id = active
-                                .inbound_resources
-                                .contains_key(&rh)
-                                .then(|| Self::inbound_resource_identity(active, &rh).0)
-                                .or_else(|| {
-                                    self.active_inbound_lifecycles
-                                        .contains_key(&(link_id, rh))
-                                        .then_some(rh)
-                                });
-                            if let Some(resource_id) = resource_id {
-                                if let Some(transfer) = active.inbound_resources.get_mut(&rh) {
-                                    transfer.handle_cancel();
-                                }
-                                tracing::debug!(
-                                    link_id = hex::encode(link_id),
-                                    "RESOURCE_ICL — inbound transfer cancelled"
-                                );
-                                Self::conclude_inbound_failure(
-                                    active,
-                                    &mut self.active_inbound_lifecycles,
-                                    &mut self.pending_inbound_request_resources,
-                                    &self.resource_event_tx,
-                                    &self.accounting_event_tx,
-                                    link_id,
-                                    resource_id,
-                                    LinkResourceConclusion::Cancelled,
-                                );
+                    if let Ok(plaintext) = active.link.decrypt(data)
+                        && plaintext.len() >= 32
+                    {
+                        let mut rh = [0u8; 32];
+                        rh.copy_from_slice(&plaintext[..32]);
+                        let resource_id = active
+                            .inbound_resources
+                            .contains_key(&rh)
+                            .then(|| Self::inbound_resource_identity(active, &rh).0)
+                            .or_else(|| {
+                                self.active_inbound_lifecycles
+                                    .contains_key(&(link_id, rh))
+                                    .then_some(rh)
+                            });
+                        if let Some(resource_id) = resource_id {
+                            if let Some(transfer) = active.inbound_resources.get_mut(&rh) {
+                                transfer.handle_cancel();
                             }
+                            tracing::debug!(
+                                link_id = hex::encode(link_id),
+                                "RESOURCE_ICL — inbound transfer cancelled"
+                            );
+                            Self::conclude_inbound_failure(
+                                active,
+                                &mut self.active_inbound_lifecycles,
+                                &mut self.pending_inbound_request_resources,
+                                &self.resource_event_tx,
+                                &self.accounting_event_tx,
+                                link_id,
+                                resource_id,
+                                LinkResourceConclusion::Cancelled,
+                            );
                         }
                     }
                 }
@@ -3465,37 +3464,37 @@ impl LinkManager {
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
-                    if let Ok(plaintext) = active.link.decrypt(data) {
-                        if plaintext.len() >= 32 {
-                            let mut rh = [0u8; 32];
-                            rh.copy_from_slice(&plaintext[..32]);
-                            let resource_id = active
-                                .outbound_resources
-                                .get(&rh)
-                                .map(Self::outbound_resource_identity)
-                                .map(|identity| identity.0);
-                            if let Some(resource_id) = resource_id {
-                                if let Some(transfer) = active.outbound_resources.get_mut(&rh) {
-                                    transfer.resource.handle_cancel();
-                                }
-                                active.outbound_resources.remove(&rh);
-                                active.outbound_split_queues.remove(&resource_id);
-                                active.link.untrack_resource(&rh);
-                                tracing::debug!(
-                                    link_id = hex::encode(link_id),
-                                    "RESOURCE_RCL — outbound transfer rejected"
-                                );
-                                Self::emit_resource_event(
-                                    &self.resource_event_tx,
-                                    &self.accounting_event_tx,
-                                    LinkResourceEvent::Concluded {
-                                        link_id,
-                                        resource_id,
-                                        direction: LinkResourceDirection::Outbound,
-                                        conclusion: LinkResourceConclusion::Rejected,
-                                    },
-                                );
+                    if let Ok(plaintext) = active.link.decrypt(data)
+                        && plaintext.len() >= 32
+                    {
+                        let mut rh = [0u8; 32];
+                        rh.copy_from_slice(&plaintext[..32]);
+                        let resource_id = active
+                            .outbound_resources
+                            .get(&rh)
+                            .map(Self::outbound_resource_identity)
+                            .map(|identity| identity.0);
+                        if let Some(resource_id) = resource_id {
+                            if let Some(transfer) = active.outbound_resources.get_mut(&rh) {
+                                transfer.resource.handle_cancel();
                             }
+                            active.outbound_resources.remove(&rh);
+                            active.outbound_split_queues.remove(&resource_id);
+                            active.link.untrack_resource(&rh);
+                            tracing::debug!(
+                                link_id = hex::encode(link_id),
+                                "RESOURCE_RCL — outbound transfer rejected"
+                            );
+                            Self::emit_resource_event(
+                                &self.resource_event_tx,
+                                &self.accounting_event_tx,
+                                LinkResourceEvent::Concluded {
+                                    link_id,
+                                    resource_id,
+                                    direction: LinkResourceDirection::Outbound,
+                                    conclusion: LinkResourceConclusion::Rejected,
+                                },
+                            );
                         }
                     }
                 }
@@ -3504,48 +3503,41 @@ impl LinkManager {
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
-                    if let Ok(plaintext) = active.link.decrypt(data) {
-                        if let Ok((rh, segment, hashmap)) =
+                    if let Ok(plaintext) = active.link.decrypt(data)
+                        && let Ok((rh, segment, hashmap)) =
                             rns_protocol::resource::parse_hashmap_update(&plaintext)
-                        {
-                            if let Some(transfer) = active.inbound_resources.get_mut(&rh) {
-                                let action = transfer.hashmap_update(segment, &hashmap);
-                                let cancelled = matches!(
-                                    action,
-                                    TransferAction::SendCancel(
-                                        rns_protocol::resource::CancelType::Rcl,
-                                        _
-                                    )
-                                );
-                                // A solicited HMU may either request the next parts or
-                                // cancel the transfer (RESOURCE_RCL) on an empty/invalid
-                                // update (1.3.9).
-                                let _ = Self::send_resource_action(
-                                    &self.transport_tx,
-                                    &mut self.pending_link_control,
-                                    &mut self.pending_endpoint_sends,
-                                    active,
-                                    &link_id,
-                                    action,
-                                );
-                                if cancelled {
-                                    let resource_id =
-                                        Self::inbound_resource_identity(active, &rh).0;
-                                    Self::conclude_inbound_failure(
-                                        active,
-                                        &mut self.active_inbound_lifecycles,
-                                        &mut self.pending_inbound_request_resources,
-                                        &self.resource_event_tx,
-                                        &self.accounting_event_tx,
-                                        link_id,
-                                        resource_id,
-                                        LinkResourceConclusion::Failed(
-                                            "sender returned an invalid Resource hashmap update"
-                                                .into(),
-                                        ),
-                                    );
-                                }
-                            }
+                        && let Some(transfer) = active.inbound_resources.get_mut(&rh)
+                    {
+                        let action = transfer.hashmap_update(segment, &hashmap);
+                        let cancelled = matches!(
+                            action,
+                            TransferAction::SendCancel(rns_protocol::resource::CancelType::Rcl, _)
+                        );
+                        // A solicited HMU may either request the next parts or
+                        // cancel the transfer (RESOURCE_RCL) on an empty/invalid
+                        // update (1.3.9).
+                        let _ = Self::send_resource_action(
+                            &self.transport_tx,
+                            &mut self.pending_link_control,
+                            &mut self.pending_endpoint_sends,
+                            active,
+                            &link_id,
+                            action,
+                        );
+                        if cancelled {
+                            let resource_id = Self::inbound_resource_identity(active, &rh).0;
+                            Self::conclude_inbound_failure(
+                                active,
+                                &mut self.active_inbound_lifecycles,
+                                &mut self.pending_inbound_request_resources,
+                                &self.resource_event_tx,
+                                &self.accounting_event_tx,
+                                link_id,
+                                resource_id,
+                                LinkResourceConclusion::Failed(
+                                    "sender returned an invalid Resource hashmap update".into(),
+                                ),
+                            );
                         }
                     }
                 }
@@ -4103,30 +4095,27 @@ impl LinkManager {
         }
 
         self.backchannel_links.retain(|_, lid| *lid != link_id);
-        if !endpoint_closing {
-            if let Some(ownership) = ownership {
-                if let Some(tombstone) = self.endpoint_tombstones.get_mut(&link_id) {
-                    tombstone.kind = EndpointCleanupKind::Explicit;
-                }
-                Self::stage_endpoint_cleanup(
-                    &self.transport_tx,
-                    &mut self.pending_link_control,
-                    &mut self.pending_endpoint_cleanups,
-                    ownership,
-                    true,
-                );
+        if !endpoint_closing && let Some(ownership) = ownership {
+            if let Some(tombstone) = self.endpoint_tombstones.get_mut(&link_id) {
+                tombstone.kind = EndpointCleanupKind::Explicit;
             }
+            Self::stage_endpoint_cleanup(
+                &self.transport_tx,
+                &mut self.pending_link_control,
+                &mut self.pending_endpoint_cleanups,
+                ownership,
+                true,
+            );
         }
         if let Ok(mut ids) = self.link_identities.lock() {
             ids.remove(&link_id);
         }
-        if let Some(ref tx) = self.accounting_event_tx {
-            if tx
+        if let Some(ref tx) = self.accounting_event_tx
+            && tx
                 .send(LinkManagerAccountingEvent::LinkClosed { link_id })
                 .is_err()
-            {
-                tracing::debug!("Link accounting event receiver is closed");
-            }
+        {
+            tracing::debug!("Link accounting event receiver is closed");
         }
         Self::stage_legacy_terminal_notification(
             &self.link_packet_proof_tx,
@@ -4391,15 +4380,13 @@ impl LinkManager {
         accounting_event_tx: &Option<mpsc::UnboundedSender<LinkManagerAccountingEvent>>,
         event: LinkResourceEvent,
     ) {
-        if !matches!(&event, LinkResourceEvent::Progress { .. }) {
-            if let Some(tx) = accounting_event_tx {
-                if tx
-                    .send(LinkManagerAccountingEvent::ResourceEvent(event.clone()))
-                    .is_err()
-                {
-                    tracing::debug!("Link accounting event receiver is closed");
-                }
-            }
+        if !matches!(&event, LinkResourceEvent::Progress { .. })
+            && let Some(tx) = accounting_event_tx
+            && tx
+                .send(LinkManagerAccountingEvent::ResourceEvent(event.clone()))
+                .is_err()
+        {
+            tracing::debug!("Link accounting event receiver is closed");
         }
         if let Some(tx) = resource_event_tx {
             let _ = tx.try_send(event);
@@ -4828,30 +4815,29 @@ impl LinkManager {
 
         let rtt = active.link.rtt_secs();
         let mut matched_channel_sequence = false;
-        if let Some(channel) = active.channel.as_mut() {
-            if let Some(sequence) = channel.delivered_by_packet_hash(&packet_hash, rtt) {
-                matched_channel_sequence = true;
-                active.link.keepalive.record_proof();
-                tracing::debug!(
-                    link_id = hex::encode(link_id),
-                    sequence,
-                    packet_hash = hex::encode(&packet_hash[..8]),
-                    "channel packet delivery proof accepted"
-                );
-            }
+        if let Some(channel) = active.channel.as_mut()
+            && let Some(sequence) = channel.delivered_by_packet_hash(&packet_hash, rtt)
+        {
+            matched_channel_sequence = true;
+            active.link.keepalive.record_proof();
+            tracing::debug!(
+                link_id = hex::encode(link_id),
+                sequence,
+                packet_hash = hex::encode(&packet_hash[..8]),
+                "channel packet delivery proof accepted"
+            );
         }
         if !matched_channel_sequence {
             let proof = LinkPacketProof {
                 link_id,
                 packet_hash,
             };
-            if let Some(tx) = &self.accounting_event_tx {
-                if tx
+            if let Some(tx) = &self.accounting_event_tx
+                && tx
                     .send(LinkManagerAccountingEvent::LinkPacketProof(proof.clone()))
                     .is_err()
-                {
-                    tracing::debug!("Link accounting event receiver is closed");
-                }
+            {
+                tracing::debug!("Link accounting event receiver is closed");
             }
             Self::stage_legacy_terminal_notification(
                 &self.link_packet_proof_tx,
@@ -4953,37 +4939,37 @@ impl LinkManager {
                         .map(|active| active.link.mdu)
                         .unwrap_or_default();
                     if packed_response.len() <= mdu {
-                        if let Some(active) = self.active_links.get_mut(&link_id) {
-                            if let Ok(encrypted) = active.link.encrypt(&packed_response) {
-                                let response_header = rns_wire::header::PacketHeader {
-                                    flags: rns_wire::flags::PacketFlags {
-                                        header_type: rns_wire::flags::HeaderType::Header1,
-                                        context_flag: false,
-                                        transport_type: rns_wire::flags::TransportType::Broadcast,
-                                        destination_type: rns_wire::flags::DestinationType::Link,
-                                        packet_type: rns_wire::flags::PacketType::Data,
-                                    },
-                                    hops: 0,
-                                    transport_id: None,
-                                    destination_hash: link_id,
-                                    context: rns_wire::context::PacketContext::Response,
-                                };
-                                let mut raw = response_header.pack();
-                                raw.extend_from_slice(&encrypted);
-                                active.link.record_tx(encrypted.len());
-                                let _ = self.transport_tx.try_send(Self::endpoint_send_message(
-                                    &mut self.pending_endpoint_sends,
-                                    link_id,
-                                    active.link.role(),
-                                    Bytes::from(raw),
-                                ));
-                                tracing::debug!(
-                                    link_id = hex::encode(link_id),
-                                    request_id = hex::encode(request_id),
-                                    response_len = response.len(),
-                                    "link request handled — response sent"
-                                );
-                            }
+                        if let Some(active) = self.active_links.get_mut(&link_id)
+                            && let Ok(encrypted) = active.link.encrypt(&packed_response)
+                        {
+                            let response_header = rns_wire::header::PacketHeader {
+                                flags: rns_wire::flags::PacketFlags {
+                                    header_type: rns_wire::flags::HeaderType::Header1,
+                                    context_flag: false,
+                                    transport_type: rns_wire::flags::TransportType::Broadcast,
+                                    destination_type: rns_wire::flags::DestinationType::Link,
+                                    packet_type: rns_wire::flags::PacketType::Data,
+                                },
+                                hops: 0,
+                                transport_id: None,
+                                destination_hash: link_id,
+                                context: rns_wire::context::PacketContext::Response,
+                            };
+                            let mut raw = response_header.pack();
+                            raw.extend_from_slice(&encrypted);
+                            active.link.record_tx(encrypted.len());
+                            let _ = self.transport_tx.try_send(Self::endpoint_send_message(
+                                &mut self.pending_endpoint_sends,
+                                link_id,
+                                active.link.role(),
+                                Bytes::from(raw),
+                            ));
+                            tracing::debug!(
+                                link_id = hex::encode(link_id),
+                                request_id = hex::encode(request_id),
+                                response_len = response.len(),
+                                "link request handled — response sent"
+                            );
                         }
                     } else if self
                         .start_response_resource(
@@ -5025,8 +5011,8 @@ impl LinkManager {
             );
         }
 
-        if let Some((data, metadata, auto_compress)) = fetch_spec {
-            if self
+        if let Some((data, metadata, auto_compress)) = fetch_spec
+            && self
                 .start_resource_transfer_inner(
                     &link_id,
                     ResourceTransferStart {
@@ -5039,12 +5025,11 @@ impl LinkManager {
                     },
                 )
                 .is_none()
-            {
-                tracing::warn!(
-                    link_id = hex::encode(link_id),
-                    "link request follow-up Resource could not be started"
-                );
-            }
+        {
+            tracing::warn!(
+                link_id = hex::encode(link_id),
+                "link request follow-up Resource could not be started"
+            );
         }
     }
 
@@ -10665,11 +10650,11 @@ mod tests {
             // Widen the receiver's WINDOW_INITIAL=4 so the blast fits in one shot.
             let segment_rh = transfer.resource.resource_hash;
             let total_parts = transfer.resource.parts.len();
-            if let Some(active) = lm.active_links.get_mut(&link_id) {
-                if let Some(in_transfer) = active.inbound_resources.get_mut(&segment_rh) {
-                    in_transfer.resource.window.window = total_parts;
-                    in_transfer.outstanding_parts = total_parts;
-                }
+            if let Some(active) = lm.active_links.get_mut(&link_id)
+                && let Some(in_transfer) = active.inbound_resources.get_mut(&segment_rh)
+            {
+                in_transfer.resource.window.window = total_parts;
+                in_transfer.outstanding_parts = total_parts;
             }
 
             for part in &transfer.resource.parts {

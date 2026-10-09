@@ -92,10 +92,10 @@ pub fn build_local_manifest(
         if entry.source.is_some() {
             continue;
         }
-        if let Some(set) = verified_ids {
-            if !set.contains(hash.as_bytes()) {
-                continue;
-            }
+        if let Some(set) = verified_ids
+            && !set.contains(hash.as_bytes())
+        {
+            continue;
         }
         let until = entry.ttl.map(|ttl| entry.created + ttl);
         let wire_entry = encode_entry_map(until, entry.reason_str(), our_identity_hash);
@@ -228,19 +228,18 @@ pub fn apply_manifest(
 ) -> usize {
     let mut applied = 0usize;
     for (id_hash, entry) in manifest {
-        if let Some(until) = entry.until {
-            if until <= now {
-                continue;
-            }
+        if let Some(until) = entry.until
+            && until <= now
+        {
+            continue;
         }
         if let Some(existing) = table
             .iter_entries()
             .find(|(h, _)| h.as_bytes() == id_hash)
             .map(|(_, e)| e.clone())
+            && existing.source.is_none()
         {
-            if existing.source.is_none() {
-                continue;
-            }
+            continue;
         }
 
         let ttl = entry.until.map(|u| (u - now).max(0.0));

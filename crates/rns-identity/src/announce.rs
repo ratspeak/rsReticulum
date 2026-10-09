@@ -289,15 +289,15 @@ impl AnnounceData {
 
         // First-seen key binding: a valid signature on a different public key
         // for an already-known destination hash implies a collision attack.
-        if let Some(known_key) = known_public_key {
-            if known_key != &self.public_key {
-                tracing::error!(
-                    dest = hex::encode(packet_dest_hash),
-                    "announce has valid signature and destination hash, but public key \
+        if let Some(known_key) = known_public_key
+            && known_key != &self.public_key
+        {
+            tracing::error!(
+                dest = hex::encode(packet_dest_hash),
+                "announce has valid signature and destination hash, but public key \
                          differs from already known key — possible hash collision attack, rejecting"
-                );
-                return Err(AnnounceError::HashCollision);
-            }
+            );
+            return Err(AnnounceError::HashCollision);
         }
 
         Ok(())

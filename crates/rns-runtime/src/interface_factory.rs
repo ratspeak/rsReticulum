@@ -430,13 +430,13 @@ pub fn synthesize_interface(
 
     // IFAC sizes outside 1..=64 would panic deep in the transport actor on
     // first egress (`ifac_sign` asserts); reject at config parse instead.
-    if let Some(size) = section.get_uint("ifac_size") {
-        if !(1..=64).contains(&size) {
-            return Err(InterfaceFactoryError::InvalidValue {
-                field: format!("{name}.ifac_size"),
-                message: format!("{size} is out of range (1-64 bytes)"),
-            });
-        }
+    if let Some(size) = section.get_uint("ifac_size")
+        && !(1..=64).contains(&size)
+    {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.ifac_size"),
+            message: format!("{size} is out of range (1-64 bytes)"),
+        });
     }
 
     let iface_type = section.get("type").ok_or_else(|| {
@@ -1102,21 +1102,21 @@ fn parse_rnode_airtime(
         .get_float("airtime_limit_long")
         .or_else(|| section.get_float("lt_alock"))
         .map(|v| v as f32);
-    if let Some(v) = st_alock {
-        if !(0.0..=100.0).contains(&v) {
-            return Err(InterfaceFactoryError::InvalidValue {
-                field: format!("{name}.airtime_limit_short"),
-                message: format!("{v} is outside 0..=100 percent"),
-            });
-        }
+    if let Some(v) = st_alock
+        && !(0.0..=100.0).contains(&v)
+    {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.airtime_limit_short"),
+            message: format!("{v} is outside 0..=100 percent"),
+        });
     }
-    if let Some(v) = lt_alock {
-        if !(0.0..=100.0).contains(&v) {
-            return Err(InterfaceFactoryError::InvalidValue {
-                field: format!("{name}.airtime_limit_long"),
-                message: format!("{v} is outside 0..=100 percent"),
-            });
-        }
+    if let Some(v) = lt_alock
+        && !(0.0..=100.0).contains(&v)
+    {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.airtime_limit_long"),
+            message: format!("{v} is outside 0..=100 percent"),
+        });
     }
     Ok((flow_control, st_alock, lt_alock))
 }
@@ -1382,21 +1382,21 @@ fn validate_rnode_multi_subinterface(
             message: format!("{} is outside 5..=8", sub.coding_rate),
         });
     }
-    if let Some(v) = sub.st_alock {
-        if !(0.0..=100.0).contains(&v) {
-            return Err(InterfaceFactoryError::InvalidValue {
-                field: format!("{}.airtime_limit_short", sub.name),
-                message: format!("{v} is outside 0..=100 percent"),
-            });
-        }
+    if let Some(v) = sub.st_alock
+        && !(0.0..=100.0).contains(&v)
+    {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{}.airtime_limit_short", sub.name),
+            message: format!("{v} is outside 0..=100 percent"),
+        });
     }
-    if let Some(v) = sub.lt_alock {
-        if !(0.0..=100.0).contains(&v) {
-            return Err(InterfaceFactoryError::InvalidValue {
-                field: format!("{}.airtime_limit_long", sub.name),
-                message: format!("{v} is outside 0..=100 percent"),
-            });
-        }
+    if let Some(v) = sub.lt_alock
+        && !(0.0..=100.0).contains(&v)
+    {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{}.airtime_limit_long", sub.name),
+            message: format!("{v} is outside 0..=100 percent"),
+        });
     }
     if sub.frequency == 0 {
         return Err(InterfaceFactoryError::InvalidValue {

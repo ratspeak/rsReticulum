@@ -133,31 +133,33 @@ fn validate_wifi_inputs(args: &Args) -> Result<(), String> {
             _ => return Err("WiFi mode must be OFF, AP or STATION".to_string()),
         }
     }
-    if let Some(channel) = args.channel {
-        if !(1..=14).contains(&channel) {
-            return Err("WiFi channel must be in 1..=14".to_string());
-        }
+    if let Some(channel) = args.channel
+        && !(1..=14).contains(&channel)
+    {
+        return Err("WiFi channel must be in 1..=14".to_string());
     }
-    if let Some(ssid) = args.ssid.as_deref() {
-        if !ssid.eq_ignore_ascii_case("none") && ssid.len() > 32 {
-            return Err("WiFi SSID must be at most 32 bytes".to_string());
-        }
+    if let Some(ssid) = args.ssid.as_deref()
+        && !ssid.eq_ignore_ascii_case("none")
+        && ssid.len() > 32
+    {
+        return Err("WiFi SSID must be at most 32 bytes".to_string());
     }
-    if let Some(psk) = args.psk.as_deref() {
-        if !psk.eq_ignore_ascii_case("none") && !(8..=32).contains(&psk.len()) {
-            return Err("WiFi PSK must be 8 to 32 bytes, or NONE".to_string());
-        }
+    if let Some(psk) = args.psk.as_deref()
+        && !psk.eq_ignore_ascii_case("none")
+        && !(8..=32).contains(&psk.len())
+    {
+        return Err("WiFi PSK must be 8 to 32 bytes, or NONE".to_string());
     }
     for (name, value) in [
         ("IP address", args.ip.as_deref()),
         ("netmask", args.nm.as_deref()),
     ] {
-        if let Some(value) = value {
-            if !value.eq_ignore_ascii_case("none") {
-                value
-                    .parse::<Ipv4Addr>()
-                    .map_err(|error| format!("invalid WiFi {name} {value}: {error}"))?;
-            }
+        if let Some(value) = value
+            && !value.eq_ignore_ascii_case("none")
+        {
+            value
+                .parse::<Ipv4Addr>()
+                .map_err(|error| format!("invalid WiFi {name} {value}: {error}"))?;
         }
     }
     Ok(())

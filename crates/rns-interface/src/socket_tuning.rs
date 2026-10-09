@@ -231,21 +231,21 @@ mod tests {
         let candidates = ["lo", "lo0", "Loopback Pseudo-Interface 1"];
         let mut found_v4 = false;
         for name in candidates {
-            if let Some(IpAddr::V4(v4)) = iface_addr_for(name, false) {
-                if v4.is_loopback() {
-                    found_v4 = true;
-                    break;
-                }
+            if let Some(IpAddr::V4(v4)) = iface_addr_for(name, false)
+                && v4.is_loopback()
+            {
+                found_v4 = true;
+                break;
             }
         }
         // Hermetic CI may not expose loopback by name; only assert when seen.
-        if let Ok(ifaces) = if_addrs::get_if_addrs() {
-            if ifaces.iter().any(|i| candidates.contains(&i.name.as_str())) {
-                assert!(
-                    found_v4,
-                    "expected a loopback IPv4 on one of {candidates:?}"
-                );
-            }
+        if let Ok(ifaces) = if_addrs::get_if_addrs()
+            && ifaces.iter().any(|i| candidates.contains(&i.name.as_str()))
+        {
+            assert!(
+                found_v4,
+                "expected a loopback IPv4 on one of {candidates:?}"
+            );
         }
     }
 

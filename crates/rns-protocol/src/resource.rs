@@ -1731,14 +1731,13 @@ impl OutboundTransfer {
         for i in search_start..search_end {
             if i < self.resource.map_hashes.len()
                 && requested_map_hashes.contains(&self.resource.map_hashes[i])
+                && let Some(part_data) = self.resource.get_part(i)
             {
-                if let Some(part_data) = self.resource.get_part(i) {
-                    actions.push(TransferAction::SendPart(i, part_data.to_vec()));
-                    if self.sent_part_indices.insert(i) {
-                        self.sent_parts += 1;
-                    }
-                    sent_count += 1;
+                actions.push(TransferAction::SendPart(i, part_data.to_vec()));
+                if self.sent_part_indices.insert(i) {
+                    self.sent_parts += 1;
                 }
+                sent_count += 1;
             }
         }
 
@@ -2419,10 +2418,8 @@ impl InboundTransfer {
         hmu.push(exhausted);
 
         // If exhausted (complete), include the last map hash
-        if is_complete {
-            if let Some(last_mh) = self.resource.map_hashes.last() {
-                hmu.extend_from_slice(last_mh);
-            }
+        if is_complete && let Some(last_mh) = self.resource.map_hashes.last() {
+            hmu.extend_from_slice(last_mh);
         }
 
         // Include the resource hash for identification

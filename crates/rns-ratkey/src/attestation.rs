@@ -255,12 +255,11 @@ fn bundled_trust_anchors() -> Vec<TrustAnchor> {
         (YUBICO_PIV_ROOT_CA_LEGACY_PEM, YUBICO_LEGACY_ROOT_SHA256),
         (YUBICO_ATTESTATION_ROOT_1_PEM, YUBICO_NEW_ROOT_SHA256),
     ] {
-        if let Some(der) = pem_to_der(pem) {
-            if hex::encode(Sha256::digest(&der)) == fp {
-                if let Ok(cert) = Certificate::from_der(&der) {
-                    anchors.push(TrustAnchor { cert });
-                }
-            }
+        if let Some(der) = pem_to_der(pem)
+            && hex::encode(Sha256::digest(&der)) == fp
+            && let Ok(cert) = Certificate::from_der(&der)
+        {
+            anchors.push(TrustAnchor { cert });
         }
     }
     anchors
@@ -505,12 +504,12 @@ fn find_oid_value(der: &[u8], oid_bytes: &[u8]) -> Option<Vec<u8>> {
     // Unwrap one level if OCTET STRING wraps another OCTET STRING or INTEGER.
     if tag == 0x04 && value.len() >= 2 {
         let inner_tag = value[0];
-        if inner_tag == 0x04 || inner_tag == 0x02 {
-            if let Some((inner_len, inner_len_bytes)) = decode_der_length(&value[1..]) {
-                let inner_start = 1 + inner_len_bytes;
-                if inner_start + inner_len <= value.len() {
-                    return Some(value[inner_start..inner_start + inner_len].to_vec());
-                }
+        if (inner_tag == 0x04 || inner_tag == 0x02)
+            && let Some((inner_len, inner_len_bytes)) = decode_der_length(&value[1..])
+        {
+            let inner_start = 1 + inner_len_bytes;
+            if inner_start + inner_len <= value.len() {
+                return Some(value[inner_start..inner_start + inner_len].to_vec());
             }
         }
         return Some(value.to_vec());

@@ -1712,10 +1712,10 @@ pub(crate) async fn run_usb_tx_pump(
         if application_rx.pending.is_none() {
             // A due beacon follows an already-pending application packet but
             // does not starve behind continuous later application traffic.
-            if let Some((interval, ref callsign)) = beacon {
-                if first_tx.is_some_and(|started| started.elapsed() >= interval) {
-                    application_rx.pending = Some(UsbPendingPacket::new(callsign.clone(), true));
-                }
+            if let Some((interval, ref callsign)) = beacon
+                && first_tx.is_some_and(|started| started.elapsed() >= interval)
+            {
+                application_rx.pending = Some(UsbPendingPacket::new(callsign.clone(), true));
             }
             if application_rx.pending.is_none() {
                 let payload = tokio::select! {
@@ -3808,10 +3808,8 @@ mod tests {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .len()
                         >= 3;
-                    if init_was_sent {
-                        if let Some(post_init) = self.post_init.take() {
-                            return Ok(UsbReadResult::Data(post_init));
-                        }
+                    if init_was_sent && let Some(post_init) = self.post_init.take() {
+                        return Ok(UsbReadResult::Data(post_init));
                     }
                     // `run_usb_reader` can call us again only after its prior
                     // blocking_send of the stale read completed.

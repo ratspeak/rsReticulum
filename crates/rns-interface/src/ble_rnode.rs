@@ -85,12 +85,9 @@ const BLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const BLE_CONTROL_STAGE_SETTLE: Duration = Duration::from_millis(150);
 const BLE_POST_INIT_SETTLE: Duration = Duration::from_secs(1);
 /// ATT's mandatory 23-byte baseline MTU leaves 20 bytes for a characteristic
-/// value. CoreBluetooth exposes the negotiated per-peripheral limit through
-/// `maximumWriteValueLength(for:)`, but btleplug 0.11.8 neither calls nor
-/// exposes it. Its no-response write path also reports success immediately,
-/// even when CoreBluetooth cannot deliver the value. Upstream Reticulum avoids
-/// this by reading Bleak's `max_write_without_response_size` for every link.
-/// Stay at the guaranteed baseline on Apple until btleplug exposes that value.
+/// value. Preserve the physically reviewed Apple RNode write size and
+/// response pacing through dependency upgrades. Increasing that size requires
+/// separate radio/firmware validation even though btleplug now exposes MTU.
 const BLE_DEFAULT_ATT_WRITE_PAYLOAD: usize = 20;
 /// RNode's reviewed high-throughput ATT MTU is 247 (247 - 3 ATT bytes).
 const BLE_RNODE_ATT_WRITE_PAYLOAD: usize = 244;
@@ -183,12 +180,12 @@ fn unregister_running(id: InterfaceId, running: &Arc<AtomicBool>) {
 /// [`crate::rnode::RNodeDriverHandle::request_shutdown`] so later ID reuse
 /// cannot redirect the request.
 pub fn stop_ble_rnode_interface(id: InterfaceId) {
-    if let Ok(map) = running_map().lock() {
-        if let Some(flag) = map.get(&id) {
-            flag.store(false, Ordering::SeqCst);
-            tracing::info!(id, "BLE RNode: stop signal sent");
-            ble_diag(format!("[ble] stop_ble_rnode_interface({id})"));
-        }
+    if let Ok(map) = running_map().lock()
+        && let Some(flag) = map.get(&id)
+    {
+        flag.store(false, Ordering::SeqCst);
+        tracing::info!(id, "BLE RNode: stop signal sent");
+        ble_diag(format!("[ble] stop_ble_rnode_interface({id})"));
     }
 }
 
@@ -222,7 +219,7 @@ const fn ble_write_chunk_size() -> usize {
 
 const fn ble_write_type() -> WriteType {
     if cfg!(any(target_os = "ios", target_os = "macos")) {
-        // btleplug 0.11.8's CoreBluetooth no-response path returns before the
+        // CoreBluetooth no-response writes can return before the
         // controller accepts the value and does not observe
         // canSendWriteWithoutResponse. Ordered response writes are the only
         // acknowledgement boundary this driver can safely own on Apple.
@@ -1501,12 +1498,11 @@ async fn resolve_ble_target(
                 }
                 // A populated list without NUS means a different device;
                 // only fall back to the name on empty service lists.
-                if props.services.is_empty() {
-                    if let Some(ref name) = props.local_name {
-                        if name.starts_with("RNode ") {
-                            return Ok((p.clone(), BleTargetResolutionClass::FirstRnode));
-                        }
-                    }
+                if props.services.is_empty()
+                    && let Some(ref name) = props.local_name
+                    && name.starts_with("RNode ")
+                {
+                    return Ok((p.clone(), BleTargetResolutionClass::FirstRnode));
                 }
             }
         }
@@ -1525,24 +1521,35 @@ async fn resolve_ble_target(
         }
     }
 
+    // Windows can create a peripheral from an explicit MAC even when this
+    // scan did not see it. Names, empty discovery targets and Apple UUIDs
+    // never enter this path; normal GATT/NUS validation still follows.
+    #[cfg(target_os = "windows")]
+    if crate::ble_connect::known_address(target).is_some() {
+        let peripheral = crate::ble_connect::resolve_address(None, target, |address| async move {
+            adapter.add_peripheral(&address.into()).await
+        })
+        .await
+        .map_err(InterfaceError::SendFailed)?;
+        return Ok((peripheral, BleTargetResolutionClass::PrimaryId));
+    }
+
     // Friendly-name resolution remains a fallback behind the configured
     // platform ID. After an exact first generation, its verified RNode name is
     // retained in memory so a post-bond CoreBluetooth handle replacement can
     // be resolved without changing the public/configured identity.
     for p in &peripherals {
-        if let Ok(Some(props)) = bounded_ble_operation("properties", p.properties()).await {
-            if let Some(ref name) = props.local_name {
-                if let Some(resolution_class) =
-                    ble_name_resolution_class(target, generation_stable_name, name)
-                {
-                    if resolution_class == BleTargetResolutionClass::PrimaryName {
-                        ble_diag(format!("[ble] resolve matched by name: {name}"));
-                    } else {
-                        ble_diag("[ble] resolve matched by generation-stable advertised name");
-                    }
-                    return Ok((p.clone(), resolution_class));
-                }
+        if let Ok(Some(props)) = bounded_ble_operation("properties", p.properties()).await
+            && let Some(ref name) = props.local_name
+            && let Some(resolution_class) =
+                ble_name_resolution_class(target, generation_stable_name, name)
+        {
+            if resolution_class == BleTargetResolutionClass::PrimaryName {
+                ble_diag(format!("[ble] resolve matched by name: {name}"));
+            } else {
+                ble_diag("[ble] resolve matched by generation-stable advertised name");
             }
+            return Ok((p.clone(), resolution_class));
         }
     }
 
@@ -1829,17 +1836,14 @@ async fn connect_rnode(
             InterfaceError::SendFailed("NUS TX characteristic not found. Is this an RNode?".into())
         })?
         .clone();
-    if generation_stable_name.is_none() {
-        if let Ok(Some(properties)) =
+    if generation_stable_name.is_none()
+        && let Ok(Some(properties)) =
             bounded_ble_operation("resolved target properties", peripheral.properties()).await
-        {
-            if let Some(name) = properties
-                .local_name
-                .filter(|name| name.starts_with("RNode "))
-            {
-                *generation_stable_name = Some(name);
-            }
-        }
+        && let Some(name) = properties
+            .local_name
+            .filter(|name| name.starts_with("RNode "))
+    {
+        *generation_stable_name = Some(name);
     }
     ble_diag(format!(
         "[ble] RX/TX chars found; RX props={:?} TX props={:?}",
@@ -2545,14 +2549,14 @@ where
     let deadline = tokio::time::Instant::now() + BleOperationStage::Detect.deadline();
     loop {
         let evidence = protocol_state.evidence();
-        if evidence.detected {
-            if let Some(firmware) = evidence.firmware {
-                return if firmware.is_supported() {
-                    BleHandshakeOutcome::Observed
-                } else {
-                    BleHandshakeOutcome::Retry("RNode firmware is unsupported")
-                };
-            }
+        if evidence.detected
+            && let Some(firmware) = evidence.firmware
+        {
+            return if firmware.is_supported() {
+                BleHandshakeOutcome::Observed
+            } else {
+                BleHandshakeOutcome::Retry("RNode firmware is unsupported")
+            };
         }
         if evidence.radio_initialisation_fault {
             return BleHandshakeOutcome::Retry("RNode reported a radio initialisation fault");
@@ -3484,16 +3488,13 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                         break 'read;
                     }
                     GenerationEvent::Poll => {
-                        if pending_outbound.is_none() {
-                            if let (Some((interval, callsign)), Some(first)) =
+                        if pending_outbound.is_none()
+                            && let (Some((interval, callsign)), Some(first)) =
                                 (beacon.as_ref(), first_tx)
-                            {
-                                if first.elapsed() >= *interval {
-                                    tracing::debug!("BLE RNode scheduling station-ID beacon");
-                                    pending_outbound =
-                                        Some(PendingOutbound::new(callsign.clone(), true));
-                                }
-                            }
+                            && first.elapsed() >= *interval
+                        {
+                            tracing::debug!("BLE RNode scheduling station-ID beacon");
+                            pending_outbound = Some(PendingOutbound::new(callsign.clone(), true));
                         }
                     }
                 }
@@ -4285,19 +4286,15 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                             );
                             break 'read;
                         }
-                        if pending_outbound.is_none() {
-                            if let (Some((interval, callsign)), Some(first)) =
+                        if pending_outbound.is_none()
+                            && let (Some((interval, callsign)), Some(first)) =
                                 (beacon.as_ref(), first_tx)
-                            {
-                                if first.elapsed() >= *interval {
-                                    tracing::debug!(
-                                        "BLE RNode (native) scheduling station-ID beacon"
-                                    );
-                                    pending_outbound = Some(NativePendingOutbound::new(
-                                        PendingOutbound::new(callsign.clone(), true),
-                                    ));
-                                }
-                            }
+                            && first.elapsed() >= *interval
+                        {
+                            tracing::debug!("BLE RNode (native) scheduling station-ID beacon");
+                            pending_outbound = Some(NativePendingOutbound::new(
+                                PendingOutbound::new(callsign.clone(), true),
+                            ));
                         }
                     }
                 }
@@ -4441,6 +4438,7 @@ mod tests {
         bytes
             .chunks(180)
             .map(|chunk| ValueNotification {
+                service_uuid: NUS_SERVICE_UUID,
                 uuid: NUS_TX_CHAR_UUID,
                 value: chunk.to_vec(),
             })
@@ -6186,6 +6184,7 @@ mod tests {
         ] {
             let mut queued = capability_notifications(&response);
             queued.push(ValueNotification {
+                service_uuid: NUS_SERVICE_UUID,
                 uuid: NUS_TX_CHAR_UUID,
                 value: kiss::frame(b"queued-before-init"),
             });

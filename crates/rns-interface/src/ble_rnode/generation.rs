@@ -39,12 +39,7 @@ pub(super) enum BleOperationStage {
     )]
     PairingRead,
     #[cfg_attr(
-        not(any(
-            target_os = "ios",
-            target_os = "macos",
-            target_os = "windows",
-            target_os = "android"
-        )),
+        not(any(target_os = "ios", target_os = "macos", test)),
         allow(dead_code)
     )]
     PairingSubscribe,

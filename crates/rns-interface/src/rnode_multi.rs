@@ -149,21 +149,21 @@ impl SubInterfaceConfig {
                 self.coding_rate, self.name
             ));
         }
-        if let Some(st) = self.st_alock {
-            if !(0.0..=100.0).contains(&st) {
-                return Err(format!(
-                    "Invalid short-term airtime limit {} for sub-interface {}",
-                    st, self.name
-                ));
-            }
+        if let Some(st) = self.st_alock
+            && !(0.0..=100.0).contains(&st)
+        {
+            return Err(format!(
+                "Invalid short-term airtime limit {} for sub-interface {}",
+                st, self.name
+            ));
         }
-        if let Some(lt) = self.lt_alock {
-            if !(0.0..=100.0).contains(&lt) {
-                return Err(format!(
-                    "Invalid long-term airtime limit {} for sub-interface {}",
-                    lt, self.name
-                ));
-            }
+        if let Some(lt) = self.lt_alock
+            && !(0.0..=100.0).contains(&lt)
+        {
+            return Err(format!(
+                "Invalid long-term airtime limit {} for sub-interface {}",
+                lt, self.name
+            ));
         }
         if self.vport as usize >= MAX_SUBINTERFACES {
             return Err(format!(

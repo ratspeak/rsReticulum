@@ -1349,19 +1349,18 @@ impl RNodeWriteInterrupt {
 
     fn interrupt(&mut self) {
         #[cfg(feature = "serial")]
-        if let Some(stream) = self.serial.take() {
-            if let Err(error) = stream
+        if let Some(stream) = self.serial.take()
+            && let Err(error) = stream
                 .into_inner()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear(serialport::ClearBuffer::Output)
-            {
-                tracing::debug!(error = %error, "RNode serial output purge during writer cleanup");
-            }
+        {
+            tracing::debug!(error = %error, "RNode serial output purge during writer cleanup");
         }
-        if let Some(stream) = self.tcp.take() {
-            if let Err(error) = stream.shutdown(std::net::Shutdown::Both) {
-                tracing::debug!(error = %error, "RNode TCP shutdown during writer cleanup");
-            }
+        if let Some(stream) = self.tcp.take()
+            && let Err(error) = stream.shutdown(std::net::Shutdown::Both)
+        {
+            tracing::debug!(error = %error, "RNode TCP shutdown during writer cleanup");
         }
     }
 }
@@ -1638,13 +1637,12 @@ where
             }
         }
 
-        if pending_packet.is_none() {
-            if let Some((interval, ref callsign)) = context.beacon {
-                if first_tx.is_some_and(|started| started.elapsed() >= interval) {
-                    tracing::debug!(id = context.id, "RNode station-ID beacon is due");
-                    pending_packet = Some(callsign.clone());
-                }
-            }
+        if pending_packet.is_none()
+            && let Some((interval, ref callsign)) = context.beacon
+            && first_tx.is_some_and(|started| started.elapsed() >= interval)
+        {
+            tracing::debug!(id = context.id, "RNode station-ID beacon is due");
+            pending_packet = Some(callsign.clone());
         }
 
         let packet_permitted = pending_packet.is_some()

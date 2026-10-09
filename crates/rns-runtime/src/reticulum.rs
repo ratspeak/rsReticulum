@@ -1825,16 +1825,13 @@ impl ReticulumHandle {
     ) -> TransportQueryResponse {
         if self.instance_mode == InstanceMode::Client
             && matches!(query, TransportQuery::FirstHopTimeout { .. })
-        {
-            if let Some(bitrate) = self
+            && let Some(bitrate) = self
                 .config
                 .force_shared_instance_bitrate
                 .filter(|bitrate| *bitrate > 0)
-            {
-                if let TransportQueryResponse::FloatResult(Some(seconds)) = &mut response {
-                    *seconds += (rns_wire::constants::MTU as f64 * 8.0) / bitrate as f64;
-                }
-            }
+            && let TransportQueryResponse::FloatResult(Some(seconds)) = &mut response
+        {
+            *seconds += (rns_wire::constants::MTU as f64 * 8.0) / bitrate as f64;
         }
         response
     }
@@ -2595,10 +2592,10 @@ fn parse_hash16_list(key: &str, list: Option<Vec<String>>) -> Result<Vec<[u8; 16
 }
 
 fn expand_home_path(path: &str) -> PathBuf {
-    if path == "~" || path.starts_with("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(format!("{home}{}", &path[1..]));
-        }
+    if (path == "~" || path.starts_with("~/"))
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(format!("{home}{}", &path[1..]));
     }
     PathBuf::from(path)
 }
@@ -2944,10 +2941,10 @@ pub async fn init_with_policy(
     // Python defaults the local shared-instance RPC key to a hash of the
     // PERSISTENT transport identity (internal_identity(), Reticulum.py:352),
     // so RPC auth stays stable across the per-boot ephemeral rotation.
-    if rc.rpc_key.is_none() {
-        if let Some(private_key) = transport_identity.get_private_key() {
-            rc.rpc_key = Some(crate::rpc::derive_rpc_key(&*private_key).to_vec());
-        }
+    if rc.rpc_key.is_none()
+        && let Some(private_key) = transport_identity.get_private_key()
+    {
+        rc.rpc_key = Some(crate::rpc::derive_rpc_key(&*private_key).to_vec());
     }
     let transport_identity = Arc::new(transport_identity);
     // Wire-facing identity for runtime consumers (Python Transport.identity):
@@ -3547,35 +3544,35 @@ pub async fn init_with_policy(
     }
 
     // RPC server runs only on Shared; CLI clients authenticate against `rpc_key`.
-    if instance_mode == InstanceMode::Shared && configured_policy {
-        if let Some(rpc_key) = rc.rpc_key.clone() {
-            let rpc_tx = transport_tx.clone();
-            let rpc_shutdown = shutdown.clone();
-            if rc.shared_instance_type == SharedInstanceType::Unix {
-                let rpc_socket = shared_unix_rpc_socket_path(&rc.instance_name, &socket_base);
-                tokio::spawn(async move {
-                    if let Err(e) = crate::rpc_server::run_unix_rpc_server(
-                        &rpc_socket,
-                        rpc_key,
-                        rpc_tx,
-                        rpc_shutdown,
-                    )
-                    .await
-                    {
-                        tracing::warn!("Unix RPC server error: {}", e);
-                    }
-                });
-            } else {
-                let rpc_port = rc.control_port;
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::rpc_server::run_rpc_server(rpc_port, rpc_key, rpc_tx, rpc_shutdown)
-                            .await
-                    {
-                        tracing::warn!("RPC server error: {}", e);
-                    }
-                });
-            }
+    if instance_mode == InstanceMode::Shared
+        && configured_policy
+        && let Some(rpc_key) = rc.rpc_key.clone()
+    {
+        let rpc_tx = transport_tx.clone();
+        let rpc_shutdown = shutdown.clone();
+        if rc.shared_instance_type == SharedInstanceType::Unix {
+            let rpc_socket = shared_unix_rpc_socket_path(&rc.instance_name, &socket_base);
+            tokio::spawn(async move {
+                if let Err(e) = crate::rpc_server::run_unix_rpc_server(
+                    &rpc_socket,
+                    rpc_key,
+                    rpc_tx,
+                    rpc_shutdown,
+                )
+                .await
+                {
+                    tracing::warn!("Unix RPC server error: {}", e);
+                }
+            });
+        } else {
+            let rpc_port = rc.control_port;
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::rpc_server::run_rpc_server(rpc_port, rpc_key, rpc_tx, rpc_shutdown).await
+                {
+                    tracing::warn!("RPC server error: {}", e);
+                }
+            });
         }
     }
 
@@ -5093,10 +5090,8 @@ async fn rollback_published_interfaces(
             .send(TransportMessage::DeregisterInterface { id: interface.id })
             .await
             .is_ok();
-        if deregistered {
-            if let Some(registration) = interface.registration.take() {
-                registration.release();
-            }
+        if deregistered && let Some(registration) = interface.registration.take() {
+            registration.release();
         }
         // A closed actor leaves the Pending cancellation tombstone in place;
         // same-ID reuse is unsafe because the stale registration cannot be
@@ -5328,10 +5323,8 @@ async fn rollback_batch_interfaces(
                 .send(TransportMessage::DeregisterInterface { id: interface.id })
                 .await
                 .is_ok();
-        if safe_to_release {
-            if let Some(registration) = interface.registration.take() {
-                registration.release();
-            }
+        if safe_to_release && let Some(registration) = interface.registration.take() {
+            registration.release();
         }
     }
 }
@@ -5419,10 +5412,10 @@ fn runtime_ifac_post_init(
         return Ok(None);
     };
 
-    if let Some(size) = ifac.ifac_size {
-        if !(1..=64).contains(&size) {
-            return Err(format!("Invalid IFAC size {size}; expected 1..=64 bytes"));
-        }
+    if let Some(size) = ifac.ifac_size
+        && !(1..=64).contains(&size)
+    {
+        return Err(format!("Invalid IFAC size {size}; expected 1..=64 bytes"));
     }
 
     let network_name = ifac.network_name.filter(|s| !s.is_empty());
@@ -8022,18 +8015,15 @@ fn clean_cache_dir_at(cache_dir: &Path, ttl: std::time::Duration, now: std::time
             if file_name.as_encoded_bytes().len() != 32 {
                 continue;
             }
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_file() {
-                    if let Ok(modified) = metadata.modified() {
-                        if let Ok(age) = now.duration_since(modified) {
-                            if age > ttl {
-                                let path = entry.path();
-                                if std::fs::remove_file(&path).is_ok() {
-                                    tracing::trace!("cleaned cache entry: {}", path.display());
-                                }
-                            }
-                        }
-                    }
+            if let Ok(metadata) = entry.metadata()
+                && metadata.is_file()
+                && let Ok(modified) = metadata.modified()
+                && let Ok(age) = now.duration_since(modified)
+                && age > ttl
+            {
+                let path = entry.path();
+                if std::fs::remove_file(&path).is_ok() {
+                    tracing::trace!("cleaned cache entry: {}", path.display());
                 }
             }
         }

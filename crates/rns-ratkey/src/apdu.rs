@@ -565,14 +565,13 @@ fn find_tlv_value(data: &[u8], target_tag: u8) -> Option<&[u8]> {
             return Some(value);
         }
 
-        if tag_first == TAG_DYNAMIC_AUTH
+        if (tag_first == TAG_DYNAMIC_AUTH
             || tag_first == 0xAC
             || tag_first == 0x53
-            || (tag_total_len == 2)
+            || (tag_total_len == 2))
+            && let Some(found) = find_tlv_value(value, target_tag)
         {
-            if let Some(found) = find_tlv_value(value, target_tag) {
-                return Some(found);
-            }
+            return Some(found);
         }
 
         pos += value_len;

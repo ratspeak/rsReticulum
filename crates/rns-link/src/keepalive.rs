@@ -137,15 +137,15 @@ impl KeepaliveState {
 
     pub(crate) fn is_stale_at(&self, now: Instant) -> bool {
         let mut latest = self.last_inbound;
-        if let Some(proof) = self.last_proof {
-            if proof > latest {
-                latest = proof;
-            }
+        if let Some(proof) = self.last_proof
+            && proof > latest
+        {
+            latest = proof;
         }
-        if let Some(activated) = self.activated_at {
-            if activated > latest {
-                latest = activated;
-            }
+        if let Some(activated) = self.activated_at
+            && activated > latest
+        {
+            latest = activated;
         }
         now.saturating_duration_since(latest) >= self.stale_time
     }

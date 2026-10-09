@@ -99,15 +99,14 @@ impl TransportActor {
             return;
         };
         let route = RouteVersion::from_path(path);
-        if self.local_link_route_attempts.len() >= MAX_LOCAL_LINK_ROUTES {
-            if let Some(oldest) = self
+        if self.local_link_route_attempts.len() >= MAX_LOCAL_LINK_ROUTES
+            && let Some(oldest) = self
                 .local_link_route_attempts
                 .iter()
                 .min_by(|a, b| a.1.observed_at.total_cmp(&b.1.observed_at))
                 .map(|(key, _)| *key)
-            {
-                self.local_link_route_attempts.remove(&oldest);
-            }
+        {
+            self.local_link_route_attempts.remove(&oldest);
         }
         self.local_link_route_attempts.insert(
             link_id,

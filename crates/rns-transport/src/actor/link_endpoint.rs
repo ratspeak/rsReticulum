@@ -99,10 +99,10 @@ impl TransportActor {
         let interface_id = self.link_endpoints[&key].binding.interface_id;
         // Give previously admitted packets first claim on newly available
         // interface capacity before considering the new packet.
-        if !self.link_endpoints[&key].egress.is_empty() {
-            if let Err(reason) = self.drain_one_link_endpoint(key) {
-                return LinkEndpointSendResult::Terminated(reason);
-            }
+        if !self.link_endpoints[&key].egress.is_empty()
+            && let Err(reason) = self.drain_one_link_endpoint(key)
+        {
+            return LinkEndpointSendResult::Terminated(reason);
         }
 
         if self.link_endpoints[&key].egress.len() >= LINK_ENDPOINT_EGRESS_QUEUE_CAPACITY {

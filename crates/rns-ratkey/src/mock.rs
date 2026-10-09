@@ -186,10 +186,11 @@ impl MockPivSession {
     }
 
     fn check_touch(&self, slot: u8) -> Result<(), RatkeyError> {
-        if let Some(slot_state) = self.slots.get(&slot) {
-            if slot_state.touch_policy == TouchPolicy::Always && self.touch_required {
-                return Err(RatkeyError::TouchRequired);
-            }
+        if let Some(slot_state) = self.slots.get(&slot)
+            && slot_state.touch_policy == TouchPolicy::Always
+            && self.touch_required
+        {
+            return Err(RatkeyError::TouchRequired);
         }
         Ok(())
     }

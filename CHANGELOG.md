@@ -8,7 +8,15 @@
 
 ### Fixed and improved
 
+- Updated btleplug to 0.13.4, including upstream Windows discovery and reconnect fixes. Windows can try an explicitly configured RNode MAC or an eligible remembered BLE Peer absent from scan results, with bounded GATT setup, existing backoff and signed peer identity checks.
+- Installed desktop BLE notification receivers before subscribing and limited packet fragments to the negotiated ATT payload.
+
 - Improved Bluetooth Peer packet sizing and flow control, including Apple write handling and queued sends.
+
+### Build and compatibility
+
+- Raised the full Rust workspace minimum compiler to Rust 1.89. Apple native BLE bindings now declare their required features explicitly. Android consumers must use btleplug's matching 0.13.4 Java bridge and JNI 0.22 initialization.
+
 
 
 ## 1.3.0 - 2026-09-10

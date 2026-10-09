@@ -150,10 +150,10 @@ fn atomic_write_inner(
         }
 
         #[cfg(unix)]
-        if let Some(dir) = path.parent() {
-            if let Ok(d) = fs::File::open(dir) {
-                let _ = d.sync_all();
-            }
+        if let Some(dir) = path.parent()
+            && let Ok(d) = fs::File::open(dir)
+        {
+            let _ = d.sync_all();
         }
 
         Ok(())

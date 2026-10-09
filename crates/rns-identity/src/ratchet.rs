@@ -763,10 +763,10 @@ impl ReceivedRatchetStore {
     /// Record a ratchet with an explicit local receive time. Re-inserting the
     /// same key remains a no-op and therefore cannot extend its lifetime.
     pub fn remember_at(&mut self, dest_hash: [u8; 16], ratchet_pub: [u8; 32], received_at: f64) {
-        if let Some(existing) = self.entries.get(&dest_hash) {
-            if existing.ratchet_pub == ratchet_pub {
-                return;
-            }
+        if let Some(existing) = self.entries.get(&dest_hash)
+            && existing.ratchet_pub == ratchet_pub
+        {
+            return;
         }
 
         let received = ReceivedRatchet::new_at(ratchet_pub, received_at);
@@ -793,27 +793,27 @@ impl ReceivedRatchetStore {
     }
 
     pub fn get_at(&mut self, dest_hash: &[u8; 16], now: f64) -> Option<[u8; 32]> {
-        if !self.entries.contains_key(dest_hash) {
-            if let Some(ref dir) = self.storage_dir {
-                let hexhash = hex::encode(dest_hash);
-                let path = dir.join(&hexhash);
-                if path.exists() {
-                    match ReceivedRatchet::load(&path) {
-                        Ok(ratchet) => {
-                            if !ratchet.is_expired_at(now) {
-                                self.entries.insert(*dest_hash, ratchet);
-                            } else {
-                                return None;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                dest = hexhash,
-                                error = %e,
-                                "failed to load ratchet from disk"
-                            );
+        if !self.entries.contains_key(dest_hash)
+            && let Some(ref dir) = self.storage_dir
+        {
+            let hexhash = hex::encode(dest_hash);
+            let path = dir.join(&hexhash);
+            if path.exists() {
+                match ReceivedRatchet::load(&path) {
+                    Ok(ratchet) => {
+                        if !ratchet.is_expired_at(now) {
+                            self.entries.insert(*dest_hash, ratchet);
+                        } else {
                             return None;
                         }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            dest = hexhash,
+                            error = %e,
+                            "failed to load ratchet from disk"
+                        );
+                        return None;
                     }
                 }
             }

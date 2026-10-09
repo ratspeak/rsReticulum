@@ -579,10 +579,10 @@ fn iface_passes_filters(
     if ignored_devices.iter().any(|n| n == iface_name) {
         return false;
     }
-    if let Some(allowed) = devices {
-        if !allowed.iter().any(|n| n == iface_name) {
-            return false;
-        }
+    if let Some(allowed) = devices
+        && !allowed.iter().any(|n| n == iface_name)
+    {
+        return false;
     }
     true
 }
@@ -623,19 +623,19 @@ fn get_link_local_addrs(
                 if !iface_passes_filters(&iface.name, devices, ignored_devices) {
                     continue;
                 }
-                if let std::net::IpAddr::V6(addr) = iface.addr.ip() {
-                    if (addr.segments()[0] & 0xffc0) == 0xfe80 {
-                        let scope_id = iface_scope_id(&iface);
-                        if scope_id == 0 {
-                            tracing::warn!(
-                                iface = %iface.name,
-                                addr = %addr,
-                                "skipping link-local: could not resolve scope id (would send on wrong NIC)"
-                            );
-                            continue;
-                        }
-                        result.push((iface.name.clone(), addr, scope_id));
+                if let std::net::IpAddr::V6(addr) = iface.addr.ip()
+                    && (addr.segments()[0] & 0xffc0) == 0xfe80
+                {
+                    let scope_id = iface_scope_id(&iface);
+                    if scope_id == 0 {
+                        tracing::warn!(
+                            iface = %iface.name,
+                            addr = %addr,
+                            "skipping link-local: could not resolve scope id (would send on wrong NIC)"
+                        );
+                        continue;
                     }
+                    result.push((iface.name.clone(), addr, scope_id));
                 }
             }
         }

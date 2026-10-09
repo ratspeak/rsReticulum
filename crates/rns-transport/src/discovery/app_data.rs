@@ -305,10 +305,10 @@ pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
     if !DISCOVERABLE_INTERFACE_TYPES.contains(&info.interface_type.as_str()) {
         return Err(AppDataError::UnsupportedInterfaceType(info.interface_type));
     }
-    if let Some(reachable_on) = info.reachable_on.as_deref() {
-        if !valid_reachable_on(reachable_on) {
-            return Err(AppDataError::InvalidReachableOn(reachable_on.to_string()));
-        }
+    if let Some(reachable_on) = info.reachable_on.as_deref()
+        && !valid_reachable_on(reachable_on)
+    {
+        return Err(AppDataError::InvalidReachableOn(reachable_on.to_string()));
     }
     Ok(info)
 }

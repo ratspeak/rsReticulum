@@ -184,10 +184,10 @@ impl DiscoveryStore {
 
             let heard_delta = now.saturating_sub(rec.last_heard);
             let mut should_remove = heard_delta > THRESHOLD_REMOVE_SECS;
-            if let Some(sources) = discovery_sources {
-                if !sources.iter().any(|s| s == &rec.network_id) {
-                    should_remove = true;
-                }
+            if let Some(sources) = discovery_sources
+                && !sources.iter().any(|s| s == &rec.network_id)
+            {
+                should_remove = true;
             }
             if should_remove {
                 let _ = std::fs::remove_file(&path);

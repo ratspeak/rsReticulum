@@ -256,16 +256,16 @@ pub async fn teardown_central() -> Result<(), String> {
 }
 
 fn finalize_stop() {
-    if let Some(lock) = POWERED_ON_TX.get() {
-        if let Ok(mut g) = lock.lock() {
-            *g = None;
-        }
+    if let Some(lock) = POWERED_ON_TX.get()
+        && let Ok(mut g) = lock.lock()
+    {
+        *g = None;
     }
     // Drop the discovery sender so receivers don't hang on recv.
-    if let Some(lock) = DISCOVERY_TX.get() {
-        if let Ok(mut g) = lock.lock() {
-            *g = None;
-        }
+    if let Some(lock) = DISCOVERY_TX.get()
+        && let Ok(mut g) = lock.lock()
+    {
+        *g = None;
     }
     apply_event(CentralEvent::ScanStopped);
     apply_event(CentralEvent::Reset);
@@ -566,13 +566,11 @@ fn get_delegate_class() -> &'static AnyClass {
 
             // No sender means stop_scan raced us between the radio event
             // and this callback — drop silently.
-            if let Some(lock) = DISCOVERY_TX.get() {
-                if let Ok(g) = lock.lock() {
-                    if let Some(tx) = g.as_ref() {
+            if let Some(lock) = DISCOVERY_TX.get()
+                && let Ok(g) = lock.lock()
+                    && let Some(tx) = g.as_ref() {
                         let _ = tx.send(event);
                     }
-                }
-            }
         }
 
         // Connection-state callbacks share this delegate (one delegate per

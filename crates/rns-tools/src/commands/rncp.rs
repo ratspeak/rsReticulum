@@ -24,10 +24,10 @@ use rns_transport::messages::{OutboundRequest, TransportMessage};
 use tokio::io::AsyncWriteExt;
 
 fn expand_tilde(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = p.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
     PathBuf::from(p)
 }
@@ -171,16 +171,16 @@ fn load_or_create_identity(
             )),
         }
     } else {
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return Err((
-                    2,
-                    format!(
-                        "Could not create identity directory \"{}\": {e}",
-                        parent.display()
-                    ),
-                ));
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return Err((
+                2,
+                format!(
+                    "Could not create identity directory \"{}\": {e}",
+                    parent.display()
+                ),
+            ));
         }
         let id = Identity::new();
         if let Err(e) = id.to_file(&path) {
@@ -616,11 +616,11 @@ async fn run_listen(args: Args) -> ! {
     }
 
     let fetch_jail = args.jail.as_deref().map(expand_tilde);
-    if let Some(ref jail) = fetch_jail {
-        if !jail.is_dir() {
-            eprintln!("Fetch jail directory not found: {}", jail.display());
-            process::exit(3);
-        }
+    if let Some(ref jail) = fetch_jail
+        && !jail.is_dir()
+    {
+        eprintln!("Fetch jail directory not found: {}", jail.display());
+        process::exit(3);
     }
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<RncpEvent>(64);

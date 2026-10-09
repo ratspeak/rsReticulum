@@ -561,29 +561,27 @@ fn import_private_identity(input: &str) -> Result<Identity, (u8, String)> {
 
 fn decode_import_identity_data(input: &str, expected_len: usize) -> Option<Vec<u8>> {
     let path = Path::new(input);
-    if path.is_file() {
-        if let Ok(data) = std::fs::read(path) {
-            if data.len() == expected_len {
-                return Some(data);
-            }
-        }
+    if path.is_file()
+        && let Ok(data) = std::fs::read(path)
+        && data.len() == expected_len
+    {
+        return Some(data);
     }
-    if input.len() == expected_len * 2 {
-        if let Ok(data) = hex::decode(input) {
-            if data.len() == expected_len {
-                return Some(data);
-            }
-        }
+    if input.len() == expected_len * 2
+        && let Ok(data) = hex::decode(input)
+        && data.len() == expected_len
+    {
+        return Some(data);
     }
-    if let Ok(data) = decode_base32(input) {
-        if data.len() == expected_len {
-            return Some(data);
-        }
+    if let Ok(data) = decode_base32(input)
+        && data.len() == expected_len
+    {
+        return Some(data);
     }
-    if let Ok(data) = URL_SAFE.decode(input) {
-        if data.len() == expected_len {
-            return Some(data);
-        }
+    if let Ok(data) = URL_SAFE.decode(input)
+        && data.len() == expected_len
+    {
+        return Some(data);
     }
     None
 }

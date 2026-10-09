@@ -1155,13 +1155,13 @@ async fn run_remote(args: Args) -> ExitCode {
         };
         req_args.push(rmpv::Value::Binary(dest.to_vec()));
     }
-    if args.table {
-        if let Some(m) = args.max {
-            if args.destination.is_none() {
-                req_args.push(rmpv::Value::Nil);
-            }
-            req_args.push(rmpv::Value::from(m));
+    if args.table
+        && let Some(m) = args.max
+    {
+        if args.destination.is_none() {
+            req_args.push(rmpv::Value::Nil);
         }
+        req_args.push(rmpv::Value::from(m));
     }
     let req_value = rmpv::Value::Array(req_args);
     let mut payload = Vec::new();

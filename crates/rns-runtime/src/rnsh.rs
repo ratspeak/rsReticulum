@@ -746,23 +746,23 @@ async fn handle_client_message(
         RnshMessage::StreamData(stream) => match stream.stream_id {
             STREAM_ID_STDOUT => {
                 stdout.extend_from_slice(&stream.data);
-                if let Some(tx) = stdout_tx {
-                    if !stream.data.is_empty() {
-                        tx.send(stream.data).await.map_err(|_| {
-                            RnshError::Process("stdout stream receiver closed".into())
-                        })?;
-                    }
+                if let Some(tx) = stdout_tx
+                    && !stream.data.is_empty()
+                {
+                    tx.send(stream.data)
+                        .await
+                        .map_err(|_| RnshError::Process("stdout stream receiver closed".into()))?;
                 }
                 Ok(None)
             }
             STREAM_ID_STDERR => {
                 stderr.extend_from_slice(&stream.data);
-                if let Some(tx) = stderr_tx {
-                    if !stream.data.is_empty() {
-                        tx.send(stream.data).await.map_err(|_| {
-                            RnshError::Process("stderr stream receiver closed".into())
-                        })?;
-                    }
+                if let Some(tx) = stderr_tx
+                    && !stream.data.is_empty()
+                {
+                    tx.send(stream.data)
+                        .await
+                        .map_err(|_| RnshError::Process("stderr stream receiver closed".into()))?;
                 }
                 Ok(None)
             }
@@ -1182,10 +1182,10 @@ async fn handle_listener_channel_message(
                     .await?;
                     return Ok(());
                 }
-                if let Some(stdin) = session.stdin.as_mut() {
-                    if !stream.data.is_empty() {
-                        stdin.write_all(&stream.data).await?;
-                    }
+                if let Some(stdin) = session.stdin.as_mut()
+                    && !stream.data.is_empty()
+                {
+                    stdin.write_all(&stream.data).await?;
                 }
                 if stream.eof {
                     if let Some(stdin) = session.stdin.as_mut() {
@@ -1338,20 +1338,20 @@ async fn start_listener_process(
             stderr,
         )));
     }
-    if let Some(ref pty) = pty {
-        if !pipe_stdout || !pipe_stderr {
-            let stream_id = if !pipe_stdout {
-                STREAM_ID_STDOUT
-            } else {
-                STREAM_ID_STDERR
-            };
-            reader_tasks.push(tokio::spawn(stream_reader_task(
-                command_tx.clone(),
-                link_id,
-                stream_id,
-                pty_reader_file(pty)?,
-            )));
-        }
+    if let Some(ref pty) = pty
+        && (!pipe_stdout || !pipe_stderr)
+    {
+        let stream_id = if !pipe_stdout {
+            STREAM_ID_STDOUT
+        } else {
+            STREAM_ID_STDERR
+        };
+        reader_tasks.push(tokio::spawn(stream_reader_task(
+            command_tx.clone(),
+            link_id,
+            stream_id,
+            pty_reader_file(pty)?,
+        )));
     }
 
     let window = pty.take().map(pty_window_target);

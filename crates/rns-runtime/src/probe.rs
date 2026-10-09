@@ -228,10 +228,10 @@ impl DeliveryProofWaiter {
                 Ok(None) => return None,
                 Err(_) => return None,
             };
-            if let DestinationEvent::DeliveryProof { msg_id, rtt } = ev {
-                if msg_id == self.msg_id {
-                    return Some(rtt);
-                }
+            if let DestinationEvent::DeliveryProof { msg_id, rtt } = ev
+                && msg_id == self.msg_id
+            {
+                return Some(rtt);
             }
         }
     }
@@ -458,12 +458,11 @@ async fn collect_path_meta(tx: &mpsc::Sender<TransportMessage>, dest: [u8; 16]) 
     let mut meta = PathMeta::default();
     if let Ok(TransportQueryResponse::PathTable(entries)) =
         query(tx, TransportQuery::GetPathTable).await
+        && let Some(entry) = entries.into_iter().find(|e| e.hash == dest)
     {
-        if let Some(entry) = entries.into_iter().find(|e| e.hash == dest) {
-            meta.hops = entry.hops;
-            meta.via = entry.via;
-            meta.interface = Some(entry.interface);
-        }
+        meta.hops = entry.hops;
+        meta.via = entry.via;
+        meta.interface = Some(entry.interface);
     }
     meta
 }

@@ -732,10 +732,10 @@ pub fn on_did_disconnect(address: &str, err: Option<String>) {
     if let Some(peer) = removed {
         peer.online.store(false, Ordering::SeqCst);
     }
-    if let Ok(mut g) = online_flags().lock() {
-        if let Some(flag) = g.remove(address) {
-            flag.store(false, Ordering::SeqCst);
-        }
+    if let Ok(mut g) = online_flags().lock()
+        && let Some(flag) = g.remove(address)
+    {
+        flag.store(false, Ordering::SeqCst);
     }
 
     let classified = classify_disconnect_reason(err.as_deref());

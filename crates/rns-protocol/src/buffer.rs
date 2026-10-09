@@ -154,10 +154,11 @@ impl StreamWriter {
             if segment_len <= 32 {
                 break;
             }
-            if let Ok(compressed) = compression::bz2_compress(&chunk[..segment_len]) {
-                if compressed.len() < self.max_data_len && compressed.len() < segment_len {
-                    return (compressed, segment_len, true);
-                }
+            if let Ok(compressed) = compression::bz2_compress(&chunk[..segment_len])
+                && compressed.len() < self.max_data_len
+                && compressed.len() < segment_len
+            {
+                return (compressed, segment_len, true);
             }
         }
 

@@ -161,10 +161,10 @@ impl LinkEndpointDispatchBindReceipt {
     /// consumes it. Dropping even a ready receipt still retires an unpublished
     /// binding, so cancellation between readiness and processing is safe.
     pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.ready.is_none() {
-            if let Poll::Ready(result) = Pin::new(&mut self.result_rx).poll(cx) {
-                self.ready = Some(result);
-            }
+        if self.ready.is_none()
+            && let Poll::Ready(result) = Pin::new(&mut self.result_rx).poll(cx)
+        {
+            self.ready = Some(result);
         }
         if self.ready.is_some() {
             Poll::Ready(())
