@@ -1589,7 +1589,7 @@ impl OutboundTransfer {
             // Parse the set of requested (needed) hashes
             let requested_data = &hmu_data[offset..];
             let mut requested_set: HashSet<[u8; MAPHASH_LEN]> = HashSet::new();
-            for chunk in requested_data.chunks_exact(MAPHASH_LEN) {
+            for chunk in requested_data.as_chunks::<MAPHASH_LEN>().0 {
                 let mut mh = [0u8; MAPHASH_LEN];
                 mh.copy_from_slice(chunk);
                 requested_set.insert(mh);
@@ -1711,7 +1711,7 @@ impl OutboundTransfer {
         let requested_hashes_data = &request_data[hash_offset..];
 
         let mut requested_map_hashes: Vec<[u8; MAPHASH_LEN]> = Vec::new();
-        for chunk in requested_hashes_data.chunks_exact(MAPHASH_LEN) {
+        for chunk in requested_hashes_data.as_chunks::<MAPHASH_LEN>().0 {
             let mut mh = [0u8; MAPHASH_LEN];
             mh.copy_from_slice(chunk);
             requested_map_hashes.push(mh);

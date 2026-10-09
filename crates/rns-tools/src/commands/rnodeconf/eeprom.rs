@@ -208,10 +208,10 @@ fn md5_digest(input: &[u8]) -> [u8; 16] {
     let mut c0 = 0x98badcfeu32;
     let mut d0 = 0x10325476u32;
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            m[i] = u32::from_le_bytes(word.try_into().unwrap());
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            m[i] = u32::from_le_bytes(*word);
         }
 
         let mut a = a0;

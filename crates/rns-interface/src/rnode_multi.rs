@@ -374,7 +374,7 @@ impl StartupEvidence {
                 if !payload.len().is_multiple_of(2) {
                     return Err("RNodeMulti returned a malformed interface list".into());
                 }
-                for pair in payload.chunks_exact(2) {
+                for pair in payload.as_chunks::<2>().0 {
                     let vport = pair[0] as usize;
                     if vport >= MAX_SUBINTERFACES {
                         return Err(format!(
@@ -1222,7 +1222,7 @@ pub async fn spawn_rnode_multi_interface(
 
                             CMD_INTERFACES => {
                                 // Reply is one or more `[vport, radio_type]` pairs.
-                                for pair in frame.chunks_exact(2) {
+                                for pair in frame.as_chunks::<2>().0 {
                                     let vp = pair[0];
                                     let rt = pair[1];
                                     let rtype = RadioType::from_u8(rt)

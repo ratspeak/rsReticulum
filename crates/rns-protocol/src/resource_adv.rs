@@ -265,7 +265,9 @@ impl ResourceAdvertisement {
     /// Split the packed `hashmap` field into fixed-length map-hash entries.
     pub fn get_map_hashes(&self) -> Vec<[u8; MAPHASH_LEN]> {
         self.hashmap
-            .chunks_exact(MAPHASH_LEN)
+            .as_chunks::<MAPHASH_LEN>()
+            .0
+            .iter()
             .map(|chunk| {
                 let mut hash = [0u8; MAPHASH_LEN];
                 hash.copy_from_slice(chunk);
