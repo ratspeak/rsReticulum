@@ -4208,21 +4208,21 @@ mod linux_peripheral {
                     let char_uuid = rx_uuid_for_trace;
                     let byte_len = new_value.len();
                     Box::pin(async move {
-                        if let Some(tx) = inbound_sender() {
-                            if let Err(e) = tx.try_send((addr.clone(), false, new_value)) {
-                                // Channel full — log so operators see the
-                                // backpressure signal instead of finding
-                                // silent fragment loss.
-                                tracing::warn!(
-                                    target: "ble_trace",
-                                    step = "linux_rx.channel_full",
-                                    peer = %addr,
-                                    %char_uuid,
-                                    bytes = byte_len,
-                                    err = %e,
-                                    "Linux BLE RX: inbound channel full, dropping frame"
-                                );
-                            }
+                        if let Some(tx) = inbound_sender()
+                            && let Err(e) = tx.try_send((addr.clone(), false, new_value))
+                        {
+                            // Channel full — log so operators see the
+                            // backpressure signal instead of finding
+                            // silent fragment loss.
+                            tracing::warn!(
+                                target: "ble_trace",
+                                step = "linux_rx.channel_full",
+                                peer = %addr,
+                                %char_uuid,
+                                bytes = byte_len,
+                                err = %e,
+                                "Linux BLE RX: inbound channel full, dropping frame"
+                            );
                         }
                         Ok(())
                     })

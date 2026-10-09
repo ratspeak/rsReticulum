@@ -1159,14 +1159,14 @@ static LINUX_PAIRING_ATTEMPT_COUNTER: std::sync::atomic::AtomicU64 =
 /// `false` if no pairing is in flight or the attempt was aborted.
 #[cfg(target_os = "linux")]
 pub fn linux_submit_passkey(passkey: u32) -> bool {
-    if let Ok(mut guard) = LINUX_PAIRING_STATE.lock() {
-        if let Some(state) = guard.as_mut() {
-            if state.aborted {
-                return false;
-            }
-            if let Some(tx) = state.passkey_tx.take() {
-                return tx.send(passkey).is_ok();
-            }
+    if let Ok(mut guard) = LINUX_PAIRING_STATE.lock()
+        && let Some(state) = guard.as_mut()
+    {
+        if state.aborted {
+            return false;
+        }
+        if let Some(tx) = state.passkey_tx.take() {
+            return tx.send(passkey).is_ok();
         }
     }
     false
@@ -2211,15 +2211,15 @@ fn parse_linux_ble_address(addr: &str) -> Result<bluer::Address, InterfaceError>
     if let Ok(parsed) = addr.parse::<bluer::Address>() {
         return Ok(parsed);
     }
-    if let Some(tail) = addr.rsplit('/').next() {
-        if let Some(mac_part) = tail.strip_prefix("dev_") {
-            let mac = mac_part.replace('_', ":");
-            return mac.parse::<bluer::Address>().map_err(|e| {
-                InterfaceError::SendFailed(format!(
-                    "invalid BLE address (BlueZ path '{addr}' → '{mac}'): {e}"
-                ))
-            });
-        }
+    if let Some(tail) = addr.rsplit('/').next()
+        && let Some(mac_part) = tail.strip_prefix("dev_")
+    {
+        let mac = mac_part.replace('_', ":");
+        return mac.parse::<bluer::Address>().map_err(|e| {
+            InterfaceError::SendFailed(format!(
+                "invalid BLE address (BlueZ path '{addr}' → '{mac}'): {e}"
+            ))
+        });
     }
     Err(InterfaceError::SendFailed(format!(
         "invalid BLE address {addr}: not a MAC nor a BlueZ D-Bus path"
@@ -2385,13 +2385,12 @@ async fn linux_trigger_pairing(bluer_addr: bluer::Address) -> Result<bool, Inter
         Ok(()) => "ok".to_string(),
         Err(e) => format!("{e}"),
     };
-    if let Ok(mut guard) = LINUX_PAIRING_STATE.lock() {
-        if guard
+    if let Ok(mut guard) = LINUX_PAIRING_STATE.lock()
+        && guard
             .as_ref()
             .is_some_and(|state| state.attempt_id == attempt_id)
-        {
-            *guard = None;
-        }
+    {
+        *guard = None;
     }
     let _ = linux_pairing_finished_sender().send(LinuxPairingFinished { attempt_id, status });
     outcome.map(|()| true)
