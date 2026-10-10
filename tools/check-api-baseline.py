@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date
 import hashlib
 import json
 import os
@@ -55,46 +54,21 @@ def load_config() -> dict[str, object]:
         config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         fail(f"cannot read {CONFIG_PATH.name}: {error}")
-    if config.get("schemaVersion") != 1:
+    if not isinstance(config, dict) or config.get("schemaVersion") != 2:
         fail("unsupported api-stability schema")
     return config
 
 
-def validate_snapshot_review(record: object) -> None:
+def require_keys(
+    record: object, required: set[str], label: str,
+    optional: set[str] | None = None,
+) -> None:
     if not isinstance(record, dict):
-        fail("snapshot review is missing")
-    required = {
-        "areas",
-        "canonicalPath",
-        "classification",
-        "publicApiDiff",
-        "semver",
-        "deprecations",
-        "wirePersistenceRuntimeImpact",
-        "platformEvidence",
-    }
-    if not required.issubset(record):
-        fail("snapshot review is incomplete")
-    if not isinstance(record.get("areas"), list) or not record["areas"]:
-        fail("snapshot review must name the affected API areas")
-    if not all(isinstance(area, str) and area for area in record["areas"]):
-        fail("snapshot review API areas must be non-empty strings")
-    diff = record.get("publicApiDiff")
-    if not isinstance(diff, dict) or set(diff) != {"added", "removed"}:
-        fail("snapshot review must classify added and removed API lines")
-    if not all(isinstance(diff[key], int) and diff[key] >= 0 for key in diff):
-        fail("snapshot review API counts must be non-negative integers")
-    if not isinstance(record.get("platformEvidence"), list) or not record["platformEvidence"]:
-        fail("snapshot review must name platform evidence")
-    for key in (
-        "canonicalPath",
-        "classification",
-        "semver",
-        "deprecations",
-        "wirePersistenceRuntimeImpact",
-    ):
-        if not isinstance(record.get(key), str) or not record[key]:
-            fail(f"snapshot review must name {key}")
+        fail(f"{label} must be an object")
+    missing = required - set(record)
+    unknown = set(record) - required - (optional or set())
+    if missing or unknown:
+        fail(f"{label}: missing fields {sorted(missing)}, unknown fields {sorted(unknown)}")
 
 
 def public_packages(manifest_path: str) -> set[str]:
@@ -121,6 +95,25 @@ def public_packages(manifest_path: str) -> set[str]:
 def validate_metadata(
     config: dict[str, object], *, updating: bool = False
 ) -> list[dict[str, object]]:
+    require_keys(
+        config, {"schemaVersion", "tool", "baseline", "compatibilityFloor", "packages"},
+        "metadata", {"approvedBreakingChanges"},
+    )
+    if config["schemaVersion"] != 2:
+        fail("unsupported api-stability schema")
+    require_keys(
+        config["tool"], {"name", "version", "rustdocToolchain", "target", "arguments"},
+        "tool",
+    )
+    require_keys(config["baseline"], {"commit"}, "baseline")
+    require_keys(
+        config["compatibilityFloor"], {"evidenceCommit", "sourceCommit"},
+        "compatibility floor",
+    )
+    if "approvedBreakingChanges" in config:
+        require_keys(config["approvedBreakingChanges"],
+                     {"releaseLine", "migrationGuide", "removed"}, "approved break")
+
     tool = config.get("tool")
     if not isinstance(tool, dict):
         fail("tool contract is missing")
@@ -174,26 +167,6 @@ def validate_metadata(
         if floor_ancestor.returncode != 0:
             fail(f"compatibility floor {label} commit is not an ancestor of HEAD")
 
-    snapshot_source = config.get("snapshotSource")
-    if not isinstance(snapshot_source, dict):
-        fail("snapshot source identity is missing")
-    snapshot_commit = snapshot_source.get("commit")
-    if not isinstance(snapshot_commit, str) or not SHA_PATTERN.fullmatch(
-        snapshot_commit
-    ):
-        fail("snapshot source commit must be a full Git commit")
-    snapshot_check = subprocess.run(
-        ["git", "cat-file", "-e", f"{snapshot_commit}^{{commit}}"], cwd=ROOT
-    )
-    if snapshot_check.returncode != 0:
-        fail(f"snapshot source commit {snapshot_commit} is unavailable")
-    snapshot_ancestor = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", snapshot_commit, "HEAD"], cwd=ROOT
-    )
-    if snapshot_ancestor.returncode != 0:
-        fail(f"snapshot source commit {snapshot_commit} is not an ancestor of HEAD")
-    validate_snapshot_review(snapshot_source.get("review"))
-
     packages = config.get("packages")
     if not isinstance(packages, list) or not packages:
         fail("package ledger is empty")
@@ -203,6 +176,10 @@ def validate_metadata(
     for package in packages:
         if not isinstance(package, dict):
             fail("package ledger entry is not an object")
+        require_keys(package, {"name", "manifestPath", "tier", "compatibility",
+                               "snapshot", "itemCount", "sha256"}, "package")
+        if type(package["itemCount"]) is not int or package["itemCount"] < 0:
+            fail("package item count must be a non-negative integer")
         name = package.get("name")
         manifest = package.get("manifestPath")
         snapshot = package.get("snapshot")
@@ -217,7 +194,9 @@ def validate_metadata(
             fail(f"{name} must use the reviewed-snapshot compatibility policy")
         if not isinstance(snapshot, str) or not snapshot.startswith("api/snapshots/"):
             fail(f"{name} has an invalid snapshot path")
-        snapshot_path = ROOT / snapshot
+        snapshot_path = (ROOT / snapshot).resolve()
+        if not snapshot_path.is_relative_to(ROOT / "api/snapshots"):
+            fail(f"{name} snapshot must stay inside api/snapshots")
         if not snapshot_path.is_file() and not updating:
             fail(f"{name} snapshot is missing: {snapshot}")
         if not updating:
@@ -296,28 +275,21 @@ def render_snapshot(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--metadata-only", action="store_true")
-    parser.add_argument("--update", action="store_true")
-    parser.add_argument("--snapshot-source-commit")
+    parser.add_argument("--update", action="store_true",
+                        help="refresh snapshots from the working tree to commit alongside source changes")
+    parser.add_argument("--snapshot-source-commit",
+                        help="optional HEAD guard for --update; includes uncommitted source changes")
     args = parser.parse_args()
     if args.metadata_only and args.update:
         fail("--metadata-only and --update are mutually exclusive")
 
     config = load_config()
-    if args.update:
-        if not args.snapshot_source_commit:
-            fail("--update requires --snapshot-source-commit")
+    if args.snapshot_source_commit is not None:
+        if not args.update:
+            fail("--snapshot-source-commit requires --update")
         head = run(["git", "rev-parse", "HEAD"]).strip()
         if args.snapshot_source_commit != head:
-            fail("snapshot source must be the clean source commit at HEAD")
-        status = run(["git", "status", "--porcelain=v1", "--untracked-files=all"])
-        dirty_paths = {line[3:] for line in status.splitlines() if len(line) > 3}
-        if dirty_paths - {"api/stability.json"}:
-            fail("snapshot source has uncommitted changes outside api/stability.json")
-        snapshot_source = config.get("snapshotSource")
-        if not isinstance(snapshot_source, dict):
-            fail("snapshot source identity is missing")
-        snapshot_source["commit"] = args.snapshot_source_commit
-        snapshot_source["capturedOn"] = date.today().isoformat()
+            fail("snapshot source guard must match HEAD")
     packages = validate_metadata(config, updating=args.update)
     if args.metadata_only:
         print("api baseline metadata: ok")

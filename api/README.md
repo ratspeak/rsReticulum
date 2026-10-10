@@ -154,8 +154,8 @@ treated as stable merely because they are publicly reachable.
 
 The `api/` directory contains the evidence used by CI:
 
-- `stability.json` records package tiers, source commits, snapshot hashes, and
-  the current review decision;
+- `stability.json` records package tiers, compatibility baselines, and snapshot
+  hashes;
 - `snapshots/` records the explicit all-feature Apple ARM64 Rust API and the
   manifest, feature, dependency, target, and MSRV contract; and
 - `fixtures/` compiles recommended and retained import paths as an external
@@ -176,6 +176,7 @@ cargo check --manifest-path api/fixtures/Cargo.toml --locked
 cargo check --manifest-path api/fixtures/Cargo.toml --all-features --locked
 ```
 
-Snapshot updates require a clean source commit and an explicit review recorded
-in `api/stability.json`. Additions, removals, deprecations, platform impact, and
-version consequences must be reviewed before accepting new evidence.
+After reviewing an API change, run
+`python3 tools/check-api-baseline.py --update` and commit the source and snapshot
+changes together. CI compares snapshots with the current source; compatibility
+checks retain the historical baseline.

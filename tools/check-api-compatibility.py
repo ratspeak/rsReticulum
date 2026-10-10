@@ -93,7 +93,7 @@ def main() -> None:
         [sys.executable, "tools/check-api-baseline.py", "--metadata-only"], cwd=ROOT
     )
     if metadata.returncode != 0:
-        fail("snapshot metadata or reviewed change record is invalid")
+        fail("snapshot metadata is invalid")
     ledger = json.loads(LEDGER_PATH.read_text(encoding="utf-8"))
     metadata_result = subprocess.run(
         ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
@@ -112,6 +112,9 @@ def main() -> None:
     floor_snapshots = {
         package["name"]: package["snapshot"] for package in floor_ledger["packages"]
     }
+    removed_packages = set(floor_snapshots) - {package["name"] for package in ledger["packages"]}
+    if removed_packages:
+        fail(f"compatibility-floor packages removed: {sorted(removed_packages)}")
     total_added = 0
     total_removed = 0
     for package in ledger["packages"]:
@@ -130,13 +133,7 @@ def main() -> None:
             for line in removed:
                 print(f"- {line}", file=sys.stderr)
         validate_removed(package["name"], set(removed), approved)
-    review = ledger["snapshotSource"]["review"]
-    if review["publicApiDiff"] != {
-        "added": total_added,
-        "removed": total_removed,
-    }:
-        fail("snapshot review does not match the measured API diff")
-    print(f"api compatibility: reviewed (+{total_added}, -{total_removed}); "
+    print(f"api compatibility: checked (+{total_added}, -{total_removed}); "
           "unapproved removals forbidden")
 
 
