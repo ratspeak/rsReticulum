@@ -173,6 +173,7 @@ impl TransportActor {
                 || (!recent
                     && self.queue_discovery_path_request(request.destination_hash, None, now))
                 || self.has_pending_path_request_admission(request.destination_hash));
+        self.process_background_starts();
         let _ = request.result_tx.send(PathRecoveryOutcome {
             path_dropped,
             has_path,

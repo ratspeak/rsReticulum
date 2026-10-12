@@ -726,9 +726,9 @@ mod tests {
             transport_id: [0x55; 16],
             interface_type: "BackboneInterface".into(),
             transport_enabled: true,
-            latitude: 1.0,
-            longitude: 2.0,
-            height: 3.0,
+            latitude: Some(1.0),
+            longitude: Some(2.0),
+            height: Some(3.0),
             port: Some(4965),
             reachable_on: Some("127.0.0.1".into()),
             ..Default::default()

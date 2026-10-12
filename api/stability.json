@@ -51,8 +51,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-transport.txt",
-      "itemCount": 1664,
-      "sha256": "da11dddf5e7519e62d194c81726ef028029f912d1f445694c0abdafb3f6234cd"
+      "itemCount": 1702,
+      "sha256": "30f20b408ac255e1f005e25e79e4999d813ebc6b4f1a501bf573de58db0e25ab"
     },
     {
       "name": "rns-link",
@@ -110,13 +110,22 @@
     }
   ],
   "approvedBreakingChanges": {
-    "releaseLine": "1.3",
-    "migrationGuide": "api/migrations/1.3.md",
+    "releaseLine": "1.4",
+    "migrationGuide": "api/migrations/1.4.md",
     "removed": {
       "rns-transport": [
         "pub rns_transport::actor::DiscoveryPathRequest::requesting_interface: rns_transport::messages::InterfaceId",
         "pub rns_transport::actor::DiscoveryPathRequest::timeout: f64",
-        "pub rns_transport::actor::TransportActor::discovery_path_requests: std::collections::hash::map::HashMap<[u8; 16], rns_transport::actor::DiscoveryPathRequest>"
+        "pub rns_transport::actor::TransportActor::discovery_path_requests: std::collections::hash::map::HashMap<[u8; 16], rns_transport::actor::DiscoveryPathRequest>",
+        "pub rns_transport::discovery::DiscoveryInterfaceConfig::height: f64",
+        "pub rns_transport::discovery::DiscoveryInterfaceConfig::latitude: f64",
+        "pub rns_transport::discovery::DiscoveryInterfaceConfig::longitude: f64",
+        "pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::height: f64",
+        "pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::latitude: f64",
+        "pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::longitude: f64",
+        "pub rns_transport::discovery::app_data::DiscoveryInfo::height: f64",
+        "pub rns_transport::discovery::app_data::DiscoveryInfo::latitude: f64",
+        "pub rns_transport::discovery::app_data::DiscoveryInfo::longitude: f64"
       ]
     }
   }

@@ -729,8 +729,8 @@ fn discovered_json(record: &DiscoveredInterface) -> serde_json::Value {
     })
 }
 
-fn finite_location(value: f64) -> Option<f64> {
-    value.is_finite().then_some(value)
+fn finite_location(value: Option<f64>) -> Option<f64> {
+    value.filter(|number| number.is_finite())
 }
 
 fn print_discovered_summary(records: &[DiscoveredInterface]) {
@@ -877,14 +877,18 @@ fn discovered_config_entry(record: &DiscoveredInterface) -> String {
     lines.join("\n")
 }
 
-fn location_summary(latitude: f64, longitude: f64, height: f64) -> String {
-    if latitude == 0.0 && longitude == 0.0 {
+fn location_summary(latitude: Option<f64>, longitude: Option<f64>, height: Option<f64>) -> String {
+    let latitude = finite_location(latitude);
+    let longitude = finite_location(longitude);
+    let height = finite_location(height);
+    if latitude.is_none() && longitude.is_none() && height.is_none() {
         return "N/A".to_string();
     }
-    if height != 0.0 {
-        format!("{latitude:.4}, {longitude:.4}, {height:.0}m h")
-    } else {
-        format!("{latitude:.4}, {longitude:.4}")
+    let latitude = latitude.map_or_else(|| "N/A".into(), |v| format!("{v:.4}"));
+    let longitude = longitude.map_or_else(|| "N/A".into(), |v| format!("{v:.4}"));
+    match height {
+        Some(height) => format!("{latitude}, {longitude}, {height:.0}m h"),
+        None => format!("{latitude}, {longitude}"),
     }
 }
 
@@ -1458,6 +1462,41 @@ fn json_str(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_location_display_preserves_absence_and_real_zero() {
+        assert_eq!(location_summary(None, None, None), "N/A");
+        assert_eq!(
+            location_summary(Some(0.0), Some(0.0), Some(0.0)),
+            "0.0000, 0.0000, 0m h"
+        );
+        assert_eq!(
+            location_summary(Some(0.0), None, Some(0.0)),
+            "0.0000, N/A, 0m h"
+        );
+        assert_eq!(location_summary(None, None, Some(0.0)), "N/A, N/A, 0m h");
+        assert_eq!(finite_location(None), None);
+        assert_eq!(finite_location(Some(0.0)), Some(0.0));
+        assert_eq!(finite_location(Some(f64::NAN)), None);
+        let record = DiscoveredInterface {
+            info: rns_transport::discovery::app_data::DiscoveryInfo {
+                height: Some(0.0),
+                ..Default::default()
+            },
+            network_id: [0; 16],
+            hops: 0,
+            stamp_value: 14,
+            stamp: vec![0; 32],
+            discovered: 1,
+            last_heard: 2,
+            heard_count: 1,
+            status: None,
+        };
+        let rendered = discovered_json(&record);
+        assert!(rendered["latitude"].is_null());
+        assert!(rendered["longitude"].is_null());
+        assert_eq!(rendered["height"], 0.0);
+    }
 
     fn test_args() -> Args {
         Args {

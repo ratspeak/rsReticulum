@@ -741,6 +741,7 @@ pub async fn spawn_rnode_multi_interface(
     // stays ordered relative to each data frame.
     let (write_tx, mut write_rx) = mpsc::channel::<WriteRequest>(256);
 
+    let mut background_lanes = Vec::with_capacity(num_subs);
     let mut handles = Vec::with_capacity(num_subs);
     let mut sub_txb: Vec<Arc<AtomicU64>> = Vec::with_capacity(num_subs);
     let mut sub_rxb: Vec<Arc<AtomicU64>> = Vec::with_capacity(num_subs);
@@ -760,6 +761,14 @@ pub async fn spawn_rnode_multi_interface(
         // Adapt the per-handle `Vec<u8>` channel into the shared WriteRequest
         // channel so the handle type stays symmetric with other interfaces.
         let (sub_tx, mut sub_rx) = mpsc::channel::<Bytes>(256);
+        let background = crate::background_announce::register(&sub_tx)?;
+        background_lanes.push((
+            sub_cfg.vport,
+            background,
+            config.flow_control || sub_cfg.flow_control,
+            txb.clone(),
+            sub_onlines[i].clone(),
+        ));
         let write_tx_clone = write_tx.clone();
         let vport = sub_cfg.vport;
         let sub_flow_control = config.flow_control || sub_cfg.flow_control;
@@ -859,13 +868,56 @@ pub async fn spawn_rnode_multi_interface(
             ok
         })
         .map(|(interval, callsign)| (Duration::from_secs(interval), Bytes::from(callsign)));
-    let beacon_vports: Vec<u8> = config.subinterfaces.iter().map(|s| s.vport).collect();
+    let beacon_vports: Vec<_> = config
+        .subinterfaces
+        .iter()
+        .map(|sub| (sub.vport, config.flow_control || sub.flow_control))
+        .collect();
 
     tokio::spawn(async move {
         let mut port_w = port_write;
+        let mut background_cursor = 0usize;
+        let mut pending_beacons = std::collections::VecDeque::<WriteRequest>::new();
         let mut first_tx: Option<tokio::time::Instant> = None;
         loop {
-            let req = if let Some((interval, ref callsign)) = beacon {
+            let mut background_packet = None;
+            let mut background_request = None;
+            if write_rx.is_empty() && pending_beacons.is_empty() && online_w.load(Ordering::SeqCst)
+            {
+                for offset in 0..background_lanes.len() {
+                    let index = (background_cursor + offset) % background_lanes.len();
+                    let (vport, lane, flow_control, txb, online) = &background_lanes[index];
+                    if online.load(Ordering::SeqCst)
+                        && lane.ordinary_is_empty()
+                        && let Some(packet) = lane.try_start_when(rns_transport::now_f64(), || {
+                            !*flow_control
+                                || ready_w
+                                    .compare_exchange(
+                                        true,
+                                        false,
+                                        Ordering::SeqCst,
+                                        Ordering::SeqCst,
+                                    )
+                                    .is_ok()
+                        })
+                    {
+                        txb.fetch_add(packet.raw().len() as u64, Ordering::Relaxed);
+                        background_request = Some(WriteRequest {
+                            index: *vport,
+                            data: packet.raw().clone(),
+                            flow_control: *flow_control,
+                        });
+                        background_packet = Some(packet);
+                        background_cursor = (index + 1) % background_lanes.len();
+                        break;
+                    }
+                }
+            }
+            let req = if let Some(request) = pending_beacons.pop_front() {
+                request
+            } else if let Some(request) = background_request {
+                request
+            } else if let Some((interval, ref callsign)) = beacon {
                 match tokio::time::timeout(Duration::from_secs(1), write_rx.recv()).await {
                     Ok(Some(req)) => req,
                     Ok(None) => break,
@@ -879,27 +931,23 @@ pub async fn spawn_rnode_multi_interface(
                             "RNodeMulti transmitting station-ID beacon on all subinterfaces"
                         );
                         first_tx = None;
-                        let mut frames = Vec::new();
-                        for &vport in &beacon_vports {
-                            frames
-                                .extend_from_slice(&build_subinterface_data_frame(vport, callsign));
+                        // Each beacon is a complete radio packet and consumes
+                        // its own READY permit in the common writer below.
+                        for &(vport, flow_control) in &beacon_vports {
+                            pending_beacons.push_back(WriteRequest {
+                                index: vport,
+                                data: callsign.clone(),
+                                flow_control,
+                            });
                         }
-                        match crate::serial_io::blocking_write_all(port_w, frames).await {
-                            Ok(p) => {
-                                port_w = p;
-                                continue;
-                            }
-                            Err(_) => {
-                                flags_w.trip_device();
-                                break;
-                            }
-                        }
+                        continue;
                     }
                 }
             } else {
-                match write_rx.recv().await {
-                    Some(req) => req,
-                    None => break,
+                match tokio::time::timeout(Duration::from_millis(100), write_rx.recv()).await {
+                    Ok(Some(req)) => req,
+                    Ok(None) => break,
+                    Err(_) => continue,
                 }
             };
             if !online_w.load(Ordering::SeqCst) {
@@ -913,15 +961,15 @@ pub async fn spawn_rnode_multi_interface(
                 }
             }
 
-            if req.flow_control {
-                // Bound CMD_READY wait at ~5 s so a stuck TNC can't block tx.
-                let mut wait_count = 0;
-                while !ready_w.load(Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    wait_count += 1;
-                    if !online_w.load(Ordering::SeqCst) || wait_count > 500 {
-                        break;
+            if req.flow_control && background_packet.is_none() {
+                while ready_w
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    if !online_w.load(Ordering::SeqCst) {
+                        return;
                     }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
 
@@ -1055,8 +1103,9 @@ pub async fn spawn_rnode_multi_interface(
                             }
 
                             rnode::CMD_READY => {
-                                let is_ready = frame.first().copied().unwrap_or(0) != 0;
-                                ready_r.store(is_ready, Ordering::SeqCst);
+                                if frame.len() == 1 {
+                                    ready_r.store(frame[0] != 0, Ordering::SeqCst);
+                                }
                             }
 
                             rnode::CMD_DETECT => {

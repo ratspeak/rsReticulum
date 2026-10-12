@@ -133,3 +133,33 @@ pub mod shared_ownership {
         let _ = rns_runtime::reticulum::ReticulumHandle::startup_interface_failures;
     }
 }
+
+/// The 1.4 discovery API distinguishes unknown components from true zeros.
+pub mod nullable_discovery {
+    use rns_transport::discovery::DiscoveryInterfaceConfig;
+    use rns_transport::discovery::app_data::DiscoveryInfo;
+
+    pub fn literal() -> DiscoveryInfo {
+        DiscoveryInfo {
+            name: "coordinate-fixture".into(),
+            interface_type: "BackboneInterface".into(),
+            latitude: Some(0.0),
+            longitude: Some(0.0),
+            height: None,
+            ..DiscoveryInfo::default()
+        }
+    }
+
+    pub fn configured() -> DiscoveryInterfaceConfig {
+        let mut config =
+            DiscoveryInterfaceConfig::backbone("relay".into(), "127.0.0.1".into(), 4965);
+        config.latitude = Some(0.0);
+        config.longitude = None;
+        config.height = Some(0.0);
+        config
+    }
+
+    pub fn read(info: &DiscoveryInfo) -> [Option<f64>; 3] {
+        [info.latitude, info.longitude, info.height]
+    }
+}

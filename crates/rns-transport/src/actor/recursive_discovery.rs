@@ -280,7 +280,7 @@ impl TransportActor {
                             && entry.mode != InterfaceMode::Roaming))
                 });
             if eligible {
-                self.send_to_interface(id, response);
+                self.send_or_retain_announce(id, response, true);
             }
         }
     }

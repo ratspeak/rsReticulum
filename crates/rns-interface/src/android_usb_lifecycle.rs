@@ -406,6 +406,7 @@ impl std::fmt::Display for UsbWriteFailure {
 }
 
 struct UsbWriteRequest {
+    background: Option<UsbBackgroundState>,
     phase: UsbWritePhase,
     bytes: Vec<u8>,
     deadline: Option<Instant>,
@@ -544,7 +545,15 @@ impl UsbTxGate {
     }
 }
 
+#[derive(Clone)]
+struct UsbBackgroundState {
+    lane: crate::background_announce::BackgroundAnnounceReceiver,
+    pending: Arc<Mutex<Option<rns_transport::background_egress::BackgroundPacket>>>,
+    ordinary_pending: Arc<AtomicBool>,
+}
+
 struct UsbWriteQueueState {
+    background: Option<(UsbBackgroundState, Arc<UsbTxGate>, Arc<AtomicU64>)>,
     requests: VecDeque<UsbWriteRequest>,
     accepting: bool,
     cancelled: bool,
@@ -567,6 +576,7 @@ impl UsbWriteQueue {
         Self {
             inner: Arc::new(UsbWriteQueueInner {
                 state: Mutex::new(UsbWriteQueueState {
+                    background: None,
                     requests: VecDeque::new(),
                     accepting: true,
                     cancelled: false,
@@ -609,6 +619,7 @@ impl UsbWriteQueue {
             });
         }
         state.requests.push_back(UsbWriteRequest {
+            background: None,
             phase,
             bytes,
             deadline,
@@ -647,6 +658,7 @@ impl UsbWriteQueue {
         self.inner.slots.close();
         state.requests.clear();
         state.requests.push_back(UsbWriteRequest {
+            background: None,
             phase,
             bytes,
             deadline: Some(deadline),
@@ -676,11 +688,45 @@ impl UsbWriteQueue {
             if state.worker_closed {
                 return None;
             }
+            if state.accepting
+                && let Some((background, gate, txb)) = &state.background
+                && background.lane.ordinary_is_empty()
+                && !background.ordinary_pending.load(Ordering::Acquire)
+            {
+                let mut pending = background.pending.lock().unwrap();
+                let permitted = if pending.is_some() {
+                    gate.take_permit()
+                } else {
+                    *pending = background
+                        .lane
+                        .try_start_when(rns_transport::now_f64(), || gate.take_permit());
+                    pending.is_some()
+                };
+                if permitted {
+                    let packet = pending.as_ref().unwrap();
+                    return Some(UsbWriteRequest {
+                        background: Some(background.clone()),
+                        phase: UsbWritePhase::Packet,
+                        bytes: kiss::frame(packet.raw()),
+                        deadline: Some(Instant::now() + USB_PACKET_WRITE_DEADLINE),
+                        acknowledgement: None,
+                        await_terminal_detach_on_failure: false,
+                        packet: Some(UsbPacketWrite {
+                            transmitted_bytes: txb.clone(),
+                            payload_len: packet.raw().len() as u64,
+                            gate: None,
+                            completed: Arc::new(AtomicBool::new(false)),
+                        }),
+                        _permit: None,
+                    });
+                }
+            }
             state = self
                 .inner
                 .wake
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .wait_timeout(state, Duration::from_millis(100))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
         }
     }
 
@@ -1132,6 +1178,11 @@ where
         } else {
             write_request(&mut backend, &request, default_timeout)
         };
+        if result.is_ok()
+            && let Some(background) = &request.background
+        {
+            background.pending.lock().unwrap().take();
+        }
         // write_request publishes known complete packet writes even if the
         // async waiter disappeared or its deadline elapsed. This is USB
         // completion, never proof of RF TX or recipient delivery.
@@ -1604,6 +1655,7 @@ pub(crate) enum UsbTxPumpExit {
 }
 
 pub(crate) struct UsbApplicationQueue {
+    background: Option<UsbBackgroundState>,
     receiver: mpsc::Receiver<Bytes>,
     pending: Option<UsbPendingPacket>,
 }
@@ -1625,10 +1677,24 @@ impl UsbPendingPacket {
 }
 
 impl UsbApplicationQueue {
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) fn with_background(
+        mut self,
+        lane: crate::background_announce::BackgroundAnnounceReceiver,
+    ) -> Self {
+        self.background = Some(UsbBackgroundState {
+            lane,
+            pending: Arc::new(Mutex::new(None)),
+            ordinary_pending: Arc::new(AtomicBool::new(false)),
+        });
+        self
+    }
+
     pub(crate) fn new(receiver: mpsc::Receiver<Bytes>) -> Self {
         Self {
             receiver,
             pending: None,
+            background: None,
         }
     }
 }
@@ -1661,6 +1727,11 @@ pub(crate) async fn run_usb_tx_pump(
         _ = &mut stop => return UsbTxPumpExit::StopRequested,
         queue = application_rx.lock() => queue,
     };
+    if let Some(background) = &application_rx.background {
+        background.lane.retire_generation();
+        writer.queue.inner.state.lock().unwrap().background =
+            Some((background.clone(), gate.clone(), transmitted_bytes.clone()));
+    }
     let mut first_tx: Option<tokio::time::Instant> = None;
     loop {
         if application_rx
@@ -1672,6 +1743,9 @@ pub(crate) async fn run_usb_tx_pump(
             // completion. Reconnects reach here only after old workers join;
             // incomplete/unknown writes keep their original payload instead.
             let packet = application_rx.pending.take().expect("completed USB packet");
+            if let Some(background) = &application_rx.background {
+                background.ordinary_pending.store(false, Ordering::Release);
+            }
             if packet.station_id {
                 first_tx = None;
             } else if first_tx.is_none() {
@@ -1716,6 +1790,9 @@ pub(crate) async fn run_usb_tx_pump(
                 && first_tx.is_some_and(|started| started.elapsed() >= interval)
             {
                 application_rx.pending = Some(UsbPendingPacket::new(callsign.clone(), true));
+                if let Some(background) = &application_rx.background {
+                    background.ordinary_pending.store(true, Ordering::Release);
+                }
             }
             if application_rx.pending.is_none() {
                 let payload = tokio::select! {
@@ -1729,6 +1806,9 @@ pub(crate) async fn run_usb_tx_pump(
                     return UsbTxPumpExit::ApplicationClosed;
                 };
                 application_rx.pending = Some(UsbPendingPacket::new(payload, false));
+                if let Some(background) = &application_rx.background {
+                    background.ordinary_pending.store(true, Ordering::Release);
+                }
                 continue;
             }
         }
@@ -4448,6 +4528,7 @@ mod tests {
 
         let observed_timeout = Arc::new(Mutex::new(None));
         let request = UsbWriteRequest {
+            background: None,
             phase: UsbWritePhase::Detach,
             bytes: vec![1, 2, 3],
             deadline: Some(Instant::now() + Duration::from_millis(15)),
@@ -5409,5 +5490,73 @@ mod tests {
         assert!(leases.reserve_opening("device").is_err());
         assert!(leases.release_opening("device").is_err());
         assert!(leases.release_active("device").is_err());
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_actor_usb_final_writer_obeys_ready_and_ordinary_priority() {
+        let scripted = ScriptedWriter::new([]);
+        let calls = scripted.calls.clone();
+        let io = test_io(scripted, Arc::new(Mutex::new(Vec::new())));
+        let (tx, rx) = mpsc::channel(2);
+        let background = crate::background_announce::register(&tx).unwrap();
+        let queue = Arc::new(tokio::sync::Mutex::new(
+            UsbApplicationQueue::new(rx).with_background(background.clone()),
+        ));
+        let (mut inbound, _driver) = projected_inbound();
+        let gate = UsbTxGate::new(true, Arc::new(AtomicBool::new(false)));
+        inbound.attach_tx_gate(gate.clone());
+        for (command, frame) in required_protocol_frames(USB_TEST_TARGET) {
+            inbound.project_frame(command, &frame);
+        }
+        inbound.project_frame(rnode::CMD_READY, &[0]);
+        let transmitted = Arc::new(AtomicU64::new(0));
+        let (stop, stopped) = oneshot::channel();
+        let pump = tokio::spawn(run_usb_tx_pump(
+            queue,
+            io.writer.clone(),
+            transmitted.clone(),
+            None,
+            gate,
+            stopped,
+        ));
+        tokio::task::yield_now().await;
+        let (actor, control, raw) = crate::background_announce::scheduled_actor(tx.clone());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(background.has_offer());
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(tx.capacity(), 2);
+        assert!(
+            io.writer
+                .queue
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .is_empty()
+        );
+        tx.send(Bytes::from_static(b"local control")).await.unwrap();
+        inbound.project_frame(rnode::CMD_READY, &[1]);
+        wait_for_count(&transmitted, 13).await;
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(bytes, _)| bytes.clone())
+                .collect::<Vec<_>>(),
+            vec![kiss::frame(b"local control")]
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        inbound.project_frame(rnode::CMD_READY, &[1]);
+        wait_for_count(&transmitted, 13 + raw.len() as u64).await;
+        assert_eq!(calls.lock().unwrap()[1].0, kiss::frame(&raw));
+        stop.send(()).unwrap();
+        assert_eq!(pump.await.unwrap(), UsbTxPumpExit::StopRequested);
+        let _ = io
+            .shutdown(None, Duration::from_millis(20), Duration::from_secs(1))
+            .await;
+        control.send(TransportMessage::Shutdown).await.unwrap();
+        actor.await.unwrap();
     }
 }

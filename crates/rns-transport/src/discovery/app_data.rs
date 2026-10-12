@@ -26,9 +26,9 @@ use super::constants::{DISCOVERABLE_INTERFACE_TYPES, FLAG_ENCRYPTED, STAMP_SIZE,
 
 /// A decoded discovery info payload. Mirrors the Python `info` dict.
 ///
-/// Optional fields mirror Python's presence-or-absence of keys. Required
-/// fields (NAME, TRANSPORT_ID, INTERFACE_TYPE, TRANSPORT, LATITUDE,
-/// LONGITUDE, HEIGHT) are always present.
+/// Location keys are always emitted, with `nil` for each unknown component.
+/// Missing location keys and integer numbers are accepted for compatibility
+/// with older Rust callers; Python requires present keys with nil or floats.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DiscoveryInfo {
     /// Human-readable interface name (key `0xFF`).
@@ -41,10 +41,11 @@ pub struct DiscoveryInfo {
     pub transport_enabled: bool,
     /// Endpoint address (IP/hostname/b32 for I2P) — optional (key `0x02`).
     pub reachable_on: Option<String>,
-    /// Geolocation (keys `0x03` / `0x04` / `0x05`).
-    pub latitude: f64,
-    pub longitude: f64,
-    pub height: f64,
+    /// Independent optional geolocation (keys `0x03` / `0x04` / `0x05`).
+    /// `Some(0.0)` is a real coordinate; absence is `None`.
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub height: Option<f64>,
     /// TCP/Backbone bind port (key `0x06`).
     pub port: Option<u16>,
     /// IFAC virtual-network overlay (keys `0x07` / `0x08`).
@@ -167,9 +168,18 @@ fn info_to_map(info: &DiscoveryInfo) -> Vec<(Value, Value)> {
             Value::Binary(info.transport_id.to_vec()),
         ),
         (u8_key(key::NAME), Value::from(info.name.clone())),
-        (u8_key(key::LATITUDE), Value::F64(info.latitude)),
-        (u8_key(key::LONGITUDE), Value::F64(info.longitude)),
-        (u8_key(key::HEIGHT), Value::F64(info.height)),
+        (
+            u8_key(key::LATITUDE),
+            info.latitude.map_or(Value::Nil, Value::F64),
+        ),
+        (
+            u8_key(key::LONGITUDE),
+            info.longitude.map_or(Value::Nil, Value::F64),
+        ),
+        (
+            u8_key(key::HEIGHT),
+            info.height.map_or(Value::Nil, Value::F64),
+        ),
     ];
 
     if let Some(addr) = &info.reachable_on {
@@ -385,14 +395,15 @@ fn value_as_bytes(v: &Value, kb: u8) -> Result<Vec<u8>, AppDataError> {
     }
 }
 
-fn value_as_f64(v: &Value, kb: u8) -> Result<f64, AppDataError> {
+fn value_as_f64(v: &Value, kb: u8) -> Result<Option<f64>, AppDataError> {
     match v {
-        Value::F64(f) => Ok(*f),
-        Value::F32(f) => Ok(*f as f64),
-        Value::Integer(n) => Ok(n.as_f64().unwrap_or(0.0)),
+        Value::Nil => Ok(None),
+        Value::F64(f) => Ok(Some(*f)),
+        Value::F32(f) => Ok(Some(*f as f64)),
+        Value::Integer(n) => Ok(n.as_f64()),
         _ => Err(AppDataError::TypeMismatch {
             key: kb,
-            expected: "float",
+            expected: "float or nil",
         }),
     }
 }
@@ -415,9 +426,9 @@ mod tests {
             interface_type: "BackboneInterface".into(),
             transport_enabled: true,
             reachable_on: Some("relay.example.org".into()),
-            latitude: 51.5074,
-            longitude: -0.1278,
-            height: 35.0,
+            latitude: Some(51.5074),
+            longitude: Some(-0.1278),
+            height: Some(35.0),
             port: Some(4965),
             ifac_netname: Some("mynet".into()),
             ifac_netkey: Some("hunter2".into()),
@@ -431,14 +442,98 @@ mod tests {
             transport_id: [0x22; 16],
             interface_type: "RNodeInterface".into(),
             transport_enabled: false,
-            latitude: 52.5200,
-            longitude: 13.4050,
-            height: 50.0,
+            latitude: Some(52.5200),
+            longitude: Some(13.4050),
+            height: Some(50.0),
             frequency: Some(869_525_000),
             bandwidth: Some(125_000),
             spreading_factor: Some(8),
             coding_rate: Some(5),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn independent_nullable_coordinates_preserve_zero_and_hash() {
+        let mut hashes = std::collections::HashSet::new();
+        for mask in 0..8 {
+            let mut info = sample_backbone();
+            info.latitude = (mask & 1 != 0).then_some(0.0);
+            info.longitude = (mask & 2 != 0).then_some(0.0);
+            info.height = (mask & 4 != 0).then_some(0.0);
+            let encoded = encode_info(&info).unwrap();
+            assert!(hashes.insert(encoded.infohash));
+            assert_eq!(decode_info(&encoded.packed).unwrap(), info);
+        }
+    }
+
+    #[test]
+    fn nullable_decoder_preserves_existing_leniencies_and_rejects_wrong_types() {
+        let info = sample_backbone();
+        let encode_map = |coordinate: Option<Value>| {
+            let mut entries = info_to_map(&info);
+            entries.retain(|(k, _)| k.as_u64() != Some(key::LATITUDE.into()));
+            if let Some(coordinate) = coordinate {
+                entries.push((u8_key(key::LATITUDE), coordinate));
+            }
+            let mut bytes = Vec::new();
+            rmpv::encode::write_value(&mut bytes, &Value::Map(entries)).unwrap();
+            bytes
+        };
+        assert_eq!(decode_info(&encode_map(None)).unwrap().latitude, None);
+        assert_eq!(
+            decode_info(&encode_map(Some(Value::Nil))).unwrap().latitude,
+            None
+        );
+        assert_eq!(
+            decode_info(&encode_map(Some(Value::from(0))))
+                .unwrap()
+                .latitude,
+            Some(0.0)
+        );
+        for value in [
+            Value::Boolean(false),
+            Value::from("0"),
+            Value::Array(vec![]),
+            Value::Map(vec![]),
+        ] {
+            assert!(matches!(
+                decode_info(&encode_map(Some(value))),
+                Err(AppDataError::TypeMismatch {
+                    key: key::LATITUDE,
+                    ..
+                })
+            ));
+        }
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let decoded = decode_info(&encode_map(Some(Value::F64(value))))
+                .unwrap()
+                .latitude
+                .unwrap();
+            assert!(if value.is_nan() {
+                decoded.is_nan()
+            } else {
+                decoded == value
+            });
+        }
+    }
+
+    #[test]
+    fn default_locations_encode_nil() {
+        let info = DiscoveryInfo {
+            interface_type: "BackboneInterface".into(),
+            ..Default::default()
+        };
+        let encoded = encode_info(&info).unwrap();
+        let value = rmpv::decode::read_value(&mut Cursor::new(encoded.packed)).unwrap();
+        for key in [key::LATITUDE, key::LONGITUDE, key::HEIGHT] {
+            let coordinate = value
+                .as_map()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.as_u64() == Some(key.into()))
+                .unwrap();
+            assert_eq!(coordinate.1, Value::Nil);
         }
     }
 

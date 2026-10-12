@@ -231,22 +231,21 @@ impl TransportActor {
             self.packet_hashlist.insert(pkt_hash);
             // Python's outbound applies should_apply_delta on attached-
             // interface sends too (Transport.py:1342-1345).
-            let sent = if self.should_apply_delta(&parsed, interface_id) {
+            if self.should_apply_delta(&parsed, interface_id) {
                 let transport_insert = parsed.flags.packet_type
                     == rns_wire::flags::PacketType::Announce
                     && parsed.flags.header_type == rns_wire::flags::HeaderType::Header1;
                 let mangled = self.mangle_hops(&request.raw, &parsed, transport_insert);
-                self.send_to_interface(interface_id, &mangled)
+                if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce {
+                    self.send_or_retain_announce(interface_id, &mangled, true)
+                } else {
+                    self.send_to_interface(interface_id, &mangled)
+                }
+            } else if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce {
+                self.send_or_retain_announce(interface_id, &request.raw, true)
             } else {
                 self.send_to_interface(interface_id, &request.raw)
-            };
-            if sent
-                && parsed.flags.packet_type == rns_wire::flags::PacketType::Announce
-                && let Some(entry) = self.interfaces.get_mut(&interface_id)
-            {
-                entry.ingress.sent_announce();
             }
-            sent
         } else {
             false
         }

@@ -271,6 +271,20 @@ fn claim_ble_packet_permit(flow_control: bool, ready: &AtomicBool) -> bool {
             .is_ok()
 }
 
+fn select_ble_background(
+    lane: &crate::background_announce::BackgroundAnnounceReceiver,
+    normal_empty: bool,
+    flow_control: bool,
+    ready: &AtomicBool,
+) -> Option<rns_transport::background_egress::BackgroundPacket> {
+    if !normal_empty {
+        return None;
+    }
+    lane.try_start_when(rns_transport::now_f64(), || {
+        claim_ble_packet_permit(flow_control, ready)
+    })
+}
+
 /// Packet admission becomes latched only after the physical generation has
 /// completed its startup boundary.  Later protocol evidence may degrade the
 /// observation snapshot, but cannot retroactively turn valid active-session
@@ -2688,6 +2702,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
     let task_rxb = shared_rxb.clone();
     let task_txb = shared_txb.clone();
     let (tx, mut outbound_rx) = mpsc::channel::<Bytes>(256);
+    let background = crate::background_announce::register(&tx)?;
     let running = register_running(id);
     let (snapshot_publisher, driver) = rnode::new_rnode_driver_observation_with_shutdown(
         RNodeTransportClass::Ble,
@@ -2738,6 +2753,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
         let _cleanup = Cleanup(id, running_task.clone());
 
         let mut pending_outbound: Option<PendingOutbound> = None;
+        let mut pending_background = None;
         let mut first_tx: Option<tokio::time::Instant> = None;
 
         loop {
@@ -3333,6 +3349,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             );
             active_packet_admission.observe_readiness(protocol_state.readiness());
 
+            background.retire_generation();
             let ready = AtomicBool::new(true);
 
             let mut last_rssi: Option<f32> = None;
@@ -3498,7 +3515,22 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                     }
                 }
 
-                if pending_outbound.is_some() && claim_ble_packet_permit(flow_control, &ready) {
+                let background_permitted = if pending_outbound.is_none() && outbound_rx.is_empty() {
+                    if let Some(packet) =
+                        select_ble_background(&background, true, flow_control, &ready)
+                    {
+                        pending_outbound = Some(PendingOutbound::new(packet.raw().clone(), false));
+                        pending_background = Some(packet);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if pending_outbound.is_some()
+                    && (background_permitted || claim_ble_packet_permit(flow_control, &ready))
+                {
                     let pending = pending_outbound
                         .as_ref()
                         .expect("pending BLE outbound checked above");
@@ -3522,6 +3554,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                                 first_tx = Some(tokio::time::Instant::now());
                             }
                             pending_outbound = None;
+                            drop(pending_background.take());
                         }
                         Err(error) => {
                             trace_ble_lifecycle(
@@ -3669,6 +3702,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
     let task_rxb = shared_rxb.clone();
     let task_txb = shared_txb.clone();
     let (tx, mut outbound_rx) = mpsc::channel::<Bytes>(256);
+    let background = crate::background_announce::register(&tx)?;
 
     let bitrate = rnode::calculate_bitrate(
         config.spreading_factor,
@@ -3697,6 +3731,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
         let mut backoff = RECONNECT_WAIT;
         let mut initial_attempt = true;
         let mut pending_outbound: Option<NativePendingOutbound> = None;
+        let mut pending_background = None;
         let mut first_tx: Option<tokio::time::Instant> = None;
         // Retain this acknowledgement boundary across native TCP/GATT
         // generations. A failed generation retries; a Ready generation makes
@@ -4090,6 +4125,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                 snapshot_publisher.sync_protocol_state(&protocol_state);
             }
 
+            background.retire_generation();
             let ready = AtomicBool::new(true);
             let mut active_packet_admission = ActiveBlePacketAdmission::for_startup_policy(
                 options.requires_capability_admission(),
@@ -4219,6 +4255,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                                     );
                                     break 'read;
                                 }
+                                drop(pending_background.take());
                                 let completed = pending_outbound.take().expect(
                                     "matching bridge acknowledgement requires pending data",
                                 );
@@ -4298,10 +4335,28 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                     }
                 }
 
+                let background_permitted = if pending_outbound.is_none() && outbound_rx.is_empty() {
+                    if let Some(packet) =
+                        select_ble_background(&background, true, flow_control, &ready)
+                    {
+                        pending_outbound = Some(NativePendingOutbound::new(PendingOutbound::new(
+                            packet.raw().clone(),
+                            false,
+                        )));
+                        pending_background = Some(packet);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
                 let should_write = pending_outbound
                     .as_ref()
                     .is_some_and(|pending| pending.expected_ack.is_none());
-                if should_write && claim_ble_packet_permit(flow_control, &ready) {
+                if should_write
+                    && (background_permitted || claim_ble_packet_permit(flow_control, &ready))
+                {
                     let pending = pending_outbound
                         .as_ref()
                         .expect("native pending outbound checked above");
@@ -7220,5 +7275,43 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(2)).await;
         handle.online.store(false, Ordering::SeqCst);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn background_actor_ble_selection_preserves_ready_and_control_for_1000_windows() {
+        let (ordinary, mut ordinary_rx) = mpsc::channel(2);
+        let background = crate::background_announce::register(&ordinary).unwrap();
+        let (actor, control, raw) =
+            crate::background_announce::scheduled_actor_with_backlog(ordinary.clone(), 1100);
+        let ready = AtomicBool::new(false);
+        for _ in 0..1000 {
+            control
+                .send(TransportMessage::Tick(rns_transport::messages::TimerTick {
+                    timestamp: rns_transport::now_f64(),
+                }))
+                .await
+                .unwrap();
+            tokio::time::advance(Duration::from_secs(134)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                select_ble_background(&background, ordinary_rx.is_empty(), true, &ready).is_none()
+            );
+            assert_eq!(ordinary.capacity(), 2);
+        }
+        assert!(background.has_offer());
+        ordinary.send(Bytes::from_static(b"local")).await.unwrap();
+        ready.store(true, Ordering::SeqCst);
+        assert!(select_ble_background(&background, ordinary_rx.is_empty(), true, &ready).is_none());
+        assert!(ready.load(Ordering::SeqCst));
+        assert_eq!(ordinary_rx.recv().await.unwrap().as_ref(), b"local");
+        assert!(claim_ble_packet_permit(true, &ready));
+        assert!(select_ble_background(&background, true, true, &ready).is_none());
+        ready.store(true, Ordering::SeqCst);
+        let packet = select_ble_background(&background, true, true, &ready).unwrap();
+        assert_eq!(packet.raw(), &raw);
+        assert!(!ready.load(Ordering::SeqCst));
+        assert!(select_ble_background(&background, true, true, &ready).is_none());
+        drop(packet);
+        control.send(TransportMessage::Shutdown).await.unwrap();
+        actor.await.unwrap();
     }
 }

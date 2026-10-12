@@ -20,6 +20,23 @@
 
 
 
+## 1.4.0 - 2026-10-12
+
+Source candidate; a versioned source change does not publish a release tag.
+
+- Represent unknown discovery latitude, longitude and height independently as
+  `None` instead of zero; accept Python nil coordinates and preserve presence
+  through configuration, storage and `rnstatus-rs`. This is a deliberate Rust
+  API change: see the [1.4 migration guide](api/migrations/1.4.md).
+- Register and own the interface-discovery destination, and commit publication
+  intervals only after actual driver admission. Preserve pending discovery
+  announcements across bounded egress backpressure and reconnect.
+- Keep learned mesh announcements out of the ordinary RNode control/data
+  backlog until the final writer can send them. Preserve same-radio relay,
+  nominal announce pacing and complete-packet flow control. Retain refused
+  local announces and attached path answers under finite, generation-specific
+  admission ownership.
+
 ## 1.3.0 - 2026-09-10
 
 - Breaking Rust API: recursive discovery now has one private operation owner.

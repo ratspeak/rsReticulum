@@ -1,5 +1,6 @@
 //! Periodic discovery announce scheduler. Pure-data: `tick(now)` returns
-//! one [`AnnounceRequest`] per due interface; the runtime owns the timer +
+//! one [`AnnounceRequest`] per due interface. Runtime owners use `prepare` and
+//! `commit` to advance the interval only after driver admission. The runtime owns the timer +
 //! identity-signed emit. Memoises `(infohash, stamp)` per interface so an
 //! unchanged info doesn't redo PoW.
 
@@ -43,10 +44,10 @@ pub struct DiscoveryInterfaceConfig {
     pub coding_rate: Option<u8>,
     pub modulation: Option<String>,
     pub channel: Option<u16>,
-    /// Geolocation (defaults to 0/0/0).
-    pub latitude: f64,
-    pub longitude: f64,
-    pub height: f64,
+    /// Independent optional geolocation (unknown by default).
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub height: Option<f64>,
     /// Set the `FLAG_ENCRYPTED` bit; caller supplies `encrypt` closure at
     /// announce time via [`Announcer::tick`].
     pub encrypt: bool,
@@ -75,9 +76,9 @@ impl DiscoveryInterfaceConfig {
             coding_rate: None,
             modulation: None,
             channel: None,
-            latitude: 0.0,
-            longitude: 0.0,
-            height: 0.0,
+            latitude: None,
+            longitude: None,
+            height: None,
             encrypt: false,
             signed: true,
         }
@@ -96,7 +97,9 @@ impl DiscoveryInterfaceConfig {
 struct InterfaceAnnounceState {
     config: DiscoveryInterfaceConfig,
     transport_id: [u8; 16],
-    last_announce_at: f64,
+    last_announce_at: Option<f64>,
+    generation: u64,
+    prepared: Option<PreparedAnnounce>,
     /// Cached `(infohash, stamp)` pair so a repeat announce doesn't
     /// redo proof-of-work when the info map is unchanged.
     stamp_cache: Option<([u8; 32], Vec<u8>)>,
@@ -111,6 +114,21 @@ pub struct AnnounceRequest {
     pub app_data: Vec<u8>,
     /// Stamp value actually achieved — useful for logging.
     pub stamp_value: u8,
+}
+
+/// One cached publication for an exact registered configuration. Its opaque
+/// generation prevents a late admission from committing a replaced interface.
+#[derive(Debug, Clone)]
+pub struct PreparedAnnounce {
+    owner: Arc<()>,
+    request: AnnounceRequest,
+    generation: u64,
+}
+
+impl PreparedAnnounce {
+    pub fn request(&self) -> &AnnounceRequest {
+        &self.request
+    }
 }
 
 /// Why an interface was skipped on a given tick.
@@ -135,15 +153,19 @@ pub type EncryptFn<'a> = &'a dyn Fn(&[u8]) -> Option<Vec<u8>>;
 
 /// Pure-data scheduler. Not async, holds no timer — drive via `tick`.
 pub struct Announcer {
+    owner: Arc<()>,
     stamper: Arc<dyn DiscoveryStamper>,
     interfaces: HashMap<InterfaceId, InterfaceAnnounceState>,
+    next_generation: u64,
 }
 
 impl Announcer {
     pub fn new(stamper: Arc<dyn DiscoveryStamper>) -> Self {
         Self {
+            owner: Arc::new(()),
             stamper,
             interfaces: HashMap::new(),
+            next_generation: 0,
         }
     }
 
@@ -155,12 +177,18 @@ impl Announcer {
         transport_id: [u8; 16],
         config: DiscoveryInterfaceConfig,
     ) {
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("discovery generation exhausted");
         self.interfaces.insert(
             interface_id,
             InterfaceAnnounceState {
                 config,
                 transport_id,
-                last_announce_at: 0.0,
+                last_announce_at: None,
+                generation: self.next_generation,
+                prepared: None,
                 stamp_cache: None,
             },
         );
@@ -180,13 +208,33 @@ impl Announcer {
         self.interfaces.is_empty()
     }
 
-    /// Return announces due at `now` plus the skip list (so tests can
-    /// assert on both). `encrypt` is required only when a config has `encrypt=true`.
+    /// Compatibility convenience: prepare and immediately commit every result.
+    /// Runtime publishers should use [`Self::prepare`] and [`Self::commit`] so
+    /// a failed egress does not consume the success interval.
     pub fn tick(
         &mut self,
         now: f64,
         encrypt: Option<EncryptFn<'_>>,
     ) -> (Vec<AnnounceRequest>, Vec<(InterfaceId, SkipReason)>) {
+        let (prepared, skips) = self.prepare(now, encrypt);
+        let requests = prepared
+            .into_iter()
+            .map(|prepared| {
+                self.commit(&prepared, now);
+                prepared.request
+            })
+            .collect();
+        (requests, skips)
+    }
+
+    /// Prepare due publications without advancing their success interval.
+    /// Repeated calls return the same bytes (including ciphertext) until commit
+    /// or replacement; callers keep at most one dispatch per prepared result.
+    pub fn prepare(
+        &mut self,
+        now: f64,
+        encrypt: Option<EncryptFn<'_>>,
+    ) -> (Vec<PreparedAnnounce>, Vec<(InterfaceId, SkipReason)>) {
         let mut out = Vec::new();
         let mut skips = Vec::new();
 
@@ -201,10 +249,15 @@ impl Announcer {
             }
 
             let interval = state.config.announce_interval_secs as f64;
-            let elapsed = now - state.last_announce_at;
-            if state.last_announce_at > 0.0 && elapsed < interval {
+            let elapsed = state.last_announce_at.map(|last| now - last);
+            if let Some(elapsed) = elapsed.filter(|elapsed| *elapsed < interval) {
                 let remaining_secs = (interval - elapsed).max(0.0) as u64;
                 skips.push((*id, SkipReason::RateLimited { remaining_secs }));
+                continue;
+            }
+
+            if let Some(prepared) = &state.prepared {
+                out.push(prepared.clone());
                 continue;
             }
 
@@ -226,6 +279,9 @@ impl Announcer {
                 },
             };
 
+            // Cache work before encryption as well: a missing key must not
+            // make the next preparation repeat proof-of-work.
+            state.stamp_cache = Some((infohash, stamp.clone()));
             let encoded = Encoded {
                 packed: packed.clone(),
                 infohash,
@@ -255,9 +311,6 @@ impl Announcer {
             };
 
             let stamp_value = self.stamper.value(&infohash, &stamp);
-            state.last_announce_at = now;
-            state.stamp_cache = Some((infohash, stamp));
-
             trace!(
                 interface_id = id,
                 name = %state.config.name,
@@ -265,11 +318,17 @@ impl Announcer {
                 "discovery announce prepared"
             );
 
-            out.push(AnnounceRequest {
-                interface_id: *id,
-                app_data: blob,
-                stamp_value,
-            });
+            let prepared = PreparedAnnounce {
+                owner: self.owner.clone(),
+                request: AnnounceRequest {
+                    interface_id: *id,
+                    app_data: blob,
+                    stamp_value,
+                },
+                generation: state.generation,
+            };
+            state.prepared = Some(prepared.clone());
+            out.push(prepared);
         }
 
         debug!(
@@ -279,6 +338,29 @@ impl Announcer {
             "discovery announcer tick"
         );
         (out, skips)
+    }
+
+    /// Record first actual driver admission for this exact publication.
+    /// A duplicate or replaced-generation result cannot restart the interval.
+    pub fn commit(&mut self, prepared: &PreparedAnnounce, now: f64) -> bool {
+        let Some(state) = self.interfaces.get_mut(&prepared.request.interface_id) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&self.owner, &prepared.owner)
+            || state.generation != prepared.generation
+            || state.prepared.is_none()
+        {
+            return false;
+        }
+        state.last_announce_at = Some(now);
+        state.prepared = None;
+        // A new publication, even with unchanged information, gets a new token.
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("discovery generation exhausted");
+        state.generation = self.next_generation;
+        true
     }
 }
 
@@ -348,6 +430,48 @@ mod tests {
             stamp: vec![0xBB; STAMP_SIZE],
             value: 16,
         })
+    }
+
+    #[test]
+    fn preparation_retries_exact_bytes_until_admission_and_rejects_stale_commit() {
+        let mut a = Announcer::new(static_stamper());
+        let mut cfg = sample_backbone();
+        cfg.encrypt = true;
+        cfg.announce_interval_secs = 6 * 60 * 60;
+        a.register(1, [0x11; 16], cfg.clone());
+        let encrypted = std::cell::Cell::new(0);
+        let encrypt = |pt: &[u8]| {
+            encrypted.set(encrypted.get() + 1);
+            Some(pt.to_vec())
+        };
+        let first = a.prepare(0.0, Some(&encrypt)).0.remove(0);
+        let mut unrelated = Announcer::new(static_stamper());
+        unrelated.register(1, [0x11; 16], cfg.clone());
+        unrelated.prepare(0.0, Some(&|pt| Some(pt.to_vec())));
+        assert!(
+            !unrelated.commit(&first, 1.0),
+            "tokens belong to one scheduler"
+        );
+        let retry = a.prepare(2.0, Some(&encrypt)).0.remove(0);
+        assert_eq!(first.request().app_data, retry.request().app_data);
+        assert_eq!(encrypted.get(), 1, "retries retain exact ciphertext");
+        assert!(a.commit(&retry, 2.0));
+        assert!(
+            !a.commit(&first, 3.0),
+            "late duplicate cannot restart interval"
+        );
+        assert!(a.prepare(3.0, Some(&encrypt)).0.is_empty());
+        let next = a.prepare(21603.0, Some(&encrypt)).0.remove(0);
+        cfg.latitude = Some(0.0);
+        a.register(1, [0x11; 16], cfg);
+        assert!(
+            !a.commit(&next, 21604.0),
+            "old config cannot consume new interval"
+        );
+        let replaced = a.prepare(21604.0, Some(&encrypt)).0.remove(0);
+        assert_ne!(next.request().app_data, replaced.request().app_data);
+        a.deregister(1);
+        assert!(!a.commit(&replaced, 21605.0));
     }
 
     #[test]
@@ -464,6 +588,17 @@ mod tests {
         let _ = a.tick(2000.0, None);
         let _ = a.tick(3000.0, None);
         assert_eq!(*count_probe.count.lock().unwrap(), 1);
+
+        let mut encrypted = sample_backbone();
+        encrypted.encrypt = true;
+        a.register(1, [0x11; 16], encrypted);
+        assert_eq!(a.prepare(4000.0, None).1[0].1, SkipReason::EncryptorMissing);
+        assert_eq!(a.prepare(4060.0, None).1[0].1, SkipReason::EncryptorMissing);
+        assert_eq!(
+            *count_probe.count.lock().unwrap(),
+            2,
+            "missing encryption key retains completed work"
+        );
     }
 
     #[test]

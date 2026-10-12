@@ -80,6 +80,15 @@ pub async fn spawn_kiss_interface(
             crate::traits::InterfaceError::SendFailed(format!("kiss serial open: {}", e))
         })?;
 
+    spawn_kiss_with_port(config, id, transport_tx, port).await
+}
+
+async fn spawn_kiss_with_port(
+    config: KissInterfaceConfig,
+    id: InterfaceId,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    port: Box<dyn serialport::SerialPort>,
+) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
     tracing::info!(
         name = %config.name,
         port = %config.port,
@@ -91,6 +100,7 @@ pub async fn spawn_kiss_interface(
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
     let (tx, mut rx) = mpsc::channel::<Bytes>(256);
+    let background = crate::background_announce::register(&tx)?;
     let name = config.name.clone();
     let mode = config.mode;
     let flow_control = config.flow_control;
@@ -139,7 +149,19 @@ pub async fn spawn_kiss_interface(
         // beacon; cleared when the beacon goes out.
         let mut first_tx: Option<tokio::time::Instant> = None;
         loop {
-            let data = if let Some((interval, ref callsign)) = beacon {
+            let background_packet = if rx.is_empty() && online_w.load(Ordering::SeqCst) {
+                background.try_start_when(rns_transport::now_f64(), || {
+                    !flow_control
+                        || ready_w
+                            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                })
+            } else {
+                None
+            };
+            let data = if let Some(packet) = &background_packet {
+                packet.raw().clone()
+            } else if let Some((interval, ref callsign)) = beacon {
                 match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
                     Ok(Some(data)) => data,
                     Ok(None) => break,
@@ -153,9 +175,10 @@ pub async fn spawn_kiss_interface(
                     }
                 }
             } else {
-                match rx.recv().await {
-                    Some(data) => data,
-                    None => break,
+                match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                    Ok(Some(data)) => data,
+                    Ok(None) => break,
+                    Err(_) => continue,
                 }
             };
 
@@ -173,14 +196,12 @@ pub async fn spawn_kiss_interface(
             }
 
             txb_w.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            // Flow control: bounded wait so a stuck TNC can't hang transmit.
-            if flow_control {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                while !ready_w.load(Ordering::SeqCst) {
-                    if tokio::time::Instant::now() >= deadline {
-                        tracing::warn!("KISS flow control timeout, proceeding anyway");
-                        break;
-                    }
+            // READY is one packet permit. A timeout must never synthesize it.
+            if flow_control && background_packet.is_none() {
+                while ready_w
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     if !online_w.load(Ordering::SeqCst) {
                         return;
@@ -333,5 +354,60 @@ mod tests {
     fn test_kiss_config_mode() {
         let cfg = KissInterfaceConfig::new("kiss0", "/dev/ttyS0", 9600);
         assert_eq!(cfg.mode, InterfaceMode::Full);
+    }
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_actor_kiss_pty_preserves_control_and_one_packet_ready() {
+        use serialport::SerialPort;
+        use std::io::{Read, Write};
+        let (mut master, slave) = serialport::TTYPort::pair().unwrap();
+        let name = slave.name().unwrap();
+        master.set_timeout(Duration::from_millis(300)).unwrap();
+        let (inbound, mut received) = mpsc::channel(4);
+        let mut config = KissInterfaceConfig::new("arbitrary TNC", &name, 9600);
+        config.flow_control = true;
+        // macOS pseudo terminals cannot accept the hardware baud ioctl;
+        // inject the already-open pair into the same production driver.
+        let driver = spawn_kiss_with_port(config, 1, inbound, Box::new(slave))
+            .await
+            .unwrap();
+        let mut revoke = kiss::frame_with_command(kiss::CMD_READY, &[0]);
+        revoke.extend(kiss::frame(b"read barrier"));
+        master.write_all(&revoke).unwrap();
+        received.recv().await.unwrap();
+        let (actor, control, raw) = crate::background_announce::scheduled_actor(driver.tx.clone());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut probe = [0; 2048];
+        assert!(
+            master.read(&mut probe).is_err(),
+            "no timeout may synthesize READY"
+        );
+        driver
+            .tx
+            .send(Bytes::from_static(b"local control"))
+            .await
+            .unwrap();
+        master
+            .write_all(&kiss::frame_with_command(kiss::CMD_READY, &[1]))
+            .unwrap();
+        let expected = kiss::frame(b"local control");
+        let mut actual = vec![0; expected.len()];
+        master.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert!(
+            master.read(&mut probe).is_err(),
+            "one READY cannot write two packets"
+        );
+        master
+            .write_all(&kiss::frame_with_command(kiss::CMD_READY, &[1]))
+            .unwrap();
+        let expected = kiss::frame(&raw);
+        let mut actual = vec![0; expected.len()];
+        master.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        driver.online.store(false, Ordering::SeqCst);
+        control.send(TransportMessage::Shutdown).await.unwrap();
+        actor.await.unwrap();
+        driver.read_task.await.unwrap();
     }
 }

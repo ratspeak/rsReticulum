@@ -5,9 +5,13 @@ impl TransportActor {
     pub(super) fn on_tick(&mut self) {
         let now = now_f64();
 
+        self.process_background_starts();
+
         // Established-Link packets that encountered temporary interface
         // backpressure are retained per Link and retried in FIFO order.
         self.drain_link_endpoint_egress();
+        self.process_pending_announce_admissions();
+        self.report_announce_pressure(now);
 
         // Startup grace delays cache cleanup so freshly restored entries
         // aren't immediately aged out before the first traffic arrives.
@@ -86,11 +90,13 @@ impl TransportActor {
                     )
                 });
                 if let Some((raw, _source_iface, Some(attached_interface), true)) = send_info {
-                    self.send_to_interface(attached_interface, &raw);
-                    self.announce_table.remove(&hash);
-                    if let Some(held_entry) = self.held_announces.remove(hash.as_bytes()) {
-                        self.announce_table.insert(*hash.as_bytes(), held_entry);
-                    }
+                    let timestamp = self.announce_table.get(&hash).unwrap().timestamp;
+                    self.admit_cached_response(
+                        *hash.as_bytes(),
+                        attached_interface,
+                        &raw,
+                        timestamp,
+                    );
                     continue;
                 }
                 if let Some(entry) = self.announce_table.get_mut(&hash) {
@@ -420,6 +426,8 @@ impl TransportActor {
                 !entry.announce_queue.is_empty()
                     && now >= entry.announce_allowed_at
                     && entry.direction.outbound
+                    && !interface_marked_offline(entry)
+                    && !self.offered_announces.contains_key(&iface_id)
             } else {
                 false
             };
@@ -461,13 +469,84 @@ impl TransportActor {
             };
 
             if let Some((idx, raw)) = selected {
-                self.send_to_interface(iface_id, &raw);
+                let destination = rns_wire::header::PacketHeader::unpack(&raw)
+                    .ok()
+                    .map(|(h, _)| h.destination_hash);
+                let obsolete = rns_wire::header::PacketHeader::unpack(&raw)
+                    .ok()
+                    .is_some_and(|(header, _)| {
+                        !self.local_destinations.contains(&header.destination_hash)
+                            && self
+                                .path_table
+                                .get_live(&header.destination_hash)
+                                .is_some_and(|path| {
+                                    path.packet_hash.is_some_and(|hash| {
+                                        hash != rns_wire::hash::packet_hash(
+                                            &raw,
+                                            header.flags.header_type,
+                                        )
+                                    })
+                                })
+                    });
+                if obsolete
+                    || destination
+                        .is_none_or(|dest| !self.interface_allows_announce(iface_id, &dest, None))
+                {
+                    if let Some(entry) = self.interfaces.get_mut(&iface_id) {
+                        entry.announce_queue.remove(idx);
+                    }
+                    continue;
+                }
+                if let Some(entry) = self.interfaces.get(&iface_id)
+                    && let Some(background) = crate::background_egress::lookup(&entry.tx)
+                {
+                    let bytes = if let Some(key) = &entry.ifac_key {
+                        Bytes::from(crate::ifac::ifac_sign(&raw, key, entry.ifac_size))
+                    } else {
+                        raw.clone()
+                    };
+                    let expires = entry.announce_queue[idx].time + QUEUED_ANNOUNCE_LIFE;
+                    if let Some(receipt) = background.try_offer(bytes, expires, now) {
+                        self.announce_pressure.offered += 1;
+                        self.offered_announces.insert(
+                            iface_id,
+                            announce_admission::OfferedAnnounce {
+                                channel: entry.tx.clone(),
+                                raw: raw.clone(),
+                                destination: destination.unwrap(),
+                                route: self
+                                    .path_table
+                                    .get_live(&destination.unwrap())
+                                    .map(path_recovery::RouteVersion::from_path),
+                                policy: (
+                                    entry.bitrate,
+                                    entry.announce_cap.to_bits(),
+                                    entry.ifac_key,
+                                    entry.ifac_size,
+                                ),
+                                receipt,
+                            },
+                        );
+                    }
+                    continue;
+                }
+                match self.try_send_to_interface(iface_id, &raw) {
+                    InterfaceSendOutcome::Sent => {}
+                    InterfaceSendOutcome::Full | InterfaceSendOutcome::Offline => continue,
+                    _ => {
+                        if let Some(entry) = self.interfaces.get_mut(&iface_id) {
+                            entry.announce_queue.remove(idx);
+                        }
+                        continue;
+                    }
+                }
 
                 if let Some(entry) = self.interfaces.get_mut(&iface_id) {
                     let bitrate = entry.bitrate.max(1) as f64;
                     let packet_time = (raw.len() as f64 * 8.0) / bitrate;
                     let announce_delay = packet_time / entry.announce_cap.max(0.001);
                     entry.announce_allowed_at = now + announce_delay;
+                    entry.ingress.sent_announce();
 
                     if idx < entry.announce_queue.len() {
                         entry.announce_queue.remove(idx);
@@ -588,9 +667,11 @@ impl TransportActor {
     /// of fresh announces isn't starved by a backlog of stale ones.
     pub(super) fn cull_announce_queues(&mut self, now: f64) {
         for iface in self.interfaces.values_mut() {
+            let before = iface.announce_queue.len();
             iface
                 .announce_queue
                 .retain(|entry| now - entry.time < QUEUED_ANNOUNCE_LIFE);
+            self.announce_pressure.expired += (before - iface.announce_queue.len()) as u64;
             if iface.announce_queue.len() > MAX_QUEUED_ANNOUNCES {
                 let excess = iface.announce_queue.len() - MAX_QUEUED_ANNOUNCES;
                 iface.announce_queue.drain(..excess);

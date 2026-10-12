@@ -26,6 +26,7 @@ use crate::traffic::TrafficCounter;
 use crate::tunnel::TunnelTable;
 use rns_wire::receipt::{PacketReceipt, ReceiptStatus};
 
+mod announce_admission;
 mod inbound;
 mod link_endpoint;
 mod maintenance;
@@ -79,6 +80,11 @@ struct LinkEndpointQueuedPacket {
 /// reaching into the tables directly.
 pub struct TransportActor {
     rx: mpsc::Receiver<TransportMessage>,
+    announce_dispatch_tx: mpsc::Sender<crate::announce_dispatch::AnnounceDispatchRequest>,
+    announce_dispatch_rx: mpsc::Receiver<crate::announce_dispatch::AnnounceDispatchRequest>,
+    pending_announce_admissions: VecDeque<announce_admission::PendingAnnounce>,
+    announce_pressure: announce_admission::AnnouncePressure,
+    offered_announces: HashMap<InterfaceId, announce_admission::OfferedAnnounce>,
     persistence_tx: mpsc::Sender<()>,
     persistence_rx: mpsc::Receiver<()>,
     path_recovery_tx: mpsc::Sender<crate::path_recovery::PathRecoveryRequest>,
@@ -353,6 +359,8 @@ impl TransportActor {
         hashlist_cap: usize,
     ) -> (Self, mpsc::Sender<TransportMessage>) {
         let (tx, rx) = mpsc::channel(channel_cap);
+        let (announce_dispatch_tx, announce_dispatch_rx) =
+            mpsc::channel(crate::announce_dispatch::CAPACITY);
         let (persistence_tx, persistence_rx) = mpsc::channel(1);
         let (path_recovery_tx, path_recovery_rx) =
             mpsc::channel(crate::path_recovery::RECOVERY_QUEUE_CAPACITY);
@@ -361,6 +369,11 @@ impl TransportActor {
 
         let actor = Self {
             rx,
+            announce_dispatch_tx,
+            announce_dispatch_rx,
+            pending_announce_admissions: VecDeque::new(),
+            announce_pressure: announce_admission::AnnouncePressure::default(),
+            offered_announces: HashMap::new(),
             persistence_tx,
             persistence_rx,
             path_recovery_tx,
@@ -490,6 +503,9 @@ impl TransportActor {
                         Some(msg) => self.handle_message(msg),
                     }
                 }
+                Some(request) = self.announce_dispatch_rx.recv() => {
+                    self.handle_announce_dispatch(request);
+                }
                 Some(()) = self.persistence_rx.recv() => {
                     self.save_state_async();
                 }
@@ -530,9 +546,7 @@ impl TransportActor {
         let _span =
             tracing::span!(tracing::Level::DEBUG, "actor.handle_message", msg = variant).entered();
         match msg {
-            TransportMessage::Inbound(packet) => {
-                self.on_inbound(packet);
-            }
+            TransportMessage::Inbound(packet) => self.on_inbound(packet),
             TransportMessage::Outbound(request) => {
                 let attempt = self.local_link_attempt(&request);
                 if attempt.is_some() {
@@ -743,6 +757,7 @@ impl TransportActor {
                         q: None,
                     };
                     self.on_inbound(inbound);
+                    self.process_background_starts();
                     return;
                 }
 
@@ -780,6 +795,7 @@ impl TransportActor {
             }
             TransportMessage::Rpc { query, response_tx } => {
                 let response = self.handle_query(query);
+                self.process_background_starts();
                 let _ = response_tx.send(response);
             }
             TransportMessage::RegisterAnnounceHandler {
@@ -849,6 +865,7 @@ impl TransportActor {
                 debug!(enabled, "setting transport enabled");
                 self.is_transport_enabled = enabled;
                 if !enabled {
+                    self.cancel_background_announcements();
                     self.cancel_recursive_discovery();
                 }
                 // The runtime sends the identity before the enable flag, so
@@ -861,6 +878,9 @@ impl TransportActor {
                     hash = hex::encode(identity_hash),
                     "setting transport identity"
                 );
+                if self.internal_identity_hash != Some(identity_hash) {
+                    self.cancel_background_announcements();
+                }
                 self.internal_identity_hash = Some(identity_hash);
                 self.apply_transport_identity_policy();
                 self.load_python_blackhole_if_ready();
@@ -913,6 +933,7 @@ impl TransportActor {
                 if self.interfaces.contains_key(&id) {
                     self.retire_recursive_discovery_interface(id);
                     self.retire_path_request_admissions(id);
+                    self.retire_announce_interface(id);
                     self.terminate_link_endpoints_for_interface(
                         id,
                         crate::messages::LinkEndpointTerminalReason::InterfaceRemoved,
@@ -1063,6 +1084,7 @@ impl TransportActor {
             }
             TransportMessage::Shutdown => unreachable!(),
         }
+        self.process_background_starts();
     }
 
     fn is_local_client_interface(&self, id: InterfaceId) -> bool {
@@ -1290,7 +1312,7 @@ impl TransportActor {
         }
         let raw = self.transport_announce_from_raw(cached_raw, destination_hash, hops, context);
         for id in ids {
-            self.send_to_interface(id, &raw);
+            self.send_or_retain_announce(id, &raw, true);
         }
     }
 
@@ -1463,6 +1485,7 @@ impl TransportActor {
             .retain(|_, waiting_interface| *waiting_interface != id);
         self.retire_recursive_discovery_interface(id);
         self.retire_path_request_admissions(id);
+        self.retire_announce_interface(id);
         self.interfaces.remove(&id);
         if role == Some(InterfaceRole::SharedInstancePeer) {
             tracing::warn!(
@@ -1777,13 +1800,10 @@ impl TransportActor {
                     let transport_insert =
                         h.flags.header_type == rns_wire::flags::HeaderType::Header1;
                     let mangled = self.mangle_hops(raw, h, transport_insert);
-                    self.send_to_interface(id, &mangled)
+                    self.send_or_retain_announce(id, &mangled, false)
                 }
-                _ => self.send_to_interface(id, raw),
+                _ => self.send_or_retain_announce(id, raw, false),
             };
-            if sent && let Some(entry) = self.interfaces.get_mut(&id) {
-                entry.ingress.sent_announce();
-            }
             accepted |= sent;
         }
         accepted
@@ -1827,12 +1847,14 @@ impl TransportActor {
                     .zip(existing_emitted)
                     .is_some_and(|(new, old)| new > old)
                 {
+                    self.announce_pressure.coalesced += 1;
                     existing.time = now;
                     existing.hops = hops;
                     existing.raw = shared.clone();
                 }
                 continue;
             }
+            self.announce_pressure.queued += 1;
             entry.announce_queue.push(crate::messages::QueuedAnnounce {
                 destination_hash,
                 time: now,
@@ -2021,6 +2043,7 @@ fn mode_discovers_unknown_paths(mode: InterfaceMode) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod announce_admission;
     mod discovery_api;
     mod link_endpoint_dispatch;
     mod slow_media_discovery;

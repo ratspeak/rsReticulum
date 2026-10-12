@@ -71,6 +71,10 @@ AutoInterface's interoperable UDP ports or alter Reticulum wire formats.
 
 ## Stability
 
+The 1.4 line changes the six discovery coordinate fields to `Option<f64>` so
+unknown values remain distinct from real zero. See the
+[1.4 migration guide](migrations/1.4.md) for source, wire and storage behavior.
+
 The 1.3 line deliberately replaces publicly mutable recursive discovery state
 with detached observations and exact requester cancellation. See the
 [1.3 migration guide](migrations/1.3.md). Normal runtime lookup/recovery APIs

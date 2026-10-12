@@ -247,9 +247,9 @@ fn encode_record(rec: &DiscoveredInterface) -> Result<Vec<u8>, StorageError> {
     map.push((s("hops"), Value::from(rec.hops)));
     map.push((s("value"), Value::from(rec.stamp_value)));
     map.push((s("stamp"), Value::Binary(rec.stamp.clone())));
-    map.push((s("latitude"), Value::F64(i.latitude)));
-    map.push((s("longitude"), Value::F64(i.longitude)));
-    map.push((s("height"), Value::F64(i.height)));
+    map.push((s("latitude"), i.latitude.map_or(Value::Nil, Value::F64)));
+    map.push((s("longitude"), i.longitude.map_or(Value::Nil, Value::F64)));
+    map.push((s("height"), i.height.map_or(Value::Nil, Value::F64)));
     if let Some(addr) = &i.reachable_on {
         map.push((s("reachable_on"), Value::from(addr.clone())));
     }
@@ -315,9 +315,9 @@ fn decode_record(bytes: &[u8]) -> Result<DiscoveredInterface, StorageError> {
         transport_id: hex16(&lookup, "transport_id").unwrap_or([0; 16]),
         name: str_or_default(&lookup, "name"),
         reachable_on: str_opt(&lookup, "reachable_on"),
-        latitude: f64_or_default(&lookup, "latitude"),
-        longitude: f64_or_default(&lookup, "longitude"),
-        height: f64_or_default(&lookup, "height"),
+        latitude: f64_optional(&lookup, "latitude"),
+        longitude: f64_optional(&lookup, "longitude"),
+        height: f64_optional(&lookup, "height"),
         port: u64_opt(&lookup, "port").map(|n| n.min(u16::MAX as u64) as u16),
         ifac_netname: str_opt(&lookup, "ifac_netname"),
         ifac_netkey: str_opt(&lookup, "ifac_netkey"),
@@ -377,12 +377,12 @@ fn bool_or_default(lookup: &HashMap<String, Value>, k: &str) -> bool {
     }
 }
 
-fn f64_or_default(lookup: &HashMap<String, Value>, k: &str) -> f64 {
+fn f64_optional(lookup: &HashMap<String, Value>, k: &str) -> Option<f64> {
     match lookup.get(k) {
-        Some(Value::F64(f)) => *f,
-        Some(Value::F32(f)) => *f as f64,
-        Some(Value::Integer(n)) => n.as_f64().unwrap_or(0.0),
-        _ => 0.0,
+        Some(Value::F64(f)) => Some(*f),
+        Some(Value::F32(f)) => Some(*f as f64),
+        Some(Value::Integer(n)) => n.as_f64(),
+        _ => None,
     }
 }
 
@@ -435,9 +435,9 @@ mod tests {
                 interface_type: "BackboneInterface".into(),
                 transport_enabled: true,
                 reachable_on: Some("1.2.3.4".into()),
-                latitude: 0.0,
-                longitude: 0.0,
-                height: 0.0,
+                latitude: Some(0.0),
+                longitude: Some(0.0),
+                height: Some(0.0),
                 port: Some(4965),
                 ..Default::default()
             },
@@ -450,6 +450,62 @@ mod tests {
             heard_count: 0,
             status: None,
         }
+    }
+
+    #[test]
+    fn nullable_disk_records_reload_and_update_without_losing_metadata() {
+        let dir = tmpdir("nullable_reload");
+        let store = DiscoveryStore::open(&dir).unwrap();
+        for mask in 0..8 {
+            let mut original = record(&format!("mask-{mask}"), [mask; 16]);
+            original.last_heard = unix_now();
+            original.info.latitude = (mask & 1 != 0).then_some(0.0);
+            original.info.longitude = (mask & 2 != 0).then_some(0.0);
+            original.info.height = (mask & 4 != 0).then_some(0.0);
+            store.upsert(original.clone()).unwrap();
+            let reopened = DiscoveryStore::open(&dir).unwrap();
+            let read = reopened
+                .list(None)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.info.name == original.info.name)
+                .unwrap();
+            assert_eq!(read.info, original.info);
+            assert_eq!(read.discovered, original.discovered);
+            assert_eq!(read.last_heard, original.last_heard);
+            assert_eq!(read.heard_count, 1);
+            assert_eq!(read.network_id, original.network_id);
+            let mut update = original.clone();
+            update.discovered += 123;
+            reopened.upsert(update).unwrap();
+            let read = reopened
+                .load_raw(&reopened.root().join(original.filename()))
+                .unwrap();
+            assert_eq!(read.discovered, original.discovered);
+            assert_eq!(read.heard_count, 2);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_disk_nil_missing_and_numeric_zero_are_distinct() {
+        let original = record("legacy", [3; 16]);
+        let encoded = encode_record(&original).unwrap();
+        let Value::Map(mut entries) = rmpv::decode::read_value(&mut &encoded[..]).unwrap() else {
+            panic!("map");
+        };
+        entries.retain(|(k, _)| k.as_str() != Some("height"));
+        for (k, v) in &mut entries {
+            if k.as_str() == Some("longitude") {
+                *v = Value::Nil;
+            }
+        }
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &Value::Map(entries)).unwrap();
+        let read = decode_record(&bytes).unwrap();
+        assert_eq!(read.info.latitude, Some(0.0));
+        assert_eq!(read.info.longitude, None);
+        assert_eq!(read.info.height, None);
     }
 
     #[test]

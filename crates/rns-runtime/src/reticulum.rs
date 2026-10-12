@@ -3,7 +3,7 @@
 //! to a Shared instance over a local socket; **Standalone** owns its
 //! interfaces and exposes no IPC. Python: `RNS/Reticulum.py`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -385,6 +385,7 @@ pub struct ReticulumHandle {
     pub transport_tx: mpsc::Sender<TransportMessage>,
     path_recovery: rns_transport::path_recovery::PathRecoveryHandle,
     link_endpoint_dispatch: rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle,
+    announce_dispatch: rns_transport::announce_dispatch::AnnounceDispatchHandle,
     pub config_dir: PathBuf,
     pub instance_mode: InstanceMode,
     pub interface_configs: Vec<interface_factory::InterfaceConfig>,
@@ -1080,6 +1081,7 @@ impl Default for DiscoveryRuntime {
 struct LocalDiscoveryInterface {
     id: u64,
     config: DiscoveryInterfaceConfig,
+    online: Option<Arc<AtomicBool>>,
 }
 
 impl ReticulumHandle {
@@ -2851,6 +2853,7 @@ pub async fn init_with_policy(
     let persistence_trigger = actor.persistence_trigger();
     let path_recovery = actor.path_recovery_handle();
     let link_endpoint_dispatch = actor.link_endpoint_dispatch_handle();
+    let announce_dispatch = actor.announce_dispatch_handle();
     actor.is_foreground = is_foreground.clone();
     actor.initialize_storage(paths.storage_dir.clone());
     // Python 1.3.8 Transport.py:234-238: non-transport nodes get a fresh
@@ -3424,6 +3427,10 @@ pub async fn init_with_policy(
                 Ok(iface_handles) => {
                     let pending_rnode =
                         pending_configured_rnode_runtime(iface_config, &iface_handles);
+                    let discovery_online: HashMap<_, _> = iface_handles
+                        .iter()
+                        .map(|owned| (owned.interface.id, owned.interface.online.clone()))
+                        .collect();
                     match register_interfaces_with_post_init_batch(
                         &transport_tx,
                         iface_handles,
@@ -3448,6 +3455,7 @@ pub async fn init_with_policy(
                                         LocalDiscoveryInterface {
                                             id: registered_id,
                                             config: cfg.clone(),
+                                            online: discovery_online.get(&registered_id).cloned(),
                                         },
                                     );
                                 }
@@ -3493,6 +3501,7 @@ pub async fn init_with_policy(
         transport_tx: transport_tx.clone(),
         path_recovery,
         link_endpoint_dispatch,
+        announce_dispatch,
         config_dir: config_dir.clone(),
         instance_mode,
         interface_configs: interfaces,
@@ -5782,16 +5791,13 @@ fn discovery_config_for_interface(
             .map(|v| v.min(u16::MAX as u64) as u16),
         latitude: section
             .get_float("discovery_latitude")
-            .or_else(|| section.get_float("latitude"))
-            .unwrap_or(0.0),
+            .or_else(|| section.get_float("latitude")),
         longitude: section
             .get_float("discovery_longitude")
-            .or_else(|| section.get_float("longitude"))
-            .unwrap_or(0.0),
+            .or_else(|| section.get_float("longitude")),
         height: section
             .get_float("discovery_height")
-            .or_else(|| section.get_float("height"))
-            .unwrap_or(0.0),
+            .or_else(|| section.get_float("height")),
         encrypt: section.get_bool("discovery_encrypt").unwrap_or(false),
         signed: false,
     })
@@ -5910,7 +5916,7 @@ async fn start_on_network_discovery(handle: ReticulumHandle) {
     }
 
     let locals = handle.discovery.local_interfaces.lock().await.clone();
-    if !locals.is_empty() {
+    if handle.instance_mode != InstanceMode::Client && !locals.is_empty() {
         let mut started = handle.discovery.announcer_started.lock().await;
         if !*started {
             *started = true;
@@ -5960,54 +5966,172 @@ async fn run_discovery_announcer(
     stamper: Arc<dyn DiscoveryStamper + Send + Sync>,
     locals: Vec<LocalDiscoveryInterface>,
 ) {
-    let mut announcer = Announcer::new(stamper);
-    for local in locals {
-        announcer.register(local.id, handle.transport_identity.hash, local.config);
-    }
+    run_discovery_publisher(&handle, stamper, locals).await;
+    *handle.discovery.announcer_started.lock().await = false;
+}
+
+async fn run_discovery_publisher(
+    handle: &ReticulumHandle,
+    stamper: Arc<dyn DiscoveryStamper + Send + Sync>,
+    locals: Vec<LocalDiscoveryInterface>,
+) {
+    use rns_transport::announce_dispatch::AnnounceDispatchResult;
+    use rns_transport::discovery::announcer::PreparedAnnounce;
 
     let announce_identity = handle
         .network_identity
-        .clone()
-        .unwrap_or_else(|| handle.transport_identity.clone());
-    let encrypt_identity = handle.network_identity.clone();
-    let tick_interval = Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
+        .as_ref()
+        .unwrap_or(&handle.transport_identity);
+    let registration = tokio::select! {
+        _ = handle.shutdown.wait() => return,
+        registration = handle.register_destination(
+            (**announce_identity).clone(),
+            rns_transport::discovery::DISCOVERY_ASPECT_FILTER,
+            crate::destination_runtime::DestinationRuntimeOptions {
+                accepts_links: false,
+                ..Default::default()
+            },
+        ) => match registration {
+            Ok(registration) => registration,
+            Err(error) => {
+                tracing::warn!(%error, "failed to register discovery destination");
+                return;
+            }
+        },
+    };
+
+    struct Publication {
+        prepared: PreparedAnnounce,
+        pending: Option<oneshot::Receiver<AnnounceDispatchResult>>,
+        last_failure: Option<AnnounceDispatchResult>,
+        retry_at: std::time::Instant,
+    }
+    let mut publications: HashMap<u64, Publication> = HashMap::new();
+    let mut announcer = Announcer::new(stamper);
+    let mut registered = HashSet::new();
+    let mut next_prepare = std::time::Instant::now();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        let encrypt = |plaintext: &[u8]| {
-            encrypt_identity
+        tokio::select! {
+            biased;
+            _ = handle.shutdown.wait() => break,
+            _ = handle.transport_tx.closed() => break,
+            _ = tick.tick() => {}
+        }
+        let now = std::time::Instant::now();
+        for local in &locals {
+            let online = local
+                .online
                 .as_ref()
-                .and_then(|identity| identity.encrypt(plaintext, None).ok())
-        };
-        let (requests, _skips) = announcer.tick(unix_now(), Some(&encrypt));
-        for request in requests {
+                .is_none_or(|online| online.load(Ordering::Acquire));
+            if online && registered.insert(local.id) {
+                announcer.register(
+                    local.id,
+                    handle.transport_identity.hash,
+                    local.config.clone(),
+                );
+                next_prepare = now;
+            }
+        }
+        if now >= next_prepare {
+            let encrypt = |plaintext: &[u8]| {
+                handle
+                    .network_identity
+                    .as_ref()
+                    .and_then(|identity| identity.encrypt(plaintext, None).ok())
+            };
+            let (prepared, _) = announcer.prepare(unix_now(), Some(&encrypt));
+            for prepared in prepared {
+                publications
+                    .entry(prepared.request().interface_id)
+                    .or_insert(Publication {
+                        prepared,
+                        pending: None,
+                        last_failure: None,
+                        retry_at: now,
+                    });
+            }
+            next_prepare =
+                now + Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
+        }
+        let mut admitted = Vec::new();
+        for local in &locals {
+            let Some(publication) = publications.get_mut(&local.id) else {
+                continue;
+            };
+            let online = local
+                .online
+                .as_ref()
+                .is_none_or(|online| online.load(Ordering::Acquire));
+            if let Some(pending) = publication.pending.as_mut() {
+                match pending.try_recv() {
+                    Ok(AnnounceDispatchResult::Admitted) => {
+                        announcer.commit(&publication.prepared, unix_now());
+                        admitted.push(local.id);
+                        continue;
+                    }
+                    Ok(result) => {
+                        if publication.last_failure != Some(result) {
+                            tracing::debug!(
+                                interface_id = local.id,
+                                ?result,
+                                "discovery publication not admitted"
+                            );
+                            publication.last_failure = Some(result);
+                        }
+                        publication.pending = None;
+                    }
+                    Err(oneshot::error::TryRecvError::Empty) => {
+                        if !online {
+                            // Recall unadmitted work for a service that went
+                            // offline. Preserve its prepared payload for recovery;
+                            // an already reported admission was handled above.
+                            publication.pending = None;
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        publication.pending = None;
+                    }
+                }
+            }
+            if !online || now < publication.retry_at {
+                continue;
+            }
+            let request = publication.prepared.request();
             match build_announce_packet(
-                &announce_identity,
+                announce_identity,
                 rns_transport::discovery::DISCOVERY_ASPECT_FILTER,
                 Some(&request.app_data),
             ) {
                 Ok(raw) => {
-                    let _ = handle
-                        .transport_tx
-                        .send(TransportMessage::Outbound(OutboundRequest {
-                            raw: Bytes::from(raw),
-                            destination_hash:
-                                rns_identity::destination::Destination::hash_from_name_and_identity(
-                                    rns_transport::discovery::DISCOVERY_ASPECT_FILTER,
-                                    Some(&announce_identity.hash),
-                                ),
-                        }))
-                        .await;
+                    // A full admission lane is retried on the next bounded
+                    // tick without repeating proof-of-work or logging each poll.
+                    if let Ok(pending) = handle.announce_dispatch.try_dispatch(
+                        Bytes::from(raw),
+                        None,
+                        Duration::from_secs(120),
+                    ) {
+                        publication.pending = Some(pending);
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to build discovery announce");
+                Err(error) => {
+                    tracing::warn!(%error, "failed to build discovery announce");
+                    publication.retry_at = now
+                        + Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
                 }
             }
         }
-
-        tokio::select! {
-            _ = handle.shutdown.wait() => break,
-            _ = tokio::time::sleep(tick_interval) => {}
+        for id in admitted {
+            publications.remove(&id);
         }
+    }
+    // Stop unacknowledged dispatch before retiring its local destination.
+    drop(publications);
+    if let Err(error) = registration.close().await {
+        tracing::debug!(%error, "discovery destination close failed");
     }
 }
 
@@ -10016,6 +10140,9 @@ loglevel = 7
             link_endpoint_dispatch: rns_transport::actor::TransportActor::new()
                 .0
                 .link_endpoint_dispatch_handle(),
+            announce_dispatch: rns_transport::actor::TransportActor::new()
+                .0
+                .announce_dispatch_handle(),
             config_dir: PathBuf::from("/tmp/dummy"),
             instance_mode: InstanceMode::Standalone,
             interface_configs: Vec::new(),
@@ -11095,6 +11222,404 @@ loglevel = 7
         }
         fn valid(&self, _infohash: &[u8; 32], _stamp: &[u8], required_value: u8) -> bool {
             required_value <= 16
+        }
+    }
+
+    fn discovery_actor() -> (ReticulumHandle, tokio::task::JoinHandle<()>) {
+        let mut handle = dummy_handle();
+        let (mut actor, tx) = rns_transport::actor::TransportActor::new();
+        actor.transport_identity_hash = Some(handle.transport_identity.hash);
+        handle.transport_tx = tx;
+        handle.announce_dispatch = actor.announce_dispatch_handle();
+        (handle, tokio::spawn(actor.run()))
+    }
+
+    async fn discovery_egress(
+        handle: &ReticulumHandle,
+        id: u64,
+        mode: rns_interface::traits::InterfaceMode,
+        capacity: usize,
+    ) -> (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let mut interface = test_interface_handle(id, None, "discovery-test-egress");
+        interface.mode = mode;
+        interface.tx = tx.clone();
+        register_interface_handle(
+            &handle.transport_tx,
+            interface,
+            &handle.interface_controls,
+            &handle.interface_registry,
+        )
+        .await
+        .unwrap();
+        (tx, rx)
+    }
+
+    fn advertised_service(id: u64, encrypted: bool) -> LocalDiscoveryInterface {
+        let mut config = DiscoveryInterfaceConfig::backbone(
+            format!("service-{id}"),
+            "relay.example.org".into(),
+            4242,
+        );
+        config.encrypt = encrypted;
+        LocalDiscoveryInterface {
+            id,
+            config,
+            online: None,
+        }
+    }
+
+    fn read_discovery_packet(
+        raw: &[u8],
+        handle: &ReticulumHandle,
+    ) -> rns_transport::discovery::app_data::DiscoveryInfo {
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(raw).unwrap();
+        let announce =
+            rns_identity::announce::AnnounceData::unpack(&raw[offset..], header.flags.context_flag)
+                .unwrap();
+        let signer = announce.validate(&header.destination_hash).unwrap();
+        assert_eq!(
+            signer.hash,
+            handle
+                .network_identity
+                .as_ref()
+                .unwrap_or(&handle.transport_identity)
+                .hash
+        );
+        let blob = announce.app_data.unwrap();
+        let body = if blob[0] & rns_transport::discovery::FLAG_ENCRYPTED != 0 {
+            handle
+                .network_identity
+                .as_ref()
+                .unwrap()
+                .decrypt(&blob[1..], None, false)
+                .unwrap()
+        } else {
+            blob[1..].to_vec()
+        };
+        let info =
+            rns_transport::discovery::app_data::decode_info(&body[..body.len() - 32]).unwrap();
+        assert_eq!(info.transport_id, handle.transport_identity.hash);
+        assert_eq!([info.latitude, info.longitude, info.height], [None; 3]);
+        info
+    }
+
+    #[tokio::test]
+    async fn discovery_publisher_registers_selected_signer_and_multiple_services() {
+        use rns_interface::traits::InterfaceMode;
+        for (mode, network, encrypted) in [
+            (InterfaceMode::Full, false, false),
+            (InterfaceMode::Gateway, true, false),
+            (InterfaceMode::Boundary, true, true),
+        ] {
+            let (mut handle, actor) = discovery_actor();
+            if network {
+                handle.network_identity = Some(Arc::new(Identity::new()));
+            }
+            let (_, mut sink) = discovery_egress(&handle, 1, mode, 8).await;
+            let mut radio = advertised_service(43, encrypted);
+            radio.config.interface_type = "RNodeInterface".into();
+            radio.config.reachable_on = None;
+            radio.config.port = None;
+            radio.config.frequency = Some(915_000_000);
+            radio.config.bandwidth = Some(125_000);
+            radio.config.spreading_factor = Some(8);
+            radio.config.coding_rate = Some(5);
+            let publisher = tokio::spawn(run_discovery_announcer(
+                handle.clone(),
+                Arc::new(StaticStamper),
+                vec![advertised_service(42, encrypted), radio],
+            ));
+            let mut names = HashSet::new();
+            for _ in 0..2 {
+                let raw = tokio::time::timeout(Duration::from_secs(3), sink.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                names.insert(read_discovery_packet(&raw, &handle).name);
+            }
+            assert_eq!(
+                names,
+                HashSet::from(["service-42".to_string(), "service-43".to_string()])
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1200), sink.recv())
+                    .await
+                    .is_err(),
+                "admitted services must not replay"
+            );
+            handle.shutdown.trigger();
+            tokio::time::timeout(Duration::from_secs(2), publisher)
+                .await
+                .unwrap()
+                .unwrap();
+            handle
+                .transport_tx
+                .send(TransportMessage::Shutdown)
+                .await
+                .unwrap();
+            actor.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_publisher_recovers_eligibility_fifo_and_services_attached_path_requests() {
+        use rns_interface::traits::InterfaceMode;
+        let (mut handle, actor) = discovery_actor();
+        handle.network_identity = Some(Arc::new(Identity::new()));
+        let (ap_tx, mut ap) = discovery_egress(&handle, 1, InterfaceMode::AccessPoint, 1).await;
+        let online = Arc::new(AtomicBool::new(false));
+        let mut local = advertised_service(42, false);
+        local.online = Some(online.clone());
+        let publisher = tokio::spawn(run_discovery_announcer(
+            handle.clone(),
+            Arc::new(StaticStamper),
+            vec![local],
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1100), ap.recv())
+                .await
+                .is_err()
+        );
+        online.store(true, Ordering::Release);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1100), ap.recv())
+                .await
+                .is_err(),
+            "AP is never general discovery egress"
+        );
+        let (full_tx, mut full) = discovery_egress(&handle, 2, InterfaceMode::Full, 1).await;
+        full_tx.send(Bytes::from_static(b"busy")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(full.recv().await.unwrap(), Bytes::from_static(b"busy"));
+        let raw = tokio::time::timeout(Duration::from_secs(3), full.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        read_discovery_packet(&raw, &handle);
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        assert!(
+            matches!(handle.query_transport(TransportQuery::GetNextHop { dest: header.destination_hash }).await, Some(TransportQueryResponse::HashResult(Some(hash))) if hash == handle.transport_identity.hash)
+        );
+
+        // Reply ownership must survive a full *attached* AP channel too.
+        ap_tx.send(Bytes::from_static(b"busy-path")).await.unwrap();
+        let path_destination = rns_identity::destination::Destination::hash_from_name_and_identity(
+            "rnstransport.path.request",
+            None,
+        );
+        let mut body = header.destination_hash.to_vec();
+        body.extend_from_slice(&[0xA7; 16]);
+        handle
+            .transport_tx
+            .send(TransportMessage::Inbound(
+                rns_transport::messages::InboundPacket {
+                    raw: make_plain_data_packet(path_destination, &body),
+                    interface_id: 1,
+                    rssi: None,
+                    snr: None,
+                    q: None,
+                },
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(ap.recv().await.unwrap(), Bytes::from_static(b"busy-path"));
+        let response = tokio::time::timeout(Duration::from_secs(3), ap.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (reply_header, offset) = rns_wire::header::PacketHeader::unpack(&response).unwrap();
+        assert_eq!(reply_header.destination_hash, header.destination_hash);
+        assert_eq!(
+            reply_header.context,
+            rns_wire::context::PacketContext::PathResponse
+        );
+        let reply = rns_identity::announce::AnnounceData::unpack(
+            &response[offset..],
+            reply_header.flags.context_flag,
+        )
+        .unwrap();
+        assert_eq!(
+            reply.validate(&reply_header.destination_hash).unwrap().hash,
+            handle.network_identity.as_ref().unwrap().hash
+        );
+        assert!(
+            reply.app_data.is_none(),
+            "one service must not become arbitrary path-response metadata"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1100), full.recv())
+                .await
+                .is_err()
+        );
+        handle.shutdown.trigger();
+        tokio::time::timeout(Duration::from_secs(2), publisher)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                handle
+                    .query_transport(TransportQuery::GetNextHop {
+                        dest: header.destination_hash
+                    })
+                    .await,
+                Some(TransportQueryResponse::HashResult(None))
+            ),
+            "publisher close must deregister the destination"
+        );
+        handle
+            .transport_tx
+            .send(TransportMessage::Shutdown)
+            .await
+            .unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_publisher_recalls_pending_service_when_it_goes_offline() {
+        struct CountedStamper(AtomicU64);
+        impl DiscoveryStamper for CountedStamper {
+            fn generate(&self, hash: &[u8; 32], value: u8) -> Option<Vec<u8>> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                StaticStamper.generate(hash, value)
+            }
+            fn value(&self, hash: &[u8; 32], stamp: &[u8]) -> u8 {
+                StaticStamper.value(hash, stamp)
+            }
+            fn valid(&self, hash: &[u8; 32], stamp: &[u8], value: u8) -> bool {
+                StaticStamper.valid(hash, stamp, value)
+            }
+        }
+        let (handle, actor) = discovery_actor();
+        let (tx, mut sink) =
+            discovery_egress(&handle, 1, rns_interface::traits::InterfaceMode::Full, 1).await;
+        tx.send(Bytes::from_static(b"busy")).await.unwrap();
+        let online = Arc::new(AtomicBool::new(true));
+        let mut local = advertised_service(42, false);
+        local.online = Some(online.clone());
+        let stamper = Arc::new(CountedStamper(AtomicU64::new(0)));
+        let publisher = tokio::spawn(run_discovery_announcer(
+            handle.clone(),
+            stamper.clone(),
+            vec![local],
+        ));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(stamper.0.load(Ordering::Relaxed), 1);
+        online.store(false, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(sink.recv().await.unwrap(), Bytes::from_static(b"busy"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1100), sink.recv())
+                .await
+                .is_err(),
+            "a freed egress must not publish an offline service"
+        );
+        online.store(true, Ordering::Release);
+        let raw = tokio::time::timeout(Duration::from_secs(3), sink.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_discovery_packet(&raw, &handle).name, "service-42");
+        assert_eq!(
+            stamper.0.load(Ordering::Relaxed),
+            1,
+            "recovery reuses prepared work"
+        );
+        handle.shutdown.trigger();
+        tokio::time::timeout(Duration::from_secs(2), publisher)
+            .await
+            .unwrap()
+            .unwrap();
+        handle
+            .transport_tx
+            .send(TransportMessage::Shutdown)
+            .await
+            .unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_enable_is_single_owner_and_clients_do_not_publish() {
+        use rns_interface::traits::InterfaceMode;
+        let (mut handle, actor) = discovery_actor();
+        let (_, mut sink) = discovery_egress(&handle, 1, InterfaceMode::Full, 8).await;
+        let dir = std::env::temp_dir().join(format!(
+            "discovery-owner-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        handle
+            .install_discovery_store_for_tests(Arc::new(DiscoveryStore::open(&dir).unwrap()))
+            .await;
+        handle
+            .discovery
+            .local_interfaces
+            .lock()
+            .await
+            .push(advertised_service(42, false));
+        handle.instance_mode = InstanceMode::Client;
+        handle
+            .enable_on_network_discovery(Arc::new(StaticStamper))
+            .await;
+        assert!(!*handle.discovery.announcer_started.lock().await);
+        assert!(sink.try_recv().is_err());
+        handle.instance_mode = InstanceMode::Standalone;
+        handle
+            .enable_on_network_discovery(Arc::new(StaticStamper))
+            .await;
+        handle
+            .enable_on_network_discovery(Arc::new(StaticStamper))
+            .await;
+        read_discovery_packet(
+            &tokio::time::timeout(Duration::from_secs(3), sink.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            &handle,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1100), sink.recv())
+                .await
+                .is_err()
+        );
+        handle.shutdown.trigger();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while *handle.discovery.announcer_started.lock().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        handle
+            .transport_tx
+            .send(TransportMessage::Shutdown)
+            .await
+            .unwrap();
+        actor.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn discovery_config_preserves_independent_location_presence_and_precedence() {
+        for (extra, expected) in [
+            ("", [None, None, None]),
+            ("latitude = 0\nheight = 0\n", [Some(0.0), None, Some(0.0)]),
+            (
+                "longitude = -2\ndiscovery_longitude = 0\n",
+                [None, Some(0.0), None],
+            ),
+        ] {
+            let config = Config::parse(&format!("[interfaces]\n[[relay]]\ntype = TCPServerInterface\nlisten_ip = 127.0.0.1\nlisten_port = 4242\ndiscoverable = yes\n{extra}")).unwrap();
+            let interfaces = synthesize_interfaces(&config, false).unwrap();
+            let post_init = get_post_init_for_config(&config, &interfaces[0]);
+            let discovery =
+                discovery_config_for_interface(&config, &interfaces[0], &post_init, true).unwrap();
+            assert_eq!(
+                [discovery.latitude, discovery.longitude, discovery.height],
+                expected
+            );
         }
     }
 

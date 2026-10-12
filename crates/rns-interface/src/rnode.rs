@@ -1293,6 +1293,7 @@ enum RNodeWriterFinish {
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 struct RNodeWriterContext {
+    background: Arc<Mutex<Option<crate::background_announce::BackgroundAnnounceReceiver>>>,
     id: InterfaceId,
     flow_control: bool,
     ready: Arc<AtomicBool>,
@@ -1429,6 +1430,7 @@ struct RNodeGenerationWriter {
     // First field on purpose: cancellation of an owning future interrupts the
     // physical transport before the actor task guard aborts.
     interrupt: RNodeWriteInterrupt,
+    background: Arc<Mutex<Option<crate::background_announce::BackgroundAnnounceReceiver>>>,
     packet_tx: mpsc::Sender<Bytes>,
     control_tx: mpsc::Sender<RNodeControlWriteRequest>,
     ready: Arc<AtomicBool>,
@@ -1645,6 +1647,36 @@ where
             pending_packet = Some(callsign.clone());
         }
 
+        // Background bypasses both ordinary FIFOs and is selected only at
+        // the physical writer, with the same one-packet READY permit.
+        let background = context.background.lock().unwrap().clone();
+        if pending_packet.is_none()
+            && packet_rx.is_empty()
+            && context.carrier_online.load(Ordering::SeqCst)
+            && context.interface_online.load(Ordering::SeqCst)
+            && let Some(background) = background.filter(|lane| lane.ordinary_is_empty())
+            && let Some(packet) = background.try_start_when(rns_transport::now_f64(), || {
+                !context.flow_control
+                    || context
+                        .ready
+                        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+            })
+        {
+            let (framed, accounting) =
+                prepare_rnode_packet(packet.raw().clone(), &context, &mut first_tx);
+            writer = write_rnode_operation(
+                writer,
+                framed,
+                RNodeWritePhase::Packet,
+                Some(accounting),
+                &mut idle_probe,
+            )
+            .await?;
+            drop(packet);
+            continue;
+        }
+
         let packet_permitted = pending_packet.is_some()
             && context.carrier_online.load(Ordering::SeqCst)
             && context.interface_online.load(Ordering::SeqCst)
@@ -1718,6 +1750,9 @@ where
                 _ = wait_for_rnode_probe_deadline(probe_deadline) => {
                     RNodeWriterEvent::ProbePoll
                 }
+                _ = tokio::time::sleep(RNODE_FLOW_POLL_INTERVAL) => {
+                    RNodeWriterEvent::FlowPoll
+                }
                 packet = packet_rx.recv(), if packet_lane_open => {
                     RNodeWriterEvent::Packet(packet)
                 }
@@ -1784,6 +1819,7 @@ where
 {
     let (packet_tx, packet_rx) = mpsc::channel(RNODE_PACKET_WRITE_QUEUE);
     let (control_tx, control_rx) = mpsc::channel(RNODE_CONTROL_WRITE_QUEUE);
+    let background = context.background.clone();
     let ready = context.ready.clone();
     let cancelled = context.cancelled.clone();
     let idle_probes_enabled = context.idle_probes_enabled.clone();
@@ -1806,6 +1842,7 @@ where
     });
     RNodeGenerationWriter {
         interrupt: RNodeWriteInterrupt::none(),
+        background,
         packet_tx,
         control_tx,
         ready,
@@ -1836,6 +1873,7 @@ fn spawn_rnode_generation_writer(
     let mut writer = spawn_rnode_writer(
         write_stream,
         RNodeWriterContext {
+            background: Arc::new(Mutex::new(None)),
             id: options.id,
             flow_control: config.flow_control,
             // Upstream flow control starts with one permissive packet token;
@@ -1867,6 +1905,7 @@ async fn finish_rnode_writer(writer: RNodeGenerationWriter) -> RNodeWriterFinish
         cancelled: _,
         idle_probes_enabled: _,
         mut task,
+        background: _,
     } = writer;
     drop(packet_tx);
     drop(control_tx);
@@ -3266,6 +3305,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
     let (tx, rx) = mpsc::channel::<Bytes>(256);
+    let background = crate::background_announce::register(&tx)?;
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
     let name = config.name.clone();
     let mode = config.mode;
@@ -3614,6 +3654,8 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
             };
             let mut port_r = port_r;
 
+            background.retire_generation();
+            *generation_writer.background.lock().unwrap() = Some(background.clone());
             let ready = generation_writer.ready.clone();
             let packet_tx = generation_writer.packet_tx.clone();
             let control_tx = generation_writer.control_tx.clone();
@@ -4014,6 +4056,7 @@ mod tests {
         beacon_poll_interval: Duration,
     ) -> RNodeWriterContext {
         RNodeWriterContext {
+            background: Arc::new(Mutex::new(None)),
             id: 0x5C71,
             flow_control,
             ready,
@@ -7471,6 +7514,21 @@ mod tests {
                 .expect("outbound RNode server ended"),
             expected_packet
         );
+        // A peer read can race the blocking writer's completion/accounting
+        // publication; reading bytes is not the driver's completion barrier.
+        yield_until_rnode_test(
+            || {
+                spawned
+                    .interface
+                    .txb
+                    .as_ref()
+                    .unwrap()
+                    .load(Ordering::Relaxed)
+                    == payload.len() as u64
+            },
+            "RNode completed-write accounting did not converge",
+        )
+        .await;
         assert_eq!(
             spawned
                 .interface
@@ -8162,5 +8220,84 @@ mod tests {
         handle.read_task.abort();
         drop(handle.tx);
         server.join().unwrap();
+    }
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test(start_paused = true)]
+    async fn background_actor_final_writer_survives_1000_windows_without_filling_either_fifo() {
+        let (outer, mut outer_rx) = mpsc::channel(2);
+        let background = crate::background_announce::register(&outer).unwrap();
+        let (actor, actor_control, raw) =
+            crate::background_announce::scheduled_actor_with_backlog(outer.clone(), 1100);
+        let scripted = ScriptedWriter::default();
+        let ready = Arc::new(AtomicBool::new(false));
+        let context = scripted_writer_context(
+            true,
+            ready.clone(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Duration::from_millis(5),
+        );
+        *context.background.lock().unwrap() = Some(background.clone());
+        let writer = spawn_rnode_writer(scripted.clone(), context);
+        let inner = writer.packet_tx.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(packet) = outer_rx.recv().await {
+                if inner.send(packet).await.is_err() {
+                    break;
+                }
+            }
+        });
+        yield_to_rnode_tasks().await;
+        for _ in 0..1000 {
+            actor_control
+                .send(TransportMessage::Tick(rns_transport::messages::TimerTick {
+                    timestamp: rns_transport::now_f64(),
+                }))
+                .await
+                .unwrap();
+            tokio::time::advance(Duration::from_secs(134)).await;
+            yield_to_rnode_tasks().await;
+            assert!(background.has_offer());
+            assert_eq!(outer.capacity(), 2);
+            assert_eq!(writer.packet_tx.capacity(), RNODE_PACKET_WRITE_QUEUE);
+            assert!(scripted.writes().is_empty());
+        }
+        outer
+            .send(Bytes::from_static(b"local control"))
+            .await
+            .unwrap();
+        yield_to_rnode_tasks().await;
+        ready.store(true, Ordering::SeqCst);
+        tokio::time::advance(RNODE_FLOW_POLL_INTERVAL).await;
+        yield_until_rnode_test(
+            || scripted.flush_calls() == 1,
+            "ordinary control should precede background",
+        )
+        .await;
+        assert_eq!(scripted.writes(), vec![kiss::frame(b"local control")]);
+        assert!(!ready.load(Ordering::SeqCst));
+        ready.store(true, Ordering::SeqCst);
+        tokio::time::advance(RNODE_FLOW_POLL_INTERVAL).await;
+        yield_until_rnode_test(
+            || scripted.flush_calls() == 2,
+            "background should progress on next permit",
+        )
+        .await;
+        assert_eq!(scripted.writes()[1], kiss::frame(&raw));
+        // More work may be offered after completion, but no READY means no burst.
+        tokio::time::advance(Duration::from_secs(134)).await;
+        yield_to_rnode_tasks().await;
+        assert_eq!(scripted.writes().len(), 2);
+        assert!(!ready.load(Ordering::SeqCst));
+        actor_control
+            .send(TransportMessage::Shutdown)
+            .await
+            .unwrap();
+        actor.await.unwrap();
+        forwarder.abort();
+        writer.cancel();
+        tokio::time::advance(RNODE_FLOW_POLL_INTERVAL).await;
+        finish_rnode_writer(writer).await;
     }
 }

@@ -100,6 +100,7 @@ pub async fn spawn_serial_interface(
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
     let (tx, mut rx) = mpsc::channel::<Bytes>(256);
+    let background = crate::background_announce::register(&tx)?;
     let name = config.name.clone();
     let mode = config.mode;
 
@@ -111,7 +112,24 @@ pub async fn spawn_serial_interface(
     let txb_w = shared_txb.clone();
     tokio::spawn(async move {
         let mut port_w = port_write;
-        while let Some(data) = rx.recv().await {
+        loop {
+            if !online_w.load(Ordering::SeqCst) {
+                break;
+            }
+            let background_packet = if rx.is_empty() {
+                background.try_start(rns_transport::now_f64())
+            } else {
+                None
+            };
+            let data = if let Some(packet) = &background_packet {
+                packet.raw().clone()
+            } else {
+                match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                    Ok(Some(data)) => data,
+                    Ok(None) => break,
+                    Err(_) => continue,
+                }
+            };
             txb_w.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let framed = hdlc::frame(&data);
             match crate::serial_io::blocking_write_all(port_w, framed).await {

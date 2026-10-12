@@ -1626,7 +1626,10 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
     // Match the serial and BLE RNode application queue. The queue is logical
     // interface state and survives physical Android USB reconnects.
     let (tx, app_rx) = mpsc::channel::<Bytes>(256);
-    let app_rx = Arc::new(tokio::sync::Mutex::new(UsbApplicationQueue::new(app_rx)));
+    let background = crate::background_announce::register(&tx)?;
+    let app_rx = Arc::new(tokio::sync::Mutex::new(
+        UsbApplicationQueue::new(app_rx).with_background(background),
+    ));
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
     let (snapshot_publisher, driver) = rnode::new_rnode_driver_observation_with_shutdown(
         RNodeTransportClass::Usb,

@@ -190,9 +190,6 @@ pub fn build_ax25_kiss_init(config: &AX25KISSConfig) -> Vec<u8> {
 #[cfg(feature = "serial")]
 const AX25_READ_TIMEOUT_MS: u64 = 100;
 
-#[cfg(feature = "serial")]
-const FLOW_CONTROL_TIMEOUT_SECS: u64 = 5;
-
 /// Parse `"CALL-SSID"` or `"CALL"`; uppercased call, SSID defaults to 0.
 pub fn parse_callsign_ssid(input: &str) -> Result<(String, u8), String> {
     let (call_part, ssid) = if let Some(idx) = input.rfind('-') {
@@ -264,6 +261,7 @@ pub async fn spawn_ax25kiss_interface(
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
     let (tx, mut rx) = mpsc::channel::<Bytes>(256);
+    let background = crate::background_announce::register(&tx)?;
     let name = config.name.clone();
     let mode = config.mode;
     let flow_control = config.flow_control;
@@ -295,30 +293,45 @@ pub async fn spawn_ax25kiss_interface(
     let txb_w = shared_txb.clone();
     tokio::spawn(async move {
         let mut port_w = port_write;
-        while let Some(data) = rx.recv().await {
+        loop {
+            if !online_w.load(Ordering::SeqCst) {
+                break;
+            }
+            let background_packet = if rx.is_empty() {
+                background.try_start_when(rns_transport::now_f64(), || {
+                    !flow_control
+                        || ready_w
+                            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                })
+            } else {
+                None
+            };
+            let data = if let Some(packet) = &background_packet {
+                packet.raw().clone()
+            } else {
+                match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                    Ok(Some(data)) => data,
+                    Ok(None) => break,
+                    Err(_) => continue,
+                }
+            };
             txb_w.fetch_add(data.len() as u64, Ordering::Relaxed);
 
-            if flow_control {
-                let start = std::time::Instant::now();
-                while !ready_w.load(Ordering::SeqCst) {
+            if flow_control && background_packet.is_none() {
+                while ready_w
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     if !online_w.load(Ordering::SeqCst) {
                         return;
-                    }
-                    if start.elapsed() > Duration::from_secs(FLOW_CONTROL_TIMEOUT_SECS) {
-                        tracing::warn!("AX.25 KISS flow control timeout, unlocking");
-                        ready_w.store(true, Ordering::SeqCst);
-                        break;
                     }
                 }
             }
 
             let framed =
                 frame_ax25_kiss(&data, &dst_call_bytes, dst_ssid, &src_call_bytes, src_ssid);
-
-            if flow_control {
-                ready_w.store(false, Ordering::SeqCst);
-            }
 
             match crate::serial_io::blocking_write_all(port_w, framed).await {
                 Ok(p) => {
