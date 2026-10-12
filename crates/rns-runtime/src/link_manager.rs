@@ -7304,6 +7304,79 @@ mod tests {
         assert_eq!(initiator.expected_hops, Some(2));
     }
 
+    /// Any initiator holds the Link keys and can report any msgpack number as
+    /// its RTT. Such values used to panic the whole LinkManager task.
+    #[test]
+    fn hostile_lrrtt_rtt_activates_responder_without_panicking() {
+        for peer_rtt in [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            -1.0,
+            1e300,
+            1e19,
+        ] {
+            let dest_hash = [0x38; 16];
+            let identity_key = Ed25519PrivateKey::generate();
+            let identity_pub = identity_key.public_key();
+            let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+            let (responder, proof_data) =
+                Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+            initiator
+                .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+                .unwrap();
+            let link_id = responder.link_id;
+
+            let (transport_tx, _transport_rx) = mpsc::channel(16);
+            let (_event_tx, event_rx) = mpsc::channel(16);
+            let mut lm = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+            lm.active_links.insert(
+                link_id,
+                ActiveLink {
+                    link: responder,
+                    _interface_id: 1,
+                    channel: None,
+                    inbound_resources: HashMap::new(),
+                    outbound_resources: HashMap::new(),
+                    outbound_split_queues: HashMap::new(),
+                    inbound_split_resources: HashMap::new(),
+                    segment_routing: HashMap::new(),
+                },
+            );
+
+            let mut rtt_payload = Vec::new();
+            rmpv::encode::write_value(&mut rtt_payload, &rmpv::Value::F64(peer_rtt)).unwrap();
+            let header = rns_wire::header::PacketHeader {
+                flags: rns_wire::flags::PacketFlags {
+                    header_type: rns_wire::flags::HeaderType::Header1,
+                    context_flag: false,
+                    transport_type: rns_wire::flags::TransportType::Broadcast,
+                    destination_type: rns_wire::flags::DestinationType::Link,
+                    packet_type: rns_wire::flags::PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: link_id,
+                context: rns_wire::context::PacketContext::Lrrtt,
+            };
+            let mut raw = header.pack();
+            raw.extend_from_slice(&initiator.encrypt(&rtt_payload).unwrap());
+
+            lm.handle_inbound_packet(&raw, 1);
+            let active = &lm.active_links[&link_id];
+            assert_eq!(active.link.state, LinkState::Active, "{peer_rtt}");
+            let rtt = active.link.rtt.unwrap();
+            assert!(
+                rtt <= std::time::Duration::from_secs(720),
+                "{peer_rtt}: {rtt:?}"
+            );
+            assert!(LinkManager::inbound_split_wait_timeout(active) > rtt);
+
+            lm.on_tick();
+            assert!(lm.active_links.contains_key(&link_id), "{peer_rtt}");
+        }
+    }
+
     #[test]
     fn request_resource_transfer_can_start_before_responder_lrrtt_activation() {
         let dest_hash = [0x36; 16];

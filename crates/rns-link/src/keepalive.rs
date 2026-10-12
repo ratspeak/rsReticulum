@@ -152,7 +152,8 @@ impl KeepaliveState {
 
     /// How long to wait in STALE before tearing the link down.
     pub fn stale_grace_timeout(&self, rtt: Duration) -> Duration {
-        rtt * KEEPALIVE_TIMEOUT_FACTOR as u32 + Duration::from_secs_f64(STALE_GRACE)
+        rtt.saturating_mul(KEEPALIVE_TIMEOUT_FACTOR as u32)
+            .saturating_add(Duration::from_secs_f64(STALE_GRACE))
     }
 
     pub fn mark_keepalive_sent(&mut self) {

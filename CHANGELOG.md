@@ -12,6 +12,7 @@
 - Installed desktop BLE notification receivers before subscribing and limited packet fragments to the negotiated ATT payload.
 
 - Improved Bluetooth Peer packet sizing and flow control, including Apple write handling and queued sends.
+- Fixed a remotely triggerable Link panic when a peer reported an infinite, NaN, negative or oversized RTT. Peer RTTs now follow Python's `max()` handling and saturate at the 720-second stale window, so keepalive and stale timing match Python RNS; initiators ignore LRRTT as Python does.
 
 ### Build and compatibility
 

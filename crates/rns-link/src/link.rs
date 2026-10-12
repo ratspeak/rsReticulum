@@ -133,6 +133,20 @@ fn msgpack_value_to_bytes(value: &rmpv::Value) -> Result<Vec<u8>, LinkCryptoErro
     }
 }
 
+/// Ceiling for peer-reported RTTs: Link.py's keepalive and stale time already
+/// saturate above `KEEPALIVE_MAX_RTT`, and no idle Link outlives a round trip
+/// longer than its stale window.
+const PEER_RTT_MAX_SECS: f64 = STALE_TIME_DEFAULT;
+
+/// Peer RTT as Link.py's `max(measured, peer)` would use it: NaN and negative
+/// values never win, larger ones saturate so derived timers stay finite.
+fn peer_reported_rtt(secs: f64) -> Option<Duration> {
+    if secs.is_nan() || secs < 0.0 {
+        return None;
+    }
+    Duration::try_from_secs_f64(secs.min(PEER_RTT_MAX_SECS)).ok()
+}
+
 /// An encrypted bidirectional tunnel between two peers.
 ///
 /// The state machine is driven by `tick()` calls from the owning actor/runtime;
@@ -584,11 +598,10 @@ impl Link {
         if let Ok(value) = rmpv::decode::read_value(&mut &plaintext[..])
             && let Some(peer_rtt) = value.as_f64()
         {
-            let local_rtt = self.request_time.elapsed().as_secs_f64();
-            let rtt = local_rtt.max(peer_rtt);
-            let rtt_dur = Duration::from_secs_f64(rtt);
-            self.rtt = Some(rtt_dur);
-            self.keepalive.update_from_rtt(rtt_dur);
+            let local_rtt = self.request_time.elapsed();
+            let rtt = peer_reported_rtt(peer_rtt).map_or(local_rtt, |peer| peer.max(local_rtt));
+            self.rtt = Some(rtt);
+            self.keepalive.update_from_rtt(rtt);
         }
 
         self.state = LinkState::Active;
@@ -1038,7 +1051,8 @@ impl Link {
     /// Update RTT from an LRRTT packet (context 0xFE) received after handshake.
     ///
     /// The initiator sends the first measurement as part of `validate_proof`; this
-    /// path handles subsequent updates during the link's lifetime.
+    /// path handles subsequent updates during the link's lifetime. A NaN or
+    /// negative RTT with no prior measurement is rejected.
     pub fn update_rtt_from_packet(
         &mut self,
         encrypted_data: &[u8],
@@ -1051,10 +1065,9 @@ impl Link {
 
         // Prefer the larger of peer and local measurements so timeouts are based on
         // the slower path — a one-sided smaller value would understate round-trip.
-        let rtt = if let Some(existing) = self.rtt {
-            Duration::from_secs_f64(peer_rtt.max(existing.as_secs_f64()))
-        } else {
-            Duration::from_secs_f64(peer_rtt)
+        let rtt = match (peer_reported_rtt(peer_rtt), self.rtt) {
+            (Some(peer), Some(existing)) => peer.max(existing),
+            (peer, existing) => peer.or(existing).ok_or(LinkCryptoError::DecryptionFailed)?,
         };
 
         self.rtt = Some(rtt);
@@ -1398,7 +1411,10 @@ impl Link {
         ),
     )]
     pub fn tick(&mut self) -> LinkAction {
-        let now = Instant::now();
+        self.tick_at(Instant::now())
+    }
+
+    fn tick_at(&mut self, now: Instant) -> LinkAction {
         for receipt in &mut self.pending_requests {
             receipt.check_timeout();
         }
@@ -1748,10 +1764,10 @@ impl Link {
 
     /// Default request timeout: `rtt * TRAFFIC_TIMEOUT_FACTOR + 1.125 * RESPONSE_MAX_GRACE_TIME`.
     pub fn default_request_timeout(&self) -> Duration {
-        let rtt_secs = self.rtt.map(|r| r.as_secs_f64()).unwrap_or(1.0);
-        let timeout =
-            rtt_secs * TRAFFIC_TIMEOUT_FACTOR + crate::constants::RESPONSE_MAX_GRACE_TIME * 1.125;
-        Duration::from_secs_f64(timeout)
+        self.rtt
+            .unwrap_or(Duration::from_secs(1))
+            .saturating_mul(TRAFFIC_TIMEOUT_FACTOR as u32)
+            .saturating_add(Duration::from_secs_f64(RESPONSE_MAX_GRACE_TIME * 1.125))
     }
 }
 
@@ -2976,5 +2992,237 @@ mod tests {
         assert!(link.sign(b"test").is_some());
         link.close(CloseReason::Timeout);
         assert!(link.sign(b"test").is_none());
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum PeerRtt {
+        Saturates,
+        Zero,
+        Ignored,
+    }
+
+    /// Degenerate msgpack RTT numbers and how Link.py's `max()` treats them.
+    fn hostile_peer_rtts() -> Vec<(rmpv::Value, PeerRtt)> {
+        use rmpv::Value;
+        vec![
+            (Value::F64(f64::INFINITY), PeerRtt::Saturates),
+            (Value::F64(f64::NEG_INFINITY), PeerRtt::Ignored),
+            (Value::F64(f64::NAN), PeerRtt::Ignored),
+            (Value::F64(-1.0), PeerRtt::Ignored),
+            (Value::F64(-0.0), PeerRtt::Zero),
+            (Value::F64(0.0), PeerRtt::Zero),
+            (Value::F64(f64::from_bits(1)), PeerRtt::Zero),
+            (Value::F64(1e300), PeerRtt::Saturates),
+            (Value::F64(18_446_744_073_709_551_616.0), PeerRtt::Saturates),
+            // Representable as a Duration, but overflowed the stale and request timers.
+            (Value::F64(1e19), PeerRtt::Saturates),
+            (Value::F32(f32::INFINITY), PeerRtt::Saturates),
+            (Value::from(u64::MAX), PeerRtt::Saturates),
+            (Value::from(i64::MIN), PeerRtt::Ignored),
+        ]
+    }
+
+    fn encrypted_rtt(sender: &Link, value: &rmpv::Value) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        rmpv::encode::write_value(&mut encoded, value).unwrap();
+        sender.encrypt(&encoded).unwrap()
+    }
+
+    /// Python's builtin `min(a, b)`: `b` only wins when strictly smaller.
+    fn py_min(a: f64, b: f64) -> f64 {
+        if b < a { b } else { a }
+    }
+
+    /// Python's builtin `max(a, b)`: `b` only wins when strictly greater.
+    fn py_max(a: f64, b: f64) -> f64 {
+        if b > a { b } else { a }
+    }
+
+    /// Link.py `max(measured_rtt, rtt)`.
+    fn link_py_rtt(measured: f64, peer: f64) -> f64 {
+        py_max(measured, peer)
+    }
+
+    /// Link.py `__update_keepalive`.
+    fn link_py_keepalive(rtt: f64) -> f64 {
+        py_max(
+            py_min(rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT), KEEPALIVE_MAX),
+            KEEPALIVE_MIN,
+        )
+    }
+
+    fn assert_link_py_keepalive(link: &Link, link_py_rtt: f64, case: &rmpv::Value) {
+        let keepalive = link_py_keepalive(link_py_rtt);
+        assert_eq!(
+            link.keepalive.keepalive_interval,
+            Duration::from_secs_f64(keepalive),
+            "keepalive for {case}"
+        );
+        assert_eq!(
+            link.keepalive.stale_time,
+            Duration::from_secs_f64(keepalive * STALE_FACTOR),
+            "stale time for {case}"
+        );
+    }
+
+    /// Initiator is Active; responder awaits the LRRTT in Handshake.
+    fn lrrtt_pair() -> (Link, Link) {
+        let dest_hash = [0xA5; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (responder, proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .unwrap();
+        (initiator, responder)
+    }
+
+    #[test]
+    fn lrrtt_activation_bounds_hostile_peer_rtt_like_link_py() {
+        let ceiling = Duration::from_secs_f64(PEER_RTT_MAX_SECS);
+        for (value, expected) in hostile_peer_rtts() {
+            let (initiator, mut responder) = lrrtt_pair();
+            responder
+                .receive_rtt_packet(&encrypted_rtt(&initiator, &value))
+                .unwrap();
+            let measured_bound = responder.request_time.elapsed();
+
+            assert_eq!(responder.state, LinkState::Active, "{value}");
+            let rtt = responder.rtt.unwrap();
+            match expected {
+                PeerRtt::Saturates => {
+                    assert_eq!(rtt, ceiling, "{value}");
+                    assert_eq!(
+                        responder.keepalive.keepalive_interval,
+                        Duration::from_secs_f64(KEEPALIVE_MAX)
+                    );
+                    assert_eq!(
+                        responder.keepalive.stale_time,
+                        Duration::from_secs_f64(STALE_TIME_DEFAULT)
+                    );
+                }
+                PeerRtt::Zero | PeerRtt::Ignored => {
+                    assert!(rtt <= measured_bound, "{value} must keep the local RTT")
+                }
+            }
+            let measured = rtt.min(measured_bound).as_secs_f64();
+            let peer = value.as_f64().unwrap();
+            assert_link_py_keepalive(&responder, link_py_rtt(measured, peer), &value);
+            assert!(responder.establishment_rate.is_none_or(f64::is_finite));
+            assert!(responder.default_request_timeout() > rtt);
+            assert!(responder.keepalive.stale_grace_timeout(rtt) > rtt);
+        }
+    }
+
+    #[test]
+    fn rtt_update_bounds_hostile_peer_rtt_with_and_without_prior_measurement() {
+        let ceiling = Duration::from_secs_f64(PEER_RTT_MAX_SECS);
+        let prior = Duration::from_millis(200);
+        for (value, expected) in hostile_peer_rtts() {
+            let (initiator, mut responder, _) = make_active_link();
+            let payload = encrypted_rtt(&initiator, &value);
+            let peer = value.as_f64().unwrap();
+
+            responder.rtt = Some(prior);
+            let updated = responder.update_rtt_from_packet(&payload).unwrap();
+            let kept = if expected == PeerRtt::Saturates {
+                ceiling
+            } else {
+                prior
+            };
+            assert_eq!(updated, kept, "{value} with a prior RTT");
+            assert_eq!(responder.rtt, Some(kept));
+            assert_link_py_keepalive(&responder, link_py_rtt(prior.as_secs_f64(), peer), &value);
+
+            responder.rtt = None;
+            let keepalive_before = responder.keepalive.keepalive_interval;
+            match (expected, responder.update_rtt_from_packet(&payload)) {
+                (PeerRtt::Saturates, Ok(rtt)) => assert_eq!(rtt, ceiling),
+                (PeerRtt::Zero, Ok(rtt)) => assert_eq!(rtt, Duration::ZERO),
+                (PeerRtt::Ignored, Err(LinkCryptoError::DecryptionFailed)) => {
+                    assert_eq!(responder.rtt, None);
+                    assert_eq!(responder.keepalive.keepalive_interval, keepalive_before);
+                }
+                (expected, result) => {
+                    panic!("{value} without a prior RTT: expected {expected:?}, got {result:?}")
+                }
+            }
+        }
+    }
+
+    /// Drives a responder from a hostile LRRTT through keepalive replies,
+    /// STALE and teardown. Link.py keeps the same 360 s keepalive and 720 s
+    /// stale window for an infinite RTT.
+    #[test]
+    fn hostile_lrrtt_link_keeps_link_py_keepalive_and_stale_timing() {
+        for peer_rtt in [f64::INFINITY, 1e19] {
+            let (initiator, mut responder) = lrrtt_pair();
+            responder
+                .receive_rtt_packet(&encrypted_rtt(&initiator, &rmpv::Value::F64(peer_rtt)))
+                .unwrap();
+            let rtt = responder.rtt.unwrap();
+            assert_eq!(rtt, Duration::from_secs_f64(PEER_RTT_MAX_SECS));
+            let keepalive = responder.keepalive.keepalive_interval;
+            assert_eq!(keepalive, Duration::from_secs_f64(KEEPALIVE_MAX));
+
+            // Link.py answers a keepalive once `keepalive` has passed since outbound.
+            let replied_at = Instant::now();
+            responder.keepalive.last_outbound = Some(replied_at);
+            assert!(
+                !responder.keepalive.should_respond_to_keepalive_at(
+                    replied_at + keepalive - Duration::from_secs(1)
+                )
+            );
+            assert!(
+                responder
+                    .keepalive
+                    .should_respond_to_keepalive_at(replied_at + keepalive)
+            );
+
+            let stale_at =
+                responder.keepalive.activated_at.unwrap() + responder.keepalive.stale_time;
+            assert_eq!(
+                responder.tick_at(stale_at - Duration::from_secs(1)),
+                LinkAction::None
+            );
+            assert_eq!(responder.tick_at(stale_at), LinkAction::TransitionedToStale);
+            assert_eq!(responder.state, LinkState::Stale);
+
+            let grace = responder.keepalive.stale_grace_timeout(rtt);
+            assert_eq!(grace, rtt * 4 + Duration::from_secs(5));
+            assert_eq!(
+                responder.tick_at(stale_at + grace - Duration::from_secs(1)),
+                LinkAction::None
+            );
+            assert!(matches!(
+                responder.tick_at(stale_at + grace),
+                LinkAction::SendTeardownAndClose(_)
+            ));
+            assert_eq!(responder.state, LinkState::Closed);
+            assert_eq!(responder.teardown_reason, Some(CloseReason::Timeout));
+        }
+    }
+
+    #[test]
+    fn derived_link_timers_saturate_instead_of_panicking() {
+        let (mut link, _, _) = make_active_link();
+        link.rtt = Some(Duration::MAX);
+        assert_eq!(link.default_request_timeout(), Duration::MAX);
+        assert_eq!(link.packet_proof_timeout(), Duration::MAX);
+        assert_eq!(
+            link.keepalive.stale_grace_timeout(Duration::MAX),
+            Duration::MAX
+        );
+        link.keepalive.update_from_rtt(Duration::MAX);
+        assert_eq!(
+            link.keepalive.keepalive_interval,
+            Duration::from_secs_f64(KEEPALIVE_MAX)
+        );
+
+        link.state = LinkState::Stale;
+        link.stale_since = Some(Instant::now());
+        assert_eq!(link.tick(), LinkAction::None);
     }
 }

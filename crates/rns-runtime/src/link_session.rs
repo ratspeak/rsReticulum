@@ -3678,10 +3678,10 @@ async fn process_destination_event(
                         return Ok(Some(LinkSessionCloseReason::Remote));
                     }
                 }
+                // Link.py applies LRRTT only on the responder; initiators just count it.
                 rns_wire::context::PacketContext::Lrrtt => {
                     link.record_inbound();
                     link.record_rx(body.len());
-                    let _ = link.update_rtt_from_packet(body);
                 }
                 rns_wire::context::PacketContext::Response => {
                     link.record_inbound();
@@ -4696,6 +4696,92 @@ mod tests {
             transport_rx.recv().await,
             Some(TransportMessage::DeregisterDestination { hash }) if hash == link_id
         ));
+    }
+
+    /// Link.py initiators ignore LRRTT. A destination reporting an infinite RTT
+    /// used to panic the session actor instead.
+    #[tokio::test]
+    async fn initiator_session_survives_hostile_lrrtt() {
+        let destination_hash = [0x45; 16];
+        let server_identity = Identity::new();
+        let server_signing = server_identity.get_signing_key().unwrap();
+        let (transport_tx, mut transport_rx) = test_transport_channel(64);
+
+        let connect = tokio::spawn(LinkSession::connect(
+            transport_tx,
+            Identity::new(),
+            LinkSessionConfig {
+                destination_hash,
+                remote_public_key: server_identity.get_public_key(),
+                hops: 1,
+                establishment_timeout: Duration::from_secs(2),
+                client_label: "test.hostile-lrrtt".into(),
+                identify: false,
+                track_phy_stats: false,
+            },
+        ));
+        let delivery_tx = match transport_rx.recv().await.unwrap() {
+            TransportMessage::RegisterDestination {
+                delivery_tx: Some(tx),
+                ..
+            } => tx,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let request = match transport_rx.recv().await.unwrap() {
+            TransportMessage::Outbound(request) => request,
+            other => panic!("unexpected transport message: {other:?}"),
+        };
+        let (_, request_offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        let (mut responder, proof) = Link::new_responder(
+            &request.raw[request_offset..],
+            &server_signing,
+            destination_hash,
+            1,
+        )
+        .unwrap();
+        let link_id = responder.link_id;
+        let inbound = move |context, body: &[u8]| DestinationEvent::InboundPacket {
+            raw: build_data_packet(link_id, context, body),
+            interface_id: 1,
+            metrics: PacketMetrics::default(),
+        };
+        delivery_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: build_proof_packet(link_id, rns_wire::context::PacketContext::None, &proof),
+                interface_id: 1,
+                metrics: PacketMetrics::default(),
+            })
+            .await
+            .unwrap();
+        let rtt = next_initiator_endpoint(&mut transport_rx).await;
+        let (_, rtt_offset) = rns_wire::header::PacketHeader::unpack(&rtt.raw).unwrap();
+        responder
+            .receive_rtt_packet(&rtt.raw[rtt_offset..])
+            .unwrap();
+        let mut session = connect.await.unwrap().unwrap();
+
+        let mut hostile_rtt = Vec::new();
+        rmpv::encode::write_value(&mut hostile_rtt, &rmpv::Value::F64(f64::INFINITY)).unwrap();
+        let hostile_rtt = responder.encrypt(&hostile_rtt).unwrap();
+        delivery_tx
+            .send(inbound(
+                rns_wire::context::PacketContext::Lrrtt,
+                &hostile_rtt,
+            ))
+            .await
+            .unwrap();
+        let after = responder.encrypt(b"after hostile LRRTT").unwrap();
+        delivery_tx
+            .send(inbound(rns_wire::context::PacketContext::None, &after))
+            .await
+            .unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(2), session.events.recv()).await {
+            Ok(Some(LinkSessionEvent::Packet { data, .. })) => {
+                assert_eq!(data, b"after hostile LRRTT");
+            }
+            other => panic!("session must survive a hostile LRRTT: {other:?}"),
+        }
     }
 
     #[tokio::test]
