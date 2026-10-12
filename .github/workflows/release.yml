@@ -7,13 +7,20 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to create or update"
+        description: "Version tag (also used for untagged qualification)"
+        required: true
+      qualify_only:
+        description: "Build and verify archives without publishing or creating a tag"
+        type: boolean
+        default: true
         required: true
 
 permissions:
   contents: read
+  actions: read
 
 env:
+  SOURCE_REF: ${{ github.sha }}
   RELEASE_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
   PACKAGE_ROOT: rsReticulum
   RETICULUM_BINS: rnsd-rs rnstatus-rs rnpath-rs rnid-rs rnprobe-rs rncp-rs rnsh-rs rnodeconf-rs
@@ -26,12 +33,25 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.SOURCE_REF }}
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: 1.89.0
-      - run: python3 scripts/ci/check_source_release_contract.py --release-tag "${RELEASE_TAG}"
+      - shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUALIFY_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.qualify_only }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SOURCE_REF}"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SOURCE_REF}&event=push&per_page=100" \
+            --jq '.workflow_runs | any(.head_sha == env.SOURCE_REF and .conclusion == "success")' | grep -qx true
+          if [[ "${QUALIFY_ONLY}" == "true" ]]; then
+            python3 scripts/ci/check_source_release_contract.py --candidate-tag "${RELEASE_TAG}"
+          else
+            python3 scripts/ci/check_source_release_contract.py --release-tag "${RELEASE_TAG}"
+          fi
 
   build:
     name: Build ${{ matrix.artifact_suffix }}
@@ -56,7 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.SOURCE_REF }}
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: 1.89.0
@@ -72,6 +92,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          for bin in ${RETICULUM_BINS}; do
+            suffix=""
+            if [[ "${RUNNER_OS}" == "Windows" ]]; then suffix=".exe"; fi
+            "target/release/${bin}${suffix}" --version
+          done
           mkdir -p "dist/${PACKAGE_ROOT}/bin"
           for bin in ${RETICULUM_BINS}; do
             if [[ "${RUNNER_OS}" == "Windows" ]]; then
@@ -97,20 +122,40 @@ jobs:
             *.zip
           if-no-files-found: error
 
+  package:
+    name: Verify release archives
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.SOURCE_REF }}
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: rsReticulum-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify archive inventory and generate checksums
+        run: python3 scripts/ci/check_release_archives.py --tag "${RELEASE_TAG}" --directory release-assets
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: verified-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
   publish:
     name: Publish GitHub release
-    needs: build
+    if: github.event_name == 'push' || !inputs.qualify_only
+    needs: package
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
+          name: verified-release-assets
           path: release-assets
-          merge-multiple: true
-      - name: Generate checksums
-        working-directory: release-assets
-        run: sha256sum * > SHA256SUMS
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
