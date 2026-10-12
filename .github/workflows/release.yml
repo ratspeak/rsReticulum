@@ -114,5 +114,9 @@ jobs:
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          body: ""
+          generate_release_notes: false
+          append_body: false
           prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           files: release-assets/*

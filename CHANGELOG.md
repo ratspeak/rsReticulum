@@ -2,66 +2,33 @@
 
 ## Unreleased
 
+## 1.3.0 - 2026-10-12
+
 ### Added
 
 - Added Link bind-readiness polling so applications can start sending as soon as the transport is ready.
 
 ### Fixed and improved
 
-- Updated btleplug to 0.13.4, including upstream Windows discovery and reconnect fixes. Windows can try an explicitly configured RNode MAC or an eligible remembered BLE Peer absent from scan results, with bounded GATT setup, existing backoff and signed peer identity checks.
+- Represent unknown discovery latitude, longitude, and height independently as `None` instead of zero, accept Python nil coordinates, and preserve presence through configuration, storage, and `rnstatus-rs`.
+- Register and own the interface-discovery destination, advance publication intervals only after driver admission, and preserve pending announcements across bounded backpressure and reconnect.
+- Keep learned mesh announcements out of ordinary RNode control/data backlogs until the final writer can send them, while preserving same-radio relay and announce pacing.
+- Retain refused local announcements and attached path answers under bounded ownership tied to the exact interface generation.
+- Preserve multiple recursive-discovery requesters, slow-radio deadlines, interface replacement safety, and hidden-peer same-radio responses without letting one cancellation affect another requester.
+- Updated btleplug to 0.13.4, including upstream Windows discovery and reconnect fixes. Windows can try an explicitly configured RNode MAC or an eligible remembered BLE Peer absent from scan results, with bounded GATT setup, existing backoff, and signed peer identity checks.
 - Installed desktop BLE notification receivers before subscribing and limited packet fragments to the negotiated ATT payload.
-
 - Improved Bluetooth Peer packet sizing and flow control, including Apple write handling and queued sends.
-- Fixed a remotely triggerable Link panic when a peer reported an infinite, NaN, negative or oversized RTT. Peer RTTs now follow Python's `max()` handling and saturate at the 720-second stale window, so keepalive and stale timing match Python RNS; initiators ignore LRRTT as Python does.
+- Fixed a remotely triggerable Link panic when a peer reported an infinite, NaN, negative, or oversized RTT. Peer RTTs follow Python's handling and saturate at the 720-second stale window; initiators ignore LRRTT as Python does.
+- Require the corrected Windows socket backend so spawned helper processes cannot keep network listeners alive after the owning runtime shuts down.
+- Match Python RNS 1.4.2 Channel receive-window admission by dropping sequence numbers more than 48 slots ahead until a retry falls inside the window.
+- Report the bundled `rnsh` compatibility level as 0.3.0 and the `rnsd-rs` interactive compatibility level as RNS 1.4.2.
 
 ### Build and compatibility
 
-- Raised the full Rust workspace minimum compiler to Rust 1.89. Apple native BLE bindings now declare their required features explicitly. Android consumers must use btleplug's matching 0.13.4 Java bridge and JNI 0.22 initialization.
-
-
-
-## 1.4.0 - 2026-10-12
-
-Source candidate; a versioned source change does not publish a release tag.
-
-- Represent unknown discovery latitude, longitude and height independently as
-  `None` instead of zero; accept Python nil coordinates and preserve presence
-  through configuration, storage and `rnstatus-rs`. This is a deliberate Rust
-  API change: see the [1.4 migration guide](api/migrations/1.4.md).
-- Register and own the interface-discovery destination, and commit publication
-  intervals only after actual driver admission. Preserve pending discovery
-  announcements across bounded egress backpressure and reconnect.
-- Keep learned mesh announcements out of the ordinary RNode control/data
-  backlog until the final writer can send them. Preserve same-radio relay,
-  nominal announce pacing and complete-packet flow control. Retain refused
-  local announces and attached path answers under finite, generation-specific
-  admission ownership.
-
-## 1.3.0 - 2026-09-10
-
-- Breaking Rust API: recursive discovery now has one private operation owner.
-  `DiscoveryPathRequest` is a detached snapshot with all live requester
-  registrations, not a mutable single-requester record. Advanced actor owners
-  use validated request/join and exact cancellation methods. See
-  [the 1.3 migration guide](api/migrations/1.3.md).
-- Preserve bounded multi-requester discovery, slow-radio deadlines, interface
-  replacement safety and hidden-peer same-radio responses. Cancellation cannot
-  affect another requester or revive queued bytes from a retired operation.
-- Project minor versions may include breaking APIs. First-party dependencies
-  select the 1.3 line explicitly; immutable source pins remain authoritative.
-- Require the corrected Windows socket backend so spawned helper processes
-  cannot keep network listeners alive after the owning runtime shuts down.
-
-- Match Python RNS 1.4.2 Channel receive-window admission by dropping sequence
-  numbers more than 48 slots ahead until a retry falls inside the window.
-- Report the bundled `rnsh` compatibility level as 0.3.0, matching RNS 1.4.2;
-  the wire protocol remains version 1 and the authenticated session hardening
-  was already implemented.
-- Report RNS 1.4.2 from the `rnsd-rs` interactive compatibility console instead
-  of the superseded 1.3.8 floor.
-- Promote exact Python RNS 1.4.2 from a selected current-reference lane to the
-  complete release baseline, including live interop, source oracles, utility
-  vectors, and regenerated corpus provenance; RNS 1.5.0 remains deferred.
+- Discovery coordinates now use `Option<f64>`, and recursive discovery exposes detached observations and exact requester cancellation instead of public mutable state. Both source-breaking changes are covered by the [1.3 migration guide](api/migrations/1.3.md).
+- Project minor versions may include breaking APIs. Select `~1.3.0` or an exact reviewed source revision when adopting this release line.
+- Raised the full Rust workspace minimum compiler to Rust 1.89. Apple native BLE bindings declare their required features explicitly; Android consumers must use btleplug's matching 0.13.4 Java bridge and JNI 0.22 initialization.
+- Promote exact Python RNS 1.4.2 to the complete release baseline, including live interoperability, source oracles, utility vectors, and corpus provenance. RNS 1.5.0 remains deferred.
 
 ## 1.2.0 - 2026-08-17
 
