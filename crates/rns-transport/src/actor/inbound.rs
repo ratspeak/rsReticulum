@@ -41,6 +41,15 @@ impl TransportActor {
             packet.raw.clone()
         };
 
+        self.emit_packet_tap(
+            crate::messages::PacketTapDirection::Rx,
+            packet.interface_id,
+            &raw,
+            packet.rssi,
+            packet.snr,
+            packet.q,
+        );
+
         let (mut parsed, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
             Ok((header, offset)) => (header, offset),
             Err(e) => {
