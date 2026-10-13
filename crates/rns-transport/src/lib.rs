@@ -26,6 +26,11 @@ pub mod discovery;
 pub mod hashlist;
 pub mod ifac;
 pub mod ingress;
+pub mod interface_ownership;
+pub use interface_ownership::{
+    InterfaceCapacityError, InterfaceOwner, InterfaceOwnerId, InterfacePacketCapacity,
+    InterfaceTransportSender,
+};
 pub mod link_endpoint_dispatch;
 pub mod link_messages;
 pub mod link_table;
@@ -63,3 +68,5 @@ pub(crate) mod test_clock {
 
 pub mod announce_dispatch;
 pub mod background_egress;
+
+pub mod link_transit;

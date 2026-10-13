@@ -1,6 +1,7 @@
 //! HDLC-framed data over a serial port. Uses `serialport` with
 //! `spawn_blocking` because no mature async driver exists yet.
 
+use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -81,6 +82,8 @@ pub async fn spawn_serial_interface(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     let port = serialport::new(&config.port, config.baud_rate)
         .data_bits(config.data_bits)
         .parity(config.parity)
@@ -192,6 +195,8 @@ pub async fn spawn_serial_interface(
 
     Ok(InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(500, 564, false),
         parent_id: None,
         name,
         mode,

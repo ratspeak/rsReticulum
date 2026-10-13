@@ -57,6 +57,8 @@ pub fn default_rncp_app_name() -> &'static str {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RncpError {
+    #[error("link request admission failed: {0}")]
+    RequestDispatch(#[from] rns_transport::link_messages::LinkRequestDispatchError),
     #[error("transport channel unavailable")]
     TransportUnavailable,
     #[error("timed out waiting for {0}")]
@@ -538,21 +540,27 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
     );
 
     let link_req_pkt = build_link_request_packet(dest_hash, &link_request_data);
-    transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw: link_req_pkt,
-            destination_hash: dest_hash,
-        }))
-        .await
-        .map_err(|_| RncpError::TransportUnavailable)?;
+    tokio::time::timeout(
+        remaining(deadline),
+        rns_transport::link_messages::dispatch_link_request(
+            &transport_tx,
+            OutboundRequest {
+                raw: link_req_pkt,
+                destination_hash: dest_hash,
+            },
+        ),
+    )
+    .await
+    .map_err(|_| RncpError::Timeout("link request admission"))??;
 
-    let (rtt_data, attached_interface) =
+    let (rtt_data, attached_interface, interface_owner) =
         wait_for_valid_rncp_proof(&mut lpkt_rx, &mut link, &pubkey, deadline).await?;
 
     let mut endpoint_lifecycle_rx = crate::link_endpoint::bind(
         &transport_tx,
         link_id,
         attached_interface,
+        interface_owner,
         LinkEndpointRole::Initiator,
     )
     .await
@@ -629,6 +637,7 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
             lpkt_rx: &mut lpkt_rx,
             endpoint_lifecycle_rx: &mut endpoint_lifecycle_rx,
             attached_interface,
+            interface_owner,
             progress_tx: progress_tx.clone(),
             progress_base: completed_parts as f32 / total_parts_nonzero as f32,
             progress_span: segment_parts as f32 / total_parts_nonzero as f32,
@@ -700,6 +709,7 @@ struct OutboundDrive<'a> {
     lpkt_rx: &'a mut mpsc::Receiver<DestinationEvent>,
     endpoint_lifecycle_rx: &'a mut mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
     attached_interface: InterfaceId,
+    interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
     progress_tx: Option<mpsc::Sender<f32>>,
     progress_base: f32,
     progress_span: f32,
@@ -715,6 +725,7 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
         lpkt_rx,
         endpoint_lifecycle_rx,
         attached_interface,
+        interface_owner,
         progress_tx,
         progress_base,
         progress_span,
@@ -765,12 +776,15 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
         };
 
         let DestinationEvent::InboundPacket {
-            raw, interface_id, ..
+            raw,
+            interface_id,
+            interface_owner: event_owner,
+            ..
         } = ev
         else {
             continue;
         };
-        if interface_id != attached_interface {
+        if interface_id != attached_interface || event_owner != interface_owner {
             continue;
         }
         let (header, off) = match rns_wire::header::PacketHeader::unpack(&raw) {
@@ -981,7 +995,14 @@ async fn wait_for_valid_rncp_proof(
     link: &mut Link,
     public_key: &[u8; 64],
     deadline: Instant,
-) -> Result<(Vec<u8>, InterfaceId), RncpError> {
+) -> Result<
+    (
+        Vec<u8>,
+        InterfaceId,
+        Option<rns_transport::messages::InterfaceOwnerId>,
+    ),
+    RncpError,
+> {
     let identity_ed25519_pub: [u8; 32] = public_key[32..64]
         .try_into()
         .map_err(|_| RncpError::ProofInvalid("remote pub key length".into()))?;
@@ -1001,7 +1022,7 @@ async fn wait_for_valid_rncp_proof(
             RncpError::HandshakeFailed("channel closed".into())
         }
     })?;
-    Ok((proof.rtt_data, proof.interface_id))
+    Ok((proof.rtt_data, proof.interface_id, proof.interface_owner))
 }
 
 fn build_link_request_packet(dest_hash: [u8; 16], request_data: &[u8]) -> Bytes {
@@ -1131,21 +1152,27 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
     );
 
     let link_req_pkt = build_link_request_packet(dest_hash, &link_request_data);
-    transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw: link_req_pkt,
-            destination_hash: dest_hash,
-        }))
-        .await
-        .map_err(|_| RncpError::TransportUnavailable)?;
+    tokio::time::timeout(
+        remaining(deadline),
+        rns_transport::link_messages::dispatch_link_request(
+            &transport_tx,
+            OutboundRequest {
+                raw: link_req_pkt,
+                destination_hash: dest_hash,
+            },
+        ),
+    )
+    .await
+    .map_err(|_| RncpError::Timeout("link request admission"))??;
 
-    let (rtt_data, attached_interface) =
+    let (rtt_data, attached_interface, interface_owner) =
         wait_for_valid_rncp_proof(&mut lpkt_rx, &mut link, &pubkey, deadline).await?;
 
     let mut endpoint_lifecycle_rx = crate::link_endpoint::bind(
         &transport_tx,
         link_id,
         attached_interface,
+        interface_owner,
         LinkEndpointRole::Initiator,
     )
     .await
@@ -1222,12 +1249,15 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
         };
 
         let DestinationEvent::InboundPacket {
-            raw, interface_id, ..
+            raw,
+            interface_id,
+            interface_owner: event_owner,
+            ..
         } = ev
         else {
             continue;
         };
-        if interface_id != attached_interface {
+        if interface_id != attached_interface || event_owner != interface_owner {
             continue;
         }
         let (header, off) = match rns_wire::header::PacketHeader::unpack(&raw) {

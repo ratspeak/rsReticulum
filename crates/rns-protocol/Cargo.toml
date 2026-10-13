@@ -17,6 +17,7 @@ tracing = { workspace = true }
 bzip2 = { workspace = true }
 rmpv = { workspace = true }
 rmp-serde = { workspace = true }
+serde = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]

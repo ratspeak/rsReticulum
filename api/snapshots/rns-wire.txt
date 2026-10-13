@@ -95,6 +95,38 @@ impl rns_wire::header::PacketHeader
 pub fn rns_wire::header::PacketHeader::pack(&self) -> alloc::vec::Vec<u8>
 pub fn rns_wire::header::PacketHeader::size(&self) -> usize
 pub fn rns_wire::header::PacketHeader::unpack(&[u8]) -> core::result::Result<(Self, usize), rns_wire::header::HeaderError>
+pub mod rns_wire::link_signalling
+pub enum rns_wire::link_signalling::LinkSignallingError
+pub rns_wire::link_signalling::LinkSignallingError::InvalidLength
+pub rns_wire::link_signalling::LinkSignallingError::InvalidLength::actual: usize
+pub rns_wire::link_signalling::LinkSignallingError::InvalidLength::legacy: usize
+pub rns_wire::link_signalling::LinkSignallingError::InvalidLength::modern: usize
+pub rns_wire::link_signalling::LinkSignallingError::InvalidMode(u8)
+pub rns_wire::link_signalling::LinkSignallingError::InvalidMtu(u32)
+pub rns_wire::link_signalling::LinkSignallingError::MduUnavailable
+pub struct rns_wire::link_signalling::LinkMtu(_)
+impl rns_wire::link_signalling::LinkMtu
+pub const rns_wire::link_signalling::LinkMtu::BASE: Self
+pub fn rns_wire::link_signalling::LinkMtu::checked_mdu(self) -> core::result::Result<usize, rns_wire::link_signalling::LinkSignallingError>
+pub const fn rns_wire::link_signalling::LinkMtu::get(self) -> u32
+pub fn rns_wire::link_signalling::LinkMtu::try_from_signal(core::option::Option<u32>) -> core::result::Result<Self, rns_wire::link_signalling::LinkSignallingError>
+pub struct rns_wire::link_signalling::LinkSignalling
+pub rns_wire::link_signalling::LinkSignalling::mode: u8
+pub rns_wire::link_signalling::LinkSignalling::mtu: rns_wire::link_signalling::LinkMtu
+pub rns_wire::link_signalling::LinkSignalling::signalling_present: bool
+pub struct rns_wire::link_signalling::SignallingData
+pub rns_wire::link_signalling::SignallingData::mode: u8
+pub rns_wire::link_signalling::SignallingData::mtu: u32
+impl rns_wire::link_signalling::SignallingData
+pub fn rns_wire::link_signalling::SignallingData::new(u8, u32) -> Self
+pub fn rns_wire::link_signalling::SignallingData::pack(&self) -> [u8; 3]
+pub fn rns_wire::link_signalling::SignallingData::try_new(u8, u32) -> core::result::Result<Self, rns_wire::link_signalling::LinkSignallingError>
+pub fn rns_wire::link_signalling::SignallingData::unpack(&[u8]) -> core::option::Option<Self>
+pub const rns_wire::link_signalling::BASE_LINK_MTU: u32
+pub const rns_wire::link_signalling::DEFAULT_LINK_MODE: u8
+pub const rns_wire::link_signalling::MAX_SIGNALLED_LINK_MTU: u32
+pub fn rns_wire::link_signalling::parse_proof_signalling(&[u8]) -> core::result::Result<rns_wire::link_signalling::LinkSignalling, rns_wire::link_signalling::LinkSignallingError>
+pub fn rns_wire::link_signalling::parse_request_signalling(&[u8]) -> core::result::Result<rns_wire::link_signalling::LinkSignalling, rns_wire::link_signalling::LinkSignallingError>
 pub mod rns_wire::packet
 pub enum rns_wire::packet::PacketError
 pub rns_wire::packet::PacketError::ExceedsMtu(usize)

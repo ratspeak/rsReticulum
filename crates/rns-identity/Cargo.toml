@@ -19,6 +19,10 @@ serde_bytes = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
 hex = { workspace = true }
+sha2 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

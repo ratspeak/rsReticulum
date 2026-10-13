@@ -8,6 +8,8 @@ pub type InterfaceId = u64;
 
 /// Handle returned by every `spawn_*`: write channel, status flag, and read task.
 pub struct InterfaceHandle {
+    pub owner: rns_transport::messages::InterfaceOwner,
+    pub packet_capacity: rns_transport::messages::InterfacePacketCapacity,
     pub id: InterfaceId,
     /// Parent interface for dynamically spawned children such as accepted TCP,
     /// Backbone or I2P peers.
@@ -184,6 +186,45 @@ pub enum InterfaceError {
 }
 
 #[cfg(test)]
+pub(crate) fn test_registered_sender(
+    id: rns_transport::messages::InterfaceId,
+    tx: tokio::sync::mpsc::Sender<rns_transport::messages::TransportMessage>,
+) -> rns_transport::messages::InterfaceTransportSender {
+    let sender = rns_transport::messages::InterfaceTransportSender::new(id, tx);
+    sender.owner().mark_registered();
+    sender
+}
+
+#[cfg(test)]
+pub(crate) fn test_event_body(
+    message: rns_transport::messages::TransportMessage,
+) -> rns_transport::messages::TransportMessage {
+    match message {
+        rns_transport::messages::TransportMessage::InterfaceEvent { message, .. } => *message,
+        message => message,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_event_for_handle(
+    message: rns_transport::messages::TransportMessage,
+    handle: &InterfaceHandle,
+) -> rns_transport::messages::TransportMessage {
+    match message {
+        rns_transport::messages::TransportMessage::InterfaceEvent {
+            interface_id,
+            owner,
+            message,
+        } => {
+            assert_eq!(interface_id, handle.id);
+            assert_eq!(owner, handle.owner);
+            *message
+        }
+        other => panic!("expected registration-bound interface event, got {other:?}"),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
@@ -298,6 +339,8 @@ mod tests {
         started_rx.await.expect("read task should start");
 
         let handle = InterfaceHandle {
+            owner: rns_transport::messages::InterfaceOwner::new(),
+            packet_capacity: rns_transport::messages::InterfacePacketCapacity::base(1),
             id: 1,
             parent_id: Some(0),
             name: "rejected-child".to_string(),
@@ -341,6 +384,8 @@ mod tests {
         started_rx.await.expect("read task should start");
 
         let handle = InterfaceHandle {
+            owner: rns_transport::messages::InterfaceOwner::new(),
+            packet_capacity: rns_transport::messages::InterfacePacketCapacity::base(1),
             id: 2,
             parent_id: Some(0),
             name: "accepted-child".to_string(),

@@ -614,7 +614,9 @@ impl TransportActor {
                 self.deregister_interface_with_link_reason(interface, reason);
                 Admission::Retired
             }
-            InterfaceSendOutcome::Missing | InterfaceSendOutcome::NotOutbound => Admission::Retired,
+            InterfaceSendOutcome::Missing
+            | InterfaceSendOutcome::NotOutbound
+            | InterfaceSendOutcome::TooLarge => Admission::Retired,
         }
     }
 

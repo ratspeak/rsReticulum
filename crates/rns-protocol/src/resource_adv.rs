@@ -122,6 +122,14 @@ impl ResourceAdvertisement {
     pub fn unpack(data: &[u8]) -> Result<Self, String> {
         use rmpv::Value;
 
+        crate::resource_control::check_control_frame(
+            rns_wire::context::PacketContext::ResourceAdv,
+            data.len(),
+            true,
+            rns_wire::constants::HEADER_MINSIZE,
+            rns_wire::constants::MTU,
+        )
+        .map_err(|error| error.to_string())?;
         let value =
             rmpv::decode::read_value(&mut &data[..]).map_err(|e| format!("msgpack decode: {e}"))?;
 
@@ -205,61 +213,25 @@ impl ResourceAdvertisement {
 
     /// Encode as the msgpack map described on the struct docs.
     pub fn pack(&self) -> Vec<u8> {
-        use rmpv::Value;
+        let mut output = Vec::new();
+        self.pack_into(&mut output).expect("Vec messagepack write");
+        output
+    }
 
-        let q_val = match &self.request_id {
-            Some(id) => Value::Binary(id.clone()),
-            None => Value::Nil,
-        };
+    /// Write the same wire encoding to either a real buffer or bounded counter.
+    /// Borrowing fields avoids allocating a duplicate hashmap/request-ID tree.
+    pub fn pack_into<W: std::io::Write>(&self, writer: W) -> Result<(), rmp_serde::encode::Error> {
+        serde::Serialize::serialize(
+            &AdvertisementRef(self),
+            &mut rmp_serde::Serializer::new(writer),
+        )
+    }
 
-        let pairs: Vec<(Value, Value)> = vec![
-            (
-                Value::String("t".into()),
-                Value::Integer(self.transfer_size.into()),
-            ),
-            (
-                Value::String("d".into()),
-                Value::Integer(self.data_size.into()),
-            ),
-            (
-                Value::String("n".into()),
-                Value::Integer(self.num_parts.into()),
-            ),
-            (
-                Value::String("h".into()),
-                Value::Binary(self.resource_hash.to_vec()),
-            ),
-            (
-                Value::String("r".into()),
-                Value::Binary(self.random_hash.to_vec()),
-            ),
-            (
-                Value::String("o".into()),
-                Value::Binary(self.original_hash.to_vec()),
-            ),
-            (
-                Value::String("i".into()),
-                Value::Integer(self.segment_index.into()),
-            ),
-            (
-                Value::String("l".into()),
-                Value::Integer(self.total_segments.into()),
-            ),
-            (Value::String("q".into()), q_val),
-            (
-                Value::String("f".into()),
-                Value::Integer(self.flags.to_byte().into()),
-            ),
-            (
-                Value::String("m".into()),
-                Value::Binary(self.hashmap.clone()),
-            ),
-        ];
-
-        let value = Value::Map(pairs);
-        let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &value).expect("msgpack encode should succeed");
-        buf
+    pub fn encoded_len(&self) -> Result<usize, crate::resource::ResourceError> {
+        let mut counter = EncodedLength(0);
+        self.pack_into(&mut counter)
+            .map_err(|_| crate::resource::ResourceError::TooLarge)?;
+        Ok(counter.0)
     }
 
     /// Split the packed `hashmap` field into fixed-length map-hash entries.
@@ -274,6 +246,47 @@ impl ResourceAdvertisement {
                 hash
             })
             .collect()
+    }
+}
+
+struct AdvertisementRef<'a>(&'a ResourceAdvertisement);
+struct BinaryRef<'a>(&'a [u8]);
+impl serde::Serialize for BinaryRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(self.0)
+    }
+}
+impl serde::Serialize for AdvertisementRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let a = self.0;
+        let mut map = serializer.serialize_map(Some(11))?;
+        map.serialize_entry("t", &a.transfer_size)?;
+        map.serialize_entry("d", &a.data_size)?;
+        map.serialize_entry("n", &a.num_parts)?;
+        map.serialize_entry("h", &BinaryRef(&a.resource_hash))?;
+        map.serialize_entry("r", &BinaryRef(&a.random_hash))?;
+        map.serialize_entry("o", &BinaryRef(&a.original_hash))?;
+        map.serialize_entry("i", &a.segment_index)?;
+        map.serialize_entry("l", &a.total_segments)?;
+        map.serialize_entry("q", &a.request_id.as_deref().map(BinaryRef))?;
+        map.serialize_entry("f", &a.flags.to_byte())?;
+        map.serialize_entry("m", &BinaryRef(&a.hashmap))?;
+        map.end()
+    }
+}
+/// Counting sink uses the actual serializer, with no transfer-sized scratch.
+struct EncodedLength(usize);
+impl std::io::Write for EncodedLength {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("length overflow"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

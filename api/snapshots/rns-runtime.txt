@@ -38,6 +38,57 @@ pub fn rns_runtime::buffer_stream::LinkSessionBufferWriter::poll_write(core::pin
 pub const rns_runtime::buffer_stream::DEFAULT_CLOSE_TIMEOUT: core::time::Duration
 pub const rns_runtime::buffer_stream::DEFAULT_READER_CAPACITY: usize
 pub mod rns_runtime::config
+pub mod rns_runtime::config::ifac
+pub enum rns_runtime::config::ifac::IfacConfigError
+pub rns_runtime::config::ifac::IfacConfigError::IfacUnitsRequired
+pub rns_runtime::config::ifac::IfacConfigError::Invalid
+pub rns_runtime::config::ifac::IfacConfigError::Invalid::field: &'static str
+pub rns_runtime::config::ifac::IfacConfigError::Invalid::reason: &'static str
+pub enum rns_runtime::config::ifac::IfacMigrationError
+pub rns_runtime::config::ifac::IfacMigrationError::EmptySelection
+pub rns_runtime::config::ifac::IfacMigrationError::Invalid
+pub rns_runtime::config::ifac::IfacMigrationError::Invalid::error: rns_runtime::config::ifac::IfacConfigError
+pub rns_runtime::config::ifac::IfacMigrationError::Invalid::interface: alloc::string::String
+pub rns_runtime::config::ifac::IfacMigrationError::NotFound(alloc::string::String)
+pub rns_runtime::config::ifac::IfacMigrationError::SourceMismatch
+pub rns_runtime::config::ifac::IfacMigrationError::Syntax(rns_runtime::config::ConfigError)
+pub enum rns_runtime::config::ifac::IfacSourceUnits
+pub rns_runtime::config::ifac::IfacSourceUnits::Bits
+pub rns_runtime::config::ifac::IfacSourceUnits::Bytes
+pub struct rns_runtime::config::ifac::IfacMigrationPlan
+impl rns_runtime::config::ifac::IfacMigrationPlan
+pub fn rns_runtime::config::ifac::IfacMigrationPlan::changes(&self) -> &[rns_runtime::config::ifac::IfacUnitChange]
+pub fn rns_runtime::config::ifac::IfacMigrationPlan::is_unchanged(&self) -> bool
+pub fn rns_runtime::config::ifac::IfacMigrationPlan::proposed_config(&self) -> &str
+pub fn rns_runtime::config::ifac::IfacMigrationPlan::source_hash(&self) -> [u8; 32]
+pub fn rns_runtime::config::ifac::IfacMigrationPlan::source_matches(&self, &str) -> bool
+impl core::fmt::Debug for rns_runtime::config::ifac::IfacMigrationPlan
+pub fn rns_runtime::config::ifac::IfacMigrationPlan::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct rns_runtime::config::ifac::IfacUnitChange
+pub rns_runtime::config::ifac::IfacUnitChange::effective_bytes: usize
+pub rns_runtime::config::ifac::IfacUnitChange::interface: alloc::string::String
+pub rns_runtime::config::ifac::IfacUnitChange::previous_value: usize
+pub struct rns_runtime::config::ifac::PropertySpan
+pub rns_runtime::config::ifac::PropertySpan::key: alloc::string::String
+pub rns_runtime::config::ifac::PropertySpan::path: alloc::vec::Vec<alloc::string::String>
+pub rns_runtime::config::ifac::PropertySpan::range: core::ops::range::Range<usize>
+pub rns_runtime::config::ifac::PropertySpan::section: alloc::string::String
+pub struct rns_runtime::config::ifac::SectionSpan
+pub rns_runtime::config::ifac::SectionSpan::header_end: usize
+pub rns_runtime::config::ifac::SectionSpan::path: alloc::vec::Vec<alloc::string::String>
+pub rns_runtime::config::ifac::SectionSpan::range: core::ops::range::Range<usize>
+pub rns_runtime::config::ifac::SectionSpan::section: alloc::string::String
+pub const rns_runtime::config::ifac::SIZE_KEYS: &[&str]
+pub fn rns_runtime::config::ifac::migration_candidates(&rns_runtime::config::Config) -> alloc::vec::Vec<rns_runtime::config::ifac::IfacUnitChange>
+pub fn rns_runtime::config::ifac::parse_ifac_size(&rns_runtime::config::ConfigSection) -> core::result::Result<core::option::Option<usize>, rns_runtime::config::ifac::IfacConfigError>
+pub fn rns_runtime::config::ifac::plan_ifac_unit_migration(&str, &[alloc::string::String], rns_runtime::config::ifac::IfacSourceUnits) -> core::result::Result<rns_runtime::config::ifac::IfacMigrationPlan, rns_runtime::config::ifac::IfacMigrationError>
+pub fn rns_runtime::config::ifac::property_spans(&str) -> core::result::Result<alloc::vec::Vec<rns_runtime::config::ifac::PropertySpan>, rns_runtime::config::ConfigError>
+pub fn rns_runtime::config::ifac::section_spans(&str) -> core::result::Result<alloc::vec::Vec<rns_runtime::config::ifac::SectionSpan>, rns_runtime::config::ConfigError>
+pub fn rns_runtime::config::ifac::validate_ifac_update(core::option::Option<&str>, &str) -> core::result::Result<(), rns_runtime::config::ifac::IfacMigrationError>
+pub mod rns_runtime::config::ifac_lock
+pub struct rns_runtime::config::ifac_lock::ConfigWriteLock
+impl rns_runtime::config::ifac_lock::ConfigWriteLock
+pub fn rns_runtime::config::ifac_lock::ConfigWriteLock::acquire(&std::path::Path) -> core::io::error::Result<Self>
 pub enum rns_runtime::config::ConfigError
 pub rns_runtime::config::ConfigError::InvalidValue
 pub rns_runtime::config::ConfigError::InvalidValue::key: alloc::string::String
@@ -118,6 +169,7 @@ pub rns_runtime::destination_runtime::DestinationRuntimeError::Destination(rns_i
 pub rns_runtime::destination_runtime::DestinationRuntimeError::InvalidEventCapacity
 pub rns_runtime::destination_runtime::DestinationRuntimeError::LinkSend(rns_runtime::link_manager::LinkSendError)
 pub rns_runtime::destination_runtime::DestinationRuntimeError::ManagerUnavailable
+pub rns_runtime::destination_runtime::DestinationRuntimeError::OrdinaryPacketConfiguration(rns_runtime::link_manager::LinkPacketConfigurationError)
 pub struct rns_runtime::destination_runtime::DestinationEvents
 pub rns_runtime::destination_runtime::DestinationEvents::channel_messages: tokio::sync::mpsc::bounded::Receiver<rns_runtime::link_manager::LinkChannelMessage>
 pub rns_runtime::destination_runtime::DestinationEvents::link_packet_proofs: tokio::sync::mpsc::bounded::Receiver<rns_runtime::link_manager::LinkPacketProof>
@@ -285,7 +337,7 @@ pub rns_runtime::interface_factory::InterfacePostInit::ingress_overrides: rns_tr
 pub rns_runtime::interface_factory::InterfacePostInit::outgoing: bool
 pub rns_runtime::interface_factory::InterfacePostInit::recursive_prs: bool
 impl rns_runtime::interface_factory::InterfacePostInit
-pub fn rns_runtime::interface_factory::InterfacePostInit::from_section(&rns_runtime::config::ConfigSection) -> Self
+pub fn rns_runtime::interface_factory::InterfacePostInit::try_from_section(&rns_runtime::config::ConfigSection) -> core::result::Result<Self, rns_runtime::interface_factory::InterfaceFactoryError>
 pub fn rns_runtime::interface_factory::InterfacePostInit::with_default_ifac_size(self, usize) -> Self
 pub struct rns_runtime::interface_factory::KissSerialConfig
 pub rns_runtime::interface_factory::KissSerialConfig::baud_rate: u32
@@ -362,6 +414,7 @@ pub rns_runtime::interface_factory::SerialInterfaceConfig::port: alloc::string::
 pub rns_runtime::interface_factory::SerialInterfaceConfig::stop_bits: u8
 pub fn rns_runtime::interface_factory::default_ifac_size_for(&rns_runtime::interface_factory::InterfaceConfig) -> usize
 pub fn rns_runtime::interface_factory::synthesize_interface(&str, &rns_runtime::config::ConfigSection) -> core::result::Result<rns_runtime::interface_factory::InterfaceConfig, rns_runtime::interface_factory::InterfaceFactoryError>
+pub fn rns_runtime::interface_factory::validate_config_capacity(&rns_runtime::interface_factory::InterfaceConfig, &rns_runtime::interface_factory::InterfacePostInit) -> core::result::Result<(), rns_runtime::interface_factory::InterfaceFactoryError>
 pub mod rns_runtime::jobs
 pub enum rns_runtime::jobs::Job
 pub rns_runtime::jobs::Job::CleanCache
@@ -397,6 +450,7 @@ pub rns_runtime::link_client::LinkClientError::LinkCrypto(alloc::string::String)
 pub rns_runtime::link_client::LinkClientError::NoSigningKey
 pub rns_runtime::link_client::LinkClientError::ProofInvalid(alloc::string::String)
 pub rns_runtime::link_client::LinkClientError::PubkeyNotDiscovered
+pub rns_runtime::link_client::LinkClientError::RequestDispatch(rns_transport::link_messages::LinkRequestDispatchError)
 pub rns_runtime::link_client::LinkClientError::Timeout(&'static str)
 pub rns_runtime::link_client::LinkClientError::TransportUnavailable
 pub rns_runtime::link_client::LinkClientError::UnexpectedResponse(alloc::string::String)
@@ -486,6 +540,18 @@ pub rns_runtime::link_manager::LinkManagerCommand::SetDefaultAppData
 pub rns_runtime::link_manager::LinkManagerCommand::SetDefaultAppData::app_data: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_runtime::link_manager::LinkManagerCommand::SetDefaultAppData::result_tx: core::option::Option<tokio::sync::oneshot::Sender<core::result::Result<(), rns_runtime::link_manager::DestinationControlError>>>
 pub rns_runtime::link_manager::LinkManagerCommand::Shutdown
+pub enum rns_runtime::link_manager::LinkPacketConfigurationError
+pub rns_runtime::link_manager::LinkPacketConfigurationError::ExactDispatchRequired
+pub rns_runtime::link_manager::LinkPacketConfigurationError::LegacyChannel
+pub rns_runtime::link_manager::LinkPacketConfigurationError::TypedChannelRequired
+pub enum rns_runtime::link_manager::LinkPacketReceiptOutcome
+pub rns_runtime::link_manager::LinkPacketReceiptOutcome::Closed
+pub rns_runtime::link_manager::LinkPacketReceiptOutcome::Dropped
+pub rns_runtime::link_manager::LinkPacketReceiptOutcome::Expired
+pub rns_runtime::link_manager::LinkPacketReceiptOutcome::Sent
+pub rns_runtime::link_manager::LinkPacketReceiptOutcome::Unavailable
+pub enum rns_runtime::link_manager::LinkPacketRejection
+pub rns_runtime::link_manager::LinkPacketRejection::InvalidPropagationStamp
 pub enum rns_runtime::link_manager::LinkPayloadSendReceipt
 pub rns_runtime::link_manager::LinkPayloadSendReceipt::Packet(rns_runtime::link_manager::LinkPacketSendReceipt)
 pub rns_runtime::link_manager::LinkPayloadSendReceipt::Resource(rns_runtime::link_manager::LinkResourceSendReceipt)
@@ -551,6 +617,14 @@ pub rns_runtime::link_manager::DestinationRequest::path: alloc::string::String
 pub rns_runtime::link_manager::DestinationRequest::remote_identity: core::option::Option<rns_identity::identity::Identity>
 pub rns_runtime::link_manager::DestinationRequest::request_id: [u8; 16]
 pub rns_runtime::link_manager::DestinationRequest::requested_at: f64
+pub struct rns_runtime::link_manager::InboundLinkPacket
+impl rns_runtime::link_manager::InboundLinkPacket
+pub fn rns_runtime::link_manager::InboundLinkPacket::destination_hash(&self) -> [u8; 16]
+pub fn rns_runtime::link_manager::InboundLinkPacket::into_parts(self) -> (bytes::bytes::Bytes, core::option::Option<rns_runtime::link_manager::LinkPacketReceipt>)
+pub fn rns_runtime::link_manager::InboundLinkPacket::link_id(&self) -> [u8; 16]
+pub fn rns_runtime::link_manager::InboundLinkPacket::packet_hash(&self) -> [u8; 32]
+pub fn rns_runtime::link_manager::InboundLinkPacket::payload(&self) -> &bytes::bytes::Bytes
+pub fn rns_runtime::link_manager::InboundLinkPacket::role(&self) -> rns_link::link::LinkRole
 pub struct rns_runtime::link_manager::LinkChannelMessage
 pub rns_runtime::link_manager::LinkChannelMessage::link_id: [u8; 16]
 pub rns_runtime::link_manager::LinkChannelMessage::msg_type: u16
@@ -574,6 +648,8 @@ pub fn rns_runtime::link_manager::LinkManager::get_link_mut(&mut self, &[u8; 16]
 pub fn rns_runtime::link_manager::LinkManager::link_identities_handle(&self) -> alloc::sync::Arc<std::sync::poison::mutex::Mutex<std::collections::hash::map::HashMap<[u8; 16], [u8; 16]>>>
 pub fn rns_runtime::link_manager::LinkManager::link_interface(&self, &[u8; 16]) -> core::option::Option<rns_transport::messages::InterfaceId>
 pub fn rns_runtime::link_manager::LinkManager::new(tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Receiver<rns_transport::link_messages::DestinationEvent>, [u8; 16], core::option::Option<rns_crypto::ed25519::Ed25519PrivateKey>) -> Self
+pub fn rns_runtime::link_manager::LinkManager::ordinary_packet_overload_count(&self) -> u64
+pub fn rns_runtime::link_manager::LinkManager::ordinary_packet_proof_strategy(&self) -> rns_identity::destination::ProofStrategy
 pub fn rns_runtime::link_manager::LinkManager::process_destination_packet(&self, &[u8], &rns_identity::identity::Identity) -> core::option::Option<alloc::vec::Vec<u8>>
 pub fn rns_runtime::link_manager::LinkManager::register_channel_message_type(&mut self, u16) -> core::result::Result<(), rns_protocol::channel::ChannelError>
 pub fn rns_runtime::link_manager::LinkManager::register_request_handler<F>(&mut self, &str, rns_identity::destination::AllowPolicy, core::option::Option<alloc::vec::Vec<[u8; 16]>>, bool, F) -> bool where F: core::ops::function::Fn(rns_runtime::link_manager::DestinationRequest) -> rns_runtime::link_manager::RequestOutcome + core::marker::Send + 'static
@@ -589,14 +665,16 @@ pub fn rns_runtime::link_manager::LinkManager::set_accounting_event_channel(&mut
 pub fn rns_runtime::link_manager::LinkManager::set_announce_handler<F>(&mut self, F) where F: core::ops::function::FnMut() + core::marker::Send + 'static
 pub fn rns_runtime::link_manager::LinkManager::set_channel_message_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::LinkChannelMessage>)
 pub fn rns_runtime::link_manager::LinkManager::set_destination_delivery_proof_channel(&mut self, tokio::sync::mpsc::unbounded::UnboundedSender<rns_runtime::link_manager::DestinationDeliveryProof>)
+pub fn rns_runtime::link_manager::LinkManager::set_inbound_link_packet_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::InboundLinkPacket>) -> core::result::Result<(), rns_runtime::link_manager::LinkPacketConfigurationError>
 pub fn rns_runtime::link_manager::LinkManager::set_inbound_raw_channel(&mut self, tokio::sync::mpsc::bounded::Sender<alloc::vec::Vec<u8>>)
 pub fn rns_runtime::link_manager::LinkManager::set_link_closed_channel(&mut self, tokio::sync::mpsc::bounded::Sender<[u8; 16]>)
 pub fn rns_runtime::link_manager::LinkManager::set_link_endpoint_dispatch_handle(&mut self, rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle)
 pub fn rns_runtime::link_manager::LinkManager::set_link_established_channel(&mut self, tokio::sync::mpsc::bounded::Sender<[u8; 16]>)
 pub fn rns_runtime::link_manager::LinkManager::set_link_identified_channel(&mut self, tokio::sync::mpsc::bounded::Sender<([u8; 16], [u8; 16])>)
 pub fn rns_runtime::link_manager::LinkManager::set_link_identity_gate<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], [u8; 16]) -> bool + core::marker::Send + 'static
-pub fn rns_runtime::link_manager::LinkManager::set_link_packet_channel(&mut self, tokio::sync::mpsc::unbounded::UnboundedSender<(alloc::vec::Vec<u8>, [u8; 16])>)
+pub fn rns_runtime::link_manager::LinkManager::set_link_packet_channel(&mut self, tokio::sync::mpsc::unbounded::UnboundedSender<(alloc::vec::Vec<u8>, [u8; 16])>) -> core::result::Result<(), rns_runtime::link_manager::LinkPacketConfigurationError>
 pub fn rns_runtime::link_manager::LinkManager::set_link_packet_proof_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::LinkPacketProof>)
+pub fn rns_runtime::link_manager::LinkManager::set_ordinary_packet_proof_strategy(&mut self, rns_identity::destination::ProofStrategy) -> core::result::Result<(), rns_runtime::link_manager::LinkPacketConfigurationError>
 pub fn rns_runtime::link_manager::LinkManager::set_outbound_resource_proof_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::LinkResourceProof>)
 pub fn rns_runtime::link_manager::LinkManager::set_request_handler<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], [u8; 16], alloc::vec::Vec<u8>) -> core::option::Option<alloc::vec::Vec<u8>> + core::marker::Send + 'static
 pub fn rns_runtime::link_manager::LinkManager::set_request_handler_ex<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], [u8; 16], alloc::vec::Vec<u8>) -> rns_runtime::link_manager::RequestOutcome + core::marker::Send + 'static
@@ -616,6 +694,14 @@ pub fn rns_runtime::link_manager::LinkManager::with_destination(tokio::sync::mps
 pub struct rns_runtime::link_manager::LinkPacketProof
 pub rns_runtime::link_manager::LinkPacketProof::link_id: [u8; 16]
 pub rns_runtime::link_manager::LinkPacketProof::packet_hash: [u8; 32]
+pub struct rns_runtime::link_manager::LinkPacketReceipt
+impl rns_runtime::link_manager::LinkPacketReceipt
+pub fn rns_runtime::link_manager::LinkPacketReceipt::accept(self) -> tokio::sync::oneshot::Receiver<rns_runtime::link_manager::LinkPacketReceiptOutcome>
+pub fn rns_runtime::link_manager::LinkPacketReceipt::close_without_proof(self) -> tokio::sync::oneshot::Receiver<rns_runtime::link_manager::LinkPacketReceiptOutcome>
+pub fn rns_runtime::link_manager::LinkPacketReceipt::drop_without_proof(self)
+pub fn rns_runtime::link_manager::LinkPacketReceipt::reject_and_close(self, rns_runtime::link_manager::LinkPacketRejection) -> tokio::sync::oneshot::Receiver<rns_runtime::link_manager::LinkPacketReceiptOutcome>
+impl core::ops::drop::Drop for rns_runtime::link_manager::LinkPacketReceipt
+pub fn rns_runtime::link_manager::LinkPacketReceipt::drop(&mut self)
 pub struct rns_runtime::link_manager::LinkPacketSendReceipt
 pub rns_runtime::link_manager::LinkPacketSendReceipt::link_id: [u8; 16]
 pub rns_runtime::link_manager::LinkPacketSendReceipt::packet_hash: [u8; 32]
@@ -657,6 +743,7 @@ pub rns_runtime::link_session::LinkSessionError::PayloadTooLarge::actual: usize
 pub rns_runtime::link_session::LinkSessionError::PayloadTooLarge::max: usize
 pub rns_runtime::link_session::LinkSessionError::ProofInvalid(alloc::string::String)
 pub rns_runtime::link_session::LinkSessionError::PublicKeyUnavailable
+pub rns_runtime::link_session::LinkSessionError::RequestDispatch(rns_transport::link_messages::LinkRequestDispatchError)
 pub rns_runtime::link_session::LinkSessionError::RequestRequiresResource
 pub rns_runtime::link_session::LinkSessionError::RequestRequiresResource::actual: usize
 pub rns_runtime::link_session::LinkSessionError::RequestRequiresResource::max: usize
@@ -697,6 +784,7 @@ pub rns_runtime::link_session::LinkSessionResourceDirection::Inbound
 pub rns_runtime::link_session::LinkSessionResourceDirection::Outbound
 pub enum rns_runtime::link_session::LinkSessionResourceError
 pub rns_runtime::link_session::LinkSessionResourceError::Cancelled
+pub rns_runtime::link_session::LinkSessionResourceError::Control(rns_protocol::resource::ResourceError)
 pub rns_runtime::link_session::LinkSessionResourceError::Failed(alloc::string::String)
 pub rns_runtime::link_session::LinkSessionResourceError::InvalidAdvertisement(alloc::string::String)
 pub rns_runtime::link_session::LinkSessionResourceError::LinkCrypto
@@ -890,6 +978,7 @@ pub rns_runtime::prelude::DestinationRuntimeError::Destination(rns_identity::des
 pub rns_runtime::prelude::DestinationRuntimeError::InvalidEventCapacity
 pub rns_runtime::prelude::DestinationRuntimeError::LinkSend(rns_runtime::link_manager::LinkSendError)
 pub rns_runtime::prelude::DestinationRuntimeError::ManagerUnavailable
+pub rns_runtime::prelude::DestinationRuntimeError::OrdinaryPacketConfiguration(rns_runtime::link_manager::LinkPacketConfigurationError)
 pub enum rns_runtime::prelude::LinkConnectError
 pub rns_runtime::prelude::LinkConnectError::Control(rns_runtime::reticulum::ControlError)
 pub rns_runtime::prelude::LinkConnectError::IdentityUnavailable(alloc::string::String)
@@ -916,6 +1005,7 @@ pub rns_runtime::prelude::LinkSessionError::PayloadTooLarge::actual: usize
 pub rns_runtime::prelude::LinkSessionError::PayloadTooLarge::max: usize
 pub rns_runtime::prelude::LinkSessionError::ProofInvalid(alloc::string::String)
 pub rns_runtime::prelude::LinkSessionError::PublicKeyUnavailable
+pub rns_runtime::prelude::LinkSessionError::RequestDispatch(rns_transport::link_messages::LinkRequestDispatchError)
 pub rns_runtime::prelude::LinkSessionError::RequestRequiresResource
 pub rns_runtime::prelude::LinkSessionError::RequestRequiresResource::actual: usize
 pub rns_runtime::prelude::LinkSessionError::RequestRequiresResource::max: usize
@@ -953,6 +1043,7 @@ pub rns_runtime::prelude::LinkSessionEvent::ResourceStarted::total_segments: usi
 pub rns_runtime::prelude::LinkSessionEvent::Stale
 pub enum rns_runtime::prelude::LinkSessionResourceError
 pub rns_runtime::prelude::LinkSessionResourceError::Cancelled
+pub rns_runtime::prelude::LinkSessionResourceError::Control(rns_protocol::resource::ResourceError)
 pub rns_runtime::prelude::LinkSessionResourceError::Failed(alloc::string::String)
 pub rns_runtime::prelude::LinkSessionResourceError::InvalidAdvertisement(alloc::string::String)
 pub rns_runtime::prelude::LinkSessionResourceError::LinkCrypto
@@ -1322,6 +1413,7 @@ pub enum rns_runtime::probe::ProbeError
 pub rns_runtime::probe::ProbeError::EncryptError(alloc::string::String)
 pub rns_runtime::probe::ProbeError::Internal(alloc::string::String)
 pub rns_runtime::probe::ProbeError::InvalidName
+pub rns_runtime::probe::ProbeError::InvalidTimeout
 pub rns_runtime::probe::ProbeError::MtuExceeded(usize, usize)
 pub rns_runtime::probe::ProbeError::NoIdentity
 pub rns_runtime::probe::ProbeError::PacketTimeout
@@ -1333,6 +1425,7 @@ pub rns_runtime::probe::ProbeOutcome::hops: u8
 pub rns_runtime::probe::ProbeOutcome::interface: core::option::Option<alloc::string::String>
 pub rns_runtime::probe::ProbeOutcome::rtt: core::time::Duration
 pub rns_runtime::probe::ProbeOutcome::via: core::option::Option<[u8; 16]>
+pub fn rns_runtime::probe::checked_probe_timeout(f64) -> core::result::Result<core::time::Duration, rns_runtime::probe::ProbeError>
 pub fn rns_runtime::probe::default_probe_app_name() -> &'static str
 pub fn rns_runtime::probe::parse_dest_hash(&str) -> core::result::Result<[u8; 16], rns_runtime::probe::ProbeError>
 pub async fn rns_runtime::probe::probe_once(tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, [u8; 16], &str, usize, core::option::Option<core::time::Duration>, core::option::Option<core::time::Duration>, bool) -> core::result::Result<rns_runtime::probe::ProbeOutcome, rns_runtime::probe::ProbeError>
@@ -1743,6 +1836,7 @@ pub rns_runtime::rncp::RncpError::NoIdentity
 pub rns_runtime::rncp::RncpError::NoSigningKey
 pub rns_runtime::rncp::RncpError::PathTimeout
 pub rns_runtime::rncp::RncpError::ProofInvalid(alloc::string::String)
+pub rns_runtime::rncp::RncpError::RequestDispatch(rns_transport::link_messages::LinkRequestDispatchError)
 pub rns_runtime::rncp::RncpError::ResourceCreate(alloc::string::String)
 pub rns_runtime::rncp::RncpError::ResourceFailed(alloc::string::String)
 pub rns_runtime::rncp::RncpError::Timeout(&'static str)
@@ -1840,6 +1934,7 @@ pub rns_runtime::rnsh::RnshError::PathTimeout
 pub rns_runtime::rnsh::RnshError::Process(alloc::string::String)
 pub rns_runtime::rnsh::RnshError::ProofInvalid(alloc::string::String)
 pub rns_runtime::rnsh::RnshError::Remote(alloc::string::String)
+pub rns_runtime::rnsh::RnshError::RequestDispatch(rns_transport::link_messages::LinkRequestDispatchError)
 pub rns_runtime::rnsh::RnshError::Timeout(&'static str)
 pub rns_runtime::rnsh::RnshError::TransportUnavailable
 impl core::convert::From<rns_protocol::channel::ChannelError> for rns_runtime::rnsh::RnshError

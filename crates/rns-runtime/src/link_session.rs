@@ -396,6 +396,8 @@ pub enum LinkSessionResourceError {
     OfferExpired,
     #[error("inbound resource advertisement is invalid: {0}")]
     InvalidAdvertisement(String),
+    #[error("resource control rejected: {0}")]
+    Control(#[from] rns_protocol::resource::ResourceError),
     #[error("resource transfer failed: {0}")]
     Failed(String),
     #[error(transparent)]
@@ -418,6 +420,8 @@ pub enum LinkSessionChannelError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LinkSessionError {
+    #[error("link request admission failed: {0}")]
+    RequestDispatch(#[from] rns_transport::link_messages::LinkRequestDispatchError),
     #[error("transport channel is unavailable")]
     TransportUnavailable,
     #[error("timed out waiting for {0}")]
@@ -609,6 +613,7 @@ struct SessionActorChannels {
 struct DestinationEventContext<'a> {
     transport_tx: &'a mpsc::Sender<TransportMessage>,
     attached_interface: InterfaceId,
+    interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
     sinks: InboundResourceSinks<'a>,
     phy_stats_tx: &'a watch::Sender<LinkPhyStats>,
 }
@@ -938,6 +943,9 @@ impl LinkSession {
         identity: Identity,
         config: LinkSessionConfig,
     ) -> Result<Self, LinkSessionError> {
+        let deadline = Instant::now()
+            .checked_add(config.establishment_timeout)
+            .ok_or_else(|| LinkSessionError::HandshakeFailed("unrepresentable timeout".into()))?;
         let (mut link, request_data) = Link::new_initiator(config.destination_hash, config.hops);
         link.track_phy_stats(config.track_phy_stats);
         let link_id = link.link_id;
@@ -958,16 +966,18 @@ impl LinkSession {
         );
 
         let request = build_link_request_packet(config.destination_hash, &request_data);
-        if transport_tx
-            .send(TransportMessage::Outbound(OutboundRequest {
-                raw: request,
-                destination_hash: config.destination_hash,
-            }))
-            .await
-            .is_err()
-        {
-            return Err(LinkSessionError::TransportUnavailable);
-        }
+        tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            rns_transport::link_messages::dispatch_link_request(
+                &transport_tx,
+                OutboundRequest {
+                    raw: request,
+                    destination_hash: config.destination_hash,
+                },
+            ),
+        )
+        .await
+        .map_err(|_| LinkSessionError::Timeout("link request admission"))??;
 
         let peer_signing_key: [u8; 32] = config.remote_public_key[32..]
             .try_into()
@@ -975,7 +985,7 @@ impl LinkSession {
         let verify_key = Ed25519PublicKey::from_bytes(&peer_signing_key)
             .map_err(|error| LinkSessionError::ProofInvalid(error.to_string()))?;
         let proof = match tokio::time::timeout(
-            config.establishment_timeout,
+            deadline.saturating_duration_since(Instant::now()),
             crate::link_endpoint::wait_for_valid_proof(
                 &mut delivery_rx,
                 &mut link,
@@ -997,6 +1007,7 @@ impl LinkSession {
             Err(_) => return Err(LinkSessionError::Timeout("link proof")),
         };
         let attached_interface = proof.interface_id;
+        let interface_owner = proof.interface_owner;
         let rtt_data = proof.rtt_data;
         update_link_phy_stats(&mut link, proof.metrics);
 
@@ -1007,6 +1018,7 @@ impl LinkSession {
             &transport_tx,
             link_id,
             attached_interface,
+            interface_owner,
             LinkEndpointRole::Initiator,
         )
         .await
@@ -1063,6 +1075,7 @@ impl LinkSession {
         tokio::spawn(run_session_actor(
             (link, channel),
             attached_interface,
+            interface_owner,
             delivery_rx,
             endpoint_lifecycle_rx,
             command_rx,
@@ -1140,9 +1153,11 @@ pub async fn lookup_destination(
         .find(|entry| entry.dest_hash == destination_hash))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session_actor(
     link_and_channel: (Link, LinkChannel),
     attached_interface: InterfaceId,
+    interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
     mut delivery_rx: mpsc::Receiver<DestinationEvent>,
     mut endpoint_lifecycle_rx: mpsc::UnboundedReceiver<
         rns_transport::messages::LinkEndpointLifecycleEvent,
@@ -1296,6 +1311,7 @@ async fn run_session_actor(
                     DestinationEventContext {
                         transport_tx: &transport_tx,
                         attached_interface,
+                        interface_owner,
                         sinks: InboundResourceSinks {
                             event_tx: &event_tx,
                             command_tx: &command_tx,
@@ -1993,6 +2009,13 @@ async fn send_resource_action(
             return Ok(());
         }
     };
+    rns_protocol::resource_control::check_control_frame(
+        context,
+        payload.len(),
+        encrypted,
+        rns_wire::constants::HEADER_MINSIZE,
+        link.mtu as usize,
+    )?;
     let body = if encrypted {
         link.encrypt(&payload)
             .map_err(|_| LinkSessionResourceError::LinkCrypto)?
@@ -3572,6 +3595,7 @@ async fn process_destination_event(
     let DestinationEventContext {
         transport_tx,
         attached_interface,
+        interface_owner: expected_owner,
         sinks,
         phy_stats_tx,
     } = context;
@@ -3587,12 +3611,13 @@ async fn process_destination_event(
         DestinationEvent::InboundPacket {
             raw,
             interface_id,
+            interface_owner,
             metrics,
         } => {
             // Python pins an established Link to the interface that delivered
             // its proof. Accepting Link traffic from another interface would
             // both break route affinity and permit cross-interface injection.
-            if interface_id != attached_interface {
+            if interface_id != attached_interface || interface_owner != expected_owner {
                 return Ok(None);
             }
             let Ok((header, data_offset)) = rns_wire::header::PacketHeader::unpack(&raw) else {
@@ -3995,6 +4020,10 @@ mod tests {
         tokio::spawn(async move {
             while let Some(message) = transport_rx.recv().await {
                 let observed = match message {
+                    TransportMessage::SendLinkRequest { request, result_tx } => {
+                        let _ = result_tx.send(Ok(()));
+                        TransportMessage::Outbound(request)
+                    }
                     TransportMessage::SendLinkEndpoint {
                         link_id,
                         role,
@@ -4462,6 +4491,7 @@ mod tests {
         tokio::spawn(run_session_actor(
             (initiator, channel),
             7,
+            None,
             delivery_rx,
             endpoint_lifecycle_rx,
             command_rx,
@@ -4492,6 +4522,7 @@ mod tests {
         delivery_tx
             .send(DestinationEvent::InboundPacket {
                 raw: inbound_packet.clone(),
+                interface_owner: None,
                 interface_id: 8,
                 metrics: Default::default(),
             })
@@ -4508,6 +4539,7 @@ mod tests {
         delivery_tx
             .send(DestinationEvent::InboundPacket {
                 raw: inbound_packet,
+                interface_owner: None,
                 interface_id: 7,
                 metrics: Default::default(),
             })
@@ -4533,6 +4565,7 @@ mod tests {
             .send(rns_transport::messages::LinkEndpointLifecycleEvent {
                 binding: rns_transport::messages::LinkEndpointBinding {
                     link_id,
+                    interface_owner: None,
                     interface_id: 7,
                     role: LinkEndpointRole::Initiator,
                 },
@@ -4555,6 +4588,51 @@ mod tests {
             Some(LinkSessionEvent::Closed {
                 reason: LinkSessionCloseReason::TransportUnavailable,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_rejection_finishes_handshake_before_proof_timeout() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let connect = tokio::spawn(LinkSession::connect(
+            tx,
+            Identity::new(),
+            LinkSessionConfig {
+                destination_hash: [0x71; 16],
+                remote_public_key: Identity::new().get_public_key(),
+                hops: 1,
+                establishment_timeout: Duration::from_secs(30),
+                client_label: "capacity".into(),
+                identify: false,
+                track_phy_stats: false,
+            },
+        ));
+        let link_id = match rx.recv().await.unwrap() {
+            TransportMessage::RegisterDestination { hash, .. } => hash,
+            other => panic!("unexpected registration: {other:?}"),
+        };
+        let expected = rns_transport::link_messages::LinkRequestDispatchError::Capacity(
+            rns_transport::InterfaceCapacityError::LinkCapacityUnavailable {
+                interface_id: 7,
+                clear_mtu: 499,
+                required: 500,
+            },
+        );
+        match rx.recv().await.unwrap() {
+            TransportMessage::SendLinkRequest { result_tx, .. } => {
+                result_tx.send(Err(expected)).unwrap();
+            }
+            other => panic!("unexpected dispatch: {other:?}"),
+        }
+        let result = tokio::time::timeout(Duration::from_secs(1), connect)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, Err(LinkSessionError::RequestDispatch(error)) if error == expected)
+        );
+        assert!(
+            matches!(rx.recv().await, Some(TransportMessage::DeregisterDestination { hash }) if hash == link_id)
         );
     }
 
@@ -4629,6 +4707,10 @@ mod tests {
             other => panic!("unexpected transport message: {other:?}"),
         };
         let request = match transport_rx.recv().await.unwrap() {
+            TransportMessage::SendLinkRequest { request, result_tx } => {
+                let _ = result_tx.send(Ok(()));
+                request
+            }
             TransportMessage::Outbound(request) => request,
             other => panic!("unexpected transport message: {other:?}"),
         };
@@ -4643,6 +4725,7 @@ mod tests {
         delivery_tx
             .send(DestinationEvent::InboundPacket {
                 raw: build_proof_packet(link_id, rns_wire::context::PacketContext::None, &proof),
+                interface_owner: None,
                 interface_id: 23,
                 metrics: Default::default(),
             })
@@ -4728,6 +4811,10 @@ mod tests {
             other => panic!("unexpected transport message: {other:?}"),
         };
         let request = match transport_rx.recv().await.unwrap() {
+            TransportMessage::SendLinkRequest { request, result_tx } => {
+                let _ = result_tx.send(Ok(()));
+                request
+            }
             TransportMessage::Outbound(request) => request,
             other => panic!("unexpected transport message: {other:?}"),
         };
@@ -4742,12 +4829,14 @@ mod tests {
         let link_id = responder.link_id;
         let inbound = move |context, body: &[u8]| DestinationEvent::InboundPacket {
             raw: build_data_packet(link_id, context, body),
+            interface_owner: None,
             interface_id: 1,
             metrics: PacketMetrics::default(),
         };
         delivery_tx
             .send(DestinationEvent::InboundPacket {
                 raw: build_proof_packet(link_id, rns_wire::context::PacketContext::None, &proof),
+                interface_owner: None,
                 interface_id: 1,
                 metrics: PacketMetrics::default(),
             })
@@ -4820,6 +4909,10 @@ mod tests {
         };
 
         let request = match transport_rx.recv().await.unwrap() {
+            TransportMessage::SendLinkRequest { request, result_tx } => {
+                let _ = result_tx.send(Ok(()));
+                request
+            }
             TransportMessage::Outbound(request) => request,
             other => panic!("unexpected transport message: {other:?}"),
         };
@@ -4844,6 +4937,7 @@ mod tests {
         delivery_tx
             .send(DestinationEvent::InboundPacket {
                 raw: proof_packet,
+                interface_owner: None,
                 interface_id: 1,
                 metrics: PacketMetrics {
                     rssi: Some(-87.0),
@@ -4944,6 +5038,7 @@ mod tests {
                     rns_wire::context::PacketContext::Response,
                     &response,
                 ),
+                interface_owner: None,
                 interface_id: 1,
                 metrics: PacketMetrics {
                     rssi: Some(-72.0),
@@ -5072,6 +5167,7 @@ mod tests {
                     rns_wire::context::PacketContext::LinkProof,
                     &first_proof,
                 ),
+                interface_owner: None,
                 interface_id: 1,
                 metrics: Default::default(),
             })
@@ -5100,6 +5196,7 @@ mod tests {
                     rns_wire::context::PacketContext::LinkProof,
                     &second_proof,
                 ),
+                interface_owner: None,
                 interface_id: 1,
                 metrics: Default::default(),
             })
@@ -5136,6 +5233,7 @@ mod tests {
         delivery_tx
             .send(DestinationEvent::InboundPacket {
                 raw: inbound_channel_packet,
+                interface_owner: None,
                 interface_id: 1,
                 metrics: Default::default(),
             })
@@ -5189,6 +5287,7 @@ mod tests {
                     rns_wire::context::PacketContext::Channel,
                     &ignored_prepared.data,
                 ),
+                interface_owner: None,
                 interface_id: 1,
                 metrics: Default::default(),
             })
@@ -5217,6 +5316,7 @@ mod tests {
                     rns_wire::context::PacketContext::Channel,
                     &inbound_stream_prepared.data,
                 ),
+                interface_owner: None,
                 interface_id: 1,
                 metrics: Default::default(),
             })
@@ -5265,6 +5365,7 @@ mod tests {
                     rns_wire::context::PacketContext::LinkProof,
                     &outbound_stream_proof,
                 ),
+                interface_owner: None,
                 interface_id: 1,
                 metrics: Default::default(),
             })
@@ -5296,6 +5397,7 @@ mod tests {
                     rns_wire::context::PacketContext::LinkProof,
                     &eof_proof,
                 ),
+                interface_owner: None,
                 interface_id: 1,
                 metrics: Default::default(),
             })
@@ -5314,6 +5416,7 @@ mod tests {
         delivery_tx
             .send(DestinationEvent::InboundPacket {
                 raw: inbound.clone(),
+                interface_owner: None,
                 interface_id: 9,
                 metrics: Default::default(),
             })
@@ -5332,6 +5435,7 @@ mod tests {
         delivery_tx
             .send(DestinationEvent::InboundPacket {
                 raw: inbound,
+                interface_owner: None,
                 interface_id: 1,
                 metrics: Default::default(),
             })
@@ -5417,6 +5521,7 @@ mod tests {
                     rns_wire::context::PacketContext::ResourceReq,
                     &encrypted_request,
                 ),
+                interface_owner: None,
                 interface_id: 1,
                 metrics: Default::default(),
             })
@@ -5449,6 +5554,7 @@ mod tests {
                     rns_wire::context::PacketContext::ResourcePrf,
                     &resource_proof,
                 ),
+                interface_owner: None,
                 interface_id: 1,
                 metrics: Default::default(),
             })
@@ -5573,6 +5679,7 @@ mod tests {
                     rns_wire::context::PacketContext::ResourceAdv,
                     &responder.encrypt(&inbound_advertisement).unwrap(),
                 ),
+                interface_owner: None,
                 interface_id: 1,
                 metrics: Default::default(),
             })
@@ -5623,6 +5730,7 @@ mod tests {
                         rns_wire::context::PacketContext::Resource,
                         &part,
                     ),
+                    interface_owner: None,
                     interface_id: 1,
                     metrics: Default::default(),
                 })
@@ -5685,6 +5793,7 @@ mod tests {
                     rns_wire::context::PacketContext::ResourceAdv,
                     &responder.encrypt(&rejected_advertisement).unwrap(),
                 ),
+                interface_owner: None,
                 interface_id: 1,
                 metrics: Default::default(),
             })
@@ -5725,6 +5834,7 @@ mod tests {
                     rns_wire::context::PacketContext::ResourceAdv,
                     &responder.encrypt(&cancelled_advertisement).unwrap(),
                 ),
+                interface_owner: None,
                 interface_id: 1,
                 metrics: Default::default(),
             })

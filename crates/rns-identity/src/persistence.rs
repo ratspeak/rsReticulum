@@ -4,6 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod strict;
+pub use strict::{
+    DurableCleanupOutcome, DurableCommitPhase, DurableDirectoryReceipt, DurableErrorKind,
+    DurableFileReceipt, DurableWriteError, durable_create_dir_all, durable_reconcile,
+    durable_reconcile_directory, durable_reconcile_hash, durable_remove, durable_rename_directory,
+    durable_write, validate_durable_storage_directory,
+};
+
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ATOMIC_WRITE_LOCK: Mutex<()> = Mutex::new(());
 

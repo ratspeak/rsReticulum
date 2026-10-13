@@ -39,6 +39,15 @@ pub const MAX_TRIES: usize = 5;
 
 /// Floor for the `rtt * 2.5` term used as the base of the retransmit backoff.
 pub const MIN_TIMEOUT_BASE: f64 = 0.025;
+/// Retained RTT ceiling, matching the Link peer-RTT policy.
+pub const RTT_MAX: f64 = 720.0;
+fn initial_rtt(rtt: f64) -> f64 {
+    if rtt.is_finite() && rtt >= 0.0 {
+        rtt.min(RTT_MAX)
+    } else {
+        1.0
+    }
+}
 
 /// One outgoing or incoming channel frame.
 ///
@@ -129,6 +138,7 @@ impl ChannelWindow {
     /// `RTT_SLOW` start pinned at a single slot with zero flexibility so we
     /// don't spray bursts onto a marginal path.
     pub fn new(rtt: f64) -> Self {
+        let rtt = initial_rtt(rtt);
         if rtt > RTT_SLOW {
             Self {
                 window: 1,
@@ -157,6 +167,11 @@ impl ChannelWindow {
     /// unlock the fast tier. Any measurement that falls out of a tier resets
     /// that tier's counter.
     pub fn grow(&mut self, rtt: f64) {
+        self.clamp_window();
+        if !rtt.is_finite() || rtt < 0.0 {
+            return;
+        }
+        let rtt = rtt.min(RTT_MAX);
         if self.window < self.window_max {
             self.window += 1;
         }
@@ -171,7 +186,7 @@ impl ChannelWindow {
             if rtt > RTT_MEDIUM {
                 self.medium_rate_rounds = 0;
             } else {
-                self.medium_rate_rounds += 1;
+                self.medium_rate_rounds = self.medium_rate_rounds.saturating_add(1);
                 if self.window_max < WINDOW_MAX_MEDIUM
                     && self.medium_rate_rounds == FAST_RATE_THRESHOLD
                 {
@@ -180,7 +195,7 @@ impl ChannelWindow {
                 }
             }
         } else {
-            self.fast_rate_rounds += 1;
+            self.fast_rate_rounds = self.fast_rate_rounds.saturating_add(1);
             if self.window_max < WINDOW_MAX_FAST && self.fast_rate_rounds == FAST_RATE_THRESHOLD {
                 self.window_max = WINDOW_MAX_FAST;
                 self.window_min = WINDOW_MIN_LIMIT_FAST;
@@ -191,7 +206,15 @@ impl ChannelWindow {
     /// Pull the window in on retransmit. Also walks `window_max` downwards so
     /// long-term packet loss actually demotes the link tier, stopping at the
     /// configured `window_flexibility` gap above `window_min`.
+    fn clamp_window(&mut self) {
+        self.window = self.window.min(WINDOW_MAX);
+        self.window_min = self.window_min.min(WINDOW_MAX);
+        self.window_max = self.window_max.min(WINDOW_MAX);
+        self.window_flexibility = self.window_flexibility.min(WINDOW_MAX);
+    }
+
     pub fn shrink(&mut self) {
+        self.clamp_window();
         if self.window > self.window_min {
             self.window -= 1;
 
@@ -236,6 +259,7 @@ pub struct Channel {
 
 impl Channel {
     pub fn new(rtt: f64) -> Self {
+        let rtt = initial_rtt(rtt);
         Self {
             next_tx_sequence: 0,
             next_rx_sequence: 0,
@@ -328,7 +352,7 @@ impl Channel {
             .iter()
             .filter(|e| e.state != MessageState::Delivered)
             .count();
-        outstanding < self.window.window
+        outstanding < self.window.window.min(WINDOW_MAX)
     }
 
     /// True when every outbound envelope has been acknowledged and removed.
@@ -401,7 +425,7 @@ impl Channel {
     /// is marked inactive at that point).
     pub fn timeout(&mut self, sequence: u16) -> Result<Option<Vec<u8>>, ChannelError> {
         if let Some(env) = self.tx_ring.iter_mut().find(|e| e.sequence == sequence) {
-            env.tries += 1;
+            env.tries = env.tries.saturating_add(1);
             if env.tries > MAX_TRIES {
                 self.active = false;
                 return Err(ChannelError::MaxRetriesExceeded);
@@ -532,20 +556,21 @@ impl Channel {
     /// based on the latest Link RTT supplied by the owning runtime.
     pub fn compute_timeout(&self, tries: usize) -> f64 {
         let rtt = self.current_rtt;
-        let backoff = 1.5_f64.powi(tries.saturating_sub(1) as i32);
+        let backoff = 1.5_f64.powi((tries.clamp(1, MAX_TRIES) - 1) as i32);
         let base = (rtt * 2.5).max(MIN_TIMEOUT_BASE);
-        let outstanding = self.outstanding_count() as f64 + 1.5;
+        let outstanding = self.outstanding_count().min(WINDOW_MAX) as f64 + 1.5;
         backoff * base * outstanding
     }
 
     fn timeout_duration(&self, tries: usize) -> Duration {
-        Duration::from_secs_f64(self.compute_timeout(tries).max(MIN_TIMEOUT_BASE))
+        Duration::try_from_secs_f64(self.compute_timeout(tries).max(MIN_TIMEOUT_BASE))
+            .unwrap_or(Duration::from_secs(1))
     }
 
     /// Update the live Link RTT used by subsequent retransmit deadlines.
     pub fn update_rtt(&mut self, rtt: f64) {
         if rtt.is_finite() && rtt >= 0.0 {
-            self.current_rtt = rtt;
+            self.current_rtt = rtt.min(RTT_MAX);
         }
     }
 
@@ -1039,6 +1064,42 @@ mod tests {
         assert_eq!(w.window, 3);
         // Dropping window_max further would violate the flexibility floor.
         assert_eq!(w.window_max, w.window_min + w.window_flexibility);
+    }
+
+    #[test]
+    fn channel_hostile_rtt_and_public_window_remain_bounded() {
+        for rtt in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let mut channel = Channel::new(rtt);
+            assert_eq!(channel.current_rtt, 1.0);
+            let before = channel.window.window;
+            channel.window.grow(rtt);
+            assert_eq!(channel.window.window, before);
+            channel.update_rtt(rtt);
+            assert_eq!(channel.current_rtt, 1.0);
+            assert!(
+                channel
+                    .timeout_duration(usize::MAX)
+                    .as_secs_f64()
+                    .is_finite()
+            );
+        }
+        let mut channel = Channel::new(f64::MAX);
+        assert_eq!(channel.current_rtt, RTT_MAX);
+        channel.window.window = usize::MAX;
+        channel.window.window_max = usize::MAX;
+        channel.window.window_min = usize::MAX;
+        channel.window.window_flexibility = usize::MAX;
+        channel.window.grow(0.1);
+        channel.window.shrink();
+        assert!(channel.window.window <= WINDOW_MAX);
+        for _ in 0..WINDOW_MAX {
+            channel.send(&TestMessage::new(b"bounded")).unwrap();
+        }
+        assert!(!channel.is_ready_to_send());
+        assert_eq!(
+            channel.compute_timeout(usize::MAX),
+            channel.compute_timeout(MAX_TRIES)
+        );
     }
 
     #[test]

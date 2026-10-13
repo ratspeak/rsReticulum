@@ -545,6 +545,7 @@ impl TransportActor {
                     .path_table
                     .get_live(&dest)
                     .and_then(|e| self.interfaces.get(&e.interface_id))
+                    .filter(|iface| iface.bitrate != 0)
                     .map(|iface| {
                         let per_byte_latency = 8.0 / iface.bitrate as f64;
                         rns_wire::constants::MTU as f64 * per_byte_latency
@@ -557,6 +558,7 @@ impl TransportActor {
                 let timeout = self
                     .interfaces
                     .get(&interface_id)
+                    .filter(|iface| iface.bitrate != 0)
                     .map(|iface| {
                         let per_byte_latency = 8.0 / iface.bitrate as f64;
                         rns_wire::constants::MTU as f64 * per_byte_latency

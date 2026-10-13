@@ -2,6 +2,7 @@
 //! Handshake: HELLO → SESSION CREATE → STREAM CONNECT/ACCEPT;
 //! stream then carries HDLC-framed packets.
 
+use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -339,6 +340,8 @@ pub async fn spawn_i2p_client(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     let online = Arc::new(AtomicBool::new(false));
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
@@ -569,6 +572,8 @@ pub async fn spawn_i2p_client(
 
     Ok(InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(500, 1064, false),
         parent_id: None,
         name,
         mode,
@@ -597,6 +602,8 @@ pub async fn spawn_i2p_server(
     transport_tx: mpsc::Sender<TransportMessage>,
     handle_tx: mpsc::Sender<InterfaceHandle>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let transport_tx = InterfaceTransportSender::new(0, transport_tx);
+    let owner = transport_tx.owner();
     let online = Arc::new(AtomicBool::new(false));
     let name = config.name.clone();
     let mode = config.mode;
@@ -747,7 +754,9 @@ pub async fn spawn_i2p_server(
 
                 let c_online_r = c_online.clone();
                 let c_rxb_r = c_rxb.clone();
-                let transport_tx2 = transport_tx.clone();
+                let transport_tx2 =
+                    InterfaceTransportSender::new(client_id, transport_tx.actor_sender());
+                let child_owner = transport_tx2.owner();
                 let peer_name = client_name.clone();
                 let c_read_task = tokio::spawn(async move {
                     i2p_read_loop(
@@ -764,6 +773,8 @@ pub async fn spawn_i2p_server(
 
                 let handle = InterfaceHandle {
                     id: client_id,
+                    owner: child_owner,
+                    packet_capacity: InterfacePacketCapacity::new(500, 1064, false),
                     parent_id: Some(0),
                     name: client_name,
                     mode: config.mode,
@@ -805,6 +816,8 @@ pub async fn spawn_i2p_server(
 
     Ok(InterfaceHandle {
         id: 0,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(500, 1064, false),
         parent_id: None,
         name,
         mode,
@@ -833,7 +846,7 @@ async fn i2p_read_loop(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     initial_data: &[u8],
     interface_id: InterfaceId,
-    transport_tx: &mpsc::Sender<TransportMessage>,
+    transport_tx: &InterfaceTransportSender,
     online: &AtomicBool,
     rxb: &AtomicU64,
 ) {

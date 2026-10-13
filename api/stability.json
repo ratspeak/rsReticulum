@@ -33,8 +33,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-wire.txt",
-      "itemCount": 370,
-      "sha256": "7ce9011e531c1642912512d9d975b8a7def0bb41f691b6b16177eddecf5bef6d"
+      "itemCount": 402,
+      "sha256": "47f17ed4b47f0fc9ccaccc42d00b7635b07083c4eae6782a4f5de7e1452e4688"
     },
     {
       "name": "rns-identity",
@@ -42,8 +42,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-identity.txt",
-      "itemCount": 374,
-      "sha256": "f2b692070a3fa1a2cc98edbb40bc75d205daadfa9da9d9994ee194e8436e00c9"
+      "itemCount": 409,
+      "sha256": "97cd9688e2c92fdf52d3f4887050a26ad1c878b793bf9f51e8a36a0022d3f00f"
     },
     {
       "name": "rns-transport",
@@ -51,8 +51,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-transport.txt",
-      "itemCount": 1702,
-      "sha256": "30f20b408ac255e1f005e25e79e4999d813ebc6b4f1a501bf573de58db0e25ab"
+      "itemCount": 1904,
+      "sha256": "39dcf51fd5d6aff1209f91985223335d677909809942a9e805d04cd8feea7ff3"
     },
     {
       "name": "rns-link",
@@ -60,8 +60,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-link.txt",
-      "itemCount": 359,
-      "sha256": "59d2f211857314e044bf31e5b78e4460483411c9b26c08904f8996295b189984"
+      "itemCount": 361,
+      "sha256": "d76714f3e697303dac4376e6b8a660e037cf2957f196b867ae3149151fc7cf78"
     },
     {
       "name": "rns-protocol",
@@ -69,8 +69,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-protocol.txt",
-      "itemCount": 624,
-      "sha256": "9fd1968c43d3a80b5da65416f43a805e3bfd3420c91acc8ad63a7a3ca58b359c"
+      "itemCount": 638,
+      "sha256": "f90d8a7a284b50df43e3c9936f7b3a3a9c4104f4e31cc9ef1c60b833239b7ec6"
     },
     {
       "name": "rns-interface",
@@ -78,8 +78,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-interface.txt",
-      "itemCount": 1406,
-      "sha256": "b097f01fc5eac53ed0ce5b6150c47c12f69fb63072ac31789a3995167123af3a"
+      "itemCount": 1408,
+      "sha256": "5655690c48730330d654762042aac637005352e5140c2af30594d57cffe8738c"
     },
     {
       "name": "rns-runtime",
@@ -87,8 +87,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-runtime.txt",
-      "itemCount": 2063,
-      "sha256": "ca162e9ddb542f0daf5817ac26d32be80346d36bdadd70673bf2cdc2535e4e29"
+      "itemCount": 2158,
+      "sha256": "129abd14b144c6f6ff3fd2939a2a4667b5d63e446448b2ae08c9a5054c721261"
     },
     {
       "name": "rns-tools",
@@ -110,8 +110,8 @@
     }
   ],
   "approvedBreakingChanges": {
-    "releaseLine": "1.3",
-    "migrationGuide": "api/migrations/1.3.md",
+    "releaseLine": "1.4",
+    "migrationGuide": "api/migrations/1.4.md",
     "removed": {
       "rns-transport": [
         "pub rns_transport::actor::DiscoveryPathRequest::requesting_interface: rns_transport::messages::InterfaceId",
@@ -126,6 +126,24 @@
         "pub rns_transport::discovery::app_data::DiscoveryInfo::height: f64",
         "pub rns_transport::discovery::app_data::DiscoveryInfo::latitude: f64",
         "pub rns_transport::discovery::app_data::DiscoveryInfo::longitude: f64"
+      ],
+      "rns-link": [
+        "impl rns_link::mtu_discovery::SignallingData",
+        "pub fn rns_link::handshake::LinkProofData::create(&rns_crypto::ed25519::Ed25519PrivateKey, &[u8; 32], &[u8; 32], &[u8; 16], rns_link::mtu_discovery::SignallingData) -> Self",
+        "pub fn rns_link::handshake::LinkProofData::create_with<F>(F, &[u8; 32], &[u8; 32], &[u8; 16], rns_link::mtu_discovery::SignallingData) -> Self where F: core::ops::function::FnOnce(&[u8]) -> [u8; 64]",
+        "pub fn rns_link::handshake::LinkRequestData::pack(&rns_link::handshake::EphemeralKeys, rns_link::mtu_discovery::SignallingData) -> alloc::vec::Vec<u8>",
+        "pub fn rns_link::mtu_discovery::SignallingData::new(u8, u32) -> Self",
+        "pub fn rns_link::mtu_discovery::SignallingData::pack(&self) -> [u8; 3]",
+        "pub fn rns_link::mtu_discovery::SignallingData::unpack(&[u8]) -> core::option::Option<Self>",
+        "pub rns_link::handshake::LinkProofData::signalling: rns_link::mtu_discovery::SignallingData",
+        "pub rns_link::handshake::LinkRequestData::signalling: rns_link::mtu_discovery::SignallingData",
+        "pub rns_link::mtu_discovery::SignallingData::mode: u8",
+        "pub rns_link::mtu_discovery::SignallingData::mtu: u32",
+        "pub struct rns_link::mtu_discovery::SignallingData"
+      ],
+      "rns-runtime": [
+        "pub fn rns_runtime::interface_factory::InterfacePostInit::from_section(&rns_runtime::config::ConfigSection) -> Self",
+        "pub fn rns_runtime::link_manager::LinkManager::set_link_packet_channel(&mut self, tokio::sync::mpsc::unbounded::UnboundedSender<(alloc::vec::Vec<u8>, [u8; 16])>)"
       ]
     }
   }

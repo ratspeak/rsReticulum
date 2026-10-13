@@ -231,6 +231,7 @@ const TRANSPORT_QUERY_BUDGET: std::time::Duration = std::time::Duration::from_se
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransportQueryFailure {
+    InvalidTimeout,
     SendTimedOut,
     ChannelClosed,
     ResponseTimedOut,
@@ -240,6 +241,7 @@ enum TransportQueryFailure {
 impl TransportQueryFailure {
     fn description(self) -> &'static str {
         match self {
+            Self::InvalidTimeout => "invalid timeout: must be finite and representable",
             Self::SendTimedOut => "request enqueue timed out",
             Self::ChannelClosed => "query channel is closed",
             Self::ResponseTimedOut => "response timed out",
@@ -252,6 +254,9 @@ fn transport_failure_response(
     operation: &'static str,
     failure: TransportQueryFailure,
 ) -> RpcResponse {
+    if matches!(failure, TransportQueryFailure::InvalidTimeout) {
+        return RpcResponse::Error("invalid timeout: must be finite and representable".into());
+    }
     RpcResponse::Error(format!(
         "transport actor failed {operation}: {}",
         failure.description()
@@ -303,7 +308,15 @@ async fn request_path(
     destination_hash: [u8; 16],
     timeout_secs: Option<f64>,
 ) -> Result<bool, TransportQueryFailure> {
-    let wait = std::time::Duration::from_secs_f64(timeout_secs.unwrap_or(5.0).max(0.1));
+    let seconds = timeout_secs.unwrap_or(5.0);
+    if !seconds.is_finite() {
+        return Err(TransportQueryFailure::InvalidTimeout);
+    }
+    let wait = std::time::Duration::try_from_secs_f64(seconds.max(0.1))
+        .map_err(|_| TransportQueryFailure::InvalidTimeout)?;
+    std::time::Instant::now()
+        .checked_add(wait)
+        .ok_or(TransportQueryFailure::InvalidTimeout)?;
     match tokio::time::timeout(
         TRANSPORT_QUERY_BUDGET,
         transport_tx.send(TransportMessage::RequestPath { destination_hash }),
@@ -719,6 +732,18 @@ fn packet_hash_to_array(hash: &[u8]) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn invalid_path_timeout_never_enqueues_network_work() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        for seconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
+            assert!(matches!(
+                super::request_path(&tx, [1; 16], Some(seconds)).await,
+                Err(super::TransportQueryFailure::InvalidTimeout)
+            ));
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
     use super::*;
 
     // These are cross-process compatibility checks, not latency benchmarks.

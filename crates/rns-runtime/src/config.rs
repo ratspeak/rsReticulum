@@ -3,6 +3,9 @@
 //! multiline values, `#` comments outside quotes, and boolean variants
 //! `True`/`Yes`/`On`/`1`.
 
+pub mod ifac;
+pub mod ifac_lock;
+
 use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;

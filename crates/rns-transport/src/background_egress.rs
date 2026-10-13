@@ -33,6 +33,7 @@ struct Shared {
     ordinary: mpsc::WeakSender<Bytes>,
 }
 struct Offer {
+    owner: Option<crate::InterfaceOwner>,
     raw: Bytes,
     expires: f64,
     cancelled: Arc<AtomicBool>,
@@ -136,6 +137,10 @@ impl BackgroundAnnounceReceiver {
             || now >= offer.expires
             || offer.cancelled.load(Ordering::Acquire)
             || offer.generation != state.generation
+            || offer
+                .owner
+                .as_ref()
+                .is_some_and(|owner| !owner.is_current())
         {
             state.active = false;
             return None;
@@ -177,7 +182,29 @@ pub(crate) fn lookup(ordinary: &mpsc::Sender<Bytes>) -> Option<BackgroundAnnounc
 }
 
 impl BackgroundAnnounceSender {
+    #[cfg(test)]
     pub fn try_offer(&self, raw: Bytes, expires: f64, now: f64) -> Option<BackgroundOfferReceipt> {
+        self.try_offer_inner(raw, expires, now, None)
+    }
+    pub fn try_offer_owned(
+        &self,
+        raw: Bytes,
+        expires: f64,
+        now: f64,
+        owner: crate::InterfaceOwner,
+    ) -> Option<BackgroundOfferReceipt> {
+        if !owner.is_current() {
+            return None;
+        }
+        self.try_offer_inner(raw, expires, now, Some(owner))
+    }
+    fn try_offer_inner(
+        &self,
+        raw: Bytes,
+        expires: f64,
+        now: f64,
+        owner: Option<crate::InterfaceOwner>,
+    ) -> Option<BackgroundOfferReceipt> {
         let mut state = self.shared.state.lock().unwrap();
         if state
             .offer
@@ -193,6 +220,7 @@ impl BackgroundAnnounceSender {
         let cancelled = Arc::new(AtomicBool::new(false));
         let (started, rx) = oneshot::channel();
         state.offer = Some(Offer {
+            owner,
             raw,
             expires,
             cancelled: cancelled.clone(),

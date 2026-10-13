@@ -323,6 +323,20 @@ impl OutboundResource {
         encrypt_fn: Option<&ResourceEncryptor<'_>>,
         collision_retries: usize,
     ) -> Result<Self, ResourceError> {
+        let sdu = link_sdu.unwrap_or(SDU);
+        if sdu == 0 {
+            return Err(ResourceError::InvalidAdvertisement);
+        }
+        // Part slicing is independent from the complete Link control budget.
+        crate::resource_control::preflight_outbound_with_sdu(
+            data.len(),
+            metadata.as_ref().map(Vec::len),
+            None,
+            false,
+            encrypt_fn.is_some(),
+            sdu,
+            rns_wire::constants::MTU,
+        )?;
         let (packed_metadata, metadata_size, has_metadata) = if let Some(ref meta) = metadata {
             if meta.len() > METADATA_MAX_SIZE {
                 return Err(ResourceError::MetadataTooLarge);
@@ -778,6 +792,12 @@ pub enum ResourceError {
     DecompressionFailed,
     #[error("invalid metadata prefix: declared {declared} bytes, available {available} bytes")]
     InvalidMetadata { declared: usize, available: usize },
+    #[error("resource control {context:?} requires {encoded_len} packet bytes, MTU is {mtu}")]
+    ControlFrameTooLarge {
+        context: rns_wire::context::PacketContext,
+        encoded_len: usize,
+        mtu: usize,
+    },
     #[error("invalid advertisement")]
     InvalidAdvertisement,
     #[error("map hash collision persists after retries")]
@@ -962,6 +982,15 @@ impl LazyMultiSegmentOutbound {
         if total_segments > MAX_SEGMENTS {
             return Err(ResourceError::TooLarge);
         }
+
+        crate::resource_control::preflight_outbound(
+            data_size,
+            metadata.as_ref().map(Vec::len),
+            request_id.as_deref(),
+            is_response,
+            true,
+            rns_wire::constants::MTU,
+        )?;
 
         // `original_hash` covers the uncompressed concatenated payload so the
         // receiver can verify reassembly across all segments.
@@ -1444,10 +1473,17 @@ impl OutboundTransfer {
         }
 
         if !self.advertised {
+            let advertisement = match self.create_advertisement() {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.resource.state = ResourceState::Failed;
+                    return TransferAction::Failed(error.to_string());
+                }
+            };
             self.advertised = true;
             self.started_at = Instant::now();
             self.resource.state = ResourceState::Advertised;
-            return TransferAction::SendAdvertisement(self.create_advertisement());
+            return TransferAction::SendAdvertisement(advertisement);
         }
 
         self.check_timeout()
@@ -1504,7 +1540,13 @@ impl OutboundTransfer {
         if self.retries < MAX_ADV_RETRIES {
             self.retries += 1;
             self.started_at = Instant::now();
-            TransferAction::SendAdvertisement(self.create_advertisement())
+            match self.create_advertisement() {
+                Ok(bytes) => TransferAction::SendAdvertisement(bytes),
+                Err(error) => {
+                    self.resource.state = ResourceState::Failed;
+                    TransferAction::Failed(error.to_string())
+                }
+            }
         } else {
             self.resource.state = ResourceState::Failed;
             TransferAction::Failed("resource advertisement timed out".to_string())
@@ -1801,18 +1843,11 @@ impl OutboundTransfer {
                 }
 
                 // HMU wire layout: resource_hash(32) || msgpack([segment, hashmap]).
-                let hmu_payload = {
-                    use rmpv::Value;
-                    let arr = Value::Array(vec![
-                        Value::Integer((segment as u64).into()),
-                        Value::Binary(hashmap_bytes),
-                    ]);
-                    let mut buf = Vec::new();
-                    buf.extend_from_slice(&self.resource.resource_hash);
-                    rmpv::encode::write_value(&mut buf, &arr)
-                        .expect("msgpack encode should succeed");
-                    buf
-                };
+                let hmu_payload = crate::resource_control::encode_hashmap_update(
+                    &self.resource.resource_hash,
+                    segment,
+                    &hashmap_bytes,
+                );
 
                 actions.push(TransferAction::SendHmu(hmu_payload));
             }
@@ -1883,9 +1918,17 @@ impl OutboundTransfer {
     }
 
     /// Build the msgpack-encoded advertisement that precedes the transfer.
-    fn create_advertisement(&self) -> Vec<u8> {
-        use rmpv::Value;
-
+    fn create_advertisement(&self) -> Result<Vec<u8>, ResourceError> {
+        let mtu = rns_wire::constants::MTU;
+        if let Some(id) = self.resource.request_id.as_deref() {
+            crate::resource_control::check_control_frame(
+                rns_wire::context::PacketContext::ResourceAdv,
+                id.len(),
+                true,
+                rns_wire::constants::HEADER_MINSIZE,
+                mtu,
+            )?;
+        }
         let mut adv = crate::resource_adv::ResourceAdvertisement::new(
             self.resource.total_size,
             self.resource.advertisement_data_size,
@@ -1911,59 +1954,8 @@ impl OutboundTransfer {
         }
         adv.request_id = self.resource.request_id.clone();
 
-        let q_val = match &adv.request_id {
-            Some(id) => Value::Binary(id.clone()),
-            None => Value::Nil,
-        };
-
-        let pairs: Vec<(Value, Value)> = vec![
-            (
-                Value::String("t".into()),
-                Value::Integer(adv.transfer_size.into()),
-            ),
-            (
-                Value::String("d".into()),
-                Value::Integer(adv.data_size.into()),
-            ),
-            (
-                Value::String("n".into()),
-                Value::Integer(adv.num_parts.into()),
-            ),
-            (
-                Value::String("h".into()),
-                Value::Binary(adv.resource_hash.to_vec()),
-            ),
-            (
-                Value::String("r".into()),
-                Value::Binary(adv.random_hash.to_vec()),
-            ),
-            (
-                Value::String("o".into()),
-                Value::Binary(adv.original_hash.to_vec()),
-            ),
-            (
-                Value::String("i".into()),
-                Value::Integer(adv.segment_index.into()),
-            ),
-            (
-                Value::String("l".into()),
-                Value::Integer(adv.total_segments.into()),
-            ),
-            (Value::String("q".into()), q_val),
-            (
-                Value::String("f".into()),
-                Value::Integer(adv.flags.to_byte().into()),
-            ),
-            (
-                Value::String("m".into()),
-                Value::Binary(adv.hashmap.clone()),
-            ),
-        ];
-
-        let value = Value::Map(pairs);
-        let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &value).expect("msgpack encode failed");
-        buf
+        crate::resource_control::check_advertisement(&adv, mtu)?;
+        Ok(adv.pack())
     }
 
     /// Fraction of unique parts transmitted, in `0.0..=1.0`.

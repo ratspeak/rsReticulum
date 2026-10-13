@@ -24,6 +24,7 @@ use crate::rnode_protocol::{
     RNodeProtocolFrame, RNodeProtocolState, RNodeProtocolTarget, RNodeReadiness,
 };
 use crate::traits::InterfaceId;
+#[cfg(test)]
 use rns_transport::messages::TransportMessage;
 
 const MIN_TRANSFER_TIMEOUT: Duration = Duration::from_millis(1);
@@ -906,7 +907,7 @@ pub(crate) async fn forward_usb_read_chunk(
     bytes: &[u8],
     id: InterfaceId,
     received_bytes: &AtomicU64,
-    transport_tx: &mpsc::Sender<TransportMessage>,
+    transport_tx: &rns_transport::messages::InterfaceTransportSender,
     stop_rx: &mut mpsc::Receiver<()>,
 ) -> UsbInboundOutcome {
     forward_usb_read_chunk_inner(
@@ -926,7 +927,7 @@ async fn forward_usb_read_chunk_inner(
     bytes: &[u8],
     id: InterfaceId,
     received_bytes: &AtomicU64,
-    transport_tx: &mpsc::Sender<TransportMessage>,
+    transport_tx: &rns_transport::messages::InterfaceTransportSender,
     stop_rx: &mut mpsc::Receiver<()>,
     deadline: Option<tokio::time::Instant>,
 ) -> UsbInboundOutcome {
@@ -992,7 +993,7 @@ pub(crate) async fn drain_usb_reader_tail(
     state: &mut UsbInboundState,
     id: InterfaceId,
     received_bytes: &AtomicU64,
-    transport_tx: &mpsc::Sender<TransportMessage>,
+    transport_tx: &rns_transport::messages::InterfaceTransportSender,
     stop_rx: &mut mpsc::Receiver<()>,
     deadline: tokio::time::Instant,
 ) -> UsbReadDrainOutcome {
@@ -2577,7 +2578,7 @@ mod tests {
                     &framed_protocol_frames(evidence),
                     1,
                     &AtomicU64::new(0),
-                    &transport,
+                    &crate::traits::test_registered_sender(1, transport.clone()),
                     &mut inbound_stop
                 )
                 .await,
@@ -2907,12 +2908,14 @@ mod tests {
         kiss::frame_with_command_into(rnode::CMD_RESET, &[0xF8], &mut bytes);
         kiss::frame_with_command_into(kiss::CMD_DATA, &[1, 2, 3], &mut bytes);
         let received = AtomicU64::new(0);
+        let bound_transport = crate::traits::test_registered_sender(1, transport.clone());
         let episode_start = tokio::time::Instant::now();
         tokio::time::timeout(USB_PROTOCOL_READINESS_DEADLINE * 2, async {
             tokio::select! {
                 exit = pump => assert_eq!(exit.unwrap(), UsbTxPumpExit::ReadinessTimedOut),
                 result = forward_usb_read_chunk(
-                    &mut inbound, &bytes, 1, &received, &transport, &mut inbound_stop_rx
+                    &mut inbound, &bytes, 1, &received,
+                &bound_transport, &mut inbound_stop_rx
                 ) => panic!("full transport queue cannot conclude before pump expiry: {result:?}"),
             }
         })
@@ -3784,7 +3787,7 @@ mod tests {
                 &[0xBB, kiss::FEND],
                 0x66,
                 &received,
-                &transport_tx,
+                &crate::traits::test_registered_sender(0x66, transport_tx.clone()),
                 &mut stop_rx,
             )
             .await,
@@ -3799,7 +3802,7 @@ mod tests {
                 &framed_protocol_frames(required_protocol_frames(target)),
                 0x66,
                 &received,
-                &transport_tx,
+                &crate::traits::test_registered_sender(0x66, transport_tx.clone()),
                 &mut stop_rx,
             )
             .await,
@@ -3995,7 +3998,7 @@ mod tests {
                 &bytes,
                 0x77,
                 &AtomicU64::new(0),
-                &transport_tx,
+                &crate::traits::test_registered_sender(0x77, transport_tx.clone()),
                 &mut stop_rx,
             )
             .await,
@@ -4027,7 +4030,7 @@ mod tests {
                     chunk,
                     0x55,
                     &received,
-                    &transport_tx,
+                    &crate::traits::test_registered_sender(0x55, transport_tx.clone()),
                     &mut stop_rx,
                 )
                 .await,
@@ -4042,7 +4045,12 @@ mod tests {
             snapshot.configuration,
             rnode::RNodeConfigurationState::Verified
         );
-        match transport_rx.recv().await.expect("projected packet") {
+        match transport_rx
+            .recv()
+            .await
+            .map(crate::traits::test_event_body)
+            .expect("projected packet")
+        {
             TransportMessage::Inbound(packet) => {
                 assert_eq!(packet.raw.as_ref(), payload);
                 assert_eq!(packet.interface_id, 0x55);
@@ -4077,7 +4085,7 @@ mod tests {
                 &wire,
                 7,
                 &received,
-                &transport_tx,
+                &crate::traits::test_registered_sender(7, transport_tx.clone()),
                 &mut stop_rx,
             )
             .await,
@@ -4104,7 +4112,7 @@ mod tests {
                 &ready_blocked,
                 8,
                 &AtomicU64::new(0),
-                &transport_tx,
+                &crate::traits::test_registered_sender(8, transport_tx.clone()),
                 &mut stop_rx,
             )
             .await,
@@ -4146,7 +4154,7 @@ mod tests {
                 &mut inbound,
                 9,
                 &AtomicU64::new(0),
-                &transport_tx,
+                &crate::traits::test_registered_sender(9, transport_tx.clone()),
                 &mut stop_rx,
                 tokio::time::Instant::now() + Duration::from_secs(1),
             )
@@ -4212,7 +4220,7 @@ mod tests {
                 &late_detect,
                 10,
                 &AtomicU64::new(0),
-                &transport_tx,
+                &crate::traits::test_registered_sender(10, transport_tx.clone()),
                 &mut stop_rx,
             )
             .await,
@@ -4656,7 +4664,7 @@ mod tests {
                 &kiss::frame(&[1, 2, 3]),
                 1,
                 &AtomicU64::new(0),
-                &forward_transport,
+                &crate::traits::test_registered_sender(1, forward_transport.clone()),
                 &mut forward_stop_rx,
             )
             .await
@@ -4836,7 +4844,7 @@ mod tests {
                     &kiss::frame(&[1, 3, 5]),
                     2,
                     &AtomicU64::new(0),
-                    &transport_tx,
+                    &crate::traits::test_registered_sender(2, transport_tx.clone()),
                     &mut stop_rx,
                 ),
             )
@@ -4845,7 +4853,10 @@ mod tests {
             UsbInboundOutcome::Complete
         );
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx
+                .recv()
+                .await
+                .map(crate::traits::test_event_body),
             Some(TransportMessage::Inbound(_))
         ));
 
@@ -4890,14 +4901,19 @@ mod tests {
                 &mut inbound,
                 77,
                 &received,
-                &transport_tx,
+                &crate::traits::test_registered_sender(77, transport_tx.clone()),
                 &mut stop_rx,
                 tokio::time::Instant::now() + Duration::from_secs(1),
             )
             .await,
             UsbReadDrainOutcome::Drained
         );
-        match transport_rx.recv().await.expect("forwarded packet") {
+        match transport_rx
+            .recv()
+            .await
+            .map(crate::traits::test_event_body)
+            .expect("forwarded packet")
+        {
             TransportMessage::Inbound(packet) => {
                 assert_eq!(packet.raw.as_ref(), payload);
                 assert_eq!(packet.interface_id, 77);
@@ -4914,7 +4930,7 @@ mod tests {
                 &kiss::frame(&second_payload),
                 77,
                 &received,
-                &transport_tx,
+                &crate::traits::test_registered_sender(77, transport_tx.clone()),
                 &mut stop_rx,
             )
             .await,
@@ -4962,7 +4978,7 @@ mod tests {
                 &mut UsbInboundState::new(),
                 77,
                 &received,
-                &transport_tx,
+                &crate::traits::test_registered_sender(77, transport_tx.clone()),
                 &mut stop_rx,
                 deadline,
             )
@@ -5124,7 +5140,7 @@ mod tests {
                                 &bytes,
                                 91,
                                 &received,
-                                &transport_tx,
+                                &crate::traits::test_registered_sender(91, transport_tx.clone()),
                                 &mut stop_rx,
                             )
                             .await,
@@ -5139,7 +5155,7 @@ mod tests {
                                 &mut inbound,
                                 91,
                                 &received,
-                                &transport_tx,
+                                &crate::traits::test_registered_sender(91, transport_tx.clone()),
                                 &mut stop_rx,
                                 tokio::time::Instant::now() + Duration::from_secs(1),
                             )
@@ -5155,7 +5171,12 @@ mod tests {
         .await
         .expect("simultaneous completion did not settle");
 
-        match transport_rx.recv().await.expect("forwarded reader tail") {
+        match transport_rx
+            .recv()
+            .await
+            .map(crate::traits::test_event_body)
+            .expect("forwarded reader tail")
+        {
             TransportMessage::Inbound(packet) => assert_eq!(packet.raw.as_ref(), [7, 8, 9]),
             _ => panic!("unexpected transport message"),
         }
@@ -5188,7 +5209,7 @@ mod tests {
                 &mut UsbInboundState::new(),
                 9,
                 &received,
-                &transport_tx,
+                &crate::traits::test_registered_sender(9, transport_tx.clone()),
                 &mut stop_rx,
                 tokio::time::Instant::now() + Duration::from_secs(1),
             )

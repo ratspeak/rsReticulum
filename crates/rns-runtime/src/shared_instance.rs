@@ -289,6 +289,8 @@ pub(crate) async fn spawn_authenticated_client(
         _ = shutdown.wait() => return Err(SharedInstanceError::Cancelled),
         result = credentials.connect() => result?,
     };
+    let transport = rns_transport::InterfaceTransportSender::new(id, transport);
+    let owner = transport.owner();
     let online = Arc::new(AtomicBool::new(true));
     let rxb = Arc::new(AtomicU64::new(0));
     let txb = Arc::new(AtomicU64::new(0));
@@ -360,6 +362,8 @@ pub(crate) async fn spawn_authenticated_client(
     Ok((
         InterfaceHandle {
             id,
+            owner,
+            packet_capacity: rns_transport::InterfacePacketCapacity::new(262_144, 262_144, true),
             parent_id: None,
             name: "Authenticated shared instance".to_string(),
             mode: InterfaceMode::Full,
@@ -402,7 +406,7 @@ async fn packet_loop(
     stream: &mut PacketStream,
     outbound: &mut mpsc::Receiver<Bytes>,
     id: u64,
-    transport: &mpsc::Sender<TransportMessage>,
+    transport: &rns_transport::InterfaceTransportSender,
     rxb: &AtomicU64,
     txb: &AtomicU64,
 ) -> std::io::Result<()> {

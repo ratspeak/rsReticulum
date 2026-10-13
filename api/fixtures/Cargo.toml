@@ -11,5 +11,7 @@ default = []
 all = ["rns-runtime/ble", "rns-runtime/rnode-tcp", "rns-runtime/serial"]
 
 [dependencies]
+rns-protocol = { path = "../../crates/rns-protocol" }
+rns-identity = { path = "../../crates/rns-identity" }
 rns-transport = { path = "../../crates/rns-transport" }
 rns-runtime = { path = "../../crates/rns-runtime", default-features = false }

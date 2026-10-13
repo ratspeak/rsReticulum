@@ -10,3 +10,6 @@ pub mod resource;
 pub mod resource_adv;
 pub mod rnsh;
 pub mod stream_data;
+
+/// Exact Resource control-packet admission using the production encoders.
+pub mod resource_control;

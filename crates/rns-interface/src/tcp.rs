@@ -1,3 +1,4 @@
+use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -182,7 +183,7 @@ use crate::socket_tuning::set_socket_buffers;
 async fn tcp_read_loop(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     interface_id: InterfaceId,
-    transport_tx: mpsc::Sender<TransportMessage>,
+    transport_tx: InterfaceTransportSender,
     state: Arc<TcpInterfaceState>,
     kiss_framing: bool,
 ) {
@@ -294,6 +295,16 @@ pub async fn spawn_tcp_client(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
+    if config
+        .fixed_mtu
+        .is_some_and(|mtu| !(500..=262144).contains(&mtu))
+    {
+        return Err(crate::traits::InterfaceError::SendFailed(
+            "fixed_mtu must be between 500 and 262144 clear packet bytes".into(),
+        ));
+    }
     let online = Arc::new(AtomicBool::new(false));
     let online2 = online.clone();
     let (tx, rx) = mpsc::channel::<Bytes>(1024);
@@ -424,6 +435,14 @@ pub async fn spawn_tcp_client(
     let bitrate: u64 = 10_000_000;
     Ok(InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(
+            fixed_mtu
+                .unwrap_or_else(|| crate::traits::optimise_mtu(bitrate).unwrap_or(TCP_HW_MTU))
+                .min(262144),
+            262144,
+            fixed_mtu.is_some() || crate::traits::optimise_mtu(bitrate).is_some(),
+        ),
         parent_id: None,
         name,
         mode,
@@ -461,6 +480,8 @@ async fn spawn_tcp_accepted(
     kiss_framing: bool,
     mode: InterfaceMode,
 ) -> InterfaceHandle {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     let online = Arc::new(AtomicBool::new(true));
     let online2 = online.clone();
     let (tx, conn_rx) = mpsc::channel::<Bytes>(1024);
@@ -494,6 +515,14 @@ async fn spawn_tcp_accepted(
     let bitrate: u64 = 10_000_000;
     InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(
+            crate::traits::optimise_mtu(bitrate)
+                .unwrap_or(TCP_HW_MTU)
+                .min(262144),
+            262144,
+            crate::traits::optimise_mtu(bitrate).is_some(),
+        ),
         parent_id: Some(parent_id),
         name,
         mode,
@@ -523,6 +552,8 @@ pub async fn spawn_tcp_server(
     transport_tx: mpsc::Sender<TransportMessage>,
     handle_tx: mpsc::Sender<InterfaceHandle>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     let addr = match config.device.as_deref() {
         Some(device) => {
             let ip = address_for_device(device, config.prefer_ipv6).ok_or_else(|| {
@@ -559,7 +590,7 @@ pub async fn spawn_tcp_server(
                         client_id,
                         id,
                         client_name,
-                        transport_tx.clone(),
+                        transport_tx.actor_sender(),
                         kiss_framing,
                         mode,
                     )
@@ -584,6 +615,14 @@ pub async fn spawn_tcp_server(
     let bitrate: u64 = 10_000_000;
     Ok(InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(
+            crate::traits::optimise_mtu(bitrate)
+                .unwrap_or(TCP_HW_MTU)
+                .min(262144),
+            262144,
+            crate::traits::optimise_mtu(bitrate).is_some(),
+        ),
         parent_id: None,
         name,
         mode,
@@ -700,12 +739,13 @@ mod tests {
         config.connect_timeout_secs = 2;
 
         let handle = spawn_tcp_client(config, 77, transport_tx).await.unwrap();
+        handle.owner.mark_registered();
 
         let msg = tokio::time::timeout(std::time::Duration::from_secs(10), transport_rx.recv())
             .await
             .expect("expected DeregisterInterface before timeout")
             .expect("transport channel closed");
-        match msg {
+        match crate::traits::test_event_for_handle(msg, &handle) {
             TransportMessage::DeregisterInterface { id } => assert_eq!(id, 77),
             other => panic!("expected DeregisterInterface, got {other:?}"),
         }
@@ -759,6 +799,7 @@ mod tests {
             spawn_tcp_server(server_cfg2, 99, id_gen, transport_tx.clone(), handle_tx)
                 .await
                 .unwrap();
+        server_handle.owner.mark_registered();
         assert_eq!(server_handle.id, 99);
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -776,21 +817,32 @@ mod tests {
         let client_handle = spawn_tcp_client(client_cfg, 1, transport_tx.clone())
             .await
             .unwrap();
+        client_handle.owner.mark_registered();
 
         let accepted = tokio::time::timeout(std::time::Duration::from_secs(3), handle_rx.recv())
             .await
             .expect("timeout waiting for accepted handle")
             .expect("handle channel closed");
 
+        assert_ne!(accepted.owner, server_handle.owner);
+        assert_ne!(accepted.owner, client_handle.owner);
+        assert_eq!(accepted.packet_capacity.max_wire_packet_bytes, 262144);
         let payload = Bytes::from_static(b"hello from client");
         client_handle.tx.send(payload.clone()).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), transport_rx.recv())
+                .await
+                .is_err(),
+            "the first packet waits for accepted-child registration"
+        );
+        accepted.owner.mark_registered();
 
         let msg = tokio::time::timeout(std::time::Duration::from_secs(3), transport_rx.recv())
             .await
             .expect("timeout waiting for transport message")
             .expect("transport channel closed");
 
-        match msg {
+        match crate::traits::test_event_for_handle(msg, &accepted) {
             TransportMessage::Inbound(pkt) => {
                 assert_eq!(pkt.raw, payload);
                 assert_eq!(pkt.interface_id, accepted.id);
@@ -806,7 +858,7 @@ mod tests {
             .expect("timeout waiting for reply")
             .expect("transport channel closed");
 
-        match msg2 {
+        match crate::traits::test_event_for_handle(msg2, &client_handle) {
             TransportMessage::Inbound(pkt) => {
                 assert_eq!(pkt.raw, reply);
                 assert_eq!(pkt.interface_id, 1);
@@ -860,6 +912,7 @@ mod tests {
         };
 
         let handle = spawn_tcp_client(config, 99, transport_tx).await.unwrap();
+        handle.owner.mark_registered();
 
         // Two failed tries with 5s waits each; 20s headroom.
         let result =
@@ -887,6 +940,7 @@ mod tests {
             spawn_tcp_server(server_cfg, 88, id_gen, transport_tx.clone(), handle_tx)
                 .await
                 .unwrap();
+        server_handle.owner.mark_registered();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -903,11 +957,13 @@ mod tests {
         let client_handle = spawn_tcp_client(client_cfg, 321, transport_tx.clone())
             .await
             .unwrap();
+        client_handle.owner.mark_registered();
 
         let accepted = tokio::time::timeout(std::time::Duration::from_secs(3), handle_rx.recv())
             .await
             .expect("timeout waiting for accepted handle")
             .expect("handle channel closed");
+        accepted.owner.mark_registered();
         let server_side_client_id = accepted.id;
 
         // Abort client-side tasks; server's per-client reader sees EOF and exits.
@@ -919,7 +975,9 @@ mod tests {
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(500), transport_rx.recv())
                 .await
-            {
+                .map(|message| {
+                    message.map(|event| crate::traits::test_event_for_handle(event, &accepted))
+                }) {
                 Ok(Some(TransportMessage::DeregisterInterface { id }))
                     if id == server_side_client_id =>
                 {

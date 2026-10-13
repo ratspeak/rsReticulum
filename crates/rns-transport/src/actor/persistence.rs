@@ -1437,9 +1437,11 @@ mod async_save_tests {
     use super::*;
 
     fn temp_storage() -> std::path::PathBuf {
+        static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "rns-async-save-{}-{}",
+            "rns-async-save-{}-{}-{}",
             std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

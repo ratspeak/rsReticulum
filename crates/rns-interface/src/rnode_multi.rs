@@ -3,6 +3,7 @@
 //! selected virtual port; one write task prepends `CMD_SEL_INT` so the device
 //! picks the right radio.
 
+use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::collections::HashSet;
 use std::io::Write;
 use std::sync::Arc;
@@ -741,6 +742,10 @@ pub async fn spawn_rnode_multi_interface(
     // stays ordered relative to each data frame.
     let (write_tx, mut write_rx) = mpsc::channel::<WriteRequest>(256);
 
+    let transport_senders: Vec<_> = ids
+        .iter()
+        .map(|id| InterfaceTransportSender::new(*id, transport_tx.clone()))
+        .collect();
     let mut background_lanes = Vec::with_capacity(num_subs);
     let mut handles = Vec::with_capacity(num_subs);
     let mut sub_txb: Vec<Arc<AtomicU64>> = Vec::with_capacity(num_subs);
@@ -819,6 +824,8 @@ pub async fn spawn_rnode_multi_interface(
 
         handles.push(InterfaceHandle {
             id: ids[i],
+            owner: transport_senders[i].owner(),
+            packet_capacity: InterfacePacketCapacity::new(500, 508, false),
             parent_id: None,
             name: sub_name,
             mode: sub_cfg.mode,
@@ -1046,7 +1053,7 @@ pub async fn spawn_rnode_multi_interface(
                                     snr,
                                     q: None,
                                 });
-                                if transport_tx.send(msg).await.is_err() {
+                                if transport_senders[local_idx].send(msg).await.is_err() {
                                     tracing::warn!(
                                         parent = %parent_name,
                                         "transport channel closed"

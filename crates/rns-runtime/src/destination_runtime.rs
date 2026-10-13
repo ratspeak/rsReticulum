@@ -144,6 +144,8 @@ pub struct DestinationEvents {
 #[derive(Debug, thiserror::Error)]
 pub enum DestinationRuntimeError {
     #[error(transparent)]
+    OrdinaryPacketConfiguration(#[from] crate::link_manager::LinkPacketConfigurationError),
+    #[error(transparent)]
     Destination(#[from] DestinationError),
     #[error(transparent)]
     Control(#[from] DestinationControlError),
@@ -427,6 +429,13 @@ impl RegisteredDestination {
         if options.event_capacity == 0 {
             return Err(DestinationRuntimeError::InvalidEventCapacity);
         }
+        // This compatibility constructor receives only the transport mailbox,
+        // which cannot grant exact endpoint-generation dispatch authority.
+        if options.proof_strategy == ProofStrategy::ProveApp {
+            return Err(
+                crate::link_manager::LinkPacketConfigurationError::ExactDispatchRequired.into(),
+            );
+        }
         let app_name = app_name.into();
         let destination =
             Destination::new(Some(&identity), Direction::In, DestType::Single, &app_name)?;
@@ -492,7 +501,7 @@ impl RegisteredDestination {
         let (links_closed_tx, links_closed) = mpsc::channel(capacity);
         manager.set_link_established_channel(links_established_tx);
         manager.set_link_identified_channel(links_identified_tx);
-        manager.set_link_packet_channel(link_packets_tx);
+        manager.set_link_packet_channel(link_packets_tx)?;
         manager.set_link_packet_proof_channel(link_packet_proofs_tx);
         manager.set_resource_completion_channel(resource_completions_tx);
         manager.set_outbound_resource_proof_channel(resource_proofs_tx);
@@ -878,6 +887,7 @@ mod tests {
             .send(
                 rns_transport::link_messages::DestinationEvent::InboundPacket {
                     raw: bytes::Bytes::from(packet.raw),
+                    interface_owner: None,
                     interface_id: 1,
                     metrics: rns_transport::link_messages::PacketMetrics::default(),
                 },

@@ -9,6 +9,8 @@
 //!   - `tcp://192.168.1.1:9000`      -> TCP, explicit port
 
 use bytes::Bytes;
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 
 use crate::kiss;
 use crate::traits::{InterfaceHandle, InterfaceId, InterfaceMode};
@@ -3262,6 +3264,8 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
     transport_tx: mpsc::Sender<TransportMessage>,
     options: RNodeStartupOptions,
 ) -> Result<SpawnedRNodeInterface, RNodeSpawnError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     config.validate().map_err(|error| {
         crate::traits::InterfaceError::SendFailed(format!(
             "rnode config {}: {error}",
@@ -3785,6 +3789,8 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
 
     let interface = InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(500, 508, false),
         parent_id: None,
         name,
         mode,
@@ -6338,6 +6344,7 @@ mod tests {
         )
         .await
         .unwrap();
+        spawned.interface.owner.mark_registered();
         tokio::time::timeout(Duration::from_secs(2), init_rx.recv())
             .await
             .unwrap()
@@ -6564,6 +6571,7 @@ mod tests {
         )
         .await
         .unwrap();
+        spawned.interface.owner.mark_registered();
         first_rx.recv().await.unwrap();
         let mut state = spawned.driver.watch();
         wait_for_rnode_snapshot(&mut state, |snapshot| {
@@ -6678,6 +6686,7 @@ mod tests {
         )
         .await
         .unwrap();
+        spawned.interface.owner.mark_registered();
         first_rx.recv().await.unwrap();
         let mut state = spawned.driver.watch();
         wait_for_rnode_snapshot(&mut state, |snapshot| snapshot.connection_generation == 1).await;
@@ -6783,6 +6792,7 @@ mod tests {
         )
         .await
         .unwrap();
+        spawned.interface.owner.mark_registered();
         first_rx.recv().await.unwrap();
         let mut state = spawned.driver.watch();
         wait_for_rnode_snapshot(&mut state, |snapshot| snapshot.connection_generation == 1).await;
@@ -7333,11 +7343,12 @@ mod tests {
     async fn receive_inbound_packet(
         receiver: &mut mpsc::Receiver<TransportMessage>,
     ) -> InboundPacket {
-        match tokio::time::timeout(Duration::from_secs(2), receiver.recv())
-            .await
-            .expect("timed out waiting for inbound RNode packet")
-            .expect("transport channel closed before inbound RNode packet")
-        {
+        match crate::traits::test_event_body(
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("timed out waiting for inbound RNode packet")
+                .expect("transport channel closed before inbound RNode packet"),
+        ) {
             TransportMessage::Inbound(packet) => packet,
             _ => panic!("unexpected non-inbound transport message"),
         }
@@ -7384,6 +7395,7 @@ mod tests {
         let spawned = spawn_rnode_interface_with_driver(config, id, transport_tx)
             .await
             .unwrap();
+        spawned.interface.owner.mark_registered();
         let mut state = spawned.driver.watch();
 
         // No yield between spawn completion and stop: this exercises the
@@ -7478,6 +7490,7 @@ mod tests {
         let spawned = spawn_rnode_interface_with_driver(config, id, transport_tx)
             .await
             .unwrap();
+        spawned.interface.owner.mark_registered();
         let mut state = spawned.driver.watch();
         wait_for_rnode_snapshot(&mut state, |snapshot| {
             snapshot.connection_generation == 1
@@ -7599,6 +7612,7 @@ mod tests {
         let spawned = spawn_rnode_interface_with_driver(config, 0x2D7F, transport_tx)
             .await
             .unwrap();
+        spawned.interface.owner.mark_registered();
         let mut state = spawned.driver.watch();
 
         assert_eq!(
@@ -7760,6 +7774,7 @@ mod tests {
         let spawned = spawn_rnode_interface_with_driver(config, 0xF12A, transport_tx)
             .await
             .unwrap();
+        spawned.interface.owner.mark_registered();
         let mut state = spawned.driver.watch();
         tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
             .await
@@ -7898,6 +7913,7 @@ mod tests {
         let spawned = spawn_rnode_interface_with_driver(config, 0xE0F1, transport_tx)
             .await
             .unwrap();
+        spawned.interface.owner.mark_registered();
         let mut state = spawned.driver.watch();
 
         assert_eq!(
@@ -7984,6 +8000,7 @@ mod tests {
         let spawned = spawn_rnode_interface_with_driver(config, id, transport_tx)
             .await
             .unwrap();
+        spawned.interface.owner.mark_registered();
         let mut state = spawned.driver.watch();
         accepted_rx.recv().await.unwrap();
         wait_for_rnode_snapshot(&mut state, |snapshot| snapshot.connection_generation == 1).await;
@@ -8046,6 +8063,7 @@ mod tests {
         let spawned = spawn_rnode_interface_with_driver(config, id, transport_tx)
             .await
             .unwrap();
+        spawned.interface.owner.mark_registered();
         let mut state = spawned.driver.watch();
         accepted_rx.recv().await.unwrap();
         wait_for_rnode_snapshot(&mut state, |snapshot| {
@@ -8195,6 +8213,7 @@ mod tests {
         let handle = spawn_rnode_interface(config, 77, transport_tx)
             .await
             .unwrap();
+        handle.owner.mark_registered();
 
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())

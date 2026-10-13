@@ -129,6 +129,7 @@ pub const rns_protocol::channel::FAST_RATE_THRESHOLD: usize
 pub const rns_protocol::channel::MAX_TRIES: usize
 pub const rns_protocol::channel::MIN_TIMEOUT_BASE: f64
 pub const rns_protocol::channel::RTT_FAST: f64
+pub const rns_protocol::channel::RTT_MAX: f64
 pub const rns_protocol::channel::RTT_MEDIUM: f64
 pub const rns_protocol::channel::RTT_SLOW: f64
 pub const rns_protocol::channel::SEQ_MAX: u16
@@ -206,6 +207,10 @@ pub enum rns_protocol::resource::CancelType
 pub rns_protocol::resource::CancelType::Icl
 pub rns_protocol::resource::CancelType::Rcl
 pub enum rns_protocol::resource::ResourceError
+pub rns_protocol::resource::ResourceError::ControlFrameTooLarge
+pub rns_protocol::resource::ResourceError::ControlFrameTooLarge::context: rns_wire::context::PacketContext
+pub rns_protocol::resource::ResourceError::ControlFrameTooLarge::encoded_len: usize
+pub rns_protocol::resource::ResourceError::ControlFrameTooLarge::mtu: usize
 pub rns_protocol::resource::ResourceError::Corrupt
 pub rns_protocol::resource::ResourceError::DecompressionFailed
 pub rns_protocol::resource::ResourceError::DecryptFailed
@@ -483,14 +488,23 @@ pub rns_protocol::resource_adv::ResourceAdvertisement::segment_index: usize
 pub rns_protocol::resource_adv::ResourceAdvertisement::total_segments: usize
 pub rns_protocol::resource_adv::ResourceAdvertisement::transfer_size: usize
 impl rns_protocol::resource_adv::ResourceAdvertisement
+pub fn rns_protocol::resource_adv::ResourceAdvertisement::encoded_len(&self) -> core::result::Result<usize, rns_protocol::resource::ResourceError>
 pub fn rns_protocol::resource_adv::ResourceAdvertisement::get_map_hashes(&self) -> alloc::vec::Vec<[u8; 4]>
 pub fn rns_protocol::resource_adv::ResourceAdvertisement::new(usize, usize, usize, [u8; 32], alloc::vec::Vec<u8>, rns_protocol::resource::ResourceFlags, &[[u8; 4]], usize) -> Self
 pub fn rns_protocol::resource_adv::ResourceAdvertisement::pack(&self) -> alloc::vec::Vec<u8>
+pub fn rns_protocol::resource_adv::ResourceAdvertisement::pack_into<W: core::io::write::Write>(&self, W) -> core::result::Result<(), rmp_serde::encode::Error>
 pub fn rns_protocol::resource_adv::ResourceAdvertisement::unpack(&[u8]) -> core::result::Result<Self, alloc::string::String>
 pub fn rns_protocol::resource_adv::ResourceAdvertisement::with_metadata_size(usize, usize, usize, [u8; 32], alloc::vec::Vec<u8>, rns_protocol::resource::ResourceFlags, &[[u8; 4]], usize, usize) -> Self
 pub const rns_protocol::resource_adv::OVERHEAD: usize
 pub fn rns_protocol::resource_adv::collision_guard_size(usize) -> usize
 pub fn rns_protocol::resource_adv::hashmap_max_len(usize) -> usize
+pub mod rns_protocol::resource_control
+pub const rns_protocol::resource_control::HASHMAP_STRIDE: usize
+pub fn rns_protocol::resource_control::check_advertisement(&rns_protocol::resource_adv::ResourceAdvertisement, usize) -> core::result::Result<(), rns_protocol::resource::ResourceError>
+pub fn rns_protocol::resource_control::check_control_frame(rns_wire::context::PacketContext, usize, bool, usize, usize) -> core::result::Result<(), rns_protocol::resource::ResourceError>
+pub fn rns_protocol::resource_control::encode_hashmap_update(&[u8; 32], usize, &[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_protocol::resource_control::encrypted_len(usize) -> core::result::Result<usize, rns_protocol::resource::ResourceError>
+pub fn rns_protocol::resource_control::preflight_outbound(usize, core::option::Option<usize>, core::option::Option<&[u8]>, bool, bool, usize) -> core::result::Result<(), rns_protocol::resource::ResourceError>
 pub mod rns_protocol::rnsh
 pub enum rns_protocol::rnsh::RnshCodecError
 pub rns_protocol::rnsh::RnshCodecError::Decode(alloc::string::String)

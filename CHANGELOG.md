@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.4.0 - 2026-10-12
+
+- Corrected packet-size limits across interfaces and Links, including IFAC overhead, and reject unsupported Link setups before sending them.
+- Added application-controlled acknowledgements so propagation nodes can confirm a message only after safely storing it.
+- Prevent stale interface or Link callbacks from acknowledging a different connection after reconnect or cancellation.
+- Reject malformed Resource metadata and invalid timeout values without panics or excessive allocation.
+- Added checked durable file operations for identities, ratchets, and application storage, with explicit recovery after interrupted writes.
+- Updated public interface, Link, and storage APIs. This source-breaking release uses the `~1.4.0` compatibility line.
+
 ## 1.3.0 - 2026-10-12
 
 ### Added

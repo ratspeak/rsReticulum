@@ -269,8 +269,15 @@ impl TransportActor {
             self.finish_cached_response(cached, &raw, id);
             return false;
         };
+        if !entry.accepts_clear_packet(raw.len()) {
+            self.finish_cached_response(cached, &raw, id);
+            return false;
+        }
         let wire = if let Some(key) = &entry.ifac_key {
-            Bytes::from(crate::ifac::ifac_sign(&raw, key, entry.ifac_size))
+            let Ok(wire) = crate::ifac::try_ifac_sign(&raw, key, entry.ifac_size) else {
+                return false;
+            };
+            Bytes::from(wire)
         } else {
             raw.clone()
         };
@@ -350,6 +357,17 @@ impl TransportActor {
     }
 
     fn try_prepared_announce(entry: &InterfaceEntry, wire: &Bytes) -> InterfaceSendOutcome {
+        if !entry.owner.is_current() {
+            return InterfaceSendOutcome::Missing;
+        }
+        if wire.len() > entry.packet_capacity.max_wire_packet_bytes as usize
+            || wire
+                .len()
+                .checked_sub(entry.active_ifac_bytes())
+                .is_none_or(|clear| !entry.accepts_clear_packet(clear))
+        {
+            return InterfaceSendOutcome::TooLarge;
+        }
         if !entry.direction.outbound {
             return InterfaceSendOutcome::NotOutbound;
         }

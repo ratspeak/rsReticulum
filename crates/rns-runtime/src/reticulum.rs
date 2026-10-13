@@ -55,6 +55,7 @@ pub const DEFAULT_ANNOUNCE_SUBSCRIPTION_CAPACITY: usize = 128;
 
 #[derive(Clone)]
 struct InterfaceControlMetadata {
+    transport_owner: rns_transport::messages::InterfaceOwner,
     registry_owner: u64,
     role: rns_transport::messages::InterfaceRole,
     ingress_overrides: rns_transport::ingress::IngressOverrides,
@@ -259,18 +260,22 @@ impl RuntimeShutdownCoordinator {
         // cancelled or unwound. Admission is already closed, so order a
         // conservative exact-ID rollback before releasing each tombstone.
         for (id, owner) in abandoned_registrations {
-            remove_interface_control_if_owner(&self.inner.interface_controls, id, owner);
-            if !self
-                .inner
-                .transport_completion
-                .stopped
-                .load(Ordering::Acquire)
-            {
-                let _ = self
+            let transport_owner =
+                remove_interface_control_if_owner(&self.inner.interface_controls, id, owner);
+            if let Some(transport_owner) = transport_owner
+                && !self
                     .inner
-                    .transport_tx
-                    .send(TransportMessage::DeregisterInterface { id })
-                    .await;
+                    .transport_completion
+                    .stopped
+                    .load(Ordering::Acquire)
+            {
+                let _ = rns_transport::messages::InterfaceTransportSender::bind(
+                    id,
+                    transport_owner,
+                    self.inner.transport_tx.clone(),
+                )
+                .send(TransportMessage::DeregisterInterface { id })
+                .await;
             }
             self.inner.interface_registry.finish_abandoned(id, owner);
         }
@@ -3401,8 +3406,31 @@ pub async fn init_with_policy(
                 }
             };
             let iface_id = next_id(&id_gen);
-            let mut post_init = get_post_init_for_config(&config, iface_config);
+            let mut post_init = match get_post_init_for_config(&config, iface_config) {
+                Ok(post_init) => post_init,
+                Err(error) => {
+                    let message = error.to_string();
+                    if rc.panic_on_interface_error {
+                        return Err(ReticulumError::Interface(message).into());
+                    }
+                    startup_interface_failures
+                        .push((interface_config_name(iface_config).to_string(), message));
+                    continue;
+                }
+            };
             finalize_post_init(&mut post_init, &rc);
+            if let Err(error) =
+                interface_factory::validate_config_capacity(iface_config, &post_init)
+            {
+                let message = error.to_string();
+                if rc.panic_on_interface_error {
+                    return Err(ReticulumError::Interface(message).into());
+                }
+                startup_interface_failures
+                    .push((interface_config_name(iface_config).to_string(), message));
+                continue;
+            }
+
             let discovery_config = discovery_config_for_interface(
                 &config,
                 iface_config,
@@ -3953,6 +3981,11 @@ async fn adopt_shared_instance_client(
 ) -> Result<InstanceMode, ReticulumError> {
     apply_forced_shared_instance_bitrate(&mut client_handle, forced_bitrate);
     let client_iface_id = client_handle.id;
+    let interface_sender = rns_transport::messages::InterfaceTransportSender::bind(
+        client_iface_id,
+        client_handle.owner.clone(),
+        transport_tx.clone(),
+    );
     let client_online = client_handle.online.clone();
     // Retain the registration's exact owner for rollback if initial actor
     // attachment fails; looking up an ID later could select a replacement.
@@ -3987,7 +4020,7 @@ async fn adopt_shared_instance_client(
             Err("shared-instance registration owner retired")
         }
         result = apply_initial_shared_peer_state(
-            transport_tx,
+            &interface_sender,
             client_iface_id,
             initial_online,
             shutdown,
@@ -4021,7 +4054,7 @@ async fn adopt_shared_instance_client(
         return Ok(InstanceMode::Standalone);
     }
     spawn_shared_peer_monitor(
-        transport_tx.clone(),
+        interface_sender,
         client_iface_id,
         client_online,
         initial_online,
@@ -4034,7 +4067,7 @@ async fn adopt_shared_instance_client(
 /// by this actor. Merely queueing Restored permits a caller's separate recovery
 /// lane to run first and then be erased by this initial state reset.
 async fn apply_initial_shared_peer_state(
-    transport_tx: &mpsc::Sender<TransportMessage>,
+    transport_tx: &rns_transport::messages::InterfaceTransportSender,
     interface_id: u64,
     initial_online: bool,
     shutdown: &ShutdownSignal,
@@ -4074,7 +4107,7 @@ async fn apply_initial_shared_peer_state(
 }
 
 fn spawn_shared_peer_monitor(
-    transport_tx: mpsc::Sender<TransportMessage>,
+    transport_tx: rns_transport::messages::InterfaceTransportSender,
     interface_id: u64,
     online: Arc<AtomicBool>,
     initial_online: bool,
@@ -4111,15 +4144,17 @@ fn spawn_shared_peer_monitor(
 fn ingress_for_role(
     role: rns_transport::messages::InterfaceRole,
     ingress_overrides: &rns_transport::ingress::IngressOverrides,
-) -> rns_transport::ingress::IngressController {
-    match role {
+) -> Result<rns_transport::ingress::IngressController, rns_transport::ingress::IngressOverrideError>
+{
+    ingress_overrides.validate()?;
+    Ok(match role {
         rns_transport::messages::InterfaceRole::LocalClient
         | rns_transport::messages::InterfaceRole::SharedInstancePeer => {
             rns_transport::ingress::IngressController::disabled()
         }
         _ if ingress_overrides.is_empty() => rns_transport::ingress::IngressController::new(),
-        _ => rns_transport::ingress::IngressController::with_overrides(ingress_overrides),
-    }
+        _ => rns_transport::ingress::IngressController::try_with_overrides(ingress_overrides)?,
+    })
 }
 
 /// Preserve Python Reticulum's interface modes in the transport actor.
@@ -4382,11 +4417,33 @@ async fn prepare_interface_with_role_and_overrides(
     kind: InterfaceKind,
     multipoint: bool,
 ) -> Result<PreparedInterfaceRegistration, InterfaceRegistrationError> {
+    let ingress = match ingress_for_role(role, &ingress_overrides) {
+        Ok(ingress) => ingress,
+        Err(error) => {
+            rollback_unreserved_interface(owned, kind).await;
+            return Err(InterfaceRegistrationError::InvalidIngress { field: error.field });
+        }
+    };
+    if ifac_key.is_some() && !(1..=64).contains(&ifac_size) {
+        rollback_unreserved_interface(owned, kind).await;
+        return Err(InterfaceRegistrationError::InvalidCapacity(
+            "active IFAC size must be 1..=64".into(),
+        ));
+    }
+    if let Err(error) = owned
+        .interface
+        .packet_capacity
+        .effective_clear_mtu(if ifac_key.is_some() { ifac_size } else { 0 })
+    {
+        rollback_unreserved_interface(owned, kind).await;
+        return Err(InterfaceRegistrationError::InvalidCapacity(
+            error.to_string(),
+        ));
+    }
     let OwnedInterfaceHandle { interface, driver } = owned;
     let handle = interface;
     let name = handle.name.clone();
     let id = handle.id;
-    let ingress = ingress_for_role(role, &ingress_overrides);
     let online = handle.online.clone();
     let registration = match interface_registry.reserve_with_online(
         id,
@@ -4429,6 +4486,7 @@ async fn prepare_interface_with_role_and_overrides(
         .insert(
             id,
             InterfaceControlMetadata {
+                transport_owner: handle.owner.clone(),
                 registry_owner,
                 role,
                 ingress_overrides: ingress_overrides.clone(),
@@ -4437,6 +4495,8 @@ async fn prepare_interface_with_role_and_overrides(
             },
         );
     let entry = rns_transport::messages::InterfaceEntry {
+        owner: handle.owner.clone(),
+        packet_capacity: handle.packet_capacity,
         name: handle.name.clone(),
         mode: convert_mode(handle.mode),
         role,
@@ -4468,6 +4528,7 @@ async fn prepare_interface_with_role_and_overrides(
         announces_from_internal: true,
     };
     Ok(PreparedInterfaceRegistration {
+        transport_owner: handle.owner.clone(),
         id,
         name,
         kind,
@@ -4582,17 +4643,47 @@ async fn prepare_interface_with_post_init(
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
 ) -> Result<PreparedInterfaceRegistration, InterfaceRegistrationError> {
+    let ingress = if post_init.ingress_overrides.is_empty() {
+        rns_transport::ingress::IngressController::new()
+    } else {
+        match rns_transport::ingress::IngressController::try_with_overrides(
+            &post_init.ingress_overrides,
+        ) {
+            Ok(ingress) => ingress,
+            Err(error) => {
+                rollback_unreserved_interface(owned, kind).await;
+                return Err(InterfaceRegistrationError::InvalidIngress { field: error.field });
+            }
+        }
+    };
+    if ifac_key.is_some()
+        && !(1..=64).contains(&post_init.ifac_size.unwrap_or(post_init.default_ifac_size))
+    {
+        rollback_unreserved_interface(owned, kind).await;
+        return Err(InterfaceRegistrationError::InvalidCapacity(
+            "active IFAC size must be 1..=64".into(),
+        ));
+    }
+    if let Err(error) = owned
+        .interface
+        .packet_capacity
+        .effective_clear_mtu(if ifac_key.is_some() {
+            post_init.ifac_size.unwrap_or(post_init.default_ifac_size)
+        } else {
+            0
+        })
+    {
+        rollback_unreserved_interface(owned, kind).await;
+        return Err(InterfaceRegistrationError::InvalidCapacity(
+            error.to_string(),
+        ));
+    }
     let OwnedInterfaceHandle { interface, driver } = owned;
     let handle = interface;
     // Outbound = physical capability AND `outgoing` config flag.
     let direction = rns_transport::constants::InterfaceDirection {
         inbound: handle.direction.inbound,
         outbound: handle.direction.outbound && post_init.outgoing,
-    };
-    let ingress = if post_init.ingress_overrides.is_empty() {
-        rns_transport::ingress::IngressController::new()
-    } else {
-        rns_transport::ingress::IngressController::with_overrides(&post_init.ingress_overrides)
     };
     let name = handle.name.clone();
     let id = handle.id;
@@ -4638,6 +4729,7 @@ async fn prepare_interface_with_post_init(
         .insert(
             id,
             InterfaceControlMetadata {
+                transport_owner: handle.owner.clone(),
                 registry_owner,
                 role: rns_transport::messages::InterfaceRole::Normal,
                 ingress_overrides: post_init.ingress_overrides.clone(),
@@ -4646,6 +4738,8 @@ async fn prepare_interface_with_post_init(
             },
         );
     let entry = rns_transport::messages::InterfaceEntry {
+        owner: handle.owner.clone(),
+        packet_capacity: handle.packet_capacity,
         name: handle.name.clone(),
         mode: convert_mode(handle.mode),
         role: rns_transport::messages::InterfaceRole::Normal,
@@ -4672,6 +4766,7 @@ async fn prepare_interface_with_post_init(
         announces_from_internal: post_init.announces_from_internal,
     };
     Ok(PreparedInterfaceRegistration {
+        transport_owner: handle.owner.clone(),
         id,
         name,
         kind,
@@ -4684,6 +4779,8 @@ async fn prepare_interface_with_post_init(
 
 #[derive(Debug)]
 enum InterfaceRegistrationError {
+    InvalidCapacity(String),
+    InvalidIngress { field: &'static str },
     Duplicate { id: u64 },
     InvalidDriverOwnership { id: u64 },
     RuntimeUnavailable { id: u64 },
@@ -4695,6 +4792,10 @@ enum InterfaceRegistrationError {
 impl std::fmt::Display for InterfaceRegistrationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidCapacity(error) => {
+                write!(formatter, "invalid interface capacity: {error}")
+            }
+            Self::InvalidIngress { field } => write!(formatter, "invalid ingress override {field}"),
             Self::Duplicate { id } => write!(formatter, "duplicate interface ID {id}"),
             Self::InvalidDriverOwnership { id } => {
                 write!(
@@ -4817,6 +4918,7 @@ struct RegistrationWorkerReply {
 }
 
 struct PreparedInterfaceRegistration {
+    transport_owner: rns_transport::messages::InterfaceOwner,
     id: u64,
     name: String,
     kind: InterfaceKind,
@@ -5096,7 +5198,14 @@ async fn rollback_published_interfaces(
 
     for mut interface in prepared {
         let deregistered = transport_tx
-            .send(TransportMessage::DeregisterInterface { id: interface.id })
+            .send(
+                rns_transport::messages::InterfaceTransportSender::bind(
+                    interface.id,
+                    interface.transport_owner.clone(),
+                    transport_tx.clone(),
+                )
+                .event(TransportMessage::DeregisterInterface { id: interface.id }),
+            )
             .await
             .is_ok();
         if deregistered && let Some(registration) = interface.registration.take() {
@@ -5329,7 +5438,14 @@ async fn rollback_batch_interfaces(
         let published = published_ids.contains(&interface.id);
         let safe_to_release = !published
             || transport_tx
-                .send(TransportMessage::DeregisterInterface { id: interface.id })
+                .send(
+                    rns_transport::messages::InterfaceTransportSender::bind(
+                        interface.id,
+                        interface.transport_owner.clone(),
+                        transport_tx.clone(),
+                    )
+                    .event(TransportMessage::DeregisterInterface { id: interface.id }),
+                )
                 .await
                 .is_ok();
         if safe_to_release && let Some(registration) = interface.registration.take() {
@@ -5369,7 +5485,7 @@ fn remove_interface_control_if_owner(
     interface_controls: &InterfaceControlMap,
     id: u64,
     registry_owner: u64,
-) {
+) -> Option<rns_transport::messages::InterfaceOwner> {
     let mut controls = interface_controls
         .lock()
         .expect("interface_controls mutex poisoned");
@@ -5377,8 +5493,9 @@ fn remove_interface_control_if_owner(
         .get(&id)
         .is_some_and(|control| control.registry_owner == registry_owner)
     {
-        controls.remove(&id);
+        return controls.remove(&id).map(|control| control.transport_owner);
     }
+    None
 }
 
 fn derive_ifac_key_from_post_init(
@@ -5433,8 +5550,10 @@ fn runtime_ifac_post_init(
         return Ok(None);
     }
 
-    let mut post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new())
-        .with_default_ifac_size(default_ifac_size);
+    let mut post_init =
+        interface_factory::InterfacePostInit::try_from_section(&ConfigSection::new())
+            .expect("empty interface defaults are valid")
+            .with_default_ifac_size(default_ifac_size);
     post_init.ifac_network_name = network_name;
     post_init.ifac_passphrase = passphrase;
     post_init.ifac_size = ifac.ifac_size;
@@ -5444,15 +5563,15 @@ fn runtime_ifac_post_init(
 fn get_post_init_for_config(
     config: &Config,
     iface_config: &interface_factory::InterfaceConfig,
-) -> interface_factory::InterfacePostInit {
+) -> Result<interface_factory::InterfacePostInit, interface_factory::InterfaceFactoryError> {
     let name = interface_config_name(iface_config);
     let default_ifac_size = interface_factory::default_ifac_size_for(iface_config);
     if let Some(section) = config.subsection("interfaces", name) {
-        return interface_factory::InterfacePostInit::from_section(section)
-            .with_default_ifac_size(default_ifac_size);
+        return interface_factory::InterfacePostInit::try_from_section(section)
+            .map(|post_init| post_init.with_default_ifac_size(default_ifac_size));
     }
-    interface_factory::InterfacePostInit::from_section(&crate::config::ConfigSection::new())
-        .with_default_ifac_size(default_ifac_size)
+    interface_factory::InterfacePostInit::try_from_section(&crate::config::ConfigSection::new())
+        .map(|post_init| post_init.with_default_ifac_size(default_ifac_size))
 }
 
 fn apply_default_announce_rate(
@@ -6235,8 +6354,10 @@ async fn spawn_discovered_backbone_client(
             .await
             .map_err(|e| format!("Backbone client spawn failed: {e}"))?;
 
-    let mut post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new())
-        .with_default_ifac_size(16);
+    let mut post_init =
+        interface_factory::InterfacePostInit::try_from_section(&ConfigSection::new())
+            .expect("empty interface defaults are valid")
+            .with_default_ifac_size(16);
     finalize_post_init(&mut post_init, &handle.config);
     post_init.ifac_network_name = record.info.ifac_netname.clone();
     post_init.ifac_passphrase = record.info.ifac_netkey.clone();
@@ -6542,6 +6663,14 @@ pub async fn spawn_tcp_client_runtime_with_ifac(
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let post_init = runtime_ifac_post_init(ifac, 16)?;
     let config = rns_interface::tcp::TcpClientConfig::new(name, host, port);
+    if let Some(post_init) = &post_init {
+        interface_factory::validate_config_capacity(
+            &interface_factory::InterfaceConfig::TcpClient(config.clone()),
+            post_init,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
     let iface_handle =
         rns_interface::tcp::spawn_tcp_client(config, id, handle.transport_tx.clone())
             .await
@@ -6599,6 +6728,14 @@ pub async fn spawn_tcp_server_runtime_with_ifac(
     let id = next_id(&handle.id_gen);
     let post_init = runtime_ifac_post_init(ifac, 16)?;
     let config = rns_interface::tcp::TcpServerConfig::new(name, listen_ip, port);
+    if let Some(post_init) = &post_init {
+        interface_factory::validate_config_capacity(
+            &interface_factory::InterfaceConfig::TcpServer(config.clone()),
+            post_init,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
     let iface_handle = rns_interface::tcp::spawn_tcp_server(
         config,
         id,
@@ -7648,21 +7785,25 @@ async fn finish_interface_shutdown(
     // shutdown primitive and join that exact task before deregistering;
     // same-ID compatibility lookups cannot redirect teardown.
     shutdown.stop_task_and_wait().await;
-    if let Some(control_owner) = shutdown.control_owner() {
-        remove_interface_control_if_owner(interface_controls, id, control_owner);
+    let transport_owner = if let Some(control_owner) = shutdown.control_owner() {
+        remove_interface_control_if_owner(interface_controls, id, control_owner)
     } else {
-        // An orphan tombstone cannot share the stale control's owner token.
-        // The tombstone blocks replacement until this deregistration is
-        // ordered, so unconditional removal is safe in this branch.
         interface_controls
             .lock()
             .expect("interface_controls mutex poisoned")
-            .remove(&id);
-    }
-    let deregistered = transport_tx
-        .send(TransportMessage::DeregisterInterface { id })
-        .await
-        .is_ok();
+            .remove(&id)
+            .map(|control| control.transport_owner)
+    };
+    let deregistered = if let Some(owner) = transport_owner {
+        rns_transport::messages::InterfaceTransportSender::bind(id, owner, transport_tx.clone())
+            .send(TransportMessage::DeregisterInterface { id })
+            .await
+            .is_ok()
+    } else {
+        // No exact published registration remains in runtime ownership. Do not
+        // fabricate authority over a current actor entry with the same ID.
+        true
+    };
     if deregistered {
         shutdown.finish();
         tracing::info!(id, "interface deregistered");
@@ -8259,6 +8400,7 @@ mod tests {
         controls.lock().unwrap().insert(
             id,
             InterfaceControlMetadata {
+                transport_owner: rns_transport::InterfaceOwner::new(),
                 registry_owner: owner,
                 role: rns_transport::messages::InterfaceRole::Normal,
                 ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
@@ -8402,6 +8544,7 @@ mod tests {
         controls.lock().unwrap().insert(
             id,
             InterfaceControlMetadata {
+                transport_owner: rns_transport::InterfaceOwner::new(),
                 registry_owner: owner,
                 role: rns_transport::messages::InterfaceRole::Normal,
                 ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
@@ -8531,7 +8674,13 @@ mod tests {
         let online = Arc::new(AtomicBool::new(false));
         let shutdown = ShutdownSignal::new();
 
-        spawn_shared_peer_monitor(tx, 7, online.clone(), false, shutdown.clone());
+        spawn_shared_peer_monitor(
+            registered_test_sender(7, tx),
+            7,
+            online.clone(),
+            false,
+            shutdown.clone(),
+        );
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         assert!(
             rx.try_recv().is_err(),
@@ -8543,7 +8692,7 @@ mod tests {
             .await
             .expect("restored event timed out")
             .expect("monitor channel closed");
-        match restored {
+        match unwrap_owned_event(restored) {
             TransportMessage::SharedConnectionRestored { interface_id } => {
                 assert_eq!(interface_id, 7)
             }
@@ -8555,7 +8704,7 @@ mod tests {
             .await
             .expect("lost event timed out")
             .expect("monitor channel closed");
-        match lost {
+        match unwrap_owned_event(lost) {
             TransportMessage::SharedConnectionLost => {}
             other => panic!("expected SharedConnectionLost, got {other:?}"),
         }
@@ -8569,9 +8718,15 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(4);
             let shutdown = ShutdownSignal::new();
             let caller = tokio::spawn(async move {
-                apply_initial_shared_peer_state(&tx, 7, initial_online, &shutdown).await
+                apply_initial_shared_peer_state(
+                    &registered_test_sender(7, tx.clone()),
+                    7,
+                    initial_online,
+                    &shutdown,
+                )
+                .await
             });
-            let event = rx.recv().await.unwrap();
+            let event = unwrap_owned_event(rx.recv().await.unwrap());
             assert!(matches!(
                 (initial_online, event),
                 (
@@ -8579,7 +8734,9 @@ mod tests {
                     TransportMessage::SharedConnectionRestored { interface_id: 7 }
                 ) | (false, TransportMessage::SharedConnectionLost)
             ));
-            let TransportMessage::Rpc { query, response_tx } = rx.recv().await.unwrap() else {
+            let TransportMessage::Rpc { query, response_tx } =
+                unwrap_owned_event(rx.recv().await.unwrap())
+            else {
                 panic!("expected same-mailbox actor barrier");
             };
             assert!(matches!(query, TransportQuery::GetLinkCount));
@@ -8600,7 +8757,13 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let online = Arc::new(AtomicBool::new(true));
         let shutdown = ShutdownSignal::new();
-        spawn_shared_peer_monitor(tx, 7, online.clone(), true, shutdown.clone());
+        spawn_shared_peer_monitor(
+            registered_test_sender(7, tx),
+            7,
+            online.clone(),
+            true,
+            shutdown.clone(),
+        );
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(120)).await;
         tokio::task::yield_now().await;
@@ -8611,13 +8774,13 @@ mod tests {
         online.store(false, Ordering::SeqCst);
         tokio::time::advance(Duration::from_millis(100)).await;
         assert!(matches!(
-            rx.recv().await.unwrap(),
+            unwrap_owned_event(rx.recv().await.unwrap()),
             TransportMessage::SharedConnectionLost
         ));
         online.store(true, Ordering::SeqCst);
         tokio::time::advance(Duration::from_millis(100)).await;
         assert!(matches!(
-            rx.recv().await.unwrap(),
+            unwrap_owned_event(rx.recv().await.unwrap()),
             TransportMessage::SharedConnectionRestored { interface_id: 7 }
         ));
         shutdown.trigger();
@@ -8645,17 +8808,17 @@ mod tests {
             .await
         });
         assert!(matches!(
-            rx.recv().await.unwrap(),
+            unwrap_owned_event(rx.recv().await.unwrap()),
             TransportMessage::RegisterInterface { id: 7, .. }
         ));
         assert!(matches!(
-            rx.recv().await.unwrap(),
+            unwrap_owned_event(rx.recv().await.unwrap()),
             TransportMessage::SharedConnectionRestored { interface_id: 7 }
         ));
         let TransportMessage::Rpc {
             response_tx: held_barrier,
             ..
-        } = rx.recv().await.unwrap()
+        } = unwrap_owned_event(rx.recv().await.unwrap())
         else {
             panic!("expected attachment barrier");
         };
@@ -8663,7 +8826,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(5)).await;
         assert_eq!(caller.await.unwrap().unwrap(), InstanceMode::Standalone);
         assert!(matches!(
-            rx.recv().await.unwrap(),
+            unwrap_owned_event(rx.recv().await.unwrap()),
             TransportMessage::DeregisterInterface { id: 7 }
         ));
         assert_eq!(registry.len(), 0);
@@ -8685,17 +8848,27 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
         assert!(
-            apply_initial_shared_peer_state(&tx, 7, true, &ShutdownSignal::new())
-                .await
-                .is_err()
+            apply_initial_shared_peer_state(
+                &registered_test_sender(7, tx.clone()),
+                7,
+                true,
+                &ShutdownSignal::new()
+            )
+            .await
+            .is_err()
         );
         let (tx, mut rx) = mpsc::channel(1);
         let shutdown = ShutdownSignal::new();
         shutdown.trigger();
         assert!(
-            apply_initial_shared_peer_state(&tx, 7, true, &shutdown)
-                .await
-                .is_err()
+            apply_initial_shared_peer_state(
+                &registered_test_sender(7, tx.clone()),
+                7,
+                true,
+                &shutdown
+            )
+            .await
+            .is_err()
         );
         assert!(rx.try_recv().is_err());
     }
@@ -8739,7 +8912,7 @@ mod tests {
             .await
         });
         assert!(matches!(
-            rx.recv().await.unwrap(),
+            unwrap_owned_event(rx.recv().await.unwrap()),
             TransportMessage::RegisterInterface { id: 7, .. }
         ));
         // Leave initial Restored occupying the only slot: both the actor
@@ -8783,7 +8956,7 @@ mod tests {
         assert_eq!(registry.len(), 1);
         assert!(controls.lock().unwrap().is_empty());
         assert!(matches!(
-            rx.try_recv().unwrap(),
+            unwrap_owned_event(rx.try_recv().unwrap()),
             TransportMessage::SharedConnectionRestored { interface_id: 7 }
         ));
         assert!(
@@ -8847,6 +9020,36 @@ mod tests {
         (first_port, second_port)
     }
 
+    fn registered_test_sender(
+        id: u64,
+        tx: mpsc::Sender<TransportMessage>,
+    ) -> rns_transport::InterfaceTransportSender {
+        let sender = rns_transport::InterfaceTransportSender::new(id, tx);
+        sender.owner().mark_registered();
+        sender
+    }
+
+    fn unwrap_owned_event(event: TransportMessage) -> TransportMessage {
+        match event {
+            TransportMessage::RegisterInterface { id, entry } => {
+                entry.owner.mark_registered();
+                TransportMessage::RegisterInterface { id, entry }
+            }
+            TransportMessage::InterfaceEvent {
+                interface_id,
+                owner,
+                message,
+            } => {
+                assert!(owner.is_current());
+                if let TransportMessage::DeregisterInterface { id } = &*message {
+                    assert_eq!(*id, interface_id, "cleanup must retain its exact interface");
+                }
+                *message
+            }
+            other => other,
+        }
+    }
+
     fn test_interface_handle(
         id: u64,
         parent_id: Option<u64>,
@@ -8855,6 +9058,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4);
         rns_interface::traits::InterfaceHandle {
             id,
+            owner: rns_transport::InterfaceOwner::new(),
+            packet_capacity: rns_transport::InterfacePacketCapacity::base(500),
             parent_id,
             name: name.to_string(),
             mode: rns_interface::traits::InterfaceMode::Gateway,
@@ -8872,6 +9077,112 @@ mod tests {
             inspection: None,
             tx,
             read_task: tokio::spawn(async {}),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_ifac_capacity_registration_stops_owned_driver_before_returning() {
+        for configured in [false, true] {
+            for size in [0, 65] {
+                let mut handle = test_interface_handle(920_299, None, "invalid-ifac");
+                handle.read_task = tokio::spawn(std::future::pending());
+                let task = handle.read_task.abort_handle();
+                let online = handle.online.clone();
+                let controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+                let registry = InterfaceRegistry::default();
+                let result = if configured {
+                    let mut post_init = interface_factory::InterfacePostInit::try_from_section(
+                        &ConfigSection::default(),
+                    )
+                    .unwrap();
+                    post_init.ifac_size = Some(size);
+                    prepare_interface_with_post_init(
+                        handle.into(),
+                        &post_init,
+                        Some([1; 64]),
+                        &controls,
+                        &registry,
+                        InterfaceKind::Standard,
+                    )
+                    .await
+                } else {
+                    prepare_interface_with_role_and_overrides(
+                        handle.into(),
+                        rns_transport::messages::InterfaceRole::Normal,
+                        Default::default(),
+                        Some([1; 64]),
+                        size,
+                        &controls,
+                        &registry,
+                        InterfaceKind::Standard,
+                        false,
+                    )
+                    .await
+                };
+                assert!(matches!(
+                    result,
+                    Err(InterfaceRegistrationError::InvalidCapacity(_))
+                ));
+                assert!(task.is_finished());
+                assert!(!online.load(Ordering::SeqCst));
+                assert!(controls.lock().unwrap().is_empty());
+                assert_eq!(registry.len(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_ingress_registration_stops_owned_driver_before_returning() {
+        for configured in [false, true] {
+            let mut handle = test_interface_handle(920_199, None, "invalid-ingress");
+            handle.read_task = tokio::spawn(std::future::pending());
+            let task = handle.read_task.abort_handle();
+            let online = handle.online.clone();
+            let controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let registry = InterfaceRegistry::default();
+            let overrides = rns_transport::ingress::IngressOverrides {
+                burst_hold: Some(f64::INFINITY),
+                ..Default::default()
+            };
+            let result = if configured {
+                let mut post_init = interface_factory::InterfacePostInit::try_from_section(
+                    &ConfigSection::default(),
+                )
+                .unwrap();
+                post_init.ingress_overrides = overrides;
+                prepare_interface_with_post_init(
+                    handle.into(),
+                    &post_init,
+                    None,
+                    &controls,
+                    &registry,
+                    InterfaceKind::Standard,
+                )
+                .await
+            } else {
+                prepare_interface_with_role_and_overrides(
+                    handle.into(),
+                    rns_transport::messages::InterfaceRole::Normal,
+                    overrides,
+                    None,
+                    0,
+                    &controls,
+                    &registry,
+                    InterfaceKind::Standard,
+                    false,
+                )
+                .await
+            };
+            assert!(matches!(
+                result,
+                Err(InterfaceRegistrationError::InvalidIngress {
+                    field: "ic_burst_hold"
+                })
+            ));
+            assert!(task.is_finished());
+            assert!(!online.load(Ordering::SeqCst));
+            assert!(controls.lock().unwrap().is_empty());
+            assert_eq!(registry.len(), 0);
         }
     }
 
@@ -11410,8 +11721,10 @@ loglevel = 7
         );
         let mut body = header.destination_hash.to_vec();
         body.extend_from_slice(&[0xA7; 16]);
-        handle
-            .transport_tx
+        let ap_owner = handle.interface_controls.lock().unwrap()[&1]
+            .transport_owner
+            .clone();
+        rns_transport::InterfaceTransportSender::bind(1, ap_owner, handle.transport_tx.clone())
             .send(TransportMessage::Inbound(
                 rns_transport::messages::InboundPacket {
                     raw: make_plain_data_packet(path_destination, &body),
@@ -11613,7 +11926,7 @@ loglevel = 7
         ] {
             let config = Config::parse(&format!("[interfaces]\n[[relay]]\ntype = TCPServerInterface\nlisten_ip = 127.0.0.1\nlisten_port = 4242\ndiscoverable = yes\n{extra}")).unwrap();
             let interfaces = synthesize_interfaces(&config, false).unwrap();
-            let post_init = get_post_init_for_config(&config, &interfaces[0]);
+            let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
             let discovery =
                 discovery_config_for_interface(&config, &interfaces[0], &post_init, true).unwrap();
             assert_eq!(
@@ -11809,7 +12122,7 @@ egress_control = Yes
         let config = Config::parse(input).unwrap();
         let rc = ReticulumConfig::from_config(&config);
         let interfaces = synthesize_interfaces(&config, false).unwrap();
-        let mut post_init = get_post_init_for_config(&config, &interfaces[0]);
+        let mut post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
 
         finalize_post_init(&mut post_init, &rc);
 
@@ -11927,14 +12240,16 @@ egress_control = Yes
 
     #[test]
     fn post_init_parses_recursive_prs_and_announces_from_internal() {
-        let post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
+        let post_init =
+            interface_factory::InterfacePostInit::try_from_section(&ConfigSection::new())
+                .expect("empty interface defaults are valid");
         assert!(!post_init.recursive_prs);
         assert!(post_init.announces_from_internal);
 
         let mut section = ConfigSection::new();
         section.set("recursive_prs", "yes");
         section.set("announces_from_internal", "no");
-        let post_init = interface_factory::InterfacePostInit::from_section(&section);
+        let post_init = interface_factory::InterfacePostInit::try_from_section(&section).unwrap();
         assert!(post_init.recursive_prs);
         assert!(!post_init.announces_from_internal);
     }
@@ -12027,7 +12342,9 @@ egress_control = Yes
             duplicate.online.clone(),
             remaining.online.clone(),
         ];
-        let post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
+        let post_init =
+            interface_factory::InterfacePostInit::try_from_section(&ConfigSection::new())
+                .expect("empty interface defaults are valid");
 
         let result = register_interfaces_with_post_init_batch(
             &transport_tx,
@@ -12098,7 +12415,7 @@ egress_control = Yes
         .await
         .unwrap();
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::RegisterInterface {
                 id: registered_id,
                 ..
@@ -12113,7 +12430,7 @@ egress_control = Yes
 
         assert!(stopped.load(Ordering::Acquire));
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::DeregisterInterface {
                 id: deregistered_id
             }) if deregistered_id == id
@@ -12234,12 +12551,12 @@ egress_control = Yes
         .await
         .unwrap();
         assert!(matches!(
-            first_transport_rx.recv().await,
+            first_transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::RegisterInterface { id: registered, .. })
                 if registered == id
         ));
         assert!(matches!(
-            second_transport_rx.recv().await,
+            second_transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::RegisterInterface { id: registered, .. })
                 if registered == id
         ));
@@ -12263,7 +12580,7 @@ egress_control = Yes
             "second same-ID peer closed during first runtime teardown"
         );
         assert!(matches!(
-            first_transport_rx.recv().await,
+            first_transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::DeregisterInterface { id: deregistered })
                 if deregistered == id
         ));
@@ -12275,7 +12592,7 @@ egress_control = Yes
         teardown_interface(&second_runtime, id).await;
         assert_exact_rnode_stopped(&second_driver);
         assert!(matches!(
-            second_transport_rx.recv().await,
+            second_transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::DeregisterInterface { id: deregistered })
                 if deregistered == id
         ));
@@ -12455,7 +12772,7 @@ egress_control = Yes
                 .is_empty()
         );
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::Shutdown)
         ));
         assert!(
@@ -12611,7 +12928,7 @@ egress_control = Yes
             .take()
             .expect("committed registration must require acknowledgement");
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::RegisterInterface {
                 id: registered_id,
                 ..
@@ -12677,7 +12994,9 @@ egress_control = Yes
         let first = test_interface_handle(ids[0], None, "batch-cancel-first");
         let second = test_interface_handle(ids[1], None, "batch-cancel-second");
         let online = [first.online.clone(), second.online.clone()];
-        let post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
+        let post_init =
+            interface_factory::InterfacePostInit::try_from_section(&ConfigSection::new())
+                .expect("empty interface defaults are valid");
         let spawn_permit = interface_registry
             .acquire_spawn_permit()
             .expect("runtime admission is open");
@@ -12714,11 +13033,11 @@ egress_control = Yes
         );
 
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::RegisterInterface { id, .. }) if id == ids[0]
         ));
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::DeregisterInterface { id }) if id == ids[0]
         ));
         wait_for_registry_len(&interface_registry, 0).await;
@@ -12739,7 +13058,7 @@ egress_control = Yes
         let (reply_tx, reply_rx) = oneshot::channel();
         drop(reply_rx);
 
-        single_registration_worker(
+        let worker = tokio::spawn(single_registration_worker(
             transport_tx.clone(),
             interface_controls.clone(),
             interface_registry.clone(),
@@ -12757,23 +13076,23 @@ egress_control = Yes
             },
             reply_tx,
             None,
-        )
-        .await;
-        drop(cancel_tx);
+        ));
 
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::RegisterInterface {
                 id: registered_id,
                 ..
             }) if registered_id == id
         ));
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::DeregisterInterface {
                 id: deregistered_id
             }) if deregistered_id == id
         ));
+        worker.await.unwrap();
+        drop(cancel_tx);
         assert!(!online.load(Ordering::SeqCst));
         assert!(interface_controls.lock().unwrap().is_empty());
         assert_eq!(interface_registry.len(), 0);
@@ -12814,7 +13133,7 @@ egress_control = Yes
         .await
         .expect("commit owner A");
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::RegisterInterface {
                 id: registered_id,
                 ..
@@ -12824,7 +13143,7 @@ egress_control = Yes
         teardown_interface_transaction(&transport_tx, &interface_controls, &interface_registry, id)
             .await;
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::DeregisterInterface {
                 id: deregistered_id
             }) if deregistered_id == id
@@ -12841,7 +13160,7 @@ egress_control = Yes
         .await
         .expect("register owner B");
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::RegisterInterface {
                 id: registered_id,
                 ..
@@ -12866,7 +13185,7 @@ egress_control = Yes
         teardown_interface_transaction(&transport_tx, &interface_controls, &interface_registry, id)
             .await;
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::DeregisterInterface {
                 id: deregistered_id
             }) if deregistered_id == id
@@ -12875,44 +13194,26 @@ egress_control = Yes
     }
 
     #[tokio::test]
-    async fn missing_teardown_tombstone_blocks_reuse_until_deregister_is_enqueued() {
+    async fn teardown_without_owned_registration_cannot_deregister_replacement() {
         let id = 920_098;
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
-        transport_tx
-            .send(TransportMessage::Shutdown)
-            .await
-            .expect("fill transport channel");
+        transport_tx.send(TransportMessage::Shutdown).await.unwrap();
         let interface_registry = InterfaceRegistry::default();
         let mut runtime = dummy_handle();
         runtime.transport_tx = transport_tx;
         runtime.interface_registry = interface_registry.clone();
-        let teardown = tokio::spawn(async move {
-            teardown_interface(&runtime, id).await;
-        });
-
-        wait_for_registry_len(&interface_registry, 1).await;
-        let rejected = match interface_registry.reserve(
-            id,
-            InterfaceKind::Standard,
-            tokio::spawn(std::future::pending()),
-            None,
-        ) {
-            Ok(_) => panic!("orphan cleanup must hold a same-ID tombstone"),
-            Err(rejected) => rejected,
-        };
-        rejected.stop_and_wait().await;
-
+        tokio::time::timeout(Duration::from_secs(1), teardown_interface(&runtime, id))
+            .await
+            .expect("missing ownership must not wait for actor capacity");
+        assert_eq!(interface_registry.len(), 0);
         assert!(matches!(
             transport_rx.recv().await,
             Some(TransportMessage::Shutdown)
         ));
-        assert!(matches!(
-            transport_rx.recv().await,
-            Some(TransportMessage::DeregisterInterface {
-                id: deregistered_id
-            }) if deregistered_id == id
-        ));
-        teardown.await.expect("teardown caller");
+        assert!(
+            transport_rx.try_recv().is_err(),
+            "bare ID must not authorize deregistration"
+        );
         let replacement = interface_registry
             .reserve(
                 id,
@@ -12920,7 +13221,7 @@ egress_control = Yes
                 tokio::spawn(std::future::pending()),
                 None,
             )
-            .expect("ID may be reused after deregistration is enqueued");
+            .unwrap();
         replacement.rollback().await;
     }
 
@@ -12971,7 +13272,7 @@ egress_control = Yes
         assert!(interface_controls.lock().unwrap().is_empty());
         assert_eq!(interface_registry.len(), 0);
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::Shutdown)
         ));
         assert!(
@@ -12998,7 +13299,7 @@ egress_control = Yes
         .await
         .expect("register completed task");
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::RegisterInterface {
                 id: registered_id,
                 ..
@@ -13011,7 +13312,7 @@ egress_control = Yes
         runtime.interface_registry = interface_registry.clone();
         teardown_interface(&runtime, id).await;
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::DeregisterInterface {
                 id: deregistered_id
             }) if deregistered_id == id
@@ -13045,7 +13346,7 @@ egress_control = Yes
         .await
         .expect("registration");
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::RegisterInterface {
                 id: registered_id,
                 ..
@@ -13074,11 +13375,11 @@ egress_control = Yes
         let _ = caller.await;
 
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::Shutdown)
         ));
         assert!(matches!(
-            transport_rx.recv().await,
+            transport_rx.recv().await.map(unwrap_owned_event),
             Some(TransportMessage::DeregisterInterface {
                 id: deregistered_id
             }) if deregistered_id == id
@@ -13097,7 +13398,7 @@ egress_control = Yes
         let mut section = ConfigSection::new();
         section.set("recursive_prs", "yes");
         section.set("announces_from_internal", "no");
-        let post_init = interface_factory::InterfacePostInit::from_section(&section);
+        let post_init = interface_factory::InterfacePostInit::try_from_section(&section).unwrap();
         let mut handle = test_interface_handle(920_101, None, "internal-mode");
         handle.mode = rns_interface::traits::InterfaceMode::Internal;
         register_interface_with_post_init(
@@ -13111,8 +13412,11 @@ egress_control = Yes
         )
         .await
         .unwrap();
-        let TransportMessage::RegisterInterface { entry, .. } =
-            transport_rx.recv().await.expect("registration")
+        let TransportMessage::RegisterInterface { entry, .. } = transport_rx
+            .recv()
+            .await
+            .map(unwrap_owned_event)
+            .expect("registration")
         else {
             panic!("expected RegisterInterface");
         };
@@ -13127,7 +13431,8 @@ egress_control = Yes
     #[test]
     fn default_announce_rate_applies_only_when_transport_enabled() {
         let mut post_init =
-            interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
+            interface_factory::InterfacePostInit::try_from_section(&ConfigSection::new())
+                .expect("empty interface defaults are valid");
         let mut rc = ReticulumConfig {
             enable_transport: false,
             default_ar_target: Some(7200),
@@ -13155,7 +13460,9 @@ egress_control = Yes
             Arc::new(std::sync::Mutex::new(HashMap::new()));
         let interface_registry = InterfaceRegistry::default();
 
-        let post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
+        let post_init =
+            interface_factory::InterfacePostInit::try_from_section(&ConfigSection::new())
+                .expect("empty interface defaults are valid");
         register_interface_with_post_init(
             &transport_tx,
             test_interface_handle(920_001, None, "default-cap"),
@@ -13167,8 +13474,11 @@ egress_control = Yes
         )
         .await
         .unwrap();
-        let TransportMessage::RegisterInterface { entry, .. } =
-            transport_rx.recv().await.expect("default cap registration")
+        let TransportMessage::RegisterInterface { entry, .. } = transport_rx
+            .recv()
+            .await
+            .map(unwrap_owned_event)
+            .expect("default cap registration")
         else {
             panic!("expected RegisterInterface");
         };
@@ -13176,7 +13486,7 @@ egress_control = Yes
 
         let mut section = ConfigSection::new();
         section.set("announce_cap", "5.0");
-        let post_init = interface_factory::InterfacePostInit::from_section(&section);
+        let post_init = interface_factory::InterfacePostInit::try_from_section(&section).unwrap();
         register_interface_with_post_init(
             &transport_tx,
             test_interface_handle(920_002, None, "custom-cap"),
@@ -13188,8 +13498,11 @@ egress_control = Yes
         )
         .await
         .unwrap();
-        let TransportMessage::RegisterInterface { entry, .. } =
-            transport_rx.recv().await.expect("custom cap registration")
+        let TransportMessage::RegisterInterface { entry, .. } = transport_rx
+            .recv()
+            .await
+            .map(unwrap_owned_event)
+            .expect("custom cap registration")
         else {
             panic!("expected RegisterInterface");
         };
@@ -13210,7 +13523,7 @@ egress_control = Yes
         section.set("ic_pr_burst_freq", "9.0");
         section.set("ec_pr_freq", "6.0");
         section.set("egress_control", "Yes");
-        let post_init = interface_factory::InterfacePostInit::from_section(&section);
+        let post_init = interface_factory::InterfacePostInit::try_from_section(&section).unwrap();
 
         register_interface_with_post_init(
             &transport_tx,
@@ -13223,7 +13536,11 @@ egress_control = Yes
         )
         .await
         .unwrap();
-        let _ = transport_rx.recv().await.expect("parent registration");
+        let _ = transport_rx
+            .recv()
+            .await
+            .map(unwrap_owned_event)
+            .expect("parent registration");
 
         let (role, inherited, ifac_key, ifac_size) =
             child_registration_from_parent(&interface_controls, Some(parent_id));
@@ -13243,7 +13560,11 @@ egress_control = Yes
         .await
         .unwrap();
 
-        let msg = transport_rx.recv().await.expect("child registration");
+        let msg = transport_rx
+            .recv()
+            .await
+            .map(unwrap_owned_event)
+            .expect("child registration");
         let TransportMessage::RegisterInterface { entry, .. } = msg else {
             panic!("expected child RegisterInterface");
         };
@@ -13288,7 +13609,11 @@ egress_control = Yes
             .await
             .unwrap();
 
-            let msg = transport_rx.recv().await.expect("registration");
+            let msg = transport_rx
+                .recv()
+                .await
+                .map(unwrap_owned_event)
+                .expect("registration");
             let TransportMessage::RegisterInterface { entry, .. } = msg else {
                 panic!("expected RegisterInterface");
             };
@@ -13308,6 +13633,7 @@ egress_control = Yes
             .insert(
                 parent_id,
                 InterfaceControlMetadata {
+                    transport_owner: rns_transport::InterfaceOwner::new(),
                     registry_owner: 1,
                     role: rns_transport::messages::InterfaceRole::SharedServer,
                     ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
@@ -13333,8 +13659,9 @@ egress_control = Yes
         let mut section = ConfigSection::new();
         section.set("networkname", "testnet");
         section.set("passphrase", "password");
-        let post_init =
-            interface_factory::InterfacePostInit::from_section(&section).with_default_ifac_size(16);
+        let post_init = interface_factory::InterfacePostInit::try_from_section(&section)
+            .unwrap()
+            .with_default_ifac_size(16);
         let ifac_key = derive_ifac_key_from_post_init(&post_init);
         assert!(ifac_key.is_some());
 
@@ -13352,7 +13679,11 @@ egress_control = Yes
         let TransportMessage::RegisterInterface {
             entry: parent_entry,
             ..
-        } = transport_rx.recv().await.expect("parent registration")
+        } = transport_rx
+            .recv()
+            .await
+            .map(unwrap_owned_event)
+            .expect("parent registration")
         else {
             panic!("expected parent RegisterInterface");
         };
@@ -13378,8 +13709,11 @@ egress_control = Yes
         )
         .await
         .unwrap();
-        let TransportMessage::RegisterInterface { entry, .. } =
-            transport_rx.recv().await.expect("child registration")
+        let TransportMessage::RegisterInterface { entry, .. } = transport_rx
+            .recv()
+            .await
+            .map(unwrap_owned_event)
+            .expect("child registration")
         else {
             panic!("expected child RegisterInterface");
         };

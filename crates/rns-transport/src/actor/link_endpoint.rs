@@ -125,6 +125,7 @@ impl TransportActor {
         }
 
         match self.try_send_link_endpoint_raw(interface_id, link_id, role, &raw) {
+            InterfaceSendOutcome::TooLarge => LinkEndpointSendResult::InvalidPacket,
             InterfaceSendOutcome::Sent => LinkEndpointSendResult::Sent,
             InterfaceSendOutcome::Full => self.enqueue_link_endpoint_packet(key, raw),
             outcome => {
@@ -217,6 +218,7 @@ impl TransportActor {
         }
 
         match self.try_send_link_endpoint_raw(interface_id, link_id, role, &raw) {
+            InterfaceSendOutcome::TooLarge => LinkEndpointSendResult::InvalidPacket,
             InterfaceSendOutcome::Sent => LinkEndpointSendResult::Sent,
             InterfaceSendOutcome::Full => {
                 if let Some(entry) = self.interfaces.get(&interface_id) {
@@ -254,7 +256,14 @@ impl TransportActor {
         // admitted packet must fit Reticulum's wire MTU. Do not let a caller
         // smuggle an arbitrarily large allocation into an established-Link
         // queue through the raw transport API.
-        if request.raw.len() > rns_wire::constants::MTU {
+        if request.raw.len() > rns_wire::constants::MTU
+            || (interface_id != LOCAL_LINK_INITIATOR_INTERFACE
+                && interface_id != LOCAL_LINK_RESPONDER_INTERFACE
+                && !self
+                    .interfaces
+                    .get(&interface_id)
+                    .is_some_and(|entry| entry.accepts_clear_packet(request.raw.len())))
+        {
             return None;
         }
         if request.destination_hash != link_id {
@@ -388,6 +397,15 @@ impl TransportActor {
                         );
                     }
                 }
+                InterfaceSendOutcome::TooLarge => {
+                    if let Some(completion) = entry.egress.pop_front().and_then(|p| p.completion) {
+                        let _ = completion.result_tx.send(
+                            crate::link_endpoint_dispatch::LinkEndpointDispatchOutcome::Rejected(
+                                crate::messages::LinkEndpointSendResult::InvalidPacket,
+                            ),
+                        );
+                    }
+                }
                 InterfaceSendOutcome::Full => {
                     self.link_endpoints.insert(key, entry);
                     return Ok(());
@@ -452,6 +470,10 @@ impl TransportActor {
             return InterfaceSendOutcome::Missing;
         };
         let event = crate::link_messages::DestinationEvent::InboundPacket {
+            interface_owner: self
+                .interfaces
+                .get(&target_interface)
+                .map(|entry| entry.owner.id()),
             raw: Bytes::copy_from_slice(raw),
             interface_id: target_interface,
             metrics: PacketMetrics::default(),
@@ -475,11 +497,19 @@ impl TransportActor {
         match (binding.interface_id, binding.role) {
             (LOCAL_LINK_INITIATOR_INTERFACE, LinkEndpointRole::Initiator)
             | (LOCAL_LINK_RESPONDER_INTERFACE, LinkEndpointRole::Responder) => {
-                self.local_link_routes.contains_key(&binding.link_id)
+                binding.interface_owner.is_none()
+                    && self.local_link_routes.contains_key(&binding.link_id)
             }
             (LOCAL_LINK_INITIATOR_INTERFACE | LOCAL_LINK_RESPONDER_INTERFACE, _) => false,
             (interface_id, _) => self.interfaces.get(&interface_id).is_some_and(|entry| {
-                entry.direction.outbound
+                binding
+                    .interface_owner
+                    .is_some_and(|owner| owner.matches(&entry.owner))
+                    && entry
+                        .packet_capacity
+                        .link_ceiling(interface_id, entry.active_ifac_bytes())
+                        .is_ok()
+                    && entry.direction.outbound
                     && !entry.tx.is_closed()
                     && !(entry.role == InterfaceRole::LocalClient
                         && interface_marked_offline(entry))
@@ -749,7 +779,9 @@ fn terminal_reason_for_interface_outcome(
 ) -> Option<crate::messages::LinkEndpointTerminalReason> {
     use crate::messages::LinkEndpointTerminalReason;
     match outcome {
-        InterfaceSendOutcome::Sent | InterfaceSendOutcome::Full => None,
+        InterfaceSendOutcome::Sent
+        | InterfaceSendOutcome::Full
+        | InterfaceSendOutcome::TooLarge => None,
         InterfaceSendOutcome::Missing => Some(LinkEndpointTerminalReason::InterfaceRemoved),
         InterfaceSendOutcome::Closed => Some(LinkEndpointTerminalReason::InterfaceClosed),
         InterfaceSendOutcome::Offline => Some(LinkEndpointTerminalReason::InterfaceOffline),

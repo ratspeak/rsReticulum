@@ -305,6 +305,21 @@ impl RatchetRing {
     /// Sign the packed key list with `identity`, persist it, and verify the
     /// final bytes before returning.
     pub fn save_verified(&self, path: &Path, identity: &Identity) -> std::io::Result<()> {
+        self.save_verified_impl(path, identity, false)
+    }
+
+    /// Acknowledge only the platform's strict file and namespace barriers.
+    /// An uncertain publication is an error, never a successful checkpoint.
+    pub fn save_verified_durable(&self, path: &Path, identity: &Identity) -> std::io::Result<()> {
+        self.save_verified_impl(path, identity, true)
+    }
+
+    fn save_verified_impl(
+        &self,
+        path: &Path,
+        identity: &Identity,
+        durable: bool,
+    ) -> std::io::Result<()> {
         let ratchets_packed = pack_ratchet_keys(&self.keys)?;
         let signature = identity.sign(&ratchets_packed).ok_or_else(|| {
             std::io::Error::new(
@@ -324,7 +339,13 @@ impl RatchetRing {
         if buf.len() > RATCHET_FILE_MAX_BYTES {
             return Err(invalid_data("ratchet ring file exceeds size limit"));
         }
-        persistence::atomic_write(path, &buf)
+        if durable {
+            persistence::durable_write(path, &buf)
+                .map(|_| ())
+                .map_err(std::io::Error::other)
+        } else {
+            persistence::atomic_write(path, &buf)
+        }
     }
 
     /// Load the ring, retrying with 1s/2s/4s backoff to ride out transient
@@ -638,6 +659,15 @@ impl ReceivedRatchet {
 
     /// Persist to `{ratchetdir}/{hex(dest_hash)}` in the shared msgpack format.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        self.save_impl(path, false)
+    }
+
+    /// Persist a received public ratchet with strict platform barriers.
+    pub fn save_durable(&self, path: &Path) -> std::io::Result<()> {
+        self.save_impl(path, true)
+    }
+
+    fn save_impl(&self, path: &Path, durable: bool) -> std::io::Result<()> {
         let persisted = ReceivedRatchetPersisted {
             ratchet: self.ratchet_pub.to_vec(),
             received: self.received_at,
@@ -649,7 +679,13 @@ impl ReceivedRatchet {
             std::fs::create_dir_all(parent)?;
         }
 
-        persistence::atomic_write(path, &buf)
+        if durable {
+            persistence::durable_write(path, &buf)
+                .map(|_| ())
+                .map_err(std::io::Error::other)
+        } else {
+            persistence::atomic_write(path, &buf)
+        }
     }
 
     pub fn load(path: &Path) -> std::io::Result<Self> {

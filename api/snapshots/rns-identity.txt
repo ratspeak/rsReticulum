@@ -38,6 +38,7 @@ pub fn rns_identity::announce_state::RatchetControlState::new([u8; 16], [u8; 16]
 pub fn rns_identity::announce_state::RatchetControlState::prepare_announce(&self, u64) -> core::io::error::Result<core::option::Option<Self>>
 pub fn rns_identity::announce_state::RatchetControlState::rotation_due(&self, u64, u64) -> bool
 pub fn rns_identity::announce_state::RatchetControlState::save_verified(&self, &std::path::Path, &rns_identity::identity::Identity) -> core::io::error::Result<()>
+pub fn rns_identity::announce_state::RatchetControlState::save_verified_durable(&self, &std::path::Path, &rns_identity::identity::Identity) -> core::io::error::Result<()>
 pub fn rns_identity::announce_state::RatchetControlState::with_rotation_at(&self, u64) -> Self
 pub mod rns_identity::destination
 #[repr(u8)] pub enum rns_identity::destination::AllowPolicy
@@ -283,9 +284,41 @@ pub fn rns_identity::known_destinations::KnownDestinations::default() -> Self
 pub mod rns_identity::name_hash
 pub fn rns_identity::name_hash::name_hash(&str) -> [u8; 10]
 pub mod rns_identity::persistence
+pub enum rns_identity::persistence::DurableCleanupOutcome
+pub rns_identity::persistence::DurableCleanupOutcome::AlreadyAbsent
+pub rns_identity::persistence::DurableCleanupOutcome::Removed
+pub enum rns_identity::persistence::DurableCommitPhase
+pub rns_identity::persistence::DurableCommitPhase::CommitUncertain
+pub rns_identity::persistence::DurableCommitPhase::NotCommitted
+pub enum rns_identity::persistence::DurableErrorKind
+pub rns_identity::persistence::DurableErrorKind::DurabilityUnsupported
+pub rns_identity::persistence::DurableErrorKind::InvalidInput
+pub rns_identity::persistence::DurableErrorKind::Io
+pub rns_identity::persistence::DurableErrorKind::Verification
+pub struct rns_identity::persistence::DurableDirectoryReceipt
+impl rns_identity::persistence::DurableDirectoryReceipt
+pub fn rns_identity::persistence::DurableDirectoryReceipt::path(&self) -> &std::path::Path
+pub struct rns_identity::persistence::DurableFileReceipt
+impl rns_identity::persistence::DurableFileReceipt
+pub fn rns_identity::persistence::DurableFileReceipt::content_hash(&self) -> [u8; 32]
+pub fn rns_identity::persistence::DurableFileReceipt::is_empty(&self) -> bool
+pub fn rns_identity::persistence::DurableFileReceipt::len(&self) -> usize
+pub fn rns_identity::persistence::DurableFileReceipt::path(&self) -> &std::path::Path
+pub struct rns_identity::persistence::DurableWriteError
+pub rns_identity::persistence::DurableWriteError::kind: rns_identity::persistence::DurableErrorKind
+pub rns_identity::persistence::DurableWriteError::phase: rns_identity::persistence::DurableCommitPhase
+pub rns_identity::persistence::DurableWriteError::recovery_paths: alloc::vec::Vec<std::path::PathBuf>
 pub fn rns_identity::persistence::atomic_write(&std::path::Path, &[u8]) -> core::io::error::Result<()>
+pub fn rns_identity::persistence::durable_create_dir_all(&std::path::Path, &rns_identity::persistence::DurableFileReceipt) -> core::result::Result<rns_identity::persistence::DurableDirectoryReceipt, rns_identity::persistence::DurableWriteError>
+pub fn rns_identity::persistence::durable_reconcile(&std::path::Path, &[u8]) -> core::result::Result<rns_identity::persistence::DurableFileReceipt, rns_identity::persistence::DurableWriteError>
+pub fn rns_identity::persistence::durable_reconcile_directory(&std::path::Path, &rns_identity::persistence::DurableFileReceipt) -> core::result::Result<rns_identity::persistence::DurableDirectoryReceipt, rns_identity::persistence::DurableWriteError>
+pub fn rns_identity::persistence::durable_reconcile_hash(&std::path::Path, [u8; 32], usize) -> core::result::Result<rns_identity::persistence::DurableFileReceipt, rns_identity::persistence::DurableWriteError>
+pub fn rns_identity::persistence::durable_remove(&std::path::Path, &rns_identity::persistence::DurableFileReceipt) -> core::result::Result<rns_identity::persistence::DurableCleanupOutcome, rns_identity::persistence::DurableWriteError>
+pub fn rns_identity::persistence::durable_rename_directory(&std::path::Path, &std::path::Path, &rns_identity::persistence::DurableFileReceipt) -> core::result::Result<rns_identity::persistence::DurableDirectoryReceipt, rns_identity::persistence::DurableWriteError>
+pub fn rns_identity::persistence::durable_write(&std::path::Path, &[u8]) -> core::result::Result<rns_identity::persistence::DurableFileReceipt, rns_identity::persistence::DurableWriteError>
 pub fn rns_identity::persistence::read_file(&std::path::Path) -> core::io::error::Result<core::option::Option<alloc::vec::Vec<u8>>>
 pub fn rns_identity::persistence::read_file_bounded(&std::path::Path, usize) -> core::io::error::Result<core::option::Option<alloc::vec::Vec<u8>>>
+pub fn rns_identity::persistence::validate_durable_storage_directory(&std::path::Path) -> core::result::Result<(), rns_identity::persistence::DurableWriteError>
 pub mod rns_identity::ratchet
 pub enum rns_identity::ratchet::RatchetRingFormat
 pub rns_identity::ratchet::RatchetRingFormat::Canonical
@@ -335,6 +368,7 @@ pub fn rns_identity::ratchet::RatchetRing::rotate(&mut self) -> [u8; 32]
 pub fn rns_identity::ratchet::RatchetRing::rotate_at(&mut self, f64) -> [u8; 32]
 pub fn rns_identity::ratchet::RatchetRing::save(&self, &std::path::Path, &[u8; 64]) -> core::io::error::Result<()>
 pub fn rns_identity::ratchet::RatchetRing::save_verified(&self, &std::path::Path, &rns_identity::identity::Identity) -> core::io::error::Result<()>
+pub fn rns_identity::ratchet::RatchetRing::save_verified_durable(&self, &std::path::Path, &rns_identity::identity::Identity) -> core::io::error::Result<()>
 pub fn rns_identity::ratchet::RatchetRing::set_ratchet_interval(&mut self, u64) -> bool
 pub fn rns_identity::ratchet::RatchetRing::set_retained_ratchets(&mut self, usize) -> bool
 impl core::default::Default for rns_identity::ratchet::RatchetRing
@@ -354,6 +388,7 @@ pub fn rns_identity::ratchet::ReceivedRatchet::new([u8; 32]) -> Self
 pub fn rns_identity::ratchet::ReceivedRatchet::new_at([u8; 32], f64) -> Self
 pub fn rns_identity::ratchet::ReceivedRatchet::ratchet_id(&self) -> alloc::vec::Vec<u8>
 pub fn rns_identity::ratchet::ReceivedRatchet::save(&self, &std::path::Path) -> core::io::error::Result<()>
+pub fn rns_identity::ratchet::ReceivedRatchet::save_durable(&self, &std::path::Path) -> core::io::error::Result<()>
 pub struct rns_identity::ratchet::ReceivedRatchetStore
 impl rns_identity::ratchet::ReceivedRatchetStore
 pub fn rns_identity::ratchet::ReceivedRatchetStore::clean_expired(&mut self)

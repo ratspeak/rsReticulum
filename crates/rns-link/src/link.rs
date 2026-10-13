@@ -11,7 +11,7 @@ use crate::handshake::{
 };
 use crate::keepalive::KeepaliveState;
 use crate::key_derivation::LinkKeys;
-use crate::mtu_discovery::SignallingData;
+use crate::mtu_discovery::{LinkMtu, SignallingData};
 use crate::request::RequestReceipt;
 
 /// Link lifecycle states.
@@ -54,6 +54,11 @@ pub enum PacketProofError {
     #[error("packet proof signature is invalid")]
     InvalidSignature,
 }
+
+/// Local timeout input cannot be represented without overflow.
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+#[error("timeout must be finite, nonnegative and representable by this platform")]
+pub struct TimeoutError;
 
 /// Reason for link closure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +165,8 @@ pub struct Link {
     pub teardown_reason: Option<CloseReason>,
     pub is_initiator: bool,
     pub mode: u8,
+    offered_mode: u8,
+    offered_mtu: LinkMtu,
 
     ephemeral_keys: Option<EphemeralKeys>,
     peer_x25519_pub: Option<[u8; 32]>,
@@ -274,6 +281,8 @@ impl Link {
             teardown_reason: None,
             is_initiator: true,
             mode: DEFAULT_MODE,
+            offered_mode: DEFAULT_MODE,
+            offered_mtu: LinkMtu::BASE,
             ephemeral_keys: Some(ephemeral_keys),
             peer_x25519_pub: None,
             peer_packet_proof_key: None,
@@ -320,8 +329,23 @@ impl Link {
     }
 
     /// Extend the establishment timeout, typically by the transport's first-hop RTT.
+    #[deprecated(note = "use try_extend_establishment_timeout to report invalid input")]
     pub fn extend_establishment_timeout(&mut self, additional_secs: f64) {
-        self.establishment_timeout += Duration::from_secs_f64(additional_secs);
+        let _ = self.try_extend_establishment_timeout(additional_secs);
+    }
+
+    pub fn try_extend_establishment_timeout(
+        &mut self,
+        additional_secs: f64,
+    ) -> Result<(), TimeoutError> {
+        let additional = Duration::try_from_secs_f64(additional_secs).map_err(|_| TimeoutError)?;
+        let timeout = self
+            .establishment_timeout
+            .checked_add(additional)
+            .ok_or(TimeoutError)?;
+        self.request_time.checked_add(timeout).ok_or(TimeoutError)?;
+        self.establishment_timeout = timeout;
+        Ok(())
     }
 
     /// Handle a received link proof (initiator side, Message 2).
@@ -338,90 +362,68 @@ impl Link {
             return Err(HandshakeError::InvalidSignature);
         }
 
-        // LRPROOF is unauthenticated until its signature validates. Reject a
-        // mismatched mode without mutating the pending Link, otherwise any
-        // party that learns the link id could cancel establishment before the
-        // legitimate proof arrives.
-        if proof_data.len() > 96 {
-            let proof_mode = (proof_data[96] & MODE_BYTEMASK as u8) >> 5;
-            if proof_mode != self.mode {
-                return Err(HandshakeError::InvalidSignature);
-            }
+        let checked = rns_wire::link_signalling::parse_proof_signalling(proof_data)?;
+        if checked.mode != self.offered_mode {
+            return Err(HandshakeError::InvalidSignature);
         }
-
+        if !ENABLED_MODES.contains(&checked.mode) {
+            return Err(HandshakeError::UnsupportedMode(checked.mode));
+        }
+        if checked.mtu > self.offered_mtu {
+            return Err(rns_wire::link_signalling::LinkSignallingError::InvalidMtu(
+                checked.mtu.get(),
+            )
+            .into());
+        }
+        let mdu = checked.mtu.checked_mdu()?;
         let proof = LinkProofData::unpack(proof_data)?;
-
-        if proof.signalling.mode != self.mode {
+        // Authenticate the original trailer, including zero or exact absence.
+        // Normalizing metadata must never change bytes covered by the signature.
+        let mut signed = Vec::with_capacity(83);
+        signed.extend_from_slice(&self.link_id);
+        signed.extend_from_slice(&proof.responder_x25519_pub);
+        signed.extend_from_slice(identity_ed25519_pub_bytes);
+        signed.extend_from_slice(&proof_data[96..]);
+        if identity_verify_key
+            .verify(&signed, &proof.signature)
+            .is_err()
+        {
             return Err(HandshakeError::InvalidSignature);
         }
-
-        // Verify the signature before deriving session keys so we never hold keys
-        // tied to an unvalidated proof, even transiently. Invalid proofs leave
-        // the initiator Pending so another interface can still deliver the
-        // authentic proof before the establishment timeout.
-        if !proof.validate(
-            identity_verify_key,
-            &self.link_id,
-            identity_ed25519_pub_bytes,
-        ) {
-            return Err(HandshakeError::InvalidSignature);
-        }
-
-        self.establishment_cost += proof_data.len();
-
-        self.peer_x25519_pub = Some(proof.responder_x25519_pub);
-        self.peer_packet_proof_key = Some(*identity_ed25519_pub_bytes);
-
         let ephemeral = self
             .ephemeral_keys
             .as_ref()
             .ok_or(HandshakeError::InvalidSignature)?;
-
         let keys = perform_handshake(
             &ephemeral.x25519_prv,
             &proof.responder_x25519_pub,
             &self.link_id,
-            self.mode,
+            checked.mode,
         )?;
-
-        self.session_keys = Some(keys);
-        self.state = LinkState::Handshake;
-        tracing::debug!(link_id = ?self.link_id, "link state -> Handshake (initiator)");
-
         let rtt = self.request_time.elapsed();
+        let mut rtt_bytes = Vec::new();
+        rmpv::encode::write_value(&mut rtt_bytes, &rmpv::Value::F64(rtt.as_secs_f64()))
+            .map_err(|_| HandshakeError::InvalidSignature)?;
+        let encrypted_rtt =
+            link_encrypt(&keys, &rtt_bytes).map_err(|_| HandshakeError::InvalidSignature)?;
+        // All fallible validation/crypto work completes before pending state,
+        // key ownership, timing or accounting is changed.
+        self.establishment_cost = self.establishment_cost.saturating_add(proof_data.len());
+        self.peer_x25519_pub = Some(proof.responder_x25519_pub);
+        self.peer_packet_proof_key = Some(*identity_ed25519_pub_bytes);
+        self.session_keys = Some(keys);
+        self.mode = checked.mode;
+        self.mtu = checked.mtu.get();
+        self.mdu = mdu;
         self.rtt = Some(rtt);
-
         self.state = LinkState::Active;
         self.activated_at = Some(Instant::now());
-        tracing::debug!(
-            link_id = ?self.link_id,
-            rtt_ms = rtt.as_millis() as u64,
-            "link state -> Active (initiator)"
-        );
-
-        // Seed the keepalive baseline so stale detection starts from activation.
         self.keepalive.mark_activated();
-
-        let rtt_secs_val = rtt.as_secs_f64();
-        if rtt_secs_val > 0.0 && self.establishment_cost > 0 {
-            self.establishment_rate = Some(self.establishment_cost as f64 / rtt_secs_val);
-        }
-
         self.keepalive.update_from_rtt(rtt);
-
-        if proof.signalling.mtu > 0 {
-            self.mtu = self.mtu.min(proof.signalling.mtu);
+        if rtt.as_secs_f64() > 0.0 {
+            self.establishment_rate = Some(self.establishment_cost as f64 / rtt.as_secs_f64());
         }
-        self.update_mdu();
-
-        // RTT is carried as a msgpack f64 so both ends see the same encoding.
-        let rtt_secs = rtt.as_secs_f64();
-        let mut rtt_bytes = Vec::new();
-        rmpv::encode::write_value(&mut rtt_bytes, &rmpv::Value::F64(rtt_secs))
-            .map_err(|_| HandshakeError::InvalidSignature)?;
-        let encrypted_rtt = self
-            .encrypt(&rtt_bytes)
-            .map_err(|_| HandshakeError::InvalidSignature)?;
+        tracing::debug!(link_id = ?self.link_id, rtt_ms = rtt.as_millis() as u64, "link state -> Active (initiator)");
 
         Ok(encrypted_rtt)
     }
@@ -491,10 +493,14 @@ impl Link {
         let request = LinkRequestData::unpack(request_data)?;
         let link_id = compute_link_id(&destination_hash, request_data);
 
-        if request.signalling.mode != MODE_AES128_CBC && request.signalling.mode != MODE_AES256_CBC
-        {
+        if !ENABLED_MODES.contains(&request.signalling.mode) {
             return Err(HandshakeError::UnsupportedMode(request.signalling.mode));
         }
+        // Current host endpoints are deliberately base-only; transit upgrade
+        // support does not imply high-MTU Resource support at an endpoint.
+        let offered = LinkMtu::try_from_signal(Some(request.signalling.mtu))?;
+        let accepted_mtu = offered.min(LinkMtu::BASE);
+        let accepted_mdu = accepted_mtu.checked_mdu()?;
 
         let responder_keys = EphemeralKeys::generate();
 
@@ -507,8 +513,7 @@ impl Link {
 
         // The proof binds the link to the responder's long-term identity key, not
         // its ephemeral one — that's what lets the initiator authenticate us.
-        let signalling =
-            SignallingData::new(request.signalling.mode, rns_wire::constants::MTU as u32);
+        let signalling = SignallingData::try_new(request.signalling.mode, accepted_mtu.get())?;
         let responder_x25519_pub = responder_keys.x25519_pub.to_bytes();
         let sig_bytes = signalling.pack();
         let mut signed_data = Vec::with_capacity(16 + 32 + 32 + 3);
@@ -535,6 +540,8 @@ impl Link {
             teardown_reason: None,
             is_initiator: false,
             mode: request.signalling.mode,
+            offered_mode: request.signalling.mode,
+            offered_mtu: accepted_mtu,
             ephemeral_keys: Some(responder_keys),
             peer_x25519_pub: Some(request.peer_x25519_pub),
             peer_packet_proof_key: Some(request.peer_ed25519_pub),
@@ -547,8 +554,8 @@ impl Link {
             activated_at: None,
             stale_since: None,
             keepalive: KeepaliveState::new(false),
-            mtu: request.signalling.mtu.min(rns_wire::constants::MTU as u32),
-            mdu: rns_wire::constants::LINK_MDU,
+            mtu: accepted_mtu.get(),
+            mdu: accepted_mdu,
             resource_strategy: ResourceStrategy::default(),
             pending_requests: Vec::new(),
             incoming_resources: Vec::new(),
@@ -588,6 +595,7 @@ impl Link {
             return Err(HandshakeError::InvalidSignature);
         }
 
+        let mdu = LinkMtu::try_from_signal(Some(self.mtu))?.checked_mdu()?;
         self.establishment_cost += encrypted_data.len();
 
         let plaintext = self
@@ -607,7 +615,7 @@ impl Link {
         self.state = LinkState::Active;
         self.activated_at = Some(Instant::now());
         self.keepalive.mark_activated();
-        self.update_mdu();
+        self.mdu = mdu;
         tracing::debug!(link_id = ?self.link_id, "link state -> Active (responder)");
 
         if let Some(rtt) = self.rtt {
@@ -1588,21 +1596,6 @@ impl Link {
         self.link_closed_callback = Some(Box::new(cb));
     }
 
-    /// Recompute MDU from the current MTU.
-    ///
-    /// MDU = `floor((mtu - header - token) / AES block) * AES block - 1`; the
-    /// trailing `-1` reserves room for PKCS7 padding worst case.
-    fn update_mdu(&mut self) {
-        let mtu = self.mtu as usize;
-        let overhead =
-            1 + rns_wire::constants::HEADER_MINSIZE + rns_wire::constants::TOKEN_OVERHEAD;
-        if mtu > overhead {
-            self.mdu = ((mtu - overhead) / rns_wire::constants::AES128_BLOCKSIZE)
-                * rns_wire::constants::AES128_BLOCKSIZE
-                - 1;
-        }
-    }
-
     pub fn is_active(&self) -> bool {
         self.state == LinkState::Active
     }
@@ -1950,39 +1943,116 @@ mod tests {
     }
 
     #[test]
-    fn test_responder_accepts_python_inbound_modes() {
-        let dest_hash = [0xA2; 16];
-        let identity_key = Ed25519PrivateKey::generate();
-        let (mut request_link, request_data) = Link::new_initiator(dest_hash, 1);
-
-        let mut aes128_request = request_data.clone();
-        aes128_request[64] = MODE_AES128_CBC << 5;
-        let (responder, proof) =
-            Link::new_responder(&aes128_request, &identity_key, dest_hash, 1).unwrap();
-        assert_eq!(responder.mode, MODE_AES128_CBC);
+    fn responder_mtu_boundary_matrix_is_base_only_and_never_wraps() {
+        let identity = Ed25519PrivateKey::generate();
+        let (_, request) = Link::new_initiator([5; 16], 1);
+        for mtu in 1..500 {
+            let mut candidate = request.clone();
+            candidate[64..].copy_from_slice(&SignallingData::new(DEFAULT_MODE, mtu).pack());
+            assert!(
+                Link::new_responder(&candidate, &identity, [5; 16], 1).is_err(),
+                "mtu {mtu}"
+            );
+        }
+        for mtu in [0, 500, 501, MTU_BYTEMASK] {
+            let mut candidate = request.clone();
+            candidate[64..].copy_from_slice(&SignallingData::new(DEFAULT_MODE, mtu).pack());
+            let (responder, proof) =
+                Link::new_responder(&candidate, &identity, [5; 16], 1).unwrap();
+            assert_eq!(responder.mtu, 500);
+            assert_eq!(responder.mdu, rns_wire::constants::LINK_MDU);
+            assert_eq!(LinkProofData::unpack(&proof).unwrap().signalling.mtu, 500);
+        }
         assert_eq!(
-            LinkProofData::unpack(&proof).unwrap().signalling.mode,
-            MODE_AES128_CBC
+            Link::new_responder(&request[..64], &identity, [5; 16], 1)
+                .unwrap()
+                .0
+                .mtu,
+            500
         );
+    }
 
-        let identity_pub = identity_key.public_key();
+    #[test]
+    fn initiator_bad_mtu_proof_never_mutates_pending_owner() {
+        let identity = Ed25519PrivateKey::generate();
+        let public = identity.public_key();
+        let (mut initiator, request) = Link::new_initiator([6; 16], 1);
+        let (_responder, good) = Link::new_responder(&request, &identity, [6; 16], 1).unwrap();
+        let parsed = LinkProofData::unpack(&good).unwrap();
+        let cost = initiator.establishment_cost;
+        for mtu in (1..500).chain([501, MTU_BYTEMASK]) {
+            let invalid = LinkProofData::create(
+                &identity,
+                &parsed.responder_x25519_pub,
+                &public.to_bytes(),
+                &initiator.link_id,
+                SignallingData::new(DEFAULT_MODE, mtu),
+            )
+            .pack();
+            assert!(
+                initiator
+                    .validate_proof(&invalid, &public, &public.to_bytes())
+                    .is_err(),
+                "mtu {mtu}"
+            );
+            assert_eq!(initiator.state, LinkState::Pending);
+            assert!(!initiator.has_keys());
+            assert_eq!(initiator.establishment_cost, cost);
+            assert_eq!(initiator.mtu, 500);
+            assert_eq!(initiator.mdu, rns_wire::constants::LINK_MDU);
+        }
         assert!(
-            request_link
-                .validate_proof(&proof, &identity_pub, &identity_pub.to_bytes())
-                .is_err(),
-            "initiator requested AES256 and must reject an AES128 proof"
+            initiator
+                .validate_proof(&good, &public, &public.to_bytes())
+                .is_ok()
         );
-        assert_eq!(request_link.state, LinkState::Pending);
+    }
 
-        let mut unsupported_request = request_data;
-        unsupported_request[64] = MODE_AES256_GCM << 5;
-        assert!(
-            matches!(
-                Link::new_responder(&unsupported_request, &identity_key, dest_hash, 1),
-                Err(HandshakeError::UnsupportedMode(mode)) if mode == MODE_AES256_GCM
-            ),
-            "Python raises for unsupported inbound mode 2"
-        );
+    #[test]
+    fn legacy_and_zero_proofs_authenticate_original_bytes_then_normalize() {
+        let identity = Ed25519PrivateKey::generate();
+        let public = identity.public_key();
+        for legacy in [false, true] {
+            let (mut initiator, request) = Link::new_initiator([7; 16], 1);
+            let (_, proof) = Link::new_responder(&request, &identity, [7; 16], 1).unwrap();
+            let parsed = LinkProofData::unpack(&proof).unwrap();
+            let mut signed = Vec::new();
+            signed.extend_from_slice(&initiator.link_id);
+            signed.extend_from_slice(&parsed.responder_x25519_pub);
+            signed.extend_from_slice(&public.to_bytes());
+            let signalling = SignallingData::new(DEFAULT_MODE, 0).pack();
+            if !legacy {
+                signed.extend_from_slice(&signalling);
+            }
+            let mut wire = identity.sign(&signed).to_vec();
+            wire.extend_from_slice(&parsed.responder_x25519_pub);
+            if !legacy {
+                wire.extend_from_slice(&signalling);
+            }
+            initiator
+                .validate_proof(&wire, &public, &public.to_bytes())
+                .unwrap();
+            assert_eq!(initiator.mtu, 500);
+            assert_eq!(initiator.mdu, rns_wire::constants::LINK_MDU);
+        }
+    }
+
+    #[test]
+    fn responder_rejects_disabled_modes() {
+        let identity = Ed25519PrivateKey::generate();
+        let (_, request) = Link::new_initiator([0xA2; 16], 1);
+        for mode in 0..=7 {
+            let mut candidate = request.clone();
+            candidate[64..].copy_from_slice(&SignallingData::new(mode, 500).pack());
+            let result = Link::new_responder(&candidate, &identity, [0xA2; 16], 1);
+            if ENABLED_MODES.contains(&mode) {
+                assert!(result.is_ok());
+            } else {
+                assert!(
+                    matches!(result,Err(HandshakeError::UnsupportedMode(value)) if value==mode)
+                );
+            }
+        }
     }
 
     #[test]
@@ -1998,6 +2068,19 @@ mod tests {
         let result = initiator.validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes());
         assert!(matches!(result, Err(HandshakeError::InvalidSignature)));
         assert_eq!(initiator.state, LinkState::Pending);
+    }
+
+    #[test]
+    fn establishment_extension_rejects_invalid_without_mutation() {
+        let (mut link, _) = Link::new_initiator([3; 16], 1);
+        let initial = link.establishment_timeout;
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, f64::MAX] {
+            assert!(link.try_extend_establishment_timeout(bad).is_err());
+            assert_eq!(link.establishment_timeout, initial);
+        }
+        link.try_extend_establishment_timeout(0.0).unwrap();
+        link.try_extend_establishment_timeout(2.0).unwrap();
+        assert_eq!(link.establishment_timeout, initial + Duration::from_secs(2));
     }
 
     #[test]

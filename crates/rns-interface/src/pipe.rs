@@ -1,5 +1,6 @@
 //! HDLC-framed data over a subprocess's stdin/stdout; respawns on exit.
 
+use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -41,6 +42,8 @@ pub async fn spawn_pipe_interface(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     let online = Arc::new(AtomicBool::new(true));
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
@@ -189,6 +192,8 @@ pub async fn spawn_pipe_interface(
 
     Ok(InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(500, 1064, false),
         parent_id: None,
         name,
         mode,

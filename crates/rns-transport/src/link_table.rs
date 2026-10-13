@@ -23,6 +23,11 @@ pub struct LinkEntry {
     /// Interface the initial link request arrived on.
     pub receiving_interface: InterfaceId,
     pub taken_hops: u8,
+    /// Exact interface registrations that admitted this request.
+    pub interface_owner: Option<crate::InterfaceOwner>,
+    pub receiving_owner: Option<crate::InterfaceOwner>,
+    pub requested_mode: u8,
+    pub accepted_mtu_ceiling: u32,
 }
 
 /// Metadata retained when an unvalidated link expires before proof.
@@ -102,6 +107,12 @@ impl LinkTable {
 
     pub fn get_mut(&mut self, link_id: &[u8; 16]) -> Option<&mut LinkEntry> {
         self.entries.get_mut(link_id)
+    }
+
+    pub fn remove_interface(&mut self, interface_id: InterfaceId) {
+        self.entries.retain(|_, entry| {
+            entry.interface_id != interface_id && entry.receiving_interface != interface_id
+        });
     }
 
     pub fn remove(&mut self, link_id: &[u8; 16]) -> Option<LinkEntry> {
@@ -216,6 +227,11 @@ mod tests {
         table.insert(
             link_id,
             LinkEntry {
+                interface_owner: None,
+                receiving_owner: None,
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: 1000.0,
                 next_hop: None,
                 interface_id: 1,
@@ -240,6 +256,11 @@ mod tests {
         table.insert(
             link_id,
             LinkEntry {
+                interface_owner: None,
+                receiving_owner: None,
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: 1000.0,
                 next_hop: Some([0xDD; 16]),
                 interface_id: 1,
@@ -265,6 +286,11 @@ mod tests {
         table.insert(
             link_id,
             LinkEntry {
+                interface_owner: None,
+                receiving_owner: None,
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: 1000.0,
                 next_hop: None,
                 interface_id: 1,
@@ -297,6 +323,11 @@ mod tests {
         table.insert(
             [0x01; 16],
             LinkEntry {
+                interface_owner: None,
+                receiving_owner: None,
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now,
                 next_hop: None,
                 interface_id: 1,
@@ -313,6 +344,11 @@ mod tests {
         table.insert(
             [0x02; 16],
             LinkEntry {
+                interface_owner: None,
+                receiving_owner: None,
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: 100.0,
                 next_hop: None,
                 interface_id: 1,
@@ -329,6 +365,11 @@ mod tests {
         table.insert(
             [0x03; 16],
             LinkEntry {
+                interface_owner: None,
+                receiving_owner: None,
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now,
                 next_hop: None,
                 interface_id: 1,
@@ -345,6 +386,11 @@ mod tests {
         table.insert(
             [0x04; 16],
             LinkEntry {
+                interface_owner: None,
+                receiving_owner: None,
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now,
                 next_hop: None,
                 interface_id: 1,
@@ -378,6 +424,11 @@ mod tests {
         table.insert(
             [0x01; 16],
             LinkEntry {
+                interface_owner: None,
+                receiving_owner: None,
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now,
                 next_hop: None,
                 interface_id: 1,
@@ -394,6 +445,11 @@ mod tests {
         table.insert(
             [0x02; 16],
             LinkEntry {
+                interface_owner: None,
+                receiving_owner: None,
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now,
                 next_hop: None,
                 interface_id: 99,

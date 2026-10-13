@@ -69,6 +69,8 @@ endpoint, not the identity of the packet socket. Selecting a trustworthy matchin
 pair remains the application's responsibility. These policies do not move
 AutoInterface's interoperable UDP ports or alter Reticulum wire formats.
 
+The in-development [capacity, IFAC and receipt migration guide](migrations/capacity-and-receipts.md) describes the next coordinated source boundary. It does not select a release version.
+
 ## Stability
 
 The 1.3 line changes the six discovery coordinate fields to `Option<f64>` so

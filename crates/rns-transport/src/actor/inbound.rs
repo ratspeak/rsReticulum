@@ -9,13 +9,48 @@ impl TransportActor {
         fields(interface_id = packet.interface_id, raw_len = packet.raw.len()),
     )]
     pub(super) fn on_inbound(&mut self, packet: crate::messages::InboundPacket) {
+        self.on_inbound_inner(packet, false);
+    }
+
+    pub(super) fn on_cached_announce(&mut self, packet: crate::messages::InboundPacket) {
+        if packet.raw.len() > 500
+            || !rns_wire::header::PacketHeader::unpack(&packet.raw).is_ok_and(|(header, _)| {
+                header.flags.packet_type == rns_wire::flags::PacketType::Announce
+            })
+        {
+            return;
+        }
+        self.on_inbound_inner(packet, true);
+    }
+
+    fn on_inbound_inner(&mut self, packet: crate::messages::InboundPacket, cached_announce: bool) {
         self.traffic
             .record_rx(packet.interface_id, packet.raw.len() as u64);
+
+        // Check the complete wire budget before IFAC allocates an unmasked copy.
+        let clear_limit = if cached_announce {
+            500
+        } else {
+            let Some(entry) = self.interfaces.get(&packet.interface_id) else {
+                return;
+            };
+            if !entry.owner.is_current()
+                || packet.raw.len() > entry.packet_capacity.max_wire_packet_bytes as usize
+            {
+                return;
+            }
+            match entry.effective_clear_mtu() {
+                Ok(n) => n as usize,
+                Err(_) => return,
+            }
+        };
 
         // Strip the IFAC tag if the interface gates membership on one; packets
         // that fail verification are silently dropped so a misconfigured peer
         // can't leak into a closed access group.
-        let raw: bytes::Bytes = if let Some(entry) = self.interfaces.get(&packet.interface_id) {
+        let raw: bytes::Bytes = if cached_announce {
+            packet.raw.clone()
+        } else if let Some(entry) = self.interfaces.get(&packet.interface_id) {
             if let Some(ref ifac_key) = entry.ifac_key {
                 let ifac_size = entry.ifac_size;
                 match crate::ifac::ifac_verify(&packet.raw, ifac_key, ifac_size) {
@@ -40,6 +75,10 @@ impl TransportActor {
         } else {
             packet.raw.clone()
         };
+
+        if raw.len() > clear_limit {
+            return;
+        }
 
         let (mut parsed, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
             Ok((header, offset)) => (header, offset),
@@ -89,6 +128,30 @@ impl TransportActor {
             return;
         }
 
+        // A malformed request must not reserve a hash or reach a destination.
+        if parsed.flags.packet_type == rns_wire::flags::PacketType::LinkRequest {
+            let Ok(signal) =
+                rns_wire::link_signalling::parse_request_signalling(&raw[data_offset..])
+            else {
+                return;
+            };
+            let Some(ingress) = self.interfaces.get(&packet.interface_id) else {
+                return;
+            };
+            if ingress
+                .packet_capacity
+                .link_ceiling(packet.interface_id, ingress.active_ifac_bytes())
+                .is_err()
+            {
+                return;
+            }
+            if self.local_destinations.contains(&parsed.destination_hash)
+                && signal.mode != rns_wire::link_signalling::DEFAULT_LINK_MODE
+            {
+                return;
+            }
+        }
+
         // Dedup via the packet hashlist. A handful of contexts legitimately
         // repeat (keepalives, resource transfer frames, channel traffic) and
         // must bypass the check.
@@ -113,7 +176,11 @@ impl TransportActor {
         // traffic; if we dedup against that, legitimate copies disappear.
         // Defer the hashlist check for packets owned by the link table or
         // carrying link-proof context.
+        // A LinkRequest has not reserved anything until its exact LinkID is
+        // admitted. Queue/capacity refusals must leave an identical retry usable;
+        // the pending/established Link table already suppresses owned requests.
         let defer_hashlist = self.link_table.contains(&parsed.destination_hash)
+            || parsed.flags.packet_type == rns_wire::flags::PacketType::LinkRequest
             || parsed.context == rns_wire::context::PacketContext::Lrproof;
 
         if !skip_hashlist && !defer_hashlist && !self.packet_hashlist.insert(pkt_hash) {
@@ -772,6 +839,10 @@ impl TransportActor {
         if self.local_destinations.contains(&header.destination_hash) {
             if let Some(tx) = self.destination_channels.get(&header.destination_hash)
                 && let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
+                    interface_owner: self
+                        .interfaces
+                        .get(&interface_id)
+                        .map(|entry| entry.owner.id()),
                     raw: raw.clone(),
                     interface_id,
                     metrics,
@@ -829,10 +900,15 @@ impl TransportActor {
         let to_local_client = for_local_client || proof_for_local_client;
 
         // on_inbound already established transport ownership (or the exact
-        // attached shared-owner ingress) before admitting this packet's hash.
+        // attached shared-owner ingress). Exact LinkID ownership is committed
+        // only after successful egress admission below.
         if self.local_destinations.contains(&header.destination_hash) {
             if let Some(tx) = self.destination_channels.get(&header.destination_hash)
                 && let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::LinkRequest {
+                    interface_owner: self
+                        .interfaces
+                        .get(&interface_id)
+                        .map(|entry| entry.owner.id()),
                     raw: raw.clone(),
                     interface_id,
                     metrics,
@@ -845,7 +921,7 @@ impl TransportActor {
             return;
         }
 
-        if let Some((target_interface, forwarded)) = self.transport_forward_candidate(
+        if let Some((target_interface, mut forwarded)) = self.transport_forward_candidate(
             raw,
             header,
             from_local_client,
@@ -869,6 +945,31 @@ impl TransportActor {
                 debug!("transit Link table capacity exhausted; request not forwarded");
                 return;
             }
+            let Some(ingress) = self.interfaces.get(&interface_id) else {
+                return;
+            };
+            let Some(egress) = self.interfaces.get(&target_interface) else {
+                return;
+            };
+            let Ok((payload, requested_mode, accepted_mtu_ceiling)) =
+                crate::link_transit::attenuate_request(
+                    &raw[header.size()..],
+                    interface_id,
+                    ingress,
+                    target_interface,
+                    egress,
+                )
+            else {
+                return;
+            };
+            let interface_owner = Some(egress.owner.clone());
+            let receiving_owner = Some(ingress.owner.clone());
+            let Ok((forwarded_header, _)) = rns_wire::header::PacketHeader::unpack(&forwarded)
+            else {
+                return;
+            };
+            forwarded.truncate(forwarded_header.size());
+            forwarded.extend_from_slice(&payload);
             let bitrate = self
                 .interfaces
                 .get(&target_interface)
@@ -899,6 +1000,10 @@ impl TransportActor {
                 proof_timeout,
                 receiving_interface: interface_id,
                 taken_hops: header.hops,
+                interface_owner,
+                receiving_owner,
+                requested_mode,
+                accepted_mtu_ceiling,
             };
             self.link_table.insert(link_id, link_entry);
 
@@ -1138,6 +1243,41 @@ impl TransportActor {
         // receive rule, so the proof must equal the remaining hops recorded
         // when the request was forwarded.
         if header.context == rns_wire::context::PacketContext::Lrproof {
+            // Local initiators may only adopt a proof from a registration to
+            // which this exact request was actually admitted. This gate runs
+            // before delivery; a later bind never looks up a replacement by ID.
+            if self.local_destinations.contains(&header.destination_hash) {
+                let admitted = self
+                    .pending_local_link_requests
+                    .get(&header.destination_hash)
+                    .and_then(|owners| owners.get(&_interface_id))
+                    .is_some_and(|owner| {
+                        self.interfaces
+                            .get(&_interface_id)
+                            .is_some_and(|entry| owner.matches(&entry.owner))
+                    });
+                let signal_valid =
+                    rns_wire::link_signalling::parse_proof_signalling(&raw[header.size()..])
+                        .is_ok_and(|signal| {
+                            signal.mode == rns_wire::link_signalling::DEFAULT_LINK_MODE
+                                && signal.mtu.get() <= 500
+                        });
+                if !admitted || !signal_valid {
+                    return;
+                }
+                if let Some(tx) = self.destination_channels.get(&header.destination_hash) {
+                    let _ = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
+                        raw: raw.clone(),
+                        interface_id: _interface_id,
+                        metrics,
+                        interface_owner: self
+                            .interfaces
+                            .get(&_interface_id)
+                            .map(|entry| entry.owner.id()),
+                    });
+                }
+                return;
+            }
             if (self.is_transport_enabled || from_local_client || for_local_client_link)
                 && let Some(link_entry) = self.link_table.get(&header.destination_hash)
             {
@@ -1184,10 +1324,19 @@ impl TransportActor {
                             self.local_hops_delta
                         };
                     }
+                    if !self.send_to_interface(target_interface, &forwarded) {
+                        return;
+                    }
                     if let Some(entry) = self.link_table.get_mut(&header.destination_hash) {
                         entry.validated = true;
+                        entry.accepted_mtu_ceiling =
+                            rns_wire::link_signalling::parse_proof_signalling(
+                                &raw[header.size()..],
+                            )
+                            .expect("validated proof")
+                            .mtu
+                            .get();
                     }
-                    self.send_to_interface(target_interface, &forwarded);
                     if !self.is_shared_instance {
                         self.use_destination(&destination_hash);
                     }
@@ -1220,6 +1369,10 @@ impl TransportActor {
             if let Some(tx) = self.destination_channels.get(&header.destination_hash) {
                 let delivered =
                     tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
+                        interface_owner: self
+                            .interfaces
+                            .get(&_interface_id)
+                            .map(|entry| entry.owner.id()),
                         raw: raw.clone(),
                         interface_id: _interface_id,
                         metrics,
@@ -1295,6 +1448,10 @@ impl TransportActor {
 
         if let Some(tx) = self.destination_channels.get(&header.destination_hash)
             && let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
+                interface_owner: self
+                    .interfaces
+                    .get(&_interface_id)
+                    .map(|entry| entry.owner.id()),
                 raw: raw.clone(),
                 interface_id: _interface_id,
                 metrics,
@@ -1322,6 +1479,12 @@ impl TransportActor {
         let Some(entry) = self.link_table.get(&header.destination_hash).cloned() else {
             return false;
         };
+        if !self.link_registration_is_current(&entry)
+            || raw.len() > entry.accepted_mtu_ceiling as usize
+        {
+            return true;
+        }
+
         if !entry.validated
             && (now_f64() >= entry.proof_timeout || !entry.proof_timeout.is_finite())
         {
@@ -1434,6 +1597,23 @@ impl TransportActor {
         true
     }
 
+    fn link_registration_is_current(&self, entry: &crate::link_table::LinkEntry) -> bool {
+        [
+            (entry.interface_id, &entry.interface_owner),
+            (entry.receiving_interface, &entry.receiving_owner),
+        ]
+        .into_iter()
+        .all(|(id, owner)| {
+            owner.as_ref().is_some_and(|owner| {
+                owner.is_current()
+                    && self
+                        .interfaces
+                        .get(&id)
+                        .is_some_and(|current| current.owner == *owner)
+            })
+        })
+    }
+
     fn validate_transit_lrproof(
         &self,
         raw: &[u8],
@@ -1457,6 +1637,17 @@ impl TransportActor {
                 proof_len = proof_data.len(),
                 "malformed link request proof length, not transporting"
             );
+            return false;
+        }
+
+        let Ok(signal) = rns_wire::link_signalling::parse_proof_signalling(proof_data) else {
+            return false;
+        };
+        if signal.mode != link_entry.requested_mode
+            || signal.mtu.get() > link_entry.accepted_mtu_ceiling
+            || (link_entry.validated && signal.mtu.get() != link_entry.accepted_mtu_ceiling)
+            || !self.link_registration_is_current(link_entry)
+        {
             return false;
         }
 

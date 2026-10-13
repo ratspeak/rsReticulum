@@ -1,0 +1,1236 @@
+//! Acknowledged native storage barriers for application transactions.
+//!
+//! These receipts attest successful native calls and exact readback, not a
+//! guarantee against dishonest hardware or later modification. Callers own
+//! private directories, exclude concurrent external writers, and journal any
+//! multi-file transaction. This API never falls back to cache durability.
+
+use super::{ATOMIC_WRITE_LOCK, atomic_replace, unique_temp_path};
+use rns_crypto::sha::sha256;
+use sha2::{Digest, Sha256};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurableCommitPhase {
+    NotCommitted,
+    CommitUncertain,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurableErrorKind {
+    Io,
+    Verification,
+    InvalidInput,
+    DurabilityUnsupported,
+}
+
+/// A failed operation never grants acceptance authority. Preserve the listed
+/// candidate/witness paths and the caller's journal on an uncertain result.
+#[derive(Debug, thiserror::Error)]
+#[error("durable storage {phase:?} ({kind:?}): {source}")]
+pub struct DurableWriteError {
+    pub phase: DurableCommitPhase,
+    pub kind: DurableErrorKind,
+    pub recovery_paths: Vec<PathBuf>,
+    #[source]
+    source: io::Error,
+}
+
+/// Privately constructed proof of acknowledged native barriers for exact bytes.
+#[derive(Debug)]
+pub struct DurableFileReceipt {
+    path: PathBuf,
+    content_hash: [u8; 32],
+    len: usize,
+}
+
+impl DurableFileReceipt {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn content_hash(&self) -> [u8; 32] {
+        self.content_hash
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Directory transitions require an independently committed outside journal.
+#[derive(Debug)]
+pub struct DurableDirectoryReceipt {
+    path: PathBuf,
+}
+impl DurableDirectoryReceipt {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurableCleanupOutcome {
+    Removed,
+    AlreadyAbsent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    Create,
+    Write,
+    Flush,
+    VerifyCandidate,
+    Publish,
+    ParentSync,
+    FinalSync,
+    VerifyFinal,
+}
+
+fn error(
+    phase: DurableCommitPhase,
+    kind: DurableErrorKind,
+    paths: &[&Path],
+    source: io::Error,
+) -> DurableWriteError {
+    DurableWriteError {
+        phase,
+        kind,
+        recovery_paths: paths.iter().map(|p| p.to_path_buf()).collect(),
+        source,
+    }
+}
+fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+fn unsupported(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, message)
+}
+fn kind(err: &io::Error) -> DurableErrorKind {
+    match err.kind() {
+        io::ErrorKind::Unsupported => DurableErrorKind::DurabilityUnsupported,
+        io::ErrorKind::InvalidData => DurableErrorKind::Verification,
+        io::ErrorKind::InvalidInput => DurableErrorKind::InvalidInput,
+        _ => DurableErrorKind::Io,
+    }
+}
+fn inject(stage: Stage, failure: Option<Stage>) -> io::Result<()> {
+    if failure == Some(stage) {
+        Err(io::Error::other(format!("injected {stage:?}")))
+    } else {
+        Ok(())
+    }
+}
+
+// Resolve only the parent, never follow a target symlink. The private directory
+// ownership/external-writer exclusion requirement remains the caller's duty.
+fn target_path(path: &Path) -> io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid("target has no file name"))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent = fs::canonicalize(parent)?;
+    ensure_native(&parent)?;
+    let result = parent.join(name);
+    match fs::symlink_metadata(&result) {
+        Ok(m) if !m.is_file() || m.file_type().is_symlink() => {
+            return Err(invalid("target must be a regular file, not a symlink"));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    Ok(result)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn ensure_native(path: &Path) -> io::Result<()> {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid("NUL in path"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    let filesystem = unsafe { CStr::from_ptr(stat.f_fstypename.as_ptr()) }.to_bytes();
+    if stat.f_flags & (libc::MNT_LOCAL as u32) == 0
+        || !matches!(filesystem, b"apfs" | b"hfs" | b"ufs")
+    {
+        return Err(unsupported(
+            "filesystem has no qualified native durability backend",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn ensure_native(path: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid("NUL in path"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    // ext2/3/4, XFS, Btrfs, F2FS. Do not silently certify network, FUSE,
+    // provider, RAM or overlay filesystems through a guessed backing device.
+    if !matches!(
+        stat.f_type as u64,
+        0xef53 | 0x58465342 | 0x9123683e | 0xf2f52010
+    ) {
+        return Err(unsupported(
+            "filesystem has no qualified native durability backend",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_native(path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDriveTypeW, GetVolumeInformationW, GetVolumePathNameW,
+    };
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut root = vec![0u16; 32768];
+    if unsafe { GetVolumePathNameW(path.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // DRIVE_FIXED. Remote, removable/provider and RAM volumes require an
+    // explicitly qualified backend instead of an implicit fallback.
+    if unsafe { GetDriveTypeW(root.as_ptr()) } != 3 {
+        return Err(unsupported(
+            "non-fixed volume has no qualified durability backend",
+        ));
+    }
+    let mut name = [0u16; 32];
+    if unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            name.as_mut_ptr(),
+            name.len() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let len = name.iter().position(|c| *c == 0).unwrap_or(name.len());
+    if !matches!(
+        String::from_utf16_lossy(&name[..len]).as_str(),
+        "NTFS" | "ReFS"
+    ) {
+        return Err(unsupported(
+            "filesystem has no qualified native durability backend",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android",
+    windows
+)))]
+fn ensure_native(_: &Path) -> io::Result<()> {
+    Err(unsupported("platform has no native durability backend"))
+}
+
+fn file_barrier(file: &File) -> io::Result<()> {
+    file.sync_all()?;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+            let e = io::Error::last_os_error();
+            if matches!(e.raw_os_error(), Some(libc::ENOTSUP) | Some(libc::EINVAL)) {
+                return Err(unsupported("F_FULLFSYNC is unavailable"));
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+fn parent_barrier(_path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    File::open(_path.parent().ok_or_else(|| invalid("missing parent"))?)?.sync_all()?;
+    // On Windows the checked WRITE_THROUGH native publication and subsequent
+    // writable-file flush are the selected acknowledgement, not directory fsync.
+    Ok(())
+}
+
+fn verify_bytes(path: &Path, data: &[u8]) -> io::Result<()> {
+    let mut file = File::open(path)?;
+    let mut offset: usize = 0;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = file.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        let end = offset
+            .checked_add(count)
+            .ok_or_else(|| invalid("verification length overflow"))?;
+        if data.get(offset..end) != Some(&chunk[..count]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable file readback mismatch",
+            ));
+        }
+        offset = end;
+    }
+    if offset != data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable file readback length mismatch",
+        ));
+    }
+    Ok(())
+}
+
+/// Check native backend availability for a private storage directory. This is
+/// only a read-only eligibility check, never a durability/commit receipt.
+pub fn validate_durable_storage_directory(path: &Path) -> Result<(), DurableWriteError> {
+    let result = (|| {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(invalid("storage directory must be a real directory"));
+        }
+        ensure_native(&fs::canonicalize(path)?)
+    })();
+    result.map_err(|cause| {
+        error(
+            DurableCommitPhase::NotCommitted,
+            kind(&cause),
+            &[path],
+            cause,
+        )
+    })
+}
+
+/// Atomically publish exact bytes and acknowledge all required native barriers.
+/// The parent must exist on a supported native filesystem. Candidates are
+/// private (0600 on Unix); errors preserve recovery paths, never return a receipt.
+pub fn durable_write(path: &Path, data: &[u8]) -> Result<DurableFileReceipt, DurableWriteError> {
+    write_inner(path, data, None)
+}
+
+fn write_inner(
+    path: &Path,
+    data: &[u8],
+    failure: Option<Stage>,
+) -> Result<DurableFileReceipt, DurableWriteError> {
+    let _guard = ATOMIC_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let target = target_path(path)
+        .map_err(|e| error(DurableCommitPhase::NotCommitted, kind(&e), &[path], e))?;
+    let candidate = unique_temp_path(&target)
+        .map_err(|e| error(DurableCommitPhase::NotCommitted, kind(&e), &[&target], e))?;
+    let mut phase = DurableCommitPhase::NotCommitted;
+    let result = (|| {
+        inject(Stage::Create, failure)?;
+        let mut options = OpenOptions::new();
+        options.write(true).read(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&candidate)?;
+        inject(Stage::Write, failure)?;
+        file.write_all(data)?;
+        inject(Stage::Flush, failure)?;
+        file.flush()?;
+        file_barrier(&file)?;
+        inject(Stage::VerifyCandidate, failure)?;
+        verify_bytes(&candidate, data)?;
+        inject(Stage::Publish, failure)?;
+        // A native publication failure can be ambiguous; retain both paths.
+        phase = DurableCommitPhase::CommitUncertain;
+        #[cfg(windows)]
+        drop(file);
+        atomic_replace(&candidate, &target)?;
+        inject(Stage::ParentSync, failure)?;
+        parent_barrier(&target)?;
+        inject(Stage::FinalSync, failure)?;
+        #[cfg(windows)]
+        let file = OpenOptions::new().read(true).write(true).open(&target)?;
+        file_barrier(&file)?;
+        inject(Stage::VerifyFinal, failure)?;
+        verify_bytes(&target, data)?;
+        Ok(())
+    })();
+    result.map_err(|e| error(phase, kind(&e), &[&target, &candidate], e))?;
+    Ok(DurableFileReceipt {
+        path: target,
+        content_hash: sha256(data),
+        len: data.len(),
+    })
+}
+
+/// Reconcile an uncertain publication by exact readback *and* renewed barriers.
+/// This never silently rewrites mismatched content to claim the old commit.
+pub fn durable_reconcile(
+    path: &Path,
+    data: &[u8],
+) -> Result<DurableFileReceipt, DurableWriteError> {
+    let _guard = ATOMIC_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let result = (|| {
+        let path = target_path(path)?;
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        verify_bytes(&path, data)?;
+        file_barrier(&file)?;
+        parent_barrier(&path)?;
+        file_barrier(&file)?;
+        verify_bytes(&path, data)?;
+        Ok(DurableFileReceipt {
+            path,
+            content_hash: sha256(data),
+            len: data.len(),
+        })
+    })();
+    result.map_err(|e: io::Error| error(DurableCommitPhase::CommitUncertain, kind(&e), &[path], e))
+}
+
+fn verify_hash(path: &Path, expected: [u8; 32], maximum_len: usize) -> io::Result<usize> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut len: usize = 0;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = file.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        len = len
+            .checked_add(count)
+            .filter(|len| *len <= maximum_len)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "durable file exceeds its reconciliation bound",
+                )
+            })?;
+        digest.update(&chunk[..count]);
+    }
+    let hash: [u8; 32] = digest.finalize().into();
+    if hash != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable file hash mismatch",
+        ));
+    }
+    Ok(len)
+}
+
+/// Reconcile a journal-recorded hash using bounded streaming readback and all
+/// required native barriers. The caller supplies trusted transaction metadata;
+/// a receipt does not establish the provenance or validity of message contents.
+pub fn durable_reconcile_hash(
+    path: &Path,
+    expected_sha256: [u8; 32],
+    maximum_len: usize,
+) -> Result<DurableFileReceipt, DurableWriteError> {
+    let _guard = ATOMIC_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let result = (|| {
+        let path = target_path(path)?;
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let len = verify_hash(&path, expected_sha256, maximum_len)?;
+        file_barrier(&file)?;
+        parent_barrier(&path)?;
+        file_barrier(&file)?;
+        if verify_hash(&path, expected_sha256, maximum_len)? != len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable file length changed",
+            ));
+        }
+        Ok(DurableFileReceipt {
+            path,
+            content_hash: expected_sha256,
+            len,
+        })
+    })();
+    result.map_err(|cause: io::Error| {
+        error(
+            DurableCommitPhase::CommitUncertain,
+            kind(&cause),
+            &[path],
+            cause,
+        )
+    })
+}
+
+fn open_witness(witness: &DurableFileReceipt, parent: &Path) -> io::Result<File> {
+    let path = target_path(&witness.path)?;
+    let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+    let mut digest = Sha256::new();
+    let mut remaining = witness.len;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = file.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        remaining = remaining
+            .checked_sub(count)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "committed witness grew"))?;
+        digest.update(&chunk[..count]);
+    }
+    let hash: [u8; 32] = digest.finalize().into();
+    if remaining != 0 || hash != witness.content_hash {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "committed witness changed",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if fs::metadata(parent)?.dev() != fs::metadata(&path)?.dev() {
+            return Err(invalid("witness must be on the same filesystem"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Volume roots are compared by the native volume-path API, not drive
+        // letters alone (mounted volumes are valid private application paths).
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+        let volume = |p: &Path| -> io::Result<Vec<u16>> {
+            let p = p
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            let mut root = vec![0u16; 32768];
+            if unsafe { GetVolumePathNameW(p.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            root.truncate(root.iter().position(|c| *c == 0).unwrap_or(root.len()));
+            Ok(root)
+        };
+        if volume(parent)? != volume(&path)? {
+            return Err(invalid("witness must be on the same filesystem"));
+        }
+    }
+    Ok(file)
+}
+
+// Re-establish the directory chain on both the first attempt and a restart
+// after some or all creations succeeded. The witness roots the transaction;
+// synchronize through the nearest shared ancestor, including sibling trees.
+#[cfg(not(windows))]
+fn directory_chain_barrier(path: &Path, witness: &DurableFileReceipt) -> io::Result<()> {
+    let witness_parent = witness
+        .path
+        .parent()
+        .ok_or_else(|| invalid("witness has no parent"))?;
+    let common = path
+        .ancestors()
+        .find(|ancestor| witness_parent.starts_with(ancestor))
+        .ok_or_else(|| invalid("directory and witness have no common ancestor"))?;
+    #[cfg(unix)]
+    for directory in path.ancestors() {
+        File::open(directory)?.sync_all()?;
+        if directory == common {
+            break;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = common;
+    Ok(())
+}
+
+/// Re-establish an existing journal-owned directory transition after restart.
+/// The caller must first verify the journal's expected paths, entries and hashes;
+/// this receipt acknowledges only the renewed native directory/witness barriers.
+pub fn durable_reconcile_directory(
+    path: &Path,
+    witness: &DurableFileReceipt,
+) -> Result<DurableDirectoryReceipt, DurableWriteError> {
+    #[cfg(windows)]
+    return Err(error(
+        DurableCommitPhase::CommitUncertain,
+        DurableErrorKind::DurabilityUnsupported,
+        &[path, &witness.path],
+        unsupported(
+            "directory rename recovery requires a journaled fresh sibling WRITE_THROUGH transition on Windows",
+        ),
+    ));
+    #[cfg(not(windows))]
+    {
+        let _guard = ATOMIC_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let result = (|| {
+            let metadata = fs::symlink_metadata(path)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(invalid("directory must be a real directory"));
+            }
+            let path = fs::canonicalize(path)?;
+            ensure_native(&path)?;
+            if witness.path.starts_with(&path) {
+                return Err(invalid("directory witness must be outside the tree"));
+            }
+            let journal = open_witness(witness, &path)?;
+            directory_chain_barrier(&path, witness)?;
+            file_barrier(&journal)?;
+            Ok(DurableDirectoryReceipt { path })
+        })();
+        result.map_err(|cause: io::Error| {
+            error(
+                DurableCommitPhase::CommitUncertain,
+                kind(&cause),
+                &[path, &witness.path],
+                cause,
+            )
+        })
+    }
+}
+
+/// Remove a transaction artifact after a separate committed witness exists.
+/// An error after deletion is cleanup-pending, never permission to roll back or
+/// destroy the witness. Windows acknowledges deletion and witness flush without
+/// claiming a separate directory-fsync guarantee.
+pub fn durable_remove(
+    path: &Path,
+    witness: &DurableFileReceipt,
+) -> Result<DurableCleanupOutcome, DurableWriteError> {
+    let _guard = ATOMIC_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut phase = DurableCommitPhase::NotCommitted;
+    let result = (|| {
+        let target = target_path(path)?;
+        if target == witness.path {
+            return Err(invalid("cannot remove the commit witness"));
+        }
+        let file = open_witness(witness, target.parent().unwrap())?;
+        phase = DurableCommitPhase::CommitUncertain;
+        let outcome = match fs::remove_file(&target) {
+            Ok(()) => DurableCleanupOutcome::Removed,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => DurableCleanupOutcome::AlreadyAbsent,
+            Err(e) => return Err(e),
+        };
+        parent_barrier(&target)?;
+        file_barrier(&file)?;
+        Ok(outcome)
+    })();
+    result.map_err(|e: io::Error| error(phase, kind(&e), &[path, &witness.path], e))
+}
+
+/// Move a directory to a fresh sibling under an already durable outside intent.
+/// The caller enforces the offline writer fence and records every phase.
+pub fn durable_rename_directory(
+    source: &Path,
+    destination: &Path,
+    witness: &DurableFileReceipt,
+) -> Result<DurableDirectoryReceipt, DurableWriteError> {
+    let _guard = ATOMIC_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut phase = DurableCommitPhase::NotCommitted;
+    let result = (|| {
+        let source_parent = fs::canonicalize(
+            source
+                .parent()
+                .ok_or_else(|| invalid("source has no parent"))?,
+        )?;
+        let destination_parent = fs::canonicalize(
+            destination
+                .parent()
+                .ok_or_else(|| invalid("destination has no parent"))?,
+        )?;
+        if source_parent != destination_parent {
+            return Err(invalid(
+                "directory migration requires siblings on one volume",
+            ));
+        }
+        ensure_native(&source_parent)?;
+        let source = source_parent.join(
+            source
+                .file_name()
+                .ok_or_else(|| invalid("source has no name"))?,
+        );
+        let destination = source_parent.join(
+            destination
+                .file_name()
+                .ok_or_else(|| invalid("destination has no name"))?,
+        );
+        let metadata = fs::symlink_metadata(&source)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(invalid("source must be a real directory"));
+        }
+        match fs::symlink_metadata(&destination) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(invalid("archive destination already exists")),
+            Err(e) => return Err(e),
+        }
+        if witness.path.starts_with(&source) || witness.path.starts_with(&destination) {
+            return Err(invalid("migration witness must be outside both trees"));
+        }
+        let journal = open_witness(witness, &source_parent)?;
+        phase = DurableCommitPhase::CommitUncertain;
+        #[cfg(not(windows))]
+        fs::rename(&source, &destination)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+            let from = source
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            let to = destination
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        parent_barrier(&destination)?;
+        file_barrier(&journal)?;
+        if !fs::symlink_metadata(&destination)?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "directory publication readback failed",
+            ));
+        }
+        Ok(DurableDirectoryReceipt { path: destination })
+    })();
+    result.map_err(|e: io::Error| error(phase, kind(&e), &[source, destination, &witness.path], e))
+}
+
+/// Create the journal-described directory tree, checking native barriers on
+/// every new ancestor. The caller must subsequently publish its format marker
+/// and phase record; this receipt alone is not a completed migration.
+pub fn durable_create_dir_all(
+    path: &Path,
+    witness: &DurableFileReceipt,
+) -> Result<DurableDirectoryReceipt, DurableWriteError> {
+    #[cfg(windows)]
+    return publish_directory_tree(path, witness, None);
+    #[cfg(not(windows))]
+    {
+        let _guard = ATOMIC_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut phase = DurableCommitPhase::NotCommitted;
+        let result = (|| {
+            let mut missing = Vec::new();
+            let mut cursor = path;
+            loop {
+                match fs::symlink_metadata(cursor) {
+                    Ok(m) if m.is_dir() && !m.file_type().is_symlink() => break,
+                    Ok(_) => return Err(invalid("directory ancestor is not a real directory")),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        let name = cursor
+                            .file_name()
+                            .ok_or_else(|| invalid("invalid directory component"))?
+                            .to_os_string();
+                        missing.push(name);
+                        cursor = cursor
+                            .parent()
+                            .filter(|p| !p.as_os_str().is_empty())
+                            .unwrap_or(Path::new("."));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            let mut current = fs::canonicalize(cursor)?;
+            ensure_native(&current)?;
+            let journal = open_witness(witness, &current)?;
+            for name in missing.into_iter().rev() {
+                current.push(name);
+                phase = DurableCommitPhase::CommitUncertain;
+                let builder = fs::DirBuilder::new();
+                #[cfg(unix)]
+                let builder = {
+                    use std::os::unix::fs::DirBuilderExt;
+                    let mut builder = builder;
+                    builder.mode(0o700);
+                    builder
+                };
+                builder.create(&current)?;
+            }
+            // Existing paths may be left by an interrupted earlier attempt.
+            // Existence alone is never acknowledgement of its directory barriers.
+            phase = DurableCommitPhase::CommitUncertain;
+            directory_chain_barrier(&current, witness)?;
+            file_barrier(&journal)?;
+            Ok(DurableDirectoryReceipt { path: current })
+        })();
+        result.map_err(|e: io::Error| error(phase, kind(&e), &[path, &witness.path], e))
+    }
+}
+
+// A directory already existing after a crash is not proof of its publication.
+// Windows uses an outside durable journal and fresh WRITE_THROUGH sibling move;
+// the committed marker avoids repeatedly renaming a live directory. The caller
+// initializes this boundary before allowing concurrent users of the tree.
+#[cfg(any(windows, test))]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DirectoryPublicationJournal {
+    version: u8,
+    target: PathBuf,
+    staging: PathBuf,
+    committed: bool,
+}
+#[cfg(any(windows, test))]
+fn publish_directory_tree(
+    path: &Path,
+    witness: &DurableFileReceipt,
+    fault: Option<u8>,
+) -> Result<DurableDirectoryReceipt, DurableWriteError> {
+    let result = (|| -> Result<PathBuf, DurableWriteError> {
+        let ioe = |e: io::Error| {
+            error(
+                DurableCommitPhase::CommitUncertain,
+                kind(&e),
+                &[path, &witness.path],
+                e,
+            )
+        };
+        let mut missing = Vec::new();
+        let mut cursor = path;
+        loop {
+            match fs::symlink_metadata(cursor) {
+                Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => break,
+                Ok(_) => return Err(ioe(invalid("directory ancestor is not a real directory"))),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    missing.push(
+                        cursor
+                            .file_name()
+                            .ok_or_else(|| ioe(invalid("invalid directory name")))?
+                            .to_os_string(),
+                    );
+                    cursor = cursor
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or(Path::new("."));
+                }
+                Err(e) => return Err(ioe(e)),
+            }
+        }
+        let mut current = fs::canonicalize(cursor).map_err(ioe)?;
+        ensure_native(&current).map_err(ioe)?;
+        // Validate the exact outside transaction authority, then close its
+        // handle before a Windows directory containing it could be renamed.
+        drop(open_witness(witness, &current).map_err(ioe)?);
+        if missing.is_empty() {
+            publish_one_directory(&current, fault)?;
+        } else {
+            for name in missing.into_iter().rev() {
+                current.push(name);
+                publish_one_directory(&current, fault)?;
+            }
+        }
+        Ok(current)
+    })();
+    result.map(|path| DurableDirectoryReceipt { path })
+}
+#[cfg(any(windows, test))]
+fn publish_one_directory(target: &Path, fault: Option<u8>) -> Result<(), DurableWriteError> {
+    let ioe = |e: io::Error| error(DurableCommitPhase::CommitUncertain, kind(&e), &[target], e);
+    let sibling = |suffix: &str| -> io::Result<PathBuf> {
+        let mut name = target
+            .file_name()
+            .ok_or_else(|| invalid("directory has no name"))?
+            .to_os_string();
+        name.push(suffix);
+        Ok(target.with_file_name(name))
+    };
+    let journal_path = sibling(".rns-directory").map_err(ioe)?;
+    let lock_path = sibling(".rns-directory-lock").map_err(ioe)?;
+    target_path(&lock_path).map_err(ioe)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(ioe)?;
+    lock.try_lock().map_err(|e| ioe(io::Error::other(e)))?;
+    let mut journal = match fs::symlink_metadata(&journal_path) {
+        Ok(meta) => {
+            if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > 8192 {
+                return Err(ioe(invalid("invalid directory publication journal")));
+            }
+            let mut bytes = Vec::new();
+            File::open(&journal_path)
+                .map_err(ioe)?
+                .take(8193)
+                .read_to_end(&mut bytes)
+                .map_err(ioe)?;
+            if bytes.len() > 8192 {
+                return Err(ioe(invalid("oversized directory publication journal")));
+            }
+            let record: DirectoryPublicationJournal =
+                rmp_serde::from_slice(&bytes).map_err(|e| ioe(io::Error::other(e)))?;
+            if record.version != 1
+                || record.target != target
+                || record.staging.parent() != target.parent()
+                || record.staging == target
+                || record.staging == journal_path
+                || record.staging == lock_path
+            {
+                return Err(ioe(invalid("directory publication paths mismatch")));
+            }
+            let mut prefix = target.file_name().unwrap().to_os_string();
+            prefix.push(".rns-publish-");
+            if !record.staging.file_name().is_some_and(|n| {
+                n.to_string_lossy()
+                    .starts_with(prefix.to_string_lossy().as_ref())
+            }) {
+                return Err(ioe(invalid("directory staging name mismatch")));
+            }
+            if record.committed {
+                let meta = fs::symlink_metadata(target).map_err(ioe)?;
+                if !meta.is_dir() || meta.file_type().is_symlink() {
+                    return Err(ioe(invalid("committed directory missing or replaced")));
+                }
+                durable_reconcile(&journal_path, &bytes)?;
+                return Ok(());
+            }
+            record
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => DirectoryPublicationJournal {
+            version: 1,
+            target: target.to_owned(),
+            staging: sibling(&format!(
+                ".rns-publish-{}",
+                hex::encode(rand::random::<[u8; 16]>())
+            ))
+            .map_err(ioe)?,
+            committed: false,
+        },
+        Err(e) => return Err(ioe(e)),
+    };
+    let encode = |record: &DirectoryPublicationJournal| {
+        rmp_serde::to_vec_named(record).map_err(|e| ioe(io::Error::other(e)))
+    };
+    let mut receipt = durable_write(&journal_path, &encode(&journal)?)?;
+    if fault == Some(0) {
+        return Err(ioe(io::Error::other("injected directory intent boundary")));
+    }
+    let source_exists = fs::symlink_metadata(target).is_ok();
+    let staging_exists = fs::symlink_metadata(&journal.staging).is_ok();
+    if source_exists && staging_exists {
+        return Err(ioe(invalid("both directory publication locations exist")));
+    }
+    if source_exists {
+        // A final move could have succeeded before its committed marker. Repeat
+        // through a fresh journaled sibling, never infer success from existence.
+        journal.staging = sibling(&format!(
+            ".rns-publish-{}",
+            hex::encode(rand::random::<[u8; 16]>())
+        ))
+        .map_err(ioe)?;
+        receipt = durable_write(&journal_path, &encode(&journal)?)?;
+        durable_rename_directory(target, &journal.staging, &receipt)?;
+    } else if !staging_exists {
+        fs::create_dir(&journal.staging).map_err(ioe)?;
+    }
+    if fault == Some(1) {
+        return Err(ioe(io::Error::other("injected directory staging boundary")));
+    }
+    durable_rename_directory(&journal.staging, target, &receipt)?;
+    if fault == Some(2) {
+        return Err(ioe(io::Error::other(
+            "injected directory final move boundary",
+        )));
+    }
+    journal.committed = true;
+    durable_write(&journal_path, &encode(&journal)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn dir() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rns-durable-{}-{}",
+            std::process::id(),
+            super::super::TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    fn assert_directory_reconciliation(path: &Path, witness: &DurableFileReceipt) {
+        let result = durable_reconcile_directory(path, witness);
+        #[cfg(not(windows))]
+        result.unwrap();
+        #[cfg(windows)]
+        assert_eq!(
+            result.unwrap_err().kind,
+            DurableErrorKind::DurabilityUnsupported
+        );
+    }
+
+    #[test]
+    fn strict_write_receipt_reconcile_and_cleanup() {
+        let dir = dir();
+        let path = dir.join("state");
+        let receipt = durable_write(&path, b"committed").unwrap();
+        assert_eq!(receipt.content_hash(), sha256(b"committed"));
+        assert_eq!(receipt.len(), 9);
+        assert_eq!(fs::read(receipt.path()).unwrap(), b"committed");
+        assert!(durable_reconcile(&path, b"wrong").is_err());
+        assert_eq!(
+            durable_reconcile(&path, b"committed")
+                .unwrap()
+                .content_hash(),
+            receipt.content_hash()
+        );
+        let old = dir.join("old");
+        durable_write(&old, b"old").unwrap();
+        assert_eq!(
+            durable_remove(&old, &receipt).unwrap(),
+            DurableCleanupOutcome::Removed
+        );
+        assert_eq!(
+            durable_remove(&old, &receipt).unwrap(),
+            DurableCleanupOutcome::AlreadyAbsent
+        );
+        assert!(durable_remove(&path, &receipt).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn strict_fault_phases_preserve_recoverable_bytes() {
+        let dir = dir();
+        let path = dir.join("state");
+        for stage in [
+            Stage::Create,
+            Stage::Write,
+            Stage::Flush,
+            Stage::VerifyCandidate,
+            Stage::Publish,
+            Stage::ParentSync,
+            Stage::FinalSync,
+            Stage::VerifyFinal,
+        ] {
+            durable_write(&path, b"old").unwrap();
+            let failure = write_inner(&path, b"new", Some(stage)).unwrap_err();
+            let published = matches!(
+                stage,
+                Stage::ParentSync | Stage::FinalSync | Stage::VerifyFinal
+            );
+            assert_eq!(
+                failure.phase,
+                if published {
+                    DurableCommitPhase::CommitUncertain
+                } else {
+                    DurableCommitPhase::NotCommitted
+                }
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                if published { b"new" } else { b"old" }
+            );
+            assert_eq!(failure.recovery_paths.len(), 2);
+            if published {
+                durable_reconcile(&path, b"new").unwrap();
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn strict_directory_journal_and_changed_witness() {
+        let dir = dir();
+        let journal = durable_write(&dir.join("journal"), b"phase one").unwrap();
+        let source = dir.join("old");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("item"), b"payload").unwrap();
+        let archive = dir.join("archive");
+        durable_rename_directory(&source, &archive, &journal).unwrap();
+        assert_eq!(fs::read(archive.join("item")).unwrap(), b"payload");
+        assert!(durable_rename_directory(&archive, &archive, &journal).is_err());
+        durable_write(&source, b"migrated tombstone").unwrap();
+        let tree = dir.join("v2").join("objects");
+        durable_create_dir_all(&tree, &journal).unwrap();
+        durable_create_dir_all(&tree, &journal).unwrap();
+        assert_directory_reconciliation(&archive, &journal);
+        assert!(tree.is_dir());
+        fs::write(journal.path(), b"replaced").unwrap();
+        assert!(durable_remove(&source, &journal).is_err());
+        assert!(source.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn strict_directory_retry_supports_sibling_journal_and_readonly_qualification() {
+        let dir = dir();
+        let state = dir.join("state");
+        fs::create_dir(&state).unwrap();
+        let journal = durable_write(&state.join("journal"), b"intent").unwrap();
+        let tree = dir.join("messages").join("objects");
+        let first = durable_create_dir_all(&tree, &journal).unwrap();
+        assert_eq!(first.path(), fs::canonicalize(&tree).unwrap());
+        assert_directory_reconciliation(&tree, &journal);
+        durable_create_dir_all(&tree, &journal).unwrap();
+        validate_durable_storage_directory(&tree).unwrap();
+        assert_eq!(fs::read_dir(&tree).unwrap().count(), 0);
+        assert!(validate_durable_storage_directory(journal.path()).is_err());
+        assert!(validate_durable_storage_directory(&dir.join("missing")).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn strict_witness_length_and_content_changes_never_authorize_cleanup() {
+        let dir = dir();
+        for bytes in [b"abc".as_slice(), b"abcde", b"xbcd"] {
+            let witness = durable_write(&dir.join("journal"), b"abcd").unwrap();
+            let target = dir.join("obsolete");
+            fs::write(&target, b"keep").unwrap();
+            fs::write(witness.path(), bytes).unwrap();
+            let error = durable_remove(&target, &witness).unwrap_err();
+            assert_eq!(error.phase, DurableCommitPhase::NotCommitted);
+            assert_eq!(error.kind, DurableErrorKind::Verification);
+            assert_eq!(fs::read(&target).unwrap(), b"keep");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn strict_hash_reconciliation_enforces_hash_and_length_bound() {
+        let dir = dir();
+        let data = vec![0x5a; 65537];
+        let receipt = durable_write(&dir.join("archive"), &data).unwrap();
+        let restored =
+            durable_reconcile_hash(receipt.path(), receipt.content_hash(), data.len()).unwrap();
+        assert_eq!(restored.len(), data.len());
+        assert!(
+            durable_reconcile_hash(receipt.path(), receipt.content_hash(), data.len() - 1).is_err()
+        );
+        assert!(durable_reconcile_hash(receipt.path(), [0; 32], data.len()).is_err());
+        assert_eq!(fs::read(receipt.path()).unwrap(), data);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sharing_violation_preserves_old_target_and_recoverable_candidate() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let root = dir();
+        let target = root.join("state");
+        durable_write(&target, b"old").unwrap();
+        // Permit readers and writers but refuse deletion/rename while this
+        // real Windows handle is open; injected errors cannot cover this.
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&target)
+            .unwrap();
+        let failure = durable_write(&target, b"new").unwrap_err();
+        assert_eq!(failure.phase, DurableCommitPhase::CommitUncertain);
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert!(
+            failure.recovery_paths.iter().any(|path| {
+                path != &target && fs::read(path).is_ok_and(|bytes| bytes == b"new")
+            })
+        );
+        drop(held);
+        assert!(durable_reconcile(&target, b"new").is_err());
+        let receipt = durable_write(&target, b"new").unwrap();
+        assert_eq!(receipt.content_hash(), sha256(b"new"));
+        durable_reconcile(&target, b"new").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cleanup_sharing_violation_retains_witness_and_retries() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let root = dir();
+        let witness = durable_write(&root.join("commit"), b"committed").unwrap();
+        let obsolete = root.join("obsolete");
+        durable_write(&obsolete, b"recovery copy").unwrap();
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&obsolete)
+            .unwrap();
+        let failure = durable_remove(&obsolete, &witness).unwrap_err();
+        assert_eq!(failure.phase, DurableCommitPhase::CommitUncertain);
+        assert_eq!(fs::read(&obsolete).unwrap(), b"recovery copy");
+        assert_eq!(fs::read(witness.path()).unwrap(), b"committed");
+        drop(held);
+        assert_eq!(
+            durable_remove(&obsolete, &witness).unwrap(),
+            DurableCleanupOutcome::Removed
+        );
+        durable_reconcile(witness.path(), b"committed").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_targets_and_directories_reject_symlinks_and_preserve_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = dir();
+        let receipt = durable_write(&dir.join("journal"), b"intent").unwrap();
+        assert_eq!(
+            fs::metadata(receipt.path()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let link = dir.join("link");
+        symlink(receipt.path(), &link).unwrap();
+        assert!(durable_write(&link, b"replace").is_err());
+        assert!(durable_remove(&link, &receipt).is_err());
+        let directory_link = dir.join("directory-link");
+        symlink(&dir, &directory_link).unwrap();
+        assert!(validate_durable_storage_directory(&directory_link).is_err());
+        assert!(durable_create_dir_all(&directory_link, &receipt).is_err());
+        assert!(durable_reconcile_directory(&directory_link, &receipt).is_err());
+        assert_eq!(fs::read(receipt.path()).unwrap(), b"intent");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn directory_publication_journal_recovers_each_transition_and_preserves_existing_tree() {
+        for stage in 0..=2 {
+            let root = dir();
+            let witness = durable_write(&root.join("intent"), b"outside transaction").unwrap();
+            let tree = root.join("tree");
+            fs::create_dir(&tree).unwrap();
+            fs::write(tree.join("retained"), b"original").unwrap();
+            assert!(publish_directory_tree(&tree, &witness, Some(stage)).is_err());
+            publish_directory_tree(&tree, &witness, None).unwrap();
+            assert_eq!(fs::read(tree.join("retained")).unwrap(), b"original");
+            publish_directory_tree(&tree, &witness, None).unwrap();
+            assert_eq!(fs::read(tree.join("retained")).unwrap(), b"original");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[test]
+    fn directory_publication_creates_nested_trees_and_rejects_missing_committed_target() {
+        let root = dir();
+        let witness = durable_write(&root.join("intent"), b"outside transaction").unwrap();
+        let tree = root.join("parent").join("child");
+        publish_directory_tree(&tree, &witness, None).unwrap();
+        assert!(tree.is_dir());
+        fs::remove_dir(&tree).unwrap();
+        assert!(publish_directory_tree(&tree, &witness, None).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+}

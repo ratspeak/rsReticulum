@@ -297,13 +297,21 @@ fn recursive_surviving_requester_retains_refused_egress_until_its_original_deadl
     request(&mut actor, dest, 2, 2);
     assert!(actor.has_pending_path_request_admission(dest));
     let deadline = actor.discovery_path_requests[&dest].timeout;
-    actor.handle_message(TransportMessage::DeregisterInterface { id: 1 });
+    actor.handle_message(owned_event(
+        &actor,
+        1,
+        TransportMessage::DeregisterInterface { id: 1 },
+    ));
     assert_eq!(actor.discovery_path_requests[&dest].timeout, deadline);
     blocked_rx.try_recv().unwrap();
     actor.process_pending_path_request_admissions(now_f64() + 1.0);
     assert!(blocked_rx.try_recv().is_ok());
     assert!(!actor.has_pending_path_request_admission(dest));
-    actor.handle_message(TransportMessage::DeregisterInterface { id: 2 });
+    actor.handle_message(owned_event(
+        &actor,
+        2,
+        TransportMessage::DeregisterInterface { id: 2 },
+    ));
     assert!(actor.discovery_path_requests.is_empty());
 }
 
@@ -389,6 +397,8 @@ fn disabling_transport_revokes_recursive_work_but_preserves_leaf_discovery() {
     actor.on_path_request(local);
     actor.queue_discovery_path_request(queued_local, None, now_f64());
     actor.handle_message(TransportMessage::RegisterLink {
+        interface_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.id()),
+
         link_id: [0xEA; 16],
         destination_hash: [0xEB; 16],
         interface_id: 1,
@@ -503,6 +513,17 @@ fn transit_table_capacity_and_driver_refusal_do_not_create_untracked_forwarding(
                 actor.link_table.insert(
                     key,
                     crate::link_table::LinkEntry {
+                        interface_owner: actor
+                            .interfaces
+                            .get(&(2))
+                            .map(|entry| entry.owner.clone()),
+                        receiving_owner: actor
+                            .interfaces
+                            .get(&(1))
+                            .map(|entry| entry.owner.clone()),
+                        requested_mode: 1,
+                        accepted_mtu_ceiling: 500,
+
                         timestamp: now_f64(),
                         next_hop: None,
                         interface_id: 2,

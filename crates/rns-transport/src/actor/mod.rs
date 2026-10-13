@@ -58,6 +58,7 @@ enum InterfaceSendOutcome {
     Closed,
     Offline,
     NotOutbound,
+    TooLarge,
 }
 
 struct LinkEndpointEntry {
@@ -134,6 +135,8 @@ pub struct TransportActor {
     /// single `destination_channels[link_id]` slot aliasing one side over the
     /// other after the responder registers the Link.
     local_link_routes: HashMap<[u8; 16], LocalLinkRoute>,
+    // Only active caller-owned temporary destinations can allocate an attempt.
+    pending_local_link_requests: HashMap<[u8; 16], HashMap<InterfaceId, crate::InterfaceOwnerId>>,
     /// Locally-owned established-Link endpoints. This is intentionally not
     /// the transit `link_table`: transit forwarding and local session
     /// ownership have different lifetimes and authority.
@@ -402,6 +405,7 @@ impl TransportActor {
             local_destinations: HashSet::new(),
             destination_channels: HashMap::new(),
             local_link_routes: HashMap::new(),
+            pending_local_link_requests: HashMap::new(),
             link_endpoints: HashMap::new(),
             path_requests: HashMap::new(),
             discovery_path_requests: HashMap::new(),
@@ -542,11 +546,57 @@ impl TransportActor {
     }
 
     fn handle_message(&mut self, msg: TransportMessage) {
+        match msg {
+            TransportMessage::InterfaceEvent {
+                interface_id,
+                owner,
+                message,
+            } => {
+                if !owner.is_current()
+                    || !self
+                        .interfaces
+                        .get(&interface_id)
+                        .is_some_and(|entry| entry.owner == owner)
+                {
+                    return;
+                }
+                let matches_owner = match message.as_ref() {
+                    TransportMessage::Inbound(packet) => packet.interface_id == interface_id,
+                    TransportMessage::DeregisterInterface { id } => *id == interface_id,
+                    TransportMessage::SharedConnectionRestored { interface_id: id } => {
+                        *id == interface_id
+                    }
+                    TransportMessage::SharedConnectionLost => true,
+                    TransportMessage::Rpc { .. } => true,
+                    _ => false,
+                };
+                if matches_owner {
+                    self.handle_admitted_message(*message);
+                }
+            }
+            TransportMessage::Inbound(_)
+            | TransportMessage::DeregisterInterface { .. }
+            | TransportMessage::SharedConnectionLost
+            | TransportMessage::SharedConnectionRestored { .. } => {
+                tracing::debug!("unowned interface event refused");
+            }
+            message => self.handle_admitted_message(message),
+        }
+    }
+
+    fn handle_admitted_message(&mut self, msg: TransportMessage) {
         let variant = msg_variant_name(&msg);
         let _span =
             tracing::span!(tracing::Level::DEBUG, "actor.handle_message", msg = variant).entered();
         match msg {
+            TransportMessage::InterfaceEvent { .. } => return,
             TransportMessage::Inbound(packet) => self.on_inbound(packet),
+            TransportMessage::SendLinkRequest { request, result_tx } => {
+                if !result_tx.is_closed() {
+                    let result = self.dispatch_link_request_checked(request);
+                    let _ = result_tx.send(result);
+                }
+            }
             TransportMessage::Outbound(request) => {
                 let attempt = self.local_link_attempt(&request);
                 if attempt.is_some() {
@@ -756,7 +806,7 @@ impl TransportActor {
                         snr: None,
                         q: None,
                     };
-                    self.on_inbound(inbound);
+                    self.on_cached_announce(inbound);
                     self.process_background_starts();
                     return;
                 }
@@ -917,6 +967,23 @@ impl TransportActor {
                 self.send_to_interface(interface_id, &raw_packet);
             }
             TransportMessage::RegisterInterface { id, entry } => {
+                if !entry.owner.is_current() {
+                    return;
+                }
+                if entry.effective_clear_mtu().is_err() {
+                    entry.owner.retire();
+                    return;
+                }
+                if let Some(existing) = self.interfaces.get(&id)
+                    && (existing.owner.epoch() > entry.owner.epoch()
+                        || (existing.owner.epoch() == entry.owner.epoch()
+                            && existing.owner.revision() >= entry.owner.revision()))
+                {
+                    if existing.owner.epoch() != entry.owner.epoch() {
+                        entry.owner.retire();
+                    }
+                    return;
+                }
                 let is_outbound = entry.direction.outbound;
                 let iface_name = entry.name.clone();
                 let role = entry.role;
@@ -927,10 +994,16 @@ impl TransportActor {
                         role = role.as_str(),
                         "skipping registration for interface already marked offline"
                     );
+                    entry.owner.retire();
                     return;
                 }
                 debug!(id, name = %iface_name, outbound = is_outbound, role = role.as_str(), "registering interface");
-                if self.interfaces.contains_key(&id) {
+                if let Some(existing) = self.interfaces.get(&id) {
+                    if existing.owner.epoch() != entry.owner.epoch() {
+                        existing.owner.retire();
+                    }
+                    self.path_table.drop_all_via(id);
+                    self.link_table.remove_interface(id);
                     self.retire_recursive_discovery_interface(id);
                     self.retire_path_request_admissions(id);
                     self.retire_announce_interface(id);
@@ -940,6 +1013,7 @@ impl TransportActor {
                     );
                 }
                 self.interfaces.insert(id, entry);
+                self.interfaces[&id].owner.mark_registered();
                 if !self.startup_complete && self.startup_time == 0.0 {
                     self.startup_time = now_f64();
                 }
@@ -1009,6 +1083,7 @@ impl TransportActor {
                 );
             }
             TransportMessage::RegisterLink {
+                interface_owner,
                 link_id,
                 destination_hash,
                 interface_id,
@@ -1023,6 +1098,17 @@ impl TransportActor {
                     // LinkTable entry would point at a non-registry interface,
                     // be culled as dead, and is not consulted for local sends.
                     debug!(link_id = hex::encode(link_id), "registered in-process Link");
+                    return;
+                }
+                if !interface_owner.is_some_and(|owner| {
+                    self.interfaces.get(&interface_id).is_some_and(|entry| {
+                        owner.matches(&entry.owner)
+                            && entry
+                                .packet_capacity
+                                .link_ceiling(interface_id, entry.active_ifac_bytes())
+                                .is_ok()
+                    })
+                }) {
                     return;
                 }
                 // Initiators start pending (validated=false) until the proof
@@ -1042,6 +1128,16 @@ impl TransportActor {
                     ),
                     receiving_interface: interface_id,
                     taken_hops: 0,
+                    interface_owner: self
+                        .interfaces
+                        .get(&interface_id)
+                        .map(|entry| entry.owner.clone()),
+                    receiving_owner: self
+                        .interfaces
+                        .get(&interface_id)
+                        .map(|entry| entry.owner.clone()),
+                    requested_mode: rns_wire::link_signalling::DEFAULT_LINK_MODE,
+                    accepted_mtu_ceiling: 500,
                 };
                 self.link_table.insert(link_id, entry);
 
@@ -1467,6 +1563,10 @@ impl TransportActor {
         link_reason: crate::messages::LinkEndpointTerminalReason,
     ) {
         self.terminate_link_endpoints_for_interface(id, link_reason);
+        if let Some(entry) = self.interfaces.get(&id) {
+            entry.owner.retire();
+        }
+        self.link_table.remove_interface(id);
         let role = self.interfaces.get(&id).map(|entry| entry.role);
         // Flip the driver-shared online flag before dropping the entry:
         // driver tasks gated on it (Auto beacons/discovery, BLE loops) hold
@@ -1537,6 +1637,7 @@ impl TransportActor {
     }
 
     fn deregister_destination(&mut self, hash: [u8; 16]) {
+        self.pending_local_link_requests.remove(&hash);
         self.local_destinations.remove(&hash);
         self.destination_channels.remove(&hash);
         if self.local_link_routes.remove(&hash).is_some() {
@@ -1566,19 +1667,89 @@ impl TransportActor {
         let Some(entry) = self.interfaces.get(&id) else {
             return InterfaceSendOutcome::Missing;
         };
+        if !entry.owner.is_current() {
+            return InterfaceSendOutcome::Missing;
+        }
+        if !entry.accepts_clear_packet(raw.len()) {
+            return InterfaceSendOutcome::TooLarge;
+        }
         if entry.role == InterfaceRole::LocalClient && interface_marked_offline(entry) {
             return InterfaceSendOutcome::Offline;
         }
         if !entry.direction.outbound {
             return InterfaceSendOutcome::NotOutbound;
         }
+        if rns_wire::header::PacketHeader::unpack(raw).is_ok_and(|(header, _)| {
+            header.flags.packet_type == rns_wire::flags::PacketType::LinkRequest
+        }) && entry
+            .packet_capacity
+            .link_ceiling(id, entry.active_ifac_bytes())
+            .is_err()
+        {
+            return InterfaceSendOutcome::TooLarge;
+        }
+        let request_owner =
+            rns_wire::header::PacketHeader::unpack(raw)
+                .ok()
+                .and_then(|(header, offset)| {
+                    if header.flags.packet_type != rns_wire::flags::PacketType::LinkRequest {
+                        return None;
+                    }
+                    let link_id = rns_wire::hash::link_id_from_raw(raw, header.flags.header_type);
+                    self.destination_channels
+                        .contains_key(&link_id)
+                        .then_some((link_id, offset))
+                });
+        if let Some((link_id, offset)) = request_owner {
+            let Ok(signal) = rns_wire::link_signalling::parse_request_signalling(&raw[offset..])
+            else {
+                return InterfaceSendOutcome::TooLarge;
+            };
+            if signal.mode != rns_wire::link_signalling::DEFAULT_LINK_MODE
+                || signal.mtu.get() > 500
+                || entry
+                    .packet_capacity
+                    .link_ceiling(id, entry.active_ifac_bytes())
+                    .is_err()
+            {
+                return InterfaceSendOutcome::TooLarge;
+            }
+            match self.pending_local_link_requests.get(&link_id) {
+                Some(owners) => {
+                    if owners
+                        .get(&id)
+                        .is_some_and(|owner| !owner.matches(&entry.owner))
+                        || (!owners.contains_key(&id) && owners.len() >= 64)
+                    {
+                        return InterfaceSendOutcome::Missing;
+                    }
+                }
+                None if self.pending_local_link_requests.len() >= 4096 => {
+                    return InterfaceSendOutcome::Full;
+                }
+                None => {}
+            }
+        }
+        let owner = entry.owner.id();
         let data: Bytes = if let Some(ref ifac_key) = entry.ifac_key {
-            Bytes::from(crate::ifac::ifac_sign(raw, ifac_key, entry.ifac_size))
+            let Ok(wire) = crate::ifac::try_ifac_sign(raw, ifac_key, entry.ifac_size) else {
+                return InterfaceSendOutcome::TooLarge;
+            };
+            Bytes::from(wire)
         } else {
             Bytes::copy_from_slice(raw)
         };
         match entry.tx.try_send(data) {
-            Ok(()) => InterfaceSendOutcome::Sent,
+            Ok(()) => {
+                if let Some((link_id, _)) = request_owner {
+                    self.pending_local_link_requests
+                        .entry(link_id)
+                        .or_default()
+                        .entry(id)
+                        .or_insert(owner);
+                }
+                InterfaceSendOutcome::Sent
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => InterfaceSendOutcome::Full,
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => InterfaceSendOutcome::Closed,
         }
@@ -1641,7 +1812,9 @@ impl TransportActor {
                 );
                 false
             }
-            InterfaceSendOutcome::Missing | InterfaceSendOutcome::NotOutbound => false,
+            InterfaceSendOutcome::Missing
+            | InterfaceSendOutcome::NotOutbound
+            | InterfaceSendOutcome::TooLarge => false,
         }
     }
 
@@ -2044,9 +2217,26 @@ fn mode_discovers_unknown_paths(mode: InterfaceMode) -> bool {
 #[cfg(test)]
 mod tests {
     mod announce_admission;
+    mod bitrate_timing;
     mod discovery_api;
     mod link_endpoint_dispatch;
+    mod packet_capacity;
     mod slow_media_discovery;
+
+    fn owned_event(
+        actor: &TransportActor,
+        id: InterfaceId,
+        message: TransportMessage,
+    ) -> TransportMessage {
+        match actor.interfaces.get(&id) {
+            Some(entry) => TransportMessage::InterfaceEvent {
+                interface_id: id,
+                owner: entry.owner.clone(),
+                message: Box::new(message),
+            },
+            None => message,
+        }
+    }
     use super::*;
     use crate::constants::{InterfaceDirection, InterfaceMode};
     use crate::messages::{
@@ -2299,6 +2489,8 @@ mod tests {
     fn make_test_interface(name: &str) -> (InterfaceEntry, mpsc::Receiver<Bytes>) {
         let (tx, rx) = mpsc::channel(64);
         let entry = InterfaceEntry {
+            owner: crate::InterfaceOwner::new(),
+            packet_capacity: crate::InterfacePacketCapacity::base(500),
             name: name.to_string(),
             mode: InterfaceMode::Gateway,
             role: InterfaceRole::Normal,
@@ -2602,7 +2794,11 @@ mod tests {
         let (mut actor, _tx) = TransportActor::new();
         let (entry, _rx) = make_test_interface("test_iface");
         actor.interfaces.insert(1, entry);
-        actor.handle_message(TransportMessage::DeregisterInterface { id: 1 });
+        actor.handle_message(owned_event(
+            &actor,
+            1,
+            TransportMessage::DeregisterInterface { id: 1 },
+        ));
         assert!(!actor.interfaces.contains_key(&1));
     }
 
@@ -2617,7 +2813,11 @@ mod tests {
         entry.online = Some(online.clone());
         actor.interfaces.insert(1, entry);
 
-        actor.handle_message(TransportMessage::DeregisterInterface { id: 1 });
+        actor.handle_message(owned_event(
+            &actor,
+            1,
+            TransportMessage::DeregisterInterface { id: 1 },
+        ));
 
         assert!(!actor.interfaces.contains_key(&1));
         assert!(
@@ -3035,15 +3235,27 @@ mod tests {
         let (entry, _rx) = make_test_interface("twice");
         actor.interfaces.insert(9, entry);
 
-        actor.handle_message(TransportMessage::DeregisterInterface { id: 9 });
+        actor.handle_message(owned_event(
+            &actor,
+            9,
+            TransportMessage::DeregisterInterface { id: 9 },
+        ));
         assert!(!actor.interfaces.contains_key(&9));
 
         // Second deregister on a missing id: must be a no-op.
-        actor.handle_message(TransportMessage::DeregisterInterface { id: 9 });
+        actor.handle_message(owned_event(
+            &actor,
+            9,
+            TransportMessage::DeregisterInterface { id: 9 },
+        ));
         assert!(!actor.interfaces.contains_key(&9));
 
         // And a deregister for an id that never existed.
-        actor.handle_message(TransportMessage::DeregisterInterface { id: 999 });
+        actor.handle_message(owned_event(
+            &actor,
+            999,
+            TransportMessage::DeregisterInterface { id: 999 },
+        ));
     }
 
     /// Deregistering an interface must cascade through every routing table
@@ -3084,7 +3296,11 @@ mod tests {
         assert!(actor.path_table.has_path(&dest));
         assert_eq!(actor.tunnel_table.get(&tunnel_id).unwrap().interface_id, 42);
 
-        actor.handle_message(TransportMessage::DeregisterInterface { id: 42 });
+        actor.handle_message(owned_event(
+            &actor,
+            42,
+            TransportMessage::DeregisterInterface { id: 42 },
+        ));
 
         assert!(
             !actor.interfaces.contains_key(&42),
@@ -3119,6 +3335,8 @@ mod tests {
         assert_eq!(
             actor.bind_link_endpoint(
                 LinkEndpointBinding {
+                    interface_owner: actor.interfaces.get(&(5)).map(|entry| entry.owner.id()),
+
                     link_id: [0x5A; 16],
                     interface_id: 5,
                     role: LinkEndpointRole::Initiator,
@@ -3530,6 +3748,11 @@ mod tests {
         let destination_identity = rns_identity::identity::Identity::new();
         insert_announce_for(&mut relay, destination_hash, &destination_identity);
         let link_entry = crate::link_table::LinkEntry {
+            interface_owner: relay.interfaces.get(&(2)).map(|entry| entry.owner.clone()),
+            receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
+            requested_mode: 1,
+            accepted_mtu_ceiling: 500,
+
             timestamp: now_f64(),
             next_hop: Some([0xBB; 16]),
             interface_id: 2,   // next-hop interface (toward destination)
@@ -3545,7 +3768,12 @@ mod tests {
 
         // Destination sends LRPROOF with hops=0 (new proof, not incremented).
         // Proof arrives at relay on interface 2 (the destination side).
-        let proof = make_lrproof_packet(link_id, 0, &destination_identity, Some([1, 0, 0]));
+        let proof = make_lrproof_packet(
+            link_id,
+            0,
+            &destination_identity,
+            Some(rns_wire::link_signalling::SignallingData::new(1, 500).pack()),
+        );
         relay.on_inbound(InboundPacket {
             raw: proof,
             interface_id: 2, // arrived from destination side
@@ -3593,6 +3821,11 @@ mod tests {
         relay.link_table.insert(
             link_id,
             crate::link_table::LinkEntry {
+                interface_owner: relay.interfaces.get(&(2)).map(|entry| entry.owner.clone()),
+                receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now_f64(),
                 next_hop: None,
                 interface_id: 2,
@@ -3642,6 +3875,11 @@ mod tests {
         relay.link_table.insert(
             link_id,
             crate::link_table::LinkEntry {
+                interface_owner: relay.interfaces.get(&(2)).map(|entry| entry.owner.clone()),
+                receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now_f64(),
                 next_hop: None,
                 interface_id: 2,
@@ -3693,6 +3931,11 @@ mod tests {
         relay.link_table.insert(
             link_id,
             crate::link_table::LinkEntry {
+                interface_owner: relay.interfaces.get(&(2)).map(|entry| entry.owner.clone()),
+                receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now_f64(),
                 next_hop: None,
                 interface_id: 2,
@@ -3740,6 +3983,11 @@ mod tests {
             relay.link_table.insert(
                 link_id,
                 crate::link_table::LinkEntry {
+                    interface_owner: relay.interfaces.get(&(2)).map(|entry| entry.owner.clone()),
+                    receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
+                    requested_mode: 1,
+                    accepted_mtu_ceiling: 500,
+
                     timestamp: now_f64(),
                     next_hop: None,
                     interface_id: 2,
@@ -3783,6 +4031,11 @@ mod tests {
         relay.link_table.insert(
             link_id,
             crate::link_table::LinkEntry {
+                interface_owner: relay.interfaces.get(&(2)).map(|entry| entry.owner.clone()),
+                receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now_f64(),
                 next_hop: None,
                 interface_id: 2,
@@ -3835,6 +4088,11 @@ mod tests {
         relay.link_table.insert(
             link_id,
             crate::link_table::LinkEntry {
+                interface_owner: relay.interfaces.get(&(2)).map(|entry| entry.owner.clone()),
+                receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now_f64(),
                 next_hop: None,
                 interface_id: 2,
@@ -3896,6 +4154,11 @@ mod tests {
         relay.link_table.insert(
             link_id,
             crate::link_table::LinkEntry {
+                interface_owner: relay.interfaces.get(&(2)).map(|entry| entry.owner.clone()),
+                receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now_f64(),
                 next_hop: None,
                 interface_id: 2,
@@ -3944,6 +4207,17 @@ mod tests {
         relay_b.link_table.insert(
             link_id,
             crate::link_table::LinkEntry {
+                interface_owner: relay_b
+                    .interfaces
+                    .get(&(2))
+                    .map(|entry| entry.owner.clone()),
+                receiving_owner: relay_b
+                    .interfaces
+                    .get(&(1))
+                    .map(|entry| entry.owner.clone()),
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now_f64(),
                 next_hop: Some([0xDD; 16]),
                 interface_id: 2, // toward destination
@@ -3970,6 +4244,17 @@ mod tests {
         relay_a.link_table.insert(
             link_id,
             crate::link_table::LinkEntry {
+                interface_owner: relay_a
+                    .interfaces
+                    .get(&(2))
+                    .map(|entry| entry.owner.clone()),
+                receiving_owner: relay_a
+                    .interfaces
+                    .get(&(1))
+                    .map(|entry| entry.owner.clone()),
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now_f64(),
                 next_hop: Some([0xCC; 16]),
                 interface_id: 2, // toward RelayB
@@ -3985,7 +4270,12 @@ mod tests {
 
         // Proof travels back: Destination → RelayB → RelayA.
         // Destination sends proof with hops=0.
-        let proof = make_lrproof_packet(link_id, 0, &destination_identity, Some([1, 2, 3]));
+        let proof = make_lrproof_packet(
+            link_id,
+            0,
+            &destination_identity,
+            Some(rns_wire::link_signalling::SignallingData::new(1, 500).pack()),
+        );
         relay_b.on_inbound(InboundPacket {
             raw: proof,
             interface_id: 2, // from destination
@@ -4237,6 +4527,8 @@ mod tests {
 
         let link_id = [0xB3; 16];
         let binding = LinkEndpointBinding {
+            interface_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.id()),
+
             link_id,
             interface_id: 1,
             role: LinkEndpointRole::Initiator,
@@ -4293,6 +4585,8 @@ mod tests {
         assert_eq!(
             actor.bind_link_endpoint(
                 LinkEndpointBinding {
+                    interface_owner: actor.interfaces.get(&(3)).map(|entry| entry.owner.id()),
+
                     link_id,
                     interface_id: 3,
                     role: LinkEndpointRole::Initiator,
@@ -4333,6 +4627,8 @@ mod tests {
         assert_eq!(
             actor.bind_link_endpoint(
                 LinkEndpointBinding {
+                    interface_owner: actor.interfaces.get(&(7)).map(|entry| entry.owner.id()),
+
                     link_id,
                     interface_id: 7,
                     role: LinkEndpointRole::Responder,
@@ -4396,6 +4692,8 @@ mod tests {
         assert_eq!(
             actor.bind_link_endpoint(
                 LinkEndpointBinding {
+                    interface_owner: actor.interfaces.get(&(13)).map(|entry| entry.owner.id()),
+
                     link_id,
                     interface_id: 13,
                     role: LinkEndpointRole::Responder,
@@ -4477,6 +4775,8 @@ mod tests {
         let (destination_tx, _destination_rx) = mpsc::channel(1);
         actor.destination_channels.insert(link_id, destination_tx);
         let binding = LinkEndpointBinding {
+            interface_owner: actor.interfaces.get(&(14)).map(|entry| entry.owner.id()),
+
             link_id,
             interface_id: 14,
             role: LinkEndpointRole::Initiator,
@@ -4584,6 +4884,8 @@ mod tests {
         );
 
         let binding = LinkEndpointBinding {
+            interface_owner: actor.interfaces.get(&(15)).map(|entry| entry.owner.id()),
+
             link_id,
             interface_id: 15,
             role: LinkEndpointRole::Initiator,
@@ -4666,6 +4968,8 @@ mod tests {
 
         let link_id = [0xB5; 16];
         let binding = LinkEndpointBinding {
+            interface_owner: actor.interfaces.get(&(9)).map(|entry| entry.owner.id()),
+
             link_id,
             interface_id: 9,
             role: LinkEndpointRole::Initiator,
@@ -4705,6 +5009,8 @@ mod tests {
 
         let link_id = [0xB8; 16];
         let binding = LinkEndpointBinding {
+            interface_owner: actor.interfaces.get(&(11)).map(|entry| entry.owner.id()),
+
             link_id,
             interface_id: 11,
             role: LinkEndpointRole::Responder,
@@ -4759,6 +5065,8 @@ mod tests {
         actor.interfaces.insert(12, interface);
         let link_id = [0xB9; 16];
         let binding = LinkEndpointBinding {
+            interface_owner: actor.interfaces.get(&(12)).map(|entry| entry.owner.id()),
+
             link_id,
             interface_id: 12,
             role: LinkEndpointRole::Initiator,
@@ -4819,6 +5127,8 @@ mod tests {
         assert_eq!(
             actor.bind_link_endpoint(
                 LinkEndpointBinding {
+                    interface_owner: actor.interfaces.get(&(10)).map(|entry| entry.owner.id()),
+
                     link_id: first_id,
                     interface_id: 10,
                     role: LinkEndpointRole::Initiator,
@@ -4830,6 +5140,8 @@ mod tests {
         assert_eq!(
             actor.bind_link_endpoint(
                 LinkEndpointBinding {
+                    interface_owner: actor.interfaces.get(&(10)).map(|entry| entry.owner.id()),
+
                     link_id: second_id,
                     interface_id: 10,
                     role: LinkEndpointRole::Responder,
@@ -5210,6 +5522,11 @@ mod tests {
         ));
 
         actor.handle_message(TransportMessage::RegisterLink {
+            interface_owner: actor
+                .interfaces
+                .get(&(LOCAL_LINK_RESPONDER_INTERFACE))
+                .map(|entry| entry.owner.id()),
+
             link_id,
             destination_hash,
             interface_id: LOCAL_LINK_RESPONDER_INTERFACE,
@@ -5275,6 +5592,11 @@ mod tests {
         assert_eq!(
             actor.bind_link_endpoint(
                 LinkEndpointBinding {
+                    interface_owner: actor
+                        .interfaces
+                        .get(&(LOCAL_LINK_INITIATOR_INTERFACE))
+                        .map(|entry| entry.owner.id()),
+
                     link_id,
                     interface_id: LOCAL_LINK_INITIATOR_INTERFACE,
                     role: LinkEndpointRole::Initiator,
@@ -5286,6 +5608,11 @@ mod tests {
         assert_eq!(
             actor.bind_link_endpoint(
                 LinkEndpointBinding {
+                    interface_owner: actor
+                        .interfaces
+                        .get(&(LOCAL_LINK_RESPONDER_INTERFACE))
+                        .map(|entry| entry.owner.id()),
+
                     link_id,
                     interface_id: LOCAL_LINK_RESPONDER_INTERFACE,
                     role: LinkEndpointRole::Responder,
@@ -6626,7 +6953,11 @@ mod tests {
                             InterfaceMode::Full,
                         ),
                     );
-                    let original = make_data_packet(destination, 0);
+                    let original = if packet_type == PacketType::LinkRequest {
+                        make_link_request_packet(destination, 0)
+                    } else {
+                        make_data_packet(destination, 0)
+                    };
                     let (mut header, offset) =
                         rns_wire::header::PacketHeader::unpack(&original).unwrap();
                     header.flags.packet_type = packet_type;
@@ -7110,9 +7441,14 @@ mod tests {
     #[test]
     fn test_register_link_initiator() {
         let (mut actor, _tx) = TransportActor::new();
+        let (interface, _wire) = make_test_interface("admitted interface");
+        actor.interfaces.insert(1, interface);
+
         let link_id = [0xAA; 16];
 
         actor.handle_message(TransportMessage::RegisterLink {
+            interface_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.id()),
+
             link_id,
             destination_hash: [0xBB; 16],
             interface_id: 1,
@@ -7133,9 +7469,14 @@ mod tests {
     #[test]
     fn test_register_link_responder() {
         let (mut actor, _tx) = TransportActor::new();
+        let (interface, _wire) = make_test_interface("admitted interface");
+        actor.interfaces.insert(1, interface);
+
         let link_id = [0xAA; 16];
 
         actor.handle_message(TransportMessage::RegisterLink {
+            interface_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.id()),
+
             link_id,
             destination_hash: [0xBB; 16],
             interface_id: 1,
@@ -7152,10 +7493,15 @@ mod tests {
     #[test]
     fn test_activate_link() {
         let (mut actor, _tx) = TransportActor::new();
+        let (interface, _wire) = make_test_interface("admitted interface");
+        actor.interfaces.insert(1, interface);
+
         let link_id = [0xAA; 16];
 
         // Register as initiator (pending)
         actor.handle_message(TransportMessage::RegisterLink {
+            interface_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.id()),
+
             link_id,
             destination_hash: [0xBB; 16],
             interface_id: 1,
@@ -8103,6 +8449,11 @@ mod tests {
         actor.link_table.insert(
             link_id,
             crate::link_table::LinkEntry {
+                interface_owner: actor.interfaces.get(&(2)).map(|entry| entry.owner.clone()),
+                receiving_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now_f64(),
                 next_hop: None,
                 interface_id: 2,
@@ -8140,6 +8491,11 @@ mod tests {
         actor.link_table.insert(
             link_id,
             crate::link_table::LinkEntry {
+                interface_owner: actor.interfaces.get(&(2)).map(|entry| entry.owner.clone()),
+                receiving_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now_f64(),
                 next_hop: None,
                 interface_id: 2,
@@ -8187,6 +8543,11 @@ mod tests {
         actor.link_table.insert(
             link_id,
             crate::link_table::LinkEntry {
+                interface_owner: actor.interfaces.get(&(2)).map(|entry| entry.owner.clone()),
+                receiving_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now_f64(),
                 next_hop: None,
                 interface_id: 2,
@@ -8227,6 +8588,11 @@ mod tests {
         actor.link_table.insert(
             link_id,
             crate::link_table::LinkEntry {
+                interface_owner: actor.interfaces.get(&(2)).map(|entry| entry.owner.clone()),
+                receiving_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
+
                 timestamp: now_f64(),
                 next_hop: None,
                 interface_id: 2,
@@ -8776,6 +9142,9 @@ mod tests {
     #[test]
     fn shared_connection_restored_discards_local_routing_state() {
         let (mut actor, _tx) = TransportActor::new();
+        let (interface, _wire) = make_test_interface("shared owner");
+        actor.interfaces.insert(42, interface);
+
         actor.path_table.insert(
             [0xAA; 16],
             crate::path_table::PathEntry::new(None, 1, 7, InterfaceMode::Gateway),
@@ -8815,7 +9184,11 @@ mod tests {
             },
         );
 
-        actor.handle_message(TransportMessage::SharedConnectionRestored { interface_id: 42 });
+        actor.handle_message(owned_event(
+            &actor,
+            42,
+            TransportMessage::SharedConnectionRestored { interface_id: 42 },
+        ));
 
         assert!(actor.is_shared_instance);
         assert!(actor.shared_instance_client_mode);
@@ -9397,6 +9770,9 @@ mod tests {
     #[test]
     fn inbound_hop_count_at_or_above_max_is_dropped_for_all_packet_types() {
         let (mut actor, _tx) = TransportActor::new();
+        let (interface, _wire) = make_test_interface("admitted interface");
+        actor.interfaces.insert(1, interface);
+
         let (dest_tx, mut dest_rx) = mpsc::channel(8);
         let dest = [0xE1; 16];
         actor.local_destinations.insert(dest);
@@ -10291,11 +10667,13 @@ mod tests {
             .get_mut(&interface_id)
             .expect("test interface should exist")
             .ingress;
-        *ingress =
-            crate::ingress::IngressController::with_overrides(&crate::ingress::IngressOverrides {
+        *ingress = crate::ingress::IngressController::try_with_overrides(
+            &crate::ingress::IngressOverrides {
                 egress_control: Some(true),
                 ..Default::default()
-            });
+            },
+        )
+        .unwrap();
         for _ in 0..IC_BURST_MIN_SAMPLES {
             ingress.sent_path_request();
         }
@@ -11706,6 +12084,8 @@ mod tests {
         assert_eq!(
             actor.bind_link_endpoint(
                 LinkEndpointBinding {
+                    interface_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.id()),
+
                     link_id,
                     interface_id: 1,
                     role: LinkEndpointRole::Initiator,
@@ -11715,7 +12095,11 @@ mod tests {
             crate::messages::LinkEndpointBindResult::Bound
         );
 
-        actor.handle_message(TransportMessage::SharedConnectionLost);
+        actor.handle_message(owned_event(
+            &actor,
+            1,
+            TransportMessage::SharedConnectionLost,
+        ));
 
         assert!(!actor.is_shared_instance);
         assert!(actor.shared_instance_client_mode);
@@ -11748,7 +12132,11 @@ mod tests {
         actor.reverse_table.insert([0x22; 16], 1, 1);
         actor.pending_local_path_requests.insert([0x33; 16], 1);
 
-        actor.handle_message(TransportMessage::DeregisterInterface { id: 1 });
+        actor.handle_message(owned_event(
+            &actor,
+            1,
+            TransportMessage::DeregisterInterface { id: 1 },
+        ));
 
         assert!(!actor.is_shared_instance);
         assert!(actor.path_table.is_empty());

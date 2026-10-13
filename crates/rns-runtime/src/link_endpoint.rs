@@ -170,6 +170,7 @@ pub(crate) enum LinkProofWaitError {
 pub(crate) struct ValidatedLinkProof {
     pub(crate) rtt_data: Vec<u8>,
     pub(crate) interface_id: InterfaceId,
+    pub(crate) interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
     pub(crate) metrics: PacketMetrics,
 }
 
@@ -191,6 +192,7 @@ pub(crate) async fn wait_for_valid_proof(
             DestinationEvent::InboundPacket {
                 raw,
                 interface_id,
+                interface_owner,
                 metrics,
             } => {
                 let Ok((header, data_offset)) = rns_wire::header::PacketHeader::unpack(&raw) else {
@@ -211,6 +213,7 @@ pub(crate) async fn wait_for_valid_proof(
                         return Ok(ValidatedLinkProof {
                             rtt_data,
                             interface_id,
+                            interface_owner,
                             metrics,
                         });
                     }
@@ -234,6 +237,7 @@ pub(crate) async fn bind(
     transport_tx: &mpsc::Sender<TransportMessage>,
     link_id: [u8; 16],
     interface_id: InterfaceId,
+    interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
     role: LinkEndpointRole,
 ) -> Result<mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>, LinkEndpointError> {
     let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
@@ -243,6 +247,7 @@ pub(crate) async fn bind(
             binding: LinkEndpointBinding {
                 link_id,
                 interface_id,
+                interface_owner,
                 role,
             },
             lifecycle_tx,
@@ -479,11 +484,14 @@ mod tests {
         let mut invalid = proof.clone();
         invalid[0] ^= 0x80;
         let link_id = initiator.link_id;
+        let original_owner = rns_transport::messages::InterfaceOwner::new();
+        let proof_owner = rns_transport::messages::InterfaceOwner::new();
         let (event_tx, mut event_rx) = mpsc::channel(2);
         event_tx
             .send(DestinationEvent::InboundPacket {
                 raw: proof_packet(link_id, &invalid),
                 interface_id: 41,
+                interface_owner: Some(original_owner.id()),
                 metrics: PacketMetrics {
                     rssi: Some(-10.0),
                     ..Default::default()
@@ -495,6 +503,7 @@ mod tests {
             .send(DestinationEvent::InboundPacket {
                 raw: proof_packet(link_id, &proof),
                 interface_id: 42,
+                interface_owner: Some(proof_owner.id()),
                 metrics: PacketMetrics {
                     rssi: Some(-80.0),
                     ..Default::default()
@@ -512,6 +521,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(validated.interface_id, 42);
+        assert_eq!(validated.interface_owner, Some(proof_owner.id()));
         assert_eq!(validated.metrics.rssi, Some(-80.0));
         assert!(matches!(
             initiator.state,
@@ -534,6 +544,7 @@ mod tests {
         event_tx
             .send(DestinationEvent::InboundPacket {
                 raw: proof_packet(link_id, &proof),
+                interface_owner: None,
                 interface_id: 99,
                 metrics: PacketMetrics::default(),
             })

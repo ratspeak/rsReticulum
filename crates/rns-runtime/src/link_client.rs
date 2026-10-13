@@ -27,6 +27,8 @@ use crate::destination_resolver::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum LinkClientError {
+    #[error("link request admission failed: {0}")]
+    RequestDispatch(#[from] rns_transport::link_messages::LinkRequestDispatchError),
     #[error("transport channel closed or full")]
     TransportUnavailable,
     #[error("timed out waiting for {0}")]
@@ -55,6 +57,7 @@ struct LinkClientEndpoint<'a> {
     delivery_rx: &'a mut mpsc::Receiver<DestinationEvent>,
     lifecycle_rx: &'a mut mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
     attached_interface: InterfaceId,
+    interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
 }
 
 impl LinkClient {
@@ -77,7 +80,9 @@ impl LinkClient {
         overall_timeout: Duration,
     ) -> Result<Vec<u8>, LinkClientError> {
         let started = Instant::now();
-        let deadline = started + overall_timeout;
+        let deadline = started
+            .checked_add(overall_timeout)
+            .ok_or_else(|| LinkClientError::HandshakeFailed("unrepresentable timeout".into()))?;
 
         let dest_hash =
             Destination::hash_from_name_and_identity(app_name, Some(&remote_transport_hash));
@@ -110,11 +115,18 @@ impl LinkClient {
         );
 
         let req_pkt = build_link_request_packet(dest_hash, &request_data);
-        self.send_msg(TransportMessage::Outbound(OutboundRequest {
-            raw: req_pkt,
-            destination_hash: dest_hash,
-        }))
-        .await?;
+        timeout(
+            time_remaining(deadline)?,
+            rns_transport::link_messages::dispatch_link_request(
+                &self.transport_tx,
+                OutboundRequest {
+                    raw: req_pkt,
+                    destination_hash: dest_hash,
+                },
+            ),
+        )
+        .await
+        .map_err(|_| LinkClientError::Timeout("link request admission"))??;
 
         let identity_ed25519_pub: [u8; 32] = pubkey[32..64].try_into().map_err(|_| {
             LinkClientError::ProofInvalid("remote public key is not 64 bytes".into())
@@ -141,12 +153,14 @@ impl LinkClient {
             }
         })?;
         let attached_interface = proof.interface_id;
+        let interface_owner = proof.interface_owner;
         let rtt_data = proof.rtt_data;
 
         let mut endpoint_lifecycle_rx = crate::link_endpoint::bind(
             &self.transport_tx,
             link_id,
             attached_interface,
+            interface_owner,
             LinkEndpointRole::Initiator,
         )
         .await
@@ -156,6 +170,7 @@ impl LinkClient {
             delivery_rx: &mut dest_rx,
             lifecycle_rx: &mut endpoint_lifecycle_rx,
             attached_interface,
+            interface_owner,
         };
 
         let rtt_pkt =
@@ -300,9 +315,14 @@ async fn wait_for_response(
                     return Err(LinkClientError::HandshakeFailed("link closed".into()));
                 }
                 DestinationEvent::InboundPacket {
-                    raw, interface_id, ..
+                    raw,
+                    interface_id,
+                    interface_owner,
+                    ..
                 } => {
-                    if interface_id != endpoint.attached_interface {
+                    if interface_id != endpoint.attached_interface
+                        || interface_owner != endpoint.interface_owner
+                    {
                         continue;
                     }
                     let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {

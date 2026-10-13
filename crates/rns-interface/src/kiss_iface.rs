@@ -1,5 +1,6 @@
 //! Serial port + KISS framing; CMD_DATA + CMD_READY flow control.
 
+use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -89,6 +90,8 @@ async fn spawn_kiss_with_port(
     transport_tx: mpsc::Sender<TransportMessage>,
     port: Box<dyn serialport::SerialPort>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     tracing::info!(
         name = %config.name,
         port = %config.port,
@@ -283,6 +286,8 @@ async fn spawn_kiss_with_port(
 
     Ok(InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(500, 564, false),
         parent_id: None,
         name,
         mode,
@@ -371,6 +376,7 @@ mod tests {
         let driver = spawn_kiss_with_port(config, 1, inbound, Box::new(slave))
             .await
             .unwrap();
+        driver.owner.mark_registered();
         let mut revoke = kiss::frame_with_command(kiss::CMD_READY, &[0]);
         revoke.extend(kiss::frame(b"read barrier"));
         master.write_all(&revoke).unwrap();

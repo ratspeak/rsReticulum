@@ -5,7 +5,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use crate::inbound_link_packet::{
+    APPLICATION_PACKET_LIFETIME, Decision, PacketDispatch, PacketEpoch, PendingInboundPacket,
+};
+pub use crate::inbound_link_packet::{
+    InboundLinkPacket, LinkPacketConfigurationError, LinkPacketReceipt, LinkPacketReceiptOutcome,
+    LinkPacketRejection,
+};
 use bytes::Bytes;
+use rns_identity::destination::ProofStrategy;
 use tokio::sync::{mpsc, oneshot};
 
 use rns_crypto::ed25519::Ed25519PrivateKey;
@@ -52,6 +60,7 @@ enum LegacyTerminalNotification {
 struct ActiveLink {
     link: Link,
     _interface_id: u64,
+    interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
     /// Created lazily on first CHANNEL packet.
     channel: Option<LinkChannel>,
     inbound_resources: HashMap<[u8; 32], InboundTransfer>,
@@ -540,6 +549,13 @@ pub struct LinkManager {
     endpoint_dispatch_tokens:
         HashMap<[u8; 16], rns_transport::link_endpoint_dispatch::LinkEndpointDispatchToken>,
     pending_packet_dispatches: Vec<PendingPacketDispatch>,
+    ordinary_packet_strategy: Option<ProofStrategy>,
+    inbound_link_packet_tx: Option<mpsc::Sender<InboundLinkPacket>>,
+    inbound_packet_epochs: HashMap<[u8; 16], Arc<PacketEpoch>>,
+    pending_inbound_packets: Vec<PendingInboundPacket>,
+    rejecting_packet_links: HashSet<[u8; 16]>,
+    inbound_packet_notify: Arc<tokio::sync::Notify>,
+    inbound_packet_overloads: u64,
     transport_tx: mpsc::Sender<TransportMessage>,
     event_rx: mpsc::Receiver<DestinationEvent>,
     /// Destination announces accepted while the bounded transport ingress is
@@ -659,6 +675,13 @@ impl LinkManager {
             endpoint_dispatch: None,
             endpoint_dispatch_tokens: HashMap::new(),
             pending_packet_dispatches: Vec::new(),
+            ordinary_packet_strategy: None,
+            inbound_link_packet_tx: None,
+            inbound_packet_epochs: HashMap::new(),
+            pending_inbound_packets: Vec::new(),
+            rejecting_packet_links: HashSet::new(),
+            inbound_packet_notify: Arc::new(tokio::sync::Notify::new()),
+            inbound_packet_overloads: 0,
             transport_tx,
             event_rx,
             pending_destination_announces: VecDeque::new(),
@@ -737,6 +760,13 @@ impl LinkManager {
             endpoint_dispatch: None,
             endpoint_dispatch_tokens: HashMap::new(),
             pending_packet_dispatches: Vec::new(),
+            ordinary_packet_strategy: None,
+            inbound_link_packet_tx: None,
+            inbound_packet_epochs: HashMap::new(),
+            pending_inbound_packets: Vec::new(),
+            rejecting_packet_links: HashSet::new(),
+            inbound_packet_notify: Arc::new(tokio::sync::Notify::new()),
+            inbound_packet_overloads: 0,
             transport_tx,
             event_rx,
             pending_destination_announces: VecDeque::new(),
@@ -856,11 +886,18 @@ impl LinkManager {
     }
 
     pub async fn step(&mut self) -> bool {
-        self.poll_link_endpoints();
+        let endpoint_progress = self.poll_link_endpoints();
         self.flush_pending_link_control();
         self.flush_pending_destination_announces();
         self.flush_pending_legacy_terminal_notifications();
+        if endpoint_progress {
+            return true;
+        }
+        let inbound_deadline = self.inbound_packet_deadline();
         tokio::select! {
+            _ = self.inbound_packet_notify.notified() => { self.poll_inbound_packet_receipts(); true }
+            _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => { self.poll_inbound_packet_receipts(); true }
+            _ = tokio::time::sleep_until(inbound_deadline.into()) => { self.poll_inbound_packet_receipts(); true }
             event = self.event_rx.recv() => {
                 let Some(event) = event else { return false; };
                 self.handle_event(event);
@@ -916,7 +953,11 @@ impl LinkManager {
             self.flush_pending_link_control();
             self.flush_pending_destination_announces();
             self.flush_pending_legacy_terminal_notifications();
+            let inbound_deadline = self.inbound_packet_deadline();
             tokio::select! {
+                _ = self.inbound_packet_notify.notified() => { self.poll_inbound_packet_receipts(); }
+                _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => { self.poll_inbound_packet_receipts(); }
+                _ = tokio::time::sleep_until(inbound_deadline.into()) => { self.poll_inbound_packet_receipts(); }
                 event = self.event_rx.recv() => {
                     match event {
                         Some(evt) => self.handle_event(evt),
@@ -967,9 +1008,331 @@ impl LinkManager {
                 break;
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::select! {
+                _ = self.inbound_packet_notify.notified() => {},
+                _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => {},
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {},
+            }
         }
         self.drain_shutdown_link_ownership().await;
+    }
+
+    fn inbound_packet_deadline(&self) -> std::time::Instant {
+        self.pending_inbound_packets
+            .iter()
+            .map(|p| p.deadline)
+            .min()
+            .unwrap_or_else(|| std::time::Instant::now() + APPLICATION_PACKET_LIFETIME)
+    }
+
+    fn handle_ordinary_link_packet(
+        &mut self,
+        link_id: [u8; 16],
+        raw: &[u8],
+        header: &rns_wire::header::PacketHeader,
+        data: &[u8],
+    ) {
+        if self.rejecting_packet_links.contains(&link_id) {
+            return;
+        }
+        let strategy = self.ordinary_packet_proof_strategy();
+        let Some(active) = self.active_links.get_mut(&link_id) else {
+            return;
+        };
+        if active.link.state == LinkState::Closed {
+            return;
+        }
+        let Ok(plaintext) = active.link.decrypt(data) else {
+            return;
+        };
+        active.link.record_inbound();
+        active.link.record_rx(data.len());
+        let role = active.link.role();
+        let packet_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
+        if strategy == ProofStrategy::ProveApp {
+            if !self.endpoint_dispatch_tokens.contains_key(&link_id)
+                || self.inbound_link_packet_tx.is_none()
+            {
+                return;
+            }
+            let Some(generation) = self.active_endpoint_generations.get(&link_id).copied() else {
+                return;
+            };
+            let epoch = self
+                .inbound_packet_epochs
+                .entry(link_id)
+                .or_insert_with(|| PacketEpoch::new(generation))
+                .clone();
+            if epoch.generation != generation
+                || !epoch.alive.load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            let Some(lease) = epoch.reserve(plaintext.len()) else {
+                self.inbound_packet_overloads = self.inbound_packet_overloads.saturating_add(1);
+                return;
+            };
+            let (receipt, resolution) =
+                LinkPacketReceipt::new(lease.clone(), self.inbound_packet_notify.clone());
+            let state = receipt.state.clone();
+            let event = InboundLinkPacket::new(
+                plaintext,
+                link_id,
+                self.destination_hash,
+                packet_hash,
+                role,
+                Some(receipt),
+            );
+            if self
+                .inbound_link_packet_tx
+                .as_ref()
+                .unwrap()
+                .try_send(event)
+                .is_err()
+            {
+                crate::inbound_link_packet::set_terminal(&state, LinkPacketReceiptOutcome::Dropped);
+                self.inbound_packet_overloads = self.inbound_packet_overloads.saturating_add(1);
+                return;
+            }
+            self.pending_inbound_packets.push(PendingInboundPacket {
+                link_id,
+                packet_hash,
+                epoch,
+                deadline: std::time::Instant::now() + APPLICATION_PACKET_LIFETIME,
+                state,
+                _lease: lease,
+                resolution,
+                dispatch: None,
+            });
+            return;
+        }
+        if strategy == ProofStrategy::ProveAll
+            && let Ok(proof) =
+                Self::prove_received_link_packet(active, &packet_hash, self.identity.as_ref())
+            && Self::send_link_packet_proof(
+                &self.transport_tx,
+                &mut self.pending_link_control,
+                &mut self.pending_endpoint_sends,
+                &link_id,
+                role,
+                &proof,
+                rns_wire::context::PacketContext::LinkProof,
+            )
+        {
+            active.link.record_tx(proof.len());
+        }
+        // Delivery is independent of signing/staging success.
+        if let Some(callback) = &active.link.packet_callback {
+            callback(&plaintext);
+        }
+        if let Some(tx) = &self.inbound_link_packet_tx {
+            let _ = tx.try_send(InboundLinkPacket::new(
+                plaintext,
+                link_id,
+                self.destination_hash,
+                packet_hash,
+                role,
+                None,
+            ));
+        } else if let Some(tx) = &self.link_packet_tx {
+            let _ = tx.send((plaintext, link_id));
+        }
+    }
+
+    fn inbound_packet_epoch_current(&self, pending: &PendingInboundPacket) -> bool {
+        pending
+            .epoch
+            .alive
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.active_endpoint_generations.get(&pending.link_id)
+                == Some(&pending.epoch.generation)
+            && self
+                .inbound_packet_epochs
+                .get(&pending.link_id)
+                .is_some_and(|epoch| Arc::ptr_eq(epoch, &pending.epoch))
+            && self.active_links.contains_key(&pending.link_id)
+    }
+
+    fn poll_inbound_packet_receipts(&mut self) -> bool {
+        use rns_transport::link_endpoint_dispatch::LinkEndpointDispatchOutcome;
+        let mut progressed = false;
+        let mut waiting = Vec::new();
+        let mut close = Vec::new();
+        for mut pending in std::mem::take(&mut self.pending_inbound_packets) {
+            if !self.inbound_packet_epoch_current(&pending) {
+                pending.finish(LinkPacketReceiptOutcome::Closed);
+                progressed = true;
+                continue;
+            }
+            if let Some(dispatch) = &mut pending.dispatch {
+                let result = match dispatch.ready.take() {
+                    Some(result) => Some(result.map_err(|_| ())),
+                    None => match dispatch.result.try_recv() {
+                        Ok(result) => Some(Ok(result)),
+                        Err(oneshot::error::TryRecvError::Closed) => Some(Err(())),
+                        Err(oneshot::error::TryRecvError::Empty) => None,
+                    },
+                };
+                let outcome = match result {
+                    Some(Ok(LinkEndpointDispatchOutcome::Sent { packet_hash, .. }))
+                        if packet_hash == dispatch.expected_hash =>
+                    {
+                        Some(LinkPacketReceiptOutcome::Sent)
+                    }
+                    Some(Ok(LinkEndpointDispatchOutcome::Expired)) => {
+                        Some(LinkPacketReceiptOutcome::Expired)
+                    }
+                    Some(Ok(LinkEndpointDispatchOutcome::Cancelled)) => {
+                        Some(LinkPacketReceiptOutcome::Dropped)
+                    }
+                    Some(_) => Some(LinkPacketReceiptOutcome::Unavailable),
+                    None if std::time::Instant::now() >= pending.deadline => {
+                        Some(LinkPacketReceiptOutcome::Expired)
+                    }
+                    None => None,
+                };
+                if let Some(outcome) = outcome {
+                    if outcome == LinkPacketReceiptOutcome::Sent
+                        && let Some(active) = self.active_links.get_mut(&pending.link_id)
+                    {
+                        active.link.record_tx(dispatch.payload_len);
+                    }
+                    if dispatch.rejecting {
+                        close.push((pending.link_id, outcome == LinkPacketReceiptOutcome::Sent));
+                    }
+                    pending.finish(outcome);
+                    progressed = true;
+                } else {
+                    waiting.push(pending);
+                }
+                continue;
+            }
+            if std::time::Instant::now() >= pending.deadline {
+                pending.finish(LinkPacketReceiptOutcome::Expired);
+                progressed = true;
+                continue;
+            }
+            let resolution = match pending.resolution.try_recv() {
+                Ok(resolution) => resolution,
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    waiting.push(pending);
+                    continue;
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    pending.finish(LinkPacketReceiptOutcome::Dropped);
+                    progressed = true;
+                    continue;
+                }
+            };
+            progressed = true;
+            if matches!(resolution.decision, Decision::Drop) {
+                pending.finish(LinkPacketReceiptOutcome::Dropped);
+                if let Some(reply) = resolution.reply {
+                    let _ = reply.send(LinkPacketReceiptOutcome::Dropped);
+                }
+                continue;
+            }
+            if self.rejecting_packet_links.contains(&pending.link_id) {
+                pending.finish(LinkPacketReceiptOutcome::Closed);
+                if let Some(reply) = resolution.reply {
+                    let _ = reply.send(LinkPacketReceiptOutcome::Closed);
+                }
+                continue;
+            }
+            if matches!(resolution.decision, Decision::Close) {
+                self.rejecting_packet_links.insert(pending.link_id);
+                pending.finish(LinkPacketReceiptOutcome::Closed);
+                if let Some(reply) = resolution.reply {
+                    let _ = reply.send(LinkPacketReceiptOutcome::Closed);
+                }
+                close.push((pending.link_id, true));
+                continue;
+            }
+            let rejecting = matches!(resolution.decision, Decision::Reject(_));
+            if rejecting {
+                self.rejecting_packet_links.insert(pending.link_id);
+            }
+            let active = self.active_links.get(&pending.link_id).unwrap();
+            let body = if rejecting {
+                active.link.encrypt(&[0x91, 0xcc, 0xf5]).ok()
+            } else {
+                Self::prove_received_link_packet(
+                    active,
+                    &pending.packet_hash,
+                    self.identity.as_ref(),
+                )
+                .ok()
+            };
+            let payload_len = body.as_ref().map_or(0, Vec::len);
+            let raw = body.map(|body| {
+                let header = rns_wire::header::PacketHeader {
+                    flags: rns_wire::flags::PacketFlags {
+                        header_type: rns_wire::flags::HeaderType::Header1,
+                        context_flag: false,
+                        transport_type: rns_wire::flags::TransportType::Broadcast,
+                        destination_type: rns_wire::flags::DestinationType::Link,
+                        packet_type: if rejecting {
+                            rns_wire::flags::PacketType::Data
+                        } else {
+                            rns_wire::flags::PacketType::Proof
+                        },
+                    },
+                    hops: 0,
+                    transport_id: None,
+                    destination_hash: pending.link_id,
+                    context: if rejecting {
+                        rns_wire::context::PacketContext::None
+                    } else {
+                        rns_wire::context::PacketContext::LinkProof
+                    },
+                };
+                let mut raw = header.pack();
+                raw.extend_from_slice(&body);
+                raw
+            });
+            let dispatch = raw.and_then(|raw| {
+                let expected_hash =
+                    rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+                let deadline = std::time::Instant::now() + LINK_ENDPOINT_ADMISSION_TIMEOUT_MAX;
+                let token = self.endpoint_dispatch_tokens.get(&pending.link_id)?;
+                let (result, cancellation) = token
+                    .try_send_cancellable(
+                        OutboundRequest {
+                            raw: raw.into(),
+                            destination_hash: pending.link_id,
+                        },
+                        deadline,
+                    )
+                    .ok()?;
+                pending.deadline = deadline;
+                Some((result, cancellation, expected_hash))
+            });
+            if let Some((result, cancellation, expected_hash)) = dispatch {
+                pending.dispatch = Some(PacketDispatch {
+                    result,
+                    cancellation,
+                    expected_hash,
+                    payload_len,
+                    rejecting,
+                    reply: resolution.reply,
+                    ready: None,
+                });
+                waiting.push(pending);
+            } else {
+                pending.finish(LinkPacketReceiptOutcome::Unavailable);
+                if let Some(reply) = resolution.reply {
+                    let _ = reply.send(LinkPacketReceiptOutcome::Unavailable);
+                }
+                if rejecting {
+                    close.push((pending.link_id, false));
+                }
+            }
+        }
+        self.pending_inbound_packets = waiting;
+        for (link_id, teardown) in close {
+            self.close_active_link(link_id, CloseReason::DestinationClosed, teardown);
+        }
+        progressed
     }
 
     fn poll_packet_dispatches(&mut self) -> bool {
@@ -1030,7 +1393,7 @@ impl LinkManager {
     }
 
     fn poll_link_endpoints(&mut self) -> bool {
-        let mut progressed = self.poll_packet_dispatches();
+        let mut progressed = self.poll_inbound_packet_receipts() | self.poll_packet_dispatches();
         let mut completed_binds = Vec::new();
         let link_ids: Vec<_> = self.pending_endpoint_binds.keys().copied().collect();
         for link_id in link_ids {
@@ -1527,16 +1890,23 @@ impl LinkManager {
             DestinationEvent::LinkRequest {
                 raw,
                 interface_id,
+                interface_owner,
                 metrics,
             } => {
-                self.handle_link_request_with_metrics(&raw, interface_id, metrics);
+                self.handle_link_request_with_metrics(&raw, interface_id, interface_owner, metrics);
             }
             DestinationEvent::InboundPacket {
                 raw,
                 interface_id,
+                interface_owner,
                 metrics,
             } => {
-                self.handle_inbound_packet_with_metrics(&raw, interface_id, metrics);
+                self.handle_inbound_packet_with_metrics(
+                    &raw,
+                    interface_id,
+                    interface_owner,
+                    metrics,
+                );
             }
             DestinationEvent::LinkEstablished { link_id } => {
                 if let Some(ref tx) = self.link_established_tx {
@@ -2060,13 +2430,14 @@ impl LinkManager {
 
     #[cfg(test)]
     fn handle_link_request(&mut self, raw: &[u8], interface_id: u64) {
-        self.handle_link_request_with_metrics(raw, interface_id, Default::default());
+        self.handle_link_request_with_metrics(raw, interface_id, None, Default::default());
     }
 
     fn handle_link_request_with_metrics(
         &mut self,
         raw: &[u8],
         interface_id: u64,
+        interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
         metrics: rns_transport::link_messages::PacketMetrics,
     ) {
         let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(raw) {
@@ -2197,6 +2568,7 @@ impl LinkManager {
             ActiveLink {
                 link,
                 _interface_id: interface_id,
+                interface_owner,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -2216,6 +2588,7 @@ impl LinkManager {
         let binding = LinkEndpointBinding {
             link_id,
             interface_id,
+            interface_owner,
             role: LinkEndpointRole::Responder,
         };
         let bind_result_rx = if let Some(handle) = &self.endpoint_dispatch {
@@ -2249,6 +2622,7 @@ impl LinkManager {
                     link_id,
                     destination_hash: self.destination_hash,
                     interface_id,
+                    interface_owner,
                     next_hop: None,
                     remaining_hops: 0,
                     initiator: false,
@@ -2273,13 +2647,14 @@ impl LinkManager {
 
     #[cfg(test)]
     fn handle_inbound_packet(&mut self, raw: &[u8], interface_id: u64) {
-        self.handle_inbound_packet_with_metrics(raw, interface_id, Default::default());
+        self.handle_inbound_packet_with_metrics(raw, interface_id, None, Default::default());
     }
 
     fn handle_inbound_packet_with_metrics(
         &mut self,
         raw: &[u8],
         interface_id: u64,
+        interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
         metrics: rns_transport::link_messages::PacketMetrics,
     ) {
         let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(raw) {
@@ -2314,14 +2689,14 @@ impl LinkManager {
             return;
         }
 
-        let Some(attached_interface) = self
+        let Some((attached_interface, expected_owner)) = self
             .active_links
             .get(&link_id)
-            .map(|active| active._interface_id)
+            .map(|active| (active._interface_id, active.interface_owner))
         else {
             return;
         };
-        if interface_id != attached_interface {
+        if interface_id != attached_interface || interface_owner != expected_owner {
             tracing::warn!(
                 link_id = %hex::encode(link_id),
                 interface_id,
@@ -2353,6 +2728,15 @@ impl LinkManager {
             )
         {
             self.handle_link_packet_proof(link_id, data);
+            return;
+        }
+
+        // Only the existing Resource proof owner accepts PROOF here. Unknown
+        // packet types cannot enter DATA control or application handlers.
+        if header.flags.packet_type != rns_wire::flags::PacketType::Data
+            && !(header.flags.packet_type == rns_wire::flags::PacketType::Proof
+                && header.context == rns_wire::context::PacketContext::ResourcePrf)
+        {
             return;
         }
 
@@ -3674,66 +4058,12 @@ impl LinkManager {
                     }
                 }
             }
-            _ => {
-                // Application data on a link (LXMF DIRECT).
-                let identity_backend = self.identity.clone();
-                if let Some(active) = self.active_links.get_mut(&link_id) {
-                    active.link.record_inbound();
-                    active.link.record_rx(data.len());
-                    if let Ok(plaintext) = active.link.decrypt(data) {
-                        // Link proofs are unencrypted (Packet.py:198-200).
-                        let pkt_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
-                        let proof = Self::prove_received_link_packet(
-                            active,
-                            &pkt_hash,
-                            identity_backend.as_ref(),
-                        );
-                        match proof {
-                            Ok(proof_data) => {
-                                if Self::send_link_packet_proof(
-                                    &self.transport_tx,
-                                    &mut self.pending_link_control,
-                                    &mut self.pending_endpoint_sends,
-                                    &link_id,
-                                    active.link.role(),
-                                    &proof_data,
-                                    rns_wire::context::PacketContext::LinkProof,
-                                ) {
-                                    // Proofs to a link count into txbytes (Link.py:388, Packet.py:291).
-                                    active.link.record_tx(proof_data.len());
-                                    tracing::info!(
-                                        link_id = hex::encode(link_id),
-                                        proof_len = proof_data.len(),
-                                        "delivery proof queued for link data packet (unencrypted)"
-                                    );
-                                    if let Some(ref cb) = active.link.packet_callback {
-                                        cb(&plaintext);
-                                    }
-                                    if let Some(ref tx) = self.link_packet_tx {
-                                        let _ = tx.send((plaintext, link_id));
-                                    }
-                                    tracing::debug!(
-                                        link_id = hex::encode(link_id),
-                                        "link data packet decrypted, proved, and forwarded"
-                                    );
-                                } else {
-                                    tracing::error!(
-                                        link_id = hex::encode(link_id),
-                                        proof_len = proof_data.len(),
-                                        "delivery proof could not be retained"
-                                    );
-                                }
-                            }
-                            Err(_) => {
-                                tracing::warn!(
-                                    link_id = hex::encode(link_id),
-                                    "could not sign delivery proof for link data packet"
-                                );
-                            }
-                        }
-                    }
-                }
+            rns_wire::context::PacketContext::None
+                if header.flags.packet_type == rns_wire::flags::PacketType::Data =>
+            {
+                self.handle_ordinary_link_packet(link_id, raw, &header, data);
             }
+            _ => {}
         }
 
         if let Some(payload) = completed_request_resource {
@@ -4054,6 +4384,19 @@ impl LinkManager {
         let Some(mut active) = self.active_links.remove(&link_id) else {
             return false;
         };
+        if let Some(epoch) = self.inbound_packet_epochs.remove(&link_id) {
+            epoch
+                .alive
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        self.rejecting_packet_links.remove(&link_id);
+        for pending in &mut self.pending_inbound_packets {
+            if pending.link_id == link_id {
+                pending.finish(LinkPacketReceiptOutcome::Closed);
+            }
+        }
+        self.pending_inbound_packets
+            .retain(|pending| pending.link_id != link_id);
         self.active_endpoint_generations.remove(&link_id);
         self.endpoint_dispatch_tokens.remove(&link_id);
         self.pending_packet_dispatches
@@ -4334,6 +4677,16 @@ impl LinkManager {
                 return false;
             }
         };
+        if let Err(error) = rns_protocol::resource_control::check_control_frame(
+            context,
+            payload.len(),
+            encrypted,
+            rns_wire::constants::HEADER_MINSIZE,
+            active.link.mtu as usize,
+        ) {
+            tracing::warn!(?error, "Resource control emission refused");
+            return false;
+        }
         let body = if encrypted {
             let Ok(body) = active.link.encrypt(&payload) else {
                 return false;
@@ -5181,12 +5534,61 @@ impl LinkManager {
         self.link_identity_gate = Some(Box::new(gate));
     }
 
-    /// Install the decrypted link-packet stream.
-    ///
-    /// Unbounded and lossless: inbound link data is proved to the peer on
-    /// receipt, so the receiver must be drained for the manager's lifetime.
-    pub fn set_link_packet_channel(&mut self, tx: mpsc::UnboundedSender<(Vec<u8>, [u8; 16])>) {
+    /// Legacy stream for ProveNone/ProveAll callers. Application-controlled
+    /// receipts require `set_inbound_link_packet_channel` instead.
+    pub fn set_link_packet_channel(
+        &mut self,
+        tx: mpsc::UnboundedSender<(Vec<u8>, [u8; 16])>,
+    ) -> Result<(), LinkPacketConfigurationError> {
+        if self.ordinary_packet_proof_strategy() == ProofStrategy::ProveApp {
+            return Err(LinkPacketConfigurationError::LegacyChannel);
+        }
         self.link_packet_tx = Some(tx);
+        Ok(())
+    }
+
+    pub fn set_inbound_link_packet_channel(
+        &mut self,
+        tx: mpsc::Sender<InboundLinkPacket>,
+    ) -> Result<(), LinkPacketConfigurationError> {
+        if self.link_packet_tx.is_some() {
+            return Err(LinkPacketConfigurationError::LegacyChannel);
+        }
+        self.inbound_link_packet_tx = Some(tx);
+        Ok(())
+    }
+
+    pub fn set_ordinary_packet_proof_strategy(
+        &mut self,
+        strategy: ProofStrategy,
+    ) -> Result<(), LinkPacketConfigurationError> {
+        if strategy == ProofStrategy::ProveApp {
+            if self.endpoint_dispatch.is_none() {
+                return Err(LinkPacketConfigurationError::ExactDispatchRequired);
+            }
+            if self.link_packet_tx.is_some() {
+                return Err(LinkPacketConfigurationError::LegacyChannel);
+            }
+            if self.inbound_link_packet_tx.is_none() {
+                return Err(LinkPacketConfigurationError::TypedChannelRequired);
+            }
+        }
+        self.ordinary_packet_strategy = Some(strategy);
+        Ok(())
+    }
+
+    pub fn ordinary_packet_proof_strategy(&self) -> ProofStrategy {
+        self.ordinary_packet_strategy.unwrap_or_else(|| {
+            self.destination
+                .as_ref()
+                .map(|d| d.proof_strategy)
+                .unwrap_or(ProofStrategy::ProveNone)
+        })
+    }
+
+    /// Aggregate count of newly dropped packets at application receipt limits.
+    pub fn ordinary_packet_overload_count(&self) -> u64 {
+        self.inbound_packet_overloads
     }
 
     pub fn set_link_packet_proof_channel(&mut self, tx: mpsc::Sender<LinkPacketProof>) {
@@ -5940,6 +6342,17 @@ impl LinkManager {
             rns_link::encryption::link_encrypt(&session_keys, plaintext)
                 .unwrap_or_else(|_| plaintext.to_vec())
         };
+        if let Err(error) = rns_protocol::resource_control::preflight_outbound(
+            data.len(),
+            metadata.as_ref().map(Vec::len),
+            request_id.as_deref(),
+            is_response,
+            true,
+            active.link.mtu as usize,
+        ) {
+            tracing::warn!(?error, "Resource control preflight refused transfer");
+            return None;
+        }
         let metadata_wire_size = metadata.as_ref().map(|m| 3 + m.len()).unwrap_or(0);
         let resources = if metadata_wire_size + data.len() <= MAX_EFFICIENT_SIZE {
             let mut resource = if metadata.is_some() {
@@ -6026,6 +6439,14 @@ impl LinkManager {
         };
 
         let resource_hash = transfer.resource.resource_hash;
+        rns_protocol::resource_control::check_control_frame(
+            rns_wire::context::PacketContext::ResourceAdv,
+            adv_data.len(),
+            true,
+            rns_wire::constants::HEADER_MINSIZE,
+            active.link.mtu as usize,
+        )
+        .ok()?;
         let encrypted = active.link.encrypt(&adv_data).ok()?;
         let adv_header = rns_wire::header::PacketHeader {
             flags: rns_wire::flags::PacketFlags {
@@ -6383,6 +6804,7 @@ mod tests {
             ActiveLink {
                 link: responder,
                 _interface_id: 7,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -6457,6 +6879,7 @@ mod tests {
             ActiveLink {
                 link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -6542,6 +6965,7 @@ mod tests {
             ActiveLink {
                 link: responder,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -6595,6 +7019,7 @@ mod tests {
             ActiveLink {
                 link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -6746,6 +7171,7 @@ mod tests {
         manager.handle_link_request_with_metrics(
             &link_request_raw(destination_hash, &request_data),
             7,
+            None,
             rns_transport::link_messages::PacketMetrics {
                 rssi: Some(-91.0),
                 snr: Some(4.0),
@@ -6778,6 +7204,7 @@ mod tests {
         manager.handle_inbound_packet_with_metrics(
             &raw,
             7,
+            None,
             rns_transport::link_messages::PacketMetrics {
                 rssi: Some(-73.0),
                 snr: Some(9.0),
@@ -7215,6 +7642,7 @@ mod tests {
             ActiveLink {
                 link: responder,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -7271,6 +7699,7 @@ mod tests {
             ActiveLink {
                 link: responder,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -7335,6 +7764,7 @@ mod tests {
                 ActiveLink {
                     link: responder,
                     _interface_id: 1,
+                    interface_owner: None,
                     channel: None,
                     inbound_resources: HashMap::new(),
                     outbound_resources: HashMap::new(),
@@ -7378,6 +7808,49 @@ mod tests {
     }
 
     #[test]
+    fn late_resource_control_failure_concludes_once_without_closing_sibling_link_work() {
+        let (_peer, link) = handshaken_link_pair();
+        let id = link.link_id;
+        let (transport, mut outgoing) = mpsc::channel(64);
+        let (_events, receiver) = mpsc::channel(8);
+        let mut manager = LinkManager::new(transport, receiver, [9; 16], None);
+        manager
+            .active_links
+            .insert(id, active_link_entry_at(link, 1));
+        let (accounting, mut receipts) = mpsc::unbounded_channel();
+        manager.set_accounting_event_channel(accounting);
+        let failed = manager
+            .start_resource_transfer(&id, b"late-invalid-advertisement".to_vec(), false)
+            .unwrap();
+        let sibling = manager
+            .start_resource_transfer(&id, b"unaffected-sibling".to_vec(), false)
+            .unwrap();
+        while receipts.try_recv().is_ok() {}
+        while next_transport_message(&mut outgoing).is_ok() {}
+        let active = manager.active_links.get_mut(&id).unwrap();
+        let transfer = active.outbound_resources.get_mut(&failed).unwrap();
+        transfer.resource.request_id = Some(vec![0; 500]);
+        transfer.started_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        active.outbound_split_queues.insert(failed, VecDeque::new());
+        manager.on_tick();
+        let active = &manager.active_links[&id];
+        assert_eq!(active.link.state, LinkState::Active);
+        assert!(!active.outbound_resources.contains_key(&failed));
+        assert!(!active.outbound_split_queues.contains_key(&failed));
+        assert!(active.outbound_resources.contains_key(&sibling));
+        assert!(
+            matches!(receipts.try_recv().unwrap(), LinkManagerAccountingEvent::ResourceEvent(LinkResourceEvent::Concluded {resource_id, conclusion:LinkResourceConclusion::Failed(_), ..}) if resource_id == failed)
+        );
+        assert!(receipts.try_recv().is_err());
+        manager.on_tick();
+        assert!(receipts.try_recv().is_err());
+        assert!(
+            next_transport_message(&mut outgoing).is_err(),
+            "oversized advertisement must never be emitted"
+        );
+    }
+
+    #[test]
     fn request_resource_transfer_can_start_before_responder_lrrtt_activation() {
         let dest_hash = [0x36; 16];
         let identity_key = Ed25519PrivateKey::generate();
@@ -7396,6 +7869,7 @@ mod tests {
             ActiveLink {
                 link: responder,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -7470,6 +7944,7 @@ mod tests {
             ActiveLink {
                 link: responder,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -7614,6 +8089,7 @@ mod tests {
         ActiveLink {
             link,
             _interface_id: interface_id,
+            interface_owner: None,
             channel: None,
             inbound_resources: HashMap::new(),
             outbound_resources: HashMap::new(),
@@ -7635,6 +8111,7 @@ mod tests {
             ResponderEndpointOwnership {
                 binding: LinkEndpointBinding {
                     link_id,
+                    interface_owner: active.interface_owner,
                     interface_id: active._interface_id,
                     role: LinkManager::endpoint_role(active.link.role()),
                 },
@@ -7895,18 +8372,17 @@ mod tests {
         let (actor, transport_tx) = rns_transport::actor::TransportActor::new();
         let actor_task = tokio::spawn(actor.run());
         let (interface_tx, mut interface_rx) = mpsc::channel(8);
+        let entry = rns_transport::messages::InterfaceEntry::new(
+            "existing-link-owner".into(),
+            rns_transport::constants::InterfaceMode::Gateway,
+            rns_transport::constants::InterfaceDirection::bidirectional(),
+            115_200,
+            500,
+            interface_tx,
+        );
+        let interface_owner = entry.owner.id();
         transport_tx
-            .send(TransportMessage::RegisterInterface {
-                id: 17,
-                entry: rns_transport::messages::InterfaceEntry::new(
-                    "existing-link-owner".into(),
-                    rns_transport::constants::InterfaceMode::Gateway,
-                    rns_transport::constants::InterfaceDirection::bidirectional(),
-                    115_200,
-                    500,
-                    interface_tx,
-                ),
-            })
+            .send(TransportMessage::RegisterInterface { id: 17, entry })
             .await
             .unwrap();
 
@@ -7923,6 +8399,7 @@ mod tests {
             .send(TransportMessage::BindLinkEndpoint {
                 binding: LinkEndpointBinding {
                     link_id,
+                    interface_owner: Some(interface_owner),
                     interface_id: 17,
                     role: LinkEndpointRole::Responder,
                 },
@@ -7941,7 +8418,12 @@ mod tests {
             "endpoint.actor-conflict",
             identity.get_signing_key(),
         );
-        manager.handle_link_request(&link_request_raw(destination_hash, &request_data), 17);
+        manager.handle_link_request_with_metrics(
+            &link_request_raw(destination_hash, &request_data),
+            17,
+            Some(interface_owner),
+            Default::default(),
+        );
         for _ in 0..100 {
             manager.poll_link_endpoints();
             if manager.pending_endpoint_binds.is_empty() {
@@ -8055,6 +8537,7 @@ mod tests {
             .send(LinkEndpointLifecycleEvent {
                 binding: LinkEndpointBinding {
                     link_id,
+                    interface_owner: None,
                     interface_id: 23,
                     role,
                 },
@@ -8088,7 +8571,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(8);
         let mut manager = LinkManager::new(transport_tx, event_rx, [0x77; 16], None);
         let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
-        manager.set_link_packet_channel(packet_tx);
+        manager.set_link_packet_channel(packet_tx).unwrap();
         manager
             .active_links
             .insert(link_id, active_link_entry_at(responder, 7));
@@ -8122,6 +8605,7 @@ mod tests {
         manager.handle_endpoint_terminal(LinkEndpointLifecycleEvent {
             binding: LinkEndpointBinding {
                 link_id,
+                interface_owner: None,
                 interface_id: 9,
                 role: LinkEndpointRole::Responder,
             },
@@ -8662,6 +9146,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -8783,6 +9268,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -8971,6 +9457,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: Some(receiver_channel),
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9068,6 +9555,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: Some(receiver_channel),
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9159,6 +9647,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: Some(receiver_channel),
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9193,6 +9682,7 @@ mod tests {
             ActiveLink {
                 link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9304,6 +9794,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9313,6 +9804,8 @@ mod tests {
             },
         );
 
+        lm.set_ordinary_packet_proof_strategy(ProofStrategy::ProveAll)
+            .unwrap();
         lm.handle_inbound_packet(&raw, 1);
 
         let outbound = next_transport_message(&mut transport_rx)
@@ -9372,12 +9865,13 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(4);
         let mut manager = LinkManager::new(transport_tx, event_rx, dest_hash, Some(identity_key));
         let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
-        manager.set_link_packet_channel(packet_tx);
+        manager.set_link_packet_channel(packet_tx).unwrap();
         manager.active_links.insert(
             link_id,
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9387,6 +9881,9 @@ mod tests {
             },
         );
 
+        manager
+            .set_ordinary_packet_proof_strategy(ProofStrategy::ProveAll)
+            .unwrap();
         manager.handle_inbound_packet(&raw, 1);
 
         let TransportMessage::Outbound(proof_request) =
@@ -9439,12 +9936,13 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(1);
         let mut lm = LinkManager::new(transport_tx, event_rx, [0xBB; 16], Some(identity_key));
         let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
-        lm.set_link_packet_channel(packet_tx);
+        lm.set_link_packet_channel(packet_tx).unwrap();
         lm.active_links.insert(
             link_id,
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9454,6 +9952,8 @@ mod tests {
             },
         );
 
+        lm.set_ordinary_packet_proof_strategy(ProofStrategy::ProveAll)
+            .unwrap();
         lm.handle_inbound_packet(&raw, 1);
 
         let (plaintext, delivered_link) = packet_rx.try_recv().expect("link data delivered");
@@ -9502,6 +10002,7 @@ mod tests {
         let mut active = ActiveLink {
             link: responder,
             _interface_id: 1,
+            interface_owner: None,
             channel: None,
             inbound_resources: HashMap::new(),
             outbound_resources: HashMap::new(),
@@ -9627,6 +10128,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9693,6 +10195,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: Some(rns_protocol::channel::LinkChannel::new_encrypted(
                     link_id,
                     0.0,
@@ -9734,6 +10237,7 @@ mod tests {
             ActiveLink {
                 link: sender_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9805,6 +10309,7 @@ mod tests {
             ActiveLink {
                 link: responder_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9918,14 +10423,15 @@ mod tests {
                 driver_tx,
             ),
         );
+        let interface_owner = actor.interfaces.get(&7).unwrap().owner.id();
         let dispatch = actor.link_endpoint_dispatch_handle();
         let actor_task = tokio::spawn(actor.run());
         let (_, event_rx) = mpsc::channel(16);
         let mut manager = LinkManager::new(transport_tx.clone(), event_rx, [0xCA; 16], None);
         manager.set_link_endpoint_dispatch_handle(dispatch.clone());
-        manager
-            .active_links
-            .insert(link_id, active_link_entry_at(responder, 7));
+        let mut active = active_link_entry_at(responder, 7);
+        active.interface_owner = Some(interface_owner);
+        manager.active_links.insert(link_id, active);
         own_test_endpoint(&mut manager, link_id);
         let token = dispatch
             .try_bind(
@@ -10069,6 +10575,7 @@ mod tests {
             ActiveLink {
                 link: local_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -10187,7 +10694,366 @@ mod tests {
     }
 
     #[test]
-    fn inbound_link_data_is_published_only_while_its_proof_is_retained() {
+    fn ordinary_none_and_unknown_contexts_preserve_delivery_policy() {
+        let (sender, receiver, key) = handshaken_link_pair_with_identity();
+        let id = receiver.link_id;
+        let (tx, mut transport) = mpsc::channel(16);
+        let (_, events) = mpsc::channel(16);
+        let mut manager = LinkManager::new(tx, events, [4; 16], Some(key));
+        manager
+            .active_links
+            .insert(id, active_link_entry_at(receiver, 1));
+        let (tx, mut packets) = mpsc::unbounded_channel();
+        manager.set_link_packet_channel(tx).unwrap();
+        let encrypted = sender.encrypt(b"ordinary").unwrap();
+        for context in [
+            rns_wire::context::PacketContext::Unknown(0x42),
+            rns_wire::context::PacketContext::Command,
+            rns_wire::context::PacketContext::CacheRequest,
+        ] {
+            manager.handle_inbound_packet(
+                &LinkManager::build_link_data_packet(id, context, &encrypted),
+                1,
+            );
+            assert!(packets.try_recv().is_err());
+            assert!(transport.try_recv().is_err());
+        }
+        manager.handle_inbound_packet(
+            &LinkManager::build_link_data_packet(
+                id,
+                rns_wire::context::PacketContext::None,
+                &encrypted,
+            ),
+            1,
+        );
+        assert_eq!(packets.try_recv().unwrap().0, b"ordinary");
+        assert!(transport.try_recv().is_err());
+        assert!(
+            manager
+                .set_ordinary_packet_proof_strategy(ProofStrategy::ProveApp)
+                .is_err()
+        );
+        assert_eq!(
+            manager.ordinary_packet_proof_strategy(),
+            ProofStrategy::ProveNone
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_responder_request_cannot_bind_reused_interface_id() {
+        use rns_transport::actor::TransportActor;
+        use rns_transport::constants::{InterfaceDirection, InterfaceMode};
+        use rns_transport::messages::{InterfaceEntry, InterfaceOwner};
+        let old_owner = InterfaceOwner::new();
+        let destination = [0x72; 16];
+        let key = Ed25519PrivateKey::generate();
+        let (initiator, request) = Link::new_initiator(destination, 1);
+        let id = initiator.link_id;
+        let (mut actor, tx) = TransportActor::new();
+        let (driver_tx, mut driver_rx) = mpsc::channel(8);
+        let replacement = InterfaceEntry::new(
+            "replacement".into(),
+            InterfaceMode::Full,
+            InterfaceDirection::bidirectional(),
+            1_000_000,
+            500,
+            driver_tx,
+        );
+        assert_ne!(old_owner.id(), replacement.owner.id());
+        actor.interfaces.insert(7, replacement);
+        let dispatch = actor.link_endpoint_dispatch_handle();
+        let actor_task = tokio::spawn(actor.run());
+        let (_events, events_rx) = mpsc::channel(8);
+        let mut manager = LinkManager::new(tx.clone(), events_rx, destination, Some(key));
+        manager.set_link_endpoint_dispatch_handle(dispatch);
+        manager.handle_event(DestinationEvent::LinkRequest {
+            raw: link_request_raw(destination, &request).into(),
+            interface_id: 7,
+            interface_owner: Some(old_owner.id()),
+            metrics: Default::default(),
+        });
+        assert_eq!(
+            manager.pending_endpoint_binds[&id]
+                .ownership
+                .binding
+                .interface_owner,
+            Some(old_owner.id())
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while manager.active_links.contains_key(&id) {
+                manager.try_step();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stale request must fail binding");
+        assert!(
+            driver_rx.try_recv().is_err(),
+            "old request must not publish proof through replacement"
+        );
+        tx.send(TransportMessage::Shutdown).await.unwrap();
+        actor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_application_receipt_waits_for_exact_driver_admission() {
+        ordinary_receipt_fixture(0).await;
+    }
+    #[tokio::test]
+    async fn ordinary_invalid_stamp_sends_msgpack_before_teardown() {
+        ordinary_receipt_fixture(1).await;
+    }
+    #[tokio::test]
+    async fn ordinary_closed_generation_cannot_admit_late_proof() {
+        ordinary_receipt_fixture(2).await;
+    }
+    #[tokio::test]
+    async fn ordinary_overflow_drops_new_packet_without_closing_admitted_work() {
+        ordinary_receipt_fixture(3).await;
+    }
+    #[tokio::test]
+    async fn ordinary_application_expiry_withholds_proof() {
+        ordinary_receipt_fixture(4).await;
+    }
+    #[tokio::test]
+    async fn ordinary_recreated_owner_cannot_reuse_receipt_generation() {
+        ordinary_receipt_fixture(5).await;
+    }
+    #[tokio::test]
+    async fn ordinary_manager_drop_resolves_worker_receipt_closed() {
+        ordinary_receipt_fixture(6).await;
+    }
+    #[tokio::test]
+    async fn ordinary_storage_failure_closes_without_proof_or_stamp_error() {
+        ordinary_receipt_fixture(7).await;
+    }
+    #[tokio::test]
+    async fn ordinary_stale_storage_failure_cannot_close_replacement() {
+        ordinary_receipt_fixture(8).await;
+    }
+
+    async fn ordinary_receipt_fixture(mode: u8) {
+        use rns_transport::actor::TransportActor;
+        use rns_transport::constants::{InterfaceDirection, InterfaceMode};
+        use rns_transport::messages::{InterfaceEntry, TimerTick};
+        use std::time::Duration;
+        let (sender, receiver, key) = handshaken_link_pair_with_identity();
+        let id = receiver.link_id;
+        let (mut actor, tx) = TransportActor::new();
+        let (driver_tx, mut driver_rx) = mpsc::channel(1);
+        driver_tx.try_send(Bytes::from_static(b"occupied")).unwrap();
+        actor.interfaces.insert(
+            7,
+            InterfaceEntry::new(
+                "receipt test".into(),
+                InterfaceMode::Full,
+                InterfaceDirection::bidirectional(),
+                1000000,
+                500,
+                driver_tx,
+            ),
+        );
+        let interface_owner = Some(actor.interfaces[&7].owner.id());
+        let dispatch = actor.link_endpoint_dispatch_handle();
+        let task = tokio::spawn(actor.run());
+        let (_events_tx, events_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::new(tx.clone(), events_rx, [6; 16], Some(key));
+        manager.set_link_endpoint_dispatch_handle(dispatch.clone());
+        manager
+            .active_links
+            .insert(id, active_link_entry_at(receiver, 7));
+        manager.active_links.get_mut(&id).unwrap().interface_owner = interface_owner;
+        own_test_endpoint(&mut manager, id);
+        let token = dispatch
+            .try_bind(
+                manager.owned_endpoint_bindings[&id].binding,
+                manager.endpoint_lifecycle_tx.clone(),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        manager.endpoint_dispatch_tokens.insert(id, token);
+        let (packet_tx, mut packet_rx) = mpsc::channel(256);
+        manager.set_inbound_link_packet_channel(packet_tx).unwrap();
+        manager
+            .set_ordinary_packet_proof_strategy(ProofStrategy::ProveApp)
+            .unwrap();
+        let raw = LinkManager::build_link_data_packet(
+            id,
+            rns_wire::context::PacketContext::None,
+            &sender.encrypt(b"deposit").unwrap(),
+        );
+        let expected = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+        if mode == 3 {
+            for _ in 0..65 {
+                manager.handle_inbound_packet_with_metrics(
+                    &raw,
+                    7,
+                    interface_owner,
+                    Default::default(),
+                );
+            }
+            assert_eq!(packet_rx.len(), 64);
+            assert_eq!(manager.ordinary_packet_overload_count(), 1);
+            assert!(manager.active_links.contains_key(&id));
+            assert_eq!(manager.pending_inbound_packets.len(), 64);
+            while let Ok(event) = packet_rx.try_recv() {
+                drop(event);
+            }
+            manager.poll_inbound_packet_receipts();
+            assert!(manager.pending_inbound_packets.is_empty());
+        } else {
+            manager.handle_inbound_packet_with_metrics(
+                &raw,
+                7,
+                interface_owner,
+                Default::default(),
+            );
+            let event = packet_rx.try_recv().unwrap();
+            assert_eq!(event.packet_hash(), expected);
+            let (bytes, receipt) = event.into_parts();
+            assert_eq!(bytes, b"deposit"[..]);
+            if mode >= 7 {
+                if mode == 8 {
+                    let generation = manager.pending_inbound_packets[0].epoch.generation;
+                    manager
+                        .inbound_packet_epochs
+                        .insert(id, PacketEpoch::new(generation));
+                }
+                let outcome = receipt.unwrap().close_without_proof();
+                manager.poll_inbound_packet_receipts();
+                assert_eq!(outcome.await.unwrap(), LinkPacketReceiptOutcome::Closed);
+                assert_eq!(manager.active_links.contains_key(&id), mode == 8);
+                assert_eq!(driver_rx.recv().await.unwrap(), b"occupied"[..]);
+                tx.send(TransportMessage::Tick(TimerTick {
+                    timestamp: unix_now(),
+                }))
+                .await
+                .unwrap();
+                if mode == 7 {
+                    let wire = tokio::time::timeout(Duration::from_secs(2), driver_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let (header, _) = rns_wire::header::PacketHeader::unpack(&wire).unwrap();
+                    assert_eq!(header.flags.packet_type, rns_wire::flags::PacketType::Data);
+                    assert_eq!(header.context, rns_wire::context::PacketContext::LinkClose);
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), driver_rx.recv())
+                        .await
+                        .is_err()
+                );
+                drop(bytes);
+                tx.send(TransportMessage::Shutdown).await.unwrap();
+                task.await.unwrap();
+                return;
+            }
+            if mode >= 4 {
+                if mode == 4 {
+                    manager.pending_inbound_packets[0].deadline =
+                        std::time::Instant::now() - Duration::from_secs(1);
+                } else if mode == 5 {
+                    let generation = manager.pending_inbound_packets[0].epoch.generation;
+                    manager
+                        .inbound_packet_epochs
+                        .insert(id, PacketEpoch::new(generation));
+                }
+                let outcome = receipt.unwrap().accept();
+                if mode == 6 {
+                    drop(manager);
+                } else {
+                    manager.poll_inbound_packet_receipts();
+                }
+                assert_eq!(
+                    outcome.await.unwrap(),
+                    if mode == 4 {
+                        LinkPacketReceiptOutcome::Expired
+                    } else {
+                        LinkPacketReceiptOutcome::Closed
+                    }
+                );
+                assert_eq!(driver_rx.recv().await.unwrap(), b"occupied"[..]);
+                assert!(driver_rx.try_recv().is_err());
+                drop(bytes);
+                tx.send(TransportMessage::Shutdown).await.unwrap();
+                task.await.unwrap();
+                return;
+            }
+            let mut outcome = if mode == 1 {
+                receipt
+                    .unwrap()
+                    .reject_and_close(LinkPacketRejection::InvalidPropagationStamp)
+            } else {
+                receipt.unwrap().accept()
+            };
+            // step must wake on the one-shot decision even when ingress is idle.
+            tokio::time::timeout(Duration::from_secs(1), manager.step())
+                .await
+                .unwrap();
+            assert!(outcome.try_recv().is_err());
+            if mode == 2 {
+                manager.close_active_link(id, CloseReason::DestinationClosed, false);
+                assert_eq!(
+                    (&mut outcome).await.unwrap(),
+                    LinkPacketReceiptOutcome::Closed
+                );
+            }
+            assert_eq!(driver_rx.recv().await.unwrap(), b"occupied"[..]);
+            tx.send(TransportMessage::Tick(TimerTick {
+                timestamp: unix_now(),
+            }))
+            .await
+            .unwrap();
+            if mode == 2 {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), driver_rx.recv())
+                        .await
+                        .is_err()
+                );
+            } else {
+                let wire = tokio::time::timeout(Duration::from_secs(2), driver_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let (header, offset) = rns_wire::header::PacketHeader::unpack(&wire).unwrap();
+                if mode == 1 {
+                    assert_eq!(header.flags.packet_type, rns_wire::flags::PacketType::Data);
+                    assert_eq!(sender.decrypt(&wire[offset..]).unwrap(), [0x91, 0xcc, 0xf5]);
+                    assert!(manager.active_links.contains_key(&id));
+                } else {
+                    assert!(sender.validate_packet_proof(&expected, &wire[offset..]));
+                }
+                tokio::time::timeout(Duration::from_secs(1), manager.step())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    (&mut outcome).await.unwrap(),
+                    LinkPacketReceiptOutcome::Sent
+                );
+                if mode == 1 {
+                    assert!(!manager.active_links.contains_key(&id));
+                    let wire = tokio::time::timeout(Duration::from_secs(2), driver_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        rns_wire::header::PacketHeader::unpack(&wire)
+                            .unwrap()
+                            .0
+                            .context,
+                        rns_wire::context::PacketContext::LinkClose
+                    );
+                }
+            }
+        }
+        tx.send(TransportMessage::Shutdown).await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn inbound_link_data_delivery_is_independent_of_proof_capacity() {
         let (initiator_link, responder_link, identity_key) = handshaken_link_pair_with_identity();
         let link_id = responder_link.link_id;
 
@@ -10195,12 +11061,13 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(16);
         let mut lm = LinkManager::new(transport_tx, event_rx, [0xC4; 16], Some(identity_key));
         let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
-        lm.set_link_packet_channel(packet_tx);
+        lm.set_link_packet_channel(packet_tx).unwrap();
         lm.active_links.insert(
             link_id,
             ActiveLink {
                 link: responder_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -10225,16 +11092,16 @@ mod tests {
         };
 
         // Burst beyond transport ingress plus retained Link-control capacity.
-        // Once a proof can no longer be retained, its plaintext must not be
-        // published locally as though sender confirmation were still possible.
+        // Application ownership remains independent of proof queue availability.
+        lm.set_ordinary_packet_proof_strategy(ProofStrategy::ProveAll)
+            .unwrap();
         for i in 0..300u16 {
             let mut raw = header.pack();
             raw.extend_from_slice(&initiator_link.encrypt(&i.to_be_bytes()).unwrap());
             lm.handle_inbound_packet(&raw, 1);
         }
 
-        let retained = 8 + MAX_PENDING_LINK_CONTROL;
-        for i in 0..retained as u16 {
+        for i in 0..300u16 {
             let (payload, from) = packet_rx.try_recv().expect("lossless link data delivery");
             assert_eq!(from, link_id);
             assert_eq!(payload, i.to_be_bytes());
@@ -10257,6 +11124,7 @@ mod tests {
             ActiveLink {
                 link: responder_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -10301,6 +11169,7 @@ mod tests {
             ActiveLink {
                 link: responder_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -10389,6 +11258,7 @@ mod tests {
             ActiveLink {
                 link: local_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -10468,6 +11338,7 @@ mod tests {
             ActiveLink {
                 link: local_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources,
@@ -10536,6 +11407,7 @@ mod tests {
             ActiveLink {
                 link: local_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources,
                 outbound_resources: HashMap::new(),
@@ -10582,6 +11454,7 @@ mod tests {
             ActiveLink {
                 link: sender_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -10659,6 +11532,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -10858,6 +11732,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -10939,6 +11814,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11030,6 +11906,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11091,6 +11968,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11292,6 +12170,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11362,6 +12241,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11466,6 +12346,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11620,6 +12501,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11698,6 +12580,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11904,6 +12787,7 @@ mod tests {
             ActiveLink {
                 link: local_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::from([(resource_id, transfer)]),
                 outbound_resources: HashMap::new(),
@@ -12042,6 +12926,7 @@ mod tests {
             ActiveLink {
                 link: receiver_link,
                 _interface_id: 1,
+                interface_owner: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),

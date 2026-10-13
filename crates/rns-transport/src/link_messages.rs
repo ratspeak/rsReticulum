@@ -38,11 +38,13 @@ impl AnnounceRequest {
 #[derive(Debug)]
 pub enum DestinationEvent {
     InboundPacket {
+        interface_owner: Option<crate::InterfaceOwnerId>,
         raw: Bytes,
         interface_id: InterfaceId,
         metrics: PacketMetrics,
     },
     LinkRequest {
+        interface_owner: Option<crate::InterfaceOwnerId>,
         raw: Bytes,
         interface_id: InterfaceId,
         metrics: PacketMetrics,
@@ -83,6 +85,7 @@ mod tests {
     #[test]
     fn test_destination_event_variants() {
         let evt1 = DestinationEvent::InboundPacket {
+            interface_owner: None,
             raw: Bytes::from_static(&[1, 2, 3]),
             interface_id: 42,
             metrics: PacketMetrics::default(),
@@ -90,6 +93,7 @@ mod tests {
         assert!(matches!(evt1, DestinationEvent::InboundPacket { .. }));
 
         let evt2 = DestinationEvent::LinkRequest {
+            interface_owner: None,
             raw: Bytes::from_static(&[4, 5, 6]),
             interface_id: 99,
             metrics: PacketMetrics::default(),
@@ -155,4 +159,34 @@ mod tests {
         assert_eq!(req.link_id, [0xAA; 16]);
         assert_eq!(req.data.len(), 5);
     }
+}
+
+/// Result of one locally owned Link request's actual transport admission.
+/// The oneshot reply belongs to that attempt, independently of Link ID reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LinkRequestDispatchError {
+    #[error(transparent)]
+    Capacity(#[from] crate::InterfaceCapacityError),
+    #[error("invalid local Link request or unsupported endpoint signalling")]
+    InvalidRequest,
+    #[error("no eligible interface accepted the Link request")]
+    NoInterface,
+    #[error("transport is unavailable")]
+    TransportUnavailable,
+}
+
+/// Dispatch one Link request and await this exact attempt's admission result.
+/// Wrap this future in the caller's existing establishment deadline.
+pub async fn dispatch_link_request(
+    transport: &tokio::sync::mpsc::Sender<crate::messages::TransportMessage>,
+    request: crate::messages::OutboundRequest,
+) -> Result<(), LinkRequestDispatchError> {
+    let (result_tx, result_rx) = oneshot::channel();
+    transport
+        .send(crate::messages::TransportMessage::SendLinkRequest { request, result_tx })
+        .await
+        .map_err(|_| LinkRequestDispatchError::TransportUnavailable)?;
+    result_rx
+        .await
+        .map_err(|_| LinkRequestDispatchError::TransportUnavailable)?
 }

@@ -1,5 +1,6 @@
 //! USB serial RNode over Android USB-C OTG via JNI to `UsbManager`. 115200 8N1.
 
+use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1597,6 +1598,8 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
     transport_tx: mpsc::Sender<TransportMessage>,
     options: RNodeStartupOptions,
 ) -> Result<SpawnedRNodeInterface, RNodeSpawnError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     config.validate_device_selector()?;
     config.validate().map_err(|error| {
         InterfaceError::SendFailed(format!("rnode config {}: {error}", error.field()))
@@ -2003,6 +2006,8 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
     );
     let interface = InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(500, 508, false),
         parent_id: None,
         name,
         mode: config.mode,

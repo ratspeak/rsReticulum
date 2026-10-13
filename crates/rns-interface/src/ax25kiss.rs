@@ -1,6 +1,8 @@
 //! AX.25-over-KISS — prepends a UI header (src/dst call+SSID) and strips on RX.
 
 #[cfg(feature = "serial")]
+use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
+#[cfg(feature = "serial")]
 use std::sync::Arc;
 #[cfg(feature = "serial")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -232,6 +234,8 @@ pub async fn spawn_ax25kiss_interface(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     config.validate().map_err(|e| {
         crate::traits::InterfaceError::SendFailed(format!("ax25kiss config: {}", e))
     })?;
@@ -406,6 +410,8 @@ pub async fn spawn_ax25kiss_interface(
 
     Ok(InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(500, 564, false),
         parent_id: None,
         name,
         mode,

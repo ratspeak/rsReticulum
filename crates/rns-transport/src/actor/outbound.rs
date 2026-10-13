@@ -14,6 +14,70 @@ macro_rules! pr_log {
 }
 
 impl TransportActor {
+    pub(super) fn dispatch_link_request_checked(
+        &mut self,
+        request: crate::messages::OutboundRequest,
+    ) -> Result<(), crate::link_messages::LinkRequestDispatchError> {
+        use crate::link_messages::LinkRequestDispatchError;
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&request.raw)
+            .map_err(|_| LinkRequestDispatchError::InvalidRequest)?;
+        if header.destination_hash != request.destination_hash
+            || header.flags.packet_type != rns_wire::flags::PacketType::LinkRequest
+            || header.flags.destination_type != rns_wire::flags::DestinationType::Single
+            || !rns_wire::link_signalling::parse_request_signalling(&request.raw[offset..])
+                .is_ok_and(|signal| {
+                    signal.mode == rns_wire::link_signalling::DEFAULT_LINK_MODE
+                        && signal.mtu.get() <= 500
+                })
+        {
+            return Err(LinkRequestDispatchError::InvalidRequest);
+        }
+        if !self.local_destinations.contains(&request.destination_hash) {
+            if let Some(path) = self.path_table.get_live(&request.destination_hash) {
+                let entry = self
+                    .interfaces
+                    .get(&path.interface_id)
+                    .ok_or(LinkRequestDispatchError::NoInterface)?;
+                entry
+                    .packet_capacity
+                    .link_ceiling(path.interface_id, entry.active_ifac_bytes())?;
+            } else {
+                let mut first_error = None;
+                let mut eligible = false;
+                for (id, entry) in &self.interfaces {
+                    if !entry.direction.outbound
+                        || !entry.owner.is_current()
+                        || entry.tx.is_closed()
+                    {
+                        continue;
+                    }
+                    match entry
+                        .packet_capacity
+                        .link_ceiling(*id, entry.active_ifac_bytes())
+                    {
+                        Ok(_) => eligible = true,
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
+                if !eligible {
+                    return Err(first_error
+                        .map(LinkRequestDispatchError::Capacity)
+                        .unwrap_or(LinkRequestDispatchError::NoInterface));
+                }
+            }
+        }
+        let attempt = self.local_link_attempt(&request);
+        let sent = self.on_outbound_with_receipt_policy(request, false);
+        self.record_local_link_attempt(attempt, sent);
+        if sent {
+            Ok(())
+        } else {
+            Err(LinkRequestDispatchError::NoInterface)
+        }
+    }
+
     pub(super) fn on_outbound(&mut self, request: crate::messages::OutboundRequest) {
         let _ = self.on_outbound_with_receipt_policy(request, true);
     }
@@ -29,6 +93,16 @@ impl TransportActor {
             Ok((header, _)) => header,
             Err(_) => return false,
         };
+
+        if parsed.flags.packet_type == rns_wire::flags::PacketType::LinkRequest
+            && !rns_wire::link_signalling::parse_request_signalling(&request.raw[parsed.size()..])
+                .is_ok_and(|signal| {
+                    signal.mode == rns_wire::link_signalling::DEFAULT_LINK_MODE
+                        && signal.mtu.get() <= 500
+                })
+        {
+            return false;
+        }
 
         // A Link can be initiated to another destination registered on this
         // same actor (for example, Ratspeak joining the RRC hub it hosts).
@@ -227,6 +301,31 @@ impl TransportActor {
         }
 
         if let Ok((parsed, _)) = rns_wire::header::PacketHeader::unpack(&request.raw) {
+            if parsed.flags.destination_type == rns_wire::flags::DestinationType::Link {
+                let current = self.interfaces.get(&interface_id).map(|entry| &entry.owner);
+                let table_owned =
+                    self.link_table
+                        .get(&parsed.destination_hash)
+                        .is_some_and(|entry| {
+                            entry.interface_id == interface_id
+                                && entry.interface_owner.as_ref().zip(current).is_some_and(
+                                    |(owned, current)| owned == current && current.is_current(),
+                                )
+                        });
+                let endpoint_owned = self.link_endpoints.values().any(|entry| {
+                    entry.binding.link_id == parsed.destination_hash
+                        && entry.binding.interface_id == interface_id
+                        && entry
+                            .binding
+                            .interface_owner
+                            .zip(current)
+                            .is_some_and(|(owned, current)| owned.matches(current))
+                });
+                if !table_owned && !endpoint_owned {
+                    return false;
+                }
+            }
+
             let pkt_hash = rns_wire::hash::packet_hash(&request.raw, parsed.flags.header_type);
             self.packet_hashlist.insert(pkt_hash);
             // Python's outbound applies should_apply_delta on attached-
@@ -274,6 +373,7 @@ impl TransportActor {
             );
             let delivered =
                 responder_tx.try_send(crate::link_messages::DestinationEvent::LinkRequest {
+                    interface_owner: None,
                     raw: request.raw.clone(),
                     interface_id: LOCAL_LINK_RESPONDER_INTERFACE,
                     metrics: PacketMetrics::default(),
@@ -306,6 +406,7 @@ impl TransportActor {
             route
                 .initiator_tx
                 .try_send(crate::link_messages::DestinationEvent::InboundPacket {
+                    interface_owner: None,
                     raw: request.raw.clone(),
                     interface_id: LOCAL_LINK_INITIATOR_INTERFACE,
                     metrics: PacketMetrics::default(),
@@ -344,6 +445,10 @@ impl TransportActor {
             _ => return None,
         };
         let delivered = target.try_send(crate::link_messages::DestinationEvent::InboundPacket {
+            interface_owner: self
+                .interfaces
+                .get(&target_interface)
+                .map(|entry| entry.owner.id()),
             raw: request.raw.clone(),
             interface_id: target_interface,
             metrics: PacketMetrics::default(),

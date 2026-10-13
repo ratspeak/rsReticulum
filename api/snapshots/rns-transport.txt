@@ -738,9 +738,15 @@ pub fn rns_transport::hashlist::PacketHashlist::new_with_capacity(usize) -> Self
 impl core::default::Default for rns_transport::hashlist::PacketHashlist
 pub fn rns_transport::hashlist::PacketHashlist::default() -> Self
 pub mod rns_transport::ifac
+pub enum rns_transport::ifac::IfacSignError
+pub rns_transport::ifac::IfacSignError::InvalidTagSize
+pub rns_transport::ifac::IfacSignError::PacketTooLarge
+pub rns_transport::ifac::IfacSignError::ShortPacket
+pub const rns_transport::ifac::MAX_IFAC_WIRE_BYTES: usize
 pub fn rns_transport::ifac::has_ifac_flag(&[u8]) -> bool
 pub fn rns_transport::ifac::ifac_sign(&[u8], &[u8; 64], usize) -> alloc::vec::Vec<u8>
 pub fn rns_transport::ifac::ifac_verify(&[u8], &[u8; 64], usize) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_transport::ifac::try_ifac_sign(&[u8], &[u8; 64], usize) -> core::result::Result<alloc::vec::Vec<u8>, rns_transport::ifac::IfacSignError>
 pub mod rns_transport::ingress
 pub struct rns_transport::ingress::HeldAnnounce
 pub rns_transport::ingress::HeldAnnounce::destination_hash: [u8; 16]
@@ -779,9 +785,12 @@ pub fn rns_transport::ingress::IngressController::should_egress_limit_pr(&mut se
 pub fn rns_transport::ingress::IngressController::should_ingress_limit(&mut self) -> bool
 pub fn rns_transport::ingress::IngressController::should_ingress_limit_pr(&mut self) -> bool
 pub fn rns_transport::ingress::IngressController::try_release_held(&mut self) -> core::option::Option<rns_transport::ingress::HeldAnnounce>
+pub fn rns_transport::ingress::IngressController::try_with_overrides(&rns_transport::ingress::IngressOverrides) -> core::result::Result<Self, rns_transport::ingress::IngressOverrideError>
 pub fn rns_transport::ingress::IngressController::with_overrides(&rns_transport::ingress::IngressOverrides) -> Self
 impl core::default::Default for rns_transport::ingress::IngressController
 pub fn rns_transport::ingress::IngressController::default() -> Self
+pub struct rns_transport::ingress::IngressOverrideError
+pub rns_transport::ingress::IngressOverrideError::field: &'static str
 pub struct rns_transport::ingress::IngressOverrides
 pub rns_transport::ingress::IngressOverrides::burst_freq: core::option::Option<f64>
 pub rns_transport::ingress::IngressOverrides::burst_freq_new: core::option::Option<f64>
@@ -797,6 +806,60 @@ pub rns_transport::ingress::IngressOverrides::pr_burst_freq: core::option::Optio
 pub rns_transport::ingress::IngressOverrides::pr_burst_freq_new: core::option::Option<f64>
 impl rns_transport::ingress::IngressOverrides
 pub fn rns_transport::ingress::IngressOverrides::is_empty(&self) -> bool
+pub fn rns_transport::ingress::IngressOverrides::validate(&self) -> core::result::Result<(), rns_transport::ingress::IngressOverrideError>
+pub mod rns_transport::interface_ownership
+pub enum rns_transport::interface_ownership::InterfaceCapacityError
+pub rns_transport::interface_ownership::InterfaceCapacityError::Empty
+pub rns_transport::interface_ownership::InterfaceCapacityError::IfacExceedsWire
+pub rns_transport::interface_ownership::InterfaceCapacityError::IfacExceedsWire::ifac_bytes: usize
+pub rns_transport::interface_ownership::InterfaceCapacityError::IfacExceedsWire::wire_bytes: u32
+pub rns_transport::interface_ownership::InterfaceCapacityError::InvalidIfac
+pub rns_transport::interface_ownership::InterfaceCapacityError::LinkCapacityUnavailable
+pub rns_transport::interface_ownership::InterfaceCapacityError::LinkCapacityUnavailable::clear_mtu: u32
+pub rns_transport::interface_ownership::InterfaceCapacityError::LinkCapacityUnavailable::interface_id: rns_transport::messages::InterfaceId
+pub rns_transport::interface_ownership::InterfaceCapacityError::LinkCapacityUnavailable::required: u32
+pub struct rns_transport::interface_ownership::InterfaceOwner
+impl rns_transport::interface_ownership::InterfaceOwner
+pub fn rns_transport::interface_ownership::InterfaceOwner::epoch(&self) -> u64
+pub fn rns_transport::interface_ownership::InterfaceOwner::id(&self) -> rns_transport::interface_ownership::InterfaceOwnerId
+pub fn rns_transport::interface_ownership::InterfaceOwner::is_current(&self) -> bool
+pub fn rns_transport::interface_ownership::InterfaceOwner::is_registered(&self) -> bool
+pub fn rns_transport::interface_ownership::InterfaceOwner::mark_registered(&self) -> bool
+pub fn rns_transport::interface_ownership::InterfaceOwner::new() -> Self
+pub fn rns_transport::interface_ownership::InterfaceOwner::next_revision(&self) -> core::option::Option<Self>
+pub fn rns_transport::interface_ownership::InterfaceOwner::revision(&self) -> u64
+impl core::cmp::Eq for rns_transport::interface_ownership::InterfaceOwner
+impl core::cmp::PartialEq for rns_transport::interface_ownership::InterfaceOwner
+pub fn rns_transport::interface_ownership::InterfaceOwner::eq(&self, &Self) -> bool
+impl core::default::Default for rns_transport::interface_ownership::InterfaceOwner
+pub fn rns_transport::interface_ownership::InterfaceOwner::default() -> Self
+pub struct rns_transport::interface_ownership::InterfaceOwnerId
+impl rns_transport::interface_ownership::InterfaceOwnerId
+pub fn rns_transport::interface_ownership::InterfaceOwnerId::matches(self, &rns_transport::interface_ownership::InterfaceOwner) -> bool
+pub struct rns_transport::interface_ownership::InterfacePacketCapacity
+pub rns_transport::interface_ownership::InterfacePacketCapacity::link_mtu_upgrade: bool
+pub rns_transport::interface_ownership::InterfacePacketCapacity::max_clear_packet_bytes: u32
+pub rns_transport::interface_ownership::InterfacePacketCapacity::max_wire_packet_bytes: u32
+impl rns_transport::interface_ownership::InterfacePacketCapacity
+pub const fn rns_transport::interface_ownership::InterfacePacketCapacity::base(u32) -> Self
+pub fn rns_transport::interface_ownership::InterfacePacketCapacity::effective_clear_mtu(self, usize) -> core::result::Result<u32, rns_transport::interface_ownership::InterfaceCapacityError>
+pub fn rns_transport::interface_ownership::InterfacePacketCapacity::link_ceiling(self, rns_transport::messages::InterfaceId, usize) -> core::result::Result<u32, rns_transport::interface_ownership::InterfaceCapacityError>
+pub const fn rns_transport::interface_ownership::InterfacePacketCapacity::new(u32, u32, bool) -> Self
+pub struct rns_transport::interface_ownership::InterfaceTransportSender
+impl rns_transport::interface_ownership::InterfaceTransportSender
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::actor_sender(&self) -> tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::bind(rns_transport::messages::InterfaceId, rns_transport::interface_ownership::InterfaceOwner, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> Self
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::capacity(&self) -> usize
+pub async fn rns_transport::interface_ownership::InterfaceTransportSender::closed(&self)
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::event(&self, rns_transport::messages::TransportMessage) -> rns_transport::messages::TransportMessage
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::interface_id(&self) -> rns_transport::messages::InterfaceId
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::is_closed(&self) -> bool
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::max_capacity(&self) -> usize
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::new(rns_transport::messages::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> Self
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::owner(&self) -> rns_transport::interface_ownership::InterfaceOwner
+pub async fn rns_transport::interface_ownership::InterfaceTransportSender::ready(&self) -> bool
+pub async fn rns_transport::interface_ownership::InterfaceTransportSender::send(&self, rns_transport::messages::TransportMessage) -> core::result::Result<(), tokio::sync::mpsc::error::SendError<rns_transport::messages::TransportMessage>>
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::try_send(&self, rns_transport::messages::TransportMessage) -> core::result::Result<(), tokio::sync::mpsc::error::TrySendError<rns_transport::messages::TransportMessage>>
 pub mod rns_transport::link_endpoint_dispatch
 #[non_exhaustive] pub enum rns_transport::link_endpoint_dispatch::LinkEndpointDispatchError
 pub rns_transport::link_endpoint_dispatch::LinkEndpointDispatchError::Closed
@@ -841,6 +904,7 @@ pub rns_transport::link_messages::DestinationEvent::DeliveryProof::msg_id: alloc
 pub rns_transport::link_messages::DestinationEvent::DeliveryProof::rtt: core::option::Option<core::time::Duration>
 pub rns_transport::link_messages::DestinationEvent::InboundPacket
 pub rns_transport::link_messages::DestinationEvent::InboundPacket::interface_id: rns_transport::messages::InterfaceId
+pub rns_transport::link_messages::DestinationEvent::InboundPacket::interface_owner: core::option::Option<rns_transport::interface_ownership::InterfaceOwnerId>
 pub rns_transport::link_messages::DestinationEvent::InboundPacket::metrics: rns_transport::link_messages::PacketMetrics
 pub rns_transport::link_messages::DestinationEvent::InboundPacket::raw: bytes::bytes::Bytes
 pub rns_transport::link_messages::DestinationEvent::LinkClosed
@@ -849,8 +913,14 @@ pub rns_transport::link_messages::DestinationEvent::LinkEstablished
 pub rns_transport::link_messages::DestinationEvent::LinkEstablished::link_id: [u8; 16]
 pub rns_transport::link_messages::DestinationEvent::LinkRequest
 pub rns_transport::link_messages::DestinationEvent::LinkRequest::interface_id: rns_transport::messages::InterfaceId
+pub rns_transport::link_messages::DestinationEvent::LinkRequest::interface_owner: core::option::Option<rns_transport::interface_ownership::InterfaceOwnerId>
 pub rns_transport::link_messages::DestinationEvent::LinkRequest::metrics: rns_transport::link_messages::PacketMetrics
 pub rns_transport::link_messages::DestinationEvent::LinkRequest::raw: bytes::bytes::Bytes
+pub enum rns_transport::link_messages::LinkRequestDispatchError
+pub rns_transport::link_messages::LinkRequestDispatchError::Capacity(rns_transport::interface_ownership::InterfaceCapacityError)
+pub rns_transport::link_messages::LinkRequestDispatchError::InvalidRequest
+pub rns_transport::link_messages::LinkRequestDispatchError::NoInterface
+pub rns_transport::link_messages::LinkRequestDispatchError::TransportUnavailable
 pub struct rns_transport::link_messages::AnnounceRequest
 pub rns_transport::link_messages::AnnounceRequest::app_name: alloc::string::String
 pub rns_transport::link_messages::AnnounceRequest::attached_interface: core::option::Option<rns_transport::messages::InterfaceId>
@@ -868,6 +938,7 @@ pub struct rns_transport::link_messages::PacketMetrics
 pub rns_transport::link_messages::PacketMetrics::q: core::option::Option<f32>
 pub rns_transport::link_messages::PacketMetrics::rssi: core::option::Option<f32>
 pub rns_transport::link_messages::PacketMetrics::snr: core::option::Option<f32>
+pub async fn rns_transport::link_messages::dispatch_link_request(&tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, rns_transport::messages::OutboundRequest) -> core::result::Result<(), rns_transport::link_messages::LinkRequestDispatchError>
 pub mod rns_transport::link_table
 pub struct rns_transport::link_table::ExpiredLink
 pub rns_transport::link_table::ExpiredLink::destination_hash: [u8; 16]
@@ -879,13 +950,17 @@ pub rns_transport::link_table::ExpiredLink::taken_hops: u8
 impl core::convert::From<&rns_transport::link_table::LinkEntry> for rns_transport::link_table::ExpiredLink
 pub fn rns_transport::link_table::ExpiredLink::from(&rns_transport::link_table::LinkEntry) -> Self
 pub struct rns_transport::link_table::LinkEntry
+pub rns_transport::link_table::LinkEntry::accepted_mtu_ceiling: u32
 pub rns_transport::link_table::LinkEntry::destination_hash: [u8; 16]
 pub rns_transport::link_table::LinkEntry::established: bool
 pub rns_transport::link_table::LinkEntry::interface_id: rns_transport::messages::InterfaceId
+pub rns_transport::link_table::LinkEntry::interface_owner: core::option::Option<rns_transport::interface_ownership::InterfaceOwner>
 pub rns_transport::link_table::LinkEntry::next_hop: core::option::Option<[u8; 16]>
 pub rns_transport::link_table::LinkEntry::proof_timeout: f64
 pub rns_transport::link_table::LinkEntry::receiving_interface: rns_transport::messages::InterfaceId
+pub rns_transport::link_table::LinkEntry::receiving_owner: core::option::Option<rns_transport::interface_ownership::InterfaceOwner>
 pub rns_transport::link_table::LinkEntry::remaining_hops: u8
+pub rns_transport::link_table::LinkEntry::requested_mode: u8
 pub rns_transport::link_table::LinkEntry::taken_hops: u8
 pub rns_transport::link_table::LinkEntry::timestamp: f64
 pub rns_transport::link_table::LinkEntry::validated: bool
@@ -904,9 +979,26 @@ pub fn rns_transport::link_table::LinkTable::iter(&self) -> impl core::iter::tra
 pub fn rns_transport::link_table::LinkTable::len(&self) -> usize
 pub fn rns_transport::link_table::LinkTable::new() -> Self
 pub fn rns_transport::link_table::LinkTable::remove(&mut self, &[u8; 16]) -> core::option::Option<rns_transport::link_table::LinkEntry>
+pub fn rns_transport::link_table::LinkTable::remove_interface(&mut self, rns_transport::messages::InterfaceId)
 impl core::default::Default for rns_transport::link_table::LinkTable
 pub fn rns_transport::link_table::LinkTable::default() -> Self
+pub mod rns_transport::link_transit
+pub enum rns_transport::link_transit::LinkTransitError
+pub rns_transport::link_transit::LinkTransitError::Capacity(rns_transport::interface_ownership::InterfaceCapacityError)
+pub rns_transport::link_transit::LinkTransitError::InvalidSignalling(rns_wire::link_signalling::LinkSignallingError)
+pub rns_transport::link_transit::LinkTransitError::StaleInterface
+pub rns_transport::link_transit::LinkTransitError::UnsupportedTransitModeTransform
 pub mod rns_transport::messages
+pub enum rns_transport::messages::InterfaceCapacityError
+pub rns_transport::messages::InterfaceCapacityError::Empty
+pub rns_transport::messages::InterfaceCapacityError::IfacExceedsWire
+pub rns_transport::messages::InterfaceCapacityError::IfacExceedsWire::ifac_bytes: usize
+pub rns_transport::messages::InterfaceCapacityError::IfacExceedsWire::wire_bytes: u32
+pub rns_transport::messages::InterfaceCapacityError::InvalidIfac
+pub rns_transport::messages::InterfaceCapacityError::LinkCapacityUnavailable
+pub rns_transport::messages::InterfaceCapacityError::LinkCapacityUnavailable::clear_mtu: u32
+pub rns_transport::messages::InterfaceCapacityError::LinkCapacityUnavailable::interface_id: rns_transport::messages::InterfaceId
+pub rns_transport::messages::InterfaceCapacityError::LinkCapacityUnavailable::required: u32
 pub enum rns_transport::messages::InterfaceRole
 pub rns_transport::messages::InterfaceRole::LocalClient
 pub rns_transport::messages::InterfaceRole::Normal
@@ -979,6 +1071,10 @@ pub rns_transport::messages::TransportMessage::DeregisterDestination::hash: [u8;
 pub rns_transport::messages::TransportMessage::DeregisterInterface
 pub rns_transport::messages::TransportMessage::DeregisterInterface::id: rns_transport::messages::InterfaceId
 pub rns_transport::messages::TransportMessage::Inbound(rns_transport::messages::InboundPacket)
+pub rns_transport::messages::TransportMessage::InterfaceEvent
+pub rns_transport::messages::TransportMessage::InterfaceEvent::interface_id: rns_transport::messages::InterfaceId
+pub rns_transport::messages::TransportMessage::InterfaceEvent::message: alloc::boxed::Box<rns_transport::messages::TransportMessage>
+pub rns_transport::messages::TransportMessage::InterfaceEvent::owner: rns_transport::interface_ownership::InterfaceOwner
 pub rns_transport::messages::TransportMessage::Outbound(rns_transport::messages::OutboundRequest)
 pub rns_transport::messages::TransportMessage::OutboundAttached
 pub rns_transport::messages::TransportMessage::OutboundAttached::interface_id: rns_transport::messages::InterfaceId
@@ -1004,6 +1100,7 @@ pub rns_transport::messages::TransportMessage::RegisterLink
 pub rns_transport::messages::TransportMessage::RegisterLink::destination_hash: [u8; 16]
 pub rns_transport::messages::TransportMessage::RegisterLink::initiator: bool
 pub rns_transport::messages::TransportMessage::RegisterLink::interface_id: rns_transport::messages::InterfaceId
+pub rns_transport::messages::TransportMessage::RegisterLink::interface_owner: core::option::Option<rns_transport::interface_ownership::InterfaceOwnerId>
 pub rns_transport::messages::TransportMessage::RegisterLink::link_id: [u8; 16]
 pub rns_transport::messages::TransportMessage::RegisterLink::next_hop: core::option::Option<[u8; 16]>
 pub rns_transport::messages::TransportMessage::RegisterLink::remaining_hops: u8
@@ -1045,6 +1142,9 @@ pub rns_transport::messages::TransportMessage::SendLinkEndpointBestEffort::link_
 pub rns_transport::messages::TransportMessage::SendLinkEndpointBestEffort::request: rns_transport::messages::OutboundRequest
 pub rns_transport::messages::TransportMessage::SendLinkEndpointBestEffort::result_tx: tokio::sync::oneshot::Sender<rns_transport::messages::LinkEndpointSendResult>
 pub rns_transport::messages::TransportMessage::SendLinkEndpointBestEffort::role: rns_transport::messages::LinkEndpointRole
+pub rns_transport::messages::TransportMessage::SendLinkRequest
+pub rns_transport::messages::TransportMessage::SendLinkRequest::request: rns_transport::messages::OutboundRequest
+pub rns_transport::messages::TransportMessage::SendLinkRequest::result_tx: tokio::sync::oneshot::Sender<core::result::Result<(), rns_transport::link_messages::LinkRequestDispatchError>>
 pub rns_transport::messages::TransportMessage::SendPacket
 pub rns_transport::messages::TransportMessage::SendPacket::attached_interface: core::option::Option<rns_transport::messages::InterfaceId>
 pub rns_transport::messages::TransportMessage::SendPacket::receipt: core::option::Option<rns_transport::messages::TrackedReceiptRegistration>
@@ -1244,6 +1344,8 @@ pub rns_transport::messages::InterfaceEntry::mtu: u32
 pub rns_transport::messages::InterfaceEntry::multipoint: bool
 pub rns_transport::messages::InterfaceEntry::name: alloc::string::String
 pub rns_transport::messages::InterfaceEntry::online: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>
+pub rns_transport::messages::InterfaceEntry::owner: rns_transport::interface_ownership::InterfaceOwner
+pub rns_transport::messages::InterfaceEntry::packet_capacity: rns_transport::interface_ownership::InterfacePacketCapacity
 pub rns_transport::messages::InterfaceEntry::recursive_prs: bool
 pub rns_transport::messages::InterfaceEntry::role: rns_transport::messages::InterfaceRole
 pub rns_transport::messages::InterfaceEntry::rxb: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>>
@@ -1251,11 +1353,16 @@ pub rns_transport::messages::InterfaceEntry::tx: tokio::sync::mpsc::bounded::Sen
 pub rns_transport::messages::InterfaceEntry::tx_drops: alloc::sync::Arc<core::sync::atomic::AtomicU64>
 pub rns_transport::messages::InterfaceEntry::txb: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>>
 impl rns_transport::messages::InterfaceEntry
+pub fn rns_transport::messages::InterfaceEntry::accepts_clear_packet(&self, usize) -> bool
+pub fn rns_transport::messages::InterfaceEntry::active_ifac_bytes(&self) -> usize
+pub fn rns_transport::messages::InterfaceEntry::effective_clear_mtu(&self) -> core::result::Result<u32, rns_transport::interface_ownership::InterfaceCapacityError>
 pub fn rns_transport::messages::InterfaceEntry::new(alloc::string::String, rns_transport::constants::InterfaceMode, rns_transport::constants::InterfaceDirection, u64, u32, tokio::sync::mpsc::bounded::Sender<bytes::bytes::Bytes>) -> Self
 pub fn rns_transport::messages::InterfaceEntry::with_announce_rate(self, f64, u32, f64) -> Self
 pub fn rns_transport::messages::InterfaceEntry::with_counters(self, alloc::sync::Arc<core::sync::atomic::AtomicBool>, alloc::sync::Arc<core::sync::atomic::AtomicU64>, alloc::sync::Arc<core::sync::atomic::AtomicU64>) -> Self
 pub fn rns_transport::messages::InterfaceEntry::with_ifac(self, [u8; 64], usize) -> Self
 pub fn rns_transport::messages::InterfaceEntry::with_multipoint(self, bool) -> Self
+pub fn rns_transport::messages::InterfaceEntry::with_owner(self, rns_transport::interface_ownership::InterfaceOwner) -> Self
+pub fn rns_transport::messages::InterfaceEntry::with_packet_capacity(self, rns_transport::interface_ownership::InterfacePacketCapacity) -> Self
 pub fn rns_transport::messages::InterfaceEntry::with_role(self, rns_transport::messages::InterfaceRole) -> Self
 impl core::fmt::Debug for rns_transport::messages::InterfaceEntry
 pub fn rns_transport::messages::InterfaceEntry::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -1268,6 +1375,33 @@ pub fn rns_transport::messages::InterfaceInspectionSource::new<F>(F) -> Self whe
 pub fn rns_transport::messages::InterfaceInspectionSource::snapshot(&self) -> rns_transport::messages::InterfaceInspectionSnapshot
 impl core::fmt::Debug for rns_transport::messages::InterfaceInspectionSource
 pub fn rns_transport::messages::InterfaceInspectionSource::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct rns_transport::messages::InterfaceOwner
+impl rns_transport::interface_ownership::InterfaceOwner
+pub fn rns_transport::interface_ownership::InterfaceOwner::epoch(&self) -> u64
+pub fn rns_transport::interface_ownership::InterfaceOwner::id(&self) -> rns_transport::interface_ownership::InterfaceOwnerId
+pub fn rns_transport::interface_ownership::InterfaceOwner::is_current(&self) -> bool
+pub fn rns_transport::interface_ownership::InterfaceOwner::is_registered(&self) -> bool
+pub fn rns_transport::interface_ownership::InterfaceOwner::mark_registered(&self) -> bool
+pub fn rns_transport::interface_ownership::InterfaceOwner::new() -> Self
+pub fn rns_transport::interface_ownership::InterfaceOwner::next_revision(&self) -> core::option::Option<Self>
+pub fn rns_transport::interface_ownership::InterfaceOwner::revision(&self) -> u64
+impl core::cmp::Eq for rns_transport::interface_ownership::InterfaceOwner
+impl core::cmp::PartialEq for rns_transport::interface_ownership::InterfaceOwner
+pub fn rns_transport::interface_ownership::InterfaceOwner::eq(&self, &Self) -> bool
+impl core::default::Default for rns_transport::interface_ownership::InterfaceOwner
+pub fn rns_transport::interface_ownership::InterfaceOwner::default() -> Self
+pub struct rns_transport::messages::InterfaceOwnerId
+impl rns_transport::interface_ownership::InterfaceOwnerId
+pub fn rns_transport::interface_ownership::InterfaceOwnerId::matches(self, &rns_transport::interface_ownership::InterfaceOwner) -> bool
+pub struct rns_transport::messages::InterfacePacketCapacity
+pub rns_transport::messages::InterfacePacketCapacity::link_mtu_upgrade: bool
+pub rns_transport::messages::InterfacePacketCapacity::max_clear_packet_bytes: u32
+pub rns_transport::messages::InterfacePacketCapacity::max_wire_packet_bytes: u32
+impl rns_transport::interface_ownership::InterfacePacketCapacity
+pub const fn rns_transport::interface_ownership::InterfacePacketCapacity::base(u32) -> Self
+pub fn rns_transport::interface_ownership::InterfacePacketCapacity::effective_clear_mtu(self, usize) -> core::result::Result<u32, rns_transport::interface_ownership::InterfaceCapacityError>
+pub fn rns_transport::interface_ownership::InterfacePacketCapacity::link_ceiling(self, rns_transport::messages::InterfaceId, usize) -> core::result::Result<u32, rns_transport::interface_ownership::InterfaceCapacityError>
+pub const fn rns_transport::interface_ownership::InterfacePacketCapacity::new(u32, u32, bool) -> Self
 pub struct rns_transport::messages::InterfaceStatRpcEntry
 pub rns_transport::messages::InterfaceStatRpcEntry::announce_cap: f64
 pub rns_transport::messages::InterfaceStatRpcEntry::announce_queue: core::option::Option<u64>
@@ -1298,8 +1432,24 @@ pub rns_transport::messages::InterfaceStatRpcEntry::rx_rate: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::tx_bytes: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::tx_drops: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::tx_rate: u64
+pub struct rns_transport::messages::InterfaceTransportSender
+impl rns_transport::interface_ownership::InterfaceTransportSender
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::actor_sender(&self) -> tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::bind(rns_transport::messages::InterfaceId, rns_transport::interface_ownership::InterfaceOwner, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> Self
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::capacity(&self) -> usize
+pub async fn rns_transport::interface_ownership::InterfaceTransportSender::closed(&self)
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::event(&self, rns_transport::messages::TransportMessage) -> rns_transport::messages::TransportMessage
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::interface_id(&self) -> rns_transport::messages::InterfaceId
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::is_closed(&self) -> bool
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::max_capacity(&self) -> usize
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::new(rns_transport::messages::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> Self
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::owner(&self) -> rns_transport::interface_ownership::InterfaceOwner
+pub async fn rns_transport::interface_ownership::InterfaceTransportSender::ready(&self) -> bool
+pub async fn rns_transport::interface_ownership::InterfaceTransportSender::send(&self, rns_transport::messages::TransportMessage) -> core::result::Result<(), tokio::sync::mpsc::error::SendError<rns_transport::messages::TransportMessage>>
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::try_send(&self, rns_transport::messages::TransportMessage) -> core::result::Result<(), tokio::sync::mpsc::error::TrySendError<rns_transport::messages::TransportMessage>>
 pub struct rns_transport::messages::LinkEndpointBinding
 pub rns_transport::messages::LinkEndpointBinding::interface_id: rns_transport::messages::InterfaceId
+pub rns_transport::messages::LinkEndpointBinding::interface_owner: core::option::Option<rns_transport::interface_ownership::InterfaceOwnerId>
 pub rns_transport::messages::LinkEndpointBinding::link_id: [u8; 16]
 pub rns_transport::messages::LinkEndpointBinding::role: rns_transport::messages::LinkEndpointRole
 pub struct rns_transport::messages::LinkEndpointLifecycleEvent
@@ -1699,4 +1849,56 @@ pub fn rns_transport::tunnel::TunnelTable::default() -> Self
 pub fn rns_transport::tunnel::build_tunnel_synthesis_packet(&rns_identity::identity::Identity, [u8; 32]) -> core::option::Option<alloc::vec::Vec<u8>>
 pub fn rns_transport::tunnel::handle_tunnel(&mut rns_transport::tunnel::TunnelTable, [u8; 32], rns_transport::messages::InterfaceId, f64)
 pub fn rns_transport::tunnel::interface_hash(&str) -> [u8; 32]
+pub enum rns_transport::InterfaceCapacityError
+pub rns_transport::InterfaceCapacityError::Empty
+pub rns_transport::InterfaceCapacityError::IfacExceedsWire
+pub rns_transport::InterfaceCapacityError::IfacExceedsWire::ifac_bytes: usize
+pub rns_transport::InterfaceCapacityError::IfacExceedsWire::wire_bytes: u32
+pub rns_transport::InterfaceCapacityError::InvalidIfac
+pub rns_transport::InterfaceCapacityError::LinkCapacityUnavailable
+pub rns_transport::InterfaceCapacityError::LinkCapacityUnavailable::clear_mtu: u32
+pub rns_transport::InterfaceCapacityError::LinkCapacityUnavailable::interface_id: rns_transport::messages::InterfaceId
+pub rns_transport::InterfaceCapacityError::LinkCapacityUnavailable::required: u32
+pub struct rns_transport::InterfaceOwner
+impl rns_transport::interface_ownership::InterfaceOwner
+pub fn rns_transport::interface_ownership::InterfaceOwner::epoch(&self) -> u64
+pub fn rns_transport::interface_ownership::InterfaceOwner::id(&self) -> rns_transport::interface_ownership::InterfaceOwnerId
+pub fn rns_transport::interface_ownership::InterfaceOwner::is_current(&self) -> bool
+pub fn rns_transport::interface_ownership::InterfaceOwner::is_registered(&self) -> bool
+pub fn rns_transport::interface_ownership::InterfaceOwner::mark_registered(&self) -> bool
+pub fn rns_transport::interface_ownership::InterfaceOwner::new() -> Self
+pub fn rns_transport::interface_ownership::InterfaceOwner::next_revision(&self) -> core::option::Option<Self>
+pub fn rns_transport::interface_ownership::InterfaceOwner::revision(&self) -> u64
+impl core::cmp::Eq for rns_transport::interface_ownership::InterfaceOwner
+impl core::cmp::PartialEq for rns_transport::interface_ownership::InterfaceOwner
+pub fn rns_transport::interface_ownership::InterfaceOwner::eq(&self, &Self) -> bool
+impl core::default::Default for rns_transport::interface_ownership::InterfaceOwner
+pub fn rns_transport::interface_ownership::InterfaceOwner::default() -> Self
+pub struct rns_transport::InterfaceOwnerId
+impl rns_transport::interface_ownership::InterfaceOwnerId
+pub fn rns_transport::interface_ownership::InterfaceOwnerId::matches(self, &rns_transport::interface_ownership::InterfaceOwner) -> bool
+pub struct rns_transport::InterfacePacketCapacity
+pub rns_transport::InterfacePacketCapacity::link_mtu_upgrade: bool
+pub rns_transport::InterfacePacketCapacity::max_clear_packet_bytes: u32
+pub rns_transport::InterfacePacketCapacity::max_wire_packet_bytes: u32
+impl rns_transport::interface_ownership::InterfacePacketCapacity
+pub const fn rns_transport::interface_ownership::InterfacePacketCapacity::base(u32) -> Self
+pub fn rns_transport::interface_ownership::InterfacePacketCapacity::effective_clear_mtu(self, usize) -> core::result::Result<u32, rns_transport::interface_ownership::InterfaceCapacityError>
+pub fn rns_transport::interface_ownership::InterfacePacketCapacity::link_ceiling(self, rns_transport::messages::InterfaceId, usize) -> core::result::Result<u32, rns_transport::interface_ownership::InterfaceCapacityError>
+pub const fn rns_transport::interface_ownership::InterfacePacketCapacity::new(u32, u32, bool) -> Self
+pub struct rns_transport::InterfaceTransportSender
+impl rns_transport::interface_ownership::InterfaceTransportSender
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::actor_sender(&self) -> tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::bind(rns_transport::messages::InterfaceId, rns_transport::interface_ownership::InterfaceOwner, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> Self
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::capacity(&self) -> usize
+pub async fn rns_transport::interface_ownership::InterfaceTransportSender::closed(&self)
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::event(&self, rns_transport::messages::TransportMessage) -> rns_transport::messages::TransportMessage
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::interface_id(&self) -> rns_transport::messages::InterfaceId
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::is_closed(&self) -> bool
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::max_capacity(&self) -> usize
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::new(rns_transport::messages::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> Self
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::owner(&self) -> rns_transport::interface_ownership::InterfaceOwner
+pub async fn rns_transport::interface_ownership::InterfaceTransportSender::ready(&self) -> bool
+pub async fn rns_transport::interface_ownership::InterfaceTransportSender::send(&self, rns_transport::messages::TransportMessage) -> core::result::Result<(), tokio::sync::mpsc::error::SendError<rns_transport::messages::TransportMessage>>
+pub fn rns_transport::interface_ownership::InterfaceTransportSender::try_send(&self, rns_transport::messages::TransportMessage) -> core::result::Result<(), tokio::sync::mpsc::error::TrySendError<rns_transport::messages::TransportMessage>>
 pub fn rns_transport::now_f64() -> f64

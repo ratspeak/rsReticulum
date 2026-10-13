@@ -25,6 +25,8 @@ const DEFAULT_TIMEOUT_SECS: f64 = 12.0;
 
 #[derive(Debug, Error)]
 pub enum ProbeError {
+    #[error("timeout must be finite, nonnegative and representable")]
+    InvalidTimeout,
     #[error("timed out waiting for path to destination")]
     PathTimeout,
     #[error("probe size {0} exceeds MTU {1}")]
@@ -261,6 +263,21 @@ pub async fn probe_once(
     if size > MTU {
         return Err(ProbeError::MtuExceeded(size, MTU));
     }
+    // Validate caller-controlled deadlines before any query, path request or
+    // destination registration. The receipt wait reserves one final second.
+    for duration in [proof_wait, path_wait].into_iter().flatten() {
+        Instant::now()
+            .checked_add(duration)
+            .ok_or(ProbeError::InvalidTimeout)?;
+    }
+    if let Some(duration) = proof_wait {
+        let duration = duration
+            .checked_add(Duration::from_secs(1))
+            .ok_or(ProbeError::InvalidTimeout)?;
+        Instant::now()
+            .checked_add(duration)
+            .ok_or(ProbeError::InvalidTimeout)?;
+    }
 
     let has_path = match query(
         &transport_tx,
@@ -361,6 +378,13 @@ pub async fn probe_once(
         None => default_probe_wait(&transport_tx, dest_hash).await?,
     };
 
+    let receipt_wait = proof_wait
+        .checked_add(Duration::from_secs(1))
+        .ok_or(ProbeError::InvalidTimeout)?;
+    std::time::Instant::now()
+        .checked_add(receipt_wait)
+        .ok_or(ProbeError::InvalidTimeout)?;
+
     // trunc_hash keys `receipt_table`; unique msg_id filters fan-out.
     let msg_id = format!(
         "probe.{}.{:x}",
@@ -374,7 +398,7 @@ pub async fn probe_once(
             destination_hash: dest_hash,
             destination_public_key: pubkey,
             msg_id: msg_id.clone(),
-            timeout: Some(proof_wait + Duration::from_secs(1)),
+            timeout: Some(receipt_wait),
         })
         .await
         .map_err(|_| ProbeError::TransportClosed)?;
@@ -435,7 +459,14 @@ async fn default_probe_wait(
         TransportQueryResponse::FloatResult(Some(t)) => t,
         _ => rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT,
     };
-    Ok(Duration::from_secs_f64(DEFAULT_TIMEOUT_SECS + first_hop))
+    let first_hop = checked_probe_timeout(first_hop)?;
+    let wait = first_hop
+        .checked_add(Duration::from_secs(DEFAULT_TIMEOUT_SECS as u64))
+        .ok_or(ProbeError::InvalidTimeout)?;
+    std::time::Instant::now()
+        .checked_add(wait)
+        .ok_or(ProbeError::InvalidTimeout)?;
+    Ok(wait)
 }
 
 pub fn parse_dest_hash(hex_str: &str) -> Result<[u8; 16], ProbeError> {
@@ -601,6 +632,7 @@ mod tests {
         delivery_tx
             .send(DestinationEvent::InboundPacket {
                 raw: bytes::Bytes::from(raw),
+                interface_owner: None,
                 interface_id: 0,
                 metrics: Default::default(),
             })
@@ -735,6 +767,7 @@ mod tests {
         delivery_tx
             .send(DestinationEvent::InboundPacket {
                 raw: bytes::Bytes::from(raw),
+                interface_owner: None,
                 interface_id: 0,
                 metrics: Default::default(),
             })
@@ -745,5 +778,46 @@ mod tests {
             Err(_) => (),
             Ok(other) => panic!("unexpected response to non-DATA packet: {other:?}"),
         }
+    }
+}
+
+/// Validate local CLI/API timeout input before starting networking.
+pub fn checked_probe_timeout(seconds: f64) -> Result<Duration, ProbeError> {
+    let duration = Duration::try_from_secs_f64(seconds).map_err(|_| ProbeError::InvalidTimeout)?;
+    std::time::Instant::now()
+        .checked_add(duration)
+        .ok_or(ProbeError::InvalidTimeout)?;
+    Ok(duration)
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    #[tokio::test]
+    async fn probe_duration_preflight_has_no_transport_side_effects() {
+        for (proof, path) in [
+            (Some(std::time::Duration::MAX), None),
+            (None, Some(std::time::Duration::MAX)),
+        ] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            assert!(matches!(
+                super::probe_once(tx, [0; 16], "probe.test", 1, proof, path, true).await,
+                Err(super::ProbeError::InvalidTimeout)
+            ));
+            assert!(rx.try_recv().is_err());
+        }
+    }
+    #[test]
+    fn probe_timeout_rejects_nonrepresentable_and_preserves_zero() {
+        for seconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, f64::MAX] {
+            assert!(super::checked_probe_timeout(seconds).is_err());
+        }
+        assert_eq!(
+            super::checked_probe_timeout(0.0).unwrap(),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            super::checked_probe_timeout(1.25).unwrap(),
+            std::time::Duration::from_millis(1250)
+        );
     }
 }

@@ -4,6 +4,7 @@
 //! buffers. Inbound deframer is capped (vs Python's unbounded) to avoid
 //! malformed-peer memory blow-up.
 
+use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -359,7 +360,7 @@ fn child_mtu() -> u32 {
 async fn backbone_read_loop(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     interface_id: InterfaceId,
-    transport_tx: mpsc::Sender<TransportMessage>,
+    transport_tx: InterfaceTransportSender,
     online: Arc<AtomicBool>,
     rxb: Arc<AtomicU64>,
 ) {
@@ -515,6 +516,8 @@ fn spawn_backbone_server_on_listener(
     fast_flap_runtime: FastFlapRuntime,
     listener: TcpListener,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     let local_addr = listener.local_addr()?;
     tracing::info!(name = %config.name, addr = %local_addr, "backbone server listening");
 
@@ -582,8 +585,10 @@ fn spawn_backbone_server_on_listener(
 
                     let c_online_r = c_online.clone();
                     let c_rxb_r = c_rxb.clone();
-                    let transport_tx2 = transport_tx.clone();
-                    let dereg_tx = transport_tx.clone();
+                    let transport_tx2 =
+                        InterfaceTransportSender::new(client_id, transport_tx.actor_sender());
+                    let child_owner = transport_tx2.owner();
+                    let dereg_tx = transport_tx2.clone();
                     let cname = client_name.clone();
                     let active_client_guard =
                         ActiveClientGuard::new(Arc::clone(&task_active_clients));
@@ -601,6 +606,12 @@ fn spawn_backbone_server_on_listener(
 
                     let handle = InterfaceHandle {
                         id: client_id,
+                        owner: child_owner,
+                        packet_capacity: InterfacePacketCapacity::new(
+                            child_mtu().min(262144),
+                            262144,
+                            true,
+                        ),
                         parent_id: Some(id),
                         name: client_name,
                         mode,
@@ -638,6 +649,8 @@ fn spawn_backbone_server_on_listener(
 
     Ok(InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::base(500),
         parent_id: None,
         name,
         mode,
@@ -663,6 +676,8 @@ pub async fn spawn_backbone_client(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     let online = Arc::new(AtomicBool::new(false));
     let online2 = online.clone();
     let (tx, rx) = mpsc::channel::<Bytes>(TX_CHANNEL_DEPTH);
@@ -807,6 +822,8 @@ pub async fn spawn_backbone_client(
 
     Ok(InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(child_mtu().min(262144), 262144, true),
         parent_id: None,
         name,
         mode,
@@ -1238,6 +1255,7 @@ mod tests {
             listener,
         )
         .unwrap();
+        parent.owner.mark_registered();
         assert_eq!(inspection_snapshot(&parent).active_clients, Some(0));
 
         let _stream = TcpStream::connect(listen_addr).await.unwrap();
@@ -1245,6 +1263,7 @@ mod tests {
             .await
             .expect("accepted child handle timed out")
             .expect("child handle channel closed");
+        child.owner.mark_registered();
         assert_eq!(inspection_snapshot(&parent).active_clients, Some(1));
         clock.advance(Duration::from_millis(1));
         child.read_task.abort();
@@ -1286,6 +1305,7 @@ mod tests {
             listener,
         )
         .unwrap();
+        parent.owner.mark_registered();
         assert_eq!(inspection_snapshot(&parent).active_clients, Some(0));
 
         let mut stream = TcpStream::connect(listen_addr).await.unwrap();
@@ -1313,11 +1333,16 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<TransportMessage>(8);
         let handle = spawn_backbone_client(cfg, 99, tx).await.unwrap();
+        handle.owner.mark_registered();
         // Wait for the read_task to finish — guarded by a generous timeout
         // to absorb the one RECONNECT_WAIT sleep + connect attempt.
         let dereg = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                match rx.recv().await {
+                match rx
+                    .recv()
+                    .await
+                    .map(|event| crate::traits::test_event_for_handle(event, &handle))
+                {
                     Some(TransportMessage::DeregisterInterface { id }) => return Some(id),
                     Some(_) => continue,
                     None => return None,

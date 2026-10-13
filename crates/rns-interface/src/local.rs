@@ -1,6 +1,7 @@
 //! Shared-instance IPC. Unix domain sockets where available, TCP on
 //! 127.0.0.1 as fallback. HDLC-framed.
 
+use rns_transport::messages::{InterfaceOwner, InterfacePacketCapacity, InterfaceTransportSender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -103,7 +104,7 @@ impl Default for LocalClientConfig {
 async fn local_read_loop<R: AsyncReadExt + Unpin>(
     mut reader: R,
     interface_id: InterfaceId,
-    transport_tx: mpsc::Sender<TransportMessage>,
+    transport_tx: InterfaceTransportSender,
     online: Arc<AtomicBool>,
     rxb: Arc<AtomicU64>,
 ) {
@@ -178,7 +179,7 @@ async fn run_local_client_connection<R, W>(
     mut writer: W,
     rx: &mut mpsc::Receiver<Bytes>,
     interface_id: InterfaceId,
-    transport_tx: &mpsc::Sender<TransportMessage>,
+    transport_tx: &InterfaceTransportSender,
     rxb: &AtomicU64,
     txb: &AtomicU64,
 ) -> LocalClientConnectionEnd
@@ -253,6 +254,8 @@ where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     let online = Arc::new(AtomicBool::new(true));
     let rxb = Arc::new(AtomicU64::new(0));
     let txb = Arc::new(AtomicU64::new(0));
@@ -277,6 +280,8 @@ where
 
     InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(262144, 262144, true),
         parent_id,
         name,
         mode: InterfaceMode::Full,
@@ -304,9 +309,12 @@ fn server_listener_handle(
     online: Arc<AtomicBool>,
     tx: mpsc::Sender<Bytes>,
     read_task: tokio::task::JoinHandle<()>,
+    owner: InterfaceOwner,
 ) -> InterfaceHandle {
     InterfaceHandle {
         id: 0,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(262144, 262144, true),
         parent_id: None,
         name,
         mode: InterfaceMode::Full,
@@ -401,6 +409,7 @@ mod platform {
         transport_tx: mpsc::Sender<TransportMessage>,
         handle_tx: mpsc::Sender<InterfaceHandle>,
     ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+        let owner = InterfaceOwner::new();
         let listener = bind_unix_listener(&config.socket_path)?;
         tracing::info!(name = %config.name, path = %display_socket_path(&config.socket_path), "local server listening");
 
@@ -444,7 +453,7 @@ mod platform {
             online2.store(false, Ordering::SeqCst);
         });
 
-        Ok(server_listener_handle(name, online, tx, read_task))
+        Ok(server_listener_handle(name, online, tx, read_task, owner))
     }
 
     pub async fn spawn_local_client_impl(
@@ -452,6 +461,8 @@ mod platform {
         id: InterfaceId,
         transport_tx: mpsc::Sender<TransportMessage>,
     ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+        let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+        let owner = transport_tx.owner();
         let initial_stream = connect_unix_stream(&config.socket_path).await?;
         tracing::info!(name = %config.name, path = %display_socket_path(&config.socket_path), "local client connected");
 
@@ -525,6 +536,8 @@ mod platform {
 
         Ok(InterfaceHandle {
             id,
+            owner,
+            packet_capacity: InterfacePacketCapacity::new(262144, 262144, true),
             parent_id: None,
             name: config.name,
             mode: InterfaceMode::Full,
@@ -569,6 +582,7 @@ mod platform {
         handle_tx: mpsc::Sender<InterfaceHandle>,
     ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
         let addr = fallback_tcp_addr(&config.socket_path);
+        let owner = InterfaceOwner::new();
         let listener = TcpListener::bind(&addr).await?;
         let local_addr = listener.local_addr()?;
         tracing::info!(name = %config.name, addr = %local_addr, "local server (TCP fallback) listening");
@@ -613,7 +627,7 @@ mod platform {
             online2.store(false, Ordering::SeqCst);
         });
 
-        Ok(server_listener_handle(name, online, tx, read_task))
+        Ok(server_listener_handle(name, online, tx, read_task, owner))
     }
 
     pub async fn spawn_local_client_impl(
@@ -736,6 +750,7 @@ mod tests {
         let server_handle = spawn_local_server(server_cfg, id_gen, transport_tx.clone(), handle_tx)
             .await
             .unwrap();
+        server_handle.owner.mark_registered();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -747,12 +762,20 @@ mod tests {
         let client_handle = spawn_local_client(client_cfg, 42, transport_tx.clone())
             .await
             .unwrap();
+        client_handle.owner.mark_registered();
 
         let accepted = tokio::time::timeout(std::time::Duration::from_secs(3), handle_rx.recv())
             .await
             .expect("timeout waiting for accepted handle")
             .expect("handle channel closed");
+        accepted.owner.mark_registered();
 
+        assert_ne!(accepted.owner, server_handle.owner);
+        assert_ne!(accepted.owner, client_handle.owner);
+        assert_eq!(
+            accepted.packet_capacity,
+            InterfacePacketCapacity::new(262144, 262144, true)
+        );
         let payload = Bytes::from_static(b"local ipc test");
         client_handle.tx.send(payload.clone()).await.unwrap();
 
@@ -761,7 +784,7 @@ mod tests {
             .expect("timeout")
             .expect("channel closed");
 
-        match msg {
+        match crate::traits::test_event_for_handle(msg, &accepted) {
             TransportMessage::Inbound(pkt) => {
                 assert_eq!(pkt.raw, payload);
                 assert_eq!(pkt.interface_id, accepted.id);
@@ -777,7 +800,7 @@ mod tests {
             .expect("timeout")
             .expect("channel closed");
 
-        match msg2 {
+        match crate::traits::test_event_for_handle(msg2, &client_handle) {
             TransportMessage::Inbound(pkt) => {
                 assert_eq!(pkt.raw, reply);
                 assert_eq!(pkt.interface_id, 42);
@@ -807,6 +830,7 @@ mod tests {
         let server_handle = spawn_local_server(server_cfg, id_gen, transport_tx.clone(), handle_tx)
             .await
             .unwrap();
+        server_handle.owner.mark_registered();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -817,11 +841,13 @@ mod tests {
         let client_handle = spawn_local_client(client_cfg, 77, transport_tx.clone())
             .await
             .unwrap();
+        client_handle.owner.mark_registered();
 
         let accepted = tokio::time::timeout(std::time::Duration::from_secs(3), handle_rx.recv())
             .await
             .expect("timeout waiting for accepted handle")
             .expect("handle channel closed");
+        accepted.owner.mark_registered();
         let server_side_client_id = accepted.id;
 
         // Abort client; server's per-client read_loop sees EOF and exits.
@@ -833,7 +859,9 @@ mod tests {
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(500), transport_rx.recv())
                 .await
-            {
+                .map(|message| {
+                    message.map(|event| crate::traits::test_event_for_handle(event, &accepted))
+                }) {
                 Ok(Some(TransportMessage::DeregisterInterface { id }))
                     if id == server_side_client_id =>
                 {
@@ -875,6 +903,7 @@ mod tests {
         )
         .await
         .unwrap();
+        server_handle.owner.mark_registered();
         let client_handle = spawn_local_client(
             LocalClientConfig {
                 socket_path: socket_path.clone(),
@@ -885,11 +914,13 @@ mod tests {
         )
         .await
         .unwrap();
+        client_handle.owner.mark_registered();
         let first_accepted =
             tokio::time::timeout(std::time::Duration::from_secs(3), handle_rx.recv())
                 .await
                 .expect("timeout waiting for first accepted client")
                 .expect("handle channel closed");
+        first_accepted.owner.mark_registered();
 
         server_handle.read_task.abort();
         first_accepted.read_task.abort();
@@ -906,11 +937,13 @@ mod tests {
             spawn_local_server(server_config(), id_gen, transport_tx.clone(), handle_tx)
                 .await
                 .unwrap();
+        restarted_server.owner.mark_registered();
         let second_accepted =
             tokio::time::timeout(std::time::Duration::from_secs(3), handle_rx.recv())
                 .await
                 .expect("client did not reconnect to restarted server")
                 .expect("handle channel closed");
+        second_accepted.owner.mark_registered();
         assert!(
             client_handle.online.load(Ordering::SeqCst),
             "stable client handle must return online after reconnect"
@@ -922,7 +955,7 @@ mod tests {
             .await
             .expect("timeout waiting for post-restart frame")
             .expect("transport channel closed");
-        match inbound {
+        match crate::traits::test_event_for_handle(inbound, &client_handle) {
             TransportMessage::Inbound(packet) => {
                 assert_eq!(packet.interface_id, 88);
                 assert_eq!(packet.raw, payload);

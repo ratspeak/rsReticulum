@@ -100,6 +100,20 @@ impl RatchetControlState {
 
     /// Persist this state as a signed, bounded MessagePack envelope.
     pub fn save_verified(&self, path: &Path, identity: &Identity) -> std::io::Result<()> {
+        self.save_verified_impl(path, identity, false)
+    }
+
+    /// Persist announce ordering before releasing the corresponding wire bytes.
+    pub fn save_verified_durable(&self, path: &Path, identity: &Identity) -> std::io::Result<()> {
+        self.save_verified_impl(path, identity, true)
+    }
+
+    fn save_verified_impl(
+        &self,
+        path: &Path,
+        identity: &Identity,
+        durable: bool,
+    ) -> std::io::Result<()> {
         if identity.hash != self.identity_hash {
             return Err(invalid_data("control state identity binding mismatch"));
         }
@@ -131,7 +145,13 @@ impl RatchetControlState {
         if encoded.len() > CONTROL_STATE_MAX_BYTES {
             return Err(invalid_data("ratchet control state exceeds size limit"));
         }
-        persistence::atomic_write(path, &encoded)
+        if durable {
+            persistence::durable_write(path, &encoded)
+                .map(|_| ())
+                .map_err(std::io::Error::other)
+        } else {
+            persistence::atomic_write(path, &encoded)
+        }
     }
 
     /// Load and verify state for exactly `identity` and `destination_hash`.

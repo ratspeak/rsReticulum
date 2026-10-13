@@ -18,17 +18,51 @@ use subtle::ConstantTimeEq;
 /// Bit 7 of byte 0 signals IFAC presence, regardless of `ifac_size`.
 const IFAC_FLAG: u8 = 0x80;
 
+/// RFC5869 SHA256 expansion bound, including the IFAC tag itself.
+pub const MAX_IFAC_WIRE_BYTES: usize = 255 * 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum IfacSignError {
+    #[error("IFAC tag size must be 1..=64")]
+    InvalidTagSize,
+    #[error("packet is shorter than the two-byte header")]
+    ShortPacket,
+    #[error("complete IFAC packet exceeds the 8160-byte mask expansion limit")]
+    PacketTooLarge,
+}
+
 /// Stamp a packet with its IFAC tag and XOR mask.
 ///
 /// `ifac_key` is the 64-byte derived interface key: bytes [32..64) seed the
 /// Ed25519 signer, and the full key acts as HKDF salt (Python uses
 /// `interface.ifac_key` in both roles, so the split must not change).
+///
+/// # Panics
+///
+/// Panics for a tag outside 1..=64, a packet shorter than two bytes, or a
+/// complete IFAC packet above 8160 bytes. Use [`try_ifac_sign`] when metadata
+/// or packet size is caller-provided. Transport egress uses the checked form.
 pub fn ifac_sign(packet: &[u8], ifac_key: &[u8; 64], ifac_size: usize) -> Vec<u8> {
-    assert!(ifac_size > 0 && ifac_size <= 64, "ifac_size must be 1..=64");
-    assert!(
-        packet.len() >= 2,
-        "packet must have at least 2 bytes (header)"
-    );
+    try_ifac_sign(packet, ifac_key, ifac_size).expect("invalid IFAC signing arguments")
+}
+
+/// Checked packet admission, suitable for caller-provided metadata and bytes.
+pub fn try_ifac_sign(
+    packet: &[u8],
+    ifac_key: &[u8; 64],
+    ifac_size: usize,
+) -> Result<Vec<u8>, IfacSignError> {
+    if !(1..=64).contains(&ifac_size) {
+        return Err(IfacSignError::InvalidTagSize);
+    }
+    if packet.len() < 2 {
+        return Err(IfacSignError::ShortPacket);
+    }
+    let mask_len = packet
+        .len()
+        .checked_add(ifac_size)
+        .filter(|len| *len <= MAX_IFAC_WIRE_BYTES)
+        .ok_or(IfacSignError::PacketTooLarge)?;
 
     let signing_key_bytes: [u8; 32] = ifac_key[32..64]
         .try_into()
@@ -37,9 +71,8 @@ pub fn ifac_sign(packet: &[u8], ifac_key: &[u8; 64], ifac_size: usize) -> Vec<u8
     let signature = ed_key.sign(packet);
     let tag = &signature[64 - ifac_size..];
 
-    let mask_len = packet.len() + ifac_size;
-    let mask =
-        hkdf_sha256(mask_len, tag, Some(ifac_key), None).expect("HKDF mask generation failed");
+    let mask = hkdf_sha256(mask_len, tag, Some(ifac_key), None)
+        .map_err(|_| IfacSignError::PacketTooLarge)?;
 
     let mut new_raw = Vec::with_capacity(2 + ifac_size + packet.len() - 2);
     new_raw.push(packet[0] | IFAC_FLAG);
@@ -61,7 +94,7 @@ pub fn ifac_sign(packet: &[u8], ifac_key: &[u8; 64], ifac_size: usize) -> Vec<u8
         }
     }
 
-    masked_raw
+    Ok(masked_raw)
 }
 
 /// Strip and authenticate an IFAC-stamped packet, returning the plain inner

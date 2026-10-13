@@ -5,6 +5,8 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+#[path = "ifac_migration.rs"]
+mod ifac_migration;
 use tracing_subscriber::fmt::MakeWriter;
 
 use rns_tools::{RETICULUM_COMPAT_VERSION, RS_RETICULUM_VERSION};
@@ -33,6 +35,12 @@ loglevel = 4
 # logtimestamps = no
 
 [interfaces]
+
+# IFAC sizes are in bits when explicitly configured. For an 8-byte tag, use
+# ifac_size = 64 and ifac_size_unit = bits in the interface section.
+# Omit both to keep the interface's default. Existing unmarked Rust sizes need
+# an explicit offline migration: rnsd-rs config ifac-units --source-units bytes
+# --interface NAME (preview), then repeat with --write after checking it.
 
 [[Default Interface]]
 type = AutoInterface
@@ -113,6 +121,8 @@ slottime = 20
     disable_version_flag = true
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Option<ifac_migration::Command>,
     /// Alternative config directory.
     #[arg(long, short = 'c', hide_short_help = true)]
     config: Option<String>,
@@ -157,6 +167,14 @@ pub(crate) async fn main() {
     }
 
     let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
+    if let Some(command) = &args.command {
+        if let Err(error) = command.run(&config_dir) {
+            eprintln!("rnsd-rs: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let config_loglevel = read_config_loglevel(&config_dir).unwrap_or(4);
     let verbosity = if args.service {
         config_loglevel
@@ -505,5 +523,71 @@ impl Write for RotatingLogFile {
 
     fn flush(&mut self) -> io::Result<()> {
         self.file_mut()?.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ifac_units_cli_requires_explicit_units_and_selection() {
+        let args = Args::try_parse_from([
+            "rnsd-rs",
+            "-c",
+            "/tmp/config-dir",
+            "config",
+            "ifac-units",
+            "--source-units",
+            "bytes",
+            "--interface",
+            "Radio",
+            "--interface",
+            "TCP",
+        ])
+        .unwrap();
+        assert_eq!(args.config.as_deref(), Some("/tmp/config-dir"));
+        let Some(ifac_migration::Command::Config {
+            command:
+                ifac_migration::ConfigCommand::IfacUnits {
+                    interfaces,
+                    units,
+                    apply,
+                },
+        }) = args.command
+        else {
+            panic!("expected offline migration command")
+        };
+        assert_eq!(interfaces, ["Radio", "TCP"]);
+        assert!(matches!(units, ifac_migration::Units::Bytes));
+        assert!(!apply);
+        for missing in [
+            vec!["rnsd-rs", "config", "ifac-units", "--interface", "Radio"],
+            vec!["rnsd-rs", "config", "ifac-units", "--source-units", "bits"],
+            vec![
+                "rnsd-rs",
+                "config",
+                "ifac-units",
+                "--source-units",
+                "guess",
+                "--interface",
+                "Radio",
+            ],
+        ] {
+            assert!(Args::try_parse_from(missing).is_err());
+        }
+        assert!(
+            Args::try_parse_from([
+                "rnsd-rs",
+                "config",
+                "ifac-units",
+                "--source-units",
+                "bits",
+                "--interface",
+                "Radio",
+                "--write",
+            ])
+            .is_ok()
+        );
     }
 }

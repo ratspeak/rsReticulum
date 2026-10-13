@@ -1,3 +1,4 @@
+use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -54,6 +55,8 @@ pub async fn spawn_udp_interface(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     // Python UDPInterface `device =`: fill unset listen/forward IPs with the
     // NIC's IPv4 broadcast address; a device that can't be resolved is a
     // config error, not a silent fallback to wildcard.
@@ -166,6 +169,8 @@ pub async fn spawn_udp_interface(
 
     Ok(InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(500, 1064, false),
         parent_id: None,
         name,
         mode,
@@ -236,6 +241,7 @@ mod tests {
         let handle = spawn_udp_interface(cfg, 2, transport_tx)
             .await
             .expect("explicit IPs bypass device resolution");
+        handle.owner.mark_registered();
         handle.read_task.abort();
     }
 
@@ -278,6 +284,7 @@ mod tests {
         let handle_a = spawn_udp_interface(cfg_a, 10, transport_tx.clone())
             .await
             .unwrap();
+        handle_a.owner.mark_registered();
 
         // Reserve two free ports via bind-drop; handle doesn't expose its addr.
         let sock_tmp1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -298,9 +305,11 @@ mod tests {
         let handle_a = spawn_udp_interface(cfg_a, 10, transport_tx.clone())
             .await
             .unwrap();
+        handle_a.owner.mark_registered();
         let handle_b = spawn_udp_interface(cfg_b, 20, transport_tx.clone())
             .await
             .unwrap();
+        handle_b.owner.mark_registered();
 
         // A → B's listen port; inbound carries B's interface_id (20).
         let payload = Bytes::from_static(b"udp test data");
@@ -311,7 +320,7 @@ mod tests {
             .expect("timeout")
             .expect("channel closed");
 
-        match msg {
+        match crate::traits::test_event_for_handle(msg, &handle_b) {
             TransportMessage::Inbound(pkt) => {
                 assert_eq!(pkt.raw, payload);
                 assert_eq!(pkt.interface_id, 20);
@@ -327,7 +336,7 @@ mod tests {
             .expect("timeout")
             .expect("channel closed");
 
-        match msg2 {
+        match crate::traits::test_event_for_handle(msg2, &handle_a) {
             TransportMessage::Inbound(pkt) => {
                 assert_eq!(pkt.raw, reply);
                 assert_eq!(pkt.interface_id, 10);

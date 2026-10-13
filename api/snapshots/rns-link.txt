@@ -49,6 +49,7 @@ pub enum rns_link::handshake::HandshakeError
 pub rns_link::handshake::HandshakeError::InvalidLength(usize)
 pub rns_link::handshake::HandshakeError::InvalidSignature
 pub rns_link::handshake::HandshakeError::KeyDerivation(rns_link::key_derivation::LinkKeyError)
+pub rns_link::handshake::HandshakeError::Signalling(rns_wire::link_signalling::LinkSignallingError)
 pub rns_link::handshake::HandshakeError::TooShort
 pub rns_link::handshake::HandshakeError::UnsupportedMode(u8)
 pub struct rns_link::handshake::EphemeralKeys
@@ -64,20 +65,20 @@ impl zeroize::Zeroize for rns_link::handshake::EphemeralKeys
 pub fn rns_link::handshake::EphemeralKeys::zeroize(&mut self)
 pub struct rns_link::handshake::LinkProofData
 pub rns_link::handshake::LinkProofData::responder_x25519_pub: [u8; 32]
-pub rns_link::handshake::LinkProofData::signalling: rns_link::mtu_discovery::SignallingData
+pub rns_link::handshake::LinkProofData::signalling: rns_wire::link_signalling::SignallingData
 pub rns_link::handshake::LinkProofData::signature: [u8; 64]
 impl rns_link::handshake::LinkProofData
-pub fn rns_link::handshake::LinkProofData::create(&rns_crypto::ed25519::Ed25519PrivateKey, &[u8; 32], &[u8; 32], &[u8; 16], rns_link::mtu_discovery::SignallingData) -> Self
-pub fn rns_link::handshake::LinkProofData::create_with<F>(F, &[u8; 32], &[u8; 32], &[u8; 16], rns_link::mtu_discovery::SignallingData) -> Self where F: core::ops::function::FnOnce(&[u8]) -> [u8; 64]
+pub fn rns_link::handshake::LinkProofData::create(&rns_crypto::ed25519::Ed25519PrivateKey, &[u8; 32], &[u8; 32], &[u8; 16], rns_wire::link_signalling::SignallingData) -> Self
+pub fn rns_link::handshake::LinkProofData::create_with<F>(F, &[u8; 32], &[u8; 32], &[u8; 16], rns_wire::link_signalling::SignallingData) -> Self where F: core::ops::function::FnOnce(&[u8]) -> [u8; 64]
 pub fn rns_link::handshake::LinkProofData::pack(&self) -> alloc::vec::Vec<u8>
 pub fn rns_link::handshake::LinkProofData::unpack(&[u8]) -> core::result::Result<Self, rns_link::handshake::HandshakeError>
 pub fn rns_link::handshake::LinkProofData::validate(&self, &rns_crypto::ed25519::Ed25519PublicKey, &[u8; 16], &[u8; 32]) -> bool
 pub struct rns_link::handshake::LinkRequestData
 pub rns_link::handshake::LinkRequestData::peer_ed25519_pub: [u8; 32]
 pub rns_link::handshake::LinkRequestData::peer_x25519_pub: [u8; 32]
-pub rns_link::handshake::LinkRequestData::signalling: rns_link::mtu_discovery::SignallingData
+pub rns_link::handshake::LinkRequestData::signalling: rns_wire::link_signalling::SignallingData
 impl rns_link::handshake::LinkRequestData
-pub fn rns_link::handshake::LinkRequestData::pack(&rns_link::handshake::EphemeralKeys, rns_link::mtu_discovery::SignallingData) -> alloc::vec::Vec<u8>
+pub fn rns_link::handshake::LinkRequestData::pack(&rns_link::handshake::EphemeralKeys, rns_wire::link_signalling::SignallingData) -> alloc::vec::Vec<u8>
 pub fn rns_link::handshake::LinkRequestData::unpack(&[u8]) -> core::result::Result<Self, rns_link::handshake::HandshakeError>
 pub fn rns_link::handshake::compute_link_id(&[u8; 16], &[u8]) -> [u8; 16]
 pub fn rns_link::handshake::compute_link_id_from_raw(&[u8], rns_wire::flags::HeaderType) -> [u8; 16]
@@ -287,6 +288,7 @@ pub fn rns_link::link::Link::track_incoming_resource(&mut self, [u8; 32])
 pub fn rns_link::link::Link::track_outgoing_resource(&mut self, [u8; 32])
 pub fn rns_link::link::Link::track_phy_stats(&mut self, bool)
 pub fn rns_link::link::Link::traffic_stats(&self) -> (u64, u64, u64, u64)
+pub fn rns_link::link::Link::try_extend_establishment_timeout(&mut self, f64) -> core::result::Result<(), rns_link::link::TimeoutError>
 pub fn rns_link::link::Link::untrack_resource(&mut self, &[u8; 32])
 pub fn rns_link::link::Link::update_outgoing_resource_state(&mut self, usize, rns_link::link::OutboundResourceState)
 pub fn rns_link::link::Link::update_pending_request_id(&mut self, &[u8; 16], [u8; 16]) -> bool
@@ -301,19 +303,19 @@ pub struct rns_link::link::LinkPhyStats
 pub rns_link::link::LinkPhyStats::q: core::option::Option<f64>
 pub rns_link::link::LinkPhyStats::rssi: core::option::Option<f64>
 pub rns_link::link::LinkPhyStats::snr: core::option::Option<f64>
+pub struct rns_link::link::TimeoutError
 pub type rns_link::link::LinkCallback = alloc::boxed::Box<(dyn core::ops::function::Fn(&rns_link::link::Link) + core::marker::Send + core::marker::Sync)>
 pub type rns_link::link::PacketCallback = alloc::boxed::Box<(dyn core::ops::function::Fn(&[u8]) + core::marker::Send + core::marker::Sync)>
 pub type rns_link::link::ParsedRequestData = ([u8; 16], [u8; 16], f64, alloc::vec::Vec<u8>)
 pub type rns_link::link::RemoteIdentifiedCallback = alloc::boxed::Box<(dyn core::ops::function::Fn(&rns_link::link::Link, &[u8; 64]) + core::marker::Send + core::marker::Sync)>
 pub type rns_link::link::ResourceCallback = alloc::boxed::Box<(dyn core::ops::function::Fn(bool) -> bool + core::marker::Send + core::marker::Sync)>
 pub mod rns_link::mtu_discovery
-pub struct rns_link::mtu_discovery::SignallingData
-pub rns_link::mtu_discovery::SignallingData::mode: u8
-pub rns_link::mtu_discovery::SignallingData::mtu: u32
-impl rns_link::mtu_discovery::SignallingData
-pub fn rns_link::mtu_discovery::SignallingData::new(u8, u32) -> Self
-pub fn rns_link::mtu_discovery::SignallingData::pack(&self) -> [u8; 3]
-pub fn rns_link::mtu_discovery::SignallingData::unpack(&[u8]) -> core::option::Option<Self>
+pub use rns_link::mtu_discovery::LinkMtu
+pub use rns_link::mtu_discovery::LinkSignalling
+pub use rns_link::mtu_discovery::LinkSignallingError
+pub use rns_link::mtu_discovery::SignallingData
+pub use rns_link::mtu_discovery::parse_proof_signalling
+pub use rns_link::mtu_discovery::parse_request_signalling
 pub mod rns_link::request
 pub enum rns_link::request::RequestState
 pub rns_link::request::RequestState::Delivered

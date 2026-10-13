@@ -9,6 +9,8 @@ use tokio::sync::oneshot;
 
 fn binding() -> LinkEndpointBinding {
     LinkEndpointBinding {
+        interface_owner: None,
+
         link_id: [0xd3; 16],
         interface_id: 7,
         role: LinkEndpointRole::Responder,
@@ -24,7 +26,13 @@ fn begin_bind(actor: &TransportActor) -> LinkEndpointDispatchBindReceipt {
     let (lifecycle_tx, _rx) = mpsc::unbounded_channel();
     actor
         .link_endpoint_dispatch_handle()
-        .try_bind(binding(), lifecycle_tx)
+        .try_bind(
+            LinkEndpointBinding {
+                interface_owner: actor.interfaces.get(&7).map(|entry| entry.owner.id()),
+                ..binding()
+            },
+            lifecycle_tx,
+        )
         .unwrap()
 }
 
@@ -167,7 +175,13 @@ fn dispatch_stale_generation_cannot_send_or_expire_replacement() {
     // binds through the legacy API: same id, role and interface, new owner.
     let (lifecycle_tx, _lifecycle_rx) = mpsc::unbounded_channel();
     assert_eq!(
-        actor.bind_link_endpoint(binding(), lifecycle_tx),
+        actor.bind_link_endpoint(
+            LinkEndpointBinding {
+                interface_owner: actor.interfaces.get(&7).map(|entry| entry.owner.id()),
+                ..binding()
+            },
+            lifecycle_tx
+        ),
         LinkEndpointBindResult::Bound
     );
     execute(&mut actor);
@@ -357,10 +371,17 @@ async fn dispatch_real_actor_reports_admission_after_low_rtt_window_not_queue_ac
     target.tx.try_send(Bytes::from_static(b"occupied")).unwrap();
     actor.interfaces.insert(7, target);
     let dispatch = actor.link_endpoint_dispatch_handle();
+    let interface_owner = actor.interfaces.get(&7).map(|entry| entry.owner.id());
     let owner = tokio::spawn(actor.run());
     let (lifecycle_tx, _lifecycle_rx) = mpsc::unbounded_channel();
     let token = dispatch
-        .try_bind(binding(), lifecycle_tx)
+        .try_bind(
+            LinkEndpointBinding {
+                interface_owner,
+                ..binding()
+            },
+            lifecycle_tx,
+        )
         .unwrap()
         .await
         .unwrap()
@@ -636,6 +657,7 @@ fn dispatch_cancelled_packet_does_not_close_or_block_another_link() {
     let (mut actor, mut rx) = fixture();
     let token = bind(&mut actor);
     let other_binding = LinkEndpointBinding {
+        interface_owner: actor.interfaces.get(&7).map(|entry| entry.owner.id()),
         link_id: [0xd4; 16],
         ..binding()
     };
@@ -685,10 +707,17 @@ async fn dispatch_real_actor_explicit_cancel_prunes_full_driver_without_closing_
     target.tx.try_send(Bytes::from_static(b"occupied")).unwrap();
     actor.interfaces.insert(7, target);
     let dispatch = actor.link_endpoint_dispatch_handle();
+    let interface_owner = actor.interfaces.get(&7).map(|entry| entry.owner.id());
     let owner = tokio::spawn(actor.run());
     let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
     let token = dispatch
-        .try_bind(binding(), lifecycle_tx)
+        .try_bind(
+            LinkEndpointBinding {
+                interface_owner,
+                ..binding()
+            },
+            lifecycle_tx,
+        )
         .unwrap()
         .await
         .unwrap()

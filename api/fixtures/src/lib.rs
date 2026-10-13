@@ -134,7 +134,7 @@ pub mod shared_ownership {
     }
 }
 
-/// The 1.4 discovery API distinguishes unknown components from true zeros.
+/// The 1.3 discovery API distinguishes unknown components from true zeros.
 pub mod nullable_discovery {
     use rns_transport::discovery::DiscoveryInterfaceConfig;
     use rns_transport::discovery::app_data::DiscoveryInfo;
@@ -161,5 +161,33 @@ pub mod nullable_discovery {
 
     pub fn read(info: &DiscoveryInfo) -> [Option<f64>; 3] {
         [info.latitude, info.longitude, info.height]
+    }
+}
+
+/// Application admission carries non-cloneable authority separately from bytes.
+pub mod application_packet_admission {
+    use rns_runtime::link_manager::{
+        InboundLinkPacket, LinkPacketReceiptOutcome, LinkPacketRejection,
+    };
+    pub async fn accept(packet: InboundLinkPacket) -> Option<LinkPacketReceiptOutcome> {
+        let (payload, receipt) = packet.into_parts();
+        let outcome = receipt?.accept().await.ok();
+        drop(payload);
+        outcome
+    }
+    pub fn compile_surface() {
+        let _ = LinkPacketRejection::InvalidPropagationStamp;
+        let _ = rns_runtime::link_manager::LinkManager::set_ordinary_packet_proof_strategy;
+        let _ = rns_runtime::interface_factory::InterfacePostInit::try_from_section;
+        let _ = rns_runtime::config::ifac::parse_ifac_size;
+        let _ = rns_runtime::config::ifac_lock::ConfigWriteLock::acquire;
+        let _ = rns_identity::persistence::durable_write;
+        let _ = rns_identity::persistence::durable_reconcile_hash;
+        let _ = rns_transport::messages::InterfacePacketCapacity::new(500, 508, false);
+        let _ = rns_transport::messages::InterfaceTransportSender::new;
+        let _ = rns_transport::link_messages::dispatch_link_request;
+        let _ = rns_transport::link_messages::LinkRequestDispatchError::NoInterface;
+        let _ = rns_transport::ifac::try_ifac_sign;
+        let _ = rns_protocol::resource_control::check_control_frame;
     }
 }

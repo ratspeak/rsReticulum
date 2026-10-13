@@ -79,6 +79,7 @@ impl LinkRequestData {
             return Err(HandshakeError::InvalidLength(data.len()));
         }
 
+        rns_wire::link_signalling::parse_request_signalling(data)?;
         let mut x25519_pub = [0u8; 32];
         x25519_pub.copy_from_slice(&data[0..32]);
 
@@ -217,6 +218,7 @@ impl LinkProofData {
             return Err(HandshakeError::InvalidLength(data.len()));
         }
 
+        rns_wire::link_signalling::parse_proof_signalling(data)?;
         let mut signature = [0u8; 64];
         signature.copy_from_slice(&data[0..64]);
 
@@ -272,6 +274,8 @@ pub fn perform_handshake(
 
 #[derive(Debug, thiserror::Error)]
 pub enum HandshakeError {
+    #[error(transparent)]
+    Signalling(#[from] rns_wire::link_signalling::LinkSignallingError),
     #[error("handshake data too short")]
     TooShort,
     #[error("invalid handshake data length: {0}")]

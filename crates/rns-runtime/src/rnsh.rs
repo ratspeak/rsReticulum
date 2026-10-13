@@ -50,6 +50,8 @@ const SIGKILL_NUM: i32 = 9;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RnshError {
+    #[error("link request admission failed: {0}")]
+    RequestDispatch(#[from] rns_transport::link_messages::LinkRequestDispatchError),
     #[error("transport channel unavailable")]
     TransportUnavailable,
     #[error("timed out waiting for {0}")]
@@ -331,13 +333,18 @@ pub async fn rnsh_client_execute(
     );
 
     let link_req_pkt = build_link_request_packet(destination_hash, &request_data);
-    transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw: link_req_pkt,
-            destination_hash,
-        }))
-        .await
-        .map_err(|_| RnshError::TransportUnavailable)?;
+    tokio::time::timeout(
+        remaining(deadline),
+        rns_transport::link_messages::dispatch_link_request(
+            &transport_tx,
+            OutboundRequest {
+                raw: link_req_pkt,
+                destination_hash,
+            },
+        ),
+    )
+    .await
+    .map_err(|_| RnshError::Timeout("link request admission"))??;
 
     let identity_ed25519_pub: [u8; 32] = pubkey[32..64]
         .try_into()
@@ -353,11 +360,13 @@ pub async fn rnsh_client_execute(
     )
     .await?;
     let attached_interface = proof.interface_id;
+    let interface_owner = proof.interface_owner;
     let rtt_data = proof.rtt_data;
     let mut endpoint_lifecycle_rx = crate::link_endpoint::bind(
         &transport_tx,
         link_id,
         attached_interface,
+        interface_owner,
         LinkEndpointRole::Initiator,
     )
     .await
@@ -365,6 +374,7 @@ pub async fn rnsh_client_execute(
     registration.endpoint_bound();
     let mut endpoint = ClientLinkEndpoint {
         attached_interface,
+        interface_owner,
         lifecycle_rx: &mut endpoint_lifecycle_rx,
         packet_rx: &mut lpkt_rx,
     };
@@ -513,6 +523,7 @@ pub async fn rnsh_client_execute(
 
 struct ClientLinkEndpoint<'a> {
     attached_interface: InterfaceId,
+    interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
     lifecycle_rx: &'a mut mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
     packet_rx: &'a mut mpsc::Receiver<DestinationEvent>,
 }
@@ -627,6 +638,7 @@ async fn run_client_io_loop(
                     pending_messages,
                     event,
                     endpoint.attached_interface,
+                    endpoint.interface_owner,
                 ).await?;
             }
             terminal = endpoint.lifecycle_rx.recv() => {
@@ -1687,6 +1699,7 @@ async fn receive_client_messages(
         pending_messages,
         event,
         endpoint.attached_interface,
+        endpoint.interface_owner,
     )
     .await
 }
@@ -1698,14 +1711,18 @@ async fn process_client_destination_event(
     pending_messages: &mut VecDeque<RnshMessage>,
     event: DestinationEvent,
     attached_interface: InterfaceId,
+    interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
 ) -> Result<bool, RnshError> {
     let DestinationEvent::InboundPacket {
-        raw, interface_id, ..
+        raw,
+        interface_id,
+        interface_owner: event_owner,
+        ..
     } = event
     else {
         return Ok(false);
     };
-    if interface_id != attached_interface {
+    if interface_id != attached_interface || event_owner != interface_owner {
         return Ok(false);
     }
     let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {

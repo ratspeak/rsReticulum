@@ -3,7 +3,6 @@
 //! Exit codes: 0 all delivered, 1 path timeout, 2 packet loss, 3 size > MTU.
 
 use std::process;
-use std::time::Duration;
 
 use clap::Parser;
 
@@ -106,8 +105,24 @@ pub(crate) async fn main() {
 
     let size = args.size.unwrap_or(DEFAULT_PROBE_SIZE);
     // None = Python default: 12 s + first-hop timeout, resolved per wait.
-    let timeout = args.timeout.map(Duration::from_secs_f64);
-    let wait = Duration::from_secs_f64(args.wait.max(0.0));
+    let timeout = match args
+        .timeout
+        .map(rns_runtime::probe::checked_probe_timeout)
+        .transpose()
+    {
+        Ok(timeout) => timeout,
+        Err(error) => {
+            eprintln!("rnprobe-rs: invalid --timeout: {error}");
+            process::exit(1);
+        }
+    };
+    let wait = match rns_runtime::probe::checked_probe_timeout(args.wait) {
+        Ok(wait) => wait,
+        Err(error) => {
+            eprintln!("rnprobe-rs: invalid --wait: {error}");
+            process::exit(1);
+        }
+    };
 
     let shutdown = rns_runtime::lifecycle::ShutdownSignal::new();
     let _signal_rx = rns_runtime::lifecycle::install_signal_handlers(shutdown.clone());

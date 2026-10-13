@@ -39,7 +39,46 @@ pub struct IngressOverrides {
     pub egress_control: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid ingress override {field}: must be finite, nonnegative and representable")]
+pub struct IngressOverrideError {
+    pub field: &'static str,
+}
+fn valid_frequency(value: f64) -> bool {
+    value.is_finite() && value >= 0.0
+}
+fn valid_time(value: f64) -> bool {
+    Duration::try_from_secs_f64(value)
+        .ok()
+        .is_some_and(|duration| Instant::now().checked_add(duration).is_some())
+}
+
 impl IngressOverrides {
+    pub fn validate(&self) -> Result<(), IngressOverrideError> {
+        for (field, value) in [
+            ("ic_burst_freq_new", self.burst_freq_new),
+            ("ic_burst_freq", self.burst_freq),
+            ("ic_pr_burst_freq_new", self.pr_burst_freq_new),
+            ("ic_pr_burst_freq", self.pr_burst_freq),
+            ("ec_pr_freq", self.ec_pr_freq),
+        ] {
+            if value.is_some_and(|value| !valid_frequency(value)) {
+                return Err(IngressOverrideError { field });
+            }
+        }
+        for (field, value) in [
+            ("ic_new_time", self.new_time),
+            ("ic_burst_hold", self.burst_hold),
+            ("ic_burst_penalty", self.burst_penalty),
+            ("ic_held_release_interval", self.held_release_interval),
+        ] {
+            if value.is_some_and(|value| !valid_time(value)) {
+                return Err(IngressOverrideError { field });
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.enabled.is_none()
             && self.burst_freq_new.is_none()
@@ -141,7 +180,31 @@ impl IngressController {
 
     /// Controller with per-interface overrides applied; unset fields keep
     /// their compile-time defaults.
+    pub fn try_with_overrides(overrides: &IngressOverrides) -> Result<Self, IngressOverrideError> {
+        overrides.validate()?;
+        Ok(Self::apply_overrides(overrides))
+    }
+
+    #[deprecated(note = "use try_with_overrides for configuration validation")]
     pub fn with_overrides(overrides: &IngressOverrides) -> Self {
+        let mut safe = overrides.clone();
+        safe.burst_freq_new = safe.burst_freq_new.filter(|value| valid_frequency(*value));
+        safe.burst_freq = safe.burst_freq.filter(|value| valid_frequency(*value));
+        safe.pr_burst_freq_new = safe
+            .pr_burst_freq_new
+            .filter(|value| valid_frequency(*value));
+        safe.pr_burst_freq = safe.pr_burst_freq.filter(|value| valid_frequency(*value));
+        safe.ec_pr_freq = safe.ec_pr_freq.filter(|value| valid_frequency(*value));
+        safe.new_time = safe.new_time.filter(|value| valid_time(*value));
+        safe.burst_hold = safe.burst_hold.filter(|value| valid_time(*value));
+        safe.burst_penalty = safe.burst_penalty.filter(|value| valid_time(*value));
+        safe.held_release_interval = safe
+            .held_release_interval
+            .filter(|value| valid_time(*value));
+        Self::apply_overrides(&safe)
+    }
+
+    fn apply_overrides(overrides: &IngressOverrides) -> Self {
         let mut ctrl = Self::new();
         if let Some(v) = overrides.enabled {
             ctrl.enabled = v;
@@ -307,7 +370,9 @@ impl IngressController {
         } else if ia_freq > freq_threshold {
             self.burst_active = true;
             self.burst_activated = now;
-            self.held_release = now + Duration::from_secs_f64(self.burst_penalty);
+            self.held_release = now
+                .checked_add(Duration::from_secs_f64(self.burst_penalty))
+                .unwrap_or(now);
             true
         } else {
             false
@@ -417,7 +482,9 @@ impl IngressController {
             .map(|(hash, _)| *hash)?;
 
         let announce = self.held_announces.remove(&best_hash)?;
-        self.held_release = now + Duration::from_secs_f64(self.held_release_interval);
+        self.held_release = now
+            .checked_add(Duration::from_secs_f64(self.held_release_interval))
+            .unwrap_or(now);
         Some(announce)
     }
 
@@ -509,6 +576,28 @@ fn sample_age(now: Instant, sample: Instant) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[allow(deprecated)]
+    fn hostile_ingress_overrides_are_rejected_or_individually_defaulted() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, f64::MAX] {
+            let overrides = super::IngressOverrides {
+                burst_penalty: Some(bad),
+                burst_freq: Some(4.0),
+                ..Default::default()
+            };
+            assert!(super::IngressController::try_with_overrides(&overrides).is_err());
+            let safe = super::IngressController::with_overrides(&overrides);
+            assert_eq!(safe.burst_freq, 4.0);
+            assert_eq!(safe.burst_penalty, super::IC_BURST_PENALTY);
+        }
+        let zero = super::IngressOverrides {
+            burst_penalty: Some(0.0),
+            burst_freq: Some(0.0),
+            ..Default::default()
+        };
+        assert!(super::IngressController::try_with_overrides(&zero).is_ok());
+    }
+
     use super::*;
 
     fn push_samples(
@@ -719,11 +808,12 @@ mod tests {
         );
         assert!(!disabled.should_egress_limit_pr());
 
-        let mut ctrl = IngressController::with_overrides(&IngressOverrides {
+        let mut ctrl = IngressController::try_with_overrides(&IngressOverrides {
             egress_control: Some(true),
             ec_pr_freq: Some(EC_PR_FREQ),
             ..Default::default()
-        });
+        })
+        .unwrap();
         push_samples(
             &mut ctrl.op_freq_deque,
             OP_FREQ_SAMPLES,

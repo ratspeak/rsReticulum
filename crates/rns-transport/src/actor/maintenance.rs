@@ -500,13 +500,27 @@ impl TransportActor {
                 if let Some(entry) = self.interfaces.get(&iface_id)
                     && let Some(background) = crate::background_egress::lookup(&entry.tx)
                 {
+                    if !entry.accepts_clear_packet(raw.len()) {
+                        self.interfaces
+                            .get_mut(&iface_id)
+                            .expect("existing interface")
+                            .announce_queue
+                            .remove(idx);
+                        continue;
+                    }
                     let bytes = if let Some(key) = &entry.ifac_key {
-                        Bytes::from(crate::ifac::ifac_sign(&raw, key, entry.ifac_size))
+                        let Ok(wire) = crate::ifac::try_ifac_sign(&raw, key, entry.ifac_size)
+                        else {
+                            continue;
+                        };
+                        Bytes::from(wire)
                     } else {
                         raw.clone()
                     };
                     let expires = entry.announce_queue[idx].time + QUEUED_ANNOUNCE_LIFE;
-                    if let Some(receipt) = background.try_offer(bytes, expires, now) {
+                    if let Some(receipt) =
+                        background.try_offer_owned(bytes, expires, now, entry.owner.clone())
+                    {
                         self.announce_pressure.offered += 1;
                         self.offered_announces.insert(
                             iface_id,

@@ -1,46 +1,13 @@
-use crate::constants::{MODE_BYTEMASK, MTU_BYTEMASK};
-
-/// MTU and encryption-mode signalling packed into 3 bytes (big-endian).
-///
-/// Wire layout: `[23:21] mode (0..=7)`, `[20:0] mtu (0..=2_097_151)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SignallingData {
-    pub mode: u8,
-    pub mtu: u32,
-}
-
-impl SignallingData {
-    pub fn new(mode: u8, mtu: u32) -> Self {
-        Self {
-            mode: mode & 0x07,
-            mtu: mtu & MTU_BYTEMASK,
-        }
-    }
-
-    /// Pack into 3 big-endian bytes.
-    pub fn pack(&self) -> [u8; 3] {
-        let value = (self.mtu & MTU_BYTEMASK) | ((((self.mode as u32) << 5) & MODE_BYTEMASK) << 16);
-        let bytes = value.to_be_bytes();
-        // Value fits in 24 bits; drop the high byte of the u32.
-        [bytes[1], bytes[2], bytes[3]]
-    }
-
-    /// Parse 3 big-endian bytes. Returns `None` if the input is shorter.
-    pub fn unpack(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 3 {
-            return None;
-        }
-        let value = ((bytes[0] as u32) << 16) | ((bytes[1] as u32) << 8) | (bytes[2] as u32);
-        let mtu = value & MTU_BYTEMASK;
-        let mode = ((value >> 21) & 0x07) as u8;
-        Some(Self { mode, mtu })
-    }
-}
+//! Shared dependency-neutral Link signalling representation and checked budget.
+pub use rns_wire::link_signalling::{
+    LinkMtu, LinkSignalling, LinkSignallingError, SignallingData, parse_proof_signalling,
+    parse_request_signalling,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::{DEFAULT_MODE, MODE_AES256_CBC};
+    use crate::constants::{DEFAULT_MODE, MODE_AES256_CBC, MTU_BYTEMASK};
 
     #[test]
     fn test_pack_unpack_roundtrip() {

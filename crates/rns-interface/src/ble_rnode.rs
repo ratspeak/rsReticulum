@@ -3,6 +3,7 @@
 
 mod generation;
 
+use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -2685,6 +2686,8 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
     transport_tx: mpsc::Sender<TransportMessage>,
     options: RNodeStartupOptions,
 ) -> Result<SpawnedRNodeInterface, RNodeSpawnError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     config.validate().map_err(|error| {
         InterfaceError::SendFailed(format!("rnode config {}: {error}", error.field()))
     })?;
@@ -3607,6 +3610,8 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
 
     let interface = InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(500, 508, false),
         parent_id: None,
         name,
         mode,
@@ -3683,6 +3688,8 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
     tcp_port: u16,
     options: RNodeStartupOptions,
 ) -> Result<SpawnedRNodeInterface, RNodeSpawnError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     config.validate().map_err(|error| {
@@ -4421,6 +4428,8 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
 
     let interface = InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(500, 508, false),
         parent_id: None,
         name,
         mode,
@@ -6112,6 +6121,7 @@ mod tests {
         )
         .await
         .expect("spawn native reliability interface");
+        spawned.interface.owner.mark_registered();
         let tx = spawned.interface.tx.clone();
         let online = spawned.interface.online.clone();
         let txb = spawned
@@ -6155,7 +6165,9 @@ mod tests {
             .await
             .expect("same-read post-Ready inbound timeout")
             .expect("same-read post-Ready transport message");
-        let TransportMessage::Inbound(inbound) = inbound else {
+        let TransportMessage::Inbound(inbound) =
+            crate::traits::test_event_for_handle(inbound, &spawned.interface)
+        else {
             panic!("expected inbound transport packet after Ready");
         };
         assert_eq!(inbound.raw, post_ready_inbound);
@@ -6189,7 +6201,9 @@ mod tests {
             .await
             .expect("pre-Ready physical DATA release timeout")
             .expect("pre-Ready physical DATA transport message");
-        let TransportMessage::Inbound(held_inbound) = held_inbound else {
+        let TransportMessage::Inbound(held_inbound) =
+            crate::traits::test_event_for_handle(held_inbound, &spawned.interface)
+        else {
             panic!("expected held inbound transport packet after reconnect Ready");
         };
         assert_eq!(held_inbound.raw, pre_ready_reconnect_inbound);
@@ -6870,6 +6884,7 @@ mod tests {
         )
         .await
         .expect("spawn strict native observer");
+        spawned.interface.owner.mark_registered();
         let mut subscription = spawned.driver.watch();
         let terminal = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -7268,6 +7283,7 @@ mod tests {
         let handle = spawn_ble_rnode_interface(config, 99, transport_tx)
             .await
             .expect("Failed to spawn BLE RNode interface");
+        handle.owner.mark_registered();
 
         assert!(handle.online.load(Ordering::SeqCst));
         assert_eq!(handle.mtu, 508);

@@ -3,6 +3,7 @@
 //! Beacons go to a multicast group derived from `SHA-256(group_id)` every
 //! ~1.6 s; data flows over unicast UDP. Peers age out after 22 s of silence.
 
+use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1039,6 +1040,8 @@ pub async fn spawn_auto_interface(
     transport_tx: mpsc::Sender<TransportMessage>,
     is_foreground: Arc<AtomicBool>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     let mcast_group = derive_multicast_address(
         &config.group_id,
         config.discovery_scope,
@@ -1761,6 +1764,8 @@ pub async fn spawn_auto_interface(
 
     Ok(InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(1196, 1196, true),
         parent_id: None,
         name,
         mode,

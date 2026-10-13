@@ -29,6 +29,7 @@
 //! Keepalive: 15s interval, 1-byte ping; 3 misses → disconnect. Cap 7
 //! simultaneous peers.
 
+use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -5188,7 +5189,7 @@ fn central_writer_key(address: &str) -> String {
 ))]
 struct PeerReadLoopCtx {
     interface_id: InterfaceId,
-    transport_tx: mpsc::Sender<TransportMessage>,
+    transport_tx: InterfaceTransportSender,
     peer_online: Arc<AtomicBool>,
     rxb: Arc<AtomicU64>,
     peer_writers: PeerWriterRegistry,
@@ -5472,6 +5473,8 @@ pub async fn spawn_ble_peer_interface(
     foreground_wake: Arc<tokio::sync::Notify>,
     seed_addresses: Vec<String>,
 ) -> Result<InterfaceHandle, InterfaceError> {
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
     let name = config.name.clone();
 
     // Reset the process-wide running flag and advance the session generation
@@ -6843,6 +6846,8 @@ pub async fn spawn_ble_peer_interface(
 
     Ok(InterfaceHandle {
         id,
+        owner,
+        packet_capacity: InterfacePacketCapacity::new(500, 500, false),
         parent_id: None,
         name,
         mode: config.mode,

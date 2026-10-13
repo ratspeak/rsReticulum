@@ -1217,6 +1217,8 @@ pub rns_interface::traits::InterfaceHandle::mode: rns_interface::traits::Interfa
 pub rns_interface::traits::InterfaceHandle::mtu: u32
 pub rns_interface::traits::InterfaceHandle::name: alloc::string::String
 pub rns_interface::traits::InterfaceHandle::online: alloc::sync::Arc<core::sync::atomic::AtomicBool>
+pub rns_interface::traits::InterfaceHandle::owner: rns_transport::interface_ownership::InterfaceOwner
+pub rns_interface::traits::InterfaceHandle::packet_capacity: rns_transport::interface_ownership::InterfacePacketCapacity
 pub rns_interface::traits::InterfaceHandle::parent_id: core::option::Option<rns_interface::traits::InterfaceId>
 pub rns_interface::traits::InterfaceHandle::read_task: tokio::runtime::task::join::JoinHandle<()>
 pub rns_interface::traits::InterfaceHandle::rxb: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>>

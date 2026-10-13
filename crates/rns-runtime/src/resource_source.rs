@@ -122,6 +122,19 @@ impl PreparedResourceSource {
             .map(|metadata| 3usize.saturating_add(metadata.len()))
             .unwrap_or(0);
 
+        let request_id = match &purpose {
+            ResourcePurpose::Request(id) => Some(id.as_slice()),
+            ResourcePurpose::Ordinary => None,
+        };
+        rns_protocol::resource_control::preflight_outbound(
+            data_size,
+            options.metadata.as_ref().map(Vec::len),
+            request_id,
+            false,
+            true,
+            rns_wire::constants::MTU,
+        )?;
+
         if metadata_wire_size.saturating_add(data_size) <= MAX_EFFICIENT_SIZE {
             let mut data = Vec::with_capacity(data_size);
             source.read_to_end(&mut data)?;

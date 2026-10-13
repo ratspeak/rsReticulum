@@ -12,6 +12,7 @@ pub mod context;
 pub mod flags;
 pub mod hash;
 pub mod header;
+pub mod link_signalling;
 pub mod packet;
 pub mod proof;
 #[cfg(feature = "std")]

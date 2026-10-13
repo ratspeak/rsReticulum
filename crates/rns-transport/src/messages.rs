@@ -16,6 +16,10 @@ pub use crate::ingress::HeldAnnounce;
 use crate::ingress::IngressController;
 
 pub type InterfaceId = u64;
+pub use crate::interface_ownership::{
+    InterfaceCapacityError, InterfaceOwner, InterfaceOwnerId, InterfacePacketCapacity,
+    InterfaceTransportSender,
+};
 
 /// Privacy-bounded, aggregate-only inspection values supplied by an
 /// interface driver.
@@ -158,6 +162,7 @@ pub enum LinkEndpointRole {
 /// Immutable egress attachment for one locally-owned established Link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkEndpointBinding {
+    pub interface_owner: Option<InterfaceOwnerId>,
     pub link_id: [u8; 16],
     pub interface_id: InterfaceId,
     pub role: LinkEndpointRole,
@@ -236,6 +241,8 @@ pub struct TimerTick {
 /// Metadata and TX handle for one registered interface. The actor owns the
 /// sender; driver code holds only the matching receiver.
 pub struct InterfaceEntry {
+    pub owner: InterfaceOwner,
+    pub packet_capacity: InterfacePacketCapacity,
     pub name: String,
     pub mode: InterfaceMode,
     pub role: InterfaceRole,
@@ -297,6 +304,8 @@ impl InterfaceEntry {
         tx: mpsc::Sender<Bytes>,
     ) -> Self {
         Self {
+            owner: InterfaceOwner::new(),
+            packet_capacity: InterfacePacketCapacity::base(mtu),
             name,
             mode,
             role: InterfaceRole::Normal,
@@ -322,6 +331,39 @@ impl InterfaceEntry {
             recursive_prs: false,
             announces_from_internal: true,
         }
+    }
+
+    pub fn with_packet_capacity(mut self, capacity: InterfacePacketCapacity) -> Self {
+        self.packet_capacity = capacity;
+        self
+    }
+    pub fn with_owner(mut self, owner: InterfaceOwner) -> Self {
+        self.owner = owner;
+        self
+    }
+    pub fn active_ifac_bytes(&self) -> usize {
+        if self.ifac_key.is_some() {
+            self.ifac_size
+        } else {
+            0
+        }
+    }
+    /// Pre-allocation admission for a complete clear Reticulum packet.
+    pub fn accepts_clear_packet(&self, len: usize) -> bool {
+        self.owner.is_current()
+            && self
+                .effective_clear_mtu()
+                .is_ok_and(|mtu| len <= mtu as usize)
+            && len
+                .checked_add(self.active_ifac_bytes())
+                .is_some_and(|wire| wire <= self.packet_capacity.max_wire_packet_bytes as usize)
+    }
+    pub fn effective_clear_mtu(&self) -> Result<u32, InterfaceCapacityError> {
+        if self.ifac_key.is_some() && !(1..=64).contains(&self.ifac_size) {
+            return Err(InterfaceCapacityError::InvalidIfac);
+        }
+        self.packet_capacity
+            .effective_clear_mtu(self.active_ifac_bytes())
     }
 
     pub fn with_multipoint(mut self, multipoint: bool) -> Self {
@@ -426,8 +468,20 @@ pub struct PathRequestOptions {
 // variants would churn all senders/receivers for little runtime benefit.
 #[allow(clippy::large_enum_variant)]
 pub enum TransportMessage {
+    /// Producer-bound event. A stale registration cannot act on a replacement.
+    InterfaceEvent {
+        interface_id: InterfaceId,
+        owner: InterfaceOwner,
+        message: Box<TransportMessage>,
+    },
     Inbound(InboundPacket),
     Outbound(OutboundRequest),
+    SendLinkRequest {
+        request: OutboundRequest,
+        result_tx: tokio::sync::oneshot::Sender<
+            Result<(), crate::link_messages::LinkRequestDispatchError>,
+        >,
+    },
     OutboundAttached {
         request: OutboundRequest,
         interface_id: InterfaceId,
@@ -600,6 +654,7 @@ pub enum TransportMessage {
     /// Record a new link in the table. `initiator=true` means we started the
     /// handshake, so the entry is pending until `ActivateLink` arrives.
     RegisterLink {
+        interface_owner: Option<InterfaceOwnerId>,
         link_id: [u8; 16],
         destination_hash: [u8; 16],
         interface_id: InterfaceId,
@@ -626,6 +681,8 @@ pub enum TransportMessage {
 /// keeps the span field cheap (no allocation in the hot path).
 pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
     match msg {
+        TransportMessage::InterfaceEvent { .. } => "InterfaceEvent",
+        TransportMessage::SendLinkRequest { .. } => "SendLinkRequest",
         TransportMessage::Inbound(_) => "Inbound",
         TransportMessage::Outbound(_) => "Outbound",
         TransportMessage::OutboundAttached { .. } => "OutboundAttached",
@@ -972,6 +1029,19 @@ pub struct BlackholeRpcEntry {
 impl std::fmt::Debug for TransportMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::SendLinkRequest { request, .. } => {
+                f.debug_tuple("SendLinkRequest").field(request).finish()
+            }
+            Self::InterfaceEvent {
+                interface_id,
+                owner,
+                message,
+            } => f
+                .debug_struct("InterfaceEvent")
+                .field("interface_id", interface_id)
+                .field("owner", owner)
+                .field("message", message)
+                .finish(),
             Self::Inbound(p) => f.debug_tuple("Inbound").field(p).finish(),
             Self::Outbound(r) => f.debug_tuple("Outbound").field(r).finish(),
             Self::OutboundAttached {

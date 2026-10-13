@@ -164,7 +164,7 @@ impl Default for KissDeframer {
 pub struct RawKissDeframer {
     buffer: Vec<u8>,
     in_frame: bool,
-    command: u8,
+    command: Option<u8>,
     /// Reusable scratch for unescape output.
     unescape_scratch: Vec<u8>,
 }
@@ -174,7 +174,7 @@ impl RawKissDeframer {
         Self {
             buffer: Vec::with_capacity(DEFRAME_BUF_CAPACITY),
             in_frame: false,
-            command: CMD_UNKNOWN,
+            command: None,
             unescape_scratch: Vec::with_capacity(DEFRAME_BUF_CAPACITY),
         }
     }
@@ -196,12 +196,14 @@ impl RawKissDeframer {
                                 &mut self.unescape_scratch,
                                 Vec::with_capacity(DEFRAME_BUF_CAPACITY),
                             );
-                            frames.push((self.command, frame_data));
+                            if let Some(command) = self.command {
+                                frames.push((command, frame_data));
+                            }
                         }
                         self.buffer.clear();
                     }
                     self.in_frame = true;
-                    self.command = CMD_UNKNOWN;
+                    self.command = None;
                     i = hit + 1;
                 }
                 None => {
@@ -221,9 +223,9 @@ impl RawKissDeframer {
     /// for the next FEND to resync — matching the previous byte-loop.
     fn append_in_frame(&mut self, chunk: &[u8]) {
         let mut chunk = chunk;
-        if self.command == CMD_UNKNOWN {
+        if self.command.is_none() {
             if let Some((&first, rest)) = chunk.split_first() {
-                self.command = first;
+                self.command = Some(first);
                 chunk = rest;
             } else {
                 return;
@@ -232,7 +234,7 @@ impl RawKissDeframer {
         if self.buffer.len() + chunk.len() > MAX_FRAME_SIZE {
             self.buffer.clear();
             self.in_frame = false;
-            self.command = CMD_UNKNOWN;
+            self.command = None;
             return;
         }
         self.buffer.extend_from_slice(chunk);
@@ -241,7 +243,7 @@ impl RawKissDeframer {
     pub fn reset(&mut self) {
         self.buffer.clear();
         self.in_frame = false;
-        self.command = CMD_UNKNOWN;
+        self.command = None;
     }
 }
 
@@ -324,6 +326,24 @@ mod tests {
         let frames = deframer.feed(&framed);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].0, CMD_DATA);
+    }
+
+    #[test]
+    fn extended_fe_command_survives_every_chunk_boundary() {
+        let expected = vec![(0xfe, vec![1, FEND, FESC, 2])];
+        let frame = frame_with_command(0xfe, &expected[0].1);
+        for split in 0..=frame.len() {
+            let mut decoder = RawKissDeframer::new();
+            let mut got = decoder.feed(&frame[..split]);
+            got.extend(decoder.feed(&frame[split..]));
+            assert_eq!(got, expected, "split {split}");
+        }
+        let mut decoder = RawKissDeframer::new();
+        let got: Vec<_> = frame
+            .iter()
+            .flat_map(|byte| decoder.feed(&[*byte]))
+            .collect();
+        assert_eq!(got, expected);
     }
 
     #[test]
