@@ -465,6 +465,15 @@ pub rns_runtime::link_manager::ChannelSendError::LinkNotActive
 pub rns_runtime::link_manager::ChannelSendError::LinkNotFound
 pub rns_runtime::link_manager::ChannelSendError::NoSessionKeys
 pub rns_runtime::link_manager::ChannelSendError::TransportUnavailable
+pub enum rns_runtime::link_manager::DeferredResponseError
+pub rns_runtime::link_manager::DeferredResponseError::Closed
+pub rns_runtime::link_manager::DeferredResponseError::TooLarge
+pub enum rns_runtime::link_manager::DeferredResponseOutcome
+pub rns_runtime::link_manager::DeferredResponseOutcome::Closed
+pub rns_runtime::link_manager::DeferredResponseOutcome::Dropped
+pub rns_runtime::link_manager::DeferredResponseOutcome::Expired
+pub rns_runtime::link_manager::DeferredResponseOutcome::Sent
+pub rns_runtime::link_manager::DeferredResponseOutcome::Unavailable
 pub enum rns_runtime::link_manager::DestinationControlError
 pub rns_runtime::link_manager::DestinationControlError::Destination(rns_identity::destination::DestinationError)
 pub rns_runtime::link_manager::DestinationControlError::DestinationUnavailable
@@ -601,6 +610,13 @@ pub struct rns_runtime::link_manager::ChannelSendReceipt
 pub rns_runtime::link_manager::ChannelSendReceipt::link_id: [u8; 16]
 pub rns_runtime::link_manager::ChannelSendReceipt::packet_hash: [u8; 32]
 pub rns_runtime::link_manager::ChannelSendReceipt::sequence: u16
+pub struct rns_runtime::link_manager::DeferredRequestResponder
+impl rns_runtime::link_manager::DeferredRequestResponder
+pub fn rns_runtime::link_manager::DeferredRequestResponder::is_cancelled(&self) -> bool
+pub fn rns_runtime::link_manager::DeferredRequestResponder::respond(self, rns_runtime::link_manager::RequestOutcome) -> core::result::Result<tokio::sync::oneshot::Receiver<rns_runtime::link_manager::DeferredResponseOutcome>, rns_runtime::link_manager::DeferredResponseError>
+pub fn rns_runtime::link_manager::DeferredRequestResponder::response_byte_limit(&self) -> usize
+impl core::ops::drop::Drop for rns_runtime::link_manager::DeferredRequestResponder
+pub fn rns_runtime::link_manager::DeferredRequestResponder::drop(&mut self)
 pub struct rns_runtime::link_manager::DestinationAnnounceOptions
 pub rns_runtime::link_manager::DestinationAnnounceOptions::app_data: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_runtime::link_manager::DestinationAnnounceOptions::attached_interface: core::option::Option<rns_transport::messages::InterfaceId>
@@ -652,6 +668,7 @@ pub fn rns_runtime::link_manager::LinkManager::ordinary_packet_overload_count(&s
 pub fn rns_runtime::link_manager::LinkManager::ordinary_packet_proof_strategy(&self) -> rns_identity::destination::ProofStrategy
 pub fn rns_runtime::link_manager::LinkManager::process_destination_packet(&self, &[u8], &rns_identity::identity::Identity) -> core::option::Option<alloc::vec::Vec<u8>>
 pub fn rns_runtime::link_manager::LinkManager::register_channel_message_type(&mut self, u16) -> core::result::Result<(), rns_protocol::channel::ChannelError>
+pub fn rns_runtime::link_manager::LinkManager::register_deferred_request_handler<F>(&mut self, &str, rns_identity::destination::AllowPolicy, core::option::Option<alloc::vec::Vec<[u8; 16]>>, bool, usize, F) -> bool where F: core::ops::function::Fn(rns_runtime::link_manager::DestinationRequest, rns_runtime::link_manager::DeferredRequestResponder) + core::marker::Send + 'static
 pub fn rns_runtime::link_manager::LinkManager::register_request_handler<F>(&mut self, &str, rns_identity::destination::AllowPolicy, core::option::Option<alloc::vec::Vec<[u8; 16]>>, bool, F) -> bool where F: core::ops::function::Fn(rns_runtime::link_manager::DestinationRequest) -> rns_runtime::link_manager::RequestOutcome + core::marker::Send + 'static
 pub async fn rns_runtime::link_manager::LinkManager::run(self)
 pub async fn rns_runtime::link_manager::LinkManager::run_with_commands(self, tokio::sync::mpsc::bounded::Receiver<rns_runtime::link_manager::LinkManagerCommand>)

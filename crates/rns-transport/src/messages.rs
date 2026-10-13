@@ -506,6 +506,14 @@ pub enum TransportMessage {
         request: OutboundRequest,
         result_tx: tokio::sync::oneshot::Sender<LinkEndpointSendResult>,
     },
+    /// Reliably admit a packet only for the exact captured endpoint generation.
+    /// The immutable authority remains attached while this command waits in a
+    /// mailbox, so reusing a Link ID cannot redirect old Resource output.
+    SendLinkEndpointExact {
+        authority: crate::link_endpoint_dispatch::LinkEndpointDispatchToken,
+        request: OutboundRequest,
+        result_tx: tokio::sync::oneshot::Sender<LinkEndpointSendResult>,
+    },
     /// Reliably admit a final packet, then remove the endpoint and temporary
     /// Link destination only after its ordered FIFO has drained. This prevents
     /// a queued LINKCLOSE from being discarded by an immediately following
@@ -689,6 +697,7 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::BindLinkEndpoint { .. } => "BindLinkEndpoint",
         TransportMessage::UnbindLinkEndpoint { .. } => "UnbindLinkEndpoint",
         TransportMessage::SendLinkEndpoint { .. } => "SendLinkEndpoint",
+        TransportMessage::SendLinkEndpointExact { .. } => "SendLinkEndpointExact",
         TransportMessage::SendLinkEndpointAndUnbind { .. } => "SendLinkEndpointAndUnbind",
         TransportMessage::SendLinkEndpointBestEffort { .. } => "SendLinkEndpointBestEffort",
         TransportMessage::SendPacket { .. } => "SendPacket",
@@ -1070,6 +1079,13 @@ impl std::fmt::Debug for TransportMessage {
                 .debug_struct("SendLinkEndpoint")
                 .field("link_id", link_id)
                 .field("role", role)
+                .field("request", request)
+                .finish_non_exhaustive(),
+            Self::SendLinkEndpointExact {
+                authority, request, ..
+            } => f
+                .debug_struct("SendLinkEndpointExact")
+                .field("binding", &authority.binding())
                 .field("request", request)
                 .finish_non_exhaustive(),
             Self::SendLinkEndpointAndUnbind {

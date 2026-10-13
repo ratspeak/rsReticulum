@@ -635,7 +635,7 @@ impl TransportActor {
         );
     }
 
-    fn retire_unpublished_link_endpoint(
+    pub(super) fn retire_unpublished_link_endpoint(
         &mut self,
         key: ([u8; 16], crate::messages::LinkEndpointRole),
     ) {

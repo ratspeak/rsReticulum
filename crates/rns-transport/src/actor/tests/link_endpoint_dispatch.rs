@@ -752,3 +752,51 @@ async fn dispatch_real_actor_explicit_cancel_prunes_full_driver_without_closing_
     transport_tx.send(TransportMessage::Shutdown).await.unwrap();
     owner.await.unwrap();
 }
+
+#[test]
+fn exact_resource_commands_cannot_cross_endpoint_replacement() {
+    let (mut actor, mut rx) = fixture();
+    let old = bind(&mut actor);
+    actor.unbind_link_endpoint(binding().link_id, binding().role);
+    let current = bind(&mut actor);
+    for context in [
+        rns_wire::context::PacketContext::Response,
+        rns_wire::context::PacketContext::ResourceAdv,
+        rns_wire::context::PacketContext::ResourceReq,
+        rns_wire::context::PacketContext::ResourceHmu,
+        rns_wire::context::PacketContext::Resource,
+        rns_wire::context::PacketContext::ResourceIcl,
+    ] {
+        let mut raw = make_link_data_packet_with_context(binding().link_id, 0, context).to_vec();
+        raw.push(1);
+        let (result_tx, mut result_rx) = oneshot::channel();
+        // Simulate a response/control/part command already queued by the old
+        // manager while its endpoint is replaced at the same ID and interface.
+        actor.handle_message(TransportMessage::SendLinkEndpointExact {
+            authority: old.clone(),
+            request: OutboundRequest {
+                raw: raw.into(),
+                destination_hash: binding().link_id,
+            },
+            result_tx,
+        });
+        assert_eq!(
+            result_rx.try_recv().unwrap(),
+            LinkEndpointSendResult::NotBound
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(
+            actor
+                .link_endpoints
+                .contains_key(&(binding().link_id, binding().role))
+        );
+    }
+    let (result_tx, mut result_rx) = oneshot::channel();
+    actor.handle_message(TransportMessage::SendLinkEndpointExact {
+        authority: current,
+        request: packet(9),
+        result_tx,
+    });
+    assert_eq!(result_rx.try_recv().unwrap(), LinkEndpointSendResult::Sent);
+    assert!(rx.try_recv().is_ok());
+}

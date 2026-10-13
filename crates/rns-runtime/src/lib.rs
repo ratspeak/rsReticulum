@@ -4,6 +4,7 @@
 pub mod buffer_stream;
 pub mod config;
 pub mod constants;
+mod deferred_request;
 pub mod destination_resolver;
 pub mod destination_runtime;
 mod inbound_link_packet;

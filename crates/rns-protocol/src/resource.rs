@@ -418,6 +418,15 @@ impl OutboundResource {
         }
 
         if has_collision && collision_retries < Self::MAX_COLLISION_RETRIES {
+            // Release attempt-local copies before retrying. Holding these until
+            // recursive return multiplies peak memory by the retry count.
+            drop(packed_metadata);
+            drop(full_data);
+            drop(processed_data);
+            drop(blob);
+            drop(parts);
+            drop(map_hashes);
+            drop(collision_guard);
             return Self::with_options_inner(
                 data,
                 auto_compress,

@@ -5,6 +5,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+pub use crate::deferred_request::{
+    DeferredRequestResponder, DeferredResponseError, DeferredResponseOutcome,
+};
 use crate::inbound_link_packet::{
     APPLICATION_PACKET_LIFETIME, Decision, PacketDispatch, PacketEpoch, PendingInboundPacket,
 };
@@ -61,6 +64,7 @@ struct ActiveLink {
     link: Link,
     _interface_id: u64,
     interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
+    endpoint_authority: Option<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchToken>,
     /// Created lazily on first CHANNEL packet.
     channel: Option<LinkChannel>,
     inbound_resources: HashMap<[u8; 32], InboundTransfer>,
@@ -527,12 +531,35 @@ type RequestHandlerEx = Box<dyn Fn([u8; 16], [u8; 16], Vec<u8>) -> RequestOutcom
 type LinkIdentityGate = Box<dyn Fn([u8; 16], [u8; 16]) -> bool + Send>;
 type ResourceAcceptHandler = Box<dyn Fn([u8; 16], &ResourceAdvertisement) -> bool + Send>;
 
+type DeferredRequestHandler =
+    Box<dyn Fn(DestinationRequest, DeferredRequestResponder) + Send + 'static>;
+enum RegisteredHandler {
+    Immediate(DestinationRequestHandler),
+    Deferred {
+        response_byte_limit: usize,
+        handler: DeferredRequestHandler,
+    },
+}
+struct PendingDeferredRequest {
+    link_id: [u8; 16],
+    request_id: [u8; 16],
+    path_hash: [u8; 16],
+    generation: u64,
+    owner: Option<rns_transport::messages::InterfaceOwnerId>,
+    auto_compress: bool,
+    response: crate::deferred_request::PendingResponse,
+}
+struct DeferredResourceLease {
+    link_id: [u8; 16],
+    resource_id: [u8; 32],
+    _lease: Arc<crate::deferred_request::RequestLease>,
+}
 struct RegisteredRequestHandler {
     path: String,
     allow: AllowPolicy,
     allowed_list: Vec<[u8; 16]>,
     auto_compress: bool,
-    handler: DestinationRequestHandler,
+    handler: RegisteredHandler,
 }
 
 struct ResourceTransferStart {
@@ -585,6 +612,9 @@ pub struct LinkManager {
     destination_ratchets: Option<PersistentRatchetRing>,
     /// `(link_id, path_hash, data) -> Option<response>`.
     request_handler: Option<RequestHandler>,
+    deferred_request_notify: Arc<tokio::sync::Notify>,
+    pending_deferred_requests: Vec<PendingDeferredRequest>,
+    deferred_resource_leases: Vec<DeferredResourceLease>,
     /// Wins over `request_handler` when set; can schedule a resource transfer.
     request_handler_ex: Option<RequestHandlerEx>,
     /// Python-compatible Destination handlers keyed by truncated path hash.
@@ -702,6 +732,9 @@ impl LinkManager {
             identity: None,
             destination_ratchets: None,
             request_handler: None,
+            deferred_request_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_deferred_requests: Vec::new(),
+            deferred_resource_leases: Vec::new(),
             request_handler_ex: None,
             destination_request_handlers: HashMap::new(),
             pending_inbound_request_resources: HashSet::new(),
@@ -787,6 +820,9 @@ impl LinkManager {
             identity: manager_identity,
             destination_ratchets: None,
             request_handler: None,
+            deferred_request_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_deferred_requests: Vec::new(),
+            deferred_resource_leases: Vec::new(),
             request_handler_ex: None,
             destination_request_handlers: HashMap::new(),
             pending_inbound_request_resources: HashSet::new(),
@@ -895,6 +931,7 @@ impl LinkManager {
         }
         let inbound_deadline = self.inbound_packet_deadline();
         tokio::select! {
+            _ = self.deferred_request_notify.notified() => { self.poll_deferred_requests(); true }
             _ = self.inbound_packet_notify.notified() => { self.poll_inbound_packet_receipts(); true }
             _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => { self.poll_inbound_packet_receipts(); true }
             _ = tokio::time::sleep_until(inbound_deadline.into()) => { self.poll_inbound_packet_receipts(); true }
@@ -955,7 +992,8 @@ impl LinkManager {
             self.flush_pending_legacy_terminal_notifications();
             let inbound_deadline = self.inbound_packet_deadline();
             tokio::select! {
-                _ = self.inbound_packet_notify.notified() => { self.poll_inbound_packet_receipts(); }
+                _ = self.deferred_request_notify.notified() => { self.poll_deferred_requests(); }
+            _ = self.inbound_packet_notify.notified() => { self.poll_inbound_packet_receipts(); }
                 _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => { self.poll_inbound_packet_receipts(); }
                 _ = tokio::time::sleep_until(inbound_deadline.into()) => { self.poll_inbound_packet_receipts(); }
                 event = self.event_rx.recv() => {
@@ -1009,7 +1047,8 @@ impl LinkManager {
             }
 
             tokio::select! {
-                _ = self.inbound_packet_notify.notified() => {},
+                _ = self.deferred_request_notify.notified() => { self.poll_deferred_requests(); }
+            _ = self.inbound_packet_notify.notified() => {},
                 _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => {},
                 _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {},
             }
@@ -1021,6 +1060,11 @@ impl LinkManager {
         self.pending_inbound_packets
             .iter()
             .map(|p| p.deadline)
+            .chain(
+                self.pending_deferred_requests
+                    .iter()
+                    .map(|p| p.response.deadline()),
+            )
             .min()
             .unwrap_or_else(|| std::time::Instant::now() + APPLICATION_PACKET_LIFETIME)
     }
@@ -1393,7 +1437,9 @@ impl LinkManager {
     }
 
     fn poll_link_endpoints(&mut self) -> bool {
-        let mut progressed = self.poll_inbound_packet_receipts() | self.poll_packet_dispatches();
+        let mut progressed = self.poll_deferred_requests()
+            | self.poll_inbound_packet_receipts()
+            | self.poll_packet_dispatches();
         let mut completed_binds = Vec::new();
         let link_ids: Vec<_> = self.pending_endpoint_binds.keys().copied().collect();
         for link_id in link_ids {
@@ -1420,6 +1466,9 @@ impl LinkManager {
                             == Some(&pending.ownership.generation) =>
                 {
                     if let Some(token) = token {
+                        if let Some(active) = self.active_links.get_mut(&link_id) {
+                            active.endpoint_authority = Some(token.clone());
+                        }
                         self.endpoint_dispatch_tokens.insert(link_id, token);
                     }
                     self.owned_endpoint_bindings
@@ -2286,6 +2335,28 @@ impl LinkManager {
         message
     }
 
+    fn active_endpoint_send_message(
+        pending_endpoint_sends: &mut Vec<crate::link_endpoint::PendingLinkEndpointSend>,
+        active: &ActiveLink,
+        link_id: [u8; 16],
+        raw: Bytes,
+    ) -> TransportMessage {
+        let message =
+            Self::endpoint_send_message(pending_endpoint_sends, link_id, active.link.role(), raw);
+        if let Some(authority) = &active.endpoint_authority
+            && let TransportMessage::SendLinkEndpoint {
+                request, result_tx, ..
+            } = message
+        {
+            return TransportMessage::SendLinkEndpointExact {
+                authority: authority.clone(),
+                request,
+                result_tx,
+            };
+        }
+        message
+    }
+
     fn endpoint_send_and_unbind_message(
         pending_endpoint_sends: &mut Vec<crate::link_endpoint::PendingLinkEndpointSend>,
         link_id: [u8; 16],
@@ -2569,6 +2640,7 @@ impl LinkManager {
                 link,
                 _interface_id: interface_id,
                 interface_owner,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -4397,6 +4469,16 @@ impl LinkManager {
         }
         self.pending_inbound_packets
             .retain(|pending| pending.link_id != link_id);
+        self.pending_deferred_requests.retain_mut(|pending| {
+            if pending.link_id == link_id {
+                pending.response.close(DeferredResponseOutcome::Closed);
+                false
+            } else {
+                true
+            }
+        });
+        self.deferred_resource_leases
+            .retain(|pending| pending.link_id != link_id);
         self.active_endpoint_generations.remove(&link_id);
         self.endpoint_dispatch_tokens.remove(&link_id);
         self.pending_packet_dispatches
@@ -4715,10 +4797,10 @@ impl LinkManager {
         let retained = Self::stage_link_control(
             transport_tx,
             pending_link_control,
-            Self::endpoint_send_message(
+            Self::active_endpoint_send_message(
                 pending_endpoint_sends,
+                active,
                 *link_id,
-                active.link.role(),
                 Bytes::from(raw),
             ),
         );
@@ -5244,14 +5326,56 @@ impl LinkManager {
 
             if allowed {
                 response_auto_compress = registered.auto_compress;
-                (registered.handler)(DestinationRequest {
+                let request = DestinationRequest {
                     path: registered.path.clone(),
-                    data: data.clone(),
+                    data,
                     request_id,
                     link_id,
                     remote_identity,
                     requested_at,
-                })
+                };
+                match &registered.handler {
+                    RegisteredHandler::Immediate(handler) => handler(request),
+                    RegisteredHandler::Deferred {
+                        response_byte_limit,
+                        handler,
+                    } => {
+                        let Some(generation) =
+                            self.active_endpoint_generations.get(&link_id).copied()
+                        else {
+                            return;
+                        };
+                        let Some(authority) = self.endpoint_dispatch_tokens.get(&link_id).cloned()
+                        else {
+                            return;
+                        };
+                        if let Some(active) = self.active_links.get_mut(&link_id) {
+                            active.endpoint_authority = Some(authority);
+                        }
+                        let owner = self
+                            .active_links
+                            .get(&link_id)
+                            .and_then(|a| a.interface_owner);
+                        let Some((responder, response)) = crate::deferred_request::reserve(
+                            request.data.capacity(),
+                            *response_byte_limit,
+                            self.deferred_request_notify.clone(),
+                        ) else {
+                            return;
+                        };
+                        self.pending_deferred_requests.push(PendingDeferredRequest {
+                            link_id,
+                            request_id,
+                            path_hash,
+                            generation,
+                            owner,
+                            auto_compress: response_auto_compress,
+                            response,
+                        });
+                        handler(request, responder);
+                        return;
+                    }
+                }
             } else {
                 tracing::debug!(
                     link_id = hex::encode(link_id),
@@ -5272,6 +5396,26 @@ impl LinkManager {
             RequestOutcome::Drop
         };
 
+        self.complete_request_response(
+            link_id,
+            request_id,
+            path_hash,
+            response_auto_compress,
+            outcome,
+            None,
+        );
+    }
+
+    fn complete_request_response(
+        &mut self,
+        link_id: [u8; 16],
+        request_id: [u8; 16],
+        path_hash: [u8; 16],
+        response_auto_compress: bool,
+        outcome: RequestOutcome,
+        lease: Option<Arc<crate::deferred_request::RequestLease>>,
+    ) -> bool {
+        let mut sent = false;
         let (response, fetch_spec) = match outcome {
             RequestOutcome::Reply(response) => (Some(response), None),
             RequestOutcome::ReplyWithResource {
@@ -5311,12 +5455,16 @@ impl LinkManager {
                             let mut raw = response_header.pack();
                             raw.extend_from_slice(&encrypted);
                             active.link.record_tx(encrypted.len());
-                            let _ = self.transport_tx.try_send(Self::endpoint_send_message(
-                                &mut self.pending_endpoint_sends,
-                                link_id,
-                                active.link.role(),
-                                Bytes::from(raw),
-                            ));
+                            sent = Self::stage_link_control(
+                                &self.transport_tx,
+                                &mut self.pending_link_control,
+                                Self::active_endpoint_send_message(
+                                    &mut self.pending_endpoint_sends,
+                                    active,
+                                    link_id,
+                                    Bytes::from(raw),
+                                ),
+                            );
                             tracing::debug!(
                                 link_id = hex::encode(link_id),
                                 request_id = hex::encode(request_id),
@@ -5324,15 +5472,20 @@ impl LinkManager {
                                 "link request handled — response sent"
                             );
                         }
-                    } else if self
-                        .start_response_resource(
-                            &link_id,
-                            packed_response,
-                            request_id,
-                            response_auto_compress,
-                        )
-                        .is_some()
-                    {
+                    } else if let Some(resource_id) = self.start_response_resource(
+                        &link_id,
+                        packed_response,
+                        request_id,
+                        response_auto_compress,
+                    ) {
+                        sent = true;
+                        if let Some(lease) = &lease {
+                            self.deferred_resource_leases.push(DeferredResourceLease {
+                                link_id,
+                                resource_id,
+                                _lease: lease.clone(),
+                            });
+                        }
                         tracing::debug!(
                             link_id = hex::encode(link_id),
                             request_id = hex::encode(request_id),
@@ -5364,26 +5517,92 @@ impl LinkManager {
             );
         }
 
-        if let Some((data, metadata, auto_compress)) = fetch_spec
-            && self
-                .start_resource_transfer_inner(
-                    &link_id,
-                    ResourceTransferStart {
-                        data,
-                        metadata,
-                        auto_compress,
-                        request_id: None,
-                        is_response: false,
-                        allow_handshake: true,
-                    },
-                )
-                .is_none()
-        {
-            tracing::warn!(
-                link_id = hex::encode(link_id),
-                "link request follow-up Resource could not be started"
-            );
+        if let Some((data, metadata, auto_compress)) = fetch_spec {
+            if let Some(resource_id) = self.start_resource_transfer_inner(
+                &link_id,
+                ResourceTransferStart {
+                    data,
+                    metadata,
+                    auto_compress,
+                    request_id: None,
+                    is_response: false,
+                    allow_handshake: true,
+                },
+            ) {
+                if let Some(lease) = lease {
+                    self.deferred_resource_leases.push(DeferredResourceLease {
+                        link_id,
+                        resource_id,
+                        _lease: lease,
+                    });
+                }
+            } else {
+                sent = false;
+            }
         }
+        sent
+    }
+
+    fn poll_deferred_requests(&mut self) -> bool {
+        self.deferred_resource_leases.retain(|pending| {
+            self.active_links
+                .get(&pending.link_id)
+                .is_some_and(|active| {
+                    active
+                        .outbound_split_queues
+                        .contains_key(&pending.resource_id)
+                        || active.outbound_resources.values().any(|transfer| {
+                            Self::outbound_resource_identity(transfer).0 == pending.resource_id
+                        })
+                })
+        });
+        let mut progressed = false;
+        let mut waiting = Vec::new();
+        for mut pending in std::mem::take(&mut self.pending_deferred_requests) {
+            let current = self.active_endpoint_generations.get(&pending.link_id)
+                == Some(&pending.generation)
+                && self
+                    .active_links
+                    .get(&pending.link_id)
+                    .is_some_and(|active| active.interface_owner == pending.owner);
+            if !current {
+                pending.response.close(DeferredResponseOutcome::Closed);
+                progressed = true;
+                continue;
+            }
+            if std::time::Instant::now() >= pending.response.deadline() {
+                pending.response.close(DeferredResponseOutcome::Expired);
+                progressed = true;
+                continue;
+            }
+            match pending.response.try_recv() {
+                Ok(resolution) => {
+                    let dropped = matches!(resolution.outcome, RequestOutcome::Drop);
+                    let sent = self.complete_request_response(
+                        pending.link_id,
+                        pending.request_id,
+                        pending.path_hash,
+                        pending.auto_compress,
+                        resolution.outcome,
+                        Some(pending.response.lease()),
+                    );
+                    let _ = resolution.reply.send(if dropped {
+                        DeferredResponseOutcome::Dropped
+                    } else if sent {
+                        DeferredResponseOutcome::Sent
+                    } else {
+                        DeferredResponseOutcome::Unavailable
+                    });
+                    progressed = true;
+                }
+                Err(oneshot::error::TryRecvError::Empty) => waiting.push(pending),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    progressed = true;
+                }
+            }
+        }
+        self.pending_deferred_requests = waiting;
+        progressed
     }
 
     pub fn set_request_handler<F>(&mut self, handler: F)
@@ -5455,7 +5674,58 @@ impl LinkManager {
                 allow,
                 allowed_list,
                 auto_compress,
-                handler,
+                handler: RegisteredHandler::Immediate(handler),
+            },
+        );
+        true
+    }
+
+    /// Register a bounded worker-backed handler. Admission occurs before the
+    /// callback, so rejected requests cannot start I/O or mutate durable state.
+    /// Requires an installed exact endpoint dispatch handle; registration fails
+    /// without it. Resource packets retain that generation through actor egress.
+    /// The callback must return promptly and retain its responder in the actual
+    /// worker. At most four process-wide jobs/Resources retain 256 MiB of
+    /// conservative reservations; the token reports its effective byte limit.
+    pub fn register_deferred_request_handler<F>(
+        &mut self,
+        path: &str,
+        allow: AllowPolicy,
+        allowed_list: Option<Vec<[u8; 16]>>,
+        auto_compress: bool,
+        response_byte_limit: usize,
+        handler: F,
+    ) -> bool
+    where
+        F: Fn(DestinationRequest, DeferredRequestResponder) + Send + 'static,
+    {
+        if self.endpoint_dispatch.is_none()
+            || path.is_empty()
+            || response_byte_limit == 0
+            || response_byte_limit > crate::deferred_request::MAX_RESPONSE
+        {
+            return false;
+        }
+        let allowed_list = allowed_list.unwrap_or_default();
+        if let Some(destination) = self.destination.as_mut() {
+            destination.register_request_handler(
+                path,
+                allow,
+                Some(allowed_list.clone()),
+                auto_compress,
+            );
+        }
+        self.destination_request_handlers.insert(
+            truncated_hash(path.as_bytes()),
+            RegisteredRequestHandler {
+                path: path.to_string(),
+                allow,
+                allowed_list,
+                auto_compress,
+                handler: RegisteredHandler::Deferred {
+                    response_byte_limit,
+                    handler: Box::new(handler),
+                },
             },
         );
         true
@@ -5724,10 +5994,10 @@ impl LinkManager {
             .get_mut(link_id)
             .ok_or(LinkSendError::LinkNotFound)?;
         active.link.record_tx(encrypted.len());
-        permit.send(Self::endpoint_send_message(
+        permit.send(Self::active_endpoint_send_message(
             &mut self.pending_endpoint_sends,
+            active,
             *link_id,
-            active.link.role(),
             Bytes::from(raw),
         ));
         Ok(LinkPacketSendReceipt {
@@ -5800,10 +6070,10 @@ impl LinkManager {
         }
         active.link.record_tx(prepared.data.len());
 
-        permit.send(Self::endpoint_send_message(
+        permit.send(Self::active_endpoint_send_message(
             &mut self.pending_endpoint_sends,
+            active,
             *link_id,
-            active.link.role(),
             Bytes::from(raw),
         ));
 
@@ -6467,10 +6737,10 @@ impl LinkManager {
         if !Self::stage_link_control(
             transport_tx,
             pending_link_control,
-            Self::endpoint_send_message(
+            Self::active_endpoint_send_message(
                 pending_endpoint_sends,
+                active,
                 *link_id,
-                active.link.role(),
                 Bytes::from(raw),
             ),
         ) {
@@ -6641,6 +6911,9 @@ mod tests {
                 }
                 | TransportMessage::SendLinkEndpointAndUnbind {
                     request, result_tx, ..
+                }
+                | TransportMessage::SendLinkEndpointExact {
+                    request, result_tx, ..
                 } => {
                     let _ = result_tx.send(LinkEndpointSendResult::Sent);
                     return Ok(TransportMessage::Outbound(request));
@@ -6805,6 +7078,7 @@ mod tests {
                 link: responder,
                 _interface_id: 7,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -6880,6 +7154,7 @@ mod tests {
                 link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -6966,6 +7241,7 @@ mod tests {
                 link: responder,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -7020,6 +7296,7 @@ mod tests {
                 link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -7643,6 +7920,7 @@ mod tests {
                 link: responder,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -7700,6 +7978,7 @@ mod tests {
                 link: responder,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -7765,6 +8044,7 @@ mod tests {
                     link: responder,
                     _interface_id: 1,
                     interface_owner: None,
+                    endpoint_authority: None,
                     channel: None,
                     inbound_resources: HashMap::new(),
                     outbound_resources: HashMap::new(),
@@ -7870,6 +8150,7 @@ mod tests {
                 link: responder,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -7945,6 +8226,7 @@ mod tests {
                 link: responder,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -8090,6 +8372,7 @@ mod tests {
             link,
             _interface_id: interface_id,
             interface_owner: None,
+            endpoint_authority: None,
             channel: None,
             inbound_resources: HashMap::new(),
             outbound_resources: HashMap::new(),
@@ -9125,6 +9408,139 @@ mod tests {
         raw
     }
 
+    #[tokio::test]
+    async fn deferred_requests_keep_owner_and_resource_reservations() {
+        let (mut sender, receiver) = handshaken_link_pair();
+        let link_id = receiver.link_id;
+        let (mut actor, actor_tx) = rns_transport::actor::TransportActor::new();
+        let (driver_tx, _driver_rx) = mpsc::channel(16);
+        actor.interfaces.insert(
+            1,
+            rns_transport::messages::InterfaceEntry::new(
+                "deferred test".into(),
+                rns_transport::constants::InterfaceMode::Full,
+                rns_transport::constants::InterfaceDirection::bidirectional(),
+                1_000_000,
+                500,
+                driver_tx,
+            ),
+        );
+        let interface_owner = Some(actor.interfaces[&1].owner.id());
+        let dispatch = actor.link_endpoint_dispatch_handle();
+        let actor_task = tokio::spawn(actor.run());
+        let (transport_tx, mut transport_rx) = mpsc::channel(32);
+        let (_event_tx, event_rx) = mpsc::channel(8);
+        let mut manager = LinkManager::new(transport_tx, event_rx, [0x91; 16], None);
+        manager.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver,
+                _interface_id: 1,
+                interface_owner,
+                endpoint_authority: None,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+        manager.set_link_endpoint_dispatch_handle(dispatch.clone());
+        own_test_endpoint(&mut manager, link_id);
+        let authority = dispatch
+            .try_bind(
+                manager.owned_endpoint_bindings[&link_id].binding,
+                manager.endpoint_lifecycle_tx.clone(),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        manager.endpoint_dispatch_tokens.insert(link_id, authority);
+        manager.active_endpoint_generations.insert(link_id, 7);
+        let jobs = Arc::new(Mutex::new(Vec::new()));
+        let captured = jobs.clone();
+        assert!(manager.register_deferred_request_handler(
+            "/get",
+            AllowPolicy::AllowAll,
+            None,
+            false,
+            4096,
+            move |request, responder| {
+                assert_eq!(request.data, b"request");
+                captured.lock().unwrap().push(responder);
+            }
+        ));
+        let path = truncated_hash(b"/get");
+        manager.handle_parsed_request(link_id, [1; 16], path, 0.0, b"request".to_vec());
+        assert_eq!(manager.pending_deferred_requests.len(), 1);
+        assert!(transport_rx.try_recv().is_err());
+        // The worker may remain blocked while an unrelated synchronous handler
+        // still progresses through the same manager.
+        manager.set_request_handler(|_, _, _| Some(b"live".to_vec()));
+        manager.handle_parsed_request(link_id, [2; 16], [9; 16], 0.0, Vec::new());
+        assert!(next_transport_message(&mut transport_rx).is_ok());
+        let worker = jobs.lock().unwrap().pop().unwrap();
+        let mut ack = worker
+            .respond(RequestOutcome::Reply(b"done".to_vec()))
+            .unwrap();
+        assert!(manager.try_step());
+        assert_eq!(ack.try_recv().unwrap(), DeferredResponseOutcome::Sent);
+        let TransportMessage::Outbound(packet) = next_transport_message(&mut transport_rx).unwrap()
+        else {
+            panic!("response packet")
+        };
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&packet.raw).unwrap();
+        let (request, response) = sender.handle_response(&packet.raw[offset..]).unwrap();
+        assert_eq!(request, [1; 16]);
+        assert_eq!(response, b"done");
+
+        // A reused Link ID with a new generation cannot consume an old result.
+        manager.handle_parsed_request(link_id, [3; 16], path, 0.0, b"request".to_vec());
+        let worker = jobs.lock().unwrap().pop().unwrap();
+        let mut ack = worker
+            .respond(RequestOutcome::Reply(b"stale".to_vec()))
+            .unwrap();
+        manager.active_endpoint_generations.insert(link_id, 8);
+        manager.poll_deferred_requests();
+        assert_eq!(ack.try_recv().unwrap(), DeferredResponseOutcome::Closed);
+        assert!(transport_rx.try_recv().is_err());
+
+        // A response beyond packet MDU owns its credit until the Resource is
+        // terminal, even though the worker and completion receiver are gone.
+        manager.handle_parsed_request(link_id, [4; 16], path, 0.0, b"request".to_vec());
+        let worker = jobs.lock().unwrap().pop().unwrap();
+        let mut ack = worker
+            .respond(RequestOutcome::Reply(vec![0x37; 3000]))
+            .unwrap();
+        manager.poll_deferred_requests();
+        assert_eq!(ack.try_recv().unwrap(), DeferredResponseOutcome::Sent);
+        assert_eq!(manager.deferred_resource_leases.len(), 1);
+        assert_eq!(manager.active_links[&link_id].outbound_resources.len(), 1);
+        manager.poll_deferred_requests();
+        assert_eq!(manager.deferred_resource_leases.len(), 1);
+        manager
+            .active_links
+            .get_mut(&link_id)
+            .unwrap()
+            .outbound_resources
+            .clear();
+        manager.poll_deferred_requests();
+        assert!(manager.deferred_resource_leases.is_empty());
+
+        manager.handle_parsed_request(link_id, [5; 16], path, 0.0, b"request".to_vec());
+        let worker = jobs.lock().unwrap().pop().unwrap();
+        drop(manager);
+        assert!(worker.is_cancelled());
+        assert_eq!(
+            worker.respond(RequestOutcome::Drop).unwrap_err(),
+            DeferredResponseError::Closed
+        );
+        actor_tx.send(TransportMessage::Shutdown).await.unwrap();
+        actor_task.await.unwrap();
+    }
+
     #[test]
     fn destination_request_handler_receives_context_and_enforces_allowlist() {
         let (mut sender_link, mut receiver_link) = handshaken_link_pair();
@@ -9147,6 +9563,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9269,6 +9686,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9458,6 +9876,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: Some(receiver_channel),
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9556,6 +9975,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: Some(receiver_channel),
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9648,6 +10068,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: Some(receiver_channel),
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9683,6 +10104,7 @@ mod tests {
                 link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9795,6 +10217,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9872,6 +10295,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -9943,6 +10367,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -10003,6 +10428,7 @@ mod tests {
             link: responder,
             _interface_id: 1,
             interface_owner: None,
+            endpoint_authority: None,
             channel: None,
             inbound_resources: HashMap::new(),
             outbound_resources: HashMap::new(),
@@ -10129,6 +10555,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -10196,6 +10623,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: Some(rns_protocol::channel::LinkChannel::new_encrypted(
                     link_id,
                     0.0,
@@ -10238,6 +10666,7 @@ mod tests {
                 link: sender_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -10310,6 +10739,7 @@ mod tests {
                 link: responder_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -10576,6 +11006,7 @@ mod tests {
                 link: local_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11068,6 +11499,7 @@ mod tests {
                 link: responder_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11125,6 +11557,7 @@ mod tests {
                 link: responder_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11170,6 +11603,7 @@ mod tests {
                 link: responder_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11259,6 +11693,7 @@ mod tests {
                 link: local_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11339,6 +11774,7 @@ mod tests {
                 link: local_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources,
@@ -11408,6 +11844,7 @@ mod tests {
                 link: local_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources,
                 outbound_resources: HashMap::new(),
@@ -11455,6 +11892,7 @@ mod tests {
                 link: sender_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11533,6 +11971,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11733,6 +12172,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11815,6 +12255,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11907,6 +12348,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -11969,6 +12411,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -12171,6 +12614,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -12242,6 +12686,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -12347,6 +12792,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -12502,6 +12948,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -12581,6 +13028,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),
@@ -12788,6 +13236,7 @@ mod tests {
                 link: local_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::from([(resource_id, transfer)]),
                 outbound_resources: HashMap::new(),
@@ -12927,6 +13376,7 @@ mod tests {
                 link: receiver_link,
                 _interface_id: 1,
                 interface_owner: None,
+                endpoint_authority: None,
                 channel: None,
                 inbound_resources: HashMap::new(),
                 outbound_resources: HashMap::new(),

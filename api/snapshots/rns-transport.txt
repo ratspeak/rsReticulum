@@ -1142,6 +1142,10 @@ pub rns_transport::messages::TransportMessage::SendLinkEndpointBestEffort::link_
 pub rns_transport::messages::TransportMessage::SendLinkEndpointBestEffort::request: rns_transport::messages::OutboundRequest
 pub rns_transport::messages::TransportMessage::SendLinkEndpointBestEffort::result_tx: tokio::sync::oneshot::Sender<rns_transport::messages::LinkEndpointSendResult>
 pub rns_transport::messages::TransportMessage::SendLinkEndpointBestEffort::role: rns_transport::messages::LinkEndpointRole
+pub rns_transport::messages::TransportMessage::SendLinkEndpointExact
+pub rns_transport::messages::TransportMessage::SendLinkEndpointExact::authority: rns_transport::link_endpoint_dispatch::LinkEndpointDispatchToken
+pub rns_transport::messages::TransportMessage::SendLinkEndpointExact::request: rns_transport::messages::OutboundRequest
+pub rns_transport::messages::TransportMessage::SendLinkEndpointExact::result_tx: tokio::sync::oneshot::Sender<rns_transport::messages::LinkEndpointSendResult>
 pub rns_transport::messages::TransportMessage::SendLinkRequest
 pub rns_transport::messages::TransportMessage::SendLinkRequest::request: rns_transport::messages::OutboundRequest
 pub rns_transport::messages::TransportMessage::SendLinkRequest::result_tx: tokio::sync::oneshot::Sender<core::result::Result<(), rns_transport::link_messages::LinkRequestDispatchError>>

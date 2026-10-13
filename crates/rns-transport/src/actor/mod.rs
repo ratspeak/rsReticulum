@@ -640,6 +640,25 @@ impl TransportActor {
             } => {
                 let _ = result_tx.send(self.send_link_endpoint(link_id, role, request));
             }
+            TransportMessage::SendLinkEndpointExact {
+                authority,
+                request,
+                result_tx,
+            } => {
+                let binding = authority.binding();
+                let key = (binding.link_id, binding.role);
+                self.retire_unpublished_link_endpoint(key);
+                let current = self.link_endpoints.get(&key).is_some_and(|entry| {
+                    entry.binding == binding
+                        && Arc::ptr_eq(&entry.generation, &authority.generation)
+                });
+                let result = if current {
+                    self.send_link_endpoint(binding.link_id, binding.role, request)
+                } else {
+                    crate::messages::LinkEndpointSendResult::NotBound
+                };
+                let _ = result_tx.send(result);
+            }
             TransportMessage::SendLinkEndpointAndUnbind {
                 link_id,
                 role,
