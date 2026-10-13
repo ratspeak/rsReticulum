@@ -900,3 +900,64 @@ impl TransportActor {
         }
     }
 }
+
+#[cfg(test)]
+mod cache_miss_tests {
+    use super::*;
+    use crate::constants::InterfaceDirection;
+    use crate::messages::InterfaceEntry;
+    use crate::path_table::PathEntry;
+
+    #[test]
+    fn live_path_without_cached_announce_uses_normal_discovery_gates() {
+        for (mode, discovers) in [
+            (InterfaceMode::Gateway, true),
+            (InterfaceMode::Boundary, false),
+        ] {
+            let (mut actor, _actor_tx) = TransportActor::new();
+            actor.is_transport_enabled = true;
+            actor.transport_identity_hash = Some([0x42; 16]);
+            let (ingress_tx, _ingress_rx) = tokio::sync::mpsc::channel(4);
+            let (egress_tx, mut egress_rx) = tokio::sync::mpsc::channel(4);
+            actor.interfaces.insert(
+                1,
+                InterfaceEntry::new(
+                    "requester".into(),
+                    mode,
+                    InterfaceDirection::bidirectional(),
+                    1_000_000,
+                    500,
+                    ingress_tx,
+                ),
+            );
+            actor.interfaces.insert(
+                2,
+                InterfaceEntry::new(
+                    "route".into(),
+                    InterfaceMode::Full,
+                    InterfaceDirection::bidirectional(),
+                    1_000_000,
+                    500,
+                    egress_tx,
+                ),
+            );
+            let requested = [0x77; 16];
+            let mut path = PathEntry::new(None, 1, 2, InterfaceMode::Full);
+            path.packet_hash = Some([0x33; 32]);
+            actor.path_table.insert(requested, path);
+            // A live route without a storage directory exactly exercises unavailable
+            // signed cache material, without touching the filesystem or Python oracle.
+            assert!(actor.path_table.get_live(&requested).is_some());
+            assert!(actor.cached_announce_raw(&[0x33; 32]).is_none());
+            let mut request = requested.to_vec();
+            request.extend_from_slice(&[0x55; 16]);
+            actor.handle_inbound_path_request(&request, 1);
+            assert_eq!(egress_rx.try_recv().is_ok(), discovers);
+            assert_eq!(
+                actor.discovery_path_requests.contains_key(&requested),
+                discovers
+            );
+            assert!(actor.announce_table.is_empty());
+        }
+    }
+}

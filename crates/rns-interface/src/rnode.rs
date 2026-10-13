@@ -197,7 +197,8 @@ impl RNodeStartupOptions {
         feature = "serial",
         feature = "rnode-tcp",
         feature = "ble",
-        target_os = "android"
+        target_os = "android",
+        test
     ))]
     pub(crate) const fn requires_capability_admission(self) -> bool {
         matches!(
