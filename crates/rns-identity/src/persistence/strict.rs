@@ -865,7 +865,7 @@ fn publish_one_directory(target: &Path, fault: Option<u8>) -> Result<(), Durable
         .truncate(false)
         .open(&lock_path)
         .map_err(ioe)?;
-    lock.try_lock().map_err(|e| ioe(io::Error::other(e)))?;
+    super::try_lock_exclusive(&lock).map_err(ioe)?;
     let mut journal = match fs::symlink_metadata(&journal_path) {
         Ok(meta) => {
             if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > 8192 {

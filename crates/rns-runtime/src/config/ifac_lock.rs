@@ -1,5 +1,5 @@
 //! Cross-process coordination for config snapshots and atomic replacement.
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 
@@ -43,13 +43,7 @@ impl ConfigWriteLock {
             options.mode(0o600);
         }
         let file = options.open(lock_path)?;
-        file.try_lock().map_err(|error| match error {
-            TryLockError::WouldBlock => io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "config is being changed by another writer",
-            ),
-            TryLockError::Error(error) => error,
-        })?;
+        rns_identity::persistence::try_lock_exclusive(&file)?;
         Ok(Self { _file: file })
     }
 }

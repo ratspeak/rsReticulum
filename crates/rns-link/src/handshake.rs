@@ -531,7 +531,7 @@ mod tests {
             x25519_pub: [u8; 32],
             ed25519_pub: [u8; 32],
             mode in 0u8..=7,
-            mtu in 0u32..=crate::constants::MTU_BYTEMASK,
+            mtu in prop_oneof![Just(0u32), 500u32..=crate::constants::MTU_BYTEMASK],
         ) {
             let signalling = SignallingData::new(mode, mtu);
             // EphemeralKeys is the higher-level wrapper; we pack the
@@ -557,7 +557,7 @@ mod tests {
             signature: [u8; 64],
             responder_x25519_pub: [u8; 32],
             mode in 0u8..=7,
-            mtu in 0u32..=crate::constants::MTU_BYTEMASK,
+            mtu in prop_oneof![Just(0u32), 500u32..=crate::constants::MTU_BYTEMASK],
         ) {
             let signalling = SignallingData::new(mode, mtu);
             let proof = LinkProofData {
@@ -573,6 +573,19 @@ mod tests {
             prop_assert_eq!(unpacked.responder_x25519_pub, responder_x25519_pub);
             prop_assert_eq!(unpacked.signalling, signalling);
             prop_assert_eq!(unpacked.pack(), packed);
+        }
+
+        /// The representation packer remains permissive, but both handshake
+        /// parsers reject every nonzero offer below the supported Link floor.
+        #[test]
+        fn proptest_handshake_rejects_sub_base_mtu(mode in 0u8..=7, mtu in 1u32..500) {
+            let signalling = SignallingData::new(mode, mtu).pack();
+            let mut request = vec![0u8; ECPUBSIZE];
+            request.extend_from_slice(&signalling);
+            prop_assert!(LinkRequestData::unpack(&request).is_err());
+            let mut proof = vec![0u8; 96];
+            proof.extend_from_slice(&signalling);
+            prop_assert!(LinkProofData::unpack(&proof).is_err());
         }
     }
 }

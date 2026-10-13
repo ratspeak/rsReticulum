@@ -42,8 +42,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-identity.txt",
-      "itemCount": 409,
-      "sha256": "97cd9688e2c92fdf52d3f4887050a26ad1c878b793bf9f51e8a36a0022d3f00f"
+      "itemCount": 410,
+      "sha256": "70380b1a6cafa4bfbbc943137ef96d88e9f1d7be2a474dbfc85bd8c98fbd9e02"
     },
     {
       "name": "rns-transport",

@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod file_lock;
 mod strict;
+pub use file_lock::try_lock_exclusive;
 pub use strict::{
     DurableCleanupOutcome, DurableCommitPhase, DurableDirectoryReceipt, DurableErrorKind,
     DurableFileReceipt, DurableWriteError, durable_create_dir_all, durable_reconcile,

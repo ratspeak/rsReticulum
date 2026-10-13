@@ -43,6 +43,9 @@ impl Eq for InterfaceOwner {}
 impl InterfaceOwner {
     pub fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
+        // `try_update` is the Rust 1.99 spelling; retain the identical atomic
+        // operation available on our Rust 1.89 minimum.
+        #[allow(deprecated)]
         let epoch = NEXT
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .expect("interface registration identity exhausted");
@@ -82,6 +85,8 @@ impl InterfaceOwner {
         }
         // A slow acknowledgement for an old revision must never overwrite a
         // newer readiness acknowledgement. MAX denotes "never registered".
+        // `fetch_update` retains Rust 1.89 support (renamed in Rust 1.99).
+        #[allow(deprecated)]
         let _ = self.validity.registered_revision.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,
@@ -280,6 +285,9 @@ impl InterfaceTransportSender {
             ready = self.owner.wait_registered() => ready,
         }
     }
+    // Preserve Tokio's by-value failure contract, including the original
+    // owned message for retry, without a failure-only heap allocation.
+    #[allow(clippy::result_large_err)]
     pub async fn send(
         &self,
         message: TransportMessage,
