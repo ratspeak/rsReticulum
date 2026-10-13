@@ -663,6 +663,10 @@ impl ReceivedRatchet {
     }
 
     /// Persist a received public ratchet with strict platform barriers.
+    ///
+    /// The caller must establish the complete parent namespace with the strict
+    /// directory helpers before publishing or checkpointing cryptographic state.
+    /// Unlike the legacy cache writer, this method never creates missing parents.
     pub fn save_durable(&self, path: &Path) -> std::io::Result<()> {
         self.save_impl(path, true)
     }
@@ -675,7 +679,7 @@ impl ReceivedRatchet {
         let buf = rmp_serde::to_vec_named(&persisted)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        if let Some(parent) = path.parent() {
+        if !durable && let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
@@ -1230,6 +1234,26 @@ mod tests {
 
         assert!(!ring.set_ratchet_interval(0));
         assert_eq!(ring.ratchet_interval(), 60);
+    }
+
+    #[test]
+    fn strict_received_ratchet_refuses_missing_namespace_without_creating_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "reticulum-received-strict-{}",
+            hex::encode(rns_crypto::random::random_32())
+        ));
+        let path = dir.join("identity/ratchets/received/peer");
+        let received = ReceivedRatchet::new_at([7; 32], 100.);
+        assert!(received.save_durable(&path).is_err());
+        assert!(
+            !dir.exists(),
+            "strict writes must not create weak parent entries"
+        );
+
+        // The legacy, non-acknowledged cache API keeps its historical behavior.
+        received.save(&path).unwrap();
+        assert_eq!(ReceivedRatchet::load(&path).unwrap().ratchet_pub, [7; 32]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
