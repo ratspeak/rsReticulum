@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- RNode drivers confirm the settings the radio applies once it is on, on every transport, and stop with the rejected setting named (for example TX power below an amplifier's minimum) instead of transmitting at other settings or retrying forever.
+- Serial and TCP RNodes keep retrying a port that is missing, busy or not permitted every 5 seconds, as in Python Reticulum, and report which.
+- Android Bluetooth RNode sessions wait for the bridge before starting, so a slow reconnect no longer drops a healthy link.
+- Interface status reports IFAC like Python Reticulum: `rnstatus-rs` shows the network name and access line only for interfaces that use IFAC.
 - Interfaces start only when `enabled` or `interface_enabled` is yes, as in Python Reticulum. A section with neither key is now skipped with a warning instead of starting, so add `enabled = yes` to it. An RNodeMulti subinterface with its own flag follows that flag, so a subinterface set to no never transmits.
 
 ## 1.4.0 - 2026-10-12
