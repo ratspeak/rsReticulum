@@ -1616,6 +1616,33 @@ impl NativePendingOutbound {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeBridgeAttach {
+    Attached,
+    Closed,
+    Stopped,
+}
+
+/// Wait without a deadline for the bridge's first byte, which only an attached
+/// GATT link produces. Nothing is consumed: the attach marker is an exact
+/// zero-count acknowledgement that every startup reducer already discards.
+async fn await_native_bridge_attach(
+    stream: &tokio::net::TcpStream,
+    running: &AtomicBool,
+) -> NativeBridgeAttach {
+    let mut first = [0u8; 1];
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            return NativeBridgeAttach::Stopped;
+        }
+        match tokio::time::timeout(RUNNING_POLL, stream.peek(&mut first)).await {
+            Ok(Ok(0) | Err(_)) => return NativeBridgeAttach::Closed,
+            Ok(Ok(_)) => return NativeBridgeAttach::Attached,
+            Err(_) => {}
+        }
+    }
+}
+
 fn native_bridge_acknowledged_data_frames(command: u8, payload: &[u8]) -> Option<u64> {
     if command != RNODE_NATIVE_BRIDGE_ACK_COMMAND
         || payload.len() != RNODE_NATIVE_BRIDGE_ACK_PAYLOAD_LEN
@@ -3716,6 +3743,10 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
 /// Android-only TCP-bridge variant. btleplug's deprecated JNI breaks on
 /// Android 14+, so Kotlin (`RatspeakBleGatt.kt`) owns the GATT lifecycle
 /// and forwards NUS bytes over `tcp_port`.
+///
+/// The bridge admits the local connection before its GATT link exists, so
+/// each TCP generation sends nothing until the bridge writes its first byte;
+/// Kotlin marks attachment with a zero-count acknowledgement.
 pub async fn spawn_ble_rnode_interface_native(
     config: BleRNodeConfig,
     id: InterfaceId,
@@ -3865,6 +3896,30 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                     continue;
                 }
             };
+
+            match await_native_bridge_attach(&stream, &running_task).await {
+                NativeBridgeAttach::Attached => {}
+                NativeBridgeAttach::Stopped => {
+                    publish_ble_stopped(&mut snapshot_publisher, RNodeRuntimeReason::StopRequested);
+                    return;
+                }
+                NativeBridgeAttach::Closed => {
+                    snapshot_publisher.connection_attempt_failed();
+                    if reconnect_try_exhausted(&mut tries) {
+                        snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
+                        return;
+                    }
+                    if wait_or_shutdown(Duration::from_secs(backoff), &running_task).await {
+                        publish_ble_stopped(
+                            &mut snapshot_publisher,
+                            RNodeRuntimeReason::StopRequested,
+                        );
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+                    continue;
+                }
+            }
 
             let (mut tcp_read, mut tcp_write) = stream.into_split();
             let mut protocol_state = RNodeProtocolState::new(protocol_target);
@@ -6112,6 +6167,90 @@ mod tests {
         frames
     }
 
+    /// Android's bridge marks an attached GATT generation with a zero-count
+    /// acknowledgement.
+    async fn native_test_attach(stream: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncWriteExt;
+
+        let mut attach = RNODE_NATIVE_BRIDGE_ACK_MAGIC.to_vec();
+        attach.extend_from_slice(&0u64.to_be_bytes());
+        stream
+            .write_all(&kiss::frame_with_command(
+                RNODE_NATIVE_BRIDGE_ACK_COMMAND,
+                &attach,
+            ))
+            .await
+            .expect("write native bridge attachment");
+    }
+
+    /// The bridge admits Rust before GATT exists; startup must not spend its
+    /// deadline, or leave stale probes queued, until the bridge attaches.
+    #[tokio::test]
+    async fn native_ble_sends_nothing_until_the_bridge_attaches() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind unattached bridge");
+        let port = listener
+            .local_addr()
+            .expect("unattached bridge address")
+            .port();
+        let config = BleRNodeConfig::new("native-unattached", "ble://RNode 0544");
+        let server_config = config.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept unattached bridge");
+            let mut early = [0u8; 64];
+            assert!(
+                tokio::time::timeout(
+                    RNODE_BLE_CAPABILITY_PREFLIGHT_TIMEOUT * 3,
+                    stream.read(&mut early),
+                )
+                .await
+                .is_err(),
+                "nothing may be written before the bridge attaches"
+            );
+
+            native_test_attach(&mut stream).await;
+            native_test_read_through_command(&mut stream, rnode::CMD_MCU).await;
+            let mut handshake = kiss::frame_with_command(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
+            handshake.extend(kiss::frame_with_command(
+                rnode::CMD_FW_VERSION,
+                &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+            ));
+            stream.write_all(&handshake).await.expect("write handshake");
+            native_test_read_through_command(&mut stream, rnode::CMD_MCU).await;
+            stream
+                .write_all(&native_ready_response(&server_config))
+                .await
+                .expect("write Ready evidence");
+            let mut trailing = [0u8; 64];
+            let _ = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut trailing)).await;
+        });
+
+        let (transport_tx, _transport_rx) = mpsc::channel(8);
+        let spawned = spawn_ble_rnode_interface_native_with_driver_and_options(
+            config,
+            0xB1E0_0544,
+            transport_tx,
+            port,
+            RNodeStartupOptions::default(),
+        )
+        .await
+        .expect("spawn unattached interface");
+        let online = spawned.interface.online.clone();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !online.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("an attached bridge reaches Ready on its first generation");
+        assert_eq!(spawned.driver.snapshot().reconnect_total, 0);
+        spawned.driver.request_shutdown();
+        server.await.expect("unattached bridge task");
+    }
+
     #[tokio::test]
     async fn native_ble_waits_for_ready_retries_payload_and_persists_bluetooth_once() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -6143,6 +6282,7 @@ mod tests {
                     .accept()
                     .await
                     .expect("accept native reliability generation");
+                native_test_attach(&mut stream).await;
 
                 let probe = native_test_read_through_command(&mut stream, rnode::CMD_MCU).await;
                 assert!(
@@ -6408,6 +6548,7 @@ mod tests {
                 .accept()
                 .await
                 .expect("accept rejection generation");
+            native_test_attach(&mut stream).await;
             native_test_read_through_command(&mut stream, rnode::CMD_MCU).await;
             let mut handshake = kiss::frame_with_command(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
             handshake.extend(kiss::frame_with_command(
@@ -7162,6 +7303,7 @@ mod tests {
             .port();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept rejecting bridge");
+            native_test_attach(&mut stream).await;
             let mut deframer = kiss::RawKissDeframer::new();
             let mut buffer = [0u8; 1024];
             loop {
