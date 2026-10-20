@@ -260,6 +260,21 @@ pub enum RNodeReadinessBlocker {
     Mismatch(RNodeReadinessEvidence),
 }
 
+impl RNodeReadinessBlocker {
+    /// The evidence the device definitively rejected, if this blocker is one
+    /// that retrying the same settings cannot clear. Mirrors upstream Android
+    /// `RNodeInterface`, which records invalid configuration and firmware as
+    /// hardware errors and stops reconnecting, but retries a radio
+    /// initialisation failure.
+    pub const fn rejected_evidence(self) -> Option<RNodeReadinessEvidence> {
+        match self {
+            Self::Mismatch(evidence) => Some(evidence),
+            Self::UnsupportedFirmware { .. } => Some(RNodeReadinessEvidence::Firmware),
+            Self::RadioInitialisationFault | Self::Missing(_) => None,
+        }
+    }
+}
+
 /// Derived readiness of the generic RNode session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RNodeReadiness {
@@ -1000,5 +1015,30 @@ mod tests {
             state.readiness(),
             RNodeReadiness::Blocked(RNodeReadinessBlocker::RadioInitialisationFault)
         );
+    }
+
+    #[test]
+    fn only_configuration_and_firmware_rejections_are_definitive() {
+        use RNodeReadinessBlocker::{Mismatch, Missing, RadioInitialisationFault};
+        use RNodeReadinessEvidence::{Firmware, TransmitPower};
+
+        assert_eq!(
+            Mismatch(TransmitPower).rejected_evidence(),
+            Some(TransmitPower)
+        );
+        let unsupported = RNodeReadinessBlocker::UnsupportedFirmware {
+            observed: RNodeFirmwareVersion::new(1, 51),
+            minimum: RNodeFirmwareVersion::MINIMUM_SUPPORTED,
+        };
+        assert_eq!(unsupported.rejected_evidence(), Some(Firmware));
+        assert_eq!(Missing(TransmitPower).rejected_evidence(), None);
+        assert_eq!(RadioInitialisationFault.rejected_evidence(), None);
+
+        let mut state = ready_state();
+        state.apply_frame(rnode::CMD_TXPOWER, &[TARGET.tx_power - 4]);
+        let RNodeReadiness::Blocked(blocker) = state.readiness() else {
+            panic!("a different transmit power echo must block readiness");
+        };
+        assert_eq!(blocker.rejected_evidence(), Some(TransmitPower));
     }
 }

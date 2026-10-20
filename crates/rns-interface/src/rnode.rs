@@ -478,6 +478,9 @@ pub enum RNodeRuntimeReason {
     DeviceReset,
     RadioInitialisationFault,
     CapabilityAdmissionRejected,
+    /// The device reported settings or firmware this configuration cannot
+    /// use; retrying the same settings cannot succeed.
+    ConfigurationRejected,
 }
 
 /// Privacy-safe local observation of one generic RNode driver.
@@ -508,6 +511,9 @@ pub struct RNodeRuntimeSnapshot {
     /// Set only by a terminal capability admission rejection; identifies the
     /// failure class without carrying any device data.
     pub capability_admission_failure: Option<RNodeCapabilityAdmissionFailureClass>,
+    /// Set only by a terminal configuration rejection; names the rejected
+    /// setting category, never its value.
+    pub configuration_rejection: Option<crate::rnode_protocol::RNodeReadinessEvidence>,
 }
 
 #[cfg(any(
@@ -534,6 +540,7 @@ impl RNodeRuntimeSnapshot {
             transmit_flow: RNodeTransmitFlowState::Unknown,
             reason: None,
             capability_admission_failure: None,
+            configuration_rejection: None,
         }
     }
 
@@ -893,6 +900,7 @@ impl RNodeSnapshotPublisher {
             snapshot.reconnect_attempt = 0;
             snapshot.reason = None;
             snapshot.capability_admission_failure = None;
+            snapshot.configuration_rejection = None;
             snapshot.reset_protocol_observations();
         });
     }
@@ -916,6 +924,7 @@ impl RNodeSnapshotPublisher {
             snapshot.reconnect_attempt = 0;
             snapshot.reason = None;
             snapshot.capability_admission_failure = None;
+            snapshot.configuration_rejection = None;
             snapshot.reset_protocol_observations();
             snapshot.capability = match admission {
                 crate::rnode_capabilities::RNodeRadioAdmission::Verified { .. } => {
@@ -946,6 +955,7 @@ impl RNodeSnapshotPublisher {
             snapshot.reconnect_total = snapshot.reconnect_total.saturating_add(1);
             snapshot.reason = None;
             snapshot.capability_admission_failure = None;
+            snapshot.configuration_rejection = None;
             snapshot.reset_protocol_observations();
         });
     }
@@ -1055,6 +1065,23 @@ impl RNodeSnapshotPublisher {
             snapshot.connection_generation = 0;
             snapshot.reason = Some(RNodeRuntimeReason::CapabilityAdmissionRejected);
             snapshot.capability_admission_failure = Some(failure);
+            snapshot.reset_protocol_observations();
+        });
+        self.terminal = true;
+    }
+
+    /// Terminal stop for settings or firmware the device definitively
+    /// rejected, publishing the rejected category atomically with the phase.
+    #[cfg(any(feature = "ble", test))]
+    pub(crate) fn stopped_for_configuration_rejection(
+        &mut self,
+        rejected: crate::rnode_protocol::RNodeReadinessEvidence,
+    ) {
+        self.update(|snapshot| {
+            snapshot.phase = RNodeRuntimePhase::Stopped;
+            snapshot.connection_generation = 0;
+            snapshot.reason = Some(RNodeRuntimeReason::ConfigurationRejected);
+            snapshot.configuration_rejection = Some(rejected);
             snapshot.reset_protocol_observations();
         });
         self.terminal = true;
@@ -2999,9 +3026,16 @@ fn build_command_stage(command: u8, payload: &[u8]) -> Vec<u8> {
 /// Unlike [`build_init_sequence`], this sequence deliberately never emits
 /// `RADIO_STATE_OFF`. A BLE client can therefore reconnect and reassert the
 /// desired RF parameters without tearing down the radio session that remained
-/// active while Bluetooth was out of range. The command order mirrors the
-/// upstream Android RNode BLE initialization path; callers are responsible for
-/// validation and pacing each returned stage.
+/// active while Bluetooth was out of range. Up to `RADIO_STATE_ON` the command
+/// order mirrors the upstream Android RNode BLE initialization path.
+///
+/// RNode firmware maps frequency, bandwidth and amplifier-backed transmit
+/// power to what the hardware will use only while the radio is on; a cold
+/// radio echoes the request instead. The stages therefore end by re-asserting
+/// those three settings after `RADIO_STATE_ON`, so their echoes report the
+/// effective settings whether or not the radio was already running. Callers
+/// validate readiness only after the final transmit-power echo and pace each
+/// returned stage.
 #[cfg(any(feature = "ble", test))]
 pub(crate) fn build_ble_radio_reassertion_stages(config: &RNodeConfig) -> Vec<Vec<u8>> {
     let mut stages = Vec::with_capacity(8);
@@ -3031,6 +3065,15 @@ pub(crate) fn build_ble_radio_reassertion_stages(config: &RNodeConfig) -> Vec<Ve
     }
 
     stages.push(build_command_stage(CMD_RADIO_STATE, &[RADIO_STATE_ON]));
+    stages.push(build_command_stage(
+        CMD_FREQUENCY,
+        &u32_to_bytes(config.frequency),
+    ));
+    stages.push(build_command_stage(
+        CMD_BANDWIDTH,
+        &u32_to_bytes(config.bandwidth),
+    ));
+    stages.push(build_command_stage(CMD_TXPOWER, &[config.tx_power]));
     stages
 }
 
@@ -3921,6 +3964,26 @@ mod tests {
         ordinary.stopped(RNodeRuntimeReason::StopRequested);
         let snapshot = driver.snapshot();
         assert_eq!(snapshot.capability_admission_failure, None);
+        assert_eq!(snapshot.configuration_rejection, None);
+    }
+
+    #[test]
+    fn configuration_rejection_stop_is_terminal_and_names_only_the_category() {
+        let (mut publisher, driver) = new_rnode_driver_observation(RNodeTransportClass::Ble);
+        publisher.stopped_for_configuration_rejection(
+            crate::rnode_protocol::RNodeReadinessEvidence::TransmitPower,
+        );
+        let snapshot = driver.snapshot();
+        assert_eq!(snapshot.phase, RNodeRuntimePhase::Stopped);
+        assert_eq!(
+            snapshot.reason,
+            Some(RNodeRuntimeReason::ConfigurationRejected)
+        );
+        assert_eq!(
+            snapshot.configuration_rejection,
+            Some(crate::rnode_protocol::RNodeReadinessEvidence::TransmitPower)
+        );
+        assert_eq!(snapshot.capability_admission_failure, None);
     }
 
     // reconnect_started only exists under the transport features.
@@ -4499,7 +4562,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ble_radio_reassertion_stages_match_upstream_order_without_radio_off() {
+    fn test_ble_radio_reassertion_stages_match_upstream_order_then_confirm_without_radio_off() {
         let mut config = RNodeConfig::new("rnode0", "ble://RNode Test");
         config.frequency = 915_000_000;
         config.bandwidth = 250_000;
@@ -4527,6 +4590,10 @@ mod tests {
                 (CMD_ST_ALOCK, 1_000u16.to_be_bytes().to_vec()),
                 (CMD_LT_ALOCK, 100u16.to_be_bytes().to_vec()),
                 (CMD_RADIO_STATE, vec![RADIO_STATE_ON]),
+                // Re-asserted while on, so the echoes report effective values.
+                (CMD_FREQUENCY, config.frequency.to_be_bytes().to_vec()),
+                (CMD_BANDWIDTH, config.bandwidth.to_be_bytes().to_vec()),
+                (CMD_TXPOWER, vec![config.tx_power]),
             ]
         );
         assert!(frames.iter().all(|(command, payload)| {
@@ -4559,6 +4626,9 @@ mod tests {
                 CMD_SF,
                 CMD_CR,
                 CMD_RADIO_STATE,
+                CMD_FREQUENCY,
+                CMD_BANDWIDTH,
+                CMD_TXPOWER,
             ]
         );
     }
