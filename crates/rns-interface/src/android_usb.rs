@@ -1753,6 +1753,7 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
             let mut stop_requested = false;
             let mut drain_reader_tail = false;
             let mut terminal_reason = RNodeRuntimeReason::ConnectionLost;
+            let mut configuration_rejected = None;
 
             loop {
                 tokio::select! {
@@ -1856,7 +1857,21 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
                                     outcome = forwarding => outcome,
                                 };
                                 match outcome {
-                                    UsbInboundOutcome::Complete => {}
+                                    UsbInboundOutcome::Complete => {
+                                        // Retrying settings the radio cannot use
+                                        // only fails again; shutdown detaches it.
+                                        if let Some(rejected) = inbound.definitive_rejection() {
+                                            tracing::warn!(
+                                                name = %read_name,
+                                                rejected = ?rejected,
+                                                "Android USB RNode rejected the configured settings"
+                                            );
+                                            configuration_rejected = Some(rejected);
+                                            terminal_reason =
+                                                RNodeRuntimeReason::ConfigurationRejected;
+                                            break;
+                                        }
+                                    }
                                     UsbInboundOutcome::StopRequested => {
                                         stop_requested = true;
                                         terminal_reason = RNodeRuntimeReason::StopRequested;
@@ -1930,6 +1945,7 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
                     terminal_reason,
                     RNodeRuntimeReason::TransportConsumerClosed
                         | RNodeRuntimeReason::DriverTerminated
+                        | RNodeRuntimeReason::ConfigurationRejected
                 );
             if terminal {
                 inbound.shutting_down(terminal_reason);
@@ -1959,7 +1975,10 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
             online_task.store(false, Ordering::SeqCst);
 
             if terminal {
-                inbound.stopped(terminal_reason);
+                match configuration_rejected {
+                    Some(rejected) => inbound.stopped_for_configuration_rejection(rejected),
+                    None => inbound.stopped(terminal_reason),
+                }
                 shutdown_status_tx.send_replace(AndroidUsbShutdownStatus::Complete(report));
                 return;
             }

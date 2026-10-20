@@ -65,8 +65,9 @@ pub mod prelude {
     pub use rns_interface::rnode::{
         RNodeCapabilityAdmissionError, RNodeCapabilityAdmissionFailureClass, RNodeCapabilityState,
         RNodeConfigurationState, RNodeDetectionState, RNodeFirmwareCompatibility,
-        RNodeObservedRadioState, RNodeRuntimePhase, RNodeRuntimeReason, RNodeRuntimeSnapshot,
-        RNodeSpawnError, RNodeStartupOptions, RNodeTransmitFlowState, RNodeTransportClass,
+        RNodeObservedRadioState, RNodePortFailureClass, RNodeRuntimePhase, RNodeRuntimeReason,
+        RNodeRuntimeSnapshot, RNodeSpawnError, RNodeStartupOptions, RNodeTransmitFlowState,
+        RNodeTransportClass,
     };
     pub use rns_link::link::{CloseReason, ResourceStrategy};
     pub use rns_transport::path_recovery::{

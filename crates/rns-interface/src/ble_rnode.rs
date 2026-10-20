@@ -1664,58 +1664,16 @@ enum NativeStartupReductionError {
     PreReadyDataOverflow,
 }
 
-/// Startup progress of the effective-settings confirmation that ends the BLE
-/// radio reassertion: a transmit-power echo observed after `RADIO_STATE_ON`.
-/// Only that echo reflects what the hardware will use (see
-/// `rnode::build_ble_radio_reassertion_stages`), so readiness and rejection
-/// both wait for it.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct BleStartupConfirmation {
-    radio_on: bool,
-    confirmed: bool,
-}
-
-impl BleStartupConfirmation {
-    fn observe(&mut self, command: u8, frame: &[u8]) {
-        match (command, frame) {
-            (rnode::CMD_RADIO_STATE, [rnode::RADIO_STATE_ON]) => self.radio_on = true,
-            (rnode::CMD_RADIO_STATE, _) => *self = Self::default(),
-            (rnode::CMD_TXPOWER, [_]) if self.radio_on => self.confirmed = true,
-            _ => {}
-        }
-    }
-
-    fn ready(self, state: &RNodeProtocolState) -> bool {
-        self.confirmed && matches!(state.readiness(), RNodeReadiness::Ready)
-    }
-
-    /// The setting the device definitively rejected, once its effective
-    /// echoes are in.
-    fn rejection(self, state: &RNodeProtocolState) -> Option<RNodeReadinessEvidence> {
-        if self.confirmed {
-            definitive_rejection(state)
-        } else {
-            None
-        }
-    }
-}
-
-fn definitive_rejection(state: &RNodeProtocolState) -> Option<RNodeReadinessEvidence> {
+/// At the readiness deadline the echoes in hand are the verdict, as upstream.
+fn deadline_rejection(state: &RNodeProtocolState) -> Option<RNodeReadinessEvidence> {
     match state.readiness() {
         RNodeReadiness::Blocked(blocker) => blocker.rejected_evidence(),
         RNodeReadiness::Ready => None,
     }
 }
 
-/// The protocol reducer plus the post-`RADIO_STATE_ON` confirmation that
-/// together decide native startup readiness.
-struct NativeStartupEvidence<'a> {
-    protocol_state: &'a mut RNodeProtocolState,
-    confirmation: &'a mut BleStartupConfirmation,
-}
-
 fn reduce_native_startup_bytes(
-    evidence: NativeStartupEvidence<'_>,
+    protocol_state: &mut RNodeProtocolState,
     deframer: &mut kiss::RawKissDeframer,
     bytes: &[u8],
     pre_ready_data: &mut Vec<Vec<u8>>,
@@ -1723,10 +1681,6 @@ fn reduce_native_startup_bytes(
     active_frames: &mut Vec<(u8, Vec<u8>)>,
     active_bytes: &mut usize,
 ) -> Result<(), NativeStartupReductionError> {
-    let NativeStartupEvidence {
-        protocol_state,
-        confirmation,
-    } = evidence;
     for (command, frame) in deframer.feed(bytes) {
         if command == RNODE_NATIVE_BRIDGE_ACK_COMMAND {
             if native_bridge_acknowledged_data_frames(command, &frame).is_none() {
@@ -1736,7 +1690,7 @@ fn reduce_native_startup_bytes(
             // is consumed without becoming RNode evidence or transport data.
             continue;
         }
-        if confirmation.ready(protocol_state) {
+        if matches!(protocol_state.readiness(), RNodeReadiness::Ready) {
             if command != kiss::CMD_DATA {
                 protocol_state.apply_frame(command, &frame);
             }
@@ -1754,7 +1708,6 @@ fn reduce_native_startup_bytes(
                 return Err(NativeStartupReductionError::PreReadyDataOverflow);
             }
         } else {
-            confirmation.observe(command, &frame);
             protocol_state.apply_frame(command, &frame);
         }
     }
@@ -2987,7 +2940,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                     continue;
                 }
             };
-            let mut protocol_state = RNodeProtocolState::new(protocol_target);
+            let mut protocol_state = RNodeProtocolState::with_effective_settings(protocol_target);
             let mut deframer = kiss::RawKissDeframer::new();
             ble_diag("[ble] sending detect sequence");
             trace_ble_lifecycle(generation_id, "detect_write", "started", None, None);
@@ -3313,13 +3266,12 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                 Rejected(RNodeReadinessEvidence),
                 Stopped,
             }
-            let mut startup_confirmation = BleStartupConfirmation::default();
             let readiness_deadline = tokio::time::Instant::now() + RNODE_BLE_READINESS_TIMEOUT;
             let startup_outcome = loop {
-                if startup_confirmation.ready(&protocol_state) {
+                if matches!(protocol_state.readiness(), RNodeReadiness::Ready) {
                     break StartupReadinessOutcome::Ready;
                 }
-                if let Some(rejected) = startup_confirmation.rejection(&protocol_state) {
+                if let Some(rejected) = protocol_state.definitive_rejection() {
                     break StartupReadinessOutcome::Rejected(rejected);
                 }
                 tokio::select! {
@@ -3330,7 +3282,6 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                                 // discarded until the complete typed target is
                                 // Ready, so no application traffic crosses an
                                 // unvalidated generation boundary.
-                                startup_confirmation.observe(command, &frame);
                                 protocol_state.apply_frame(command, &frame);
                             }
                         }
@@ -3358,7 +3309,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                         }
                     }
                     _ = tokio::time::sleep_until(readiness_deadline) => {
-                        break match definitive_rejection(&protocol_state) {
+                        break match deadline_rejection(&protocol_state) {
                             Some(rejected) => StartupReadinessOutcome::Rejected(rejected),
                             None => StartupReadinessOutcome::Retry("typed readiness timed out"),
                         };
@@ -3922,7 +3873,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
             }
 
             let (mut tcp_read, mut tcp_write) = stream.into_split();
-            let mut protocol_state = RNodeProtocolState::new(protocol_target);
+            let mut protocol_state = RNodeProtocolState::with_effective_settings(protocol_target);
             let mut startup_deframer = kiss::RawKissDeframer::new();
             let mut startup_pre_ready_data: Vec<Vec<u8>> = Vec::new();
             let mut startup_pre_ready_data_bytes = 0usize;
@@ -4151,13 +4102,12 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
             let mut startup_buf = [0u8; 4096];
             let mut startup_active_frames: Vec<(u8, Vec<u8>)> = Vec::new();
             let mut startup_active_bytes = 0usize;
-            let mut startup_confirmation = BleStartupConfirmation::default();
             let readiness_deadline = tokio::time::Instant::now() + RNODE_BLE_READINESS_TIMEOUT;
             let startup_outcome = loop {
-                if startup_confirmation.ready(&protocol_state) {
+                if matches!(protocol_state.readiness(), RNodeReadiness::Ready) {
                     break NativeStartupOutcome::Ready;
                 }
-                if let Some(rejected) = startup_confirmation.rejection(&protocol_state) {
+                if let Some(rejected) = protocol_state.definitive_rejection() {
                     break NativeStartupOutcome::Rejected(rejected);
                 }
                 tokio::select! {
@@ -4167,10 +4117,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                         ),
                         Ok(count) => {
                             match reduce_native_startup_bytes(
-                                NativeStartupEvidence {
-                                    protocol_state: &mut protocol_state,
-                                    confirmation: &mut startup_confirmation,
-                                },
+                                &mut protocol_state,
                                 &mut startup_deframer,
                                 &startup_buf[..count],
                                 &mut startup_pre_ready_data,
@@ -4206,7 +4153,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                         }
                     }
                     _ = tokio::time::sleep_until(readiness_deadline) => {
-                        break match definitive_rejection(&protocol_state) {
+                        break match deadline_rejection(&protocol_state) {
                             Some(rejected) => NativeStartupOutcome::Rejected(rejected),
                             None => NativeStartupOutcome::Retry("typed readiness timed out"),
                         };
@@ -4751,7 +4698,7 @@ mod tests {
     #[test]
     fn native_startup_holds_pre_ready_data_and_preserves_post_ready_order() {
         let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
-        let mut state = RNodeProtocolState::new(target);
+        let mut state = RNodeProtocolState::with_effective_settings(target);
         for (command, frame) in [
             (rnode::CMD_DETECT, vec![rnode::DETECT_RESP]),
             (
@@ -4786,7 +4733,6 @@ mod tests {
             &[target.tx_power],
         ));
         same_read.extend(kiss::frame(retained));
-        let mut confirmation = BleStartupConfirmation::default();
         let mut deframer = kiss::RawKissDeframer::new();
         let mut pre_ready_data = Vec::new();
         let mut pre_ready_data_bytes = 0;
@@ -4794,10 +4740,7 @@ mod tests {
         let mut active_bytes = 0;
         assert_eq!(
             reduce_native_startup_bytes(
-                NativeStartupEvidence {
-                    protocol_state: &mut state,
-                    confirmation: &mut confirmation,
-                },
+                &mut state,
                 &mut deframer,
                 &same_read,
                 &mut pre_ready_data,
@@ -4817,7 +4760,7 @@ mod tests {
     #[test]
     fn native_startup_carries_partial_data_begun_after_ready_into_active_read() {
         let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
-        let mut state = RNodeProtocolState::new(target);
+        let mut state = RNodeProtocolState::with_effective_settings(target);
         for (command, frame) in [
             (rnode::CMD_DETECT, vec![rnode::DETECT_RESP]),
             (
@@ -4850,7 +4793,6 @@ mod tests {
         ));
         first_read.extend_from_slice(&framed[..split]);
 
-        let mut confirmation = BleStartupConfirmation::default();
         let mut startup_deframer = kiss::RawKissDeframer::new();
         let mut pre_ready_data = Vec::new();
         let mut pre_ready_data_bytes = 0;
@@ -4858,10 +4800,7 @@ mod tests {
         let mut active_bytes = 0;
         assert_eq!(
             reduce_native_startup_bytes(
-                NativeStartupEvidence {
-                    protocol_state: &mut state,
-                    confirmation: &mut confirmation,
-                },
+                &mut state,
                 &mut startup_deframer,
                 &first_read,
                 &mut pre_ready_data,
@@ -4886,8 +4825,7 @@ mod tests {
     #[test]
     fn native_startup_pre_ready_data_bound_exceeds_rnode_receive_buffer_and_fails_explicitly() {
         let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
-        let mut state = RNodeProtocolState::new(target);
-        let mut confirmation = BleStartupConfirmation::default();
+        let mut state = RNodeProtocolState::with_effective_settings(target);
         let mut deframer = kiss::RawKissDeframer::new();
         let mut pre_ready_data = Vec::new();
         let mut pre_ready_data_bytes = 0;
@@ -4898,10 +4836,7 @@ mod tests {
         for _ in 0..129 {
             assert_eq!(
                 reduce_native_startup_bytes(
-                    NativeStartupEvidence {
-                        protocol_state: &mut state,
-                        confirmation: &mut confirmation,
-                    },
+                    &mut state,
                     &mut deframer,
                     &kiss::frame(&record),
                     &mut pre_ready_data,
@@ -4916,10 +4851,7 @@ mod tests {
         assert!(pre_ready_data_bytes <= RNODE_NATIVE_STARTUP_PRE_READY_DATA_MAX_BYTES);
         assert_eq!(
             reduce_native_startup_bytes(
-                NativeStartupEvidence {
-                    protocol_state: &mut state,
-                    confirmation: &mut confirmation,
-                },
+                &mut state,
                 &mut deframer,
                 &kiss::frame(&record),
                 &mut pre_ready_data,
@@ -6616,79 +6548,6 @@ mod tests {
         );
         assert!(!online.load(Ordering::SeqCst));
         server.await.expect("rejection bridge task");
-    }
-
-    #[test]
-    fn startup_confirmation_needs_a_transmit_power_echo_after_radio_on() {
-        let target = RNodeProtocolTarget::new(915_000_000, 250_000, 9, 5, 14);
-        let mut state = RNodeProtocolState::new(target);
-        let mut confirmation = BleStartupConfirmation::default();
-        let apply = |state: &mut RNodeProtocolState,
-                     confirmation: &mut BleStartupConfirmation,
-                     command: u8,
-                     frame: &[u8]| {
-            confirmation.observe(command, frame);
-            state.apply_frame(command, frame);
-        };
-        for (command, frame) in [
-            (rnode::CMD_DETECT, vec![rnode::DETECT_RESP]),
-            (
-                rnode::CMD_FW_VERSION,
-                vec![rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
-            ),
-            (
-                rnode::CMD_FREQUENCY,
-                target.frequency.to_be_bytes().to_vec(),
-            ),
-            (
-                rnode::CMD_BANDWIDTH,
-                target.bandwidth.to_be_bytes().to_vec(),
-            ),
-            (rnode::CMD_TXPOWER, vec![target.tx_power]),
-            (rnode::CMD_SF, vec![target.spreading_factor]),
-            (rnode::CMD_CR, vec![target.coding_rate]),
-            (rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_ON]),
-        ] {
-            apply(&mut state, &mut confirmation, command, &frame);
-        }
-        // The reducer alone is satisfied by the pre-RADIO_ON echoes.
-        assert_eq!(state.readiness(), RNodeReadiness::Ready);
-        assert!(!confirmation.ready(&state));
-        assert_eq!(confirmation.rejection(&state), None);
-
-        apply(
-            &mut state,
-            &mut confirmation,
-            rnode::CMD_TXPOWER,
-            &[target.tx_power],
-        );
-        assert!(confirmation.ready(&state));
-
-        // A radio that turns off again needs a fresh confirmation.
-        apply(
-            &mut state,
-            &mut confirmation,
-            rnode::CMD_RADIO_STATE,
-            &[rnode::RADIO_STATE_OFF],
-        );
-        apply(
-            &mut state,
-            &mut confirmation,
-            rnode::CMD_RADIO_STATE,
-            &[rnode::RADIO_STATE_ON],
-        );
-        assert!(!confirmation.ready(&state));
-        apply(
-            &mut state,
-            &mut confirmation,
-            rnode::CMD_TXPOWER,
-            &[target.tx_power + 3],
-        );
-        assert!(!confirmation.ready(&state));
-        assert_eq!(
-            confirmation.rejection(&state),
-            Some(RNodeReadinessEvidence::TransmitPower)
-        );
     }
 
     #[tokio::test]

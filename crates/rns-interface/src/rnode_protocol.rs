@@ -311,13 +311,24 @@ pub enum RNodeProtocolEffect {
     Rejected(RNodeFrameRejection),
 }
 
-/// Pure, order-independent reducer for generic single-radio readiness.
+/// Pure reducer for generic single-radio readiness.
+///
+/// Order-independent unless created with
+/// [`RNodeProtocolState::with_effective_settings`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RNodeProtocolState {
     target: RNodeProtocolTarget,
     evidence: RNodeProtocolEvidence,
     detection_observed: bool,
     flow_permission_observed: bool,
+    effective: Option<EffectiveSettings>,
+}
+
+/// Progress toward a transmit-power echo that follows `RADIO_STATE_ON`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EffectiveSettings {
+    radio_on: bool,
+    confirmed: bool,
 }
 
 impl RNodeProtocolState {
@@ -338,7 +349,25 @@ impl RNodeProtocolState {
             },
             detection_observed: false,
             flow_permission_observed: false,
+            effective: None,
         }
+    }
+
+    /// Like [`Self::new`], but readiness also waits for a transmit-power echo
+    /// that follows `RADIO_STATE_ON`.
+    ///
+    /// RNode firmware maps frequency, bandwidth and amplifier-backed transmit
+    /// power to what the hardware will use only while the radio is on; a cold
+    /// radio echoes the request. Callers re-assert those settings after
+    /// `RADIO_STATE_ON` (as `rnode::build_init_sequence` does), so readiness
+    /// and [`Self::definitive_rejection`] judge the effective values.
+    pub const fn with_effective_settings(target: RNodeProtocolTarget) -> Self {
+        let mut state = Self::new(target);
+        state.effective = Some(EffectiveSettings {
+            radio_on: false,
+            confirmed: false,
+        });
+        state
     }
 
     pub const fn target(&self) -> RNodeProtocolTarget {
@@ -365,8 +394,54 @@ impl RNodeProtocolState {
     /// Rejected frames leave state unchanged.
     pub fn apply_frame(&mut self, command: u8, payload: &[u8]) -> RNodeProtocolEffect {
         match RNodeProtocolFrame::decode(command, payload) {
-            Ok(frame) => self.apply_decoded_frame(frame),
+            Ok(frame) => {
+                let before = self.effective;
+                let effect = self.apply_decoded_frame(frame);
+                self.observe_effective_settings(frame);
+                match (effect, frame) {
+                    (RNodeProtocolEffect::NoChange, RNodeProtocolFrame::RadioState(_))
+                        if self.effective != before =>
+                    {
+                        RNodeProtocolEffect::EvidenceChanged(RNodeReadinessEvidence::RadioState)
+                    }
+                    (RNodeProtocolEffect::NoChange, RNodeProtocolFrame::TransmitPower(_))
+                        if self.effective != before =>
+                    {
+                        RNodeProtocolEffect::EvidenceChanged(RNodeReadinessEvidence::TransmitPower)
+                    }
+                    _ => effect,
+                }
+            }
             Err(error) => RNodeProtocolEffect::Rejected(error),
+        }
+    }
+
+    /// The setting the device definitively rejected: a blocker that retrying
+    /// the same settings cannot clear. With effective settings this waits for
+    /// the post-`RADIO_STATE_ON` transmit-power echo.
+    pub fn definitive_rejection(&self) -> Option<RNodeReadinessEvidence> {
+        if self.effective.is_some_and(|effective| !effective.confirmed) {
+            return None;
+        }
+        match self.readiness() {
+            RNodeReadiness::Blocked(blocker) => blocker.rejected_evidence(),
+            RNodeReadiness::Ready => None,
+        }
+    }
+
+    fn observe_effective_settings(&mut self, frame: RNodeProtocolFrame) {
+        let Some(effective) = self.effective.as_mut() else {
+            return;
+        };
+        match frame {
+            RNodeProtocolFrame::RadioState(RNodeRadioState::On) => effective.radio_on = true,
+            RNodeProtocolFrame::RadioState(RNodeRadioState::Off) | RNodeProtocolFrame::Reset => {
+                *effective = EffectiveSettings::default();
+            }
+            RNodeProtocolFrame::TransmitPower(_) if effective.radio_on => {
+                effective.confirmed = true;
+            }
+            _ => {}
         }
     }
 
@@ -425,6 +500,9 @@ impl RNodeProtocolState {
                 return RNodeReadiness::Blocked(Mismatch(CodingRate));
             }
             Some(_) => {}
+        }
+        if self.effective.is_some_and(|effective| !effective.confirmed) {
+            return RNodeReadiness::Blocked(Missing(TransmitPower));
         }
         match self.evidence.tx_power {
             None => return RNodeReadiness::Blocked(Missing(TransmitPower)),
@@ -1040,5 +1118,73 @@ mod tests {
             panic!("a different transmit power echo must block readiness");
         };
         assert_eq!(blocker.rejected_evidence(), Some(TransmitPower));
+    }
+
+    fn apply_all(state: &mut RNodeProtocolState, frames: &[(u8, Vec<u8>)]) {
+        for (command, payload) in frames {
+            state.apply_frame(*command, payload);
+        }
+    }
+
+    #[test]
+    fn effective_settings_wait_for_a_transmit_power_echo_after_radio_on() {
+        let mut state = RNodeProtocolState::with_effective_settings(TARGET);
+        apply_all(&mut state, &required_frames());
+        // Pre-RADIO_ON echoes alone satisfy the order-independent reducer only.
+        assert_eq!(
+            state.readiness(),
+            RNodeReadiness::Blocked(RNodeReadinessBlocker::Missing(
+                RNodeReadinessEvidence::TransmitPower
+            ))
+        );
+        assert_eq!(state.definitive_rejection(), None);
+
+        // An unchanged value still confirms, and reports the change.
+        assert_eq!(
+            state.apply_frame(rnode::CMD_TXPOWER, &[TARGET.tx_power]),
+            RNodeProtocolEffect::EvidenceChanged(RNodeReadinessEvidence::TransmitPower)
+        );
+        assert_eq!(state.readiness(), RNodeReadiness::Ready);
+
+        // A radio that turns off needs a fresh confirmation.
+        state.apply_frame(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF]);
+        state.apply_frame(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_ON]);
+        assert_ne!(state.readiness(), RNodeReadiness::Ready);
+        state.apply_frame(rnode::CMD_TXPOWER, &[TARGET.tx_power]);
+        assert_eq!(state.readiness(), RNodeReadiness::Ready);
+    }
+
+    #[test]
+    fn effective_settings_judge_the_amplifier_mapped_echo() {
+        // A cold amplifier board echoes the request, then its floor once on.
+        let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 2);
+        let mut state = RNodeProtocolState::with_effective_settings(target);
+        let mut frames = required_frames().to_vec();
+        frames[6] = (rnode::CMD_TXPOWER, vec![2]);
+        apply_all(&mut state, &frames);
+        assert_eq!(state.definitive_rejection(), None);
+
+        state.apply_frame(rnode::CMD_TXPOWER, &[13]);
+        assert_eq!(
+            state.definitive_rejection(),
+            Some(RNodeReadinessEvidence::TransmitPower)
+        );
+
+        // The legacy reducer accepts the same cold echoes.
+        let mut legacy = RNodeProtocolState::new(target);
+        apply_all(&mut legacy, &frames);
+        assert_eq!(legacy.readiness(), RNodeReadiness::Ready);
+    }
+
+    #[test]
+    fn effective_settings_reset_with_the_device() {
+        let mut state = RNodeProtocolState::with_effective_settings(TARGET);
+        apply_all(&mut state, &required_frames());
+        state.apply_frame(rnode::CMD_TXPOWER, &[TARGET.tx_power]);
+        assert_eq!(state.readiness(), RNodeReadiness::Ready);
+
+        state.apply_frame(rnode::CMD_RESET, &[0xF8]);
+        apply_all(&mut state, &required_frames());
+        assert_ne!(state.readiness(), RNodeReadiness::Ready);
     }
 }

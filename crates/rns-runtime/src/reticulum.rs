@@ -9050,6 +9050,25 @@ mod tests {
         }
     }
 
+    /// Stand in for the transport actor: acknowledge each registration so owned
+    /// senders, teardown's deregistration included, can proceed.
+    #[cfg(feature = "rnode-tcp")]
+    fn acknowledging_transport(
+        capacity: usize,
+    ) -> (
+        mpsc::Sender<TransportMessage>,
+        mpsc::UnboundedReceiver<TransportMessage>,
+    ) {
+        let (tx, mut rx) = mpsc::channel(capacity);
+        let (seen_tx, seen_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                let _ = seen_tx.send(unwrap_owned_event(message));
+            }
+        });
+        (tx, seen_rx)
+    }
+
     fn test_interface_handle(
         id: u64,
         parent_id: Option<u64>,
@@ -9329,6 +9348,16 @@ mod tests {
             (rnode::CMD_CR, vec![settings.coding_rate]),
             (rnode::CMD_TXPOWER, vec![settings.tx_power]),
             (rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_ON]),
+            // Settings re-asserted while on echo their effective values.
+            (
+                rnode::CMD_FREQUENCY,
+                settings.frequency.to_be_bytes().to_vec(),
+            ),
+            (
+                rnode::CMD_BANDWIDTH,
+                settings.bandwidth.to_be_bytes().to_vec(),
+            ),
+            (rnode::CMD_TXPOWER, vec![settings.tx_power]),
         ] {
             kiss::frame_with_command_into(command, &payload, &mut responses);
         }
@@ -9431,6 +9460,16 @@ mod tests {
                 (rnode::CMD_CR, vec![settings.coding_rate]),
                 (rnode::CMD_TXPOWER, vec![settings.tx_power]),
                 (rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_ON]),
+                // Settings re-asserted while on echo their effective values.
+                (
+                    rnode::CMD_FREQUENCY,
+                    settings.frequency.to_be_bytes().to_vec(),
+                ),
+                (
+                    rnode::CMD_BANDWIDTH,
+                    settings.bandwidth.to_be_bytes().to_vec(),
+                ),
+                (rnode::CMD_TXPOWER, vec![settings.tx_power]),
             ] {
                 kiss::frame_with_command_into(command, &payload, &mut echoes);
             }
@@ -9511,13 +9550,15 @@ mod tests {
     #[tokio::test]
     async fn rnode_options_wrapper_preserves_typed_lower_spawn_failure() {
         let runtime = dummy_handle();
+        // An unreachable radio is retried by the driver, but a malformed port
+        // remains a typed spawn failure.
         let error = spawn_rnode_runtime_observed_with_options(
             &runtime,
-            test_rnode_runtime_args("strict-runtime-rnode", "tcp://127.0.0.1:0"),
+            test_rnode_runtime_args("strict-runtime-rnode", "tcp://"),
             rns_interface::rnode::RNodeStartupOptions::require_capability_admission(),
         )
         .await
-        .expect_err("port zero cannot accept the strict startup connection");
+        .expect_err("a port without a host cannot be spawned");
 
         assert!(matches!(
             error,
@@ -9706,7 +9747,7 @@ mod tests {
             rns_interface::rnode::RNodeConfig::new("atomic-observer-template", "tcp://127.0.0.1:1");
         let settings = rns_interface::rnode::RNodeRadioSettings::from(&defaults);
         let (port, closed_rx, peer) = test_ready_rnode_tcp_peer(settings);
-        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let (transport_tx, mut transport_rx) = acknowledging_transport(4);
         let mut runtime = dummy_handle();
         runtime.transport_tx = transport_tx;
 
@@ -9767,7 +9808,7 @@ mod tests {
         let template =
             rnode::RNodeConfig::new("strict-atomic-observer-template", "tcp://127.0.0.1:1");
         let (port, closed_rx, peer) = test_strict_ready_rnode_tcp_peer(template.clone());
-        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let (transport_tx, mut transport_rx) = acknowledging_transport(4);
         let mut runtime = dummy_handle();
         runtime.transport_tx = transport_tx;
 
@@ -9834,7 +9875,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_rnode_spawn_preserves_id_and_reports_unready_radio() {
         let (port, closed_rx, peer) = test_rnode_tcp_peer();
-        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let (transport_tx, mut transport_rx) = acknowledging_transport(4);
         let mut runtime = dummy_handle();
         runtime.transport_tx = transport_tx;
 
@@ -9970,7 +10011,7 @@ mod tests {
             settings
         );
 
-        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let (transport_tx, _transport_rx) = acknowledging_transport(8);
         let controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let registry = InterfaceRegistry::default();
         let spawned = rns_interface::rnode::spawn_rnode_interface_with_driver(
@@ -10100,7 +10141,7 @@ mod tests {
     async fn rnode_runtime_wait_timeout_and_cancellation_are_observation_only() {
         let id = 920_200;
         let (port, closed_rx, peer) = test_rnode_tcp_peer();
-        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let (transport_tx, _transport_rx) = acknowledging_transport(8);
         let controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let registry = InterfaceRegistry::default();
         let spawned = rns_interface::rnode::spawn_rnode_interface_with_driver(
@@ -10179,7 +10220,7 @@ mod tests {
     #[tokio::test]
     async fn rnode_runtime_observer_never_follows_same_id_replacement() {
         let id = 920_201;
-        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let (transport_tx, _transport_rx) = acknowledging_transport(8);
         let controls: InterfaceControlMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let registry = InterfaceRegistry::default();
         let mut runtime = dummy_handle();

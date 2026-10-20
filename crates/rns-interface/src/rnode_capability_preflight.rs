@@ -160,7 +160,7 @@ impl RNodeCapabilityPreflight {
     pub(crate) fn into_protocol_state(self) -> RNodeProtocolState {
         let target = self.protocol_state.target();
         let evidence = self.protocol_state.evidence();
-        let mut admitted = RNodeProtocolState::new(target);
+        let mut admitted = RNodeProtocolState::with_effective_settings(target);
         if evidence.detected {
             admitted.apply_frame(crate::rnode::CMD_DETECT, &[crate::rnode::DETECT_RESP]);
         }

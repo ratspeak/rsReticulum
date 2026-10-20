@@ -22,6 +22,7 @@ use crate::rnode_capabilities::RNodeRadioAdmission;
 use crate::rnode_capability_preflight::RNodeCapabilityPreflight;
 use crate::rnode_protocol::{
     RNodeProtocolFrame, RNodeProtocolState, RNodeProtocolTarget, RNodeReadiness,
+    RNodeReadinessEvidence,
 };
 use crate::traits::InterfaceId;
 #[cfg(test)]
@@ -879,6 +880,26 @@ impl UsbInboundState {
         }
     }
 
+    /// The setting this generation's radio definitively rejected.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) fn definitive_rejection(&self) -> Option<RNodeReadinessEvidence> {
+        self.projection
+            .as_ref()
+            .and_then(|projection| projection.protocol.definitive_rejection())
+    }
+
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) fn stopped_for_configuration_rejection(&mut self, rejected: RNodeReadinessEvidence) {
+        if let Some(gate) = &self.tx_gate {
+            gate.close();
+        }
+        if let Some(projection) = self.projection.as_mut() {
+            projection
+                .publisher
+                .stopped_for_configuration_rejection(rejected);
+        }
+    }
+
     /// Return the lifecycle publisher after one physical USB generation ends.
     ///
     /// Framing and protocol evidence are intentionally generation-local, but
@@ -1458,7 +1479,7 @@ pub(crate) async fn run_usb_rnode_startup<O: UsbConnectionLifecycle>(
     // admission, without making ROM availability a normal-startup requirement.
     // Preserve only detect/firmware evidence; queued RF echoes, READY permits,
     // DATA and partial framing cannot establish post-init operational readiness.
-    let mut protocol = RNodeProtocolState::new(target);
+    let mut protocol = RNodeProtocolState::with_effective_settings(target);
     let mut deframer = kiss::RawKissDeframer::new();
     let mut observe = |event| -> Result<(), UsbWriteFailure> {
         let UsbIoEvent::Read(bytes) = event else {
@@ -3287,6 +3308,69 @@ mod tests {
             .await;
     }
 
+    /// A cold amplifier board echoes the requested power, then its floor once
+    /// on: the generation must report a terminal rejection and never open TX.
+    #[tokio::test]
+    async fn effective_usb_generation_reports_a_definitive_rejection() {
+        let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 2);
+        let (mut publisher, driver) =
+            rnode::new_rnode_driver_observation(rnode::RNodeTransportClass::Usb);
+        publisher.connection_established();
+        let mut inbound = UsbInboundState::projected_with_protocol_state(
+            RNodeProtocolState::with_effective_settings(target),
+            publisher,
+        );
+        let gate = UsbTxGate::new(false, Arc::new(AtomicBool::new(false)));
+        inbound.attach_tx_gate(gate.clone());
+
+        let (_stop_tx, mut stop_rx) = mpsc::channel(1);
+        let (transport_tx, _transport_rx) = mpsc::channel(1);
+        let mut floor = post_radio_on_echoes(target);
+        floor[2] = (rnode::CMD_TXPOWER, vec![13]);
+        assert_eq!(
+            forward_usb_read_chunk(
+                &mut inbound,
+                &framed_protocol_frames(required_protocol_frames(target)),
+                0x88,
+                &AtomicU64::new(0),
+                &crate::traits::test_registered_sender(0x88, transport_tx.clone()),
+                &mut stop_rx,
+            )
+            .await,
+            UsbInboundOutcome::Complete
+        );
+        assert_eq!(inbound.definitive_rejection(), None);
+        assert_eq!(
+            forward_usb_read_chunk(
+                &mut inbound,
+                &framed_protocol_frames(floor),
+                0x88,
+                &AtomicU64::new(0),
+                &crate::traits::test_registered_sender(0x88, transport_tx),
+                &mut stop_rx,
+            )
+            .await,
+            UsbInboundOutcome::Complete
+        );
+        assert_eq!(
+            inbound.definitive_rejection(),
+            Some(RNodeReadinessEvidence::TransmitPower)
+        );
+        assert!(!gate.can_send());
+
+        inbound.stopped_for_configuration_rejection(RNodeReadinessEvidence::TransmitPower);
+        let stopped = driver.snapshot();
+        assert_eq!(stopped.phase, rnode::RNodeRuntimePhase::Stopped);
+        assert_eq!(
+            stopped.reason,
+            Some(rnode::RNodeRuntimeReason::ConfigurationRejected)
+        );
+        assert_eq!(
+            stopped.configuration_rejection,
+            Some(RNodeReadinessEvidence::TransmitPower)
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ordinary_usb_startup_discards_preinit_rf_ready_and_partial_frames() {
         struct PreinitReader(Option<Vec<u8>>);
@@ -3339,6 +3423,7 @@ mod tests {
         for (command, frame) in required_protocol_frames(USB_TEST_TARGET)
             .into_iter()
             .skip(2)
+            .chain(post_radio_on_echoes(USB_TEST_TARGET))
         {
             inbound.project_frame(command, &frame);
         }
@@ -3370,6 +3455,22 @@ mod tests {
             (rnode::CMD_CR, vec![target.coding_rate]),
             (rnode::CMD_TXPOWER, vec![target.tx_power]),
             (rnode::CMD_RADIO_STATE, vec![rnode::RADIO_STATE_ON]),
+        ]
+    }
+
+    /// What RNode firmware echoes for the settings re-asserted after
+    /// `RADIO_STATE_ON` when the hardware uses them as requested.
+    fn post_radio_on_echoes(target: RNodeProtocolTarget) -> [(u8, Vec<u8>); 3] {
+        [
+            (
+                rnode::CMD_FREQUENCY,
+                target.frequency.to_be_bytes().to_vec(),
+            ),
+            (
+                rnode::CMD_BANDWIDTH,
+                target.bandwidth.to_be_bytes().to_vec(),
+            ),
+            (rnode::CMD_TXPOWER, vec![target.tx_power]),
         ]
     }
 
@@ -3799,7 +3900,11 @@ mod tests {
         assert_eq!(
             forward_usb_read_chunk(
                 &mut inbound,
-                &framed_protocol_frames(required_protocol_frames(target)),
+                &framed_protocol_frames(
+                    required_protocol_frames(target)
+                        .into_iter()
+                        .chain(post_radio_on_echoes(target))
+                ),
                 0x66,
                 &received,
                 &crate::traits::test_registered_sender(0x66, transport_tx.clone()),
@@ -3922,8 +4027,12 @@ mod tests {
         let stale_enqueued = Arc::new(AtomicBool::new(false));
         let response = capability_response(0xB8);
         let stale_rf = framed_protocol_frames(required_protocol_frames(target).into_iter().skip(2));
-        let post_init =
-            framed_protocol_frames(required_protocol_frames(target).into_iter().skip(2));
+        let post_init = framed_protocol_frames(
+            required_protocol_frames(target)
+                .into_iter()
+                .skip(2)
+                .chain(post_radio_on_echoes(target)),
+        );
         let reader = SeparateStaleReader {
             writer_calls: calls.clone(),
             capability_reads: response.chunks(512).map(|chunk| chunk.to_vec()).collect(),

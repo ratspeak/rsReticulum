@@ -206,7 +206,9 @@ impl RNodeMultiConfig {
     }
 }
 
-/// SEL_INT, push params, then RADIO_STATE=ON last.
+/// SEL_INT, push params, RADIO_STATE=ON, then frequency, bandwidth and TX
+/// power again: firmware maps them to what the hardware will use only while
+/// the radio is on, so these last echoes report the effective settings.
 pub fn build_subinterface_init(index: u8, config: &SubInterfaceConfig) -> Vec<u8> {
     let mut out = Vec::with_capacity(80);
 
@@ -237,6 +239,17 @@ pub fn build_subinterface_init(index: u8, config: &SubInterfaceConfig) -> Vec<u8
         kiss::frame_with_command_into(rnode::CMD_LT_ALOCK, &[c1, c2], &mut out);
     }
     kiss::frame_with_command_into(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_ON], &mut out);
+    kiss::frame_with_command_into(
+        rnode::CMD_FREQUENCY,
+        &config.frequency.to_be_bytes(),
+        &mut out,
+    );
+    kiss::frame_with_command_into(
+        rnode::CMD_BANDWIDTH,
+        &config.bandwidth.to_be_bytes(),
+        &mut out,
+    );
+    kiss::frame_with_command_into(rnode::CMD_TXPOWER, &[config.tx_power], &mut out);
 
     out
 }
@@ -291,6 +304,9 @@ struct RadioEvidence {
     coding_rate: Option<u8>,
     tx_power: Option<u8>,
     radio_state: Option<u8>,
+    /// A TX power echo arrived while the radio was on, so the evidence holds
+    /// the effective values.
+    effective: bool,
 }
 
 impl RadioEvidence {
@@ -301,6 +317,7 @@ impl RadioEvidence {
             && self.coding_rate.is_some()
             && self.tx_power.is_some()
             && self.radio_state.is_some()
+            && self.effective
     }
 
     fn validate(self, config: &SubInterfaceConfig) -> Result<(), String> {
@@ -441,12 +458,14 @@ impl StartupEvidence {
                 let value = one_byte(payload, "TX power")?;
                 if let Some(radio) = self.selected_radio_mut() {
                     radio.tx_power = Some(value);
+                    radio.effective |= radio.radio_state == Some(rnode::RADIO_STATE_ON);
                 }
             }
             rnode::CMD_RADIO_STATE => {
                 let value = one_byte(payload, "radio state")?;
                 if let Some(radio) = self.selected_radio_mut() {
                     radio.radio_state = Some(value);
+                    radio.effective &= value == rnode::RADIO_STATE_ON;
                 }
             }
             CMD_ERROR => {
@@ -1421,8 +1440,8 @@ mod tests {
 
         let mut deframer = kiss::KissDeframer::new();
         let frames = deframer.feed(&seq);
-        // sel_int + freq + bw + sf + cr + txpower + radio_state
-        assert_eq!(frames.len(), 7);
+        // sel_int + freq + bw + sf + cr + txpower + radio_state + freq + bw + txpower
+        assert_eq!(frames.len(), 10);
     }
 
     #[test]
@@ -1434,8 +1453,8 @@ mod tests {
         let seq = build_subinterface_init(0, &sub_cfg);
         let mut deframer = kiss::KissDeframer::new();
         let frames = deframer.feed(&seq);
-        // 7 base + 2 airtime limits
-        assert_eq!(frames.len(), 9);
+        // 10 base + 2 airtime limits
+        assert_eq!(frames.len(), 12);
     }
 
     #[test]
@@ -1779,9 +1798,20 @@ mod tests {
         state
             .apply_frame(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_ON])
             .unwrap();
+        // Pre-RADIO_ON echoes are the request, not what the radio will use.
+        assert!(!state.radio_complete(0));
+        state
+            .apply_frame(rnode::CMD_TXPOWER, &[config.tx_power])
+            .unwrap();
 
         assert!(state.radio_complete(0));
         assert!(state.radios[0].validate(&config).is_ok());
+
+        // An amplifier floor reported once on is a mismatch.
+        state
+            .apply_frame(rnode::CMD_TXPOWER, &[config.tx_power + 3])
+            .unwrap();
+        assert!(state.radios[0].validate(&config).is_err());
 
         let mut mismatch = state.radios[0];
         mismatch.coding_rate = Some(config.coding_rate + 1);
