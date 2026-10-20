@@ -12022,7 +12022,7 @@ loglevel = 7
                 [None, Some(0.0), None],
             ),
         ] {
-            let config = Config::parse(&format!("[interfaces]\n[[relay]]\ntype = TCPServerInterface\nlisten_ip = 127.0.0.1\nlisten_port = 4242\ndiscoverable = yes\n{extra}")).unwrap();
+            let config = Config::parse(&format!("[interfaces]\n[[relay]]\ntype = TCPServerInterface\nenabled = yes\nlisten_ip = 127.0.0.1\nlisten_port = 4242\ndiscoverable = yes\n{extra}")).unwrap();
             let interfaces = synthesize_interfaces(&config, false).unwrap();
             let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
             let discovery =
@@ -12168,6 +12168,7 @@ loglevel = 7
         let input = "[interfaces]\n\
                      [[upstream]]\n\
                      type = TCPServerInterface\n\
+                     enabled = yes\n\
                      listen_ip = 0.0.0.0\n\
                      listen_port = 4242\n\
                      discoverable = yes\n";
@@ -12184,6 +12185,7 @@ loglevel = 7
         let opted_out = "[interfaces]\n\
                          [[upstream]]\n\
                          type = TCPServerInterface\n\
+                         enabled = yes\n\
                          listen_ip = 0.0.0.0\n\
                          listen_port = 4242\n\
                          discoverable = yes\n\
@@ -12212,6 +12214,7 @@ egress_control = No
 
 [[Test TCP]]
 type = TCPClientInterface
+enabled = yes
 target_host = 127.0.0.1
 target_port = 4242
 ic_pr_burst_freq = 5
@@ -12355,7 +12358,7 @@ egress_control = Yes
     #[test]
     fn internal_interface_mode_parses_and_discovery_autocorrects() {
         // Python 1.3.8 Reticulum.py:721,737-738: mode = internal → MODE_INTERNAL.
-        let base = "[interfaces]\n\n[[Test TCP]]\ntype = TCPClientInterface\n\
+        let base = "[interfaces]\n\n[[Test TCP]]\ntype = TCPClientInterface\nenabled = yes\n\
                     target_host = 127.0.0.1\ntarget_port = 4242\nmode = internal\n";
         let config = Config::parse(base).unwrap();
         let mut interfaces = synthesize_interfaces(&config, false).unwrap();
@@ -14009,10 +14012,16 @@ enabled = no
 
 [[Test UDP]]
 type = UDPInterface
+interface_enabled = yes
 listen_port = 5555
+
+[[No Flag]]
+type = UDPInterface
+listen_port = 5556
 "#;
         let config = Config::parse(input).unwrap();
         let interfaces = synthesize_interfaces(&config, false).unwrap();
+        // Upstream skips a section with neither `enabled` nor `interface_enabled`.
         assert_eq!(interfaces.len(), 2);
     }
 
@@ -14828,20 +14837,24 @@ enabled = yes
 
 [[Serial Port]]
 type = SerialInterface
+enabled = yes
 port = /dev/ttyUSB0
 speed = 115200
 
 [[KISS TNC]]
 type = KISSInterface
+enabled = yes
 port = /dev/ttyUSB1
 speed = 57600
 
 [[Auto Discovery]]
 type = AutoInterface
+enabled = yes
 group_id = testgroup
 
 [[LoRa Radio]]
 type = RNodeInterface
+enabled = yes
 port = /dev/ttyACM0
 frequency = 868000000
 bandwidth = 125000
@@ -14851,6 +14864,7 @@ txpower = 17
 
 [[OpenCom XL]]
 type = RNodeMultiInterface
+enabled = yes
 port = /dev/ttyACM1
 baud_rate = 230400
 
@@ -14874,6 +14888,7 @@ codingrate = 5
 
 [[Local]]
 type = LocalInterface
+enabled = yes
 port = 37428
 "#;
         let config = Config::parse(input).unwrap();

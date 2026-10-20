@@ -418,13 +418,21 @@ pub fn synthesize_interface(
     name: &str,
     section: &ConfigSection,
 ) -> Result<InterfaceConfig, InterfaceFactoryError> {
-    let enabled = section
-        .get_bool("enabled")
-        .or_else(|| section.get_bool("interface_enabled"))
-        .unwrap_or(true);
-
-    if !enabled {
-        debug!(interface = %name, "interface disabled in config, skipping");
+    if let Some(key) = section.invalid_enable_key() {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{key}"),
+            message: "expected yes or no".to_string(),
+        });
+    }
+    if !section.interface_enabled() {
+        if section.has_enable_key() {
+            debug!(interface = %name, "interface disabled in config, skipping");
+        } else {
+            warn!(
+                interface = %name,
+                "interface has no `enabled` key and is skipped, as in Python Reticulum; add `enabled = yes` to start it"
+            );
+        }
         return Err(InterfaceFactoryError::Disabled(name.to_string()));
     }
 
@@ -1304,10 +1312,20 @@ fn synthesize_rnode_multi(
     let mut subinterfaces = Vec::new();
     let mut seen_vports = std::collections::HashSet::new();
     for (sub_name, sub_section) in &section.subsections {
-        let enabled = sub_section
-            .get_bool("interface_enabled")
-            .or_else(|| sub_section.get_bool("enabled"))
-            .unwrap_or(true);
+        if let Some(key) = sub_section.invalid_enable_key() {
+            return Err(InterfaceFactoryError::InvalidValue {
+                field: format!("{sub_name}.{key}"),
+                message: "expected yes or no".to_string(),
+            });
+        }
+        // Upstream enables a subinterface by its own `interface_enabled` or the
+        // parent's `enabled`; an explicit subinterface flag wins, as upstream
+        // documents, so a radio switched off never transmits.
+        let enabled = if sub_section.has_enable_key() {
+            sub_section.interface_enabled()
+        } else {
+            section.get_bool("enabled") == Some(true)
+        };
         if !enabled {
             continue;
         }
@@ -1751,9 +1769,17 @@ pub fn default_ifac_size_for(config: &InterfaceConfig) -> usize {
 mod tests {
     use super::*;
 
+    /// Fixtures are enabled unless a test says otherwise; upstream skips a
+    /// section with no `enabled` key.
+    fn enabled_section() -> ConfigSection {
+        let mut section = ConfigSection::new();
+        section.set("enabled", "yes");
+        section
+    }
+
     #[test]
     fn test_synthesize_tcp_client() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "TCPClientInterface");
         section.set("target_host", "127.0.0.1");
         section.set("target_port", "4242");
@@ -1771,7 +1797,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_tcp_server() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "TCPServerInterface");
         section.set("listen_port", "4242");
 
@@ -1787,7 +1813,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_udp() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "UDPInterface");
         section.set("listen_ip", "0.0.0.0");
         section.set("listen_port", "4242");
@@ -1807,7 +1833,7 @@ mod tests {
 
     #[test]
     fn test_disabled_interface() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "TCPClientInterface");
         section.set("enabled", "no");
         section.set("target_host", "127.0.0.1");
@@ -1821,7 +1847,7 @@ mod tests {
 
     #[test]
     fn test_unknown_type() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "FooInterface");
 
         match synthesize_interface("unknown", &section) {
@@ -1833,7 +1859,7 @@ mod tests {
     /// T1-11: ports over 65535 are config errors, never silent u16 wraps.
     #[test]
     fn test_out_of_range_port_rejected() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "TCPClientInterface");
         section.set("target_host", "127.0.0.1");
         section.set("target_port", "70000");
@@ -1845,7 +1871,7 @@ mod tests {
             other => panic!("expected InvalidValue, got {other:?}"),
         }
 
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "UDPInterface");
         section.set("listen_ip", "0.0.0.0");
         section.set("listen_port", "65536");
@@ -1856,7 +1882,7 @@ mod tests {
             other => panic!("expected InvalidValue, got {other:?}"),
         }
 
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "AutoInterface");
         section.set("discovery_port", "99999");
         match synthesize_interface("auto_badport", &section) {
@@ -1872,7 +1898,7 @@ mod tests {
     #[test]
     fn test_ifac_size_out_of_range_rejected() {
         for bad in ["0", "65", "4096"] {
-            let mut section = ConfigSection::new();
+            let mut section = enabled_section();
             section.set("type", "TCPClientInterface");
             section.set("target_host", "127.0.0.1");
             section.set("target_port", "4242");
@@ -1886,7 +1912,7 @@ mod tests {
         }
 
         // In-range sizes still parse.
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "TCPClientInterface");
         section.set("target_host", "127.0.0.1");
         section.set("target_port", "4242");
@@ -1897,7 +1923,7 @@ mod tests {
 
     #[test]
     fn test_missing_type() {
-        let section = ConfigSection::new();
+        let section = enabled_section();
         match synthesize_interface("no_type", &section) {
             Err(InterfaceFactoryError::MissingField { field, .. }) => {
                 assert_eq!(field, "type");
@@ -1940,7 +1966,7 @@ mod tests {
 
     #[test]
     fn test_tcp_client_with_options() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "TCPClientInterface");
         section.set("target_host", "10.0.0.1");
         section.set("target_port", "5555");
@@ -1973,7 +1999,7 @@ mod tests {
 
     #[test]
     fn test_announce_rate_target_defaults_grace_and_penalty() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("announce_rate_target", "2");
 
         let pi = InterfacePostInit::try_from_section(&section).unwrap();
@@ -1987,7 +2013,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_kiss_defaults_match_python() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "KISSInterface");
         section.set("port", "/dev/ttyUSB1");
 
@@ -2008,7 +2034,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_kiss_full_params_and_beacon() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "KISSInterface");
         section.set("port", "/dev/ttyUSB1");
         section.set("preamble", "150");
@@ -2037,7 +2063,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_ax25kiss_defaults_and_ssid() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "AX25KISSInterface");
         section.set("port", "/dev/ttyUSB2");
         section.set("callsign", "NO1CLL");
@@ -2053,7 +2079,7 @@ mod tests {
             _ => panic!("expected AX25KISS"),
         }
 
-        let mut no_ssid = ConfigSection::new();
+        let mut no_ssid = enabled_section();
         no_ssid.set("type", "AX25KISSInterface");
         no_ssid.set("port", "/dev/ttyUSB2");
         no_ssid.set("callsign", "NO1CLL");
@@ -2071,7 +2097,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_tcp_fixed_mtu_and_device() {
-        let mut client = ConfigSection::new();
+        let mut client = enabled_section();
         client.set("type", "TCPClientInterface");
         client.set("target_host", "example.com");
         client.set("target_port", "4242");
@@ -2087,7 +2113,7 @@ mod tests {
             Err(InterfaceFactoryError::InvalidValue { field, .. }) if field.ends_with("fixed_mtu")
         ));
 
-        let mut server = ConfigSection::new();
+        let mut server = enabled_section();
         server.set("type", "TCPServerInterface");
         server.set("listen_port", "4242");
         server.set("device", "eth0");
@@ -2099,7 +2125,7 @@ mod tests {
 
     #[test]
     fn fixed_mtu_checks_exact_integer_and_active_ifac_before_spawn() {
-        let mut client = ConfigSection::new();
+        let mut client = enabled_section();
         client.set("type", "TCPClientInterface");
         client.set("target_host", "example.com");
         client.set("target_port", "4242");
@@ -2143,7 +2169,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_rnode_beacon_keys() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeInterface");
         section.set("port", "/dev/ttyACM0");
         section.set("frequency", "868000000");
@@ -2163,7 +2189,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_rnode_airtime_and_flow_control() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeInterface");
         section.set("port", "/dev/ttyACM0");
         section.set("frequency", "868000000");
@@ -2187,7 +2213,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_rnode_airtime_defaults() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeInterface");
         section.set("port", "/dev/ttyACM0");
         section.set("frequency", "868000000");
@@ -2207,7 +2233,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_rnode_airtime_out_of_range() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeInterface");
         section.set("port", "/dev/ttyACM0");
         section.set("frequency", "868000000");
@@ -2225,7 +2251,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_serial() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "SerialInterface");
         section.set("port", "/dev/ttyUSB0");
         section.set("speed", "115200");
@@ -2250,7 +2276,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_serial_defaults() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "SerialInterface");
         section.set("port", "/dev/ttyS0");
 
@@ -2269,7 +2295,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_serial_missing_port() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "SerialInterface");
 
         match synthesize_interface("serial_no_port", &section) {
@@ -2283,7 +2309,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_kiss_serial() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "KISSInterface");
         section.set("port", "/dev/ttyUSB1");
         section.set("speed", "57600");
@@ -2302,7 +2328,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_kiss_serial_defaults() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "KISSInterface");
         section.set("port", "/dev/ttyS0");
 
@@ -2317,7 +2343,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_auto() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "AutoInterface");
         section.set("group_id", "mygroup");
         section.set("discovery_port", "30000");
@@ -2337,7 +2363,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_auto_defaults() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "AutoInterface");
 
         let config = synthesize_interface("auto_defaults", &section).unwrap();
@@ -2361,7 +2387,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_auto_advanced_options() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "AutoInterface");
         section.set("group_id", "campus");
         section.set("discovery_scope", "site");
@@ -2391,7 +2417,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_rnode() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeInterface");
         section.set("port", "/dev/ttyACM0");
         section.set("frequency", "868000000");
@@ -2429,7 +2455,7 @@ mod tests {
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     fn complete_rnode_section() -> ConfigSection {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeInterface");
         section.set("port", "tcp://rnode.local");
         section.set("frequency", "868000000");
@@ -2439,7 +2465,7 @@ mod tests {
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     fn complete_rnode_alias_section() -> ConfigSection {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeInterface");
         section.set("port", "tcp://rnode.local");
         section.set("frequency", "868000000");
@@ -2605,7 +2631,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_rnode_requires_radio_params() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeInterface");
         section.set("port", "/dev/ttyACM0");
         section.set("frequency", "915000000");
@@ -2631,7 +2657,7 @@ mod tests {
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_synthesize_rnode_tcp() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeInterface");
         section.set("port", "tcp://rnode.local");
         section.set("frequency", "915000000");
@@ -2668,7 +2694,7 @@ mod tests {
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_synthesize_rnode_missing_port() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeInterface");
         section.set("frequency", "868000000");
 
@@ -2683,7 +2709,7 @@ mod tests {
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn android_usb_stable_selector_and_station_id_round_trip_through_factory() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         for (key, value) in [
             ("port", "androidusb:///dev/bus/usb/001/002"),
             ("frequency", "915000000"),
@@ -2715,7 +2741,7 @@ mod tests {
     #[test]
     fn android_usb_stable_selector_rejects_partial_or_narrowed_ids() {
         let base = |vendor: &str, product: Option<&str>| {
-            let mut section = ConfigSection::new();
+            let mut section = enabled_section();
             for (key, value) in [
                 ("port", "androidusb:///dev/bus/usb/001/002"),
                 ("frequency", "915000000"),
@@ -2746,7 +2772,7 @@ mod tests {
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
     fn test_synthesize_rnode_missing_frequency() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeInterface");
         section.set("port", "tcp://rnode.local");
 
@@ -2760,7 +2786,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_local() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "LocalInterface");
         section.set("port", "12345");
 
@@ -2776,7 +2802,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_local_default_port() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "LocalInterface");
 
         let config = synthesize_interface("local_defaults", &section).unwrap();
@@ -2860,7 +2886,7 @@ mod tests {
 
     #[test]
     fn test_post_init_with_values() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("outgoing", "no");
         section.set("bitrate", "115200");
         section.set("networkname", "testnet");
@@ -2891,7 +2917,7 @@ mod tests {
 
     #[test]
     fn announce_cap_config_uses_python_percent_shape() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("announce_cap", "2");
         let pi = InterfacePostInit::try_from_section(&section).unwrap();
         assert_eq!(pi.announce_cap, Some(0.02));
@@ -2911,7 +2937,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_i2p() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "I2PInterface");
         section.set("connectable", "yes");
         section.set("peers", "abc123.b32.i2p, def456.b32.i2p");
@@ -2933,7 +2959,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_i2p_defaults() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "I2PInterface");
 
         let config = synthesize_interface("i2p_defaults", &section).unwrap();
@@ -2950,7 +2976,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_pipe() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "PipeInterface");
         section.set("command", "netcat -l 5757");
         section.set("respawn_delay", "10");
@@ -2968,7 +2994,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_pipe_defaults() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "PipeInterface");
         section.set("command", "cat");
 
@@ -2983,7 +3009,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_pipe_missing_command() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "PipeInterface");
 
         match synthesize_interface("pipe_no_cmd", &section) {
@@ -2996,7 +3022,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_backbone_client() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "BackboneInterface");
         section.set("target_host", "amsterdam.connect.reticulum.network");
         section.set("target_port", "4251");
@@ -3018,7 +3044,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_backbone_listener() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "BackboneInterface");
         section.set("listen_on", "0.0.0.0");
         section.set("port", "4242");
@@ -3036,7 +3062,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_backbone_with_remote() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "BackboneInterface");
         section.set("remote", "some.host.network");
         section.set("target_port", "4343");
@@ -3055,7 +3081,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_backbone_defaults() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "BackboneInterface");
 
         // Python BackboneInterface errors without an explicit port.
@@ -3087,7 +3113,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_backbone_fast_flap_overrides_allow_fractions() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "BackboneInterface");
         section.set("listen_on", "0.0.0.0");
         section.set("port", "4242");
@@ -3123,7 +3149,7 @@ mod tests {
             ("fast_flapping_block_time", "-1"),
             ("fast_flapping_block_time", "1e307"),
         ] {
-            let mut section = ConfigSection::new();
+            let mut section = enabled_section();
             section.set("type", "BackboneInterface");
             section.set("listen_on", "0.0.0.0");
             section.set("port", "4242");
@@ -3140,7 +3166,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_backbone_connect_timeout() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "BackboneInterface");
         section.set("target_host", "host.example");
         section.set("target_port", "4242");
@@ -3155,7 +3181,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_backbone_max_reconnect_tries() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "BackboneInterface");
         section.set("target_host", "host.example");
         section.set("target_port", "4242");
@@ -3170,7 +3196,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_backbone_i2p_tunneled() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "BackboneInterface");
         section.set("target_host", "host.example");
         section.set("target_port", "4242");
@@ -3185,7 +3211,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_backbone_listen_port_alias() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "BackboneInterface");
         section.set("listen_on", "0.0.0.0");
         section.set("listen_port", "5151");
@@ -3200,7 +3226,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_ax25kiss() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "AX25KISSInterface");
         section.set("port", "/dev/ttyUSB2");
         section.set("callsign", "NO1CLL");
@@ -3232,7 +3258,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_ax25kiss_missing_callsign() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "AX25KISSInterface");
         section.set("port", "/dev/ttyUSB2");
 
@@ -3244,16 +3270,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn interfaces_start_only_when_an_enable_key_is_true() {
+        let synthesize = |pairs: &[(&str, &str)]| {
+            let mut section = ConfigSection::new();
+            section.set("type", "AutoInterface");
+            for (key, value) in pairs {
+                section.set(key, value);
+            }
+            synthesize_interface("auto", &section)
+        };
+        for skipped in [
+            &[][..],
+            &[("enabled", "no")],
+            &[("interface_enabled", "off")],
+        ] {
+            assert!(
+                matches!(synthesize(skipped), Err(InterfaceFactoryError::Disabled(_))),
+                "{skipped:?}"
+            );
+        }
+        for started in [
+            &[("enabled", "yes")][..],
+            &[("interface_enabled", "True")],
+            &[("enabled", "no"), ("interface_enabled", "yes")],
+            &[("enabled", "yes"), ("interface_enabled", "no")],
+        ] {
+            assert!(synthesize(started).is_ok(), "{started:?}");
+        }
+        assert!(matches!(
+            synthesize(&[("enabled", "maybe")]),
+            Err(InterfaceFactoryError::InvalidValue { field, .. }) if field == "auto.enabled"
+        ));
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn rnode_multi_subinterfaces_follow_upstream_unless_flagged() {
+        let radio = |vport: &str, flag: Option<(&str, &str)>| {
+            let mut sub = ConfigSection::new();
+            if let Some((key, value)) = flag {
+                sub.set(key, value);
+            }
+            sub.set("vport", vport);
+            sub.set("frequency", "865600000");
+            sub.set("bandwidth", "125000");
+            sub.set("txpower", "14");
+            sub.set("spreadingfactor", "7");
+            sub.set("codingrate", "5");
+            sub
+        };
+        let vports = |parent: (&str, &str), subs: Vec<ConfigSection>| {
+            let mut section = ConfigSection::new();
+            section.set(parent.0, parent.1);
+            section.set("type", "RNodeMultiInterface");
+            section.set("port", "/dev/ttyACM0");
+            for (i, sub) in subs.into_iter().enumerate() {
+                section.subsections.insert(format!("sub{i}"), sub);
+            }
+            match synthesize_interface("multi", &section) {
+                Ok(InterfaceConfig::RNodeMulti(c)) => {
+                    c.subinterfaces.iter().map(|s| s.vport).collect::<Vec<_>>()
+                }
+                other => panic!("expected RNodeMulti, got {other:?}"),
+            }
+        };
+        // A parent `enabled = yes` enables flagless subinterfaces, as upstream;
+        // a subinterface switched off stays off (upstream would enable it).
+        assert_eq!(
+            vports(
+                ("enabled", "yes"),
+                vec![radio("0", None), radio("1", Some(("enabled", "no")))]
+            ),
+            vec![0]
+        );
+        // A parent `interface_enabled` enables none by itself, as upstream; a
+        // subinterface's own `enabled = yes` is honored (upstream ignores it).
+        assert_eq!(
+            vports(
+                ("interface_enabled", "yes"),
+                vec![radio("0", None), radio("1", Some(("enabled", "yes")))]
+            ),
+            vec![1]
+        );
+    }
+
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_rnode_multi() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeMultiInterface");
         section.set("port", "/dev/ttyACM0");
         section.set("baud_rate", "230400");
         section.set("flow_control", "yes");
 
-        let mut high = ConfigSection::new();
+        let mut high = enabled_section();
         high.set("enabled", "yes");
         high.set("vport", "1");
         high.set("frequency", "2400000000");
@@ -3269,7 +3380,7 @@ mod tests {
             .subsections
             .insert("High Datarate".to_string(), high);
 
-        let mut low = ConfigSection::new();
+        let mut low = enabled_section();
         low.set("enabled", "yes");
         low.set("vport", "0");
         low.set("frequency", "865600000");
@@ -3322,11 +3433,11 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_rnode_multi_no_enabled_subinterfaces() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeMultiInterface");
         section.set("port", "/dev/ttyACM0");
 
-        let mut disabled = ConfigSection::new();
+        let mut disabled = enabled_section();
         disabled.set("enabled", "no");
         disabled.set("vport", "0");
         disabled.set("frequency", "865600000");
@@ -3343,11 +3454,11 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_rnode_multi_rejects_first_out_of_range_vport() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeMultiInterface");
         section.set("port", "/dev/ttyACM0");
 
-        let mut sub = ConfigSection::new();
+        let mut sub = enabled_section();
         sub.set(
             "vport",
             &rns_interface::rnode_multi::MAX_SUBINTERFACES.to_string(),
@@ -3368,12 +3479,12 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_rnode_multi_duplicate_vport() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeMultiInterface");
         section.set("port", "/dev/ttyACM0");
 
         for name in ["a", "b"] {
-            let mut sub = ConfigSection::new();
+            let mut sub = enabled_section();
             sub.set("vport", "0");
             sub.set("frequency", "865600000");
             sub.set("bandwidth", "125000");
@@ -3395,7 +3506,7 @@ mod tests {
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_rnode_multi_missing_port() {
-        let mut section = ConfigSection::new();
+        let mut section = enabled_section();
         section.set("type", "RNodeMultiInterface");
 
         match synthesize_interface("rnodemulti_no_port", &section) {

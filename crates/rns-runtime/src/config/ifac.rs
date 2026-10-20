@@ -263,14 +263,7 @@ pub fn validate_ifac_update(
                         .iter()
                         .all(|key| prev.values.get(*key) == section.values.get(*key))
                         && parse_ifac_size(prev).as_ref().err() == Some(&error)
-                        && (!section
-                            .get_bool("enabled")
-                            .or_else(|| section.get_bool("interface_enabled"))
-                            .unwrap_or(true)
-                            || prev
-                                .get_bool("enabled")
-                                .or_else(|| prev.get_bool("interface_enabled"))
-                                .unwrap_or(true))
+                        && (!section.interface_enabled() || prev.interface_enabled())
                 });
             if !unchanged {
                 return Err(IfacMigrationError::Invalid {

@@ -74,6 +74,24 @@ impl ConfigSection {
         self.get_bool(key).unwrap_or(default)
     }
 
+    /// Upstream's interface rule (Reticulum.py): enabled only when
+    /// `interface_enabled` or `enabled` is present and true.
+    pub fn interface_enabled(&self) -> bool {
+        self.get_bool("interface_enabled") == Some(true) || self.get_bool("enabled") == Some(true)
+    }
+
+    /// Whether the section sets `interface_enabled` or `enabled` at all.
+    pub fn has_enable_key(&self) -> bool {
+        self.has("interface_enabled") || self.has("enabled")
+    }
+
+    /// An enable key whose value is not a boolean, which upstream rejects.
+    pub fn invalid_enable_key(&self) -> Option<&'static str> {
+        ["interface_enabled", "enabled"]
+            .into_iter()
+            .find(|key| self.has(key) && self.get_bool(key).is_none())
+    }
+
     pub fn get_int(&self, key: &str) -> Option<i64> {
         let v = self.get(key)?;
         v.parse().ok()
