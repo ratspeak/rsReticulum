@@ -21,6 +21,7 @@ use rns_transport::messages::{
 };
 
 use crate::remote_management_schema as schema;
+use crate::reticulum::{InterfaceIfac, InterfaceIfacStats};
 
 const STATUS_PATH: &str = "/status";
 const PATH_PATH: &str = "/path";
@@ -32,6 +33,17 @@ pub async fn start_remote_management(
     transport_tx: mpsc::Sender<TransportMessage>,
     identity: &Identity,
     allowed_identities: Vec<[u8; 16]>,
+) -> Result<[u8; 16], String> {
+    start_remote_management_with_ifac(transport_tx, identity, allowed_identities, None).await
+}
+
+/// As [`start_remote_management`], with the runtime's IFAC records so status
+/// replies carry Python's IFAC fields.
+pub(crate) async fn start_remote_management_with_ifac(
+    transport_tx: mpsc::Sender<TransportMessage>,
+    identity: &Identity,
+    allowed_identities: Vec<[u8; 16]>,
+    ifac: Option<InterfaceIfacStats>,
 ) -> Result<[u8; 16], String> {
     let signing_key = identity
         .get_signing_key()
@@ -81,7 +93,7 @@ pub async fn start_remote_management(
         }
 
         if path_hash == status_hash {
-            handle_status(&tx, &data)
+            handle_status(&tx, &data, ifac.as_ref())
         } else if path_hash == paths_hash {
             handle_path(&tx, &data)
         } else {
@@ -114,7 +126,11 @@ fn peer_allowed(allowed: &[[u8; 16]], peer: &[u8; 16]) -> bool {
 
 /// Request: `[include_link_count: bool]`.
 /// Response: `[stats_dict]` or `[stats_dict, link_count]`.
-fn handle_status(tx: &mpsc::Sender<TransportMessage>, data: &[u8]) -> Option<Vec<u8>> {
+fn handle_status(
+    tx: &mpsc::Sender<TransportMessage>,
+    data: &[u8],
+    ifac: Option<&InterfaceIfacStats>,
+) -> Option<Vec<u8>> {
     let include_link_count = parse_status_request(data).unwrap_or(false);
 
     let iface_stats = match blocking_query(tx, TransportQuery::GetInterfaceStats)? {
@@ -131,7 +147,7 @@ fn handle_status(tx: &mpsc::Sender<TransportMessage>, data: &[u8]) -> Option<Vec
         None
     };
 
-    let stats = build_transport_stats(iface_stats);
+    let stats = build_transport_stats(iface_stats, ifac);
 
     let bytes = if let Some(lc) = link_count {
         rmp_serde::to_vec_named(&(&stats, lc)).ok()?
@@ -212,7 +228,10 @@ fn blocking_query(
     tokio::task::block_in_place(|| resp_rx.blocking_recv().ok())
 }
 
-fn build_transport_stats(entries: Vec<InterfaceStatRpcEntry>) -> schema::TransportStats {
+fn build_transport_stats(
+    entries: Vec<InterfaceStatRpcEntry>,
+    ifac: Option<&InterfaceIfacStats>,
+) -> schema::TransportStats {
     let (total_rxb, total_txb) = entries
         .iter()
         .fold((0u64, 0u64), |(r, t), e| (r + e.rx_bytes, t + e.tx_bytes));
@@ -220,7 +239,13 @@ fn build_transport_stats(entries: Vec<InterfaceStatRpcEntry>) -> schema::Transpo
         .iter()
         .fold((0u64, 0u64), |(r, t), e| (r + e.rx_rate, t + e.tx_rate));
 
-    let interfaces = entries.into_iter().map(interface_stats_from_rpc).collect();
+    let interfaces = entries
+        .into_iter()
+        .map(|e| {
+            let ifac = ifac.map(|ifac| ifac.lookup(e.id)).unwrap_or_default();
+            interface_stats_from_rpc(e, ifac)
+        })
+        .collect();
 
     schema::TransportStats {
         interfaces,
@@ -236,13 +261,11 @@ fn build_transport_stats(entries: Vec<InterfaceStatRpcEntry>) -> schema::Transpo
     }
 }
 
-fn interface_stats_from_rpc(e: InterfaceStatRpcEntry) -> schema::InterfaceStats {
+fn interface_stats_from_rpc(
+    e: InterfaceStatRpcEntry,
+    ifac: InterfaceIfac,
+) -> schema::InterfaceStats {
     let mode = mode_from_debug_string(&e.mode);
-    let ifac_size = if e.ifac_size > 0 {
-        Some(e.ifac_size as u64)
-    } else {
-        None
-    };
     schema::InterfaceStats {
         name: e.name.clone(),
         short_name: e.name,
@@ -267,9 +290,9 @@ fn interface_stats_from_rpc(e: InterfaceStatRpcEntry) -> schema::InterfaceStats 
         announce_queue: e.announce_queue,
         clients: e.clients,
         blocked_ips: e.blocked_ips,
-        ifac_signature: None,
-        ifac_size,
-        ifac_netname: None,
+        ifac_signature: ifac.signature.map(Vec::from),
+        ifac_size: ifac.size.map(|size| size as u64),
+        ifac_netname: ifac.netname,
     }
 }
 
@@ -514,6 +537,61 @@ mod tests {
         assert_eq!(max_hops, Some(3));
     }
 
+    // RNode-like: a default IFAC size is configured, IFAC itself is off.
+    fn mock_stat_entry() -> InterfaceStatRpcEntry {
+        InterfaceStatRpcEntry {
+            id: 1,
+            name: "MockIf".to_string(),
+            rx_bytes: 100,
+            tx_bytes: 200,
+            rx_rate: 10,
+            tx_rate: 20,
+            online: true,
+            bitrate: 12_000,
+            mtu: 512,
+            mode: "Gateway".to_string(),
+            role: "normal".to_string(),
+            announce_queue: Some(2),
+            held_announces: 1,
+            incoming_announce_frequency: 0.5,
+            outgoing_announce_frequency: 0.25,
+            incoming_pr_frequency: 3.0,
+            outgoing_pr_frequency: 1.5,
+            burst_active: true,
+            burst_activated: 1_700_000_001.0,
+            pr_burst_active: true,
+            pr_burst_activated: 1_700_000_002.0,
+            clients: None,
+            blocked_ips: Some(3),
+            announce_rate_target: None,
+            announce_rate_grace: None,
+            announce_rate_penalty: None,
+            announce_cap: 0.02,
+            ifac_size: 8,
+            tx_drops: 0,
+        }
+    }
+
+    #[test]
+    fn status_reports_ifac_only_for_interfaces_with_ifac() {
+        let plain = interface_stats_from_rpc(mock_stat_entry(), InterfaceIfac::default());
+        assert_eq!(
+            (plain.ifac_signature, plain.ifac_size, plain.ifac_netname),
+            (None, None, None)
+        );
+        let ifac = interface_stats_from_rpc(
+            mock_stat_entry(),
+            InterfaceIfac {
+                signature: Some([7; 64]),
+                size: Some(8),
+                netname: Some("testnet".to_string()),
+            },
+        );
+        assert_eq!(ifac.ifac_signature, Some(vec![7; 64]));
+        assert_eq!(ifac.ifac_size, Some(8));
+        assert_eq!(ifac.ifac_netname.as_deref(), Some("testnet"));
+    }
+
     fn spawn_mock_transport() -> mpsc::Sender<TransportMessage> {
         let (tx, mut rx) = mpsc::channel::<TransportMessage>(16);
         tokio::spawn(async move {
@@ -521,37 +599,7 @@ mod tests {
                 if let TransportMessage::Rpc { query, response_tx } = msg {
                     let resp = match query {
                         TransportQuery::GetInterfaceStats => {
-                            let stats = vec![InterfaceStatRpcEntry {
-                                id: 1,
-                                name: "MockIf".to_string(),
-                                rx_bytes: 100,
-                                tx_bytes: 200,
-                                rx_rate: 10,
-                                tx_rate: 20,
-                                online: true,
-                                bitrate: 12_000,
-                                mtu: 512,
-                                mode: "Gateway".to_string(),
-                                role: "normal".to_string(),
-                                announce_queue: Some(2),
-                                held_announces: 1,
-                                incoming_announce_frequency: 0.5,
-                                outgoing_announce_frequency: 0.25,
-                                incoming_pr_frequency: 3.0,
-                                outgoing_pr_frequency: 1.5,
-                                burst_active: true,
-                                burst_activated: 1_700_000_001.0,
-                                pr_burst_active: true,
-                                pr_burst_activated: 1_700_000_002.0,
-                                clients: None,
-                                blocked_ips: Some(3),
-                                announce_rate_target: None,
-                                announce_rate_grace: None,
-                                announce_rate_penalty: None,
-                                announce_cap: 0.02,
-                                ifac_size: 0,
-                                tx_drops: 0,
-                            }];
+                            let stats = vec![mock_stat_entry()];
                             TransportQueryResponse::InterfaceStats(stats)
                         }
                         TransportQuery::GetLinkCount => TransportQueryResponse::IntResult(3),
@@ -594,7 +642,7 @@ mod tests {
         let tx = spawn_mock_transport();
 
         let req = rmp_serde::to_vec(&(true,)).unwrap();
-        let resp = handle_status(&tx, &req).expect("handler produced a response");
+        let resp = handle_status(&tx, &req, None).expect("handler produced a response");
 
         let decoded: rmpv::Value = rmp_serde::from_slice(&resp).unwrap();
         let arr = decoded.as_array().expect("response is an array");
@@ -689,7 +737,7 @@ mod tests {
         let tx = spawn_mock_transport();
 
         let req = rmp_serde::to_vec(&(false,)).unwrap();
-        let resp = handle_status(&tx, &req).unwrap();
+        let resp = handle_status(&tx, &req, None).unwrap();
         let decoded: rmpv::Value = rmp_serde::from_slice(&resp).unwrap();
         let arr = decoded.as_array().unwrap();
         assert_eq!(arr.len(), 1, "response is [stats_dict] with no link count");

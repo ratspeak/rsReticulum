@@ -64,6 +64,14 @@ pub fn derive_ifac_identity(
     Ok((identity, ifac_key, signature))
 }
 
+/// The IFAC identity's signature over `SHA-256(ifac_key)`, which Python
+/// publishes as an interface's `ifac_signature`.
+pub fn ifac_signature(ifac_key: &[u8; 64]) -> Option<[u8; 64]> {
+    crate::identity::Identity::from_private_key(ifac_key)
+        .ok()?
+        .sign(&sha256(ifac_key))
+}
+
 /// Split IFAC key into `(signing_key, masking_key)`, each 32 bytes.
 pub fn split_ifac_key(key: &[u8; 64]) -> (&[u8], &[u8]) {
     (&key[..32], &key[32..])
@@ -139,5 +147,22 @@ mod tests {
 
         let key_hash = sha256(&ifac_key);
         assert!(identity.verify(&key_hash, &signature));
+        assert_eq!(ifac_signature(&ifac_key), Some(signature));
+    }
+
+    /// Upstream `Identity.from_bytes(key).sign(Identity.full_hash(key))` for
+    /// the `ifac_testnet_password` vector key.
+    #[test]
+    fn ifac_signature_matches_upstream() {
+        let key = derive_ifac_key(Some("testnet"), Some("password")).unwrap();
+        let expected = hex_decode(
+            "ce6b8bc4028852077243868e4b5f7faadb715c7a2fb75d1a211d30035f65b0c1\
+             fc4271ef61e91599e7bcc42723afe97503e3c432b01264185233274e3603e708",
+        )
+        .unwrap();
+        assert_eq!(
+            ifac_signature(&key).unwrap().as_slice(),
+            expected.as_slice()
+        );
     }
 }

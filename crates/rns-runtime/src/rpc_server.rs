@@ -8,24 +8,55 @@ use tokio::sync::mpsc;
 use rns_transport::messages::TransportMessage;
 
 use crate::lifecycle::ShutdownSignal;
+use crate::reticulum::InterfaceIfacStats;
 use crate::rpc::{self, RpcError, RpcRequest, RpcResponse};
 
 const MAX_REQUEST_SIZE: usize = 1_048_576;
 const MAX_CONTROL_CLIENTS: usize = 64;
 const CONTROL_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// What the control port answers from: the transport, plus the runtime's IFAC
+/// records when a runtime serves it.
+#[derive(Clone)]
+pub(crate) struct RpcBackend {
+    transport_tx: mpsc::Sender<TransportMessage>,
+    ifac: Option<InterfaceIfacStats>,
+}
+
+impl RpcBackend {
+    pub(crate) fn new(
+        transport_tx: mpsc::Sender<TransportMessage>,
+        ifac: Option<InterfaceIfacStats>,
+    ) -> Self {
+        Self { transport_tx, ifac }
+    }
+}
+
+/// Serve the control port from a bare transport; interface stats then carry
+/// no IFAC fields.
 pub async fn run_rpc_server(
     port: u16,
     rpc_key: Vec<u8>,
-    _transport_tx: mpsc::Sender<TransportMessage>,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    shutdown: ShutdownSignal,
+) -> Result<(), RpcError> {
+    serve_rpc_port(port, rpc_key, RpcBackend::new(transport_tx, None), shutdown).await
+}
+
+pub(crate) async fn serve_rpc_port(
+    port: u16,
+    rpc_key: Vec<u8>,
+    backend: RpcBackend,
     shutdown: ShutdownSignal,
 ) -> Result<(), RpcError> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
         .await
         .map_err(RpcError::Io)?;
-    run_rpc_server_with_listener(listener, rpc_key, _transport_tx, shutdown).await
+    run_rpc_server_with_listener(listener, rpc_key, backend, shutdown).await
 }
 
+/// Serve the control socket from a bare transport; interface stats then carry
+/// no IFAC fields.
 #[cfg(unix)]
 pub async fn run_unix_rpc_server(
     socket_path: &str,
@@ -33,12 +64,28 @@ pub async fn run_unix_rpc_server(
     transport_tx: mpsc::Sender<TransportMessage>,
     shutdown: ShutdownSignal,
 ) -> Result<(), RpcError> {
+    serve_unix_rpc(
+        socket_path,
+        rpc_key,
+        RpcBackend::new(transport_tx, None),
+        shutdown,
+    )
+    .await
+}
+
+#[cfg(unix)]
+pub(crate) async fn serve_unix_rpc(
+    socket_path: &str,
+    rpc_key: Vec<u8>,
+    backend: RpcBackend,
+    shutdown: ShutdownSignal,
+) -> Result<(), RpcError> {
     let listener = bind_unix_rpc_listener(socket_path).map_err(RpcError::Io)?;
     run_unix_rpc_server_with_listener(
         listener,
         display_socket_path(socket_path),
         rpc_key,
-        transport_tx,
+        backend,
         shutdown,
     )
     .await
@@ -46,9 +93,25 @@ pub async fn run_unix_rpc_server(
 
 #[cfg(not(unix))]
 pub async fn run_unix_rpc_server(
+    socket_path: &str,
+    rpc_key: Vec<u8>,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    shutdown: ShutdownSignal,
+) -> Result<(), RpcError> {
+    serve_unix_rpc(
+        socket_path,
+        rpc_key,
+        RpcBackend::new(transport_tx, None),
+        shutdown,
+    )
+    .await
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn serve_unix_rpc(
     _socket_path: &str,
     _rpc_key: Vec<u8>,
-    _transport_tx: mpsc::Sender<TransportMessage>,
+    _backend: RpcBackend,
     _shutdown: ShutdownSignal,
 ) -> Result<(), RpcError> {
     Err(RpcError::Io(std::io::Error::new(
@@ -60,7 +123,7 @@ pub async fn run_unix_rpc_server(
 pub(crate) async fn run_rpc_server_with_listener(
     listener: TcpListener,
     rpc_key: Vec<u8>,
-    _transport_tx: mpsc::Sender<TransportMessage>,
+    backend: RpcBackend,
     shutdown: ShutdownSignal,
 ) -> Result<(), RpcError> {
     let port = listener.local_addr().map_err(RpcError::Io)?.port();
@@ -79,10 +142,10 @@ pub(crate) async fn run_rpc_server_with_listener(
                         if clients.len() >= MAX_CONTROL_CLIENTS { continue; }
                         tracing::debug!("RPC connection from {}", addr);
                         let key = rpc_key.clone();
-                        let tx = _transport_tx.clone();
+                        let backend = backend.clone();
                         clients.spawn(async move {
                             let _ = tokio::time::timeout(CONTROL_SESSION_TIMEOUT,
-                                handle_rpc_client(stream, &key, tx)).await;
+                                handle_rpc_client(stream, &key, backend)).await;
                         });
                     }
                     Err(e) => {
@@ -101,7 +164,7 @@ pub(crate) async fn run_unix_rpc_server_with_listener(
     listener: tokio::net::UnixListener,
     display_path: String,
     rpc_key: Vec<u8>,
-    transport_tx: mpsc::Sender<TransportMessage>,
+    backend: RpcBackend,
     shutdown: ShutdownSignal,
 ) -> Result<(), RpcError> {
     tracing::info!("RPC server listening on {}", display_path);
@@ -119,10 +182,10 @@ pub(crate) async fn run_unix_rpc_server_with_listener(
                         if clients.len() >= MAX_CONTROL_CLIENTS { continue; }
                         tracing::debug!("Unix RPC connection accepted");
                         let key = rpc_key.clone();
-                        let tx = transport_tx.clone();
+                        let backend = backend.clone();
                         clients.spawn(async move {
                             let _ = tokio::time::timeout(CONTROL_SESSION_TIMEOUT,
-                                handle_rpc_client(stream, &key, tx)).await;
+                                handle_rpc_client(stream, &key, backend)).await;
                         });
                     }
                     Err(e) => {
@@ -183,7 +246,7 @@ fn display_socket_path(path: &str) -> String {
 async fn handle_rpc_client(
     mut stream: impl AsyncRead + AsyncWrite + Unpin,
     rpc_key: &[u8],
-    transport_tx: mpsc::Sender<TransportMessage>,
+    backend: RpcBackend,
 ) -> Result<(), RpcError> {
     let challenge = rpc::new_python_challenge();
     let mut challenge_frame = Vec::with_capacity(rpc::MP_CHALLENGE.len() + challenge.len());
@@ -219,7 +282,7 @@ async fn handle_rpc_client(
     let req_buf = rpc::read_mp_frame(&mut stream, MAX_REQUEST_SIZE).await?;
     let request = rpc::decode_request(&req_buf)?;
 
-    let response = process_rpc_request(request, &transport_tx).await;
+    let response = process_rpc_request(request, &backend.transport_tx, backend.ifac.as_ref()).await;
     let resp_data = rpc::encode_response(&response)?;
 
     rpc::write_mp_frame(&mut stream, &resp_data).await?;
@@ -355,6 +418,7 @@ async fn request_path(
 async fn process_rpc_request(
     request: RpcRequest,
     transport_tx: &mpsc::Sender<TransportMessage>,
+    ifac: Option<&InterfaceIfacStats>,
 ) -> RpcResponse {
     use rns_transport::messages::{TransportQuery, TransportQueryResponse};
 
@@ -393,36 +457,41 @@ async fn process_rpc_request(
                 TransportQueryResponse::InterfaceStats(entries) => {
                     let rpc_entries = entries
                         .into_iter()
-                        .map(|e| rpc::InterfaceStatEntry {
-                            id: e.id,
-                            name: e.name,
-                            rx_bytes: e.rx_bytes,
-                            tx_bytes: e.tx_bytes,
-                            rx_rate: e.rx_rate,
-                            tx_rate: e.tx_rate,
-                            online: e.online,
-                            bitrate: e.bitrate,
-                            mtu: e.mtu,
-                            mode: e.mode,
-                            role: e.role,
-                            announce_queue: e.announce_queue,
-                            held_announces: e.held_announces,
-                            incoming_announce_frequency: e.incoming_announce_frequency,
-                            outgoing_announce_frequency: e.outgoing_announce_frequency,
-                            incoming_pr_frequency: e.incoming_pr_frequency,
-                            outgoing_pr_frequency: e.outgoing_pr_frequency,
-                            burst_active: e.burst_active,
-                            burst_activated: e.burst_activated,
-                            pr_burst_active: e.pr_burst_active,
-                            pr_burst_activated: e.pr_burst_activated,
-                            clients: e.clients,
-                            blocked_ips: e.blocked_ips,
-                            announce_rate_target: e.announce_rate_target,
-                            announce_rate_grace: e.announce_rate_grace,
-                            announce_rate_penalty: e.announce_rate_penalty,
-                            announce_cap: e.announce_cap,
-                            ifac_size: e.ifac_size,
-                            tx_drops: e.tx_drops,
+                        .map(|e| {
+                            let ifac = ifac.map(|ifac| ifac.lookup(e.id)).unwrap_or_default();
+                            rpc::InterfaceStatEntry {
+                                id: e.id,
+                                name: e.name,
+                                rx_bytes: e.rx_bytes,
+                                tx_bytes: e.tx_bytes,
+                                rx_rate: e.rx_rate,
+                                tx_rate: e.tx_rate,
+                                online: e.online,
+                                bitrate: e.bitrate,
+                                mtu: e.mtu,
+                                mode: e.mode,
+                                role: e.role,
+                                announce_queue: e.announce_queue,
+                                held_announces: e.held_announces,
+                                incoming_announce_frequency: e.incoming_announce_frequency,
+                                outgoing_announce_frequency: e.outgoing_announce_frequency,
+                                incoming_pr_frequency: e.incoming_pr_frequency,
+                                outgoing_pr_frequency: e.outgoing_pr_frequency,
+                                burst_active: e.burst_active,
+                                burst_activated: e.burst_activated,
+                                pr_burst_active: e.pr_burst_active,
+                                pr_burst_activated: e.pr_burst_activated,
+                                clients: e.clients,
+                                blocked_ips: e.blocked_ips,
+                                announce_rate_target: e.announce_rate_target,
+                                announce_rate_grace: e.announce_rate_grace,
+                                announce_rate_penalty: e.announce_rate_penalty,
+                                announce_cap: e.announce_cap,
+                                ifac_signature: ifac.signature.map(Vec::from),
+                                ifac_size: ifac.size,
+                                ifac_netname: ifac.netname,
+                                tx_drops: e.tx_drops,
+                            }
                         })
                         .collect();
                     RpcResponse::InterfaceStats(rpc_entries)
@@ -868,7 +937,13 @@ mod tests {
         let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(async move {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            run_rpc_server_with_listener(listener, rpc_key, tx, shutdown_clone).await
+            run_rpc_server_with_listener(
+                listener,
+                rpc_key,
+                RpcBackend::new(tx, None),
+                shutdown_clone,
+            )
+            .await
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1177,7 +1252,7 @@ listener.close()
         tokio::spawn(actor.run());
 
         for req in all_rpc_requests() {
-            let resp = process_rpc_request(req, &tx).await;
+            let resp = process_rpc_request(req, &tx, None).await;
             assert!(
                 !matches!(resp, RpcResponse::Error(_)),
                 "unexpected Error response"
@@ -1198,6 +1273,7 @@ listener.close()
                     timeout_secs: Some(1.0),
                 },
                 &tx,
+                None,
             )
             .await
         });
@@ -1254,7 +1330,13 @@ listener.close()
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _ = run_rpc_server_with_listener(listener, rpc_key, tx, shutdown).await;
+            let _ = run_rpc_server_with_listener(
+                listener,
+                rpc_key,
+                RpcBackend::new(tx, None),
+                shutdown,
+            )
+            .await;
         });
         port
     }

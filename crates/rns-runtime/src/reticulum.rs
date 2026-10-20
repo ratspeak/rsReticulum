@@ -63,9 +63,47 @@ struct InterfaceControlMetadata {
     // spawned interfaces copy the listener's ifac_size/netname/netkey).
     ifac_key: Option<[u8; 64]>,
     ifac_size: usize,
+    ifac_netname: Option<String>,
 }
 
 type InterfaceControlMap = Arc<std::sync::Mutex<HashMap<u64, InterfaceControlMetadata>>>;
+
+/// IFAC fields of Python's interface stats, from the runtime's registration
+/// records: all `None` for an interface without IFAC.
+#[derive(Clone)]
+pub(crate) struct InterfaceIfacStats(InterfaceControlMap);
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct InterfaceIfac {
+    pub(crate) signature: Option<[u8; 64]>,
+    pub(crate) size: Option<usize>,
+    pub(crate) netname: Option<String>,
+}
+
+impl InterfaceIfacStats {
+    pub(crate) fn lookup(&self, id: u64) -> InterfaceIfac {
+        let record = self
+            .0
+            .lock()
+            .expect("interface_controls mutex poisoned")
+            .get(&id)
+            .and_then(|control| {
+                Some((
+                    control.ifac_key?,
+                    control.ifac_size,
+                    control.ifac_netname.clone(),
+                ))
+            });
+        let Some((key, size, netname)) = record else {
+            return InterfaceIfac::default();
+        };
+        InterfaceIfac {
+            signature: rns_identity::ifac::ifac_signature(&key),
+            size: Some(size),
+            netname,
+        }
+    }
+}
 
 #[derive(Default)]
 struct TransportCompletion {
@@ -2142,7 +2180,7 @@ fn rpc_response_to_transport_response(
                     announce_rate_grace: entry.announce_rate_grace,
                     announce_rate_penalty: entry.announce_rate_penalty,
                     announce_cap: entry.announce_cap,
-                    ifac_size: entry.ifac_size,
+                    ifac_size: entry.ifac_size.unwrap_or(0),
                     tx_drops: entry.tx_drops,
                 })
                 .collect();
@@ -3059,7 +3097,10 @@ pub async fn init_with_policy(
             let rpc_key = rc.rpc_key.clone().ok_or(SharedInstanceError::InvalidKey)?;
             shutdown_coordinator.install_owned_control_task(tokio::spawn(control.run(
                 rpc_key,
-                transport_tx.clone(),
+                crate::rpc_server::RpcBackend::new(
+                    transport_tx.clone(),
+                    Some(InterfaceIfacStats(interface_controls.clone())),
+                ),
                 shutdown.clone(),
             )));
             Ok(InstanceMode::Shared)
@@ -3585,15 +3626,18 @@ pub async fn init_with_policy(
         && configured_policy
         && let Some(rpc_key) = rc.rpc_key.clone()
     {
-        let rpc_tx = transport_tx.clone();
+        let rpc_backend = crate::rpc_server::RpcBackend::new(
+            transport_tx.clone(),
+            Some(InterfaceIfacStats(interface_controls.clone())),
+        );
         let rpc_shutdown = shutdown.clone();
         if rc.shared_instance_type == SharedInstanceType::Unix {
             let rpc_socket = shared_unix_rpc_socket_path(&rc.instance_name, &socket_base);
             tokio::spawn(async move {
-                if let Err(e) = crate::rpc_server::run_unix_rpc_server(
+                if let Err(e) = crate::rpc_server::serve_unix_rpc(
                     &rpc_socket,
                     rpc_key,
-                    rpc_tx,
+                    rpc_backend,
                     rpc_shutdown,
                 )
                 .await
@@ -3605,7 +3649,8 @@ pub async fn init_with_policy(
             let rpc_port = rc.control_port;
             tokio::spawn(async move {
                 if let Err(e) =
-                    crate::rpc_server::run_rpc_server(rpc_port, rpc_key, rpc_tx, rpc_shutdown).await
+                    crate::rpc_server::serve_rpc_port(rpc_port, rpc_key, rpc_backend, rpc_shutdown)
+                        .await
                 {
                     tracing::warn!("RPC server error: {}", e);
                 }
@@ -3646,10 +3691,11 @@ pub async fn init_with_policy(
             );
         }
 
-        match crate::remote_management::start_remote_management(
+        match crate::remote_management::start_remote_management_with_ifac(
             transport_tx.clone(),
             &mgmt_identity,
             allowed,
+            Some(InterfaceIfacStats(interface_controls.clone())),
         )
         .await
         {
@@ -4480,10 +4526,16 @@ async fn prepare_interface_with_role_and_overrides(
         }
     };
     let registry_owner = registration.owner();
-    interface_controls
-        .lock()
-        .expect("interface_controls mutex poisoned")
-        .insert(
+    {
+        let mut controls = interface_controls
+            .lock()
+            .expect("interface_controls mutex poisoned");
+        // A spawned child's IFAC is its parent's, network name included.
+        let ifac_netname = ifac_key
+            .and(handle.parent_id)
+            .and_then(|parent| controls.get(&parent))
+            .and_then(|parent| parent.ifac_netname.clone());
+        controls.insert(
             id,
             InterfaceControlMetadata {
                 transport_owner: handle.owner.clone(),
@@ -4492,8 +4544,10 @@ async fn prepare_interface_with_role_and_overrides(
                 ingress_overrides: ingress_overrides.clone(),
                 ifac_key,
                 ifac_size,
+                ifac_netname,
             },
         );
+    }
     let entry = rns_transport::messages::InterfaceEntry {
         owner: handle.owner.clone(),
         packet_capacity: handle.packet_capacity,
@@ -4735,6 +4789,7 @@ async fn prepare_interface_with_post_init(
                 ingress_overrides: post_init.ingress_overrides.clone(),
                 ifac_key,
                 ifac_size: post_init.ifac_size.unwrap_or(post_init.default_ifac_size),
+                ifac_netname: ifac_key.and(post_init.ifac_network_name.clone()),
             },
         );
     let entry = rns_transport::messages::InterfaceEntry {
@@ -8406,6 +8461,7 @@ mod tests {
                 ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
                 ifac_key: None,
                 ifac_size: 0,
+                ifac_netname: None,
             },
         );
 
@@ -8550,6 +8606,7 @@ mod tests {
                 ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
                 ifac_key: None,
                 ifac_size: 0,
+                ifac_netname: None,
             },
         );
         drop(registration);
@@ -13680,6 +13737,7 @@ egress_control = Yes
                     ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
                     ifac_key: None,
                     ifac_size: 0,
+                    ifac_netname: None,
                 },
             );
 
@@ -13760,6 +13818,46 @@ egress_control = Yes
         };
         assert_eq!(entry.ifac_key, ifac_key);
         assert_eq!(entry.ifac_size, 16);
+
+        // Stats report Python's IFAC fields for the listener and its child.
+        let stats = InterfaceIfacStats(interface_controls.clone());
+        let expected = InterfaceIfac {
+            signature: rns_identity::ifac::ifac_signature(&ifac_key.unwrap()),
+            size: Some(16),
+            netname: Some("testnet".to_string()),
+        };
+        assert!(expected.signature.is_some());
+        assert_eq!(stats.lookup(parent_id), expected);
+        assert_eq!(stats.lookup(child_id), expected);
+        assert_eq!(stats.lookup(930_003), InterfaceIfac::default());
+    }
+
+    #[tokio::test]
+    async fn interfaces_without_ifac_report_none_despite_a_configured_size() {
+        let id = 930_101;
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let post_init =
+            interface_factory::InterfacePostInit::try_from_section(&ConfigSection::new())
+                .unwrap()
+                .with_default_ifac_size(8);
+        register_interface_with_post_init(
+            &transport_tx,
+            test_interface_handle(id, None, "plain-radio"),
+            &post_init,
+            derive_ifac_key_from_post_init(&post_init),
+            &interface_controls,
+            &InterfaceRegistry::default(),
+            InterfaceKind::Standard,
+        )
+        .await
+        .unwrap();
+        let _ = transport_rx.recv().await.map(unwrap_owned_event);
+        assert_eq!(
+            InterfaceIfacStats(interface_controls).lookup(id),
+            InterfaceIfac::default()
+        );
     }
 
     #[test]

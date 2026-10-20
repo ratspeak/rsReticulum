@@ -473,18 +473,18 @@ impl BoundControlListener {
     pub(crate) async fn run(
         self,
         key: Vec<u8>,
-        transport: mpsc::Sender<TransportMessage>,
+        backend: crate::rpc_server::RpcBackend,
         shutdown: ShutdownSignal,
     ) {
         let result = match self {
             Self::Tcp(listener) => {
-                crate::rpc_server::run_rpc_server_with_listener(listener, key, transport, shutdown)
+                crate::rpc_server::run_rpc_server_with_listener(listener, key, backend, shutdown)
                     .await
             }
             #[cfg(unix)]
             Self::Unix(listener, path) => {
                 crate::rpc_server::run_unix_rpc_server_with_listener(
-                    listener, path, key, transport, shutdown,
+                    listener, path, key, backend, shutdown,
                 )
                 .await
             }

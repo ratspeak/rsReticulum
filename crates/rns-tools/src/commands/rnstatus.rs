@@ -520,6 +520,9 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
         for entry in entries {
             let status = if entry.online { "Up" } else { "Down" };
             println!("  {}", entry.name);
+            if let Some(netname) = &entry.ifac_netname {
+                println!("    Network  : {netname}");
+            }
             println!("    Status   : {status}");
             println!("    Mode     : {}", mode_display_name(&entry.mode));
             println!("    Role     : {}", entry.role);
@@ -531,8 +534,11 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
             if let Some(blocked) = blocked_count_text(entry.blocked_ips) {
                 println!("    Blocked  : {blocked}");
             }
-            if entry.ifac_size > 0 {
-                println!("    IFAC     : {} bits", entry.ifac_size * 8);
+            if let Some(access) = ifac_access_text(
+                entry.ifac_signature.as_deref(),
+                entry.ifac_size.map(|size| size as u64),
+            ) {
+                println!("    Access   : {access}");
             }
             if args.announce_stats {
                 if let Some(queued) = entry.announce_queue
@@ -619,7 +625,7 @@ fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, 
             print!(",");
         }
         print!(
-            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"tx_drops\":{}}}",
+            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"ifac_signature\":{},\"ifac_size\":{},\"ifac_netname\":{},\"tx_drops\":{}}}",
             json_str(&e.name),
             e.online,
             json_str(&e.mode),
@@ -647,6 +653,9 @@ fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, 
             opt_f64_json(e.announce_rate_target),
             opt_u32_json(e.announce_rate_grace),
             opt_f64_json(e.announce_rate_penalty),
+            opt_hex_json(e.ifac_signature.as_deref()),
+            opt_u64_json(e.ifac_size.map(|size| size as u64)),
+            opt_str_json(e.ifac_netname.as_deref()),
             e.tx_drops,
         );
     }
@@ -1049,6 +1058,9 @@ struct RemoteInterface {
     announce_rate_target: Option<f64>,
     announce_rate_grace: Option<u32>,
     announce_rate_penalty: Option<f64>,
+    ifac_signature: Option<Vec<u8>>,
+    ifac_size: Option<u64>,
+    ifac_netname: Option<String>,
 }
 
 impl RemoteInterface {
@@ -1146,7 +1158,7 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 print!(",");
             }
             print!(
-                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{}}}",
+                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"ifac_signature\":{},\"ifac_size\":{},\"ifac_netname\":{}}}",
                 json_str(&iface.name),
                 iface.online,
                 iface.mode,
@@ -1173,6 +1185,9 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 opt_f64_json(iface.announce_rate_target),
                 opt_u32_json(iface.announce_rate_grace),
                 opt_f64_json(iface.announce_rate_penalty),
+                opt_hex_json(iface.ifac_signature.as_deref()),
+                opt_u64_json(iface.ifac_size),
+                opt_str_json(iface.ifac_netname.as_deref()),
             );
         }
         print!("]");
@@ -1193,6 +1208,9 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
         for iface in &parsed_interfaces {
             let status = if iface.online { "Up" } else { "Down" };
             println!("  {}", iface.name);
+            if let Some(netname) = &iface.ifac_netname {
+                println!("    Network  : {netname}");
+            }
             println!("    Status   : {status}");
             println!("    Mode     : {}", remote_mode_display_name(iface.mode));
             println!("    Bitrate  : {}", format::pretty_speed(iface.bitrate));
@@ -1201,6 +1219,10 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
             }
             if let Some(blocked) = blocked_count_text(iface.blocked_ips) {
                 println!("    Blocked  : {blocked}");
+            }
+            if let Some(access) = ifac_access_text(iface.ifac_signature.as_deref(), iface.ifac_size)
+            {
+                println!("    Access   : {access}");
             }
             if args.announce_stats {
                 if let Some(queued) = iface.announce_queue
@@ -1302,7 +1324,16 @@ fn remote_interface_from_map(m: &[(rmpv::Value, rmpv::Value)]) -> RemoteInterfac
         announce_rate_grace: map_u64(m, "announce_rate_grace")
             .map(|v| v.min(u32::MAX as u64) as u32),
         announce_rate_penalty: map_f64_or_u64(m, "announce_rate_penalty"),
+        ifac_signature: map_bytes(m, "ifac_signature"),
+        ifac_size: map_u64(m, "ifac_size"),
+        ifac_netname: map_str(m, "ifac_netname"),
     }
+}
+
+fn map_bytes(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<Vec<u8>> {
+    map.iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .and_then(|(_, v)| v.as_slice().map(<[u8]>::to_vec))
 }
 
 fn map_str(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<String> {
@@ -1427,6 +1458,28 @@ fn opt_f64_json(value: Option<f64>) -> String {
     value
         .map(|v| v.to_string())
         .unwrap_or_else(|| "null".to_string())
+}
+
+fn opt_hex_json(value: Option<&[u8]>) -> String {
+    value
+        .map(|bytes| json_str(&hex::encode(bytes)))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn opt_str_json(value: Option<&str>) -> String {
+    value.map(json_str).unwrap_or_else(|| "null".to_string())
+}
+
+/// Python's `Access` line, present only when the interface has IFAC: the tag
+/// size and the last five bytes of the IFAC signature.
+fn ifac_access_text(signature: Option<&[u8]>, size: Option<u64>) -> Option<String> {
+    let (signature, size) = (signature?, size?);
+    let tail = &signature[signature.len().saturating_sub(5)..];
+    Some(format!(
+        "{}-bit IFAC by <…{}>",
+        size.saturating_mul(8),
+        hex::encode(tail)
+    ))
 }
 
 fn remote_err(e: &LinkClientError) -> String {
@@ -1561,9 +1614,54 @@ mod tests {
             announce_rate_grace: None,
             announce_rate_penalty: None,
             announce_cap: 0.0,
-            ifac_size: 0,
+            ifac_signature: None,
+            ifac_size: None,
+            ifac_netname: None,
             tx_drops: 0,
         }
+    }
+
+    /// Upstream signature for the `testnet`/`password` IFAC key.
+    const UPSTREAM_IFAC_SIGNATURE: &str = "ce6b8bc4028852077243868e4b5f7faadb715c7a2fb75d1a211d30035f65b0c1\
+                                            fc4271ef61e91599e7bcc42723afe97503e3c432b01264185233274e3603e708";
+
+    #[test]
+    fn access_line_appears_only_with_ifac() {
+        // A configured size alone is not IFAC: RNode defaults to 8 bytes.
+        assert_eq!(ifac_access_text(None, Some(8)), None);
+        let signature = hex::decode(UPSTREAM_IFAC_SIGNATURE.replace(' ', "")).unwrap();
+        assert_eq!(
+            ifac_access_text(Some(&signature), Some(8)).as_deref(),
+            Some("64-bit IFAC by <…4e3603e708>"),
+            "matches upstream rnstatus for the same signature"
+        );
+    }
+
+    #[test]
+    fn remote_stats_carry_ifac_only_when_present() {
+        let key = |name: &str| rmpv::Value::from(name);
+        let enabled = vec![
+            (key("name"), rmpv::Value::from("IFAC Link")),
+            (key("ifac_signature"), rmpv::Value::Binary(vec![0xCD; 64])),
+            (key("ifac_size"), rmpv::Value::from(16u64)),
+            (key("ifac_netname"), rmpv::Value::from("testnet")),
+        ];
+        let iface = remote_interface_from_map(&enabled);
+        assert_eq!(iface.ifac_signature.as_deref(), Some(&[0xCD; 64][..]));
+        assert_eq!(iface.ifac_size, Some(16));
+        assert_eq!(iface.ifac_netname.as_deref(), Some("testnet"));
+
+        let plain = vec![
+            (key("name"), rmpv::Value::from("Plain Link")),
+            (key("ifac_signature"), rmpv::Value::Nil),
+            (key("ifac_size"), rmpv::Value::Nil),
+            (key("ifac_netname"), rmpv::Value::Nil),
+        ];
+        let iface = remote_interface_from_map(&plain);
+        assert_eq!(
+            (iface.ifac_signature, iface.ifac_size, iface.ifac_netname),
+            (None, None, None)
+        );
     }
 
     #[test]

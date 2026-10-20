@@ -177,7 +177,13 @@ pub struct InterfaceStatEntry {
     pub announce_rate_grace: Option<u32>,
     pub announce_rate_penalty: Option<f64>,
     pub announce_cap: f64,
-    pub ifac_size: usize,
+    /// Python's IFAC fields, all `None` for an interface without IFAC.
+    #[serde(default)]
+    pub ifac_signature: Option<Vec<u8>>,
+    #[serde(default)]
+    pub ifac_size: Option<usize>,
+    #[serde(default)]
+    pub ifac_netname: Option<String>,
     pub tx_drops: u64,
 }
 
@@ -531,7 +537,26 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                         ),
                         ("bitrate", PyValue::Int(i128::from(e.bitrate))),
                         ("mtu", PyValue::Int(i128::from(e.mtu))),
-                        ("ifac_size", PyValue::Int(i128::from(e.ifac_size as u64))),
+                        (
+                            "ifac_signature",
+                            e.ifac_signature
+                                .clone()
+                                .map(PyValue::Bytes)
+                                .unwrap_or(PyValue::None),
+                        ),
+                        (
+                            "ifac_size",
+                            e.ifac_size
+                                .map(|v| PyValue::Int(i128::from(v as u64)))
+                                .unwrap_or(PyValue::None),
+                        ),
+                        (
+                            "ifac_netname",
+                            e.ifac_netname
+                                .clone()
+                                .map(PyValue::String)
+                                .unwrap_or(PyValue::None),
+                        ),
                         (
                             "announce_queue",
                             e.announce_queue
@@ -854,10 +879,14 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, Rpc
                 announce_rate_grace: dict_get(m, "announce_rate_grace").and_then(py_u32),
                 announce_rate_penalty: dict_get(m, "announce_rate_penalty").and_then(py_f64),
                 announce_cap: dict_get(m, "announce_cap").and_then(py_f64).unwrap_or(0.0),
+                ifac_signature: match dict_get(m, "ifac_signature") {
+                    Some(PyValue::Bytes(v)) => Some(v.clone()),
+                    _ => None,
+                },
                 ifac_size: dict_get(m, "ifac_size")
                     .and_then(py_u64)
-                    .map(|v| v as usize)
-                    .unwrap_or(0),
+                    .map(|v| v as usize),
+                ifac_netname: dict_get(m, "ifac_netname").and_then(py_string),
                 tx_drops: dict_get(m, "tx_drops").and_then(py_u64).unwrap_or(0),
             })
         })
@@ -1786,9 +1815,40 @@ mod tests {
             announce_rate_grace: Some(5),
             announce_rate_penalty: Some(30.0),
             announce_cap: 0.02,
-            ifac_size: 0,
+            ifac_signature: None,
+            ifac_size: None,
+            ifac_netname: None,
             tx_drops: 1,
         }
+    }
+
+    /// Python publishes IFAC as signature, size and network name, all `None`
+    /// without IFAC; clients key off the signature.
+    #[test]
+    fn interface_stats_carry_python_ifac_fields() {
+        let mut ifac = interface_stat_entry();
+        ifac.ifac_signature = Some(vec![0xAB; 64]);
+        ifac.ifac_size = Some(8);
+        ifac.ifac_netname = Some("testnet".to_string());
+        let encoded = encode_response(&RpcResponse::InterfaceStats(vec![
+            ifac,
+            interface_stat_entry(),
+        ]))
+        .unwrap();
+        let raw = decode_umsgpack(&encoded).unwrap();
+        assert!(contains_string_key(&raw, "ifac_signature"));
+        assert!(contains_string_key(&raw, "ifac_netname"));
+        let RpcResponse::InterfaceStats(entries) =
+            decode_response_for_request(&encoded, &RpcRequest::GetInterfaceStats).unwrap()
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(entries[0].ifac_signature.as_deref(), Some(&[0xAB; 64][..]));
+        assert_eq!(entries[0].ifac_size, Some(8));
+        assert_eq!(entries[0].ifac_netname.as_deref(), Some("testnet"));
+        assert_eq!(entries[1].ifac_signature, None);
+        assert_eq!(entries[1].ifac_size, None);
+        assert_eq!(entries[1].ifac_netname, None);
     }
 
     #[test]
@@ -1839,6 +1899,8 @@ mod tests {
                 assert_eq!(entry.pr_burst_activated, 0.0);
                 assert_eq!(entry.blocked_ips, None);
                 assert_eq!(entry.mtu, 0, "Python stats omit MTU");
+                assert_eq!(entry.ifac_signature, None);
+                assert_eq!(entry.ifac_size, None);
             }
             _ => panic!("wrong variant"),
         }
