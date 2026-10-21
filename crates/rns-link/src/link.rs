@@ -702,11 +702,20 @@ impl Link {
     }
 
     /// Verify a received LINKIDENTIFY and record the remote identity key.
+    ///
+    /// As in Python's `Link.receive`, only a responder accepts it, from the
+    /// handshake on: the initiator turns Active on the proof and may identify
+    /// before its RTT packet arrives.
     pub fn handle_identification(
         &mut self,
         encrypted_data: &[u8],
     ) -> Result<[u8; 64], LinkCryptoError> {
-        if self.state != LinkState::Active {
+        if self.role() != LinkRole::Responder
+            || !matches!(
+                self.state,
+                LinkState::Handshake | LinkState::Active | LinkState::Stale
+            )
+        {
             return Err(LinkCryptoError::DecryptionFailed);
         }
 
@@ -2560,6 +2569,51 @@ mod tests {
         let returned = responder.handle_identification(&second_data).unwrap();
         assert_eq!(returned, first_pub);
         assert_eq!(responder.remote_identity().unwrap(), &first_pub);
+    }
+
+    #[test]
+    fn test_identify_before_rtt_is_accepted() {
+        // Python's initiator turns Active on the proof, so its LINKIDENTIFY can
+        // reach a responder still waiting for the RTT packet.
+        let dest_hash = [0xAB; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .unwrap();
+        assert_eq!(responder.state, LinkState::Handshake);
+
+        let client = Ed25519PrivateKey::generate();
+        let mut client_pub = [0u8; 64];
+        client_pub[..32].copy_from_slice(&[0x11; 32]);
+        client_pub[32..].copy_from_slice(&client.public_key().to_bytes());
+        let identify_data = initiator.identify(&client_pub, &client).unwrap();
+
+        assert_eq!(
+            responder.handle_identification(&identify_data).unwrap(),
+            client_pub
+        );
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+        assert_eq!(responder.state, LinkState::Active);
+        assert_eq!(responder.remote_identity(), Some(&client_pub));
+    }
+
+    #[test]
+    fn test_initiator_rejects_identification() {
+        // Only the responder learns a remote identity from LINKIDENTIFY.
+        let (mut initiator, _responder, _) = make_active_link();
+        let before = initiator.remote_identity().copied();
+        let peer = Ed25519PrivateKey::generate();
+        let mut peer_pub = [0u8; 64];
+        peer_pub[32..].copy_from_slice(&peer.public_key().to_bytes());
+        let identify_data = initiator.identify(&peer_pub, &peer).unwrap();
+
+        assert!(initiator.handle_identification(&identify_data).is_err());
+        assert!(!initiator.identified);
+        assert_eq!(initiator.remote_identity().copied(), before);
     }
 
     #[test]

@@ -9553,6 +9553,83 @@ mod tests {
     }
 
     #[test]
+    fn identify_before_rtt_is_tracked_for_link_requests() {
+        // A Python initiator can send LINKIDENTIFY ahead of its RTT packet; the
+        // identity must still reach the request handlers that follow it.
+        let dest_hash = [0x78u8; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (responder, proof_data) =
+            rns_link::link::Link::new_responder(&request_data, &identity_key, dest_hash, 1)
+                .expect("responder");
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .expect("validate proof");
+        let link_id = responder.link_id;
+        let client = Identity::new();
+        let identify = initiator
+            .identify(&client.get_public_key(), &client.get_signing_key().unwrap())
+            .unwrap();
+
+        let (transport_tx, _transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+        manager.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder,
+                _interface_id: 1,
+                interface_owner: None,
+                endpoint_authority: None,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+        own_test_endpoint(&mut manager, link_id);
+        let link_packet = |context, body: &[u8]| {
+            let mut raw = rns_wire::header::PacketHeader {
+                flags: rns_wire::flags::PacketFlags {
+                    header_type: rns_wire::flags::HeaderType::Header1,
+                    context_flag: false,
+                    transport_type: rns_wire::flags::TransportType::Broadcast,
+                    destination_type: rns_wire::flags::DestinationType::Link,
+                    packet_type: rns_wire::flags::PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: link_id,
+                context,
+            }
+            .pack();
+            raw.extend_from_slice(body);
+            raw
+        };
+
+        manager.handle_inbound_packet(
+            &link_packet(rns_wire::context::PacketContext::LinkIdentify, &identify),
+            1,
+        );
+        assert_eq!(
+            manager.link_identities.lock().unwrap().get(&link_id),
+            Some(&client.hash)
+        );
+        manager.handle_inbound_packet(
+            &link_packet(rns_wire::context::PacketContext::Lrrtt, &rtt_data),
+            1,
+        );
+        assert_eq!(manager.active_links[&link_id].link.state, LinkState::Active);
+        assert_eq!(
+            manager.link_identities.lock().unwrap().get(&link_id),
+            Some(&client.hash)
+        );
+    }
+
+    #[test]
     fn destination_request_handler_receives_context_and_enforces_allowlist() {
         let (mut sender_link, mut receiver_link) = handshaken_link_pair();
         let remote_identity = Identity::new();
