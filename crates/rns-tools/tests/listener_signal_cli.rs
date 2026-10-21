@@ -88,9 +88,9 @@ fn wait_for_ready_log(child: &mut Child, log: &Path, timeout: Duration) -> bool 
 
 /// Sends a process signal after observed readiness (or a settle period for the
 /// interactive listeners) and asserts a clean exit. The settle-only path retries once
-/// with a longer settle if the child died from the raw signal (exit by signal
-/// number): under full-workspace load the child can still be booting when the
-/// first signal lands, before its handler is registered. A real handler
+/// with a longer settle if the child was still booting when the first signal landed
+/// under full-workspace load: it died from the raw signal before its handler was
+/// registered, or the handler interrupted interface startup. A real handler
 /// regression fails both attempts.
 #[cfg(unix)]
 fn assert_signal_exits(
@@ -144,20 +144,17 @@ fn assert_signal_exits(
 
         match exit_status {
             Some(status) if status.success() => return,
-            Some(status)
-                if ready_log.is_none()
-                    && attempt < last_attempt
-                    && status.signal() == Some(signal_number) =>
-            {
-                let _ = child.wait_with_output();
-                continue;
-            }
             Some(status) => {
                 let output = child.wait_with_output().expect("collect child output");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let booting = status.signal() == Some(signal_number)
+                    || stderr.contains("runtime shutdown during interface initialization");
+                if ready_log.is_none() && attempt < last_attempt && booting {
+                    continue;
+                }
                 panic!(
-                    "{name} exited unsuccessfully after {signal_name}: {status}\nstdout:\n{}\nstderr:\n{}\nreadiness log:\n{}",
+                    "{name} exited unsuccessfully after {signal_name}: {status}\nstdout:\n{}\nstderr:\n{stderr}\nreadiness log:\n{}",
                     String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr),
                     ready_log
                         .and_then(|log| fs::read_to_string(log).ok())
                         .unwrap_or_default(),
