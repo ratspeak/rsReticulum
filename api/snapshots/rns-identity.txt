@@ -251,6 +251,7 @@ pub rns_identity::ifac::IfacError::InvalidSalt
 pub const rns_identity::ifac::IFAC_SALT: &str
 pub fn rns_identity::ifac::derive_ifac_identity(core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<(rns_identity::identity::Identity, [u8; 64], [u8; 64]), rns_identity::ifac::IfacError>
 pub fn rns_identity::ifac::derive_ifac_key(core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<[u8; 64], rns_identity::ifac::IfacError>
+pub fn rns_identity::ifac::ifac_signature(&[u8; 64]) -> core::option::Option<[u8; 64]>
 pub fn rns_identity::ifac::split_ifac_key(&[u8; 64]) -> (&[u8], &[u8])
 pub mod rns_identity::known_destinations
 pub struct rns_identity::known_destinations::KnownDestination

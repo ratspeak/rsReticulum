@@ -129,6 +129,9 @@ pub fn rns_runtime::config::ConfigSection::get_int(&self, &str) -> core::option:
 pub fn rns_runtime::config::ConfigSection::get_list(&self, &str) -> core::option::Option<alloc::vec::Vec<alloc::string::String>>
 pub fn rns_runtime::config::ConfigSection::get_uint(&self, &str) -> core::option::Option<u64>
 pub fn rns_runtime::config::ConfigSection::has(&self, &str) -> bool
+pub fn rns_runtime::config::ConfigSection::has_enable_key(&self) -> bool
+pub fn rns_runtime::config::ConfigSection::interface_enabled(&self) -> bool
+pub fn rns_runtime::config::ConfigSection::invalid_enable_key(&self) -> core::option::Option<&'static str>
 pub fn rns_runtime::config::ConfigSection::new() -> Self
 pub fn rns_runtime::config::ConfigSection::set(&mut self, &str, &str)
 pub fn rns_runtime::config::ConfigSection::set_list(&mut self, &str, alloc::vec::Vec<alloc::string::String>)
@@ -965,6 +968,7 @@ pub use rns_runtime::prelude::RNodeConfigurationState
 pub use rns_runtime::prelude::RNodeDetectionState
 pub use rns_runtime::prelude::RNodeFirmwareCompatibility
 pub use rns_runtime::prelude::RNodeObservedRadioState
+pub use rns_runtime::prelude::RNodePortFailureClass
 pub use rns_runtime::prelude::RNodeRuntimePhase
 pub use rns_runtime::prelude::RNodeRuntimeReason
 pub use rns_runtime::prelude::RNodeRuntimeSnapshot
@@ -2080,7 +2084,9 @@ pub rns_runtime::rpc::InterfaceStatEntry::burst_active: bool
 pub rns_runtime::rpc::InterfaceStatEntry::clients: core::option::Option<u64>
 pub rns_runtime::rpc::InterfaceStatEntry::held_announces: u64
 pub rns_runtime::rpc::InterfaceStatEntry::id: u64
-pub rns_runtime::rpc::InterfaceStatEntry::ifac_size: usize
+pub rns_runtime::rpc::InterfaceStatEntry::ifac_netname: core::option::Option<alloc::string::String>
+pub rns_runtime::rpc::InterfaceStatEntry::ifac_signature: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_runtime::rpc::InterfaceStatEntry::ifac_size: core::option::Option<usize>
 pub rns_runtime::rpc::InterfaceStatEntry::incoming_announce_frequency: f64
 pub rns_runtime::rpc::InterfaceStatEntry::incoming_pr_frequency: f64
 pub rns_runtime::rpc::InterfaceStatEntry::mode: alloc::string::String

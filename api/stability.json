@@ -42,8 +42,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-identity.txt",
-      "itemCount": 410,
-      "sha256": "70380b1a6cafa4bfbbc943137ef96d88e9f1d7be2a474dbfc85bd8c98fbd9e02"
+      "itemCount": 411,
+      "sha256": "18d971bea6c074f54a8aba37ae88140fe2a47dccb0456d0bdf190a0f76cb59ce"
     },
     {
       "name": "rns-transport",
@@ -78,8 +78,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-interface.txt",
-      "itemCount": 1408,
-      "sha256": "5655690c48730330d654762042aac637005352e5140c2af30594d57cffe8738c"
+      "itemCount": 1420,
+      "sha256": "e2296e983d6356d2582601c045f18360e543383201904ffb7ca7f1d217197935"
     },
     {
       "name": "rns-runtime",
@@ -87,8 +87,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-runtime.txt",
-      "itemCount": 2175,
-      "sha256": "3b38223be4b13ecbefa9f7d70180fe8755895e987652a7bd17296de8e8578285"
+      "itemCount": 2181,
+      "sha256": "d46ae3abe0b937ae4c34069b3ff0d2ead7feec395768aa0fc80e8d846791524f"
     },
     {
       "name": "rns-tools",
@@ -143,7 +143,8 @@
       ],
       "rns-runtime": [
         "pub fn rns_runtime::interface_factory::InterfacePostInit::from_section(&rns_runtime::config::ConfigSection) -> Self",
-        "pub fn rns_runtime::link_manager::LinkManager::set_link_packet_channel(&mut self, tokio::sync::mpsc::unbounded::UnboundedSender<(alloc::vec::Vec<u8>, [u8; 16])>)"
+        "pub fn rns_runtime::link_manager::LinkManager::set_link_packet_channel(&mut self, tokio::sync::mpsc::unbounded::UnboundedSender<(alloc::vec::Vec<u8>, [u8; 16])>)",
+        "pub rns_runtime::rpc::InterfaceStatEntry::ifac_size: usize"
       ]
     }
   }

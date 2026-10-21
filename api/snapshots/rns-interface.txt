@@ -658,6 +658,11 @@ pub rns_interface::rnode::RNodeFirmwareCompatibility::Unsupported
 pub rns_interface::rnode::RNodeObservedRadioState::Off
 pub rns_interface::rnode::RNodeObservedRadioState::On
 pub rns_interface::rnode::RNodeObservedRadioState::Unknown
+#[non_exhaustive] pub enum rns_interface::rnode::RNodePortFailureClass
+pub rns_interface::rnode::RNodePortFailureClass::AccessDenied
+pub rns_interface::rnode::RNodePortFailureClass::InUse
+pub rns_interface::rnode::RNodePortFailureClass::NotFound
+pub rns_interface::rnode::RNodePortFailureClass::Unavailable
 pub enum rns_interface::rnode::RNodeResponse
 pub rns_interface::rnode::RNodeResponse::None
 pub rns_interface::rnode::RNodeResponse::Packet(rns_transport::messages::TransportMessage)
@@ -671,6 +676,7 @@ pub rns_interface::rnode::RNodeRuntimePhase::ShuttingDown
 pub rns_interface::rnode::RNodeRuntimePhase::Stopped
 #[non_exhaustive] pub enum rns_interface::rnode::RNodeRuntimeReason
 pub rns_interface::rnode::RNodeRuntimeReason::CapabilityAdmissionRejected
+pub rns_interface::rnode::RNodeRuntimeReason::ConfigurationRejected
 pub rns_interface::rnode::RNodeRuntimeReason::ConnectionAttemptFailed
 pub rns_interface::rnode::RNodeRuntimeReason::ConnectionLost
 pub rns_interface::rnode::RNodeRuntimeReason::DeviceReset
@@ -751,11 +757,13 @@ pub fn rns_interface::rnode::RNodeRadioSettings::from(&rns_interface::rnode::RNo
 pub rns_interface::rnode::RNodeRuntimeSnapshot::capability: rns_interface::rnode::RNodeCapabilityState
 pub rns_interface::rnode::RNodeRuntimeSnapshot::capability_admission_failure: core::option::Option<rns_interface::rnode::RNodeCapabilityAdmissionFailureClass>
 pub rns_interface::rnode::RNodeRuntimeSnapshot::configuration: rns_interface::rnode::RNodeConfigurationState
+pub rns_interface::rnode::RNodeRuntimeSnapshot::configuration_rejection: core::option::Option<rns_interface::rnode_protocol::RNodeReadinessEvidence>
 pub rns_interface::rnode::RNodeRuntimeSnapshot::connection_generation: u64
 pub rns_interface::rnode::RNodeRuntimeSnapshot::detection: rns_interface::rnode::RNodeDetectionState
 pub rns_interface::rnode::RNodeRuntimeSnapshot::disconnect_total: u64
 pub rns_interface::rnode::RNodeRuntimeSnapshot::firmware_compatibility: rns_interface::rnode::RNodeFirmwareCompatibility
 pub rns_interface::rnode::RNodeRuntimeSnapshot::phase: rns_interface::rnode::RNodeRuntimePhase
+pub rns_interface::rnode::RNodeRuntimeSnapshot::port_failure: core::option::Option<rns_interface::rnode::RNodePortFailureClass>
 pub rns_interface::rnode::RNodeRuntimeSnapshot::radio: rns_interface::rnode::RNodeObservedRadioState
 pub rns_interface::rnode::RNodeRuntimeSnapshot::reason: core::option::Option<rns_interface::rnode::RNodeRuntimeReason>
 pub rns_interface::rnode::RNodeRuntimeSnapshot::reconnect_attempt: u64
@@ -1070,6 +1078,8 @@ pub rns_interface::rnode_protocol::RNodeReadinessBlocker::RadioInitialisationFau
 pub rns_interface::rnode_protocol::RNodeReadinessBlocker::UnsupportedFirmware
 pub rns_interface::rnode_protocol::RNodeReadinessBlocker::UnsupportedFirmware::minimum: rns_interface::rnode_protocol::RNodeFirmwareVersion
 pub rns_interface::rnode_protocol::RNodeReadinessBlocker::UnsupportedFirmware::observed: rns_interface::rnode_protocol::RNodeFirmwareVersion
+impl rns_interface::rnode_protocol::RNodeReadinessBlocker
+pub const fn rns_interface::rnode_protocol::RNodeReadinessBlocker::rejected_evidence(self) -> core::option::Option<rns_interface::rnode_protocol::RNodeReadinessEvidence>
 pub enum rns_interface::rnode_protocol::RNodeReadinessEvidence
 pub rns_interface::rnode_protocol::RNodeReadinessEvidence::Bandwidth
 pub rns_interface::rnode_protocol::RNodeReadinessEvidence::CodingRate
@@ -1100,12 +1110,14 @@ pub rns_interface::rnode_protocol::RNodeProtocolEvidence::tx_power: core::option
 pub struct rns_interface::rnode_protocol::RNodeProtocolState
 impl rns_interface::rnode_protocol::RNodeProtocolState
 pub fn rns_interface::rnode_protocol::RNodeProtocolState::apply_frame(&mut self, u8, &[u8]) -> rns_interface::rnode_protocol::RNodeProtocolEffect
+pub fn rns_interface::rnode_protocol::RNodeProtocolState::definitive_rejection(&self) -> core::option::Option<rns_interface::rnode_protocol::RNodeReadinessEvidence>
 pub const fn rns_interface::rnode_protocol::RNodeProtocolState::detection_observed(&self) -> bool
 pub const fn rns_interface::rnode_protocol::RNodeProtocolState::evidence(&self) -> rns_interface::rnode_protocol::RNodeProtocolEvidence
 pub const fn rns_interface::rnode_protocol::RNodeProtocolState::flow_permission_observed(&self) -> bool
 pub const fn rns_interface::rnode_protocol::RNodeProtocolState::new(rns_interface::rnode_protocol::RNodeProtocolTarget) -> Self
 pub fn rns_interface::rnode_protocol::RNodeProtocolState::readiness(&self) -> rns_interface::rnode_protocol::RNodeReadiness
 pub const fn rns_interface::rnode_protocol::RNodeProtocolState::target(&self) -> rns_interface::rnode_protocol::RNodeProtocolTarget
+pub const fn rns_interface::rnode_protocol::RNodeProtocolState::with_effective_settings(rns_interface::rnode_protocol::RNodeProtocolTarget) -> Self
 pub struct rns_interface::rnode_protocol::RNodeProtocolTarget
 pub rns_interface::rnode_protocol::RNodeProtocolTarget::bandwidth: u32
 pub rns_interface::rnode_protocol::RNodeProtocolTarget::coding_rate: u8
