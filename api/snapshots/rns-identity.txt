@@ -296,6 +296,11 @@ pub rns_identity::persistence::DurableErrorKind::DurabilityUnsupported
 pub rns_identity::persistence::DurableErrorKind::InvalidInput
 pub rns_identity::persistence::DurableErrorKind::Io
 pub rns_identity::persistence::DurableErrorKind::Verification
+#[non_exhaustive] pub enum rns_identity::persistence::StorageRisk
+pub rns_identity::persistence::StorageRisk::Remote
+pub rns_identity::persistence::StorageRisk::Volatile
+impl core::fmt::Display for rns_identity::persistence::StorageRisk
+pub fn rns_identity::persistence::StorageRisk::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct rns_identity::persistence::DurableDirectoryReceipt
 impl rns_identity::persistence::DurableDirectoryReceipt
 pub fn rns_identity::persistence::DurableDirectoryReceipt::path(&self) -> &std::path::Path
@@ -319,6 +324,7 @@ pub fn rns_identity::persistence::durable_rename_directory(&std::path::Path, &st
 pub fn rns_identity::persistence::durable_write(&std::path::Path, &[u8]) -> core::result::Result<rns_identity::persistence::DurableFileReceipt, rns_identity::persistence::DurableWriteError>
 pub fn rns_identity::persistence::read_file(&std::path::Path) -> core::io::error::Result<core::option::Option<alloc::vec::Vec<u8>>>
 pub fn rns_identity::persistence::read_file_bounded(&std::path::Path, usize) -> core::io::error::Result<core::option::Option<alloc::vec::Vec<u8>>>
+pub fn rns_identity::persistence::storage_risk(&std::path::Path) -> core::io::error::Result<core::option::Option<rns_identity::persistence::StorageRisk>>
 pub fn rns_identity::persistence::try_lock_exclusive(&std::fs::File) -> core::io::error::Result<()>
 pub fn rns_identity::persistence::validate_durable_storage_directory(&std::path::Path) -> core::result::Result<(), rns_identity::persistence::DurableWriteError>
 pub mod rns_identity::ratchet

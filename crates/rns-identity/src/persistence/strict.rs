@@ -3,7 +3,9 @@
 //! These receipts attest successful native calls and exact readback, not a
 //! guarantee against dishonest hardware or later modification. Callers own
 //! private directories, exclude concurrent external writers, and journal any
-//! multi-file transaction. This API never falls back to cache durability.
+//! multi-file transaction. Every filesystem is accepted, as in Python
+//! Reticulum: a barrier the filesystem lacks is skipped and logged once, and
+//! [`storage_risk`] reports network or RAM-backed storage.
 
 use super::{ATOMIC_WRITE_LOCK, atomic_replace, unique_temp_path};
 use rns_crypto::sha::sha256;
@@ -106,6 +108,7 @@ fn error(
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
+#[cfg(windows)]
 fn unsupported(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, message)
 }
@@ -136,7 +139,7 @@ fn target_path(path: &Path) -> io::Result<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let parent = fs::canonicalize(parent)?;
-    ensure_native(&parent)?;
+    note_storage(&parent)?;
     let result = parent.join(name);
     match fs::symlink_metadata(&result) {
         Ok(m) if !m.is_file() || m.file_type().is_symlink() => {
@@ -149,29 +152,43 @@ fn target_path(path: &Path) -> io::Result<PathBuf> {
     Ok(result)
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn ensure_native(path: &Path) -> io::Result<()> {
-    use std::ffi::{CStr, CString};
-    use std::os::unix::ffi::OsStrExt;
-    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid("NUL in path"))?;
-    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
+/// Storage that cannot promise crash safety. Writes still run every barrier the
+/// filesystem supports; applications may surface this to the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StorageRisk {
+    /// Network or user-space filesystem; flushes may not reach stable storage.
+    Remote,
+    /// RAM-backed filesystem; contents do not survive a restart.
+    Volatile,
+}
+
+impl std::fmt::Display for StorageRisk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Remote => "network or user-space filesystem",
+            Self::Volatile => "RAM-backed filesystem",
+        })
     }
-    let stat = unsafe { stat.assume_init() };
-    let filesystem = unsafe { CStr::from_ptr(stat.f_fstypename.as_ptr()) }.to_bytes();
-    if stat.f_flags & (libc::MNT_LOCAL as u32) == 0
-        || !matches!(filesystem, b"apfs" | b"hfs" | b"ufs")
-    {
-        return Err(unsupported(
-            "filesystem has no qualified native durability backend",
-        ));
+}
+
+/// Classify the filesystem holding `path`; `None` is ordinary local storage.
+pub fn storage_risk(path: &Path) -> io::Result<Option<StorageRisk>> {
+    filesystem_risk(&fs::canonicalize(path)?)
+}
+
+fn note_storage(path: &Path) -> io::Result<()> {
+    if let Some(risk) = filesystem_risk(path)? {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(path = %path.display(), %risk, "storage cannot guarantee crash safety");
+        });
     }
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn ensure_native(path: &Path) -> io::Result<()> {
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn filesystem_risk(path: &Path) -> io::Result<Option<StorageRisk>> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid("NUL in path"))?;
@@ -180,25 +197,36 @@ fn ensure_native(path: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let stat = unsafe { stat.assume_init() };
-    // ext2/3/4, XFS, Btrfs, F2FS. Do not silently certify network, FUSE,
-    // provider, RAM or overlay filesystems through a guessed backing device.
-    if !matches!(
-        stat.f_type as u64,
-        0xef53 | 0x58465342 | 0x9123683e | 0xf2f52010
-    ) {
-        return Err(unsupported(
-            "filesystem has no qualified native durability backend",
-        ));
+    Ok((stat.f_flags & (libc::MNT_LOCAL as u32) == 0).then_some(StorageRisk::Remote))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn filesystem_risk(path: &Path) -> io::Result<Option<StorageRisk>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid("NUL in path"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
     }
-    Ok(())
+    let stat = unsafe { stat.assume_init() };
+    // Magic numbers are 32-bit; a signed 32-bit f_type must not sign-extend.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = stat.f_type as u32;
+    Ok(match magic {
+        // tmpfs, ramfs
+        0x0102_1994 | 0x8584_58f6 => Some(StorageRisk::Volatile),
+        // NFS, SMB, CIFS, SMB2, 9P, Ceph, AFS, Coda, FUSE
+        0x6969 | 0x517b | 0xff53_4d42 | 0xfe53_4d42 | 0x0102_1997 | 0x00c3_6400 | 0x5346_414f
+        | 0x7375_7245 | 0x6573_5546 => Some(StorageRisk::Remote),
+        _ => None,
+    })
 }
 
 #[cfg(windows)]
-fn ensure_native(path: &Path) -> io::Result<()> {
+fn filesystem_risk(path: &Path) -> io::Result<Option<StorageRisk>> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetDriveTypeW, GetVolumeInformationW, GetVolumePathNameW,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW};
     let path = path
         .as_os_str()
         .encode_wide()
@@ -208,39 +236,12 @@ fn ensure_native(path: &Path) -> io::Result<()> {
     if unsafe { GetVolumePathNameW(path.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    // DRIVE_FIXED. Remote, removable/provider and RAM volumes require an
-    // explicitly qualified backend instead of an implicit fallback.
-    if unsafe { GetDriveTypeW(root.as_ptr()) } != 3 {
-        return Err(unsupported(
-            "non-fixed volume has no qualified durability backend",
-        ));
-    }
-    let mut name = [0u16; 32];
-    if unsafe {
-        GetVolumeInformationW(
-            root.as_ptr(),
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            name.as_mut_ptr(),
-            name.len() as u32,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let len = name.iter().position(|c| *c == 0).unwrap_or(name.len());
-    if !matches!(
-        String::from_utf16_lossy(&name[..len]).as_str(),
-        "NTFS" | "ReFS"
-    ) {
-        return Err(unsupported(
-            "filesystem has no qualified native durability backend",
-        ));
-    }
-    Ok(())
+    // DRIVE_REMOTE, DRIVE_RAMDISK
+    Ok(match unsafe { GetDriveTypeW(root.as_ptr()) } {
+        4 => Some(StorageRisk::Remote),
+        6 => Some(StorageRisk::Volatile),
+        _ => None,
+    })
 }
 
 #[cfg(not(any(
@@ -250,21 +251,45 @@ fn ensure_native(path: &Path) -> io::Result<()> {
     target_os = "android",
     windows
 )))]
-fn ensure_native(_: &Path) -> io::Result<()> {
-    Err(unsupported("platform has no native durability backend"))
+fn filesystem_risk(_: &Path) -> io::Result<Option<StorageRisk>> {
+    Ok(None)
+}
+
+/// A barrier the filesystem does not implement is skipped and logged once;
+/// every other failure still fails the operation.
+fn supported_barrier(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(e) if barrier_unsupported(&e) => {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(error = %e, "filesystem lacks a storage barrier; using the ones it supports");
+            });
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+fn barrier_unsupported(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error().is_some_and(|code| {
+            [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EINVAL, libc::ENOSYS].contains(&code)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        error.kind() == io::ErrorKind::Unsupported
+    }
 }
 
 fn file_barrier(file: &File) -> io::Result<()> {
-    file.sync_all()?;
+    supported_barrier(file.sync_all())?;
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         use std::os::fd::AsRawFd;
         if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
-            let e = io::Error::last_os_error();
-            if matches!(e.raw_os_error(), Some(libc::ENOTSUP) | Some(libc::EINVAL)) {
-                return Err(unsupported("F_FULLFSYNC is unavailable"));
-            }
-            return Err(e);
+            supported_barrier(Err(io::Error::last_os_error()))?;
         }
     }
     Ok(())
@@ -272,7 +297,9 @@ fn file_barrier(file: &File) -> io::Result<()> {
 
 fn parent_barrier(_path: &Path) -> io::Result<()> {
     #[cfg(unix)]
-    File::open(_path.parent().ok_or_else(|| invalid("missing parent"))?)?.sync_all()?;
+    supported_barrier(
+        File::open(_path.parent().ok_or_else(|| invalid("missing parent"))?)?.sync_all(),
+    )?;
     // On Windows the checked WRITE_THROUGH native publication and subsequent
     // writable-file flush are the selected acknowledgement, not directory fsync.
     Ok(())
@@ -307,15 +334,15 @@ fn verify_bytes(path: &Path, data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Check native backend availability for a private storage directory. This is
-/// only a read-only eligibility check, never a durability/commit receipt.
+/// Check that a private storage directory is a real directory, logging risky
+/// storage once. This is a read-only eligibility check, never a commit receipt.
 pub fn validate_durable_storage_directory(path: &Path) -> Result<(), DurableWriteError> {
     let result = (|| {
         let metadata = fs::symlink_metadata(path)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(invalid("storage directory must be a real directory"));
         }
-        ensure_native(&fs::canonicalize(path)?)
+        note_storage(&fs::canonicalize(path)?)
     })();
     result.map_err(|cause| {
         error(
@@ -327,9 +354,9 @@ pub fn validate_durable_storage_directory(path: &Path) -> Result<(), DurableWrit
     })
 }
 
-/// Atomically publish exact bytes and acknowledge all required native barriers.
-/// The parent must exist on a supported native filesystem. Candidates are
-/// private (0600 on Unix); errors preserve recovery paths, never return a receipt.
+/// Atomically publish exact bytes and acknowledge every barrier the filesystem
+/// supports. The parent must exist. Candidates are private (0600 on Unix);
+/// errors preserve recovery paths, never return a receipt.
 pub fn durable_write(path: &Path, data: &[u8]) -> Result<DurableFileReceipt, DurableWriteError> {
     write_inner(path, data, None)
 }
@@ -551,7 +578,7 @@ fn directory_chain_barrier(path: &Path, witness: &DurableFileReceipt) -> io::Res
         .ok_or_else(|| invalid("directory and witness have no common ancestor"))?;
     #[cfg(unix)]
     for directory in path.ancestors() {
-        File::open(directory)?.sync_all()?;
+        supported_barrier(File::open(directory)?.sync_all())?;
         if directory == common {
             break;
         }
@@ -586,7 +613,7 @@ pub fn durable_reconcile_directory(
                 return Err(invalid("directory must be a real directory"));
             }
             let path = fs::canonicalize(path)?;
-            ensure_native(&path)?;
+            note_storage(&path)?;
             if witness.path.starts_with(&path) {
                 return Err(invalid("directory witness must be outside the tree"));
             }
@@ -660,7 +687,7 @@ pub fn durable_rename_directory(
                 "directory migration requires siblings on one volume",
             ));
         }
-        ensure_native(&source_parent)?;
+        note_storage(&source_parent)?;
         let source = source_parent.join(
             source
                 .file_name()
@@ -753,7 +780,7 @@ pub fn durable_create_dir_all(
                 }
             }
             let mut current = fs::canonicalize(cursor)?;
-            ensure_native(&current)?;
+            note_storage(&current)?;
             let journal = open_witness(witness, &current)?;
             for name in missing.into_iter().rev() {
                 current.push(name);
@@ -828,7 +855,7 @@ fn publish_directory_tree(
             }
         }
         let mut current = fs::canonicalize(cursor).map_err(ioe)?;
-        ensure_native(&current).map_err(ioe)?;
+        note_storage(&current).map_err(ioe)?;
         // Validate the exact outside transaction authority, then close its
         // handle before a Windows directory containing it could be renamed.
         drop(open_witness(witness, &current).map_err(ioe)?);
@@ -982,6 +1009,25 @@ mod tests {
             result.unwrap_err().kind,
             DurableErrorKind::DurabilityUnsupported
         );
+    }
+
+    #[test]
+    fn risky_storage_is_reported_and_still_written() {
+        let local = dir();
+        #[cfg(target_os = "macos")]
+        assert_eq!(storage_risk(&local).unwrap(), None);
+        assert!(storage_risk(&local).is_ok());
+        #[cfg(target_os = "linux")]
+        {
+            let shm = Path::new("/dev/shm");
+            if shm.is_dir() {
+                assert_eq!(storage_risk(shm).unwrap(), Some(StorageRisk::Volatile));
+                let path = shm.join(format!("rns-durable-{}", std::process::id()));
+                durable_write(&path, b"volatile").unwrap();
+                assert_eq!(fs::read(&path).unwrap(), b"volatile");
+                fs::remove_file(path).unwrap();
+            }
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@
 - Android Bluetooth RNode sessions wait for the bridge before starting, so a slow reconnect no longer drops a healthy link.
 - Interface status reports IFAC like Python Reticulum: `rnstatus-rs` shows the network name and access line only for interfaces that use IFAC.
 - Interfaces start only when `enabled` or `interface_enabled` is yes, as in Python Reticulum. A section with neither key is now skipped with a warning instead of starting, so add `enabled = yes` to it. An RNodeMulti subinterface with its own flag follows that flag, so a subinterface set to no never transmits.
+- Durable storage works on any filesystem again, as in Python Reticulum, including ZFS, Docker overlays, external drives and network shares. A flush the filesystem lacks is skipped and logged once, and network or RAM-backed storage logs a warning instead of refusing to start.
 
 ## 1.4.0 - 2026-10-12
 

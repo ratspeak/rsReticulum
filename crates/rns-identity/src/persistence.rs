@@ -9,9 +9,9 @@ mod strict;
 pub use file_lock::try_lock_exclusive;
 pub use strict::{
     DurableCleanupOutcome, DurableCommitPhase, DurableDirectoryReceipt, DurableErrorKind,
-    DurableFileReceipt, DurableWriteError, durable_create_dir_all, durable_reconcile,
+    DurableFileReceipt, DurableWriteError, StorageRisk, durable_create_dir_all, durable_reconcile,
     durable_reconcile_directory, durable_reconcile_hash, durable_remove, durable_rename_directory,
-    durable_write, validate_durable_storage_directory,
+    durable_write, storage_risk, validate_durable_storage_directory,
 };
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
