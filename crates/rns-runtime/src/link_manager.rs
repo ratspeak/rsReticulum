@@ -6880,6 +6880,17 @@ pub fn register_destination(
 
 #[cfg(test)]
 mod tests {
+    /// `Instant::now() - age`, or return from the test when the monotonic clock is
+    /// younger than `age`: Windows counts from boot, so fresh CI runners can't.
+    macro_rules! ago_or_skip {
+        ($age:expr) => {
+            match std::time::Instant::now().checked_sub($age) {
+                Some(instant) => instant,
+                None => return,
+            }
+        };
+    }
+
     use super::*;
     use rns_identity::identity::LocalKeyBackend;
     use std::sync::{
@@ -7112,7 +7123,7 @@ mod tests {
 
         let active = manager.active_links.get_mut(&link_id).unwrap();
         active.link.keepalive.last_outbound =
-            std::time::Instant::now().checked_sub(active.link.keepalive.keepalive_interval);
+            Some(ago_or_skip!(active.link.keepalive.keepalive_interval));
         manager.handle_inbound_packet(&request, 7);
         assert!(matches!(
             next_transport_message(&mut transport_rx).unwrap(),
@@ -8110,7 +8121,7 @@ mod tests {
         let active = manager.active_links.get_mut(&id).unwrap();
         let transfer = active.outbound_resources.get_mut(&failed).unwrap();
         transfer.resource.request_id = Some(vec![0; 500]);
-        transfer.started_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        transfer.started_at = ago_or_skip!(std::time::Duration::from_secs(60));
         active.outbound_split_queues.insert(failed, VecDeque::new());
         manager.on_tick();
         let active = &manager.active_links[&id];
@@ -11763,7 +11774,7 @@ mod tests {
             transfer.tick(),
             TransferAction::SendAdvertisement(_)
         ));
-        transfer.started_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        transfer.started_at = ago_or_skip!(std::time::Duration::from_secs(60));
         let resource_hash = transfer.resource.resource_hash;
 
         let mut outbound_resources = HashMap::new();
@@ -11831,7 +11842,7 @@ mod tests {
             transfer.request_next(),
             TransferAction::SendRequest(_)
         ));
-        transfer.last_activity = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        transfer.last_activity = ago_or_skip!(std::time::Duration::from_secs(60));
         let initial_retries = transfer.retries_left;
 
         let mut inbound_resources = HashMap::new();

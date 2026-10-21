@@ -2496,6 +2496,17 @@ impl InboundTransfer {
 
 #[cfg(test)]
 mod tests {
+    /// `Instant::now() - age`, or return from the test when the monotonic clock is
+    /// younger than `age`: Windows counts from boot, so fresh CI runners can't.
+    macro_rules! ago_or_skip {
+        ($age:expr) => {
+            match std::time::Instant::now().checked_sub($age) {
+                Some(instant) => instant,
+                None => return,
+            }
+        };
+    }
+
     use super::*;
 
     #[test]
@@ -3008,7 +3019,7 @@ mod tests {
             TransferAction::SendAdvertisement(_)
         ));
 
-        transfer.started_at = Instant::now() - Duration::from_secs(60);
+        transfer.started_at = ago_or_skip!(Duration::from_secs(60));
         assert!(matches!(
             transfer.check_timeout(),
             TransferAction::SendAdvertisement(_)
@@ -3027,7 +3038,7 @@ mod tests {
         .unwrap();
         transfer.tick();
         transfer.retries = MAX_ADV_RETRIES;
-        transfer.started_at = Instant::now() - Duration::from_secs(60);
+        transfer.started_at = ago_or_skip!(Duration::from_secs(60));
 
         assert!(matches!(
             transfer.check_timeout(),
@@ -3411,7 +3422,7 @@ mod tests {
         let (data, mut sender, mut receiver) = loss_test_pair(8192, Duration::from_secs(2));
         // Lose the first advertisement, then the first receiver request. The
         // sender remains Advertised through arbitrary local polling.
-        sender.started_at = Instant::now() - Duration::from_secs(60);
+        sender.started_at = ago_or_skip!(Duration::from_secs(60));
         assert!(matches!(
             sender.tick(),
             TransferAction::SendAdvertisement(_)
@@ -3424,7 +3435,7 @@ mod tests {
             assert_eq!(sender.tick(), TransferAction::None);
         }
         assert_eq!(sender.resource.state, ResourceState::Advertised);
-        receiver.last_activity = Instant::now() - Duration::from_secs(60);
+        receiver.last_activity = ago_or_skip!(Duration::from_secs(60));
         assert!(matches!(
             receiver.check_timeout(),
             TransferAction::SendRequest(_)
@@ -3449,7 +3460,7 @@ mod tests {
         let mut lost_hmu = false;
         for _ in 0..1000 {
             if matches!(pending, TransferAction::None) {
-                receiver.last_activity = Instant::now() - Duration::from_secs(600);
+                receiver.last_activity = ago_or_skip!(Duration::from_secs(600));
                 pending = receiver.check_timeout();
             }
             let TransferAction::SendRequest(request) = pending else {
@@ -3507,7 +3518,7 @@ mod tests {
             sender.handle_request(&request);
         }
         assert_eq!(sender.last_progress, progress_at);
-        sender.last_progress = Instant::now() - sender.progress_timeout() - Duration::from_secs(1);
+        sender.last_progress = ago_or_skip!(sender.progress_timeout() + Duration::from_secs(1));
         assert_eq!(
             sender.tick(),
             TransferAction::Failed("resource part requests timed out".to_string())
@@ -3515,13 +3526,13 @@ mod tests {
         assert!(sender.handle_request(&request).is_empty());
 
         for _ in 0..MAX_RETRIES {
-            receiver.last_activity = Instant::now() - Duration::from_secs(600);
+            receiver.last_activity = ago_or_skip!(Duration::from_secs(600));
             assert!(matches!(
                 receiver.check_timeout(),
                 TransferAction::SendRequest(_)
             ));
         }
-        receiver.last_activity = Instant::now() - Duration::from_secs(600);
+        receiver.last_activity = ago_or_skip!(Duration::from_secs(600));
         assert!(matches!(
             receiver.check_timeout(),
             TransferAction::Failed(_)
@@ -3541,7 +3552,7 @@ mod tests {
         assert_eq!(sender.resource.state, ResourceState::AwaitingProof);
         // Receiver has delivered, but its proof is lost. Sender must release
         // ownership as failed, never infer success from all parts being sent.
-        sender.last_progress = Instant::now() - sender.progress_timeout() - Duration::from_secs(1);
+        sender.last_progress = ago_or_skip!(sender.progress_timeout() + Duration::from_secs(1));
         assert_eq!(
             sender.tick(),
             TransferAction::Failed("resource proof timed out".to_string())
@@ -3567,14 +3578,14 @@ mod tests {
             "do not replace the slow RTT with local scheduling time"
         );
         assert!(sender.progress_timeout() > Duration::from_secs(180));
-        sender.last_progress = Instant::now() - Duration::from_secs(180);
+        sender.last_progress = ago_or_skip!(Duration::from_secs(180));
         assert_eq!(sender.check_timeout(), TransferAction::None);
         // No absolute transfer deadline: requesting new parts restarts the
         // bounded no-progress owner even after a long healthy transfer.
         let mut next = vec![HASHMAP_IS_NOT_EXHAUSTED];
         next.extend_from_slice(&sender.resource.resource_hash);
         next.extend_from_slice(&sender.resource.map_hashes[4]);
-        sender.started_at = Instant::now() - Duration::from_secs(3600);
+        sender.started_at = ago_or_skip!(Duration::from_secs(3600));
         sender.handle_request(&next);
         assert!(sender.last_progress.elapsed() < Duration::from_secs(1));
         assert_eq!(sender.check_timeout(), TransferAction::None);
@@ -4754,7 +4765,7 @@ mod tests {
 
         inbound.outstanding_parts = 2;
         // Set last_activity far enough in the past to trigger timeout
-        inbound.last_activity = Instant::now() - Duration::from_secs(60);
+        inbound.last_activity = ago_or_skip!(Duration::from_secs(60));
 
         let initial_retries = inbound.retries_left;
         let action = inbound.check_timeout();
@@ -4790,7 +4801,7 @@ mod tests {
 
         inbound.outstanding_parts = 2;
         inbound.retries_left = 0;
-        inbound.last_activity = Instant::now() - Duration::from_secs(60);
+        inbound.last_activity = ago_or_skip!(Duration::from_secs(60));
 
         let action = inbound.check_timeout();
         assert!(matches!(action, TransferAction::Failed(_)));

@@ -6874,6 +6874,17 @@ pub async fn spawn_ble_peer_interface(
 
 #[cfg(test)]
 mod tests {
+    /// `Instant::now() - age`, or return from the test when the monotonic clock is
+    /// younger than `age`: Windows counts from boot, so fresh CI runners can't.
+    macro_rules! ago_or_skip {
+        ($age:expr) => {
+            match std::time::Instant::now().checked_sub($age) {
+                Some(instant) => instant,
+                None => return,
+            }
+        };
+    }
+
     #[test]
     fn remembered_candidates_obey_discovery_expiry_capacity_and_backoff() {
         let recent = new_recently_disconnected();
@@ -6901,7 +6912,7 @@ mod tests {
         recent.lock().unwrap().insert(
             address.into(),
             (
-                Instant::now() - RECONNECT_BACKOFF_DURATION,
+                ago_or_skip!(RECONNECT_BACKOFF_DURATION),
                 RECONNECT_BACKOFF_FAILURES,
             ),
         );
@@ -6909,7 +6920,7 @@ mod tests {
         recent
             .lock()
             .unwrap()
-            .insert(address.into(), (Instant::now() - RECONNECT_PRUNE_AFTER, 0));
+            .insert(address.into(), (ago_or_skip!(RECONNECT_PRUNE_AFTER), 0));
         assert!(remembered_peer_candidate(&[], &connected, &recent).is_none());
     }
 
