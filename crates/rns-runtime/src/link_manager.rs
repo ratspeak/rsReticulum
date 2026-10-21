@@ -82,6 +82,7 @@ struct PendingResponderEndpointBind {
     result_rx: ResponderBindReceiver,
     register_link: TransportMessage,
     proof: TransportMessage,
+    proof_len: usize,
 }
 
 enum ResponderBindReceiver {
@@ -1486,6 +1487,10 @@ impl LinkManager {
                         &mut self.pending_link_control,
                         pending.proof,
                     );
+                    // LRPROOF is Link outbound traffic (Link.py prove(), Packet.py send()).
+                    if let Some(active) = self.active_links.get_mut(&link_id) {
+                        active.link.record_tx(pending.proof_len);
+                    }
                 }
                 Some((LinkEndpointBindResult::Bound, _)) => {
                     // The candidate was closed while Bind was in flight. We
@@ -2706,6 +2711,7 @@ impl LinkManager {
                     },
                     interface_id,
                 },
+                proof_len: proof_data.len(),
             },
         );
 
@@ -8466,6 +8472,84 @@ mod tests {
             })
         ));
         assert_eq!(manager.link_interface(&initiator.link_id), Some(73));
+    }
+
+    #[test]
+    fn responder_counts_lrproof_as_link_outbound() {
+        // Link.py prove() sends LRPROOF as Link traffic, so a keepalive before
+        // LRRTT finds recent outbound and the 360 s default interval: no echo.
+        let identity = Identity::new();
+        let destination_hash =
+            Destination::hash_from_name_and_identity("endpoint.binding", Some(&identity.hash));
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::with_destination(
+            transport_tx,
+            event_rx,
+            &identity,
+            "endpoint.binding",
+            identity.get_signing_key(),
+        );
+        let (initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        let link_id = initiator.link_id;
+        manager.handle_link_request(&link_request_raw(destination_hash, &request_data), 73);
+        let Ok(TransportMessage::BindLinkEndpoint {
+            lifecycle_tx,
+            result_tx,
+            ..
+        }) = transport_rx.try_recv()
+        else {
+            panic!("responder must bind its endpoint first");
+        };
+        let _ = result_tx.send(LinkEndpointBindResult::Bound);
+        std::mem::forget(lifecycle_tx);
+        assert!(manager.poll_link_endpoints());
+        assert!(matches!(
+            transport_rx.try_recv(),
+            Ok(TransportMessage::RegisterLink { .. })
+        ));
+        let Ok(TransportMessage::OutboundAttached { request, .. }) = transport_rx.try_recv() else {
+            panic!("LRPROOF must follow registration");
+        };
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        let proof_len = (request.raw.len() - offset) as u64;
+
+        let link = &manager.active_links.get(&link_id).unwrap().link;
+        assert_eq!(link.state, LinkState::Handshake);
+        let (tx_bytes, _, tx_count, _) = link.traffic_stats();
+        assert_eq!((tx_bytes, tx_count), (proof_len, 1));
+
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Keepalive,
+        };
+        let mut keepalive = header.pack();
+        keepalive.push(rns_link::constants::KEEPALIVE_REQUEST);
+        manager.handle_inbound_packet(&keepalive, 73);
+        assert!(
+            next_transport_message(&mut transport_rx).is_err(),
+            "a handshake responder must not echo within the default keepalive interval"
+        );
+
+        let active = manager.active_links.get_mut(&link_id).unwrap();
+        active.link.keepalive.last_outbound =
+            Some(ago_or_skip!(active.link.keepalive.keepalive_interval));
+        manager.handle_inbound_packet(&keepalive, 73);
+        assert!(matches!(
+            next_transport_message(&mut transport_rx).unwrap(),
+            TransportMessage::Outbound(OutboundRequest { raw, destination_hash })
+                if destination_hash == link_id
+                    && raw.last() == Some(&rns_link::constants::KEEPALIVE_RESPONSE)
+        ));
     }
 
     #[test]

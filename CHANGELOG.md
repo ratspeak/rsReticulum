@@ -9,6 +9,7 @@
 - Interfaces start only when `enabled` or `interface_enabled` is yes, as in Python Reticulum. A section with neither key is now skipped with a warning instead of starting, so add `enabled = yes` to it. An RNodeMulti subinterface with its own flag follows that flag, so a subinterface set to no never transmits.
 - Durable storage works on any filesystem again, as in Python Reticulum, including ZFS, Docker overlays, external drives and network shares. A flush the filesystem lacks is skipped and logged once, and network or RAM-backed storage logs a warning instead of refusing to start.
 - A Link accepts the peer's identification as soon as its handshake completes, as in Python Reticulum, so a request a Python client sends right after identifying no longer fails for lack of an identity. Only the receiving side of a Link accepts identification.
+- The receiving side of a Link counts its Link proof as sent traffic, as in Python Reticulum, so it no longer answers keepalives before the Link is established and its traffic totals include the proof.
 
 ## 1.4.0 - 2026-10-12
 
