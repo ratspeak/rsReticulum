@@ -16,7 +16,7 @@ use crate::android_usb_lifecycle::{
     UsbReadDrainOutcome, UsbReadResult, UsbReaderBackend, UsbShutdownReport, UsbTransferError,
     UsbTxGate, UsbTxPumpExit, UsbWriterBackend, drain_usb_reader_tail, forward_usb_read_chunk,
     resolve_usb_device, run_usb_rnode_capability_startup, run_usb_rnode_startup, run_usb_tx_pump,
-    spawn_owned_usb_io,
+    spawn_owned_usb_io, usb_bulk_read_size,
 };
 #[cfg(test)]
 use crate::kiss;
@@ -664,6 +664,7 @@ struct JniUsbReader {
     device_name: String,
     attached: Arc<AtomicBool>,
     idle_polls: u8,
+    read_size: i32,
 }
 
 struct PendingAndroidUsbOpen {
@@ -919,8 +920,8 @@ impl UsbReaderBackend for JniUsbReader {
         if !self.attached.load(Ordering::Acquire) {
             return Err("Android USB device detached".into());
         }
+        let read_size = self.read_size;
         with_env(|env| {
-            const READ_SIZE: i32 = 1_024;
             let connection = self
                 .connection
                 .as_ref()
@@ -930,7 +931,7 @@ impl UsbReaderBackend for JniUsbReader {
                 .as_ref()
                 .ok_or("USB reader endpoint already released")?;
             let buffer = env
-                .new_byte_array(READ_SIZE)
+                .new_byte_array(read_size)
                 .map_err(|error| jni_failure(env, "USB read buffer allocation", error))?;
             let value = env
                 .call_method(
@@ -940,7 +941,7 @@ impl UsbReaderBackend for JniUsbReader {
                     &[
                         JValue::Object(endpoint.as_obj()),
                         JValue::Object(buffer.into()),
-                        JValue::Int(READ_SIZE),
+                        JValue::Int(read_size),
                         JValue::Int(USB_READ_TIMEOUT_MS),
                     ],
                 )
@@ -992,9 +993,9 @@ impl UsbReaderBackend for JniUsbReader {
                 return Ok(UsbReadResult::Idle);
             }
             self.idle_polls = 0;
-            if read > READ_SIZE {
+            if read > read_size {
                 return Err(format!(
-                    "USB bulk read returned invalid length {read} (capacity {READ_SIZE})"
+                    "USB bulk read returned invalid length {read} (capacity {read_size})"
                 ));
             }
             let bytes = env
@@ -1222,7 +1223,7 @@ fn open_usb_serial_attached(
             attached: attached.clone(),
         };
 
-        let setup = (|| -> Result<(GlobalRef, GlobalRef), String> {
+        let setup = (|| -> Result<(GlobalRef, GlobalRef, i32), String> {
             // CDC-Data (0x0A) or vendor-specific (0xFF), with a matched
             // IN/OUT endpoint pair from one interface.
             let iface_count = env
@@ -1334,16 +1335,25 @@ fn open_usb_serial_attached(
             }
             clear_pending_jni_exception(env);
 
+            let max_packet_size = env
+                .call_method(ep_in, "getMaxPacketSize", "()I", &[])
+                .map_err(|error| jni_failure(env, "getMaxPacketSize", error))?
+                .i()
+                .map_err(|error| jni_failure(env, "USB endpoint packet size", error))?;
             let input_endpoint = env
                 .new_global_ref(ep_in)
                 .map_err(|error| jni_failure(env, "USB input endpoint global reference", error))?;
             let output_endpoint = env
                 .new_global_ref(ep_out)
                 .map_err(|error| jni_failure(env, "USB output endpoint global reference", error))?;
-            Ok((input_endpoint, output_endpoint))
+            Ok((
+                input_endpoint,
+                output_endpoint,
+                usb_bulk_read_size(max_packet_size),
+            ))
         })();
 
-        let (input_endpoint, output_endpoint) = match setup {
+        let (input_endpoint, output_endpoint, read_size) = match setup {
             Ok(endpoints) => endpoints,
             Err(error) => return Err(cleanup_failed_android_usb_open(owner, error)),
         };
@@ -1372,6 +1382,7 @@ fn open_usb_serial_attached(
                 device_name: dev_name.to_string(),
                 attached,
                 idle_polls: 0,
+                read_size,
             },
         ))
     });

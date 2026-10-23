@@ -309,6 +309,18 @@ pub(crate) trait UsbReaderBackend: Send + 'static {
     fn read(&mut self) -> Result<UsbReadResult, String>;
 }
 
+/// Bulk IN request size: exactly one max-size packet. A longer request stays
+/// open when the device's data ends on a packet boundary without a ZLP, times
+/// out, and usbdevfs then discards everything it had received.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) const fn usb_bulk_read_size(max_packet_size: i32) -> i32 {
+    if max_packet_size > 0 && max_packet_size <= 1_024 {
+        max_packet_size
+    } else {
+        64
+    }
+}
+
 pub(crate) enum UsbConnectionCleanup<O> {
     Closed {
         release_interface: Result<(), String>,
@@ -2216,6 +2228,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_reads_request_exactly_one_max_size_packet() {
+        assert_eq!(usb_bulk_read_size(64), 64);
+        assert_eq!(usb_bulk_read_size(512), 512);
+        assert_eq!(usb_bulk_read_size(0), 64);
+        assert_eq!(usb_bulk_read_size(-1), 64);
+        assert_eq!(usb_bulk_read_size(4_096), 64);
+    }
 
     fn usb_candidate(
         device_name: &str,
