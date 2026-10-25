@@ -2407,6 +2407,9 @@ pub struct ReticulumConfig {
     /// Maximum number of discovered interfaces to auto-connect to. Python
     /// `autoconnect_discovered_interfaces`.
     pub autoconnect_discovered_interfaces: usize,
+    /// Python `autoconnect_unverified_implementations`: also auto-connect
+    /// interfaces whose stack is not a trusted release, rsRNS included.
+    pub autoconnect_unverified_implementations: bool,
     /// Minimum stamp value (leading-zero bits). Default 16 (LXStamper
     /// `DEFAULT_STAMP_VALUE`). Python `required_discovery_value`.
     pub discover_interfaces_required_value: u8,
@@ -2459,6 +2462,7 @@ impl Default for ReticulumConfig {
             network_identity_path: None,
             discover_interfaces: false,
             autoconnect_discovered_interfaces: 0,
+            autoconnect_unverified_implementations: false,
             discover_interfaces_required_value: rns_transport::discovery::DEFAULT_STAMP_VALUE,
             interface_discovery_sources: Vec::new(),
             blackhole_sources: Vec::new(),
@@ -2737,6 +2741,11 @@ impl ReticulumConfig {
             }
             rc.autoconnect_discovered_interfaces =
                 parse_autoconnect_limit(sec)?.unwrap_or(rc.autoconnect_discovered_interfaces);
+            if let Some(value) =
+                config_bool("reticulum", sec, "autoconnect_unverified_implementations")?
+            {
+                rc.autoconnect_unverified_implementations = value;
+            }
             if let Some(v) = config_uint("reticulum", sec, "required_discovery_value")?.or(
                 config_uint("reticulum", sec, "discover_interfaces_required_value")?,
             ) {
@@ -6370,13 +6379,7 @@ async fn maybe_autoconnect_discovered(handle: &ReticulumHandle, record: Discover
         return;
     }
     let limit = handle.config.autoconnect_discovered_interfaces;
-    if limit == 0 {
-        return;
-    }
-    if !matches!(
-        record.info.interface_type.as_str(),
-        "BackboneInterface" | "TCPServerInterface"
-    ) {
+    if limit == 0 || !autoconnect_admits(&record, &handle.config) {
         return;
     }
     let Some(host) = record.info.reachable_on.clone() else {
@@ -6414,6 +6417,25 @@ async fn maybe_autoconnect_discovered(handle: &ReticulumHandle, record: Discover
             );
         }
     }
+}
+
+/// Python auto-connects only Backbone interfaces of a trusted stack and
+/// release, unless unverified stacks are allowed (Discovery.py:782-798).
+fn autoconnect_admits(record: &DiscoveredInterface, config: &ReticulumConfig) -> bool {
+    let admitted = rns_transport::discovery::autoconnect::qualifies(
+        &record.info,
+        config.autoconnect_unverified_implementations,
+    );
+    if !admitted {
+        tracing::debug!(
+            name = %record.info.name,
+            interface_type = %record.info.interface_type,
+            implementation = ?record.info.impl_name,
+            version = ?record.info.impl_version,
+            "not auto-connecting discovered interface, auto-connect criteria not satisfied"
+        );
+    }
+    admitted
 }
 
 async fn spawn_discovered_backbone_client(
@@ -12161,6 +12183,72 @@ loglevel = 7
         h.config.blackhole_sources = vec![[0xAA; 16], [0xBB; 16]];
         assert_eq!(h.blackhole_sources().len(), 2);
         assert_eq!(h.blackhole_sources()[0], [0xAA; 16]);
+    }
+
+    /// Python's `autoconnect_unverified_implementations` (Reticulum.py:632-634).
+    #[test]
+    fn autoconnect_unverified_implementations_is_parsed_and_off_by_default() {
+        assert!(!ReticulumConfig::default().autoconnect_unverified_implementations);
+        let rc = ReticulumConfig::from_config(
+            &Config::parse("[reticulum]\nautoconnect_unverified_implementations = Yes\n").unwrap(),
+        );
+        assert!(rc.autoconnect_unverified_implementations);
+    }
+
+    /// Only Backbone interfaces from Python 1.5.2 or later, unless unverified
+    /// stacks are allowed (Discovery.py:782-798).
+    #[test]
+    fn discovered_interfaces_auto_connect_like_python() {
+        let record = |interface_type: &str, impl_name: Option<&str>, version: Option<&str>| {
+            DiscoveredInterface {
+                info: rns_transport::discovery::app_data::DiscoveryInfo {
+                    interface_type: interface_type.into(),
+                    impl_name: impl_name.map(str::to_string),
+                    impl_version: version.map(str::to_string),
+                    reachable_on: Some("192.0.2.10".into()),
+                    port: Some(4242),
+                    ..Default::default()
+                },
+                network_id: [0x51; 16],
+                hops: 1,
+                stamp_value: 16,
+                stamp: vec![0; 32],
+                discovered: 0,
+                last_heard: 0,
+                heard_count: 1,
+                status: None,
+            }
+        };
+        let mut config = ReticulumConfig::default();
+        assert!(autoconnect_admits(
+            &record("BackboneInterface", Some("RNS"), Some("1.5.2")),
+            &config
+        ));
+        for rejected in [
+            record("TCPServerInterface", Some("RNS"), Some("1.5.5")),
+            record("BackboneInterface", Some("RNS"), Some("1.5.1")),
+            record(
+                "BackboneInterface",
+                Some("rsRNS"),
+                Some(env!("CARGO_PKG_VERSION")),
+            ),
+            record("BackboneInterface", None, None),
+        ] {
+            assert!(
+                !autoconnect_admits(&rejected, &config),
+                "{:?}",
+                rejected.info
+            );
+        }
+        config.autoconnect_unverified_implementations = true;
+        assert!(autoconnect_admits(
+            &record("BackboneInterface", Some("rsRNS"), Some("1.4.0")),
+            &config
+        ));
+        assert!(!autoconnect_admits(
+            &record("TCPServerInterface", None, None),
+            &config
+        ));
     }
 
     #[test]

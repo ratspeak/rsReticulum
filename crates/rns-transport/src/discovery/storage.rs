@@ -9,7 +9,8 @@ use thiserror::Error;
 
 use super::app_data::DiscoveryInfo;
 use super::constants::{
-    STAMP_SIZE, THRESHOLD_REMOVE_SECS, THRESHOLD_STALE_SECS, THRESHOLD_UNKNOWN_SECS,
+    DISCOVERED_INTERFACE_TYPES, STAMP_SIZE, THRESHOLD_REMOVE_SECS, THRESHOLD_STALE_SECS,
+    THRESHOLD_UNKNOWN_SECS,
 };
 
 /// Freshness status for a learned interface.
@@ -148,8 +149,9 @@ impl DiscoveryStore {
     }
 
     /// List records sorted desc by `(status_code, stamp_value, last_heard)`.
-    /// Expired entries are culled from disk; `discovery_sources` (when set)
-    /// filters out records whose `network_id` is not in the set.
+    /// Expired records, records of a type Python does not list, and records
+    /// whose `network_id` is not in `discovery_sources` (when set) are culled
+    /// from disk (Discovery.py:536-547).
     pub fn list(
         &self,
         discovery_sources: Option<&[[u8; 16]]>,
@@ -183,7 +185,8 @@ impl DiscoveryStore {
             };
 
             let heard_delta = now.saturating_sub(rec.last_heard);
-            let mut should_remove = heard_delta > THRESHOLD_REMOVE_SECS;
+            let mut should_remove = heard_delta > THRESHOLD_REMOVE_SECS
+                || !DISCOVERED_INTERFACE_TYPES.contains(&rec.info.interface_type.as_str());
             if let Some(sources) = discovery_sources
                 && !sources.iter().any(|s| s == &rec.network_id)
             {
@@ -240,6 +243,12 @@ fn encode_record(rec: &DiscoveredInterface) -> Result<Vec<u8>, StorageError> {
 
     let i = &rec.info;
     map.push((s("type"), Value::from(i.interface_type.clone())));
+    if let Some(impl_name) = &i.impl_name {
+        map.push((s("impl_name"), Value::from(impl_name.clone())));
+    }
+    if let Some(impl_version) = &i.impl_version {
+        map.push((s("version"), Value::from(impl_version.clone())));
+    }
     map.push((s("transport"), Value::from(i.transport_enabled)));
     map.push((s("name"), Value::from(i.name.clone())));
     map.push((s("transport_id"), Value::from(hex::encode(i.transport_id))));
@@ -311,6 +320,8 @@ fn decode_record(bytes: &[u8]) -> Result<DiscoveredInterface, StorageError> {
 
     let info = DiscoveryInfo {
         interface_type: str_or_default(&lookup, "type"),
+        impl_name: str_opt(&lookup, "impl_name"),
+        impl_version: str_opt(&lookup, "version"),
         transport_enabled: bool_or_default(&lookup, "transport"),
         transport_id: hex16(&lookup, "transport_id").unwrap_or([0; 16]),
         name: str_or_default(&lookup, "name"),
@@ -573,6 +584,67 @@ mod tests {
         // The non-authorized record should have been removed on read.
         let listed_again = store.list(None).unwrap();
         assert_eq!(listed_again.len(), 1);
+    }
+
+    /// Python stores the announcer's stack as `impl_name` and `version`
+    /// (Discovery.py:364-365).
+    #[test]
+    fn records_keep_the_announcing_implementation() {
+        let dir = tmpdir("implementation");
+        let store = DiscoveryStore::open(&dir).unwrap();
+        let mut r = record("versioned", [0x31; 16]);
+        r.last_heard = unix_now();
+        r.info.impl_name = Some("RNS".into());
+        r.info.impl_version = Some("1.5.5".into());
+        store.upsert(r).unwrap();
+
+        let listed = store.list(None).unwrap();
+        assert_eq!(listed[0].info.impl_name.as_deref(), Some("RNS"));
+        assert_eq!(listed[0].info.impl_version.as_deref(), Some("1.5.5"));
+        let raw = std::fs::read(store.root().join(listed[0].filename())).unwrap();
+        let Value::Map(map) = rmpv::decode::read_value(&mut raw.as_slice()).unwrap() else {
+            panic!("record is a map");
+        };
+        let field = |name: &str| {
+            map.iter()
+                .find(|(k, _)| k.as_str() == Some(name))
+                .and_then(|(_, v)| v.as_str().map(str::to_string))
+        };
+        assert_eq!(field("impl_name").as_deref(), Some("RNS"));
+        assert_eq!(field("version").as_deref(), Some("1.5.5"));
+    }
+
+    /// Python lists only `InterfaceDiscovery.DISCOVERABLE_TYPES` and removes
+    /// other records, such as a KISS TCP client's (Discovery.py:484, :542).
+    #[test]
+    fn listing_removes_types_python_does_not_list() {
+        let dir = tmpdir("listed_types");
+        let store = DiscoveryStore::open(&dir).unwrap();
+        let now = unix_now();
+        for (id, name, interface_type) in [
+            (1, "backbone", "BackboneInterface"),
+            (2, "kiss-tcp", "TCPClientInterface"),
+            (3, "rnode", "RNodeInterface"),
+        ] {
+            let mut r = record(name, [id; 16]);
+            r.info.interface_type = interface_type.into();
+            r.last_heard = now;
+            store.upsert(r).unwrap();
+        }
+
+        let listed: Vec<String> = store
+            .list(None)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.info.name)
+            .collect();
+        assert_eq!(listed.len(), 2);
+        assert!(!listed.contains(&"kiss-tcp".to_string()));
+        assert_eq!(
+            std::fs::read_dir(store.root()).unwrap().count(),
+            2,
+            "the unlisted record is removed from disk"
+        );
     }
 
     #[test]

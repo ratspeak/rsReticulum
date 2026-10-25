@@ -359,6 +359,8 @@ pub rns_transport::discovery::app_data::DiscoveryInfo::frequency: core::option::
 pub rns_transport::discovery::app_data::DiscoveryInfo::height: core::option::Option<f64>
 pub rns_transport::discovery::app_data::DiscoveryInfo::ifac_netkey: core::option::Option<alloc::string::String>
 pub rns_transport::discovery::app_data::DiscoveryInfo::ifac_netname: core::option::Option<alloc::string::String>
+pub rns_transport::discovery::app_data::DiscoveryInfo::impl_name: core::option::Option<alloc::string::String>
+pub rns_transport::discovery::app_data::DiscoveryInfo::impl_version: core::option::Option<alloc::string::String>
 pub rns_transport::discovery::app_data::DiscoveryInfo::interface_type: alloc::string::String
 pub rns_transport::discovery::app_data::DiscoveryInfo::latitude: core::option::Option<f64>
 pub rns_transport::discovery::app_data::DiscoveryInfo::longitude: core::option::Option<f64>
@@ -380,6 +382,8 @@ pub fn rns_transport::discovery::app_data::sanitize_name(&str) -> alloc::string:
 pub fn rns_transport::discovery::app_data::split_flags(&[u8]) -> core::result::Result<(u8, &[u8]), rns_transport::discovery::app_data::AppDataError>
 pub fn rns_transport::discovery::app_data::split_stamp(&[u8]) -> core::result::Result<(&[u8], &[u8]), rns_transport::discovery::app_data::AppDataError>
 pub type rns_transport::discovery::app_data::DiscoveryEncryptor<'a> = (dyn core::ops::function::Fn(&[u8]) -> core::option::Option<alloc::vec::Vec<u8>> + 'a)
+pub mod rns_transport::discovery::autoconnect
+pub fn rns_transport::discovery::autoconnect::qualifies(&rns_transport::discovery::app_data::DiscoveryInfo, bool) -> bool
 pub mod rns_transport::discovery::blackhole_manifest
 pub enum rns_transport::discovery::blackhole_manifest::ManifestError
 pub rns_transport::discovery::blackhole_manifest::ManifestError::BadField(&'static str)
@@ -431,9 +435,12 @@ pub const rns_transport::discovery::constants::key::REACHABLE_ON: u8
 pub const rns_transport::discovery::constants::key::SPREADING_FACTOR: u8
 pub const rns_transport::discovery::constants::key::TRANSPORT: u8
 pub const rns_transport::discovery::constants::key::TRANSPORT_ID: u8
+pub const rns_transport::discovery::constants::key::TRANSPORT_IMPL: u8
+pub const rns_transport::discovery::constants::key::TRANSPORT_VERS: u8
 pub const rns_transport::discovery::constants::ANNOUNCE_JOB_INTERVAL_SECS: u64
 pub const rns_transport::discovery::constants::APP_NAME: &str
 pub const rns_transport::discovery::constants::AUTOCONNECT_INTERFACE_TYPES: &[&str]
+pub const rns_transport::discovery::constants::AUTOCONNECT_MINIMUM_VERSIONS: &[(&str, core::option::Option<&str>)]
 pub const rns_transport::discovery::constants::BLACKHOLE_ASPECTS: &[&str]
 pub const rns_transport::discovery::constants::BLACKHOLE_ASPECT_FILTER: &str
 pub const rns_transport::discovery::constants::BLACKHOLE_INITIAL_WAIT_SECS: u64
@@ -443,10 +450,13 @@ pub const rns_transport::discovery::constants::BLACKHOLE_UPDATE_INTERVAL_SECS: u
 pub const rns_transport::discovery::constants::DEFAULT_STAMP_VALUE: u8
 pub const rns_transport::discovery::constants::DETACH_THRESHOLD_TICKS: u64
 pub const rns_transport::discovery::constants::DISCOVERABLE_INTERFACE_TYPES: &[&str]
+pub const rns_transport::discovery::constants::DISCOVERED_INTERFACE_TYPES: &[&str]
 pub const rns_transport::discovery::constants::DISCOVERY_ASPECTS: &[&str]
 pub const rns_transport::discovery::constants::DISCOVERY_ASPECT_FILTER: &str
 pub const rns_transport::discovery::constants::FLAG_ENCRYPTED: u8
 pub const rns_transport::discovery::constants::FLAG_SIGNED: u8
+pub const rns_transport::discovery::constants::IMPLEMENTATION_NAME: &str
+pub const rns_transport::discovery::constants::IMPLEMENTATION_VERSION: &str
 pub const rns_transport::discovery::constants::MONITOR_INTERVAL_SECS: u64
 pub const rns_transport::discovery::constants::STAMP_SIZE: usize
 pub const rns_transport::discovery::constants::THRESHOLD_REMOVE_SECS: u64
@@ -471,6 +481,8 @@ pub const rns_transport::discovery::key::REACHABLE_ON: u8
 pub const rns_transport::discovery::key::SPREADING_FACTOR: u8
 pub const rns_transport::discovery::key::TRANSPORT: u8
 pub const rns_transport::discovery::key::TRANSPORT_ID: u8
+pub const rns_transport::discovery::key::TRANSPORT_IMPL: u8
+pub const rns_transport::discovery::key::TRANSPORT_VERS: u8
 pub mod rns_transport::discovery::receiver
 pub enum rns_transport::discovery::receiver::Outcome
 pub rns_transport::discovery::receiver::Outcome::Accepted
@@ -484,6 +496,7 @@ pub rns_transport::discovery::receiver::Reason::MissingAppData
 pub rns_transport::discovery::receiver::Reason::StampInvalid
 pub rns_transport::discovery::receiver::Reason::StorageFailed
 pub rns_transport::discovery::receiver::Reason::UnauthorizedSource
+pub rns_transport::discovery::receiver::Reason::UnlistedType
 pub rns_transport::discovery::receiver::Reason::ValidationBusy
 pub struct rns_transport::discovery::receiver::ReceiverConfig
 pub rns_transport::discovery::receiver::ReceiverConfig::decryptor: core::option::Option<alloc::sync::Arc<dyn rns_transport::discovery::receiver::DiscoveryDecryptor>>
@@ -583,6 +596,7 @@ pub rns_transport::discovery::Reason::MissingAppData
 pub rns_transport::discovery::Reason::StampInvalid
 pub rns_transport::discovery::Reason::StorageFailed
 pub rns_transport::discovery::Reason::UnauthorizedSource
+pub rns_transport::discovery::Reason::UnlistedType
 pub rns_transport::discovery::Reason::ValidationBusy
 pub enum rns_transport::discovery::SkipReason
 pub rns_transport::discovery::SkipReason::EncryptionFailed
@@ -683,6 +697,7 @@ pub fn rns_transport::discovery::receiver::ReceiverConfig::process_event(&self, 
 pub const rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS: u64
 pub const rns_transport::discovery::APP_NAME: &str
 pub const rns_transport::discovery::AUTOCONNECT_INTERFACE_TYPES: &[&str]
+pub const rns_transport::discovery::AUTOCONNECT_MINIMUM_VERSIONS: &[(&str, core::option::Option<&str>)]
 pub const rns_transport::discovery::BLACKHOLE_ASPECTS: &[&str]
 pub const rns_transport::discovery::BLACKHOLE_ASPECT_FILTER: &str
 pub const rns_transport::discovery::BLACKHOLE_INITIAL_WAIT: core::time::Duration
@@ -696,10 +711,13 @@ pub const rns_transport::discovery::BLACKHOLE_UPDATE_INTERVAL_SECS: u64
 pub const rns_transport::discovery::DEFAULT_STAMP_VALUE: u8
 pub const rns_transport::discovery::DETACH_THRESHOLD_TICKS: u64
 pub const rns_transport::discovery::DISCOVERABLE_INTERFACE_TYPES: &[&str]
+pub const rns_transport::discovery::DISCOVERED_INTERFACE_TYPES: &[&str]
 pub const rns_transport::discovery::DISCOVERY_ASPECTS: &[&str]
 pub const rns_transport::discovery::DISCOVERY_ASPECT_FILTER: &str
 pub const rns_transport::discovery::FLAG_ENCRYPTED: u8
 pub const rns_transport::discovery::FLAG_SIGNED: u8
+pub const rns_transport::discovery::IMPLEMENTATION_NAME: &str
+pub const rns_transport::discovery::IMPLEMENTATION_VERSION: &str
 pub const rns_transport::discovery::MONITOR_INTERVAL_SECS: u64
 pub const rns_transport::discovery::STAMP_SIZE: usize
 pub const rns_transport::discovery::THRESHOLD_REMOVE_SECS: u64

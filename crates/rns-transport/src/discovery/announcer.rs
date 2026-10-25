@@ -13,7 +13,8 @@ use crate::messages::InterfaceId;
 
 use super::app_data::{self, DiscoveryInfo, Encoded};
 use super::constants::{
-    ANNOUNCE_JOB_INTERVAL_SECS, DEFAULT_STAMP_VALUE, DISCOVERABLE_INTERFACE_TYPES, STAMP_SIZE,
+    ANNOUNCE_JOB_INTERVAL_SECS, DEFAULT_STAMP_VALUE, DISCOVERABLE_INTERFACE_TYPES,
+    IMPLEMENTATION_NAME, IMPLEMENTATION_VERSION, STAMP_SIZE,
 };
 use super::stamper::DiscoveryStamper;
 
@@ -368,6 +369,8 @@ fn config_to_info(cfg: &DiscoveryInterfaceConfig, transport_id: [u8; 16]) -> Dis
     DiscoveryInfo {
         name: cfg.name.clone(),
         transport_id,
+        impl_name: Some(IMPLEMENTATION_NAME.to_string()),
+        impl_version: Some(IMPLEMENTATION_VERSION.to_string()),
         interface_type: cfg.interface_type.clone(),
         transport_enabled: cfg.transport_enabled,
         reachable_on: cfg.reachable_on.clone(),
@@ -502,6 +505,23 @@ mod tests {
         assert_eq!(info.name, "relay-a");
         assert_eq!(info.transport_id, [0x11; 16]);
         assert_eq!(info.port, Some(4965));
+    }
+
+    /// D12: the announcer names its own stack and version, as Python names
+    /// "RNS" and its `__version__` (Discovery.py:46-47, :173-174).
+    #[test]
+    fn announces_name_the_rust_implementation_and_its_version() {
+        let mut a = Announcer::new(static_stamper());
+        a.register(1, [0x11; 16], sample_backbone());
+        let (requests, _) = a.tick(1000.0, None);
+        let (_, body) = app_data::split_flags(&requests[0].app_data).unwrap();
+        let (info_bytes, _) = app_data::split_stamp(body).unwrap();
+        let info = app_data::decode_info(info_bytes).unwrap();
+        assert_eq!(info.impl_name.as_deref(), Some("rsRNS"));
+        assert_eq!(
+            info.impl_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@
 
 pub mod announcer;
 pub mod app_data;
+pub mod autoconnect;
 pub mod blackhole_manifest;
 pub mod blackhole_subscriber;
 pub mod constants;

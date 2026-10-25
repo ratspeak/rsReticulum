@@ -37,8 +37,8 @@ pub const STAMP_SIZE: usize = 32;
 pub const FLAG_SIGNED: u8 = 0b0000_0001;
 pub const FLAG_ENCRYPTED: u8 = 0b0000_0010;
 
-/// Interface types that announce themselves via discovery. Mirrors
-/// `InterfaceAnnouncer.DISCOVERABLE_INTERFACE_TYPES`.
+/// Interface types that announce themselves via discovery, and that a
+/// receiver accepts. Mirrors `InterfaceAnnouncer.DISCOVERABLE_INTERFACE_TYPES`.
 pub const DISCOVERABLE_INTERFACE_TYPES: &[&str] = &[
     "BackboneInterface",
     "TCPServerInterface",
@@ -49,9 +49,34 @@ pub const DISCOVERABLE_INTERFACE_TYPES: &[&str] = &[
     "KISSInterface",
 ];
 
+/// Discovered interface types that are listed; stored records of other types
+/// are removed. Mirrors `InterfaceDiscovery.DISCOVERABLE_TYPES`.
+pub const DISCOVERED_INTERFACE_TYPES: &[&str] = &[
+    "BackboneInterface",
+    "TCPServerInterface",
+    "I2PInterface",
+    "RNodeInterface",
+    "WeaveInterface",
+    "KISSInterface",
+];
+
 /// Interface types eligible for auto-connect. Mirrors
 /// `InterfaceDiscovery.AUTOCONNECT_TYPES`.
-pub const AUTOCONNECT_INTERFACE_TYPES: &[&str] = &["BackboneInterface", "TCPServerInterface"];
+pub const AUTOCONNECT_INTERFACE_TYPES: &[&str] = &["BackboneInterface"];
+
+/// The implementation name this stack announces (`0xFD`); Python announces
+/// "RNS" (`IMPLEMENTATION_NAME`).
+pub const IMPLEMENTATION_NAME: &str = "rsRNS";
+
+/// The version this stack announces (`0xFC`): its own, never Python's.
+pub const IMPLEMENTATION_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The oldest release of each implementation that auto-connect trusts.
+/// Python's 1.5.2 floor is its Backbone flow control; no rsRNS release has
+/// Backbone egress control yet, so none qualifies without
+/// `autoconnect_unverified_implementations`.
+pub const AUTOCONNECT_MINIMUM_VERSIONS: &[(&str, Option<&str>)] =
+    &[("RNS", Some("1.5.2")), (IMPLEMENTATION_NAME, None)];
 
 /// Freshness tiers for discovered interfaces (seconds). Match
 /// `InterfaceDiscovery.THRESHOLD_*`.
@@ -75,6 +100,8 @@ pub const BLACKHOLE_SOURCE_TIMEOUT_SECS: u64 = 25;
 pub mod key {
     pub const NAME: u8 = 0xFF;
     pub const TRANSPORT_ID: u8 = 0xFE;
+    pub const TRANSPORT_IMPL: u8 = 0xFD;
+    pub const TRANSPORT_VERS: u8 = 0xFC;
     pub const INTERFACE_TYPE: u8 = 0x00;
     pub const TRANSPORT: u8 = 0x01;
     pub const REACHABLE_ON: u8 = 0x02;

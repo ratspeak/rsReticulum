@@ -1632,6 +1632,7 @@ impl core::fmt::Debug for rns_runtime::reticulum::RecalledDestination
 pub fn rns_runtime::reticulum::RecalledDestination::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct rns_runtime::reticulum::ReticulumConfig
 pub rns_runtime::reticulum::ReticulumConfig::autoconnect_discovered_interfaces: usize
+pub rns_runtime::reticulum::ReticulumConfig::autoconnect_unverified_implementations: bool
 pub rns_runtime::reticulum::ReticulumConfig::blackhole_sources: alloc::vec::Vec<[u8; 16]>
 pub rns_runtime::reticulum::ReticulumConfig::blackhole_update_interval: f64
 pub rns_runtime::reticulum::ReticulumConfig::bootstrap_configs: alloc::vec::Vec<std::path::PathBuf>

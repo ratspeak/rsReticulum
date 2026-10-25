@@ -6,7 +6,8 @@
 //! 1. split the `app_data` payload into flags / body / stamp,
 //! 2. (optionally) decrypt the body using a shared-network decryptor,
 //! 3. validate the stamp against a [`DiscoveryStamper`],
-//! 4. decode the info map, filter by `discovery_sources` if configured,
+//! 4. decode the info map, filter by `discovery_sources` if configured, and
+//!    drop types that are never listed,
 //! 5. upsert into [`DiscoveryStore`] and notify any observer.
 //!
 //! Mirrors Python `Discovery.InterfaceAnnounceHandler.received_announce`.
@@ -25,7 +26,7 @@ use tracing::{debug, trace, warn};
 use crate::messages::AnnounceHandlerEvent;
 
 use super::app_data::{self, DiscoveryInfo};
-use super::constants::FLAG_ENCRYPTED;
+use super::constants::{DISCOVERED_INTERFACE_TYPES, FLAG_ENCRYPTED};
 use super::stamper::DiscoveryStamper;
 use super::storage::{DiscoveredInterface, DiscoveryStore};
 
@@ -93,6 +94,8 @@ pub enum Reason {
     DecodeFailed,
     /// Source (transport_id) not in the configured discovery_sources list.
     UnauthorizedSource,
+    /// An announceable type that is never listed ([`DISCOVERED_INTERFACE_TYPES`]).
+    UnlistedType,
     /// Upsert into the on-disk store failed (io error).
     StorageFailed,
 }
@@ -415,6 +418,9 @@ impl ReceiverConfig {
             && !sources.iter().any(|s| s == &announced_identity)
         {
             return Outcome::Rejected(Reason::UnauthorizedSource);
+        }
+        if !DISCOVERED_INTERFACE_TYPES.contains(&info.interface_type.as_str()) {
+            return Outcome::Rejected(Reason::UnlistedType);
         }
 
         let now = now_unix();
@@ -1036,6 +1042,35 @@ mod tests {
 
         let received = obs_rx.try_recv().expect("observer should receive");
         assert_eq!(received.info.name, "unit-test-iface");
+    }
+
+    /// Python validates TCPClientInterface announces but neither stores nor
+    /// reports them (Discovery.py:354, :596).
+    #[test]
+    fn client_interfaces_are_validated_but_not_stored() {
+        let dir = tmpdir("client");
+        let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
+        let stamp = vec![0xAB; STAMP_SIZE];
+        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20));
+        let mut info = sample_info();
+        info.interface_type = "TCPClientInterface".into();
+        let (blob, _) = stamped_blob(&info, &stamp);
+
+        let (obs_tx, mut obs_rx) = mpsc::channel::<DiscoveredInterface>(4);
+        let cfg = ReceiverConfig {
+            stamper,
+            store: store.clone(),
+            required_value: 14,
+            discovery_sources: None,
+            decryptor: None,
+            observer: Some(obs_tx),
+        };
+        assert_eq!(
+            cfg.process_event(&event_with(blob)),
+            Outcome::Rejected(Reason::UnlistedType)
+        );
+        assert!(obs_rx.try_recv().is_err());
+        assert_eq!(std::fs::read_dir(store.root()).unwrap().count(), 0);
     }
 
     #[test]

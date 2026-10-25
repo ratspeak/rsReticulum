@@ -35,6 +35,10 @@ pub struct DiscoveryInfo {
     pub name: String,
     /// Transport identity hash of the announcer (key `0xFE`, 16 bytes).
     pub transport_id: [u8; 16],
+    /// The announcing stack and its version (keys `0xFD` / `0xFC`), when it
+    /// names them as strings.
+    pub impl_name: Option<String>,
+    pub impl_version: Option<String>,
     /// Interface type string, e.g. `"BackboneInterface"` (key `0x00`).
     pub interface_type: String,
     /// Whether the announcer has transport (routing) enabled (key `0x01`).
@@ -167,6 +171,17 @@ fn info_to_map(info: &DiscoveryInfo) -> Vec<(Value, Value)> {
             u8_key(key::TRANSPORT_ID),
             Value::Binary(info.transport_id.to_vec()),
         ),
+    ];
+    if let Some(impl_name) = &info.impl_name {
+        entries.push((u8_key(key::TRANSPORT_IMPL), Value::from(impl_name.clone())));
+    }
+    if let Some(impl_version) = &info.impl_version {
+        entries.push((
+            u8_key(key::TRANSPORT_VERS),
+            Value::from(impl_version.clone()),
+        ));
+    }
+    entries.extend([
         (u8_key(key::NAME), Value::from(info.name.clone())),
         (
             u8_key(key::LATITUDE),
@@ -180,7 +195,7 @@ fn info_to_map(info: &DiscoveryInfo) -> Vec<(Value, Value)> {
             u8_key(key::HEIGHT),
             info.height.map_or(Value::Nil, Value::F64),
         ),
-    ];
+    ]);
 
     if let Some(addr) = &info.reachable_on {
         entries.push((u8_key(key::REACHABLE_ON), Value::from(addr.clone())));
@@ -274,6 +289,8 @@ pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
                 info.interface_type = value_as_string(&v, kb)?;
                 saw_interface_type = true;
             }
+            key::TRANSPORT_IMPL => info.impl_name = v.as_str().map(str::to_string),
+            key::TRANSPORT_VERS => info.impl_version = v.as_str().map(str::to_string),
             key::TRANSPORT => {
                 info.transport_enabled = value_as_bool(&v, kb)?;
             }
@@ -451,6 +468,47 @@ mod tests {
             coding_rate: Some(5),
             ..Default::default()
         }
+    }
+
+    /// Python 1.5.5 packs the implementation name and version right after
+    /// the transport id (Discovery.py:170-178).
+    #[test]
+    fn implementation_keys_follow_the_transport_id_as_python_packs_them() {
+        let mut info = sample_backbone();
+        info.impl_name = Some("rsRNS".into());
+        info.impl_version = Some("1.4.0".into());
+        let encoded = encode_info(&info).unwrap();
+        let Value::Map(map) = rmpv::decode::read_value(&mut Cursor::new(&encoded.packed)).unwrap()
+        else {
+            panic!("info is a map");
+        };
+        let keys: Vec<u8> = map.iter().map(|(k, _)| value_as_u8(k).unwrap()).collect();
+        assert_eq!(
+            keys[..6],
+            [
+                key::INTERFACE_TYPE,
+                key::TRANSPORT,
+                key::TRANSPORT_ID,
+                key::TRANSPORT_IMPL,
+                key::TRANSPORT_VERS,
+                key::NAME
+            ]
+        );
+        assert_eq!(map[3].1.as_str(), Some("rsRNS"));
+        assert_eq!(map[4].1.as_str(), Some("1.4.0"));
+        assert_eq!(decode_info(&encoded.packed).unwrap(), info);
+    }
+
+    /// Python reads the keys without checking their type (Discovery.py:348-349).
+    #[test]
+    fn an_implementation_that_is_not_a_string_is_ignored() {
+        let mut map = info_to_map(&sample_backbone());
+        map.push((u8_key(key::TRANSPORT_IMPL), Value::from(7u64)));
+        map.push((u8_key(key::TRANSPORT_VERS), Value::Nil));
+        let mut packed = Vec::new();
+        rmpv::encode::write_value(&mut packed, &Value::Map(map)).unwrap();
+        let decoded = decode_info(&packed).unwrap();
+        assert_eq!((decoded.impl_name, decoded.impl_version), (None, None));
     }
 
     #[test]
