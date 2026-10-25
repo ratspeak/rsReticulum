@@ -106,8 +106,9 @@ fn verify_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// Read a secret file of at most `max_len` bytes into one buffer that is
 /// allocated up front and wiped on drop, so neither growth nor a failed read
-/// leaves a copy behind.
-pub(crate) fn read_secret_file(path: &Path, max_len: usize) -> std::io::Result<Zeroizing<Vec<u8>>> {
+/// leaves a copy behind. A longer file is refused with `InvalidData` once
+/// `max_len + 1` bytes have been read.
+pub fn read_secret_file(path: &Path, max_len: usize) -> std::io::Result<Zeroizing<Vec<u8>>> {
     let mut file = fs::File::open(path)?;
     let mut data = Zeroizing::new(vec![0u8; max_len.saturating_add(1)]);
     let mut filled = 0;

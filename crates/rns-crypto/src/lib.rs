@@ -16,6 +16,10 @@ pub mod token;
 pub mod x25519;
 
 pub use token::TOKEN_OVERHEAD;
+/// The wiping types in this crate's API, such as the output of
+/// [`hkdf::hkdf_sha256`], for crates that hold secrets without depending on
+/// `zeroize` themselves.
+pub use zeroize;
 
 use alloc::string::String;
 use core::fmt::Write;

@@ -37,6 +37,7 @@
 - Writing, verifying and recovering state files retries a read that a signal interrupts instead of failing.
 - Interface options wipe their IFAC passphrase when dropped, and the debug output of IFAC settings no longer shows it.
 - Each interface's IFAC key lives in one allocation that is wiped when dropped, so interface tables no longer leave copies of it in freed memory.
+- I2P interfaces no longer leave their private key in freed memory when they read it, store it or exchange it with the SAM bridge, and refuse a key file or SAM reply longer than 16 KiB.
 
 ## 1.4.0 - 2026-10-12
 

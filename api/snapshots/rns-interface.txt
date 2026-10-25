@@ -471,6 +471,8 @@ pub rns_interface::i2p::I2PServerConfig::sam_host: alloc::string::String
 pub rns_interface::i2p::I2PServerConfig::sam_port: u16
 impl rns_interface::i2p::I2PServerConfig
 pub fn rns_interface::i2p::I2PServerConfig::new(&str) -> Self
+impl core::fmt::Debug for rns_interface::i2p::I2PServerConfig
+pub fn rns_interface::i2p::I2PServerConfig::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub const rns_interface::i2p::BITRATE_GUESS: u64
 pub const rns_interface::i2p::DEFAULT_SAM_ADDRESS: &str
 pub const rns_interface::i2p::DEFAULT_SAM_PORT: u16

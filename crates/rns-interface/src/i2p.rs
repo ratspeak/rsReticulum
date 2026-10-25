@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use rns_crypto::zeroize::Zeroizing;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -37,6 +38,12 @@ pub const RECONNECT_WAIT: u64 = 15;
 pub const RECONNECT_WAIT_MAX: u64 = 300;
 
 pub const SAM_VERSION: &str = "3.1";
+
+/// The longest SAM reply line read, well past a SESSION STATUS that carries a
+/// private key.
+const SAM_REPLY_MAX_BYTES: usize = 16 * 1024;
+/// An I2P key file holds one base64 SAM private key of a few kilobytes.
+const I2P_KEY_FILE_MAX_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SamError {
@@ -80,23 +87,81 @@ pub fn sam_reply_has_token(pairs: &[(String, String)], token: &str) -> bool {
     pairs.iter().any(|(k, v)| k == token && v.is_empty())
 }
 
-async fn read_sam_reply(
-    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
-) -> Result<String, SamError> {
-    let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
-    if n == 0 {
-        return Err(SamError::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "SAM connection closed during handshake",
-        )));
-    }
-    Ok(line.trim_end().to_string())
+/// The value of `key` in a reply, borrowed from it.
+fn reply_value<'a>(reply: &'a str, key: &str) -> Option<&'a str> {
+    reply
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix(key)?.strip_prefix('='))
 }
 
-async fn sam_hello(
+/// Whether a reply holds `token` with no value.
+fn reply_has_token(reply: &str, token: &str) -> bool {
+    reply
+        .split_whitespace()
+        .any(|word| word == token || word.strip_suffix('=') == Some(token))
+}
+
+/// A reply for an error message, with any private key left out.
+fn without_destination(reply: &str) -> String {
+    reply
+        .split_whitespace()
+        .map(|token| {
+            if token.starts_with("DESTINATION=") {
+                "DESTINATION=<redacted>"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Read one reply line into a buffer reserved once and wiped on drop, since a
+/// SESSION STATUS reply carries the session's private key. Bytes are read one
+/// at a time, so nothing past the line is consumed.
+async fn read_sam_reply<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Zeroizing<String>, SamError> {
+    let mut line = Zeroizing::new(Vec::with_capacity(SAM_REPLY_MAX_BYTES));
+    loop {
+        match reader.read_u8().await {
+            Ok(b'\n') => break,
+            Ok(_) if line.len() == SAM_REPLY_MAX_BYTES => {
+                return Err(SamError::UnexpectedReply(format!(
+                    "reply longer than {SAM_REPLY_MAX_BYTES} bytes"
+                )));
+            }
+            Ok(byte) => line.push(byte),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !line.is_empty() => break,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(SamError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "SAM connection closed during handshake",
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let end = line
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(0, |last| last + 1);
+    line.truncate(end);
+    match String::from_utf8(std::mem::take(&mut *line)) {
+        Ok(text) => Ok(Zeroizing::new(text)),
+        Err(error) => {
+            drop(Zeroizing::new(error.into_bytes()));
+            Err(SamError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "SAM reply is not UTF-8",
+            )))
+        }
+    }
+}
+
+async fn sam_hello<R: AsyncRead + Unpin>(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    reader: &mut R,
 ) -> Result<(), SamError> {
     let hello_msg = format!("HELLO VERSION MIN={} MAX={}\n", SAM_VERSION, SAM_VERSION);
     writer.write_all(hello_msg.as_bytes()).await?;
@@ -108,7 +173,7 @@ async fn sam_hello(
     if !sam_reply_has_token(&pairs, "HELLO") || !sam_reply_has_token(&pairs, "REPLY") {
         return Err(SamError::HandshakeFailed(format!(
             "expected HELLO REPLY, got: {}",
-            reply
+            reply.as_str()
         )));
     }
 
@@ -120,45 +185,58 @@ async fn sam_hello(
         ))),
         None => Err(SamError::HandshakeFailed(format!(
             "no RESULT in HELLO reply: {}",
-            reply
+            reply.as_str()
         ))),
     }
 }
 
-/// Returns the destination (base64). `private_key=None` = transient.
-async fn sam_session_create(
+/// Returns the session's private key (base64), wiped on drop.
+/// `private_key=None` = transient.
+async fn sam_session_create<R: AsyncRead + Unpin>(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    reader: &mut R,
     session_id: &str,
     private_key: Option<&str>,
     transient_signature_type: Option<u8>,
-) -> Result<String, SamError> {
-    let dest_param = match (private_key, transient_signature_type) {
-        (Some(key), _) => key.to_string(),
-        (None, Some(signature_type)) => format!("TRANSIENT SIGNATURE_TYPE={signature_type}"),
-        (None, None) => "TRANSIENT".to_string(),
+) -> Result<Zeroizing<String>, SamError> {
+    let transient;
+    let destination = match (private_key, transient_signature_type) {
+        (Some(key), _) => key,
+        (None, Some(signature_type)) => {
+            transient = format!("TRANSIENT SIGNATURE_TYPE={signature_type}");
+            &transient
+        }
+        (None, None) => "TRANSIENT",
     };
-    let create_msg = format!(
-        "SESSION CREATE STYLE=STREAM ID={} DESTINATION={}\n",
-        session_id, dest_param
-    );
+    // Sized up front: the command carries the private key.
+    let mut create_msg = Zeroizing::new(String::with_capacity(
+        64 + session_id.len() + destination.len(),
+    ));
+    for part in [
+        "SESSION CREATE STYLE=STREAM ID=",
+        session_id,
+        " DESTINATION=",
+        destination,
+        "\n",
+    ] {
+        create_msg.push_str(part);
+    }
     writer.write_all(create_msg.as_bytes()).await?;
     writer.flush().await?;
 
     let reply = read_sam_reply(reader).await?;
-    let pairs = parse_sam_reply(&reply);
 
-    if !sam_reply_has_token(&pairs, "SESSION") || !sam_reply_has_token(&pairs, "STATUS") {
+    if !reply_has_token(&reply, "SESSION") || !reply_has_token(&reply, "STATUS") {
         return Err(SamError::SessionFailed(format!(
             "expected SESSION STATUS, got: {}",
-            reply
+            without_destination(&reply)
         )));
     }
 
-    match sam_reply_get(&pairs, "RESULT") {
+    match reply_value(&reply, "RESULT") {
         Some("OK") => {}
         Some(other) => {
-            let msg_detail = sam_reply_get(&pairs, "MESSAGE").unwrap_or("no details");
+            let msg_detail = reply_value(&reply, "MESSAGE").unwrap_or("no details");
             return Err(SamError::SessionFailed(format!(
                 "SESSION RESULT={}: {}",
                 other, msg_detail
@@ -167,13 +245,13 @@ async fn sam_session_create(
         None => {
             return Err(SamError::SessionFailed(format!(
                 "no RESULT in SESSION STATUS: {}",
-                reply
+                without_destination(&reply)
             )));
         }
     }
 
-    match sam_reply_get(&pairs, "DESTINATION") {
-        Some(dest) => Ok(dest.to_string()),
+    match reply_value(&reply, "DESTINATION") {
+        Some(dest) => Ok(Zeroizing::new(dest.to_string())),
         None => Err(SamError::SessionFailed(
             "SESSION STATUS OK but no DESTINATION returned".to_string(),
         )),
@@ -201,7 +279,7 @@ async fn sam_stream_connect(
     if !sam_reply_has_token(&pairs, "STREAM") || !sam_reply_has_token(&pairs, "STATUS") {
         return Err(SamError::StreamFailed(format!(
             "expected STREAM STATUS, got: {}",
-            reply
+            reply.as_str()
         )));
     }
 
@@ -216,7 +294,7 @@ async fn sam_stream_connect(
         }
         None => Err(SamError::StreamFailed(format!(
             "no RESULT in STREAM STATUS: {}",
-            reply
+            reply.as_str()
         ))),
     }
 }
@@ -238,7 +316,7 @@ async fn sam_stream_accept(
     if !sam_reply_has_token(&pairs, "STREAM") || !sam_reply_has_token(&pairs, "STATUS") {
         return Err(SamError::AcceptFailed(format!(
             "expected STREAM STATUS, got: {}",
-            reply
+            reply.as_str()
         )));
     }
 
@@ -254,7 +332,7 @@ async fn sam_stream_accept(
         None => {
             return Err(SamError::AcceptFailed(format!(
                 "no RESULT in STREAM STATUS: {}",
-                reply
+                reply.as_str()
             )));
         }
     }
@@ -286,7 +364,7 @@ fn generate_session_id() -> String {
     format!("reticulum_{:016x}", id)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct I2PServerConfig {
     pub name: String,
     pub sam_host: String,
@@ -302,6 +380,23 @@ pub struct I2PServerConfig {
     /// Receives the server's b32 address (Python `I2PInterface.b32`) whenever
     /// SAM creates its session.
     pub b32: Option<tokio::sync::watch::Sender<Option<String>>>,
+}
+
+// The key is the destination's secret; debug output names only its presence.
+impl std::fmt::Debug for I2PServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("I2PServerConfig")
+            .field("name", &self.name)
+            .field("sam_host", &self.sam_host)
+            .field("sam_port", &self.sam_port)
+            .field("keyfile", &self.keyfile.as_ref().map(|_| "<redacted>"))
+            .field("key_path", &self.key_path)
+            .field("reconnect_delay", &self.reconnect_delay)
+            .field("mode", &self.mode)
+            .field("b32", &self.b32)
+            .finish()
+    }
 }
 
 impl I2PServerConfig {
@@ -323,14 +418,21 @@ impl I2PServerConfig {
 /// (RNS/vendor/i2plib/sam.py:91-93).
 const NEW_DESTINATION_SIGNATURE_TYPE: u8 = 7;
 
-/// The stored key, `None` when there is none yet. A file that cannot be read
-/// is an error, so it is never replaced.
-fn read_private_key(path: &std::path::Path) -> std::io::Result<Option<String>> {
-    match std::fs::read_to_string(path) {
-        Ok(key) => Ok(Some(key.trim().to_string()).filter(|key| !key.is_empty())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
+/// The stored key, `None` when there is none yet, read into buffers that are
+/// wiped on drop. A file that cannot be read is an error, so it is never
+/// replaced.
+fn read_private_key(path: &std::path::Path) -> std::io::Result<Option<Zeroizing<String>>> {
+    let data = match rns_identity::persistence::read_secret_file(path, I2P_KEY_FILE_MAX_BYTES) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let key = std::str::from_utf8(&data)
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "I2P key file is not UTF-8")
+        })?
+        .trim();
+    Ok((!key.is_empty()).then(|| Zeroizing::new(key.to_string())))
 }
 
 /// Keep a session's private key readable by its owner only, replaced
@@ -352,9 +454,10 @@ pub fn destination_b32(private_key: &str) -> Option<String> {
     Some(base32_lowercase(&hash))
 }
 
-/// Base64 with I2P's `-~` alphabet (i2plib `i2p_b64decode`).
-fn i2p_base64_decode(text: &str) -> Option<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(text.len() * 3 / 4);
+/// Base64 with I2P's `-~` alphabet (i2plib `i2p_b64decode`), into a buffer
+/// sized up front and wiped on drop: the input is usually a private key.
+fn i2p_base64_decode(text: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let mut bytes = Zeroizing::new(Vec::with_capacity(text.len() * 3 / 4));
     let (mut buffer, mut bits) = (0u32, 0u32);
     for c in text.trim_end_matches('=').bytes() {
         let value = match c {
@@ -483,10 +586,10 @@ pub async fn spawn_i2p_client(
                 }
             };
 
-            let (session_reader, mut session_writer) = session_stream.into_split();
-            let mut session_buf_reader = BufReader::new(session_reader);
+            // Read unbuffered: a read buffer would keep SAM's reply, private key included.
+            let (mut session_reader, mut session_writer) = session_stream.into_split();
 
-            if let Err(e) = sam_hello(&mut session_writer, &mut session_buf_reader).await {
+            if let Err(e) = sam_hello(&mut session_writer, &mut session_reader).await {
                 tracing::warn!(
                     name = %config.name,
                     error = %e,
@@ -505,7 +608,7 @@ pub async fn spawn_i2p_client(
 
             let _our_dest = match sam_session_create(
                 &mut session_writer,
-                &mut session_buf_reader,
+                &mut session_reader,
                 &session_id,
                 None,
                 None,
@@ -740,20 +843,23 @@ pub async fn spawn_i2p_server(
                 }
             };
 
-            let (session_reader, mut session_writer) = session_stream.into_split();
-            let mut session_buf_reader = BufReader::new(session_reader);
+            // Read unbuffered: a read buffer would keep SAM's reply, private key included.
+            let (mut session_reader, mut session_writer) = session_stream.into_split();
 
-            if let Err(e) = sam_hello(&mut session_writer, &mut session_buf_reader).await {
+            if let Err(e) = sam_hello(&mut session_writer, &mut session_reader).await {
                 tracing::warn!(name = %config.name, error = %e, "I2P server: SAM HELLO failed");
                 tokio::time::sleep(std::time::Duration::from_secs(config.reconnect_delay)).await;
                 continue;
             }
 
             let (private_key, store_key) = match (&config.keyfile, config.key_path.as_deref()) {
-                (Some(key), _) => (Some(key.clone()), false),
+                (Some(key), _) => (Some(Zeroizing::new(key.clone())), false),
                 (None, None) => (None, false),
                 (None, Some(path)) => match read_private_key(path) {
-                    Ok(key) => (key.clone(), key.is_none()),
+                    Ok(key) => {
+                        let missing = key.is_none();
+                        (key, missing)
+                    }
                     Err(error) => {
                         tracing::warn!(
                             name = %config.name,
@@ -767,9 +873,9 @@ pub async fn spawn_i2p_server(
             };
             let our_dest = match sam_session_create(
                 &mut session_writer,
-                &mut session_buf_reader,
+                &mut session_reader,
                 &session_id,
-                private_key.as_deref(),
+                private_key.as_deref().map(String::as_str),
                 Some(NEW_DESTINATION_SIGNATURE_TYPE),
             )
             .await

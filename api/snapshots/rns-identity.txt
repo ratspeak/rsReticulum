@@ -337,6 +337,7 @@ pub fn rns_identity::persistence::durable_rename_directory(&std::path::Path, &st
 pub fn rns_identity::persistence::durable_write(&std::path::Path, &[u8]) -> core::result::Result<rns_identity::persistence::DurableFileReceipt, rns_identity::persistence::DurableWriteError>
 pub fn rns_identity::persistence::read_file(&std::path::Path) -> core::io::error::Result<core::option::Option<alloc::vec::Vec<u8>>>
 pub fn rns_identity::persistence::read_file_bounded(&std::path::Path, usize) -> core::io::error::Result<core::option::Option<alloc::vec::Vec<u8>>>
+pub fn rns_identity::persistence::read_secret_file(&std::path::Path, usize) -> core::io::error::Result<zeroize::Zeroizing<alloc::vec::Vec<u8>>>
 pub fn rns_identity::persistence::storage_risk(&std::path::Path) -> core::io::error::Result<core::option::Option<rns_identity::persistence::StorageRisk>>
 pub fn rns_identity::persistence::try_lock_exclusive(&std::fs::File) -> core::io::error::Result<()>
 pub fn rns_identity::persistence::validate_durable_storage_directory(&std::path::Path) -> core::result::Result<(), rns_identity::persistence::DurableWriteError>

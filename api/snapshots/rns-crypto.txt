@@ -1,4 +1,5 @@
 pub mod rns_crypto
+pub use rns_crypto::zeroize
 pub mod rns_crypto::aes_cbc
 pub enum rns_crypto::aes_cbc::AesCbcError
 pub rns_crypto::aes_cbc::AesCbcError::DecryptionFailed
