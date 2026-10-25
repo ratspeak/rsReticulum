@@ -209,24 +209,39 @@ fn info_to_map(info: &DiscoveryInfo) -> Vec<(Value, Value)> {
     if let Some(k) = &info.ifac_netkey {
         entries.push((u8_key(key::IFAC_NETKEY), Value::from(k.clone())));
     }
-    if let Some(f) = info.frequency {
-        entries.push((u8_key(key::FREQUENCY), Value::from(f)));
-    }
-    if let Some(b) = info.bandwidth {
-        entries.push((u8_key(key::BANDWIDTH), Value::from(b)));
-    }
-    if let Some(sf) = info.spreading_factor {
-        entries.push((u8_key(key::SPREADING_FACTOR), Value::from(sf)));
-    }
-    if let Some(cr) = info.coding_rate {
-        entries.push((u8_key(key::CODING_RATE), Value::from(cr)));
-    }
-    if let Some(mod_) = &info.modulation {
-        entries.push((u8_key(key::MODULATION), Value::from(mod_.clone())));
-    }
-    if let Some(ch) = info.channel {
-        entries.push((u8_key(key::CHANNEL), Value::from(ch)));
-    }
+    // Python always writes a radio type's parameters, unset ones as nil.
+    let required: &[u8] = match info.interface_type.as_str() {
+        "RNodeInterface" => &[
+            key::FREQUENCY,
+            key::BANDWIDTH,
+            key::SPREADING_FACTOR,
+            key::CODING_RATE,
+        ],
+        "WeaveInterface" => &[
+            key::FREQUENCY,
+            key::BANDWIDTH,
+            key::CHANNEL,
+            key::MODULATION,
+        ],
+        "KISSInterface" => &[key::FREQUENCY, key::BANDWIDTH, key::MODULATION],
+        _ => &[],
+    };
+    let radio = [
+        (key::FREQUENCY, info.frequency.map(Value::from)),
+        (key::BANDWIDTH, info.bandwidth.map(Value::from)),
+        (
+            key::SPREADING_FACTOR,
+            info.spreading_factor.map(Value::from),
+        ),
+        (key::CODING_RATE, info.coding_rate.map(Value::from)),
+        (key::MODULATION, info.modulation.clone().map(Value::from)),
+        (key::CHANNEL, info.channel.map(Value::from)),
+    ];
+    entries.extend(radio.into_iter().filter_map(|(k, value)| {
+        value
+            .or_else(|| required.contains(&k).then_some(Value::Nil))
+            .map(|value| (u8_key(k), value))
+    }));
 
     entries
 }
@@ -306,17 +321,23 @@ pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
             }
             key::IFAC_NETNAME => info.ifac_netname = Some(value_as_string(&v, kb)?),
             key::IFAC_NETKEY => info.ifac_netkey = Some(value_as_string(&v, kb)?),
-            key::FREQUENCY => info.frequency = Some(value_as_u64(&v, kb)?),
-            key::BANDWIDTH => info.bandwidth = Some(value_as_u64(&v, kb)?),
+            key::FREQUENCY => info.frequency = unset_or(&v, |v| value_as_u64(v, kb))?,
+            key::BANDWIDTH => info.bandwidth = unset_or(&v, |v| value_as_u64(v, kb))?,
             key::SPREADING_FACTOR => {
-                info.spreading_factor = Some(value_as_u64(&v, kb)?.min(u8::MAX as u64) as u8);
+                info.spreading_factor = unset_or(&v, |v| {
+                    value_as_u64(v, kb).map(|n| n.min(u8::MAX as u64) as u8)
+                })?;
             }
             key::CODING_RATE => {
-                info.coding_rate = Some(value_as_u64(&v, kb)?.min(u8::MAX as u64) as u8);
+                info.coding_rate = unset_or(&v, |v| {
+                    value_as_u64(v, kb).map(|n| n.min(u8::MAX as u64) as u8)
+                })?;
             }
-            key::MODULATION => info.modulation = Some(value_as_string(&v, kb)?),
+            key::MODULATION => info.modulation = unset_or(&v, |v| value_as_string(v, kb))?,
             key::CHANNEL => {
-                info.channel = Some(value_as_u64(&v, kb)?.min(u16::MAX as u64) as u16);
+                info.channel = unset_or(&v, |v| {
+                    value_as_u64(v, kb).map(|n| n.min(u16::MAX as u64) as u16)
+                })?;
             }
             _ => { /* unknown key: ignore for forward compat */ }
         }
@@ -422,6 +443,18 @@ fn value_as_f64(v: &Value, kb: u8) -> Result<Option<f64>, AppDataError> {
             key: kb,
             expected: "float or nil",
         }),
+    }
+}
+
+/// A radio parameter Python leaves unset arrives as nil.
+fn unset_or<T>(
+    v: &Value,
+    read: impl FnOnce(&Value) -> Result<T, AppDataError>,
+) -> Result<Option<T>, AppDataError> {
+    if v.is_nil() {
+        Ok(None)
+    } else {
+        read(v).map(Some)
     }
 }
 
@@ -632,6 +665,56 @@ mod tests {
             decode_info(&encoded.packed),
             Err(AppDataError::InvalidReachableOn(_))
         ));
+    }
+
+    /// Python's announcer always writes a radio type's parameters, unset ones
+    /// as nil, and its receiver reads them unguarded (Discovery.py:218-234,
+    /// :410-456).
+    #[test]
+    fn radio_types_carry_every_parameter_python_reads() {
+        for (interface_type, keys) in [
+            (
+                "RNodeInterface",
+                &[
+                    key::FREQUENCY,
+                    key::BANDWIDTH,
+                    key::SPREADING_FACTOR,
+                    key::CODING_RATE,
+                ][..],
+            ),
+            (
+                "WeaveInterface",
+                &[
+                    key::FREQUENCY,
+                    key::BANDWIDTH,
+                    key::CHANNEL,
+                    key::MODULATION,
+                ][..],
+            ),
+            (
+                "KISSInterface",
+                &[key::FREQUENCY, key::BANDWIDTH, key::MODULATION][..],
+            ),
+        ] {
+            let info = DiscoveryInfo {
+                interface_type: interface_type.into(),
+                transport_id: [0x33; 16],
+                ..Default::default()
+            };
+            let packed = encode_info(&info).unwrap().packed;
+            let Value::Map(map) = rmpv::decode::read_value(&mut Cursor::new(&packed)).unwrap()
+            else {
+                panic!("info is a map");
+            };
+            for k in keys {
+                assert!(
+                    map.iter()
+                        .any(|(key, value)| value_as_u8(key) == Some(*k) && value.is_nil()),
+                    "{interface_type} carries {k:#04x}"
+                );
+            }
+            assert_eq!(decode_info(&packed).unwrap(), info, "{interface_type}");
+        }
     }
 
     #[test]

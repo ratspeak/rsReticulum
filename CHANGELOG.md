@@ -18,6 +18,7 @@
 - Python Reticulum 1.5 `rnstatus` and `rnpath` work against `rnsd-rs`, locally and with `-R`: interface stats carry every field they read, including announce and path request counts, violation counters and the transport instance, and remote management answers on the transport identity, as in Python Reticulum.
 - Announces held during an ingress burst on an IFAC interface are processed when released instead of being dropped, and released or replayed announces no longer count as received traffic again, as in Python Reticulum.
 - Interface discovery announces name this stack, `rsRNS`, and its version. `rnsd-rs` auto-connects only to Backbone interfaces announced by Python Reticulum 1.5.2 or later, or to any announced Backbone interface with `autoconnect_unverified_implementations`, and no longer stores or lists discovered TCP client interfaces, as in Python Reticulum.
+- Discovery announces a KISS-framed TCP client as a KISS interface and sends and reads unset radio parameters as nil, so Python and `rnsd-rs` read each other's KISS, Weave and RNode announces, as in Python Reticulum.
 
 ## 1.4.0 - 2026-10-12
 

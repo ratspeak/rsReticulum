@@ -5876,15 +5876,11 @@ fn discovery_config_for_interface(
                 None,
                 None,
             ),
-            interface_factory::InterfaceConfig::TcpClient(c) if c.kiss_framing => (
-                "TCPClientInterface",
-                configured_reachable_on(section).or_else(|| Some(c.target_host.clone())),
-                Some(c.target_port),
-                None,
-                None,
-                None,
-                None,
-            ),
+            // Python announces a KISS-framed TCP client as a KISS interface
+            // (Discovery.py:230-234).
+            interface_factory::InterfaceConfig::TcpClient(c) if c.kiss_framing => {
+                ("KISSInterface", None, None, None, None, None, None)
+            }
             interface_factory::InterfaceConfig::Backbone(c) => (
                 "BackboneInterface",
                 configured_reachable_on(section).or_else(|| {
@@ -12133,6 +12129,21 @@ loglevel = 7
                 expected
             );
         }
+    }
+
+    /// Python announces a KISS-framed TCP client as a KISS interface with its
+    /// discovery radio parameters and no address (Discovery.py:182-185, :230-234).
+    #[test]
+    fn a_kiss_framed_tcp_client_is_discovered_as_a_kiss_interface() {
+        let config = Config::parse("[interfaces]\n[[kiss tnc]]\ntype = TCPClientInterface\nenabled = yes\nkiss_framing = yes\ntarget_host = 10.0.0.2\ntarget_port = 8001\ndiscoverable = yes\ndiscovery_frequency = 433775000\ndiscovery_modulation = AFSK\n").unwrap();
+        let interfaces = synthesize_interfaces(&config, false).unwrap();
+        let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
+        let discovery =
+            discovery_config_for_interface(&config, &interfaces[0], &post_init, true).unwrap();
+        assert_eq!(discovery.interface_type, "KISSInterface");
+        assert_eq!((discovery.reachable_on, discovery.port), (None, None));
+        assert_eq!(discovery.frequency, Some(433_775_000));
+        assert_eq!(discovery.modulation.as_deref(), Some("AFSK"));
     }
 
     #[tokio::test]
