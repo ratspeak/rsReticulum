@@ -1,9 +1,13 @@
-//! Runtime wiring for server interface ids and accepted clients' routing
-//! state, observed from the public handle.
+//! Runtime wiring for tunnel synthesis, server interface ids and accepted
+//! clients' routing state, observed from the wire and the public handle.
 use super::*;
 use rns_transport::messages::InterfaceStatRpcEntry;
 use rns_transport::path_table::{PathEntry, PathTable};
-use rns_wire::flags::HeaderType;
+use rns_transport::tunnel::TunnelSynthesisData;
+use rns_wire::context::PacketContext;
+use rns_wire::flags::{DestinationType, HeaderType, PacketFlags, PacketType, TransportType};
+use rns_wire::header::PacketHeader;
+use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -214,20 +218,28 @@ async fn an_i2p_interface_runs_its_server_and_every_peer() {
         handle.startup_interface_failures()
     );
 
-    let mut commands = Vec::new();
-    while commands.len() < peers.len() {
-        let (command, _stream) = tokio::time::timeout(Duration::from_secs(10), streams.recv())
+    let mut openings = HashMap::new();
+    while openings.len() < peers.len() {
+        let (command, stream) = tokio::time::timeout(Duration::from_secs(10), streams.recv())
             .await
             .expect("every peer opens a SAM stream")
             .unwrap();
-        commands.push(command);
+        let peer = peers
+            .into_iter()
+            .find(|peer| command.contains(&format!("DESTINATION={peer} ")))
+            .unwrap_or_else(|| panic!("unexpected stream: {command}"));
+        let opening = Frames::new(stream, false)
+            .next(Duration::from_secs(5))
+            .await
+            .and_then(|frame| synthesis_in(&frame))
+            .expect("every peer connection opens with a tunnel synthesis");
+        openings.insert(peer, opening.interface_hash);
     }
     for peer in peers {
-        assert!(
-            commands
-                .iter()
-                .any(|command| command.contains(&format!("DESTINATION={peer} "))),
-            "{peer}: {commands:?}"
+        assert_eq!(
+            openings[peer],
+            python_interface_hash(&format!("I2PInterfacePeer[Golden I2P to {peer}]")),
+            "each peer synthesizes under its own Python name"
         );
         assert!(
             wait_for_interface(&handle, |entry| entry.name
@@ -435,4 +447,432 @@ async fn accepted_client_paths_are_not_persisted() {
         "a path through an accepted client is not persisted"
     );
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Forwards connections to `upstream`; `cut` drops every live connection.
+struct Proxy {
+    port: u16,
+    cut: watch::Sender<u64>,
+}
+
+impl Proxy {
+    async fn start(upstream: u16) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (cut, cut_rx) = watch::channel(0u64);
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let mut cut_rx = cut_rx.clone();
+                cut_rx.borrow_and_update();
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = TcpStream::connect(("127.0.0.1", upstream)).await else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                        _ = cut_rx.changed() => {}
+                    }
+                });
+            }
+        });
+        Self { port, cut }
+    }
+
+    fn cut(&self) {
+        self.cut.send_modify(|generation| *generation += 1);
+    }
+}
+
+/// Frames a hub reads from one client connection, in arrival order.
+struct Frames {
+    reader: BufReader<TcpStream>,
+    kiss: bool,
+    hdlc: rns_interface::hdlc::HdlcDeframer,
+    kiss_frames: rns_interface::kiss::KissDeframer,
+    ready: VecDeque<Vec<u8>>,
+}
+
+impl Frames {
+    fn new(reader: BufReader<TcpStream>, kiss: bool) -> Self {
+        Self {
+            reader,
+            kiss,
+            hdlc: rns_interface::hdlc::HdlcDeframer::new(),
+            kiss_frames: rns_interface::kiss::KissDeframer::new(),
+            ready: VecDeque::new(),
+        }
+    }
+
+    async fn accept(listener: &TcpListener, kiss: bool) -> Self {
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(20), listener.accept())
+            .await
+            .expect("the client connects")
+            .unwrap();
+        Self::new(BufReader::new(stream), kiss)
+    }
+
+    async fn next(&mut self, within: Duration) -> Option<Vec<u8>> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if let Some(frame) = self.ready.pop_front() {
+                return Some(frame);
+            }
+            let mut buf = [0u8; 4096];
+            let n = match tokio::time::timeout_at(deadline, self.reader.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => n,
+                _ => return None,
+            };
+            if self.kiss {
+                let frames = self.kiss_frames.feed(&buf[..n]);
+                self.ready.extend(
+                    frames
+                        .into_iter()
+                        .filter(|(command, _)| *command == 0)
+                        .map(|(_, frame)| frame),
+                );
+            } else {
+                self.ready.extend(self.hdlc.feed(&buf[..n]));
+            }
+            self.ready.retain(|frame| !frame.is_empty());
+        }
+    }
+
+    async fn collect(&mut self, within: Duration) -> Vec<Vec<u8>> {
+        let deadline = tokio::time::Instant::now() + within;
+        let mut frames = Vec::new();
+        while let Some(frame) = self
+            .next(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await
+        {
+            frames.push(frame);
+        }
+        frames
+    }
+}
+
+fn synthesis_in(frame: &[u8]) -> Option<TunnelSynthesisData> {
+    let (header, offset) = PacketHeader::unpack(frame).ok()?;
+    let synthesize =
+        Destination::hash_from_name_and_identity("rnstransport.tunnel.synthesize", None);
+    let shape = header.destination_hash == synthesize
+        && header.flags.header_type == HeaderType::Header1
+        && header.flags.transport_type == TransportType::Broadcast
+        && header.flags.destination_type == DestinationType::Plain
+        && header.flags.packet_type == PacketType::Data
+        && header.hops == 0
+        && header.context == PacketContext::None
+        && frame.len() == offset + 176;
+    shape
+        .then(|| TunnelSynthesisData::unpack(&frame[offset..]))
+        .flatten()
+}
+
+fn assert_signed(synthesis: &TunnelSynthesisData) {
+    let signer = Identity::from_public_key(&synthesis.public_key).unwrap();
+    let mut signed = synthesis.public_key.to_vec();
+    signed.extend_from_slice(&synthesis.interface_hash);
+    signed.extend_from_slice(&synthesis.random_hash);
+    assert!(
+        signer.verify(&signed, &synthesis.signature),
+        "the synthesis verifies under its own Ed25519 key"
+    );
+}
+
+/// Python `Interface.get_hash()`: the full hash of `str(interface)`.
+fn python_interface_hash(python_str: &str) -> [u8; 32] {
+    rns_transport::tunnel::interface_hash(python_str)
+}
+
+/// Queue a PLAIN broadcast for every interface; returns its wire bytes.
+async fn send_plain_marker(handle: &ReticulumHandle, app: &str) -> Vec<u8> {
+    let destination_hash = Destination::hash_from_name_and_identity(app, None);
+    let mut marker = PacketHeader {
+        flags: PacketFlags {
+            header_type: HeaderType::Header1,
+            context_flag: false,
+            transport_type: TransportType::Broadcast,
+            destination_type: DestinationType::Plain,
+            packet_type: PacketType::Data,
+        },
+        hops: 0,
+        transport_id: None,
+        destination_hash,
+        context: PacketContext::None,
+    }
+    .pack();
+    marker.extend_from_slice(app.as_bytes());
+    handle
+        .transport_tx
+        .send(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(marker.clone()),
+            destination_hash,
+        }))
+        .await
+        .unwrap();
+    marker
+}
+
+#[tokio::test]
+async fn a_tcp_client_opens_every_connection_with_its_tunnel_synthesis() {
+    let hub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = hub.local_addr().unwrap().port();
+    let dir = config_dir(
+        "tcp-synthesis",
+        &format!(
+            "[reticulum]\n  share_instance = No\n\n[interfaces]\n  [[Uplink]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 127.0.0.1\n    target_port = {port}\n"
+        ),
+    );
+    let handle = start(&dir).await;
+
+    let mut first = Frames::accept(&hub, false).await;
+    let opening = first
+        .next(Duration::from_secs(5))
+        .await
+        .and_then(|frame| synthesis_in(&frame))
+        .expect("a new connection opens with a tunnel synthesis (TCPInterface.py:178-179)");
+    assert_eq!(
+        opening.public_key,
+        handle.transport_identity.get_public_key(),
+        "signed with the per-process transport identity (Transport.py:2767)"
+    );
+    assert_eq!(
+        opening.interface_hash,
+        python_interface_hash(&format!("TCPInterface[Uplink/127.0.0.1:{port}]")),
+        "the interface hash is Python's get_hash() of str(TCPClientInterface)"
+    );
+    assert_signed(&opening);
+
+    drop(first);
+    let mut second = Frames::accept(&hub, false).await;
+    let reopening = second
+        .next(Duration::from_secs(5))
+        .await
+        .and_then(|frame| synthesis_in(&frame))
+        .expect("a reconnect opens with a fresh synthesis (TCPInterface.py:298-299)");
+    assert_eq!(reopening.tunnel_id(), opening.tunnel_id());
+    assert_ne!(reopening.random_hash, opening.random_hash);
+    assert_signed(&reopening);
+
+    handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_tcp_client_drops_traffic_queued_while_it_was_disconnected() {
+    let hub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = hub.local_addr().unwrap().port();
+    let dir = config_dir(
+        "tcp-backlog",
+        &format!(
+            "[reticulum]\n  share_instance = No\n\n[interfaces]\n  [[Uplink]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 127.0.0.1\n    target_port = {port}\n"
+        ),
+    );
+    let handle = start(&dir).await;
+
+    drop(Frames::accept(&hub, false).await);
+    assert!(
+        wait_for_interface(&handle, |entry| entry.name == "Uplink" && !entry.online)
+            .await
+            .is_some(),
+        "the client notices the lost connection"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let marker = send_plain_marker(&handle, "wp4.backlog").await;
+
+    let mut second = Frames::accept(&hub, false).await;
+    let frames = second.collect(Duration::from_secs(2)).await;
+    assert!(
+        !frames.contains(&marker),
+        "Python drops packets while offline (TCPInterface.py:314-315)"
+    );
+
+    handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_tcp_client_keeps_traffic_queued_before_its_first_connection() {
+    let port = unused_port().await;
+    let dir = config_dir(
+        "tcp-first-backlog",
+        &format!(
+            "[reticulum]\n  share_instance = No\n\n[interfaces]\n  [[Uplink]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 127.0.0.1\n    target_port = {port}\n"
+        ),
+    );
+    let handle = start(&dir).await;
+
+    let marker = send_plain_marker(&handle, "wp4.first.backlog").await;
+    let hub = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    let mut first = Frames::accept(&hub, false).await;
+    let frames = first.collect(Duration::from_secs(2)).await;
+    assert!(
+        frames.iter().any(|frame| synthesis_in(frame).is_some()),
+        "control: the first connection opens with its synthesis"
+    );
+    assert!(
+        frames.contains(&marker),
+        "only an outage drops queued traffic; the first connection delivers it"
+    );
+
+    handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_shared_instance_client_never_synthesizes() {
+    assert!(
+        shared_tcp_client_config(37428).tunnel_identity.is_none(),
+        "Python's LocalInterface never synthesizes"
+    );
+}
+
+#[tokio::test]
+async fn a_kiss_framed_tcp_client_never_synthesizes() {
+    let hub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = hub.local_addr().unwrap().port();
+    let dir = config_dir(
+        "tcp-kiss",
+        &format!(
+            "[reticulum]\n  share_instance = No\n\n[interfaces]\n  [[KISS Uplink]]\n    type = TCPClientInterface\n    enabled = yes\n    kiss_framing = yes\n    target_host = 127.0.0.1\n    target_port = {port}\n"
+        ),
+    );
+    let handle = start(&dir).await;
+
+    let mut connection = Frames::accept(&hub, true).await;
+    let frames = connection.collect(Duration::from_secs(2)).await;
+    assert!(
+        frames.iter().all(|frame| synthesis_in(frame).is_none()),
+        "Python never synthesizes on KISS framing (TCPInterface.py:178-179, :298-299)"
+    );
+
+    handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_backbone_client_opens_with_its_tunnel_synthesis() {
+    let hub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = hub.local_addr().unwrap().port();
+    let dir = config_dir(
+        "backbone-synthesis",
+        &format!(
+            "[reticulum]\n  share_instance = No\n\n[interfaces]\n  [[Backbone Up]]\n    type = BackboneInterface\n    enabled = yes\n    target_host = 127.0.0.1\n    port = {port}\n"
+        ),
+    );
+    let handle = start(&dir).await;
+
+    let mut connection = Frames::accept(&hub, false).await;
+    let opening = connection
+        .next(Duration::from_secs(5))
+        .await
+        .and_then(|frame| synthesis_in(&frame))
+        .expect("a Backbone connection opens with a tunnel synthesis (BackboneInterface.py:922)");
+    assert_eq!(
+        opening.public_key,
+        handle.transport_identity.get_public_key()
+    );
+    assert_eq!(
+        opening.interface_hash,
+        python_interface_hash(&format!("BackboneInterface[Backbone Up/127.0.0.1:{port}]"))
+    );
+    assert_signed(&opening);
+
+    handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn an_i2p_client_opens_with_its_tunnel_synthesis() {
+    let (sam_port, mut streams) = fake_sam(0).await;
+    let peer = "abcdefghijklmnop.b32.i2p";
+    let dir = config_dir(
+        "i2p-synthesis",
+        &format!(
+            "[reticulum]\n  share_instance = No\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    peers = {peer}\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n"
+        ),
+    );
+    let handle = start(&dir).await;
+
+    let (command, stream) = tokio::time::timeout(Duration::from_secs(10), streams.recv())
+        .await
+        .expect("the client opens a SAM stream")
+        .unwrap();
+    assert!(command.starts_with("STREAM CONNECT"), "{command}");
+    let mut connection = Frames::new(stream, false);
+    let opening = connection
+        .next(Duration::from_secs(5))
+        .await
+        .and_then(|frame| synthesis_in(&frame))
+        .expect("an I2P peer connection opens with a tunnel synthesis (I2PInterface.py:503)");
+    assert_eq!(
+        opening.public_key,
+        handle.transport_identity.get_public_key()
+    );
+    assert_eq!(
+        opening.interface_hash,
+        python_interface_hash(&format!("I2PInterfacePeer[Golden I2P to {peer}]"))
+    );
+    assert_signed(&opening);
+
+    handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_rust_hub_restores_a_reconnecting_rust_clients_paths() {
+    let uplink_port = unused_port().await;
+    let hub_port = unused_port().await;
+    let hub_dir = config_dir("rust-hub", &hub_config(hub_port, uplink_port));
+    let hub = start(&hub_dir).await;
+    let proxy = Proxy::start(hub_port).await;
+    let client_dir = config_dir(
+        "rust-client",
+        &format!(
+            "[reticulum]\n  share_instance = No\n\n[interfaces]\n  [[Hub Uplink]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 127.0.0.1\n    target_port = {}\n",
+            proxy.port
+        ),
+    );
+    let client = start(&client_dir).await;
+    // An interface reports online once its synthesis is queued; Python's
+    // startup likewise synthesizes before applications announce.
+    assert!(
+        wait_for_interface(&client, |entry| entry.name == "Hub Uplink" && entry.online)
+            .await
+            .is_some(),
+        "the client connects"
+    );
+    let destination = client
+        .register_destination(
+            Identity::new(),
+            "wp4.tunnel.rust",
+            crate::destination_runtime::DestinationRuntimeOptions::default(),
+        )
+        .await
+        .unwrap();
+    destination
+        .handle
+        .announce(crate::link_manager::DestinationAnnounceOptions::default())
+        .await
+        .unwrap();
+    let dest = destination.handle.destination_hash();
+
+    assert!(
+        wait_for_path(&hub, dest).await,
+        "the hub learns the client's announce"
+    );
+    proxy.cut();
+    assert!(
+        path_state_within(&hub, dest, false, Duration::from_secs(10)).await,
+        "the hub drops the lost connection's paths"
+    );
+    assert!(
+        path_state_within(&hub, dest, true, Duration::from_secs(20)).await,
+        "the client's reconnect synthesis restores its path without a new announce"
+    );
+
+    client.shutdown_and_wait().await;
+    hub.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(client_dir);
+    let _ = std::fs::remove_dir_all(hub_dir);
 }

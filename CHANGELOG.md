@@ -14,6 +14,7 @@
 - After a restart, a hub no longer gives a previous client's saved paths to a new client that reuses its interface name, and it keeps saved tunnels that had no live interface, as in Python Reticulum.
 - Transport hubs now accept tunnel synthesis, so a Python client that reconnects gets its paths back without announcing again, and losing a tunnel's interface no longer drops paths the hub learned through other interfaces, as in Python Reticulum.
 - PLAIN and GROUP packets that arrive from more than one hop away, and announces typed PLAIN or GROUP, are dropped before deduplication, as in Python Reticulum.
+- TCP, Backbone and I2P client interfaces open every connection with a tunnel synthesis, so a transport hub restores their paths after a reconnect, and traffic queued while a connection was down is dropped when it returns, as in Python Reticulum.
 
 ## 1.4.0 - 2026-10-12
 

@@ -3429,6 +3429,8 @@ pub async fn init_with_policy(
 
     // Client mode leaves hardware to the Shared sibling.
     if instance_mode != InstanceMode::Client {
+        let tunnel_identity =
+            rns_interface::traits::TunnelIdentity(wire_transport_identity.clone());
         for iface_config in &interfaces {
             #[cfg(feature = "ble")]
             if should_defer_android_ble_rnode(iface_config, cfg!(target_os = "android")) {
@@ -3492,6 +3494,7 @@ pub async fn init_with_policy(
                 &socket_base,
                 is_foreground.clone(),
                 rnode_startup_options,
+                &tunnel_identity,
             )
             .await
             {
@@ -6408,6 +6411,9 @@ async fn spawn_discovered_backbone_client(
     );
     let mut config = rns_interface::backbone::BackboneClientConfig::new(&name, host, port);
     config.mode = discovered_backbone_client_mode(&handle.config);
+    config.tunnel_identity = Some(rns_interface::traits::TunnelIdentity(
+        handle.transport_identity.clone(),
+    ));
     let iface_handle =
         rns_interface::backbone::spawn_backbone_client(config, id, handle.transport_tx.clone())
             .await
@@ -6721,7 +6727,10 @@ pub async fn spawn_tcp_client_runtime_with_ifac(
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let post_init = runtime_ifac_post_init(ifac, 16)?;
-    let config = rns_interface::tcp::TcpClientConfig::new(name, host, port);
+    let mut config = rns_interface::tcp::TcpClientConfig::new(name, host, port);
+    config.tunnel_identity = Some(rns_interface::traits::TunnelIdentity(
+        handle.transport_identity.clone(),
+    ));
     if let Some(post_init) = &post_init {
         interface_factory::validate_config_capacity(
             &interface_factory::InterfaceConfig::TcpClient(config.clone()),
@@ -6879,6 +6888,9 @@ pub async fn spawn_backbone_client_runtime_with_ifac(
         config.connect_timeout_secs = t;
     }
     config.max_reconnect_tries = runtime_config.max_reconnect_tries;
+    config.tunnel_identity = Some(rns_interface::traits::TunnelIdentity(
+        handle.transport_identity.clone(),
+    ));
 
     let iface_handle =
         rns_interface::backbone::spawn_backbone_client(config, id, handle.transport_tx.clone())
@@ -7884,6 +7896,7 @@ async fn spawn_interface_with_rnode_startup_options(
     socket_base: &Path,
     is_foreground: Arc<AtomicBool>,
     rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
+    tunnel_identity: &rns_interface::traits::TunnelIdentity,
 ) -> Result<Vec<OwnedInterfaceHandle>, String> {
     #[cfg(not(any(
         feature = "serial",
@@ -7895,7 +7908,9 @@ async fn spawn_interface_with_rnode_startup_options(
 
     match iface_config {
         interface_factory::InterfaceConfig::TcpClient(c) => {
-            rns_interface::tcp::spawn_tcp_client(c.clone(), id, transport_tx)
+            let mut config = c.clone();
+            config.tunnel_identity = Some(tunnel_identity.clone());
+            rns_interface::tcp::spawn_tcp_client(config, id, transport_tx)
                 .await
                 .map(|h| vec![h.into()])
                 .map_err(|e| format!("TCP client: {e}"))
@@ -8086,6 +8101,7 @@ async fn spawn_interface_with_rnode_startup_options(
                 client_config.sam_host = c.i2p_sam_host.clone();
                 client_config.sam_port = c.i2p_sam_port;
                 client_config.mode = c.mode;
+                client_config.tunnel_identity = Some(tunnel_identity.clone());
                 let peer_id = next.take().unwrap_or_else(|| next_id(&id_gen));
                 match rns_interface::i2p::spawn_i2p_client(
                     client_config,
@@ -8215,6 +8231,7 @@ async fn spawn_interface_with_rnode_startup_options(
                 config.prefer_ipv6 = c.prefer_ipv6;
                 config.connect_timeout_secs = c.connect_timeout;
                 config.max_reconnect_tries = c.max_reconnect_tries;
+                config.tunnel_identity = Some(tunnel_identity.clone());
                 rns_interface::backbone::spawn_backbone_client(config, id, transport_tx)
                     .await
                     .map(|h| vec![h.into()])

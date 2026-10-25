@@ -121,6 +121,7 @@ pub rns_interface::backbone::BackboneClientConfig::name: alloc::string::String
 pub rns_interface::backbone::BackboneClientConfig::prefer_ipv6: bool
 pub rns_interface::backbone::BackboneClientConfig::target_host: alloc::string::String
 pub rns_interface::backbone::BackboneClientConfig::target_port: u16
+pub rns_interface::backbone::BackboneClientConfig::tunnel_identity: core::option::Option<rns_interface::traits::TunnelIdentity>
 impl rns_interface::backbone::BackboneClientConfig
 pub fn rns_interface::backbone::BackboneClientConfig::new(&str, &str, u16) -> Self
 pub struct rns_interface::backbone::BackboneServerConfig
@@ -454,6 +455,7 @@ pub rns_interface::i2p::I2PClientConfig::peer_destination: alloc::string::String
 pub rns_interface::i2p::I2PClientConfig::reconnect_delay: u64
 pub rns_interface::i2p::I2PClientConfig::sam_host: alloc::string::String
 pub rns_interface::i2p::I2PClientConfig::sam_port: u16
+pub rns_interface::i2p::I2PClientConfig::tunnel_identity: core::option::Option<rns_interface::traits::TunnelIdentity>
 impl rns_interface::i2p::I2PClientConfig
 pub fn rns_interface::i2p::I2PClientConfig::new(&str, &str) -> Self
 pub struct rns_interface::i2p::I2PServerConfig
@@ -1160,6 +1162,7 @@ pub rns_interface::tcp::TcpClientConfig::mode: rns_interface::traits::InterfaceM
 pub rns_interface::tcp::TcpClientConfig::name: alloc::string::String
 pub rns_interface::tcp::TcpClientConfig::target_host: alloc::string::String
 pub rns_interface::tcp::TcpClientConfig::target_port: u16
+pub rns_interface::tcp::TcpClientConfig::tunnel_identity: core::option::Option<rns_interface::traits::TunnelIdentity>
 impl rns_interface::tcp::TcpClientConfig
 pub fn rns_interface::tcp::TcpClientConfig::new(&str, &str, u16) -> Self
 pub struct rns_interface::tcp::TcpInterfaceState
@@ -1236,6 +1239,11 @@ pub rns_interface::traits::InterfaceHandle::read_task: tokio::runtime::task::joi
 pub rns_interface::traits::InterfaceHandle::rxb: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>>
 pub rns_interface::traits::InterfaceHandle::tx: tokio::sync::mpsc::bounded::Sender<bytes::bytes::Bytes>
 pub rns_interface::traits::InterfaceHandle::txb: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>>
+pub struct rns_interface::traits::TunnelIdentity(pub alloc::sync::Arc<rns_identity::identity::Identity>)
+impl rns_interface::traits::TunnelIdentity
+pub fn rns_interface::traits::TunnelIdentity::synthesis(&self, &str) -> core::option::Option<bytes::bytes::Bytes>
+impl core::fmt::Debug for rns_interface::traits::TunnelIdentity
+pub fn rns_interface::traits::TunnelIdentity::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub const rns_interface::traits::AR_FREQ_DECAY: f64
 pub const rns_interface::traits::AR_MINFREQ_HZ: f64
 pub const rns_interface::traits::DEFAULT_AR_GRACE: u32

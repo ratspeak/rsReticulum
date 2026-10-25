@@ -52,6 +52,67 @@ pub(crate) async fn handoff_accepted_interface(
     }
 }
 
+/// The transport identity a client signs its tunnel syntheses with (Python
+/// `Transport.identity`). Debug shows only its hash.
+#[derive(Clone)]
+pub struct TunnelIdentity(pub Arc<rns_identity::identity::Identity>);
+
+impl TunnelIdentity {
+    /// A fresh synthesis for the interface whose Python `str()` is
+    /// `python_name` (Transport.py:2764-2785).
+    pub fn synthesis(&self, python_name: &str) -> Option<Bytes> {
+        rns_transport::tunnel::build_tunnel_synthesis_packet(
+            &self.0,
+            rns_transport::tunnel::interface_hash(python_name),
+        )
+        .map(Bytes::from)
+    }
+}
+
+impl std::fmt::Debug for TunnelIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TunnelIdentity")
+            .field(&hex::encode(self.0.hash))
+            .finish()
+    }
+}
+
+/// A host as Python's interface `str()` renders it: IPv6 in brackets.
+pub(crate) fn python_host(host: &str) -> std::borrow::Cow<'_, str> {
+    if host.contains(':') {
+        format!("[{host}]").into()
+    } else {
+        host.into()
+    }
+}
+
+/// Start a client connection as Python does: traffic queued during an outage
+/// is dropped (TCPInterface.py:314-315), then the connection's synthesis is
+/// queued, and only then does the interface report online.
+pub(crate) async fn open_client_connection(
+    outbound: &tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
+    after_outage: bool,
+    transport_tx: &rns_transport::messages::InterfaceTransportSender,
+    synthesis: Option<Bytes>,
+    online: &AtomicBool,
+) {
+    if after_outage {
+        let mut queued = outbound.lock().await;
+        while queued.try_recv().is_ok() {}
+    }
+    if let Some(raw_packet) = synthesis {
+        let _ = transport_tx
+            .send(
+                rns_transport::messages::TransportMessage::SynthesizeTunnel {
+                    interface_id: transport_tx.interface_id(),
+                    raw_packet,
+                },
+            )
+            .await;
+    }
+    online.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Interface operating mode. Byte values are on-wire constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

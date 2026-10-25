@@ -13,7 +13,8 @@ use tokio::sync::mpsc;
 
 use crate::hdlc;
 use crate::traits::{
-    InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, handoff_accepted_interface,
+    InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, TunnelIdentity,
+    handoff_accepted_interface, open_client_connection,
 };
 use rns_transport::messages::{InboundPacket, TransportMessage};
 
@@ -318,6 +319,8 @@ pub struct I2PClientConfig {
     pub max_reconnect_tries: Option<usize>,
     pub reconnect_delay: u64,
     pub mode: InterfaceMode,
+    /// Signs a tunnel synthesis for every connection; `None` sends none.
+    pub tunnel_identity: Option<TunnelIdentity>,
 }
 
 impl I2PClientConfig {
@@ -330,7 +333,13 @@ impl I2PClientConfig {
             max_reconnect_tries: None,
             reconnect_delay: RECONNECT_WAIT,
             mode: InterfaceMode::Full,
+            tunnel_identity: None,
         }
+    }
+
+    /// Python `str(I2PInterfacePeer)` (I2PInterface.py:714-715).
+    fn python_name(&self) -> String {
+        format!("I2PInterfacePeer[{}]", self.name)
     }
 }
 
@@ -356,8 +365,10 @@ pub async fn spawn_i2p_client(
     let task_rxb = shared_rxb.clone();
     let task_txb = shared_txb.clone();
 
+    let python_name = config.python_name();
     let read_task = tokio::spawn(async move {
         let mut pacer = ReconnectPacer::new(config.reconnect_delay, config.max_reconnect_tries);
+        let mut connected_before = false;
 
         loop {
             let session_id = generate_session_id();
@@ -508,8 +519,21 @@ pub async fn spawn_i2p_client(
                 "I2P client: stream connected"
             );
 
-            online_task.store(true, Ordering::SeqCst);
             pacer.reset();
+            // Python synthesizes on every connection (I2PInterface.py:503,
+            // :533).
+            let synthesis = config
+                .tunnel_identity
+                .as_ref()
+                .and_then(|identity| identity.synthesis(&python_name));
+            open_client_connection(
+                &rx,
+                std::mem::replace(&mut connected_before, true),
+                &transport_tx,
+                synthesis,
+                &online_task,
+            )
+            .await;
 
             // BufReader may have prefetched past the handshake; flush its tail first.
             let buffered = stream_buf_reader.buffer().to_vec();
@@ -961,6 +985,16 @@ impl ReconnectPacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_python_name_matches_python() {
+        // Python 1.5.5 `str()` output for this interface.
+        let peer = "abcdefghijklmnop.b32.i2p";
+        assert_eq!(
+            I2PClientConfig::new(&format!("Golden I2P to {peer}"), peer).python_name(),
+            "I2PInterfacePeer[Golden I2P to abcdefghijklmnop.b32.i2p]"
+        );
+    }
 
     #[test]
     fn test_i2p_client_config() {

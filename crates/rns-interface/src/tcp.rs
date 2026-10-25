@@ -10,7 +10,8 @@ use tokio::sync::mpsc;
 use crate::hdlc;
 use crate::kiss;
 use crate::traits::{
-    InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, handoff_accepted_interface,
+    InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, TunnelIdentity,
+    handoff_accepted_interface, open_client_connection, python_host,
 };
 use rns_transport::messages::{InboundPacket, TransportMessage};
 
@@ -50,6 +51,9 @@ pub struct TcpClientConfig {
     pub mode: InterfaceMode,
     /// Override HW MTU for link MTU discovery (Python `fixed_mtu`, >= 500).
     pub fixed_mtu: Option<u32>,
+    /// Signs a tunnel synthesis for every connection unless KISS-framed;
+    /// `None` sends none.
+    pub tunnel_identity: Option<TunnelIdentity>,
 }
 
 impl TcpClientConfig {
@@ -63,7 +67,18 @@ impl TcpClientConfig {
             max_reconnect_tries: None,
             mode: InterfaceMode::Full,
             fixed_mtu: None,
+            tunnel_identity: None,
         }
+    }
+
+    /// Python `str(TCPClientInterface)` (TCPInterface.py:457-461).
+    fn python_name(&self) -> String {
+        format!(
+            "TCPInterface[{}/{}:{}]",
+            self.name,
+            python_host(&self.target_host),
+            self.target_port
+        )
     }
 }
 
@@ -321,10 +336,12 @@ pub async fn spawn_tcp_client(
     let task_rxb = shared_rxb.clone();
     let task_txb = shared_txb.clone();
 
+    let python_name = config.python_name();
     let read_task = tokio::spawn(async move {
         let max_tries = config.max_reconnect_tries;
         let mut tries: usize = 0;
         let mut backoff = RECONNECT_WAIT_INITIAL;
+        let mut connected_before = false;
 
         loop {
             let addr = format!("{}:{}", config.target_host, config.target_port);
@@ -379,9 +396,23 @@ pub async fn spawn_tcp_client(
 
             let state = TcpInterfaceState::with_shared_counters(task_rxb.clone(), task_txb.clone());
             state.online.store(true, Ordering::SeqCst);
-            online2.store(true, Ordering::SeqCst);
             tries = 0;
             backoff = RECONNECT_WAIT_INITIAL;
+            // Python synthesizes on every non-KISS connection
+            // (TCPInterface.py:178-179, :298-299).
+            let synthesis = config
+                .tunnel_identity
+                .as_ref()
+                .filter(|_| !kiss_framing)
+                .and_then(|identity| identity.synthesis(&python_name));
+            open_client_connection(
+                &rx,
+                std::mem::replace(&mut connected_before, true),
+                &transport_tx,
+                synthesis,
+                &online2,
+            )
+            .await;
 
             let (reader, writer) = stream.into_split();
 
@@ -648,6 +679,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn client_python_names_match_python() {
+        // Python 1.5.5 `str()` output for these interfaces.
+        for (host, expected) in [
+            ("127.0.0.1", "TCPInterface[Golden Uplink/127.0.0.1:4242]"),
+            ("::1", "TCPInterface[Golden Uplink/[::1]:4242]"),
+            (
+                "hub.example.org",
+                "TCPInterface[Golden Uplink/hub.example.org:4242]",
+            ),
+        ] {
+            assert_eq!(
+                TcpClientConfig::new("Golden Uplink", host, 4242).python_name(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn test_tcp_client_config() {
         let config = TcpClientConfig::new("test", "127.0.0.1", 4242);
         assert_eq!(config.target_port, 4242);
@@ -813,6 +862,7 @@ mod tests {
             max_reconnect_tries: Some(1),
             mode: InterfaceMode::Full,
             fixed_mtu: None,
+            tunnel_identity: None,
         };
         let client_handle = spawn_tcp_client(client_cfg, 1, transport_tx.clone())
             .await
@@ -909,6 +959,7 @@ mod tests {
             max_reconnect_tries: Some(2),
             mode: InterfaceMode::Full,
             fixed_mtu: None,
+            tunnel_identity: None,
         };
 
         let handle = spawn_tcp_client(config, 99, transport_tx).await.unwrap();
@@ -953,6 +1004,7 @@ mod tests {
             max_reconnect_tries: Some(1),
             mode: InterfaceMode::Full,
             fixed_mtu: None,
+            tunnel_identity: None,
         };
         let client_handle = spawn_tcp_client(client_cfg, 321, transport_tx.clone())
             .await

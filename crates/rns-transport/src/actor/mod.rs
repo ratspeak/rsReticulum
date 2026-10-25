@@ -565,6 +565,9 @@ impl TransportActor {
                     }
                     TransportMessage::SharedConnectionLost => true,
                     TransportMessage::Rpc { .. } => true,
+                    TransportMessage::SynthesizeTunnel {
+                        interface_id: id, ..
+                    } => *id == interface_id,
                     _ => false,
                 };
                 if matches_owner {

@@ -19,7 +19,8 @@ use tokio::sync::mpsc;
 use crate::hdlc;
 use crate::socket_tuning::{iface_addr_for, set_keepalive_tuned, set_socket_buffers};
 use crate::traits::{
-    InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, handoff_accepted_interface,
+    InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, TunnelIdentity,
+    handoff_accepted_interface, open_client_connection, python_host,
 };
 use rns_transport::messages::{
     InboundPacket, InterfaceInspectionSnapshot, InterfaceInspectionSource, TransportMessage,
@@ -103,6 +104,8 @@ pub struct BackboneClientConfig {
     pub connect_timeout_secs: u64,
     pub max_reconnect_tries: Option<usize>,
     pub mode: InterfaceMode,
+    /// Signs a tunnel synthesis for every connection; `None` sends none.
+    pub tunnel_identity: Option<TunnelIdentity>,
 }
 
 impl BackboneClientConfig {
@@ -115,7 +118,18 @@ impl BackboneClientConfig {
             connect_timeout_secs: INITIAL_CONNECT_TIMEOUT,
             max_reconnect_tries: None,
             mode: InterfaceMode::Full,
+            tunnel_identity: None,
         }
+    }
+
+    /// Python `str(BackboneClientInterface)` (BackboneInterface.py:1114-1117).
+    fn python_name(&self) -> String {
+        format!(
+            "BackboneInterface[{}/{}:{}]",
+            self.name,
+            python_host(&self.target_host),
+            self.target_port
+        )
     }
 }
 
@@ -690,9 +704,11 @@ pub async fn spawn_backbone_client(
     let task_rxb = shared_rxb.clone();
     let task_txb = shared_txb.clone();
 
+    let python_name = config.python_name();
     let read_task = tokio::spawn(async move {
         let max_tries = config.max_reconnect_tries;
         let mut tries: usize = 0;
+        let mut connected_before = false;
 
         loop {
             let target = match tokio::time::timeout(
@@ -770,8 +786,21 @@ pub async fn spawn_backbone_client(
             };
 
             tune_stream(&stream);
-            online2.store(true, Ordering::SeqCst);
             tries = 0;
+            // Python synthesizes on every connection (BackboneInterface.py:922,
+            // :1019).
+            let synthesis = config
+                .tunnel_identity
+                .as_ref()
+                .and_then(|identity| identity.synthesis(&python_name));
+            open_client_connection(
+                &rx,
+                std::mem::replace(&mut connected_before, true),
+                &transport_tx,
+                synthesis,
+                &online2,
+            )
+            .await;
 
             let c_online = Arc::new(AtomicBool::new(true));
             let (reader, writer) = stream.into_split();
@@ -848,6 +877,26 @@ pub async fn spawn_backbone_client(
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn client_python_names_match_python() {
+        // Python 1.5.5 `str()` output for these interfaces.
+        for (host, expected) in [
+            (
+                "10.0.0.1",
+                "BackboneInterface[Golden Backbone/10.0.0.1:4243]",
+            ),
+            (
+                "fd00::1",
+                "BackboneInterface[Golden Backbone/[fd00::1]:4243]",
+            ),
+        ] {
+            assert_eq!(
+                BackboneClientConfig::new("Golden Backbone", host, 4243).python_name(),
+                expected
+            );
+        }
+    }
 
     #[derive(Clone)]
     struct TestClock {
