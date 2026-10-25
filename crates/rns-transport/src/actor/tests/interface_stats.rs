@@ -21,7 +21,7 @@ fn attach(actor: &mut TransportActor, id: InterfaceId) -> mpsc::Receiver<Bytes> 
 
 fn attach_ifac(actor: &mut TransportActor, id: InterfaceId, ifac_key: [u8; 64]) {
     let (mut entry, _rx) = make_test_interface(&format!("ifac_{id}"));
-    entry.ifac_key = Some(ifac_key);
+    entry.ifac_key = Some(ifac_key.into());
     entry.ifac_size = 8;
     actor.interfaces.insert(id, entry);
 }

@@ -42,7 +42,7 @@ pub(super) struct OfferedAnnounce {
     pub raw: Bytes,
     pub destination: [u8; 16],
     pub route: Option<path_recovery::RouteVersion>,
-    pub policy: (u64, u64, Option<[u8; 64]>, usize),
+    pub policy: (u64, u64, Option<rns_identity::ifac::IfacKey>, usize),
     pub receipt: crate::background_egress::BackgroundOfferReceipt,
 }
 
@@ -589,7 +589,7 @@ impl TransportActor {
                         (
                             entry.bitrate,
                             entry.announce_cap.to_bits(),
-                            entry.ifac_key,
+                            entry.ifac_key.clone(),
                             entry.ifac_size,
                         ) == offered.policy
                             && now_f64() >= entry.announce_allowed_at

@@ -10,7 +10,7 @@ fn ifac_hub() -> (TransportActor, mpsc::Receiver<Bytes>) {
     actor.transport_identity_hash = Some([0x42; 16]);
     let (mut entry, rx) = make_test_interface("held_ifac");
     entry.ifac_key =
-        Some(rns_identity::ifac::derive_ifac_key(Some("held"), Some("announces")).unwrap());
+        Some(rns_identity::ifac::IfacKey::derive(Some("held"), Some("announces")).unwrap());
     entry.ifac_size = 8;
     actor.interfaces.insert(1, entry);
     (actor, rx)
@@ -87,7 +87,7 @@ fn a_wire_announce_without_valid_ifac_is_dropped_and_never_held() {
         ingress.received_announce();
     }
     assert!(ingress.should_ingress_limit(), "precondition: a burst");
-    let ifac_key = actor.interfaces[&1].ifac_key.unwrap();
+    let ifac_key = actor.interfaces[&1].ifac_key.clone().unwrap();
     let (signed, signed_destination) = make_valid_announce("held.ifac.signed", 1);
     let (unsigned, unsigned_destination) = make_valid_announce("held.ifac.unsigned", 1);
 

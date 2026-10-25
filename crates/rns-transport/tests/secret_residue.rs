@@ -1,14 +1,18 @@
-//! IFAC masks, derived from the interface key, must not survive in freed heap
-//! memory once a packet is signed or verified.
+//! IFAC keys, and the masks derived from them, must not survive in freed heap
+//! memory once a packet is signed or verified or an interface is dropped.
 
 #[path = "../../rns-crypto/tests/residue/mod.rs"]
 mod residue;
+
+use std::collections::HashMap;
 
 use residue::{assert_no_residue, freed_by, pseudo_random, serial};
 use rns_crypto::ed25519::Ed25519PrivateKey;
 use rns_crypto::hkdf::hkdf_sha256;
 use rns_identity::ifac::derive_ifac_key;
+use rns_transport::constants::{InterfaceDirection, InterfaceMode};
 use rns_transport::ifac::{ifac_sign, ifac_verify};
+use rns_transport::messages::InterfaceEntry;
 
 const IFAC_SIZE: usize = 16;
 
@@ -52,4 +56,31 @@ fn ifac_verify_frees_no_mask() {
 
     assert_no_residue(&freed, &[("IFAC mask", &mask)]);
     assert_eq!(verified.unwrap(), packet);
+}
+
+#[test]
+fn an_interface_table_frees_no_ifac_keys() {
+    let _serial = serial();
+    let keys: Vec<[u8; 64]> = (0..48).map(|seed| pseudo_random(200 + seed)).collect();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+
+    // Growing the table moves every entry, so each key is moved several times.
+    let ((), freed) = freed_by(|| {
+        let mut interfaces = HashMap::new();
+        for (id, key) in keys.iter().enumerate() {
+            let entry = InterfaceEntry::new(
+                format!("ifac-{id}"),
+                InterfaceMode::Full,
+                InterfaceDirection::bidirectional(),
+                0,
+                500,
+                tx.clone(),
+            )
+            .with_ifac(*key, IFAC_SIZE);
+            interfaces.insert(id as u64, entry);
+        }
+    });
+
+    let secrets: Vec<(&str, &[u8])> = keys.iter().map(|key| ("IFAC key", &key[..])).collect();
+    assert_no_residue(&freed, &secrets);
 }

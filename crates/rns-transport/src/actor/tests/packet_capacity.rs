@@ -26,7 +26,7 @@ fn payload(mode: u8, mtu: u32) -> Vec<u8> {
 fn packet_capacity_attenuates_two_relays_without_changing_key_body() {
     let input = capacity(10_000, 10_000, true);
     let mut middle = capacity(1500, 1500, true);
-    middle.ifac_key = Some([1; 64]);
+    middle.ifac_key = Some([1; 64].into());
     middle.ifac_size = 16;
     let output = capacity(1000, 1000, true);
     let original = payload(1, 4096);
@@ -75,7 +75,7 @@ fn packet_capacity_opaque_modes_only_transit_with_exact_supported_shape() {
         );
     }
     let mut narrow = capacity(500, 508, false);
-    narrow.ifac_key = Some([1; 64]);
+    narrow.ifac_key = Some([1; 64].into());
     narrow.ifac_size = 9;
     assert_eq!(narrow.effective_clear_mtu().unwrap(), 499);
     assert!(
@@ -88,7 +88,7 @@ fn packet_capacity_checks_clear_and_wire_with_ifac_before_admission() {
     let (mut actor, _) = TransportActor::new();
     let (mut entry, mut rx) = make_test_interface("radio");
     entry.packet_capacity = InterfacePacketCapacity::new(500, 508, false);
-    entry.ifac_key = Some([5; 64]);
+    entry.ifac_key = Some([5; 64].into());
     entry.ifac_size = 8;
     actor.interfaces.insert(1, entry);
     let mut raw = make_data_packet([9; 16], 0).to_vec();

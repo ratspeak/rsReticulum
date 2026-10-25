@@ -113,7 +113,7 @@ impl TransportActor {
         } else {
             self.interfaces
                 .get(&packet.interface_id)
-                .map(|entry| (entry.ifac_key, entry.ifac_size))
+                .map(|entry| (entry.ifac_key.clone(), entry.ifac_size))
         };
         let raw: bytes::Bytes = match ifac {
             Some((Some(ifac_key), ifac_size)) => {

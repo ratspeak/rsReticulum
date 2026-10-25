@@ -248,6 +248,19 @@ pub mod rns_identity::ifac
 pub enum rns_identity::ifac::IfacError
 pub rns_identity::ifac::IfacError::HkdfFailed(rns_crypto::hkdf::HkdfError)
 pub rns_identity::ifac::IfacError::InvalidSalt
+pub struct rns_identity::ifac::IfacKey(_)
+impl rns_identity::ifac::IfacKey
+pub fn rns_identity::ifac::IfacKey::derive(core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<Self, rns_identity::ifac::IfacError>
+impl core::cmp::Eq for rns_identity::ifac::IfacKey
+impl core::cmp::PartialEq for rns_identity::ifac::IfacKey
+pub fn rns_identity::ifac::IfacKey::eq(&self, &Self) -> bool
+impl core::convert::From<[u8; 64]> for rns_identity::ifac::IfacKey
+pub fn rns_identity::ifac::IfacKey::from([u8; 64]) -> Self
+impl core::fmt::Debug for rns_identity::ifac::IfacKey
+pub fn rns_identity::ifac::IfacKey::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::deref::Deref for rns_identity::ifac::IfacKey
+pub type rns_identity::ifac::IfacKey::Target = [u8; 64]
+pub fn rns_identity::ifac::IfacKey::deref(&self) -> &[u8; 64]
 pub const rns_identity::ifac::IFAC_SALT: &str
 pub fn rns_identity::ifac::derive_ifac_identity(core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<(rns_identity::identity::Identity, [u8; 64], [u8; 64]), rns_identity::ifac::IfacError>
 pub fn rns_identity::ifac::derive_ifac_key(core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<[u8; 64], rns_identity::ifac::IfacError>

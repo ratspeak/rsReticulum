@@ -1362,7 +1362,7 @@ pub rns_transport::messages::InterfaceEntry::announce_rate_target: core::option:
 pub rns_transport::messages::InterfaceEntry::announces_from_internal: bool
 pub rns_transport::messages::InterfaceEntry::bitrate: u64
 pub rns_transport::messages::InterfaceEntry::direction: rns_transport::constants::InterfaceDirection
-pub rns_transport::messages::InterfaceEntry::ifac_key: core::option::Option<[u8; 64]>
+pub rns_transport::messages::InterfaceEntry::ifac_key: core::option::Option<rns_identity::ifac::IfacKey>
 pub rns_transport::messages::InterfaceEntry::ifac_size: usize
 pub rns_transport::messages::InterfaceEntry::ifac_violations: u64
 pub rns_transport::messages::InterfaceEntry::ingress: rns_transport::ingress::IngressController

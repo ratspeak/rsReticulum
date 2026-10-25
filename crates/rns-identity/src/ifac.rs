@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use rns_crypto::hkdf::hkdf_sha256;
 use rns_crypto::sha::sha256;
 use thiserror::Error;
@@ -28,6 +30,16 @@ pub fn derive_ifac_key(
     network_name: Option<&str>,
     passphrase: Option<&str>,
 ) -> Result<[u8; 64], IfacError> {
+    let mut key = [0u8; 64];
+    derive_into(network_name, passphrase, &mut key)?;
+    Ok(key)
+}
+
+fn derive_into(
+    network_name: Option<&str>,
+    passphrase: Option<&str>,
+    key: &mut [u8; 64],
+) -> Result<(), IfacError> {
     let mut ifac_origin = Zeroizing::new(Vec::with_capacity(64));
 
     if let Some(name) = network_name {
@@ -42,9 +54,55 @@ pub fn derive_ifac_key(
     let salt = hex_decode(IFAC_SALT).ok_or(IfacError::InvalidSalt)?;
 
     let derived = hkdf_sha256(64, &*ifac_origin_hash, Some(&salt), None)?;
-    let mut key = [0u8; 64];
     key.copy_from_slice(&derived);
-    Ok(key)
+    Ok(())
+}
+
+/// A derived IFAC key in one heap allocation, wiped when its last clone
+/// drops. Clones share the allocation, so tables and queues that move or copy
+/// an interface's settings never copy the key.
+#[derive(Clone)]
+pub struct IfacKey(Arc<Zeroizing<[u8; 64]>>);
+
+impl IfacKey {
+    /// [`derive_ifac_key`], written straight into the shared allocation.
+    pub fn derive(network_name: Option<&str>, passphrase: Option<&str>) -> Result<Self, IfacError> {
+        let mut key = Arc::new(Zeroizing::new([0u8; 64]));
+        derive_into(
+            network_name,
+            passphrase,
+            Arc::get_mut(&mut key).expect("a new Arc is unique"),
+        )?;
+        Ok(Self(key))
+    }
+}
+
+impl From<[u8; 64]> for IfacKey {
+    fn from(key: [u8; 64]) -> Self {
+        Self(Arc::new(Zeroizing::new(key)))
+    }
+}
+
+impl std::ops::Deref for IfacKey {
+    type Target = [u8; 64];
+
+    fn deref(&self) -> &[u8; 64] {
+        &self.0
+    }
+}
+
+impl PartialEq for IfacKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0[..] == other.0[..]
+    }
+}
+
+impl Eq for IfacKey {}
+
+impl std::fmt::Debug for IfacKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("IfacKey(<redacted>)")
+    }
 }
 
 /// Build the IFAC identity plus a self-signature over `SHA-256(ifac_key)`.
@@ -91,6 +149,17 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_key_matches_the_derived_bytes() {
+        let key = IfacKey::derive(Some("testnet"), Some("password")).unwrap();
+        assert_eq!(
+            *key,
+            derive_ifac_key(Some("testnet"), Some("password")).unwrap()
+        );
+        assert_eq!(key, IfacKey::from(*key));
+        assert_eq!(format!("{key:?}"), "IfacKey(<redacted>)");
+    }
 
     #[test]
     fn test_ifac_derivation_deterministic() {

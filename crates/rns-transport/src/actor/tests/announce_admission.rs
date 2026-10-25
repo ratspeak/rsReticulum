@@ -39,7 +39,7 @@ async fn announce_admission_partial_targets_keep_exact_wire_without_replay() {
     let (mut actor, _) = TransportActor::new();
     let (first, mut first_rx) = limited();
     let (mut second, mut second_rx) = limited();
-    second.ifac_key = Some([9; 64]);
+    second.ifac_key = Some([9; 64].into());
     second.ifac_size = 16;
     second.tx.try_send(Bytes::from_static(b"ordinary")).unwrap();
     actor.interfaces.insert(1, first);
@@ -61,7 +61,7 @@ async fn announce_admission_partial_targets_keep_exact_wire_without_replay() {
         &raw,
         rns_wire::flags::HeaderType::Header1
     )));
-    actor.interfaces.get_mut(&2).unwrap().ifac_key = Some([7; 64]);
+    actor.interfaces.get_mut(&2).unwrap().ifac_key = Some([7; 64].into());
     second_rx.try_recv().unwrap();
     actor.process_pending_announce_admissions();
     assert_eq!(second_rx.try_recv().unwrap().as_ref(), expected);

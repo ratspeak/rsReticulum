@@ -42,8 +42,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-identity.txt",
-      "itemCount": 417,
-      "sha256": "7bafe01c7a5a5a88cedb1ed3207008a5373a691b3b014dd3ebd1ee40b4ac4293"
+      "itemCount": 430,
+      "sha256": "3ea675b37cbbbb57d60659316d56f2582da42558b66760a87092018bca3d15e2"
     },
     {
       "name": "rns-transport",
@@ -52,7 +52,7 @@
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-transport.txt",
       "itemCount": 1947,
-      "sha256": "43b699055b574dd1c04ef5b0add1c49cdeef65570023cfed9de3f0baf6bc5396"
+      "sha256": "79cd60b1cde9c92e97f58ded693d3754b53311ec16f161ffa5b90775ec3c4a45"
     },
     {
       "name": "rns-link",
@@ -134,6 +134,7 @@
         "pub rns_transport::discovery::app_data::DiscoveryInfo::height: f64",
         "pub rns_transport::discovery::app_data::DiscoveryInfo::latitude: f64",
         "pub rns_transport::discovery::app_data::DiscoveryInfo::longitude: f64",
+        "pub rns_transport::messages::InterfaceEntry::ifac_key: core::option::Option<[u8; 64]>",
         "pub rns_transport::tunnel::TunnelEntry::interface_id: rns_transport::messages::InterfaceId"
       ],
       "rns-link": [

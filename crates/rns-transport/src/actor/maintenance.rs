@@ -538,7 +538,7 @@ impl TransportActor {
                                 policy: (
                                     entry.bitrate,
                                     entry.announce_cap.to_bits(),
-                                    entry.ifac_key,
+                                    entry.ifac_key.clone(),
                                     entry.ifac_size,
                                 ),
                                 receipt,

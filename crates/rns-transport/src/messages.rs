@@ -252,7 +252,7 @@ pub struct InterfaceEntry {
     pub bitrate: u64,
     pub mtu: u32,
     pub tx: mpsc::Sender<Bytes>,
-    pub ifac_key: Option<[u8; 64]>,
+    pub ifac_key: Option<rns_identity::ifac::IfacKey>,
     pub ifac_size: usize,
     pub announce_cap: f64,
     /// Earliest Unix time at which the next announce may be sent — enforces
@@ -388,7 +388,7 @@ impl InterfaceEntry {
     }
 
     pub fn with_ifac(mut self, key: [u8; 64], size: usize) -> Self {
-        self.ifac_key = Some(key);
+        self.ifac_key = Some(key.into());
         self.ifac_size = size;
         self
     }

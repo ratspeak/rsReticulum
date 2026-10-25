@@ -5362,7 +5362,7 @@ mod tests {
 
         // Configure IFAC on this interface
         let ifac_key = rns_identity::ifac::derive_ifac_key(Some("test"), Some("pass")).unwrap();
-        entry.ifac_key = Some(ifac_key);
+        entry.ifac_key = Some(ifac_key.into());
         entry.ifac_size = 4;
         actor.interfaces.insert(1, entry);
 
@@ -5385,7 +5385,7 @@ mod tests {
         let ifac_size = 4;
 
         let (mut entry1, _rx1) = make_test_interface("ifac_in");
-        entry1.ifac_key = Some(ifac_key);
+        entry1.ifac_key = Some(ifac_key.into());
         entry1.ifac_size = ifac_size;
         actor.interfaces.insert(1, entry1);
 
@@ -5425,7 +5425,7 @@ mod tests {
         let ifac_size = 4;
 
         let (mut entry1, _rx1) = make_test_interface("ifac_in");
-        entry1.ifac_key = Some(ifac_key);
+        entry1.ifac_key = Some(ifac_key.into());
         entry1.ifac_size = ifac_size;
         actor.interfaces.insert(1, entry1);
 

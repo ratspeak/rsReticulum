@@ -3,6 +3,7 @@
 //! to a Shared instance over a local socket; **Standalone** owns its
 //! interfaces and exposes no IPC. Python: `RNS/Reticulum.py`.
 
+use rns_identity::ifac::IfacKey;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -61,7 +62,7 @@ struct InterfaceControlMetadata {
     ingress_overrides: rns_transport::ingress::IngressOverrides,
     // Parent IFAC, inherited by accepted child connections (Python parity:
     // spawned interfaces copy the listener's ifac_size/netname/netkey).
-    ifac_key: Option<[u8; 64]>,
+    ifac_key: Option<IfacKey>,
     ifac_size: usize,
     ifac_netname: Option<String>,
     /// The host and port a client interface connects to (Python
@@ -96,7 +97,7 @@ impl InterfaceIfacStats {
             .get(&id)
             .and_then(|control| {
                 Some((
-                    control.ifac_key?,
+                    control.ifac_key.clone()?,
                     control.ifac_size,
                     control.ifac_netname.clone(),
                 ))
@@ -3895,7 +3896,7 @@ fn child_registration_from_parent(
 ) -> (
     rns_transport::messages::InterfaceRole,
     rns_transport::ingress::IngressOverrides,
-    Option<[u8; 64]>,
+    Option<IfacKey>,
     usize,
 ) {
     let parent_control = parent_id.and_then(|parent_id| {
@@ -3917,7 +3918,7 @@ fn child_registration_from_parent(
         .map(|control| {
             (
                 control.ingress_overrides,
-                control.ifac_key,
+                control.ifac_key.clone(),
                 control.ifac_size,
             )
         })
@@ -4457,7 +4458,7 @@ async fn register_interface_handle_with_role_and_overrides(
     handle: rns_interface::traits::InterfaceHandle,
     role: rns_transport::messages::InterfaceRole,
     ingress_overrides: rns_transport::ingress::IngressOverrides,
-    ifac_key: Option<[u8; 64]>,
+    ifac_key: Option<IfacKey>,
     ifac_size: usize,
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
@@ -4487,7 +4488,7 @@ async fn register_interface_handle_with_role_and_overrides_and_spawn_permit(
     handle: rns_interface::traits::InterfaceHandle,
     role: rns_transport::messages::InterfaceRole,
     ingress_overrides: rns_transport::ingress::IngressOverrides,
-    ifac_key: Option<[u8; 64]>,
+    ifac_key: Option<IfacKey>,
     ifac_size: usize,
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
@@ -4517,7 +4518,7 @@ async fn register_owned_interface_handle_with_role_and_overrides(
     owned: OwnedInterfaceHandle,
     role: rns_transport::messages::InterfaceRole,
     ingress_overrides: rns_transport::ingress::IngressOverrides,
-    ifac_key: Option<[u8; 64]>,
+    ifac_key: Option<IfacKey>,
     ifac_size: usize,
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
@@ -4549,7 +4550,7 @@ async fn prepare_interface_with_role_and_overrides(
     owned: OwnedInterfaceHandle,
     role: rns_transport::messages::InterfaceRole,
     ingress_overrides: rns_transport::ingress::IngressOverrides,
-    ifac_key: Option<[u8; 64]>,
+    ifac_key: Option<IfacKey>,
     ifac_size: usize,
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
@@ -4627,6 +4628,7 @@ async fn prepare_interface_with_role_and_overrides(
             .expect("interface_controls mutex poisoned");
         // A spawned child's IFAC is its parent's, network name included.
         let ifac_netname = ifac_key
+            .as_ref()
             .and(handle.parent_id)
             .and_then(|parent| controls.get(&parent))
             .and_then(|parent| parent.ifac_netname.clone());
@@ -4637,7 +4639,7 @@ async fn prepare_interface_with_role_and_overrides(
                 registry_owner,
                 role,
                 ingress_overrides: ingress_overrides.clone(),
-                ifac_key,
+                ifac_key: ifac_key.clone(),
                 ifac_size,
                 ifac_netname,
                 client_target: None,
@@ -4701,7 +4703,7 @@ async fn register_interface_with_post_init(
     transport_tx: &mpsc::Sender<TransportMessage>,
     handle: rns_interface::traits::InterfaceHandle,
     post_init: &interface_factory::InterfacePostInit,
-    ifac_key: Option<[u8; 64]>,
+    ifac_key: Option<IfacKey>,
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
@@ -4724,7 +4726,7 @@ async fn register_interface_with_post_init_and_spawn_permit(
     transport_tx: &mpsc::Sender<TransportMessage>,
     handle: rns_interface::traits::InterfaceHandle,
     post_init: &interface_factory::InterfacePostInit,
-    ifac_key: Option<[u8; 64]>,
+    ifac_key: Option<IfacKey>,
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
@@ -4748,7 +4750,7 @@ async fn register_owned_interface_with_post_init(
     transport_tx: &mpsc::Sender<TransportMessage>,
     owned: OwnedInterfaceHandle,
     post_init: &interface_factory::InterfacePostInit,
-    ifac_key: Option<[u8; 64]>,
+    ifac_key: Option<IfacKey>,
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
@@ -4839,7 +4841,7 @@ fn configured_peer_post_init(
 async fn prepare_interface_with_post_init(
     owned: OwnedInterfaceHandle,
     post_init: &interface_factory::InterfacePostInit,
-    ifac_key: Option<[u8; 64]>,
+    ifac_key: Option<IfacKey>,
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
@@ -4944,9 +4946,9 @@ async fn prepare_interface_with_post_init(
                 registry_owner,
                 role: rns_transport::messages::InterfaceRole::Normal,
                 ingress_overrides: post_init.ingress_overrides.clone(),
-                ifac_key,
+                ifac_netname: ifac_key.as_ref().and(post_init.ifac_network_name.clone()),
+                ifac_key: ifac_key.clone(),
                 ifac_size: post_init.ifac_size.unwrap_or(post_init.default_ifac_size),
-                ifac_netname: ifac_key.and(post_init.ifac_network_name.clone()),
                 client_target: None,
                 autoconnect_source: None,
             },
@@ -5049,7 +5051,7 @@ enum SingleRegistrationSpec {
         owned: OwnedInterfaceHandle,
         role: rns_transport::messages::InterfaceRole,
         ingress_overrides: rns_transport::ingress::IngressOverrides,
-        ifac_key: Option<[u8; 64]>,
+        ifac_key: Option<IfacKey>,
         ifac_size: usize,
         kind: InterfaceKind,
         multipoint: bool,
@@ -5057,7 +5059,7 @@ enum SingleRegistrationSpec {
     PostInit {
         owned: OwnedInterfaceHandle,
         post_init: interface_factory::InterfacePostInit,
-        ifac_key: Option<[u8; 64]>,
+        ifac_key: Option<IfacKey>,
         kind: InterfaceKind,
     },
 }
@@ -5441,7 +5443,7 @@ async fn register_interfaces_with_post_init_batch(
     transport_tx: &mpsc::Sender<TransportMessage>,
     handles: Vec<OwnedInterfaceHandle>,
     post_init: &interface_factory::InterfacePostInit,
-    ifac_key: Option<[u8; 64]>,
+    ifac_key: Option<IfacKey>,
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
@@ -5487,7 +5489,7 @@ async fn batch_registration_worker(
     transport_tx: mpsc::Sender<TransportMessage>,
     handles: Vec<OwnedInterfaceHandle>,
     post_init: interface_factory::InterfacePostInit,
-    ifac_key: Option<[u8; 64]>,
+    ifac_key: Option<IfacKey>,
     interface_controls: InterfaceControlMap,
     interface_registry: InterfaceRegistry,
     kind: InterfaceKind,
@@ -5525,7 +5527,7 @@ async fn register_interfaces_with_post_init_batch_transaction(
     transport_tx: &mpsc::Sender<TransportMessage>,
     handles: Vec<OwnedInterfaceHandle>,
     post_init: &interface_factory::InterfacePostInit,
-    ifac_key: Option<[u8; 64]>,
+    ifac_key: Option<IfacKey>,
     interface_controls: &InterfaceControlMap,
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
@@ -5537,7 +5539,7 @@ async fn register_interfaces_with_post_init_batch_transaction(
         match prepare_interface_with_post_init(
             owned,
             post_init,
-            ifac_key,
+            ifac_key.clone(),
             interface_controls,
             interface_registry,
             kind,
@@ -5720,9 +5722,9 @@ fn remove_interface_control_if_owner(
 
 fn derive_ifac_key_from_post_init(
     post_init: &interface_factory::InterfacePostInit,
-) -> Option<[u8; 64]> {
+) -> Option<IfacKey> {
     if post_init.ifac_network_name.is_some() || post_init.ifac_passphrase.is_some() {
-        rns_identity::ifac::derive_ifac_key(
+        IfacKey::derive(
             post_init.ifac_network_name.as_deref(),
             post_init.ifac_passphrase.as_deref().map(String::as_str),
         )
@@ -9525,7 +9527,7 @@ mod tests {
                     prepare_interface_with_post_init(
                         handle.into(),
                         &post_init,
-                        Some([1; 64]),
+                        Some([1; 64].into()),
                         &controls,
                         &registry,
                         InterfaceKind::Standard,
@@ -9536,7 +9538,7 @@ mod tests {
                         handle.into(),
                         rns_transport::messages::InterfaceRole::Normal,
                         Default::default(),
-                        Some([1; 64]),
+                        Some([1; 64].into()),
                         size,
                         &controls,
                         &registry,
@@ -14254,7 +14256,7 @@ egress_control = Yes
             &transport_tx,
             test_interface_handle(parent_id, None, "ifac-parent"),
             &post_init,
-            ifac_key,
+            ifac_key.clone(),
             &interface_controls,
             &interface_registry,
             InterfaceKind::Standard,
