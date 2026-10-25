@@ -92,7 +92,8 @@ mod pcsc_transport {
     }
 
     fn transmit_once(card: &pcsc::Card, command: &[u8]) -> Result<Vec<u8>, RatkeyError> {
-        let mut response_buf = vec![0u8; MAX_RESPONSE];
+        // The receive buffer can hold an ECDH shared secret.
+        let mut response_buf = zeroize::Zeroizing::new(vec![0u8; MAX_RESPONSE]);
         let response = card.transmit(command, &mut response_buf).map_err(|e| {
             warn!("PC/SC transmit failed: {}", e);
             RatkeyError::Disconnected

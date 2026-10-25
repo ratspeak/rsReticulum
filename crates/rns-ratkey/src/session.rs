@@ -7,6 +7,7 @@ use crate::detect::DeviceType;
 use crate::error::RatkeyError;
 use crate::pin::PinCache;
 use crate::transport::PivTransport;
+use zeroize::Zeroizing;
 
 /// Device identity captured once at connect time; no per-operation cost.
 pub struct DeviceMeta {
@@ -180,28 +181,32 @@ impl<T: PivTransport> PivSession<T> {
     /// when the card answers 0x6982 (security status not satisfied) — e.g.
     /// pin_policy=ALWAYS slots, or the applet was re-selected since the last
     /// VERIFY. The cache expires on its own timeout and is cleared by `lock`.
-    fn transmit_pin_gated(&mut self, cmd: &[u8]) -> Result<Vec<u8>, RatkeyError> {
-        let resp = self.transport.transmit(cmd)?;
-        match apdu::check_response(&resp) {
+    /// Responses can carry an ECDH shared secret, so they are wiped on drop.
+    fn transmit_pin_gated(&mut self, cmd: &[u8]) -> Result<Zeroizing<Vec<u8>>, RatkeyError> {
+        let mut resp = Zeroizing::new(self.transport.transmit(cmd)?);
+        let mut data_len = apdu::check_response(&resp).map(<[u8]>::len);
+        if matches!(
+            data_len,
             Err(RatkeyError::Apdu {
                 sw1: 0x69,
                 sw2: 0x82,
-            }) => {
-                let pin = match self.pin_cache.get() {
-                    Some(pin) => zeroize::Zeroizing::new(pin.to_string()),
-                    None => {
-                        return Err(RatkeyError::Apdu {
-                            sw1: 0x69,
-                            sw2: 0x82,
-                        });
-                    }
-                };
-                self.verify_pin(&pin)?;
-                let resp = self.transport.transmit(cmd)?;
-                Ok(apdu::check_response(&resp)?.to_vec())
-            }
-            other => Ok(other?.to_vec()),
+            })
+        ) {
+            let pin = match self.pin_cache.get() {
+                Some(pin) => Zeroizing::new(pin.to_string()),
+                None => {
+                    return Err(RatkeyError::Apdu {
+                        sw1: 0x69,
+                        sw2: 0x82,
+                    });
+                }
+            };
+            self.verify_pin(&pin)?;
+            resp = Zeroizing::new(self.transport.transmit(cmd)?);
+            data_len = apdu::check_response(&resp).map(<[u8]>::len);
         }
+        resp.truncate(data_len?);
+        Ok(resp)
     }
 
     pub fn sign_ed25519(&mut self, slot: u8, message: &[u8]) -> Result<[u8; 64], RatkeyError> {

@@ -7,6 +7,7 @@ use std::path::Path;
 use rns_crypto::hkdf::derive_key_64;
 use rns_crypto::token;
 use rns_identity::identity::Identity;
+use zeroize::Zeroizing;
 
 use crate::apdu::{SLOT_AUTHENTICATION as SLOT_9A, SLOT_KEY_MANAGEMENT as SLOT_9D};
 use crate::error::RatkeyError;
@@ -220,10 +221,10 @@ impl HardwareIdentity {
             }
         }
 
-        let shared_secret = self.ecdh(&ephemeral_pub_bytes)?;
+        let shared_secret = Zeroizing::new(self.ecdh(&ephemeral_pub_bytes)?);
 
         // HKDF-SHA256, salt = identity hash. Matches Identity::decrypt.
-        let derived = derive_key_64(&shared_secret, &self.identity.hash)
+        let derived = derive_key_64(&shared_secret[..], &self.identity.hash)
             .map_err(|_| RatkeyError::EcdhFailed("HKDF derivation failed".to_string()))?;
 
         token::decrypt(encrypted_token, &derived[..])
