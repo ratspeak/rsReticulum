@@ -333,7 +333,7 @@ pub rns_runtime::interface_factory::InterfacePostInit::announces_from_internal: 
 pub rns_runtime::interface_factory::InterfacePostInit::bitrate: core::option::Option<u64>
 pub rns_runtime::interface_factory::InterfacePostInit::default_ifac_size: usize
 pub rns_runtime::interface_factory::InterfacePostInit::ifac_network_name: core::option::Option<alloc::string::String>
-pub rns_runtime::interface_factory::InterfacePostInit::ifac_passphrase: core::option::Option<alloc::string::String>
+pub rns_runtime::interface_factory::InterfacePostInit::ifac_passphrase: core::option::Option<zeroize::Zeroizing<alloc::string::String>>
 pub rns_runtime::interface_factory::InterfacePostInit::ifac_size: core::option::Option<usize>
 pub rns_runtime::interface_factory::InterfacePostInit::ingress_control: bool
 pub rns_runtime::interface_factory::InterfacePostInit::ingress_overrides: rns_transport::ingress::IngressOverrides
@@ -1748,6 +1748,8 @@ pub struct rns_runtime::reticulum::RuntimeInterfaceIfacConfig
 pub rns_runtime::reticulum::RuntimeInterfaceIfacConfig::ifac_size: core::option::Option<usize>
 pub rns_runtime::reticulum::RuntimeInterfaceIfacConfig::network_name: core::option::Option<alloc::string::String>
 pub rns_runtime::reticulum::RuntimeInterfaceIfacConfig::passphrase: core::option::Option<alloc::string::String>
+impl core::fmt::Debug for rns_runtime::reticulum::RuntimeInterfaceIfacConfig
+pub fn rns_runtime::reticulum::RuntimeInterfaceIfacConfig::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct rns_runtime::reticulum::SendOptions
 pub rns_runtime::reticulum::SendOptions::attached_interface: core::option::Option<rns_transport::messages::InterfaceId>
 pub rns_runtime::reticulum::SendOptions::create_receipt: bool

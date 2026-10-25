@@ -5724,7 +5724,7 @@ fn derive_ifac_key_from_post_init(
     if post_init.ifac_network_name.is_some() || post_init.ifac_passphrase.is_some() {
         rns_identity::ifac::derive_ifac_key(
             post_init.ifac_network_name.as_deref(),
-            post_init.ifac_passphrase.as_deref(),
+            post_init.ifac_passphrase.as_deref().map(String::as_str),
         )
         .ok()
     } else {
@@ -5732,11 +5732,26 @@ fn derive_ifac_key_from_post_init(
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct RuntimeInterfaceIfacConfig {
     pub network_name: Option<String>,
     pub passphrase: Option<String>,
     pub ifac_size: Option<usize>,
+}
+
+// The passphrase is the interface's secret; debug output names only its presence.
+impl std::fmt::Debug for RuntimeInterfaceIfacConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeInterfaceIfacConfig")
+            .field("network_name", &self.network_name)
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .field("ifac_size", &self.ifac_size)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -5775,7 +5790,7 @@ fn runtime_ifac_post_init(
             .expect("empty interface defaults are valid")
             .with_default_ifac_size(default_ifac_size);
     post_init.ifac_network_name = network_name;
-    post_init.ifac_passphrase = passphrase;
+    post_init.ifac_passphrase = passphrase.map(zeroize::Zeroizing::new);
     post_init.ifac_size = ifac.ifac_size;
     Ok(Some(post_init))
 }
@@ -6098,7 +6113,7 @@ fn discovery_config_for_interface(
             .then(|| post_init.ifac_network_name.clone())
             .flatten(),
         ifac_netkey: publish_ifac
-            .then(|| post_init.ifac_passphrase.clone())
+            .then(|| post_init.ifac_passphrase.as_deref().cloned())
             .flatten(),
         frequency: section.get_uint("discovery_frequency").or(frequency),
         bandwidth: section.get_uint("discovery_bandwidth").or(bandwidth),
@@ -6608,7 +6623,7 @@ async fn spawn_discovered_backbone_client(
             .with_default_ifac_size(16);
     finalize_post_init(&mut post_init, &handle.config);
     post_init.ifac_network_name = record.info.ifac_netname.clone();
-    post_init.ifac_passphrase = record.info.ifac_netkey.clone();
+    post_init.ifac_passphrase = record.info.ifac_netkey.clone().map(zeroize::Zeroizing::new);
     let ifac_key = derive_ifac_key_from_post_init(&post_init);
     register_interface_with_post_init_and_spawn_permit(
         &handle.transport_tx,
@@ -9035,7 +9050,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(post_init.ifac_network_name.as_deref(), Some("testnet"));
-        assert_eq!(post_init.ifac_passphrase.as_deref(), Some("secret"));
+        assert_eq!(
+            post_init.ifac_passphrase.as_deref().map(String::as_str),
+            Some("secret")
+        );
         assert_eq!(post_init.ifac_size, None);
         assert_eq!(post_init.default_ifac_size, 16);
     }

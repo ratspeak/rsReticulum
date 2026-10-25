@@ -87,8 +87,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-runtime.txt",
-      "itemCount": 2143,
-      "sha256": "bbc823bcc6673a564785b135ee2f73404bcdaa4a231b2b112589e422e7b19654"
+      "itemCount": 2145,
+      "sha256": "a4496892f8c4f6aeb9f840179e1a967b576679056045dd4511d5fe064f32544c"
     },
     {
       "name": "rns-tools",
@@ -158,6 +158,7 @@
         "pub fn rns_runtime::interface_factory::InterfacePostInit::from_section(&rns_runtime::config::ConfigSection) -> Self",
         "pub fn rns_runtime::link_manager::LinkManager::set_link_packet_channel(&mut self, tokio::sync::mpsc::unbounded::UnboundedSender<(alloc::vec::Vec<u8>, [u8; 16])>)",
         "pub mod rns_runtime::remote_management_schema",
+        "pub rns_runtime::interface_factory::InterfacePostInit::ifac_passphrase: core::option::Option<alloc::string::String>",
         "pub rns_runtime::remote_management_schema::InterfaceStats::announce_queue: core::option::Option<u64>",
         "pub rns_runtime::remote_management_schema::InterfaceStats::bitrate: core::option::Option<u64>",
         "pub rns_runtime::remote_management_schema::InterfaceStats::blocked_ips: core::option::Option<u64>",

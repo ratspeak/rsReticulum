@@ -35,6 +35,7 @@
 - Decryption, key derivation and identity and ratchet file handling no longer leave copies of keys or plaintext in freed memory, and identity files larger than 1 KiB are refused.
 - A 64-byte identity file always loads as a raw key, as in Python Reticulum. About one key in 29,000 began with bytes that were misread as the older envelope format, and its identity failed to load.
 - Writing, verifying and recovering state files retries a read that a signal interrupts instead of failing.
+- Interface options wipe their IFAC passphrase when dropped, and the debug output of IFAC settings no longer shows it.
 
 ## 1.4.0 - 2026-10-12
 

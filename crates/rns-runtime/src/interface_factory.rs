@@ -1633,7 +1633,8 @@ pub struct InterfacePostInit {
     pub announce_rate_grace: Option<u32>,
     pub announce_rate_penalty: Option<u64>,
     pub ifac_network_name: Option<String>,
-    pub ifac_passphrase: Option<String>,
+    /// Wiped when dropped.
+    pub ifac_passphrase: Option<zeroize::Zeroizing<String>>,
     pub ifac_size: Option<usize>,
     /// Fallback when `ifac_size` is unset; per-class in Python.
     pub default_ifac_size: usize,
@@ -1719,7 +1720,7 @@ impl InterfacePostInit {
             ifac_passphrase: section
                 .get("passphrase")
                 .or_else(|| section.get("pass_phrase"))
-                .map(|s| s.to_string()),
+                .map(|s| zeroize::Zeroizing::new(s.to_string())),
             ifac_size,
             default_ifac_size: 8,
             ingress_control,
@@ -2904,7 +2905,10 @@ mod tests {
         assert!(!pi.outgoing);
         assert_eq!(pi.bitrate, Some(115200));
         assert_eq!(pi.ifac_network_name.as_deref(), Some("testnet"));
-        assert_eq!(pi.ifac_passphrase.as_deref(), Some("secret"));
+        assert_eq!(
+            pi.ifac_passphrase.as_deref().map(String::as_str),
+            Some("secret")
+        );
         assert_eq!(pi.ifac_size, Some(16));
         assert!(!pi.ingress_control);
         assert!((pi.announce_cap.unwrap() - 0.05).abs() < f64::EPSILON);
