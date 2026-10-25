@@ -94,8 +94,10 @@ pub(crate) fn stat_entries(
     entries
         .into_iter()
         .map(|e| {
+            let autoconnect_source = ifac.and_then(|records| records.autoconnect_source(e.id));
             let ifac = ifac.map(|ifac| ifac.lookup(e.id)).unwrap_or_default();
             rpc::InterfaceStatEntry {
+                autoconnect_source,
                 parent_interface_name: e.parent_id.and_then(|id| names.get(&id).cloned()),
                 id: e.id,
                 name: e.name,

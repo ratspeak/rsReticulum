@@ -121,3 +121,50 @@ async fn autoconnect_connects_once_per_endpoint() {
     handle.shutdown_and_wait().await;
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Python names the network that announced an auto-connected interface in
+/// its stats, as the announcer's identity hash in hex (Discovery.py:865,
+/// Reticulum.py:1611-1612), and `rnstatus` prints it (rnstatus.py:525-526).
+#[tokio::test]
+async fn an_autoconnected_interface_names_its_source() {
+    let (uplink_port, port) = (unused_port().await, unused_port().await);
+    let dir = config_dir("source", &hub_config(uplink_port));
+    let handle = start(&dir).await;
+    maybe_autoconnect_discovered(&handle, discovered("sourced", "localhost", port)).await;
+    let id = *handle
+        .discovery
+        .autoconnected
+        .lock()
+        .await
+        .values()
+        .next()
+        .expect("the interface auto-connected");
+
+    let Some(TransportQueryResponse::InterfaceStats(entries)) = handle
+        .query_transport(TransportQuery::GetInterfaceStats)
+        .await
+    else {
+        panic!("no interface stats");
+    };
+    let records = InterfaceIfacStats(handle.interface_controls.clone());
+    let stats = crate::rpc_server::stat_entries(entries, Some(&records));
+    let source = |name: &str| {
+        stats
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("{name} is listed"))
+            .autoconnect_source
+            .clone()
+    };
+    let autoconnected_name = stats
+        .iter()
+        .find(|entry| entry.id == id)
+        .expect("the auto-connected interface is listed")
+        .name
+        .clone();
+    assert_eq!(source(&autoconnected_name), Some(hex::encode([0x5a; 16])));
+    assert_eq!(source("Uplink"), None);
+
+    handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(dir);
+}

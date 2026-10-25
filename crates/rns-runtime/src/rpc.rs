@@ -205,6 +205,10 @@ pub struct InterfaceStatEntry {
     /// Name of the listener that accepted this interface.
     #[serde(default)]
     pub parent_interface_name: Option<String>,
+    /// The network identity, in hex, that announced an auto-connected
+    /// interface (Python `autoconnect_source`).
+    #[serde(default)]
+    pub autoconnect_source: Option<String>,
 }
 
 /// What a transport instance adds to its interface stats
@@ -751,7 +755,10 @@ fn interface_stat_value(e: &InterfaceStatEntry) -> PyValue {
             "ifac_netname",
             optional(e.ifac_netname.clone().map(PyValue::String)),
         ),
-        ("autoconnect_source", PyValue::None),
+        (
+            "autoconnect_source",
+            optional(e.autoconnect_source.clone().map(PyValue::String)),
+        ),
         ("announce_queue", optional(e.announce_queue.map(int))),
         ("held_announces", int(e.held_announces)),
         (
@@ -1043,6 +1050,7 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, Rpc
                     .and_then(py_u64)
                     .unwrap_or(0),
                 parent_interface_name: dict_get(m, "parent_interface_name").and_then(py_string),
+                autoconnect_source: dict_get(m, "autoconnect_source").and_then(py_string),
             })
         })
         .collect()

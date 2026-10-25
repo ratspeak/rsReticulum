@@ -87,8 +87,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-runtime.txt",
-      "itemCount": 2142,
-      "sha256": "a318326e7ce8e7bace2e2bcb3299e96cd18a8eb89d3f0703921ea12712fb3bc0"
+      "itemCount": 2143,
+      "sha256": "bbc823bcc6673a564785b135ee2f73404bcdaa4a231b2b112589e422e7b19654"
     },
     {
       "name": "rns-tools",

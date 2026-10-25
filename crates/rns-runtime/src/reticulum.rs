@@ -67,12 +67,16 @@ struct InterfaceControlMetadata {
     /// The host and port a client interface connects to (Python
     /// `target_ip`, `target_port`), which auto-connect checks.
     client_target: Option<(String, u16)>,
+    /// The network identity, in hex, that announced an auto-connected
+    /// interface (Python `autoconnect_source`, Discovery.py:865).
+    autoconnect_source: Option<String>,
 }
 
 type InterfaceControlMap = Arc<std::sync::Mutex<HashMap<u64, InterfaceControlMetadata>>>;
 
-/// IFAC fields of Python's interface stats, from the runtime's registration
-/// records: all `None` for an interface without IFAC.
+/// The fields of Python's interface stats that come from the runtime's
+/// registration records: IFAC, all `None` for an interface without it, and
+/// the auto-connect source.
 #[derive(Clone)]
 pub(crate) struct InterfaceIfacStats(InterfaceControlMap);
 
@@ -105,6 +109,14 @@ impl InterfaceIfacStats {
             size: Some(size),
             netname,
         }
+    }
+
+    pub(crate) fn autoconnect_source(&self, id: u64) -> Option<String> {
+        self.0
+            .lock()
+            .expect("interface_controls mutex poisoned")
+            .get(&id)
+            .and_then(|control| control.autoconnect_source.clone())
     }
 }
 
@@ -4629,6 +4641,7 @@ async fn prepare_interface_with_role_and_overrides(
                 ifac_size,
                 ifac_netname,
                 client_target: None,
+                autoconnect_source: None,
             },
         );
     }
@@ -4935,6 +4948,7 @@ async fn prepare_interface_with_post_init(
                 ifac_size: post_init.ifac_size.unwrap_or(post_init.default_ifac_size),
                 ifac_netname: ifac_key.and(post_init.ifac_network_name.clone()),
                 client_target: None,
+                autoconnect_source: None,
             },
         );
     let entry = rns_transport::messages::InterfaceEntry {
@@ -6608,7 +6622,10 @@ async fn spawn_discovered_backbone_client(
     )
     .await
     .map_err(|error| format!("Backbone client registration failed: {error}"))?;
-    record_client_target(&handle.interface_controls, id, host, port);
+    update_interface_control(&handle.interface_controls, id, |control| {
+        control.client_target = Some((host.to_string(), port));
+        control.autoconnect_source = Some(hex::encode(record.network_id));
+    });
     tracing::info!(name = %name, id, endpoint = %format!("{host}:{port}"), "auto-connected discovered interface");
     Ok(id)
 }
@@ -8774,6 +8791,7 @@ mod tests {
                 ifac_size: 0,
                 ifac_netname: None,
                 client_target: None,
+                autoconnect_source: None,
             },
         );
 
@@ -8920,6 +8938,7 @@ mod tests {
                 ifac_size: 0,
                 ifac_netname: None,
                 client_target: None,
+                autoconnect_source: None,
             },
         );
         drop(registration);
@@ -14186,6 +14205,7 @@ egress_control = Yes
                     ifac_size: 0,
                     ifac_netname: None,
                     client_target: None,
+                    autoconnect_source: None,
                 },
             );
 

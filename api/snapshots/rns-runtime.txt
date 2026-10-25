@@ -2031,6 +2031,7 @@ pub rns_runtime::rpc::InterfaceStatEntry::announce_rate_penalty: core::option::O
 pub rns_runtime::rpc::InterfaceStatEntry::announce_rate_target: core::option::Option<f64>
 pub rns_runtime::rpc::InterfaceStatEntry::announces_received: u64
 pub rns_runtime::rpc::InterfaceStatEntry::announces_sent: u64
+pub rns_runtime::rpc::InterfaceStatEntry::autoconnect_source: core::option::Option<alloc::string::String>
 pub rns_runtime::rpc::InterfaceStatEntry::bitrate: u64
 pub rns_runtime::rpc::InterfaceStatEntry::blocked_ips: core::option::Option<u64>
 pub rns_runtime::rpc::InterfaceStatEntry::burst_activated: f64
