@@ -459,6 +459,7 @@ pub rns_interface::i2p::I2PClientConfig::tunnel_identity: core::option::Option<r
 impl rns_interface::i2p::I2PClientConfig
 pub fn rns_interface::i2p::I2PClientConfig::new(&str, &str) -> Self
 pub struct rns_interface::i2p::I2PServerConfig
+pub rns_interface::i2p::I2PServerConfig::b32: core::option::Option<tokio::sync::watch::Sender<core::option::Option<alloc::string::String>>>
 pub rns_interface::i2p::I2PServerConfig::keyfile: core::option::Option<alloc::string::String>
 pub rns_interface::i2p::I2PServerConfig::mode: rns_interface::traits::InterfaceMode
 pub rns_interface::i2p::I2PServerConfig::name: alloc::string::String
@@ -480,6 +481,7 @@ pub const rns_interface::i2p::RECONNECT_WAIT: u64
 pub const rns_interface::i2p::RECONNECT_WAIT_MAX: u64
 pub const rns_interface::i2p::SAM_VERSION: &str
 pub const rns_interface::i2p::TUNNEL_KEEPALIVE: u64
+pub fn rns_interface::i2p::destination_b32(&str) -> core::option::Option<alloc::string::String>
 pub fn rns_interface::i2p::parse_sam_reply(&str) -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)>
 pub fn rns_interface::i2p::sam_reply_get<'a>(&'a [(alloc::string::String, alloc::string::String)], &str) -> core::option::Option<&'a str>
 pub fn rns_interface::i2p::sam_reply_has_token(&[(alloc::string::String, alloc::string::String)], &str) -> bool

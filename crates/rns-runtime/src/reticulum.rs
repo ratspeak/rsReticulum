@@ -3,7 +3,7 @@
 //! to a Shared instance over a local socket; **Standalone** owns its
 //! interfaces and exposes no IPC. Python: `RNS/Reticulum.py`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1125,6 +1125,8 @@ struct LocalDiscoveryInterface {
     id: u64,
     config: DiscoveryInterfaceConfig,
     online: Option<Arc<AtomicBool>>,
+    /// Overrides `config.reachable_on` once the interface learns its address.
+    reachable_on: Option<tokio::sync::watch::Receiver<Option<String>>>,
 }
 
 impl ReticulumHandle {
@@ -3533,6 +3535,12 @@ pub async fn init_with_policy(
                         .iter()
                         .map(|owned| (owned.interface.id, owned.interface.online.clone()))
                         .collect();
+                    let discovery_addresses: HashMap<_, _> = iface_handles
+                        .iter()
+                        .filter_map(|owned| {
+                            Some((owned.interface.id, owned.discovery_address.clone()?))
+                        })
+                        .collect();
                     match register_interfaces_with_post_init_batch(
                         &transport_tx,
                         iface_handles,
@@ -3551,13 +3559,25 @@ pub async fn init_with_policy(
                             {
                                 startup_rnode_runtimes.push(runtime);
                             }
-                            for registered_id in registered_ids {
+                            // Python announces an I2P interface itself, never its
+                            // peers (Discovery.py:112); without a server the
+                            // first peer stands in.
+                            let announced = match iface_config {
+                                interface_factory::InterfaceConfig::I2P(_) => {
+                                    &registered_ids[..registered_ids.len().min(1)]
+                                }
+                                _ => &registered_ids[..],
+                            };
+                            for &registered_id in announced {
                                 if let Some(ref cfg) = discovery_config {
                                     discovery_runtime.local_interfaces.lock().await.push(
                                         LocalDiscoveryInterface {
                                             id: registered_id,
                                             config: cfg.clone(),
                                             online: discovery_online.get(&registered_id).cloned(),
+                                            reachable_on: discovery_addresses
+                                                .get(&registered_id)
+                                                .cloned(),
                                         },
                                     );
                                 }
@@ -3938,6 +3958,10 @@ fn interface_kind_for_config(config: &interface_factory::InterfaceConfig) -> Int
 struct OwnedInterfaceHandle {
     interface: rns_interface::traits::InterfaceHandle,
     driver: Option<rns_interface::rnode::RNodeDriverHandle>,
+    /// An I2P peer that Python's `I2PInterface` creates for a configured peer.
+    configured_peer: bool,
+    /// The address a discoverable interface learns at runtime (I2P b32).
+    discovery_address: Option<tokio::sync::watch::Receiver<Option<String>>>,
 }
 
 /// Startup-only observation captured before ownership moves into the
@@ -4019,6 +4043,8 @@ impl From<rns_interface::traits::InterfaceHandle> for OwnedInterfaceHandle {
         Self {
             interface,
             driver: None,
+            configured_peer: false,
+            discovery_address: None,
         }
     }
 }
@@ -4028,6 +4054,8 @@ impl From<rns_interface::rnode::SpawnedRNodeInterface> for OwnedInterfaceHandle 
         Self {
             interface: spawned.interface,
             driver: Some(spawned.driver),
+            configured_peer: false,
+            discovery_address: None,
         }
     }
 }
@@ -4516,7 +4544,9 @@ async fn prepare_interface_with_role_and_overrides(
             error.to_string(),
         ));
     }
-    let OwnedInterfaceHandle { interface, driver } = owned;
+    let OwnedInterfaceHandle {
+        interface, driver, ..
+    } = owned;
     let handle = interface;
     let name = handle.name.clone();
     let id = handle.id;
@@ -4724,6 +4754,29 @@ fn clone_interface_post_init(
     }
 }
 
+/// Python's configured I2P peers take only IFAC from their interface and keep
+/// every other default (I2PInterface.py:359-381).
+fn configured_peer_post_init(
+    post_init: &interface_factory::InterfacePostInit,
+) -> interface_factory::InterfacePostInit {
+    interface_factory::InterfacePostInit {
+        outgoing: true,
+        bitrate: None,
+        announce_cap: None,
+        announce_rate_target: None,
+        announce_rate_grace: None,
+        announce_rate_penalty: None,
+        ifac_network_name: post_init.ifac_network_name.clone(),
+        ifac_passphrase: post_init.ifac_passphrase.clone(),
+        ifac_size: post_init.ifac_size,
+        default_ifac_size: post_init.default_ifac_size,
+        ingress_control: true,
+        ingress_overrides: Default::default(),
+        recursive_prs: false,
+        announces_from_internal: true,
+    }
+}
+
 async fn prepare_interface_with_post_init(
     owned: OwnedInterfaceHandle,
     post_init: &interface_factory::InterfacePostInit,
@@ -4732,6 +4785,13 @@ async fn prepare_interface_with_post_init(
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
 ) -> Result<PreparedInterfaceRegistration, InterfaceRegistrationError> {
+    let peer_post_init;
+    let post_init = if owned.configured_peer {
+        peer_post_init = configured_peer_post_init(post_init);
+        &peer_post_init
+    } else {
+        post_init
+    };
     let ingress = if post_init.ingress_overrides.is_empty() {
         rns_transport::ingress::IngressController::new()
     } else {
@@ -4767,7 +4827,9 @@ async fn prepare_interface_with_post_init(
             error.to_string(),
         ));
     }
-    let OwnedInterfaceHandle { interface, driver } = owned;
+    let OwnedInterfaceHandle {
+        interface, driver, ..
+    } = owned;
     let handle = interface;
     // Outbound = physical capability AND `outgoing` config flag.
     let direction = rns_transport::constants::InterfaceDirection {
@@ -5553,6 +5615,7 @@ async fn rollback_unreserved_interface(owned: OwnedInterfaceHandle, kind: Interf
     let OwnedInterfaceHandle {
         interface: handle,
         driver,
+        ..
     } = owned;
     handle.online.store(false, Ordering::SeqCst);
     stop_special_interface_before_abort(kind).await;
@@ -5895,21 +5958,11 @@ fn discovery_config_for_interface(
                 None,
                 None,
             ),
-            interface_factory::InterfaceConfig::I2P(c) => (
-                "I2PInterface",
-                configured_reachable_on(section).or_else(|| {
-                    if c.connectable {
-                        c.peers.first().cloned()
-                    } else {
-                        None
-                    }
-                }),
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
+            // The server announces its own b32 once SAM assigns it
+            // (Discovery.py:215-216).
+            interface_factory::InterfaceConfig::I2P(_) => {
+                ("I2PInterface", None, None, None, None, None, None)
+            }
             #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
             interface_factory::InterfaceConfig::RNode(c) => (
                 "RNodeInterface",
@@ -6218,7 +6271,7 @@ async fn run_discovery_publisher(
     }
     let mut publications: HashMap<u64, Publication> = HashMap::new();
     let mut announcer = Announcer::new(stamper);
-    let mut registered = HashSet::new();
+    let mut registered: HashMap<u64, Option<String>> = HashMap::new();
     let mut next_prepare = std::time::Instant::now();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -6236,12 +6289,21 @@ async fn run_discovery_publisher(
                 .online
                 .as_ref()
                 .is_none_or(|online| online.load(Ordering::Acquire));
-            if online && registered.insert(local.id) {
-                announcer.register(
-                    local.id,
-                    handle.transport_identity.hash,
-                    local.config.clone(),
-                );
+            let reachable_on = local
+                .reachable_on
+                .as_ref()
+                .map(|reachable_on| reachable_on.borrow().clone());
+            let moved = reachable_on
+                .as_ref()
+                .is_some_and(|reachable_on| registered.get(&local.id) != Some(reachable_on));
+            if online && (!registered.contains_key(&local.id) || moved) {
+                let mut config = local.config.clone();
+                if let Some(reachable_on) = reachable_on.clone() {
+                    config.reachable_on = reachable_on;
+                }
+                registered.insert(local.id, reachable_on.flatten());
+                publications.remove(&local.id);
+                announcer.register(local.id, handle.transport_identity.hash, config);
                 next_prepare = now;
             }
         }
@@ -8123,6 +8185,8 @@ async fn spawn_interface_with_rnode_startup_options(
                 server_config.sam_host = c.i2p_sam_host.clone();
                 server_config.sam_port = c.i2p_sam_port;
                 server_config.mode = c.mode;
+                let (b32_tx, b32_rx) = tokio::sync::watch::channel(None);
+                server_config.b32 = Some(b32_tx);
                 let server_id = next.take().unwrap_or_else(|| next_id(&id_gen));
                 let server = rns_interface::i2p::spawn_i2p_server(
                     server_config,
@@ -8133,7 +8197,10 @@ async fn spawn_interface_with_rnode_startup_options(
                 )
                 .await
                 .map_err(|e| format!("I2P server: {e}"))?;
-                handles.push(server.into());
+                handles.push(OwnedInterfaceHandle {
+                    discovery_address: Some(b32_rx),
+                    ..server.into()
+                });
             }
             for peer in &c.peers {
                 let mut client_config = rns_interface::i2p::I2PClientConfig::new(
@@ -8142,7 +8209,6 @@ async fn spawn_interface_with_rnode_startup_options(
                 );
                 client_config.sam_host = c.i2p_sam_host.clone();
                 client_config.sam_port = c.i2p_sam_port;
-                client_config.mode = c.mode;
                 client_config.tunnel_identity = Some(tunnel_identity.clone());
                 let peer_id = next.take().unwrap_or_else(|| next_id(&id_gen));
                 match rns_interface::i2p::spawn_i2p_client(
@@ -8152,7 +8218,10 @@ async fn spawn_interface_with_rnode_startup_options(
                 )
                 .await
                 {
-                    Ok(client) => handles.push(client.into()),
+                    Ok(client) => handles.push(OwnedInterfaceHandle {
+                        configured_peer: true,
+                        ..client.into()
+                    }),
                     Err(e) => {
                         for spawned in handles {
                             rollback_unreserved_interface(spawned, InterfaceKind::Standard).await;
@@ -8471,6 +8540,7 @@ pub enum ReticulumError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     mod interface_stats;
     mod tunnels;
@@ -11772,6 +11842,7 @@ loglevel = 7
             id,
             config,
             online: None,
+            reachable_on: None,
         }
     }
 
@@ -11866,6 +11937,45 @@ loglevel = 7
                 .unwrap();
             actor.await.unwrap();
         }
+    }
+
+    /// An interface announces the address it learns at runtime, and again
+    /// whenever that address changes (Discovery.py:215-216).
+    #[tokio::test]
+    async fn discovery_publisher_announces_the_address_an_interface_learns() {
+        use rns_interface::traits::InterfaceMode;
+        let (handle, actor) = discovery_actor();
+        let (_, mut sink) = discovery_egress(&handle, 1, InterfaceMode::Full, 8).await;
+        let (address, reachable_on) = tokio::sync::watch::channel(Some("a".repeat(52)));
+        let mut i2p = advertised_service(44, false);
+        i2p.config.interface_type = "I2PInterface".into();
+        i2p.config.reachable_on = None;
+        i2p.config.port = None;
+        i2p.reachable_on = Some(reachable_on);
+        let publisher = tokio::spawn(run_discovery_announcer(
+            handle.clone(),
+            Arc::new(StaticStamper),
+            vec![i2p],
+        ));
+        for b32 in ["a".repeat(52), "b".repeat(52)] {
+            address.send_replace(Some(b32.clone()));
+            let raw = tokio::time::timeout(Duration::from_secs(3), sink.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(read_discovery_packet(&raw, &handle).reachable_on, Some(b32));
+        }
+        handle.shutdown.trigger();
+        tokio::time::timeout(Duration::from_secs(2), publisher)
+            .await
+            .unwrap()
+            .unwrap();
+        handle
+            .transport_tx
+            .send(TransportMessage::Shutdown)
+            .await
+            .unwrap();
+        actor.await.unwrap();
     }
 
     #[tokio::test]

@@ -293,6 +293,9 @@ pub struct I2PServerConfig {
     pub keyfile: Option<String>,
     pub reconnect_delay: u64,
     pub mode: InterfaceMode,
+    /// Receives the server's b32 address (Python `I2PInterface.b32`) whenever
+    /// SAM creates its session.
+    pub b32: Option<tokio::sync::watch::Sender<Option<String>>>,
 }
 
 impl I2PServerConfig {
@@ -304,8 +307,63 @@ impl I2PServerConfig {
             keyfile: None,
             reconnect_delay: RECONNECT_WAIT,
             mode: InterfaceMode::Full,
+            b32: None,
         }
     }
+}
+
+/// The b32 address of the destination in a SAM private key: the hash of its
+/// first 387 bytes plus its certificate (i2plib `Destination.base32`,
+/// RNS/vendor/i2plib/sam.py:113-129).
+pub fn destination_b32(private_key: &str) -> Option<String> {
+    let key = i2p_base64_decode(private_key)?;
+    let certificate = usize::from(u16::from_be_bytes(key.get(385..387)?.try_into().ok()?));
+    let hash = rns_crypto::sha::sha256(key.get(..387 + certificate)?);
+    Some(base32_lowercase(&hash))
+}
+
+/// Base64 with I2P's `-~` alphabet (i2plib `i2p_b64decode`).
+fn i2p_base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut buffer, mut bits) = (0u32, 0u32);
+    for c in text.trim_end_matches('=').bytes() {
+        let value = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' => 62,
+            b'~' => 63,
+            _ => return None,
+        };
+        buffer = buffer << 6 | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    Some(bytes)
+}
+
+/// RFC 4648 base32, lowercase and unpadded.
+fn base32_lowercase(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut text = String::with_capacity(bytes.len().div_ceil(5) * 8);
+    let (mut buffer, mut bits) = (0u32, 0u32);
+    for byte in bytes {
+        buffer = buffer << 8 | u32::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            text.push(char::from(ALPHABET[(buffer >> bits) as usize & 31]));
+        }
+        buffer &= (1 << bits) - 1;
+    }
+    if bits > 0 {
+        text.push(char::from(ALPHABET[(buffer << (5 - bits)) as usize & 31]));
+    }
+    text
 }
 
 #[derive(Debug, Clone)]
@@ -688,6 +746,9 @@ pub async fn spawn_i2p_server(
                 dest_len = our_dest.len(),
                 "I2P server: session created, accepting streams"
             );
+            if let Some(b32) = &config.b32 {
+                b32.send_replace(destination_b32(&our_dest));
+            }
             online_task.store(true, Ordering::SeqCst);
 
             // Each STREAM ACCEPT needs its own SAM TCP connection.
@@ -1097,6 +1158,49 @@ mod tests {
         assert!(sam_reply_has_token(&pairs, "REPLY"));
         assert!(!sam_reply_has_token(&pairs, "RESULT"));
         assert!(!sam_reply_has_token(&pairs, "NONEXISTENT"));
+    }
+
+    fn i2p_base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-~";
+        let mut text = String::new();
+        for chunk in bytes.chunks(3) {
+            let bits = chunk.iter().enumerate().fold(0u32, |bits, (n, byte)| {
+                bits | u32::from(*byte) << (16 - 8 * n)
+            });
+            for n in 0..=chunk.len() {
+                text.push(char::from(ALPHABET[(bits >> (18 - 6 * n)) as usize & 63]));
+            }
+            text.extend(std::iter::repeat_n('=', 3 - chunk.len()));
+        }
+        text
+    }
+
+    fn private_key(certificate: &[u8], secret: u8) -> Vec<u8> {
+        let mut key: Vec<u8> = (0..384).map(|n| n as u8).collect();
+        key.extend_from_slice(certificate);
+        key.extend(std::iter::repeat_n(secret, 288));
+        key
+    }
+
+    /// Only the destination, keys plus certificate, names the address
+    /// (i2plib sam.py:113-129); the golden is checked against i2plib in tests.
+    #[test]
+    fn the_b32_address_hashes_only_the_destination() {
+        let ed25519 = [5, 0, 4, 0, 7, 0, 0];
+        let b32 = destination_b32(&i2p_base64(&private_key(&ed25519, 0x42))).unwrap();
+        assert_eq!(b32.len(), 52);
+        assert!(b32.bytes().all(|c| matches!(c, b'a'..=b'z' | b'2'..=b'7')));
+        assert_eq!(
+            destination_b32(&i2p_base64(&private_key(&ed25519, 0x24))).as_ref(),
+            Some(&b32)
+        );
+        assert_ne!(
+            destination_b32(&i2p_base64(&private_key(&[0, 0, 0], 0x42))).as_ref(),
+            Some(&b32)
+        );
+        assert_eq!(destination_b32("not+base64"), None);
+        assert_eq!(destination_b32(&i2p_base64(&[0; 300])), None);
     }
 
     #[test]

@@ -78,8 +78,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-interface.txt",
-      "itemCount": 1428,
-      "sha256": "e34b67309d70de46edbcec1941517a5602603bdf76a1944e249bd3fa95bf2146"
+      "itemCount": 1430,
+      "sha256": "00ef8baba7b42d50c77748061dc1ed3cf4c3fbf0d6b5756ac316f2a5e0cb5731"
     },
     {
       "name": "rns-runtime",

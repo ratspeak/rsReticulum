@@ -94,6 +94,26 @@ async fn wait_for_interface(
     }
 }
 
+/// A SAM private key in I2P's base64 alphabet: a destination of 384 key bytes
+/// and an Ed25519 key certificate, then 256 private and 32 signing-key bytes.
+fn fake_sam_private_key() -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-~";
+    let mut key: Vec<u8> = (0..384).map(|n| n as u8).collect();
+    key.extend_from_slice(&[5, 0, 4, 0, 7, 0, 0]);
+    key.extend(std::iter::repeat_n(0x42, 256 + 32));
+    let mut text = String::new();
+    for chunk in key.chunks(3) {
+        let bits = chunk.iter().enumerate().fold(0u32, |bits, (n, byte)| {
+            bits | u32::from(*byte) << (16 - 8 * n)
+        });
+        for n in 0..=chunk.len() {
+            text.push(char::from(ALPHABET[(bits >> (18 - 6 * n)) as usize & 63]));
+        }
+        text.extend(std::iter::repeat_n('=', 3 - chunk.len()));
+    }
+    text
+}
+
 /// Minimal SAM v3.1 bridge. Completes HELLO, SESSION CREATE and every STREAM
 /// CONNECT, plus the first `accepts` STREAM ACCEPTs, handing each data socket
 /// to the test; later accepts stay pending.
@@ -128,10 +148,11 @@ async fn fake_sam(
                         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                         .is_ok();
                 if command.starts_with("SESSION CREATE") {
-                    let _ = reader
-                        .get_mut()
-                        .write_all(b"SESSION STATUS RESULT=OK DESTINATION=fakesamsession\n")
-                        .await;
+                    let reply = format!(
+                        "SESSION STATUS RESULT=OK DESTINATION={}\n",
+                        fake_sam_private_key()
+                    );
+                    let _ = reader.get_mut().write_all(reply.as_bytes()).await;
                 } else if command.starts_with("STREAM CONNECT") || accepted {
                     let reply: &[u8] = if accepted {
                         b"STREAM STATUS RESULT=OK\npeerdestination0123456789\n"
@@ -262,6 +283,140 @@ async fn an_i2p_interface_runs_its_server_and_every_peer() {
             .any(|entry| entry.name == "Golden I2P"),
         "the server runs alongside its peers"
     );
+
+    handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Python announces only the `I2PInterface` itself; its peers are not
+/// discoverable (Interface.py:119, Discovery.py:112, :140). Rust has no
+/// interface for a non-connectable server, so its first peer stands in.
+#[tokio::test]
+async fn a_discoverable_i2p_interface_announces_once() {
+    for (connectable, announcer) in [
+        ("yes", "Golden I2P"),
+        ("no", "Golden I2P to peeraaaaaaaaaaaa.b32.i2p"),
+    ] {
+        let (sam_port, _streams) = fake_sam(0).await;
+        let dir = config_dir(
+            "i2p-discovery",
+            &format!(
+                "[reticulum]\n  share_instance = No\n  enable_transport = Yes\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = {connectable}\n    peers = peeraaaaaaaaaaaa.b32.i2p, peerbbbbbbbbbbbb.b32.i2p\n    discoverable = yes\n    bootstrap_only = yes\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n"
+            ),
+        );
+        let handle = start(&dir).await;
+        let registered = interfaces(&handle).await;
+        let name = |id: u64| {
+            registered
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.name.clone())
+        };
+        let discoverable: Vec<_> = handle
+            .discovery
+            .local_interfaces
+            .lock()
+            .await
+            .iter()
+            .map(|local| name(local.id))
+            .collect();
+        let bootstrap: Vec<_> = handle
+            .discovery
+            .bootstrap_interfaces
+            .lock()
+            .await
+            .iter()
+            .map(|id| name(*id))
+            .collect();
+        assert_eq!(
+            discoverable,
+            [Some(announcer.to_string())],
+            "connectable = {connectable}"
+        );
+        assert_eq!(
+            bootstrap,
+            [Some(announcer.to_string())],
+            "connectable = {connectable}"
+        );
+
+        handle.shutdown_and_wait().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Python announces a connectable I2P interface at its own b32 address
+/// (Discovery.py:215-216), never at a configured peer's.
+#[tokio::test]
+async fn a_connectable_i2p_interface_announces_its_own_b32() {
+    let (sam_port, _streams) = fake_sam(0).await;
+    let dir = config_dir(
+        "i2p-b32",
+        &format!(
+            "[reticulum]\n  share_instance = No\n  enable_transport = Yes\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    peers = peeraaaaaaaaaaaa.b32.i2p\n    discoverable = yes\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n"
+        ),
+    );
+    let handle = start(&dir).await;
+    let mut reachable = handle.discovery.local_interfaces.lock().await[0]
+        .reachable_on
+        .clone()
+        .expect("the server publishes its address");
+    let b32 = tokio::time::timeout(
+        Duration::from_secs(10),
+        reachable.wait_for(|b32| b32.is_some()),
+    )
+    .await
+    .expect("SAM creates the server's session")
+    .unwrap()
+    .clone();
+    assert_eq!(
+        b32,
+        rns_interface::i2p::destination_b32(&fake_sam_private_key())
+    );
+    assert_eq!(
+        handle.discovery.local_interfaces.lock().await[0]
+            .config
+            .reachable_on,
+        None,
+        "a configured peer is not our address"
+    );
+
+    handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Python's configured peers keep MODE_FULL and no announce-rate settings,
+/// and take only IFAC from their interface (I2PInterface.py:359-381); the
+/// interface's own settings apply to it alone (Reticulum.py:1030, :1059).
+#[tokio::test]
+async fn configured_i2p_peers_take_only_ifac_from_their_interface() {
+    let (sam_port, _streams) = fake_sam(0).await;
+    let peer = "peeraaaaaaaaaaaa.b32.i2p";
+    let dir = config_dir(
+        "i2p-peer-settings",
+        &format!(
+            "[reticulum]\n  share_instance = No\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    peers = {peer}\n    mode = gateway\n    announce_rate_target = 3600\n    announce_cap = 5\n    network_name = tunnelnet\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n"
+        ),
+    );
+    let handle = start(&dir).await;
+    let server = wait_for_interface(&handle, |entry| entry.name == "Golden I2P")
+        .await
+        .unwrap();
+    let peer = wait_for_interface(&handle, |entry| {
+        entry.name == format!("Golden I2P to {peer}")
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        (server.mode.as_str(), server.announce_rate_target),
+        ("Gateway", Some(3600.0))
+    );
+    assert_eq!(
+        (peer.mode.as_str(), peer.announce_rate_target),
+        ("Full", None)
+    );
+    assert_eq!(peer.announce_cap, ANNOUNCE_CAP);
+    assert!(server.ifac_size > 0);
+    assert_eq!(peer.ifac_size, server.ifac_size);
 
     handle.shutdown_and_wait().await;
     let _ = std::fs::remove_dir_all(dir);
