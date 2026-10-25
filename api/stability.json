@@ -52,7 +52,7 @@
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-transport.txt",
       "itemCount": 1947,
-      "sha256": "c4ff5c04b28d12b3ad660f5e0608810bf80235e6c4dd41a674413ded29c11240"
+      "sha256": "43b699055b574dd1c04ef5b0add1c49cdeef65570023cfed9de3f0baf6bc5396"
     },
     {
       "name": "rns-link",
@@ -114,6 +114,8 @@
     "migrationGuide": "api/migrations/1.4.md",
     "removed": {
       "rns-transport": [
+        "pub enum rns_transport::discovery::Reason",
+        "pub enum rns_transport::discovery::receiver::Reason",
         "pub fn rns_transport::tunnel::handle_tunnel(&mut rns_transport::tunnel::TunnelTable, [u8; 32], rns_transport::messages::InterfaceId, f64)",
         "pub rns_transport::actor::DiscoveryPathRequest::requesting_interface: rns_transport::messages::InterfaceId",
         "pub rns_transport::actor::DiscoveryPathRequest::timeout: f64",

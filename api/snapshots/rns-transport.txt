@@ -488,7 +488,7 @@ pub mod rns_transport::discovery::receiver
 pub enum rns_transport::discovery::receiver::Outcome
 pub rns_transport::discovery::receiver::Outcome::Accepted
 pub rns_transport::discovery::receiver::Outcome::Rejected(rns_transport::discovery::receiver::Reason)
-pub enum rns_transport::discovery::receiver::Reason
+#[non_exhaustive] pub enum rns_transport::discovery::receiver::Reason
 pub rns_transport::discovery::receiver::Reason::DecodeFailed
 pub rns_transport::discovery::receiver::Reason::DecryptFailed
 pub rns_transport::discovery::receiver::Reason::EncryptedWithoutKey
@@ -588,7 +588,7 @@ pub rns_transport::discovery::ManifestError::NotAMap
 pub enum rns_transport::discovery::Outcome
 pub rns_transport::discovery::Outcome::Accepted
 pub rns_transport::discovery::Outcome::Rejected(rns_transport::discovery::receiver::Reason)
-pub enum rns_transport::discovery::Reason
+#[non_exhaustive] pub enum rns_transport::discovery::Reason
 pub rns_transport::discovery::Reason::DecodeFailed
 pub rns_transport::discovery::Reason::DecryptFailed
 pub rns_transport::discovery::Reason::EncryptedWithoutKey

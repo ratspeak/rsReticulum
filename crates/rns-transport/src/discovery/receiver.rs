@@ -77,6 +77,7 @@ pub enum Outcome {
 }
 
 #[derive(Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Reason {
     /// No `app_data` on the announce — discovery announces always carry one.
     MissingAppData,
