@@ -606,10 +606,6 @@ impl TransportActor {
             self.protocol_violation(interface_id);
         }
 
-        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
-            entry.ingress.received_path_request();
-        }
-
         let now = now_f64();
         let mut unique_tag = Vec::with_capacity(32);
         unique_tag.extend_from_slice(&requested_dest);
@@ -621,6 +617,11 @@ impl TransportActor {
             return;
         }
         self.discovery_pr_tags.insert(unique_tag, now);
+        // Python counts a path request once its tag passes this gate
+        // (Transport.py:1847-1858).
+        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
+            entry.ingress.received_path_request();
+        }
 
         if self.local_destinations.contains(&requested_dest) {
             debug!(

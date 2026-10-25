@@ -11001,8 +11001,10 @@ mod tests {
         assert_eq!(actor.discovery_pr_tags.len(), 3);
     }
 
+    /// Python 1.5 counts a path request only once its tag passes the
+    /// duplicate gate (Transport.py:1847-1858), where 1.4 counted every one.
     #[test]
-    fn duplicate_path_requests_still_count_toward_ingress_frequency() {
+    fn duplicate_path_requests_do_not_count_toward_ingress_frequency() {
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
 
@@ -11024,15 +11026,15 @@ mod tests {
         actor.handle_inbound_path_request(&payload, 1);
 
         assert!(boundary_rx.try_recv().is_err());
-        assert!(
+        assert_eq!(
             actor
                 .interfaces
                 .get(&1)
                 .unwrap()
                 .ingress
-                .incoming_pr_frequency()
-                > 0.0,
-            "duplicate tagged PRs must still contribute to ingress PR stats"
+                .path_requests_received(),
+            1,
+            "duplicate tagged PRs neither forward nor count"
         );
     }
 

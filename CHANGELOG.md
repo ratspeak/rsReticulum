@@ -25,6 +25,7 @@
 - Interface discovery announces name this stack, `rsRNS`, and its version. `rnsd-rs` auto-connects only to Backbone interfaces announced by Python Reticulum 1.5.2 or later, or to any announced Backbone interface with `autoconnect_unverified_implementations`, and no longer stores or lists discovered TCP client interfaces, as in Python Reticulum.
 - Discovery announces a KISS-framed TCP client as a KISS interface and sends and reads unset radio parameters as nil, so Python and `rnsd-rs` read each other's KISS, Weave and RNode announces, as in Python Reticulum.
 - `rns_link::clock::ContinuousInstant` reads a monotonic clock that keeps counting while the system is suspended, for deadlines that must hold in real time across a sleep.
+- An interface counts a path request in its stats only once its tag passes the duplicate check, as in Python Reticulum 1.5.
 
 ## 1.4.0 - 2026-10-12
 

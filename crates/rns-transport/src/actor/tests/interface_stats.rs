@@ -304,6 +304,25 @@ fn a_full_transmit_queue_counts_dropped_bytes() {
     assert_eq!(entry.tx_dropped_bytes, 50, "txdrb");
 }
 
+/// Python counts a path request once its destination and tag pass the
+/// duplicate gate (Transport.py:1847-1858), so a repeat sent through another
+/// requestor neither counts nor brings the ingress limit closer.
+#[test]
+fn a_repeated_path_request_tag_is_not_counted() {
+    let mut actor = hub();
+    let _rx = attach(&mut actor, 1);
+    let request = |requestor: u8| {
+        let mut rest = vec![requestor; 16];
+        rest.extend_from_slice(&[0xA1; 16]);
+        path_request([0x51; 16], &rest)
+    };
+
+    inbound(&mut actor, request(0xC1), 1);
+    inbound(&mut actor, request(0xC2), 1);
+
+    assert_eq!(stats(&mut actor, 1).path_requests_received, 1, "prxc");
+}
+
 #[test]
 fn an_accepted_client_names_its_listener() {
     let mut actor = hub();
