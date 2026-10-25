@@ -853,6 +853,11 @@ async fn a_tcp_client_drops_traffic_queued_while_it_was_disconnected() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The clients below give up a connection attempt after this many seconds,
+/// so their first attempt has failed once it passes, even where the system
+/// keeps retrying a refused connect (Windows does for about two seconds).
+const FIRST_ATTEMPT_TIMEOUT_SECS: u64 = 1;
+
 /// A failed connection attempt is an outage too: traffic queued while a
 /// client's first attempts fail is dropped, so however much was queued the
 /// synthesis opens the connection (Python drops traffic while offline,
@@ -863,7 +868,10 @@ async fn assert_failed_first_attempts_drop_their_backlog(tag: &str, port: u16, i
         &format!("[reticulum]\n  share_instance = No\n\n[interfaces]\n{interface}"),
     );
     let handle = start(&dir).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(
+        FIRST_ATTEMPT_TIMEOUT_SECS * 1000 + 500,
+    ))
+    .await;
 
     let mut markers = Vec::new();
     for n in 0..1100 {
@@ -895,7 +903,7 @@ async fn a_tcp_client_drops_traffic_queued_while_its_first_attempts_fail() {
     assert_failed_first_attempts_drop_their_backlog(
         "tcp-first-backlog",
         port,
-        &format!("  [[Uplink]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 127.0.0.1\n    target_port = {port}\n"),
+        &format!("  [[Uplink]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 127.0.0.1\n    target_port = {port}\n    connect_timeout = {FIRST_ATTEMPT_TIMEOUT_SECS}\n"),
     )
     .await;
 }
@@ -906,7 +914,7 @@ async fn a_backbone_client_drops_traffic_queued_while_its_first_attempts_fail() 
     assert_failed_first_attempts_drop_their_backlog(
         "backbone-first-backlog",
         port,
-        &format!("  [[Backbone Up]]\n    type = BackboneInterface\n    enabled = yes\n    target_host = 127.0.0.1\n    port = {port}\n"),
+        &format!("  [[Backbone Up]]\n    type = BackboneInterface\n    enabled = yes\n    target_host = 127.0.0.1\n    port = {port}\n    connect_timeout = {FIRST_ATTEMPT_TIMEOUT_SECS}\n"),
     )
     .await;
 }
