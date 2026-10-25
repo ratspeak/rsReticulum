@@ -131,10 +131,12 @@ async fn sam_session_create(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
     session_id: &str,
     private_key: Option<&str>,
+    transient_signature_type: Option<u8>,
 ) -> Result<String, SamError> {
-    let dest_param = match private_key {
-        Some(key) => key.to_string(),
-        None => "TRANSIENT".to_string(),
+    let dest_param = match (private_key, transient_signature_type) {
+        (Some(key), _) => key.to_string(),
+        (None, Some(signature_type)) => format!("TRANSIENT SIGNATURE_TYPE={signature_type}"),
+        (None, None) => "TRANSIENT".to_string(),
     };
     let create_msg = format!(
         "SESSION CREATE STYLE=STREAM ID={} DESTINATION={}\n",
@@ -289,8 +291,12 @@ pub struct I2PServerConfig {
     pub name: String,
     pub sam_host: String,
     pub sam_port: u16,
-    /// Base64 private key for a persistent destination; `None` = transient.
+    /// Base64 private key for the server's destination, used before `key_path`.
     pub keyfile: Option<String>,
+    /// File holding the server's private key, as Python keeps it under
+    /// `storage/i2p` (I2PInterface.py:225-255): every session uses it, and
+    /// the first session's key is written to it when it is missing.
+    pub key_path: Option<std::path::PathBuf>,
     pub reconnect_delay: u64,
     pub mode: InterfaceMode,
     /// Receives the server's b32 address (Python `I2PInterface.b32`) whenever
@@ -305,11 +311,35 @@ impl I2PServerConfig {
             sam_host: DEFAULT_SAM_ADDRESS.to_string(),
             sam_port: DEFAULT_SAM_PORT,
             keyfile: None,
+            key_path: None,
             reconnect_delay: RECONNECT_WAIT,
             mode: InterfaceMode::Full,
             b32: None,
         }
     }
+}
+
+/// i2plib's signature type for new destinations, EdDSA-SHA512-Ed25519
+/// (RNS/vendor/i2plib/sam.py:91-93).
+const NEW_DESTINATION_SIGNATURE_TYPE: u8 = 7;
+
+/// The stored key, `None` when there is none yet. A file that cannot be read
+/// is an error, so it is never replaced.
+fn read_private_key(path: &std::path::Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(key) => Ok(Some(key.trim().to_string()).filter(|key| !key.is_empty())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Keep a session's private key readable by its owner only, replaced
+/// atomically, as the other private keys are.
+fn store_private_key(path: &std::path::Path, key: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    rns_identity::persistence::atomic_write(path, key.as_bytes())
 }
 
 /// The b32 address of the destination in a SAM private key: the hash of its
@@ -477,6 +507,7 @@ pub async fn spawn_i2p_client(
                 &mut session_writer,
                 &mut session_buf_reader,
                 &session_id,
+                None,
                 None,
             )
             .await
@@ -718,12 +749,28 @@ pub async fn spawn_i2p_server(
                 continue;
             }
 
-            let private_key = config.keyfile.as_deref();
+            let (private_key, store_key) = match (&config.keyfile, config.key_path.as_deref()) {
+                (Some(key), _) => (Some(key.clone()), false),
+                (None, None) => (None, false),
+                (None, Some(path)) => match read_private_key(path) {
+                    Ok(key) => (key.clone(), key.is_none()),
+                    Err(error) => {
+                        tracing::warn!(
+                            name = %config.name,
+                            path = %path.display(),
+                            %error,
+                            "I2P server: cannot read its private key; this session's address is transient"
+                        );
+                        (None, false)
+                    }
+                },
+            };
             let our_dest = match sam_session_create(
                 &mut session_writer,
                 &mut session_buf_reader,
                 &session_id,
-                private_key,
+                private_key.as_deref(),
+                Some(NEW_DESTINATION_SIGNATURE_TYPE),
             )
             .await
             {
@@ -746,6 +793,17 @@ pub async fn spawn_i2p_server(
                 dest_len = our_dest.len(),
                 "I2P server: session created, accepting streams"
             );
+            if store_key
+                && let Some(path) = config.key_path.as_deref()
+                && let Err(error) = store_private_key(path, &our_dest)
+            {
+                tracing::warn!(
+                    name = %config.name,
+                    path = %path.display(),
+                    %error,
+                    "I2P server: failed to store its private key; its address changes with the next session"
+                );
+            }
             if let Some(b32) = &config.b32 {
                 b32.send_replace(destination_b32(&our_dest));
             }

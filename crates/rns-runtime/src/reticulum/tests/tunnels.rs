@@ -96,9 +96,10 @@ async fn wait_for_interface(
 
 /// A SAM private key in I2P's base64 alphabet: a destination of 384 key bytes
 /// and an Ed25519 key certificate, then 256 private and 32 signing-key bytes.
-fn fake_sam_private_key() -> String {
+/// Each `seed` names a different destination.
+fn fake_sam_private_key(seed: u8) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-~";
-    let mut key: Vec<u8> = (0..384).map(|n| n as u8).collect();
+    let mut key: Vec<u8> = (0..384).map(|n| (n as u8).wrapping_add(seed)).collect();
     key.extend_from_slice(&[5, 0, 4, 0, 7, 0, 0]);
     key.extend(std::iter::repeat_n(0x42, 256 + 32));
     let mut text = String::new();
@@ -116,7 +117,8 @@ fn fake_sam_private_key() -> String {
 
 /// Minimal SAM v3.1 bridge. Completes HELLO, SESSION CREATE and every STREAM
 /// CONNECT, plus the first `accepts` STREAM ACCEPTs, handing each data socket
-/// to the test; later accepts stay pending.
+/// to the test; later accepts stay pending. A session keeps the destination it
+/// asks for, and each `TRANSIENT` session gets a new one.
 async fn fake_sam(
     accepts: usize,
 ) -> (u16, mpsc::UnboundedReceiver<(String, BufReader<TcpStream>)>) {
@@ -124,10 +126,12 @@ async fn fake_sam(
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::unbounded_channel();
     let remaining = Arc::new(AtomicUsize::new(accepts));
+    let transient_sessions = Arc::new(AtomicUsize::new(0));
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             let tx = tx.clone();
             let remaining = remaining.clone();
+            let transient_sessions = transient_sessions.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(socket);
                 let mut line = String::new();
@@ -148,10 +152,16 @@ async fn fake_sam(
                         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                         .is_ok();
                 if command.starts_with("SESSION CREATE") {
-                    let reply = format!(
-                        "SESSION STATUS RESULT=OK DESTINATION={}\n",
-                        fake_sam_private_key()
-                    );
+                    let destination = match command
+                        .split_whitespace()
+                        .find_map(|token| token.strip_prefix("DESTINATION="))
+                    {
+                        Some("TRANSIENT") | None => fake_sam_private_key(
+                            transient_sessions.fetch_add(1, Ordering::SeqCst) as u8,
+                        ),
+                        Some(key) => key.to_string(),
+                    };
+                    let reply = format!("SESSION STATUS RESULT=OK DESTINATION={destination}\n");
                     let _ = reader.get_mut().write_all(reply.as_bytes()).await;
                 } else if command.starts_with("STREAM CONNECT") || accepted {
                     let reply: &[u8] = if accepted {
@@ -343,6 +353,22 @@ async fn a_discoverable_i2p_interface_announces_once() {
     }
 }
 
+async fn own_b32(handle: &ReticulumHandle) -> String {
+    let mut reachable = handle.discovery.local_interfaces.lock().await[0]
+        .reachable_on
+        .clone()
+        .expect("the server publishes its address");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        reachable.wait_for(|b32| b32.is_some()),
+    )
+    .await
+    .expect("SAM creates the server's session")
+    .unwrap()
+    .clone()
+    .unwrap()
+}
+
 /// Python announces a connectable I2P interface at its own b32 address
 /// (Discovery.py:215-216), never at a configured peer's.
 #[tokio::test]
@@ -355,21 +381,9 @@ async fn a_connectable_i2p_interface_announces_its_own_b32() {
         ),
     );
     let handle = start(&dir).await;
-    let mut reachable = handle.discovery.local_interfaces.lock().await[0]
-        .reachable_on
-        .clone()
-        .expect("the server publishes its address");
-    let b32 = tokio::time::timeout(
-        Duration::from_secs(10),
-        reachable.wait_for(|b32| b32.is_some()),
-    )
-    .await
-    .expect("SAM creates the server's session")
-    .unwrap()
-    .clone();
     assert_eq!(
-        b32,
-        rns_interface::i2p::destination_b32(&fake_sam_private_key())
+        Some(own_b32(&handle).await),
+        rns_interface::i2p::destination_b32(&fake_sam_private_key(0))
     );
     assert_eq!(
         handle.discovery.local_interfaces.lock().await[0]
@@ -380,6 +394,96 @@ async fn a_connectable_i2p_interface_announces_its_own_b32() {
     );
 
     handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Python keeps a connectable I2P interface's private key in `storage/i2p`,
+/// in a file named for the interface and the transport identity, and reuses
+/// it, so the interface keeps its address across restarts
+/// (I2PInterface.py:225-255).
+#[tokio::test]
+async fn a_connectable_i2p_interface_keeps_its_key_across_restarts() {
+    let (sam_port, _streams) = fake_sam(0).await;
+    let dir = config_dir(
+        "i2p-key",
+        &format!(
+            "[reticulum]\n  share_instance = No\n  enable_transport = Yes\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    discoverable = yes\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n"
+        ),
+    );
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let handle = start(&dir).await;
+        runs.push((own_b32(&handle).await, handle.transport_identity.hash));
+        handle.shutdown_and_wait().await;
+    }
+    assert_eq!(
+        runs[0].1, runs[1].1,
+        "precondition: the transport identity persists"
+    );
+    assert_eq!(runs[0].0, runs[1].0, "the address survives a restart");
+
+    let key_file = python_i2p_key_file(&dir.join("storage"), "Golden I2P", &runs[0].1);
+    assert_eq!(
+        std::fs::read_to_string(&key_file).unwrap(),
+        fake_sam_private_key(0)
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&key_file).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a private key is readable by its owner only"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Python's key file for an I2P interface (I2PInterface.py:229-238).
+fn python_i2p_key_file(storage: &Path, name: &str, transport_identity_hash: &[u8; 16]) -> PathBuf {
+    let mut material = rns_crypto::sha::sha256(name.as_bytes()).to_vec();
+    material.extend_from_slice(&rns_crypto::sha::sha256(transport_identity_hash));
+    storage.join("i2p").join(format!(
+        "{}.i2p",
+        hex::encode(rns_crypto::sha::sha256(&material))
+    ))
+}
+
+/// A key file that cannot be read is left in place, and the server opens a
+/// session at a new address instead.
+#[tokio::test]
+async fn an_unreadable_i2p_key_file_is_never_replaced() {
+    let (sam_port, _streams) = fake_sam(0).await;
+    let dir = config_dir(
+        "i2p-unreadable-key",
+        &format!(
+            "[reticulum]\n  share_instance = No\n  enable_transport = Yes\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    discoverable = yes\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n"
+        ),
+    );
+    let storage = dir.join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    let identity = Identity::new();
+    identity
+        .to_file(&storage.join("transport_identity"))
+        .unwrap();
+    let key_file = python_i2p_key_file(&storage, "Golden I2P", &identity.hash);
+    std::fs::create_dir_all(&key_file).unwrap();
+
+    let handle = start(&dir).await;
+    assert_eq!(
+        handle.transport_identity.hash, identity.hash,
+        "precondition"
+    );
+    assert_eq!(
+        Some(own_b32(&handle).await),
+        rns_interface::i2p::destination_b32(&fake_sam_private_key(0))
+    );
+    handle.shutdown_and_wait().await;
+    assert!(
+        key_file.is_dir(),
+        "the unreadable key file is left in place"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

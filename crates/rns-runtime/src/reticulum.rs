@@ -3522,6 +3522,7 @@ pub async fn init_with_policy(
                 id_gen.clone(),
                 handle_tx.clone(),
                 &socket_base,
+                &paths.storage_dir,
                 &rc.ingress_overrides,
                 is_foreground.clone(),
                 rnode_startup_options,
@@ -4761,6 +4762,26 @@ fn clone_interface_post_init(
         recursive_prs: post_init.recursive_prs,
         announces_from_internal: post_init.announces_from_internal,
     }
+}
+
+/// Python's I2P key file for an interface: the old name when that file
+/// exists, else one bound to the transport identity (I2PInterface.py:229-238).
+fn i2p_key_path(storage_dir: &Path, name: &str, transport_identity_hash: &[u8; 16]) -> PathBuf {
+    let dir = storage_dir.join("i2p");
+    let name_hash = rns_crypto::sha::sha256(name.as_bytes());
+    let old_format = dir.join(format!(
+        "{}.i2p",
+        hex::encode(rns_crypto::sha::sha256(&name_hash))
+    ));
+    if old_format.is_file() {
+        return old_format;
+    }
+    let mut material = name_hash.to_vec();
+    material.extend_from_slice(&rns_crypto::sha::sha256(transport_identity_hash));
+    dir.join(format!(
+        "{}.i2p",
+        hex::encode(rns_crypto::sha::sha256(&material))
+    ))
 }
 
 /// Python's configured I2P peers take IFAC from their interface and every
@@ -6313,10 +6334,18 @@ async fn run_discovery_publisher(
                 if let Some(reachable_on) = reachable_on.clone() {
                     config.reachable_on = reachable_on;
                 }
-                registered.insert(local.id, reachable_on.flatten());
-                publications.remove(&local.id);
-                announcer.register(local.id, handle.transport_identity.hash, config);
-                next_prepare = now;
+                if registered
+                    .insert(local.id, reachable_on.flatten())
+                    .is_none()
+                {
+                    announcer.register(local.id, handle.transport_identity.hash, config);
+                    next_prepare = now;
+                } else {
+                    // A new address goes out with the next due announce, as
+                    // Python announces discovery only on its interval.
+                    publications.remove(&local.id);
+                    announcer.reconfigure(local.id, config);
+                }
             }
         }
         if now >= next_prepare {
@@ -8010,6 +8039,7 @@ async fn spawn_interface_with_rnode_startup_options(
     id_gen: Arc<AtomicU64>,
     handle_tx: mpsc::Sender<rns_interface::traits::InterfaceHandle>,
     socket_base: &Path,
+    storage_dir: &Path,
     global_ingress_overrides: &rns_transport::ingress::IngressOverrides,
     is_foreground: Arc<AtomicBool>,
     rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
@@ -8198,6 +8228,8 @@ async fn spawn_interface_with_rnode_startup_options(
                 server_config.sam_host = c.i2p_sam_host.clone();
                 server_config.sam_port = c.i2p_sam_port;
                 server_config.mode = c.mode;
+                server_config.key_path =
+                    Some(i2p_key_path(storage_dir, &c.name, &tunnel_identity.0.hash));
                 let (b32_tx, b32_rx) = tokio::sync::watch::channel(None);
                 server_config.b32 = Some(b32_tx);
                 let server_id = next.take().unwrap_or_else(|| next_id(&id_gen));
@@ -11952,10 +11984,11 @@ loglevel = 7
         }
     }
 
-    /// An interface announces the address it learns at runtime, and again
-    /// whenever that address changes (Discovery.py:215-216).
+    /// An interface announces the address it learns at runtime
+    /// (Discovery.py:215-216); a later change waits for the interval instead
+    /// of announcing at once, so a flapping address cannot flood announces.
     #[tokio::test]
-    async fn discovery_publisher_announces_the_address_an_interface_learns() {
+    async fn discovery_publisher_announces_a_learned_address_on_its_interval() {
         use rns_interface::traits::InterfaceMode;
         let (handle, actor) = discovery_actor();
         let (_, mut sink) = discovery_egress(&handle, 1, InterfaceMode::Full, 8).await;
@@ -11970,14 +12003,21 @@ loglevel = 7
             Arc::new(StaticStamper),
             vec![i2p],
         ));
-        for b32 in ["a".repeat(52), "b".repeat(52)] {
-            address.send_replace(Some(b32.clone()));
-            let raw = tokio::time::timeout(Duration::from_secs(3), sink.recv())
+        let raw = tokio::time::timeout(Duration::from_secs(3), sink.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read_discovery_packet(&raw, &handle).reachable_on,
+            Some("a".repeat(52))
+        );
+        address.send_replace(Some("b".repeat(52)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), sink.recv())
                 .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(read_discovery_packet(&raw, &handle).reachable_on, Some(b32));
-        }
+                .is_err(),
+            "a changed address waits for the announce interval"
+        );
         handle.shutdown.trigger();
         tokio::time::timeout(Duration::from_secs(2), publisher)
             .await

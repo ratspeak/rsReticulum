@@ -462,6 +462,7 @@ pub fn rns_interface::i2p::I2PClientConfig::new(&str, &str) -> Self
 pub fn rns_interface::i2p::I2PClientConfig::python_name(&self) -> alloc::string::String
 pub struct rns_interface::i2p::I2PServerConfig
 pub rns_interface::i2p::I2PServerConfig::b32: core::option::Option<tokio::sync::watch::Sender<core::option::Option<alloc::string::String>>>
+pub rns_interface::i2p::I2PServerConfig::key_path: core::option::Option<std::path::PathBuf>
 pub rns_interface::i2p::I2PServerConfig::keyfile: core::option::Option<alloc::string::String>
 pub rns_interface::i2p::I2PServerConfig::mode: rns_interface::traits::InterfaceMode
 pub rns_interface::i2p::I2PServerConfig::name: alloc::string::String

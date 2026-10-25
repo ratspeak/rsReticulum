@@ -195,6 +195,27 @@ impl Announcer {
         );
     }
 
+    /// Replace a registered interface's config but keep its announce interval,
+    /// so new information goes out with the next due announce. Returns `false`
+    /// for an unregistered interface.
+    pub fn reconfigure(
+        &mut self,
+        interface_id: InterfaceId,
+        config: DiscoveryInterfaceConfig,
+    ) -> bool {
+        let Some(state) = self.interfaces.get_mut(&interface_id) else {
+            return false;
+        };
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("discovery generation exhausted");
+        state.config = config;
+        state.generation = self.next_generation;
+        state.prepared = None;
+        true
+    }
+
     /// Drop an interface from the announcer (called on deregister).
     pub fn deregister(&mut self, interface_id: InterfaceId) {
         self.interfaces.remove(&interface_id);
@@ -533,6 +554,29 @@ mod tests {
         assert!(requests.is_empty());
         assert_eq!(skips.len(), 1);
         assert!(matches!(skips[0].1, SkipReason::RateLimited { .. }));
+    }
+
+    /// A new address waits for the interval like any other change, so an
+    /// address that keeps changing cannot make the interface announce early.
+    #[test]
+    fn a_reconfigured_interface_keeps_its_announce_interval() {
+        let mut a = Announcer::new(static_stamper());
+        let mut config = sample_backbone();
+        a.register(1, [0x11; 16], config.clone());
+        assert_eq!(a.tick(1000.0, None).0.len(), 1);
+        config.reachable_on = Some("10.0.0.2".into());
+        assert!(a.reconfigure(1, config));
+        assert!(!a.reconfigure(2, sample_backbone()));
+        assert!(a.tick(1001.0, None).0.is_empty());
+
+        let interval = sample_backbone().announce_interval_secs as f64;
+        let (requests, _) = a.tick(1000.0 + interval + 1.0, None);
+        let body = &requests[0].app_data[1..];
+        let (info, _) = app_data::split_stamp(body).unwrap();
+        assert_eq!(
+            app_data::decode_info(info).unwrap().reachable_on.as_deref(),
+            Some("10.0.0.2")
+        );
     }
 
     #[test]

@@ -305,6 +305,7 @@ pub fn rns_transport::discovery::announcer::Announcer::is_empty(&self) -> bool
 pub fn rns_transport::discovery::announcer::Announcer::len(&self) -> usize
 pub fn rns_transport::discovery::announcer::Announcer::new(alloc::sync::Arc<dyn rns_transport::discovery::stamper::DiscoveryStamper>) -> Self
 pub fn rns_transport::discovery::announcer::Announcer::prepare(&mut self, f64, core::option::Option<rns_transport::discovery::announcer::EncryptFn<'_>>) -> (alloc::vec::Vec<rns_transport::discovery::announcer::PreparedAnnounce>, alloc::vec::Vec<(rns_transport::messages::InterfaceId, rns_transport::discovery::announcer::SkipReason)>)
+pub fn rns_transport::discovery::announcer::Announcer::reconfigure(&mut self, rns_transport::messages::InterfaceId, rns_transport::discovery::announcer::DiscoveryInterfaceConfig) -> bool
 pub fn rns_transport::discovery::announcer::Announcer::register(&mut self, rns_transport::messages::InterfaceId, [u8; 16], rns_transport::discovery::announcer::DiscoveryInterfaceConfig)
 pub fn rns_transport::discovery::announcer::Announcer::tick(&mut self, f64, core::option::Option<rns_transport::discovery::announcer::EncryptFn<'_>>) -> (alloc::vec::Vec<rns_transport::discovery::announcer::AnnounceRequest>, alloc::vec::Vec<(rns_transport::messages::InterfaceId, rns_transport::discovery::announcer::SkipReason)>)
 pub struct rns_transport::discovery::announcer::DiscoveryInterfaceConfig
@@ -618,6 +619,7 @@ pub fn rns_transport::discovery::announcer::Announcer::is_empty(&self) -> bool
 pub fn rns_transport::discovery::announcer::Announcer::len(&self) -> usize
 pub fn rns_transport::discovery::announcer::Announcer::new(alloc::sync::Arc<dyn rns_transport::discovery::stamper::DiscoveryStamper>) -> Self
 pub fn rns_transport::discovery::announcer::Announcer::prepare(&mut self, f64, core::option::Option<rns_transport::discovery::announcer::EncryptFn<'_>>) -> (alloc::vec::Vec<rns_transport::discovery::announcer::PreparedAnnounce>, alloc::vec::Vec<(rns_transport::messages::InterfaceId, rns_transport::discovery::announcer::SkipReason)>)
+pub fn rns_transport::discovery::announcer::Announcer::reconfigure(&mut self, rns_transport::messages::InterfaceId, rns_transport::discovery::announcer::DiscoveryInterfaceConfig) -> bool
 pub fn rns_transport::discovery::announcer::Announcer::register(&mut self, rns_transport::messages::InterfaceId, [u8; 16], rns_transport::discovery::announcer::DiscoveryInterfaceConfig)
 pub fn rns_transport::discovery::announcer::Announcer::tick(&mut self, f64, core::option::Option<rns_transport::discovery::announcer::EncryptFn<'_>>) -> (alloc::vec::Vec<rns_transport::discovery::announcer::AnnounceRequest>, alloc::vec::Vec<(rns_transport::messages::InterfaceId, rns_transport::discovery::announcer::SkipReason)>)
 pub struct rns_transport::discovery::BlackholeManifestEntry
