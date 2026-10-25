@@ -10,7 +10,7 @@
 - Durable storage works on any filesystem again, as in Python Reticulum, including ZFS, Docker overlays, external drives and network shares. A flush the filesystem lacks is skipped and logged once, and network or RAM-backed storage logs a warning instead of refusing to start.
 - A Link accepts the peer's identification as soon as its handshake completes, as in Python Reticulum, so a request a Python client sends right after identifying no longer fails for lack of an identity. Only the receiving side of a Link accepts identification.
 - The receiving side of a Link counts its Link proof as sent traffic, as in Python Reticulum, so it no longer answers keepalives before the Link is established and its traffic totals include the proof.
-- A connectable I2P interface now starts alongside a Unix-socket shared instance or another connectable I2P interface, and an I2P interface runs its server and one connection for every configured peer, as in Python Reticulum.
+- A connectable I2P interface now starts alongside a Unix-socket shared instance or another connectable I2P interface, and an I2P interface runs one connection for every configured peer, plus its server when connectable, as in Python Reticulum.
 - Hub restarts restore saved paths and tunnels as in Python Reticulum.
 - Transport hubs now accept tunnel synthesis, so a Python client that reconnects gets its paths back without announcing again, and losing a tunnel's interface no longer drops paths the hub learned through other interfaces, as in Python Reticulum.
 - PLAIN and GROUP packets that arrive from more than one hop away, and announces typed PLAIN or GROUP, are dropped before deduplication, as in Python Reticulum.
