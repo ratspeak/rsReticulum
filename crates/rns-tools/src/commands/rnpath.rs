@@ -462,7 +462,10 @@ async fn show_rate_table(
     if let Some(dest) = destination_filter {
         resp.retain(|entry| entry.hash.as_slice() == dest);
     }
+    print_rate_table(&resp, json)
+}
 
+fn print_rate_table(resp: &[rpc::RateTableEntry], json: bool) -> ExitCode {
     if json {
         print!("[");
         for (i, e) in resp.iter().enumerate() {
@@ -488,7 +491,7 @@ async fn show_rate_table(
         "{:<36} {:>10} {:>12}",
         "Destination", "Violations", "Blocked"
     );
-    for e in &resp {
+    for e in resp {
         let blocked = if e.blocked_until > 0.0 {
             format::pretty_time(e.blocked_until - now_epoch())
         } else {
@@ -1266,51 +1269,19 @@ fn print_remote_path_table(bytes: &[u8], json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Remote rates are the control port's rate table entries (Transport.py:3364-3369).
 fn print_remote_rate_table(bytes: &[u8], json: bool) -> ExitCode {
-    let value: rmpv::Value = match rmp_serde::from_slice(bytes) {
-        Ok(v) => v,
+    match rpc::decode_response_for_request(bytes, &RpcRequest::GetRateTable) {
+        Ok(RpcResponse::RateTable(entries)) => print_rate_table(&entries, json),
+        Ok(other) => {
+            eprintln!("rnpath-rs: unexpected response: {other:?}");
+            ExitCode::from(1)
+        }
         Err(e) => {
             eprintln!("rnpath-rs: malformed response: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let arr = match value.as_array() {
-        Some(a) => a,
-        None => {
-            eprintln!("rnpath-rs: response is not an array");
-            return ExitCode::from(1);
-        }
-    };
-
-    if json {
-        print!("[");
-        for (i, entry) in arr.iter().enumerate() {
-            if i > 0 {
-                print!(",");
-            }
-            if let Some(m) = entry.as_map() {
-                let h = map_bin(m, "hash").unwrap_or_default();
-                let rate = map_f64(m, "rate").unwrap_or(0.0);
-                print!("{{\"hash\":\"{}\",\"rate\":{rate}}}", hex::encode(&h));
-            }
-        }
-        println!("]");
-        return ExitCode::SUCCESS;
-    }
-
-    if arr.is_empty() {
-        println!("Remote rate table is empty.");
-        return ExitCode::SUCCESS;
-    }
-    println!("{:<36} {:>10}", "Destination", "Rate");
-    for entry in arr {
-        if let Some(m) = entry.as_map() {
-            let h = map_bin(m, "hash").unwrap_or_default();
-            let rate = map_f64(m, "rate").unwrap_or(0.0);
-            println!("{:<36} {:>10.4}", hex::encode(&h), rate);
+            ExitCode::from(1)
         }
     }
-    ExitCode::SUCCESS
 }
 
 fn remote_err(e: &LinkClientError) -> String {
@@ -1337,12 +1308,6 @@ fn map_u64(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<u64> {
         .and_then(|(_, v)| v.as_u64())
 }
 
-fn map_f64(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<f64> {
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .and_then(|(_, v)| v.as_f64())
-}
-
 fn map_bin(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<Vec<u8>> {
     map.iter()
         .find(|(k, _)| k.as_str() == Some(key))
@@ -1352,6 +1317,37 @@ fn map_bin(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Python's remote rates carry no `rate` key (Reticulum.py:1757-1763).
+    #[test]
+    fn remote_rates_read_python_rate_entries() {
+        let entry = rmpv::Value::Map(vec![
+            (
+                rmpv::Value::from("hash"),
+                rmpv::Value::Binary(vec![0x44; 16]),
+            ),
+            (rmpv::Value::from("last"), rmpv::Value::F64(1_700_000_000.0)),
+            (
+                rmpv::Value::from("rate_violations"),
+                rmpv::Value::from(2u64),
+            ),
+            (rmpv::Value::from("blocked_until"), rmpv::Value::F64(0.0)),
+            (
+                rmpv::Value::from("timestamps"),
+                rmpv::Value::Array(vec![rmpv::Value::F64(1_700_000_000.0)]),
+            ),
+        ]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &rmpv::Value::Array(vec![entry])).unwrap();
+        let Ok(RpcResponse::RateTable(entries)) =
+            rpc::decode_response_for_request(&bytes, &RpcRequest::GetRateTable)
+        else {
+            panic!("remote rates decode as a rate table");
+        };
+        assert_eq!(entries[0].hash, vec![0x44; 16]);
+        assert_eq!(entries[0].rate_violations, 2);
+        assert_eq!(print_remote_rate_table(&bytes, true), ExitCode::SUCCESS);
+    }
 
     #[test]
     fn local_rpc_auth_failure_explains_config_mismatch_and_port_owner() {

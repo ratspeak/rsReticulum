@@ -1796,9 +1796,10 @@ impl TransportActor {
         match self.try_send_to_interface(id, raw) {
             InterfaceSendOutcome::Sent => true,
             InterfaceSendOutcome::Full => {
-                let Some(entry) = self.interfaces.get(&id) else {
+                let Some(entry) = self.interfaces.get_mut(&id) else {
                     return false;
                 };
+                entry.tx_dropped_bytes = entry.tx_dropped_bytes.saturating_add(raw.len() as u64);
                 let tx_drops = entry
                     .tx_drops
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -2256,6 +2257,7 @@ mod tests {
     mod announce_admission;
     mod bitrate_timing;
     mod discovery_api;
+    mod interface_stats;
     mod link_endpoint_dispatch;
     mod packet_capacity;
     mod slow_media_discovery;
@@ -2549,6 +2551,10 @@ mod tests {
             txb: None,
             inspection: None,
             tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            tx_dropped_bytes: 0,
+            protocol_violations: 0,
+            ifac_violations: 0,
+            packet_filter_hits: 0,
             multipoint: false,
             recursive_prs: false,
             announces_from_internal: true,

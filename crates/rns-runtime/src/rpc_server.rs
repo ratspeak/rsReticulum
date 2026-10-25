@@ -16,11 +16,12 @@ const MAX_CONTROL_CLIENTS: usize = 64;
 const CONTROL_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What the control port answers from: the transport, plus the runtime's IFAC
-/// records when a runtime serves it.
+/// records and transport instance when a runtime serves it.
 #[derive(Clone)]
 pub(crate) struct RpcBackend {
     transport_tx: mpsc::Sender<TransportMessage>,
     ifac: Option<InterfaceIfacStats>,
+    transport: Option<TransportStatsSource>,
 }
 
 impl RpcBackend {
@@ -28,8 +29,116 @@ impl RpcBackend {
         transport_tx: mpsc::Sender<TransportMessage>,
         ifac: Option<InterfaceIfacStats>,
     ) -> Self {
-        Self { transport_tx, ifac }
+        Self {
+            transport_tx,
+            ifac,
+            transport: None,
+        }
     }
+
+    pub(crate) fn with_transport(mut self, transport: Option<TransportStatsSource>) -> Self {
+        self.transport = transport;
+        self
+    }
+}
+
+/// A transport instance's identity, network identity, start and probe
+/// responder for its interface stats; the responder registers after the
+/// control port starts.
+#[derive(Clone)]
+pub(crate) struct TransportStatsSource {
+    transport_id: [u8; 16],
+    network_id: Option<[u8; 16]>,
+    started_at: std::time::Instant,
+    probe_responder: std::sync::Arc<std::sync::OnceLock<[u8; 16]>>,
+}
+
+impl TransportStatsSource {
+    pub(crate) fn new(
+        transport_id: [u8; 16],
+        network_id: Option<[u8; 16]>,
+        started_at: std::time::Instant,
+    ) -> Self {
+        Self {
+            transport_id,
+            network_id,
+            started_at,
+            probe_responder: Default::default(),
+        }
+    }
+
+    pub(crate) fn set_probe_responder(&self, destination: [u8; 16]) {
+        let _ = self.probe_responder.set(destination);
+    }
+
+    pub(crate) fn snapshot(&self) -> rpc::TransportStats {
+        rpc::TransportStats {
+            transport_id: self.transport_id,
+            network_id: self.network_id,
+            uptime: self.started_at.elapsed().as_secs_f64(),
+            probe_responder: self.probe_responder.get().copied(),
+        }
+    }
+}
+
+/// Transport stat entries as the control port and remote management report
+/// them: with IFAC, and accepted clients naming their listener.
+pub(crate) fn stat_entries(
+    entries: Vec<rns_transport::messages::InterfaceStatRpcEntry>,
+    ifac: Option<&InterfaceIfacStats>,
+) -> Vec<rpc::InterfaceStatEntry> {
+    let names: std::collections::HashMap<u64, String> = entries
+        .iter()
+        .map(|entry| (entry.id, entry.name.clone()))
+        .collect();
+    entries
+        .into_iter()
+        .map(|e| {
+            let ifac = ifac.map(|ifac| ifac.lookup(e.id)).unwrap_or_default();
+            rpc::InterfaceStatEntry {
+                parent_interface_name: e.parent_id.and_then(|id| names.get(&id).cloned()),
+                id: e.id,
+                name: e.name,
+                rx_bytes: e.rx_bytes,
+                tx_bytes: e.tx_bytes,
+                rx_rate: e.rx_rate,
+                tx_rate: e.tx_rate,
+                online: e.online,
+                bitrate: e.bitrate,
+                mtu: e.mtu,
+                mode: e.mode,
+                role: e.role,
+                announce_queue: e.announce_queue,
+                held_announces: e.held_announces,
+                incoming_announce_frequency: e.incoming_announce_frequency,
+                outgoing_announce_frequency: e.outgoing_announce_frequency,
+                incoming_pr_frequency: e.incoming_pr_frequency,
+                outgoing_pr_frequency: e.outgoing_pr_frequency,
+                burst_active: e.burst_active,
+                burst_activated: e.burst_activated,
+                pr_burst_active: e.pr_burst_active,
+                pr_burst_activated: e.pr_burst_activated,
+                clients: e.clients,
+                blocked_ips: e.blocked_ips,
+                announce_rate_target: e.announce_rate_target,
+                announce_rate_grace: e.announce_rate_grace,
+                announce_rate_penalty: e.announce_rate_penalty,
+                announce_cap: e.announce_cap,
+                ifac_signature: ifac.signature.map(Vec::from),
+                ifac_size: ifac.size,
+                ifac_netname: ifac.netname,
+                tx_drops: e.tx_drops,
+                tx_dropped_bytes: e.tx_dropped_bytes,
+                announces_received: e.announces_received,
+                announces_sent: e.announces_sent,
+                path_requests_received: e.path_requests_received,
+                path_requests_sent: e.path_requests_sent,
+                protocol_violations: e.protocol_violations,
+                ifac_violations: e.ifac_violations,
+                packet_filter_hits: e.packet_filter_hits,
+            }
+        })
+        .collect()
 }
 
 /// Serve the control port from a bare transport; interface stats then carry
@@ -282,12 +391,24 @@ async fn handle_rpc_client(
     let req_buf = rpc::read_mp_frame(&mut stream, MAX_REQUEST_SIZE).await?;
     let request = rpc::decode_request(&req_buf)?;
 
-    let response = process_rpc_request(request, &backend.transport_tx, backend.ifac.as_ref()).await;
-    let resp_data = rpc::encode_response(&response)?;
-
+    let resp_data = respond(request, &backend).await?;
     rpc::write_mp_frame(&mut stream, &resp_data).await?;
 
     Ok(())
+}
+
+async fn respond(request: RpcRequest, backend: &RpcBackend) -> Result<Vec<u8>, RpcError> {
+    match process_rpc_request(request, &backend.transport_tx, backend.ifac.as_ref()).await {
+        RpcResponse::InterfaceStats(entries) => rpc::encode_interface_stats(
+            &entries,
+            backend
+                .transport
+                .as_ref()
+                .map(TransportStatsSource::snapshot)
+                .as_ref(),
+        ),
+        response => rpc::encode_response(&response),
+    }
 }
 
 const TRANSPORT_QUERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
@@ -455,46 +576,7 @@ async fn process_rpc_request(
         RpcRequest::GetInterfaceStats => {
             match authoritative_query!(TransportQuery::GetInterfaceStats, "interface stats query") {
                 TransportQueryResponse::InterfaceStats(entries) => {
-                    let rpc_entries = entries
-                        .into_iter()
-                        .map(|e| {
-                            let ifac = ifac.map(|ifac| ifac.lookup(e.id)).unwrap_or_default();
-                            rpc::InterfaceStatEntry {
-                                id: e.id,
-                                name: e.name,
-                                rx_bytes: e.rx_bytes,
-                                tx_bytes: e.tx_bytes,
-                                rx_rate: e.rx_rate,
-                                tx_rate: e.tx_rate,
-                                online: e.online,
-                                bitrate: e.bitrate,
-                                mtu: e.mtu,
-                                mode: e.mode,
-                                role: e.role,
-                                announce_queue: e.announce_queue,
-                                held_announces: e.held_announces,
-                                incoming_announce_frequency: e.incoming_announce_frequency,
-                                outgoing_announce_frequency: e.outgoing_announce_frequency,
-                                incoming_pr_frequency: e.incoming_pr_frequency,
-                                outgoing_pr_frequency: e.outgoing_pr_frequency,
-                                burst_active: e.burst_active,
-                                burst_activated: e.burst_activated,
-                                pr_burst_active: e.pr_burst_active,
-                                pr_burst_activated: e.pr_burst_activated,
-                                clients: e.clients,
-                                blocked_ips: e.blocked_ips,
-                                announce_rate_target: e.announce_rate_target,
-                                announce_rate_grace: e.announce_rate_grace,
-                                announce_rate_penalty: e.announce_rate_penalty,
-                                announce_cap: e.announce_cap,
-                                ifac_signature: ifac.signature.map(Vec::from),
-                                ifac_size: ifac.size,
-                                ifac_netname: ifac.netname,
-                                tx_drops: e.tx_drops,
-                            }
-                        })
-                        .collect();
-                    RpcResponse::InterfaceStats(rpc_entries)
+                    RpcResponse::InterfaceStats(stat_entries(entries, ifac))
                 }
                 _ => unexpected_transport_response("interface stats query"),
             }
@@ -972,6 +1054,77 @@ mod tests {
         }
 
         shutdown.trigger();
+    }
+
+    /// A transport instance adds its identity, network identity, uptime and
+    /// probe responder to the stats dict (Reticulum.py:1700-1705).
+    #[tokio::test]
+    async fn interface_stats_answer_names_the_transport_instance() {
+        let (actor, tx) = rns_transport::actor::TransportActor::new();
+        tokio::spawn(actor.run());
+        let transport = TransportStatsSource::new(
+            [0x11; 16],
+            Some([0x22; 16]),
+            std::time::Instant::now() - std::time::Duration::from_secs(3),
+        );
+        let backend = RpcBackend::new(tx, None).with_transport(Some(transport.clone()));
+
+        let stats = |encoded: Vec<u8>| -> Vec<(rmpv::Value, rmpv::Value)> {
+            rmpv::decode::read_value(&mut encoded.as_slice())
+                .unwrap()
+                .as_map()
+                .expect("stats dict")
+                .clone()
+        };
+        let field = |stats: &[(rmpv::Value, rmpv::Value)], key: &str| {
+            stats
+                .iter()
+                .find(|(k, _)| k.as_str() == Some(key))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        let before = stats(
+            respond(RpcRequest::GetInterfaceStats, &backend)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            field(&before, "transport_id").as_slice(),
+            Some(&[0x11; 16][..])
+        );
+        assert_eq!(
+            field(&before, "network_id").as_slice(),
+            Some(&[0x22; 16][..])
+        );
+        assert!(field(&before, "transport_uptime").as_f64().unwrap() >= 3.0);
+        assert!(
+            field(&before, "probe_responder").is_nil(),
+            "no probe responder has registered yet"
+        );
+
+        transport.set_probe_responder([0x33; 16]);
+        let after = stats(
+            respond(RpcRequest::GetInterfaceStats, &backend)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            field(&after, "probe_responder").as_slice(),
+            Some(&[0x33; 16][..])
+        );
+
+        let (actor, tx) = rns_transport::actor::TransportActor::new();
+        tokio::spawn(actor.run());
+        let leaf = stats(
+            respond(RpcRequest::GetInterfaceStats, &RpcBackend::new(tx, None))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            !leaf.iter().any(|(k, _)| k.as_str() == Some("transport_id")),
+            "a leaf names no transport instance"
+        );
     }
 
     #[tokio::test]

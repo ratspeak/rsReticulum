@@ -1,6 +1,14 @@
 use super::*;
 use crate::now_f64;
 
+/// A transit link proof's verdict; only a bad signature is a protocol
+/// violation (Transport.py:2668).
+enum TransitProof {
+    Valid,
+    InvalidSignature,
+    Refused,
+}
+
 impl TransportActor {
     #[tracing::instrument(
         level = "trace",
@@ -10,6 +18,26 @@ impl TransportActor {
     )]
     pub(super) fn on_inbound(&mut self, packet: crate::messages::InboundPacket) {
         self.on_inbound_inner(packet, false);
+    }
+
+    /// Python `Interface.protocol_violation`, `ifac_violation` and
+    /// `packet_filter_hit` (Interface.py:327-338).
+    pub(super) fn protocol_violation(&mut self, interface_id: InterfaceId) {
+        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
+            entry.protocol_violations = entry.protocol_violations.saturating_add(1);
+        }
+    }
+
+    fn ifac_violation(&mut self, interface_id: InterfaceId) {
+        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
+            entry.ifac_violations = entry.ifac_violations.saturating_add(1);
+        }
+    }
+
+    fn packet_filter_hit(&mut self, interface_id: InterfaceId) {
+        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
+            entry.packet_filter_hits = entry.packet_filter_hits.saturating_add(1);
+        }
     }
 
     pub(super) fn on_cached_announce(&mut self, packet: crate::messages::InboundPacket) {
@@ -34,49 +62,58 @@ impl TransportActor {
             let Some(entry) = self.interfaces.get(&packet.interface_id) else {
                 return;
             };
-            if !entry.owner.is_current()
-                || packet.raw.len() > entry.packet_capacity.max_wire_packet_bytes as usize
-            {
+            if !entry.owner.is_current() {
                 return;
             }
-            match entry.effective_clear_mtu() {
+            let oversized = packet.raw.len() > entry.packet_capacity.max_wire_packet_bytes as usize;
+            let clear_mtu = entry.effective_clear_mtu();
+            if oversized {
+                self.protocol_violation(packet.interface_id);
+                return;
+            }
+            match clear_mtu {
                 Ok(n) => n as usize,
                 Err(_) => return,
             }
         };
 
         // Strip the IFAC tag if the interface gates membership on one; packets
-        // that fail verification are silently dropped so a misconfigured peer
-        // can't leak into a closed access group.
-        let raw: bytes::Bytes = if cached_announce {
-            packet.raw.clone()
-        } else if let Some(entry) = self.interfaces.get(&packet.interface_id) {
-            if let Some(ref ifac_key) = entry.ifac_key {
-                let ifac_size = entry.ifac_size;
-                match crate::ifac::ifac_verify(&packet.raw, ifac_key, ifac_size) {
+        // that fail verification are dropped so a misconfigured peer can't
+        // leak into a closed access group.
+        let ifac = if cached_announce {
+            None
+        } else {
+            self.interfaces
+                .get(&packet.interface_id)
+                .map(|entry| (entry.ifac_key, entry.ifac_size))
+        };
+        let raw: bytes::Bytes = match ifac {
+            Some((Some(ifac_key), ifac_size)) => {
+                match crate::ifac::ifac_verify(&packet.raw, &ifac_key, ifac_size) {
                     Some(stripped) => bytes::Bytes::from(stripped),
                     None => {
                         trace!(
                             interface_id = packet.interface_id,
                             "IFAC verification failed, dropping packet"
                         );
+                        self.ifac_violation(packet.interface_id);
                         return;
                     }
                 }
-            } else if crate::ifac::has_ifac_flag(&packet.raw) {
+            }
+            Some((None, _)) if crate::ifac::has_ifac_flag(&packet.raw) => {
                 trace!(
                     interface_id = packet.interface_id,
                     "IFAC packet received on clear interface, dropping packet"
                 );
+                self.ifac_violation(packet.interface_id);
                 return;
-            } else {
-                packet.raw.clone()
             }
-        } else {
-            packet.raw.clone()
+            _ => packet.raw.clone(),
         };
 
         if raw.len() > clear_limit {
+            self.protocol_violation(packet.interface_id);
             return;
         }
 
@@ -90,6 +127,7 @@ impl TransportActor {
                     error = %e,
                     "inbound packet dropped: header parse failed"
                 );
+                self.protocol_violation(packet.interface_id);
                 return;
             }
         };
@@ -104,6 +142,7 @@ impl TransportActor {
                 interface_id = packet.interface_id,
                 "inbound packet dropped: invalid hop count"
             );
+            self.protocol_violation(packet.interface_id);
             return;
         }
 
@@ -125,6 +164,7 @@ impl TransportActor {
                 interface_id = packet.interface_id,
                 "packet for another transport dropped before hash admission"
             );
+            self.packet_filter_hit(packet.interface_id);
             return;
         }
 
@@ -161,6 +201,7 @@ impl TransportActor {
                 packet_type = ?parsed.flags.packet_type,
                 "PLAIN or GROUP packet filtered"
             );
+            self.packet_filter_hit(packet.interface_id);
             return;
         }
 
@@ -216,6 +257,7 @@ impl TransportActor {
             {
             } else {
                 trace!("duplicate packet dropped");
+                self.packet_filter_hit(packet.interface_id);
                 return;
             }
         }
@@ -272,6 +314,7 @@ impl TransportActor {
                     dest = hex::encode(header.destination_hash),
                     "announce missing payload, dropping"
                 );
+                self.protocol_violation(interface_id);
                 return;
             }
 
@@ -311,6 +354,7 @@ impl TransportActor {
                                 error = %e,
                                 "announce validation failed, dropping"
                             );
+                            self.protocol_violation(interface_id);
                             return;
                         }
                     }
@@ -323,6 +367,7 @@ impl TransportActor {
                         error = %e,
                         "announce unpack failed, dropping"
                     );
+                    self.protocol_violation(interface_id);
                     return;
                 }
             }
@@ -374,6 +419,7 @@ impl TransportActor {
                 error = %e,
                 "announce validation failed, dropping"
             );
+            self.protocol_violation(interface_id);
             return;
         }
 
@@ -812,7 +858,10 @@ impl TransportActor {
                         self.state_dirty = true;
                         self.restore_tunnel_paths(&tunnel_id, interface_id);
                     }
-                    None => debug!(interface_id, "invalid tunnel synthesis"),
+                    None => {
+                        debug!(interface_id, "invalid tunnel synthesis");
+                        self.protocol_violation(interface_id);
+                    }
                 }
             }
             return;
@@ -1296,8 +1345,13 @@ impl TransportActor {
                 // change or a spoof and must not be relayed.
                 let hops_match = header.hops == expected_hops;
                 if hops_match && _interface_id == outbound_interface {
-                    if !self.validate_transit_lrproof(raw, header, link_entry) {
-                        return;
+                    match self.validate_transit_lrproof(raw, header, link_entry) {
+                        TransitProof::Valid => {}
+                        TransitProof::InvalidSignature => {
+                            self.protocol_violation(_interface_id);
+                            return;
+                        }
+                        TransitProof::Refused => return,
                     }
                     let pkt_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
                     if !self.packet_hashlist.insert(pkt_hash) {
@@ -1613,7 +1667,7 @@ impl TransportActor {
         raw: &[u8],
         header: &rns_wire::header::PacketHeader,
         link_entry: &crate::link_table::LinkEntry,
-    ) -> bool {
+    ) -> TransitProof {
         let payload_offset = header.size();
         if raw.len() < payload_offset {
             warn!(
@@ -1621,7 +1675,7 @@ impl TransportActor {
                 raw_len = raw.len(),
                 "link proof missing payload, not transporting"
             );
-            return false;
+            return TransitProof::Refused;
         }
 
         let proof_data = &raw[payload_offset..];
@@ -1631,18 +1685,18 @@ impl TransportActor {
                 proof_len = proof_data.len(),
                 "malformed link request proof length, not transporting"
             );
-            return false;
+            return TransitProof::Refused;
         }
 
         let Ok(signal) = rns_wire::link_signalling::parse_proof_signalling(proof_data) else {
-            return false;
+            return TransitProof::Refused;
         };
         if signal.mode != link_entry.requested_mode
             || signal.mtu.get() > link_entry.accepted_mtu_ceiling
             || (link_entry.validated && signal.mtu.get() != link_entry.accepted_mtu_ceiling)
             || !self.link_registration_is_current(link_entry)
         {
-            return false;
+            return TransitProof::Refused;
         }
 
         let mut signature = [0u8; 64];
@@ -1664,7 +1718,7 @@ impl TransportActor {
                 destination = hex::encode(link_entry.destination_hash),
                 "link request proof has no known destination identity, not transporting"
             );
-            return false;
+            return TransitProof::Refused;
         };
 
         let mut destination_ed25519 = [0u8; 32];
@@ -1679,7 +1733,7 @@ impl TransportActor {
                         error = %err,
                         "link request proof destination identity is invalid, not transporting"
                     );
-                    return false;
+                    return TransitProof::Refused;
                 }
             };
 
@@ -1690,14 +1744,14 @@ impl TransportActor {
         signed_data.extend_from_slice(signalling);
 
         if verify_key.verify(&signed_data, &signature).is_ok() {
-            true
+            TransitProof::Valid
         } else {
             warn!(
                 link_id = hex::encode(header.destination_hash),
                 destination = hex::encode(link_entry.destination_hash),
                 "invalid link request proof signature, not transporting"
             );
-            false
+            TransitProof::InvalidSignature
         }
     }
 }

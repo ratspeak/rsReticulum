@@ -118,7 +118,7 @@ The `rns-tools` crate builds Rust-namespaced Reticulum utilities:
 
 ```text
 rnsd-rs     [-c CONFIG_DIR] [-v|-q]... [-i] [--service] [--exampleconfig] [--version]
-rnstatus-rs [--all] [--sort rate|traffic|rx|tx|rxs|txs|announces|arx|atx|prx|ptx|held]
+rnstatus-rs [--all] [--sort rate|traffic|rx|tx|rxs|txs|announces|arx|atx|arxc|atxc|prx|ptx|prxc|ptxc|held|pvs|ivs|flt|txdrp|txdrb]
          [--reverse] [--announce-stats] [--link-stats] [--totals] [--json]
          [-d|--discovered] [-D] [-m [-I SECONDS]] [FILTER]
          [-R <transport_hash> -i <identity_file>]

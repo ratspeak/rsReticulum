@@ -120,6 +120,15 @@ impl TransportActor {
                             announce_cap: entry.announce_cap,
                             ifac_size: entry.ifac_size,
                             tx_drops: entry.tx_drops.load(std::sync::atomic::Ordering::Relaxed),
+                            tx_dropped_bytes: entry.tx_dropped_bytes,
+                            announces_received: entry.ingress.announces_received(),
+                            announces_sent: entry.ingress.announces_sent(),
+                            path_requests_received: entry.ingress.path_requests_received(),
+                            path_requests_sent: entry.ingress.path_requests_sent(),
+                            protocol_violations: entry.protocol_violations,
+                            ifac_violations: entry.ifac_violations,
+                            packet_filter_hits: entry.packet_filter_hits,
+                            parent_id: entry.parent_id,
                         }
                     })
                     .collect();

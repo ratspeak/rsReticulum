@@ -598,8 +598,13 @@ impl TransportActor {
                 dest = %hex::encode(requested_dest),
                 "ignoring tagless path request"
             );
+            self.protocol_violation(interface_id);
             return;
         };
+        // Python counts a tag cut to 16 bytes as a violation (Transport.py:1843-1845).
+        if data.len() > 48 {
+            self.protocol_violation(interface_id);
+        }
 
         if let Some(entry) = self.interfaces.get_mut(&interface_id) {
             entry.ingress.received_path_request();

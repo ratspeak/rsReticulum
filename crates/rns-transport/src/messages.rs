@@ -272,6 +272,15 @@ pub struct InterfaceEntry {
     /// Incremented when an outbound `try_send` cannot enqueue — surfaced in
     /// interface stats to flag a driver whose receiver is falling behind.
     pub tx_drops: Arc<std::sync::atomic::AtomicU64>,
+    /// Bytes of the packets counted in `tx_drops` (Python `tx_dropped_bytes`).
+    pub tx_dropped_bytes: u64,
+    /// Inbound packets dropped as malformed or invalid (Python
+    /// `Interface.protocol_violation`, Interface.py:327-330).
+    pub protocol_violations: u64,
+    /// Inbound packets dropped for a missing, invalid or unexpected IFAC.
+    pub ifac_violations: u64,
+    /// Inbound packets the packet filter rejected (Transport.py:1795).
+    pub packet_filter_hits: u64,
     pub ingress: IngressController,
     /// Announces awaiting bandwidth-capped retransmission. Drained in
     /// hop-priority order (lowest hops first, oldest among ties).
@@ -328,6 +337,10 @@ impl InterfaceEntry {
             txb: None,
             inspection: None,
             tx_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            tx_dropped_bytes: 0,
+            protocol_violations: 0,
+            ifac_violations: 0,
+            packet_filter_hits: 0,
             ingress: IngressController::new(),
             announce_queue: Vec::new(),
             multipoint: false,
@@ -981,6 +994,17 @@ pub struct InterfaceStatRpcEntry {
     pub announce_cap: f64,
     pub ifac_size: usize,
     pub tx_drops: u64,
+    pub tx_dropped_bytes: u64,
+    /// Python `arxc`/`atxc`/`prxc`/`ptxc` (Interface.py:303-325).
+    pub announces_received: u64,
+    pub announces_sent: u64,
+    pub path_requests_received: u64,
+    pub path_requests_sent: u64,
+    pub protocol_violations: u64,
+    pub ifac_violations: u64,
+    pub packet_filter_hits: u64,
+    /// The listener that accepted this interface.
+    pub parent_id: Option<InterfaceId>,
 }
 
 #[derive(Debug, Clone)]

@@ -60,7 +60,8 @@ struct Args {
     #[arg(short, long)]
     totals: bool,
 
-    /// Sort interfaces by rate, traffic, rx, tx, rxs, txs, announces, arx, atx, prx, ptx or held.
+    /// Sort interfaces by rate, traffic, rx, tx, rxs, txs, announces, arx, atx, arxc, atxc, prx,
+    /// ptx, prxc, ptxc, held, pvs, ivs, flt, txdrp or txdrb.
     #[arg(short, long)]
     sort: Option<String>,
 
@@ -358,9 +359,18 @@ enum SortKey {
     Announces,
     AnnounceRx,
     AnnounceTx,
+    AnnounceRxCount,
+    AnnounceTxCount,
     PathRequestRx,
     PathRequestTx,
+    PathRequestRxCount,
+    PathRequestTxCount,
     Held,
+    ProtocolViolations,
+    IfacViolations,
+    FilterHits,
+    TxDrops,
+    TxDroppedBytes,
 }
 
 fn validate_args(args: &Args) -> Result<(), String> {
@@ -387,15 +397,25 @@ fn parse_sort_key(value: Option<&str>) -> Result<Option<SortKey>, String> {
         "rxs" => SortKey::RxRate,
         "txs" => SortKey::TxRate,
         "traffic" => SortKey::Traffic,
-        "announces" | "announce" => SortKey::Announces,
+        "announces" | "announce" | "anns" => SortKey::Announces,
         "arx" => SortKey::AnnounceRx,
         "atx" => SortKey::AnnounceTx,
+        "arxc" => SortKey::AnnounceRxCount,
+        "atxc" => SortKey::AnnounceTxCount,
         "prx" => SortKey::PathRequestRx,
         "ptx" => SortKey::PathRequestTx,
+        "prxc" => SortKey::PathRequestRxCount,
+        "ptxc" => SortKey::PathRequestTxCount,
         "held" => SortKey::Held,
+        "pvs" => SortKey::ProtocolViolations,
+        "ivs" => SortKey::IfacViolations,
+        "flt" => SortKey::FilterHits,
+        "txdrp" => SortKey::TxDrops,
+        "txdrb" => SortKey::TxDroppedBytes,
         _ => {
             return Err(format!(
-                "--sort must be one of rate, traffic, rx, tx, rxs, txs, announces, arx, atx, prx, ptx or held; got {value}"
+                "--sort must be one of rate, traffic, rx, tx, rxs, txs, announces, arx, atx, \
+                 arxc, atxc, prx, ptx, prxc, ptxc, held, pvs, ivs, flt, txdrp or txdrb; got {value}"
             ));
         }
     };
@@ -413,9 +433,18 @@ fn local_stat_sort_value(e: &rpc::InterfaceStatEntry, key: SortKey) -> f64 {
         SortKey::Announces => e.incoming_announce_frequency + e.outgoing_announce_frequency,
         SortKey::AnnounceRx => e.incoming_announce_frequency,
         SortKey::AnnounceTx => e.outgoing_announce_frequency,
+        SortKey::AnnounceRxCount => e.announces_received as f64,
+        SortKey::AnnounceTxCount => e.announces_sent as f64,
         SortKey::PathRequestRx => e.incoming_pr_frequency,
         SortKey::PathRequestTx => e.outgoing_pr_frequency,
+        SortKey::PathRequestRxCount => e.path_requests_received as f64,
+        SortKey::PathRequestTxCount => e.path_requests_sent as f64,
         SortKey::Held => e.held_announces as f64,
+        SortKey::ProtocolViolations => e.protocol_violations as f64,
+        SortKey::IfacViolations => e.ifac_violations as f64,
+        SortKey::FilterHits => e.packet_filter_hits as f64,
+        SortKey::TxDrops => e.tx_drops as f64,
+        SortKey::TxDroppedBytes => e.tx_dropped_bytes as f64,
     }
 }
 
@@ -563,6 +592,7 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
                     print_announce_frequency(
                         entry.incoming_announce_frequency,
                         entry.outgoing_announce_frequency,
+                        (entry.announces_received, entry.announces_sent),
                         entry.clients,
                         entry.announce_rate_target,
                         entry.announce_rate_penalty,
@@ -575,10 +605,16 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
                 print_path_request_frequency(
                     entry.incoming_pr_frequency,
                     entry.outgoing_pr_frequency,
+                    (entry.path_requests_received, entry.path_requests_sent),
                     entry.clients,
                     burst_status_text(entry.pr_burst_active, entry.pr_burst_activated),
                 );
             }
+            print_violations(
+                entry.protocol_violations,
+                entry.ifac_violations,
+                entry.packet_filter_hits,
+            );
             println!(
                 "    Traffic  : {} rx / {} tx",
                 format::pretty_size(entry.rx_bytes),
@@ -592,7 +628,11 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
                 );
             }
             if entry.tx_drops > 0 {
-                println!("    TX drops : {}", entry.tx_drops);
+                println!(
+                    "    TX drops : {} ({})",
+                    entry.tx_drops,
+                    format::pretty_size(entry.tx_dropped_bytes)
+                );
             }
             println!();
         }
@@ -625,7 +665,7 @@ fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, 
             print!(",");
         }
         print!(
-            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"ifac_signature\":{},\"ifac_size\":{},\"ifac_netname\":{},\"tx_drops\":{}}}",
+            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"ifac_signature\":{},\"ifac_size\":{},\"ifac_netname\":{},\"tx_drops\":{},\"tx_dropped_bytes\":{},\"arxc\":{},\"atxc\":{},\"prxc\":{},\"ptxc\":{},\"protocol_violations\":{},\"ifac_violations\":{},\"packet_filter_hits\":{}}}",
             json_str(&e.name),
             e.online,
             json_str(&e.mode),
@@ -657,6 +697,14 @@ fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, 
             opt_u64_json(e.ifac_size.map(|size| size as u64)),
             opt_str_json(e.ifac_netname.as_deref()),
             e.tx_drops,
+            e.tx_dropped_bytes,
+            e.announces_received,
+            e.announces_sent,
+            e.path_requests_received,
+            e.path_requests_sent,
+            e.protocol_violations,
+            e.ifac_violations,
+            e.packet_filter_hits,
         );
     }
     print!("]");
@@ -1061,6 +1109,15 @@ struct RemoteInterface {
     ifac_signature: Option<Vec<u8>>,
     ifac_size: Option<u64>,
     ifac_netname: Option<String>,
+    announces_received: u64,
+    announces_sent: u64,
+    path_requests_received: u64,
+    path_requests_sent: u64,
+    protocol_violations: u64,
+    ifac_violations: u64,
+    packet_filter_hits: u64,
+    tx_drops: u64,
+    tx_dropped_bytes: u64,
 }
 
 impl RemoteInterface {
@@ -1077,9 +1134,18 @@ impl RemoteInterface {
             }
             SortKey::AnnounceRx => self.incoming_announce_frequency,
             SortKey::AnnounceTx => self.outgoing_announce_frequency,
+            SortKey::AnnounceRxCount => self.announces_received as f64,
+            SortKey::AnnounceTxCount => self.announces_sent as f64,
             SortKey::PathRequestRx => self.incoming_pr_frequency,
             SortKey::PathRequestTx => self.outgoing_pr_frequency,
+            SortKey::PathRequestRxCount => self.path_requests_received as f64,
+            SortKey::PathRequestTxCount => self.path_requests_sent as f64,
             SortKey::Held => self.held_announces as f64,
+            SortKey::ProtocolViolations => self.protocol_violations as f64,
+            SortKey::IfacViolations => self.ifac_violations as f64,
+            SortKey::FilterHits => self.packet_filter_hits as f64,
+            SortKey::TxDrops => self.tx_drops as f64,
+            SortKey::TxDroppedBytes => self.tx_dropped_bytes as f64,
         }
     }
 }
@@ -1158,7 +1224,7 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 print!(",");
             }
             print!(
-                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"ifac_signature\":{},\"ifac_size\":{},\"ifac_netname\":{}}}",
+                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"ifac_signature\":{},\"ifac_size\":{},\"ifac_netname\":{},\"tx_drops\":{},\"tx_dropped_bytes\":{},\"arxc\":{},\"atxc\":{},\"prxc\":{},\"ptxc\":{},\"protocol_violations\":{},\"ifac_violations\":{},\"packet_filter_hits\":{}}}",
                 json_str(&iface.name),
                 iface.online,
                 iface.mode,
@@ -1188,6 +1254,15 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 opt_hex_json(iface.ifac_signature.as_deref()),
                 opt_u64_json(iface.ifac_size),
                 opt_str_json(iface.ifac_netname.as_deref()),
+                iface.tx_drops,
+                iface.tx_dropped_bytes,
+                iface.announces_received,
+                iface.announces_sent,
+                iface.path_requests_received,
+                iface.path_requests_sent,
+                iface.protocol_violations,
+                iface.ifac_violations,
+                iface.packet_filter_hits,
             );
         }
         print!("]");
@@ -1247,6 +1322,7 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                     print_announce_frequency(
                         iface.incoming_announce_frequency,
                         iface.outgoing_announce_frequency,
+                        (iface.announces_received, iface.announces_sent),
                         iface.clients,
                         iface.announce_rate_target,
                         iface.announce_rate_penalty,
@@ -1259,10 +1335,16 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 print_path_request_frequency(
                     iface.incoming_pr_frequency,
                     iface.outgoing_pr_frequency,
+                    (iface.path_requests_received, iface.path_requests_sent),
                     iface.clients,
                     burst_status_text(iface.pr_burst_active, iface.pr_burst_activated),
                 );
             }
+            print_violations(
+                iface.protocol_violations,
+                iface.ifac_violations,
+                iface.packet_filter_hits,
+            );
             println!(
                 "    Traffic  : {} rx / {} tx",
                 format::pretty_size(iface.rxb),
@@ -1327,6 +1409,15 @@ fn remote_interface_from_map(m: &[(rmpv::Value, rmpv::Value)]) -> RemoteInterfac
         ifac_signature: map_bytes(m, "ifac_signature"),
         ifac_size: map_u64(m, "ifac_size"),
         ifac_netname: map_str(m, "ifac_netname"),
+        announces_received: map_u64(m, "arxc").unwrap_or(0),
+        announces_sent: map_u64(m, "atxc").unwrap_or(0),
+        path_requests_received: map_u64(m, "prxc").unwrap_or(0),
+        path_requests_sent: map_u64(m, "ptxc").unwrap_or(0),
+        protocol_violations: map_u64(m, "protocol_violations").unwrap_or(0),
+        ifac_violations: map_u64(m, "ifac_violations").unwrap_or(0),
+        packet_filter_hits: map_u64(m, "packet_filter_hits").unwrap_or(0),
+        tx_drops: map_u64(m, "txdrp").unwrap_or(0),
+        tx_dropped_bytes: map_u64(m, "txdrb").unwrap_or(0),
     }
 }
 
@@ -1360,9 +1451,11 @@ fn map_bool(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<bool> {
         .and_then(|(_, v)| v.as_bool())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_announce_frequency(
     incoming: f64,
     outgoing: f64,
+    (received, sent): (u64, u64),
     clients: Option<u64>,
     target: Option<f64>,
     penalty: Option<f64>,
@@ -1376,13 +1469,18 @@ fn print_announce_frequency(
         .map(|clients| format!(" {}/c", format::pretty_frequency(outgoing / clients as f64)))
         .unwrap_or_default();
     let limits = announce_rate_limits_text(target, penalty, grace);
-    println!("    Announces: {outgoing_text}{per_client}");
-    println!("               {incoming_text} {limits}{burst_text}");
+    print_frequency_lines(
+        "Announces",
+        (received, sent),
+        format!("{outgoing_text}{per_client}"),
+        format!("{incoming_text} {limits}{burst_text}"),
+    );
 }
 
 fn print_path_request_frequency(
     incoming: f64,
     outgoing: f64,
+    (received, sent): (u64, u64),
     clients: Option<u64>,
     burst_text: String,
 ) {
@@ -1392,8 +1490,44 @@ fn print_path_request_frequency(
         .filter(|clients| *clients > 0)
         .map(|clients| format!(" {}/c", format::pretty_frequency(outgoing / clients as f64)))
         .unwrap_or_default();
-    println!("    Path Rqs.: {outgoing_text}{per_client}");
-    println!("               {incoming_text} {burst_text}");
+    print_frequency_lines(
+        "Path Rqs.",
+        (received, sent),
+        format!("{outgoing_text}{per_client}"),
+        format!("{incoming_text} {burst_text}"),
+    );
+}
+
+/// Python leads with the totals when both directions have any
+/// (rnstatus.py:723-735).
+fn print_frequency_lines(
+    label: &str,
+    (received, sent): (u64, u64),
+    outgoing: String,
+    incoming: String,
+) {
+    if received > 0 && sent > 0 {
+        println!("    {label:<9}: {received}↓ {sent}↑ total");
+        println!("               {outgoing}");
+    } else {
+        println!("    {label:<9}: {outgoing}");
+    }
+    println!("               {incoming}");
+}
+
+/// Python's violation and filter lines (rnstatus.py:712-720).
+fn print_violations(protocol: u64, ifac: u64, filtered: u64) {
+    if protocol > 0 || ifac > 0 {
+        let ifac_text = if ifac > 0 {
+            format!(", {ifac} IFAC")
+        } else {
+            String::new()
+        };
+        println!("    Violatns.: {protocol} protocol{ifac_text}");
+    }
+    if filtered > 0 {
+        println!("    Flt. Hits: {filtered}");
+    }
 }
 
 fn burst_status_text(active: bool, activated: f64) -> String {
@@ -1618,6 +1752,7 @@ mod tests {
             ifac_size: None,
             ifac_netname: None,
             tx_drops: 0,
+            ..Default::default()
         }
     }
 
@@ -1678,6 +1813,70 @@ mod tests {
         let entry = local_entry("SortIf", false, false);
         assert_eq!(local_stat_sort_value(&entry, SortKey::PathRequestRx), 2.0);
         assert_eq!(local_stat_sort_value(&entry, SortKey::PathRequestTx), 3.0);
+    }
+
+    /// Python 1.5.5 `rnstatus -s` count and violation keys (rnstatus.py:432-443).
+    #[test]
+    fn sort_keys_accept_python_counts_and_violations() {
+        let mut entry = local_entry("CountIf", false, false);
+        entry.announces_received = 11;
+        entry.announces_sent = 12;
+        entry.path_requests_received = 13;
+        entry.path_requests_sent = 14;
+        entry.protocol_violations = 15;
+        entry.ifac_violations = 16;
+        entry.packet_filter_hits = 17;
+        entry.tx_drops = 18;
+        entry.tx_dropped_bytes = 19;
+        for (key, expected) in [
+            ("arxc", 11.0),
+            ("atxc", 12.0),
+            ("prxc", 13.0),
+            ("ptxc", 14.0),
+            ("pvs", 15.0),
+            ("ivs", 16.0),
+            ("flt", 17.0),
+            ("txdrp", 18.0),
+            ("txdrb", 19.0),
+        ] {
+            let sort = parse_sort_key(Some(key)).unwrap().unwrap();
+            assert_eq!(local_stat_sort_value(&entry, sort), expected, "{key}");
+        }
+        assert_eq!(
+            parse_sort_key(Some("anns")).unwrap(),
+            Some(SortKey::Announces)
+        );
+    }
+
+    #[test]
+    fn remote_stats_carry_python_counters() {
+        let key = |name: &str| rmpv::Value::from(name);
+        let map = vec![
+            (key("name"), rmpv::Value::from("Counted")),
+            (key("arxc"), rmpv::Value::from(21u64)),
+            (key("atxc"), rmpv::Value::from(22u64)),
+            (key("prxc"), rmpv::Value::from(23u64)),
+            (key("ptxc"), rmpv::Value::from(24u64)),
+            (key("protocol_violations"), rmpv::Value::from(25u64)),
+            (key("ifac_violations"), rmpv::Value::from(26u64)),
+            (key("packet_filter_hits"), rmpv::Value::from(27u64)),
+            (key("txdrp"), rmpv::Value::from(28u64)),
+            (key("txdrb"), rmpv::Value::from(29u64)),
+        ];
+        let iface = remote_interface_from_map(&map);
+        for (sort, expected) in [
+            (SortKey::AnnounceRxCount, 21.0),
+            (SortKey::AnnounceTxCount, 22.0),
+            (SortKey::PathRequestRxCount, 23.0),
+            (SortKey::PathRequestTxCount, 24.0),
+            (SortKey::ProtocolViolations, 25.0),
+            (SortKey::IfacViolations, 26.0),
+            (SortKey::FilterHits, 27.0),
+            (SortKey::TxDrops, 28.0),
+            (SortKey::TxDroppedBytes, 29.0),
+        ] {
+            assert_eq!(iface.sort_value(sort), expected, "{sort:?}");
+        }
     }
 
     #[test]

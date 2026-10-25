@@ -15,35 +15,35 @@ use tokio::sync::{mpsc, oneshot};
 use rns_crypto::sha::truncated_hash;
 use rns_identity::destination::Destination;
 use rns_identity::identity::Identity;
-use rns_transport::messages::{
-    InterfaceStatRpcEntry, PathTableRpcEntry, RateTableRpcEntry, TransportMessage, TransportQuery,
-    TransportQueryResponse,
-};
+use rns_transport::messages::{TransportMessage, TransportQuery, TransportQueryResponse};
 
-use crate::remote_management_schema as schema;
-use crate::reticulum::{InterfaceIfac, InterfaceIfacStats};
+use crate::reticulum::InterfaceIfacStats;
+use crate::rpc::{self, RpcResponse};
+use crate::rpc_server::{TransportStatsSource, stat_entries};
 
 const STATUS_PATH: &str = "/status";
 const PATH_PATH: &str = "/path";
 
-/// `identity` must be stable across restarts so clients can cache the dest
-/// hash. Empty `allowed_identities` denies all peers, matching Python's
-/// `Destination.ALLOW_LIST` semantics.
+/// Python registers this destination on `Transport.identity`
+/// (Transport.py:367-368), so `rnstatus -R` and `rnpath -R` find it from the
+/// transport identity hash. Empty `allowed_identities` denies all peers,
+/// matching Python's `Destination.ALLOW_LIST` semantics.
 pub async fn start_remote_management(
     transport_tx: mpsc::Sender<TransportMessage>,
     identity: &Identity,
     allowed_identities: Vec<[u8; 16]>,
 ) -> Result<[u8; 16], String> {
-    start_remote_management_with_ifac(transport_tx, identity, allowed_identities, None).await
+    start_remote_management_with_stats(transport_tx, identity, allowed_identities, None, None).await
 }
 
-/// As [`start_remote_management`], with the runtime's IFAC records so status
-/// replies carry Python's IFAC fields.
-pub(crate) async fn start_remote_management_with_ifac(
+/// As [`start_remote_management`], with the runtime's IFAC records and
+/// transport instance, so status replies carry every field of Python's.
+pub(crate) async fn start_remote_management_with_stats(
     transport_tx: mpsc::Sender<TransportMessage>,
     identity: &Identity,
     allowed_identities: Vec<[u8; 16]>,
     ifac: Option<InterfaceIfacStats>,
+    transport: Option<TransportStatsSource>,
 ) -> Result<[u8; 16], String> {
     let signing_key = identity
         .get_signing_key()
@@ -93,7 +93,7 @@ pub(crate) async fn start_remote_management_with_ifac(
         }
 
         if path_hash == status_hash {
-            handle_status(&tx, &data, ifac.as_ref())
+            handle_status(&tx, &data, ifac.as_ref(), transport.as_ref())
         } else if path_hash == paths_hash {
             handle_path(&tx, &data)
         } else {
@@ -125,11 +125,13 @@ fn peer_allowed(allowed: &[[u8; 16]], peer: &[u8; 16]) -> bool {
 }
 
 /// Request: `[include_link_count: bool]`.
-/// Response: `[stats_dict]` or `[stats_dict, link_count]`.
+/// Response: `[stats_dict]` or `[stats_dict, link_count]`, where the stats
+/// dict is the control port's (Transport.py:3325-3337).
 fn handle_status(
     tx: &mpsc::Sender<TransportMessage>,
     data: &[u8],
     ifac: Option<&InterfaceIfacStats>,
+    transport: Option<&TransportStatsSource>,
 ) -> Option<Vec<u8>> {
     let include_link_count = parse_status_request(data).unwrap_or(false);
 
@@ -147,49 +149,65 @@ fn handle_status(
         None
     };
 
-    let stats = build_transport_stats(iface_stats, ifac);
-
-    let bytes = if let Some(lc) = link_count {
-        rmp_serde::to_vec_named(&(&stats, lc)).ok()?
-    } else {
-        rmp_serde::to_vec_named(&(&stats,)).ok()?
-    };
-    Some(bytes)
+    rpc::encode_remote_status(
+        &stat_entries(iface_stats, ifac),
+        transport.map(TransportStatsSource::snapshot).as_ref(),
+        link_count,
+    )
+    .ok()
 }
 
 /// Request: `[command: "table"|"rates", destination?: bytes, max_hops?: int]`.
-/// Response: list of path-entry or rate-entry dicts.
+/// Response: the control port's path or rate table, filtered
+/// (Transport.py:3346-3371).
 fn handle_path(tx: &mpsc::Sender<TransportMessage>, data: &[u8]) -> Option<Vec<u8>> {
     let (command, destination, max_hops) = parse_path_request(data)?;
 
-    match command.as_str() {
+    let response = match command.as_str() {
         "table" => {
             let entries = match blocking_query(tx, TransportQuery::GetPathTable)? {
                 TransportQueryResponse::PathTable(v) => v,
                 _ => return None,
             };
-            let filtered: Vec<schema::PathEntry> = entries
-                .into_iter()
-                .filter(|e| destination.is_none_or(|d| e.hash == d))
-                .filter(|e| max_hops.is_none_or(|m| e.hops <= m))
-                .map(path_entry_from_rpc)
-                .collect();
-            rmp_serde::to_vec_named(&filtered).ok()
+            RpcResponse::PathTable(
+                entries
+                    .into_iter()
+                    .filter(|e| destination.is_none_or(|d| e.hash == d))
+                    .filter(|e| max_hops.is_none_or(|m| e.hops <= m))
+                    .map(|e| rpc::PathTableEntry {
+                        hash: e.hash.to_vec(),
+                        timestamp: e.timestamp,
+                        via: e.via.map(|v| v.to_vec()),
+                        hops: e.hops,
+                        expires: e.expires,
+                        interface: e.interface,
+                    })
+                    .collect(),
+            )
         }
         "rates" => {
             let entries = match blocking_query(tx, TransportQuery::GetRateTable)? {
                 TransportQueryResponse::RateTable(v) => v,
                 _ => return None,
             };
-            let filtered: Vec<schema::RateEntry> = entries
-                .into_iter()
-                .filter(|e| destination.is_none_or(|d| e.hash == d))
-                .map(rate_entry_from_rpc)
-                .collect();
-            rmp_serde::to_vec_named(&filtered).ok()
+            RpcResponse::RateTable(
+                entries
+                    .into_iter()
+                    .filter(|e| destination.is_none_or(|d| e.hash == d))
+                    .map(|e| rpc::RateTableEntry {
+                        hash: e.hash.to_vec(),
+                        rate: e.rate,
+                        last: e.last,
+                        rate_violations: e.rate_violations,
+                        blocked_until: e.blocked_until,
+                        timestamps: e.timestamps,
+                    })
+                    .collect(),
+            )
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    rpc::encode_response(&response).ok()
 }
 
 fn parse_status_request(data: &[u8]) -> Option<bool> {
@@ -228,105 +246,6 @@ fn blocking_query(
     tokio::task::block_in_place(|| resp_rx.blocking_recv().ok())
 }
 
-fn build_transport_stats(
-    entries: Vec<InterfaceStatRpcEntry>,
-    ifac: Option<&InterfaceIfacStats>,
-) -> schema::TransportStats {
-    let (total_rxb, total_txb) = entries
-        .iter()
-        .fold((0u64, 0u64), |(r, t), e| (r + e.rx_bytes, t + e.tx_bytes));
-    let (total_rxs, total_txs) = entries
-        .iter()
-        .fold((0u64, 0u64), |(r, t), e| (r + e.rx_rate, t + e.tx_rate));
-
-    let interfaces = entries
-        .into_iter()
-        .map(|e| {
-            let ifac = ifac.map(|ifac| ifac.lookup(e.id)).unwrap_or_default();
-            interface_stats_from_rpc(e, ifac)
-        })
-        .collect();
-
-    schema::TransportStats {
-        interfaces,
-        rxb: total_rxb,
-        txb: total_txb,
-        rxs: total_rxs,
-        txs: total_txs,
-        transport_id: None,
-        network_id: None,
-        transport_uptime: None,
-        probe_responder: None,
-        rss: None,
-    }
-}
-
-fn interface_stats_from_rpc(
-    e: InterfaceStatRpcEntry,
-    ifac: InterfaceIfac,
-) -> schema::InterfaceStats {
-    let mode = mode_from_debug_string(&e.mode);
-    schema::InterfaceStats {
-        name: e.name.clone(),
-        short_name: e.name,
-        hash: None,
-        type_: "Interface".to_string(),
-        rxb: e.rx_bytes,
-        txb: e.tx_bytes,
-        incoming_announce_frequency: e.incoming_announce_frequency,
-        outgoing_announce_frequency: e.outgoing_announce_frequency,
-        incoming_pr_frequency: e.incoming_pr_frequency,
-        outgoing_pr_frequency: e.outgoing_pr_frequency,
-        held_announces: e.held_announces,
-        burst_active: e.burst_active,
-        burst_activated: e.burst_activated,
-        pr_burst_active: e.pr_burst_active,
-        pr_burst_activated: e.pr_burst_activated,
-        status: e.online,
-        mode,
-        bitrate: Some(e.bitrate),
-        rxs: e.rx_rate,
-        txs: e.tx_rate,
-        announce_queue: e.announce_queue,
-        clients: e.clients,
-        blocked_ips: e.blocked_ips,
-        ifac_signature: ifac.signature.map(Vec::from),
-        ifac_size: ifac.size.map(|size| size as u64),
-        ifac_netname: ifac.netname,
-    }
-}
-
-fn path_entry_from_rpc(e: PathTableRpcEntry) -> schema::PathEntry {
-    schema::PathEntry {
-        hash: e.hash.to_vec(),
-        timestamp: e.timestamp,
-        via: e.via.map(|v| v.to_vec()),
-        hops: e.hops,
-        expires: e.expires,
-        interface: e.interface,
-    }
-}
-
-fn rate_entry_from_rpc(e: RateTableRpcEntry) -> schema::RateEntry {
-    schema::RateEntry {
-        hash: e.hash.to_vec(),
-        rate: e.rate,
-    }
-}
-
-/// Maps Debug-formatted InterfaceMode to Python `Interface.MODE_*` integers.
-fn mode_from_debug_string(s: &str) -> u8 {
-    match s {
-        "Full" => 0x01,
-        "PointToPoint" => 0x02,
-        "Access" | "AccessPoint" => 0x03,
-        "Roaming" => 0x04,
-        "Boundary" => 0x05,
-        "Gateway" => 0x06,
-        _ => 0x01,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,157 +265,6 @@ mod tests {
         let other = [0x24; 16];
         assert!(peer_allowed(&[peer], &peer));
         assert!(!peer_allowed(&[peer], &other));
-    }
-
-    #[test]
-    fn status_response_is_python_compatible_list() {
-        let stats = schema::TransportStats {
-            interfaces: vec![schema::InterfaceStats {
-                name: "TestIf".to_string(),
-                short_name: "TestIf".to_string(),
-                hash: None,
-                type_: "Interface".to_string(),
-                rxb: 42,
-                txb: 7,
-                incoming_announce_frequency: 0.0,
-                outgoing_announce_frequency: 0.0,
-                incoming_pr_frequency: 0.0,
-                outgoing_pr_frequency: 0.0,
-                held_announces: 0,
-                burst_active: false,
-                burst_activated: 0.0,
-                pr_burst_active: false,
-                pr_burst_activated: 0.0,
-                status: true,
-                mode: 0x01,
-                bitrate: Some(1_000_000),
-                rxs: 0,
-                txs: 0,
-                announce_queue: None,
-                clients: None,
-                blocked_ips: None,
-                ifac_signature: None,
-                ifac_size: None,
-                ifac_netname: None,
-            }],
-            rxb: 42,
-            txb: 7,
-            rxs: 0,
-            txs: 0,
-            transport_id: None,
-            network_id: None,
-            transport_uptime: None,
-            probe_responder: None,
-            rss: None,
-        };
-
-        let encoded = rmp_serde::to_vec_named(&(&stats, 5u64)).unwrap();
-        let decoded: rmpv::Value = rmp_serde::from_slice(&encoded).unwrap();
-        let arr = decoded.as_array().expect("top level is an array");
-        assert_eq!(arr.len(), 2, "response is [stats_dict, link_count]");
-
-        let stats_map = arr[0].as_map().expect("first element is map");
-        let has_interfaces = stats_map
-            .iter()
-            .any(|(k, _)| k.as_str() == Some("interfaces"));
-        assert!(has_interfaces, "stats dict has 'interfaces' key");
-
-        let interface_map = stats_map
-            .iter()
-            .find(|(key, _)| key.as_str() == Some("interfaces"))
-            .and_then(|(_, value)| value.as_array())
-            .and_then(|interfaces| interfaces.first())
-            .and_then(rmpv::Value::as_map)
-            .expect("first interface is a map");
-        assert!(
-            !interface_map
-                .iter()
-                .any(|(key, _)| key.as_str() == Some("blocked_ips")),
-            "absent aggregate count is omitted"
-        );
-        assert_eq!(arr[1].as_u64(), Some(5));
-    }
-
-    #[test]
-    fn status_response_serializes_only_aggregate_blocked_ip_count() {
-        let stats = schema::InterfaceStats {
-            name: "Backbone".to_string(),
-            short_name: "Backbone".to_string(),
-            hash: None,
-            type_: "Interface".to_string(),
-            rxb: 0,
-            txb: 0,
-            incoming_announce_frequency: 0.0,
-            outgoing_announce_frequency: 0.0,
-            incoming_pr_frequency: 0.0,
-            outgoing_pr_frequency: 0.0,
-            held_announces: 0,
-            burst_active: false,
-            burst_activated: 0.0,
-            pr_burst_active: false,
-            pr_burst_activated: 0.0,
-            status: true,
-            mode: 0x01,
-            bitrate: Some(1_000_000),
-            rxs: 0,
-            txs: 0,
-            announce_queue: None,
-            clients: Some(2),
-            blocked_ips: Some(3),
-            ifac_signature: None,
-            ifac_size: None,
-            ifac_netname: None,
-        };
-        let encoded = rmp_serde::to_vec_named(&stats).unwrap();
-        let decoded: rmpv::Value = rmp_serde::from_slice(&encoded).unwrap();
-        let map = decoded.as_map().expect("interface stats are a map");
-        assert_eq!(
-            map.iter()
-                .find(|(key, _)| key.as_str() == Some("blocked_ips"))
-                .and_then(|(_, value)| value.as_u64()),
-            Some(3)
-        );
-        assert!(
-            !map.iter()
-                .any(|(key, _)| key.as_str() == Some("blocked_ip_list"))
-        );
-    }
-
-    #[test]
-    fn path_response_is_list_of_dicts() {
-        let entry = schema::PathEntry {
-            hash: vec![0xAA; 16],
-            timestamp: 1_700_000_000.0,
-            via: Some(vec![0xBB; 16]),
-            hops: 2,
-            expires: 1_700_001_000.0,
-            interface: "TestIf".to_string(),
-        };
-        let encoded = rmp_serde::to_vec_named(&vec![entry]).unwrap();
-        let decoded: rmpv::Value = rmp_serde::from_slice(&encoded).unwrap();
-        let arr = decoded.as_array().expect("top-level array");
-        assert_eq!(arr.len(), 1);
-
-        let m = arr[0].as_map().expect("each entry is a map");
-        let keys: Vec<&str> = m.iter().filter_map(|(k, _)| k.as_str()).collect();
-        for expected in ["hash", "timestamp", "via", "hops", "expires", "interface"] {
-            assert!(
-                keys.contains(&expected),
-                "missing key {expected} in {keys:?}"
-            );
-        }
-
-        // hash/via are msgpack bin, not arrays-of-ints
-        let hash_val = m
-            .iter()
-            .find(|(k, _)| k.as_str() == Some("hash"))
-            .map(|(_, v)| v)
-            .unwrap();
-        assert_eq!(
-            hash_val.as_slice(),
-            Some(&[0xAA; 16][..]),
-            "hash is msgpack bin"
-        );
     }
 
     #[test]
@@ -537,6 +305,8 @@ mod tests {
         assert_eq!(max_hops, Some(3));
     }
 
+    use rns_transport::messages::{InterfaceStatRpcEntry, PathTableRpcEntry, RateTableRpcEntry};
+
     // RNode-like: a default IFAC size is configured, IFAC itself is off.
     fn mock_stat_entry() -> InterfaceStatRpcEntry {
         InterfaceStatRpcEntry {
@@ -569,38 +339,24 @@ mod tests {
             announce_cap: 0.02,
             ifac_size: 8,
             tx_drops: 0,
+            ..Default::default()
         }
     }
 
-    #[test]
-    fn status_reports_ifac_only_for_interfaces_with_ifac() {
-        let plain = interface_stats_from_rpc(mock_stat_entry(), InterfaceIfac::default());
-        assert_eq!(
-            (plain.ifac_signature, plain.ifac_size, plain.ifac_netname),
-            (None, None, None)
-        );
-        let ifac = interface_stats_from_rpc(
-            mock_stat_entry(),
-            InterfaceIfac {
-                signature: Some([7; 64]),
-                size: Some(8),
-                netname: Some("testnet".to_string()),
-            },
-        );
-        assert_eq!(ifac.ifac_signature, Some(vec![7; 64]));
-        assert_eq!(ifac.ifac_size, Some(8));
-        assert_eq!(ifac.ifac_netname.as_deref(), Some("testnet"));
+    fn spawn_mock_transport() -> mpsc::Sender<TransportMessage> {
+        spawn_mock_transport_with(vec![mock_stat_entry()])
     }
 
-    fn spawn_mock_transport() -> mpsc::Sender<TransportMessage> {
+    fn spawn_mock_transport_with(
+        interfaces: Vec<InterfaceStatRpcEntry>,
+    ) -> mpsc::Sender<TransportMessage> {
         let (tx, mut rx) = mpsc::channel::<TransportMessage>(16);
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 if let TransportMessage::Rpc { query, response_tx } = msg {
                     let resp = match query {
                         TransportQuery::GetInterfaceStats => {
-                            let stats = vec![mock_stat_entry()];
-                            TransportQueryResponse::InterfaceStats(stats)
+                            TransportQueryResponse::InterfaceStats(interfaces.clone())
                         }
                         TransportQuery::GetLinkCount => TransportQueryResponse::IntResult(3),
                         TransportQuery::GetPathTable => {
@@ -642,7 +398,7 @@ mod tests {
         let tx = spawn_mock_transport();
 
         let req = rmp_serde::to_vec(&(true,)).unwrap();
-        let resp = handle_status(&tx, &req, None).expect("handler produced a response");
+        let resp = handle_status(&tx, &req, None, None).expect("handler produced a response");
 
         let decoded: rmpv::Value = rmp_serde::from_slice(&resp).unwrap();
         let arr = decoded.as_array().expect("response is an array");
@@ -732,12 +488,101 @@ mod tests {
         );
     }
 
+    fn map_get<'a>(map: &'a [(rmpv::Value, rmpv::Value)], key: &str) -> Option<&'a rmpv::Value> {
+        map.iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .map(|(_, v)| v)
+    }
+
+    fn remote_interfaces(
+        stats: &[(rmpv::Value, rmpv::Value)],
+    ) -> Vec<Vec<(rmpv::Value, rmpv::Value)>> {
+        map_get(stats, "interfaces")
+            .and_then(rmpv::Value::as_array)
+            .expect("stats list their interfaces")
+            .iter()
+            .map(|interface| interface.as_map().expect("interface is a map").clone())
+            .collect()
+    }
+
+    /// Python's `/status` answers with `get_interface_stats()` itself
+    /// (Transport.py:3325-3337), so `rnstatus -R` needs the full 1.5.5 key set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_status_carries_every_python_155_key() {
+        let tx = spawn_mock_transport();
+        let resp = handle_status(&tx, &rmp_serde::to_vec(&(true,)).unwrap(), None, None).unwrap();
+        let decoded: rmpv::Value = rmp_serde::from_slice(&resp).unwrap();
+        let stats = decoded.as_array().unwrap()[0].as_map().unwrap();
+        for key in crate::rpc::PYTHON_TOTAL_KEYS {
+            assert!(map_get(stats, key).is_some(), "missing total {key}");
+        }
+        let interface = &remote_interfaces(stats)[0];
+        for key in crate::rpc::PYTHON_INTERFACE_KEYS {
+            assert!(map_get(interface, key).is_some(), "missing {key}");
+        }
+        assert_eq!(
+            map_get(interface, "mtu").and_then(rmpv::Value::as_u64),
+            Some(512),
+            "rnstatus -R prints the MTU beside the bitrate (rnstatus.py:542-543)"
+        );
+        assert!(
+            map_get(interface, "clients").is_some_and(rmpv::Value::is_nil),
+            "rnstatus reads clients unguarded (rnstatus.py:489)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_and_local_stats_map_the_internal_mode_alike() {
+        let mut internal = mock_stat_entry();
+        internal.mode = "Internal".to_string();
+        let tx = spawn_mock_transport_with(vec![internal]);
+        let resp = handle_status(&tx, &rmp_serde::to_vec(&(false,)).unwrap(), None, None).unwrap();
+        let decoded: rmpv::Value = rmp_serde::from_slice(&resp).unwrap();
+        let interface = &remote_interfaces(decoded.as_array().unwrap()[0].as_map().unwrap())[0];
+        assert_eq!(
+            map_get(interface, "mode").and_then(rmpv::Value::as_u64),
+            Some(0x07),
+            "Python MODE_INTERNAL (Interface.py:51), as the local RPC reports it"
+        );
+    }
+
+    /// `rnpath -R -r` sorts the remote rate table on `last` and reads every
+    /// rate field (rnpath.py:327-370); Python returns whole rate-table entries
+    /// (Transport.py:3364-3369, Reticulum.py:1747-1766).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_rates_return_whole_python_rate_entries() {
+        let tx = spawn_mock_transport();
+        let resp = handle_path(&tx, &rmp_serde::to_vec(&("rates",)).unwrap()).unwrap();
+        let decoded: rmpv::Value = rmp_serde::from_slice(&resp).unwrap();
+        let entry = decoded.as_array().unwrap()[0].as_map().unwrap();
+        assert_eq!(
+            map_get(entry, "hash").and_then(rmpv::Value::as_slice),
+            Some(&[0x33; 16][..])
+        );
+        assert_eq!(
+            map_get(entry, "last").and_then(rmpv::Value::as_f64),
+            Some(1_700_000_000.0)
+        );
+        assert_eq!(
+            map_get(entry, "rate_violations").and_then(rmpv::Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            map_get(entry, "blocked_until").and_then(rmpv::Value::as_f64),
+            Some(0.0)
+        );
+        let timestamps = map_get(entry, "timestamps")
+            .and_then(rmpv::Value::as_array)
+            .expect("timestamps list");
+        assert_eq!(timestamps[0].as_f64(), Some(1_700_000_000.0));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handle_status_without_link_count() {
         let tx = spawn_mock_transport();
 
         let req = rmp_serde::to_vec(&(false,)).unwrap();
-        let resp = handle_status(&tx, &req, None).unwrap();
+        let resp = handle_status(&tx, &req, None, None).unwrap();
         let decoded: rmpv::Value = rmp_serde::from_slice(&resp).unwrap();
         let arr = decoded.as_array().unwrap();
         assert_eq!(arr.len(), 1, "response is [stats_dict] with no link count");
@@ -787,16 +632,5 @@ mod tests {
         let tx = spawn_mock_transport();
         let req = rmp_serde::to_vec(&("wat",)).unwrap();
         assert!(handle_path(&tx, &req).is_none());
-    }
-
-    #[test]
-    fn mode_mapping_matches_python_constants() {
-        assert_eq!(mode_from_debug_string("Full"), 0x01);
-        assert_eq!(mode_from_debug_string("PointToPoint"), 0x02);
-        assert_eq!(mode_from_debug_string("Access"), 0x03);
-        assert_eq!(mode_from_debug_string("Roaming"), 0x04);
-        assert_eq!(mode_from_debug_string("Boundary"), 0x05);
-        assert_eq!(mode_from_debug_string("Gateway"), 0x06);
-        assert_eq!(mode_from_debug_string("Unknown"), 0x01);
     }
 }

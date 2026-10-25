@@ -2182,6 +2182,15 @@ fn rpc_response_to_transport_response(
                     announce_cap: entry.announce_cap,
                     ifac_size: entry.ifac_size.unwrap_or(0),
                     tx_drops: entry.tx_drops,
+                    tx_dropped_bytes: entry.tx_dropped_bytes,
+                    announces_received: entry.announces_received,
+                    announces_sent: entry.announces_sent,
+                    path_requests_received: entry.path_requests_received,
+                    path_requests_sent: entry.path_requests_sent,
+                    protocol_violations: entry.protocol_violations,
+                    ifac_violations: entry.ifac_violations,
+                    packet_filter_hits: entry.packet_filter_hits,
+                    parent_id: None,
                 })
                 .collect();
             TransportQueryResponse::InterfaceStats(entries)
@@ -3005,6 +3014,13 @@ pub async fn init_with_policy(
         .as_ref()
         .map(|path| load_or_create_network_identity(path))
         .transpose()?;
+    let transport_stats = rc.enable_transport.then(|| {
+        crate::rpc_server::TransportStatsSource::new(
+            wire_transport_identity.hash,
+            network_identity.as_ref().map(|identity| identity.hash),
+            started_at,
+        )
+    });
 
     let socket_base = socket_dir.clone().unwrap_or_else(std::env::temp_dir);
     let mut shared_spawn_permit = Some(match interface_registry.acquire_spawn_permit() {
@@ -3096,14 +3112,17 @@ pub async fn init_with_policy(
             .await
             .map_err(|_| SharedInstanceError::Cancelled)?;
             let rpc_key = rc.rpc_key.clone().ok_or(SharedInstanceError::InvalidKey)?;
-            shutdown_coordinator.install_owned_control_task(tokio::spawn(control.run(
-                rpc_key,
-                crate::rpc_server::RpcBackend::new(
-                    transport_tx.clone(),
-                    Some(InterfaceIfacStats(interface_controls.clone())),
+            shutdown_coordinator.install_owned_control_task(tokio::spawn(
+                control.run(
+                    rpc_key,
+                    crate::rpc_server::RpcBackend::new(
+                        transport_tx.clone(),
+                        Some(InterfaceIfacStats(interface_controls.clone())),
+                    )
+                    .with_transport(transport_stats.clone()),
+                    shutdown.clone(),
                 ),
-                shutdown.clone(),
-            )));
+            ));
             Ok(InstanceMode::Shared)
         }
         .await;
@@ -3634,7 +3653,8 @@ pub async fn init_with_policy(
         let rpc_backend = crate::rpc_server::RpcBackend::new(
             transport_tx.clone(),
             Some(InterfaceIfacStats(interface_controls.clone())),
-        );
+        )
+        .with_transport(transport_stats.clone());
         let rpc_shutdown = shutdown.clone();
         if rc.shared_instance_type == SharedInstanceType::Unix {
             let rpc_socket = shared_unix_rpc_socket_path(&rc.instance_name, &socket_base);
@@ -3664,20 +3684,6 @@ pub async fn init_with_policy(
     }
 
     if instance_mode != InstanceMode::Client && rc.enable_remote_management {
-        // Persist so the destination hash stays stable across restarts.
-        let mgmt_path = paths.storage_dir.join("remote_management_identity");
-        let mgmt_identity = match rns_identity::identity::Identity::from_file(&mgmt_path) {
-            Ok(id) => id,
-            Err(_) => {
-                let id = rns_identity::identity::Identity::new();
-                if let Err(e) = id.to_file(&mgmt_path) {
-                    tracing::warn!(path = %mgmt_path.display(), error = %e,
-                        "failed to persist remote management identity — destination hash will change on restart");
-                }
-                id
-            }
-        };
-
         // Drop wrong-length entries with a warning so a single typo doesn't disable management.
         let allowed: Vec<[u8; 16]> = rc
             .remote_management_allowed
@@ -3696,16 +3702,23 @@ pub async fn init_with_policy(
             );
         }
 
-        match crate::remote_management::start_remote_management_with_ifac(
+        // Python serves remote management on Transport.identity
+        // (Transport.py:367-368), the hash `rnstatus -R` and `rnpath -R` take.
+        match crate::remote_management::start_remote_management_with_stats(
             transport_tx.clone(),
-            &mgmt_identity,
+            &handle.transport_identity,
             allowed,
             Some(InterfaceIfacStats(interface_controls.clone())),
+            transport_stats.clone(),
         )
         .await
         {
             Ok(dest) => {
-                tracing::info!(dest = %hex::encode(dest), "remote management started");
+                tracing::info!(
+                    dest = %hex::encode(dest),
+                    transport_identity = %hex::encode(handle.transport_identity.hash),
+                    "remote management started"
+                );
             }
             Err(e) => {
                 tracing::warn!("failed to start remote management: {}", e);
@@ -3735,6 +3748,9 @@ pub async fn init_with_policy(
         .await
         {
             Ok(dest) => {
+                if let Some(transport_stats) = &transport_stats {
+                    transport_stats.set_probe_responder(dest);
+                }
                 tracing::info!(dest = %hex::encode(dest), "probe responder started");
             }
             Err(e) => {
@@ -4579,6 +4595,10 @@ async fn prepare_interface_with_role_and_overrides(
         txb: handle.txb,
         inspection: handle.inspection,
         tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        tx_dropped_bytes: 0,
+        protocol_violations: 0,
+        ifac_violations: 0,
+        packet_filter_hits: 0,
         ingress,
         announce_queue: Vec::new(),
         multipoint,
@@ -4821,6 +4841,10 @@ async fn prepare_interface_with_post_init(
         txb: handle.txb,
         inspection: handle.inspection,
         tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        tx_dropped_bytes: 0,
+        protocol_violations: 0,
+        ifac_violations: 0,
+        packet_filter_hits: 0,
         ingress,
         announce_queue: Vec::new(),
         multipoint: false,
@@ -8430,6 +8454,7 @@ pub enum ReticulumError {
 mod tests {
     use super::*;
 
+    mod interface_stats;
     mod tunnels;
 
     async fn wait_for_registry_len(registry: &InterfaceRegistry, expected: usize) {
@@ -11350,6 +11375,7 @@ loglevel = 7
             announce_cap: 0.02,
             ifac_size: 0,
             tx_drops: 0,
+            ..Default::default()
         };
         let mut second = first.clone();
         second.id = 2;
@@ -11495,6 +11521,7 @@ loglevel = 7
             announce_cap: 0.02,
             ifac_size: 0,
             tx_drops: 0,
+            ..Default::default()
         };
         let mut missing_mtu_interface = master_interface.clone();
         missing_mtu_interface.id = 82;

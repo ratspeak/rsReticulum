@@ -124,6 +124,11 @@ pub struct IngressController {
     /// Earliest instant at which the next held announce may be released.
     held_release: Instant,
     held_announces: HashMap<[u8; 16], HeldAnnounce>,
+    /// Python `arxc`/`atxc`/`prxc`/`ptxc`: every sample, unbounded.
+    announces_received: u64,
+    announces_sent: u64,
+    path_requests_received: u64,
+    path_requests_sent: u64,
 
     burst_freq_new: f64,
     burst_freq: f64,
@@ -154,6 +159,10 @@ impl IngressController {
             pr_burst_activated: now,
             held_release: now,
             held_announces: HashMap::new(),
+            announces_received: 0,
+            announces_sent: 0,
+            path_requests_received: 0,
+            path_requests_sent: 0,
             burst_freq_new: IC_BURST_FREQ_NEW,
             burst_freq: IC_BURST_FREQ,
             pr_burst_freq_new: IC_PR_BURST_FREQ_NEW,
@@ -289,19 +298,39 @@ impl IngressController {
     }
 
     pub fn received_announce(&mut self) {
+        self.announces_received = self.announces_received.saturating_add(1);
         push_sample(&mut self.ia_freq_deque, IA_FREQ_SAMPLES, Instant::now());
     }
 
     pub fn sent_announce(&mut self) {
+        self.announces_sent = self.announces_sent.saturating_add(1);
         push_sample(&mut self.oa_freq_deque, OA_FREQ_SAMPLES, Instant::now());
     }
 
     pub fn received_path_request(&mut self) {
+        self.path_requests_received = self.path_requests_received.saturating_add(1);
         push_sample(&mut self.ip_freq_deque, IP_FREQ_SAMPLES, Instant::now());
     }
 
     pub fn sent_path_request(&mut self) {
+        self.path_requests_sent = self.path_requests_sent.saturating_add(1);
         push_sample(&mut self.op_freq_deque, OP_FREQ_SAMPLES, Instant::now());
+    }
+
+    pub fn announces_received(&self) -> u64 {
+        self.announces_received
+    }
+
+    pub fn announces_sent(&self) -> u64 {
+        self.announces_sent
+    }
+
+    pub fn path_requests_received(&self) -> u64 {
+        self.path_requests_received
+    }
+
+    pub fn path_requests_sent(&self) -> u64 {
+        self.path_requests_sent
     }
 
     pub fn incoming_announce_frequency(&self) -> f64 {
@@ -658,6 +687,38 @@ mod tests {
             ctrl.received_announce();
         }
         assert!(!ctrl.should_ingress_limit());
+    }
+
+    /// Python 1.5.5 counts every announce and path request it receives or
+    /// sends (`arxc`/`atxc`/`prxc`/`ptxc`, Interface.py:303-325), past the
+    /// bounded frequency windows and with ingress control off.
+    #[test]
+    fn announce_and_path_request_counts_outlast_the_sample_windows() {
+        for mut ctrl in [IngressController::new(), IngressController::disabled()] {
+            assert_eq!(
+                (
+                    ctrl.announces_received(),
+                    ctrl.announces_sent(),
+                    ctrl.path_requests_received(),
+                    ctrl.path_requests_sent()
+                ),
+                (0, 0, 0, 0)
+            );
+            for _ in 0..IA_FREQ_SAMPLES + 2 {
+                ctrl.received_announce();
+            }
+            for _ in 0..2 {
+                ctrl.sent_announce();
+            }
+            ctrl.received_path_request();
+            for _ in 0..OP_FREQ_SAMPLES + 3 {
+                ctrl.sent_path_request();
+            }
+            assert_eq!(ctrl.announces_received(), IA_FREQ_SAMPLES as u64 + 2);
+            assert_eq!(ctrl.announces_sent(), 2);
+            assert_eq!(ctrl.path_requests_received(), 1);
+            assert_eq!(ctrl.path_requests_sent(), OP_FREQ_SAMPLES as u64 + 3);
+        }
     }
 
     #[test]

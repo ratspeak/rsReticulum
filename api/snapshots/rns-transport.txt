@@ -755,6 +755,8 @@ pub rns_transport::ingress::HeldAnnounce::receiving_interface_id: u64
 pub struct rns_transport::ingress::IngressController
 impl rns_transport::ingress::IngressController
 pub fn rns_transport::ingress::IngressController::age(&self) -> f64
+pub fn rns_transport::ingress::IngressController::announces_received(&self) -> u64
+pub fn rns_transport::ingress::IngressController::announces_sent(&self) -> u64
 pub fn rns_transport::ingress::IngressController::burst_activated(&self) -> std::time::Instant
 pub fn rns_transport::ingress::IngressController::burst_freq(&self) -> f64
 pub fn rns_transport::ingress::IngressController::burst_freq_new(&self) -> f64
@@ -773,6 +775,8 @@ pub fn rns_transport::ingress::IngressController::is_pr_burst_active(&self) -> b
 pub fn rns_transport::ingress::IngressController::new() -> Self
 pub fn rns_transport::ingress::IngressController::outgoing_announce_frequency(&self) -> f64
 pub fn rns_transport::ingress::IngressController::outgoing_pr_frequency(&self) -> f64
+pub fn rns_transport::ingress::IngressController::path_requests_received(&self) -> u64
+pub fn rns_transport::ingress::IngressController::path_requests_sent(&self) -> u64
 pub fn rns_transport::ingress::IngressController::pr_burst_activated(&self) -> std::time::Instant
 pub fn rns_transport::ingress::IngressController::pr_burst_freq(&self) -> f64
 pub fn rns_transport::ingress::IngressController::pr_burst_freq_new(&self) -> f64
@@ -1340,6 +1344,7 @@ pub rns_transport::messages::InterfaceEntry::bitrate: u64
 pub rns_transport::messages::InterfaceEntry::direction: rns_transport::constants::InterfaceDirection
 pub rns_transport::messages::InterfaceEntry::ifac_key: core::option::Option<[u8; 64]>
 pub rns_transport::messages::InterfaceEntry::ifac_size: usize
+pub rns_transport::messages::InterfaceEntry::ifac_violations: u64
 pub rns_transport::messages::InterfaceEntry::ingress: rns_transport::ingress::IngressController
 pub rns_transport::messages::InterfaceEntry::inspection: core::option::Option<rns_transport::messages::InterfaceInspectionSource>
 pub rns_transport::messages::InterfaceEntry::mode: rns_transport::constants::InterfaceMode
@@ -1349,11 +1354,14 @@ pub rns_transport::messages::InterfaceEntry::name: alloc::string::String
 pub rns_transport::messages::InterfaceEntry::online: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>
 pub rns_transport::messages::InterfaceEntry::owner: rns_transport::interface_ownership::InterfaceOwner
 pub rns_transport::messages::InterfaceEntry::packet_capacity: rns_transport::interface_ownership::InterfacePacketCapacity
+pub rns_transport::messages::InterfaceEntry::packet_filter_hits: u64
 pub rns_transport::messages::InterfaceEntry::parent_id: core::option::Option<rns_transport::messages::InterfaceId>
+pub rns_transport::messages::InterfaceEntry::protocol_violations: u64
 pub rns_transport::messages::InterfaceEntry::recursive_prs: bool
 pub rns_transport::messages::InterfaceEntry::role: rns_transport::messages::InterfaceRole
 pub rns_transport::messages::InterfaceEntry::rxb: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>>
 pub rns_transport::messages::InterfaceEntry::tx: tokio::sync::mpsc::bounded::Sender<bytes::bytes::Bytes>
+pub rns_transport::messages::InterfaceEntry::tx_dropped_bytes: u64
 pub rns_transport::messages::InterfaceEntry::tx_drops: alloc::sync::Arc<core::sync::atomic::AtomicU64>
 pub rns_transport::messages::InterfaceEntry::txb: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>>
 impl rns_transport::messages::InterfaceEntry
@@ -1412,6 +1420,8 @@ pub rns_transport::messages::InterfaceStatRpcEntry::announce_queue: core::option
 pub rns_transport::messages::InterfaceStatRpcEntry::announce_rate_grace: core::option::Option<u32>
 pub rns_transport::messages::InterfaceStatRpcEntry::announce_rate_penalty: core::option::Option<f64>
 pub rns_transport::messages::InterfaceStatRpcEntry::announce_rate_target: core::option::Option<f64>
+pub rns_transport::messages::InterfaceStatRpcEntry::announces_received: u64
+pub rns_transport::messages::InterfaceStatRpcEntry::announces_sent: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::bitrate: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::blocked_ips: core::option::Option<u64>
 pub rns_transport::messages::InterfaceStatRpcEntry::burst_activated: f64
@@ -1420,6 +1430,7 @@ pub rns_transport::messages::InterfaceStatRpcEntry::clients: core::option::Optio
 pub rns_transport::messages::InterfaceStatRpcEntry::held_announces: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::id: rns_transport::messages::InterfaceId
 pub rns_transport::messages::InterfaceStatRpcEntry::ifac_size: usize
+pub rns_transport::messages::InterfaceStatRpcEntry::ifac_violations: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::incoming_announce_frequency: f64
 pub rns_transport::messages::InterfaceStatRpcEntry::incoming_pr_frequency: f64
 pub rns_transport::messages::InterfaceStatRpcEntry::mode: alloc::string::String
@@ -1428,12 +1439,18 @@ pub rns_transport::messages::InterfaceStatRpcEntry::name: alloc::string::String
 pub rns_transport::messages::InterfaceStatRpcEntry::online: bool
 pub rns_transport::messages::InterfaceStatRpcEntry::outgoing_announce_frequency: f64
 pub rns_transport::messages::InterfaceStatRpcEntry::outgoing_pr_frequency: f64
+pub rns_transport::messages::InterfaceStatRpcEntry::packet_filter_hits: u64
+pub rns_transport::messages::InterfaceStatRpcEntry::parent_id: core::option::Option<rns_transport::messages::InterfaceId>
+pub rns_transport::messages::InterfaceStatRpcEntry::path_requests_received: u64
+pub rns_transport::messages::InterfaceStatRpcEntry::path_requests_sent: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::pr_burst_activated: f64
 pub rns_transport::messages::InterfaceStatRpcEntry::pr_burst_active: bool
+pub rns_transport::messages::InterfaceStatRpcEntry::protocol_violations: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::role: alloc::string::String
 pub rns_transport::messages::InterfaceStatRpcEntry::rx_bytes: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::rx_rate: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::tx_bytes: u64
+pub rns_transport::messages::InterfaceStatRpcEntry::tx_dropped_bytes: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::tx_drops: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::tx_rate: u64
 pub struct rns_transport::messages::InterfaceTransportSender

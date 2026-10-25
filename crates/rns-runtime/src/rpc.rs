@@ -141,7 +141,7 @@ pub struct PathTableEntry {
     pub interface: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InterfaceStatEntry {
     pub id: u64,
     pub name: String,
@@ -185,6 +185,36 @@ pub struct InterfaceStatEntry {
     #[serde(default)]
     pub ifac_netname: Option<String>,
     pub tx_drops: u64,
+    #[serde(default)]
+    pub tx_dropped_bytes: u64,
+    /// Python `arxc`/`atxc`/`prxc`/`ptxc`.
+    #[serde(default)]
+    pub announces_received: u64,
+    #[serde(default)]
+    pub announces_sent: u64,
+    #[serde(default)]
+    pub path_requests_received: u64,
+    #[serde(default)]
+    pub path_requests_sent: u64,
+    #[serde(default)]
+    pub protocol_violations: u64,
+    #[serde(default)]
+    pub ifac_violations: u64,
+    #[serde(default)]
+    pub packet_filter_hits: u64,
+    /// Name of the listener that accepted this interface.
+    #[serde(default)]
+    pub parent_interface_name: Option<String>,
+}
+
+/// What a transport instance adds to its interface stats
+/// (Reticulum.py:1700-1705).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TransportStats {
+    pub(crate) transport_id: [u8; 16],
+    pub(crate) network_id: Option<[u8; 16]>,
+    pub(crate) uptime: f64,
+    pub(crate) probe_responder: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,100 +547,7 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                 })
                 .collect(),
         ),
-        RpcResponse::InterfaceStats(entries) => {
-            let interfaces = entries
-                .iter()
-                .map(|e| {
-                    let mut fields = vec![
-                        ("id", PyValue::Int(i128::from(e.id))),
-                        ("name", PyValue::String(e.name.clone())),
-                        ("short_name", PyValue::String(e.name.clone())),
-                        ("type", PyValue::String(e.role.clone())),
-                        ("rxb", PyValue::Int(i128::from(e.rx_bytes))),
-                        ("txb", PyValue::Int(i128::from(e.tx_bytes))),
-                        ("rxs", PyValue::Int(i128::from(e.rx_rate))),
-                        ("txs", PyValue::Int(i128::from(e.tx_rate))),
-                        ("status", PyValue::Bool(e.online)),
-                        (
-                            "mode",
-                            PyValue::Int(i128::from(mode_to_python_int(&e.mode))),
-                        ),
-                        ("bitrate", PyValue::Int(i128::from(e.bitrate))),
-                        ("mtu", PyValue::Int(i128::from(e.mtu))),
-                        (
-                            "ifac_signature",
-                            e.ifac_signature
-                                .clone()
-                                .map(PyValue::Bytes)
-                                .unwrap_or(PyValue::None),
-                        ),
-                        (
-                            "ifac_size",
-                            e.ifac_size
-                                .map(|v| PyValue::Int(i128::from(v as u64)))
-                                .unwrap_or(PyValue::None),
-                        ),
-                        (
-                            "ifac_netname",
-                            e.ifac_netname
-                                .clone()
-                                .map(PyValue::String)
-                                .unwrap_or(PyValue::None),
-                        ),
-                        (
-                            "announce_queue",
-                            e.announce_queue
-                                .map(|v| PyValue::Int(i128::from(v)))
-                                .unwrap_or(PyValue::None),
-                        ),
-                        ("held_announces", PyValue::Int(i128::from(e.held_announces))),
-                        (
-                            "incoming_announce_frequency",
-                            PyValue::Float(e.incoming_announce_frequency),
-                        ),
-                        (
-                            "outgoing_announce_frequency",
-                            PyValue::Float(e.outgoing_announce_frequency),
-                        ),
-                        (
-                            "incoming_pr_frequency",
-                            PyValue::Float(e.incoming_pr_frequency),
-                        ),
-                        (
-                            "outgoing_pr_frequency",
-                            PyValue::Float(e.outgoing_pr_frequency),
-                        ),
-                        ("burst_active", PyValue::Bool(e.burst_active)),
-                        ("burst_activated", PyValue::Float(e.burst_activated)),
-                        ("pr_burst_active", PyValue::Bool(e.pr_burst_active)),
-                        ("pr_burst_activated", PyValue::Float(e.pr_burst_activated)),
-                        (
-                            "clients",
-                            e.clients
-                                .map(|v| PyValue::Int(i128::from(v)))
-                                .unwrap_or(PyValue::None),
-                        ),
-                        ("tx_drops", PyValue::Int(i128::from(e.tx_drops))),
-                    ];
-                    if let Some(blocked_ips) = e.blocked_ips {
-                        fields.push(("blocked_ips", PyValue::Int(i128::from(blocked_ips))));
-                    }
-                    py_dict(fields)
-                })
-                .collect();
-            let rxb = entries.iter().map(|e| e.rx_bytes).sum::<u64>();
-            let txb = entries.iter().map(|e| e.tx_bytes).sum::<u64>();
-            let rxs = entries.iter().map(|e| e.rx_rate).sum::<u64>();
-            let txs = entries.iter().map(|e| e.tx_rate).sum::<u64>();
-            py_dict(vec![
-                ("interfaces", PyValue::List(interfaces)),
-                ("rxb", PyValue::Int(i128::from(rxb))),
-                ("txb", PyValue::Int(i128::from(txb))),
-                ("rxs", PyValue::Int(i128::from(rxs))),
-                ("txs", PyValue::Int(i128::from(txs))),
-                ("rss", PyValue::None),
-            ])
-        }
+        RpcResponse::InterfaceStats(entries) => interface_stats_value(entries, None),
         RpcResponse::RateTable(entries) => PyValue::List(
             entries
                 .iter()
@@ -672,6 +609,208 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
         RpcResponse::Ok => PyValue::Bool(true),
         RpcResponse::Error(e) => py_dict(vec![("error", PyValue::String(e.clone()))]),
     }
+}
+
+pub(crate) fn encode_interface_stats(
+    entries: &[InterfaceStatEntry],
+    transport: Option<&TransportStats>,
+) -> Result<Vec<u8>, RpcError> {
+    encode_umsgpack(&interface_stats_value(entries, transport))
+}
+
+/// Remote management's `/status` answer: `[stats]` or `[stats, link_count]`
+/// (Transport.py:3325-3337).
+pub(crate) fn encode_remote_status(
+    entries: &[InterfaceStatEntry],
+    transport: Option<&TransportStats>,
+    link_count: Option<u64>,
+) -> Result<Vec<u8>, RpcError> {
+    let mut response = vec![interface_stats_value(entries, transport)];
+    if let Some(link_count) = link_count {
+        response.push(PyValue::Int(i128::from(link_count)));
+    }
+    encode_umsgpack(&PyValue::List(response))
+}
+
+/// Python 1.5.5 `Reticulum.get_interface_stats()` (Reticulum.py:1494-1716)
+/// for the control port and remote management alike. Rust keeps no inbound
+/// queues, packet rates, announce or path request byte counters, transmit
+/// buffer or gravity, so those keys carry Python's idle values.
+fn interface_stats_value(
+    entries: &[InterfaceStatEntry],
+    transport: Option<&TransportStats>,
+) -> PyValue {
+    let sum = |select: fn(&InterfaceStatEntry) -> u64| {
+        entries.iter().map(select).fold(0u64, u64::saturating_add)
+    };
+    let mut stats = vec![
+        (
+            "interfaces",
+            PyValue::List(entries.iter().map(interface_stat_value).collect()),
+        ),
+        ("rxb", PyValue::Int(i128::from(sum(|e| e.rx_bytes)))),
+        ("txb", PyValue::Int(i128::from(sum(|e| e.tx_bytes)))),
+        ("rxs", PyValue::Int(i128::from(sum(|e| e.rx_rate)))),
+        ("txs", PyValue::Int(i128::from(sum(|e| e.tx_rate)))),
+    ];
+    for key in [
+        "arxb",
+        "atxb",
+        "arxs",
+        "atxs",
+        "arxf",
+        "atxf",
+        "prxb",
+        "ptxb",
+        "prxs",
+        "ptxs",
+        "prxf",
+        "ptxf",
+        "rxpps",
+        "txpps",
+        "rxqt",
+        "rxqd",
+        "rxqa",
+        "rxqp",
+        "rxqil",
+        "rxqtd",
+        "rxqdd",
+        "rxqad",
+        "rxqpd",
+        "rxqild",
+        "tqpressure",
+        "dqpressure",
+        "aqpressure",
+        "pqpressure",
+        "ilqpressure",
+    ] {
+        stats.push((key, PyValue::Int(0)));
+    }
+    stats.push(("txq", PyValue::None));
+    if let Some(transport) = transport {
+        let hash = |hash: Option<[u8; 16]>| {
+            hash.map(|hash| PyValue::Bytes(hash.to_vec()))
+                .unwrap_or(PyValue::None)
+        };
+        stats.push((
+            "transport_id",
+            PyValue::Bytes(transport.transport_id.to_vec()),
+        ));
+        stats.push(("network_id", hash(transport.network_id)));
+        stats.push(("transport_uptime", PyValue::Float(transport.uptime)));
+        stats.push(("probe_responder", hash(transport.probe_responder)));
+    }
+    stats.push(("rss", PyValue::None));
+    py_dict(stats)
+}
+
+fn interface_stat_value(e: &InterfaceStatEntry) -> PyValue {
+    let int = |value: u64| PyValue::Int(i128::from(value));
+    let optional = |value: Option<PyValue>| value.unwrap_or(PyValue::None);
+    let mut fields = vec![
+        ("id", int(e.id)),
+        ("name", PyValue::String(e.name.clone())),
+        ("short_name", PyValue::String(e.name.clone())),
+        (
+            "hash",
+            PyValue::Bytes(rns_crypto::sha::sha256(e.name.as_bytes()).to_vec()),
+        ),
+        ("type", PyValue::String(e.role.clone())),
+        ("rxb", int(e.rx_bytes)),
+        ("txb", int(e.tx_bytes)),
+        ("rxs", int(e.rx_rate)),
+        ("txs", int(e.tx_rate)),
+        ("arxb", int(0)),
+        ("atxb", int(0)),
+        ("arxs", int(0)),
+        ("atxs", int(0)),
+        ("prxb", int(0)),
+        ("ptxb", int(0)),
+        ("prxs", int(0)),
+        ("ptxs", int(0)),
+        ("arxc", int(e.announces_received)),
+        ("atxc", int(e.announces_sent)),
+        ("prxc", int(e.path_requests_received)),
+        ("ptxc", int(e.path_requests_sent)),
+        ("status", PyValue::Bool(e.online)),
+        (
+            "mode",
+            PyValue::Int(i128::from(python_interface_mode(&e.mode))),
+        ),
+        ("bitrate", int(e.bitrate)),
+        ("mtu", PyValue::Int(i128::from(e.mtu))),
+        (
+            "ifac_signature",
+            optional(e.ifac_signature.clone().map(PyValue::Bytes)),
+        ),
+        (
+            "ifac_size",
+            optional(e.ifac_size.map(|v| PyValue::Int(i128::from(v as u64)))),
+        ),
+        (
+            "ifac_netname",
+            optional(e.ifac_netname.clone().map(PyValue::String)),
+        ),
+        ("autoconnect_source", PyValue::None),
+        ("announce_queue", optional(e.announce_queue.map(int))),
+        ("held_announces", int(e.held_announces)),
+        (
+            "incoming_announce_frequency",
+            PyValue::Float(e.incoming_announce_frequency),
+        ),
+        (
+            "outgoing_announce_frequency",
+            PyValue::Float(e.outgoing_announce_frequency),
+        ),
+        (
+            "incoming_pr_frequency",
+            PyValue::Float(e.incoming_pr_frequency),
+        ),
+        (
+            "outgoing_pr_frequency",
+            PyValue::Float(e.outgoing_pr_frequency),
+        ),
+        (
+            "announce_rate_target",
+            optional(e.announce_rate_target.map(PyValue::Float)),
+        ),
+        (
+            "announce_rate_penalty",
+            optional(e.announce_rate_penalty.map(PyValue::Float)),
+        ),
+        (
+            "announce_rate_grace",
+            optional(e.announce_rate_grace.map(|v| PyValue::Int(i128::from(v)))),
+        ),
+        ("burst_active", PyValue::Bool(e.burst_active)),
+        ("burst_activated", PyValue::Float(e.burst_activated)),
+        ("burst_count", PyValue::None),
+        ("pr_burst_active", PyValue::Bool(e.pr_burst_active)),
+        ("pr_burst_activated", PyValue::Float(e.pr_burst_activated)),
+        ("pr_burst_count", PyValue::None),
+        ("clients", optional(e.clients.map(int))),
+        ("txdrp", int(e.tx_drops)),
+        ("txdrb", int(e.tx_dropped_bytes)),
+        ("txstalled", PyValue::Bool(false)),
+        ("txbuffered", int(0)),
+        ("tx_drops", int(e.tx_drops)),
+        ("gravity", int(0)),
+        ("announces_to_internal", PyValue::None),
+        ("protocol_violations", int(e.protocol_violations)),
+        ("ifac_violations", int(e.ifac_violations)),
+        ("packet_filter_hits", int(e.packet_filter_hits)),
+    ];
+    if let Some(parent) = &e.parent_interface_name {
+        fields.push(("parent_interface_name", PyValue::String(parent.clone())));
+        fields.push((
+            "parent_interface_hash",
+            PyValue::Bytes(rns_crypto::sha::sha256(parent.as_bytes()).to_vec()),
+        ));
+    }
+    if let Some(blocked_ips) = e.blocked_ips {
+        fields.push(("blocked_ips", int(blocked_ips)));
+    }
+    py_dict(fields)
 }
 
 fn py_value_to_response(value: &PyValue) -> Result<RpcResponse, RpcError> {
@@ -887,7 +1026,23 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, Rpc
                     .and_then(py_u64)
                     .map(|v| v as usize),
                 ifac_netname: dict_get(m, "ifac_netname").and_then(py_string),
-                tx_drops: dict_get(m, "tx_drops").and_then(py_u64).unwrap_or(0),
+                tx_drops: dict_get(m, "txdrp")
+                    .or_else(|| dict_get(m, "tx_drops"))
+                    .and_then(py_u64)
+                    .unwrap_or(0),
+                tx_dropped_bytes: dict_get(m, "txdrb").and_then(py_u64).unwrap_or(0),
+                announces_received: dict_get(m, "arxc").and_then(py_u64).unwrap_or(0),
+                announces_sent: dict_get(m, "atxc").and_then(py_u64).unwrap_or(0),
+                path_requests_received: dict_get(m, "prxc").and_then(py_u64).unwrap_or(0),
+                path_requests_sent: dict_get(m, "ptxc").and_then(py_u64).unwrap_or(0),
+                protocol_violations: dict_get(m, "protocol_violations")
+                    .and_then(py_u64)
+                    .unwrap_or(0),
+                ifac_violations: dict_get(m, "ifac_violations").and_then(py_u64).unwrap_or(0),
+                packet_filter_hits: dict_get(m, "packet_filter_hits")
+                    .and_then(py_u64)
+                    .unwrap_or(0),
+                parent_interface_name: dict_get(m, "parent_interface_name").and_then(py_string),
             })
         })
         .collect()
@@ -1061,7 +1216,8 @@ fn i64_from_i128(v: i128) -> Result<i64, RpcError> {
     i64::try_from(v).map_err(|_| RpcError::Deserialize(format!("integer out of range: {v}")))
 }
 
-fn mode_to_python_int(mode: &str) -> u8 {
+/// Python `Interface.MODE_*` (Interface.py:45-51) for a Debug-formatted mode.
+fn python_interface_mode(mode: &str) -> u8 {
     match mode {
         "Full" => 0x01,
         "PointToPoint" => 0x02,
@@ -1069,7 +1225,6 @@ fn mode_to_python_int(mode: &str) -> u8 {
         "Roaming" => 0x04,
         "Boundary" => 0x05,
         "Gateway" => 0x06,
-        // Python 1.3.8 MODE_INTERNAL (Interface.py:51).
         "Internal" => 0x07,
         _ => 0x01,
     }
@@ -1725,6 +1880,114 @@ pub enum RpcError {
     Io(#[from] std::io::Error),
 }
 
+/// Keys Python 1.5.5 `get_interface_stats()` gives every interface
+/// (Reticulum.py:1501-1663); `rnstatus` indexes most of them unguarded.
+#[cfg(test)]
+pub(crate) const PYTHON_INTERFACE_KEYS: &[&str] = &[
+    "clients",
+    "bitrate",
+    "rxs",
+    "txs",
+    "arxs",
+    "atxs",
+    "prxs",
+    "ptxs",
+    "ifac_signature",
+    "ifac_size",
+    "ifac_netname",
+    "autoconnect_source",
+    "name",
+    "short_name",
+    "hash",
+    "type",
+    "mtu",
+    "rxb",
+    "txb",
+    "arxb",
+    "atxb",
+    "arxc",
+    "atxc",
+    "prxb",
+    "ptxb",
+    "prxc",
+    "ptxc",
+    "txdrp",
+    "txdrb",
+    "txstalled",
+    "txbuffered",
+    "incoming_announce_frequency",
+    "outgoing_announce_frequency",
+    "incoming_pr_frequency",
+    "outgoing_pr_frequency",
+    "announce_rate_target",
+    "announce_rate_penalty",
+    "announce_rate_grace",
+    "held_announces",
+    "burst_active",
+    "burst_activated",
+    "burst_count",
+    "pr_burst_active",
+    "pr_burst_activated",
+    "pr_burst_count",
+    "status",
+    "mode",
+    "gravity",
+    "announces_to_internal",
+    "protocol_violations",
+    "ifac_violations",
+    "packet_filter_hits",
+];
+
+/// Totals in every Python 1.5.5 stats dict (Reticulum.py:1673-1714).
+#[cfg(test)]
+pub(crate) const PYTHON_TOTAL_KEYS: &[&str] = &[
+    "interfaces",
+    "rxb",
+    "txb",
+    "rxs",
+    "txs",
+    "arxb",
+    "atxb",
+    "arxs",
+    "atxs",
+    "arxf",
+    "atxf",
+    "prxb",
+    "ptxb",
+    "prxs",
+    "ptxs",
+    "prxf",
+    "ptxf",
+    "rxpps",
+    "txpps",
+    "rxqt",
+    "rxqd",
+    "rxqa",
+    "rxqp",
+    "rxqil",
+    "rxqtd",
+    "rxqdd",
+    "rxqad",
+    "rxqpd",
+    "rxqild",
+    "tqpressure",
+    "dqpressure",
+    "aqpressure",
+    "pqpressure",
+    "ilqpressure",
+    "txq",
+    "rss",
+];
+
+/// Added only by a transport instance (Reticulum.py:1700-1705).
+#[cfg(test)]
+pub(crate) const PYTHON_TRANSPORT_KEYS: &[&str] = &[
+    "transport_id",
+    "network_id",
+    "transport_uptime",
+    "probe_responder",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1819,6 +2082,244 @@ mod tests {
             ifac_size: None,
             ifac_netname: None,
             tx_drops: 1,
+            ..Default::default()
+        }
+    }
+
+    fn stats_dict(encoded: &[u8]) -> Vec<(PyDictKey, PyValue)> {
+        let PyValue::Dict(stats) = decode_umsgpack(encoded).unwrap() else {
+            panic!("interface stats are a dict");
+        };
+        stats
+    }
+
+    fn interface_dicts(stats: &[(PyDictKey, PyValue)]) -> Vec<Vec<(PyDictKey, PyValue)>> {
+        let Some(PyValue::List(interfaces)) = dict_get(stats, "interfaces") else {
+            panic!("interface stats list their interfaces");
+        };
+        interfaces
+            .iter()
+            .map(|interface| as_dict(interface).unwrap().to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn interface_stats_carry_every_python_155_key() {
+        let encoded =
+            encode_response(&RpcResponse::InterfaceStats(vec![interface_stat_entry()])).unwrap();
+        let stats = stats_dict(&encoded);
+        for key in PYTHON_TOTAL_KEYS {
+            assert!(dict_get(&stats, key).is_some(), "missing total {key}");
+        }
+        for key in PYTHON_TRANSPORT_KEYS {
+            assert!(
+                dict_get(&stats, key).is_none(),
+                "{key} belongs only to a transport instance"
+            );
+        }
+        let interface = &interface_dicts(&stats)[0];
+        for key in PYTHON_INTERFACE_KEYS {
+            assert!(dict_get(interface, key).is_some(), "missing {key}");
+        }
+        assert_eq!(dict_get(interface, "txdrp"), Some(&PyValue::Int(1)));
+        assert_eq!(
+            dict_get(interface, "txstalled"),
+            Some(&PyValue::Bool(false))
+        );
+        assert_eq!(dict_get(interface, "mtu"), Some(&PyValue::Int(500)));
+        assert_eq!(dict_get(&stats, "txq"), Some(&PyValue::None));
+    }
+
+    #[test]
+    fn interface_stats_without_clients_report_python_none() {
+        let mut entry = interface_stat_entry();
+        entry.clients = None;
+        let encoded = encode_response(&RpcResponse::InterfaceStats(vec![entry])).unwrap();
+        let interface = &interface_dicts(&stats_dict(&encoded))[0];
+        assert_eq!(
+            dict_get(interface, "clients"),
+            Some(&PyValue::None),
+            "rnstatus reads clients unguarded (rnstatus.py:489)"
+        );
+    }
+
+    #[test]
+    fn interface_stats_report_rust_counters_under_python_keys() {
+        let mut entry = interface_stat_entry();
+        entry.announces_received = 11;
+        entry.announces_sent = 12;
+        entry.path_requests_received = 13;
+        entry.path_requests_sent = 14;
+        entry.protocol_violations = 15;
+        entry.ifac_violations = 16;
+        entry.packet_filter_hits = 17;
+        entry.tx_dropped_bytes = 18;
+        let encoded = encode_response(&RpcResponse::InterfaceStats(vec![entry])).unwrap();
+        let interface = &interface_dicts(&stats_dict(&encoded))[0];
+        for (key, value) in [
+            ("arxc", 11),
+            ("atxc", 12),
+            ("prxc", 13),
+            ("ptxc", 14),
+            ("protocol_violations", 15),
+            ("ifac_violations", 16),
+            ("packet_filter_hits", 17),
+            ("txdrb", 18),
+        ] {
+            assert_eq!(
+                dict_get(interface, key),
+                Some(&PyValue::Int(value)),
+                "{key}"
+            );
+        }
+
+        let RpcResponse::InterfaceStats(decoded) =
+            decode_response_for_request(&encoded, &RpcRequest::GetInterfaceStats).unwrap()
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(
+            (
+                decoded[0].announces_received,
+                decoded[0].announces_sent,
+                decoded[0].path_requests_received,
+                decoded[0].path_requests_sent,
+                decoded[0].protocol_violations,
+                decoded[0].ifac_violations,
+                decoded[0].packet_filter_hits,
+                decoded[0].tx_drops,
+                decoded[0].tx_dropped_bytes,
+            ),
+            (11, 12, 13, 14, 15, 16, 17, 1, 18)
+        );
+    }
+
+    #[test]
+    fn python_daemon_counters_parse_into_interface_stats() {
+        let upstream = py_dict(vec![(
+            "interfaces",
+            PyValue::List(vec![py_dict(vec![
+                (
+                    "name",
+                    PyValue::String("TCPInterface[Client on Hub]".to_string()),
+                ),
+                ("status", PyValue::Bool(true)),
+                ("arxc", PyValue::Int(21)),
+                ("atxc", PyValue::Int(22)),
+                ("prxc", PyValue::Int(23)),
+                ("ptxc", PyValue::Int(24)),
+                ("protocol_violations", PyValue::Int(25)),
+                ("ifac_violations", PyValue::Int(26)),
+                ("packet_filter_hits", PyValue::Int(27)),
+                ("txdrp", PyValue::Int(28)),
+                ("txdrb", PyValue::Int(29)),
+                (
+                    "parent_interface_name",
+                    PyValue::String("TCPServerInterface[Hub/0.0.0.0:4242]".to_string()),
+                ),
+            ])]),
+        )]);
+        let encoded = encode_umsgpack(&upstream).unwrap();
+        let RpcResponse::InterfaceStats(entries) =
+            decode_response_for_request(&encoded, &RpcRequest::GetInterfaceStats).unwrap()
+        else {
+            panic!("wrong variant");
+        };
+        let entry = &entries[0];
+        assert_eq!(
+            (
+                entry.announces_received,
+                entry.announces_sent,
+                entry.path_requests_received,
+                entry.path_requests_sent,
+                entry.protocol_violations,
+                entry.ifac_violations,
+                entry.packet_filter_hits,
+                entry.tx_drops,
+                entry.tx_dropped_bytes,
+            ),
+            (21, 22, 23, 24, 25, 26, 27, 28, 29)
+        );
+        assert_eq!(
+            entry.parent_interface_name.as_deref(),
+            Some("TCPServerInterface[Hub/0.0.0.0:4242]")
+        );
+    }
+
+    #[test]
+    fn a_spawned_interface_names_its_parent_like_python() {
+        let parent = interface_stat_entry();
+        let mut child = interface_stat_entry();
+        child.id = 8;
+        child.name = "TestIf/client_8".to_string();
+        child.parent_interface_name = Some(parent.name.clone());
+        let encoded = encode_response(&RpcResponse::InterfaceStats(vec![parent, child])).unwrap();
+        let interfaces = interface_dicts(&stats_dict(&encoded));
+        assert!(dict_get(&interfaces[0], "parent_interface_name").is_none());
+        assert_eq!(
+            dict_get(&interfaces[1], "parent_interface_name"),
+            Some(&PyValue::String("TestIf".to_string()))
+        );
+        assert_eq!(
+            dict_get(&interfaces[1], "parent_interface_hash"),
+            Some(&PyValue::Bytes(rns_crypto::sha::sha256(b"TestIf").to_vec())),
+            "Python's get_hash() is the full hash of the interface name (Interface.py:181-183)"
+        );
+        assert_eq!(
+            dict_get(&interfaces[0], "hash"),
+            Some(&PyValue::Bytes(rns_crypto::sha::sha256(b"TestIf").to_vec()))
+        );
+    }
+
+    #[test]
+    fn transport_instance_stats_carry_python_transport_fields() {
+        let transport = TransportStats {
+            transport_id: [0x11; 16],
+            network_id: Some([0x22; 16]),
+            uptime: 12.5,
+            probe_responder: Some([0x33; 16]),
+        };
+        let encoded = encode_interface_stats(&[interface_stat_entry()], Some(&transport)).unwrap();
+        let stats = stats_dict(&encoded);
+        assert_eq!(
+            dict_get(&stats, "transport_id"),
+            Some(&PyValue::Bytes(vec![0x11; 16]))
+        );
+        assert_eq!(
+            dict_get(&stats, "network_id"),
+            Some(&PyValue::Bytes(vec![0x22; 16]))
+        );
+        assert_eq!(
+            dict_get(&stats, "transport_uptime"),
+            Some(&PyValue::Float(12.5))
+        );
+        assert_eq!(
+            dict_get(&stats, "probe_responder"),
+            Some(&PyValue::Bytes(vec![0x33; 16]))
+        );
+
+        let bare = TransportStats {
+            network_id: None,
+            probe_responder: None,
+            ..transport
+        };
+        let stats = stats_dict(&encode_interface_stats(&[], Some(&bare)).unwrap());
+        assert_eq!(dict_get(&stats, "network_id"), Some(&PyValue::None));
+        assert_eq!(dict_get(&stats, "probe_responder"), Some(&PyValue::None));
+    }
+
+    #[test]
+    fn interface_modes_map_to_python_mode_constants() {
+        for (mode, python) in [
+            ("Full", 0x01),
+            ("PointToPoint", 0x02),
+            ("AccessPoint", 0x03),
+            ("Roaming", 0x04),
+            ("Boundary", 0x05),
+            ("Gateway", 0x06),
+            ("Internal", 0x07),
+        ] {
+            assert_eq!(python_interface_mode(mode), python, "{mode}");
         }
     }
 
@@ -1898,7 +2399,7 @@ mod tests {
                 assert!(!entry.pr_burst_active);
                 assert_eq!(entry.pr_burst_activated, 0.0);
                 assert_eq!(entry.blocked_ips, None);
-                assert_eq!(entry.mtu, 0, "Python stats omit MTU");
+                assert_eq!(entry.mtu, 0, "a legacy dict without MTU reads as 0");
                 assert_eq!(entry.ifac_signature, None);
                 assert_eq!(entry.ifac_size, None);
             }
