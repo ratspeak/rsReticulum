@@ -528,8 +528,8 @@ mod tests {
         assert_eq!(info.port, Some(4965));
     }
 
-    /// D12: the announcer names its own stack and version, as Python names
-    /// "RNS" and its `__version__` (Discovery.py:46-47, :173-174).
+    /// The announcer names its own stack and version, as Python names "RNS"
+    /// and its `__version__` (Discovery.py:46-47, :173-174).
     #[test]
     fn announces_name_the_rust_implementation_and_its_version() {
         let mut a = Announcer::new(static_stamper());

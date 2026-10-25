@@ -71,10 +71,9 @@ pub const IMPLEMENTATION_NAME: &str = "rsRNS";
 /// The version this stack announces (`0xFC`): its own, never Python's.
 pub const IMPLEMENTATION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The oldest release of each implementation that auto-connect trusts.
-/// Python's 1.5.2 floor is its Backbone flow control; no rsRNS release has
-/// Backbone egress control yet, so none qualifies without
-/// `autoconnect_unverified_implementations`.
+/// The oldest release of each implementation that auto-connect trusts:
+/// Python's floor for "RNS" (Discovery.py:486-487), and none for rsRNS, which
+/// qualifies only with `autoconnect_unverified_implementations`.
 pub const AUTOCONNECT_MINIMUM_VERSIONS: &[(&str, Option<&str>)] =
     &[("RNS", Some("1.5.2")), (IMPLEMENTATION_NAME, None)];
 

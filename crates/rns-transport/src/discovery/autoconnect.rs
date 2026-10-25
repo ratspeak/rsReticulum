@@ -72,9 +72,8 @@ mod tests {
         assert!(!qualifies(&backbone(Some("RNS"), None), false));
     }
 
-    /// No rsRNS release has Backbone egress control yet, so rsRNS hubs need
-    /// the unverified opt-in, as unknown stacks and announces without an
-    /// implementation do.
+    /// rsRNS hubs need the unverified opt-in, as unknown stacks and announces
+    /// without an implementation do.
     #[test]
     fn rust_and_unknown_stacks_need_the_unverified_opt_in() {
         for info in [
