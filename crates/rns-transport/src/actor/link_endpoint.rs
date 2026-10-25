@@ -221,7 +221,9 @@ impl TransportActor {
             InterfaceSendOutcome::TooLarge => LinkEndpointSendResult::InvalidPacket,
             InterfaceSendOutcome::Sent => LinkEndpointSendResult::Sent,
             InterfaceSendOutcome::Full => {
-                if let Some(entry) = self.interfaces.get(&interface_id) {
+                if let Some(entry) = self.interfaces.get_mut(&interface_id) {
+                    entry.tx_dropped_bytes =
+                        entry.tx_dropped_bytes.saturating_add(raw.len() as u64);
                     entry
                         .tx_drops
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

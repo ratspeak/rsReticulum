@@ -26,6 +26,7 @@
 - Discovery announces a KISS-framed TCP client as a KISS interface and sends and reads unset radio parameters as nil, so Python and `rnsd-rs` read each other's KISS, Weave and RNode announces, as in Python Reticulum.
 - `rns_link::clock::ContinuousInstant` reads a monotonic clock that keeps counting while the system is suspended, for deadlines that must hold in real time across a sleep.
 - An interface counts a path request in its stats only once its tag passes the duplicate check, as in Python Reticulum 1.5.
+- A realtime Link packet dropped at a full transmit queue counts toward the interface's dropped bytes.
 
 ## 1.4.0 - 2026-10-12
 

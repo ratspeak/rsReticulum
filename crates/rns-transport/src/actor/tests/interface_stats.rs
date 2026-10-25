@@ -323,6 +323,46 @@ fn a_repeated_path_request_tag_is_not_counted() {
     assert_eq!(stats(&mut actor, 1).path_requests_received, 1, "prxc");
 }
 
+/// A realtime Link packet dropped at a full transmit queue is a transmit
+/// drop like any other, bytes included.
+#[test]
+fn a_dropped_realtime_link_packet_counts_its_bytes() {
+    let mut actor = hub();
+    let (entry, _rx) = make_test_interface_with_capacity("media", 1);
+    entry.tx.try_send(Bytes::from_static(b"occupied")).unwrap();
+    actor.interfaces.insert(1, entry);
+    let link_id = [0xBB; 16];
+    let (lifecycle_tx, _lifecycle_rx) = mpsc::unbounded_channel();
+    assert_eq!(
+        actor.bind_link_endpoint(
+            crate::messages::LinkEndpointBinding {
+                interface_owner: actor.interfaces.get(&1).map(|entry| entry.owner.id()),
+                link_id,
+                interface_id: 1,
+                role: crate::messages::LinkEndpointRole::Responder,
+            },
+            lifecycle_tx,
+        ),
+        crate::messages::LinkEndpointBindResult::Bound
+    );
+    let media = make_link_data_packet_with_context(link_id, 0, PacketContext::None);
+
+    assert_eq!(
+        actor.send_link_endpoint_best_effort(
+            link_id,
+            crate::messages::LinkEndpointRole::Responder,
+            OutboundRequest {
+                raw: media.clone(),
+                destination_hash: link_id,
+            },
+        ),
+        crate::messages::LinkEndpointSendResult::DroppedBackpressure
+    );
+    let entry = stats(&mut actor, 1);
+    assert_eq!(entry.tx_drops, 1, "txdrp");
+    assert_eq!(entry.tx_dropped_bytes, media.len() as u64, "txdrb");
+}
+
 #[test]
 fn an_accepted_client_names_its_listener() {
     let mut actor = hub();
