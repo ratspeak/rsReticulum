@@ -11,7 +11,7 @@
 - A Link accepts the peer's identification as soon as its handshake completes, as in Python Reticulum, so a request a Python client sends right after identifying no longer fails for lack of an identity. Only the receiving side of a Link accepts identification.
 - The receiving side of a Link counts its Link proof as sent traffic, as in Python Reticulum, so it no longer answers keepalives before the Link is established and its traffic totals include the proof.
 - A connectable I2P interface now starts alongside a Unix-socket shared instance or another connectable I2P interface, and an I2P interface runs its server and one connection for every configured peer, as in Python Reticulum.
-- After a restart, a hub no longer gives a previous client's saved paths to a new client that reuses its interface name, and it keeps saved tunnels that had no live interface, as in Python Reticulum.
+- Hub restarts restore saved paths and tunnels as in Python Reticulum.
 - Transport hubs now accept tunnel synthesis, so a Python client that reconnects gets its paths back without announcing again, and losing a tunnel's interface no longer drops paths the hub learned through other interfaces, as in Python Reticulum.
 - PLAIN and GROUP packets that arrive from more than one hop away, and announces typed PLAIN or GROUP, are dropped before deduplication, as in Python Reticulum.
 - TCP, Backbone and I2P client interfaces open every connection with a tunnel synthesis, so a transport hub restores their paths after a reconnect, and traffic queued while a connection was down or failing to open is dropped when it opens, as in Python Reticulum.
