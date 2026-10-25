@@ -2255,6 +2255,7 @@ fn mode_discovers_unknown_paths(mode: InterfaceMode) -> bool {
 #[cfg(test)]
 mod tests {
     mod announce_admission;
+    mod announce_identity;
     mod bitrate_timing;
     mod discovery_api;
     mod held_announces;

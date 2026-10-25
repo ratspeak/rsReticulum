@@ -326,11 +326,6 @@ impl TransportActor {
     ) {
         let is_from_local_client = self.is_local_client_interface(interface_id);
 
-        if header.hops >= PATHFINDER_M {
-            debug!(hops = header.hops, "announce exceeded hop limit");
-            return;
-        }
-
         if self.local_destinations.contains(&header.destination_hash) {
             debug!("dropping own announce");
             return;
@@ -463,6 +458,43 @@ impl TransportActor {
         let announce_name_hash = announce_data.name_hash;
         let announce_identity_hash = Some(validated_identity.hash);
         let announce_random_hash = announce_data.random_hash;
+
+        // Python remembers every validated announce, replays included, before
+        // it decides whether the path changes (Transport.py:2172,
+        // Identity.py:101-113, :597).
+        match self.recent_announces.entry(header.destination_hash) {
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let e = o.get_mut();
+                e.timestamp = now_f64();
+                e.public_key = announce_public_key;
+                e.app_data = announce_app_data.clone();
+                if announce_ratchet.is_some() {
+                    e.ratchet = announce_ratchet;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(RecentAnnounce {
+                    dest_hash: header.destination_hash,
+                    hops: header.hops,
+                    app_data: announce_app_data.clone(),
+                    timestamp: now_f64(),
+                    public_key: announce_public_key,
+                    ratchet: announce_ratchet,
+                    packet_hash: None,
+                    is_path_response: header.context
+                        == rns_wire::context::PacketContext::PathResponse,
+                    retained: false,
+                    last_used: None,
+                    name_hash: announce_name_hash,
+                });
+                self.state_dirty = true;
+            }
+        }
+
+        if header.hops >= PATHFINDER_M {
+            debug!(hops = header.hops, "announce exceeded hop limit");
+            return;
+        }
 
         let mut rate_blocked = false;
 
@@ -687,45 +719,21 @@ impl TransportActor {
             return;
         }
 
-        // Diagnostics + identity cache (metadata only — raw bytes go to the
-        // disk announce cache below, Python `Transport.cache` parity).
+        // The remembered announce takes this path's metadata (raw bytes go to
+        // the disk announce cache below, Python `Transport.cache` parity).
         // `retained` pins survive re-announce so a fresh announce never
         // silently un-pins an RPC-retained destination. Swept by
         // `cleanup_known_destinations` (linger + 7-day eviction).
-        let now_ts = now_f64();
         let announce_packet_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
         let is_path_response = header.context == rns_wire::context::PacketContext::PathResponse;
         self.cache_announce_to_disk(&announce_packet_hash, raw, interface_id);
-        let app_data_for_handlers = announce_app_data.clone();
-        match self.recent_announces.entry(header.destination_hash) {
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                let e = o.get_mut();
-                e.hops = header.hops;
-                e.app_data = announce_app_data;
-                e.timestamp = now_ts;
-                e.public_key = announce_public_key;
-                e.ratchet = announce_ratchet;
-                e.packet_hash = Some(announce_packet_hash);
-                e.is_path_response = is_path_response;
-                e.name_hash = announce_name_hash;
-            }
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(RecentAnnounce {
-                    dest_hash: header.destination_hash,
-                    hops: header.hops,
-                    app_data: announce_app_data,
-                    timestamp: now_ts,
-                    public_key: announce_public_key,
-                    ratchet: announce_ratchet,
-                    packet_hash: Some(announce_packet_hash),
-                    is_path_response,
-                    retained: false,
-                    last_used: None,
-                    name_hash: announce_name_hash,
-                });
-                self.state_dirty = true;
-            }
+        if let Some(e) = self.recent_announces.get_mut(&header.destination_hash) {
+            e.hops = header.hops;
+            e.ratchet = announce_ratchet;
+            e.packet_hash = Some(announce_packet_hash);
+            e.is_path_response = is_path_response;
         }
+        let app_data_for_handlers = announce_app_data;
 
         if is_from_local_client
             && header.context == rns_wire::context::PacketContext::PathResponse
