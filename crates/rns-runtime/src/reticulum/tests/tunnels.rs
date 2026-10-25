@@ -691,32 +691,62 @@ async fn a_tcp_client_drops_traffic_queued_while_it_was_disconnected() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[tokio::test]
-async fn a_tcp_client_keeps_traffic_queued_before_its_first_connection() {
-    let port = unused_port().await;
+/// A failed connection attempt is an outage too: traffic queued while a
+/// client's first attempts fail is dropped, so however much was queued the
+/// synthesis opens the connection (Python drops traffic while offline,
+/// TCPInterface.py:314-315).
+async fn assert_failed_first_attempts_drop_their_backlog(tag: &str, port: u16, interface: &str) {
     let dir = config_dir(
-        "tcp-first-backlog",
-        &format!(
-            "[reticulum]\n  share_instance = No\n\n[interfaces]\n  [[Uplink]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 127.0.0.1\n    target_port = {port}\n"
-        ),
+        tag,
+        &format!("[reticulum]\n  share_instance = No\n\n[interfaces]\n{interface}"),
     );
     let handle = start(&dir).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let marker = send_plain_marker(&handle, "wp4.first.backlog").await;
+    let mut markers = Vec::new();
+    for n in 0..1100 {
+        markers.push(send_plain_marker(&handle, &format!("backlog.{tag}.{n}")).await);
+    }
     let hub = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
-    let mut first = Frames::accept(&hub, false).await;
-    let frames = first.collect(Duration::from_secs(2)).await;
+    let mut connection = Frames::accept(&hub, false).await;
+    let first = connection
+        .next(Duration::from_secs(5))
+        .await
+        .expect("the connection carries a frame");
     assert!(
-        frames.iter().any(|frame| synthesis_in(frame).is_some()),
-        "control: the first connection opens with its synthesis"
+        synthesis_in(&first).is_some(),
+        "the synthesis opens the connection despite the backlog"
     );
+    let rest = connection.collect(Duration::from_secs(2)).await;
     assert!(
-        frames.contains(&marker),
-        "only an outage drops queued traffic; the first connection delivers it"
+        !rest.iter().any(|frame| markers.contains(frame)),
+        "traffic queued while the first attempts failed is dropped"
     );
 
     handle.shutdown_and_wait().await;
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_tcp_client_drops_traffic_queued_while_its_first_attempts_fail() {
+    let port = unused_port().await;
+    assert_failed_first_attempts_drop_their_backlog(
+        "tcp-first-backlog",
+        port,
+        &format!("  [[Uplink]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 127.0.0.1\n    target_port = {port}\n"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_backbone_client_drops_traffic_queued_while_its_first_attempts_fail() {
+    let port = unused_port().await;
+    assert_failed_first_attempts_drop_their_backlog(
+        "backbone-first-backlog",
+        port,
+        &format!("  [[Backbone Up]]\n    type = BackboneInterface\n    enabled = yes\n    target_host = 127.0.0.1\n    port = {port}\n"),
+    )
+    .await;
 }
 
 #[test]

@@ -341,9 +341,11 @@ pub async fn spawn_tcp_client(
         let max_tries = config.max_reconnect_tries;
         let mut tries: usize = 0;
         let mut backoff = RECONNECT_WAIT_INITIAL;
-        let mut connected_before = false;
+        // Every attempt after the first follows a failure or an outage.
+        let mut attempted = false;
 
         loop {
+            let after_outage = std::mem::replace(&mut attempted, true);
             let addr = format!("{}:{}", config.target_host, config.target_port);
             let stream = match tokio::time::timeout(
                 std::time::Duration::from_secs(config.connect_timeout_secs),
@@ -405,14 +407,7 @@ pub async fn spawn_tcp_client(
                 .as_ref()
                 .filter(|_| !kiss_framing)
                 .and_then(|identity| identity.synthesis(&python_name));
-            open_client_connection(
-                &rx,
-                std::mem::replace(&mut connected_before, true),
-                &transport_tx,
-                synthesis,
-                &online2,
-            )
-            .await;
+            open_client_connection(&rx, after_outage, &transport_tx, synthesis, &online2).await;
 
             let (reader, writer) = stream.into_split();
 

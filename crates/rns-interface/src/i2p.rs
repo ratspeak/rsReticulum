@@ -368,9 +368,11 @@ pub async fn spawn_i2p_client(
     let python_name = config.python_name();
     let read_task = tokio::spawn(async move {
         let mut pacer = ReconnectPacer::new(config.reconnect_delay, config.max_reconnect_tries);
-        let mut connected_before = false;
+        // Every attempt after the first follows a failure or an outage.
+        let mut attempted = false;
 
         loop {
+            let after_outage = std::mem::replace(&mut attempted, true);
             let session_id = generate_session_id();
 
             let session_stream = match connect_to_sam(&config.sam_host, config.sam_port).await {
@@ -526,14 +528,7 @@ pub async fn spawn_i2p_client(
                 .tunnel_identity
                 .as_ref()
                 .and_then(|identity| identity.synthesis(&python_name));
-            open_client_connection(
-                &rx,
-                std::mem::replace(&mut connected_before, true),
-                &transport_tx,
-                synthesis,
-                &online_task,
-            )
-            .await;
+            open_client_connection(&rx, after_outage, &transport_tx, synthesis, &online_task).await;
 
             // BufReader may have prefetched past the handshake; flush its tail first.
             let buffered = stream_buf_reader.buffer().to_vec();

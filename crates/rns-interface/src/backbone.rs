@@ -708,9 +708,11 @@ pub async fn spawn_backbone_client(
     let read_task = tokio::spawn(async move {
         let max_tries = config.max_reconnect_tries;
         let mut tries: usize = 0;
-        let mut connected_before = false;
+        // Every attempt after the first follows a failure or an outage.
+        let mut attempted = false;
 
         loop {
+            let after_outage = std::mem::replace(&mut attempted, true);
             let target = match tokio::time::timeout(
                 Duration::from_secs(config.connect_timeout_secs),
                 resolve_target(&config.target_host, config.target_port, config.prefer_ipv6),
@@ -793,14 +795,7 @@ pub async fn spawn_backbone_client(
                 .tunnel_identity
                 .as_ref()
                 .and_then(|identity| identity.synthesis(&python_name));
-            open_client_connection(
-                &rx,
-                std::mem::replace(&mut connected_before, true),
-                &transport_tx,
-                synthesis,
-                &online2,
-            )
-            .await;
+            open_client_connection(&rx, after_outage, &transport_tx, synthesis, &online2).await;
 
             let c_online = Arc::new(AtomicBool::new(true));
             let (reader, writer) = stream.into_split();
