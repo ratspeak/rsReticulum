@@ -76,6 +76,47 @@ fn a_released_held_announce_is_not_counted_as_received_traffic() {
     assert_eq!(rx_bytes(&actor, 1), before, "the held bytes arrived once");
 }
 
+/// IFAC runs before the ingress hold, so a wire announce without valid IFAC
+/// is dropped even during a burst, and never held for a release that skips
+/// IFAC.
+#[test]
+fn a_wire_announce_without_valid_ifac_is_dropped_and_never_held() {
+    let (mut actor, _rx) = ifac_hub();
+    let ingress = &mut actor.interfaces.get_mut(&1).unwrap().ingress;
+    for _ in 0..50 {
+        ingress.received_announce();
+    }
+    assert!(ingress.should_ingress_limit(), "precondition: a burst");
+    let ifac_key = actor.interfaces[&1].ifac_key.unwrap();
+    let (signed, signed_destination) = make_valid_announce("held.ifac.signed", 1);
+    let (unsigned, unsigned_destination) = make_valid_announce("held.ifac.unsigned", 1);
+
+    for raw in [
+        Bytes::from(crate::ifac::ifac_sign(&signed, &ifac_key, 8)),
+        unsigned,
+    ] {
+        actor.on_inbound(InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+    }
+
+    assert_eq!(
+        actor.interfaces[&1].ingress.held_count(),
+        1,
+        "only the announce with valid IFAC is held"
+    );
+    assert_eq!(actor.interfaces[&1].ifac_violations, 1);
+    assert!(
+        !actor.path_table.has_path(&signed_destination),
+        "held, not processed"
+    );
+    assert!(!actor.path_table.has_path(&unsigned_destination));
+}
+
 #[test]
 fn a_replayed_cached_announce_is_not_counted_as_received_traffic() {
     let (mut actor, _) = TransportActor::new();
