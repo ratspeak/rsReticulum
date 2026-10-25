@@ -28,6 +28,7 @@
 - An interface counts a path request in its stats only once its tag passes the duplicate check, as in Python Reticulum 1.5.
 - A realtime Link packet dropped at a full transmit queue counts toward the interface's dropped bytes.
 - `rnpath -R` filters the remote path and rate tables as Python Reticulum compares them: a destination hash of another length matches nothing, and the hop limit compares as a number instead of wrapping above 255.
+- Remote management Links refuse Resources other than requests and responses, as Python Reticulum's do.
 
 ## 1.4.0 - 2026-10-12
 

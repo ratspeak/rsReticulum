@@ -59,6 +59,8 @@ pub(crate) async fn start_remote_management_with_stats(
         app_name,
         Some(signing_key),
     );
+    // Python's management Links take the Link default (Link.py:239).
+    lm.set_resource_strategy(rns_link::link::ResourceStrategy::AcceptNone);
 
     let status_hash: [u8; 16] = truncated_hash(STATUS_PATH.as_bytes());
     let paths_hash: [u8; 16] = truncated_hash(PATH_PATH.as_bytes());
