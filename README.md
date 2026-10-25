@@ -296,7 +296,7 @@ Known gaps and intentional limits:
   filters, apart from the remote blackhole-list query path. Remote mutations
   and remote active path requests are full gaps.
 - Interface discovery announces name this stack `rsRNS` and its version. Python
-  Reticulum 1.5.2 and later auto-connects only to Backbone interfaces
+  Reticulum 1.5.5 and later auto-connects only to Backbone interfaces
   announced by Python Reticulum 1.5.2 or later, so a Python node auto-connects
   to an `rsRNS` interface only with `autoconnect_unverified_implementations =
   yes` in its `[reticulum]` section. `rnsd-rs` follows the same rule, and the
