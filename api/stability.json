@@ -52,7 +52,7 @@
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-transport.txt",
       "itemCount": 1908,
-      "sha256": "52cfb242fdf4fca126f74decc73f5e4e20adc04cad112e6687f2d8ab4cbf3fe9"
+      "sha256": "e191078827715eb320d27cf15131b75271f104eb18f05a802d895254493516a9"
     },
     {
       "name": "rns-link",
@@ -117,6 +117,7 @@
         "pub rns_transport::actor::DiscoveryPathRequest::requesting_interface: rns_transport::messages::InterfaceId",
         "pub rns_transport::actor::DiscoveryPathRequest::timeout: f64",
         "pub rns_transport::actor::TransportActor::discovery_path_requests: std::collections::hash::map::HashMap<[u8; 16], rns_transport::actor::DiscoveryPathRequest>",
+        "pub rns_transport::actor::TransportActor::pending_tunnel_entries: alloc::vec::Vec<rns_transport::persistence::PersistedTunnelEntry>",
         "pub rns_transport::discovery::DiscoveryInterfaceConfig::height: f64",
         "pub rns_transport::discovery::DiscoveryInterfaceConfig::latitude: f64",
         "pub rns_transport::discovery::DiscoveryInterfaceConfig::longitude: f64",

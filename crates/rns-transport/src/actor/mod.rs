@@ -256,8 +256,6 @@ pub struct TransportActor {
     /// Persisted path entries waiting on their interface to re-register.
     /// Drained by `drain_pending_for_interface` on `RegisterInterface`.
     pub pending_path_entries: Vec<crate::persistence::PersistedPathEntry>,
-    /// Tunnel-table equivalent of `pending_path_entries`.
-    pub pending_tunnel_entries: Vec<crate::persistence::PersistedTunnelEntry>,
 
     /// Cache of recently learnt announces, keyed by dest_hash for O(1) upsert.
     pub recent_announces: HashMap<[u8; 16], RecentAnnounce>,
@@ -448,7 +446,6 @@ impl TransportActor {
                 false,
             )),
             pending_path_entries: Vec::new(),
-            pending_tunnel_entries: Vec::new(),
             recent_announces: HashMap::new(),
             startup_complete: false,
             startup_time: 0.0,
@@ -1011,6 +1008,7 @@ impl TransportActor {
                 let is_outbound = entry.direction.outbound;
                 let iface_name = entry.name.clone();
                 let role = entry.role;
+                let accepted_child = entry.parent_id.is_some();
                 if role == InterfaceRole::LocalClient && interface_marked_offline(&entry) {
                     tracing::info!(
                         id,
@@ -1041,11 +1039,12 @@ impl TransportActor {
                 if !self.startup_complete && self.startup_time == 0.0 {
                     self.startup_time = now_f64();
                 }
-                // Rebind any persisted path/tunnel entries that referenced
-                // this interface by name. Done immediately on register so
-                // queries from other code (e.g. announce replay below) see
-                // the restored paths.
-                self.drain_pending_for_interface(id, &iface_name);
+                // Rebind persisted paths that referenced this interface by
+                // name, immediately so later queries see them. Accepted
+                // clients' names recur across restarts for other peers.
+                if !accepted_child {
+                    self.drain_pending_for_interface(id, &iface_name);
+                }
                 // Python interface registration does not trigger announce
                 // retransmission. Cached/path-response announces stay queued
                 // for the announce job, and local shared clients only receive
@@ -1214,11 +1213,12 @@ impl TransportActor {
     }
 
     /// The registered interface a cached packet names, as Python matches
-    /// `str(interface)` against the cache file's interface reference.
+    /// `str(interface)` against the cache file's interface reference. An
+    /// accepted client's name may belong to another peer by now.
     fn replay_interface(&self, name: &str) -> Option<InterfaceId> {
         self.interfaces
             .iter()
-            .find(|(_, entry)| entry.name == name)
+            .find(|(_, entry)| entry.parent_id.is_none() && entry.name == name)
             .map(|(&id, _)| id)
     }
 
@@ -1335,7 +1335,6 @@ impl TransportActor {
         self.reverse_table = ReverseTable::new();
         self.tunnel_table = TunnelTable::new();
         self.pending_path_entries.clear();
-        self.pending_tunnel_entries.clear();
         self.path_requests.clear();
         self.path_states.clear();
         self.packet_metrics.clear();
@@ -2528,6 +2527,7 @@ mod tests {
             name: name.to_string(),
             mode: InterfaceMode::Gateway,
             role: InterfaceRole::Normal,
+            parent_id: None,
             direction: InterfaceDirection::bidirectional(),
             bitrate: 115200,
             mtu: 500,

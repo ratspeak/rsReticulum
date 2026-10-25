@@ -1041,12 +1041,11 @@ pub struct PersistedTunnelEntry {
     pub interface_id: u64,
     pub expires: f64,
     pub paths: Vec<PersistedTunnelPath>,
-    /// Same role as `PersistedPathEntry::interface_name` — used to remap a
-    /// stale `interface_id` once the matching interface registers.
+    /// Interface the tunnel was bound to when saved. Tunnels load unbound,
+    /// so this and `interface_hash` are informational.
     #[serde(default)]
     pub interface_name: Option<String>,
-    /// Python-compatible stable interface hash for remapping canonical
-    /// `tunnels` entries across restarts.
+    /// Python-compatible hash of `interface_name`.
     #[serde(default)]
     pub interface_hash: Option<Vec<u8>>,
 }
@@ -1083,10 +1082,11 @@ pub fn save_tunnel_table(
 ) -> Result<(), PersistenceError> {
     let entries: Vec<PersistedTunnelEntry> = table
         .iter()
-        .filter_map(|(_, entry)| {
-            // Skip entries whose interface has already been deregistered.
-            let interface_id = entry.interface_id?;
-            let interface_name = interface_names.get(&interface_id).cloned()?;
+        .map(|(_, entry)| {
+            let interface_name = entry
+                .interface_id
+                .and_then(|id| interface_names.get(&id))
+                .cloned();
             let paths: Vec<PersistedTunnelPath> = entry
                 .tunnel_paths
                 .iter()
@@ -1107,14 +1107,16 @@ pub fn save_tunnel_table(
                     packet_hash: tp.packet_hash.map(|h| h.to_vec()),
                 })
                 .collect();
-            Some(PersistedTunnelEntry {
+            PersistedTunnelEntry {
                 tunnel_id: entry.tunnel_id.to_vec(),
-                interface_id,
+                interface_id: entry.interface_id.unwrap_or_default(),
                 expires: entry.expires,
                 paths,
-                interface_hash: Some(interface_hash_from_name(&interface_name).to_vec()),
-                interface_name: Some(interface_name),
-            })
+                interface_hash: interface_name
+                    .as_deref()
+                    .map(|name| interface_hash_from_name(name).to_vec()),
+                interface_name,
+            }
         })
         .collect();
 

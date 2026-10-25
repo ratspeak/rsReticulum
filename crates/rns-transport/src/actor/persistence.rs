@@ -257,9 +257,11 @@ impl TransportActor {
             tunnel_table: self.tunnel_table.clone(),
             blackhole_table: self.blackhole_table.clone(),
             recent_announces: self.recent_announces.values().cloned().collect(),
+            // Accepted clients' names recur across restarts for other peers.
             interface_names: self
                 .interfaces
                 .iter()
+                .filter(|(_, entry)| entry.parent_id.is_none())
                 .map(|(&id, entry)| (id, entry.name.clone()))
                 .collect(),
             transport_identity_hash: self.transport_identity_hash,
@@ -365,13 +367,6 @@ impl TransportActor {
             self.pending_path_entries
                 .iter()
                 .filter_map(|e| e.packet_hash.as_deref())
-                .filter_map(|h| <[u8; 32]>::try_from(h).ok()),
-        );
-        keep.extend(
-            self.pending_tunnel_entries
-                .iter()
-                .flat_map(|e| e.paths.iter())
-                .filter_map(|p| p.packet_hash.as_deref())
                 .filter_map(|h| <[u8; 32]>::try_from(h).ok()),
         );
 
@@ -619,11 +614,11 @@ impl TransportActor {
         }
     }
 
-    /// Restore on-disk transport state. Entries can't bind to a concrete
+    /// Restore on-disk transport state. Paths can't bind to a concrete
     /// `interface_id` until the matching interface re-registers, so they're
-    /// staged in `pending_path_entries` / `pending_tunnel_entries` and
-    /// drained by `RegisterInterface`. Entries lacking `interface_name`
-    /// (pre-v3) are dropped — `interface_id` is volatile across boots.
+    /// staged in `pending_path_entries` and drained by `RegisterInterface`;
+    /// path entries lacking an interface name or hash (pre-v3) are dropped.
+    /// Tunnels load unbound.
     pub(super) fn load_state(&mut self) {
         let Some(dir) = self.storage_dir.clone() else {
             return;
@@ -778,9 +773,9 @@ impl TransportActor {
         }
         self.load_python_blackhole_if_ready();
 
-        // Python tunnels — canonical interop shape. Each path is only staged
-        // when its cached announce packet is present, mirroring upstream's
-        // dependency between tunnel paths and the announce cache.
+        // Python tunnels — canonical interop shape. A path loads only when
+        // its cached announce is present, and every tunnel loads unbound
+        // until a synthesis rebinds it (Transport.py:462-499).
         let python_tunnels_path = dir.join("tunnels");
         let loaded_python_tunnel_table = if python_tunnels_path.exists() {
             match crate::persistence::load_python_tunnel_table(&python_tunnels_path) {
@@ -788,8 +783,7 @@ impl TransportActor {
                     let total = entries.len();
                     let mut expired = 0usize;
                     let mut missing_cache = 0usize;
-                    let mut legacy = 0usize;
-                    let mut pending = 0usize;
+                    let mut loaded = 0usize;
                     let announce_cache_dir = dir.join("cache").join("announces");
                     let announce_cache_index = python_announce_cache_index(&announce_cache_dir);
                     for te in entries {
@@ -799,18 +793,10 @@ impl TransportActor {
                         }
 
                         let mut paths = Vec::new();
-                        let mut interface_name = None;
-                        let mut interface_hash =
-                            te.interface_hash.as_ref().map(|hash| hash.to_vec());
-
                         for tp in te.paths {
                             if tp.expires <= now_ts {
                                 expired += 1;
                                 continue;
-                            }
-                            if interface_hash.is_none() {
-                                interface_hash =
-                                    tp.interface_hash.as_ref().map(|hash| hash.to_vec());
                             }
                             let cached = match load_indexed_python_cached_announce(
                                 &announce_cache_dir,
@@ -823,9 +809,6 @@ impl TransportActor {
                                     continue;
                                 }
                             };
-                            if interface_name.is_none() {
-                                interface_name = cached.interface_reference.clone();
-                            }
                             let next_hop = if tp.received_from == tp.destination_hash {
                                 None
                             } else {
@@ -856,30 +839,15 @@ impl TransportActor {
                                 });
                         }
 
-                        if paths.is_empty() {
-                            continue;
+                        if self.load_unbound_tunnel(&te.tunnel_id, te.expires, &paths) {
+                            loaded += 1;
                         }
-                        if interface_name.is_none() && interface_hash.is_none() {
-                            legacy += 1;
-                            continue;
-                        }
-                        self.pending_tunnel_entries.push(
-                            crate::persistence::PersistedTunnelEntry {
-                                tunnel_id: te.tunnel_id.to_vec(),
-                                interface_id: 0,
-                                expires: te.expires,
-                                paths,
-                                interface_name,
-                                interface_hash,
-                            },
-                        );
-                        pending += 1;
                     }
                     debug!(
                         total,
-                        pending, expired, missing_cache, legacy, "staged Python tunnel entries"
+                        loaded, expired, missing_cache, "loaded Python tunnel entries"
                     );
-                    pending > 0
+                    loaded > 0
                 }
                 Err(e) => {
                     trace!("failed to load Python tunnels table: {}", e);
@@ -890,34 +858,24 @@ impl TransportActor {
             false
         };
 
-        // tunnel_table — legacy Rust sidecar fallback, defer remap.
+        // tunnel_table — legacy Rust sidecar fallback.
         let tunnel_path = dir.join("tunnel_table.msgpack");
         if !loaded_python_tunnel_table && tunnel_path.exists() {
             match crate::persistence::load_tunnel_table(&tunnel_path) {
                 Ok(entries) => {
                     let total = entries.len();
                     let mut expired = 0usize;
-                    let mut legacy = 0usize;
-                    let mut pending = 0usize;
+                    let mut loaded = 0usize;
                     for te in entries {
-                        if te.tunnel_id.len() != 32 {
-                            continue;
-                        }
                         if te.expires <= now_ts {
                             expired += 1;
                             continue;
                         }
-                        if te.interface_name.is_none() && te.interface_hash.is_none() {
-                            legacy += 1;
-                            continue;
+                        if self.load_unbound_tunnel(&te.tunnel_id, te.expires, &te.paths) {
+                            loaded += 1;
                         }
-                        self.pending_tunnel_entries.push(te);
-                        pending += 1;
                     }
-                    debug!(
-                        total,
-                        pending, expired, legacy, "staged tunnel entries from disk"
-                    );
+                    debug!(total, loaded, expired, "loaded tunnel entries from disk");
                 }
                 Err(e) => {
                     trace!("failed to load tunnel table: {}", e);
@@ -1067,7 +1025,55 @@ impl TransportActor {
         }
     }
 
-    /// Drain pending path/tunnel entries whose `interface_name` matches the
+    /// Load a persisted tunnel unbound; only a later synthesis binds it.
+    /// Python keeps a tunnel only when one of its paths loads.
+    fn load_unbound_tunnel(
+        &mut self,
+        tunnel_id: &[u8],
+        expires: f64,
+        paths: &[crate::persistence::PersistedTunnelPath],
+    ) -> bool {
+        let Ok(tunnel_id) = <[u8; 32]>::try_from(tunnel_id) else {
+            return false;
+        };
+        let tunnel_paths: std::collections::HashMap<_, _> = paths
+            .iter()
+            .filter_map(|tp| {
+                let dest = <[u8; 16]>::try_from(tp.destination_hash.as_slice()).ok()?;
+                let path = crate::tunnel::TunnelPath {
+                    timestamp: tp.timestamp,
+                    next_hop: tp
+                        .next_hop
+                        .as_deref()
+                        .and_then(|next_hop| <[u8; 16]>::try_from(next_hop).ok()),
+                    hops: tp.hops,
+                    expires: tp.expires,
+                    random_blobs: tp
+                        .random_blobs
+                        .iter()
+                        .filter_map(|blob| <[u8; 10]>::try_from(blob.as_slice()).ok())
+                        .collect(),
+                    packet_hash: tp
+                        .packet_hash
+                        .as_deref()
+                        .and_then(|packet_hash| <[u8; 32]>::try_from(packet_hash).ok()),
+                };
+                Some((dest, path))
+            })
+            .collect();
+        if tunnel_paths.is_empty() {
+            return false;
+        }
+        self.tunnel_table.insert(crate::tunnel::TunnelEntry {
+            tunnel_id,
+            interface_id: None,
+            tunnel_paths,
+            expires,
+        });
+        true
+    }
+
+    /// Drain pending path entries whose interface name or hash matches the
     /// just-registered interface. Bound to `RegisterInterface` so each entry
     /// rebinds to whatever `interface_id` the runtime allocated this boot.
     pub(super) fn drain_pending_for_interface(&mut self, id: InterfaceId, name: &str) {
@@ -1136,90 +1142,6 @@ impl TransportActor {
                     name = %name,
                     promoted,
                     "rebound persisted path entries to live interface"
-                );
-            }
-        }
-
-        if !self.pending_tunnel_entries.is_empty() {
-            let mut promoted = 0usize;
-            self.pending_tunnel_entries.retain(|te| {
-                let name_matches = te.interface_name.as_deref() == Some(name);
-                let hash_matches = te.interface_hash.as_deref().is_some_and(|hash| {
-                    hash == crate::persistence::interface_hash_from_name(name).as_slice()
-                });
-                if !name_matches && !hash_matches {
-                    return true;
-                }
-                if te.tunnel_id.len() != 32 {
-                    return false;
-                }
-                let mut tunnel_id = [0u8; 32];
-                tunnel_id.copy_from_slice(&te.tunnel_id);
-                let mut tunnel_paths = std::collections::HashMap::new();
-                for tp in &te.paths {
-                    if tp.destination_hash.len() == 16 {
-                        let mut dest = [0u8; 16];
-                        dest.copy_from_slice(&tp.destination_hash);
-                        let next_hop = tp.next_hop.as_ref().and_then(|next_hop| {
-                            if next_hop.len() == 16 {
-                                let mut arr = [0u8; 16];
-                                arr.copy_from_slice(next_hop);
-                                Some(arr)
-                            } else {
-                                None
-                            }
-                        });
-                        let packet_hash = tp.packet_hash.as_ref().and_then(|packet_hash| {
-                            if packet_hash.len() == 32 {
-                                let mut arr = [0u8; 32];
-                                arr.copy_from_slice(packet_hash);
-                                Some(arr)
-                            } else {
-                                None
-                            }
-                        });
-                        let random_blobs = tp
-                            .random_blobs
-                            .iter()
-                            .filter_map(|blob| {
-                                if blob.len() == 10 {
-                                    let mut arr = [0u8; 10];
-                                    arr.copy_from_slice(blob);
-                                    Some(arr)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        tunnel_paths.insert(
-                            dest,
-                            crate::tunnel::TunnelPath {
-                                timestamp: tp.timestamp,
-                                next_hop,
-                                hops: tp.hops,
-                                expires: tp.expires,
-                                random_blobs,
-                                packet_hash,
-                            },
-                        );
-                    }
-                }
-                let entry = crate::tunnel::TunnelEntry {
-                    tunnel_id,
-                    interface_id: Some(id),
-                    tunnel_paths,
-                    expires: te.expires,
-                };
-                self.tunnel_table.insert(entry);
-                promoted += 1;
-                false
-            });
-            if promoted > 0 {
-                debug!(
-                    interface_id = id,
-                    name = %name,
-                    promoted,
-                    "rebound persisted tunnel entries to live interface"
                 );
             }
         }
@@ -1303,14 +1225,12 @@ mod announce_sweep_actor_tests {
         let tunnel_hash = [0x44; 32];
         let pin_hash = [0x55; 32];
         let pending_path_hash = [0x66; 32];
-        let pending_tunnel_hash = [0x77; 32];
         let orphan_hash = [0x88; 32];
         for h in [
             path_hash,
             tunnel_hash,
             pin_hash,
             pending_path_hash,
-            pending_tunnel_hash,
             orphan_hash,
         ] {
             write_aged(&storage, h);
@@ -1362,24 +1282,6 @@ mod announce_sweep_actor_tests {
                 interface_hash: None,
                 packet_hash: Some(pending_path_hash.to_vec()),
             });
-        actor
-            .pending_tunnel_entries
-            .push(crate::persistence::PersistedTunnelEntry {
-                tunnel_id: vec![0xCD; 32],
-                interface_id: 9,
-                expires: crate::now_f64() + 600.0,
-                paths: vec![crate::persistence::PersistedTunnelPath {
-                    destination_hash: vec![0x14; 16],
-                    next_hop: None,
-                    hops: 3,
-                    expires: crate::now_f64() + 600.0,
-                    timestamp: crate::now_f64(),
-                    random_blobs: Vec::new(),
-                    packet_hash: Some(pending_tunnel_hash.to_vec()),
-                }],
-                interface_name: None,
-                interface_hash: None,
-            });
 
         actor.maybe_sweep_announce_cache();
 
@@ -1389,7 +1291,6 @@ mod announce_sweep_actor_tests {
             (tunnel_hash, "tunnel path"),
             (pin_hash, "retained pin"),
             (pending_path_hash, "pending path entry"),
-            (pending_tunnel_hash, "pending tunnel entry"),
         ] {
             assert!(
                 dir.join(hex::encode(h)).exists(),

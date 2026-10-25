@@ -55,7 +55,6 @@ pub rns_transport::actor::TransportActor::path_waiters: std::collections::hash::
 pub rns_transport::actor::TransportActor::pending_discovery_prs: alloc::collections::vec_deque::VecDeque<rns_transport::actor::PendingDiscoveryPathRequest>
 pub rns_transport::actor::TransportActor::pending_local_path_requests: std::collections::hash::map::HashMap<[u8; 16], rns_transport::messages::InterfaceId>
 pub rns_transport::actor::TransportActor::pending_path_entries: alloc::vec::Vec<rns_transport::persistence::PersistedPathEntry>
-pub rns_transport::actor::TransportActor::pending_tunnel_entries: alloc::vec::Vec<rns_transport::persistence::PersistedTunnelEntry>
 pub rns_transport::actor::TransportActor::rate_table: rns_transport::rate_limit::RateTable
 pub rns_transport::actor::TransportActor::receipt_msg_ids: std::collections::hash::map::HashMap<[u8; 16], alloc::string::String>
 pub rns_transport::actor::TransportActor::receipt_proof_txs: std::collections::hash::map::HashMap<[u8; 16], tokio::sync::mpsc::unbounded::UnboundedSender<rns_transport::link_messages::DestinationEvent>>
@@ -1350,6 +1349,7 @@ pub rns_transport::messages::InterfaceEntry::name: alloc::string::String
 pub rns_transport::messages::InterfaceEntry::online: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>
 pub rns_transport::messages::InterfaceEntry::owner: rns_transport::interface_ownership::InterfaceOwner
 pub rns_transport::messages::InterfaceEntry::packet_capacity: rns_transport::interface_ownership::InterfacePacketCapacity
+pub rns_transport::messages::InterfaceEntry::parent_id: core::option::Option<rns_transport::messages::InterfaceId>
 pub rns_transport::messages::InterfaceEntry::recursive_prs: bool
 pub rns_transport::messages::InterfaceEntry::role: rns_transport::messages::InterfaceRole
 pub rns_transport::messages::InterfaceEntry::rxb: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>>

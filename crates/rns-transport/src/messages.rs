@@ -246,6 +246,8 @@ pub struct InterfaceEntry {
     pub name: String,
     pub mode: InterfaceMode,
     pub role: InterfaceRole,
+    /// The listener that accepted this interface; `None` for configured ones.
+    pub parent_id: Option<InterfaceId>,
     pub direction: InterfaceDirection,
     pub bitrate: u64,
     pub mtu: u32,
@@ -309,6 +311,7 @@ impl InterfaceEntry {
             name,
             mode,
             role: InterfaceRole::Normal,
+            parent_id: None,
             direction,
             bitrate,
             mtu,
@@ -418,6 +421,7 @@ impl std::fmt::Debug for InterfaceEntry {
             .field("name", &self.name)
             .field("mode", &self.mode)
             .field("role", &self.role)
+            .field("parent_id", &self.parent_id)
             .field("direction", &self.direction)
             .field("bitrate", &self.bitrate)
             .field("mtu", &self.mtu)

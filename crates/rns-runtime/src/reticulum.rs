@@ -4556,6 +4556,7 @@ async fn prepare_interface_with_role_and_overrides(
         name: handle.name.clone(),
         mode: convert_mode(handle.mode),
         role,
+        parent_id: handle.parent_id,
         direction: rns_transport::constants::InterfaceDirection {
             inbound: handle.direction.inbound,
             outbound: handle.direction.outbound,
@@ -4800,6 +4801,7 @@ async fn prepare_interface_with_post_init(
         name: handle.name.clone(),
         mode: convert_mode(handle.mode),
         role: rns_transport::messages::InterfaceRole::Normal,
+        parent_id: handle.parent_id,
         direction,
         bitrate: post_init.bitrate.unwrap_or(handle.bitrate),
         mtu: handle.mtu,

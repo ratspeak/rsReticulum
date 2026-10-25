@@ -11,6 +11,7 @@
 - A Link accepts the peer's identification as soon as its handshake completes, as in Python Reticulum, so a request a Python client sends right after identifying no longer fails for lack of an identity. Only the receiving side of a Link accepts identification.
 - The receiving side of a Link counts its Link proof as sent traffic, as in Python Reticulum, so it no longer answers keepalives before the Link is established and its traffic totals include the proof.
 - A connectable I2P interface now starts alongside a Unix-socket shared instance or another connectable I2P interface, and an I2P interface runs its server and one connection for every configured peer, as in Python Reticulum.
+- After a restart, a hub no longer gives a previous client's saved paths to a new client that reuses its interface name, and it keeps saved tunnels that had no live interface, as in Python Reticulum.
 
 ## 1.4.0 - 2026-10-12
 
