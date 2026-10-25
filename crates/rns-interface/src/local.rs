@@ -517,6 +517,8 @@ mod platform {
                     match connect_unix_stream(&task_socket_path).await {
                         Ok(connected) => {
                             stream = connected;
+                            // Python drops traffic while offline (LocalInterface.py:218).
+                            while rx.try_recv().is_ok() {}
                             task_online.store(true, Ordering::SeqCst);
                             tracing::info!(
                                 name = %task_name,
@@ -984,6 +986,110 @@ mod tests {
         restarted_server.read_task.abort();
         second_accepted.read_task.abort();
         drop(second_accepted.tx);
+        client_handle.read_task.abort();
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Python's `LocalClientInterface` drops outgoing traffic while offline
+    /// (LocalInterface.py:218), so nothing queued during an outage reaches
+    /// the restarted shared instance.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_local_client_drops_traffic_queued_while_disconnected() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(64);
+        let (handle_tx, mut handle_rx) = mpsc::channel::<InterfaceHandle>(8);
+        let id_gen = Arc::new(AtomicU64::new(950));
+        let socket_path = unique_test_socket_path("reticulum_offline_queue_test");
+        let server_config = || LocalServerConfig {
+            socket_path: socket_path.clone(),
+            name: "restartable-local-server".to_string(),
+        };
+        let server_handle = spawn_local_server(
+            server_config(),
+            698,
+            id_gen.clone(),
+            transport_tx.clone(),
+            handle_tx.clone(),
+        )
+        .await
+        .unwrap();
+        server_handle.owner.mark_registered();
+        let client_handle = spawn_local_client(
+            LocalClientConfig {
+                socket_path: socket_path.clone(),
+                name: "offline-local-client".to_string(),
+            },
+            89,
+            transport_tx.clone(),
+        )
+        .await
+        .unwrap();
+        client_handle.owner.mark_registered();
+        let first_accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(3), handle_rx.recv())
+                .await
+                .expect("timeout waiting for first accepted client")
+                .expect("handle channel closed");
+        server_handle.read_task.abort();
+        first_accepted.read_task.abort();
+        drop(first_accepted.tx);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while client_handle.online.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("client did not observe server shutdown");
+        client_handle
+            .tx
+            .send(Bytes::from_static(b"queued while offline"))
+            .await
+            .unwrap();
+
+        let restarted_server = spawn_local_server(
+            server_config(),
+            698,
+            id_gen,
+            transport_tx.clone(),
+            handle_tx,
+        )
+        .await
+        .unwrap();
+        restarted_server.owner.mark_registered();
+        let second_accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(3), handle_rx.recv())
+                .await
+                .expect("client did not reconnect to restarted server")
+                .expect("handle channel closed");
+        second_accepted.owner.mark_registered();
+        let after = Bytes::from_static(b"after reconnect");
+        client_handle.tx.send(after.clone()).await.unwrap();
+
+        let first_frame = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match transport_rx.recv().await.expect("transport channel closed") {
+                    TransportMessage::InterfaceEvent {
+                        interface_id,
+                        message,
+                        ..
+                    } if interface_id == second_accepted.id => {
+                        if let TransportMessage::Inbound(packet) = *message {
+                            return packet.raw;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the reconnected client's traffic reaches the shared instance");
+        assert_eq!(
+            first_frame, after,
+            "traffic queued while disconnected is dropped"
+        );
+
+        restarted_server.read_task.abort();
+        second_accepted.read_task.abort();
         client_handle.read_task.abort();
         let _ = std::fs::remove_file(&socket_path);
     }
