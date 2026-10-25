@@ -7,11 +7,11 @@
 //! Reticulum: a barrier the filesystem lacks is skipped and logged once, and
 //! [`storage_risk`] reports network or RAM-backed storage.
 
-use super::{ATOMIC_WRITE_LOCK, atomic_replace, unique_temp_path, verify_bytes};
+use super::{ATOMIC_WRITE_LOCK, atomic_replace, read_retrying, unique_temp_path, verify_bytes};
 use rns_crypto::sha::sha256;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -378,7 +378,7 @@ fn verify_hash(path: &Path, expected: [u8; 32], maximum_len: usize) -> io::Resul
     let mut len: usize = 0;
     let mut chunk = [0u8; 8192];
     loop {
-        let count = file.read(&mut chunk)?;
+        let count = read_retrying(&mut file, &mut chunk)?;
         if count == 0 {
             break;
         }
@@ -448,7 +448,7 @@ fn open_witness(witness: &DurableFileReceipt, parent: &Path) -> io::Result<File>
     let mut remaining = witness.len;
     let mut chunk = [0u8; 8192];
     loop {
-        let count = file.read(&mut chunk)?;
+        let count = read_retrying(&mut file, &mut chunk)?;
         if count == 0 {
             break;
         }
@@ -807,6 +807,8 @@ fn publish_directory_tree(
 }
 #[cfg(any(windows, test))]
 fn publish_one_directory(target: &Path) -> Result<(), DurableWriteError> {
+    use std::io::Read;
+
     let ioe = |e: io::Error| error(DurableCommitPhase::CommitUncertain, kind(&e), &[target], e);
     let sibling = |suffix: &str| -> io::Result<PathBuf> {
         let mut name = target
@@ -913,6 +915,20 @@ fn publish_one_directory(target: &Path) -> Result<(), DurableWriteError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn hash_verification_retries_an_interrupted_read() {
+        let data = vec![0x3c; 64];
+        let expected = sha256(&data);
+        let result = super::super::tests::read_through_a_signal(
+            "verify-hash-interrupted",
+            &data,
+            move |path| verify_hash(path, expected, 64),
+        );
+        assert_eq!(result.unwrap(), 64);
+    }
+
     fn dir() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "rns-durable-{}-{}",

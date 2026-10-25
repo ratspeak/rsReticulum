@@ -71,6 +71,16 @@ fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     }
 }
 
+/// `Read::read`, retried when a signal interrupts it.
+fn read_retrying(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match reader.read(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
+}
+
 /// Compare the file at `path` with `data`. The file is read through a stack
 /// buffer that is wiped afterwards, so reading back a secret leaves no copy.
 fn verify_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -78,7 +88,7 @@ fn verify_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let mut offset: usize = 0;
     let mut chunk = Zeroizing::new([0u8; 8192]);
     loop {
-        let count = file.read(&mut chunk[..])?;
+        let count = read_retrying(&mut file, &mut chunk[..])?;
         if count == 0 {
             break;
         }
@@ -102,11 +112,9 @@ pub(crate) fn read_secret_file(path: &Path, max_len: usize) -> std::io::Result<Z
     let mut data = Zeroizing::new(vec![0u8; max_len.saturating_add(1)]);
     let mut filled = 0;
     while filled < data.len() {
-        match file.read(&mut data[filled..]) {
-            Ok(0) => break,
-            Ok(count) => filled += count,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+        match read_retrying(&mut file, &mut data[filled..])? {
+            0 => break,
+            count => filled += count,
         }
     }
     if filled > max_len {
@@ -556,5 +564,78 @@ mod tests {
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Feed `data` to `read` through a FIFO in two halves, signalling the
+    /// reading thread while it waits for the second. The handler is installed
+    /// without `SA_RESTART`, so that wait fails with EINTR.
+    #[cfg(unix)]
+    pub(super) fn read_through_a_signal<T: Send + 'static>(
+        label: &str,
+        data: &[u8],
+        read: impl FnOnce(&Path) -> std::io::Result<T> + Send + 'static,
+    ) -> std::io::Result<T> {
+        use std::os::unix::ffi::OsStrExt;
+
+        extern "C" fn ignore(_: libc::c_int) {}
+
+        let dir = unique_test_dir(label);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fifo");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        unsafe {
+            assert_eq!(libc::mkfifo(c_path.as_ptr(), 0o600), 0);
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = ignore as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+
+        let (thread_tx, thread_rx) = std::sync::mpsc::channel();
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            thread_tx
+                .send(unsafe { libc::pthread_self() } as usize)
+                .unwrap();
+            read(&reader_path)
+        });
+        let thread = thread_rx.recv().unwrap() as libc::pthread_t;
+        let mut fifo = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let (first, second) = data.split_at(data.len() / 2);
+        fifo.write_all(first).unwrap();
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            unsafe { libc::pthread_kill(thread, libc::SIGUSR1) };
+        }
+        // A reader that gave up has closed its end.
+        let _ = fifo.write_all(second);
+        drop(fifo);
+        let result = reader.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readback_verification_retries_an_interrupted_read() {
+        let data = vec![0x5a; 64];
+        let expected = data.clone();
+        let result = read_through_a_signal("verify-interrupted", &data, move |path| {
+            verify_bytes(path, &expected)
+        });
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_read_retries_an_interrupted_read() {
+        let data = vec![0xa5; 64];
+        let read = read_through_a_signal("secret-read-interrupted", &data, |path| {
+            read_secret_file(path, 1024)
+        });
+        assert_eq!(read.unwrap()[..], data[..]);
     }
 }
