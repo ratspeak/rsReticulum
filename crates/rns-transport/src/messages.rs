@@ -946,7 +946,7 @@ pub struct PathTableRpcEntry {
     pub interface_role: InterfaceRole,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct InterfaceStatRpcEntry {
     pub id: InterfaceId,
     pub name: String,
