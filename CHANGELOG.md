@@ -12,6 +12,7 @@
 - The receiving side of a Link counts its Link proof as sent traffic, as in Python Reticulum, so it no longer answers keepalives before the Link is established and its traffic totals include the proof.
 - A connectable I2P interface now starts alongside a Unix-socket shared instance or another connectable I2P interface, and an I2P interface runs its server and one connection for every configured peer, as in Python Reticulum.
 - After a restart, a hub no longer gives a previous client's saved paths to a new client that reuses its interface name, and it keeps saved tunnels that had no live interface, as in Python Reticulum.
+- Transport hubs now accept tunnel synthesis, so a Python client that reconnects gets its paths back without announcing again, and losing a tunnel's interface no longer drops paths the hub learned through other interfaces, as in Python Reticulum.
 
 ## 1.4.0 - 2026-10-12
 

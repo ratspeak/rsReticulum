@@ -1848,6 +1848,7 @@ pub fn rns_transport::tunnel::TunnelTable::len(&self) -> usize
 pub fn rns_transport::tunnel::TunnelTable::new() -> Self
 pub fn rns_transport::tunnel::TunnelTable::remove(&mut self, &[u8; 32]) -> core::option::Option<rns_transport::tunnel::TunnelEntry>
 pub fn rns_transport::tunnel::TunnelTable::tunnel_paths(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&[u8; 16], &rns_transport::tunnel::TunnelPath)>
+pub fn rns_transport::tunnel::TunnelTable::void_interface(&mut self, rns_transport::messages::InterfaceId) -> usize
 impl core::default::Default for rns_transport::tunnel::TunnelTable
 pub fn rns_transport::tunnel::TunnelTable::default() -> Self
 pub fn rns_transport::tunnel::build_tunnel_synthesis_packet(&rns_identity::identity::Identity, [u8; 32]) -> core::option::Option<alloc::vec::Vec<u8>>

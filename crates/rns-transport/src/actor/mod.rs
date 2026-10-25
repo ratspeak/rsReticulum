@@ -1025,6 +1025,8 @@ impl TransportActor {
                         existing.owner.retire();
                     }
                     self.path_table.drop_all_via(id);
+                    // A new interface starts without a tunnel (Interface.py:127).
+                    self.void_tunnel_interface(id);
                     self.link_table.remove_interface(id);
                     self.retire_recursive_discovery_interface(id);
                     self.retire_path_request_admissions(id);
@@ -3293,8 +3295,8 @@ mod tests {
     }
 
     /// Deregistering an interface must cascade through every routing table
-    /// that points at it: paths via the interface, tunnels anchored to it,
-    /// and the interface entry itself all go away in one shot.
+    /// that points at it: paths via the interface and the interface entry
+    /// go away in one shot, and tunnels anchored to it unbind.
     #[test]
     fn test_deregister_cleans_path_and_tunnel_tables() {
         let (mut actor, _tx) = TransportActor::new();
@@ -8893,17 +8895,13 @@ mod tests {
         actor.path_table.insert(dest_hash, path_entry);
         assert!(actor.path_table.has_path(&dest_hash));
 
-        // Void the interface
         actor.void_tunnel_interface(1);
 
-        // Path should be removed
-        assert!(!actor.path_table.has_path(&dest_hash));
-
-        // Tunnel interface should be voided
-        assert_eq!(
-            actor.tunnel_table.get(&tunnel_id).unwrap().interface_id,
-            None
-        );
+        // Voiding only unbinds; deregistration drops the paths via 1.
+        assert!(actor.path_table.has_path(&dest_hash));
+        let tunnel = actor.tunnel_table.get(&tunnel_id).unwrap();
+        assert_eq!(tunnel.interface_id, None);
+        assert!(tunnel.tunnel_paths.contains_key(&dest_hash));
     }
 
     #[test]

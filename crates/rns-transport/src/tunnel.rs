@@ -27,16 +27,24 @@ pub struct TunnelPath {
 #[derive(Clone)]
 pub struct TunnelTable {
     entries: HashMap<[u8; 32], TunnelEntry>,
+    /// Python's `interface.tunnel_id`: the tunnel each interface's latest
+    /// synthesis named, which may outlive that tunnel as it does in Python.
+    by_interface: HashMap<InterfaceId, [u8; 32]>,
 }
 
 impl TunnelTable {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            by_interface: HashMap::new(),
         }
     }
 
+    /// A bound entry also becomes its interface's tunnel.
     pub fn insert(&mut self, entry: TunnelEntry) {
+        if let Some(interface_id) = entry.interface_id {
+            self.by_interface.insert(interface_id, entry.tunnel_id);
+        }
         self.entries.insert(entry.tunnel_id, entry);
     }
 
@@ -68,10 +76,26 @@ impl TunnelTable {
         self.entries.iter_mut()
     }
 
+    /// The tunnel that announces arriving on `interface_id` join
+    /// (Transport.py:2467-2476).
     pub fn get_mut_by_interface(&mut self, interface_id: InterfaceId) -> Option<&mut TunnelEntry> {
-        self.entries
-            .values_mut()
-            .find(|entry| entry.interface_id == Some(interface_id))
+        let tunnel_id = self.by_interface.get(&interface_id)?;
+        self.entries.get_mut(tunnel_id)
+    }
+
+    /// Forget `interface_id`: it names no tunnel, and the tunnels bound to it
+    /// become unbound but keep their paths (Transport.py:1031-1033). Returns
+    /// how many tunnels were unbound.
+    pub fn void_interface(&mut self, interface_id: InterfaceId) -> usize {
+        self.by_interface.remove(&interface_id);
+        let mut voided = 0;
+        for entry in self.entries.values_mut() {
+            if entry.interface_id == Some(interface_id) {
+                entry.interface_id = None;
+                voided += 1;
+            }
+        }
+        voided
     }
 
     pub fn tunnel_paths(&self) -> impl Iterator<Item = (&[u8; 16], &TunnelPath)> {
@@ -84,7 +108,7 @@ impl TunnelTable {
         let now = crate::now_f64();
 
         let before = self.entries.len();
-        self.entries.retain(|_, entry| entry.expires > now);
+        self.entries.retain(|_, entry| !is_stale(entry, now));
         before - self.entries.len()
     }
 
@@ -95,7 +119,7 @@ impl TunnelTable {
         let to_remove: Vec<[u8; 32]> = self
             .entries
             .iter()
-            .filter(|(_, entry)| entry.expires <= now)
+            .filter(|(_, entry)| is_stale(entry, now))
             .take(limit)
             .map(|(hash, _)| *hash)
             .collect();
@@ -111,6 +135,11 @@ impl Default for TunnelTable {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Expired, or set to expire implausibly late (Transport.py:1022-1027).
+fn is_stale(entry: &TunnelEntry, now: f64) -> bool {
+    entry.expires <= now || entry.expires > now + 2.0 * crate::constants::TUNNEL_TIMEOUT as f64
 }
 
 /// Payload of a tunnel-synthesis announce. Total wire size = 176 bytes.
@@ -137,8 +166,9 @@ impl TunnelSynthesisData {
         data
     }
 
+    /// Python accepts exactly 176 bytes (Transport.py:2790-2791).
     pub fn unpack(data: &[u8]) -> Option<Self> {
-        if data.len() < 176 {
+        if data.len() != 176 {
             return None;
         }
         let mut public_key = [0u8; 64];
@@ -166,9 +196,23 @@ impl TunnelSynthesisData {
         tunnel_id_data.extend_from_slice(&self.interface_hash);
         sha256(&tunnel_id_data)
     }
+
+    /// The signature verifies under the Ed25519 half of `public_key`
+    /// (Transport.py:2799-2805).
+    pub(crate) fn is_signed(&self) -> bool {
+        let Ok(signer) = rns_identity::identity::Identity::from_public_key(&self.public_key) else {
+            return false;
+        };
+        let mut signed = Vec::with_capacity(112);
+        signed.extend_from_slice(&self.public_key);
+        signed.extend_from_slice(&self.interface_hash);
+        signed.extend_from_slice(&self.random_hash);
+        signer.verify(&signed, &self.signature)
+    }
 }
 
-/// Install or refresh a tunnel from a validated tunnel-synthesis announce.
+/// Install or refresh a tunnel from a validated tunnel-synthesis announce,
+/// making it the receiving interface's tunnel (Transport.py:2819-2834).
 /// A reappearing tunnel keeps its existing path set — only the interface
 /// binding and expiry move forward, so in-flight routes aren't lost when the
 /// underlying link flaps.
@@ -184,6 +228,7 @@ pub fn handle_tunnel(
     if let Some(existing) = tunnel_table.get_mut(&tunnel_id) {
         existing.interface_id = Some(interface_id);
         existing.expires = expires;
+        tunnel_table.by_interface.insert(interface_id, tunnel_id);
     } else {
         let entry = TunnelEntry {
             tunnel_id,
@@ -292,6 +337,25 @@ mod tests {
     }
 
     #[test]
+    fn synthesis_payload_must_be_exactly_176_bytes() {
+        let packed = TunnelSynthesisData {
+            public_key: [0x42; 64],
+            interface_hash: [0xAB; 32],
+            random_hash: [0xCD; 16],
+            signature: [0xEF; 64],
+        }
+        .pack();
+        assert!(TunnelSynthesisData::unpack(&packed).is_some());
+        assert!(TunnelSynthesisData::unpack(&packed[..175]).is_none());
+        let mut trailing = packed.clone();
+        trailing.push(0);
+        assert!(
+            TunnelSynthesisData::unpack(&trailing).is_none(),
+            "Python requires exactly 176 bytes (Transport.py:2791)"
+        );
+    }
+
+    #[test]
     fn test_tunnel_synthesis_id() {
         let data = TunnelSynthesisData {
             public_key: [0x42; 64],
@@ -326,6 +390,39 @@ mod tests {
     }
 
     #[test]
+    fn an_interface_keeps_naming_the_tunnel_of_its_latest_synthesis() {
+        let mut table = TunnelTable::new();
+        let (older, newer) = ([0x0A; 32], [0x0B; 32]);
+        handle_tunnel(&mut table, older, 1, 600.0);
+        handle_tunnel(&mut table, newer, 1, 600.0);
+        assert_eq!(
+            table.get_mut_by_interface(1).map(|tunnel| tunnel.tunnel_id),
+            Some(newer)
+        );
+        assert_eq!(
+            table.get(&older).unwrap().interface_id,
+            Some(1),
+            "the superseded tunnel keeps its own binding (Transport.py:2827-2834)"
+        );
+
+        handle_tunnel(&mut table, newer, 2, 600.0);
+        assert_eq!(
+            table.get_mut_by_interface(1).map(|tunnel| tunnel.tunnel_id),
+            Some(newer),
+            "interface 1 still names the tunnel that moved, as Python's interface.tunnel_id does"
+        );
+
+        assert_eq!(table.void_interface(1), 1);
+        assert!(table.get_mut_by_interface(1).is_none());
+        assert_eq!(table.get(&older).unwrap().interface_id, None);
+        assert_eq!(table.get(&newer).unwrap().interface_id, Some(2));
+        assert_eq!(
+            table.get_mut_by_interface(2).map(|tunnel| tunnel.tunnel_id),
+            Some(newer)
+        );
+    }
+
+    #[test]
     fn test_tunnel_cull_expired() {
         let mut table = TunnelTable::new();
         let entry = TunnelEntry {
@@ -338,6 +435,35 @@ mod tests {
         assert_eq!(table.len(), 1);
         table.cull_expired();
         assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn tunnels_with_excessive_expiry_are_culled() {
+        let now = crate::now_f64();
+        let limit = 2.0 * crate::constants::TUNNEL_TIMEOUT as f64;
+        let culls: [fn(&mut TunnelTable) -> usize; 2] = [TunnelTable::cull_expired, |table| {
+            table.cull_expired_batch(usize::MAX)
+        }];
+        for cull in culls {
+            let mut table = TunnelTable::new();
+            for (tunnel_id, expires) in [
+                ([0x01; 32], now + limit + 60.0),
+                ([0x02; 32], now + limit - 60.0),
+            ] {
+                table.insert(TunnelEntry {
+                    tunnel_id,
+                    interface_id: None,
+                    tunnel_paths: HashMap::new(),
+                    expires,
+                });
+            }
+            assert_eq!(cull(&mut table), 1);
+            assert!(
+                table.get(&[0x01; 32]).is_none(),
+                "Python culls an expiry beyond twice TUNNEL_TIMEOUT (Transport.py:1022-1024)"
+            );
+            assert!(table.get(&[0x02; 32]).is_some());
+        }
     }
 
     #[test]

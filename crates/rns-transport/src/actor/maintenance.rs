@@ -696,47 +696,13 @@ impl TransportActor {
         }
     }
 
-    /// On interface drop: remove tunnel-bound paths and re-announce the
-    /// affected local destinations on remaining interfaces.
+    /// On interface drop the interface names no tunnel, and the tunnels
+    /// bound to it keep their paths for their next synthesis.
     pub(super) fn void_tunnel_interface(&mut self, interface_id: InterfaceId) {
-        let mut voided_destinations: Vec<[u8; 16]> = Vec::new();
-
-        let tunnel_ids: Vec<[u8; 32]> = self
-            .tunnel_table
-            .iter()
-            .filter(|(_, entry)| entry.interface_id == Some(interface_id))
-            .map(|(id, _)| *id)
-            .collect();
-
-        for tunnel_id in &tunnel_ids {
-            if let Some(tunnel) = self.tunnel_table.get(tunnel_id) {
-                for dest_hash in tunnel.tunnel_paths.keys() {
-                    voided_destinations.push(*dest_hash);
-                    self.path_table.remove(dest_hash);
-                    self.state_dirty = true;
-                }
-            }
-            if let Some(tunnel) = self.tunnel_table.get_mut(tunnel_id) {
-                tunnel.interface_id = None;
-                debug!(
-                    tunnel_id = hex::encode(&tunnel_id[..16]),
-                    "voided tunnel interface"
-                );
-            }
-        }
-
-        for dest_hash in &voided_destinations {
-            if self.local_destinations.contains(dest_hash)
-                && let Some(tx) = self.destination_channels.get(dest_hash)
-                && let Err(e) =
-                    tx.try_send(crate::link_messages::DestinationEvent::AnnounceRequested(
-                        crate::link_messages::AnnounceRequest::normal(String::new()),
-                    ))
-            {
-                self.channel_drops += 1;
-                warn!(dest = hex::encode(dest_hash), drops = self.channel_drops, err = %e,
-                                "failed to send re-announce after tunnel void (channel full)");
-            }
+        let voided = self.tunnel_table.void_interface(interface_id);
+        if voided > 0 {
+            debug!(interface_id, voided, "voided tunnel interface");
+            self.state_dirty = true;
         }
     }
 }

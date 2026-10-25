@@ -765,60 +765,29 @@ impl TransportActor {
             return;
         }
 
-        // Tunnel-synthesis: validate the Ed25519 signature, install the
-        // tunnel, and replay any cached paths for it. Uses TUNNEL_TIMEOUT
-        // (short) rather than DESTINATION_TIMEOUT (long) because the
-        // tunnel-layer binding is more volatile than identity lifetime.
+        // Tunnel synthesis: install the tunnel, and replay its cached paths,
+        // once the signature verifies (Transport.py:2788-2805).
         if header.destination_hash == tunnel_synth_dest {
             if let Some(payload_start) = self.data_payload_offset(raw, header) {
-                let payload = &raw[payload_start..];
-                if let Some(synth_data) = crate::tunnel::TunnelSynthesisData::unpack(payload) {
-                    let ed25519_pub_bytes: [u8; 32] = {
-                        let mut buf = [0u8; 32];
-                        // First 32 bytes of the 64-byte public_key blob are
-                        // the Ed25519 signing key; remaining 32 are X25519.
-                        buf.copy_from_slice(&synth_data.public_key[..32]);
-                        buf
-                    };
-
-                    match rns_crypto::ed25519::Ed25519PublicKey::from_bytes(&ed25519_pub_bytes) {
-                        Ok(verify_key) => {
-                            let mut signed_data = Vec::with_capacity(112);
-                            signed_data.extend_from_slice(&synth_data.public_key);
-                            signed_data.extend_from_slice(&synth_data.interface_hash);
-                            signed_data.extend_from_slice(&synth_data.random_hash);
-
-                            if verify_key
-                                .verify(&signed_data, &synth_data.signature)
-                                .is_ok()
-                            {
-                                let tunnel_id = synth_data.tunnel_id();
-                                debug!(
-                                    tunnel_id = hex::encode(&tunnel_id[..16]),
-                                    interface_id, "tunnel synthesis request validated"
-                                );
-                                crate::tunnel::handle_tunnel(
-                                    &mut self.tunnel_table,
-                                    tunnel_id,
-                                    interface_id,
-                                    TUNNEL_TIMEOUT as f64,
-                                );
-                                self.state_dirty = true;
-
-                                self.restore_tunnel_paths(&tunnel_id, interface_id);
-                            } else {
-                                debug!(
-                                    interface_id,
-                                    "tunnel synthesis signature verification failed"
-                                );
-                            }
-                        }
-                        Err(_) => {
-                            debug!(interface_id, "tunnel synthesis invalid Ed25519 public key");
-                        }
+                match crate::tunnel::TunnelSynthesisData::unpack(&raw[payload_start..])
+                    .filter(crate::tunnel::TunnelSynthesisData::is_signed)
+                {
+                    Some(synthesis) => {
+                        let tunnel_id = synthesis.tunnel_id();
+                        debug!(
+                            tunnel_id = hex::encode(&tunnel_id[..16]),
+                            interface_id, "tunnel synthesis request validated"
+                        );
+                        crate::tunnel::handle_tunnel(
+                            &mut self.tunnel_table,
+                            tunnel_id,
+                            interface_id,
+                            TUNNEL_TIMEOUT as f64,
+                        );
+                        self.state_dirty = true;
+                        self.restore_tunnel_paths(&tunnel_id, interface_id);
                     }
-                } else {
-                    trace!(interface_id, "tunnel synthesis data too short or malformed");
+                    None => debug!(interface_id, "invalid tunnel synthesis"),
                 }
             }
             return;

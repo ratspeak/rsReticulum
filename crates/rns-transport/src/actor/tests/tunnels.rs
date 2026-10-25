@@ -1,10 +1,13 @@
-//! Tunnel binding, persistence and cache replay through the production actor
-//! paths.
+//! Tunnel synthesis, binding, persistence and cache replay through the
+//! production actor paths.
 use super::*;
 use crate::persistence::{
     PersistedPathEntry, PersistedTunnelEntry, PersistedTunnelPath, PersistedTunnelTable,
 };
-use crate::tunnel::{TunnelPath, handle_tunnel};
+use crate::tunnel::{
+    TunnelPath, TunnelSynthesisData, build_tunnel_synthesis_packet, handle_tunnel,
+};
+use rns_identity::identity::Identity;
 use rns_wire::flags::HeaderType;
 
 fn hub() -> TransportActor {
@@ -30,6 +33,15 @@ fn inbound(actor: &mut TransportActor, raw: Bytes, interface_id: InterfaceId) {
     });
 }
 
+fn synthesis(identity: &Identity, interface: &str) -> (Bytes, [u8; 32]) {
+    let raw =
+        build_tunnel_synthesis_packet(identity, crate::tunnel::interface_hash(interface)).unwrap();
+    let tunnel_id = TunnelSynthesisData::unpack(&raw[rns_wire::constants::HEADER_MINSIZE..])
+        .unwrap()
+        .tunnel_id();
+    (Bytes::from(raw), tunnel_id)
+}
+
 fn carries(actor: &TransportActor, tunnel_id: &[u8; 32], dest: &[u8; 16]) -> bool {
     actor
         .tunnel_table
@@ -47,6 +59,153 @@ fn cache_announce(dir: &std::path::Path, raw: &[u8], interface: Option<&str>) ->
     )
     .unwrap();
     packet_hash
+}
+
+#[test]
+fn valid_synthesis_installs_a_tunnel_that_collects_announces() {
+    let mut actor = hub();
+    let _rx = attach(&mut actor, 1, "hub/client_1");
+    let (raw, tunnel_id) = synthesis(&Identity::new(), "TCPInterface[Uplink/127.0.0.1:4242]");
+    inbound(&mut actor, raw, 1);
+    assert!(
+        actor.tunnel_table.get(&tunnel_id).is_some(),
+        "a valid synthesis installs its tunnel"
+    );
+
+    let (announce, dest) = make_valid_announce("wp4.tunnel.collect", 0);
+    inbound(&mut actor, announce, 1);
+    assert!(
+        carries(&actor, &tunnel_id, &dest),
+        "announces on the tunnel's interface join the tunnel"
+    );
+}
+
+#[test]
+fn synthesis_with_a_bad_signature_or_extra_bytes_installs_nothing() {
+    let mut actor = hub();
+    let _rx: Vec<_> = (1..=3)
+        .map(|id| attach(&mut actor, id, &format!("hub/client_{id}")))
+        .collect();
+    let (valid, valid_id) = synthesis(&Identity::new(), "uplink-a");
+    inbound(&mut actor, valid, 1);
+    assert!(
+        actor.tunnel_table.get(&valid_id).is_some(),
+        "control: a valid synthesis installs"
+    );
+
+    let (raw, tampered_id) = synthesis(&Identity::new(), "uplink-b");
+    let mut tampered = raw.to_vec();
+    *tampered.last_mut().unwrap() ^= 0x01;
+    inbound(&mut actor, Bytes::from(tampered), 2);
+    assert!(
+        actor.tunnel_table.get(&tampered_id).is_none(),
+        "a flipped signature bit is rejected"
+    );
+
+    let (raw, trailing_id) = synthesis(&Identity::new(), "uplink-c");
+    let mut trailing = raw.to_vec();
+    trailing.push(0);
+    inbound(&mut actor, Bytes::from(trailing), 3);
+    assert!(
+        actor.tunnel_table.get(&trailing_id).is_none(),
+        "a payload longer than 176 bytes is rejected (Transport.py:2791)"
+    );
+    assert_eq!(actor.tunnel_table.len(), 1);
+}
+
+#[test]
+fn the_newer_synthesis_on_an_interface_takes_its_later_announces() {
+    let mut actor = hub();
+    let _rx = attach(&mut actor, 1, "hub/client_1");
+    let (older, older_id) = synthesis(&Identity::new(), "uplink");
+    let (newer, newer_id) = synthesis(&Identity::new(), "uplink");
+    inbound(&mut actor, older, 1);
+    inbound(&mut actor, newer, 1);
+    assert!(
+        actor.tunnel_table.get(&older_id).is_some() && actor.tunnel_table.get(&newer_id).is_some(),
+        "both syntheses install"
+    );
+
+    let (announce, dest) = make_valid_announce("wp4.tunnel.newer", 0);
+    inbound(&mut actor, announce, 1);
+    assert!(
+        carries(&actor, &newer_id, &dest),
+        "the last synthesis owns the interface (Transport.py:2827, :2834)"
+    );
+    assert!(
+        !carries(&actor, &older_id, &dest),
+        "the superseded tunnel takes no new paths"
+    );
+}
+
+#[test]
+fn losing_a_tunnel_interface_keeps_paths_through_other_interfaces() {
+    let mut actor = hub();
+    let _tunnel_rx = attach(&mut actor, 1, "hub/client_1");
+    let _uplink_rx = attach(&mut actor, 2, "uplink");
+    let tunnel_id = [0x77; 32];
+    handle_tunnel(&mut actor.tunnel_table, tunnel_id, 1, TUNNEL_TIMEOUT as f64);
+
+    let identity = Identity::new();
+    let emitted = now_f64() as u64;
+    let (via_tunnel, dest) = make_announce_for_with_random_blob(
+        &identity,
+        "wp4.tunnel.elsewhere",
+        1,
+        random_blob(1, emitted - 10),
+    );
+    inbound(&mut actor, via_tunnel, 1);
+    assert!(carries(&actor, &tunnel_id, &dest));
+    let (fresher, _) = make_announce_for_with_random_blob(
+        &identity,
+        "wp4.tunnel.elsewhere",
+        1,
+        random_blob(2, emitted),
+    );
+    inbound(&mut actor, fresher, 2);
+    assert_eq!(
+        actor.path_table.get(&dest).map(|path| path.interface_id),
+        Some(2)
+    );
+
+    actor.deregister_interface(1);
+    assert_eq!(
+        actor
+            .path_table
+            .get_live(&dest)
+            .map(|path| path.interface_id),
+        Some(2),
+        "losing the tunnel's interface only unbinds the tunnel (Transport.py:1031-1033)"
+    );
+    assert!(
+        carries(&actor, &tunnel_id, &dest),
+        "the tunnel keeps its paths for the next synthesis"
+    );
+}
+
+#[test]
+fn a_replacement_registration_does_not_inherit_the_tunnel_binding() {
+    let mut actor = hub();
+    let (entry, _old_rx) = make_test_interface("hub/client_4");
+    actor.handle_message(TransportMessage::RegisterInterface { id: 4, entry });
+    let tunnel_id = [0x66; 32];
+    handle_tunnel(&mut actor.tunnel_table, tunnel_id, 4, TUNNEL_TIMEOUT as f64);
+
+    let (replacement, _new_rx) = make_test_interface("hub/client_4");
+    actor.handle_message(TransportMessage::RegisterInterface {
+        id: 4,
+        entry: replacement,
+    });
+    let (announce, dest) = make_valid_announce("wp4.tunnel.replaced", 0);
+    inbound(&mut actor, announce, 4);
+    assert!(
+        actor.path_table.has_path(&dest),
+        "control: the replacement is live"
+    );
+    assert!(
+        !carries(&actor, &tunnel_id, &dest),
+        "a replacement interface starts without a tunnel (Interface.py:127)"
+    );
 }
 
 #[test]
