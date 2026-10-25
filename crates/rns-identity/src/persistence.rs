@@ -119,6 +119,78 @@ pub(crate) fn read_secret_file(path: &Path, max_len: usize) -> std::io::Result<Z
     Ok(data)
 }
 
+/// A msgpack byte field read from a secret file. Binary and string values
+/// borrow from a slice input; integer arrays fill a buffer reserved once (at
+/// most `MAX` bytes) and wiped on drop, so neither growth nor a failed decode
+/// leaves a copy behind.
+pub(crate) enum SecretBytes<'a, const MAX: usize> {
+    Borrowed(&'a [u8]),
+    Owned(Zeroizing<Vec<u8>>),
+}
+
+impl<const MAX: usize> std::ops::Deref for SecretBytes<'_, MAX> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+impl<'de: 'a, 'a, const MAX: usize> serde::Deserialize<'de> for SecretBytes<'a, MAX> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_bytes(SecretBytesVisitor::<MAX>)
+    }
+}
+
+struct SecretBytesVisitor<const MAX: usize>;
+
+impl<'de, const MAX: usize> serde::de::Visitor<'de> for SecretBytesVisitor<MAX> {
+    type Value = SecretBytes<'de, MAX>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a byte array")
+    }
+
+    fn visit_borrowed_bytes<E: serde::de::Error>(self, bytes: &'de [u8]) -> Result<Self::Value, E> {
+        Ok(SecretBytes::Borrowed(bytes))
+    }
+
+    fn visit_borrowed_str<E: serde::de::Error>(self, text: &'de str) -> Result<Self::Value, E> {
+        Ok(SecretBytes::Borrowed(text.as_bytes()))
+    }
+
+    fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
+        Ok(SecretBytes::Owned(Zeroizing::new(bytes.to_vec())))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+        self.visit_bytes(text.as_bytes())
+    }
+
+    fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<Self::Value, E> {
+        Ok(SecretBytes::Owned(Zeroizing::new(bytes)))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, text: String) -> Result<Self::Value, E> {
+        self.visit_byte_buf(text.into_bytes())
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let capacity = seq.size_hint().unwrap_or(0).min(MAX);
+        let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
+        while let Some(byte) = seq.next_element::<u8>()? {
+            if bytes.len() == capacity {
+                return Err(serde::de::Error::invalid_length(capacity + 1, &self));
+            }
+            bytes.push(byte);
+        }
+        Ok(SecretBytes::Owned(bytes))
+    }
+}
+
 /// Write `data` to `path` via a unique same-directory temporary file and
 /// atomic rename.
 ///

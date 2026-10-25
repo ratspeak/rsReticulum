@@ -3,11 +3,11 @@ use rns_crypto::hkdf::derive_key_64;
 use rns_crypto::sha::truncated_hash;
 use rns_crypto::token;
 use rns_crypto::x25519::{X25519PrivateKey, X25519PublicKey};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use thiserror::Error;
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::persistence;
+use crate::persistence::{self, SecretBytes};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -447,9 +447,10 @@ impl fmt::Display for Identity {
 const IDENTITY_FILE_MAX_BYTES: usize = 1024;
 
 // Msgpack envelope wrapping the raw 64-byte private key on disk.
-#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
-struct IdentityPersisted {
-    private_key: Vec<u8>,
+#[derive(Deserialize)]
+struct IdentityPersisted<'a> {
+    #[serde(borrow)]
+    private_key: SecretBytes<'a, IDENTITY_FILE_MAX_BYTES>,
 }
 
 #[cfg(test)]
@@ -616,12 +617,6 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
-    }
-
-    #[test]
-    fn persisted_envelope_is_wiped_on_drop() {
-        fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
-        wiped_on_drop::<IdentityPersisted>();
     }
 
     #[test]

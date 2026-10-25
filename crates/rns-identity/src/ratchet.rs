@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::identity::Identity;
-use crate::persistence;
+use crate::persistence::{self, SecretBytes};
 
 const RATCHET_FILE_MAX_BYTES: usize = 64 * 1024;
 const RATCHET_PACKED_MAX_BYTES: usize = 32 * 1024;
@@ -44,12 +44,9 @@ fn unpack_ratchet_keys(packed: &[u8]) -> std::io::Result<Vec<[u8; 32]>> {
     if packed.len() > RATCHET_PACKED_MAX_BYTES {
         return Err(invalid_data("packed ratchet ring exceeds size limit"));
     }
-    let mut encoded_keys: Vec<serde_bytes::ByteBuf> =
+    let encoded_keys: Vec<SecretBytes<'_, RATCHET_PACKED_MAX_BYTES>> =
         rmp_serde::from_slice(packed).map_err(|e| std::io::Error::other(e.to_string()))?;
     if encoded_keys.len() > RATCHET_COUNT {
-        for key in &mut encoded_keys {
-            key.as_mut().zeroize();
-        }
         return Err(invalid_data(format!(
             "ratchet ring contains {} keys; maximum is {RATCHET_COUNT}",
             encoded_keys.len()
@@ -57,18 +54,13 @@ fn unpack_ratchet_keys(packed: &[u8]) -> std::io::Result<Vec<[u8; 32]>> {
     }
 
     if encoded_keys.iter().any(|key| key.len() != 32) {
-        for key in &mut encoded_keys {
-            key.as_mut().zeroize();
-        }
         return Err(invalid_data("ratchet private key must be exactly 32 bytes"));
     }
 
     let mut keys = Vec::with_capacity(RATCHET_COUNT);
-    for encoded in &mut encoded_keys {
-        let mut key = [0u8; 32];
+    keys.resize(encoded_keys.len(), [0u8; 32]);
+    for (key, encoded) in keys.iter_mut().zip(&encoded_keys) {
         key.copy_from_slice(encoded);
-        keys.push(key);
-        encoded.as_mut().zeroize();
     }
     Ok(keys)
 }
@@ -360,8 +352,9 @@ impl RatchetRing {
                 std::thread::sleep(std::time::Duration::from_millis(*delay));
             }
 
-            match Self::try_load(path) {
-                Ok(decoded) => return Ok((decoded.ring, decoded.signature)),
+            let data = persistence::read_secret_file(path, RATCHET_FILE_MAX_BYTES);
+            match data.and_then(|data| Self::decode(&data).map(|d| (d.ring, d.signature))) {
+                Ok(loaded) => return Ok(loaded),
                 Err(e) => {
                     if attempt < delays_ms.len() - 1 {
                         tracing::warn!(
@@ -385,7 +378,8 @@ impl RatchetRing {
     /// files are accepted only when their old current-public-key signature is
     /// valid; their unsigned rotation timestamp is deliberately ignored.
     pub fn load_verified(path: &Path, identity: &Identity) -> std::io::Result<LoadedRatchetRing> {
-        let decoded = Self::try_load(path)?;
+        let data = persistence::read_secret_file(path, RATCHET_FILE_MAX_BYTES)?;
+        let decoded = Self::decode(&data)?;
 
         let format = if identity.verify(&decoded.packed, &decoded.signature) {
             RatchetRingFormat::Canonical
@@ -406,11 +400,9 @@ impl RatchetRing {
         })
     }
 
-    fn try_load(path: &Path) -> std::io::Result<DecodedRatchetRing> {
-        let data = persistence::read_secret_file(path, RATCHET_FILE_MAX_BYTES)?;
-
+    fn decode(data: &[u8]) -> std::io::Result<DecodedRatchetRing<'_>> {
         let persisted: RatchetRingPersistedRead =
-            rmp_serde::from_slice(&data).map_err(|e| std::io::Error::other(e.to_string()))?;
+            rmp_serde::from_slice(data).map_err(|e| std::io::Error::other(e.to_string()))?;
 
         if persisted.signature.len() != 64 {
             return Err(std::io::Error::new(
@@ -422,7 +414,7 @@ impl RatchetRing {
         let mut signature = [0u8; 64];
         signature.copy_from_slice(&persisted.signature);
 
-        let packed = Zeroizing::new(persisted.ratchets);
+        let packed = persisted.ratchets;
         let keys = unpack_ratchet_keys(&packed)?;
         let had_legacy_rotation = persisted.last_rotation.is_some();
 
@@ -547,11 +539,11 @@ impl PersistentRatchetRing {
     }
 }
 
-struct DecodedRatchetRing {
+struct DecodedRatchetRing<'a> {
     ring: RatchetRing,
     signature: [u8; 64],
     had_legacy_rotation: bool,
-    packed: Zeroizing<Vec<u8>>,
+    packed: SecretBytes<'a, RATCHET_FILE_MAX_BYTES>,
 }
 
 /// A rotation candidate owns a duplicate secret ring and zeroises it on drop
@@ -580,11 +572,11 @@ struct RatchetRingPersistedWrite {
 }
 
 #[derive(Deserialize)]
-struct RatchetRingPersistedRead {
-    #[serde(with = "serde_bytes")]
-    signature: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    ratchets: Vec<u8>,
+struct RatchetRingPersistedRead<'a> {
+    #[serde(borrow)]
+    signature: SecretBytes<'a, RATCHET_FILE_MAX_BYTES>,
+    #[serde(borrow)]
+    ratchets: SecretBytes<'a, RATCHET_FILE_MAX_BYTES>,
     #[serde(default)]
     last_rotation: Option<f64>,
 }
