@@ -161,29 +161,29 @@ fn handle_status(
 /// Response: the control port's path or rate table, filtered
 /// (Transport.py:3346-3371).
 fn handle_path(tx: &mpsc::Sender<TransportMessage>, data: &[u8]) -> Option<Vec<u8>> {
-    let (command, destination, max_hops) = parse_path_request(data)?;
+    let request = parse_path_request(data)?;
+    let destination = request.destination.as_ref();
 
-    let response = match command.as_str() {
+    let response = match request.command.as_str() {
         "table" => {
             let entries = match blocking_query(tx, TransportQuery::GetPathTable)? {
                 TransportQueryResponse::PathTable(v) => v,
                 _ => return None,
             };
-            RpcResponse::PathTable(
-                entries
-                    .into_iter()
-                    .filter(|e| destination.is_none_or(|d| e.hash == d))
-                    .filter(|e| max_hops.is_none_or(|m| e.hops <= m))
-                    .map(|e| rpc::PathTableEntry {
+            let mut kept = Vec::new();
+            for e in entries {
+                if within_hops(request.max_hops.as_ref(), e.hops)? && wanted(destination, &e.hash) {
+                    kept.push(rpc::PathTableEntry {
                         hash: e.hash.to_vec(),
                         timestamp: e.timestamp,
                         via: e.via.map(|v| v.to_vec()),
                         hops: e.hops,
                         expires: e.expires,
                         interface: e.interface,
-                    })
-                    .collect(),
-            )
+                    });
+                }
+            }
+            RpcResponse::PathTable(kept)
         }
         "rates" => {
             let entries = match blocking_query(tx, TransportQuery::GetRateTable)? {
@@ -193,7 +193,7 @@ fn handle_path(tx: &mpsc::Sender<TransportMessage>, data: &[u8]) -> Option<Vec<u
             RpcResponse::RateTable(
                 entries
                     .into_iter()
-                    .filter(|e| destination.is_none_or(|d| e.hash == d))
+                    .filter(|e| wanted(destination, &e.hash))
                     .map(|e| rpc::RateTableEntry {
                         hash: e.hash.to_vec(),
                         rate: e.rate,
@@ -210,21 +210,53 @@ fn handle_path(tx: &mpsc::Sender<TransportMessage>, data: &[u8]) -> Option<Vec<u
     rpc::encode_response(&response).ok()
 }
 
+/// Python keeps an entry when a destination argument other than nil equals
+/// its hash (Transport.py:3361, :3368), so a hash of another length, or one
+/// sent as a string, matches nothing.
+fn wanted(destination: Option<&rmpv::Value>, hash: &[u8; 16]) -> bool {
+    match destination {
+        None | Some(rmpv::Value::Nil) => true,
+        Some(rmpv::Value::Binary(wanted)) => wanted.as_slice() == hash,
+        Some(_) => false,
+    }
+}
+
+/// Python's `hops <= max_hops` (Reticulum.py:1738), or `None` where Python
+/// cannot compare the two, which makes its handler raise and send nothing.
+fn within_hops(max_hops: Option<&rmpv::Value>, hops: u8) -> Option<bool> {
+    let Some(max_hops) = max_hops.filter(|max_hops| !max_hops.is_nil()) else {
+        return Some(true);
+    };
+    let hops_f64 = f64::from(hops);
+    match max_hops {
+        rmpv::Value::Integer(max) => Some(max.as_i64().is_none_or(|max| i64::from(hops) <= max)),
+        rmpv::Value::F32(max) => Some(hops_f64 <= f64::from(*max)),
+        rmpv::Value::F64(max) => Some(hops_f64 <= *max),
+        rmpv::Value::Boolean(max) => Some(hops <= u8::from(*max)),
+        _ => None,
+    }
+}
+
 fn parse_status_request(data: &[u8]) -> Option<bool> {
     let v: rmpv::Value = rmp_serde::from_slice(data).ok()?;
     v.as_array()?.first()?.as_bool()
 }
 
-fn parse_path_request(data: &[u8]) -> Option<(String, Option<[u8; 16]>, Option<u8>)> {
+/// Python's `/path` arguments, kept as sent (Transport.py:3350-3355).
+struct PathRequest {
+    command: String,
+    destination: Option<rmpv::Value>,
+    max_hops: Option<rmpv::Value>,
+}
+
+fn parse_path_request(data: &[u8]) -> Option<PathRequest> {
     let v: rmpv::Value = rmp_serde::from_slice(data).ok()?;
     let args = v.as_array()?;
-    let command = args.first()?.as_str()?.to_string();
-    let destination = args
-        .get(1)
-        .and_then(|v| v.as_slice())
-        .and_then(|s| s.try_into().ok());
-    let max_hops = args.get(2).and_then(|v| v.as_u64()).map(|n| n as u8);
-    Some((command, destination, max_hops))
+    Some(PathRequest {
+        command: args.first()?.as_str()?.to_string(),
+        destination: args.get(1).cloned(),
+        max_hops: args.get(2).cloned(),
+    })
 }
 
 /// `block_in_place` requires multi-threaded runtime; single-threaded
@@ -282,10 +314,10 @@ mod tests {
     #[test]
     fn parse_path_request_table_no_filters() {
         let data = rmp_serde::to_vec(&("table",)).unwrap();
-        let (cmd, dest, max_hops) = parse_path_request(&data).unwrap();
-        assert_eq!(cmd, "table");
-        assert_eq!(dest, None);
-        assert_eq!(max_hops, None);
+        let request = parse_path_request(&data).unwrap();
+        assert_eq!(request.command, "table");
+        assert_eq!(request.destination, None);
+        assert_eq!(request.max_hops, None);
     }
 
     #[test]
@@ -299,10 +331,13 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &value).unwrap();
-        let (cmd, dest, max_hops) = parse_path_request(&buf).unwrap();
-        assert_eq!(cmd, "rates");
-        assert_eq!(dest, Some(dest_bytes));
-        assert_eq!(max_hops, Some(3));
+        let request = parse_path_request(&buf).unwrap();
+        assert_eq!(request.command, "rates");
+        assert_eq!(
+            request.destination,
+            Some(rmpv::Value::Binary(dest_bytes.to_vec()))
+        );
+        assert_eq!(request.max_hops, Some(rmpv::Value::from(3u64)));
     }
 
     use rns_transport::messages::{InterfaceStatRpcEntry, PathTableRpcEntry, RateTableRpcEntry};
@@ -632,5 +667,62 @@ mod tests {
         let tx = spawn_mock_transport();
         let req = rmp_serde::to_vec(&("wat",)).unwrap();
         assert!(handle_path(&tx, &req).is_none());
+    }
+
+    fn path_request(command: &str, arguments: Vec<rmpv::Value>) -> Vec<u8> {
+        let mut request = vec![rmpv::Value::from(command)];
+        request.extend(arguments);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &rmpv::Value::Array(request)).unwrap();
+        buf
+    }
+
+    fn answered_entries(tx: &mpsc::Sender<TransportMessage>, request: &[u8]) -> Option<usize> {
+        let response = handle_path(tx, request)?;
+        let decoded: rmpv::Value = rmp_serde::from_slice(&response).unwrap();
+        Some(decoded.as_array().expect("response is a list").len())
+    }
+
+    /// Python keeps a path when `hops <= max_hops` compares true and a
+    /// destination argument equals its hash (Reticulum.py:1738,
+    /// Transport.py:3361, :3368): a hash of another length, or one sent as a
+    /// string, matches nothing, and a `max_hops` it cannot compare raises,
+    /// so no answer is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_path_filters_compare_like_python() {
+        use rmpv::Value;
+        let tx = spawn_mock_transport();
+        let hops = |max_hops: Value| path_request("table", vec![Value::Nil, max_hops]);
+        assert_eq!(answered_entries(&tx, &hops(Value::from(256))), Some(1));
+        assert_eq!(answered_entries(&tx, &hops(Value::from(2))), Some(1));
+        assert_eq!(answered_entries(&tx, &hops(Value::from(1))), Some(0));
+        assert_eq!(answered_entries(&tx, &hops(Value::from(-1))), Some(0));
+        assert_eq!(answered_entries(&tx, &hops(Value::F64(1.5))), Some(0));
+        assert_eq!(answered_entries(&tx, &hops(Value::Nil)), Some(1));
+        assert_eq!(answered_entries(&tx, &hops(Value::from("two"))), None);
+
+        for (command, hash) in [("table", 0x11u8), ("rates", 0x33)] {
+            let wanted = |destination: Value| {
+                answered_entries(&tx, &path_request(command, vec![destination]))
+            };
+            assert_eq!(wanted(Value::Binary(vec![hash; 16])), Some(1), "{command}");
+            assert_eq!(wanted(Value::Binary(vec![hash; 8])), Some(0), "{command}");
+            assert_eq!(
+                wanted(Value::from(char::from(hash).to_string().repeat(16))),
+                Some(0),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            answered_entries(
+                &tx,
+                &path_request(
+                    "rates",
+                    vec![Value::Binary(vec![0x33; 16]), Value::from("two")]
+                )
+            ),
+            Some(1),
+            "rates take no max_hops"
+        );
     }
 }
