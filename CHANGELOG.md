@@ -24,6 +24,7 @@
 - Announces held during an ingress burst on an IFAC interface are processed when released instead of being dropped, and released or replayed announces no longer count as received traffic again, as in Python Reticulum.
 - Interface discovery announces name this stack, `rsRNS`, and its version. `rnsd-rs` auto-connects only to Backbone interfaces announced by Python Reticulum 1.5.2 or later, or to any announced Backbone interface with `autoconnect_unverified_implementations`, and no longer stores or lists discovered TCP client interfaces, as in Python Reticulum.
 - Discovery announces a KISS-framed TCP client as a KISS interface and sends and reads unset radio parameters as nil, so Python and `rnsd-rs` read each other's KISS, Weave and RNode announces, as in Python Reticulum.
+- `rns_link::clock::ContinuousInstant` reads a monotonic clock that keeps counting while the system is suspended, for deadlines that must hold in real time across a sleep.
 
 ## 1.4.0 - 2026-10-12
 

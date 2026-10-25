@@ -1702,6 +1702,7 @@ name = "rns-link"
 version = "1.4.0"
 dependencies = [
  "hex",
+ "libc",
  "proptest",
  "rand 0.8.5",
  "rmpv",
@@ -1710,6 +1711,7 @@ dependencies = [
  "rns-wire",
  "thiserror 2.0.21",
  "tracing",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

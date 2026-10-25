@@ -843,6 +843,30 @@
             "derive"
           ],
           "sourceKind": "registry"
+        },
+        {
+          "name": "libc",
+          "rename": null,
+          "kind": null,
+          "target": "cfg(unix)",
+          "requirement": "^0.2",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "windows-sys",
+          "rename": null,
+          "kind": null,
+          "target": "cfg(windows)",
+          "requirement": "^0.61",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [
+            "Win32_System_Performance"
+          ],
+          "sourceKind": "registry"
         }
       ]
     },

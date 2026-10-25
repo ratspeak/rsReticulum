@@ -1,4 +1,27 @@
 pub mod rns_link
+pub mod rns_link::clock
+pub struct rns_link::clock::ContinuousInstant(_)
+impl rns_link::clock::ContinuousInstant
+pub fn rns_link::clock::ContinuousInstant::checked_add(self, core::time::Duration) -> core::option::Option<Self>
+pub fn rns_link::clock::ContinuousInstant::checked_duration_since(self, Self) -> core::option::Option<core::time::Duration>
+pub fn rns_link::clock::ContinuousInstant::checked_sub(self, core::time::Duration) -> core::option::Option<Self>
+pub fn rns_link::clock::ContinuousInstant::duration_since(self, Self) -> core::time::Duration
+pub fn rns_link::clock::ContinuousInstant::elapsed(self) -> core::time::Duration
+pub fn rns_link::clock::ContinuousInstant::now() -> Self
+pub fn rns_link::clock::ContinuousInstant::saturating_duration_since(self, Self) -> core::time::Duration
+impl core::ops::arith::Add<core::time::Duration> for rns_link::clock::ContinuousInstant
+pub type rns_link::clock::ContinuousInstant::Output = rns_link::clock::ContinuousInstant
+pub fn rns_link::clock::ContinuousInstant::add(self, core::time::Duration) -> Self
+impl core::ops::arith::AddAssign<core::time::Duration> for rns_link::clock::ContinuousInstant
+pub fn rns_link::clock::ContinuousInstant::add_assign(&mut self, core::time::Duration)
+impl core::ops::arith::Sub for rns_link::clock::ContinuousInstant
+pub type rns_link::clock::ContinuousInstant::Output = core::time::Duration
+pub fn rns_link::clock::ContinuousInstant::sub(self, Self) -> core::time::Duration
+impl core::ops::arith::Sub<core::time::Duration> for rns_link::clock::ContinuousInstant
+pub type rns_link::clock::ContinuousInstant::Output = rns_link::clock::ContinuousInstant
+pub fn rns_link::clock::ContinuousInstant::sub(self, core::time::Duration) -> Self
+impl core::ops::arith::SubAssign<core::time::Duration> for rns_link::clock::ContinuousInstant
+pub fn rns_link::clock::ContinuousInstant::sub_assign(&mut self, core::time::Duration)
 pub mod rns_link::constants
 pub const rns_link::constants::ACCEPT_ALL: u8
 pub const rns_link::constants::ACCEPT_APP: u8
