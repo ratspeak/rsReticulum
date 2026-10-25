@@ -33,6 +33,7 @@
 - `rnsd-rs` never auto-connects a discovered interface at an onion address, at 127.0.0.1 or 0.0.0.0, or at a host and port that an interface already connects to, as in Python Reticulum.
 - Interface stats name the network an auto-connected interface was discovered through (`autoconnect_source`), as in Python Reticulum.
 - Key material and decrypted data are wiped from memory after use, and identity files larger than 1 KiB are refused.
+- A 64-byte identity file always loads as a raw key, as in Python Reticulum. About one key in 29,000 began with bytes that were misread as the older envelope format, and its identity failed to load.
 - Writing, verifying and recovering state files retries a read that a signal interrupts instead of failing.
 
 ## 1.4.0 - 2026-10-12

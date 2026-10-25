@@ -601,6 +601,39 @@ mod tests {
     }
 
     #[test]
+    fn raw_keys_that_begin_like_an_envelope_load_as_raw_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "reticulum_identity_test_envelope_prefix_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // One-field msgpack arrays holding an empty array, 61 bytes of binary
+        // that end exactly at byte 64, and three integers.
+        let prefixes: [&[u8]; 3] = [&[0x91, 0x90], &[0x91, 0xc4, 0x3d], &[0x91, 0x93, 1, 2, 3]];
+        let mut failures = Vec::new();
+        for (index, prefix) in prefixes.into_iter().enumerate() {
+            let mut key = [0u8; 64];
+            for (offset, byte) in key.iter_mut().enumerate() {
+                *byte = (offset as u8).wrapping_mul(37).wrapping_add(index as u8);
+            }
+            key[..prefix.len()].copy_from_slice(prefix);
+            let expected = Identity::from_private_key(&key).unwrap();
+            let path = dir.join(format!("identity-{index}"));
+            std::fs::write(&path, key).unwrap();
+
+            match Identity::from_file(&path) {
+                Ok(loaded) => {
+                    assert_eq!(loaded.hash, expected.hash, "prefix {prefix:02x?}");
+                    assert_eq!(*loaded.get_private_key().unwrap(), key);
+                }
+                Err(e) => failures.push(format!("prefix {prefix:02x?}: {e}")),
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
     fn test_file_backward_compat_raw() {
         let dir = std::env::temp_dir().join("reticulum_identity_test_compat");
         let _ = std::fs::create_dir_all(&dir);
