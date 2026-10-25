@@ -5,6 +5,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, UnsafeCell};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -109,20 +110,46 @@ pub fn freed_by<R>(f: impl FnOnce() -> R) -> (R, Freed) {
 
 /// Whether `block` holds 16 consecutive bytes of `secret`.
 pub fn holds(block: &[u8], secret: &[u8]) -> bool {
-    assert!(secret.len() >= 16, "secret is too short to search for");
-    secret
-        .windows(16)
-        .any(|needle| block.windows(16).any(|window| window == needle))
+    !find(&[block.to_vec()], &[secret]).is_empty()
+}
+
+/// For each block holding 16 consecutive bytes of any of `secrets`: its
+/// length and the indexes of the secrets it holds.
+pub fn find(blocks: &[Vec<u8>], secrets: &[&[u8]]) -> Vec<(usize, Vec<usize>)> {
+    let mut windows: HashMap<&[u8], Vec<usize>> = HashMap::new();
+    for (index, secret) in secrets.iter().enumerate() {
+        assert!(secret.len() >= 16, "secret is too short to search for");
+        for window in secret.windows(16) {
+            let owners = windows.entry(window).or_default();
+            if owners.last() != Some(&index) {
+                owners.push(index);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for block in blocks {
+        let mut held: Vec<usize> = block
+            .windows(16)
+            .filter_map(|window| windows.get(window))
+            .flatten()
+            .copied()
+            .collect();
+        held.sort_unstable();
+        held.dedup();
+        if !held.is_empty() {
+            found.push((block.len(), held));
+        }
+    }
+    found
 }
 
 /// Fail if any freed block holds part of a secret.
 pub fn assert_no_residue(freed: &Freed, secrets: &[(&str, &[u8])]) {
+    let values: Vec<&[u8]> = secrets.iter().map(|(_, secret)| *secret).collect();
     let mut found = Vec::new();
-    for (name, secret) in secrets {
-        for block in &freed.blocks {
-            if holds(block, secret) {
-                found.push(format!("{name} in a freed {}-byte block", block.len()));
-            }
+    for (len, held) in find(&freed.blocks, &values) {
+        for index in held {
+            found.push(format!("{} in a freed {len}-byte block", secrets[index].0));
         }
     }
     assert!(found.is_empty(), "secret residue: {found:?}");

@@ -58,10 +58,11 @@ fn piv_ecdh_frees_no_shared_secret() {
     let expected = Zeroizing::new(key.exchange(&X25519PublicKey::from_bytes(&peer)));
     let mut session = session(key);
 
-    let (shared, freed) =
-        freed_by(|| Zeroizing::new(session.ecdh_x25519(SLOT_KEY_MANAGEMENT, &peer).unwrap()));
+    let ((), freed) = freed_by(|| {
+        let shared = Zeroizing::new(session.ecdh_x25519(SLOT_KEY_MANAGEMENT, &peer).unwrap());
+        assert_eq!(*shared, *expected);
+    });
 
-    assert_eq!(*shared, *expected);
     assert_no_residue(&freed, &[("shared secret", &expected[..])]);
 }
 

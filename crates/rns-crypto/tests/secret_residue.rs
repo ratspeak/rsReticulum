@@ -2,9 +2,44 @@
 
 mod residue;
 
-use residue::{assert_no_residue, freed_by, pseudo_random, serial};
+use residue::{assert_no_residue, freed_by, holds, pseudo_random, serial};
 use rns_crypto::{aes_cbc, hkdf, hmac, token};
+use std::hint::black_box;
 use zeroize::Zeroizing;
+
+#[test]
+fn the_harness_finds_unwiped_copies() {
+    let _serial = serial();
+    let secret: [u8; 64] = pseudo_random(12);
+
+    let ((), dropped) = freed_by(|| drop(black_box(secret.to_vec())));
+    // A wiped buffer that grew still frees its first block unwiped.
+    let ((), grown) = freed_by(|| {
+        let mut copy = Zeroizing::new(Vec::with_capacity(32));
+        copy.extend_from_slice(&secret[..32]);
+        copy.extend_from_slice(&secret[32..]);
+        black_box(&copy);
+    });
+
+    for (case, freed) in [("dropped", dropped), ("grown", grown)] {
+        assert!(
+            freed.blocks.iter().any(|block| holds(block, &secret)),
+            "{case}: copy not found"
+        );
+    }
+}
+
+#[test]
+fn the_harness_ignores_bytes_freed_before_the_check() {
+    let _serial = serial();
+    let secret: [u8; 64] = pseudo_random(13);
+    // Large enough that the allocator hands the same block straight back.
+    drop(black_box(secret.repeat(1024)));
+
+    let ((), freed) = freed_by(|| drop(black_box(Vec::<u8>::with_capacity(64 * 1024))));
+
+    assert_no_residue(&freed, &[("secret", &secret)]);
+}
 
 #[test]
 fn token_encrypt_frees_no_plaintext() {
@@ -76,12 +111,13 @@ fn derive_key_64_frees_no_key() {
     let _serial = serial();
     let shared: [u8; 32] = pseudo_random(8);
     let salt: [u8; 16] = pseudo_random(9);
-    let expected = Zeroizing::new(hkdf::hkdf_sha256(64, &shared, Some(&salt), None).unwrap());
+    let expected = hkdf::hkdf_sha256(64, &shared, Some(&salt), None).unwrap();
 
-    let (derived, freed): (Zeroizing<[u8; 64]>, _) =
-        freed_by(|| hkdf::derive_key_64(&shared, &salt).unwrap());
+    let ((), freed) = freed_by(|| {
+        let derived = hkdf::derive_key_64(&shared, &salt).unwrap();
+        assert_eq!(&derived[..], &expected[..]);
+    });
 
-    assert_eq!(&derived[..], &expected[..]);
     assert_no_residue(&freed, &[("derived key", &expected)]);
 }
 

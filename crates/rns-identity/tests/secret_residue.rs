@@ -7,7 +7,7 @@ mod residue;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use residue::{assert_no_residue, freed_by, holds, pseudo_random, serial};
+use residue::{assert_no_residue, freed_by, pseudo_random, serial};
 use rns_crypto::hkdf::hkdf_sha256;
 use rns_crypto::sha::sha256;
 use rns_crypto::x25519::{X25519PrivateKey, X25519PublicKey};
@@ -67,10 +67,10 @@ fn identity_from_file_frees_no_key() {
     let path = dir.0.join("identity");
     std::fs::write(&path, key).unwrap();
 
-    let (identity, freed) = freed_by(|| Identity::from_file(&path).unwrap());
+    let (hash, freed) = freed_by(|| Identity::from_file(&path).unwrap().hash);
 
     assert_no_residue(&freed, &[("private key", &key)]);
-    assert_eq!(identity.hash, expected);
+    assert_eq!(hash, expected);
 }
 
 #[test]
@@ -89,10 +89,10 @@ fn identity_from_file_with_a_msgpack_looking_key_frees_no_key() {
     let path = dir.0.join("identity");
     std::fs::write(&path, key).unwrap();
 
-    let (identity, freed) = freed_by(|| Identity::from_file(&path).unwrap());
+    let (hash, freed) = freed_by(|| Identity::from_file(&path).unwrap().hash);
 
     assert_no_residue(&freed, &[("private key", &key[4..])]);
-    assert_eq!(identity.hash, expected);
+    assert_eq!(hash, expected);
 }
 
 #[test]
@@ -116,10 +116,16 @@ fn identity_from_envelope_file_frees_no_key() {
         let path = dir.0.join(name);
         std::fs::write(&path, bytes).unwrap();
 
-        let (identity, freed) = freed_by(|| Identity::from_file(&path).unwrap());
+        let (hash, freed) = freed_by(|| Identity::from_file(&path).unwrap().hash);
 
-        assert_no_residue(&freed, &[("private key", &key)]);
-        assert_eq!(identity.hash, expected, "{name} envelope");
+        assert_no_residue(
+            &freed,
+            &[
+                ("private key", &key),
+                ("msgpack integers private key", &msgpack_integers(&key)),
+            ],
+        );
+        assert_eq!(hash, expected, "{name} envelope");
     }
 }
 
@@ -225,28 +231,22 @@ fn ratchet_ring_save_and_load_free_no_ratchet_keys() {
     for _ in 0..200 {
         ring.rotate();
     }
-    let keys = Zeroizing::new(ring.private_keys().concat());
+    let keys = Zeroizing::new(ring.private_keys().to_vec());
     let path = dir.0.join("ratchets");
 
     let ((), saved) = freed_by(|| ring.save_verified(&path, &identity).unwrap());
-    let (loaded, read) = freed_by(|| RatchetRing::load_verified(&path, &identity).unwrap());
+    let ((), read) = freed_by(|| {
+        let loaded = RatchetRing::load_verified(&path, &identity).unwrap();
+        assert_eq!(loaded.ring().private_keys(), &keys[..]);
+    });
 
     let mut found = Vec::new();
     for (stage, freed) in [("save", &saved), ("load", &read)] {
-        let sizes: Vec<usize> = freed
-            .blocks
-            .iter()
-            .filter(|block| keys.chunks(32).any(|key| holds(block, key)))
-            .map(Vec::len)
-            .collect();
-        if !sizes.is_empty() {
-            found.push(format!(
-                "{stage}: ratchet keys in freed blocks of {sizes:?} bytes"
-            ));
+        for residue in ratchet_key_residue(freed, &keys) {
+            found.push(format!("{stage}: {residue}"));
         }
     }
     assert!(found.is_empty(), "secret residue: {found:?}");
-    assert_eq!(loaded.ring().private_keys(), ring.private_keys());
 }
 
 #[test]
@@ -254,7 +254,12 @@ fn ifac_key_derivation_frees_no_key() {
     let _serial = serial();
     let passphrase = "correct horse battery staple";
 
-    let (key, freed) = freed_by(|| derive_ifac_key(Some("residue"), Some(passphrase)).unwrap());
+    let key = derive_ifac_key(Some("residue"), Some(passphrase)).unwrap();
+
+    let ((), freed) = freed_by(|| {
+        let derived = derive_ifac_key(Some("residue"), Some(passphrase)).unwrap();
+        assert_eq!(derived, key);
+    });
 
     assert_no_residue(
         &freed,
@@ -292,11 +297,11 @@ fn ratchet_key_residue(freed: &residue::Freed, keys: &[[u8; 32]]) -> Vec<String>
     ];
     let mut found = Vec::new();
     for (form, encode) in forms {
-        let sizes: Vec<usize> = freed
-            .blocks
-            .iter()
-            .filter(|block| keys.iter().any(|key| holds(block, &encode(key))))
-            .map(Vec::len)
+        let encoded: Vec<Vec<u8>> = keys.iter().map(|key| encode(key)).collect();
+        let secrets: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+        let sizes: Vec<usize> = residue::find(&freed.blocks, &secrets)
+            .into_iter()
+            .map(|(len, _)| len)
             .collect();
         if !sizes.is_empty() {
             found.push(format!(
