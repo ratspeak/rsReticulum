@@ -333,10 +333,9 @@ async fn a_discoverable_i2p_interface_announces_once() {
             [Some(announcer.to_string())],
             "connectable = {connectable}"
         );
-        assert_eq!(
-            bootstrap,
-            [Some(announcer.to_string())],
-            "connectable = {connectable}"
+        assert!(
+            bootstrap.is_empty(),
+            "Python never detaches an I2PInterface (Reticulum.py:809): {bootstrap:?}"
         );
 
         handle.shutdown_and_wait().await;

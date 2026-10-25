@@ -3581,7 +3581,14 @@ pub async fn init_with_policy(
                                         },
                                     );
                                 }
-                                if bootstrap_only {
+                                // Python never detaches an I2PInterface
+                                // (Reticulum.py:809).
+                                if bootstrap_only
+                                    && !matches!(
+                                        iface_config,
+                                        interface_factory::InterfaceConfig::I2P(_)
+                                    )
+                                {
                                     discovery_runtime
                                         .bootstrap_interfaces
                                         .lock()
