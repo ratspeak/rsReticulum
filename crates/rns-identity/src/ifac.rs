@@ -1,6 +1,7 @@
 use rns_crypto::hkdf::hkdf_sha256;
 use rns_crypto::sha::sha256;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// Fixed IFAC HKDF salt shared with the Python reference.
 ///
@@ -27,7 +28,7 @@ pub fn derive_ifac_key(
     network_name: Option<&str>,
     passphrase: Option<&str>,
 ) -> Result<[u8; 64], IfacError> {
-    let mut ifac_origin = Vec::new();
+    let mut ifac_origin = Zeroizing::new(Vec::with_capacity(64));
 
     if let Some(name) = network_name {
         ifac_origin.extend_from_slice(&sha256(name.as_bytes()));
@@ -36,11 +37,11 @@ pub fn derive_ifac_key(
         ifac_origin.extend_from_slice(&sha256(key.as_bytes()));
     }
 
-    let ifac_origin_hash = sha256(&ifac_origin);
+    let ifac_origin_hash = Zeroizing::new(sha256(&ifac_origin));
 
     let salt = hex_decode(IFAC_SALT).ok_or(IfacError::InvalidSalt)?;
 
-    let derived = hkdf_sha256(64, &ifac_origin_hash, Some(&salt), None)?;
+    let derived = Zeroizing::new(hkdf_sha256(64, &*ifac_origin_hash, Some(&salt), None)?);
     let mut key = [0u8; 64];
     key.copy_from_slice(&derived);
     Ok(key)

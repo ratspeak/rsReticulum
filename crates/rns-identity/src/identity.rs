@@ -5,7 +5,7 @@ use rns_crypto::token;
 use rns_crypto::x25519::{X25519PrivateKey, X25519PublicKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::persistence;
 use std::fmt;
@@ -198,12 +198,16 @@ impl Identity {
         Ok(id)
     }
 
-    /// Load an identity from file, accepting either the current msgpack envelope
-    /// or a legacy raw 64-byte private key.
+    /// Load an identity from file, accepting either the raw 64-byte private key
+    /// that Python and [`Self::to_file`] write, or the older msgpack envelope.
+    /// A file larger than 1 KiB is refused without being read.
     pub fn from_file(path: &Path) -> Result<Self, IdentityError> {
-        let data = std::fs::read(path)?;
+        let data = persistence::read_secret_file(path, IDENTITY_FILE_MAX_BYTES)?;
 
-        if let Ok(persisted) = rmp_serde::from_slice::<IdentityPersisted>(&data) {
+        // An envelope never fits in 64 bytes, so a raw key is never parsed as one.
+        if data.len() != 64
+            && let Ok(persisted) = rmp_serde::from_slice::<IdentityPersisted>(&data)
+        {
             return Self::from_private_key(&persisted.private_key);
         }
 
@@ -311,7 +315,7 @@ impl Identity {
         shared.zeroize();
         let derived = derived?;
         let ciphertext =
-            token::encrypt(plaintext, &derived).map_err(|_| IdentityError::DecryptionFailed)?;
+            token::encrypt(plaintext, &derived[..]).map_err(|_| IdentityError::DecryptionFailed)?;
 
         let mut result = Vec::with_capacity(32 + ciphertext.len());
         result.extend_from_slice(&ephemeral_pub.to_bytes());
@@ -358,7 +362,7 @@ impl Identity {
                 let derived_result = derive_key_64(&shared, &self.hash);
                 shared.zeroize();
                 if let Ok(derived) = derived_result
-                    && let Ok(plaintext) = token::decrypt(ct, &derived)
+                    && let Ok(plaintext) = token::decrypt(ct, &derived[..])
                 {
                     return Ok(DecryptionResult {
                         plaintext,
@@ -387,7 +391,7 @@ impl Identity {
         shared.zeroize();
         let derived = derived_result?;
         let plaintext =
-            token::decrypt(ct, &derived).map_err(|_| IdentityError::DecryptionFailed)?;
+            token::decrypt(ct, &derived[..]).map_err(|_| IdentityError::DecryptionFailed)?;
         Ok(DecryptionResult {
             plaintext,
             ratchet_id: None,
@@ -439,8 +443,11 @@ impl fmt::Display for Identity {
     }
 }
 
+/// Identity files are a raw key or a small envelope; larger files are refused unread.
+const IDENTITY_FILE_MAX_BYTES: usize = 1024;
+
 // Msgpack envelope wrapping the raw 64-byte private key on disk.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct IdentityPersisted {
     private_key: Vec<u8>,
 }
@@ -609,6 +616,12 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn persisted_envelope_is_wiped_on_drop() {
+        fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        wiped_on_drop::<IdentityPersisted>();
     }
 
     #[test]

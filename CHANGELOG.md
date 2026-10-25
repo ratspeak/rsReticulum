@@ -32,6 +32,7 @@
 - Remote management Links refuse Resources other than requests and responses, as Python Reticulum's do.
 - `rnsd-rs` never auto-connects a discovered interface at an onion address, at 127.0.0.1 or 0.0.0.0, or at a host and port that an interface already connects to, as in Python Reticulum.
 - Interface stats name the network an auto-connected interface was discovered through (`autoconnect_source`), as in Python Reticulum.
+- Key material and decrypted data are wiped from memory after use, and identity files larger than 1 KiB are refused.
 
 ## 1.4.0 - 2026-10-12
 

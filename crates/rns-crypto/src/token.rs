@@ -63,7 +63,7 @@ pub fn encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, TokenError> {
     let (signing_key, encryption_key) = split_key(key)?;
 
     let iv = random_16();
-    let padded = pkcs7::pad(plaintext);
+    let padded = Zeroizing::new(pkcs7::pad(plaintext));
 
     let ciphertext =
         aes_cbc::encrypt(encryption_key, &iv, &padded).map_err(|_| TokenError::EncryptionFailed)?;
@@ -82,6 +82,10 @@ pub fn encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, TokenError> {
 
 /// Token decrypt. All failure modes collapse to `AuthenticationFailed`
 /// (padding-oracle defence). HMAC comparison is constant-time.
+///
+/// The plaintext is returned in the buffer it was decrypted into, and a failed
+/// decryption wipes that buffer. Callers wrap a secret plaintext in
+/// [`Zeroizing`] so it is wiped when dropped.
 pub fn decrypt(token: &[u8], key: &[u8]) -> Result<Vec<u8>, TokenError> {
     let (signing_key, encryption_key) = split_key(key)?;
 
@@ -105,12 +109,17 @@ pub fn decrypt(token: &[u8], key: &[u8]) -> Result<Vec<u8>, TokenError> {
         return Err(TokenError::AuthenticationFailed);
     }
 
-    let padded = aes_cbc::decrypt(encryption_key, iv, ciphertext)
-        .map_err(|_| TokenError::AuthenticationFailed)?;
+    let mut padded = Zeroizing::new(
+        aes_cbc::decrypt(encryption_key, iv, ciphertext)
+            .map_err(|_| TokenError::AuthenticationFailed)?,
+    );
 
-    let plaintext = pkcs7::unpad(&padded).map_err(|_| TokenError::AuthenticationFailed)?;
+    let len = pkcs7::unpad(&padded)
+        .map_err(|_| TokenError::AuthenticationFailed)?
+        .len();
+    padded.truncate(len);
 
-    Ok(plaintext.to_vec())
+    Ok(core::mem::take(&mut *padded))
 }
 
 #[cfg(test)]

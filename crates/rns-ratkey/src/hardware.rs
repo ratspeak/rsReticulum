@@ -226,7 +226,7 @@ impl HardwareIdentity {
         let derived = derive_key_64(&shared_secret, &self.identity.hash)
             .map_err(|_| RatkeyError::EcdhFailed("HKDF derivation failed".to_string()))?;
 
-        token::decrypt(encrypted_token, &derived)
+        token::decrypt(encrypted_token, &derived[..])
             .map_err(|_| RatkeyError::EcdhFailed("decryption failed".to_string()))
     }
 

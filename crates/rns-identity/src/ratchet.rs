@@ -30,9 +30,10 @@ fn pack_ratchet_keys(keys: &[[u8; 32]]) -> std::io::Result<Zeroizing<Vec<u8>>> {
         .iter()
         .map(|key| serde_bytes::Bytes::new(key))
         .collect();
-    let packed = Zeroizing::new(
-        rmp_serde::to_vec(&byte_keys).map_err(|e| std::io::Error::other(e.to_string()))?,
-    );
+    // Sized up front: a growing buffer would free copies of the keys.
+    let mut packed = Zeroizing::new(Vec::with_capacity(RATCHET_PACKED_MAX_BYTES));
+    rmp_serde::encode::write(&mut *packed, &byte_keys)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     if packed.len() > RATCHET_PACKED_MAX_BYTES {
         return Err(invalid_data("packed ratchet ring exceeds size limit"));
     }
@@ -406,10 +407,7 @@ impl RatchetRing {
     }
 
     fn try_load(path: &Path) -> std::io::Result<DecodedRatchetRing> {
-        let data = Zeroizing::new(
-            persistence::read_file_bounded(path, RATCHET_FILE_MAX_BYTES)?
-                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?,
-        );
+        let data = persistence::read_secret_file(path, RATCHET_FILE_MAX_BYTES)?;
 
         let persisted: RatchetRingPersistedRead =
             rmp_serde::from_slice(&data).map_err(|e| std::io::Error::other(e.to_string()))?;

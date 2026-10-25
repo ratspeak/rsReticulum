@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// Per RFC 5869, HKDF-SHA256 can emit at most 255 * HashLen = 8160 bytes.
 const MAX_OUTPUT_LENGTH: usize = 255 * 32;
@@ -43,11 +44,13 @@ pub fn hkdf_sha256(
 
 /// Derive the 64-byte session key used for RNS link encryption:
 /// `HKDF-SHA256(length=64, ikm=shared_secret, salt=identity_hash, info=None)`.
-pub fn derive_key_64(shared_secret: &[u8], salt: &[u8]) -> Result<[u8; 64], HkdfError> {
-    let okm = hkdf_sha256(64, shared_secret, Some(salt), None)?;
-    let mut out = [0u8; 64];
-    out.copy_from_slice(&okm);
-    Ok(out)
+/// The key is expanded straight into its return buffer, which is wiped on drop.
+pub fn derive_key_64(shared_secret: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 64]>, HkdfError> {
+    let mut okm = Zeroizing::new([0u8; 64]);
+    Hkdf::<Sha256>::new(Some(salt), shared_secret)
+        .expand(b"", &mut okm[..])
+        .map_err(|_| HkdfError::ExpansionFailed)?;
+    Ok(okm)
 }
 
 #[cfg(test)]
@@ -84,5 +87,12 @@ mod tests {
     fn test_derive_key_64() {
         let key = derive_key_64(b"shared_secret", b"salt_value").unwrap();
         assert_eq!(key.len(), 64);
+        let cases: [(&[u8], &[u8]); 2] = [(b"shared_secret", b"salt_value"), (&[7; 32], &[9; 16])];
+        for (ikm, salt) in cases {
+            assert_eq!(
+                &derive_key_64(ikm, salt).unwrap()[..],
+                &hkdf_sha256(64, ikm, Some(salt), None).unwrap()[..]
+            );
+        }
     }
 }

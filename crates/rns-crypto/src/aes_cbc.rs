@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use cbc::{Decryptor, Encryptor};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 const AES_BLOCK_SIZE: usize = 16;
 
@@ -46,7 +47,8 @@ pub fn encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, AesCb
         return Err(AesCbcError::NotBlockAligned);
     }
 
-    let mut buf = plaintext.to_vec();
+    // Wiped if an error leaves this plaintext copy unencrypted.
+    let mut buf = Zeroizing::new(plaintext.to_vec());
     match key.len() {
         16 => {
             let enc = Encryptor::<Aes128>::new_from_slices(key, iv)
@@ -68,7 +70,7 @@ pub fn encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, AesCb
         }
         n => return Err(AesCbcError::InvalidKeyLength(n)),
     }
-    Ok(buf)
+    Ok(core::mem::take(&mut *buf))
 }
 
 /// AES-CBC decrypt. Output is still PKCS7-padded; caller strips it.

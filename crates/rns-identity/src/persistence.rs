@@ -94,6 +94,31 @@ fn verify_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Read a secret file of at most `max_len` bytes into one buffer that is
+/// allocated up front and wiped on drop, so neither growth nor a failed read
+/// leaves a copy behind.
+pub(crate) fn read_secret_file(path: &Path, max_len: usize) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    let mut file = fs::File::open(path)?;
+    let mut data = Zeroizing::new(vec![0u8; max_len.saturating_add(1)]);
+    let mut filled = 0;
+    while filled < data.len() {
+        match file.read(&mut data[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if filled > max_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds {max_len}-byte limit"),
+        ));
+    }
+    data.truncate(filled);
+    Ok(data)
+}
+
 /// Write `data` to `path` via a unique same-directory temporary file and
 /// atomic rename.
 ///
@@ -410,6 +435,30 @@ mod tests {
             let err = verify_bytes(&path, &data).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{name}");
         }
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn secret_reads_are_bounded() {
+        let dir = unique_test_dir("secret-read");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret");
+
+        fs::write(&path, [0xA5; 64]).unwrap();
+        assert_eq!(&read_secret_file(&path, 64).unwrap()[..], &[0xA5; 64]);
+        assert_eq!(
+            read_secret_file(&path, 63).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        fs::write(&path, b"").unwrap();
+        assert!(read_secret_file(&path, 64).unwrap().is_empty());
+        assert_eq!(
+            read_secret_file(&dir.join("missing"), 64)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
 
         fs::remove_dir_all(dir).unwrap();
     }
