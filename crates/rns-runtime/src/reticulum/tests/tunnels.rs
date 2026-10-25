@@ -38,6 +38,7 @@ async fn start(dir: &Path) -> ReticulumHandle {
     .unwrap()
 }
 
+#[cfg(unix)]
 async fn start_unix_owner(dir: &Path) -> ReticulumHandle {
     let socket_dir = std::env::temp_dir().join(format!("wp4s{}", nonce() % 1_000_000));
     std::fs::create_dir_all(&socket_dir).unwrap();
@@ -146,6 +147,8 @@ async fn fake_sam(
     (port, rx)
 }
 
+// Off Unix the shared listener binds a fixed TCP port.
+#[cfg(unix)]
 #[tokio::test]
 async fn the_unix_shared_listener_and_a_connectable_i2p_interface_both_register() {
     let sam_port = unused_port().await;
@@ -261,6 +264,7 @@ async fn an_i2p_interface_runs_its_server_and_every_peer() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn i2p_server_peers_register_under_their_server() {
     let (sam_port, mut streams) = fake_sam(1).await;
