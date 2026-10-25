@@ -16,7 +16,7 @@
 - PLAIN and GROUP packets that arrive from more than one hop away, and announces typed PLAIN or GROUP, are dropped before deduplication, as in Python Reticulum.
 - TCP, Backbone and I2P client interfaces open every connection with a tunnel synthesis, so a transport hub restores their paths after a reconnect, and traffic queued while a connection was down or failing to open is dropped when it opens, as in Python Reticulum.
 - A client of a Unix-socket shared instance drops traffic queued while the instance was unreachable, as in Python Reticulum.
-- A discoverable I2P interface announces itself once, at its own b32 address, instead of once per peer at a peer's address, and the peers listed in `peers` keep Python's defaults instead of the interface's mode and announce settings, sharing only its IFAC, as in Python Reticulum.
+- I2P interfaces announce their own address for discovery, and the peers listed in `peers` keep Python's defaults, sharing only the interface's IFAC, as in Python Reticulum.
 - A bootstrap-only I2P interface keeps running once discovered interfaces connect, as in Python Reticulum, which never detaches an I2P interface.
 - A connectable I2P interface keeps its I2P address across restarts. Its key is stored in Python Reticulum's key file under `storage/i2p`, readable by its owner only; as in Python Reticulum, a node without `enable_transport` or `static_transport_identity` gets a new address each start.
 - Every validated announce refreshes the identity remembered for its destination, including path responses and replays that leave the path unchanged, so a destination's identity stays recallable as in Python Reticulum.
