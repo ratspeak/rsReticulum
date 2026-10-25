@@ -881,7 +881,6 @@ impl TransportActor {
                             &mut self.tunnel_table,
                             tunnel_id,
                             interface_id,
-                            TUNNEL_TIMEOUT as f64,
                         );
                         self.state_dirty = true;
                         self.restore_tunnel_paths(&tunnel_id, interface_id);

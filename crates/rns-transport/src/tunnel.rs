@@ -212,7 +212,8 @@ impl TunnelSynthesisData {
 }
 
 /// Install or refresh a tunnel from a validated tunnel-synthesis announce,
-/// making it the receiving interface's tunnel (Transport.py:2819-2834).
+/// making it the receiving interface's tunnel and expiring it
+/// `TUNNEL_TIMEOUT` later (Transport.py:2819-2834).
 /// A reappearing tunnel keeps its existing path set — only the interface
 /// binding and expiry move forward, so in-flight routes aren't lost when the
 /// underlying link flaps.
@@ -220,10 +221,8 @@ pub fn handle_tunnel(
     tunnel_table: &mut TunnelTable,
     tunnel_id: [u8; 32],
     interface_id: crate::messages::InterfaceId,
-    destination_timeout: f64,
 ) {
-    let now = crate::now_f64();
-    let expires = now + destination_timeout;
+    let expires = crate::now_f64() + crate::constants::TUNNEL_TIMEOUT as f64;
 
     if let Some(existing) = tunnel_table.get_mut(&tunnel_id) {
         existing.interface_id = Some(interface_id);
@@ -373,7 +372,7 @@ mod tests {
     fn test_handle_tunnel_new() {
         let mut table = TunnelTable::new();
         let tunnel_id = [0xFF; 32];
-        handle_tunnel(&mut table, tunnel_id, 1, 604800.0);
+        handle_tunnel(&mut table, tunnel_id, 1);
         assert!(table.get(&tunnel_id).is_some());
         assert_eq!(table.get(&tunnel_id).unwrap().interface_id, Some(1));
     }
@@ -382,9 +381,9 @@ mod tests {
     fn test_handle_tunnel_reappear() {
         let mut table = TunnelTable::new();
         let tunnel_id = [0xFF; 32];
-        handle_tunnel(&mut table, tunnel_id, 1, 604800.0);
+        handle_tunnel(&mut table, tunnel_id, 1);
 
-        handle_tunnel(&mut table, tunnel_id, 2, 604800.0);
+        handle_tunnel(&mut table, tunnel_id, 2);
         assert_eq!(table.get(&tunnel_id).unwrap().interface_id, Some(2));
         assert_eq!(table.len(), 1);
     }
@@ -393,8 +392,8 @@ mod tests {
     fn an_interface_keeps_naming_the_tunnel_of_its_latest_synthesis() {
         let mut table = TunnelTable::new();
         let (older, newer) = ([0x0A; 32], [0x0B; 32]);
-        handle_tunnel(&mut table, older, 1, 600.0);
-        handle_tunnel(&mut table, newer, 1, 600.0);
+        handle_tunnel(&mut table, older, 1);
+        handle_tunnel(&mut table, newer, 1);
         assert_eq!(
             table.get_mut_by_interface(1).map(|tunnel| tunnel.tunnel_id),
             Some(newer)
@@ -405,7 +404,7 @@ mod tests {
             "the superseded tunnel keeps its own binding (Transport.py:2827-2834)"
         );
 
-        handle_tunnel(&mut table, newer, 2, 600.0);
+        handle_tunnel(&mut table, newer, 2);
         assert_eq!(
             table.get_mut_by_interface(1).map(|tunnel| tunnel.tunnel_id),
             Some(newer),
@@ -420,6 +419,18 @@ mod tests {
             table.get_mut_by_interface(2).map(|tunnel| tunnel.tunnel_id),
             Some(newer)
         );
+    }
+
+    /// Python expires a tunnel TUNNEL_TIMEOUT after its synthesis
+    /// (Transport.py:2821), so the next cull keeps it.
+    #[test]
+    fn a_handled_tunnel_expires_after_tunnel_timeout_and_survives_the_cull() {
+        let mut table = TunnelTable::new();
+        handle_tunnel(&mut table, [0x0C; 32], 1);
+        let expires = table.get(&[0x0C; 32]).unwrap().expires;
+        let timeout = crate::constants::TUNNEL_TIMEOUT as f64;
+        assert!((expires - crate::now_f64() - timeout).abs() < 5.0);
+        assert_eq!(table.cull_expired(), 0);
     }
 
     #[test]

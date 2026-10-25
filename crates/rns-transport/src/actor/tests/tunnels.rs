@@ -147,7 +147,7 @@ fn losing_a_tunnel_interface_keeps_paths_through_other_interfaces() {
     let _tunnel_rx = attach(&mut actor, 1, "hub/client_1");
     let _uplink_rx = attach(&mut actor, 2, "uplink");
     let tunnel_id = [0x77; 32];
-    handle_tunnel(&mut actor.tunnel_table, tunnel_id, 1, TUNNEL_TIMEOUT as f64);
+    handle_tunnel(&mut actor.tunnel_table, tunnel_id, 1);
 
     let identity = Identity::new();
     let emitted = now_f64() as u64;
@@ -192,7 +192,7 @@ fn a_replacement_registration_does_not_inherit_the_tunnel_binding() {
     let (entry, _old_rx) = make_test_interface("hub/client_4");
     actor.handle_message(TransportMessage::RegisterInterface { id: 4, entry });
     let tunnel_id = [0x66; 32];
-    handle_tunnel(&mut actor.tunnel_table, tunnel_id, 4, TUNNEL_TIMEOUT as f64);
+    handle_tunnel(&mut actor.tunnel_table, tunnel_id, 4);
 
     let (replacement, _new_rx) = make_test_interface("hub/client_4");
     actor.handle_message(TransportMessage::RegisterInterface {
@@ -220,7 +220,7 @@ fn an_unbound_tunnel_persists_without_an_interface_hash() {
     let _listener_rx = attach(&mut actor, 0, "SharedInstanceServer");
     let _client_rx = attach(&mut actor, 7, "hub/client_7");
     let tunnel_id = [0x55; 32];
-    handle_tunnel(&mut actor.tunnel_table, tunnel_id, 7, TUNNEL_TIMEOUT as f64);
+    handle_tunnel(&mut actor.tunnel_table, tunnel_id, 7);
     actor.deregister_interface(7);
     actor.save_routing_state();
 
@@ -291,7 +291,7 @@ fn a_cache_request_replay_adds_no_tunnel_path() {
     actor.storage_dir = Some(dir.clone());
     let _rx = attach(&mut actor, 1, "hub/client_1");
     let tunnel_id = [0x44; 32];
-    handle_tunnel(&mut actor.tunnel_table, tunnel_id, 1, TUNNEL_TIMEOUT as f64);
+    handle_tunnel(&mut actor.tunnel_table, tunnel_id, 1);
     actor.deregister_interface(1);
 
     let (announce, dest) = make_valid_announce("wp4.cache.tunnel", 1);
@@ -319,12 +319,7 @@ fn persisted_tunnels_load_unbound_even_when_their_interface_returns() {
         let mut writer = hub();
         writer.storage_dir = Some(dir.clone());
         let _rx = attach(&mut writer, 5, "uplink");
-        handle_tunnel(
-            &mut writer.tunnel_table,
-            tunnel_id,
-            5,
-            TUNNEL_TIMEOUT as f64,
-        );
+        handle_tunnel(&mut writer.tunnel_table, tunnel_id, 5);
         let (announce, dest) = make_valid_announce("wp4.load.unbound", 0);
         inbound(&mut writer, announce, 5);
         assert!(carries(&writer, &tunnel_id, &dest));
@@ -361,12 +356,7 @@ fn tunnels_without_an_interface_survive_a_reload() {
         let mut writer = hub();
         writer.storage_dir = Some(dir.clone());
         let _rx = attach(&mut writer, 5, "hub/client_5");
-        handle_tunnel(
-            &mut writer.tunnel_table,
-            tunnel_id,
-            5,
-            TUNNEL_TIMEOUT as f64,
-        );
+        handle_tunnel(&mut writer.tunnel_table, tunnel_id, 5);
         let now = now_f64();
         writer
             .tunnel_table

@@ -1887,7 +1887,7 @@ pub fn rns_transport::tunnel::TunnelTable::void_interface(&mut self, rns_transpo
 impl core::default::Default for rns_transport::tunnel::TunnelTable
 pub fn rns_transport::tunnel::TunnelTable::default() -> Self
 pub fn rns_transport::tunnel::build_tunnel_synthesis_packet(&rns_identity::identity::Identity, [u8; 32]) -> core::option::Option<alloc::vec::Vec<u8>>
-pub fn rns_transport::tunnel::handle_tunnel(&mut rns_transport::tunnel::TunnelTable, [u8; 32], rns_transport::messages::InterfaceId, f64)
+pub fn rns_transport::tunnel::handle_tunnel(&mut rns_transport::tunnel::TunnelTable, [u8; 32], rns_transport::messages::InterfaceId)
 pub fn rns_transport::tunnel::interface_hash(&str) -> [u8; 32]
 pub enum rns_transport::InterfaceCapacityError
 pub rns_transport::InterfaceCapacityError::Empty
