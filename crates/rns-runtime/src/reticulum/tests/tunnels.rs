@@ -383,9 +383,10 @@ async fn a_connectable_i2p_interface_announces_its_own_b32() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Python's configured peers keep MODE_FULL and no announce-rate settings,
-/// and take only IFAC from their interface (I2PInterface.py:359-381); the
-/// interface's own settings apply to it alone (Reticulum.py:1030, :1059).
+/// Python's configured peers keep MODE_FULL, no announce-rate settings and
+/// the `[reticulum]` ingress defaults (Interface.py:140-150), and take only
+/// IFAC from their interface (I2PInterface.py:359-381); the interface's own
+/// settings apply to it alone (Reticulum.py:1030, :1059).
 #[tokio::test]
 async fn configured_i2p_peers_take_only_ifac_from_their_interface() {
     let (sam_port, _streams) = fake_sam(0).await;
@@ -393,7 +394,7 @@ async fn configured_i2p_peers_take_only_ifac_from_their_interface() {
     let dir = config_dir(
         "i2p-peer-settings",
         &format!(
-            "[reticulum]\n  share_instance = No\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    peers = {peer}\n    mode = gateway\n    announce_rate_target = 3600\n    announce_cap = 5\n    network_name = tunnelnet\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n"
+            "[reticulum]\n  share_instance = No\n  ic_burst_freq_new = 7.5\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    peers = {peer}\n    mode = gateway\n    announce_rate_target = 3600\n    announce_cap = 5\n    network_name = tunnelnet\n    ic_burst_freq_new = 2.5\n    ic_new_time = 1234\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n"
         ),
     );
     let handle = start(&dir).await;
@@ -416,6 +417,13 @@ async fn configured_i2p_peers_take_only_ifac_from_their_interface() {
     assert_eq!(peer.announce_cap, ANNOUNCE_CAP);
     assert!(server.ifac_size > 0);
     assert_eq!(peer.ifac_size, server.ifac_size);
+    let ingress = |id: u64| {
+        let controls = handle.interface_controls.lock().unwrap();
+        let overrides = &controls[&id].ingress_overrides;
+        (overrides.burst_freq_new, overrides.new_time)
+    };
+    assert_eq!(ingress(server.id), (Some(2.5), Some(1234.0)));
+    assert_eq!(ingress(peer.id), (Some(7.5), None));
 
     handle.shutdown_and_wait().await;
     let _ = std::fs::remove_dir_all(dir);

@@ -3522,6 +3522,7 @@ pub async fn init_with_policy(
                 id_gen.clone(),
                 handle_tx.clone(),
                 &socket_base,
+                &rc.ingress_overrides,
                 is_foreground.clone(),
                 rnode_startup_options,
                 &tunnel_identity,
@@ -3965,8 +3966,9 @@ fn interface_kind_for_config(config: &interface_factory::InterfaceConfig) -> Int
 struct OwnedInterfaceHandle {
     interface: rns_interface::traits::InterfaceHandle,
     driver: Option<rns_interface::rnode::RNodeDriverHandle>,
-    /// An I2P peer that Python's `I2PInterface` creates for a configured peer.
-    configured_peer: bool,
+    /// An I2P peer that Python's `I2PInterface` creates for a configured peer,
+    /// with the `[reticulum]` ingress settings it takes.
+    configured_peer: Option<rns_transport::ingress::IngressOverrides>,
     /// The address a discoverable interface learns at runtime (I2P b32).
     discovery_address: Option<tokio::sync::watch::Receiver<Option<String>>>,
 }
@@ -4050,7 +4052,7 @@ impl From<rns_interface::traits::InterfaceHandle> for OwnedInterfaceHandle {
         Self {
             interface,
             driver: None,
-            configured_peer: false,
+            configured_peer: None,
             discovery_address: None,
         }
     }
@@ -4061,7 +4063,7 @@ impl From<rns_interface::rnode::SpawnedRNodeInterface> for OwnedInterfaceHandle 
         Self {
             interface: spawned.interface,
             driver: Some(spawned.driver),
-            configured_peer: false,
+            configured_peer: None,
             discovery_address: None,
         }
     }
@@ -4761,10 +4763,12 @@ fn clone_interface_post_init(
     }
 }
 
-/// Python's configured I2P peers take only IFAC from their interface and keep
-/// every other default (I2PInterface.py:359-381).
+/// Python's configured I2P peers take IFAC from their interface and every
+/// other default (I2PInterface.py:359-381), the `[reticulum]` ingress settings
+/// included (Interface.py:140-150).
 fn configured_peer_post_init(
     post_init: &interface_factory::InterfacePostInit,
+    ingress_overrides: &rns_transport::ingress::IngressOverrides,
 ) -> interface_factory::InterfacePostInit {
     interface_factory::InterfacePostInit {
         outgoing: true,
@@ -4778,7 +4782,7 @@ fn configured_peer_post_init(
         ifac_size: post_init.ifac_size,
         default_ifac_size: post_init.default_ifac_size,
         ingress_control: true,
-        ingress_overrides: Default::default(),
+        ingress_overrides: ingress_overrides.clone(),
         recursive_prs: false,
         announces_from_internal: true,
     }
@@ -4793,11 +4797,12 @@ async fn prepare_interface_with_post_init(
     kind: InterfaceKind,
 ) -> Result<PreparedInterfaceRegistration, InterfaceRegistrationError> {
     let peer_post_init;
-    let post_init = if owned.configured_peer {
-        peer_post_init = configured_peer_post_init(post_init);
-        &peer_post_init
-    } else {
-        post_init
+    let post_init = match &owned.configured_peer {
+        Some(ingress_overrides) => {
+            peer_post_init = configured_peer_post_init(post_init, ingress_overrides);
+            &peer_post_init
+        }
+        None => post_init,
     };
     let ingress = if post_init.ingress_overrides.is_empty() {
         rns_transport::ingress::IngressController::new()
@@ -8005,6 +8010,7 @@ async fn spawn_interface_with_rnode_startup_options(
     id_gen: Arc<AtomicU64>,
     handle_tx: mpsc::Sender<rns_interface::traits::InterfaceHandle>,
     socket_base: &Path,
+    global_ingress_overrides: &rns_transport::ingress::IngressOverrides,
     is_foreground: Arc<AtomicBool>,
     rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
     tunnel_identity: &rns_interface::traits::TunnelIdentity,
@@ -8226,7 +8232,7 @@ async fn spawn_interface_with_rnode_startup_options(
                 .await
                 {
                     Ok(client) => handles.push(OwnedInterfaceHandle {
-                        configured_peer: true,
+                        configured_peer: Some(global_ingress_overrides.clone()),
                         ..client.into()
                     }),
                     Err(e) => {
