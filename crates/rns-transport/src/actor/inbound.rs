@@ -128,6 +128,42 @@ impl TransportActor {
             return;
         }
 
+        // A handful of contexts legitimately repeat (keepalives, resource
+        // transfer frames, channel traffic): they bypass Python's packet
+        // filter and the hashlist (Transport.py:1635-1640).
+        let skip_hashlist = matches!(
+            parsed.context,
+            rns_wire::context::PacketContext::Keepalive
+                | rns_wire::context::PacketContext::Resource
+                | rns_wire::context::PacketContext::ResourceReq
+                | rns_wire::context::PacketContext::ResourcePrf
+                | rns_wire::context::PacketContext::CacheRequest
+                | rns_wire::context::PacketContext::Channel
+        );
+
+        // PLAIN and GROUP packets travel one hop at most and are never
+        // announced (Transport.py:1642-1666). Checked on wire hops before
+        // the hashlist, so a dropped copy reserves no hash; the shared
+        // owner already filtered its ingress (:1627).
+        if !skip_hashlist
+            && !from_shared_owner
+            && matches!(
+                parsed.flags.destination_type,
+                rns_wire::flags::DestinationType::Plain | rns_wire::flags::DestinationType::Group
+            )
+            && (parsed.flags.packet_type == rns_wire::flags::PacketType::Announce
+                || parsed.hops > 1)
+        {
+            debug!(
+                interface_id = packet.interface_id,
+                hops = parsed.hops,
+                destination_type = ?parsed.flags.destination_type,
+                packet_type = ?parsed.flags.packet_type,
+                "PLAIN or GROUP packet filtered"
+            );
+            return;
+        }
+
         // A malformed request must not reserve a hash or reach a destination.
         if parsed.flags.packet_type == rns_wire::flags::PacketType::LinkRequest {
             let Ok(signal) =
@@ -152,9 +188,7 @@ impl TransportActor {
             }
         }
 
-        // Dedup via the packet hashlist. A handful of contexts legitimately
-        // repeat (keepalives, resource transfer frames, channel traffic) and
-        // must bypass the check.
+        // Dedup via the packet hashlist.
         let pkt_hash = rns_wire::hash::packet_hash(&raw, parsed.flags.header_type);
         let packet_metrics = PacketMetrics {
             rssi: packet.rssi,
@@ -162,15 +196,6 @@ impl TransportActor {
             q: packet.q,
         };
         self.record_packet_metrics(pkt_hash, packet_metrics);
-        let skip_hashlist = matches!(
-            parsed.context,
-            rns_wire::context::PacketContext::Keepalive
-                | rns_wire::context::PacketContext::Resource
-                | rns_wire::context::PacketContext::ResourceReq
-                | rns_wire::context::PacketContext::ResourcePrf
-                | rns_wire::context::PacketContext::CacheRequest
-                | rns_wire::context::PacketContext::Channel
-        );
 
         // On shared media (e.g. LoRa) we overhear our own forwards and link
         // traffic; if we dedup against that, legitimate copies disappear.

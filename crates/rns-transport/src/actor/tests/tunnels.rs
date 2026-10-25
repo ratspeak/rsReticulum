@@ -1,6 +1,7 @@
-//! Tunnel synthesis, binding, persistence and cache replay through the
-//! production actor paths.
+//! Tunnel synthesis, binding, persistence, cache replay and the PLAIN/GROUP
+//! ingress filter through the production actor paths.
 use super::*;
+use crate::link_messages::DestinationEvent;
 use crate::persistence::{
     PersistedPathEntry, PersistedTunnelEntry, PersistedTunnelPath, PersistedTunnelTable,
 };
@@ -8,7 +9,9 @@ use crate::tunnel::{
     TunnelPath, TunnelSynthesisData, build_tunnel_synthesis_packet, handle_tunnel,
 };
 use rns_identity::identity::Identity;
-use rns_wire::flags::HeaderType;
+use rns_wire::context::PacketContext;
+use rns_wire::flags::{DestinationType, HeaderType, PacketFlags, PacketType, TransportType};
+use rns_wire::header::PacketHeader;
 
 fn hub() -> TransportActor {
     let (mut actor, _) = TransportActor::new();
@@ -474,5 +477,158 @@ fn pending_paths_are_culled_once_they_expire() {
         remaining,
         vec![&[0x22; 16][..]],
         "only the expired pending path is dropped"
+    );
+}
+
+fn named_hash(app: &str) -> [u8; 16] {
+    rns_identity::destination::Destination::hash_from_name_and_identity(app, None)
+}
+
+fn data_packet(
+    dest: [u8; 16],
+    destination_type: DestinationType,
+    hops: u8,
+    context: PacketContext,
+) -> Bytes {
+    let header = PacketHeader {
+        flags: PacketFlags {
+            header_type: HeaderType::Header1,
+            context_flag: false,
+            transport_type: TransportType::Broadcast,
+            destination_type,
+            packet_type: PacketType::Data,
+        },
+        hops,
+        transport_id: None,
+        destination_hash: dest,
+        context,
+    };
+    let mut raw = header.pack();
+    raw.extend_from_slice(b"wp4 filter payload");
+    Bytes::from(raw)
+}
+
+fn local_destination(
+    actor: &mut TransportActor,
+    app: &str,
+) -> ([u8; 16], mpsc::Receiver<DestinationEvent>) {
+    let hash = named_hash(app);
+    let (tx, rx) = mpsc::channel(8);
+    actor.handle_message(TransportMessage::RegisterDestination {
+        hash,
+        app_name: app.to_string(),
+        delivery_tx: Some(tx),
+    });
+    (hash, rx)
+}
+
+fn delivered(rx: &mut mpsc::Receiver<DestinationEvent>) -> bool {
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, DestinationEvent::InboundPacket { .. }) {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn plain_and_group_packets_beyond_one_hop_are_dropped_before_dedup() {
+    for destination_type in [DestinationType::Plain, DestinationType::Group] {
+        let mut actor = hub();
+        let _rx = attach(&mut actor, 1, "radio");
+        let (dest, mut deliveries) = local_destination(&mut actor, "wp4.filter.hops");
+        inbound(
+            &mut actor,
+            data_packet(dest, destination_type, 2, PacketContext::None),
+            1,
+        );
+        assert!(
+            !delivered(&mut deliveries),
+            "{destination_type:?} with two wire hops is dropped (Transport.py:1642-1667)"
+        );
+        inbound(
+            &mut actor,
+            data_packet(dest, destination_type, 0, PacketContext::None),
+            1,
+        );
+        assert!(
+            delivered(&mut deliveries),
+            "{destination_type:?}: the dropped copy must not reserve its packet hash"
+        );
+    }
+}
+
+#[test]
+fn one_hop_plain_and_group_packets_are_delivered() {
+    for destination_type in [DestinationType::Plain, DestinationType::Group] {
+        let mut actor = hub();
+        let _rx = attach(&mut actor, 1, "radio");
+        let (dest, mut deliveries) = local_destination(&mut actor, "wp4.filter.one");
+        inbound(
+            &mut actor,
+            data_packet(dest, destination_type, 1, PacketContext::None),
+            1,
+        );
+        assert!(delivered(&mut deliveries), "{destination_type:?}");
+    }
+}
+
+#[test]
+fn plain_and_group_typed_announces_are_dropped() {
+    for destination_type in [DestinationType::Plain, DestinationType::Group] {
+        let mut actor = hub();
+        let _rx = attach(&mut actor, 1, "radio");
+        let (announce, dest) = make_valid_announce("wp4.filter.announce", 0);
+        let (mut header, offset) = PacketHeader::unpack(&announce).unwrap();
+        header.flags.destination_type = destination_type;
+        let mut retyped = header.pack();
+        retyped.extend_from_slice(&announce[offset..]);
+        inbound(&mut actor, Bytes::from(retyped), 1);
+        assert!(
+            !actor.path_table.has_path(&dest),
+            "{destination_type:?}-typed announces are invalid (Transport.py:1650-1653, :1663-1666)"
+        );
+        assert!(!actor.recent_announces.contains_key(&dest));
+    }
+}
+
+#[test]
+fn exempt_contexts_bypass_the_plain_hop_filter() {
+    let mut actor = hub();
+    let _rx = attach(&mut actor, 1, "radio");
+    let (dest, mut deliveries) = local_destination(&mut actor, "wp4.filter.exempt");
+    for context in [
+        PacketContext::Keepalive,
+        PacketContext::Resource,
+        PacketContext::Channel,
+    ] {
+        inbound(
+            &mut actor,
+            data_packet(dest, DestinationType::Plain, 3, context),
+            1,
+        );
+        assert!(
+            delivered(&mut deliveries),
+            "{context:?} passes before the PLAIN rule (Transport.py:1635-1640)"
+        );
+    }
+}
+
+#[test]
+fn shared_owner_ingress_bypasses_the_plain_hop_filter() {
+    let (mut actor, _) = TransportActor::new();
+    actor.is_shared_instance = true;
+    let (mut entry, _rx) = make_test_interface("SharedInstanceClient");
+    entry.role = InterfaceRole::SharedInstancePeer;
+    actor.interfaces.insert(1, entry);
+    let (dest, mut deliveries) = local_destination(&mut actor, "wp4.filter.shared");
+    inbound(
+        &mut actor,
+        data_packet(dest, DestinationType::Plain, 2, PacketContext::None),
+        1,
+    );
+    assert!(
+        delivered(&mut deliveries),
+        "the shared instance already filtered this packet (Transport.py:1627)"
     );
 }
