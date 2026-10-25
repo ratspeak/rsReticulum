@@ -51,8 +51,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-transport.txt",
-      "itemCount": 1944,
-      "sha256": "cc186fce5185f4b3a3a71f4629ac59b609538be81fa7e8948c74382e25b2820f"
+      "itemCount": 1945,
+      "sha256": "c4092c2802b8271b64150bf96c46d51d4d56a1e1266eed25e97f4a6d6ef746a8"
     },
     {
       "name": "rns-link",
@@ -78,8 +78,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-interface.txt",
-      "itemCount": 1430,
-      "sha256": "00ef8baba7b42d50c77748061dc1ed3cf4c3fbf0d6b5756ac316f2a5e0cb5731"
+      "itemCount": 1433,
+      "sha256": "088245affebeb547f366fea0e5e21912b802f40178806827c8cf16b1eda15d78"
     },
     {
       "name": "rns-runtime",

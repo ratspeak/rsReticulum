@@ -1865,6 +1865,7 @@ pub rns_transport::tunnel::TunnelSynthesisData::public_key: [u8; 64]
 pub rns_transport::tunnel::TunnelSynthesisData::random_hash: [u8; 16]
 pub rns_transport::tunnel::TunnelSynthesisData::signature: [u8; 64]
 impl rns_transport::tunnel::TunnelSynthesisData
+pub fn rns_transport::tunnel::TunnelSynthesisData::is_signed(&self) -> bool
 pub fn rns_transport::tunnel::TunnelSynthesisData::pack(&self) -> alloc::vec::Vec<u8>
 pub fn rns_transport::tunnel::TunnelSynthesisData::tunnel_id(&self) -> [u8; 32]
 pub fn rns_transport::tunnel::TunnelSynthesisData::unpack(&[u8]) -> core::option::Option<Self>

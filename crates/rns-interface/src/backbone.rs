@@ -123,7 +123,7 @@ impl BackboneClientConfig {
     }
 
     /// Python `str(BackboneClientInterface)` (BackboneInterface.py:1114-1117).
-    fn python_name(&self) -> String {
+    pub fn python_name(&self) -> String {
         format!(
             "BackboneInterface[{}/{}:{}]",
             self.name,

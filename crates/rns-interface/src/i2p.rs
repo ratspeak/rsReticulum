@@ -396,7 +396,7 @@ impl I2PClientConfig {
     }
 
     /// Python `str(I2PInterfacePeer)` (I2PInterface.py:714-715).
-    fn python_name(&self) -> String {
+    pub fn python_name(&self) -> String {
         format!("I2PInterfacePeer[{}]", self.name)
     }
 }

@@ -199,7 +199,7 @@ impl TunnelSynthesisData {
 
     /// The signature verifies under the Ed25519 half of `public_key`
     /// (Transport.py:2799-2805).
-    pub(crate) fn is_signed(&self) -> bool {
+    pub fn is_signed(&self) -> bool {
         let Ok(signer) = rns_identity::identity::Identity::from_public_key(&self.public_key) else {
             return false;
         };

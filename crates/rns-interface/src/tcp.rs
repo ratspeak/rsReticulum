@@ -72,7 +72,7 @@ impl TcpClientConfig {
     }
 
     /// Python `str(TCPClientInterface)` (TCPInterface.py:457-461).
-    fn python_name(&self) -> String {
+    pub fn python_name(&self) -> String {
         format!(
             "TCPInterface[{}/{}:{}]",
             self.name,

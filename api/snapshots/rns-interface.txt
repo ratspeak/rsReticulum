@@ -124,6 +124,7 @@ pub rns_interface::backbone::BackboneClientConfig::target_port: u16
 pub rns_interface::backbone::BackboneClientConfig::tunnel_identity: core::option::Option<rns_interface::traits::TunnelIdentity>
 impl rns_interface::backbone::BackboneClientConfig
 pub fn rns_interface::backbone::BackboneClientConfig::new(&str, &str, u16) -> Self
+pub fn rns_interface::backbone::BackboneClientConfig::python_name(&self) -> alloc::string::String
 pub struct rns_interface::backbone::BackboneServerConfig
 pub rns_interface::backbone::BackboneServerConfig::block_fast_flapping: bool
 pub rns_interface::backbone::BackboneServerConfig::device: core::option::Option<alloc::string::String>
@@ -458,6 +459,7 @@ pub rns_interface::i2p::I2PClientConfig::sam_port: u16
 pub rns_interface::i2p::I2PClientConfig::tunnel_identity: core::option::Option<rns_interface::traits::TunnelIdentity>
 impl rns_interface::i2p::I2PClientConfig
 pub fn rns_interface::i2p::I2PClientConfig::new(&str, &str) -> Self
+pub fn rns_interface::i2p::I2PClientConfig::python_name(&self) -> alloc::string::String
 pub struct rns_interface::i2p::I2PServerConfig
 pub rns_interface::i2p::I2PServerConfig::b32: core::option::Option<tokio::sync::watch::Sender<core::option::Option<alloc::string::String>>>
 pub rns_interface::i2p::I2PServerConfig::keyfile: core::option::Option<alloc::string::String>
@@ -1167,6 +1169,7 @@ pub rns_interface::tcp::TcpClientConfig::target_port: u16
 pub rns_interface::tcp::TcpClientConfig::tunnel_identity: core::option::Option<rns_interface::traits::TunnelIdentity>
 impl rns_interface::tcp::TcpClientConfig
 pub fn rns_interface::tcp::TcpClientConfig::new(&str, &str, u16) -> Self
+pub fn rns_interface::tcp::TcpClientConfig::python_name(&self) -> alloc::string::String
 pub struct rns_interface::tcp::TcpInterfaceState
 pub rns_interface::tcp::TcpInterfaceState::detached: core::sync::atomic::AtomicBool
 pub rns_interface::tcp::TcpInterfaceState::online: core::sync::atomic::AtomicBool
