@@ -29,6 +29,7 @@
 - A realtime Link packet dropped at a full transmit queue counts toward the interface's dropped bytes.
 - `rnpath -R` filters the remote path and rate tables as Python Reticulum compares them: a destination hash of another length matches nothing, and the hop limit compares as a number instead of wrapping above 255.
 - Remote management Links refuse Resources other than requests and responses, as Python Reticulum's do.
+- `rnsd-rs` never auto-connects a discovered interface at an onion address, at 127.0.0.1 or 0.0.0.0, or at a host and port that an interface already connects to, as in Python Reticulum.
 
 ## 1.4.0 - 2026-10-12
 

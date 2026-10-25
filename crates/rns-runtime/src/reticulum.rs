@@ -42,7 +42,7 @@ use rns_transport::constants::DESTINATION_TIMEOUT;
 use rns_transport::discovery::{
     Announcer, BLACKHOLE_INITIAL_WAIT, BLACKHOLE_JOB_INTERVAL, BLACKHOLE_SOURCE_TIMEOUT,
     BLACKHOLE_UPDATE_INTERVAL, BlackholeSubscriberState, DiscoveredInterface, DiscoveryDecryptor,
-    DiscoveryInterfaceConfig, DiscoveryStamper, DiscoveryStore, ReceiverConfig, discovery_hash,
+    DiscoveryInterfaceConfig, DiscoveryStamper, DiscoveryStore, ReceiverConfig,
 };
 use rns_transport::messages::{
     AnnounceHandlerEvent, AnnounceHandlerId, OutboundDispatchResult, OutboundRequest,
@@ -64,6 +64,9 @@ struct InterfaceControlMetadata {
     ifac_key: Option<[u8; 64]>,
     ifac_size: usize,
     ifac_netname: Option<String>,
+    /// The host and port a client interface connects to (Python
+    /// `target_ip`, `target_port`), which auto-connect checks.
+    client_target: Option<(String, u16)>,
 }
 
 type InterfaceControlMap = Arc<std::sync::Mutex<HashMap<u64, InterfaceControlMetadata>>>;
@@ -3561,6 +3564,16 @@ pub async fn init_with_policy(
                             {
                                 startup_rnode_runtimes.push(runtime);
                             }
+                            if let Some((host, port)) = configured_client_target(iface_config) {
+                                for &registered_id in &registered_ids {
+                                    record_client_target(
+                                        &interface_controls,
+                                        registered_id,
+                                        &host,
+                                        port,
+                                    );
+                                }
+                            }
                             // Python announces an I2P interface itself, never its
                             // peers (Discovery.py:112); without a server the
                             // first peer stands in.
@@ -4615,6 +4628,7 @@ async fn prepare_interface_with_role_and_overrides(
                 ifac_key,
                 ifac_size,
                 ifac_netname,
+                client_target: None,
             },
         );
     }
@@ -4920,6 +4934,7 @@ async fn prepare_interface_with_post_init(
                 ifac_key,
                 ifac_size: post_init.ifac_size.unwrap_or(post_init.default_ifac_size),
                 ifac_netname: ifac_key.and(post_init.ifac_network_name.clone()),
+                client_target: None,
             },
         );
     let entry = rns_transport::messages::InterfaceEntry {
@@ -6484,15 +6499,24 @@ async fn maybe_autoconnect_discovered(handle: &ReticulumHandle, record: Discover
     let Some(host) = record.info.reachable_on.clone() else {
         return;
     };
+    let Some(port) = record.info.port else {
+        return;
+    };
+    if discovered_endpoint_exists(handle, &host, port).await {
+        tracing::debug!(endpoint = %format!("{host}:{port}"), "discovered interface already exists, not auto-connecting");
+        return;
+    }
     if is_yggdrasil_ipv6(&host) {
         tracing::debug!(host = %host, "skipping Yggdrasil IPv6 discovery autoconnect");
         return;
     }
-    let Some(port) = record.info.port else {
+    if refused_autoconnect_host(&host) {
+        tracing::debug!(host = %host, "not auto-connecting a discovered onion or local address");
         return;
-    };
+    }
 
-    let key = discovery_hash(&record.info.transport_id, &record.info.name);
+    // Python's `endpoint_hash` (Discovery.py:747-752).
+    let key = rns_crypto::sha::sha256(format!("{host}:{port}").as_bytes());
     {
         let mut connected = handle.discovery.autoconnected.lock().await;
         if connected.contains_key(&key) || connected.len() >= limit {
@@ -6584,8 +6608,77 @@ async fn spawn_discovered_backbone_client(
     )
     .await
     .map_err(|error| format!("Backbone client registration failed: {error}"))?;
+    record_client_target(&handle.interface_controls, id, host, port);
     tracing::info!(name = %name, id, endpoint = %format!("{host}:{port}"), "auto-connected discovered interface");
     Ok(id)
+}
+
+/// Python's `interface_exists` (Discovery.py:754-770): a client interface
+/// already aimed at this host and port, or an I2P interface at this address.
+async fn discovered_endpoint_exists(handle: &ReticulumHandle, host: &str, port: u16) -> bool {
+    let aimed = handle
+        .interface_controls
+        .lock()
+        .expect("interface_controls mutex poisoned")
+        .values()
+        .any(|control| {
+            control
+                .client_target
+                .as_ref()
+                .is_some_and(|(target_host, target_port)| {
+                    target_host == host && *target_port == port
+                })
+        });
+    aimed
+        || handle
+            .discovery
+            .local_interfaces
+            .lock()
+            .await
+            .iter()
+            .filter_map(|local| local.reachable_on.as_ref())
+            .any(|b32| b32.borrow().as_deref() == Some(host))
+}
+
+/// Python never auto-connects to an onion address, nor to the literal
+/// addresses 127.0.0.1 and 0.0.0.0 (Discovery.py:814-825, :978-985).
+fn refused_autoconnect_host(host: &str) -> bool {
+    host.to_lowercase().ends_with(".onion") || ["127.0.0.1", "0.0.0.0"].contains(&host)
+}
+
+/// The host and port a configured client interface connects to.
+fn configured_client_target(config: &interface_factory::InterfaceConfig) -> Option<(String, u16)> {
+    match config {
+        interface_factory::InterfaceConfig::TcpClient(c) => {
+            Some((c.target_host.clone(), c.target_port))
+        }
+        interface_factory::InterfaceConfig::Backbone(c) => {
+            c.target_host.clone().map(|host| (host, c.port))
+        }
+        _ => None,
+    }
+}
+
+/// Record where a client interface connects, which Python keeps as its
+/// `target_ip` and `target_port`.
+fn record_client_target(controls: &InterfaceControlMap, id: u64, host: &str, port: u16) {
+    update_interface_control(controls, id, |control| {
+        control.client_target = Some((host.to_string(), port));
+    });
+}
+
+fn update_interface_control(
+    controls: &InterfaceControlMap,
+    id: u64,
+    update: impl FnOnce(&mut InterfaceControlMetadata),
+) {
+    if let Some(control) = controls
+        .lock()
+        .expect("interface_controls mutex poisoned")
+        .get_mut(&id)
+    {
+        update(control);
+    }
 }
 
 fn is_yggdrasil_ipv6(host: &str) -> bool {
@@ -6914,6 +7007,7 @@ pub async fn spawn_tcp_client_runtime_with_ifac(
         .await
         .map_err(|error| format!("TCP client registration failed: {error}"))?;
     }
+    record_client_target(&handle.interface_controls, id, host, port);
     tracing::info!(name = %name, id, "runtime TCP client interface spawned");
     Ok(id)
 }
@@ -7067,6 +7161,12 @@ pub async fn spawn_backbone_client_runtime_with_ifac(
         .await
         .map_err(|error| format!("Backbone client registration failed: {error}"))?;
     }
+    record_client_target(
+        &handle.interface_controls,
+        id,
+        runtime_config.host,
+        runtime_config.port,
+    );
     tracing::info!(name = %runtime_config.name, id, "runtime Backbone client interface spawned");
     Ok(id)
 }
@@ -8587,6 +8687,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    mod autoconnect;
     mod interface_stats;
     mod tunnels;
 
@@ -8672,6 +8773,7 @@ mod tests {
                 ifac_key: None,
                 ifac_size: 0,
                 ifac_netname: None,
+                client_target: None,
             },
         );
 
@@ -8817,6 +8919,7 @@ mod tests {
                 ifac_key: None,
                 ifac_size: 0,
                 ifac_netname: None,
+                client_target: None,
             },
         );
         drop(registration);
@@ -14082,6 +14185,7 @@ egress_control = Yes
                     ifac_key: None,
                     ifac_size: 0,
                     ifac_netname: None,
+                    client_target: None,
                 },
             );
 
