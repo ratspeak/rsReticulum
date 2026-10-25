@@ -200,7 +200,7 @@ impl Identity {
 
     /// Load an identity from file, accepting either the raw 64-byte private key
     /// that Python and [`Self::to_file`] write, or the older msgpack envelope.
-    /// A file larger than 1 KiB is refused without being read.
+    /// A file larger than 1 KiB is refused once 1025 bytes have been read.
     pub fn from_file(path: &Path) -> Result<Self, IdentityError> {
         let data = persistence::read_secret_file(path, IDENTITY_FILE_MAX_BYTES)?;
 
@@ -443,7 +443,8 @@ impl fmt::Display for Identity {
     }
 }
 
-/// Identity files are a raw key or a small envelope; larger files are refused unread.
+/// Identity files are a raw key or a small envelope; reading stops one byte
+/// past this limit and refuses the file.
 const IDENTITY_FILE_MAX_BYTES: usize = 1024;
 
 // Msgpack envelope wrapping the raw 64-byte private key on disk.

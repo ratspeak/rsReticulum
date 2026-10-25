@@ -40,6 +40,21 @@ fn pack_ratchet_keys(keys: &[[u8; 32]]) -> std::io::Result<Zeroizing<Vec<u8>>> {
     Ok(packed)
 }
 
+fn encode_ring_file(signature: &[u8; 64], packed: &[u8]) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    let persisted = RatchetRingPersistedWrite {
+        signature,
+        ratchets: packed,
+    };
+    // Sized up front: a growing buffer would free copies of the keys.
+    let mut buf = Zeroizing::new(Vec::with_capacity(RATCHET_FILE_MAX_BYTES));
+    rmp_serde::encode::write_named(&mut *buf, &persisted)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    if buf.len() > RATCHET_FILE_MAX_BYTES {
+        return Err(invalid_data("ratchet ring file exceeds size limit"));
+    }
+    Ok(buf)
+}
+
 fn unpack_ratchet_keys(packed: &[u8]) -> std::io::Result<Vec<[u8; 32]>> {
     if packed.len() > RATCHET_PACKED_MAX_BYTES {
         return Err(invalid_data("packed ratchet ring exceeds size limit"));
@@ -280,18 +295,7 @@ impl RatchetRing {
     /// should prefer [`Self::save_verified`], which cannot sign the wrong data.
     pub fn save(&self, path: &Path, signature: &[u8; 64]) -> std::io::Result<()> {
         let ratchets_packed = pack_ratchet_keys(&self.keys)?;
-
-        let persisted = Zeroizing::new(RatchetRingPersistedWrite {
-            signature: signature.to_vec(),
-            ratchets: ratchets_packed.to_vec(),
-        });
-        let buf = Zeroizing::new(
-            rmp_serde::to_vec_named(&*persisted)
-                .map_err(|e| std::io::Error::other(e.to_string()))?,
-        );
-        if buf.len() > RATCHET_FILE_MAX_BYTES {
-            return Err(invalid_data("ratchet ring file exceeds size limit"));
-        }
+        let buf = encode_ring_file(signature, &ratchets_packed)?;
         persistence::atomic_write(path, &buf)
     }
 
@@ -321,17 +325,7 @@ impl RatchetRing {
             )
         })?;
 
-        let persisted = Zeroizing::new(RatchetRingPersistedWrite {
-            signature: signature.to_vec(),
-            ratchets: ratchets_packed.to_vec(),
-        });
-        let buf = Zeroizing::new(
-            rmp_serde::to_vec_named(&*persisted)
-                .map_err(|e| std::io::Error::other(e.to_string()))?,
-        );
-        if buf.len() > RATCHET_FILE_MAX_BYTES {
-            return Err(invalid_data("ratchet ring file exceeds size limit"));
-        }
+        let buf = encode_ring_file(&signature, &ratchets_packed)?;
         if durable {
             persistence::durable_write(path, &buf)
                 .map(|_| ())
@@ -563,12 +557,12 @@ impl PreparedRatchetRotation {
     }
 }
 
-#[derive(Serialize, Zeroize)]
-struct RatchetRingPersistedWrite {
+#[derive(Serialize)]
+struct RatchetRingPersistedWrite<'a> {
     #[serde(with = "serde_bytes")]
-    signature: Vec<u8>,
+    signature: &'a [u8; 64],
     #[serde(with = "serde_bytes")]
-    ratchets: Vec<u8>,
+    ratchets: &'a [u8],
 }
 
 #[derive(Deserialize)]
@@ -1152,8 +1146,8 @@ mod tests {
         let keys = vec![[0x44; 32]; RATCHET_COUNT + 1];
         let packed = rmp_serde::to_vec(&keys).unwrap();
         let envelope = RatchetRingPersistedWrite {
-            signature: vec![0u8; 64],
-            ratchets: packed,
+            signature: &[0u8; 64],
+            ratchets: &packed,
         };
         std::fs::write(&path, rmp_serde::to_vec_named(&envelope).unwrap()).unwrap();
         assert_eq!(
