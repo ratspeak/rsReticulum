@@ -75,7 +75,7 @@ fn valid_synthesis_installs_a_tunnel_that_collects_announces() {
         "a valid synthesis installs its tunnel"
     );
 
-    let (announce, dest) = make_valid_announce("wp4.tunnel.collect", 0);
+    let (announce, dest) = make_valid_announce("tunnel.collect", 0);
     inbound(&mut actor, announce, 1);
     assert!(
         carries(&actor, &tunnel_id, &dest),
@@ -129,7 +129,7 @@ fn the_newer_synthesis_on_an_interface_takes_its_later_announces() {
         "both syntheses install"
     );
 
-    let (announce, dest) = make_valid_announce("wp4.tunnel.newer", 0);
+    let (announce, dest) = make_valid_announce("tunnel.newer", 0);
     inbound(&mut actor, announce, 1);
     assert!(
         carries(&actor, &newer_id, &dest),
@@ -153,7 +153,7 @@ fn losing_a_tunnel_interface_keeps_paths_through_other_interfaces() {
     let emitted = now_f64() as u64;
     let (via_tunnel, dest) = make_announce_for_with_random_blob(
         &identity,
-        "wp4.tunnel.elsewhere",
+        "tunnel.elsewhere",
         1,
         random_blob(1, emitted - 10),
     );
@@ -161,7 +161,7 @@ fn losing_a_tunnel_interface_keeps_paths_through_other_interfaces() {
     assert!(carries(&actor, &tunnel_id, &dest));
     let (fresher, _) = make_announce_for_with_random_blob(
         &identity,
-        "wp4.tunnel.elsewhere",
+        "tunnel.elsewhere",
         1,
         random_blob(2, emitted),
     );
@@ -199,7 +199,7 @@ fn a_replacement_registration_does_not_inherit_the_tunnel_binding() {
         id: 4,
         entry: replacement,
     });
-    let (announce, dest) = make_valid_announce("wp4.tunnel.replaced", 0);
+    let (announce, dest) = make_valid_announce("tunnel.replaced", 0);
     inbound(&mut actor, announce, 4);
     assert!(
         actor.path_table.has_path(&dest),
@@ -213,7 +213,7 @@ fn a_replacement_registration_does_not_inherit_the_tunnel_binding() {
 
 #[test]
 fn an_unbound_tunnel_persists_without_an_interface_hash() {
-    let dir = unique_temp_dir("wp4-unbound-tunnel");
+    let dir = unique_temp_dir("unbound-tunnel");
     let mut actor = hub();
     actor.storage_dir = Some(dir.clone());
     // Id 0 used to be both the shared-instance listener and "unbound".
@@ -238,11 +238,11 @@ fn an_unbound_tunnel_persists_without_an_interface_hash() {
 
 #[test]
 fn a_cache_request_replays_on_the_interface_its_cache_file_names() {
-    let dir = unique_temp_dir("wp4-cache-replay-interface");
+    let dir = unique_temp_dir("cache-replay-interface");
     let mut actor = hub();
     actor.storage_dir = Some(dir.clone());
     let _rx = attach(&mut actor, 3, "radio");
-    let (announce, dest) = make_valid_announce("wp4.cache.interface", 1);
+    let (announce, dest) = make_valid_announce("cache.interface", 1);
     let packet_hash = cache_announce(&dir, &announce, Some("radio"));
 
     actor.handle_message(TransportMessage::CacheRequest {
@@ -259,13 +259,13 @@ fn a_cache_request_replays_on_the_interface_its_cache_file_names() {
 
 #[test]
 fn a_cache_request_never_replays_on_an_accepted_client() {
-    let dir = unique_temp_dir("wp4-cache-replay-child");
+    let dir = unique_temp_dir("cache-replay-child");
     let mut actor = hub();
     actor.storage_dir = Some(dir.clone());
     let (mut entry, _rx) = make_test_interface("hub/client_3");
     entry.parent_id = Some(2);
     actor.interfaces.insert(3, entry);
-    let (announce, dest) = make_valid_announce("wp4.cache.child", 1);
+    let (announce, dest) = make_valid_announce("cache.child", 1);
     let packet_hash = cache_announce(&dir, &announce, Some("hub/client_3"));
 
     actor.handle_message(TransportMessage::CacheRequest {
@@ -286,7 +286,7 @@ fn a_cache_request_never_replays_on_an_accepted_client() {
 
 #[test]
 fn a_cache_request_replay_adds_no_tunnel_path() {
-    let dir = unique_temp_dir("wp4-cache-replay-tunnel");
+    let dir = unique_temp_dir("cache-replay-tunnel");
     let mut actor = hub();
     actor.storage_dir = Some(dir.clone());
     let _rx = attach(&mut actor, 1, "hub/client_1");
@@ -294,7 +294,7 @@ fn a_cache_request_replay_adds_no_tunnel_path() {
     handle_tunnel(&mut actor.tunnel_table, tunnel_id, 1);
     actor.deregister_interface(1);
 
-    let (announce, dest) = make_valid_announce("wp4.cache.tunnel", 1);
+    let (announce, dest) = make_valid_announce("cache.tunnel", 1);
     let packet_hash = cache_announce(&dir, &announce, None);
     actor.handle_message(TransportMessage::CacheRequest {
         packet_hash,
@@ -313,14 +313,14 @@ fn a_cache_request_replay_adds_no_tunnel_path() {
 
 #[test]
 fn persisted_tunnels_load_unbound_even_when_their_interface_returns() {
-    let dir = unique_temp_dir("wp4-tunnels-load-unbound");
+    let dir = unique_temp_dir("tunnels-load-unbound");
     let tunnel_id = [0x33; 32];
     {
         let mut writer = hub();
         writer.storage_dir = Some(dir.clone());
         let _rx = attach(&mut writer, 5, "uplink");
         handle_tunnel(&mut writer.tunnel_table, tunnel_id, 5);
-        let (announce, dest) = make_valid_announce("wp4.load.unbound", 0);
+        let (announce, dest) = make_valid_announce("load.unbound", 0);
         inbound(&mut writer, announce, 5);
         assert!(carries(&writer, &tunnel_id, &dest));
         writer.save_routing_state();
@@ -337,7 +337,7 @@ fn persisted_tunnels_load_unbound_even_when_their_interface_returns() {
 
     let (entry, _rx) = make_test_interface("uplink");
     reader.handle_message(TransportMessage::RegisterInterface { id: 9, entry });
-    let (announce, later) = make_valid_announce("wp4.load.unbound.later", 0);
+    let (announce, later) = make_valid_announce("load.unbound.later", 0);
     inbound(&mut reader, announce, 9);
     assert!(
         !carries(&reader, &tunnel_id, &later),
@@ -348,9 +348,9 @@ fn persisted_tunnels_load_unbound_even_when_their_interface_returns() {
 
 #[test]
 fn tunnels_without_an_interface_survive_a_reload() {
-    let dir = unique_temp_dir("wp4-nil-tunnel");
+    let dir = unique_temp_dir("nil-tunnel");
     let tunnel_id = [0x22; 32];
-    let (announce, dest) = make_valid_announce("wp4.load.nil", 0);
+    let (announce, dest) = make_valid_announce("load.nil", 0);
     let packet_hash = cache_announce(&dir, &announce, None);
     {
         let mut writer = hub();
@@ -398,7 +398,7 @@ fn tunnels_without_an_interface_survive_a_reload() {
 
 #[test]
 fn legacy_sidecar_tunnels_without_an_interface_survive_a_reload() {
-    let dir = unique_temp_dir("wp4-sidecar-tunnel");
+    let dir = unique_temp_dir("sidecar-tunnel");
     let tunnel_id = [0x21; 32];
     let now = now_f64();
     let table = PersistedTunnelTable {
@@ -494,7 +494,7 @@ fn data_packet(
         context,
     };
     let mut raw = header.pack();
-    raw.extend_from_slice(b"wp4 filter payload");
+    raw.extend_from_slice(b"filter payload");
     Bytes::from(raw)
 }
 
@@ -526,7 +526,7 @@ fn plain_and_group_packets_beyond_one_hop_are_dropped_before_dedup() {
     for destination_type in [DestinationType::Plain, DestinationType::Group] {
         let mut actor = hub();
         let _rx = attach(&mut actor, 1, "radio");
-        let (dest, mut deliveries) = local_destination(&mut actor, "wp4.filter.hops");
+        let (dest, mut deliveries) = local_destination(&mut actor, "filter.hops");
         inbound(
             &mut actor,
             data_packet(dest, destination_type, 2, PacketContext::None),
@@ -553,7 +553,7 @@ fn one_hop_plain_and_group_packets_are_delivered() {
     for destination_type in [DestinationType::Plain, DestinationType::Group] {
         let mut actor = hub();
         let _rx = attach(&mut actor, 1, "radio");
-        let (dest, mut deliveries) = local_destination(&mut actor, "wp4.filter.one");
+        let (dest, mut deliveries) = local_destination(&mut actor, "filter.one");
         inbound(
             &mut actor,
             data_packet(dest, destination_type, 1, PacketContext::None),
@@ -568,7 +568,7 @@ fn plain_and_group_typed_announces_are_dropped() {
     for destination_type in [DestinationType::Plain, DestinationType::Group] {
         let mut actor = hub();
         let _rx = attach(&mut actor, 1, "radio");
-        let (announce, dest) = make_valid_announce("wp4.filter.announce", 0);
+        let (announce, dest) = make_valid_announce("filter.announce", 0);
         let (mut header, offset) = PacketHeader::unpack(&announce).unwrap();
         header.flags.destination_type = destination_type;
         let mut retyped = header.pack();
@@ -586,7 +586,7 @@ fn plain_and_group_typed_announces_are_dropped() {
 fn exempt_contexts_bypass_the_plain_hop_filter() {
     let mut actor = hub();
     let _rx = attach(&mut actor, 1, "radio");
-    let (dest, mut deliveries) = local_destination(&mut actor, "wp4.filter.exempt");
+    let (dest, mut deliveries) = local_destination(&mut actor, "filter.exempt");
     for context in [
         PacketContext::Keepalive,
         PacketContext::Resource,
@@ -611,7 +611,7 @@ fn shared_owner_ingress_bypasses_the_plain_hop_filter() {
     let (mut entry, _rx) = make_test_interface("SharedInstanceClient");
     entry.role = InterfaceRole::SharedInstancePeer;
     actor.interfaces.insert(1, entry);
-    let (dest, mut deliveries) = local_destination(&mut actor, "wp4.filter.shared");
+    let (dest, mut deliveries) = local_destination(&mut actor, "filter.shared");
     inbound(
         &mut actor,
         data_packet(dest, DestinationType::Plain, 2, PacketContext::None),

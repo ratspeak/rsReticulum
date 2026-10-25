@@ -20,8 +20,11 @@ fn nonce() -> u128 {
 }
 
 fn config_dir(tag: &str, config: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("rns-wp4-{tag}-{}-{}", std::process::id(), nonce()));
+    let dir = std::env::temp_dir().join(format!(
+        "rns-tunnels-{tag}-{}-{}",
+        std::process::id(),
+        nonce()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config"), config).unwrap();
     dir
@@ -40,7 +43,7 @@ async fn start(dir: &Path) -> ReticulumHandle {
 
 #[cfg(unix)]
 async fn start_unix_owner(dir: &Path) -> ReticulumHandle {
-    let socket_dir = std::env::temp_dir().join(format!("wp4s{}", nonce() % 1_000_000));
+    let socket_dir = std::env::temp_dir().join(format!("tuns{}", nonce() % 1_000_000));
     std::fs::create_dir_all(&socket_dir).unwrap();
     init_with_options(
         Some(dir.to_str().unwrap()),
@@ -127,11 +130,11 @@ async fn fake_sam(
                 if command.starts_with("SESSION CREATE") {
                     let _ = reader
                         .get_mut()
-                        .write_all(b"SESSION STATUS RESULT=OK DESTINATION=wp4fakesamsession\n")
+                        .write_all(b"SESSION STATUS RESULT=OK DESTINATION=fakesamsession\n")
                         .await;
                 } else if command.starts_with("STREAM CONNECT") || accepted {
                     let reply: &[u8] = if accepted {
-                        b"STREAM STATUS RESULT=OK\nwp4peerdestination0123456789\n"
+                        b"STREAM STATUS RESULT=OK\npeerdestination0123456789\n"
                     } else {
                         b"STREAM STATUS RESULT=OK\n"
                     };
@@ -155,7 +158,7 @@ async fn the_unix_shared_listener_and_a_connectable_i2p_interface_both_register(
     let dir = config_dir(
         "unix-i2p",
         &format!(
-            "[reticulum]\n  share_instance = Yes\n  shared_instance_type = unix\n  instance_name = wp4u{}\n  enable_transport = No\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n",
+            "[reticulum]\n  share_instance = Yes\n  shared_instance_type = unix\n  instance_name = tunu{}\n  enable_transport = No\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n",
             nonce() % 1_000_000
         ),
     );
@@ -271,7 +274,7 @@ async fn i2p_server_peers_register_under_their_server() {
     let dir = config_dir(
         "i2p-peers",
         &format!(
-            "[reticulum]\n  share_instance = Yes\n  shared_instance_type = unix\n  instance_name = wp4p{}\n  enable_transport = No\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    network_name = wp4net\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n",
+            "[reticulum]\n  share_instance = Yes\n  shared_instance_type = unix\n  instance_name = tunp{}\n  enable_transport = No\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    network_name = tunnelnet\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n",
             nonce() % 1_000_000
         ),
     );
@@ -393,8 +396,8 @@ async fn a_persisted_path_never_rebinds_to_an_accepted_client() {
     let dir = config_dir("child-rebind", &config);
     let storage = dir.join("storage");
     std::fs::create_dir_all(&storage).unwrap();
-    let (old_client_announce, old_client_dest) = announce("wp4.child.rebind");
-    let (uplink_announce, uplink_dest) = announce("wp4.child.uplink");
+    let (old_client_announce, old_client_dest) = announce("child.rebind");
+    let (uplink_announce, uplink_dest) = announce("child.uplink");
     persist_paths(
         &storage,
         &[
@@ -430,7 +433,7 @@ async fn accepted_client_paths_are_not_persisted() {
     let handle = start(&dir).await;
 
     let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let (raw, dest) = announce("wp4.child.persist");
+    let (raw, dest) = announce("child.persist");
     client
         .write_all(&rns_interface::hdlc::frame(&raw))
         .await
@@ -682,7 +685,7 @@ async fn a_tcp_client_drops_traffic_queued_while_it_was_disconnected() {
     );
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let marker = send_plain_marker(&handle, "wp4.backlog").await;
+    let marker = send_plain_marker(&handle, "backlog").await;
 
     let mut second = Frames::accept(&hub, false).await;
     let frames = second.collect(Duration::from_secs(2)).await;
@@ -879,7 +882,7 @@ async fn a_rust_hub_restores_a_reconnecting_rust_clients_paths() {
     let destination = client
         .register_destination(
             Identity::new(),
-            "wp4.tunnel.rust",
+            "tunnel.rust",
             crate::destination_runtime::DestinationRuntimeOptions::default(),
         )
         .await
