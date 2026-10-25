@@ -176,6 +176,15 @@ mod tests {
         assert_eq!(&pt[..], &plaintext[..]);
     }
 
+    #[test]
+    fn cipher_state_is_wiped_on_drop() {
+        fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        wiped_on_drop::<Encryptor<Aes128>>();
+        wiped_on_drop::<Encryptor<Aes256>>();
+        wiped_on_drop::<Decryptor<Aes128>>();
+        wiped_on_drop::<Decryptor<Aes256>>();
+    }
+
     /// Different key sizes must produce different ciphertexts for the same input.
     #[test]
     fn test_aes128_vs_aes256_distinct_ciphertexts() {

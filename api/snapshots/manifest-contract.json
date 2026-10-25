@@ -34,7 +34,9 @@
           "requirement": "^0.8",
           "optional": false,
           "defaultFeatures": true,
-          "features": [],
+          "features": [
+            "zeroize"
+          ],
           "sourceKind": "registry"
         },
         {
@@ -46,7 +48,8 @@
           "optional": false,
           "defaultFeatures": true,
           "features": [
-            "alloc"
+            "alloc",
+            "zeroize"
           ],
           "sourceKind": "registry"
         },
@@ -1052,7 +1055,9 @@
           "requirement": "^0.8",
           "optional": false,
           "defaultFeatures": true,
-          "features": [],
+          "features": [
+            "zeroize"
+          ],
           "sourceKind": "registry"
         },
         {
