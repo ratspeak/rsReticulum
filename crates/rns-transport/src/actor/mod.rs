@@ -2257,6 +2257,7 @@ mod tests {
     mod announce_admission;
     mod bitrate_timing;
     mod discovery_api;
+    mod held_announces;
     mod interface_stats;
     mod link_endpoint_dispatch;
     mod packet_capacity;

@@ -590,13 +590,7 @@ impl TransportActor {
                     "releasing held announce"
                 );
 
-                self.on_inbound(crate::messages::InboundPacket {
-                    raw: announce.raw,
-                    interface_id: announce.receiving_interface_id,
-                    rssi: None,
-                    snr: None,
-                    q: None,
-                });
+                self.on_released_announce(announce);
             }
         }
     }

@@ -1,6 +1,17 @@
 use super::*;
 use crate::now_f64;
 
+/// Where an inbound packet comes from. Python re-injects held and cached
+/// announces with `ifac_handled=True` (Interface.py:296, Transport.py:3119),
+/// and its byte counters live in the interface drivers, so neither passes
+/// IFAC or counts as received traffic again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InboundOrigin {
+    Wire,
+    HeldAnnounce,
+    CachedAnnounce,
+}
+
 /// A transit link proof's verdict; only a bad signature is a protocol
 /// violation (Transport.py:2668).
 enum TransitProof {
@@ -17,7 +28,22 @@ impl TransportActor {
         fields(interface_id = packet.interface_id, raw_len = packet.raw.len()),
     )]
     pub(super) fn on_inbound(&mut self, packet: crate::messages::InboundPacket) {
-        self.on_inbound_inner(packet, false);
+        self.on_inbound_inner(packet, InboundOrigin::Wire);
+    }
+
+    /// An announce the ingress controller held, released for processing; it
+    /// can be held again (Interface.py:278-297).
+    pub(super) fn on_released_announce(&mut self, announce: crate::ingress::HeldAnnounce) {
+        self.on_inbound_inner(
+            crate::messages::InboundPacket {
+                raw: announce.raw,
+                interface_id: announce.receiving_interface_id,
+                rssi: None,
+                snr: None,
+                q: None,
+            },
+            InboundOrigin::HeldAnnounce,
+        );
     }
 
     /// Python `Interface.protocol_violation`, `ifac_violation` and
@@ -48,15 +74,17 @@ impl TransportActor {
         {
             return;
         }
-        self.on_inbound_inner(packet, true);
+        self.on_inbound_inner(packet, InboundOrigin::CachedAnnounce);
     }
 
-    fn on_inbound_inner(&mut self, packet: crate::messages::InboundPacket, cached_announce: bool) {
-        self.traffic
-            .record_rx(packet.interface_id, packet.raw.len() as u64);
+    fn on_inbound_inner(&mut self, packet: crate::messages::InboundPacket, origin: InboundOrigin) {
+        if origin == InboundOrigin::Wire {
+            self.traffic
+                .record_rx(packet.interface_id, packet.raw.len() as u64);
+        }
 
         // Check the complete wire budget before IFAC allocates an unmasked copy.
-        let clear_limit = if cached_announce {
+        let clear_limit = if origin == InboundOrigin::CachedAnnounce {
             500
         } else {
             let Some(entry) = self.interfaces.get(&packet.interface_id) else {
@@ -80,7 +108,7 @@ impl TransportActor {
         // Strip the IFAC tag if the interface gates membership on one; packets
         // that fail verification are dropped so a misconfigured peer can't
         // leak into a closed access group.
-        let ifac = if cached_announce {
+        let ifac = if origin != InboundOrigin::Wire {
             None
         } else {
             self.interfaces
