@@ -39,9 +39,9 @@ pub const RECONNECT_WAIT_MAX: u64 = 300;
 
 pub const SAM_VERSION: &str = "3.1";
 
-/// The longest SAM reply line read, well past a SESSION STATUS that carries a
-/// private key.
-const SAM_REPLY_MAX_BYTES: usize = 16 * 1024;
+/// The longest SAM reply line read: the line limit of Python's asyncio SAM
+/// client, far past a SESSION STATUS that carries a private key.
+const SAM_REPLY_MAX_BYTES: usize = 64 * 1024;
 /// An I2P key file holds one base64 SAM private key of a few kilobytes.
 const I2P_KEY_FILE_MAX_BYTES: usize = 16 * 1024;
 
