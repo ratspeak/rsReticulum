@@ -198,11 +198,19 @@ impl TransportActor {
     /// (`cache/announces/<packet_hash>`). Misses are normal: legacy entries,
     /// cleaned cache files, or shared-instance client mode.
     pub(super) fn cached_announce_raw(&self, packet_hash: &[u8; 32]) -> Option<Vec<u8>> {
+        self.cached_announce(packet_hash)
+            .map(|cached| cached.raw_packet)
+    }
+
+    /// The cached announce with the interface it was received on.
+    pub(super) fn cached_announce(
+        &self,
+        packet_hash: &[u8; 32],
+    ) -> Option<crate::persistence::PythonCachedAnnounce> {
         let dir = self.storage_dir.as_ref()?;
         let announce_cache_dir = dir.join("cache").join("announces");
         match crate::persistence::load_python_cached_announce(&announce_cache_dir, packet_hash) {
-            Ok(Some(cached)) => Some(cached.raw_packet),
-            Ok(None) => None,
+            Ok(cached) => cached,
             Err(e) => {
                 trace!("failed to load cached announce: {}", e);
                 None
@@ -1198,7 +1206,7 @@ impl TransportActor {
                 }
                 let entry = crate::tunnel::TunnelEntry {
                     tunnel_id,
-                    interface_id: id,
+                    interface_id: Some(id),
                     tunnel_paths,
                     expires: te.expires,
                 };
@@ -1323,7 +1331,7 @@ mod announce_sweep_actor_tests {
         );
         actor.tunnel_table.insert(crate::tunnel::TunnelEntry {
             tunnel_id: [0xAB; 32],
-            interface_id: 7,
+            interface_id: Some(7),
             tunnel_paths: std::collections::HashMap::from([(
                 [0x12; 16],
                 crate::tunnel::TunnelPath {

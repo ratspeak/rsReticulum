@@ -334,8 +334,9 @@ pub fn save_python_tunnel_table(
 ) -> Result<(), PersistenceError> {
     let mut tunnel_values = Vec::new();
     for (_, tunnel) in table.iter() {
-        let interface_hash = interface_names
-            .get(&tunnel.interface_id)
+        let interface_hash = tunnel
+            .interface_id
+            .and_then(|id| interface_names.get(&id))
             .map(|name| Value::Binary(interface_hash_from_name(name).to_vec()))
             .unwrap_or(Value::Nil);
 
@@ -1084,7 +1085,8 @@ pub fn save_tunnel_table(
         .iter()
         .filter_map(|(_, entry)| {
             // Skip entries whose interface has already been deregistered.
-            let interface_name = interface_names.get(&entry.interface_id).cloned()?;
+            let interface_id = entry.interface_id?;
+            let interface_name = interface_names.get(&interface_id).cloned()?;
             let paths: Vec<PersistedTunnelPath> = entry
                 .tunnel_paths
                 .iter()
@@ -1107,13 +1109,11 @@ pub fn save_tunnel_table(
                 .collect();
             Some(PersistedTunnelEntry {
                 tunnel_id: entry.tunnel_id.to_vec(),
-                interface_id: entry.interface_id,
+                interface_id,
                 expires: entry.expires,
                 paths,
+                interface_hash: Some(interface_hash_from_name(&interface_name).to_vec()),
                 interface_name: Some(interface_name),
-                interface_hash: interface_names
-                    .get(&entry.interface_id)
-                    .map(|name| interface_hash_from_name(name).to_vec()),
             })
         })
         .collect();
@@ -1553,7 +1553,7 @@ mod tests {
         let mut tunnels = crate::tunnel::TunnelTable::new();
         tunnels.insert(crate::tunnel::TunnelEntry {
             tunnel_id,
-            interface_id: 7,
+            interface_id: Some(7),
             tunnel_paths: paths,
             expires: 9999.5,
         });

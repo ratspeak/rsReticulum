@@ -302,9 +302,10 @@ where
     }
 }
 
-/// Handle for the listener pseudo-interface (id 0): inbound-only, no
-/// per-byte counters of its own.
+/// Handle for the listener pseudo-interface: inbound-only, no per-byte
+/// counters of its own.
 fn server_listener_handle(
+    id: InterfaceId,
     name: String,
     online: Arc<AtomicBool>,
     tx: mpsc::Sender<Bytes>,
@@ -312,7 +313,7 @@ fn server_listener_handle(
     owner: InterfaceOwner,
 ) -> InterfaceHandle {
     InterfaceHandle {
-        id: 0,
+        id,
         owner,
         packet_capacity: InterfacePacketCapacity::new(262144, 262144, true),
         parent_id: None,
@@ -405,6 +406,7 @@ mod platform {
 
     pub async fn spawn_local_server_impl(
         config: LocalServerConfig,
+        id: InterfaceId,
         id_gen: Arc<AtomicU64>,
         transport_tx: mpsc::Sender<TransportMessage>,
         handle_tx: mpsc::Sender<InterfaceHandle>,
@@ -430,7 +432,7 @@ mod platform {
                         let handle = wire_local_stream(
                             client_id,
                             client_name,
-                            Some(0),
+                            Some(id),
                             reader,
                             writer,
                             transport_tx.clone(),
@@ -453,7 +455,9 @@ mod platform {
             online2.store(false, Ordering::SeqCst);
         });
 
-        Ok(server_listener_handle(name, online, tx, read_task, owner))
+        Ok(server_listener_handle(
+            id, name, online, tx, read_task, owner,
+        ))
     }
 
     pub async fn spawn_local_client_impl(
@@ -577,6 +581,7 @@ mod platform {
 
     pub async fn spawn_local_server_impl(
         config: LocalServerConfig,
+        id: InterfaceId,
         id_gen: Arc<AtomicU64>,
         transport_tx: mpsc::Sender<TransportMessage>,
         handle_tx: mpsc::Sender<InterfaceHandle>,
@@ -604,7 +609,7 @@ mod platform {
                         let handle = wire_local_stream(
                             client_id,
                             client_name,
-                            Some(0),
+                            Some(id),
                             reader,
                             writer,
                             transport_tx.clone(),
@@ -627,7 +632,9 @@ mod platform {
             online2.store(false, Ordering::SeqCst);
         });
 
-        Ok(server_listener_handle(name, online, tx, read_task, owner))
+        Ok(server_listener_handle(
+            id, name, online, tx, read_task, owner,
+        ))
     }
 
     pub async fn spawn_local_client_impl(
@@ -660,11 +667,12 @@ mod platform {
 )]
 pub async fn spawn_local_server(
     config: LocalServerConfig,
+    id: InterfaceId,
     id_gen: Arc<AtomicU64>,
     transport_tx: mpsc::Sender<TransportMessage>,
     handle_tx: mpsc::Sender<InterfaceHandle>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-    platform::spawn_local_server_impl(config, id_gen, transport_tx, handle_tx).await
+    platform::spawn_local_server_impl(config, id, id_gen, transport_tx, handle_tx).await
 }
 
 #[tracing::instrument(
@@ -747,10 +755,12 @@ mod tests {
             name: "test-local-server".to_string(),
         };
 
-        let server_handle = spawn_local_server(server_cfg, id_gen, transport_tx.clone(), handle_tx)
-            .await
-            .unwrap();
+        let server_handle =
+            spawn_local_server(server_cfg, 499, id_gen, transport_tx.clone(), handle_tx)
+                .await
+                .unwrap();
         server_handle.owner.mark_registered();
+        assert_eq!(server_handle.id, 499);
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -772,6 +782,7 @@ mod tests {
 
         assert_ne!(accepted.owner, server_handle.owner);
         assert_ne!(accepted.owner, client_handle.owner);
+        assert_eq!(accepted.parent_id, Some(server_handle.id));
         assert_eq!(
             accepted.packet_capacity,
             InterfacePacketCapacity::new(262144, 262144, true)
@@ -827,9 +838,10 @@ mod tests {
             socket_path: socket_path.clone(),
             name: "dereg-server".to_string(),
         };
-        let server_handle = spawn_local_server(server_cfg, id_gen, transport_tx.clone(), handle_tx)
-            .await
-            .unwrap();
+        let server_handle =
+            spawn_local_server(server_cfg, 599, id_gen, transport_tx.clone(), handle_tx)
+                .await
+                .unwrap();
         server_handle.owner.mark_registered();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -897,6 +909,7 @@ mod tests {
         };
         let server_handle = spawn_local_server(
             server_config(),
+            699,
             id_gen.clone(),
             transport_tx.clone(),
             handle_tx.clone(),
@@ -933,10 +946,15 @@ mod tests {
         .await
         .expect("client did not observe server shutdown");
 
-        let restarted_server =
-            spawn_local_server(server_config(), id_gen, transport_tx.clone(), handle_tx)
-                .await
-                .unwrap();
+        let restarted_server = spawn_local_server(
+            server_config(),
+            699,
+            id_gen,
+            transport_tx.clone(),
+            handle_tx,
+        )
+        .await
+        .unwrap();
         restarted_server.owner.mark_registered();
         let second_accepted =
             tokio::time::timeout(std::time::Duration::from_secs(3), handle_rx.recv())

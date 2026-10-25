@@ -1241,15 +1241,15 @@ fn synthesize_i2p(
     mode: InterfaceMode,
 ) -> Result<InterfaceConfig, InterfaceFactoryError> {
     let connectable = section.get_bool("connectable").unwrap_or(false);
+    // A comma-separated config value parses as a list (Python `as_list`).
     let peers = section
-        .get("peers")
-        .map(|s| {
-            s.split(',')
-                .map(|p| p.trim().to_string())
-                .filter(|p| !p.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+        .get_list("peers")
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|peers| peers.split(','))
+        .map(|peer| peer.trim().to_string())
+        .filter(|peer| !peer.is_empty())
+        .collect();
     let i2p_sam_host = section
         .get("i2p_sam_host")
         .unwrap_or("127.0.0.1")
@@ -2953,6 +2953,19 @@ mod tests {
                 assert_eq!(c.i2p_sam_host, "127.0.0.1");
                 assert_eq!(c.i2p_sam_port, 7656);
             }
+            _ => panic!("expected I2P"),
+        }
+    }
+
+    #[test]
+    fn test_synthesize_i2p_reads_every_configured_peer() {
+        let config = crate::config::Config::parse(
+            "[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    peers = peera.b32.i2p, peerb.b32.i2p\n",
+        )
+        .unwrap();
+        let section = config.subsection("interfaces", "Golden I2P").unwrap();
+        match synthesize_interface("Golden I2P", section).unwrap() {
+            InterfaceConfig::I2P(c) => assert_eq!(c.peers, ["peera.b32.i2p", "peerb.b32.i2p"]),
             _ => panic!("expected I2P"),
         }
     }

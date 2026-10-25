@@ -1814,7 +1814,7 @@ pub fn rns_transport::traffic::TrafficCounter::default() -> Self
 pub mod rns_transport::tunnel
 pub struct rns_transport::tunnel::TunnelEntry
 pub rns_transport::tunnel::TunnelEntry::expires: f64
-pub rns_transport::tunnel::TunnelEntry::interface_id: rns_transport::messages::InterfaceId
+pub rns_transport::tunnel::TunnelEntry::interface_id: core::option::Option<rns_transport::messages::InterfaceId>
 pub rns_transport::tunnel::TunnelEntry::tunnel_id: [u8; 32]
 pub rns_transport::tunnel::TunnelEntry::tunnel_paths: std::collections::hash::map::HashMap<[u8; 16], rns_transport::tunnel::TunnelPath>
 pub struct rns_transport::tunnel::TunnelPath

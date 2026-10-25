@@ -52,7 +52,7 @@
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-transport.txt",
       "itemCount": 1908,
-      "sha256": "7b461964db77f113995efc869cbd7098e9211f9745e1982822fd77a2a8c34231"
+      "sha256": "52cfb242fdf4fca126f74decc73f5e4e20adc04cad112e6687f2d8ab4cbf3fe9"
     },
     {
       "name": "rns-link",
@@ -79,7 +79,7 @@
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-interface.txt",
       "itemCount": 1420,
-      "sha256": "e2296e983d6356d2582601c045f18360e543383201904ffb7ca7f1d217197935"
+      "sha256": "5e88a0e267d37a3d3ec8552749333841cd298f41362701ef293694b9d14e483a"
     },
     {
       "name": "rns-runtime",
@@ -125,7 +125,8 @@
         "pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::longitude: f64",
         "pub rns_transport::discovery::app_data::DiscoveryInfo::height: f64",
         "pub rns_transport::discovery::app_data::DiscoveryInfo::latitude: f64",
-        "pub rns_transport::discovery::app_data::DiscoveryInfo::longitude: f64"
+        "pub rns_transport::discovery::app_data::DiscoveryInfo::longitude: f64",
+        "pub rns_transport::tunnel::TunnelEntry::interface_id: rns_transport::messages::InterfaceId"
       ],
       "rns-link": [
         "impl rns_link::mtu_discovery::SignallingData",
@@ -140,6 +141,10 @@
         "pub rns_link::mtu_discovery::SignallingData::mode: u8",
         "pub rns_link::mtu_discovery::SignallingData::mtu: u32",
         "pub struct rns_link::mtu_discovery::SignallingData"
+      ],
+      "rns-interface": [
+        "pub async fn rns_interface::i2p::spawn_i2p_server(rns_interface::i2p::I2PServerConfig, alloc::sync::Arc<core::sync::atomic::AtomicU64>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Sender<rns_interface::traits::InterfaceHandle>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>",
+        "pub async fn rns_interface::local::spawn_local_server(rns_interface::local::LocalServerConfig, alloc::sync::Arc<core::sync::atomic::AtomicU64>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Sender<rns_interface::traits::InterfaceHandle>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>"
       ],
       "rns-runtime": [
         "pub fn rns_runtime::interface_factory::InterfacePostInit::from_section(&rns_runtime::config::ConfigSection) -> Self",

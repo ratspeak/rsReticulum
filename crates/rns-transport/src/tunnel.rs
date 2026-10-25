@@ -8,7 +8,8 @@ use crate::messages::InterfaceId;
 #[derive(Debug, Clone)]
 pub struct TunnelEntry {
     pub tunnel_id: [u8; 32],
-    pub interface_id: InterfaceId,
+    /// Interface the latest synthesis arrived on; `None` while unbound.
+    pub interface_id: Option<InterfaceId>,
     pub tunnel_paths: HashMap<[u8; 16], TunnelPath>,
     pub expires: f64,
 }
@@ -70,7 +71,7 @@ impl TunnelTable {
     pub fn get_mut_by_interface(&mut self, interface_id: InterfaceId) -> Option<&mut TunnelEntry> {
         self.entries
             .values_mut()
-            .find(|entry| entry.interface_id == interface_id)
+            .find(|entry| entry.interface_id == Some(interface_id))
     }
 
     pub fn tunnel_paths(&self) -> impl Iterator<Item = (&[u8; 16], &TunnelPath)> {
@@ -181,12 +182,12 @@ pub fn handle_tunnel(
     let expires = now + destination_timeout;
 
     if let Some(existing) = tunnel_table.get_mut(&tunnel_id) {
-        existing.interface_id = interface_id;
+        existing.interface_id = Some(interface_id);
         existing.expires = expires;
     } else {
         let entry = TunnelEntry {
             tunnel_id,
-            interface_id,
+            interface_id: Some(interface_id),
             tunnel_paths: std::collections::HashMap::new(),
             expires,
         };
@@ -263,7 +264,7 @@ mod tests {
         let tunnel_id = [0xAA; 32];
         let entry = TunnelEntry {
             tunnel_id,
-            interface_id: 1,
+            interface_id: Some(1),
             tunnel_paths: std::collections::HashMap::new(),
             expires: 99999999.0,
         };
@@ -310,7 +311,7 @@ mod tests {
         let tunnel_id = [0xFF; 32];
         handle_tunnel(&mut table, tunnel_id, 1, 604800.0);
         assert!(table.get(&tunnel_id).is_some());
-        assert_eq!(table.get(&tunnel_id).unwrap().interface_id, 1);
+        assert_eq!(table.get(&tunnel_id).unwrap().interface_id, Some(1));
     }
 
     #[test]
@@ -320,7 +321,7 @@ mod tests {
         handle_tunnel(&mut table, tunnel_id, 1, 604800.0);
 
         handle_tunnel(&mut table, tunnel_id, 2, 604800.0);
-        assert_eq!(table.get(&tunnel_id).unwrap().interface_id, 2);
+        assert_eq!(table.get(&tunnel_id).unwrap().interface_id, Some(2));
         assert_eq!(table.len(), 1);
     }
 
@@ -329,7 +330,7 @@ mod tests {
         let mut table = TunnelTable::new();
         let entry = TunnelEntry {
             tunnel_id: [0xAA; 32],
-            interface_id: 1,
+            interface_id: Some(1),
             tunnel_paths: std::collections::HashMap::new(),
             expires: 0.0,
         };
@@ -344,13 +345,13 @@ mod tests {
         let mut table = TunnelTable::new();
         let entry1 = TunnelEntry {
             tunnel_id: [0xAA; 32],
-            interface_id: 1,
+            interface_id: Some(1),
             tunnel_paths: std::collections::HashMap::new(),
             expires: 99999999.0,
         };
         let entry2 = TunnelEntry {
             tunnel_id: [0xBB; 32],
-            interface_id: 2,
+            interface_id: Some(2),
             tunnel_paths: std::collections::HashMap::new(),
             expires: 99999999.0,
         };

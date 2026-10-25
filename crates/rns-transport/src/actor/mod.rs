@@ -39,7 +39,7 @@ mod rpc;
 
 // In-process Links need two distinguishable ingress edges even though both
 // endpoints are owned by this actor. Real interface ids are allocated upward
-// from zero by the runtime, so reserve the top two values for this private
+// from one by the runtime, so reserve the top two values for this private
 // duplex route. They never appear on the wire or in the interface registry.
 const LOCAL_LINK_INITIATOR_INTERFACE: InterfaceId = InterfaceId::MAX;
 const LOCAL_LINK_RESPONDER_INTERFACE: InterfaceId = InterfaceId::MAX - 1;
@@ -812,15 +812,20 @@ impl TransportActor {
                 packet_hash,
                 destination_hash,
             } => {
-                // Serve straight from the disk announce cache (Python parity:
-                // cache_request_packet reads the cache file), then replay
-                // through our own inbound path (interface_id=0 marks it as
-                // locally injected, not from the wire).
-                if let Some(raw) = self.cached_announce_raw(&packet_hash) {
+                // Serve straight from the disk announce cache, then replay
+                // through our own inbound path on the interface the file
+                // names (Transport.py:3083-3087, :3119). Id 0, which no
+                // interface registers, stands for Python's missing interface.
+                if let Some(cached) = self.cached_announce(&packet_hash) {
                     debug!(hash = %hex::encode(&packet_hash[..8]), "cache request: local hit, replaying");
+                    let interface_id = cached
+                        .interface_reference
+                        .as_deref()
+                        .and_then(|name| self.replay_interface(name))
+                        .unwrap_or(0);
                     let inbound = crate::messages::InboundPacket {
-                        raw: Bytes::from(raw),
-                        interface_id: 0,
+                        raw: Bytes::from(cached.raw_packet),
+                        interface_id,
                         rssi: None,
                         snr: None,
                         q: None,
@@ -1206,6 +1211,15 @@ impl TransportActor {
         self.interfaces
             .get(&id)
             .is_some_and(|entry| entry.role == InterfaceRole::LocalClient)
+    }
+
+    /// The registered interface a cached packet names, as Python matches
+    /// `str(interface)` against the cache file's interface reference.
+    fn replay_interface(&self, name: &str) -> Option<InterfaceId> {
+        self.interfaces
+            .iter()
+            .find(|(_, entry)| entry.name == name)
+            .map(|(&id, _)| id)
     }
 
     fn allocate_announce_handler_id(&mut self) -> crate::messages::AnnounceHandlerId {
@@ -2241,6 +2255,7 @@ mod tests {
     mod link_endpoint_dispatch;
     mod packet_capacity;
     mod slow_media_discovery;
+    mod tunnels;
 
     fn owned_event(
         actor: &TransportActor,
@@ -3307,13 +3322,16 @@ mod tests {
         );
         actor.tunnel_table.insert(crate::tunnel::TunnelEntry {
             tunnel_id,
-            interface_id: 42,
+            interface_id: Some(42),
             tunnel_paths,
             expires: now_f64() + 600.0,
         });
 
         assert!(actor.path_table.has_path(&dest));
-        assert_eq!(actor.tunnel_table.get(&tunnel_id).unwrap().interface_id, 42);
+        assert_eq!(
+            actor.tunnel_table.get(&tunnel_id).unwrap().interface_id,
+            Some(42)
+        );
 
         actor.handle_message(owned_event(
             &actor,
@@ -3329,10 +3347,10 @@ mod tests {
             !actor.path_table.has_path(&dest),
             "paths via the interface dropped"
         );
-        // Tunnel interface_id voided to 0 (matches void_tunnel_interface contract).
+        // The tunnel loses its binding but keeps its paths.
         assert_eq!(
             actor.tunnel_table.get(&tunnel_id).unwrap().interface_id,
-            0,
+            None,
             "tunnel interface voided"
         );
     }
@@ -6573,7 +6591,7 @@ mod tests {
         let tunnel_id = [0x31; 32];
         actor.tunnel_table.insert(crate::tunnel::TunnelEntry {
             tunnel_id,
-            interface_id: 1,
+            interface_id: Some(1),
             tunnel_paths: std::collections::HashMap::new(),
             expires: now_f64() + 600.0,
         });
@@ -6626,7 +6644,7 @@ mod tests {
         );
         actor.tunnel_table.insert(crate::tunnel::TunnelEntry {
             tunnel_id,
-            interface_id: 0,
+            interface_id: None,
             tunnel_paths,
             expires: now_f64() + 600.0,
         });
@@ -6666,7 +6684,7 @@ mod tests {
         );
         actor.tunnel_table.insert(crate::tunnel::TunnelEntry {
             tunnel_id,
-            interface_id: 0,
+            interface_id: None,
             tunnel_paths,
             expires: now_f64() + 600.0,
         });
@@ -6719,7 +6737,7 @@ mod tests {
         );
         actor.tunnel_table.insert(crate::tunnel::TunnelEntry {
             tunnel_id,
-            interface_id: 1,
+            interface_id: Some(1),
             tunnel_paths,
             expires: now_f64() + 600.0,
         });
@@ -8865,7 +8883,7 @@ mod tests {
 
         actor.tunnel_table.insert(crate::tunnel::TunnelEntry {
             tunnel_id,
-            interface_id: 1,
+            interface_id: Some(1),
             tunnel_paths,
             expires: now_f64() + 600.0,
         });
@@ -8881,8 +8899,11 @@ mod tests {
         // Path should be removed
         assert!(!actor.path_table.has_path(&dest_hash));
 
-        // Tunnel interface should be voided (set to 0)
-        assert_eq!(actor.tunnel_table.get(&tunnel_id).unwrap().interface_id, 0);
+        // Tunnel interface should be voided
+        assert_eq!(
+            actor.tunnel_table.get(&tunnel_id).unwrap().interface_id,
+            None
+        );
     }
 
     #[test]

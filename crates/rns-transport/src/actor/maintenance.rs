@@ -701,7 +701,7 @@ impl TransportActor {
         let tunnel_ids: Vec<[u8; 32]> = self
             .tunnel_table
             .iter()
-            .filter(|(_, entry)| entry.interface_id == interface_id)
+            .filter(|(_, entry)| entry.interface_id == Some(interface_id))
             .map(|(id, _)| *id)
             .collect();
 
@@ -714,9 +714,7 @@ impl TransportActor {
                 }
             }
             if let Some(tunnel) = self.tunnel_table.get_mut(tunnel_id) {
-                // Sentinel 0 marks the tunnel as bound to no interface until
-                // a fresh synthesis arrives and rebinds it.
-                tunnel.interface_id = 0;
+                tunnel.interface_id = None;
                 debug!(
                     tunnel_id = hex::encode(&tunnel_id[..16]),
                     "voided tunnel interface"

@@ -598,11 +598,12 @@ pub async fn spawn_i2p_client(
 /// is recreated if the control socket drops.
 pub async fn spawn_i2p_server(
     config: I2PServerConfig,
+    id: InterfaceId,
     id_gen: Arc<AtomicU64>,
     transport_tx: mpsc::Sender<TransportMessage>,
     handle_tx: mpsc::Sender<InterfaceHandle>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-    let transport_tx = InterfaceTransportSender::new(0, transport_tx);
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
     let owner = transport_tx.owner();
     let online = Arc::new(AtomicBool::new(false));
     let name = config.name.clone();
@@ -775,7 +776,7 @@ pub async fn spawn_i2p_server(
                     id: client_id,
                     owner: child_owner,
                     packet_capacity: InterfacePacketCapacity::new(500, 1064, false),
-                    parent_id: Some(0),
+                    parent_id: Some(id),
                     name: client_name,
                     mode: config.mode,
                     direction: InterfaceDirection {
@@ -815,7 +816,7 @@ pub async fn spawn_i2p_server(
     });
 
     Ok(InterfaceHandle {
-        id: 0,
+        id,
         owner,
         packet_capacity: InterfacePacketCapacity::new(500, 1064, false),
         parent_id: None,

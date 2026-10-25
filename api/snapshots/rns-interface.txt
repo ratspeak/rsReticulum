@@ -482,7 +482,7 @@ pub fn rns_interface::i2p::parse_sam_reply(&str) -> alloc::vec::Vec<(alloc::stri
 pub fn rns_interface::i2p::sam_reply_get<'a>(&'a [(alloc::string::String, alloc::string::String)], &str) -> core::option::Option<&'a str>
 pub fn rns_interface::i2p::sam_reply_has_token(&[(alloc::string::String, alloc::string::String)], &str) -> bool
 pub async fn rns_interface::i2p::spawn_i2p_client(rns_interface::i2p::I2PClientConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
-pub async fn rns_interface::i2p::spawn_i2p_server(rns_interface::i2p::I2PServerConfig, alloc::sync::Arc<core::sync::atomic::AtomicU64>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Sender<rns_interface::traits::InterfaceHandle>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub async fn rns_interface::i2p::spawn_i2p_server(rns_interface::i2p::I2PServerConfig, rns_interface::traits::InterfaceId, alloc::sync::Arc<core::sync::atomic::AtomicU64>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Sender<rns_interface::traits::InterfaceHandle>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
 pub mod rns_interface::kiss
 pub struct rns_interface::kiss::KissDeframer
 impl rns_interface::kiss::KissDeframer
@@ -560,7 +560,7 @@ pub fn rns_interface::local::python_shared_socket_name(&str) -> alloc::string::S
 pub fn rns_interface::local::socket_path(core::option::Option<&std::path::Path>) -> std::path::PathBuf
 pub fn rns_interface::local::socket_path_for(&str) -> alloc::string::String
 pub async fn rns_interface::local::spawn_local_client(rns_interface::local::LocalClientConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
-pub async fn rns_interface::local::spawn_local_server(rns_interface::local::LocalServerConfig, alloc::sync::Arc<core::sync::atomic::AtomicU64>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Sender<rns_interface::traits::InterfaceHandle>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
+pub async fn rns_interface::local::spawn_local_server(rns_interface::local::LocalServerConfig, rns_interface::traits::InterfaceId, alloc::sync::Arc<core::sync::atomic::AtomicU64>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Sender<rns_interface::traits::InterfaceHandle>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
 pub mod rns_interface::pipe
 pub struct rns_interface::pipe::PipeInterfaceConfig
 pub rns_interface::pipe::PipeInterfaceConfig::command: alloc::string::String

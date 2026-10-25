@@ -3076,6 +3076,7 @@ pub async fn init_with_policy(
                         socket_path: shared_unix_socket_path(&rc.instance_name, &socket_base),
                         name: "SharedInstanceServer".to_string(),
                     },
+                    next_id(&id_gen),
                     id_gen.clone(),
                     transport_tx.clone(),
                     handle_tx.clone(),
@@ -3287,6 +3288,7 @@ pub async fn init_with_policy(
                 };
                 match rns_interface::local::spawn_local_server(
                     server_config,
+                    next_id(&id_gen),
                     id_gen.clone(),
                     transport_tx.clone(),
                     handle_tx.clone(),
@@ -8047,30 +8049,59 @@ async fn spawn_interface_with_rnode_startup_options(
                 .map_err(|e| format!("Local: {e}"))
         }
         interface_factory::InterfaceConfig::I2P(c) => {
+            if !c.connectable && c.peers.is_empty() {
+                return Err(format!(
+                    "I2PInterface '{}': requires 'connectable' or 'peers'",
+                    c.name
+                ));
+            }
+            // Python runs the server and one peer interface per configured
+            // peer, each named "<name> to <peer>" (I2PInterface.py:793-819).
+            let mut handles = Vec::new();
+            let mut next = Some(id);
             if c.connectable {
                 let mut server_config = rns_interface::i2p::I2PServerConfig::new(&c.name);
                 server_config.sam_host = c.i2p_sam_host.clone();
                 server_config.sam_port = c.i2p_sam_port;
                 server_config.mode = c.mode;
-                rns_interface::i2p::spawn_i2p_server(server_config, id_gen, transport_tx, handle_tx)
-                    .await
-                    .map(|h| vec![h.into()])
-                    .map_err(|e| format!("I2P server: {e}"))
-            } else if let Some(peer) = c.peers.first() {
-                let mut client_config = rns_interface::i2p::I2PClientConfig::new(&c.name, peer);
+                let server_id = next.take().unwrap_or_else(|| next_id(&id_gen));
+                let server = rns_interface::i2p::spawn_i2p_server(
+                    server_config,
+                    server_id,
+                    id_gen.clone(),
+                    transport_tx.clone(),
+                    handle_tx,
+                )
+                .await
+                .map_err(|e| format!("I2P server: {e}"))?;
+                handles.push(server.into());
+            }
+            for peer in &c.peers {
+                let mut client_config = rns_interface::i2p::I2PClientConfig::new(
+                    &format!("{} to {peer}", c.name),
+                    peer,
+                );
                 client_config.sam_host = c.i2p_sam_host.clone();
                 client_config.sam_port = c.i2p_sam_port;
                 client_config.mode = c.mode;
-                rns_interface::i2p::spawn_i2p_client(client_config, id, transport_tx)
-                    .await
-                    .map(|h| vec![h.into()])
-                    .map_err(|e| format!("I2P client: {e}"))
-            } else {
-                Err(format!(
-                    "I2PInterface '{}': requires 'connectable' or 'peers'",
-                    c.name
-                ))
+                let peer_id = next.take().unwrap_or_else(|| next_id(&id_gen));
+                match rns_interface::i2p::spawn_i2p_client(
+                    client_config,
+                    peer_id,
+                    transport_tx.clone(),
+                )
+                .await
+                {
+                    Ok(client) => handles.push(client.into()),
+                    Err(e) => {
+                        for spawned in handles {
+                            rollback_unreserved_interface(spawned, InterfaceKind::Standard).await;
+                        }
+                        return Err(format!("I2P client: {e}"));
+                    }
+                }
             }
+            Ok(handles)
         }
         interface_factory::InterfaceConfig::Pipe(c) => {
             let pipe_config = rns_interface::pipe::PipeInterfaceConfig {
@@ -8379,6 +8410,8 @@ pub enum ReticulumError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod tunnels;
 
     async fn wait_for_registry_len(registry: &InterfaceRegistry, expected: usize) {
         tokio::time::timeout(Duration::from_secs(2), async {
