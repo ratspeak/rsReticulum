@@ -41,7 +41,7 @@ pub fn derive_ifac_key(
 
     let salt = hex_decode(IFAC_SALT).ok_or(IfacError::InvalidSalt)?;
 
-    let derived = Zeroizing::new(hkdf_sha256(64, &*ifac_origin_hash, Some(&salt), None)?);
+    let derived = hkdf_sha256(64, &*ifac_origin_hash, Some(&salt), None)?;
     let mut key = [0u8; 64];
     key.copy_from_slice(&derived);
     Ok(key)

@@ -1,5 +1,5 @@
 use rns_crypto::x25519::{X25519PrivateKey, X25519PublicKey};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 use crate::constants::{
     AES128_DERIVED_KEY_LENGTH, AES256_DERIVED_KEY_LENGTH, MODE_AES128_CBC, MODE_AES256_CBC,
@@ -38,7 +38,7 @@ impl LinkKeys {
             rns_crypto::hkdf::hkdf_sha256(derived_key_length, &shared_key, Some(link_id), None)
                 .map_err(|_| LinkKeyError::HkdfFailed);
         shared_key.zeroize();
-        let derived = Zeroizing::new(derived_result?);
+        let derived = derived_result?;
 
         let half = derived_key_length / 2;
         let signing_key = derived[..half].to_vec();

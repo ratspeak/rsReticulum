@@ -1,126 +1,10 @@
 //! Plaintext and key material must not survive in freed heap memory.
-//!
-//! A recording allocator copies every block the test thread frees while a
-//! check runs; each check then searches those copies for its secrets.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::{Cell, UnsafeCell};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+mod residue;
 
+use residue::{assert_no_residue, freed_by, pseudo_random, serial};
 use rns_crypto::{aes_cbc, hkdf, hmac, token};
 use zeroize::Zeroizing;
-
-const RECORD_CAPACITY: usize = 4 << 20;
-
-struct Recording(UnsafeCell<[u8; RECORD_CAPACITY]>);
-
-// Written only by the armed thread while armed, read only after disarming.
-unsafe impl Sync for Recording {}
-
-static RECORDING: Recording = Recording(UnsafeCell::new([0; RECORD_CAPACITY]));
-static RECORDED: AtomicUsize = AtomicUsize::new(0);
-static OVERFLOWED: AtomicBool = AtomicBool::new(false);
-static SERIAL: Mutex<()> = Mutex::new(());
-
-thread_local! {
-    static ARMED: Cell<bool> = const { Cell::new(false) };
-}
-
-struct RecordingAllocator;
-
-unsafe impl GlobalAlloc for RecordingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { System.alloc(layout) }
-    }
-
-    // The default `realloc` frees the old block through `dealloc`, so blocks
-    // left behind by growth are recorded too.
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if ARMED.try_with(Cell::get).unwrap_or(false) {
-            let start = RECORDED.load(Ordering::Relaxed);
-            let end = start + 4 + layout.size();
-            if end <= RECORD_CAPACITY {
-                let base = RECORDING.0.get().cast::<u8>();
-                unsafe {
-                    base.add(start)
-                        .cast::<[u8; 4]>()
-                        .write_unaligned((layout.size() as u32).to_le_bytes());
-                    std::ptr::copy_nonoverlapping(ptr, base.add(start + 4), layout.size());
-                }
-                RECORDED.store(end, Ordering::Relaxed);
-            } else {
-                OVERFLOWED.store(true, Ordering::Relaxed);
-            }
-        }
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: RecordingAllocator = RecordingAllocator;
-
-fn serial() -> MutexGuard<'static, ()> {
-    SERIAL
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Run `f` and return its result with a copy of every block it freed.
-fn freed_by<R>(f: impl FnOnce() -> R) -> (R, Vec<Vec<u8>>) {
-    RECORDED.store(0, Ordering::Relaxed);
-    OVERFLOWED.store(false, Ordering::Relaxed);
-    ARMED.with(|armed| armed.set(true));
-    let result = f();
-    ARMED.with(|armed| armed.set(false));
-    assert!(
-        !OVERFLOWED.load(Ordering::Relaxed),
-        "freed blocks exceeded the recording buffer"
-    );
-    let len = RECORDED.load(Ordering::Relaxed);
-    let recorded = unsafe { std::slice::from_raw_parts(RECORDING.0.get().cast::<u8>(), len) };
-    let mut blocks = Vec::new();
-    let mut at = 0;
-    while at < len {
-        let size = u32::from_le_bytes(recorded[at..at + 4].try_into().unwrap()) as usize;
-        blocks.push(recorded[at + 4..at + 4 + size].to_vec());
-        at += 4 + size;
-    }
-    (result, blocks)
-}
-
-/// Whether `block` holds 16 consecutive bytes of `secret`.
-fn holds(block: &[u8], secret: &[u8]) -> bool {
-    assert!(secret.len() >= 16, "secret is too short to search for");
-    secret
-        .windows(16)
-        .any(|needle| block.windows(16).any(|window| window == needle))
-}
-
-/// Fail if any freed block holds part of a secret.
-fn assert_no_residue(freed: &[Vec<u8>], secrets: &[(&str, &[u8])]) {
-    let mut found = Vec::new();
-    for (name, secret) in secrets {
-        for block in freed {
-            if holds(block, secret) {
-                found.push(format!("{name} in a freed {}-byte block", block.len()));
-            }
-        }
-    }
-    assert!(found.is_empty(), "secret residue: {found:?}");
-}
-
-fn pseudo_random<const N: usize>(seed: u64) -> [u8; N] {
-    let mut state = seed;
-    let mut out = [0u8; N];
-    for byte in &mut out {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        *byte = (state >> 24) as u8;
-    }
-    out
-}
 
 #[test]
 fn token_encrypt_frees_no_plaintext() {
@@ -199,4 +83,19 @@ fn derive_key_64_frees_no_key() {
 
     assert_eq!(&derived[..], &expected[..]);
     assert_no_residue(&freed, &[("derived key", &expected)]);
+}
+
+#[test]
+fn hkdf_output_is_wiped_when_dropped() {
+    let _serial = serial();
+    let ikm: [u8; 32] = pseudo_random(10);
+    let salt: [u8; 16] = pseudo_random(11);
+    let expected = hkdf::derive_key_64(&ikm, &salt).unwrap();
+
+    let ((), freed) = freed_by(|| {
+        let okm: Zeroizing<Vec<u8>> = hkdf::hkdf_sha256(64, &ikm, Some(&salt), None).unwrap();
+        assert_eq!(&okm[..], &expected[..]);
+    });
+
+    assert_no_residue(&freed, &[("HKDF output", &expected[..])]);
 }

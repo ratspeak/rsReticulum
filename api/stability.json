@@ -25,7 +25,7 @@
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-crypto.txt",
       "itemCount": 91,
-      "sha256": "4546ac55341926ea19b9f7ccd9f902e253b2f4b89a2a712307ddd302eb4735b0"
+      "sha256": "2422d2c6ab0100d84c6cd7bc5adf81a006d6c05ed5cc81eca82f889777de09de"
     },
     {
       "name": "rns-wire",
@@ -114,7 +114,8 @@
     "migrationGuide": "api/migrations/1.4.md",
     "removed": {
       "rns-crypto": [
-        "pub fn rns_crypto::hkdf::derive_key_64(&[u8], &[u8]) -> core::result::Result<[u8; 64], rns_crypto::hkdf::HkdfError>"
+        "pub fn rns_crypto::hkdf::derive_key_64(&[u8], &[u8]) -> core::result::Result<[u8; 64], rns_crypto::hkdf::HkdfError>",
+        "pub fn rns_crypto::hkdf::hkdf_sha256(usize, &[u8], core::option::Option<&[u8]>, core::option::Option<&[u8]>) -> core::result::Result<alloc::vec::Vec<u8>, rns_crypto::hkdf::HkdfError>"
       ],
       "rns-transport": [
         "pub enum rns_transport::discovery::Reason",

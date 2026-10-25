@@ -24,19 +24,20 @@ pub enum HkdfError {
 /// HKDF-SHA256 key derivation (RFC 5869).
 ///
 /// `length` is capped at 8160 bytes. `salt = None` uses 32 zero bytes as
-/// specified by the RFC; `info = None` uses an empty context string.
+/// specified by the RFC; `info = None` uses an empty context string. The
+/// output is wiped when it is dropped.
 pub fn hkdf_sha256(
     length: usize,
     ikm: &[u8],
     salt: Option<&[u8]>,
     info: Option<&[u8]>,
-) -> Result<Vec<u8>, HkdfError> {
+) -> Result<Zeroizing<Vec<u8>>, HkdfError> {
     if length > MAX_OUTPUT_LENGTH {
         return Err(HkdfError::OutputTooLong(length));
     }
 
     let hk = Hkdf::<Sha256>::new(salt, ikm);
-    let mut okm = vec![0u8; length];
+    let mut okm = Zeroizing::new(vec![0u8; length]);
     hk.expand(info.unwrap_or(b""), &mut okm)
         .map_err(|_| HkdfError::ExpansionFailed)?;
     Ok(okm)

@@ -34,7 +34,7 @@ pub enum rns_crypto::hkdf::HkdfError
 pub rns_crypto::hkdf::HkdfError::ExpansionFailed
 pub rns_crypto::hkdf::HkdfError::OutputTooLong(usize)
 pub fn rns_crypto::hkdf::derive_key_64(&[u8], &[u8]) -> core::result::Result<zeroize::Zeroizing<[u8; 64]>, rns_crypto::hkdf::HkdfError>
-pub fn rns_crypto::hkdf::hkdf_sha256(usize, &[u8], core::option::Option<&[u8]>, core::option::Option<&[u8]>) -> core::result::Result<alloc::vec::Vec<u8>, rns_crypto::hkdf::HkdfError>
+pub fn rns_crypto::hkdf::hkdf_sha256(usize, &[u8], core::option::Option<&[u8]>, core::option::Option<&[u8]>) -> core::result::Result<zeroize::Zeroizing<alloc::vec::Vec<u8>>, rns_crypto::hkdf::HkdfError>
 pub mod rns_crypto::hmac
 pub fn rns_crypto::hmac::hmac_sha256(&[u8], &[u8]) -> [u8; 32]
 pub fn rns_crypto::hmac::hmac_verify(&[u8], &[u8], &[u8; 32]) -> bool

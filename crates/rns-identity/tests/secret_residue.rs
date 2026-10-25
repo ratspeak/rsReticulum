@@ -1,15 +1,13 @@
 //! Private keys, derived keys and plaintext must not survive in freed heap
 //! memory when identities are stored, loaded and used.
-//!
-//! A recording allocator copies every block the test thread frees while a
-//! check runs; each check then searches those copies for its secrets.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::{Cell, UnsafeCell};
+#[path = "../../rns-crypto/tests/residue/mod.rs"]
+mod residue;
+
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use residue::{assert_no_residue, freed_by, holds, pseudo_random, serial};
 use rns_crypto::hkdf::hkdf_sha256;
 use rns_crypto::sha::sha256;
 use rns_crypto::x25519::{X25519PrivateKey, X25519PublicKey};
@@ -17,135 +15,6 @@ use rns_identity::identity::Identity;
 use rns_identity::ifac::derive_ifac_key;
 use rns_identity::ratchet::RatchetRing;
 use zeroize::Zeroizing;
-
-const RECORD_CAPACITY: usize = 8 << 20;
-
-struct Recording(UnsafeCell<[u8; RECORD_CAPACITY]>);
-
-// Written only by the armed thread while armed, read only after disarming.
-unsafe impl Sync for Recording {}
-
-static RECORDING: Recording = Recording(UnsafeCell::new([0; RECORD_CAPACITY]));
-static RECORDED: AtomicUsize = AtomicUsize::new(0);
-static OVERFLOWED: AtomicBool = AtomicBool::new(false);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-static SERIAL: Mutex<()> = Mutex::new(());
-
-thread_local! {
-    static ARMED: Cell<bool> = const { Cell::new(false) };
-}
-
-struct RecordingAllocator;
-
-fn armed() -> bool {
-    ARMED.try_with(Cell::get).unwrap_or(false)
-}
-
-unsafe impl GlobalAlloc for RecordingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if armed() {
-            PEAK.fetch_max(layout.size(), Ordering::Relaxed);
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    // The default `realloc` frees the old block through `dealloc`, so blocks
-    // left behind by growth are recorded too.
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if armed() {
-            let start = RECORDED.load(Ordering::Relaxed);
-            let end = start + 4 + layout.size();
-            if end <= RECORD_CAPACITY {
-                let base = RECORDING.0.get().cast::<u8>();
-                unsafe {
-                    base.add(start)
-                        .cast::<[u8; 4]>()
-                        .write_unaligned((layout.size() as u32).to_le_bytes());
-                    std::ptr::copy_nonoverlapping(ptr, base.add(start + 4), layout.size());
-                }
-                RECORDED.store(end, Ordering::Relaxed);
-            } else {
-                OVERFLOWED.store(true, Ordering::Relaxed);
-            }
-        }
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: RecordingAllocator = RecordingAllocator;
-
-fn serial() -> MutexGuard<'static, ()> {
-    SERIAL
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-struct Freed {
-    blocks: Vec<Vec<u8>>,
-    peak_allocation: usize,
-}
-
-/// Run `f` and return its result with a copy of every block it freed.
-fn freed_by<R>(f: impl FnOnce() -> R) -> (R, Freed) {
-    RECORDED.store(0, Ordering::Relaxed);
-    OVERFLOWED.store(false, Ordering::Relaxed);
-    PEAK.store(0, Ordering::Relaxed);
-    ARMED.with(|armed| armed.set(true));
-    let result = f();
-    ARMED.with(|armed| armed.set(false));
-    assert!(
-        !OVERFLOWED.load(Ordering::Relaxed),
-        "freed blocks exceeded the recording buffer"
-    );
-    let len = RECORDED.load(Ordering::Relaxed);
-    let recorded = unsafe { std::slice::from_raw_parts(RECORDING.0.get().cast::<u8>(), len) };
-    let mut blocks = Vec::new();
-    let mut at = 0;
-    while at < len {
-        let size = u32::from_le_bytes(recorded[at..at + 4].try_into().unwrap()) as usize;
-        blocks.push(recorded[at + 4..at + 4 + size].to_vec());
-        at += 4 + size;
-    }
-    let freed = Freed {
-        blocks,
-        peak_allocation: PEAK.load(Ordering::Relaxed),
-    };
-    (result, freed)
-}
-
-/// Whether `block` holds 16 consecutive bytes of `secret`.
-fn holds(block: &[u8], secret: &[u8]) -> bool {
-    assert!(secret.len() >= 16, "secret is too short to search for");
-    secret
-        .windows(16)
-        .any(|needle| block.windows(16).any(|window| window == needle))
-}
-
-/// Fail if any freed block holds part of a secret.
-fn assert_no_residue(freed: &Freed, secrets: &[(&str, &[u8])]) {
-    let mut found = Vec::new();
-    for (name, secret) in secrets {
-        for block in &freed.blocks {
-            if holds(block, secret) {
-                found.push(format!("{name} in a freed {}-byte block", block.len()));
-            }
-        }
-    }
-    assert!(found.is_empty(), "secret residue: {found:?}");
-}
-
-fn pseudo_random<const N: usize>(seed: u64) -> [u8; N] {
-    let mut state = seed;
-    let mut out = [0u8; N];
-    for byte in &mut out {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        *byte = (state >> 24) as u8;
-    }
-    out
-}
 
 struct TempDir(PathBuf);
 
@@ -172,7 +41,7 @@ fn derived_key(private: &[u8; 32], ephemeral_public: &[u8], salt: &[u8]) -> Zero
     let private = X25519PrivateKey::from_bytes(private);
     let public = X25519PublicKey::from_bytes(ephemeral_public.try_into().unwrap());
     let shared = Zeroizing::new(private.exchange(&public));
-    Zeroizing::new(hkdf_sha256(64, &*shared, Some(salt), None).unwrap())
+    hkdf_sha256(64, &*shared, Some(salt), None).unwrap()
 }
 
 #[test]

@@ -64,10 +64,10 @@ pub fn try_ifac_sign(
         .filter(|len| *len <= MAX_IFAC_WIRE_BYTES)
         .ok_or(IfacSignError::PacketTooLarge)?;
 
-    let signing_key_bytes: [u8; 32] = ifac_key[32..64]
+    let signing_seed: &[u8; 32] = ifac_key[32..64]
         .try_into()
         .expect("ifac_key is [u8; 64]; slice [32..64] is always 32 bytes");
-    let ed_key = Ed25519PrivateKey::from_bytes(&signing_key_bytes);
+    let ed_key = Ed25519PrivateKey::from_bytes(signing_seed);
     let signature = ed_key.sign(packet);
     let tag = &signature[64 - ifac_size..];
 
@@ -131,10 +131,10 @@ pub fn ifac_verify(raw: &[u8], ifac_key: &[u8; 64], ifac_size: usize) -> Option<
     new_raw.extend_from_slice(&new_header);
     new_raw.extend_from_slice(&unmasked_raw[2 + ifac_size..]);
 
-    let signing_key_bytes: [u8; 32] = ifac_key[32..64]
+    let signing_seed: &[u8; 32] = ifac_key[32..64]
         .try_into()
         .expect("ifac_key is [u8; 64]; slice [32..64] is always 32 bytes");
-    let ed_key = Ed25519PrivateKey::from_bytes(&signing_key_bytes);
+    let ed_key = Ed25519PrivateKey::from_bytes(signing_seed);
     let expected_sig = ed_key.sign(&new_raw);
     let expected_ifac = &expected_sig[64 - ifac_size..];
 
