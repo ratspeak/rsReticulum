@@ -622,16 +622,20 @@ pub(crate) fn encode_interface_stats(
     encode_umsgpack(&interface_stats_value(entries, transport))
 }
 
-/// Remote management's `/status` answer: `[stats]` or `[stats, link_count]`
-/// (Transport.py:3325-3337).
+/// Remote management's `/status` answer: `[stats]`, then the link count and
+/// nil profiling results when asked for, in that order (Transport.py:3325-3337).
 pub(crate) fn encode_remote_status(
     entries: &[InterfaceStatEntry],
     transport: Option<&TransportStats>,
     link_count: Option<u64>,
+    profiling: bool,
 ) -> Result<Vec<u8>, RpcError> {
     let mut response = vec![interface_stats_value(entries, transport)];
     if let Some(link_count) = link_count {
         response.push(PyValue::Int(i128::from(link_count)));
+    }
+    if profiling {
+        response.push(PyValue::None);
     }
     encode_umsgpack(&PyValue::List(response))
 }

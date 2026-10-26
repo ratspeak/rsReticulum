@@ -126,23 +126,25 @@ fn peer_allowed(allowed: &[[u8; 16]], peer: &[u8; 16]) -> bool {
     allowed.iter().any(|a| a == peer)
 }
 
-/// Request: `[include_link_count: bool]`.
-/// Response: `[stats_dict]` or `[stats_dict, link_count]`, where the stats
-/// dict is the control port's (Transport.py:3325-3337).
+/// Request: `[include_link_count, include_profiling?]`.
+/// Response: the control port's stats dict, then the link count when it is
+/// asked for, then the profiling results when they are (Transport.py:3325-3337).
+/// Rust runs no profiler, so those are nil, as Python's are until its profiler
+/// has run (Reticulum.py:1956-1965).
 fn handle_status(
     tx: &mpsc::Sender<TransportMessage>,
     data: &[u8],
     ifac: Option<&InterfaceIfacStats>,
     transport: Option<&TransportStatsSource>,
 ) -> Option<Vec<u8>> {
-    let include_link_count = parse_status_request(data).unwrap_or(false);
+    let request = parse_status_request(data)?;
 
     let iface_stats = match blocking_query(tx, TransportQuery::GetInterfaceStats)? {
         TransportQueryResponse::InterfaceStats(v) => v,
         _ => return None,
     };
 
-    let link_count = if include_link_count {
+    let link_count = if request.link_count {
         match blocking_query(tx, TransportQuery::GetLinkCount)? {
             TransportQueryResponse::IntResult(n) => Some(n.max(0) as u64),
             _ => None,
@@ -155,6 +157,7 @@ fn handle_status(
         &stat_entries(iface_stats, ifac),
         transport.map(TransportStatsSource::snapshot).as_ref(),
         link_count,
+        request.profiling,
     )
     .ok()
 }
@@ -239,9 +242,33 @@ fn within_hops(max_hops: Option<&rmpv::Value>, hops: u8) -> Option<bool> {
     }
 }
 
-fn parse_status_request(data: &[u8]) -> Option<bool> {
+/// Python's `/status` flags (Transport.py:3329-3335).
+#[derive(Debug, PartialEq, Eq)]
+struct StatusRequest {
+    link_count: bool,
+    profiling: bool,
+}
+
+/// `None` unless the request is a non-empty list, which Python leaves
+/// unanswered (Transport.py:3329).
+fn parse_status_request(data: &[u8]) -> Option<StatusRequest> {
     let v: rmpv::Value = rmp_serde::from_slice(data).ok()?;
-    v.as_array()?.first()?.as_bool()
+    let flags = v.as_array().filter(|flags| !flags.is_empty())?;
+    Some(StatusRequest {
+        link_count: python_eq_true(&flags[0]),
+        profiling: flags.get(1).is_some_and(python_eq_true),
+    })
+}
+
+/// Python's `value == True`, which also holds for 1 and 1.0.
+fn python_eq_true(value: &rmpv::Value) -> bool {
+    match value {
+        rmpv::Value::Boolean(flag) => *flag,
+        rmpv::Value::Integer(n) => n.as_u64() == Some(1),
+        rmpv::Value::F32(n) => *n == 1.0,
+        rmpv::Value::F64(n) => *n == 1.0,
+        _ => false,
+    }
 }
 
 /// Python's `/path` arguments, kept as sent (Transport.py:3350-3355).
@@ -303,11 +330,20 @@ mod tests {
 
     #[test]
     fn parse_status_request_decodes_bool_array() {
+        let flags = |link_count, profiling| {
+            Some(StatusRequest {
+                link_count,
+                profiling,
+            })
+        };
         let data_true = rmp_serde::to_vec(&(true,)).unwrap();
-        assert_eq!(parse_status_request(&data_true), Some(true));
+        assert_eq!(parse_status_request(&data_true), flags(true, false));
 
         let data_false = rmp_serde::to_vec(&(false,)).unwrap();
-        assert_eq!(parse_status_request(&data_false), Some(false));
+        assert_eq!(parse_status_request(&data_false), flags(false, false));
+
+        let data_both = rmp_serde::to_vec(&(true, true)).unwrap();
+        assert_eq!(parse_status_request(&data_both), flags(true, true));
 
         let data_empty = rmp_serde::to_vec::<Vec<bool>>(&vec![]).unwrap();
         assert_eq!(parse_status_request(&data_empty), None);
@@ -623,6 +659,61 @@ mod tests {
         let decoded: rmpv::Value = rmp_serde::from_slice(&resp).unwrap();
         let arr = decoded.as_array().unwrap();
         assert_eq!(arr.len(), 1, "response is [stats_dict] with no link count");
+    }
+
+    /// The reply after the stats dict, or `None` when no reply is sent.
+    fn status_reply_tail(
+        tx: &mpsc::Sender<TransportMessage>,
+        request: &rmpv::Value,
+    ) -> Option<Vec<rmpv::Value>> {
+        let mut data = Vec::new();
+        rmpv::encode::write_value(&mut data, request).unwrap();
+        let response = handle_status(tx, &data, None, None)?;
+        let decoded: rmpv::Value = rmp_serde::from_slice(&response).unwrap();
+        let reply = decoded.as_array().expect("response is a list");
+        assert!(reply[0].is_map(), "the stats dict comes first");
+        Some(reply[1..].to_vec())
+    }
+
+    /// Python appends the link count when the first flag `== True`, then the
+    /// profiling results when the second does, and answers nothing unless the
+    /// request is a non-empty list (Transport.py:3325-3337). Until a profiler
+    /// has run, the results are nil (Reticulum.py:1956-1965).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_status_flags_follow_python() {
+        use rmpv::Value;
+        let tx = spawn_mock_transport();
+        let tail = |flags: Vec<Value>| status_reply_tail(&tx, &Value::Array(flags));
+        let links = Value::from(3);
+
+        assert_eq!(tail(vec![true.into()]), Some(vec![links.clone()]));
+        assert_eq!(tail(vec![false.into()]), Some(vec![]));
+        assert_eq!(
+            tail(vec![true.into(), false.into()]),
+            Some(vec![links.clone()])
+        );
+        assert_eq!(
+            tail(vec![true.into(), true.into()]),
+            Some(vec![links.clone(), Value::Nil])
+        );
+        assert_eq!(
+            tail(vec![false.into(), true.into()]),
+            Some(vec![Value::Nil]),
+            "profiling results take the link count's place when it is not asked for"
+        );
+        assert_eq!(
+            tail(vec![Value::from(1), Value::F64(1.0), true.into()]),
+            Some(vec![links.clone(), Value::Nil]),
+            "Python's 1 == True and 1.0 == True hold, and extra flags are ignored"
+        );
+        assert_eq!(tail(vec![Value::from(2), Value::from("yes")]), Some(vec![]));
+        assert_eq!(tail(vec![Value::Nil, true.into()]), Some(vec![Value::Nil]));
+        assert_eq!(tail(vec![]), None, "an empty request gets no answer");
+        assert_eq!(status_reply_tail(&tx, &Value::from(true)), None);
+        assert_eq!(
+            status_reply_tail(&tx, &Value::Map(vec![(0.into(), true.into())])),
+            None
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
