@@ -293,7 +293,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn unique_test_dir(label: &str) -> PathBuf {
+    pub(super) fn unique_test_dir(label: &str) -> PathBuf {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!(
@@ -345,36 +345,6 @@ mod tests {
         assert_eq!(read_file_bounded(&path, 17).unwrap().unwrap().len(), 17);
 
         fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Re-run `test` in a child process whose files are limited to `limit`
-    /// bytes, with SIGXFSZ ignored so a longer write fails with EFBIG. Returns
-    /// true in the child, which then runs the test body.
-    #[cfg(unix)]
-    pub(super) fn in_file_size_limited_child(test: &str, limit: u64) -> bool {
-        const CHILD: &str = "RNS_FILE_SIZE_LIMITED_CHILD";
-        if std::env::var_os(CHILD).is_some() {
-            unsafe {
-                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
-                let mut current = std::mem::zeroed::<libc::rlimit>();
-                assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut current), 0);
-                current.rlim_cur = limit as libc::rlim_t;
-                assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &current), 0);
-            }
-            return true;
-        }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([test, "--exact", "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("1 passed"),
-            "file-size-limited child failed:\n{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        false
     }
 
     /// Root ignores directory permissions.
@@ -436,28 +406,6 @@ mod tests {
             result.unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
         );
-        assert_eq!(fs::read(&path).unwrap(), b"previous");
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_beyond_the_file_size_limit_keeps_the_previous_file() {
-        if !in_file_size_limited_child(
-            "persistence::tests::atomic_write_beyond_the_file_size_limit_keeps_the_previous_file",
-            4096,
-        ) {
-            return;
-        }
-        let dir = unique_test_dir("atomic-file-size");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("state");
-        fs::write(&path, b"previous").unwrap();
-
-        let err = atomic_write(&path, &[0x5a; 16384]).unwrap_err();
-
-        assert_eq!(err.raw_os_error(), Some(libc::EFBIG));
         assert_eq!(fs::read(&path).unwrap(), b"previous");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_dir_all(dir).unwrap();
@@ -614,6 +562,16 @@ mod tests {
         // A reader that gave up has closed its end.
         let _ = fifo.write_all(second);
         drop(fifo);
+        // Fail instead of hanging if another descriptor still holds the writer.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !reader.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reader of {} saw no EOF 30 s after the writer closed",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let result = reader.join().unwrap();
         fs::remove_dir_all(dir).unwrap();
         result

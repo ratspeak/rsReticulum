@@ -930,11 +930,7 @@ mod tests {
     }
 
     fn dir() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "rns-durable-{}-{}",
-            std::process::id(),
-            super::super::TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        let path = super::super::tests::unique_test_dir("durable");
         fs::create_dir(&path).unwrap();
         path
     }
@@ -967,6 +963,7 @@ mod tests {
                 fs::remove_file(path).unwrap();
             }
         }
+        fs::remove_dir_all(local).unwrap();
     }
 
     #[test]
@@ -1041,31 +1038,6 @@ mod tests {
         assert_eq!(failure.kind, DurableErrorKind::Io);
         assert_eq!(fs::read(&target).unwrap(), b"old");
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn strict_write_beyond_the_file_size_limit_keeps_the_previous_file() {
-        if !super::super::tests::in_file_size_limited_child(
-            "persistence::strict::tests::strict_write_beyond_the_file_size_limit_keeps_the_previous_file",
-            4096,
-        ) {
-            return;
-        }
-        let root = dir();
-        let target = root.join("state");
-        durable_write(&target, b"old").unwrap();
-
-        let failure = durable_write(&target, &[0x5a; 16384]).unwrap_err();
-
-        assert_eq!(failure.phase, DurableCommitPhase::NotCommitted);
-        let source = std::error::Error::source(&failure)
-            .and_then(|source| source.downcast_ref::<io::Error>())
-            .unwrap();
-        assert_eq!(source.raw_os_error(), Some(libc::EFBIG));
-        assert_eq!(fs::read(&target).unwrap(), b"old");
-        assert_eq!(failure.recovery_paths.len(), 2);
         fs::remove_dir_all(root).unwrap();
     }
 

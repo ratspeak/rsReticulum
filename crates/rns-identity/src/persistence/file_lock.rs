@@ -35,11 +35,7 @@ pub fn try_lock_exclusive(file: &File) -> io::Result<()> {
 mod tests {
     use super::*;
     fn lock_files() -> (std::path::PathBuf, File, File) {
-        let path = std::env::temp_dir().join(format!(
-            "rns-native-lock-{}-{}",
-            std::process::id(),
-            super::super::TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        let path = super::super::tests::unique_test_dir("native-lock");
         let first = File::create_new(&path).unwrap();
         let second = File::options().read(true).write(true).open(&path).unwrap();
         (path, first, second)

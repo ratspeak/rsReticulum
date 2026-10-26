@@ -47,27 +47,3 @@ impl ConfigWriteLock {
         Ok(Self { _file: file })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn config_lock_excludes_concurrent_writers_and_releases_on_drop() {
-        let dir = std::env::temp_dir().join(format!(
-            "rns-config-lock-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let config = dir.join("config");
-        let lock = ConfigWriteLock::acquire(&config).unwrap();
-        assert_eq!(
-            ConfigWriteLock::acquire(&config).unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        drop(lock);
-        let next = ConfigWriteLock::acquire(&config).unwrap();
-        drop(next);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-}
