@@ -813,16 +813,20 @@ fn synthesize_auto(
     };
 
     // Python: comma-separated `devices` (whitelist) and `ignored_devices` (blacklist).
-    let devices = section.get("devices").map(|s| {
-        s.split(',')
+    let devices = section.get_list("devices").map(|devices| {
+        devices
+            .iter()
+            .flat_map(|names| names.split(','))
             .map(|n| n.trim().to_string())
             .filter(|n| !n.is_empty())
             .collect::<Vec<String>>()
     });
     let ignored_devices = section
-        .get("ignored_devices")
-        .map(|s| {
-            s.split(',')
+        .get_list("ignored_devices")
+        .map(|devices| {
+            devices
+                .iter()
+                .flat_map(|names| names.split(','))
                 .map(|n| n.trim().to_string())
                 .filter(|n| !n.is_empty())
                 .collect::<Vec<String>>()
@@ -2384,6 +2388,26 @@ mod tests {
             }
             _ => panic!("expected Auto"),
         }
+    }
+
+    #[test]
+    fn test_synthesize_auto_reads_parsed_device_lists() {
+        let config = crate::config::Config::parse(
+            "[interfaces]\n  [[Local Network]]\n    type = AutoInterface\n    enabled = yes\n    devices = en0, en1\n    ignored_devices = bridge0, awdl0\n",
+        )
+        .unwrap();
+        let section = config.subsection("interfaces", "Local Network").unwrap();
+        let InterfaceConfig::Auto(config) = synthesize_interface("Local Network", section).unwrap()
+        else {
+            panic!("expected Auto");
+        };
+        assert_eq!(
+            (config.devices, config.ignored_devices),
+            (
+                Some(vec!["en0".to_string(), "en1".to_string()]),
+                vec!["bridge0".to_string(), "awdl0".to_string()],
+            )
+        );
     }
 
     #[test]
