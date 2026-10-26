@@ -6011,7 +6011,7 @@ fn discovery_config_for_interface(
         match iface_config {
             interface_factory::InterfaceConfig::TcpServer(c) => (
                 "TCPServerInterface",
-                Some(configured_reachable_on(section)?),
+                Some(server_reachable_on(section, iface_config)?),
                 Some(c.listen_port),
                 None,
                 None,
@@ -6023,9 +6023,14 @@ fn discovery_config_for_interface(
             interface_factory::InterfaceConfig::TcpClient(c) if c.kiss_framing => {
                 ("KISSInterface", None, None, None, None, None, None)
             }
+            // A target host makes a BackboneClientInterface, which Python never
+            // announces (Reticulum.py:1120-1122, BackboneInterface.py:154).
+            interface_factory::InterfaceConfig::Backbone(c) if c.target_host.is_some() => {
+                return None;
+            }
             interface_factory::InterfaceConfig::Backbone(c) => (
                 "BackboneInterface",
-                Some(configured_reachable_on(section)?),
+                Some(server_reachable_on(section, iface_config)?),
                 Some(c.port),
                 None,
                 None,
@@ -6142,10 +6147,25 @@ fn discovery_config_for_interface(
 
 fn configured_reachable_on(section: &ConfigSection) -> Option<String> {
     section
-        .get("discovery_reachable_on")
-        .or_else(|| section.get("reachable_on"))
+        .get("reachable_on")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Python announces a server only with a configured `reachable_on`, and logs
+/// an error at each announce it skips (Discovery.py:120, :186-188).
+fn server_reachable_on(
+    section: &ConfigSection,
+    iface_config: &interface_factory::InterfaceConfig,
+) -> Option<String> {
+    let reachable_on = configured_reachable_on(section);
+    if reachable_on.is_none() {
+        tracing::warn!(
+            interface = %interface_config_name(iface_config),
+            "discoverable interface has no reachable_on, so it is not announced for discovery"
+        );
+    }
+    reachable_on
 }
 
 fn discovery_announce_interval_secs(section: &ConfigSection) -> u64 {
@@ -12419,29 +12439,34 @@ loglevel = 7
         }
     }
 
+    /// Python reads only `reachable_on` (Reticulum.py:999), and a Backbone
+    /// client is a `BackboneClientInterface`, which never supports discovery
+    /// (Reticulum.py:1120-1122, Discovery.py:77-78, BackboneInterface.py:154).
     #[test]
     fn network_discovery_uses_the_configured_reachable_on() {
-        for endpoint in [
+        let discovery = |endpoint: &str, key: &str| {
+            let config = Config::parse(&format!(
+                "[interfaces]\n[[relay]]\nenabled = yes\ndiscoverable = yes\n{endpoint}{key} = published.example.org\n"
+            ))
+            .unwrap();
+            let interfaces = synthesize_interfaces(&config, false).unwrap();
+            let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
+            discovery_config_for_interface(&config, &interfaces[0], &post_init, true)
+        };
+        for server in [
             "type = TCPServerInterface\nlisten_ip = 192.0.2.10\nlisten_port = 4242\n",
             "type = BackboneInterface\nlisten_on = 192.0.2.10\nport = 4242\n",
-            "type = BackboneInterface\ntarget_host = relay.example.org\nport = 4242\n",
         ] {
-            for key in ["reachable_on", "discovery_reachable_on"] {
-                let config = Config::parse(&format!(
-                    "[interfaces]\n[[relay]]\nenabled = yes\ndiscoverable = yes\n{endpoint}{key} = published.example.org\n"
-                )).unwrap();
-                let interfaces = synthesize_interfaces(&config, false).unwrap();
-                let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
-                let discovery =
-                    discovery_config_for_interface(&config, &interfaces[0], &post_init, true)
-                        .unwrap();
-                assert_eq!(
-                    discovery.reachable_on.as_deref(),
-                    Some("published.example.org")
-                );
-                assert_eq!(discovery.port, Some(4242));
-            }
+            let announced = discovery(server, "reachable_on").unwrap();
+            assert_eq!(
+                announced.reachable_on.as_deref(),
+                Some("published.example.org")
+            );
+            assert_eq!(announced.port, Some(4242));
+            assert!(discovery(server, "discovery_reachable_on").is_none());
         }
+        let client = "type = BackboneInterface\ntarget_host = relay.example.org\nport = 4242\n";
+        assert!(discovery(client, "reachable_on").is_none());
     }
 
     #[test]

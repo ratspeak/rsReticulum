@@ -42,6 +42,7 @@
 - `rnstatus-rs` shows the network an auto-connected interface was discovered through on a `Source` line under its name, as Python's `rnstatus` does, and its JSON output carries it as `autoconnect_source`.
 - AutoInterface's `devices` and `ignored_devices` take effect, and they and I2P `peers` are read as Python Reticulum reads lists: a quoted name that contains a comma stays one name, and `devices = ,` allows every interface.
 - TCP client interfaces read `i2p_tunneled`, as Python Reticulum does, and give a connection tunneled over I2P its longer I2P socket timeouts.
+- TCP server and Backbone interfaces are announced for discovery only with `reachable_on` set, and Backbone clients never, as in Python Reticulum. A discoverable server without `reachable_on` logs a warning and is not announced, so set `reachable_on` to keep announcing it. The `discovery_reachable_on` key is no longer read.
 
 ## 1.4.0 - 2026-10-12
 
