@@ -34,16 +34,6 @@ pub const FALLBACK_TCP_PORT: u16 = 37428;
 #[cfg(unix)]
 const LOCAL_RECONNECT_WAIT_SECS: u64 = 8;
 
-#[cfg(all(unix, not(test)))]
-fn local_reconnect_wait() -> std::time::Duration {
-    std::time::Duration::from_secs(LOCAL_RECONNECT_WAIT_SECS)
-}
-
-#[cfg(all(unix, test))]
-fn local_reconnect_wait() -> std::time::Duration {
-    std::time::Duration::from_millis(50)
-}
-
 pub fn socket_path_for(instance_name: &str) -> String {
     format!("/tmp/rns_{}.sock", instance_name)
 }
@@ -510,7 +500,8 @@ mod platform {
                     "local shared-instance connection lost; reconnecting"
                 );
                 loop {
-                    tokio::time::sleep(local_reconnect_wait()).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(LOCAL_RECONNECT_WAIT_SECS))
+                        .await;
                     if transport_tx.is_closed() || rx.is_closed() {
                         return;
                     }
@@ -717,6 +708,24 @@ mod tests {
             drop(listener);
             format!("tcp://127.0.0.1:{port}")
         }
+    }
+
+    /// The client's real reconnect wait, plus one missed attempt on a loaded host.
+    #[cfg(unix)]
+    const RECONNECT_DEADLINE: std::time::Duration =
+        std::time::Duration::from_secs(2 * LOCAL_RECONNECT_WAIT_SECS);
+
+    /// The server hands off an accepted client before that client has
+    /// necessarily published itself online, so wait for the flag itself.
+    #[cfg(unix)]
+    async fn wait_until_online(online: &AtomicBool) {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !online.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stable client handle must return online after reconnect");
     }
 
     #[test]
@@ -958,16 +967,12 @@ mod tests {
         .await
         .unwrap();
         restarted_server.owner.mark_registered();
-        let second_accepted =
-            tokio::time::timeout(std::time::Duration::from_secs(3), handle_rx.recv())
-                .await
-                .expect("client did not reconnect to restarted server")
-                .expect("handle channel closed");
+        let second_accepted = tokio::time::timeout(RECONNECT_DEADLINE, handle_rx.recv())
+            .await
+            .expect("client did not reconnect to restarted server")
+            .expect("handle channel closed");
         second_accepted.owner.mark_registered();
-        assert!(
-            client_handle.online.load(Ordering::SeqCst),
-            "stable client handle must return online after reconnect"
-        );
+        wait_until_online(&client_handle.online).await;
 
         let payload = Bytes::from_static(b"after shared restart");
         second_accepted.tx.send(payload.clone()).await.unwrap();
@@ -1056,12 +1061,13 @@ mod tests {
         .await
         .unwrap();
         restarted_server.owner.mark_registered();
-        let second_accepted =
-            tokio::time::timeout(std::time::Duration::from_secs(3), handle_rx.recv())
-                .await
-                .expect("client did not reconnect to restarted server")
-                .expect("handle channel closed");
+        let second_accepted = tokio::time::timeout(RECONNECT_DEADLINE, handle_rx.recv())
+            .await
+            .expect("client did not reconnect to restarted server")
+            .expect("handle channel closed");
         second_accepted.owner.mark_registered();
+        // Online is published only after the offline queue is dropped.
+        wait_until_online(&client_handle.online).await;
         let after = Bytes::from_static(b"after reconnect");
         client_handle.tx.send(after.clone()).await.unwrap();
 
