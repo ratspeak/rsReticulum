@@ -535,6 +535,24 @@ fn filtered_local_stats<'a>(
     entries
 }
 
+/// The interface name, then the lines Python's rnstatus prints under it
+/// before the rest (rnstatus.py:523-530).
+fn print_interface_heading(
+    name: &str,
+    autoconnect_source: Option<&str>,
+    ifac_netname: Option<&str>,
+    online: bool,
+) {
+    println!("  {name}");
+    if let Some(source) = autoconnect_source {
+        println!("    Source   : Auto-connect via <{source}>");
+    }
+    if let Some(netname) = ifac_netname {
+        println!("    Network  : {netname}");
+    }
+    println!("    Status   : {}", if online { "Up" } else { "Down" });
+}
+
 fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, args: &Args) {
     println!(
         "Reticulum Status [rnstatus-rs {}]",
@@ -547,12 +565,12 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
         println!("  No interfaces.");
     } else {
         for entry in entries {
-            let status = if entry.online { "Up" } else { "Down" };
-            println!("  {}", entry.name);
-            if let Some(netname) = &entry.ifac_netname {
-                println!("    Network  : {netname}");
-            }
-            println!("    Status   : {status}");
+            print_interface_heading(
+                &entry.name,
+                entry.autoconnect_source.as_deref(),
+                entry.ifac_netname.as_deref(),
+                entry.online,
+            );
             println!("    Mode     : {}", mode_display_name(&entry.mode));
             println!("    Role     : {}", entry.role);
             println!("    Bitrate  : {}", format::pretty_speed(entry.bitrate));
@@ -665,7 +683,7 @@ fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, 
             print!(",");
         }
         print!(
-            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"ifac_signature\":{},\"ifac_size\":{},\"ifac_netname\":{},\"tx_drops\":{},\"tx_dropped_bytes\":{},\"arxc\":{},\"atxc\":{},\"prxc\":{},\"ptxc\":{},\"protocol_violations\":{},\"ifac_violations\":{},\"packet_filter_hits\":{}}}",
+            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"ifac_signature\":{},\"ifac_size\":{},\"ifac_netname\":{},\"autoconnect_source\":{},\"tx_drops\":{},\"tx_dropped_bytes\":{},\"arxc\":{},\"atxc\":{},\"prxc\":{},\"ptxc\":{},\"protocol_violations\":{},\"ifac_violations\":{},\"packet_filter_hits\":{}}}",
             json_str(&e.name),
             e.online,
             json_str(&e.mode),
@@ -696,6 +714,7 @@ fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, 
             opt_hex_json(e.ifac_signature.as_deref()),
             opt_u64_json(e.ifac_size.map(|size| size as u64)),
             opt_str_json(e.ifac_netname.as_deref()),
+            opt_str_json(e.autoconnect_source.as_deref()),
             e.tx_drops,
             e.tx_dropped_bytes,
             e.announces_received,
@@ -1109,6 +1128,7 @@ struct RemoteInterface {
     ifac_signature: Option<Vec<u8>>,
     ifac_size: Option<u64>,
     ifac_netname: Option<String>,
+    autoconnect_source: Option<String>,
     announces_received: u64,
     announces_sent: u64,
     path_requests_received: u64,
@@ -1224,7 +1244,7 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 print!(",");
             }
             print!(
-                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"ifac_signature\":{},\"ifac_size\":{},\"ifac_netname\":{},\"tx_drops\":{},\"tx_dropped_bytes\":{},\"arxc\":{},\"atxc\":{},\"prxc\":{},\"ptxc\":{},\"protocol_violations\":{},\"ifac_violations\":{},\"packet_filter_hits\":{}}}",
+                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"ifac_signature\":{},\"ifac_size\":{},\"ifac_netname\":{},\"autoconnect_source\":{},\"tx_drops\":{},\"tx_dropped_bytes\":{},\"arxc\":{},\"atxc\":{},\"prxc\":{},\"ptxc\":{},\"protocol_violations\":{},\"ifac_violations\":{},\"packet_filter_hits\":{}}}",
                 json_str(&iface.name),
                 iface.online,
                 iface.mode,
@@ -1254,6 +1274,7 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 opt_hex_json(iface.ifac_signature.as_deref()),
                 opt_u64_json(iface.ifac_size),
                 opt_str_json(iface.ifac_netname.as_deref()),
+                opt_str_json(iface.autoconnect_source.as_deref()),
                 iface.tx_drops,
                 iface.tx_dropped_bytes,
                 iface.announces_received,
@@ -1281,12 +1302,12 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
 
     if !parsed_interfaces.is_empty() {
         for iface in &parsed_interfaces {
-            let status = if iface.online { "Up" } else { "Down" };
-            println!("  {}", iface.name);
-            if let Some(netname) = &iface.ifac_netname {
-                println!("    Network  : {netname}");
-            }
-            println!("    Status   : {status}");
+            print_interface_heading(
+                &iface.name,
+                iface.autoconnect_source.as_deref(),
+                iface.ifac_netname.as_deref(),
+                iface.online,
+            );
             println!("    Mode     : {}", remote_mode_display_name(iface.mode));
             println!("    Bitrate  : {}", format::pretty_speed(iface.bitrate));
             if let Some(clients) = iface.clients {
@@ -1409,6 +1430,7 @@ fn remote_interface_from_map(m: &[(rmpv::Value, rmpv::Value)]) -> RemoteInterfac
         ifac_signature: map_bytes(m, "ifac_signature"),
         ifac_size: map_u64(m, "ifac_size"),
         ifac_netname: map_str(m, "ifac_netname"),
+        autoconnect_source: map_str(m, "autoconnect_source"),
         announces_received: map_u64(m, "arxc").unwrap_or(0),
         announces_sent: map_u64(m, "atxc").unwrap_or(0),
         path_requests_received: map_u64(m, "prxc").unwrap_or(0),
@@ -1797,6 +1819,22 @@ mod tests {
             (iface.ifac_signature, iface.ifac_size, iface.ifac_netname),
             (None, None, None)
         );
+    }
+
+    #[test]
+    fn remote_stats_carry_the_auto_connect_source() {
+        let source = |value: rmpv::Value| {
+            remote_interface_from_map(&[
+                (rmpv::Value::from("name"), rmpv::Value::from("Discovered")),
+                (rmpv::Value::from("autoconnect_source"), value),
+            ])
+            .autoconnect_source
+        };
+        assert_eq!(
+            source(rmpv::Value::from("a4bc81fd6b20c9e1")).as_deref(),
+            Some("a4bc81fd6b20c9e1")
+        );
+        assert_eq!(source(rmpv::Value::Nil), None);
     }
 
     #[test]

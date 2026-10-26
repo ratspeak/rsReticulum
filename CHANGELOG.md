@@ -39,6 +39,7 @@
 - Each interface's IFAC key lives in one allocation that is wiped when dropped, so interface tables no longer leave copies of it in freed memory.
 - I2P interfaces no longer leave their private key in freed memory when they read it, store it or exchange it with the SAM bridge. They refuse a key file larger than 16 KiB and, as Python Reticulum's SAM client does, a SAM reply line longer than 64 KiB.
 - Remote management answers the profiling flag of `rnstatus -R -z` with empty results, and leaves a status request that is not a list of flags unanswered, as Python Reticulum does.
+- `rnstatus-rs` shows the network an auto-connected interface was discovered through on a `Source` line under its name, as Python's `rnstatus` does, and its JSON output carries it as `autoconnect_source`.
 
 ## 1.4.0 - 2026-10-12
 
