@@ -28,15 +28,30 @@ pub const TCP_KEEPIDLE: u32 = 5;
 pub const TCP_KEEPINTVL: u32 = 2;
 pub const TCP_KEEPCNT: u32 = 12;
 
-/// Tuned keepalive (idle/interval/count + Linux `TCP_USER_TIMEOUT`) for plain
-/// TCP client and accepted sockets, matching Python `set_timeouts_linux`.
-pub(crate) fn set_tcp_keepalive_tuned(stream: &TcpStream) {
+/// Python's ordinary TCP or I2P Linux timeout values through the shared Rust
+/// socket tuner. Accepted sockets use ordinary TCP tuning.
+pub(crate) fn set_tcp_keepalive_tuned(stream: &TcpStream, i2p_tunneled: bool) {
+    let (idle, interval, count, user_timeout) = if i2p_tunneled {
+        (
+            crate::i2p::I2P_PROBE_AFTER,
+            crate::i2p::I2P_PROBE_INTERVAL,
+            crate::i2p::I2P_PROBES as u32,
+            crate::i2p::I2P_TCP_USER_TIMEOUT,
+        )
+    } else {
+        (
+            TCP_KEEPIDLE as u64,
+            TCP_KEEPINTVL as u64,
+            TCP_KEEPCNT,
+            DEFAULT_TCP_USER_TIMEOUT,
+        )
+    };
     crate::socket_tuning::set_keepalive_tuned(
         stream,
-        std::time::Duration::from_secs(TCP_KEEPIDLE as u64),
-        std::time::Duration::from_secs(TCP_KEEPINTVL as u64),
-        TCP_KEEPCNT,
-        std::time::Duration::from_secs(DEFAULT_TCP_USER_TIMEOUT as u64),
+        std::time::Duration::from_secs(idle),
+        std::time::Duration::from_secs(interval),
+        count,
+        std::time::Duration::from_secs(user_timeout as u64),
     );
 }
 
@@ -46,6 +61,8 @@ pub struct TcpClientConfig {
     pub target_host: String,
     pub target_port: u16,
     pub kiss_framing: bool,
+    /// Use the longer socket timeouts for a TCP connection tunneled over I2P.
+    pub i2p_tunneled: bool,
     pub connect_timeout_secs: u64,
     pub max_reconnect_tries: Option<usize>,
     pub mode: InterfaceMode,
@@ -63,6 +80,7 @@ impl TcpClientConfig {
             target_host: host.to_string(),
             target_port: port,
             kiss_framing: false,
+            i2p_tunneled: false,
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT,
             max_reconnect_tries: None,
             mode: InterfaceMode::Full,
@@ -390,7 +408,7 @@ pub async fn spawn_tcp_client(
                 }
             };
 
-            set_tcp_keepalive_tuned(&stream);
+            set_tcp_keepalive_tuned(&stream, config.i2p_tunneled);
 
             // Nagle off for low-latency packets; larger buffers for bulk transfers.
             let _ = stream.set_nodelay(true);
@@ -517,7 +535,7 @@ async fn spawn_tcp_accepted(
     let state = TcpInterfaceState::with_shared_counters(shared_rxb.clone(), shared_txb.clone());
     state.online.store(true, Ordering::SeqCst);
 
-    set_tcp_keepalive_tuned(&stream);
+    set_tcp_keepalive_tuned(&stream, false);
     let _ = stream.set_nodelay(true);
     set_socket_buffers(&stream, 131072);
 
@@ -706,9 +724,8 @@ mod tests {
         assert!(!config.prefer_ipv6);
     }
 
-    /// T1-2 regression: the client/accept paths must apply the TUNED keepalive
-    /// (idle 5s + 12 probes × 2s ≈ 29s dead-peer parity with Python), not just
-    /// SO_KEEPALIVE. Reads the options back via getsockopt.
+    /// Read back Python's Linux timeout values applied by the shared Rust
+    /// socket tuner for ordinary TCP and I2P-tunneled connections.
     #[cfg(unix)]
     #[tokio::test]
     async fn tuned_keepalive_applies_python_probe_values() {
@@ -736,33 +753,35 @@ mod tests {
         let client = client.unwrap();
         let (server, _) = accepted.unwrap();
 
-        for stream in [&client, &server] {
-            set_tcp_keepalive_tuned(stream);
-            let fd = stream.as_ref().as_raw_fd();
-            // BSD getsockopt returns the option bit, not 1 — assert enabled.
-            assert_ne!(get_opt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 0);
+        for (i2p_tunneled, _expected) in [(false, [5, 2, 12, 24]), (true, [10, 9, 5, 45])] {
+            for stream in [&client, &server] {
+                set_tcp_keepalive_tuned(stream, i2p_tunneled);
+                let fd = stream.as_ref().as_raw_fd();
+                // BSD getsockopt returns the option bit, not 1 — assert enabled.
+                assert_ne!(get_opt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 0);
 
-            #[cfg(target_os = "linux")]
-            let idle = get_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE);
-            #[cfg(target_os = "macos")]
-            let idle = get_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPALIVE);
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            {
-                assert_eq!(idle, TCP_KEEPIDLE as i32);
+                #[cfg(target_os = "linux")]
+                let idle = get_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE);
+                #[cfg(target_os = "macos")]
+                let idle = get_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPALIVE);
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    assert_eq!(idle, _expected[0]);
+                    assert_eq!(
+                        get_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL),
+                        _expected[1]
+                    );
+                    assert_eq!(
+                        get_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT),
+                        _expected[2]
+                    );
+                }
+                #[cfg(target_os = "linux")]
                 assert_eq!(
-                    get_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL),
-                    TCP_KEEPINTVL as i32
-                );
-                assert_eq!(
-                    get_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT),
-                    TCP_KEEPCNT as i32
+                    get_opt(fd, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT),
+                    _expected[3] * 1000
                 );
             }
-            #[cfg(target_os = "linux")]
-            assert_eq!(
-                get_opt(fd, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT),
-                (DEFAULT_TCP_USER_TIMEOUT * 1000) as i32
-            );
         }
     }
 
@@ -853,6 +872,7 @@ mod tests {
             target_host: "127.0.0.1".into(),
             target_port: port,
             kiss_framing: false,
+            i2p_tunneled: false,
             connect_timeout_secs: 5,
             max_reconnect_tries: Some(1),
             mode: InterfaceMode::Full,
@@ -950,6 +970,7 @@ mod tests {
             target_host: "127.0.0.1".into(),
             target_port: 1,
             kiss_framing: false,
+            i2p_tunneled: false,
             connect_timeout_secs: 1,
             max_reconnect_tries: Some(2),
             mode: InterfaceMode::Full,
@@ -995,6 +1016,7 @@ mod tests {
             target_host: "127.0.0.1".into(),
             target_port: port,
             kiss_framing: false,
+            i2p_tunneled: false,
             connect_timeout_secs: 5,
             max_reconnect_tries: Some(1),
             mode: InterfaceMode::Full,

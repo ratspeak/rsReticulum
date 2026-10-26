@@ -565,6 +565,7 @@ fn synthesize_tcp_client(
 
     let mut config = TcpClientConfig::new(name, host, port);
     config.mode = mode;
+    config.i2p_tunneled = parse_bool_strict(name, "i2p_tunneled", section, false)?;
 
     if let Some(kiss) = section.get_bool("kiss_framing") {
         config.kiss_framing = kiss;
@@ -1798,6 +1799,38 @@ mod tests {
             }
             _ => panic!("expected TcpClient"),
         }
+    }
+
+    #[test]
+    fn tcp_client_parses_i2p_tunneled_from_config() {
+        for (setting, expected) in [
+            ("", false),
+            ("i2p_tunneled = yes\n", true),
+            ("i2p_tunneled = no\n", false),
+        ] {
+            let config = crate::config::Config::parse(&format!(
+                "[interfaces]\n[[tunnel]]\ntype = TCPClientInterface\nenabled = yes\ntarget_host = 127.0.0.1\ntarget_port = 4242\n{setting}"
+            )).unwrap();
+            let section = config.subsection("interfaces", "tunnel").unwrap();
+            let InterfaceConfig::TcpClient(config) =
+                synthesize_interface("tunnel", section).unwrap()
+            else {
+                panic!("expected TcpClient");
+            };
+            assert_eq!(config.i2p_tunneled, expected);
+        }
+    }
+
+    #[test]
+    fn tcp_client_rejects_invalid_i2p_tunneled() {
+        let config = crate::config::Config::parse(
+            "[interfaces]\n[[tunnel]]\ntype = TCPClientInterface\nenabled = yes\ntarget_host = 127.0.0.1\ntarget_port = 4242\ni2p_tunneled = fish\n"
+        ).unwrap();
+        let section = config.subsection("interfaces", "tunnel").unwrap();
+        assert!(matches!(
+            synthesize_interface("tunnel", section),
+            Err(InterfaceFactoryError::InvalidValue { field, .. }) if field == "tunnel.i2p_tunneled"
+        ));
     }
 
     #[test]

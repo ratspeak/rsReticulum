@@ -1163,6 +1163,7 @@ pub mod rns_interface::tcp
 pub struct rns_interface::tcp::TcpClientConfig
 pub rns_interface::tcp::TcpClientConfig::connect_timeout_secs: u64
 pub rns_interface::tcp::TcpClientConfig::fixed_mtu: core::option::Option<u32>
+pub rns_interface::tcp::TcpClientConfig::i2p_tunneled: bool
 pub rns_interface::tcp::TcpClientConfig::kiss_framing: bool
 pub rns_interface::tcp::TcpClientConfig::max_reconnect_tries: core::option::Option<usize>
 pub rns_interface::tcp::TcpClientConfig::mode: rns_interface::traits::InterfaceMode
