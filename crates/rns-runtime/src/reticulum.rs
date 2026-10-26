@@ -6011,7 +6011,7 @@ fn discovery_config_for_interface(
         match iface_config {
             interface_factory::InterfaceConfig::TcpServer(c) => (
                 "TCPServerInterface",
-                configured_reachable_on(section).or_else(|| usable_listen_addr(&c.listen_ip)),
+                Some(configured_reachable_on(section)?),
                 Some(c.listen_port),
                 None,
                 None,
@@ -6025,12 +6025,7 @@ fn discovery_config_for_interface(
             }
             interface_factory::InterfaceConfig::Backbone(c) => (
                 "BackboneInterface",
-                configured_reachable_on(section).or_else(|| {
-                    c.listen_on
-                        .as_ref()
-                        .and_then(|addr| usable_listen_addr(addr))
-                        .or_else(|| c.target_host.clone())
-                }),
+                Some(configured_reachable_on(section)?),
                 Some(c.port),
                 None,
                 None,
@@ -6151,15 +6146,6 @@ fn configured_reachable_on(section: &ConfigSection) -> Option<String> {
         .or_else(|| section.get("reachable_on"))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-}
-
-fn usable_listen_addr(addr: &str) -> Option<String> {
-    let trimmed = addr.trim();
-    if trimmed.is_empty() || trimmed == "0.0.0.0" || trimmed == "::" {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
 }
 
 fn discovery_announce_interval_secs(section: &ConfigSection) -> u64 {
@@ -12415,6 +12401,50 @@ loglevel = 7
     }
 
     #[test]
+    fn network_discovery_requires_explicit_reachable_on() {
+        for endpoint in [
+            "type = TCPServerInterface\nlisten_ip = 192.0.2.10\nlisten_port = 4242\n",
+            "type = BackboneInterface\nlisten_on = 192.0.2.10\nport = 4242\n",
+            "type = BackboneInterface\ntarget_host = relay.example.org\nport = 4242\n",
+        ] {
+            let config = Config::parse(&format!(
+                "[interfaces]\n[[relay]]\nenabled = yes\ndiscoverable = yes\n{endpoint}"
+            ))
+            .unwrap();
+            let interfaces = synthesize_interfaces(&config, false).unwrap();
+            let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
+            assert!(
+                discovery_config_for_interface(&config, &interfaces[0], &post_init, true).is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn network_discovery_uses_the_configured_reachable_on() {
+        for endpoint in [
+            "type = TCPServerInterface\nlisten_ip = 192.0.2.10\nlisten_port = 4242\n",
+            "type = BackboneInterface\nlisten_on = 192.0.2.10\nport = 4242\n",
+            "type = BackboneInterface\ntarget_host = relay.example.org\nport = 4242\n",
+        ] {
+            for key in ["reachable_on", "discovery_reachable_on"] {
+                let config = Config::parse(&format!(
+                    "[interfaces]\n[[relay]]\nenabled = yes\ndiscoverable = yes\n{endpoint}{key} = published.example.org\n"
+                )).unwrap();
+                let interfaces = synthesize_interfaces(&config, false).unwrap();
+                let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
+                let discovery =
+                    discovery_config_for_interface(&config, &interfaces[0], &post_init, true)
+                        .unwrap();
+                assert_eq!(
+                    discovery.reachable_on.as_deref(),
+                    Some("published.example.org")
+                );
+                assert_eq!(discovery.port, Some(4242));
+            }
+        }
+    }
+
+    #[test]
     fn discovery_config_preserves_independent_location_presence_and_precedence() {
         for (extra, expected) in [
             ("", [None, None, None]),
@@ -12424,7 +12454,7 @@ loglevel = 7
                 [None, Some(0.0), None],
             ),
         ] {
-            let config = Config::parse(&format!("[interfaces]\n[[relay]]\ntype = TCPServerInterface\nenabled = yes\nlisten_ip = 127.0.0.1\nlisten_port = 4242\ndiscoverable = yes\n{extra}")).unwrap();
+            let config = Config::parse(&format!("[interfaces]\n[[relay]]\ntype = TCPServerInterface\nenabled = yes\nlisten_ip = 127.0.0.1\nlisten_port = 4242\ndiscoverable = yes\nreachable_on = relay.example.org\n{extra}")).unwrap();
             let interfaces = synthesize_interfaces(&config, false).unwrap();
             let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
             let discovery =
