@@ -41,6 +41,7 @@
 - Remote management answers the profiling flag of `rnstatus -R -z` with empty results, and leaves a status request that is not a list of flags unanswered, as Python Reticulum does.
 - `rnstatus-rs` shows the network an auto-connected interface was discovered through on a `Source` line under its name, as Python's `rnstatus` does, and its JSON output carries it as `autoconnect_source`.
 - AutoInterface's `devices` and `ignored_devices` take effect, and they and I2P `peers` are read as Python Reticulum reads lists: a quoted name that contains a comma stays one name, and `devices = ,` allows every interface.
+- TCP client interfaces read `i2p_tunneled`, as Python Reticulum does, and give a connection tunneled over I2P its longer I2P socket timeouts.
 
 ## 1.4.0 - 2026-10-12
 
