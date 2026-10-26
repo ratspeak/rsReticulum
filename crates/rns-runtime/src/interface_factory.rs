@@ -813,26 +813,12 @@ fn synthesize_auto(
         None => rns_interface::auto::McastAddrType::Temporary,
     };
 
-    // Python: comma-separated `devices` (whitelist) and `ignored_devices` (blacklist).
-    let devices = section.get_list("devices").map(|devices| {
-        devices
-            .iter()
-            .flat_map(|names| names.split(','))
-            .map(|n| n.trim().to_string())
-            .filter(|n| !n.is_empty())
-            .collect::<Vec<String>>()
-    });
-    let ignored_devices = section
-        .get_list("ignored_devices")
-        .map(|devices| {
-            devices
-                .iter()
-                .flat_map(|names| names.split(','))
-                .map(|n| n.trim().to_string())
-                .filter(|n| !n.is_empty())
-                .collect::<Vec<String>>()
-        })
-        .unwrap_or_default();
+    // Python `as_list`; an empty whitelist allows every interface
+    // (AutoInterface.py:111-112, :229).
+    let devices = section
+        .get_list("devices")
+        .filter(|devices| !devices.is_empty());
+    let ignored_devices = section.get_list("ignored_devices").unwrap_or_default();
 
     let configured_bitrate = section
         .get_uint("configured_bitrate")
@@ -1246,15 +1232,8 @@ fn synthesize_i2p(
     mode: InterfaceMode,
 ) -> Result<InterfaceConfig, InterfaceFactoryError> {
     let connectable = section.get_bool("connectable").unwrap_or(false);
-    // A comma-separated config value parses as a list (Python `as_list`).
-    let peers = section
-        .get_list("peers")
-        .unwrap_or_default()
-        .iter()
-        .flat_map(|peers| peers.split(','))
-        .map(|peer| peer.trim().to_string())
-        .filter(|peer| !peer.is_empty())
-        .collect();
+    // Python `as_list`: each item is a peer (I2PInterface.py:731, :812-813).
+    let peers = section.get_list("peers").unwrap_or_default();
     let i2p_sam_host = section
         .get("i2p_sam_host")
         .unwrap_or("127.0.0.1")
@@ -2443,6 +2422,31 @@ mod tests {
         );
     }
 
+    /// Python reads both lists with `as_list`, and an empty whitelist allows
+    /// every interface (AutoInterface.py:111-112, :154-162, :229).
+    #[test]
+    fn auto_device_lists_read_like_python_as_list() {
+        let lists = |devices: &str, ignored: &str| {
+            let text = format!(
+                "[interfaces]\n  [[Local]]\n    type = AutoInterface\n    enabled = yes\n    devices = {devices}\n    ignored_devices = {ignored}\n"
+            );
+            let config = crate::config::Config::parse(&text).unwrap();
+            let section = config.subsection("interfaces", "Local").unwrap();
+            let InterfaceConfig::Auto(config) = synthesize_interface("Local", section).unwrap()
+            else {
+                panic!("expected Auto");
+            };
+            (config.devices, config.ignored_devices)
+        };
+        let names = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(lists(",", ","), (None, vec![]));
+        assert_eq!(
+            lists("\"eth0,wlan0\"", "\"vmnet1,docker0\""),
+            (Some(names(&["eth0,wlan0"])), names(&["vmnet1,docker0"]))
+        );
+        assert_eq!(lists("", ""), (Some(names(&[""])), names(&[""])));
+    }
+
     #[test]
     fn test_synthesize_auto_advanced_options() {
         let mut section = enabled_section();
@@ -2450,8 +2454,11 @@ mod tests {
         section.set("group_id", "campus");
         section.set("discovery_scope", "site");
         section.set("multicast_address_type", "permanent");
-        section.set("devices", "eth0, wlan0 ,br-lan");
-        section.set("ignored_devices", "vmnet1,docker0");
+        section.set_list(
+            "devices",
+            vec!["eth0".into(), "wlan0".into(), "br-lan".into()],
+        );
+        section.set_list("ignored_devices", vec!["vmnet1".into(), "docker0".into()]);
         section.set("configured_bitrate", "100000000");
 
         let config = synthesize_interface("campus_auto", &section).unwrap();
@@ -2996,12 +3003,37 @@ mod tests {
         assert_eq!(pi.announce_cap, None);
     }
 
+    /// Python takes each `as_list` item as a peer (I2PInterface.py:731, :812-813).
+    #[test]
+    fn i2p_peers_read_like_python_as_list() {
+        let peers = |value: &str| {
+            let text = format!(
+                "[interfaces]\n  [[I2P]]\n    type = I2PInterface\n    enabled = yes\n    peers = {value}\n"
+            );
+            let config = crate::config::Config::parse(&text).unwrap();
+            let section = config.subsection("interfaces", "I2P").unwrap();
+            let InterfaceConfig::I2P(config) = synthesize_interface("I2P", section).unwrap() else {
+                panic!("expected I2P");
+            };
+            config.peers
+        };
+        assert_eq!(peers(","), Vec::<String>::new());
+        assert_eq!(
+            peers("\"a.b32.i2p,b.b32.i2p\", c.b32.i2p"),
+            ["a.b32.i2p,b.b32.i2p", "c.b32.i2p"]
+        );
+        assert_eq!(peers(""), [""]);
+    }
+
     #[test]
     fn test_synthesize_i2p() {
         let mut section = enabled_section();
         section.set("type", "I2PInterface");
         section.set("connectable", "yes");
-        section.set("peers", "abc123.b32.i2p, def456.b32.i2p");
+        section.set_list(
+            "peers",
+            vec!["abc123.b32.i2p".into(), "def456.b32.i2p".into()],
+        );
 
         let config = synthesize_interface("test_i2p", &section).unwrap();
         match config {
