@@ -236,6 +236,12 @@ shared_instance_port = 37432
 instance_control_port = 37433
 ```
 
+Programs use the control port with the instance's RPC key: `rpc_key` under
+`[reticulum]` when it is set, otherwise a key derived from the transport
+identity. That key is an admin credential: a program that has it can read the
+daemon's network state, drop its paths and block identities, so treat it like
+a password and give it only to programs you trust.
+
 ## Interface Support
 
 ###### Note: This is alpha, if something doesn't work, open an issue with enough context/information to help contribute to fixing it.
