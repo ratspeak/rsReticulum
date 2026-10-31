@@ -689,6 +689,7 @@ pub rns_interface::rnode::RNodeRuntimeReason::ConfigurationRejected
 pub rns_interface::rnode::RNodeRuntimeReason::ConnectionAttemptFailed
 pub rns_interface::rnode::RNodeRuntimeReason::ConnectionLost
 pub rns_interface::rnode::RNodeRuntimeReason::DeviceReset
+pub rns_interface::rnode::RNodeRuntimeReason::DeviceUnresponsive
 pub rns_interface::rnode::RNodeRuntimeReason::DriverTerminated
 pub rns_interface::rnode::RNodeRuntimeReason::RadioInitialisationFault
 pub rns_interface::rnode::RNodeRuntimeReason::StopRequested
@@ -718,6 +719,9 @@ pub rns_interface::rnode::RNodeTransportClass::Ble
 pub rns_interface::rnode::RNodeTransportClass::Serial
 pub rns_interface::rnode::RNodeTransportClass::Tcp
 pub rns_interface::rnode::RNodeTransportClass::Usb
+#[non_exhaustive] pub struct rns_interface::rnode::RNodeAttemptFailure
+pub rns_interface::rnode::RNodeAttemptFailure::consecutive: u32
+pub rns_interface::rnode::RNodeAttemptFailure::reason: rns_interface::rnode::RNodeRuntimeReason
 pub struct rns_interface::rnode::RNodeConfig
 pub rns_interface::rnode::RNodeConfig::bandwidth: u32
 pub rns_interface::rnode::RNodeConfig::baud_rate: u32
@@ -771,6 +775,7 @@ pub rns_interface::rnode::RNodeRuntimeSnapshot::connection_generation: u64
 pub rns_interface::rnode::RNodeRuntimeSnapshot::detection: rns_interface::rnode::RNodeDetectionState
 pub rns_interface::rnode::RNodeRuntimeSnapshot::disconnect_total: u64
 pub rns_interface::rnode::RNodeRuntimeSnapshot::firmware_compatibility: rns_interface::rnode::RNodeFirmwareCompatibility
+pub rns_interface::rnode::RNodeRuntimeSnapshot::last_attempt_failure: core::option::Option<rns_interface::rnode::RNodeAttemptFailure>
 pub rns_interface::rnode::RNodeRuntimeSnapshot::phase: rns_interface::rnode::RNodeRuntimePhase
 pub rns_interface::rnode::RNodeRuntimeSnapshot::port_failure: core::option::Option<rns_interface::rnode::RNodePortFailureClass>
 pub rns_interface::rnode::RNodeRuntimeSnapshot::radio: rns_interface::rnode::RNodeObservedRadioState
