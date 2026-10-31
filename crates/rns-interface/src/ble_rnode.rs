@@ -106,6 +106,11 @@ const RNODE_BLE_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 const RNODE_NATIVE_BRIDGE_ACK_COMMAND: u8 = 0xA0;
 const RNODE_NATIVE_BRIDGE_ACK_MAGIC: &[u8; 5] = b"RSBA\x01";
 const RNODE_NATIVE_BRIDGE_ACK_PAYLOAD_LEN: usize = RNODE_NATIVE_BRIDGE_ACK_MAGIC.len() + 8;
+/// Closed localhost-only record the driver sends the Android GATT owner when
+/// the radio never answered detection on this bridge generation. The owner
+/// consumes it, never forwards it to the radio, and replaces the physical link.
+const RNODE_NATIVE_BRIDGE_UNRESPONSIVE_COMMAND: u8 = 0xA1;
+const RNODE_NATIVE_BRIDGE_UNRESPONSIVE_MAGIC: &[u8; 5] = b"RSBU\x01";
 const RNODE_NATIVE_MAX_PACKET: usize = 508;
 const RNODE_NATIVE_MAX_ESCAPED_FRAME: usize = RNODE_NATIVE_MAX_PACKET * 2 + 3;
 const RNODE_NATIVE_ACK_MIN_WRITE_CHUNK: usize = BLE_DEFAULT_ATT_WRITE_PAYLOAD;
@@ -633,13 +638,22 @@ struct NativeHandshakeState<'a> {
     pre_ready_data_bytes: &'a mut usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeHandshakeOutcome {
+    Detected,
+    /// The bridge stayed open for the whole window and the radio never answered.
+    TimedOut,
+    /// Stop requested, the bridge closed, or its carry overflowed.
+    Ended,
+}
+
 async fn probe_native_rnode_handshake(
     tcp_read: &mut tokio::net::tcp::OwnedReadHalf,
     tcp_write: &mut tokio::net::tcp::OwnedWriteHalf,
     timeout: Duration,
     probe_interval: Duration,
     state: NativeHandshakeState<'_>,
-) -> bool {
+) -> NativeHandshakeOutcome {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let detect_seq = rnode::build_detect_sequence();
@@ -649,14 +663,14 @@ async fn probe_native_rnode_handshake(
 
     while std::time::Instant::now() < deadline {
         if !state.running_task.load(Ordering::SeqCst) {
-            return false;
+            return NativeHandshakeOutcome::Ended;
         }
 
         let now = std::time::Instant::now();
         if now >= next_probe {
             if let Err(e) = tcp_write.write_all(&detect_seq).await {
                 tracing::warn!(error = %e, "BLE RNode native detect probe write failed");
-                return false;
+                return NativeHandshakeOutcome::Ended;
             }
             let _ = tcp_write.flush().await;
             next_probe = std::time::Instant::now() + probe_interval;
@@ -674,9 +688,8 @@ async fn probe_native_rnode_handshake(
 
         let read = tokio::time::timeout(read_budget, tcp_read.read(&mut buf)).await;
         let n = match read {
-            Ok(Ok(0)) => return false,
+            Ok(Ok(0)) | Ok(Err(_)) => return NativeHandshakeOutcome::Ended,
             Ok(Ok(n)) => n,
-            Ok(Err(_)) => return false,
             Err(_) => continue,
         };
 
@@ -687,16 +700,16 @@ async fn probe_native_rnode_handshake(
             state.pre_ready_data,
             state.pre_ready_data_bytes,
         ) {
-            Ok(true) => return true,
+            Ok(true) => return NativeHandshakeOutcome::Detected,
             Ok(false) => {}
             Err(()) => {
                 tracing::warn!("native BLE pre-Ready DATA carry exceeded bound during handshake");
-                return false;
+                return NativeHandshakeOutcome::Ended;
             }
         }
     }
 
-    false
+    NativeHandshakeOutcome::TimedOut
 }
 
 enum BleCapabilityPreflightOutcome {
@@ -1657,6 +1670,36 @@ fn native_bridge_acknowledged_data_frames(command: u8, payload: &[u8]) -> Option
     ))
 }
 
+fn native_bridge_unresponsive_frame() -> Vec<u8> {
+    let mut frame = Vec::with_capacity(RNODE_NATIVE_BRIDGE_UNRESPONSIVE_MAGIC.len() + 4);
+    kiss::frame_with_command_into(
+        RNODE_NATIVE_BRIDGE_UNRESPONSIVE_COMMAND,
+        RNODE_NATIVE_BRIDGE_UNRESPONSIVE_MAGIC,
+        &mut frame,
+    );
+    frame
+}
+
+async fn report_native_radio_unresponsive(tcp_write: &mut tokio::net::tcp::OwnedWriteHalf) {
+    use tokio::io::AsyncWriteExt;
+    let _ = tcp_write
+        .write_all(&native_bridge_unresponsive_frame())
+        .await;
+    let _ = tcp_write.flush().await;
+}
+
+/// Why a pre-Ready attempt failed, from the evidence that attempt gathered.
+fn attempt_failure_reason(state: &RNodeProtocolState, timed_out: bool) -> RNodeRuntimeReason {
+    let evidence = state.evidence();
+    if evidence.radio_initialisation_fault {
+        RNodeRuntimeReason::RadioInitialisationFault
+    } else if timed_out && !state.detection_observed() && evidence.firmware.is_none() {
+        RNodeRuntimeReason::DeviceUnresponsive
+    } else {
+        RNodeRuntimeReason::ConnectionAttemptFailed
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeStartupReductionError {
     MalformedBridgeAck,
@@ -2585,6 +2628,8 @@ enum BleHandshakeOutcome {
     Stopped,
 }
 
+const DESKTOP_DETECT_TIMED_OUT: &str = "detect evidence timed out";
+
 async fn observe_desktop_ble_handshake<S, E>(
     notification_stream: &mut S,
     adapter_events: &mut E,
@@ -2644,7 +2689,7 @@ where
                 }
             }
             _ = tokio::time::sleep_until(deadline) => {
-                return BleHandshakeOutcome::Retry("detect evidence timed out");
+                return BleHandshakeOutcome::Retry(DESKTOP_DETECT_TIMED_OUT);
             }
         }
     }
@@ -3043,7 +3088,13 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                         return;
                     }
                     BleCapabilityPreflightOutcome::Retry(reason) => {
-                        snapshot_publisher.connection_attempt_failed();
+                        snapshot_publisher.connection_attempt_failed_because(
+                            if reason == BleCapabilityRetry::ResponseTimedOut {
+                                RNodeRuntimeReason::DeviceUnresponsive
+                            } else {
+                                RNodeRuntimeReason::ConnectionAttemptFailed
+                            },
+                        );
                         tracing::warn!(
                             name = %log_name,
                             admission_failure = reason.log_class(),
@@ -3127,7 +3178,12 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                     }
                     BleHandshakeOutcome::Retry(reason) => {
                         trace_ble_lifecycle(generation_id, "detect_handshake", "retry", None, None);
-                        snapshot_publisher.connection_attempt_failed();
+                        snapshot_publisher.connection_attempt_failed_because(
+                            attempt_failure_reason(
+                                &protocol_state,
+                                reason == DESKTOP_DETECT_TIMED_OUT,
+                            ),
+                        );
                         tracing::warn!(
                             name = %log_name,
                             reason,
@@ -3362,7 +3418,10 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                         _ => "retry",
                     };
                     trace_ble_lifecycle(generation_id, "typed_readiness", result_class, None, None);
-                    snapshot_publisher.connection_attempt_failed();
+                    snapshot_publisher.connection_attempt_failed_because(attempt_failure_reason(
+                        &protocol_state,
+                        false,
+                    ));
                     tracing::warn!(name = %log_name, reason, "BLE RNode did not reach Ready");
                     ble_diag(format!("[ble] readiness retry: {reason}"));
                     let _ =
@@ -3903,7 +3962,15 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                         return;
                     }
                     BleCapabilityPreflightOutcome::Retry(reason) => {
-                        snapshot_publisher.connection_attempt_failed();
+                        let cause = if reason == BleCapabilityRetry::ResponseTimedOut {
+                            report_native_radio_unresponsive(&mut tcp_write).await;
+                            RNodeRuntimeReason::DeviceUnresponsive
+                        } else {
+                            RNodeRuntimeReason::ConnectionAttemptFailed
+                        };
+                        drop(tcp_read);
+                        drop(tcp_write);
+                        snapshot_publisher.connection_attempt_failed_because(cause);
                         tracing::warn!(
                             name = %log_name,
                             admission_failure = reason.log_class(),
@@ -3937,7 +4004,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                 // Preserve native bridge compatibility: either a confirmed
                 // detect response or any non-empty firmware response admits
                 // the connection in the legacy policy.
-                let detected = probe_native_rnode_handshake(
+                let handshake = probe_native_rnode_handshake(
                     &mut tcp_read,
                     &mut tcp_write,
                     RNODE_NATIVE_HANDSHAKE_TIMEOUT,
@@ -3951,7 +4018,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                     },
                 )
                 .await;
-                if !detected {
+                if handshake != NativeHandshakeOutcome::Detected {
                     if !running_task.load(Ordering::SeqCst) {
                         publish_ble_stopped(
                             &mut snapshot_publisher,
@@ -3959,7 +4026,18 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                         );
                         return;
                     }
-                    snapshot_publisher.connection_attempt_failed();
+                    let timed_out = handshake == NativeHandshakeOutcome::TimedOut;
+                    if timed_out {
+                        report_native_radio_unresponsive(&mut tcp_write).await;
+                    }
+                    // Release the bridge before backing off so the GATT owner
+                    // learns of the failure now, not after the backoff.
+                    drop(tcp_read);
+                    drop(tcp_write);
+                    snapshot_publisher.connection_attempt_failed_because(attempt_failure_reason(
+                        &protocol_state,
+                        timed_out,
+                    ));
                     tracing::warn!(
                         name = %log_name,
                         "BLE RNode handshake timed out — RNode did not respond to detect, retrying"
@@ -4110,6 +4188,10 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                 if let Some(rejected) = protocol_state.definitive_rejection() {
                     break NativeStartupOutcome::Rejected(rejected);
                 }
+                // Upstream treats ERROR_INITRADIO as an I/O failure and reconnects.
+                if protocol_state.evidence().radio_initialisation_fault {
+                    break NativeStartupOutcome::Retry("radio initialisation fault");
+                }
                 tokio::select! {
                     result = tcp_read.read(&mut startup_buf) => match result {
                         Ok(0) => break NativeStartupOutcome::Retry(
@@ -4186,8 +4268,16 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                     return;
                 }
                 NativeStartupOutcome::Retry(reason) => {
-                    snapshot_publisher.connection_attempt_failed();
-                    tracing::warn!(name = %log_name, reason, "BLE RNode native did not reach Ready");
+                    snapshot_publisher.connection_attempt_failed_because(attempt_failure_reason(
+                        &protocol_state,
+                        false,
+                    ));
+                    tracing::warn!(
+                        name = %log_name,
+                        reason,
+                        blocker = ?protocol_state.readiness(),
+                        "BLE RNode native did not reach Ready"
+                    );
                     if reconnect_try_exhausted(&mut tries) {
                         snapshot_publisher.stopped(RNodeRuntimeReason::DriverTerminated);
                         return;
@@ -5957,6 +6047,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_bridge_unresponsive_record_is_the_exact_android_contract() {
+        assert_eq!(
+            native_bridge_unresponsive_frame(),
+            [kiss::FEND, 0xA1, b'R', b'S', b'B', b'U', 0x01, kiss::FEND]
+        );
+    }
+
+    #[test]
+    fn attempt_failure_reason_names_faults_and_silence_only() {
+        let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
+        let silent = RNodeProtocolState::new(target);
+        assert_eq!(
+            attempt_failure_reason(&silent, true),
+            RNodeRuntimeReason::DeviceUnresponsive
+        );
+        assert_eq!(
+            attempt_failure_reason(&silent, false),
+            RNodeRuntimeReason::ConnectionAttemptFailed
+        );
+        let mut answered = RNodeProtocolState::new(target);
+        answered.apply_frame(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
+        assert_eq!(
+            attempt_failure_reason(&answered, true),
+            RNodeRuntimeReason::ConnectionAttemptFailed
+        );
+        answered.apply_frame(rnode::CMD_ERROR, &[0x01]);
+        assert_eq!(
+            attempt_failure_reason(&answered, false),
+            RNodeRuntimeReason::RadioInitialisationFault
+        );
+    }
+
+    #[tokio::test]
+    async fn test_native_ble_handshake_probe_times_out_only_while_the_bridge_stays_open() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind native bridge loopback");
+        let address = listener.local_addr().expect("loopback address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept native bridge");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            drop(stream);
+        });
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect native bridge loopback");
+        let (mut read, mut write) = stream.into_split();
+        let target = RNodeProtocolTarget::new(915_000_000, 125_000, 7, 5, 17);
+        let mut protocol_state = RNodeProtocolState::new(target);
+        let mut deframer = kiss::RawKissDeframer::new();
+        let running = AtomicBool::new(true);
+        let mut pre_ready_data = Vec::new();
+        let mut pre_ready_data_bytes = 0;
+        macro_rules! probe {
+            ($timeout:expr) => {
+                probe_native_rnode_handshake(
+                    &mut read,
+                    &mut write,
+                    $timeout,
+                    Duration::from_millis(50),
+                    NativeHandshakeState {
+                        protocol_state: &mut protocol_state,
+                        deframer: &mut deframer,
+                        running_task: &running,
+                        pre_ready_data: &mut pre_ready_data,
+                        pre_ready_data_bytes: &mut pre_ready_data_bytes,
+                    },
+                )
+                .await
+            };
+        }
+        assert_eq!(
+            probe!(Duration::from_millis(200)),
+            NativeHandshakeOutcome::TimedOut
+        );
+        server.await.expect("native bridge server task");
+        assert_eq!(
+            probe!(Duration::from_secs(2)),
+            NativeHandshakeOutcome::Ended
+        );
+    }
+
     #[tokio::test]
     async fn test_native_ble_handshake_probe_accepts_loopback_batch() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -5994,7 +6167,7 @@ mod tests {
         let mut pre_ready_data = Vec::new();
         let mut pre_ready_data_bytes = 0;
 
-        assert!(
+        assert_eq!(
             probe_native_rnode_handshake(
                 &mut read,
                 &mut write,
@@ -6008,7 +6181,8 @@ mod tests {
                     pre_ready_data_bytes: &mut pre_ready_data_bytes,
                 },
             )
-            .await
+            .await,
+            NativeHandshakeOutcome::Detected
         );
         assert!(pre_ready_data.is_empty());
         let legacy_request = server.await.expect("native bridge server task");

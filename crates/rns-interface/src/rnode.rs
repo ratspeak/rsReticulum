@@ -477,10 +477,21 @@ pub enum RNodeRuntimeReason {
     DriverTerminated,
     DeviceReset,
     RadioInitialisationFault,
+    /// The transport connected, but the device never answered detection.
+    DeviceUnresponsive,
     CapabilityAdmissionRejected,
     /// The device reported settings or firmware this configuration cannot
     /// use; retrying the same settings cannot succeed.
     ConfigurationRejected,
+}
+
+/// Why the latest attempt to reach Ready failed, and how many attempts in a
+/// row failed the same way. Survives reconnects; cleared once Ready.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct RNodeAttemptFailure {
+    pub reason: RNodeRuntimeReason,
+    pub consecutive: u32,
 }
 
 /// Privacy-safe class of a serial port or TCP endpoint that could not be
@@ -530,6 +541,7 @@ pub struct RNodeRuntimeSnapshot {
     pub configuration_rejection: Option<crate::rnode_protocol::RNodeReadinessEvidence>,
     /// Why the port could not be opened; kept across retries until it opens.
     pub port_failure: Option<RNodePortFailureClass>,
+    pub last_attempt_failure: Option<RNodeAttemptFailure>,
 }
 
 #[cfg(any(
@@ -558,7 +570,19 @@ impl RNodeRuntimeSnapshot {
             capability_admission_failure: None,
             configuration_rejection: None,
             port_failure: None,
+            last_attempt_failure: None,
         }
+    }
+
+    fn record_attempt_failure(&mut self, reason: RNodeRuntimeReason) {
+        let consecutive = match self.last_attempt_failure {
+            Some(last) if last.reason == reason => last.consecutive.saturating_add(1),
+            _ => 1,
+        };
+        self.last_attempt_failure = Some(RNodeAttemptFailure {
+            reason,
+            consecutive,
+        });
     }
 
     fn reset_protocol_observations(&mut self) {
@@ -643,6 +667,9 @@ fn project_rnode_protocol_state(
         RNodeReadiness::Ready => RNodeRuntimePhase::Ready,
         RNodeReadiness::Blocked(_) => RNodeRuntimePhase::AwaitingReadiness,
     };
+    if snapshot.phase == RNodeRuntimePhase::Ready {
+        snapshot.last_attempt_failure = None;
+    }
 
     if evidence.radio_initialisation_fault {
         snapshot.reason = Some(RNodeRuntimeReason::RadioInitialisationFault);
@@ -986,11 +1013,22 @@ impl RNodeSnapshotPublisher {
         target_os = "android"
     ))]
     pub(crate) fn connection_attempt_failed(&self) {
+        self.connection_attempt_failed_because(RNodeRuntimeReason::ConnectionAttemptFailed);
+    }
+
+    #[cfg(any(
+        feature = "serial",
+        feature = "rnode-tcp",
+        feature = "ble",
+        target_os = "android"
+    ))]
+    pub(crate) fn connection_attempt_failed_because(&self, reason: RNodeRuntimeReason) {
         self.update(|snapshot| {
             snapshot.phase = RNodeRuntimePhase::ReconnectBackoff;
             snapshot.connection_generation = 0;
-            snapshot.reason = Some(RNodeRuntimeReason::ConnectionAttemptFailed);
+            snapshot.reason = Some(reason);
             snapshot.port_failure = None;
+            snapshot.record_attempt_failure(reason);
             snapshot.reset_protocol_observations();
         });
     }
@@ -1002,6 +1040,7 @@ impl RNodeSnapshotPublisher {
             snapshot.connection_generation = 0;
             snapshot.reason = Some(RNodeRuntimeReason::ConnectionAttemptFailed);
             snapshot.port_failure = Some(failure);
+            snapshot.record_attempt_failure(RNodeRuntimeReason::ConnectionAttemptFailed);
             snapshot.reset_protocol_observations();
         });
     }
@@ -4121,6 +4160,35 @@ mod tests {
         for (error, token) in cases {
             assert_eq!(error.failure_class().log_class(), *token);
         }
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn attempt_failures_count_in_a_row_survive_reconnects_and_clear_at_ready() {
+        use RNodeRuntimeReason::{DeviceUnresponsive, RadioInitialisationFault};
+        let failure = |driver: &RNodeDriverHandle| {
+            driver
+                .snapshot()
+                .last_attempt_failure
+                .map(|failure| (failure.reason, failure.consecutive))
+        };
+        let (publisher, driver) = new_rnode_driver_observation(RNodeTransportClass::Ble);
+        publisher.connection_attempt_failed_because(RadioInitialisationFault);
+        publisher.reconnect_started();
+        assert_eq!(driver.snapshot().reason, None);
+        assert_eq!(failure(&driver), Some((RadioInitialisationFault, 1)));
+        publisher.connection_attempt_failed_because(RadioInitialisationFault);
+        assert_eq!(failure(&driver), Some((RadioInitialisationFault, 2)));
+        publisher.connection_attempt_failed_because(DeviceUnresponsive);
+        assert_eq!(failure(&driver), Some((DeviceUnresponsive, 1)));
+
+        let mut snapshot = (*driver.snapshot()).clone();
+        let mut state = RNodeProtocolState::new(TEST_PROTOCOL_TARGET);
+        for (command, payload) in protocol_required_frames(TEST_PROTOCOL_TARGET) {
+            apply_projected_frame(&mut state, &mut snapshot, command, &payload);
+        }
+        assert_eq!(snapshot.phase, RNodeRuntimePhase::Ready);
+        assert_eq!(snapshot.last_attempt_failure, None);
     }
 
     #[test]
