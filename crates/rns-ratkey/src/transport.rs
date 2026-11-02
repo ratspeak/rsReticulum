@@ -1,7 +1,7 @@
 //! Transport seam for PIV. The PIV protocol logic lives in `PivSession`; this
 //! trait is the only platform-specific part: APDU bytes in, response bytes out.
-//! Desktop PC/SC ships here behind the `hardware` feature. Mobile NFC/USB
-//! transports live in the application layer and implement the same trait.
+//! Desktop PC/SC ships here behind the `hardware` feature. Applications can
+//! implement mobile NFC/USB transports through this trait.
 
 use crate::error::RatkeyError;
 
@@ -9,7 +9,9 @@ pub trait PivTransport {
     /// Send one ISO 7816-4 APDU; return the full response including SW1/SW2.
     fn transmit(&mut self, apdu: &[u8]) -> Result<Vec<u8>, RatkeyError>;
 
-    /// Cheap liveness probe — token still present and responding.
+    /// Best-effort liveness probe, not an authentication or capability check.
+    /// The PC/SC implementation only checks whether a metadata command can be
+    /// transmitted; it does not require a successful APDU status.
     fn is_connected(&self) -> bool;
 }
 
@@ -29,8 +31,10 @@ mod pcsc_transport {
 
     const MAX_RESPONSE: usize = 4096;
 
-    /// Real PIV transport over PC/SC (YubiKey 5, Nitrokey 3). Requires a PC/SC
-    /// daemon: macOS CryptoTokenKit / Linux pcscd / Windows WinSCard.
+    /// PC/SC APDU transport, enabled by `hardware`. Requires the platform
+    /// PC/SC library/service (system smart-card support on macOS/Windows,
+    /// libpcsclite and pcscd on Linux). Connection does not establish that
+    /// the card supports the required key algorithms or vendor extensions.
     pub struct PcscTransport {
         card: pcsc::Card,
     }

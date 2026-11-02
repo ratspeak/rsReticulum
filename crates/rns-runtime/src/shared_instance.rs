@@ -1,10 +1,11 @@
 //! Explicit local shared-instance admission for applications that require RPC.
 //!
-//! This is an opt-in application policy, not a change to Python-compatible
-//! automatic sharing. Packet IPC is not authenticated by upstream's protocol;
-//! RPC authenticates the control endpoint, not the identity of a packet socket.
-//! Both endpoints must be selected by the caller. Every reconnect revalidates
-//! RPC before resuming packet traffic. No local interface fallback is performed.
+//! `SharedClient` authenticates the selected control endpoint before packet
+//! traffic starts and on every reconnect. The separate packet socket has no
+//! cryptographic binding to that RPC authentication. Both endpoints must be
+//! selected by the caller; this policy does not fall back to local interfaces.
+//! Queued outbound packets are discarded while reconnecting, so higher
+//! protocol layers must handle retries. `Configured` retains automatic sharing.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -116,7 +117,9 @@ impl std::fmt::Debug for SharedInstanceCredentials {
 }
 
 impl SharedInstanceCredentials {
-    /// Keys are opaque HMAC bytes, not necessarily the default 32-byte hash.
+    /// Validate the endpoint and accept 1..=1024 opaque HMAC-key bytes. The key
+    /// need not be the default 32-byte hash; construction does not contact or
+    /// authenticate the service.
     pub fn new(
         endpoint: SharedInstanceEndpoint,
         rpc_key: Vec<u8>,
@@ -138,8 +141,9 @@ impl SharedInstanceCredentials {
         config.rpc_key = Some(self.rpc_key.to_vec());
     }
 
-    /// Test packet availability and authenticated interface-status RPC without
-    /// starting a Reticulum runtime or persisting the credential.
+    /// Connect to the packet socket, authenticate the control socket and request
+    /// interface status, then close the connections. This does not exchange a
+    /// Reticulum packet, start a runtime or persist the credential.
     pub async fn test(&self) -> Result<(), SharedInstanceError> {
         self.connect().await.map(|_| ())
     }
@@ -238,7 +242,7 @@ pub enum SharedInstanceState {
     Stopped,
 }
 
-/// Bounded, credential-free shared admission failures.
+/// Credential-free shared-admission errors with fixed variants and messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SharedInstanceError {
     #[error("invalid local shared-instance endpoint")]
@@ -265,7 +269,7 @@ pub enum SharedInstanceError {
     ControlBindFailed,
 }
 
-/// Policy startup errors are additive; the existing `ReticulumError` stays intact.
+/// Runtime-initialization or explicit shared-instance admission failure.
 #[derive(Debug, thiserror::Error)]
 pub enum InstanceStartupError {
     #[error(transparent)]

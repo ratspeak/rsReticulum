@@ -1,12 +1,13 @@
-//! Weave switching fabric — protocol primitives only.
+//! Weave switching-fabric codecs and constants.
 //!
 //! Wire format (WDCL inside HDLC):
 //! ```text
 //! [HDLC_FLAG] [escaped WDCL] [HDLC_FLAG]
-//! WDCL = [ADDR u32][TYPE u8][PAYLOAD…]   ADDR 0xFFFFFFFF = broadcast
+//! WDCL = [ADDR:4 bytes][TYPE:1 byte][PAYLOAD...]
+//! ADDR 0xFFFFFFFF = broadcast
 //! ```
-//! Discovery: Ed25519 challenge-response over WDCL_T_DISCOVER / WDCL_T_CONNECT.
-//! Runtime spawn (serial I/O, peer mgmt) not yet wired up.
+//! This module provides frame and log codecs plus configuration types. It
+//! has no serial runtime, discovery handshake, or signature-verification path.
 
 use crate::traits::InterfaceMode;
 

@@ -1,4 +1,7 @@
-//! HDLC-framed data over a subprocess's stdin/stdout; respawns on exit.
+//! HDLC-framed data over a subprocess's stdin/stdout. The task retries failed
+//! spawns and respawns after stdout EOF or a read error. The command is split
+//! on whitespace and executed directly: shell quoting, expansion, and
+//! pipelines are not interpreted.
 
 use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::sync::Arc;
@@ -21,7 +24,8 @@ pub const DEFAULT_RESPAWN_DELAY: f64 = 5.0;
 pub struct PipeInterfaceConfig {
     pub name: String,
     pub command: String,
-    /// Seconds before respawning after subprocess exit.
+    /// Seconds before respawning. Must be finite, non-negative, and representable
+    /// as a `Duration`; this field is not validated before the task starts.
     pub respawn_delay: f64,
     pub mode: InterfaceMode,
 }

@@ -39,8 +39,9 @@ type BleCentralEventStream = std::pin::Pin<Box<dyn futures::Stream<Item = Centra
 #[cfg(target_os = "android")]
 static BTLEPLUG_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// Set from `JNI_OnLoad` after `btleplug::platform::init()` succeeds.
-/// Without it, btleplug has no JVM reference and every call panics.
+/// Record successful `btleplug::platform::init()` during Android JNI setup.
+/// This flag does not initialise btleplug itself; callers must complete that
+/// initialisation before setting it.
 #[cfg(target_os = "android")]
 pub fn mark_btleplug_initialized() {
     BTLEPLUG_INITIALIZED.store(true, Ordering::SeqCst);
@@ -1126,7 +1127,8 @@ pub struct LinuxPairingPrompt {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LinuxPairingFinished {
     pub attempt_id: u64,
-    /// "ok", "cancelled", "timed_out", or a short BlueZ error string.
+    /// `"ok"` on success; otherwise the formatted interface error. Error strings
+    /// are descriptive text, not stable status codes.
     pub status: String,
 }
 
@@ -1202,16 +1204,10 @@ pub fn linux_submit_passkey(passkey: u32) -> bool {
     false
 }
 
-/// Tear down the in-flight pair attempt:
-///   1. Flip `aborted` so any subsequent `request_passkey` rejects without
-///      broadcasting a fresh prompt.
-///   2. Drop the oneshot so the current `request_passkey` (if any) resolves
-///      with `Canceled`.
-///   3. Notify the task running `linux_trigger_pairing` to drop its
-///      `device.pair()` future — bluer translates that drop into a BlueZ
-///      `CancelPairing` D-Bus call so the daemon stops retrying SMP.
-///   4. Drain any prompts queued in the broadcast channel so a relay that
-///      hasn't run since cancel can't surface a stale prompt.
+/// Cancel the in-flight Linux pairing attempt. Marks it aborted, drops the
+/// waiting passkey sender, and notifies the pairing task to cancel its pending
+/// operation. Already broadcast prompts are not removed; consumers must use
+/// attempt IDs and completion events to discard stale prompts.
 #[cfg(target_os = "linux")]
 pub fn linux_cancel_pairing() {
     let cancel_notify = if let Ok(mut guard) = LINUX_PAIRING_STATE.lock() {
@@ -1235,7 +1231,8 @@ pub fn linux_cancel_pairing() {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BleDeviceType {
-    /// Advertises the Nordic UART Service.
+    /// Classified as an RNode candidate by the scan filter; not authenticated
+    /// as RNode firmware.
     RNode,
     Unknown,
 }
@@ -1246,15 +1243,10 @@ pub struct BleDevice {
     pub address: String,
     pub rssi: Option<i16>,
     pub device_type: BleDeviceType,
-    /// True if the OS already has a bond with this device.
-    ///
-    /// Reliability by platform:
-    ///   - Android: ground truth (Kotlin reads `BluetoothDevice.bondState`).
-    ///   - Linux: ground truth (bluer's `device.is_paired()` queried in
-    ///     `scan_ble_devices`).
-    ///   - Apple (iOS / macOS) and Windows: always `false` — neither
-    ///     CoreBluetooth nor btleplug's WinRT backend exposes bond state.
-    ///     Embedding UIs should hide bonded-state badges on these platforms.
+    /// Paired-state observation. This module queries BlueZ on Linux, returning
+    /// false if the query fails; its other scan backends report false. Android
+    /// embedding code may populate this field from a native bond-state query.
+    /// False therefore does not always mean that the device is unpaired.
     pub bonded: bool,
 }
 
@@ -1391,25 +1383,15 @@ pub async fn ble_adapter_present() -> Result<bool, String> {
     }
 }
 
-/// Tags anything advertising the Nordic UART Service as `RNode`, the rest
-/// as `Unknown`.
+/// Scan for named RNode candidates. A result must have a name beginning with
+/// `RNode` and either advertise Nordic UART Service or report no service UUIDs.
+/// Unnamed and other devices are omitted. This is a discovery filter, not
+/// firmware or identity authentication.
 ///
-/// `bonded` semantics by platform:
-///   - **Linux**: queried directly from BlueZ via bluer's `device.is_paired()`.
-///     Ground truth.
-///   - **Android**: not used here — the Android frontend bypasses this
-///     function entirely and reads `BluetoothDevice.bondState` natively in
-///     Kotlin.
-///   - **Apple (iOS / macOS) and Windows**: always `false`. CoreBluetooth
-///     (by design, for privacy) and btleplug's WinRT backend don't expose
-///     bond state to apps. Embedding UIs should hide bonded-state badges on
-///     these platforms.
-///
-/// Apple bonded-state detection would require an objc2 bridge to
-/// `CBCentralManager.retrievePeripheralsWithIdentifiers(_:)` or a local cache.
-///
-/// Windows bonded-state detection would require a WinRT
-/// `BluetoothLEDevice.DeviceInformation.Pairing.IsPaired` binding.
+/// On Linux, `bonded` uses BlueZ's paired flag and is false when the query
+/// fails. This function reports false on other platforms; Android embedding
+/// code can obtain bond state separately through its native bridge. A false
+/// result outside Linux does not establish that no bond exists.
 pub async fn scan_ble_devices(timeout_secs: u64) -> Result<Vec<BleDevice>, String> {
     let adapter = get_adapter().await.map_err(|e| format!("{e}"))?;
 
@@ -2720,8 +2702,9 @@ fn project_ble_rnode_startup_bytes(
     projection
 }
 
-/// Auto-reconnect across drops; resolve_ble_target re-runs every retry so
-/// iOS RPA rotation heals automatically.
+/// Reconnect after connection loss, resolving the configured BLE target on
+/// each retry. Rediscovery depends on the target remaining identifiable;
+/// address changes do not guarantee a successful reconnect.
 pub async fn spawn_ble_rnode_interface(
     config: BleRNodeConfig,
     id: InterfaceId,
@@ -2734,11 +2717,10 @@ pub async fn spawn_ble_rnode_interface(
     )
 }
 
-/// Spawn a desktop BLE RNode interface with privacy-safe local observation.
+/// Spawn a btleplug-based BLE RNode interface with local driver observation.
 ///
-/// This retains btleplug ownership and the compatibility facade above. The
-/// native Android TCP bridge has its own lifecycle and is intentionally not
-/// projected here.
+/// This owns the btleplug connection. The native Android TCP bridge uses the
+/// separate `spawn_ble_rnode_interface_native_with_driver` entry point.
 pub async fn spawn_ble_rnode_interface_with_driver(
     config: BleRNodeConfig,
     id: InterfaceId,
@@ -2754,14 +2736,13 @@ pub async fn spawn_ble_rnode_interface_with_driver(
     .map_err(RNodeSpawnError::into_legacy_interface_error)
 }
 
-/// Spawn a desktop BLE RNode interface with an explicit startup policy.
+/// Spawn a btleplug-based BLE RNode interface with an explicit startup policy.
 ///
-/// BLE connection work remains asynchronous, so capability results arrive on
-/// the returned driver observation rather than as a late function error. A
-/// deterministic capability rejection on any connection generation publishes
-/// terminal [`RNodeRuntimeReason::CapabilityAdmissionRejected`]. A response
-/// timeout or transport loss retains the established BLE reconnect policy.
-/// [`RNodeStartupOptions::default`] preserves the historical wire sequence.
+/// Connection work is asynchronous, so capability outcomes arrive through the
+/// returned driver observation. Deterministic rejection on any generation
+/// publishes terminal [`RNodeRuntimeReason::CapabilityAdmissionRejected`].
+/// A response timeout or transport loss retains the reconnect policy.
+/// [`RNodeStartupOptions::default`] does not request EEPROM capability data.
 pub async fn spawn_ble_rnode_interface_with_driver_and_options(
     config: BleRNodeConfig,
     id: InterfaceId,
@@ -3750,13 +3731,13 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
     Ok(SpawnedRNodeInterface { interface, driver })
 }
 
-/// Android-only TCP-bridge variant. btleplug's deprecated JNI breaks on
-/// Android 14+, so Kotlin (`RatspeakBleGatt.kt`) owns the GATT lifecycle
-/// and forwards NUS bytes over `tcp_port`.
+/// TCP-bridge entry point used by the Android native BLE integration. Kotlin
+/// (`RatspeakBleGatt.kt`) owns GATT and forwards NUS bytes over `tcp_port`;
+/// this Rust function itself is available with feature `ble` on other targets.
 ///
-/// The bridge admits the local connection before its GATT link exists, so
-/// each TCP generation sends nothing until the bridge writes its first byte;
-/// Kotlin marks attachment with a zero-count acknowledgement.
+/// Each TCP generation sends no startup bytes until the bridge produces its
+/// first byte. The Android bridge marks attachment with a zero-count
+/// acknowledgement.
 pub async fn spawn_ble_rnode_interface_native(
     config: BleRNodeConfig,
     id: InterfaceId,

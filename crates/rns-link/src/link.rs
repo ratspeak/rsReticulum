@@ -25,11 +25,12 @@ pub enum LinkState {
     Active = 0x02,
     /// No inbound traffic for `stale_time`.
     Stale = 0x03,
-    /// Link torn down and keys purged.
+    /// Link torn down and its owned keys purged. External key copies remain
+    /// the responsibility of their owners.
     Closed = 0x04,
 }
 
-/// The local endpoint's immutable role in a Link session.
+/// The local endpoint's role, fixed by construction for a valid Link session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkRole {
     Initiator,
@@ -107,7 +108,8 @@ pub enum OutboundResourceState {
     Failed,
 }
 
-/// The result of a `request()` call indicating how the request should be sent.
+/// Size classification returned by [`Link::classify_request`].
+/// The contained bytes remain plaintext and have not been sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestSendMode {
     /// Request fits in a single packet (data size <= MDU).
@@ -155,7 +157,10 @@ fn peer_reported_rtt(secs: f64) -> Option<Duration> {
 /// An encrypted bidirectional tunnel between two peers.
 ///
 /// The state machine is driven by `tick()` calls from the owning actor/runtime;
-/// there is no internal watchdog thread.
+/// there is no internal watchdog thread. It uses `std::time::Instant` for
+/// state deadlines. The owner handles transport, peer-key trust, callback
+/// dispatch and packet-size admission. Keep public role, ID, mode and budget
+/// fields consistent with construction; changing them does not renegotiate a Link.
 pub struct Link {
     /// Truncated SHA-256 of the request's hashable part.
     pub link_id: [u8; 16],
@@ -224,24 +229,29 @@ pub struct Link {
     pub rssi: Option<f64>,
     /// Signal-to-noise ratio in dB.
     pub snr: Option<f64>,
-    /// Link quality indicator in `[0.0, 1.0]`.
+    /// Caller/interface-supplied quality value. Stored without normalization
+    /// or clamping; its scale depends on the source interface.
     pub q: Option<f64>,
     track_phy_stats: bool,
 
     pub has_channel: bool,
 
     pub packet_callback: Option<PacketCallback>,
-    /// Called when a resource transfer begins; returns `true` to accept.
+    /// Stored acceptance callback for an owner that dispatches it. Link itself
+    /// does not invoke this callback; [`Self::should_accept_resource`] returns
+    /// the configured strategy without calling it.
     pub resource_callback: Option<ResourceCallback>,
     pub remote_identified_callback: Option<RemoteIdentifiedCallback>,
-    /// Fires when the link transitions to `Active`.
+    /// Stored activation callback. The owner dispatches it; state transitions
+    /// in this type do not invoke Link lifecycle callbacks themselves.
     pub link_established_callback: Option<LinkCallback>,
     pub link_closed_callback: Option<LinkCallback>,
 }
 
 /// Callback for decrypted link-packet payloads.
 pub type PacketCallback = Box<dyn Fn(&[u8]) + Send + Sync>;
-/// Callback for accepting or rejecting an incoming resource transfer.
+/// Owner-dispatched Resource acceptance callback. Its boolean input is supplied
+/// by that owner; `true` as the return value means acceptance.
 pub type ResourceCallback = Box<dyn Fn(bool) -> bool + Send + Sync>;
 /// Callback fired after the remote peer identifies on the link.
 pub type RemoteIdentifiedCallback = Box<dyn Fn(&Link, &[u8; 64]) + Send + Sync>;
@@ -352,6 +362,9 @@ impl Link {
     ///
     /// Verifies the signature, runs ECDH, derives session keys, and returns the
     /// encrypted RTT measurement (Message 3) to hand back to the responder.
+    /// The caller must supply the authenticated destination identity key and
+    /// its matching Ed25519 public bytes. Success activates the local initiator;
+    /// it does not transmit the RTT payload or dispatch lifecycle callbacks.
     pub fn validate_proof(
         &mut self,
         proof_data: &[u8],
@@ -628,7 +641,9 @@ impl Link {
         Ok(())
     }
 
-    /// AES-CBC encrypt with the initiator-to-responder session key.
+    /// AES-CBC encrypt with the shared bidirectional session keys.
+    /// Requires keys, but does not check active state, enforce the MDU, send a
+    /// packet, or update traffic counters.
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, LinkCryptoError> {
         let keys = self
             .session_keys
@@ -648,7 +663,7 @@ impl Link {
 
     /// Build a LINKIDENTIFY payload that reveals the initiator's identity.
     ///
-    /// Wire format (after encryption): `public_key(64) || signature(64)`, where
+    /// Plaintext before encryption: `public_key(64) || signature(64)`, where
     /// the signature covers `link_id(16) || public_key(64)`. Send with context
     /// LINKIDENTIFY (0xFB).
     pub fn identify(
@@ -705,7 +720,9 @@ impl Link {
     ///
     /// As in Python's `Link.receive`, only a responder accepts it, from the
     /// handshake on: the initiator turns Active on the proof and may identify
-    /// before its RTT packet arrives.
+    /// before its RTT packet arrives. The first valid identity is retained;
+    /// subsequent valid identifications return the existing key. The owner
+    /// handles callbacks and any application admission policy.
     pub fn handle_identification(
         &mut self,
         encrypted_data: &[u8],
@@ -768,8 +785,10 @@ impl Link {
     /// Build a REQUEST payload and return `(encrypted, request_id)`.
     ///
     /// Plaintext is msgpack `[timestamp_f64, sha256_trunc(path), data]`. Send with
-    /// context REQUEST (0x09); the returned `request_id` matches what the remote
-    /// side will compute.
+    /// context REQUEST (0x09). The initial ID hashes the plaintext body. For an
+    /// inline packet, the owner must replace it with that packet's truncated
+    /// hash via [`Self::update_pending_request_id`]. Resource requests retain
+    /// the body hash. This method does not enforce the MDU or send data.
     pub fn request(
         &mut self,
         path: &str,
@@ -790,6 +809,10 @@ impl Link {
     ///
     /// Packet-sized callers encrypt the returned body directly. Bodies larger
     /// than the Link MDU are passed to Resource with the returned request ID.
+    /// A complete MessagePack value in `data` is embedded as that value; other
+    /// bytes become a binary field. `None` becomes nil. Inline packet callers
+    /// replace the initial body-hash ID after packing the packet, as described
+    /// on [`Self::request`].
     pub fn prepare_request(
         &mut self,
         path: &str,
@@ -926,7 +949,9 @@ impl Link {
         }
     }
 
-    /// Decrypt and parse a REQUEST packet into `(request_id, path_hash, timestamp, data)`.
+    /// Decrypt and parse a REQUEST body into `(request_id, path_hash, timestamp, data)`.
+    /// The returned ID hashes the plaintext body; an inline-packet dispatcher
+    /// uses the received packet's truncated hash as the actual request ID.
     pub fn handle_request(
         &self,
         encrypted_data: &[u8],
@@ -939,7 +964,10 @@ impl Link {
     ///
     /// Packet requests use [`Self::handle_request`]. Request Resources are
     /// decrypted by the Resource transfer before reaching the Link runtime,
-    /// so they use this parser directly.
+    /// so they use this parser directly. This parser checks the first three
+    /// array fields but accepts additional fields and trailing bytes; it does
+    /// not authorize a handler or validate timestamp freshness. Binary/string
+    /// payloads become raw bytes; other MessagePack values are re-encoded.
     pub fn parse_request(plaintext: &[u8]) -> Result<ParsedRequestData, LinkCryptoError> {
         // request_id = SHA-256(packed_request)[:16]
         let request_id = truncated_hash(plaintext);
@@ -982,7 +1010,8 @@ impl Link {
     }
 
     /// Build plaintext msgpack `[request_id, response_data]` for a Link
-    /// response packet or response resource.
+    /// response packet or response resource. A complete MessagePack value in
+    /// `response_data` is embedded as that value; other bytes become binary.
     pub fn pack_response(
         request_id: &[u8; 16],
         response_data: &[u8],
@@ -999,7 +1028,9 @@ impl Link {
     }
 
     /// Decrypt a RESPONSE payload, deliver it to the matching receipt, and return
-    /// `(request_id, response_data)`.
+    /// `(request_id, response_data)`. A well-formed response is returned even
+    /// when no pending receipt matches; successful parsing is not proof that a
+    /// request was completed.
     pub fn handle_response(
         &mut self,
         encrypted_data: &[u8],
@@ -1023,7 +1054,9 @@ impl Link {
     }
 
     /// Parse plaintext MsgPack `[request_id, response_data]` without mutating
-    /// pending request state.
+    /// pending request state. Checks the first two array fields, accepts extra
+    /// fields and trailing bytes, and applies the same payload-byte conversion
+    /// as [`Self::parse_request`].
     pub fn parse_response_plaintext(
         plaintext: &[u8],
     ) -> Result<([u8; 16], Vec<u8>), LinkCryptoError> {
@@ -1102,7 +1135,8 @@ impl Link {
         self.encrypt(&rtt_bytes)
     }
 
-    /// Return this endpoint's immutable Link role.
+    /// Return the role selected by `is_initiator`. The owner must not change
+    /// that field during a session.
     pub fn role(&self) -> LinkRole {
         if self.is_initiator {
             LinkRole::Initiator
@@ -1365,7 +1399,8 @@ impl Link {
         }
     }
 
-    /// Current PHY measurements as `(rssi, snr, q)`.
+    /// Current PHY measurements as `(rssi, snr, q)`. Returns three `None` values
+    /// when tracking is disabled, even if forced measurements were stored.
     pub fn phy_stats(&self) -> (Option<f64>, Option<f64>, Option<f64>) {
         let stats = self.phy_stats_snapshot();
         (stats.rssi, stats.snr, stats.q)
@@ -1395,7 +1430,8 @@ impl Link {
         self.track_phy_stats.then_some(self.q).flatten()
     }
 
-    /// Clone of the session keys, for handing to a Channel or Resource.
+    /// Clone the session keys for a Channel or Resource. Closing this Link
+    /// drops its own keys, not copies already returned to callers.
     pub fn session_keys(&self) -> Option<LinkKeys> {
         self.session_keys.clone()
     }
@@ -1585,7 +1621,8 @@ impl Link {
         self.packet_callback = Some(Box::new(cb));
     }
 
-    /// Install a callback invoked for each inbound resource; return `true` to accept.
+    /// Store a Resource acceptance callback for the owner to dispatch. This
+    /// setter does not connect it to a runtime or invoke it automatically.
     pub fn set_resource_callback(&mut self, cb: impl Fn(bool) -> bool + Send + Sync + 'static) {
         self.resource_callback = Some(Box::new(cb));
     }
@@ -1735,7 +1772,8 @@ impl Link {
         }
     }
 
-    /// Whether the link can accept a new outbound resource.
+    /// Whether the tracked outbound Resource states allow another transfer.
+    /// The owner must separately check Link state and admission limits.
     ///
     /// Allows new transfers not just when the queue is empty but also when all
     /// existing transfers have finished sending data and are only waiting on the
@@ -1765,6 +1803,7 @@ impl Link {
     }
 
     /// Default request timeout: `rtt * TRAFFIC_TIMEOUT_FACTOR + 1.125 * RESPONSE_MAX_GRACE_TIME`.
+    /// Uses a one-second RTT when none has been measured.
     pub fn default_request_timeout(&self) -> Duration {
         self.rtt
             .unwrap_or(Duration::from_secs(1))

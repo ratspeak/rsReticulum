@@ -1,18 +1,18 @@
-//! BLE Peer-to-Peer mesh interface. Each device acts as both Central
-//! (scanner/GATT client) and Peripheral (advertiser/GATT server)
-//! simultaneously.
+//! BLE peer interface with a central (scanner/GATT client) role and an
+//! optional peripheral (advertiser/GATT server) role. Peripheral startup
+//! failure leaves the central role running.
 //!
 //! ## Dual-service GATT
 //!
 //! ### Ratspeak (primary)
 //! - Service: `a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d`
-//! - RX:      `…4c5e` (WRITE, WRITE_NO_RESPONSE)
-//! - TX:      `…4c5f` (READ, NOTIFY)
+//! - RX:      `…4c5e` (peer writes here)
+//! - TX:      `…4c5f` (peer subscribes to notifications)
 //!
 //! ### Columba (cross-app compat)
 //! - Service: `37145b00-442d-4a94-917f-8f42c5da28e3`
-//! - RX:      `…28e5` (WRITE, WRITE_NO_RESPONSE)
-//! - TX:      `…28e4` (READ, NOTIFY, INDICATE)
+//! - RX:      `…28e5` (peer writes here)
+//! - TX:      `…28e4` (peer subscribes to notifications)
 //!
 //! Peer identity binds only from directly-originated, signature-verified LXMF
 //! delivery announces. There is no ID characteristic: a statically readable
@@ -26,8 +26,11 @@
 //! packets are encoded as a two-frame START/END sequence instead of LONE so
 //! older reassemblers can still decode them.
 //!
-//! Keepalive: 15s interval, 1-byte ping; 3 misses → disconnect. Cap 7
-//! simultaneous peers.
+//! On the btleplug central backend (Linux/Windows), 15 seconds without a
+//! notification triggers a one-byte keepalive write. Three consecutive failed
+//! writes end the peer reader loop; a successful write or a nonempty matching
+//! notification resets the failure count. Central connections are capped at
+//! seven peers.
 
 use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::collections::HashMap;
@@ -57,10 +60,9 @@ pub const COLUMBA_RX_UUID: Uuid = Uuid::from_u128(0x37145b00_442d_4a94_917f_8f42
 pub const COLUMBA_ID_UUID: Uuid = Uuid::from_u128(0x37145b00_442d_4a94_917f_8f42c5da28e6);
 
 pub const MAX_PEERS: usize = 7;
-/// Upper bound on a fragment set's `total`. A Reticulum packet is <=500 bytes,
-/// so even at a pathologically small ATT MTU the count stays well under this;
-/// the cap stops an unauthenticated writer from sizing a reassembly buffer off
-/// an attacker-controlled 16-bit field (multi-MB allocation per START frame).
+/// Maximum accepted fragment count in a received header. This bounds the
+/// number of reassembly slots allocated from `total`; it does not independently
+/// bound the size of each fragment or total buffered bytes.
 pub const MAX_FRAGMENTS: u16 = 64;
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 pub const KEEPALIVE_MAX_MISSES: u32 = 3;
@@ -69,13 +71,11 @@ pub const MIN_RSSI: i16 = -85;
 pub const SCAN_ACTIVE_INTERVAL: Duration = Duration::from_secs(5);
 pub const SCAN_IDLE_INTERVAL: Duration = Duration::from_secs(30);
 pub const BLE_FRAGMENT_PACING: Duration = Duration::from_millis(8);
-/// Upper bound on a single btleplug fragment write; a wedged BlueZ/WinRT stack
-/// would otherwise hang the per-peer write loop (and everything queued behind
-/// it) forever. Generous — a healthy write completes in milliseconds.
+/// Timeout applied while awaiting a single btleplug fragment write. A timeout
+/// lets the per-peer writer stop waiting for that operation.
 pub const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Recently-disconnected peers stay "wanted" — scan loop uses the active
-/// interval for them until they reconnect or the entry expires.
+/// Failure or short-session count that triggers reconnect backoff.
 pub const RECONNECT_BACKOFF_FAILURES: u32 = 3;
 pub const RECONNECT_BACKOFF_DURATION: Duration = Duration::from_secs(300);
 pub const RECONNECT_PRUNE_AFTER: Duration = Duration::from_secs(600);
@@ -107,8 +107,7 @@ pub fn seed_recently_disconnected(map: &RecentlyDisconnected, addresses: Vec<Str
     }
 }
 
-/// All-zero is the sentinel ("no identity yet") and must never reach
-/// advertising.
+/// Return whether the input contains exactly 16 bytes and is not all zero.
 pub fn is_valid_identity_hash(bytes: &[u8]) -> bool {
     bytes.len() == 16 && bytes.iter().any(|b| *b != 0)
 }
@@ -117,8 +116,8 @@ pub fn is_valid_identity_hash(bytes: &[u8]) -> bool {
 /// that legitimate retransmits eventually reach the original sender.
 pub const ANTI_LOOP_TTL: Duration = Duration::from_secs(30);
 
-/// `payload_hash → (sources, first_seen)`. Lets the fan-out skip echoing
-/// a packet back to the peers it arrived from.
+/// `payload_hash → (sources, last_seen)`. Records allow fan-out to skip peers
+/// that recently supplied the same packet.
 pub type AntiLoopMap =
     Arc<std::sync::Mutex<HashMap<u64, (std::collections::HashSet<String>, Instant)>>>;
 
@@ -173,7 +172,8 @@ pub fn anti_loop_record(map: &AntiLoopMap, source: String, payload: &[u8]) {
     }
 }
 
-/// false iff `dest` is one of the peers `payload` arrived from.
+/// Return false when an unexpired cache entry for the payload hash includes
+/// `dest`. Missing entries and a poisoned cache lock allow sending.
 pub fn anti_loop_should_send(map: &AntiLoopMap, dest: &str, payload: &[u8]) -> bool {
     let h = payload_hash(payload);
     if let Ok(g) = map.lock()
@@ -392,7 +392,7 @@ fn has_wanted_reconnects(map: &RecentlyDisconnected) -> bool {
     }
 }
 
-/// Already-connected peers stay alive via keepalive.
+/// Interval used for background scans with `mobile-throttle`.
 pub const SCAN_BACKGROUND_INTERVAL: Duration = Duration::from_secs(60);
 
 const SCAN_SLEEP_SLICE: Duration = Duration::from_secs(2);
@@ -428,7 +428,7 @@ async fn scan_sleep(
     }
 }
 
-/// BLE 5.0 max.
+/// Requested ATT MTU. The platform may negotiate a smaller value.
 pub const TARGET_MTU: u16 = 517;
 
 #[repr(u8)]
@@ -454,9 +454,10 @@ impl FragmentType {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlePeer {
-    /// 16-byte hex Reticulum identity hash.
+    /// Legacy identity field, empty in scan results. Live identity resolution is
+    /// reported by [`BlePeerEvent::IdentityResolved`] as an LXMF delivery address.
     pub identity_hash: String,
-    /// May rotate on Android.
+    /// Platform scan address or identifier; it may change across rediscovery.
     pub ble_address: String,
     pub rssi: i16,
     pub protocol: PeerProtocol,
@@ -670,9 +671,8 @@ async fn stop_central_connections() {
     disconnect_central_peripherals().await;
 }
 
-/// Force-disconnect a single central-role mesh peer by BLE address on every
-/// platform (previously only Android). The per-peer read loop then runs its
-/// own disconnect cleanup / reconnect bookkeeping.
+/// Request disconnection of one central-role mesh peer through the platform
+/// backend. Subsequent cleanup and reconnect bookkeeping are backend-specific.
 pub async fn disconnect_mesh_peer(address: &str) {
     #[cfg(target_os = "android")]
     {
@@ -990,14 +990,10 @@ fn recent_ratspeak_prune() {
 
 /// Scan for BLE mesh peers advertising Ratspeak or Columba.
 ///
-/// Creates a fresh btleplug adapter, so use this only for scan-only callers.
-/// On non-Apple platforms, scan-then-connect flows must use
-/// `scan_mesh_peers_shared` with the same adapter they later pass to
-/// `connect_mesh_peer`; btleplug adapter instances do not share peripheral
-/// registries.
-///
-/// Safe entry point for one-off scan-only callers and the Apple branch
-/// (which uses the native CoreBluetooth path).
+/// On non-Apple platforms this creates a btleplug adapter for a one-off scan.
+/// Scan-then-connect callers should use `scan_mesh_peers_shared` and pass the
+/// same adapter to `connect_mesh_peer`. Apple uses the native CoreBluetooth
+/// scan path.
 pub async fn scan_mesh_peers(timeout_secs: u64) -> Result<Vec<BlePeer>, String> {
     #[cfg(all(feature = "ble", any(target_os = "ios", target_os = "macos")))]
     {
@@ -5458,13 +5454,12 @@ async fn peer_write_loop(
 // Spawn
 // ---------------------------------------------------------------------------
 
-/// Spawn a BLE Peer-to-Peer mesh interface.
-///
-/// Starts both Central (scanning + GATT client) and Peripheral (advertising +
-/// GATT server) roles simultaneously. Discovered peers are connected,
-/// identities exchanged, and raw Reticulum packets flow bidirectionally
-/// through the interface — enabling announces, LXMF messages, and all
-/// protocol traffic over BLE. Compatible with Columba (Torlando) BLE mesh.
+/// Spawn a BLE peer interface with central scanning and GATT client support.
+/// Peripheral advertising and GATT server startup are also attempted; if that
+/// role is unavailable, the central role continues. The interface supports
+/// Ratspeak and Columba service UUIDs and the fragment format described in
+/// this module. Verified direct LXMF delivery announces supply peer identity
+/// observations; advertisements alone do not establish identity.
 pub async fn spawn_ble_peer_interface(
     config: BlePeerConfig,
     id: InterfaceId,

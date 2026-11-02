@@ -1,5 +1,9 @@
-//! Python ref: `RNS/__init__.py` (`prettyspeed`, `prettysize`, `prettytime`).
+//! Human-readable CLI formatting for byte counts, bit rates, elapsed time,
+//! frequencies and hexadecimal values. Size/rate prefixes use powers of 1000.
+//! Python reference functions: `prettyspeed`, `prettysize` and `prettytime`
+//! in `RNS/__init__.py`; this module defines its own output precision/layout.
 
+/// Format bytes with decimal prefixes (`1000` becomes `1.00 KB`, not `KiB`).
 pub fn pretty_size(num: u64) -> String {
     let units = ["", "K", "M", "G", "T", "P", "E", "Z"];
     let mut val = num as f64;
@@ -16,6 +20,7 @@ pub fn pretty_size(num: u64) -> String {
     format!("{val:.2}YB")
 }
 
+/// Format bits per second with decimal prefixes. Convert byte rates before calling.
 pub fn pretty_speed(bps: u64) -> String {
     let units = ["", "K", "M", "G", "T", "P", "E", "Z"];
     let mut val = bps as f64;
@@ -32,6 +37,8 @@ pub fn pretty_speed(bps: u64) -> String {
     format!("{val:.2}Ybps")
 }
 
+/// Format finite seconds using seconds, minutes/seconds, hours/minutes or
+/// days/hours. Fractional seconds are truncated; negative input returns `unknown`.
 pub fn pretty_time(seconds: f64) -> String {
     if seconds < 0.0 {
         return "unknown".to_string();

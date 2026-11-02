@@ -6,12 +6,13 @@ use crate::stream_data::{STREAM_ID_MAX, StreamDataMessage};
 /// Upper bound on a single chunk before the writer splits (16 KiB).
 pub const MAX_CHUNK_LEN: usize = 16384;
 
-/// Number of progressively smaller segments the writer will try when
-/// compressing a chunk before giving up and sending it uncompressed.
+/// Exclusive upper bound for compression-prefix trials. The writer tries
+/// chunk/1, chunk/2 and chunk/3 before falling back to raw bytes.
 pub const COMPRESSION_TRIES: usize = 4;
 
-/// Accumulates inbound [`StreamDataMessage`] payloads into a byte queue and
-/// tracks explicit EOF.
+/// Accumulates decoded [`StreamDataMessage`] payloads and tracks explicit EOF.
+/// The owner must provide ordered messages, bound queued data, and stop feeding
+/// after EOF; this queue has no size limit and accepts later data.
 pub struct StreamReader {
     stream_id: u16,
     buffer: VecDeque<u8>,
@@ -27,8 +28,8 @@ impl StreamReader {
         }
     }
 
-    /// Append `msg` to the buffer. Returns `false` (and ignores the payload)
-    /// if the message belongs to a different stream.
+    /// Append an already-decoded `msg`; this method does not decompress its data.
+    /// Returns `false` and ignores the payload for a different stream ID.
     pub fn feed(&mut self, msg: &StreamDataMessage) -> bool {
         if msg.stream_id != self.stream_id {
             return false;
@@ -47,9 +48,9 @@ impl StreamReader {
 
     /// Pop up to `size` bytes off the front of the buffer.
     ///
-    /// Returns `None` when the buffer is empty and EOF has not yet arrived,
-    /// and `Some(Vec::new())` once it has — letting callers distinguish "wait"
-    /// from "end of stream".
+    /// For a positive `size`, `None` means the empty stream is still open, and
+    /// `Some(Vec::new())` means EOF with no buffered data. A zero-size read can
+    /// also return an empty vector while data remains; it is not an EOF test.
     pub fn read(&mut self, size: usize) -> Option<Vec<u8>> {
         if self.buffer.is_empty() {
             if self.eof {
@@ -89,8 +90,10 @@ impl StreamReader {
     }
 }
 
-/// Chunks outbound bytes into [`StreamDataMessage`]s sized for the underlying
-/// channel, opportunistically compressing each chunk with bzip2.
+/// Chunks outbound bytes into [`StreamDataMessage`]s with optional bzip2
+/// compression. `max_data_len` must be positive and excludes the two-byte
+/// stream header and six-byte Channel envelope. Zero is not checked and makes
+/// a nonempty write fail to advance. Stream IDs are masked to 14 bits.
 pub struct StreamWriter {
     stream_id: u16,
     max_data_len: usize,
@@ -106,9 +109,10 @@ impl StreamWriter {
         }
     }
 
-    /// Slice `data` into channel-sized frames. Each frame is sent compressed
-    /// if bzip2 would fit a larger source segment into `max_data_len` than the
-    /// uncompressed alternative; otherwise the chunk is sent raw.
+    /// Slice `data` into frames within the configured payload budget. A prefix
+    /// is compressed when bzip2 makes it smaller and its encoded size is
+    /// strictly below `max_data_len`; otherwise the writer takes raw bytes.
+    /// Returned frames still need packing, Channel admission and transmission.
     pub fn write(&mut self, data: &[u8]) -> Result<Vec<StreamDataMessage>, BufferError> {
         if self.closed {
             return Err(BufferError::WriterClosed);
@@ -200,8 +204,10 @@ pub enum BufferError {
     WriterClosed,
 }
 
-/// Bidirectional convenience wrapper that pairs a [`StreamWriter`] and
-/// [`StreamReader`] on the same stream ID.
+/// Pairs a [`StreamWriter`] and [`StreamReader`] on the same stream.
+/// `max_data_len` must satisfy the writer's positive-budget requirement.
+/// Use an ID in `0..=STREAM_ID_MAX`: the reader/writer mask higher bits,
+/// while this wrapper's `stream_id()` returns the original argument.
 pub struct ChannelBuffer {
     writer: StreamWriter,
     reader: StreamReader,

@@ -1,7 +1,11 @@
-//! Bridges a PIV token to an `rns_identity::Identity` via the `LocalKeyBackend`
-//! seam. The PIV session runs on a dedicated thread — pcsc handles want serial
-//! APDU access and are not `Sync` — so the backend handle holds only channel
-//! senders and is therefore `Send + Sync`, usable directly from the async runtime.
+//! Bridge a PC/SC PIV session to `rns_identity::Identity` through
+//! `LocalKeyBackend`. A dedicated worker serializes card access; the shared
+//! backend handle is `Send + Sync`, but its methods block waiting for replies.
+//! Async callers should use an appropriate blocking execution context.
+//!
+//! `lock` waits for an attempted applet reselect but does not return its result.
+//! An acknowledgement is not proof the card was relocked; callers needing
+//! that result must use the fallible session API.
 
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -29,8 +33,9 @@ enum Cmd {
     Lock { reply: Sender<()> },
 }
 
-/// `LocalKeyBackend` over a PIV token. Each call round-trips a request to the
-/// card-service thread and blocks for the device's reply (PIV ops are ~10-50ms).
+/// `LocalKeyBackend` over a PIV token. Each call blocks for the card-service
+/// thread's reply; touch prompts or transport delays can make this much longer
+/// than a normal cryptographic operation. No per-call timeout is imposed here.
 pub struct HardwareBackend {
     cmd_tx: Mutex<Sender<Cmd>>,
 }
@@ -72,10 +77,14 @@ impl LocalKeyBackend for HardwareBackend {
     }
 }
 
-/// Connect to the token described by `hwid`, verify the on-device keys match it
-/// (fail-closed), unlock with `pin`, and return an `Identity` whose private
-/// operations run on the device. The PIV session lives on a worker thread that
-/// exits when the returned identity (and its backend) is dropped.
+/// Connect to the first detected PC/SC token, compare its fixed 9A/9D public
+/// keys with `hwid`, verify `pin`, and return a device-backed `Identity`.
+/// The file's serial, slot overrides and cache-timeout policy do not select or
+/// configure this session. A different first token yields an error even if a
+/// matching token is attached elsewhere.
+///
+/// The worker exits after all backend/identity clones are dropped. This
+/// function blocks during connection and PIN verification.
 pub fn load_hardware_identity(hwid: &HwidConfig, pin: &str) -> Result<Identity, RatkeyError> {
     let ed_pub = hwid.ed25519_pub_bytes()?;
     let x_pub = hwid.x25519_pub_bytes()?;

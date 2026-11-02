@@ -1,6 +1,7 @@
-//! In-memory PIV mock with real Ed25519/X25519 crypto; signatures/ECDH are bit-identical
-//! to software results for test vector reuse. Simulates PIN retry/lockout, touch policy,
-//! disconnect, slot state. Primary dev/validation env until hardware lands.
+//! In-memory test double using the software Ed25519/X25519 implementations.
+//! It models PIN retries, connection state, slots and an explicit touch flag;
+//! it does not reproduce card transport, management authentication, firmware
+//! behavior or every touch policy. Private keys remain in host memory.
 
 use std::collections::HashMap;
 
@@ -19,7 +20,8 @@ pub const SLOT_9D: u8 = 0x9D;
 pub enum TouchPolicy {
     Never,
     Always,
-    /// YubiKey ~15s cache.
+    /// Yubico policy value for a roughly 15-second touch cache. The mock does
+    /// not simulate that timer; only `Always` checks its touch-required flag.
     Cached,
 }
 

@@ -5,19 +5,22 @@ use crate::messages::InterfaceId;
 use rns_wire::types::TruncatedHash;
 
 /// Record of an in-flight packet so the matching proof can be routed back
-/// along the same path. Entries expire after `REVERSE_TIMEOUT` — long enough
-/// to tolerate slow links, short enough that stale routes don't accumulate.
+/// along the recorded path. Explicit culling removes entries at least
+/// `REVERSE_TIMEOUT` seconds old; lookup alone does not enforce that lifetime.
 #[derive(Debug, Clone)]
 pub struct ReverseEntry {
     pub timestamp: f64,
     pub receiving_interface: InterfaceId,
     pub remaining_hops: u8,
     /// Interface we forwarded the packet on, when known. Proofs that come
-    /// back on a different interface are rejected — the mismatch means
-    /// either a routing change or a spoof attempt.
+    /// back on a different interface are not forwarded by the actor. This
+    /// routing check is separate from cryptographic proof validation.
     pub outbound_interface: Option<InterfaceId>,
 }
 
+/// Packet-hash keyed reverse routes. Insertions replace matching entries;
+/// lookup includes expired records until explicit culling. The table itself
+/// neither validates proofs nor limits the number of entries.
 pub struct ReverseTable {
     entries: HashMap<TruncatedHash, ReverseEntry>,
 }
@@ -77,7 +80,8 @@ impl ReverseTable {
         before - self.entries.len()
     }
 
-    /// Batched cull — bounds per-tick work on large tables.
+    /// Remove at most `limit` expired entries. This bounds removals, not the
+    /// scan: the whole table may be examined to find them.
     pub fn cull_expired_batch(&mut self, limit: usize) -> usize {
         let now = crate::now_f64();
         let cutoff = now - REVERSE_TIMEOUT as f64;
@@ -96,8 +100,8 @@ impl ReverseTable {
         count
     }
 
-    /// Drop entries whose receiving or outbound interface has gone away —
-    /// those proofs could never be routed back regardless.
+    /// Remove entries whose receiving interface or specified outbound
+    /// interface is absent from the caller-supplied active set.
     pub fn cull_dead_interfaces(
         &mut self,
         active_interfaces: &std::collections::HashSet<InterfaceId>,

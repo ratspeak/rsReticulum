@@ -1,4 +1,13 @@
-//! Generate keys on-device, derive identity hash, write `.hwid`.
+//! Provision fixed slots 9A (Ed25519) and 9D (X25519), then optionally write
+//! public `.hwid` metadata. Choose on-device generation or mnemonic-derived
+//! key import explicitly.
+//!
+//! Real-card generation/import can replace existing slot keys. These steps
+//! are sequential, with no empty-slot guard or rollback: an error can leave
+//! one slot changed, and a later file-write failure does not undo card changes.
+//! The caller owns consent, credential handling and recovery of partial work.
+//! Provisioning does not change the card PIN, PUK or management key, or verify
+//! attestation. `config.pin` is used only by `provision_mock`.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,7 +35,9 @@ pub struct ProvisionResult {
 
 #[derive(Debug, Clone)]
 pub struct ProvisionConfig {
-    /// PIV PIN (6-8 chars).
+    /// PIN used by `provision_mock`. Real provisioning helpers do not read this
+    /// field or verify/change the card PIN. This ordinary `String` is not
+    /// automatically wiped; the caller owns its lifetime and input validation.
     pub pin: String,
     pub touch_signing: TouchPolicy,
     pub touch_encryption: TouchPolicy,
@@ -152,9 +163,11 @@ fn touch_str(tp: TouchPolicy) -> &'static str {
     }
 }
 
-/// Recoverable provision / restore: derive the identity from `mnemonic`, import
-/// both keys into the token (PIN-once + configured touch policy), and write the
-/// `.hwid`. Requires the management key. The session must already be connected.
+/// Derive private keys from `mnemonic` on the host and import them into
+/// 9A/9D with PIN-once and the requested touch policies. Requires a connected
+/// session and valid management key. Writes `.hwid` only when a directory is
+/// configured. Existing keys can be replaced, and partial failure is not
+/// rolled back; see the module's provisioning boundary.
 pub fn import_recoverable_identity<T: PivTransport>(
     session: &mut PivSession<T>,
     mgmt_key: &[u8],
@@ -179,8 +192,9 @@ pub fn import_recoverable_identity<T: PivTransport>(
     finalize_provision(session, config, derived.ed25519_pub, derived.x25519_pub)
 }
 
-/// On-device provisioning (no seed backup): authenticate, generate both keys on
-/// the token, and write the `.hwid`. Requires the management key.
+/// Authenticate with the management key and generate new 9A/9D keys on the
+/// token, without a seed backup. Write `.hwid` only when configured. This can
+/// replace existing keys and has no rollback after partial failure.
 pub fn provision_hardware_only<T: PivTransport>(
     session: &mut PivSession<T>,
     mgmt_key: &[u8],
@@ -200,8 +214,10 @@ pub fn provision_hardware_only<T: PivTransport>(
     finalize_provision(session, config, ed_pub, x_pub)
 }
 
-/// Register an already-provisioned token: read its slot public keys and write a
-/// `.hwid` for it (import-existing). No key material is created; no mgmt key needed.
+/// Read fixed 9A/9D public keys and optionally write `.hwid`; no keys are
+/// created and no management key is required. The recorded touch policies
+/// come from `config`, not a readback of the token's actual policy.
+/// This requires the token's public-key metadata extension.
 pub fn read_existing<T: PivTransport>(
     session: &mut PivSession<T>,
     config: &ProvisionConfig,
@@ -275,8 +291,9 @@ fn finalize_provision<T: PivTransport>(
     })
 }
 
-/// Recoverable provisioning: generate a fresh 12-word mnemonic, import the
-/// derived identity, and return both the result and the mnemonic to show once.
+/// Generate a 12-word mnemonic and import its derived identity using
+/// [`import_recoverable_identity`]. The returned phrase is an ordinary
+/// `String`; the caller controls its display, backup and eventual wiping.
 pub fn provision_recoverable<T: PivTransport>(
     session: &mut PivSession<T>,
     mgmt_key: &[u8],

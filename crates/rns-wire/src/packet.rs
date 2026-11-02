@@ -23,7 +23,12 @@ pub enum PacketError {
 ///
 /// `raw` is the on-wire representation; the payload is the trailing slice
 /// `raw[data_offset..]`, exposed via [`Packet::data`]. `packet_hash` and
-/// `truncated_hash` are cached at construction (see [`crate::hash`]).
+/// `truncated_hash` are cached at construction (see [`crate::hash`]). The bytes
+/// here exclude interface framing such as an IFAC tag.
+///
+/// Public fields can be changed without updating the other representations.
+/// Reconstruct the packet after changing its header or payload;
+/// [`Packet::increment_hops`] is the supported hash-preserving mutation.
 #[allow(missing_docs)]
 #[derive(Debug, Clone)]
 pub struct Packet {
@@ -35,13 +40,20 @@ pub struct Packet {
 }
 
 impl Packet {
-    /// Payload bytes — the slice of `raw` after the packed header.
+    /// Payload bytes — the slice of `raw` after the original packed header.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the public `raw` buffer has been shortened below that offset.
     #[inline]
     pub fn data(&self) -> &[u8] {
         &self.raw[self.data_offset..]
     }
 
     /// Build a packet from a header and payload, precomputing its hashes.
+    ///
+    /// Rejects packets above [`MTU`]. The header must have consistent fields
+    /// (see [`PacketHeader::pack`]); payload encryption is the caller's job.
     pub fn new(header: PacketHeader, data: Vec<u8>) -> Result<Self, PacketError> {
         let mut raw = header.pack();
         let data_offset = raw.len();
@@ -65,13 +77,18 @@ impl Packet {
 
     /// Parse a packet from borrowed wire bytes. Allocates one `Vec<u8>` to
     /// own the buffer; callers that already own the buffer should use
-    /// [`Packet::from_raw_owned`] instead.
+    /// [`Packet::from_raw_owned`] instead. Like that method, this checks the
+    /// header shape but imposes no MTU or authentication policy.
     pub fn from_raw(raw: &[u8]) -> Result<Self, PacketError> {
         Self::from_raw_owned(raw.to_vec())
     }
 
     /// Parse a packet from owned wire bytes. Saves one allocation versus
     /// [`Packet::from_raw`] when the caller already owns the buffer.
+    ///
+    /// Validates the minimum header length, but does not enforce [`MTU`],
+    /// authenticate data, or decrypt payloads. The caller must remove IFAC
+    /// framing and apply the applicable packet-size policy first.
     pub fn from_raw_owned(raw: Vec<u8>) -> Result<Self, PacketError> {
         if raw.len() < 19 {
             return Err(PacketError::TooShort);

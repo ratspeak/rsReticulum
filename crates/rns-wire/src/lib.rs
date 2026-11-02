@@ -1,8 +1,10 @@
 //! Reticulum wire format: packets, headers, flags, receipts, proofs.
 //!
-//! Source of truth for packet bit-packing — must match the Python reference
-//! ([`Packet.py`](https://github.com/markqvist/Reticulum/blob/master/RNS/Packet.py))
-//! exactly. `no_std + alloc` when `std` is off; `receipt` is `std`-only.
+//! Defines Reticulum packet encodings and the checked Link signalling parser.
+//! These low-level types do not authenticate packets or apply endpoint policy.
+//!
+//! Disabling `std` makes this crate use `no_std + alloc` and omits `receipt`;
+//! it does not disable default features in the dependency graph.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
 extern crate alloc;

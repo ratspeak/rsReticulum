@@ -65,11 +65,13 @@ impl Platform {
     }
 }
 
-/// Explicit `configdir` wins. Without one, use rsReticulum-specific defaults:
-/// `/etc/rsReticulum/config`, then `~/.config/rsReticulum/config`, then
-/// `~/.rsReticulum` on Unix-like systems. Windows uses the appdata
-/// `rsReticulum` directory. Pass `--config ~/.reticulum` explicitly when
-/// intentionally sharing a Python Reticulum config.
+/// Return an explicit `configdir` unchanged, without shell or tilde expansion.
+/// Otherwise, on non-Windows/non-Android targets, select `/etc/rsReticulum`
+/// or `$HOME/.config/rsReticulum` only if its `config` file exists, then fall
+/// back to `$HOME/.rsReticulum` (or relative `.rsReticulum` without `HOME`).
+/// Windows uses `$APPDATA/rsReticulum`, or relative `.rsReticulum`. Android
+/// falls back to `/data/local/tmp/.rsReticulum` with a warning; applications
+/// should supply their own writable config directory.
 pub fn resolve_config_dir(configdir: Option<&str>) -> PathBuf {
     match configdir {
         Some(dir) => PathBuf::from(dir),

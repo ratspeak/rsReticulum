@@ -1,4 +1,6 @@
-//! Wire-compatible with Python `rnprobe.py`.
+//! Encrypted SINGLE-packet probes and signed delivery-proof responses, used
+//! by `rnprobe-rs`. A valid proof confirms receipt of the packet; it is not an
+//! application-payload processing acknowledgment.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -48,16 +50,19 @@ pub enum ProbeError {
 #[derive(Debug, Clone)]
 pub struct ProbeOutcome {
     pub rtt: Duration,
-    /// 0 for direct.
+    /// Path-table hop count captured before sending. Defaults to zero when
+    /// path metadata is unavailable; zero alone does not establish a direct route.
     pub hops: u8,
     pub via: Option<[u8; 16]>,
     pub interface: Option<String>,
     pub destination_hash: [u8; 16],
 }
 
-/// Signs every inbound DATA with a PROOF (Python `PROVE_ALL`). Callers must
-/// persist `identity` (canonical `<storage_dir>/probe_identity`) for a stable
-/// destination hash across restarts.
+/// Register a SINGLE destination that attempts an implicit signed proof for
+/// received DATA packets. The responder hashes and signs the packet without
+/// decrypting or validating its application payload. Persist `identity`
+/// (normally `<storage_dir>/probe_identity`) to retain its destination hash
+/// across restarts.
 pub async fn spawn_probe_responder(
     transport_tx: mpsc::Sender<TransportMessage>,
     identity: Identity,
@@ -249,8 +254,16 @@ impl Drop for DeliveryProofWaiter {
     }
 }
 
-/// `None` waits mirror Python rnprobe: `DEFAULT_TIMEOUT +
-/// get_first_hop_timeout(dest)`, resolved fresh at each wait.
+/// Send `size` bytes of random plaintext to a matching SINGLE destination
+/// and wait for its signed delivery proof. `app_name` and the cached identity
+/// must derive `dest_hash`; callers supply that binding. The encrypted packet
+/// including headers must fit the MTU, so the maximum plaintext is smaller.
+///
+/// Path and proof waits are separate budgets. `None` selects 12 seconds plus
+/// the current first-hop timeout for each phase. Transport queries and mailbox
+/// admission are outside those waits; use an outer timeout for a whole-call
+/// deadline. `use_implicit_proof` is retained for compatibility and ignored;
+/// proof validation belongs to the transport receipt handler.
 pub async fn probe_once(
     transport_tx: mpsc::Sender<TransportMessage>,
     dest_hash: [u8; 16],
@@ -781,7 +794,8 @@ mod tests {
     }
 }
 
-/// Validate local CLI/API timeout input before starting networking.
+/// Convert finite, nonnegative seconds into a duration whose deadline fits
+/// `Instant`. Zero is allowed. This performs no networking.
 pub fn checked_probe_timeout(seconds: f64) -> Result<Duration, ProbeError> {
     let duration = Duration::try_from_secs_f64(seconds).map_err(|_| ProbeError::InvalidTimeout)?;
     std::time::Instant::now()

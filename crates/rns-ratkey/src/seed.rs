@@ -1,15 +1,18 @@
-//! BIP-39 recoverable backup: a deterministic Reticulum identity derived from a
-//! 12-word mnemonic. Interop-compatible with ratkey-py (derivation scheme v1):
+//! Derive Reticulum identity keys from a 12-word BIP-39 English mnemonic.
+//! The salts and HKDF info match Ratkey derivation scheme v1, but Rust
+//! validates exactly 12 words while the Python Ratkey backup API validates
+//! 24. Their public restore inputs are therefore not interchangeable.
 //!
 //! ```text
 //! mnemonic (12 words)
-//!   -> PBKDF2-SHA512 (BIP-39, passphrase="")          -> 64-byte seed
-//!   -> HKDF-SHA256(seed, salt="ratkey-ed25519-v1", info) -> 32-byte Ed25519 seed
-//!   -> HKDF-SHA256(seed, salt="ratkey-x25519-v1",  info) -> 32-byte X25519 secret
+//!   -> PBKDF2-SHA512 (BIP-39, empty passphrase) -> 64-byte seed
+//!   -> HKDF-SHA256(seed, salt="ratkey-ed25519-v1", info) -> Ed25519 seed
+//!   -> HKDF-SHA256(seed, salt="ratkey-x25519-v1", info) -> X25519 secret
+//! info = "ratkey identity key derivation"
 //! ```
 //!
-//! The seed phrase is a second attack surface (it reconstructs the private keys
-//! and is not protected by the device PIN). Callers must surface that tradeoff.
+//! The phrase reconstructs the private keys without the device PIN. Callers
+//! must protect it separately and make this recovery tradeoff clear.
 
 use bip39::{Language, Mnemonic};
 use hkdf::Hkdf;
@@ -27,7 +30,8 @@ const HKDF_INFO: &[u8] = b"ratkey identity key derivation";
 const MNEMONIC_WORDS: usize = 12;
 const MNEMONIC_ENTROPY_BYTES: usize = 16;
 
-/// Key material derived from a mnemonic. The two secret fields are zeroized on drop.
+/// Key material derived from a mnemonic. Its two secret fields are zeroized
+/// on drop; caller-created copies and the source phrase have separate lifetimes.
 pub struct DerivedIdentity {
     pub ed25519_seed: [u8; 32],
     pub x25519_secret: [u8; 32],

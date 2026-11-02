@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use rns_wire::types::IdentityHash;
 use serde::{Deserialize, Serialize};
 
-/// Why an identity ended up in the blackhole table. `Manual` is an operator
-/// add; the other variants are system-populated. UIs distinguish operator
-/// blocks from automatic defences.
+/// Caller-supplied classification for an identity block. `Manual` is the
+/// default; [`BlackholeTable::clear_system_entries`] removes all other
+/// variants. The value itself is not evidence of a particular violation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum BlackholeReason {
     #[default]
@@ -27,8 +27,8 @@ impl BlackholeReason {
     }
 
     /// Parse the stable identifier (case-insensitive). Unknown values fall back
-    /// to `Manual`; never silently promote to a system reason that would hide
-    /// the entry from an operator view.
+    /// to `Manual`. This also accepts `ratelimit` and `protocolviolation`;
+    /// whitespace is not trimmed.
     pub fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "malformed" => Self::Malformed,
@@ -41,17 +41,18 @@ impl BlackholeReason {
 
 #[derive(Debug, Clone)]
 pub struct BlackholeEntry {
-    /// Insertion time (Unix seconds).
+    /// Creation time (Unix seconds), supplied by the caller for restored or
+    /// source-provided entries.
     pub created: f64,
-    /// Lifetime relative to `created`; `None` is permanent.
+    /// Lifetime in seconds relative to `created`; `None` has no automatic
+    /// expiry. External timestamps and TTLs are not validated by this table.
     pub ttl: Option<f64>,
     pub reason: BlackholeReason,
-    /// Original operator/source reason string when it is more specific than
-    /// the internal reason enum. Python preserves arbitrary reason labels.
+    /// Optional reason text, used by `reason_str` in preference to the enum.
     pub reason_label: Option<String>,
-    /// Identity hash of the publisher that issued this entry; `None` if local.
-    /// The distributed blackhole updater uses it to filter locally-issued
-    /// entries for publication and to key remote entries on ingest.
+    /// Caller-supplied publisher identity hash; `None` marks a local entry.
+    /// This is metadata, not verified provenance. Entries are keyed by the
+    /// blocked identity alone, so different sources do not get separate rows.
     pub source: Option<IdentityHash>,
 }
 
@@ -63,6 +64,10 @@ impl BlackholeEntry {
     }
 }
 
+/// In-memory identity block entries. Each insertion replaces any entry for
+/// the same identity. Expiry is checked by `is_blackholed`, but expired rows
+/// remain in counts and iteration until removed or culled. This table does
+/// not authenticate sources, enforce packet policy or persist itself.
 #[derive(Clone)]
 pub struct BlackholeTable {
     entries: HashMap<IdentityHash, BlackholeEntry>,
@@ -122,11 +127,10 @@ impl BlackholeTable {
         );
     }
 
-    /// Add an entry that was pulled from a remote blackhole source. The
-    /// `source` field is retained so local publication filters it out of
-    /// our own manifest (parity with Python `Transport.persist_blackhole`
-    /// which only persists entries whose source matches the local
-    /// identity, Discovery.py:3253-3258).
+    /// Insert or replace an entry with the supplied source and creation time.
+    /// The source is retained as metadata; this method neither authenticates
+    /// it nor merges competing claims. Callers must validate external data
+    /// and choose their source/override policy before insertion.
     pub fn add_from_source(
         &mut self,
         identity_hash: impl Into<IdentityHash>,
@@ -153,6 +157,8 @@ impl BlackholeTable {
         self.entries.insert(identity_hash.into(), entry);
     }
 
+    /// Check whether an entry has no expiry or its elapsed wall-clock time is
+    /// less than its TTL. Expired entries are not removed by this lookup.
     pub fn is_blackholed(&self, identity_hash: &[u8; 16]) -> bool {
         match self.entries.get(identity_hash) {
             Some(entry) => {

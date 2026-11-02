@@ -1,8 +1,8 @@
 //! rnodeconf-rs - RNode configuration and firmware utility.
 //!
-//! The safe inspection/configuration paths are implemented first. Firmware
-//! flashing, ROM bootstrap, and full signing-key management remain
-//! hardware-gated work.
+//! Supports inspection, EEPROM backup, and saved TNC/normal startup configuration.
+//! Firmware installation, signing/trust enrollment, and Bluetooth, Wi-Fi,
+//! display and interference-avoidance mutations are disabled in this build.
 
 use std::fs;
 use std::path::PathBuf;
@@ -56,121 +56,175 @@ use session::{FrameSession, SerialFrameSession};
     disable_version_flag = true
 )]
 struct Args {
+    /// Read device identification, firmware version and EEPROM summary.
     #[arg(short = 'i', long)]
     info: bool,
+    /// Unavailable: firmware installation is not implemented.
     #[arg(short = 'a', long)]
     autoinstall: bool,
+    /// Unavailable: firmware updating is not implemented.
     #[arg(short = 'u', long)]
     update: bool,
+    /// Unavailable: firmware updating is not implemented.
     #[arg(short = 'U', long = "force-update")]
     force_update: bool,
+    /// Unavailable: firmware selection/planning is not implemented.
     #[arg(long = "fw-version")]
     fw_version: Option<String>,
+    /// Unavailable: firmware download/planning is not implemented.
     #[arg(long = "fw-url")]
     fw_url: Option<String>,
+    /// Unavailable: firmware planning options are not implemented.
     #[arg(long)]
     nocheck: bool,
+    /// Unavailable: firmware extraction is not implemented.
     #[arg(short = 'e', long)]
     extract: bool,
+    /// Unavailable: flashing extracted firmware is not implemented.
     #[arg(short = 'E', long = "use-extracted")]
     use_extracted: bool,
+    /// Remove and recreate the local update and extracted-cache directories, then exit.
     #[arg(short = 'C', long = "clear-cache")]
     clear_cache: bool,
+    /// Reserved flashing baud rate; non-default values are rejected and flashing is disabled.
     #[arg(long = "baud-flash", default_value = "921600")]
     baud_flash: String,
 
+    /// Delete the saved TNC startup configuration and check EEPROM readback.
     #[arg(short = 'N', long)]
     normal: bool,
+    /// Apply and save a complete RF tuple; requires --freq, --bw, --sf, --cr and --txp.
     #[arg(short = 'T', long)]
     tnc: bool,
 
+    /// Unavailable: Bluetooth mutations are disabled.
     #[arg(short = 'b', long = "bluetooth-on")]
     bluetooth_on: bool,
+    /// Unavailable: Bluetooth mutations are disabled.
     #[arg(short = 'B', long = "bluetooth-off")]
     bluetooth_off: bool,
+    /// Unavailable: Bluetooth mutations are disabled.
     #[arg(short = 'p', long = "bluetooth-pair")]
     bluetooth_pair: bool,
 
+    /// Unavailable: Wi-Fi mode mutations are disabled.
     #[arg(short = 'w', long = "wifi")]
     wifi: Option<String>,
+    /// Unavailable: Wi-Fi channel mutations are disabled.
     #[arg(long)]
     channel: Option<u8>,
+    /// Unavailable: Wi-Fi SSID mutations are disabled.
     #[arg(long)]
     ssid: Option<String>,
+    /// Unavailable: Wi-Fi password mutations are disabled.
     #[arg(long)]
     psk: Option<String>,
+    /// Include password bytes in the configuration-sector hex dump; requires --config.
     #[arg(long = "show-psk")]
     show_psk: bool,
+    /// Unavailable: Wi-Fi IP address mutations are disabled.
     #[arg(long)]
     ip: Option<String>,
+    /// Unavailable: Wi-Fi netmask mutations are disabled.
     #[arg(long)]
     nm: Option<String>,
 
+    /// Unavailable: display mutations are disabled.
     #[arg(short = 'D', long = "display")]
     display: Option<i32>,
+    /// Unavailable: display-timeout mutations are disabled; this is not a command timeout.
     #[arg(short = 't', long = "timeout")]
     timeout: Option<i32>,
+    /// Unavailable: display-rotation mutations are disabled.
     #[arg(short = 'R', long = "rotation")]
     rotation: Option<i32>,
+    /// Unavailable: display-address mutations are disabled.
     #[arg(long = "display-addr")]
     display_addr: Option<String>,
+    /// Unavailable: display reconditioning is disabled.
     #[arg(long = "recondition-display")]
     recondition_display: bool,
+    /// Unavailable: NeoPixel mutations are disabled.
     #[arg(long = "np")]
     neopixel: Option<i32>,
 
+    /// RF centre frequency in hertz; requires the complete --tnc tuple.
     #[arg(long = "freq")]
     freq: Option<u32>,
+    /// RF bandwidth in hertz; requires the complete --tnc tuple.
     #[arg(long = "bw")]
     bandwidth: Option<u32>,
+    /// Requested TX power in dBm; requires the complete --tnc tuple.
     #[arg(long = "txp")]
     tx_power: Option<u8>,
+    /// LoRa spreading factor; requires the complete --tnc tuple.
     #[arg(long = "sf")]
     spreading_factor: Option<u8>,
+    /// LoRa coding-rate denominator (5 means 4/5); requires the complete --tnc tuple.
     #[arg(long = "cr")]
     coding_rate: Option<u8>,
 
+    /// Unavailable: interference-avoidance mutations are disabled.
     #[arg(short = 'x', long = "ia-enable")]
     ia_enable: bool,
+    /// Unavailable: interference-avoidance mutations are disabled.
     #[arg(short = 'X', long = "ia-disable")]
     ia_disable: bool,
 
+    /// Read the configuration sector as hex, with password bytes redacted by default.
     #[arg(short = 'c', long = "config")]
     config: bool,
+    /// Read EEPROM and save a timestamped .eeprom file in the local rnodeconf data directory.
     #[arg(long = "eeprom-backup")]
     eeprom_backup: bool,
+    /// Read EEPROM and print its raw hex bytes and summary.
     #[arg(long = "eeprom-dump")]
     eeprom_dump: bool,
+    /// Unavailable: EEPROM wiping is disabled until provisioning is implemented.
     #[arg(long = "eeprom-wipe")]
     eeprom_wipe: bool,
 
+    /// Unavailable: signing-key management is not implemented.
     #[arg(short = 'P', long = "public")]
     public: bool,
+    /// Unavailable: trusted-key enrollment is disabled.
     #[arg(long = "trust-key")]
     trust_key: Option<String>,
 
+    /// Print the utility version and exit.
     #[arg(long)]
     version: bool,
+    /// Unavailable: firmware flashing is not implemented.
     #[arg(short = 'f', long)]
     flash: bool,
+    /// Unavailable: ROM bootstrap is not implemented.
     #[arg(short = 'r', long)]
     rom: bool,
+    /// Unavailable: signing-key management is not implemented.
     #[arg(short = 'k', long)]
     key: bool,
+    /// Unavailable: signing/provisioning is not implemented.
     #[arg(short = 'S', long)]
     sign: bool,
+    /// Unavailable: writing device trust state is disabled.
     #[arg(short = 'H', long = "firmware-hash")]
     firmware_hash: Option<String>,
+    /// Read the device-reported target firmware hash.
     #[arg(short = 'K', long = "get-target-firmware-hash", hide = true)]
     get_target_firmware_hash: bool,
+    /// Read the device-reported firmware hash.
     #[arg(short = 'L', long = "get-firmware-hash", hide = true)]
     get_firmware_hash: bool,
+    /// Unavailable: firmware platform selection is not implemented.
     #[arg(long)]
     platform: Option<String>,
+    /// Unavailable: firmware product selection is not implemented.
     #[arg(long)]
     product: Option<String>,
+    /// Unavailable: firmware model selection is not implemented.
     #[arg(long)]
     model: Option<String>,
+    /// Unavailable: firmware hardware-revision selection is not implemented.
     #[arg(long)]
     hwrev: Option<u8>,
 

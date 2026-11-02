@@ -75,10 +75,14 @@ struct LinkEndpointQueuedPacket {
     completion: Option<crate::link_endpoint_dispatch::LinkEndpointDispatchCompletion>,
 }
 
-/// Owns every routing table and drains the `TransportMessage` channel in one
-/// task. The single-owner model means the hot path has no shared state and no
-/// locks — callers drive the actor by sending typed commands rather than
-/// reaching into the tables directly.
+/// Owns transport routing tables and processes mailbox/control-channel work
+/// on one task. Configure it before calling `run`; use commands and replies
+/// for running operations. Public table mutations do not automatically perform
+/// command-side housekeeping, mark persistence dirty or refresh shared snapshots.
+///
+/// Driver counters, the blackhole snapshot and background persistence state
+/// use shared atomics or locks. Sequential command handling is not a claim
+/// that the entire transport has no shared state or locking.
 pub struct TransportActor {
     rx: mpsc::Receiver<TransportMessage>,
     announce_dispatch_tx: mpsc::Sender<crate::announce_dispatch::AnnounceDispatchRequest>,
@@ -101,8 +105,8 @@ pub struct TransportActor {
     pub path_table: PathTable,
     pub link_table: LinkTable,
     pub announce_table: AnnounceTable,
-    /// Python `held_announces`: normal queued announces temporarily displaced
-    /// while a known-path response occupies `announce_table`.
+    /// Queued announces temporarily displaced while a known-path response
+    /// occupies `announce_table`.
     pub held_announces: HashMap<[u8; 16], crate::announce::AnnounceEntry>,
     pub reverse_table: ReverseTable,
     pub tunnel_table: TunnelTable,
@@ -110,18 +114,20 @@ pub struct TransportActor {
     pub rate_table: RateTable,
     pub blackhole_table: BlackholeTable,
     pub traffic: TrafficCounter,
+    /// Optional driver observations keyed by packet hash. Actor insertion keeps
+    /// at most 512 entries; metrics are not normalized or independently validated.
     pub packet_metrics: HashMap<[u8; 32], PacketMetrics>,
     pub packet_metrics_order: VecDeque<[u8; 32]>,
 
     pub receipt_table: HashMap<[u8; 16], PacketReceipt>,
-    /// Truncated packet hash → LXMF msg_id for pairing delivery proofs back
-    /// to their originating outbound message.
+    /// Truncated packet hash to caller-supplied message ID for proof notifications.
     pub receipt_msg_ids: HashMap<[u8; 16], String>,
-    /// Direct application proof sinks for receipt owners that cannot tolerate
-    /// loss through the legacy bounded destination-event fan-out.
+    /// Unbounded direct application proof sinks. They avoid bounded destination
+    /// mailbox pressure, but a closed receiver still loses its notification.
     pub receipt_proof_txs:
         HashMap<[u8; 16], mpsc::UnboundedSender<crate::link_messages::DestinationEvent>>,
-    /// Direct per-send receipt observers used by the high-level runtime API.
+    /// Latest per-send receipt state for runtime observers. Watch receivers can
+    /// skip intermediate updates; this is not an event log.
     pub receipt_updates:
         HashMap<[u8; 16], tokio::sync::watch::Sender<crate::messages::ReceiptUpdate>>,
 
@@ -144,28 +150,29 @@ pub struct TransportActor {
     pub path_requests: HashMap<[u8; 16], f64>,
     // One canonical owner; detached public snapshots cannot mutate registrations.
     discovery_path_requests: HashMap<[u8; 16], recursive_discovery::DiscoveryOperation>,
-    /// Python `discovery_pr_tags`: destination hash plus truncated path-request tag.
+    /// Destination hash plus truncated request tag, mapped to observation time
+    /// in Unix seconds for duplicate-request admission.
     pub discovery_pr_tags: HashMap<Vec<u8>, f64>,
-    /// Python `pending_discovery_prs`: failed-link rediscovery requests queued
-    /// for throttled emission.
+    /// Failed-Link rediscovery requests awaiting throttled emission.
     pub pending_discovery_prs: VecDeque<PendingDiscoveryPathRequest>,
     // Only rejected driver admissions live here; successfully admitted targets
     // are never replayed by this owner. The public discovery records stay ABI/API
     // compatible and continue to describe operation scheduling, not radio TX.
     pending_path_request_admissions: VecDeque<path_request_admission::PendingAdmission>,
-    /// Destination/interface pairs temporarily barred from installing paths.
-    /// Used when a Direct LinkRequest timed out on one route, so the next
-    /// path request can discover alternates instead of instantly reusing it.
+    /// Destination/interface pairs barred from new path installation until their
+    /// Unix-seconds deadline. Suppression does not remove an existing path or
+    /// guarantee discovery of an alternative.
     pub path_interface_suppressions: HashMap<([u8; 16], InterfaceId), f64>,
     last_discovery_pr_tx: f64,
     /// External interface waiting for a path response from a local shared client.
-    /// Python calls this `pending_local_path_requests`.
     pub pending_local_path_requests: HashMap<[u8; 16], InterfaceId>,
+    /// Legacy separate path-state map, cleared on shared-connection reset.
+    /// Current path-state queries use `PathTable`'s state instead.
     pub path_states: HashMap<[u8; 16], PathState>,
 
-    /// Tasks blocked on `AwaitPath`. Each entry pairs the oneshot reply with
-    /// the registration timestamp so `expire_path_waiters` can bound how long
-    /// a caller can wait before receiving a negative result.
+    /// AwaitPath reply channels and registration times in Unix seconds.
+    /// Maintenance expires pending waiters after 15 seconds; callers needing a
+    /// strict deadline must bound mailbox admission and reply waiting themselves.
     pub path_waiters: HashMap<[u8; 16], Vec<(tokio::sync::oneshot::Sender<bool>, f64)>>,
 
     last_tables_cull: f64,
@@ -182,49 +189,46 @@ pub struct TransportActor {
     last_held_announce_check: f64,
 
     pub is_transport_enabled: bool,
-    /// Wire-facing transport identity (Python `Transport.identity`): HEADER_2
-    /// path responses, link-request transport_id matching, local next-hop
-    /// answers. On non-transport nodes this rotates per boot by default —
-    /// see `apply_transport_identity_policy`.
+    /// Hash used for wire-facing transport identifiers and local next-hop
+    /// answers. Derived from the internal or ephemeral hash by identity policy;
+    /// it is not itself a signing key.
     pub transport_identity_hash: Option<[u8; 16]>,
-    /// Persisted transport identity (Python 1.3.8 `Transport._identity`,
-    /// Transport.py:211-215). RPC-key derivation and operator identification
-    /// stay bound to this; never emitted on the wire when the ephemeral
-    /// policy is active.
+    /// Configured internal identity hash supplied by `SetTransportIdentity`.
+    /// Identity policy uses it directly when forwarding or static identity is
+    /// enabled. This actor does not derive RPC keys from it or retain a private key.
     pub internal_identity_hash: Option<[u8; 16]>,
-    /// Per-boot ephemeral identity hash substituted for the persisted one
-    /// when transport is disabled and `static_transport_identity` is unset
-    /// (Python 1.3.8 Transport.py:234-238). Generated lazily once per boot;
-    /// the runtime may pre-seed it with the hash of a full ephemeral
-    /// `Identity` so runtime-side consumers (discovery announcer, blackhole
-    /// publisher) share the same value.
+    /// Optional ephemeral hash used when forwarding and static identity are
+    /// disabled. Policy lazily generates it once per actor if not pre-seeded.
+    /// The runtime can supply a hash from an identity it owns; this field alone
+    /// contains no key and makes no claim about other services' identity choices.
     pub ephemeral_identity_hash: Option<[u8; 16]>,
-    /// Python 1.3.8 `static_transport_identity` config key (Reticulum.py:502-504,
-    /// default false): opts a non-transport node out of the per-boot ephemeral
-    /// transport identity. Set by the runtime before spawn.
+    /// Use the configured internal hash even when forwarding is disabled.
+    /// Default false; configure before identity policy is applied by
+    /// `SetTransportIdentity` or `SetTransportEnabled`.
     pub static_transport_identity: bool,
-    /// Python 1.3.8 `Transport.local_hops_delta` (Transport.py:167,240): when
-    /// the `local_hops_delta` config key is set, a per-boot random 2..=7
-    /// replaces the hops byte of locally-originated packets at egress
-    /// (`should_apply_delta`/`mangle_hops`). 0 = disabled (the default). Set
-    /// by the runtime before spawn.
+    /// Replacement hop byte for eligible locally originated egress; zero disables
+    /// it. The actor stores this byte without choosing or validating a random
+    /// range. Not every packet or interface is eligible for replacement.
     pub local_hops_delta: u8,
+    /// Allowed external source hashes for on-disk blackhole loading. Changing
+    /// this vector alone does not reload or purge the table.
     pub blackhole_sources: Vec<[u8; 16]>,
-    /// Live snapshot of currently blackholed identity hashes, shared with the
-    /// runtime's link layer so the LINKIDENTIFY handler can tear down links
-    /// from blackholed identities (Python 1.3.8 Link.py:966-968) without an
-    /// actor round-trip. Rebuilt on every blackhole-table mutation.
+    /// Shared set of currently blackholed identity hashes for runtime Link checks.
+    /// Managed mutation/cull paths rebuild it and filter expired entries. Direct
+    /// public table mutation does not publish a snapshot; a poisoned snapshot
+    /// lock prevents publication.
     pub blackholed_snapshot: Arc<std::sync::RwLock<HashSet<[u8; 16]>>>,
 
-    /// True when connected to a shared Reticulum instance — the transport
-    /// defers to the shared instance for routing decisions rather than
-    /// originating them locally.
+    /// Whether this actor currently uses a shared-instance peer. Routing policy
+    /// uses that peer and reconnect handling invalidates prior routing state.
     pub is_shared_instance: bool,
     /// Sticky process-mode marker for shared-instance clients. It remains true
     /// after a shared connection drops so shutdown cannot persist an empty
     /// local routing table over the real shared instance's cache.
     pub shared_instance_client_mode: bool,
 
+    /// Trusted persistence root. Prefer `initialize_storage` to assigning this
+    /// field when saved state must also be loaded.
     pub storage_dir: Option<PathBuf>,
     /// One-shot guard for lazy packet-hashlist restore. The hashlist is only
     /// authoritative on an enabled transport node that is not a shared
@@ -232,15 +236,17 @@ pub struct TransportActor {
     /// known.
     hashlist_load_attempted: bool,
 
-    /// Last save (Unix seconds) — gates the periodic save tick. 0 forces an
-    /// initial baseline write after storage initialisation.
+    /// Unix time of the last routing-save request or attempt, not confirmation
+    /// of successful persistence. Zero makes the first dirty periodic save eligible.
     pub last_state_save: f64,
 
-    /// Set when persisted-state mutates; cleared after each `save_state`.
-    /// Gates the periodic tick so idle devices don't spin disk uselessly.
+    /// Requests a periodic routing-state save. Maintenance and managed mutations
+    /// set it; queued/synchronous save paths can clear it before success is known.
+    /// It is not a reliable comparison between memory and durable disk state.
     pub state_dirty: bool,
-    /// Guards the blocking-pool routing-state writer; concurrent writers
-    /// would race on the shared `<file>.tmp` paths.
+    /// Whether an asynchronous routing writer is in flight. The separate
+    /// publication lock and generation counter coordinate queued and synchronous
+    /// snapshots; this flag alone is not a cross-process writer lock.
     pub routing_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Monotonic claim used to prevent an older queued routing snapshot from
     /// replacing a newer synchronous/shutdown snapshot.
@@ -249,15 +255,17 @@ pub struct TransportActor {
     /// decides whether a queued writer is still current.
     pub routing_save_lock: std::sync::Arc<std::sync::Mutex<()>>,
     pub hashlist_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Guards the blocking-pool announce-cache sweep (Python parity with the
-    /// non-blocking `cache_clean_lock`: an in-flight sweep skips the pass).
+    /// Whether an asynchronous announce-cache sweep is in flight. Scheduling
+    /// skips another sweep while this flag is set.
     pub announce_sweep_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     /// Persisted path entries waiting on their interface to re-register.
     /// Drained by `drain_pending_for_interface` on `RegisterInterface`.
     pub pending_path_entries: Vec<crate::persistence::PersistedPathEntry>,
 
-    /// Cache of recently learnt announces, keyed by dest_hash for O(1) upsert.
+    /// Announce metadata keyed by destination hash. Fresh network input is
+    /// validated before caching, but restored local metadata is trusted and queries
+    /// do not re-verify signatures.
     pub recent_announces: HashMap<[u8; 16], RecentAnnounce>,
 
     /// Grace window before cache cleaning runs — protects freshly restored
@@ -265,31 +273,32 @@ pub struct TransportActor {
     startup_complete: bool,
     startup_time: f64,
 
-    /// Try_send failures into destination channels (diagnostic gauge).
+    /// Cumulative counted failures when trying destination delivery channels.
+    /// This is not a complete transport-loss counter.
     pub channel_drops: u64,
 
     announce_handlers: Vec<AnnounceHandlerRegistration>,
     next_announce_handler_id: u64,
 
-    /// Foreground/background flag shared with the app layer. Flipping to
-    /// background switches the maintenance tick to the long interval so the
-    /// actor stops burning CPU (and battery) while the app is suspended.
+    /// Shared foreground flag, observed on maintenance ticks. A falling edge
+    /// requests asynchronous persistence and a rising edge resets maintenance
+    /// checks. Only the `mobile-throttle` feature changes the background tick
+    /// period to 2 seconds; neither transition guarantees completed disk writes.
     pub is_foreground: Arc<AtomicBool>,
 }
 
-/// Cached announce metadata for diagnostics + CacheRequest replay. Raw
-/// announce bytes live on disk (`cache/announces/<packet_hash>`, written
-/// event-driven at receive — Python `Transport.cache` parity) and are fetched
-/// via `packet_hash`; keeping them in RAM doubled per-destination retention
-/// and dominated the periodic state snapshot. `retained` pins the entry
-/// against the cull sweep (`RetainDestination` / `UnretainDestination`).
+/// Cached announce metadata used by diagnostics and path/identity lookups.
+/// Raw announce packets, when saved, live under `cache/announces/<packet_hash>`
+/// and can be replayed by cache requests. This record itself carries no
+/// signature-verification evidence: local persistence is a trusted input.
+/// `retained` prevents age-based cleanup, not explicit cache clearing.
 #[derive(Debug, Clone)]
 pub struct RecentAnnounce {
     pub dest_hash: [u8; 16],
     pub hops: u8,
     pub app_data: Option<Vec<u8>>,
-    /// Announce receive time (Python `known_destinations[0]`). Not bumped on
-    /// use — see `last_used`.
+    /// Announce receive time in Unix seconds; using the destination does not
+    /// refresh it. See `last_used`.
     pub timestamp: f64,
     pub public_key: Option<[u8; 64]>,
     pub ratchet: Option<[u8; 32]>,
@@ -299,14 +308,20 @@ pub struct RecentAnnounce {
     /// Captured at receive so RPC consumers don't re-parse the raw packet.
     pub is_path_response: bool,
     pub retained: bool,
-    /// Last `UseDestination` touch (Python `known_destinations[4]`). Drives
-    /// the `UNUSED_DESTINATION_LINGER` sweep for pathless entries.
+    /// Last `UseDestination` time in Unix seconds. Never-used pathless entries
+    /// use the short linger threshold; used entries use the longer destination
+    /// timeout. Retained or currently routed entries are preserved by age cleanup.
     pub last_used: Option<f64>,
-    /// `SHA-256(app_name)[:10]` so cache consumers can filter by aspect
-    /// without re-parsing the announce. Zeroed if the announce had no payload.
+    /// Ten-byte announce name hash from the destination's expanded hash name,
+    /// which can include aspects and a generated-identity suffix. Legacy restored
+    /// entries can contain zero when metadata is unavailable; fresh announces
+    /// without valid payloads are rejected.
     pub name_hash: [u8; 10],
 }
 
+/// One automatic rediscovery queue entry after a failed Link attempt.
+/// `blocked_interface` is excluded from that queued request's targets; this
+/// record does not send traffic or remove a cached route by itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingDiscoveryPathRequest {
     pub destination_hash: [u8; 16],
@@ -330,31 +345,41 @@ enum AnnounceHandlerOwnership {
     Subscription,
 }
 
-/// Dedicated trigger for scheduled full-state persistence.
-///
-/// Keeping this control outside [`TransportMessage`] avoids expanding the
-/// public transport command enum for a runtime-lifecycle concern. Requests
-/// are serialized by the owning actor.
+/// Cloneable handle to the actor's one-slot full-state persistence request
+/// channel. The actor serializes request handling, but writes may be queued
+/// on blocking workers and errors are logged rather than returned here.
 #[derive(Clone)]
 pub struct PersistenceTrigger {
     tx: mpsc::Sender<()>,
 }
 
 impl PersistenceTrigger {
-    /// Request a full asynchronous persistence pass. Returns `false` only
-    /// after the owning transport actor has stopped.
+    /// Admit a full-state save request to the one-slot control mailbox. True
+    /// means queue admission, not save completion or success. False means the
+    /// receiver is closed. There is no internal timeout; apply a caller deadline
+    /// when admission must be bounded.
     pub async fn request(&self) -> bool {
         self.tx.send(()).await.is_ok()
     }
 }
 
 impl TransportActor {
+    /// Construct an unstarted actor with a 4096-command mailbox, default two-million
+    /// hash insertion capacity, no interfaces/storage/identity, and forwarding
+    /// disabled. Configure the returned actor before running it; retain the sender
+    /// for commands. No task or network interface is started here.
     pub fn new() -> (Self, mpsc::Sender<TransportMessage>) {
         Self::new_with_capacity(4096, HASHLIST_MAXSIZE)
     }
 
-    /// Benchmarks at scale override both caps to avoid running the host out of
-    /// memory with synthetic traffic.
+    /// Construct an unstarted actor with a caller-sized ordinary mailbox and
+    /// duplicate-hash insertion capacity. Dedicated control queues have their
+    /// own fixed bounds. Hash restoration does not enforce `hashlist_cap`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `channel_cap` is zero or exceeds Tokio's maximum semaphore
+    /// permits, as required by its bounded channel constructor.
     pub fn new_with_capacity(
         channel_cap: usize,
         hashlist_cap: usize,
@@ -475,20 +500,25 @@ impl TransportActor {
         }
     }
 
-    /// Load persisted state before the actor starts draining live traffic.
-    ///
-    /// Startup restore can touch thousands of Python cache files on slow
-    /// storage. Doing that work after `run()` starts blocks interface
-    /// registration, RPC queries and inbound packet processing behind a
-    /// synchronous `SetStoragePaths` message.
+    /// Set a trusted local storage directory and synchronously load persisted
+    /// state. Call before `run` to keep restore work out of live command handling.
+    /// Read/parse failures are logged instead of returned, and loading may write
+    /// legacy cache migrations. Repeated calls do not reset the actor to an empty
+    /// state; this is not a storage-isolation or identity-switch operation.
     pub fn initialize_storage(&mut self, storage_dir: PathBuf) {
         self.storage_dir = Some(storage_dir);
         self.load_state();
         self.maybe_load_hashlist();
     }
 
-    /// Run the actor event loop. Messages are processed sequentially so no
-    /// routing state is ever touched from two tasks at once.
+    /// Consume the actor and service ordinary commands, dedicated control lanes
+    /// and an internal maintenance timer. A foreground change is observed on a
+    /// tick; `mobile-throttle` changes tick cadence, not channel admission policy.
+    ///
+    /// An ordinary `Shutdown` or closure of the ordinary mailbox runs the
+    /// synchronous shutdown save path and exits. Save errors are logged, and
+    /// returning does not join every previously started background writer/sweep
+    /// or confirm durable storage. The caller must supply a Tokio timer runtime.
     pub async fn run(mut self) {
         let mut tick_interval = tokio::time::interval(Duration::from_millis(JOB_INTERVAL_MS));
         let mut was_foreground = true;
@@ -2131,10 +2161,12 @@ impl TransportActor {
         Some(raw)
     }
 
+    /// Whether a non-expired path is cached. This does not probe reachability.
     pub fn has_path(&self, dest_hash: &[u8; 16]) -> bool {
         self.path_table.has_path(dest_hash)
     }
 
+    /// Return hops for a non-expired cached path, or None if absent/expired.
     pub fn hops_to(&self, dest_hash: &[u8; 16]) -> Option<u8> {
         self.path_table.hops_to(dest_hash)
     }

@@ -1,7 +1,5 @@
-//! Deadline-aware, handler-free destination identity resolution.
-//!
-//! Python applications resolve finite destinations through validated identity
-//! recall and path requests. They do not install temporary announce handlers.
+//! Deadline-aware destination identity resolution through transport recall
+//! and path-request commands, without temporary announce handlers.
 
 use std::time::Duration;
 
@@ -18,11 +16,11 @@ pub struct DestinationResolveOptions {
     /// Complete command admission, path request and recall before this budget.
     pub timeout: Duration,
     /// Remove an existing route before requesting a fresh path response when
-    /// the validated identity is not already cached.
+    /// identity metadata is not already cached.
     pub drop_existing_path: bool,
-    /// Request a path refresh even when validated identity data is cached.
-    /// The cached identity remains immediately usable, matching upstream
-    /// applications that refresh routing separately from identity recall.
+    /// Queue a path-refresh request even when identity metadata is cached.
+    /// The call waits for command admission, then returns the cached identity
+    /// without waiting for a fresh path response.
     pub refresh_cached_path: bool,
 }
 
@@ -46,12 +44,14 @@ pub enum DestinationResolveError {
     UnexpectedResponse(&'static str),
 }
 
-/// Resolve one validated destination without installing an announce handler.
+/// Resolve cached announce identity metadata from the transport. This helper
+/// trusts the transport and its persistent cache; it does not freshly verify
+/// an announce signature or establish current on-network presence.
 ///
-/// A missing identity always emits an explicit path request. This deliberately
-/// covers the state where a route exists but its validated announce metadata
-/// is absent: `AwaitPath` alone would return immediately and never repair the
-/// identity cache.
+/// When identity data is absent, queue an explicit path-request command even
+/// if a route already exists, then poll recall until the deadline. Command
+/// admission does not establish that the request reached the network; the
+/// transport handles routing and request suppression.
 pub async fn resolve_destination_on_transport(
     transport_tx: &mpsc::Sender<TransportMessage>,
     destination_hash: [u8; 16],

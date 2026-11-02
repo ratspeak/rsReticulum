@@ -8,22 +8,24 @@ use crate::constants::{
 use crate::messages::InterfaceId;
 use rns_wire::types::DestHash;
 
-/// One known path to a destination.
+/// Stored route metadata for a destination. Fields are caller-writable; this
+/// record alone does not establish a live interface or reachable peer.
 #[derive(Debug, Clone)]
 pub struct PathEntry {
-    /// Learn time (Unix seconds).
+    /// Learn or last-touch time (Unix seconds).
     pub timestamp: f64,
     /// Next-hop transport id; `None` for a directly-connected neighbour.
     pub next_hop: Option<[u8; 16]>,
     pub hops: u8,
-    /// Expiry (Unix seconds), derived from interface mode at insert time.
+    /// Expiry (Unix seconds). `new` derives it from the supplied interface mode.
     pub expires: f64,
-    /// Recent announce-random blobs, capped at `MAX_RANDOM_BLOBS` to bound
-    /// anti-replay memory on long-lived paths.
+    /// Recent announce-random blobs. Normal `add_random_blob` use from an empty
+    /// deque retains at most `MAX_RANDOM_BLOBS`; direct field mutation can
+    /// exceed that size. The helper does not authenticate or deduplicate blobs.
     pub random_blobs: VecDeque<[u8; 10]>,
     pub interface_id: InterfaceId,
-    /// Hash of the cached announce packet — used to satisfy CacheRequest
-    /// without holding the full packet bytes.
+    /// Hash used to locate a cached announce packet. The record does not own
+    /// its bytes, and a corresponding cache file may be unavailable.
     pub packet_hash: Option<[u8; 32]>,
 }
 
@@ -63,9 +65,10 @@ impl PathEntry {
         now_f64() > self.expires
     }
 
-    /// Mark an actively used route as live. Reticulum's Python path cull is
-    /// timestamp based; Rust stores an explicit expiry, so both clocks must
-    /// move together when traffic proves the route is still useful.
+    /// Set the timestamp to now and preserve a positive prior lifetime
+    /// (`expires - timestamp`), or use the seven-day default otherwise.
+    /// This can renew an expired entry and performs no network liveness check;
+    /// the caller decides whether activity justifies renewal.
     pub fn touch(&mut self) {
         let now = now_f64();
         let lifetime = if self.expires > self.timestamp {
@@ -77,17 +80,18 @@ impl PathEntry {
         self.expires = now + lifetime;
     }
 
-    /// Most recent blobs to persist — older entries can be regenerated from
-    /// the wire on replay, so we cap the snapshot at `PERSIST_RANDOM_BLOBS`
-    /// to keep the on-disk table small.
+    /// Return at most the last `PERSIST_RANDOM_BLOBS` entries, preserving their
+    /// deque order, for a bounded persistence snapshot. Older blobs are omitted.
     pub fn blobs_for_persist(&self) -> Vec<[u8; 10]> {
         let start = self.random_blobs.len().saturating_sub(PERSIST_RANDOM_BLOBS);
         self.random_blobs.iter().skip(start).copied().collect()
     }
 }
 
-/// Destination-hash → path mapping plus a parallel liveness state map so we
-/// can probe unresponsive paths without rewriting the entries.
+/// Destination-keyed routes and separately stored path-state labels. Ordinary
+/// lookup/iteration includes expired entries; `get_live`/`iter_live` checks
+/// expiry only, not interface health or reachability. State labels are supplied
+/// by callers and can exist without a route. This table does not probe peers.
 #[derive(Clone)]
 pub struct PathTable {
     entries: HashMap<DestHash, PathEntry>,
@@ -102,17 +106,9 @@ impl PathTable {
         }
     }
 
-    /// Insert or replace a path entry. The parallel liveness state is
-    /// cleared so a fresh/replacement entry never inherits a stale
-    /// `Responsive`/`Unresponsive` reading from its predecessor. `get_state`
-    /// reads a missing entry as `Unknown`, so clearing is equivalent to
-    /// writing `Unknown` but avoids holding an entry we'd only overwrite.
-    ///
-    /// Python Reticulum 1.1.8 (`8c082b2`) fixes the same bug by clearing state
-    /// at the inbound insert sites. The Rust transport has additional insert
-    /// sites (announce install, PathResponse install, tunnel path restore, disk
-    /// load), so the invariant is enforced here: state is never older than the
-    /// entry it describes.
+    /// Insert or replace a route without validating its fields, and remove the
+    /// old state label so `get_state` returns `Unknown`. Mutation through
+    /// `get_mut` does not perform this reset.
     pub fn insert(&mut self, dest_hash: impl Into<DestHash>, entry: PathEntry) {
         let hash: DestHash = dest_hash.into();
         self.states.remove(&hash);
@@ -136,7 +132,8 @@ impl PathTable {
     }
 
     /// A path exists and has not yet expired. Callers should prefer this
-    /// over `get().is_some()` so stale entries are not treated as routable.
+    /// over `get().is_some()` to exclude expired entries. This does not confirm
+    /// that the recorded interface or remote destination is currently reachable.
     pub fn has_path(&self, dest_hash: &[u8; 16]) -> bool {
         self.get_live(dest_hash).is_some()
     }
@@ -150,23 +147,25 @@ impl PathTable {
         self.entries.remove(dest_hash)
     }
 
-    /// Drop every path whose interface id matches — used when an interface
-    /// goes down so we don't keep routing through a dead transport.
+    /// Remove every route whose interface ID matches. Associated state labels
+    /// remain until separately removed, replaced or cleaned by a full cull.
     pub fn drop_all_via(&mut self, interface_id: InterfaceId) -> usize {
         let before = self.entries.len();
         self.entries.retain(|_, e| e.interface_id != interface_id);
         before - self.entries.len()
     }
 
+    /// Remove routes through this next hop, leaving their state labels intact.
     pub fn drop_all_via_next_hop(&mut self, next_hop: &[u8; 16]) -> usize {
         let before = self.entries.len();
         self.entries.retain(|_, e| e.next_hop != Some(*next_hop));
         before - self.entries.len()
     }
 
-    /// Force-expire a path and cull immediately. Useful when the caller
-    /// already knows the path is bad (e.g. a link proof failed) and
-    /// shouldn't wait for the periodic cull cycle.
+    /// Set a present route's expiry to zero, then run a full expired-route cull
+    /// across the table. Return whether the target entry existed before the
+    /// operation. The cull uses the current wall clock and can remove other
+    /// expired entries too.
     pub fn expire(&mut self, dest_hash: &[u8; 16]) -> bool {
         if let Some(entry) = self.entries.get_mut(dest_hash) {
             entry.expires = 0.0;
@@ -188,8 +187,8 @@ impl PathTable {
             .unwrap_or(PathState::Unknown)
     }
 
-    /// Full cull pass. Prefer `cull_expired_batch` on the hot path to bound
-    /// per-tick work.
+    /// Scan all routes, remove expired entries and remove every state label
+    /// without a remaining route. Return the number of routes removed.
     pub fn cull_expired(&mut self) -> usize {
         let before = self.entries.len();
         self.entries.retain(|_, entry| !entry.is_expired());
@@ -198,8 +197,9 @@ impl PathTable {
         before - self.entries.len()
     }
 
-    /// Batched cull — removes at most `limit` expired entries so the actor
-    /// cannot stall on a very large path table.
+    /// Remove at most `limit` expired routes and their state labels. The limit
+    /// bounds removals, not scanning time: finding those entries can examine
+    /// the entire table. Unrelated orphan state labels are not cleaned here.
     pub fn cull_expired_batch(&mut self, limit: usize) -> usize {
         let to_remove: Vec<DestHash> = self
             .entries

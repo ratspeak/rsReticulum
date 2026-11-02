@@ -1,12 +1,11 @@
-//! Authenticated RPC over Reticulum links (`rnstatus -R`, `rnpath -R`).
-//! Registers `rnstransport.remote.management` with `/status` + `/path`.
+//! Remote-management requests over Reticulum Links, used by `rnstatus-rs -R`
+//! and `rnpath-rs -R`. Registers `rnstransport.remote.management` with `/status`
+//! and `/path` handlers. Requests require prior Link identification and an
+//! identity in the supplied allow-list; an empty list denies every peer.
+//! Denied and unknown requests receive no response.
 //!
-//! Auth: requires prior `LinkIdentify`, then checks identity against
-//! `remote_management_allowed`. This mirrors Python `Destination.ALLOW_LIST`:
-//! an empty allow-list denies all peers.
-//!
-//! REQUIRES a multi-threaded Tokio runtime — sync handler calls
-//! `block_in_place`. Tests must use `#[tokio::test(flavor = "multi_thread")]`.
+//! Requires a multithreaded Tokio runtime: synchronous handlers use
+//! `block_in_place` while awaiting transport queries.
 
 use std::sync::Arc;
 
@@ -24,10 +23,11 @@ use crate::rpc_server::{TransportStatsSource, stat_entries};
 const STATUS_PATH: &str = "/status";
 const PATH_PATH: &str = "/path";
 
-/// Python registers this destination on `Transport.identity`
-/// (Transport.py:367-368), so `rnstatus -R` and `rnpath -R` find it from the
-/// transport identity hash. Empty `allowed_identities` denies all peers,
-/// matching Python's `Destination.ALLOW_LIST` semantics.
+/// Start remote management using the supplied identity and return its
+/// application destination hash. Pass the runtime transport identity for
+/// clients that address the service by transport identity hash. The caller
+/// provides the allow-list; an empty list denies every peer. Return success
+/// indicates manager startup, not an advertised or remotely reachable service.
 pub async fn start_remote_management(
     transport_tx: mpsc::Sender<TransportMessage>,
     identity: &Identity,

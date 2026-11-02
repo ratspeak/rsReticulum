@@ -371,9 +371,10 @@ pub struct I2PServerConfig {
     pub sam_port: u16,
     /// Base64 private key for the server's destination, used before `key_path`.
     pub keyfile: Option<String>,
-    /// File holding the server's private key, as Python keeps it under
-    /// `storage/i2p` (I2PInterface.py:225-255): every session uses it, and
-    /// the first session's key is written to it when it is missing.
+    /// Optional path for the server destination's private key, used when
+    /// `keyfile` is absent. A missing or empty file is populated after session
+    /// creation. Read failures leave the file untouched and use a transient
+    /// destination; write failures can likewise change the next session's address.
     pub key_path: Option<std::path::PathBuf>,
     pub reconnect_delay: u64,
     pub mode: InterfaceMode,
@@ -504,13 +505,16 @@ pub struct I2PClientConfig {
     pub name: String,
     pub sam_host: String,
     pub sam_port: u16,
-    /// Peer I2P destination (base64).
+    /// Peer destination passed verbatim as SAM STREAM CONNECT's `DESTINATION`
+    /// value. This library does not perform a separate name lookup.
     pub peer_destination: String,
-    /// Reconnect attempt cap; `None` = unlimited.
+    /// Consecutive failure cap, including the initial connection attempt. A
+    /// successful connection resets the count. `None` means unlimited retries.
     pub max_reconnect_tries: Option<usize>,
     pub reconnect_delay: u64,
     pub mode: InterfaceMode,
-    /// Signs a tunnel synthesis for every connection; `None` sends none.
+    /// Identity used to request a signed tunnel synthesis for each connection.
+    /// `None`, or an identity without signing material, sends no synthesis.
     pub tunnel_identity: Option<TunnelIdentity>,
 }
 
@@ -805,8 +809,9 @@ pub async fn spawn_i2p_client(
     })
 }
 
-/// Accept SAM streams; each becomes a sub-interface via `handle_tx`. Session
-/// is recreated if the control socket drops.
+/// Accept SAM streams; each becomes a sub-interface via `handle_tx`.
+/// The session is recreated after an accept-connection or SAM handshake
+/// failure. The session control socket is not monitored independently.
 pub async fn spawn_i2p_server(
     config: I2PServerConfig,
     id: InterfaceId,

@@ -7,9 +7,11 @@ pub struct DeviceInfo {
     pub reader_name: String,
     pub serial: Option<u32>,
     pub firmware: Option<String>,
-    /// Slot 9A occupied.
+    /// Whether GET METADATA succeeded for slot 9A. An error also produces false;
+    /// this is not a verified Ed25519-key or empty-slot diagnosis.
     pub has_signing_key: bool,
-    /// Slot 9D occupied.
+    /// Whether GET METADATA succeeded for slot 9D. An error also produces false;
+    /// this is not a verified X25519-key or empty-slot diagnosis.
     pub has_encryption_key: bool,
 }
 
@@ -30,7 +32,9 @@ impl DeviceType {
     }
 }
 
-/// YubiKey readers contain "Yubico" / "YubiKey"; Nitrokey 3 contains "Nitrokey".
+/// Classify a reader name by case-insensitive substrings: `yubico`/`yubikey`
+/// or `nitrokey`. This does not verify a model, firmware, algorithm support
+/// or authenticity; unmatched names yield `Unknown`.
 pub fn detect_device_type(reader_name: &str) -> DeviceType {
     let lower = reader_name.to_lowercase();
     if lower.contains("yubico") || lower.contains("yubikey") {

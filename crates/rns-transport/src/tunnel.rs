@@ -2,13 +2,13 @@ use std::collections::HashMap;
 
 use crate::messages::InterfaceId;
 
-/// One virtual-overlay tunnel plus the per-destination paths riding it.
-/// Tunnels let transports stitch together routes that cross a network
-/// boundary the underlying interface cannot reach directly.
+/// Retained routes for one transport tunnel. A valid synthesis packet can
+/// rebind this path collection to an interface when connectivity returns.
+/// Tunnel bookkeeping adds no separate payload encryption.
 #[derive(Debug, Clone)]
 pub struct TunnelEntry {
     pub tunnel_id: [u8; 32],
-    /// Interface the latest synthesis arrived on; `None` while unbound.
+    /// Current interface binding; `None` while unbound.
     pub interface_id: Option<InterfaceId>,
     pub tunnel_paths: HashMap<[u8; 16], TunnelPath>,
     pub expires: f64,
@@ -24,6 +24,9 @@ pub struct TunnelPath {
     pub packet_hash: Option<[u8; 32]>,
 }
 
+/// Tunnel records and cached interface-to-tunnel associations. Lookup does not
+/// check expiry. Removing, expiring or rebinding an entry does not clear old
+/// interface associations; `void_interface` explicitly forgets one binding.
 #[derive(Clone)]
 pub struct TunnelTable {
     entries: HashMap<[u8; 32], TunnelEntry>,
@@ -40,7 +43,9 @@ impl TunnelTable {
         }
     }
 
-    /// A bound entry also becomes its interface's tunnel.
+    /// Insert or replace a record and associate its interface when supplied.
+    /// Previous interface associations are not removed, and fields are not
+    /// validated by this method.
     pub fn insert(&mut self, entry: TunnelEntry) {
         if let Some(interface_id) = entry.interface_id {
             self.by_interface.insert(interface_id, entry.tunnel_id);
@@ -76,15 +81,16 @@ impl TunnelTable {
         self.entries.iter_mut()
     }
 
-    /// The tunnel that announces arriving on `interface_id` join
-    /// (Transport.py:2467-2476).
+    /// Resolve the cached association for this interface. It can return None
+    /// for a removed record, or a record now bound to another interface;
+    /// neither current binding nor expiry is checked here.
     pub fn get_mut_by_interface(&mut self, interface_id: InterfaceId) -> Option<&mut TunnelEntry> {
         let tunnel_id = self.by_interface.get(&interface_id)?;
         self.entries.get_mut(tunnel_id)
     }
 
     /// Forget `interface_id`: it names no tunnel, and the tunnels bound to it
-    /// become unbound but keep their paths (Transport.py:1031-1033). Returns
+    /// become unbound but keep their paths. Returns
     /// how many tunnels were unbound.
     pub fn void_interface(&mut self, interface_id: InterfaceId) -> usize {
         self.by_interface.remove(&interface_id);
@@ -104,6 +110,9 @@ impl TunnelTable {
             .flat_map(|entry| entry.tunnel_paths.iter())
     }
 
+    /// Remove records whose expiry is at/before now or more than twice the
+    /// eight-hour tunnel timeout ahead. This does not cull individual cached
+    /// paths or remove interface associations.
     pub fn cull_expired(&mut self) -> usize {
         let now = crate::now_f64();
 
@@ -112,7 +121,9 @@ impl TunnelTable {
         before - self.entries.len()
     }
 
-    /// Batched cull — bounds per-tick work on large tables.
+    /// Apply the same expiry test as `cull_expired`, removing at most `limit`
+    /// records. The limit does not bound scanning time, and interface
+    /// associations remain unchanged.
     pub fn cull_expired_batch(&mut self, limit: usize) -> usize {
         let now = crate::now_f64();
 
@@ -142,14 +153,15 @@ fn is_stale(entry: &TunnelEntry, now: f64) -> bool {
     entry.expires <= now || entry.expires > now + 2.0 * crate::constants::TUNNEL_TIMEOUT as f64
 }
 
-/// Payload of a tunnel-synthesis announce. Total wire size = 176 bytes.
+/// The 176-byte tunnel-synthesis payload, excluding the Reticulum packet header.
 #[derive(Debug, Clone)]
 pub struct TunnelSynthesisData {
     /// Transport identity key: `X25519(32) || Ed25519(32)`.
     pub public_key: [u8; 64],
     /// SHA-256 of the interface identifier string.
     pub interface_hash: [u8; 32],
-    /// Randomness that makes each announce unique for replay protection.
+    /// Random bytes included in the signed payload. This type does not track
+    /// or reject replayed synthesis packets.
     pub random_hash: [u8; 16],
     /// Ed25519 signature over `public_key || interface_hash || random_hash`.
     pub signature: [u8; 64],
@@ -166,7 +178,8 @@ impl TunnelSynthesisData {
         data
     }
 
-    /// Python accepts exactly 176 bytes (Transport.py:2790-2791).
+    /// Parse exactly 176 bytes without verifying the signature. Call
+    /// [`Self::is_signed`] before treating the payload as signed.
     pub fn unpack(data: &[u8]) -> Option<Self> {
         if data.len() != 176 {
             return None;
@@ -197,8 +210,8 @@ impl TunnelSynthesisData {
         sha256(&tunnel_id_data)
     }
 
-    /// The signature verifies under the Ed25519 half of `public_key`
-    /// (Transport.py:2799-2805).
+    /// Verify the signature under the Ed25519 half of the embedded public key.
+    /// This does not check an external trust policy, replay state or freshness.
     pub fn is_signed(&self) -> bool {
         let Ok(signer) = rns_identity::identity::Identity::from_public_key(&self.public_key) else {
             return false;
@@ -211,12 +224,11 @@ impl TunnelSynthesisData {
     }
 }
 
-/// Install or refresh a tunnel from a validated tunnel-synthesis announce,
-/// making it the receiving interface's tunnel and expiring it
-/// `TUNNEL_TIMEOUT` later (Transport.py:2819-2834).
-/// A reappearing tunnel keeps its existing path set — only the interface
-/// binding and expiry move forward, so in-flight routes aren't lost when the
-/// underlying link flaps.
+/// Insert or refresh a tunnel's interface binding and eight-hour expiry,
+/// retaining an existing path set. The caller must validate the synthesis
+/// packet first; this helper accepts IDs without cryptographic checks. It
+/// does not restore routes into the path table or remove old interface
+/// associations when rebinding.
 pub fn handle_tunnel(
     tunnel_table: &mut TunnelTable,
     tunnel_id: [u8; 32],
@@ -240,9 +252,10 @@ pub fn handle_tunnel(
 }
 
 /// Build a tunnel-synthesis packet addressed to the well-known tunnel
-/// synthesize PLAIN destination. The returned bytes are ready to send on the
-/// interface that should host the tunnel; the receiver validates the
-/// signature and installs the tunnel via `handle_tunnel`.
+/// synthesize PLAIN destination, with fresh random bytes and a signature.
+/// Return `None` if the identity cannot sign. The result is a complete inner
+/// Reticulum packet; interface-specific IFAC and framing remain separate.
+/// The receiving transport validates the signature before installing the tunnel.
 pub fn build_tunnel_synthesis_packet(
     identity: &rns_identity::identity::Identity,
     interface_hash: [u8; 32],

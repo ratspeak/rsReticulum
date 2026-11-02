@@ -46,7 +46,8 @@ impl TransportActor {
 
     /// Enable bounded local-Link route observations and obtain an owned
     /// recovery handle. A handle from a retired actor cannot mutate its
-    /// replacement. Explicit legacy suppression operations are unaffected.
+    /// replacement. Recovery does not suppress an interface; observation
+    /// retention and queue limits are documented on `PathRecoveryHandle`.
     pub fn path_recovery_handle(&mut self) -> crate::path_recovery::PathRecoveryHandle {
         self.observe_local_link_routes = true;
         crate::path_recovery::PathRecoveryHandle {

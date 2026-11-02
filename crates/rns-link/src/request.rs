@@ -13,8 +13,9 @@ pub enum RequestState {
     Receiving,
     Delivered,
     Failed,
-    /// Response payload has arrived; kept distinct from [`Delivered`] so callers
-    /// can distinguish "ack with data" from "ack only".
+    /// Response payload arrived through [`RequestReceipt::receive_response`].
+    /// [`Delivered`] can represent either an ack-only transition or a response
+    /// recorded through [`RequestReceipt::deliver`].
     ///
     /// [`Delivered`]: RequestState::Delivered
     ResponseReceived,
@@ -28,12 +29,13 @@ pub struct RequestCallbacks {
     pub progress: Option<ProgressCallback>,
 }
 
-/// Callback invoked once when a request receives a response or terminal failure.
+/// Callback consumed at most once per registration on a response or failure.
 pub type RequestCallback = Box<dyn FnOnce(&RequestReceipt) + Send>;
 /// Progress callback for resource-backed request responses.
 pub type ProgressCallback = Box<dyn Fn(f32) + Send + Sync>;
 
-/// Tracks the lifecycle of an outbound request over a link.
+/// Tracks an outbound request. The owner drives timeout and delivery methods;
+/// this type does not start a timer or observe a Resource transfer itself.
 pub struct RequestReceipt {
     pub request_id: [u8; 32],
     pub link_id: [u8; 16],
@@ -42,7 +44,8 @@ pub struct RequestReceipt {
     pub timeout: Duration,
     pub response: Option<Vec<u8>>,
     pub rtt: Option<Duration>,
-    /// Transfer progress in [0.0, 1.0]; only meaningful for resource responses.
+    /// Caller-supplied transfer progress, conventionally in `[0.0, 1.0]` for
+    /// Resource responses. Neither this public field nor its setter clamps values.
     pub progress: f32,
     pub callbacks: RequestCallbacks,
 }
@@ -125,7 +128,8 @@ impl RequestReceipt {
         }
     }
 
-    /// Transition to `Delivered` without a response payload (ack-only).
+    /// Transition from `Sent` to `Delivered` without a response payload (ack-only).
+    /// Other states are unchanged; this does not invoke a response callback.
     pub fn mark_delivered(&mut self) {
         if self.state == RequestState::Sent {
             self.state = RequestState::Delivered;
@@ -158,7 +162,8 @@ impl RequestReceipt {
         }
     }
 
-    /// True once the request has reached a terminal state (delivered, failed, or response received).
+    /// Whether the request is no longer pending for timeout processing.
+    /// A `Delivered` receipt can still transition through [`Self::receive_response`].
     pub fn concluded(&self) -> bool {
         matches!(
             self.state,

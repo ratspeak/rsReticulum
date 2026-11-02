@@ -1,4 +1,7 @@
-//! PIN cache: `Zeroizing<String>` wiped on drop or expiry.
+//! Host-side PIN cache backed by `Zeroizing<String>`. Replacing, clearing or
+//! dropping the stored value wipes it. Expiry only makes `get` return `None`;
+//! it does not clear the allocation or relock a card. The owner must call
+//! `clear` and perform any required card-session lock.
 
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
@@ -10,7 +13,9 @@ pub struct PinCache {
 }
 
 impl PinCache {
-    /// `Duration::ZERO` disables caching (PIN required every op).
+    /// `Duration::ZERO` disables cache reuse. `cache` still stores the PIN until
+    /// clear/replacement/drop; this setting does not force an already-authorized
+    /// card to require a PIN for each operation.
     pub fn new(timeout: Duration) -> Self {
         Self {
             pin: None,

@@ -40,10 +40,9 @@ impl Eq for DiscoveryRequester {}
 
 /// Detached read-only snapshot of one pending recursive search.
 ///
-/// Since 1.3, replaces the legacy single-requester public fields and `Copy`
-/// contract. Accessors describe the observation instant, not a live view.
-/// Changing/dropping a snapshot cannot modify the actor. The historical first
-/// requester is deliberately not privileged.
+/// Cloneable but not `Copy`. Accessors describe the observation instant,
+/// not a live view. Changing or dropping a snapshot cannot modify the actor;
+/// no requester in the collection has privileged ownership.
 ///
 /// ```compile_fail
 /// use rns_transport::actor::TransportActor;

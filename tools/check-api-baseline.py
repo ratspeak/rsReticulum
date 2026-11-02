@@ -273,10 +273,15 @@ def render_snapshot(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--metadata-only", action="store_true")
+    parser = argparse.ArgumentParser(
+        description="Compare current public APIs with the stored snapshots, or refresh them after review."
+    )
+    parser.add_argument(
+        "--metadata-only", action="store_true",
+        help="validate metadata, package inventory and stored snapshot hashes without generating API output; incompatible with --update",
+    )
     parser.add_argument("--update", action="store_true",
-                        help="refresh snapshots from the working tree to commit alongside source changes")
+                        help="regenerate snapshots and update their counts/hashes in api/stability.json; review the diff before committing")
     parser.add_argument("--snapshot-source-commit",
                         help="optional HEAD guard for --update; includes uncommitted source changes")
     args = parser.parse_args()

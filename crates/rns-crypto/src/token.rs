@@ -1,4 +1,5 @@
-//! RNS encryption token: AES-256-CBC + HMAC-SHA256 over an IV-prefixed ciphertext.
+//! RNS encryption token: AES-CBC + HMAC-SHA256 over an IV-prefixed ciphertext.
+//! A 64-byte key selects AES-256; a legacy 32-byte key selects AES-128.
 
 use alloc::vec::Vec;
 use thiserror::Error;
@@ -15,9 +16,9 @@ pub const TOKEN_OVERHEAD: usize = 48;
 pub const AES128_BLOCKSIZE: usize = 16;
 /// AES block size used by current AES-256 tokens.
 pub const AES256_BLOCKSIZE: usize = 16;
-/// AES-256 token key size: 32-byte signing key + 32-byte encryption key.
+/// AES-256 token key size: 32-byte HMAC key + 32-byte encryption key.
 pub const KEY_LENGTH: usize = 64;
-/// Legacy AES-128 token key size: 16-byte signing key + 16-byte encryption key.
+/// Legacy AES-128 token key size: 16-byte HMAC key + 16-byte encryption key.
 pub const LEGACY_KEY_LENGTH: usize = 32;
 /// Python `Identity.DERIVED_KEY_LENGTH_LEGACY`.
 pub const DERIVED_KEY_LENGTH_LEGACY: usize = LEGACY_KEY_LENGTH;
@@ -28,13 +29,15 @@ pub enum TokenError {
     /// Key must be 32 or 64 bytes.
     #[error("invalid key length: expected 32 or 64, got {0}")]
     InvalidKeyLength(usize),
-    /// Token is shorter than [`TOKEN_OVERHEAD`] so cannot contain IV + HMAC.
+    /// Retained short-token error variant. The current `decrypt` method maps
+    /// every token shorter than 64 bytes to `AuthenticationFailed`.
     #[error("token too short for decryption")]
     TooShort,
-    /// HMAC tag did not validate.
+    /// Token length, authentication, block alignment, decryption or padding failed.
     #[error("authentication failed")]
     AuthenticationFailed,
-    /// Underlying AES-CBC decrypt returned an error.
+    /// Retained decryption error variant. The current `decrypt` method maps
+    /// underlying cipher failures to `AuthenticationFailed`.
     #[error("decryption failed")]
     DecryptionFailed,
     /// Underlying AES-CBC encrypt returned an error.
@@ -80,8 +83,9 @@ pub fn encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, TokenError> {
     Ok(token)
 }
 
-/// Token decrypt. All failure modes collapse to `AuthenticationFailed`
-/// (padding-oracle defence). HMAC comparison is constant-time.
+/// Authenticate and decrypt a Token. An invalid key length returns
+/// `InvalidKeyLength`; malformed-token, authentication, cipher and padding
+/// failures return `AuthenticationFailed`. HMAC comparison is constant-time.
 ///
 /// The plaintext is returned in the buffer it was decrypted into, and a failed
 /// decryption wipes that buffer. Callers wrap a secret plaintext in

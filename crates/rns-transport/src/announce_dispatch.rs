@@ -1,21 +1,31 @@
-//! Finite, exact-target admission of locally produced announcements.
+//! Bounded admission intents for locally produced announcements.
 //!
-//! An admitted result means a driver accepted bytes, never radio delivery.
+//! `Admitted` means one interface queue accepted bytes. Results do not report
+//! every target, physical transmission or delivery. The actor owns retry state
+//! until its deadline or retirement; callers must bound their own reply wait.
 use bytes::Bytes;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 pub(crate) const CAPACITY: usize = 256;
 
+/// First reported result for an intent, not a complete per-interface report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AnnounceDispatchResult {
+    /// At least one target's interface queue accepted bytes.
     Admitted,
+    /// The intent expired, was coalesced or lost admission eligibility. A
+    /// coalesced target can resolve this before other targets are processed,
+    /// so it does not prove that no bytes were or will be admitted.
     Expired,
+    /// Initial target selection found no eligible interface.
     NoEligibleInterface,
+    /// The header could not be parsed or the packet was not an announce.
     Invalid,
 }
 
+/// The intent could not enter the actor's bounded dispatch queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AnnounceDispatchError {
@@ -23,6 +33,8 @@ pub enum AnnounceDispatchError {
     Closed,
 }
 
+/// Cloneable handle to the actor's 256-intent admission queue. The actor must
+/// be running to process requests; cloning does not create another queue.
 #[derive(Clone, Debug)]
 pub struct AnnounceDispatchHandle {
     pub(crate) tx: mpsc::Sender<AnnounceDispatchRequest>,
@@ -36,10 +48,20 @@ pub(crate) struct AnnounceDispatchRequest {
 }
 
 impl AnnounceDispatchHandle {
-    /// Queue an admission intent for at most 120 seconds. The reply resolves
-    /// on the first driver acceptance; refused targets remain owned until the
-    /// original deadline. Accepted targets are never replayed. Dropping the
-    /// receiver before its first result cancels unadmitted work.
+    /// Queue a complete inner announce packet with a lifetime capped at 120
+    /// seconds. The actor checks its header/type, not its announce signature;
+    /// callers must construct a valid payload. An attached interface is an
+    /// explicit outbound target; otherwise normal announce egress policy applies.
+    ///
+    /// The first reported result resolves the reply. Refused targets can remain
+    /// pending until the original deadline even after another target is admitted.
+    /// Accepted targets are not retried by this intent. `Expired` can also mean
+    /// one target was coalesced while other targets continue. A dropped receiver
+    /// is checked before initial processing and during retries until the first
+    /// result; dropping it cannot recall queued bytes or interrupt processing
+    /// already underway. Bound the reply wait separately from work lifetime.
+    /// On `Full`/`Closed`, the intent was not queued and its input bytes are not
+    /// returned; retain a copy if retrying.
     pub fn try_dispatch(
         &self,
         raw: Bytes,

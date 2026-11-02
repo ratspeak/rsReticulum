@@ -64,14 +64,15 @@ impl RatchetControlState {
         }
     }
 
-    /// Rotation is due only when a persisted age exists and the wall clock has
+    /// Rotation is due only when an age anchor exists and the wall clock has
     /// advanced by the full interval. Clock rollback never looks elapsed.
     pub fn rotation_due(&self, wall_now: u64, interval_secs: u64) -> bool {
         self.last_rotation_wall
             .is_some_and(|last| wall_now >= last && wall_now.saturating_sub(last) >= interval_secs)
     }
 
-    /// Return a cloned candidate recording a successful rotation.
+    /// Return a cloned candidate recording the supplied rotation time.
+    /// The caller performs the rotation and persists the candidate.
     pub fn with_rotation_at(&self, wall_now: u64) -> Self {
         let mut candidate = self.clone();
         candidate.last_rotation_wall = Some(wall_now);
@@ -103,7 +104,9 @@ impl RatchetControlState {
         self.save_verified_impl(path, identity, false)
     }
 
-    /// Persist announce ordering before releasing the corresponding wire bytes.
+    /// Persist announce ordering through [`persistence::durable_write`].
+    /// The caller must wait for success before releasing the corresponding
+    /// wire bytes and must handle the storage limits documented by that helper.
     pub fn save_verified_durable(&self, path: &Path, identity: &Identity) -> std::io::Result<()> {
         self.save_verified_impl(path, identity, true)
     }

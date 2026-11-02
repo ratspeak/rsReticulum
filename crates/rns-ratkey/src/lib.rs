@@ -1,11 +1,18 @@
-//! Hardware-backed identity (YubiKey 5, Nitrokey 3) via PIV. Ed25519 sign + X25519
-//! ECDH keys live on-device; only public keys and results leave the token.
-//! Wire-compatible with software identities.
+//! PIV-backed Reticulum identities using Ed25519 signing and X25519 ECDH.
+//! The token performs private-key operations; ECDH results and derived token
+//! keys are processed on the host. Recoverable provisioning also derives
+//! private keys on the host before importing them; on-device generation does
+//! not provide a seed backup. Both produce ordinary Reticulum identities.
 //!
-//! The PIV protocol logic (`PivSession`, `apdu`) is transport-agnostic; the
-//! `PivTransport` seam isolates platform access. The `hardware` feature adds the
-//! PC/SC transport (`PcscTransport`) and its `connect()` entry points. Mobile
-//! NFC/USB transports implement `PivTransport` from the application layer.
+//! A device needs both algorithms and the PIV extensions used by the selected
+//! workflow. Standard non-FIPS YubiKey 5 firmware 5.7+ provides these algorithms.
+//! Recognizing a Nitrokey reader name does not establish workflow compatibility.
+//! See [Yubico PIV algorithms](https://developers.yubico.com/PIV/Introduction/YubiKey_and_PIV.html)
+//! and [Nitrokey algorithm support](https://docs.nitrokey.com/nitrokeys/nitrokey3/faq).
+//!
+//! [`PivSession`] uses a caller-supplied [`PivTransport`]. The `hardware` feature
+//! adds desktop PC/SC and its connection helpers; applications can supply other
+//! transports. The default build includes codecs and mocks, not a PC/SC driver.
 
 pub mod apdu;
 pub mod attestation;

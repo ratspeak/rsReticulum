@@ -139,7 +139,7 @@ fn target_path(path: &Path) -> io::Result<PathBuf> {
 pub enum StorageRisk {
     /// Network or user-space filesystem; flushes may not reach stable storage.
     Remote,
-    /// RAM-backed filesystem; contents do not survive a restart.
+    /// RAM-backed filesystem; contents do not survive a system restart.
     Volatile,
 }
 
@@ -152,7 +152,9 @@ impl std::fmt::Display for StorageRisk {
     }
 }
 
-/// Classify the filesystem holding `path`; `None` is ordinary local storage.
+/// Classify known filesystem risks for an existing path. `None` means no risk
+/// was identified by this platform's checks, not proof of durable local storage.
+/// Platforms without a classifier return `None`.
 pub fn storage_risk(path: &Path) -> io::Result<Option<StorageRisk>> {
     filesystem_risk(&fs::canonicalize(path)?)
 }
@@ -526,6 +528,8 @@ fn directory_chain_barrier(path: &Path, witness: &DurableFileReceipt) -> io::Res
 /// Re-establish an existing journal-owned directory transition after restart.
 /// The caller must first verify the journal's expected paths, entries and hashes;
 /// this receipt acknowledges only the renewed native directory/witness barriers.
+/// On Windows this returns `DurabilityUnsupported`; recovery must use a
+/// journaled fresh sibling directory transition instead.
 pub fn durable_reconcile_directory(
     path: &Path,
     witness: &DurableFileReceipt,

@@ -18,8 +18,9 @@ pub fn link_encrypt(keys: &LinkKeys, plaintext: &[u8]) -> Result<Vec<u8>, LinkCr
 
 /// Decrypt a ciphertext frame with the link's session keys.
 ///
-/// Errors are deliberately opaque — padding and HMAC failures are indistinguishable
-/// to callers so timing side channels cannot leak which check failed.
+/// All token errors map to `DecryptionFailed`, so the error value does not
+/// distinguish padding, HMAC, or key-length failure. This error mapping alone
+/// is not a guarantee of identical execution time for every invalid input.
 pub fn link_decrypt(keys: &LinkKeys, ciphertext: &[u8]) -> Result<Vec<u8>, LinkCryptoError> {
     let mut combined_key = Zeroizing::new(Vec::with_capacity(
         keys.signing_key.len() + keys.encryption_key.len(),

@@ -1,12 +1,13 @@
 //! LoRa radio control via RNode firmware's extended-KISS protocol.
-//! Shared constants + transport-agnostic response handler. Serial:
-//! [`spawn_rnode_interface`] (feature `serial`); BLE: the optional
-//! `ble_rnode` module (feature `ble`).
+//! Shared constants and response codecs are available without a transport
+//! feature. `spawn_rnode_interface` supports serial ports with feature
+//! `serial`, and TCP with either `serial` or `rnode-tcp`. BLE drivers are in
+//! the optional `ble_rnode` module (feature `ble`).
 //!
-//! Transport selection is driven by the `port` string in [`RNodeConfig`]:
-//!   - `/dev/ttyUSB0`, `COM3`, etc.  -> serial (feature `serial` required)
-//!   - `tcp://192.168.1.1`           -> TCP, default port 7633
-//!   - `tcp://192.168.1.1:9000`      -> TCP, explicit port
+//! Transport selection uses the `port` string in [`RNodeConfig`]:
+//! - `/dev/ttyUSB0`, `COM3`, etc.: serial (`serial` required).
+//! - `tcp://192.168.1.1`: TCP, default port 7633.
+//! - `tcp://192.168.1.1:9000`: TCP, explicit port.
 
 use bytes::Bytes;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -163,12 +164,14 @@ enum RNodeCapabilityPolicy {
 }
 
 impl RNodeStartupOptions {
-    /// Require a validated EEPROM capability image before radio settings are
-    /// sent to each connection generation.
+    /// Require EEPROM capability classification before radio settings are sent
+    /// to each connection generation.
     ///
-    /// Known models enforce their reviewed frequency and TX-power limits.
-    /// A validated but unknown or quarantined model is admitted explicitly as
-    /// unverified; no model alias or capability profile is inferred.
+    /// Locked images must pass the identity-prefix checksum. Known models enforce
+    /// their code-table frequency and TX-power limits. Unknown or quarantined
+    /// models are admitted as unverified; unlocked images are admitted as
+    /// unprovisioned. Neither case infers model-specific limits. This check does
+    /// not authenticate a device signature.
     ///
     /// Each options-aware transport documents how its first connection reports
     /// admission failure. Synchronously prepared transports can return
@@ -502,7 +505,8 @@ pub enum RNodePortFailureClass {
     NotFound,
     /// The OS denied this process access to the port.
     AccessDenied,
-    /// Another process holds the port.
+    /// Port-open failure classified as in use. On Unix this includes the
+    /// serial library's `NoDevice` error; it does not identify a locking process.
     InUse,
     /// Any other failure, including an unreachable TCP endpoint.
     Unavailable,
@@ -2363,10 +2367,10 @@ impl RNodeStream {
         Ok(Self::Tcp(stream))
     }
 
-    /// Shallow-clone the stream for the write half.
+    /// Clone an I/O handle for the write half.
     ///
-    /// - Serial: uses `SerialPort::try_clone`.
-    /// - TCP: uses `TcpStream::try_clone` (both halves share the same fd).
+    /// - Serial uses `SerialPort::try_clone`.
+    /// - TCP uses `TcpStream::try_clone`; the handles refer to the same socket.
     pub fn try_clone(&self) -> std::io::Result<Self> {
         match self {
             #[cfg(feature = "serial")]
@@ -2891,9 +2895,11 @@ pub struct RNodeConfig {
     pub tx_power: u8,
     pub mode: InterfaceMode,
     pub flow_control: bool,
-    /// Short-term airtime cap, percent (0.0..100.0). `None` = unlimited.
+    /// Short-term airtime cap, percent (0.0..=100.0). `None` sends no command
+    /// and leaves the device's corresponding setting unchanged.
     pub st_alock: Option<f32>,
-    /// Long-term airtime cap, percent (0.0..100.0). `None` = unlimited.
+    /// Long-term airtime cap, percent (0.0..=100.0). `None` sends no command
+    /// and leaves the device's corresponding setting unchanged.
     pub lt_alock: Option<f32>,
     /// Station-ID beacon: seconds between IDs, armed by data TX
     /// (Python `id_interval`/`id_callsign`, callsign max 32 bytes).
@@ -2980,8 +2986,8 @@ impl RNodeConfig {
         }
     }
 
-    /// Validate all generic RNode RF and airtime settings without touching the
-    /// configured endpoint. These bounds match upstream RNodeInterface 1.4.
+    /// Validate generic RF and airtime bounds without touching the configured
+    /// endpoint. Model-specific capability admission is a separate check.
     pub fn validate(&self) -> Result<(), RNodeConfigValidationError> {
         RNodeRadioSettings::from(self).validate()?;
         validate_airtime(RNodeConfigField::ShortTermAirtime, self.st_alock)?;
@@ -3043,7 +3049,9 @@ fn validate_airtime(
     Ok(())
 }
 
-/// LoRa on-air bps via `SF * (4/CR) / (2^SF / BW_kHz) * 1000`. 0 on invalid.
+/// Estimate LoRa bit rate as `SF * (4/CR) / (2^SF / BW_kHz) * 1000`, truncated
+/// to whole bits per second. Returns zero for zero inputs or a non-positive or
+/// non-finite result; this helper does not validate the radio's supported ranges.
 pub fn calculate_bitrate(sf: u8, cr: u8, bandwidth_hz: u32) -> u64 {
     if sf == 0 || cr == 0 || bandwidth_hz == 0 {
         return 0;
@@ -3132,12 +3140,11 @@ fn build_radio_configuration_sequence_before_on(
     out
 }
 
-/// KISS init sequence. Order matters: turn the radio off first so persisted
-/// TNC startup profiles cannot keep old parameters active, and airtime locks
-/// precede RADIO_STATE=ON. Frequency, bandwidth and transmit power then follow
-/// RADIO_STATE=ON again: RNode firmware maps them to what the hardware will
-/// use only while the radio is on, so these last echoes report the effective
-/// settings that [`RNodeProtocolState::with_effective_settings`] judges.
+/// KISS initialization sequence: radio off, radio parameters and configured
+/// airtime locks, then radio on. Frequency, bandwidth and transmit power are
+/// reasserted after radio-on. [`RNodeProtocolState::with_effective_settings`]
+/// requires that later transmit-power echo before declaring readiness or a
+/// definitive settings rejection.
 pub fn build_init_sequence(config: &RNodeConfig) -> Vec<u8> {
     let settings = RNodeRadioSettings::from(config);
     let airtime = build_airtime_sequence(config);

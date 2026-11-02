@@ -8,10 +8,12 @@
 //! Exit codes: 0 success, 1 generic failure, 2 identity unreadable,
 //! 3 output dir missing, 4 output dir not writable.
 //!
-//! Security: listener mode follows Python rncp auth semantics. By default it
-//! accepts only identities from `-a` or the standard rncp allow-list files.
-//! `-n` / `--no-auth` explicitly accepts anyone. Use `-j <jail>` with `-F`
-//! unless you intentionally want upstream-compatible unrestricted fetch paths.
+//! The current listener checks `-a` and allow-list files when a peer identifies,
+//! but does not require identification before receiving a pushed file. Do not
+//! rely on the allow-list to exclude unidentified senders. Fetch requests require
+//! an allowed identity unless `-n` / `--no-auth` is used. `-F` also leaves push
+//! reception enabled. Use `-j <jail>` to constrain fetched paths to a directory
+//! under trusted local control; it is not an OS sandbox.
 
 use std::path::PathBuf;
 use std::process;
@@ -75,7 +77,8 @@ struct Args {
     #[arg(short = 'C', long)]
     no_compress: bool,
 
-    /// Allow clients to fetch files from this listener (use -a or -n; -j is recommended)
+    /// Allow clients to fetch files from this listener (use -a or -n; -j is recommended).
+    /// Pushed-file reception remains enabled.
     #[arg(short = 'F', long)]
     allow_fetch: bool,
 
@@ -84,12 +87,12 @@ struct Args {
     #[arg(short = 'f', long)]
     fetch: bool,
 
-    /// Restrict fetch requests to the specified directory (absolute path).
-    /// Used with -F on listener side, or with -f on fetch client side.
+    /// Restrict served fetch paths to this directory (-l -F only; ignored with -f).
+    /// Keep the directory under trusted local control; this is not an OS sandbox.
     #[arg(short = 'j', long, value_name = "path")]
     jail: Option<String>,
 
-    /// Save received files in specified path (listen mode)
+    /// Save received files in this directory (listen or fetch mode; default: current directory)
     #[arg(short = 's', long, value_name = "path")]
     save: Option<String>,
 
@@ -101,7 +104,8 @@ struct Args {
     #[arg(short = 'b', value_name = "seconds", default_value_t = -1)]
     announce_interval: i64,
 
-    /// Allowed sender identity hash (repeat for multiple). 32 hex chars each.
+    /// Allowed identity hash (repeat for multiple). 32 hex chars each.
+    /// The listener does not require identification before accepting pushed files.
     #[arg(short = 'a', value_name = "hash", action = clap::ArgAction::Append)]
     allowed: Vec<String>,
 
@@ -117,11 +121,11 @@ struct Args {
     #[arg(short = 'i', value_name = "identity")]
     identity_path: Option<String>,
 
-    /// Timeout before giving up (seconds)
+    /// Protocol wait budget in seconds (minimum 1); transport work and file I/O can add time
     #[arg(short = 'w', value_name = "seconds", default_value_t = DEFAULT_TIMEOUT_SECS)]
     timeout: f64,
 
-    /// Display physical layer transfer rates.
+    /// Request physical-layer rates (currently unsupported; exits with an error).
     #[arg(short = 'P', long = "phy-rates")]
     phy_rates: bool,
 
@@ -580,7 +584,7 @@ async fn run_listen(args: Args) -> ! {
     };
     let allow_all = args.no_auth;
     if allowed.is_empty() && !allow_all && !args.print_identity {
-        eprintln!("Warning: No allowed identities configured, rncp will not accept any files!");
+        eprintln!("Warning: No allowed identities configured. This listener does not require identification before receiving pushed files; do not rely on the allow-list to exclude unidentified senders.");
     }
 
     let handle = start_reticulum(args.config.as_deref(), shutdown.clone()).await;

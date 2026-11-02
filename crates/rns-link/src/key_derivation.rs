@@ -5,10 +5,11 @@ use crate::constants::{
     AES128_DERIVED_KEY_LENGTH, AES256_DERIVED_KEY_LENGTH, MODE_AES128_CBC, MODE_AES256_CBC,
 };
 
-/// Derived session keys for a link.
+/// Symmetric session keys shared by both directions of a Link. Cloning copies
+/// the key material; each owned copy is zeroised when dropped.
 #[derive(Clone)]
 pub struct LinkKeys {
-    /// HMAC-SHA256 signing key.
+    /// HMAC-SHA256 authentication key, distinct from an Ed25519 signing key.
     pub signing_key: Vec<u8>,
     /// AES encryption key.
     pub encryption_key: Vec<u8>,
@@ -20,6 +21,10 @@ impl LinkKeys {
     /// Runs `HKDF-SHA256(ECDH(my_prv, peer_pub), salt = link_id)` and splits the
     /// output into `signing_key || encryption_key`. Intermediate shared secrets
     /// are zeroized as soon as HKDF consumes them.
+    ///
+    /// This primitive accepts AES-128-CBC and AES-256-CBC; endpoint admission
+    /// is narrower (see [`crate::constants::ENABLED_MODES`]). It does not
+    /// authenticate the peer or reject an all-zero X25519 shared secret.
     pub fn derive(
         my_prv: &X25519PrivateKey,
         peer_pub: &X25519PublicKey,

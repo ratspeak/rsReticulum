@@ -1,6 +1,11 @@
-//! Responder side of Reticulum links: accepts link requests, holds per-link
-//! state (session keys, channel, in/outbound transfers), drives keepalives
-//! and teardown. Lives here to break the rns-transport ↔ rns-link cycle.
+//! Responder-side Reticulum Links: handshakes, encrypted packets, Channels,
+//! requests and Resources. [`LinkManager`] owns the per-Link state and timers.
+//! Run it continuously, or combine `step`/`try_step` with periodic `tick` calls.
+//!
+//! Configure application admission and event receivers before running. Request
+//! allow-lists, ordinary-packet proof policy and ordinary-Resource acceptance
+//! are separate controls; verifying a LinkIdentify does not authorize every
+//! operation. Callbacks run on the manager task and must return promptly.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -208,11 +213,13 @@ pub struct LinkResourceProof {
     pub resource_hash: [u8; 32],
 }
 
-/// Valid delivery proof for a non-Link packet registered by an application.
+/// Valid delivery proof for an application-registered non-Link packet.
 ///
-/// The transport actor authenticates the proof before emitting this event.
-/// The message identifier is the opaque value supplied with
-/// [`TransportMessage::RegisterReceipt`].
+/// The transport verifies the proof against the receipt's destination signing
+/// key before emitting this event. The message identifier is the opaque value
+/// supplied with [`TransportMessage::RegisterReceipt`] or
+/// [`TransportMessage::RegisterReceiptWithProof`]. This does not acknowledge
+/// remote application processing or persistence.
 #[derive(Debug, Clone)]
 pub struct DestinationDeliveryProof {
     pub msg_id: String,
@@ -329,10 +336,12 @@ pub enum LinkManagerCommand {
         reason: CloseReason,
         send_teardown: bool,
     },
-    /// Broadcast an announce using the manager's owned Destination.
+    /// Request an announce through the custom announce handler, if installed,
+    /// otherwise through the owned Destination.
     Announce,
-    /// Broadcast an announce with the same options exposed by Python's
-    /// `Destination.announce`.
+    /// Build an announce with explicit app data, path-response, tag,
+    /// interface and ratchet options. Success means local staging, possibly
+    /// in the manager retry queue; it does not confirm transmission.
     AnnounceWith {
         options: DestinationAnnounceOptions,
         result_tx: Option<oneshot::Sender<Result<(), DestinationControlError>>>,
@@ -348,7 +357,8 @@ pub enum LinkManagerCommand {
         app_data: Option<Vec<u8>>,
         result_tx: Option<oneshot::Sender<Result<(), DestinationControlError>>>,
     },
-    /// Register or replace a Python-compatible per-path request handler.
+    /// Register or replace a per-path handler with its own admission policy.
+    /// See [`LinkManager::register_request_handler`].
     RegisterRequestHandler {
         path: String,
         allow: AllowPolicy,
@@ -371,7 +381,8 @@ pub struct DestinationAnnounceOptions {
     pub path_response: bool,
     pub attached_interface: Option<rns_transport::messages::InterfaceId>,
     pub tag: Option<Vec<u8>>,
-    /// Public ratchet key to advertise, when the caller manages a ratchet ring.
+    /// Public ratchet key to advertise. With a manager-owned persistent ring,
+    /// an explicitly supplied key must match its current key.
     pub ratchet: Option<[u8; 32]>,
 }
 
@@ -391,32 +402,36 @@ pub enum DestinationControlError {
     TransportUnavailable,
 }
 
-/// Resource hash + sender metadata (e.g. rncp filename).
+/// Completed inbound payload with its logical Resource hash and optional
+/// sender metadata. Automatic completion stages a proof before application
+/// processing; the application still owns validation and persistence.
 #[derive(Debug, Clone)]
 pub struct ResourceCompletion {
     pub link_id: [u8; 16],
     pub resource_hash: [u8; 32],
     pub data: Vec<u8>,
-    /// msgpack-encoded metadata, if the sender attached any.
+    /// Opaque metadata bytes, if supplied by the sender. Applications such
+    /// as rncp use MessagePack; this type does not validate that encoding.
     pub metadata: Option<Vec<u8>>,
 }
 
-/// Ordered, capacity-lossless Link accounting notifications.
+/// Ordered Link accounting notifications on an opt-in unbounded channel.
 ///
-/// This opt-in stream contains validated ordinary Link-packet proofs, Resource
-/// starts and conclusions, ordinary inbound completion payloads, and Link
-/// closure in manager-observation order. It also observes exact bounded
-/// outbound wait windows. UI progress remains available only through the
-/// bounded best-effort Resource event channel. Delivery is
-/// guaranteed while the unbounded receiver remains alive. Request Resources
-/// retain their start and conclusion events but dispatch inline and never
-/// produce a [`LinkManagerAccountingEvent::ResourceCompletion`].
+/// The stream includes ordinary Link-packet proofs, Resource starts and
+/// conclusions, inbound completion payloads, Link closure and outbound wait
+/// windows in manager-observation order. Progress uses the separate bounded
+/// Resource-event channel. A live receiver prevents capacity drops, but does
+/// not guarantee consumption or persistence; drain it to avoid memory growth.
+/// Request Resources retain lifecycle events and dispatch to request handlers,
+/// without a [`LinkManagerAccountingEvent::ResourceCompletion`].
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum LinkManagerAccountingEvent {
-    /// Exact bounded wait for an ordinary outbound packet: local command
-    /// admission first, then the Link RTT proof window on endpoint acceptance.
-    /// Endpoint acceptance is not radio transmission or remote delivery.
+    /// A local-admission or peer-proof wait window for an ordinary packet.
+    /// Retain `started_at` when consuming a delayed event. Exact dispatch
+    /// starts the proof window at driver admission; the legacy queued path
+    /// uses an allowance and retains `awaiting_admission`. These observations
+    /// are not on-air or remote-delivery acknowledgments.
     OutboundPacketWait {
         receipt: LinkPacketSendReceipt,
         started_at: std::time::Instant,
@@ -424,9 +439,9 @@ pub enum LinkManagerAccountingEvent {
         awaiting_admission: bool,
         cancellation: Option<LinkEndpointDispatchCancellation>,
     },
-    /// Exact bounded wait currently owned by an outbound logical Resource.
-    /// Emitted only when its protocol deadline changes. Delayed consumers
-    /// must retain `started_at` rather than restarting the clock on receipt.
+    /// The current protocol wait window for an outbound logical Resource.
+    /// Emitted when its deadline changes. Delayed consumers must retain
+    /// `started_at` rather than restarting the clock on receipt.
     OutboundResourceWait {
         link_id: [u8; 16],
         resource_id: [u8; 32],
@@ -496,24 +511,31 @@ impl std::fmt::Debug for LinkManagerAccountingEvent {
     }
 }
 
-/// Result of an extended request handler. `Reply` is the ordinary response;
-/// `ReplyWithResource` sends an inline ack followed by a resource transfer
-/// (rncp --fetch). Python: `RNS.Resource(..., target_link=link)`.
+/// Request-handler response. `Reply` uses a RESPONSE packet or, when the packed
+/// response exceeds the Link MDU, a response Resource. `ReplyWithResource`
+/// stages the acknowledgment and a separate ordinary Resource, as used by rncp
+/// fetch. Neither staging
+/// operation confirms delivery; arrival order is not guaranteed.
 #[derive(Debug, Clone)]
 pub enum RequestOutcome {
     Reply(Vec<u8>),
     ReplyWithResource {
         ack: Vec<u8>,
         data: Vec<u8>,
-        /// Optional msgpack-encoded metadata (e.g. `{"name": "file.bin"}`).
+        /// Optional opaque Resource metadata. rncp expects a MessagePack map
+        /// such as `{"name": "file.bin"}`; the manager does not validate it.
         metadata: Option<Vec<u8>>,
         auto_compress: bool,
     },
-    /// Silently drop; caller sees a timeout. Useful for ACL denies.
+    /// Send no response. A waiting requester can time out; no explicit denial
+    /// is sent.
     Drop,
 }
 
-/// Python-compatible context supplied to a per-path Destination request handler.
+/// Context for a per-path Destination request handler. `remote_identity`
+/// comes from verified LinkIdentify, when present; the registered `AllowPolicy`
+/// is applied separately. `requested_at` is the sender's timestamp, not a
+/// trusted local arrival time.
 #[derive(Clone)]
 pub struct DestinationRequest {
     pub path: String,
@@ -572,6 +594,10 @@ struct ResourceTransferStart {
     allow_handshake: bool,
 }
 
+/// Owns responder Links for one destination. Configure admission policies and
+/// receivers before `run` or `run_with_commands`; callbacks execute on this
+/// manager task. Ordinary Resources default to `AcceptAll`, independently of
+/// LinkIdentify and per-path request authorization.
 pub struct LinkManager {
     endpoint_dispatch: Option<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle>,
     endpoint_dispatch_tokens:
@@ -639,7 +665,7 @@ pub struct LinkManager {
     resource_accept_handler: Option<ResourceAcceptHandler>,
     /// Fires when a link reaches the active state.
     link_established_tx: Option<mpsc::Sender<[u8; 16]>>,
-    /// Fires on LinkIdentify before a resource ADV can race it.
+    /// Best-effort notification on the first verified LinkIdentify.
     link_identified_tx: Option<mpsc::Sender<([u8; 16], [u8; 16])>>,
     /// Synchronous LinkIdentify gate. Returning false closes the link before
     /// later resource packets can be accepted.
@@ -695,6 +721,10 @@ impl LinkManager {
         self.endpoint_dispatch = Some(handle);
     }
 
+    /// Create a manager for an already-known destination hash, without owning
+    /// its [`Destination`] or registering it with the transport. Supply a signing
+    /// key to answer Link requests; use `with_destination` for destination
+    /// callbacks, announcements and a backend-aware identity.
     pub fn new(
         transport_tx: mpsc::Sender<TransportMessage>,
         event_rx: mpsc::Receiver<DestinationEvent>,
@@ -767,7 +797,13 @@ impl LinkManager {
         }
     }
 
-    /// Wraps its own [`Destination`] so acceptance gating + dest callbacks are active.
+    /// Create a manager with an inbound SINGLE [`Destination`] and its
+    /// callbacks. This does not register the destination with the transport.
+    /// Check `destination()` before use: invalid destination construction is
+    /// logged and leaves `None` with an all-zero `destination_hash`.
+    ///
+    /// A software private identity or hardware backend is retained for signing.
+    /// A public-only identity alone cannot supply that signer.
     pub fn with_destination(
         transport_tx: mpsc::Sender<TransportMessage>,
         event_rx: mpsc::Receiver<DestinationEvent>,
@@ -859,10 +895,14 @@ impl LinkManager {
         self.backchannel_links.get(identity_hash).copied()
     }
 
-    /// Enable a verified, persistent ratchet ring for the owned destination.
+    /// Enable a persistent ratchet ring for the owned destination. A current
+    /// ratchet is persisted before it is advertised or enforced.
     ///
-    /// A current ratchet is persisted before the destination starts
-    /// advertising or enforcing it.
+    /// This uses [`PersistentRatchetRing::open`], which also accepts the legacy
+    /// format whose signature covers only its current public key. If full-ring
+    /// authentication is required, first use
+    /// [`rns_identity::ratchet::RatchetRing::load_verified`] and inspect its format;
+    /// this wrapper does not expose that distinction.
     pub fn enable_persistent_ratchets(
         &mut self,
         path: impl AsRef<std::path::Path>,
@@ -900,12 +940,17 @@ impl LinkManager {
         self.use_implicit_proof = use_implicit_proof;
     }
 
-    /// Shared auth map for sync request handlers (which can't borrow `self`).
-    /// Populated on `LinkIdentify`, pruned on link close.
+    /// Shared Link-id to peer-identity-hash map, populated on verified
+    /// LinkIdentify and pruned on close. This is identity bookkeeping, not an
+    /// authorization result: insertion precedes closing a rejected identity,
+    /// and callers can mutate the returned map.
     pub fn link_identities_handle(&self) -> Arc<Mutex<HashMap<[u8; 16], [u8; 16]>>> {
         Arc::clone(&self.link_identities)
     }
 
+    /// Poll local completions and handle at most one queued destination event.
+    /// False can mean either no progress or a disconnected receiver; it is not
+    /// a shutdown signal. Call `tick` periodically to advance protocol timers.
     pub fn try_step(&mut self) -> bool {
         let endpoint_progress = self.poll_link_endpoints();
         self.flush_pending_link_control();
@@ -922,6 +967,9 @@ impl LinkManager {
         }
     }
 
+    /// Wait for a destination event or local completion. False indicates a
+    /// closed receive branch. This does not schedule periodic protocol ticks;
+    /// call `tick` separately, or use `run`/`run_with_commands`.
     pub async fn step(&mut self) -> bool {
         let endpoint_progress = self.poll_link_endpoints();
         self.flush_pending_link_control();
@@ -950,6 +998,9 @@ impl LinkManager {
         }
     }
 
+    /// Poll completions and advance Link, Channel and Resource timers.
+    /// Manual event loops should call this regularly (the built-in loops target
+    /// one second); a blocked callback delays timer work.
     pub fn tick(&mut self) {
         self.poll_link_endpoints();
         self.flush_pending_link_control();
@@ -983,6 +1034,9 @@ impl LinkManager {
         self.outbound_resource_waits = current;
     }
 
+    /// Run event handling with one-second protocol ticks until the destination
+    /// event channel closes, then close Links and drain endpoint ownership.
+    /// Shutdown waits for transport cleanup without its own deadline.
     pub async fn run(mut self) {
         let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
@@ -1016,6 +1070,10 @@ impl LinkManager {
         self.drain_shutdown_link_ownership().await;
     }
 
+    /// Run events, commands and protocol ticks until `Shutdown` or command
+    /// channel closure. Losing the destination event channel closes live Links
+    /// but leaves destination commands available. Final endpoint cleanup has
+    /// no deadline; keep the transport running until this future completes.
     pub async fn run_with_commands(mut self, mut command_rx: mpsc::Receiver<LinkManagerCommand>) {
         let mut last_tick = std::time::Instant::now();
         let mut events_closed = false;
@@ -5611,6 +5669,9 @@ impl LinkManager {
         progressed
     }
 
+    /// Install a synchronous fallback `(link_id, path_hash, data)` handler.
+    /// Per-path handlers and `set_request_handler_ex` take precedence. This
+    /// fallback must check authorization itself; `None` sends no response.
     pub fn set_request_handler<F>(&mut self, handler: F)
     where
         F: Fn([u8; 16], [u8; 16], Vec<u8>) -> Option<Vec<u8>> + Send + 'static,
@@ -5618,8 +5679,10 @@ impl LinkManager {
         self.request_handler = Some(Box::new(handler));
     }
 
-    /// Handler that may schedule a follow-up resource transfer (rncp --fetch).
-    /// Takes precedence over [`Self::set_request_handler`].
+    /// Synchronous fallback handler `(link_id, path_hash, data)` that can
+    /// schedule a follow-up Resource. A registered per-path handler takes
+    /// precedence; otherwise this overrides [`Self::set_request_handler`].
+    /// The fallback must perform its own authorization and return promptly.
     pub fn set_request_handler_ex<F>(&mut self, handler: F)
     where
         F: Fn([u8; 16], [u8; 16], Vec<u8>) -> RequestOutcome + Send + 'static,
@@ -5627,11 +5690,14 @@ impl LinkManager {
         self.request_handler_ex = Some(Box::new(handler));
     }
 
-    /// Register or replace a request handler for `path`.
+    /// Register or replace a synchronous handler keyed by the truncated hash
+    /// of `path`. Returns false for an empty path. A matching per-path handler
+    /// takes precedence over both fallback handlers, even when it denies access.
     ///
-    /// The callback receives the same request context as Python Reticulum's
-    /// `Destination.register_request_handler`: path, data, request id, Link id,
-    /// authenticated remote identity (when identified), and request timestamp.
+    /// `AllowAll` permits unidentified peers; `AllowList` requires a verified
+    /// identity in `allowed_list` (missing means empty); `AllowNone` denies all.
+    /// `auto_compress` applies to response Resources. The callback runs on the
+    /// manager task and must return promptly.
     pub fn register_request_handler<F>(
         &mut self,
         path: &str,
@@ -5686,13 +5752,15 @@ impl LinkManager {
         true
     }
 
-    /// Register a bounded worker-backed handler. Admission occurs before the
-    /// callback, so rejected requests cannot start I/O or mutate durable state.
-    /// Requires an installed exact endpoint dispatch handle; registration fails
-    /// without it. Resource packets retain that generation through actor egress.
-    /// The callback must return promptly and retain its responder in the actual
-    /// worker. At most four process-wide jobs/Resources retain 256 MiB of
-    /// conservative reservations; the token reports its effective byte limit.
+    /// Register a handler that can hand its responder to an application worker.
+    /// The manager checks the request policy and reserves capacity before calling
+    /// it, but does not spawn the worker. Return promptly and retain the responder
+    /// in the worker until completion; the token reports its effective byte limit.
+    ///
+    /// Registration fails without exact endpoint dispatch, for an empty path, or
+    /// for a zero or greater-than-64-MiB response limit. At most four process-wide jobs or
+    /// Resources share 256 MiB of conservative reservations. This is an admission
+    /// budget, not a limit on arbitrary worker allocations or side effects.
     pub fn register_deferred_request_handler<F>(
         &mut self,
         path: &str,
@@ -5747,6 +5815,8 @@ impl LinkManager {
             .is_some()
     }
 
+    /// Override ordinary announce requests with a synchronous callback.
+    /// Path responses and `AnnounceWith` still use the owned Destination.
     pub fn set_announce_handler<F>(&mut self, handler: F)
     where
         F: FnMut() + Send + 'static,
@@ -5754,6 +5824,9 @@ impl LinkManager {
         self.announce_handler = Some(Box::new(handler));
     }
 
+    /// Install a best-effort channel for packet-sized responses. A full or
+    /// closed receiver loses notifications; response Resources use Resource
+    /// completion handling instead.
     pub fn set_response_channel(&mut self, tx: mpsc::Sender<LinkResponse>) {
         self.response_tx = Some(tx);
     }
@@ -5768,11 +5841,10 @@ impl LinkManager {
         self.resource_completion_tx = Some(tx);
     }
 
-    /// Set the inbound Resource policy for current and future responder Links.
-    ///
-    /// Request and response Resources remain protocol-owned and bypass this
-    /// policy, matching Python Reticulum. The manager defaults to
-    /// [`ResourceStrategy::AcceptAll`] for LXMF compatibility.
+    /// Set the ordinary inbound Resource policy for current and future Links.
+    /// Request and response Resources bypass this policy. The default is
+    /// [`ResourceStrategy::AcceptAll`]; it does not require peer identification.
+    /// Use `AcceptApp` with a decision hook for application admission.
     pub fn set_resource_strategy(&mut self, strategy: ResourceStrategy) {
         self.resource_strategy = strategy;
         for active in self.active_links.values_mut() {
@@ -5780,8 +5852,10 @@ impl LinkManager {
         }
     }
 
-    /// Install the per-advertisement decision hook used by
-    /// [`ResourceStrategy::AcceptApp`].
+    /// Install the synchronous decision hook `(link_id, advertisement)` for
+    /// each ordinary Resource segment under [`ResourceStrategy::AcceptApp`].
+    /// Set that strategy separately. True accepts; a missing hook or caught
+    /// panic rejects. Request and response Resources bypass this hook.
     pub fn set_resource_accept_handler<F>(&mut self, handler: F)
     where
         F: Fn([u8; 16], &ResourceAdvertisement) -> bool + Send + 'static,
@@ -5793,16 +5867,24 @@ impl LinkManager {
         self.resource_accept_handler = None;
     }
 
-    /// Fires when a link reaches the active state.
+    /// Install a best-effort active-Link notification channel. A full or
+    /// closed receiver loses the event.
     pub fn set_link_established_channel(&mut self, tx: mpsc::Sender<[u8; 16]>) {
         self.link_established_tx = Some(tx);
     }
 
-    /// Fires on LinkIdentify before any resource ADV can race it.
+    /// Install a best-effort `(link_id, identity_hash)` notification channel
+    /// for the first verified LinkIdentify. Full or closed channels lose the
+    /// event. This notification neither requires prior identification for
+    /// Resources nor waits for the application's receiver to act.
     pub fn set_link_identified_channel(&mut self, tx: mpsc::Sender<([u8; 16], [u8; 16])>) {
         self.link_identified_tx = Some(tx);
     }
 
+    /// Install a synchronous `(link_id, identity_hash)` check after successful
+    /// LinkIdentify; false closes that Link. This does not require identification
+    /// before ordinary packets or Resources. Configure their admission policies
+    /// separately; an identity notification can precede closure of a rejected peer.
     pub fn set_link_identity_gate<F>(&mut self, gate: F)
     where
         F: Fn([u8; 16], [u8; 16]) -> bool + Send + 'static,
@@ -5823,6 +5905,11 @@ impl LinkManager {
         Ok(())
     }
 
+    /// Install the bounded typed ordinary-packet receiver. In `ProveApp` mode,
+    /// each packet carries an application-controlled receipt; call `accept` only after
+    /// the application's acceptance boundary. Installation fails if a legacy
+    /// packet channel is already present.
+    /// Install exact dispatch and this channel before selecting `ProveApp`.
     pub fn set_inbound_link_packet_channel(
         &mut self,
         tx: mpsc::Sender<InboundLinkPacket>,
@@ -5834,6 +5921,10 @@ impl LinkManager {
         Ok(())
     }
 
+    /// Select the proof policy for ordinary Link packets, separately from
+    /// Resource or Channel policy. `ProveApp` requires exact endpoint dispatch,
+    /// a typed receiver and no legacy packet channel. Without an explicit
+    /// override, the owned Destination's policy applies, or `ProveNone`.
     pub fn set_ordinary_packet_proof_strategy(
         &mut self,
         strategy: ProofStrategy,
@@ -5867,16 +5958,25 @@ impl LinkManager {
         self.inbound_packet_overloads
     }
 
+    /// Receive verified ordinary packet proofs, excluding proofs consumed by
+    /// the Channel. Full-channel events share the retained legacy terminal
+    /// queue with Resource proofs and Link closure; closed receivers discard
+    /// notifications. Proofs do not attest to remote application processing.
     pub fn set_link_packet_proof_channel(&mut self, tx: mpsc::Sender<LinkPacketProof>) {
         self.link_packet_proof_tx = Some(tx);
     }
 
+    /// Receive a proof notification after all segments of an outbound Resource
+    /// are proved. Full channels use the retained legacy terminal queue;
+    /// shutdown need not drain it. Proof does not establish remote persistence.
     pub fn set_outbound_resource_proof_channel(&mut self, tx: mpsc::Sender<LinkResourceProof>) {
         self.outbound_resource_proof_tx = Some(tx);
     }
 
-    /// Install the lossless application receiver for validated non-Link packet
-    /// delivery proofs.
+    /// Install an unbounded receiver for validated non-Link delivery proofs.
+    /// Drain it to avoid memory growth. Queue admission does not establish
+    /// application consumption; legacy transport broadcast can lose events
+    /// before they reach this manager.
     pub fn set_destination_delivery_proof_channel(
         &mut self,
         tx: mpsc::UnboundedSender<DestinationDeliveryProof>,
@@ -5889,13 +5989,11 @@ impl LinkManager {
         self.resource_event_tx = Some(tx);
     }
 
-    /// Install one ordered, capacity-lossless accounting stream.
-    ///
-    /// The receiver must be drained for the manager's lifetime. Existing
-    /// bounded completion, Resource-event, and Link-close channels remain
-    /// independent compatibility notifications.
-    /// Protocol deadline observations are coalesced to at most one changed
-    /// window per active Resource per tick; UI progress is not sent here.
+    /// Install the ordered unbounded accounting stream described by
+    /// [`LinkManagerAccountingEvent`]. Drain it for the manager's lifetime to
+    /// avoid memory growth. Compatibility notifications remain independent.
+    /// Resource wait observations emit at most one changed window per active
+    /// Resource per tick; progress is not sent here.
     pub fn set_accounting_event_channel(
         &mut self,
         tx: mpsc::UnboundedSender<LinkManagerAccountingEvent>,
@@ -5904,6 +6002,9 @@ impl LinkManager {
         self.outbound_resource_waits.clear();
     }
 
+    /// Receive decoded Channel messages through a best-effort bounded queue.
+    /// The manager can prove Channel packets before this application delivery;
+    /// a full receiver may lose a message despite the peer receiving a proof.
     pub fn set_channel_message_channel(&mut self, tx: mpsc::Sender<LinkChannelMessage>) {
         self.channel_message_tx = Some(tx);
     }
@@ -5929,12 +6030,19 @@ impl LinkManager {
         Ok(())
     }
 
-    /// Install the bounded best-effort Link-close channel.
+    /// Install the bounded Link-close channel. While the manager is running,
+    /// full-channel notifications are retained and retried in order alongside
+    /// legacy proof notifications; a stalled receiver can delay that queue.
+    /// Closed receivers discard their notifications. Shutdown does not promise
+    /// to drain this application queue.
     pub fn set_link_closed_channel(&mut self, tx: mpsc::Sender<[u8; 16]>) {
         self.link_closed_tx = Some(tx);
     }
 
-    /// Raw destination-encrypted packets for app-level decryption (opportunistic LXMF).
+    /// Install a best-effort raw non-Link packet channel. Parsed packets are
+    /// copied here after destination dispatch, even if decryption or application
+    /// handling failed. They are not necessarily encrypted or valid app data;
+    /// a full or closed channel loses the copy.
     pub fn set_inbound_raw_channel(&mut self, tx: mpsc::Sender<Vec<u8>>) {
         self.inbound_raw_tx = Some(tx);
     }
@@ -5960,10 +6068,10 @@ impl LinkManager {
             .map(|active| active._interface_id)
     }
 
-    /// Emit an initiator identity proof over this Link's typed endpoint.
-    ///
-    /// Responder Links reject identification, matching Reticulum's rule that
-    /// LINKIDENTIFY reveals only the initiator to the responder.
+    /// Stage an initiator identity proof through this Link's typed endpoint.
+    /// The returned receipt records local queue admission, not transmission or
+    /// remote authorization. Responder Links reject this operation because
+    /// LINKIDENTIFY reveals the initiator to the responder.
     pub fn send_link_identify(
         &mut self,
         link_id: &[u8; 16],
@@ -6012,8 +6120,9 @@ impl LinkManager {
         })
     }
 
-    /// Close exactly the requested Link owner, optionally sending LINKCLOSE
-    /// before the endpoint is unbound.
+    /// Remove the requested Link locally and start endpoint cleanup, optionally
+    /// staging LINKCLOSE. True means local ownership was removed; it does not
+    /// wait for teardown delivery or completion of asynchronous cleanup.
     pub fn close_link(
         &mut self,
         link_id: [u8; 16],
@@ -6028,6 +6137,9 @@ impl LinkManager {
         Self::ensure_link_channel(active, *link_id, &self.channel_message_types)
     }
 
+    /// Prepare and enqueue a Channel message. Success records local transport
+    /// command admission, not driver dispatch or peer delivery. Continue driving
+    /// the manager so the Channel can process proofs and retransmissions.
     pub fn send_channel_message(
         &mut self,
         link_id: &[u8; 16],
@@ -6090,6 +6202,10 @@ impl LinkManager {
         })
     }
 
+    /// Encrypt and enqueue an ordinary packet. The returned receipt records
+    /// local command admission, not peer delivery. Keep payloads within the Link
+    /// MDU (or use `send_link_payload`); endpoint rejection can occur later.
+    /// Ordinary packets are not automatically retransmitted.
     pub fn send_link_packet(
         &mut self,
         link_id: &[u8; 16],
@@ -6222,12 +6338,11 @@ impl LinkManager {
         }
     }
 
-    /// Send realtime Link data on the Link's exact bound interface without
-    /// entering the lossless per-Link control FIFO.
-    ///
-    /// Backpressure is reported as [`LinkEndpointSendResult::DroppedBackpressure`]
-    /// so media callers can account for an intentional drop without delaying
-    /// later frames. This API never falls back to destination routing.
+    /// Send realtime Link data on the bound interface, without entering the
+    /// per-Link control retry queue or falling back to destination routing.
+    /// Inspect the returned [`LinkEndpointSendResult`]: `Ok` can contain a drop,
+    /// invalid-packet or terminated-endpoint result. `Sent` is local driver
+    /// admission, not peer delivery. There is no whole-call timeout here.
     pub async fn send_link_packet_best_effort(
         &mut self,
         link_id: &[u8; 16],
@@ -6285,6 +6400,9 @@ impl LinkManager {
         ))
     }
 
+    /// Prepare and start a Resource, returning its logical hash after local
+    /// advertisement staging. Observe lifecycle/proof notifications for the
+    /// terminal result; successful return alone does not establish delivery.
     pub fn send_link_resource(
         &mut self,
         link_id: &[u8; 16],
@@ -6312,6 +6430,9 @@ impl LinkManager {
         })
     }
 
+    /// Send a packet when the payload fits the Link MDU, otherwise a Resource.
+    /// Both receipt variants identify locally admitted work; delivery is observed
+    /// separately through proof and Resource lifecycle notifications.
     pub fn send_link_payload(
         &mut self,
         link_id: &[u8; 16],
@@ -6335,8 +6456,9 @@ impl LinkManager {
         }
     }
 
-    /// Cancel an active Resource by the logical id returned in lifecycle
-    /// events or [`LinkResourceSendReceipt`].
+    /// Cancel using a logical Resource id or an active segment hash. True
+    /// means a local transfer was removed; it does not acknowledge peer
+    /// cancellation. Sending the cancel control packet can fail independently.
     pub fn cancel_link_resource(
         &mut self,
         link_id: &[u8; 16],
@@ -6533,7 +6655,10 @@ impl LinkManager {
         true
     }
 
-    /// Sends ADV + initial window, registers transfer so later HMU drives the rest.
+    /// Prepare all Resource segments in memory and stage the first
+    /// advertisement. Receiver requests drive part transmission. Returns the
+    /// logical Resource hash after local start, not a delivery proof. Preparation
+    /// is synchronous; use bounded payloads to avoid stalling the manager.
     pub fn start_resource_transfer(
         &mut self,
         link_id: &[u8; 16],
@@ -6543,8 +6668,9 @@ impl LinkManager {
         self.start_resource_transfer_with_metadata(link_id, data, None, auto_compress)
     }
 
-    /// As [`Self::start_resource_transfer`] but attaches msgpack metadata
-    /// (e.g. `{"name": "file.bin"}`). Used by rncp --fetch.
+    /// As [`Self::start_resource_transfer`], with opaque metadata bytes.
+    /// For rncp fetch, supply its expected MessagePack metadata map; this
+    /// method does not validate the application encoding.
     pub fn start_resource_transfer_with_metadata(
         &mut self,
         link_id: &[u8; 16],
@@ -6763,11 +6889,12 @@ impl LinkManager {
         Some(resource_hash)
     }
 
-    /// Legacy pull-style completion for a single inbound Resource.
+    /// Legacy pull completion for an unsplit inbound Resource. Returns data
+    /// and proof bytes without transmitting the proof, and supplies no decryptor.
     ///
-    /// The actor normally completes Resources while handling their final part.
-    /// Split Resources require that actor path so proofs and coordinator state
-    /// remain ordered.
+    /// The actor normally completes Resources with the Link decryptor on their
+    /// final part. Use that path for encrypted or split transfers and consume
+    /// the completion/accounting channel; this helper cannot replace it.
     #[deprecated(note = "Resources complete automatically; consume the accounting stream instead")]
     pub fn complete_resource(
         &mut self,
@@ -6867,6 +6994,12 @@ fn unix_now() -> f64 {
         .as_secs_f64()
 }
 
+/// Try to register a destination and return its bounded 256-event receiver.
+/// This helper does not await transport acknowledgment. If command admission
+/// fails it logs the error and still returns a receiver, which then closes;
+/// use [`crate::reticulum::ReticulumHandle::register_destination`] for awaited
+/// command admission and an owned destination lifecycle. That API also does
+/// not wait for actor acknowledgment.
 pub fn register_destination(
     transport_tx: &mpsc::Sender<TransportMessage>,
     dest_hash: [u8; 16],

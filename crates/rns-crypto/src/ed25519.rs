@@ -14,7 +14,9 @@ pub enum Ed25519Error {
     /// Public key bytes were not a valid Ed25519 point.
     #[error("invalid public key bytes")]
     InvalidPublicKey,
-    /// Signature bytes could not be decoded as an Ed25519 signature.
+    /// Retained signature-decoding error variant. The current `verify` method
+    /// accepts a fixed 64-byte signature and returns `VerificationFailed` on
+    /// verification failure.
     #[error("invalid signature bytes")]
     InvalidSignature,
 }

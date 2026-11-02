@@ -4,9 +4,11 @@ use crate::constants::HASHLIST_MAXSIZE;
 
 /// Two-generation rotating hash set used for packet deduplication.
 ///
-/// When the `current` set fills to `max_size / 2`, it is promoted to
-/// `previous` and a new empty `current` begins — giving a bounded, amortised
-/// O(1) membership structure with a window of up to `max_size` entries.
+/// A new insertion rotates `current` into `previous` once `current` has at
+/// least `max_size / 2` entries. With `max_size >= 2`, normal insertions retain
+/// at most twice that half-capacity; capacities zero and one can retain two
+/// entries. [`Self::load_from`] does not enforce this bound. The window is
+/// count-based, with no time expiry, and lookups check both generations.
 #[derive(Clone)]
 pub struct PacketHashlist {
     current: HashSet<[u8; 32]>,
@@ -19,8 +21,9 @@ impl PacketHashlist {
         Self::new_with_capacity(HASHLIST_MAXSIZE)
     }
 
-    /// Build a hashlist with a custom `max_size`, useful when the default
-    /// capacity would dominate memory (e.g. in benchmarks).
+    /// Set the rotation threshold to `max_size / 2`, without preallocating.
+    /// Use at least two for the normal capacity bound; zero does not disable
+    /// storage. Restored snapshots are not limited by this setting.
     pub fn new_with_capacity(max_size: usize) -> Self {
         Self {
             current: HashSet::new(),
@@ -48,7 +51,8 @@ impl PacketHashlist {
         true
     }
 
-    /// Rotate: current becomes previous, new empty set becomes current.
+    /// Discard the old previous generation, move current to previous and
+    /// begin an empty current generation.
     pub fn force_rotate(&mut self) {
         self.previous = std::mem::take(&mut self.current);
     }
@@ -66,7 +70,7 @@ impl PacketHashlist {
         self.previous.clear();
     }
 
-    /// Snapshot the current generation for persistence.
+    /// Snapshot the current generation in unspecified order for persistence.
     ///
     /// The previous generation is deliberately transient. Persisting both
     /// generations would continually carry already-aged hashes across
@@ -75,11 +79,10 @@ impl PacketHashlist {
         self.current.iter().copied().collect()
     }
 
-    /// Snapshot both in-memory generations.
+    /// Snapshot both in-memory generations in unspecified order.
     ///
-    /// This preserves the pre-1.4 public inspection API. Persistence must use
-    /// [`Self::current_hashes`] so the aged previous generation remains
-    /// transient.
+    /// Use [`Self::current_hashes`] for persistence so the aged previous
+    /// generation remains transient across restarts.
     pub fn all_hashes(&self) -> Vec<[u8; 32]> {
         self.current
             .iter()
@@ -88,11 +91,11 @@ impl PacketHashlist {
             .collect()
     }
 
-    /// Rehydrate the current generation from a persisted snapshot.
-    ///
-    /// This mirrors Reticulum's canonical `packet_hashlist.raw` lifecycle:
-    /// the restored generation remains the one written at the next
-    /// persistence boundary, while the previous generation stays ephemeral.
+    /// Replace current with the distinct supplied hashes and clear previous.
+    /// The restored hashes are included by [`Self::current_hashes`]. This
+    /// method does not enforce `max_size`; bound untrusted snapshots before
+    /// loading them. A later new insertion can rotate an oversized current
+    /// generation into previous, where it remains until another rotation.
     pub fn load_from(&mut self, hashes: Vec<[u8; 32]>) {
         self.current = hashes.into_iter().collect();
         self.previous.clear();

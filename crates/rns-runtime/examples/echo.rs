@@ -38,7 +38,7 @@ async fn server(args: ExampleArgs) -> ExampleResult {
             _ = runtime.shutdown.wait() => break,
             packet = destination.events.packets.recv() => {
                 let Some(packet) = packet else { break };
-                println!("Proved {} bytes: {}", packet.data.len(), String::from_utf8_lossy(&packet.data));
+                println!("Received {} bytes (automatic proof enabled): {}", packet.data.len(), String::from_utf8_lossy(&packet.data));
             }
         }
     }

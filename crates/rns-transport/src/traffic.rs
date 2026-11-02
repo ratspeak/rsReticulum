@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use crate::messages::InterfaceId;
 
+/// Accumulated byte counts and the most recently sampled byte deltas for one
+/// interface. The speed fields assume a one-second sampling interval.
 #[derive(Debug, Clone, Default)]
 pub struct InterfaceTraffic {
     pub rx_bytes: u64,
@@ -10,11 +12,15 @@ pub struct InterfaceTraffic {
     /// without keeping a ring buffer of samples.
     pub rx_bytes_prev: u64,
     pub tx_bytes_prev: u64,
-    /// Bytes per second, over the last `update_speeds` interval.
+    /// Received-byte delta from the last `update_speeds` call. This represents
+    /// bytes per second only when calls are one second apart.
     pub rx_speed: f64,
+    /// Transmitted-byte delta, with the same sampling assumption as `rx_speed`.
     pub tx_speed: f64,
 }
 
+/// Per-interface counters updated explicitly by the caller. Records remain
+/// until this counter is dropped; this type does not measure elapsed time.
 pub struct TrafficCounter {
     interfaces: HashMap<InterfaceId, InterfaceTraffic>,
 }
@@ -36,8 +42,10 @@ impl TrafficCounter {
         entry.tx_bytes += bytes;
     }
 
-    /// Compute per-second speeds from the delta since the last call. Intended
-    /// to run on a 1 Hz tick so the delta equals bytes-per-second directly.
+    /// Store the byte-count deltas since the last call and advance the samples.
+    /// No division by elapsed time is performed. Call once per second if the
+    /// speed fields are to represent bytes per second; delayed or background
+    /// ticks represent a longer interval instead.
     pub fn update_speeds(&mut self) {
         for entry in self.interfaces.values_mut() {
             entry.rx_speed = (entry.rx_bytes - entry.rx_bytes_prev) as f64;

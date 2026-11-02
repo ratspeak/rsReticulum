@@ -1,4 +1,7 @@
-//! Runtime support for `rnsh`, the Reticulum remote shell utility.
+//! Remote command sessions over encrypted Reticulum Links and Channels.
+//! Listeners execute processes with the host process's account and filesystem
+//! access; they do not create a sandbox. Interactive PTYs require Unix; fully
+//! piped stdin/stdout/stderr do not require a PTY.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(unix)]
@@ -86,6 +89,16 @@ impl From<ChannelError> for RnshError {
     }
 }
 
+/// Client command, input/output channels and terminal options. `command` is
+/// an argument vector interpreted under the listener's command policy. `no_id`
+/// suppresses LinkIdentify, but this implementation still requires a signing
+/// identity locally.
+///
+/// When `stdin_rx` is supplied, it replaces `stdin_data`; an empty chunk or
+/// channel close means EOF. Without it, `stdin_data` is sent only with
+/// `pipe_stdin`. Drain supplied output channels: they apply backpressure, and
+/// all received stdout/stderr bytes are also retained in the returned outcome.
+/// `timeout` is a protocol deadline, not a bound on every channel/transport wait.
 pub struct RnshClientConfig {
     pub identity: Identity,
     pub destination_hash: [u8; 16],
@@ -122,6 +135,20 @@ pub struct RnshClientOutcome {
     pub return_code: i64,
 }
 
+/// Command and admission policy for a remote shell listener. With `allow_all`
+/// false, a session must identify with a hash in `allowed` or in an identity
+/// file before commands are accepted. Identity files are reread on identification;
+/// each valid line is a 32-character hex hash. Unreadable files and invalid lines
+/// are ignored. `allow_all` also admits unidentified sessions.
+///
+/// `command` contains the executable and arguments; no implicit shell is used.
+/// `allow_remote_command` permits a client-supplied argument vector to replace
+/// it. With `remote_command_as_args`, that vector is appended to the configured
+/// command instead, and still requires `allow_remote_command`.
+///
+/// `announce_period` is in seconds. `None` disables initial/periodic announces;
+/// `Some(0)` sends only the initial one, and positive values enable an interval.
+/// Path-request announce responses are independent of that setting.
 pub struct RnshListenerConfig {
     pub identity: Identity,
     pub command: Vec<String>,
@@ -133,6 +160,9 @@ pub struct RnshListenerConfig {
     pub announce_period: Option<u64>,
 }
 
+/// Run a remote command listener until its event streams close or an error
+/// occurs. Use `run_rnsh_listener_with_shutdown` for an explicit stop signal.
+/// Authorized commands run with this process's privileges.
 pub async fn run_rnsh_listener(
     transport_tx: mpsc::Sender<TransportMessage>,
     cfg: RnshListenerConfig,
@@ -140,6 +170,10 @@ pub async fn run_rnsh_listener(
     run_rnsh_listener_inner(transport_tx, cfg, None).await
 }
 
+/// Run a listener that also observes `shutdown` in its event loop. On that
+/// path it requests manager shutdown and joins the manager, then drops sessions
+/// to signal child cleanup. It does not wait for every child cleanup task or
+/// guarantee a shutdown deadline; an awaited handler can delay signal handling.
 pub async fn run_rnsh_listener_with_shutdown(
     transport_tx: mpsc::Sender<TransportMessage>,
     cfg: RnshListenerConfig,
@@ -300,6 +334,15 @@ async fn run_rnsh_listener_inner(
     Ok(())
 }
 
+/// Open a Link, negotiate rnsh and execute one remote command session. Return
+/// captured stdout/stderr and the remote exit code; a nonzero exit code is still
+/// an `Ok` outcome. Optional output channels receive the same bytes while the
+/// received output is retained in memory.
+///
+/// The configured timeout applies to protocol waits, but some transport and
+/// output-channel operations are awaited without it. Use an outer deadline
+/// when the entire call needs a time bound. An error or cancellation is not an
+/// acknowledgment that the remote process has stopped.
 pub async fn rnsh_client_execute(
     transport_tx: mpsc::Sender<TransportMessage>,
     mut cfg: RnshClientConfig,

@@ -1,7 +1,9 @@
-//! Automatic peer discovery over IPv6 link-local multicast.
+//! Automatic peer discovery over IPv6 multicast, using link scope by default.
 //!
-//! Beacons go to a multicast group derived from `SHA-256(group_id)` every
-//! ~1.6 s; data flows over unicast UDP. Peers age out after 22 s of silence.
+//! Beacons use a group derived from `SHA-256(group_id)`; data uses unicast UDP.
+//! The normal beacon interval is 1.6 seconds. With `mobile-throttle`, background
+//! beacons use 8 seconds. Periodic maintenance removes peers after at least
+//! 22 seconds without a beacon.
 
 use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -20,7 +22,7 @@ use rns_transport::messages::{InboundPacket, TransportMessage};
 pub const DISCOVERY_PORT: u16 = 29716;
 pub const DATA_PORT: u16 = 42671;
 pub const BEACON_INTERVAL: f64 = 1.6;
-/// Background beacon — slow enough to save battery, still inside expiry window.
+/// Background beacon interval with feature `mobile-throttle`, in seconds.
 pub const BEACON_INTERVAL_BG: f64 = 8.0;
 pub const PEER_EXPIRY: f64 = 22.0;
 pub const HW_MTU: u32 = 1196;
@@ -158,23 +160,20 @@ impl std::fmt::Display for McastAddrType {
     }
 }
 
-/// Async events from `spawn_auto_interface`; forwarded to Tauri broadcasts.
+/// Async events from AutoInterface instances for embedding applications.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AutoInterfaceEvent {
-    /// `IPV6_JOIN_GROUP` was rejected by the OS. On Apple this can indicate a
-    /// missing `com.apple.developer.networking.multicast` entitlement or Local
-    /// Network authorization that has not been granted yet. On Linux it
-    /// usually means the interface vanished between enumeration and join.
+    /// `IPV6_JOIN_GROUP` was rejected by the OS. `reason` contains the reported
+    /// error; this event alone does not establish a permission or network cause.
     JoinFailed {
         interface_name: String,
         ifname: String,
         reason: String,
     },
-    /// Carrier state changed — multicast echoes started or stopped arriving
-    /// on `ifname` within `MCAST_ECHO_TIMEOUT`. `ok=false` is the trip-wire
-    /// for Windows Public-profile firewall block, bridged-AP reboot, or
-    /// general IPv6 multicast suppression. `reason` is human-readable.
+    /// Carrier state changed as local multicast echoes arrived or timed out on
+    /// `ifname`. `ok=false` reports missing echoes within `MCAST_ECHO_TIMEOUT`;
+    /// it does not identify the underlying network or firewall cause.
     CarrierState {
         interface_name: String,
         ifname: String,
@@ -294,7 +293,8 @@ impl MultiIfDedup {
         }
     }
 
-    /// Record the packet and return whether it was already seen within TTL.
+    /// Return whether this packet hash is still in the bounded TTL cache. New
+    /// hashes are recorded; a duplicate does not refresh its timestamp.
     pub fn is_duplicate(&mut self, data: &[u8]) -> bool {
         let hash = rns_crypto::sha::sha256(data);
         let now = Instant::now();
@@ -331,7 +331,9 @@ impl Default for MultiIfDedup {
     }
 }
 
-/// Verify a beacon against `SHA-256(group_id + peer_addr_string)`.
+/// Compare the first 32 beacon bytes with `SHA-256(group_id + peer_addr_string)`.
+/// Shorter inputs fail; trailing bytes are ignored. This shared-group digest
+/// does not authenticate a peer identity.
 pub fn verify_beacon(beacon: &[u8], group_id: &str, peer_addr: &Ipv6Addr) -> bool {
     if beacon.len() < 32 {
         return false;
@@ -508,7 +510,9 @@ pub struct NetworkInterfaceInfo {
     pub is_loopback: bool,
 }
 
-/// Enumerate all host NICs (including loopback / ignored). Callers filter on top.
+/// Enumerate addresses reported by the host and group them by NIC name,
+/// including loopback and normally ignored names. Callers apply filters.
+/// `is_up` means an address was found; it is not a carrier or reachability test.
 pub fn list_network_interfaces() -> Result<Vec<NetworkInterfaceInfo>, String> {
     use std::collections::BTreeMap;
 

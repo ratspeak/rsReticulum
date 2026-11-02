@@ -25,17 +25,21 @@ pub enum ReceiptStatus {
     Receiving = 0x06,
 }
 
-/// Tracks a sent packet until it is delivered, times out, or is culled.
+/// State and callbacks for a sent packet.
+///
+/// The owner drives proof validation and timeout checks; this type starts no
+/// timer. Direct state-changing methods do not reject repeated or out-of-order
+/// transitions. Keep lifecycle and destination-key validation in the owner.
 #[allow(missing_docs)]
 pub struct PacketReceipt {
     pub hash: [u8; 32],
     pub truncated_hash: [u8; 16],
-    /// Destination this packet was sent to. Proofs are only accepted from the
-    /// identity bound to this destination.
+    /// Destination this packet was sent to. This metadata does not itself
+    /// authenticate a proof or establish that a stored key belongs to the hash.
     pub destination_hash: Option<[u8; 16]>,
     /// Full Reticulum public key (`X25519 || Ed25519`) captured for the
-    /// destination. Keeping the exact identity used for the send prevents an
-    /// unrelated signature from concluding the receipt.
+    /// destination. [`Self::validate_proof_from_destination`] verifies with
+    /// this key; the owner must first validate its binding to the destination.
     pub destination_public_key: Option<[u8; 64]>,
     pub status: ReceiptStatus,
     pub sent_at: Instant,
@@ -44,7 +48,8 @@ pub struct PacketReceipt {
     pub callbacks: ReceiptCallbacks,
 }
 
-/// Optional callbacks invoked when a receipt transitions out of `Sent`.
+/// Optional callbacks consumed by delivery or failure methods.
+/// Culling does not invoke either callback.
 #[allow(missing_docs)]
 #[derive(Default)]
 pub struct ReceiptCallbacks {
@@ -52,7 +57,8 @@ pub struct ReceiptCallbacks {
     pub timeout: Option<ReceiptCallback>,
 }
 
-/// Callback invoked once when a packet receipt reaches a terminal state.
+/// Callback consumed at most once per registration.
+/// Delivery and timeout callbacks are independent; the owner controls transitions.
 pub type ReceiptCallback = Box<dyn FnOnce(&PacketReceipt) + Send>;
 
 impl PacketReceipt {
@@ -75,6 +81,8 @@ impl PacketReceipt {
     ///
     /// The public key may be supplied later when the destination hash is
     /// already known but its validated announce has not yet been recalled.
+    /// This records the first hash and the first supplied key for that hash;
+    /// it does not verify their cryptographic relationship.
     pub fn set_destination_identity(
         &mut self,
         destination_hash: [u8; 16],
@@ -115,7 +123,8 @@ impl PacketReceipt {
         self.concluded_at = Some(Instant::now());
     }
 
-    /// Measured round-trip time, if this receipt has concluded.
+    /// Elapsed time from creation to conclusion, for any concluded status.
+    /// Only a proof-backed delivery makes this a delivery round-trip measure.
     pub fn get_rtt(&self) -> Option<Duration> {
         self.concluded_at.map(|t| t.duration_since(self.sent_at))
     }
@@ -140,8 +149,11 @@ impl PacketReceipt {
 
     /// Validate a PROOF body and mark delivered on match.
     /// Explicit (96): embedded hash must equal receipt hash. Implicit (64):
-    /// signature over the receipt hash. `verify` is Ed25519 verify with the
-    /// expected identity key.
+    /// signature over the receipt hash. The callback receives
+    /// `(signature, packet_hash)` in that order; it must perform Ed25519
+    /// verification with the expected identity key. This method does
+    /// not consult the stored destination hash or public key and does not
+    /// require the current status to be `Sent`.
     pub fn validate_proof<F>(&mut self, proof: &[u8], verify: F) -> bool
     where
         F: FnOnce(&[u8], &[u8]) -> bool,
@@ -172,8 +184,9 @@ impl PacketReceipt {
     }
 
     /// Validate a PROOF body against the destination identity captured for
-    /// this receipt. A receipt without a known identity cannot be concluded by
-    /// a proof.
+    /// this receipt. Returns false if no public key is stored or verification
+    /// fails. It relies on the owner having validated that key's destination
+    /// binding; it does not rederive or compare the stored destination hash.
     pub fn validate_proof_from_destination(&mut self, proof: &[u8]) -> bool {
         let Some(public_key) = self.destination_public_key else {
             return false;

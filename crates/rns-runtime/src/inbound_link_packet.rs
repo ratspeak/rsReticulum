@@ -185,8 +185,9 @@ impl InboundLinkPacket {
     }
 }
 
-/// Non-cloneable authority for one exact received packet. Resolution does not
-/// imply admission until its returned receiver reports `Sent`.
+/// Non-cloneable authority for one exact received packet. For acceptance or
+/// rejection, the returned receiver reports `Sent` only after matching endpoint
+/// dispatch of the proof or rejection. It does not confirm peer reception.
 #[derive(Debug)]
 pub struct LinkPacketReceipt {
     resolver: Option<oneshot::Sender<Resolution>>,
@@ -222,9 +223,10 @@ impl LinkPacketReceipt {
     pub fn drop_without_proof(self) {
         drop(self);
     }
-    /// Close only this receipt's still-current Link without a delivery proof or
-    /// an invalid-stamp error. `Closed` confirms local closure, not peer receipt
-    /// of the best-effort teardown. Stale authority cannot close a replacement.
+    /// Request closure of this receipt's still-current Link without a delivery
+    /// proof or invalid-stamp error. `Closed` reports the local close decision or
+    /// already-stale authority, not peer receipt of a best-effort teardown.
+    /// Stale authority cannot close a replacement Link.
     pub fn close_without_proof(self) -> oneshot::Receiver<LinkPacketReceiptOutcome> {
         self.resolve(Decision::Close)
     }

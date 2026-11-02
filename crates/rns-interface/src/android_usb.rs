@@ -1,4 +1,8 @@
-//! USB serial RNode over Android USB-C OTG via JNI to `UsbManager`. 115200 8N1.
+//! RNode over Android USB host access through JNI to `UsbManager`. The
+//! driver selects a CDC data (`0x0A`) or vendor-specific (`0xFF`) interface
+//! with IN and OUT endpoints on that same interface. It requests 8N1 line
+//! coding, defaulting to 115200 baud. That control request is best effort;
+//! enumeration alone does not establish chipset compatibility.
 
 use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::collections::HashMap;
@@ -43,7 +47,9 @@ const USB_DETACH_ACK_DEADLINE: Duration = Duration::from_millis(500);
 const USB_WORKER_JOIN_DEADLINE: Duration = Duration::from_millis(1_250);
 const USB_RECONNECT_DELAY: Duration = Duration::from_secs(rnode::RECONNECT_WAIT);
 
-/// USB VIDs of serial chipsets commonly used by RNode hardware.
+/// Vendor-ID allowlist used to filter and label enumerated USB devices.
+/// Connection still requires a suitable CDC-data or vendor-specific interface
+/// and a device compatible with this driver's line control and RNode protocol.
 pub const KNOWN_VIDS: &[(u16, &str)] = &[
     (0x0403, "FTDI"),
     (0x10C4, "Silicon Labs CP210x"),
@@ -157,9 +163,9 @@ pub fn stop_android_usb_rnode_interface(id: InterfaceId) {
     let _ = request_android_usb_rnode_stop(id);
 }
 
-/// Request stop and wait until the JNI workers have joined and Java ownership
-/// is either safely closed or explicitly quarantined. Idempotent; unknown ids
-/// have already left the interface registry.
+/// Request stop and wait for the owner's shutdown report. A successful result
+/// means workers joined and ownership closed; unresolved ownership is
+/// quarantined and reported as an error. Unknown IDs return `Ok(())`.
 pub async fn stop_android_usb_rnode_interface_and_wait(id: InterfaceId) -> Result<(), String> {
     let Some(mut stop_handle) = request_android_usb_rnode_stop(id) else {
         return Ok(());
@@ -239,9 +245,11 @@ pub struct AndroidUsbConfig {
     pub mode: InterfaceMode,
     /// Gate each TX on the radio's CMD_READY. Python default: off.
     pub flow_control: bool,
-    /// Short-term airtime cap, percent (0.0..=100.0). `None` = unlimited.
+    /// Short-term airtime cap, percent (0.0..=100.0). `None` sends no command
+    /// and leaves the device's corresponding setting unchanged.
     pub st_alock: Option<f32>,
-    /// Long-term airtime cap, percent (0.0..=100.0). `None` = unlimited.
+    /// Long-term airtime cap, percent (0.0..=100.0). `None` sends no command
+    /// and leaves the device's corresponding setting unchanged.
     pub lt_alock: Option<f32>,
     /// Station-ID beacon: seconds between IDs, sent only after data TX.
     pub id_interval: Option<u64>,
@@ -569,10 +577,8 @@ pub async fn resolve_android_usb_device_selector(
 }
 
 /// Return whether Android has already granted this app access to `device_name`.
-///
-/// This is deliberately a probe only. Android permission prompts are owned by
-/// the Activity bridge because JNI cannot safely create the required
-/// `PendingIntent`/`BroadcastReceiver` interaction here.
+/// This is a permission probe and never opens a prompt. The embedding Activity
+/// bridge is responsible for requesting access.
 pub async fn has_usb_permission(device_name: &str) -> Result<bool, String> {
     let dev_name = device_name.to_string();
     tokio::task::spawn_blocking(move || {
@@ -759,8 +765,9 @@ fn unregister_android_usb_presence(device_name: &str, attached: &Arc<AtomicBool>
     }
 }
 
-/// Invalidate the exact active physical generation from Android's USB detach
-/// broadcast. Unknown and stale device paths are harmless no-ops.
+/// Mark the currently registered connection for `device_name` as detached
+/// and wake reconnect loops. Unknown paths are ignored. Selection uses the
+/// path alone; callers must supply the current detach notification.
 pub fn notify_android_usb_device_detached(device_name: &str) {
     if let Some(attached) = android_usb_presence_registry()
         .lock()
@@ -2059,10 +2066,9 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
     Ok(SpawnedRNodeInterface { interface, driver })
 }
 
-/// Push an already-KISS-framed control frame through the raw USB writer,
-/// bypassing the transport CMD_DATA wrapper. The canonical caller is the
-/// BLE→serial handoff, which sends `[FEND, CMD_BT_CTRL, 0x00, FEND]` to turn
-/// off the RNode's BT radio before the USB link takes over.
+/// Enqueue an already-KISS-framed control message on the supplied raw USB
+/// writer channel, bypassing the transport CMD_DATA wrapper. Success confirms
+/// queue admission, not device receipt or execution.
 pub async fn send_raw_frame(
     writer: &mpsc::Sender<Vec<u8>>,
     frame: Vec<u8>,

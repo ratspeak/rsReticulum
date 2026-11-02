@@ -1,9 +1,10 @@
 //! Shared TCP socket tuning for [`crate::tcp`], [`crate::backbone`],
 //! [`crate::i2p`], and [`crate::rnode`] (TCP transport).
-//! `set_keepalive`: portable SO_KEEPALIVE. `set_keepalive_tuned`: adds Linux
-//! TCP_KEEPIDLE/INTVL/CNT + TCP_USER_TIMEOUT. All helpers are generic over
-//! the raw-fd/raw-socket borrow, so they accept tokio and std streams alike.
-//! `iface_addr_for`: kernel iface name → IpAddr for Backbone `device =` key.
+//!
+//! The helpers accept Tokio and standard-library streams through their raw
+//! socket handles. Keepalive settings are applied where the platform supports
+//! them; TCP_USER_TIMEOUT is set on Linux, Android, and Fuchsia. Tuning is
+//! best effort. Interface-address helpers resolve local device names.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -53,7 +54,8 @@ pub fn set_keepalive<S: RawStream>(stream: &S) -> std::io::Result<()> {
     with_socket2(stream, |sock| sock.set_keepalive(true))
 }
 
-/// Tuned keepalive: idle/interval/retries + Linux TCP_USER_TIMEOUT. Best-effort.
+/// Request keepalive idle time, interval, and retry count where supported,
+/// plus TCP_USER_TIMEOUT on Linux, Android, and Fuchsia. Best effort.
 pub fn set_keepalive_tuned<S: RawStream>(
     stream: &S,
     idle: Duration,
@@ -66,7 +68,8 @@ pub fn set_keepalive_tuned<S: RawStream>(
     });
 }
 
-/// Raise TCP send/recv buffers; best-effort.
+/// Request TCP send and receive buffer sizes. The kernel may adjust them;
+/// errors are ignored.
 pub fn set_socket_buffers<S: RawStream>(stream: &S, size: usize) {
     with_socket2(stream, |sock| {
         let _ = sock.set_recv_buffer_size(size);
@@ -124,8 +127,9 @@ pub fn iface_broadcast_for(name: &str) -> Option<std::net::Ipv4Addr> {
     })
 }
 
-/// Resolve interface name to `IpAddr`; `None` if missing. Caller falls back
-/// to wildcard bind.
+/// Resolve an interface name to `IpAddr`, preferring the requested address
+/// family and falling back to the other family. Returns `None` if enumeration
+/// fails or no address matches; the caller decides whether to fall back.
 pub fn iface_addr_for(name: &str, prefer_ipv6: bool) -> Option<IpAddr> {
     let ifaces = match if_addrs::get_if_addrs() {
         Ok(v) => v,

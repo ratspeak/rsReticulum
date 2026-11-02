@@ -66,10 +66,11 @@ pub struct TcpClientConfig {
     pub connect_timeout_secs: u64,
     pub max_reconnect_tries: Option<usize>,
     pub mode: InterfaceMode,
-    /// Override HW MTU for link MTU discovery (Python `fixed_mtu`, >= 500).
+    /// Override the MTU used for link MTU discovery. Accepted values are
+    /// 500 through 262,144 bytes, inclusive.
     pub fixed_mtu: Option<u32>,
-    /// Signs a tunnel synthesis for every connection unless KISS-framed;
-    /// `None` sends none.
+    /// Identity used to request a signed tunnel synthesis for each non-KISS
+    /// connection. `None`, or an identity without signing material, sends none.
     pub tunnel_identity: Option<TunnelIdentity>,
 }
 

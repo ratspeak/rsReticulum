@@ -127,19 +127,21 @@ struct Args {
     #[arg(long, short = 'c', hide_short_help = true)]
     config: Option<String>,
 
-    /// Increase verbosity.
+    /// Increase verbosity (repeatable; ignored with --service).
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Decrease verbosity.
+    /// Decrease verbosity (repeatable; ignored with --service).
     #[arg(short = 'q', long, action = clap::ArgAction::Count)]
     quiet: u8,
 
-    /// Run as service and log to `<configdir>/logfile`.
+    /// Log to `<configdir>/logfile` using the configured log level.
+    /// The process remains in the foreground.
     #[arg(short = 's', long)]
     service: bool,
 
-    /// Drop into an interactive shell after initialisation.
+    /// Open the built-in status console after initialisation.
+    /// Supports the listed status names, not arbitrary shell or Python commands.
     #[arg(short = 'i', long)]
     interactive: bool,
 

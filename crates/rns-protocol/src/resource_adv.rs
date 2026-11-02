@@ -1,9 +1,13 @@
 use crate::resource::{MAPHASH_LEN, ResourceFlags};
 
-/// Advertisement overhead in bytes (non-hashmap data).
+/// Nominal non-hashmap overhead used by the hashmap-capacity estimator.
+/// Actual MessagePack size depends on field values; use exact control admission
+/// before transmission.
 pub const OVERHEAD: usize = 134;
 
-/// Maximum map-hash entries that fit alongside the advertisement overhead in one MDU.
+/// Estimate map-hash capacity as `(mdu - OVERHEAD) / MAPHASH_LEN`. This does
+/// not check the actual advertisement encoding or encrypted packet length; use
+/// [`crate::resource_control::check_advertisement`] for admission.
 pub fn hashmap_max_len(mdu: usize) -> usize {
     if mdu > OVERHEAD {
         (mdu - OVERHEAD) / MAPHASH_LEN
@@ -48,8 +52,9 @@ pub struct ResourceAdvertisement {
 }
 
 impl ResourceAdvertisement {
-    /// Build an advertisement with no metadata prefix. Equivalent to
-    /// [`Self::with_metadata_size`] with `metadata_size = 0`.
+    /// Build an advertisement with a local metadata-size annotation of zero.
+    /// Equivalent to [`Self::with_metadata_size`] with `metadata_size = 0`; it
+    /// does not clear the caller-supplied `has_metadata` flag.
     // Mirrors the Resource ADV wire fields; grouping these into a builder
     // would hide the packet layout this constructor exists to preserve.
     #[allow(clippy::too_many_arguments)]
@@ -76,9 +81,10 @@ impl ResourceAdvertisement {
         )
     }
 
-    /// Build an advertisement, truncating `map_hashes` to what actually fits in
-    /// the MDU. Callers are expected to send the remaining hashes in a
-    /// subsequent hashmap-update packet.
+    /// Build an advertisement, truncating `map_hashes` using the nominal MDU
+    /// estimate. Send remaining hashes in subsequent hashmap updates. Before
+    /// sending, call [`crate::resource_control::check_advertisement`] to verify
+    /// the actual encoded packet size.
     // Same Resource ADV field set as `new`, plus the local metadata prefix
     // size needed to split payload from metadata after receive.
     #[allow(clippy::too_many_arguments)]
@@ -117,8 +123,14 @@ impl ResourceAdvertisement {
         }
     }
 
-    /// Decode an advertisement produced by [`Self::pack`] or by the Python
-    /// reference implementation.
+    /// Decode an advertisement body after checking that its length fits an
+    /// encrypted Link control packet with a minimum header and base MTU.
+    ///
+    /// This is field decoding, not complete transfer admission. It accepts
+    /// trailing bytes, chooses the first matching map key, and truncates `h`
+    /// and `o` to 32 bytes. The random tag must contain at least four bytes.
+    /// Callers must validate segment counts, lengths, flags and hash-map shape
+    /// before allocating a receiver; see [`crate::resource::InboundResource`].
     pub fn unpack(data: &[u8]) -> Result<Self, String> {
         use rmpv::Value;
 
@@ -234,7 +246,8 @@ impl ResourceAdvertisement {
         Ok(counter.0)
     }
 
-    /// Split the packed `hashmap` field into fixed-length map-hash entries.
+    /// Split `hashmap` into four-byte entries, dropping any incomplete trailing
+    /// entry. Validate divisibility first when rejecting malformed input.
     pub fn get_map_hashes(&self) -> Vec<[u8; MAPHASH_LEN]> {
         self.hashmap
             .as_chunks::<MAPHASH_LEN>()

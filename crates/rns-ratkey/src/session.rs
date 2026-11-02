@@ -1,6 +1,11 @@
-//! Transport-agnostic PIV session. Every PIV operation is built on `apdu` plus a
-//! `PivTransport`; the transport is the only platform-specific part (see `transport`).
-//! `hardware` feature adds the PC/SC `connect()` entry points.
+//! Transport-agnostic PIV session built on [`crate::apdu`] and
+//! [`PivTransport`]. The `hardware` feature adds PC/SC connection helpers.
+//! A caller-supplied transport must already have selected the PIV application.
+//!
+//! PIN caching enables one verification/retry when a command returns `0x6982`.
+//! Expiry does not clear an authorized card session or wipe the cached PIN;
+//! use `lock` and handle its result for application session policy. Input
+//! length/character validation and secret-buffer ownership remain with callers.
 
 use crate::apdu;
 use crate::detect::DeviceType;
@@ -51,10 +56,10 @@ impl<T: PivTransport> PivSession<T> {
         self.transport.is_connected()
     }
 
-    /// Re-locks the card: re-selects the PIV applet (resetting the on-card PIN
-    /// verification) and clears the cached PIN, so the next private-key op needs
-    /// a fresh `verify_pin`. This is the mechanism behind the app-side session
-    /// timeout / lock-on-quit.
+    /// Reselect the PIV application, then clear the host PIN cache on success.
+    /// A transport/status error returns before the cache is cleared. The owner
+    /// must handle the result; this method does not schedule a lock timer, and
+    /// subsequent PIN requirements depend on the card and key policy.
     pub fn lock(&mut self) -> Result<(), RatkeyError> {
         let resp = self.transport.transmit(&apdu::select_piv())?;
         apdu::check_response(&resp)?;
@@ -62,6 +67,9 @@ impl<T: PivTransport> PivSession<T> {
         Ok(())
     }
 
+    /// Verify the supplied PIN and cache it on success. Validate the card's PIN
+    /// policy first (normally 6–8 ASCII bytes); the APDU builder truncates at
+    /// eight bytes. Failed verification can consume a card retry.
     pub fn verify_pin(&mut self, pin: &str) -> Result<(), RatkeyError> {
         // PIN-bearing APDU buffers are wiped once transmitted.
         let cmd = zeroize::Zeroizing::new(apdu::verify_pin(pin));
@@ -71,6 +79,9 @@ impl<T: PivTransport> PivSession<T> {
         Ok(())
     }
 
+    /// Change the card PIN and cache the new value on success. Validate both
+    /// inputs first; the APDU builder truncates at eight bytes. A wrong old PIN
+    /// can consume a retry.
     pub fn change_pin(&mut self, old_pin: &str, new_pin: &str) -> Result<(), RatkeyError> {
         let cmd = zeroize::Zeroizing::new(apdu::change_pin(old_pin, new_pin));
         let resp = self.transport.transmit(&cmd)?;
@@ -79,6 +90,9 @@ impl<T: PivTransport> PivSession<T> {
         Ok(())
     }
 
+    /// Set a new PIN using the PUK, preserving the stored keys. A wrong PUK
+    /// can consume its retry counter. Validate both inputs before calling;
+    /// this does not recover private keys from a reset or lost token.
     pub fn unblock_pin(&mut self, puk: &str, new_pin: &str) -> Result<(), RatkeyError> {
         let cmd = zeroize::Zeroizing::new(apdu::reset_retry(puk, new_pin));
         let resp = self.transport.transmit(&cmd)?;
@@ -93,6 +107,9 @@ impl<T: PivTransport> PivSession<T> {
         }
     }
 
+    /// Send the destructive PIV reset command; see [`crate::apdu::reset_piv`]
+    /// for scope and prerequisites. This method does not first block the PIN
+    /// or PUK. It clears the host PIN cache only after the card reports success.
     pub fn reset_piv(&mut self) -> Result<(), RatkeyError> {
         let resp = self.transport.transmit(&apdu::reset_piv())?;
         match apdu::check_response(&resp) {
@@ -108,6 +125,9 @@ impl<T: PivTransport> PivSession<T> {
         }
     }
 
+    /// Generate an Ed25519 key in `slot` after management authentication.
+    /// This can overwrite an existing key; no backup, empty-slot guard or
+    /// rollback is provided.
     pub fn generate_ed25519(
         &mut self,
         slot: u8,
@@ -124,6 +144,9 @@ impl<T: PivTransport> PivSession<T> {
         apdu::parse_generate_response(data)
     }
 
+    /// Generate an X25519 key in `slot` after management authentication.
+    /// This can overwrite an existing key; no backup, empty-slot guard or
+    /// rollback is provided.
     pub fn generate_x25519(
         &mut self,
         slot: u8,
@@ -140,8 +163,10 @@ impl<T: PivTransport> PivSession<T> {
         apdu::parse_generate_response(data)
     }
 
-    /// Import an off-device Ed25519 key (recoverable provisioning / restore).
-    /// Requires prior `authenticate_management_key`.
+    /// Import an off-device Ed25519 key into `slot`. Requires prior management
+    /// authentication and can replace the slot's existing key; there is no
+    /// empty-slot guard or rollback. The caller retains responsibility for the
+    /// private-key input and any copies made during provisioning.
     pub fn import_ed25519(
         &mut self,
         slot: u8,
@@ -159,7 +184,9 @@ impl<T: PivTransport> PivSession<T> {
         Ok(())
     }
 
-    /// Import an off-device X25519 key. Requires prior `authenticate_management_key`.
+    /// Import an off-device X25519 key into `slot`, potentially replacing an
+    /// existing key. Requires prior management authentication. No empty-slot
+    /// guard or rollback is provided; treat the private-key input as secret.
     pub fn import_x25519(
         &mut self,
         slot: u8,
@@ -219,7 +246,9 @@ impl<T: PivTransport> PivSession<T> {
         apdu::parse_ecdh_response(&data)
     }
 
-    /// Returns DER-encoded X.509 attestation certificate.
+    /// Request the target slot's DER X.509 attestation statement (command `F9`,
+    /// not attestation slot F9). On YubiKey this is available for keys generated
+    /// on-device, not imported recovery keys. The returned bytes are not verified.
     pub fn attest_key(&mut self, slot: u8) -> Result<Vec<u8>, RatkeyError> {
         let resp = self.transport.transmit(&apdu::attest_key(slot))?;
         Ok(apdu::check_response(&resp)?.to_vec())
@@ -250,18 +279,18 @@ impl<T: PivTransport> PivSession<T> {
         Ok(apdu::check_response(&resp)?.to_vec())
     }
 
-    /// Reads the slot's 32-byte public key from GET METADATA. The metadata byte
-    /// layout is pending confirmation against a real device — see
-    /// `apdu::parse_metadata_public_key`. Yubico 5.3+ only (Nitrokey 3 has no
-    /// GET METADATA).
+    /// Read a 32-byte slot public key through Yubico GET METADATA and
+    /// [`crate::apdu::parse_metadata_public_key`]. This requires the corresponding
+    /// extension and algorithm support; reader detection alone is insufficient.
     pub fn read_public_key(&mut self, slot: u8) -> Result<[u8; 32], RatkeyError> {
         let metadata = self.read_metadata(slot)?;
         apdu::parse_metadata_public_key(&metadata)
     }
 
-    /// Authenticate the PIV management key (slot 9B) via witness/challenge mutual
-    /// auth — required before on-device key generation. The algorithm is read
-    /// from the card (YubiKey 5.7 default: AES-192).
+    /// Authenticate the management key (9B) with witness/challenge mutual auth
+    /// before key generation or import. Reads the algorithm through GET METADATA
+    /// and supports TDES/AES variants. This path requires that extension; it does
+    /// not infer the algorithm from key length or fall back for other cards.
     pub fn authenticate_management_key(&mut self, key: &[u8]) -> Result<(), RatkeyError> {
         let meta = self.read_metadata(apdu::SLOT_CARD_MANAGEMENT)?;
         let alg = apdu::parse_metadata_algorithm(&meta)?;

@@ -49,8 +49,12 @@ fn integer(section: &ConfigSection, key: &'static str) -> Result<Option<usize>, 
         .transpose()
 }
 
-/// Decode file units without changing credential activation or class defaults.
-/// A legacy byte escape must be diagnosed by the caller when present.
+/// Decode an IFAC size into bytes, or return `None` for the class default.
+/// `ifac_size` is 8..=512 bits in multiples of eight; values 1..=64 require
+/// explicit `ifac_size_unit = bits` because legacy files used bytes.
+/// `ifac_size_bytes` accepts 1..=64 bytes and cannot coexist with either
+/// other size key. This parser does not activate IFAC credentials; callers
+/// must diagnose use of the legacy byte escape.
 pub fn parse_ifac_size(section: &ConfigSection) -> Result<Option<usize>, IfacConfigError> {
     let has_bits = section.has("ifac_size");
     let has_unit = section.has("ifac_size_unit");
@@ -365,7 +369,9 @@ pub fn plan_ifac_unit_migration(
     })
 }
 
-/// Redacted status consumed by configuration editors. Credentials never enter it.
+/// List interfaces whose IFAC size needs an explicit units decision, without
+/// copying credential fields. `effective_bytes` initially repeats the raw
+/// value as the legacy-byte interpretation; it is not a resolved size.
 pub fn migration_candidates(config: &Config) -> Vec<IfacUnitChange> {
     config
         .subsections("interfaces")

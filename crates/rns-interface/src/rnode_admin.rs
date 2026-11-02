@@ -1,4 +1,6 @@
-//! Extended-KISS admin codec shared by RNode runtime and `rnodeconf`.
+//! Extended-KISS administrative frame codecs and command builders used by
+//! `rnodeconf`. These helpers construct or decode bytes; they perform no
+//! transport I/O or device authorization.
 
 use std::net::Ipv4Addr;
 

@@ -1,6 +1,14 @@
-//! Atomic msgpack persistence for transport tables. `atomic_write` is
-//! write-to-tmp + fsync + rename (via the shared rns-identity helper) so a
-//! crash or power loss leaves either the old or the new file, never a torn one.
+//! Local snapshots and Python-compatible cache formats for transport state.
+//!
+//! Table and hashlist writers use [`rns_identity::persistence::atomic_write`]:
+//! a same-directory temporary file, file sync, readback checks and replacement.
+//! Parent-directory sync is best-effort on Unix; this is not an unconditional
+//! power-loss guarantee or a transaction across files. The per-announce cache
+//! writer has a separate, unsynced temporary-file path.
+//!
+//! Loaders decode local storage, not authenticated network input. Most read the
+//! whole file and have no size limit; decoded metadata still needs validation
+//! before use. Loading a route does not establish that its peer is reachable.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read};
@@ -13,6 +21,9 @@ use crate::constants::PERSIST_RANDOM_BLOBS;
 use crate::hashlist::PacketHashlist;
 use crate::path_table::PathTable;
 
+/// Rust path-snapshot fields. Byte-vector lengths and timestamp validity are not
+/// checked by deserialization; callers must validate and rebind the interface
+/// before installing a route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedPathEntry {
     pub destination_hash: Vec<u8>,
@@ -22,17 +33,16 @@ pub struct PersistedPathEntry {
     pub expires: f64,
     pub random_blobs: Vec<Vec<u8>>,
     pub interface_id: u64,
-    /// Stable identifier for the interface that learned this path. The load
-    /// path uses it to remap the volatile `interface_id` (re-allocated from
-    /// zero on every actor boot) once the matching interface registers.
+    /// Saved interface name for rebinding to a current interface. A stored
+    /// `interface_id` alone is not a stable identity across actor instances.
     #[serde(default)]
     pub interface_name: Option<String>,
-    /// Python's `destination_table` stores the full hash of `str(interface)`.
-    /// Keep it in the Rust sidecar too so sidecar/canonical loads can share
-    /// the same rebinding path.
+    /// Full SHA-256 of the saved interface name, as produced by
+    /// [`interface_hash_from_name`]. This is a lookup key, not authentication.
     #[serde(default)]
     pub interface_hash: Option<Vec<u8>>,
-    /// Full hash of the cached announce packet backing this path.
+    /// Optional full hash used to locate the cached announce packet.
+    /// Deserializing this byte vector does not validate its length or contents.
     #[serde(default)]
     pub packet_hash: Option<Vec<u8>>,
 }
@@ -54,6 +64,9 @@ pub struct PersistedHashlist {
     pub version: u32,
 }
 
+/// Save a version-4 Rust path snapshot. Paths without a supplied interface name
+/// are skipped, and at most the last 32 random blobs per path are retained.
+/// Expired paths are not filtered here; cull the table first when needed.
 pub fn save_path_table(
     table: &PathTable,
     interface_names: &HashMap<u64, String>,
@@ -97,8 +110,11 @@ pub fn save_path_table(
     atomic_write(path, &persisted)
 }
 
-/// Loads a path-table snapshot. Entries without `interface_name` (v1/v2)
-/// are dropped at the actor boundary since `interface_id` is volatile.
+/// Decode a Rust path snapshot with a supported version (1 through 4).
+///
+/// This returns stored entries without checking byte-vector lengths, expiry,
+/// announce signatures or interface availability. Older entries may lack an
+/// interface name; the caller must decide whether they can be rebound safely.
 pub fn load_path_table(path: &Path) -> Result<Vec<PersistedPathEntry>, PersistenceError> {
     let data = std::fs::read(path).map_err(PersistenceError::Io)?;
     let persisted: PersistedPathTable =
@@ -152,10 +168,15 @@ pub struct PythonTunnelPath {
     pub packet_hash: [u8; 32],
 }
 
+/// Hash the exact UTF-8 interface name with full SHA-256. No normalization or
+/// identity authentication is performed.
 pub fn interface_hash_from_name(name: &str) -> [u8; 32] {
     rns_crypto::sha::full_hash(name.as_bytes())
 }
 
+/// Save the Python-compatible eight-field destination rows. Entries without a
+/// supplied interface name or cached announce hash are skipped; expired entries
+/// are retained. Each row includes at most the last 32 random blobs.
 pub fn save_python_destination_table(
     table: &PathTable,
     interface_names: &HashMap<u64, String>,
@@ -193,6 +214,13 @@ pub fn save_python_destination_table(
     atomic_write_bytes(path, &serialized)
 }
 
+/// Decode Python-compatible destination rows from a local file.
+///
+/// The outer value must be an array. Non-array rows are skipped, but an array
+/// row shorter than eight fields fails the load. Invalid fixed-length hashes or
+/// hop counts skip that row; unsupported time encodings become zero, and invalid
+/// random blobs are discarded. Valid blob lists are not length-capped here.
+/// No announce signature, expiry or current-path check is performed.
 pub fn load_python_destination_table(
     path: &Path,
 ) -> Result<Vec<PythonDestinationEntry>, PersistenceError> {
@@ -257,12 +285,13 @@ pub fn load_python_destination_table(
     Ok(out)
 }
 
-/// Write one announce's raw bytes into the Python-compatible per-packet
-/// announce cache, skipping when the file already exists (cache files are
-/// content-addressed by packet hash, and SINGLE announces retransmit
-/// byte-identical). Plain tmp+rename without fsync — matches Python
-/// `Transport.cache`'s plain write; the cache is best-effort and rebuilt
-/// from live traffic, and this runs on the actor for every fresh announce.
+/// Write raw packet bytes and an optional interface reference under the
+/// supplied packet hash in the Python-compatible announce cache.
+///
+/// An existing path is left untouched without validating its contents. This
+/// helper does not compute the packet hash or verify the announce. It uses a
+/// fixed sibling `.tmp` file and rename without fsync; serialize writers for
+/// the same key. The existence check is not an exclusive create operation.
 pub fn write_python_cached_announce_if_absent(
     announce_cache_dir: &Path,
     packet_hash: &[u8; 32],
@@ -289,6 +318,11 @@ pub fn write_python_cached_announce_if_absent(
     std::fs::rename(&tmp, &path).map_err(PersistenceError::Io)
 }
 
+/// Read the cached packet for a supplied hash, returning `None` if absent.
+///
+/// The cache value must contain binary packet bytes; an invalid optional
+/// interface-reference value becomes `None`. The filename hash, packet header,
+/// signature and age are not checked. Validate the returned packet before use.
 pub fn load_python_cached_announce(
     announce_cache_dir: &Path,
     packet_hash: &[u8; 32],
@@ -327,6 +361,9 @@ pub fn load_python_cached_announce(
     }))
 }
 
+/// Save Python-compatible tunnel rows, retaining expired tunnels and paths.
+/// Nested paths without a cached announce hash are omitted; each saved path
+/// keeps at most the last 32 random blobs. An unknown interface has no hash.
 pub fn save_python_tunnel_table(
     table: &crate::tunnel::TunnelTable,
     interface_names: &HashMap<u64, String>,
@@ -382,6 +419,10 @@ pub fn save_python_tunnel_table(
     atomic_write_bytes(path, &serialized)
 }
 
+/// Decode a local Python-compatible tunnel table. Malformed tunnel or path
+/// rows are skipped; unsupported time encodings become zero and invalid random
+/// blobs are discarded. Hash lengths are checked, but signatures, timestamp
+/// finiteness, expiry and current reachability are not. Blob lists are not capped.
 pub fn load_python_tunnel_table(path: &Path) -> Result<Vec<PythonTunnelEntry>, PersistenceError> {
     let data = std::fs::read(path).map_err(PersistenceError::Io)?;
     let value = rmpv::decode::read_value(&mut std::io::Cursor::new(data))
@@ -494,28 +535,29 @@ fn value_u8(value: &Value) -> Option<u8> {
 
 /// Result of streaming a canonical `packet_hashlist.raw` file.
 ///
-/// A trailing fragment is recoverable: complete 32-byte hashes are returned
-/// and the caller can report the ignored byte count. Duplicates are removed
-/// while reading so a corrupt or manually concatenated file cannot inflate
-/// the in-memory set.
+/// Complete 32-byte hashes are returned in first-seen order, with duplicates
+/// removed. A partial final record is ignored and reported separately. There
+/// is no cap on the number of unique hashes loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawHashlistLoad {
     pub hashes: Vec<[u8; 32]>,
+    /// Number of complete records that repeated an earlier hash.
     pub duplicate_count: usize,
+    /// Bytes ignored after the last complete 32-byte record (0 through 31).
     pub partial_tail_bytes: usize,
 }
 
-/// Atomically write the current packet-hash generation in Reticulum 1.4's
-/// canonical raw format: an unframed concatenation of 32-byte hashes.
+/// Write only the current packet-hash generation as an unframed
+/// concatenation of 32-byte hashes. The previous generation is omitted.
 pub fn save_hashlist_raw(hashlist: &PacketHashlist, path: &Path) -> Result<(), PersistenceError> {
     let hashes = hashlist.current_hashes();
     save_raw_hashes(&hashes, path)
 }
 
-/// Persist a packet hashlist through the stable pre-1.4 facade.
+/// Select a hashlist format by the exact, case-sensitive `raw` extension.
 ///
-/// A `.raw` path uses the current canonical format; other paths retain the
-/// legacy msgpack writer so existing save/load callers continue to round-trip.
+/// Raw output saves only the current generation; every other extension uses
+/// [`save_hashlist_legacy`] and saves both generations.
 pub fn save_hashlist(hashlist: &PacketHashlist, path: &Path) -> Result<(), PersistenceError> {
     if path.extension().is_some_and(|extension| extension == "raw") {
         save_hashlist_raw(hashlist, path)
@@ -524,10 +566,8 @@ pub fn save_hashlist(hashlist: &PacketHashlist, path: &Path) -> Result<(), Persi
     }
 }
 
-/// Write both in-memory generations using the legacy msgpack list shape.
-///
-/// Runtime persistence never calls this; it exists only for compatibility
-/// tooling and one-way migration support.
+/// Write both in-memory generations as a legacy MessagePack array of binary
+/// hashes. The file does not preserve the boundary between generations.
 pub fn save_hashlist_legacy(
     hashlist: &PacketHashlist,
     path: &Path,
@@ -543,9 +583,9 @@ pub fn save_hashlist_legacy(
     atomic_write_bytes(path, &serialized)
 }
 
-/// Atomically write an explicit hash snapshot. Used by legacy migration so
-/// the canonical file is materialised without deleting or rewriting the
-/// source file.
+/// Replace `path` with the supplied hashes concatenated as raw 32-byte records.
+/// Input order and duplicates are preserved. The full output is allocated in
+/// memory before writing through the shared atomic-file helper.
 pub fn save_raw_hashes(hashes: &[[u8; 32]], path: &Path) -> Result<(), PersistenceError> {
     let mut serialized = Vec::with_capacity(hashes.len().saturating_mul(32));
     for hash in hashes {
@@ -554,11 +594,11 @@ pub fn save_raw_hashes(hashes: &[[u8; 32]], path: &Path) -> Result<(), Persisten
     atomic_write_bytes(path, &serialized)
 }
 
-/// Stream a canonical raw hashlist with fixed-size buffering.
+/// Load raw 32-byte hash records through a 64 KiB reader buffer.
 ///
-/// This intentionally does not read the whole file into one byte vector.
-/// The retained memory is the deduplicated set itself plus a bounded reader
-/// buffer. A short final record is ignored and surfaced in the result.
+/// Unique hashes are retained in both an output vector and a deduplication
+/// set while reading, so total memory grows with the unique-record count.
+/// A partial final record is ignored and reported in [`RawHashlistLoad`].
 pub fn load_hashlist_raw(path: &Path) -> Result<RawHashlistLoad, PersistenceError> {
     const READ_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -598,6 +638,10 @@ pub fn load_hashlist_raw(path: &Path) -> Result<RawHashlistLoad, PersistenceErro
 ///
 /// - Python's `packet_hashlist`: a list of binary hashes.
 /// - Rust's old `hashlist.msgpack`: `{ hashes, version }`.
+///
+/// The Rust wrapper's version value is not checked. Non-32-byte records are
+/// discarded, and duplicates are removed in first-seen order. The entire
+/// file is read into memory without a size bound.
 pub fn load_hashlist_legacy(path: &Path) -> Result<Vec<[u8; 32]>, PersistenceError> {
     let data = std::fs::read(path).map_err(PersistenceError::Io)?;
     let raw_hashes = match rmp_serde::from_slice::<Vec<Vec<u8>>>(&data) {
@@ -623,10 +667,11 @@ pub fn load_hashlist_legacy(path: &Path) -> Result<Vec<[u8; 32]>, PersistenceErr
     Ok(hashes)
 }
 
-/// Load a packet hashlist through the stable pre-1.4 facade.
+/// Select a hashlist reader by the exact, case-sensitive `raw` extension.
 ///
-/// A `.raw` path uses the current canonical format; other paths retain the
-/// legacy msgpack reader so existing migration tools keep working.
+/// Raw loads return only hashes, discarding duplicate and partial-tail
+/// diagnostics. Call [`load_hashlist_raw`] directly when those counts matter.
+/// Every other extension uses [`load_hashlist_legacy`].
 pub fn load_hashlist(path: &Path) -> Result<Vec<[u8; 32]>, PersistenceError> {
     if path.extension().is_some_and(|extension| extension == "raw") {
         Ok(load_hashlist_raw(path)?.hashes)
@@ -671,6 +716,9 @@ impl PersistedBlackholeTable {
     pub const SUPPORTED_VERSIONS: &'static [u32] = &[1, 2];
 }
 
+/// Save all entries as a version-2 Rust blackhole snapshot, including expired
+/// entries. Publisher/source identity is not stored in this format; use
+/// [`save_python_blackhole_files`] when source grouping must be preserved.
 pub fn save_blackhole_table(
     table: &crate::blackhole::BlackholeTable,
     path: &Path,
@@ -694,6 +742,9 @@ pub fn save_blackhole_table(
     atomic_write(path, &persisted)
 }
 
+/// Decode a version-1 or version-2 Rust blackhole snapshot. Stored hash lengths,
+/// timestamps and expiry are not validated. This format has no publisher/source
+/// identity field; loading it cannot recover that provenance.
 pub fn load_blackhole_table(path: &Path) -> Result<Vec<PersistedBlackholeEntry>, PersistenceError> {
     let data = std::fs::read(path).map_err(PersistenceError::Io)?;
     let persisted: PersistedBlackholeTable =
@@ -719,6 +770,11 @@ pub struct PythonBlackholeEntry {
     pub reason_label: Option<String>,
 }
 
+/// Write a `local` file and one file per remote source represented in the table.
+///
+/// Each file is replaced separately; this is not a multi-file transaction.
+/// Obsolete source files are left in place, so the directory is not necessarily
+/// an exact snapshot of this table after saving. Expired entries are included.
 pub fn save_python_blackhole_files(
     table: &crate::blackhole::BlackholeTable,
     local_identity_hash: [u8; 16],
@@ -753,6 +809,19 @@ pub fn save_python_blackhole_files(
     Ok(())
 }
 
+/// Load local blackholes and enabled remote-source files from a directory.
+///
+/// A missing directory gives an empty result; other directory-open errors fail.
+/// Unreadable files, non-map records and invalid identity keys are skipped.
+/// A map with a valid 16-byte identity can still omit `until`: missing, Nil or
+/// nonnumeric values become a permanent entry (`ttl=None`). A missing or
+/// nonstring reason becomes Manual; string reasons are also retained as labels.
+/// Source identity comes from the filename (or `local_identity_hash` for
+/// `local`), not an authenticated signature or stored `source`. Trust the directory.
+///
+/// Expired entries are omitted. Returned creation times are `now`, and finite
+/// lifetimes become the remaining duration. Remote entries precede local entries;
+/// ordering between remote files is unspecified.
 pub fn load_python_blackhole_dir(
     blackhole_dir: &Path,
     local_identity_hash: [u8; 16],
@@ -879,16 +948,17 @@ pub struct PersistedAnnounceEntry {
     pub timestamp: f64,
     pub public_key: Option<Vec<u8>>,
     pub ratchet: Option<Vec<u8>>,
-    /// Disk announce-cache key (`cache/announces/<hex>`). Raw announce bytes
-    /// are not persisted inline since v6 — CacheRequest replays read the
-    /// byte-identical packet from the per-announce cache file.
+    /// Optional disk-cache key (`cache/announces/<hex>`). Version 6 stores
+    /// metadata separately from raw packets; this value alone does not prove
+    /// that a valid packet is present in the cache.
     #[serde(default)]
     pub packet_hash: Option<Vec<u8>>,
-    /// Pinned via `RetainDestination`; the maintenance sweep skips the
-    /// entry regardless of age while this is `true`.
+    /// Stored retention preference. Loading this record does not itself
+    /// install the entry or run the actor's retention policy.
     pub retained: bool,
-    /// `SHA-256(app_name)[:10]` of the announced aspect. Lets cache consumers
-    /// retro-filter without re-parsing the announce.
+    /// Stored announce name hash from the destination's expanded hash name,
+    /// which can include aspects and a generated-identity suffix. It should
+    /// contain 10 bytes; deserialization does not validate its length or derivation.
     pub name_hash: Vec<u8>,
     #[serde(default)]
     pub is_path_response: bool,
@@ -896,8 +966,8 @@ pub struct PersistedAnnounceEntry {
     pub last_used: Option<f64>,
 }
 
-/// Exact v5 on-disk entry shape (raw announce bytes inline), kept for
-/// one-shot migration to the disk-backed v6 cache.
+/// Version-5 on-disk entry shape with raw announce bytes inline, accepted by
+/// [`load_announce_cache_legacy_v5`] for migration to separate packet files.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LegacyPersistedAnnounceEntryV5 {
     pub destination_hash: Vec<u8>,
@@ -928,6 +998,8 @@ impl PersistedAnnounceCache {
     pub const LEGACY_RAW_VERSION: u32 = 5;
 }
 
+/// Save version-6 announce metadata without raw packet bytes. Entries are
+/// copied as supplied, without filtering expiry or validating their hashes.
 pub fn save_announce_cache<'a, I>(announces: I, path: &Path) -> Result<(), PersistenceError>
 where
     I: IntoIterator<Item = &'a crate::actor::RecentAnnounce>,
@@ -957,6 +1029,9 @@ where
     atomic_write(path, &persisted)
 }
 
+/// Decode version-6 announce metadata. Other versions are rejected; this does
+/// not fall back to the legacy reader or validate field lengths, signatures,
+/// expiry or the referenced packet files.
 pub fn load_announce_cache(path: &Path) -> Result<Vec<PersistedAnnounceEntry>, PersistenceError> {
     let data = std::fs::read(path).map_err(PersistenceError::Io)?;
     let persisted: PersistedAnnounceCache =
@@ -972,8 +1047,9 @@ pub fn load_announce_cache(path: &Path) -> Result<Vec<PersistedAnnounceEntry>, P
     Ok(persisted.entries)
 }
 
-/// Decode a v5 announce cache (raw bytes inline). Used only as the fallback
-/// path when `load_announce_cache` rejects the file.
+/// Decode a version-5 announce cache with inline raw bytes. This reader rejects
+/// other versions and does not validate the embedded packets. Call
+/// [`migrate_legacy_announce_entries`] explicitly to create separate cache files.
 pub fn load_announce_cache_legacy_v5(
     path: &Path,
 ) -> Result<Vec<LegacyPersistedAnnounceEntryV5>, PersistenceError> {
@@ -989,10 +1065,15 @@ pub fn load_announce_cache_legacy_v5(
     Ok(persisted.entries)
 }
 
-/// One-shot v5 → v6 migration: write each entry's raw announce into the
-/// per-packet disk cache, derive `packet_hash`/`is_path_response` from the
-/// raw bytes, and return the slim v6 shape. Entries whose raw bytes fail to
-/// parse keep `packet_hash = None` (replay treats that as a cache miss).
+/// Convert version-5 entries to version-6 metadata and attempt to cache their
+/// raw packet bytes. This does not save the returned metadata or remove the
+/// legacy file.
+///
+/// A parseable packet header supplies the hash inputs and path-response flag;
+/// the packet type and announce signature are not validated. Empty or malformed
+/// bytes, or a failed cache write, leave `packet_hash = None`. Cache-write
+/// errors are not returned, and an existing cache file is not checked. All
+/// other stored metadata is retained, with `last_used` unset.
 pub fn migrate_legacy_announce_entries(
     legacy: Vec<LegacyPersistedAnnounceEntryV5>,
     announce_cache_dir: &Path,
@@ -1041,11 +1122,11 @@ pub struct PersistedTunnelEntry {
     pub interface_id: u64,
     pub expires: f64,
     pub paths: Vec<PersistedTunnelPath>,
-    /// Interface the tunnel was bound to when saved. Tunnels load unbound,
-    /// so this and `interface_hash` are informational.
+    /// Interface name recorded at save time. The loader returns this field
+    /// without binding the tunnel to a current interface.
     #[serde(default)]
     pub interface_name: Option<String>,
-    /// Python-compatible hash of `interface_name`.
+    /// Full SHA-256 of the saved UTF-8 interface name, when available.
     #[serde(default)]
     pub interface_hash: Option<Vec<u8>>,
 }
@@ -1075,6 +1156,9 @@ impl PersistedTunnelTable {
     pub const SUPPORTED_VERSIONS: &'static [u32] = &[1, 2, 3];
 }
 
+/// Save all tunnels and their paths as a version-3 Rust snapshot. Expired entries
+/// are retained, and at most the last 32 random blobs per path are saved.
+/// Interface names and hashes are included only when available.
 pub fn save_tunnel_table(
     table: &crate::tunnel::TunnelTable,
     interface_names: &HashMap<u64, String>,
@@ -1128,6 +1212,9 @@ pub fn save_tunnel_table(
     atomic_write(path, &persisted)
 }
 
+/// Decode a supported Rust tunnel snapshot (versions 1 through 3). This returns
+/// stored fields without checking hash lengths, expiry, announce signatures or
+/// interface availability, and does not install or bind any tunnel.
 pub fn load_tunnel_table(path: &Path) -> Result<Vec<PersistedTunnelEntry>, PersistenceError> {
     let data = std::fs::read(path).map_err(PersistenceError::Io)?;
     let persisted: PersistedTunnelTable =
@@ -1155,14 +1242,18 @@ pub enum PersistenceError {
     VersionMismatch { expected: u32, found: u32 },
 }
 
-/// Reference-counted prune of `storage/cache/announces` — Python
-/// `Transport.clean_announce_cache` parity (Transport.py: keep only files
-/// whose hex name is a packet hash referenced by an active path or tunnel
-/// path; non-hex names are removed). Files younger than `grace` are always
-/// kept: the keep-set is snapshotted on the actor while announces keep
-/// arriving, so a fresh cache file can precede its path-table entry.
-/// Returns (removed, total_seen). Missing dir and per-entry IO errors are
-/// tolerated — the sweep is idempotent and re-runs on the next pass.
+/// Remove old regular files from `storage/cache/announces` unless their hex
+/// filename decodes to a hash in `keep`.
+///
+/// The caller supplies the complete keep-set; this function does not inspect
+/// transport tables. Non-hex names are eligible too. Files younger than
+/// `grace`, with unknown modification time, or dated after the sweep starts are kept.
+///
+/// Returns `(successfully_removed, maximum_files_seen_in_one_pass)`. Passes
+/// repeat until one removes nothing. Directory and per-entry I/O errors are
+/// tolerated, so a zero removal count does not establish an empty or fully
+/// checked cache. Concurrent writers are not part of a transaction with this
+/// sweep; use a dedicated, trusted cache directory.
 pub fn sweep_announce_cache(
     storage_dir: &Path,
     keep: &std::collections::HashSet<[u8; 32]>,

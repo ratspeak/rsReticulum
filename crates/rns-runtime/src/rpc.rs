@@ -1,12 +1,10 @@
-//! Shared-instance control RPC over TCP.
+//! Shared-instance control RPC codecs and clients for TCP loopback or Unix
+//! sockets. Frames use Python multiprocessing-compatible lengths and mutual
+//! HMAC challenge/response, followed by MessagePack requests and responses.
+//! Tagged SHA-256 and legacy MD5 HMAC challenges are supported; pickle is not.
 //!
-//! Python Reticulum uses `multiprocessing.connection.Listener/Client` for the
-//! local control port. Keep the Rust control socket wire-compatible with that:
-//! framed auth challenge (`#CHALLENGE#`), then framed msgpack request
-//! dictionaries and responses, byte-exact with the vendored umsgpack
-//! (Python >=1.3.4, commit a2ef9782 — hard cutover from pickle, no fallback).
-//! Python 3.12+ uses tagged SHA-256 auth challenges, while Python 3.11 and
-//! older use raw MD5 HMAC responses.
+//! Authentication proves possession of the shared RPC key. It does not encrypt
+//! request/response frames or authenticate the separate packet-IPC socket.
 
 use serde::{Deserialize, Serialize};
 
@@ -81,7 +79,7 @@ pub enum RpcRequest {
         packet_hash: Vec<u8>,
     },
     GetBlackholedIdentities,
-    /// Python 1.3.8 `is_blackholed()` RPC verb (Reticulum.py:1649-1661).
+    /// Query whether the transport currently blackholes an identity hash.
     IsBlackholed {
         identity_hash: Vec<u8>,
     },
@@ -177,7 +175,9 @@ pub struct InterfaceStatEntry {
     pub announce_rate_grace: Option<u32>,
     pub announce_rate_penalty: Option<f64>,
     pub announce_cap: f64,
-    /// Python's IFAC fields, all `None` for an interface without IFAC.
+    /// IFAC signature supplied by runtime records. IFAC fields can also be
+    /// `None` when the stats provider has no IFAC records; absence is not proof
+    /// that the interface has no IFAC protection.
     #[serde(default)]
     pub ifac_signature: Option<Vec<u8>>,
     #[serde(default)]
@@ -187,7 +187,9 @@ pub struct InterfaceStatEntry {
     pub tx_drops: u64,
     #[serde(default)]
     pub tx_dropped_bytes: u64,
-    /// Python `arxc`/`atxc`/`prxc`/`ptxc`.
+    /// Count of received announces, encoded as Python-compatible `arxc`.
+    /// The following sent-announce and received/sent-path-request counters map
+    /// to `atxc`, `prxc` and `ptxc` respectively.
     #[serde(default)]
     pub announces_received: u64,
     #[serde(default)]
@@ -252,11 +254,17 @@ pub fn encode_response(resp: &RpcResponse) -> Result<Vec<u8>, RpcError> {
     encode_umsgpack(&response_to_py_value(resp))
 }
 
+/// Decode one response by its MessagePack shape. Empty lists are ambiguous
+/// and become an empty path table; prefer `decode_response_for_request` when
+/// the originating request is known. Trailing bytes are ignored.
 pub fn decode_response(data: &[u8]) -> Result<RpcResponse, RpcError> {
     let value = decode_umsgpack(data)?;
     py_value_to_response(&value)
 }
 
+/// Decode one MessagePack response using the originating request to select
+/// its result type, including empty lists and nil values. Trailing bytes are
+/// ignored; the caller owns framing and peer authentication.
 pub fn decode_response_for_request(
     data: &[u8],
     request: &RpcRequest,
@@ -289,15 +297,17 @@ pub fn compute_legacy_auth_hmac(key: &[u8], challenge: &[u8]) -> [u8; 16] {
     out
 }
 
-/// Constant-time comparison; handshake MUST NOT leak via timing.
+/// Compare the computed HMAC-SHA-256 with a fixed 32-byte response using
+/// constant-time equality. This is not a timing guarantee for an entire RPC session.
 pub fn verify_auth_hmac(key: &[u8], challenge: &[u8], provided: &[u8; 32]) -> bool {
     use subtle::ConstantTimeEq;
     let expected = compute_auth_hmac(key, challenge);
     expected.ct_eq(provided).into()
 }
 
-/// Derived from the transport identity so server + local CLI share a secret
-/// without extra on-disk state.
+/// SHA-256 of the supplied private-key bytes, used as the default shared RPC
+/// secret. The caller supplies the correct transport private-key material;
+/// this helper does not validate its representation or length.
 pub fn derive_rpc_key(identity_private_key: &[u8]) -> [u8; 32] {
     rns_crypto::sha::sha256(identity_private_key)
 }
@@ -1633,6 +1643,8 @@ pub(crate) fn new_python_challenge_for(protocol: PythonAuthProtocol) -> Vec<u8> 
     message
 }
 
+/// Write a signed 32-bit big-endian length followed by the payload. Rejects
+/// lengths above `i32::MAX`; this helper imposes no I/O timeout.
 pub async fn write_mp_frame<S>(stream: &mut S, data: &[u8]) -> Result<(), RpcError>
 where
     S: tokio::io::AsyncWrite + Unpin,
@@ -1647,6 +1659,9 @@ where
     stream.write_all(data).await.map_err(RpcError::Io)
 }
 
+/// Read one multiprocessing frame, accepting the 32-bit length or `-1`
+/// followed by a 64-bit length. Reject a length above `max_size` before
+/// allocating the payload. The caller supplies any I/O timeout.
 pub async fn read_mp_frame<S>(stream: &mut S, max_size: usize) -> Result<Vec<u8>, RpcError>
 where
     S: tokio::io::AsyncRead + Unpin,
@@ -1683,7 +1698,11 @@ where
     Ok(data)
 }
 
-/// Every I/O step is bounded by `timeout` so a stuck daemon never hangs the CLI.
+/// Connect to `127.0.0.1:port`, mutually authenticate and issue one request.
+/// `timeout` is reapplied to individual connection, handshake and request I/O
+/// operations; it is not a total-call deadline. The authentication-failure
+/// notification write is currently unbounded. Use an outer timeout when the
+/// whole operation needs a deadline.
 pub async fn connect_and_request(
     port: u16,
     rpc_key: &[u8],

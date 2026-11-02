@@ -1,8 +1,10 @@
-//! Periodic discovery announce scheduler. Pure-data: `tick(now)` returns
-//! one [`AnnounceRequest`] per due interface. Runtime owners use `prepare` and
-//! `commit` to advance the interval only after driver admission. The runtime owns the timer +
-//! identity-signed emit. Memoises `(infohash, stamp)` per interface so an
-//! unchanged info doesn't redo PoW.
+//! Discovery publication scheduler, driven by caller-supplied timestamps.
+//!
+//! Use [`Announcer::prepare`] to obtain app-data, then [`Announcer::commit`]
+//! when the caller's required admission condition is met. This module neither
+//! sends a packet nor verifies driver admission. The caller supplies the timer,
+//! outer signed announce and egress handling. Preparation may synchronously
+//! generate proof of work; unchanged info bytes reuse a cached stamp.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,20 +25,27 @@ use super::stamper::DiscoveryStamper;
 pub struct DiscoveryInterfaceConfig {
     /// Interface type — must be in [`DISCOVERABLE_INTERFACE_TYPES`].
     pub interface_type: String,
+    /// Whether preparation may publish this interface's metadata.
     pub discoverable: bool,
     /// Name advertised in the announce.
     pub name: String,
+    /// Advertised routing state; this does not enable transport itself.
     pub transport_enabled: bool,
-    /// Seconds between announces; defaults to [`ANNOUNCE_JOB_INTERVAL_SECS`].
+    /// Minimum seconds after the last successful commit. The backbone helper
+    /// uses [`ANNOUNCE_JOB_INTERVAL_SECS`]; zero permits immediate preparation.
     pub announce_interval_secs: u64,
-    /// Stamp target value required by the receiver; defaults to [`DEFAULT_STAMP_VALUE`].
+    /// Sender's generation target; receivers choose their own requirement.
+    /// The backbone helper uses [`DEFAULT_STAMP_VALUE`]. Raising this through
+    /// `reconfigure` alone does not invalidate an unchanged info map's stamp.
     pub stamp_value: u8,
     /// Endpoint address (IP / host / I2P b32) — optional.
     pub reachable_on: Option<String>,
-    /// TCP/Backbone bind port, if applicable.
+    /// Advertised TCP/Backbone port, if applicable.
     pub port: Option<u16>,
-    /// IFAC virtual-network overlay (name / key).
+    /// Advertised IFAC network name.
     pub ifac_netname: Option<String>,
+    /// Advertised IFAC passphrase. Without discovery-body encryption this is
+    /// cleartext in the announce; omit it when it must remain undisclosed.
     pub ifac_netkey: Option<String>,
     /// Radio-link parameters for RNode / KISS / Weave.
     pub frequency: Option<u64>,
@@ -49,16 +58,19 @@ pub struct DiscoveryInterfaceConfig {
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub height: Option<f64>,
-    /// Set the `FLAG_ENCRYPTED` bit; caller supplies `encrypt` closure at
-    /// announce time via [`Announcer::tick`].
+    /// Encrypt the info/stamp body and set `FLAG_ENCRYPTED`; the caller must
+    /// supply an encryptor to [`Announcer::prepare`] or [`Announcer::tick`].
     pub encrypt: bool,
-    /// Set the `FLAG_SIGNED` bit (independent of `encrypt`).
+    /// Set `FLAG_SIGNED` independently of encryption. This flag does not
+    /// create a signature; the caller constructs the outer signed announce.
     pub signed: bool,
 }
 
 impl DiscoveryInterfaceConfig {
-    /// Minimal config: discoverable backbone interface with default
-    /// stamp + interval.
+    /// Build discoverable Backbone metadata: transport advertised as enabled,
+    /// 60-second interval, stamp target 16, signed flag set and no body
+    /// encryption. Optional IFAC, radio and location fields start absent.
+    /// This does not open an interface or validate the endpoint.
     pub fn backbone(name: String, reachable_on: String, port: u16) -> Self {
         Self {
             interface_type: "BackboneInterface".into(),
@@ -85,7 +97,8 @@ impl DiscoveryInterfaceConfig {
         }
     }
 
-    /// True iff `interface_type` is in [`DISCOVERABLE_INTERFACE_TYPES`].
+    /// Check only whether the type is in [`DISCOVERABLE_INTERFACE_TYPES`].
+    /// This does not check `discoverable`, endpoint fields or runtime support.
     pub fn is_advertisable(&self) -> bool {
         DISCOVERABLE_INTERFACE_TYPES
             .iter()
@@ -106,9 +119,11 @@ struct InterfaceAnnounceState {
     stamp_cache: Option<([u8; 32], Vec<u8>)>,
 }
 
-/// One "interface wants to announce now" output from [`Announcer::tick`].
+/// Prepared discovery app-data for one interface. The caller still needs to
+/// construct and send the outer Reticulum announce.
 #[derive(Debug, Clone)]
 pub struct AnnounceRequest {
+    /// Local interface whose metadata this publication describes.
     pub interface_id: InterfaceId,
     /// Fully assembled `app_data` bytes (flags followed by the optionally
     /// encrypted body).
@@ -117,8 +132,9 @@ pub struct AnnounceRequest {
     pub stamp_value: u8,
 }
 
-/// One cached publication for an exact registered configuration. Its opaque
-/// generation prevents a late admission from committing a replaced interface.
+/// One cached publication tied to its announcer instance and configuration
+/// generation. Clones refer to the same publication; a stale or already
+/// committed token cannot advance the current publication's interval.
 #[derive(Debug, Clone)]
 pub struct PreparedAnnounce {
     owner: Arc<()>,
@@ -127,6 +143,7 @@ pub struct PreparedAnnounce {
 }
 
 impl PreparedAnnounce {
+    /// Read the cached publication bytes and achieved stamp value.
     pub fn request(&self) -> &AnnounceRequest {
         &self.request
     }
@@ -139,20 +156,25 @@ pub enum SkipReason {
     NotDiscoverable,
     /// Interface type not in [`DISCOVERABLE_INTERFACE_TYPES`].
     TypeNotAdvertisable,
-    /// Too soon after the last announce.
+    /// Too soon after the last successful commit; remaining seconds truncate
+    /// the fractional part of the computed interval.
     RateLimited { remaining_secs: u64 },
-    /// Stamper refused to generate (LXStamper cancelled or missing key).
+    /// Encoding failed, the stamper returned no result, or its stamp had
+    /// the wrong length. This variant does not identify a specific cause.
     StampGenerationFailed,
-    /// `FLAG_ENCRYPTED` requested but no encryptor supplied to `tick`.
+    /// Encryption requested but no encryptor supplied to preparation.
     EncryptorMissing,
     /// Encryptor returned `None` for this payload.
     EncryptionFailed,
 }
 
-/// Optional encryptor closure; the announcer holds no identity material.
+/// Per-call body encryptor. Return `None` if encryption cannot be performed.
 pub type EncryptFn<'a> = &'a dyn Fn(&[u8]) -> Option<Vec<u8>>;
 
-/// Pure-data scheduler. Not async, holds no timer — drive via `tick`.
+/// Synchronous scheduler with no timer or network I/O. Drive publication with
+/// [`Self::prepare`] and [`Self::commit`]; custom stamper/encryptor callbacks
+/// may perform expensive work. Supply finite timestamps in one consistent
+/// clock domain; they are not validated here.
 pub struct Announcer {
     owner: Arc<()>,
     stamper: Arc<dyn DiscoveryStamper>,
@@ -161,6 +183,7 @@ pub struct Announcer {
 }
 
 impl Announcer {
+    /// Create an empty scheduler using the supplied stamp implementation.
     pub fn new(stamper: Arc<dyn DiscoveryStamper>) -> Self {
         Self {
             owner: Arc::new(()),
@@ -170,8 +193,10 @@ impl Announcer {
         }
     }
 
-    /// Register (or replace) an interface's discovery config.
-    /// `transport_id` = 16-byte identity hash carried in `TRANSPORT_ID`.
+    /// Register or replace an interface's metadata. `transport_id` is copied
+    /// into the advertised info; its relationship to the outer signer is the
+    /// caller's responsibility. Replacement clears the success timestamp,
+    /// cached stamp and prepared publication, making this entry due immediately.
     pub fn register(
         &mut self,
         interface_id: InterfaceId,
@@ -195,9 +220,14 @@ impl Announcer {
         );
     }
 
-    /// Replace a registered interface's config but keep its announce interval,
-    /// so new information goes out with the next due announce. Returns `false`
-    /// for an unregistered interface.
+    /// Replace config while keeping the last successful commit time. The new
+    /// interval determines when the replacement is due; any prepared token is
+    /// invalidated. Returns `false` for an unregistered interface.
+    ///
+    /// The cached stamp is retained and reused if the encoded info is unchanged.
+    /// Since the generation target is not in that info, raising only
+    /// `stamp_value` can reuse a lower-work stamp. Use [`Self::register`] to
+    /// clear the cache when changing that requirement; it also resets timing.
     pub fn reconfigure(
         &mut self,
         interface_id: InterfaceId,
@@ -216,23 +246,25 @@ impl Announcer {
         true
     }
 
-    /// Drop an interface from the announcer (called on deregister).
+    /// Remove the interface's scheduler state and invalidate its prepared token.
+    /// This does not remove an actual network interface.
     pub fn deregister(&mut self, interface_id: InterfaceId) {
         self.interfaces.remove(&interface_id);
     }
 
-    /// Inspect registered interfaces (for tests / introspection).
+    /// Number of registered configs, including entries not marked discoverable.
     pub fn len(&self) -> usize {
         self.interfaces.len()
     }
 
+    /// Whether no interface configs are registered.
     pub fn is_empty(&self) -> bool {
         self.interfaces.is_empty()
     }
 
-    /// Compatibility convenience: prepare and immediately commit every result.
-    /// Runtime publishers should use [`Self::prepare`] and [`Self::commit`] so
-    /// a failed egress does not consume the success interval.
+    /// Prepare and immediately commit every result before returning it.
+    /// No transmission is attempted. Use [`Self::prepare`] and [`Self::commit`]
+    /// separately when failed egress must not consume the success interval.
     pub fn tick(
         &mut self,
         now: f64,
@@ -250,8 +282,13 @@ impl Announcer {
     }
 
     /// Prepare due publications without advancing their success interval.
-    /// Repeated calls return the same bytes (including ciphertext) until commit
-    /// or replacement; callers keep at most one dispatch per prepared result.
+    /// Repeated calls return cached bytes, including ciphertext, until commit
+    /// or replacement. A different encryptor alone does not replace cached
+    /// ciphertext. Keep at most one active dispatch per prepared token.
+    ///
+    /// Stamp generation and encryption run synchronously here. Returned stamps
+    /// are length-checked but not revalidated against the target; the stamper
+    /// must honor its contract. Per-interface result ordering is unspecified.
     pub fn prepare(
         &mut self,
         now: f64,
@@ -362,8 +399,13 @@ impl Announcer {
         (out, skips)
     }
 
-    /// Record first actual driver admission for this exact publication.
-    /// A duplicate or replaced-generation result cannot restart the interval.
+    /// Mark this exact publication successful at `now`. Returns `false` for
+    /// another announcer's token, a removed/replaced entry, or a token already
+    /// committed. A successful commit clears prepared bytes and advances the
+    /// generation while retaining the stamp cache.
+    ///
+    /// This trusts the caller's admission decision; it does not check driver
+    /// queues, dispatch or delivery. The timestamp is stored without validation.
     pub fn commit(&mut self, prepared: &PreparedAnnounce, now: f64) -> bool {
         let Some(state) = self.interfaces.get_mut(&prepared.request.interface_id) else {
             return false;

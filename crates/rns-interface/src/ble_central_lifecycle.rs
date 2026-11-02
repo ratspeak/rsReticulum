@@ -1,5 +1,6 @@
-//! BLE central (scan) lifecycle. `PlatformUnavailable` rewinds active states
-//! to `StartingWaitingPlatform` so scanning resumes after a Bluetooth toggle.
+//! BLE central scan lifecycle. `PlatformUnavailable` rewinds starting or
+//! scanning states to `StartingWaitingPlatform`. A later `PlatformReady` can
+//! resume scanning; stopping states are not rewound.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
@@ -12,7 +13,8 @@ pub enum AdvertisedProtocol {
     Columba,
 }
 
-/// `identifier` is platform-stable (Apple UUIDString, bluer D-Bus path, Android MAC).
+/// `identifier` is a platform-provided scan identifier, such as an Apple UUID
+/// or Bluetooth address. It is not a persistent authenticated peer identity.
 #[derive(Debug, Clone)]
 pub struct DiscoveryEvent {
     pub identifier: String,
@@ -48,7 +50,7 @@ pub enum CentralState {
     StoppingScan,
     /// Cleanly torn down. Distinct from `Idle` for telemetry.
     Stopped,
-    /// Bluetooth unsupported / permission denied; requires explicit `Reset`.
+    /// A fatal platform error was reported; requires explicit `Reset`.
     Failed,
 }
 
@@ -75,8 +77,8 @@ pub enum CentralEvent {
     StartRequested,
     /// Platform ready: adapter calls `scanForPeripheralsWithServices` here.
     PlatformReady,
-    /// Active states rewind to `StartingWaitingPlatform` so recovery
-    /// resumes scanning.
+    /// Starting and scanning states rewind to `StartingWaitingPlatform`.
+    /// Stopping states reject this event.
     PlatformUnavailable {
         reason: String,
     },

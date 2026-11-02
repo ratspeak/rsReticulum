@@ -4,7 +4,9 @@ use crate::constants::*;
 
 /// Keepalive timing state for a single link.
 ///
-/// Only the initiator side schedules keepalives; the responder simply echoes them.
+/// Only the initiator schedules requests. The responder can suppress a reply
+/// when it has sent other traffic within the keepalive interval. The owner
+/// records activity and sends any required frames.
 #[derive(Debug, Clone)]
 pub struct KeepaliveState {
     pub keepalive_interval: Duration,
@@ -46,7 +48,8 @@ impl KeepaliveState {
 
     /// Rescale the keepalive interval after a new RTT measurement.
     ///
-    /// Interval scales linearly with RTT up to `KEEPALIVE_MAX_RTT`, then saturates.
+    /// Interval scales linearly with RTT, clamped to `KEEPALIVE_MIN` through
+    /// `KEEPALIVE_MAX`; it reaches the upper limit at `KEEPALIVE_MAX_RTT`.
     /// Jitter is re-rolled so the ±10% spread is relative to the new interval.
     pub fn update_from_rtt(&mut self, rtt: Duration) {
         let rtt_secs = rtt.as_secs_f64();

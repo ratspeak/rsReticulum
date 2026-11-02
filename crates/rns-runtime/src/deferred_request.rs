@@ -83,9 +83,10 @@ impl DeferredRequestResponder {
     pub fn is_cancelled(&self) -> bool {
         !self.state.alive.load(Ordering::Acquire) || Instant::now() >= self.state.deadline
     }
-    /// Queues one result. `Sent` acknowledges transport queue acceptance or
-    /// Resource initiation, not remote delivery. No response is emitted for a
-    /// closed/replaced Link, a dropped manager or an expired request.
+    /// Queues one result. `Sent` acknowledges local response staging in the
+    /// transport mailbox or manager retry queue, or Resource initiation. It
+    /// does not acknowledge endpoint dispatch or remote delivery. No response
+    /// is emitted for a closed/replaced Link, dropped manager or expired request.
     pub fn respond(
         mut self,
         outcome: RequestOutcome,

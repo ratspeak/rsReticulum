@@ -1,6 +1,12 @@
-//! rnsh channel message codecs.
+//! rnsh Channel message codecs.
 //!
-//! Python reference: `RNS/Utilities/rnsh/protocol.py`.
+//! Use `MessageBase` to pack/unpack a message or `RnshMessage::decode` to
+//! dispatch by type, and register `MESSAGE_TYPES` with the Channel. These
+//! codecs do not execute commands or authorize a remote shell.
+//!
+//! Stream messages use IDs 0/1/2 for stdin/stdout/stderr and the Buffer
+//! compression format. Decoding expands compressed data while retaining its
+//! flag; clear the flag or recompress before repacking that message.
 
 use std::io::Cursor;
 

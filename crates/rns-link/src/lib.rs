@@ -1,6 +1,8 @@
 //! Encrypted point-to-point Links between two Reticulum destinations.
-//! LR/LRPROOF handshake → AES-256 + HMAC-SHA256 session, MTU discovery,
-//! keepalives, request/response. Python reference: `RNS/Link.py`.
+//! LR/LRPROOF handshake, AES-256-CBC + HMAC-SHA256 sessions, checked MTU
+//! signalling, keepalives, and request/response. Current [`link::Link`] endpoints
+//! use the 500-byte base MTU; representable signalling offers are a wider domain.
+//! The owning runtime sends packets, drives ticks, and dispatches Link callbacks.
 
 pub mod clock;
 pub mod constants;

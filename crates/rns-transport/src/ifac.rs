@@ -1,15 +1,16 @@
-//! Interface Access Control (IFAC) signing and verification.
+//! Interface Access Control (IFAC) packet encoding and verification.
 //!
-//! IFAC authenticates every packet on a closed-membership interface. A shared
-//! interface key drives both an Ed25519 signing key (the tag is the last
-//! `ifac_size` bytes of the signature) and an HKDF-XOR mask over the header
-//! and payload — the tag itself is left in the clear because receivers need it
-//! to regenerate the mask. Packets without a valid tag are dropped before any
-//! routing decision, so unauthorised peers can neither send nor decode traffic.
+//! The shared interface key seeds an Ed25519 signer. The final `ifac_size`
+//! signature bytes form a tag, which also drives an HKDF-XOR mask over the
+//! packet. Before masking, the layout is `[flags|0x80, hops, tag, rest]`.
+//! The tag stays clear and the IFAC presence bit remains set; the remaining
+//! header bits and payload are masked.
 //!
-//! Wire layout matches the Python reference (`Transport.transmit` /
-//! `Transport.inbound`): `[flags|0x80, hops, tag(ifac_size), payload]` with
-//! everything except the tag masked.
+//! IFAC gates access to one configured interface. Members share its key, so
+//! a valid tag does not identify an individual member or replace destination
+//! or Link encryption. These helpers do not reject replays or validate the
+//! complete inner packet. The transport actor drops failed IFAC verification
+//! on wire ingress before parsing the inner packet.
 
 use rns_crypto::ed25519::Ed25519PrivateKey;
 use rns_crypto::hkdf::hkdf_sha256;
@@ -34,8 +35,9 @@ pub enum IfacSignError {
 /// Stamp a packet with its IFAC tag and XOR mask.
 ///
 /// `ifac_key` is the 64-byte derived interface key: bytes [32..64) seed the
-/// Ed25519 signer, and the full key acts as HKDF salt (Python uses
-/// `interface.ifac_key` in both roles, so the split must not change).
+/// Ed25519 signer, and the full key acts as HKDF salt. Supply an inner packet
+/// with bit 7 of byte 0 clear. This wrapper performs the same checks as
+/// [`try_ifac_sign`] and panics on its errors.
 ///
 /// # Panics
 ///
@@ -46,7 +48,12 @@ pub fn ifac_sign(packet: &[u8], ifac_key: &[u8; 64], ifac_size: usize) -> Vec<u8
     try_ifac_sign(packet, ifac_key, ifac_size).expect("invalid IFAC signing arguments")
 }
 
-/// Checked packet admission, suitable for caller-provided metadata and bytes.
+/// Sign and mask with checked tag size and byte length. Accepts tag sizes
+/// of 1..=64 bytes and inner packets of at least two bytes, provided packet
+/// plus tag is at most [`MAX_IFAC_WIRE_BYTES`]. This is not full packet validation: the
+/// caller must supply an inner packet with the IFAC flag clear. A two-byte
+/// inner packet can be signed here but is rejected by [`ifac_verify`], which
+/// requires at least one additional byte after the two-byte header.
 pub fn try_ifac_sign(
     packet: &[u8],
     ifac_key: &[u8; 64],
@@ -97,9 +104,12 @@ pub fn try_ifac_sign(
     Ok(masked_raw)
 }
 
-/// Strip and authenticate an IFAC-stamped packet, returning the plain inner
-/// form when the tag matches. `None` on any failure — callers should drop the
-/// packet silently to avoid leaking membership probes.
+/// Unmask an IFAC packet and compare its tag against the supplied shared key.
+/// Return the inner packet bytes on a match; application payloads can still
+/// be encrypted. Reject missing flags, invalid tag sizes, packets with no
+/// byte after the two-byte header and tag, oversized masks, and mismatched
+/// tags. The comparison is constant-time; no inner packet parsing or replay
+/// check is performed. Callers must discard `None` results.
 pub fn ifac_verify(raw: &[u8], ifac_key: &[u8; 64], ifac_size: usize) -> Option<Vec<u8>> {
     if ifac_size == 0 || ifac_size > 64 {
         return None;
@@ -146,8 +156,8 @@ pub fn ifac_verify(raw: &[u8], ifac_key: &[u8; 64], ifac_size: usize) -> Option<
     }
 }
 
-/// Whether a raw packet carries the IFAC flag. Cheap pre-check to avoid
-/// running the full verify path on clear-interface traffic.
+/// Whether a nonempty byte slice has the IFAC presence bit set. This does
+/// not establish a valid tag, packet length or interface membership.
 pub fn has_ifac_flag(raw: &[u8]) -> bool {
     !raw.is_empty() && raw[0] & IFAC_FLAG != 0
 }

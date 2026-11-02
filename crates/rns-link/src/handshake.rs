@@ -49,7 +49,8 @@ impl EphemeralKeys {
 
 /// Link request payload (Message 1: initiator -> destination).
 ///
-/// Wire format: `X25519_pub(32) || Ed25519_pub(32) || signalling(3)` — 67 bytes.
+/// Modern wire format: `X25519_pub(32) || Ed25519_pub(32) || signalling(3)`
+/// (67 bytes). Parsing also accepts the 64-byte legacy form without signalling.
 #[derive(Debug, Clone)]
 pub struct LinkRequestData {
     pub peer_x25519_pub: [u8; 32],
@@ -69,8 +70,9 @@ impl LinkRequestData {
 
     /// Parse a link request payload.
     ///
-    /// Python accepts exactly the legacy 64-byte key payload or the modern
-    /// 67-byte key payload with signalling. Other lengths are dropped.
+    /// Accepts exactly the legacy 64-byte key payload or modern 67-byte
+    /// payload, and validates the signalled MTU domain. It does not authenticate
+    /// the keys or enforce the endpoint's enabled cipher modes.
     pub fn unpack(data: &[u8]) -> Result<Self, HandshakeError> {
         if data.len() < ECPUBSIZE {
             return Err(HandshakeError::TooShort);
@@ -106,7 +108,9 @@ impl LinkRequestData {
 ///
 /// The hashable body is `flags_low_nibble || dest_hash || context || data[..ECPUBSIZE]`
 /// — the signalling trailer is intentionally excluded so both sides agree on the same
-/// link ID regardless of MTU/mode negotiation.
+/// link ID regardless of MTU/mode signalling. The flags are fixed to a SINGLE
+/// LINKREQUEST with context NONE. Short payloads are hashed as supplied;
+/// validate request shape separately with [`LinkRequestData::unpack`].
 pub fn compute_link_id(destination_hash: &[u8; 16], request_data: &[u8]) -> [u8; 16] {
     // LinkRequest(0x02) | DestinationType::Single(0x00); context is PacketContext::None.
     let flags_low_nibble = 0x02u8;
@@ -123,6 +127,11 @@ pub fn compute_link_id(destination_hash: &[u8; 16], request_data: &[u8]) -> [u8;
 }
 
 /// Compute the link ID from a full raw packet (for transport relay paths).
+/// The caller supplies a validated packet and its matching header type.
+///
+/// # Panics
+///
+/// Panics if `raw` is empty; see [`rns_wire::hash::link_id_from_raw`].
 pub fn compute_link_id_from_raw(raw: &[u8], header_type: rns_wire::flags::HeaderType) -> [u8; 16] {
     rns_wire::hash::link_id_from_raw(raw, header_type)
 }
@@ -132,6 +141,11 @@ pub fn compute_link_id_from_raw(raw: &[u8], header_type: rns_wire::flags::Header
 /// Wire format: `signature(64) || X25519_pub(32) || signalling(3)` — 99 bytes.
 /// The signature covers `link_id || responder_x25519_pub || identity_ed25519_pub || signalling`
 /// under the destination's long-term identity Ed25519 key.
+///
+/// Parsing also accepts a 96-byte legacy body, but this representation does
+/// not preserve trailer absence. Its `pack` and `validate` methods use the
+/// modern three-byte trailer. Use [`crate::link::Link::validate_proof`] with
+/// the original bytes to validate legacy or modern incoming proofs.
 #[derive(Debug, Clone)]
 pub struct LinkProofData {
     pub signature: [u8; 64],
@@ -209,7 +223,9 @@ impl LinkProofData {
     }
 
     /// Parse a proof payload, accepting exactly 96-byte legacy frames or
-    /// 99-byte frames with signalling.
+    /// 99-byte frames with signalling. Validates the MTU domain but not the
+    /// signature or endpoint mode policy. A legacy body receives default
+    /// signalling in this representation; see [`LinkProofData`].
     pub fn unpack(data: &[u8]) -> Result<Self, HandshakeError> {
         if data.len() < 96 {
             return Err(HandshakeError::TooShort);
@@ -241,7 +257,10 @@ impl LinkProofData {
         })
     }
 
-    /// Verify the proof signature against the destination's identity public key.
+    /// Verify a modern proof signature, including this representation's trailer.
+    /// `peer_ed25519_pub` must be the destination identity bytes corresponding
+    /// to `identity_verify_key`. For an incoming legacy proof, use
+    /// [`crate::link::Link::validate_proof`] with the original packet payload.
     pub fn validate(
         &self,
         identity_verify_key: &Ed25519PublicKey,
@@ -261,7 +280,9 @@ impl LinkProofData {
     }
 }
 
-/// Perform the ECDH handshake and derive session keys.
+/// Perform ECDH and derive session keys. This primitive does not authenticate
+/// a handshake proof or enforce the current endpoint admission policy; see
+/// [`LinkKeys::derive`] for its supported modes and input responsibilities.
 pub fn perform_handshake(
     my_x25519_prv: &X25519PrivateKey,
     peer_x25519_pub_bytes: &[u8; 32],

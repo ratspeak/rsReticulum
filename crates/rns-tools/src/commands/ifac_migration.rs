@@ -22,7 +22,8 @@ pub(super) enum ConfigCommand {
         /// Interpret the selected unmarked sizes using their known original units.
         #[arg(long = "source-units", value_enum)]
         units: Units,
-        /// Publish the previewed conversion with a private immutable backup.
+        /// Save the original config to a new backup and publish the conversion.
+        /// The backup includes credentials; protect access to the config directory.
         #[arg(long = "write")]
         apply: bool,
     },

@@ -1,4 +1,6 @@
-/// Accepts `aabbcc...` or `aa:bb:cc:...`; must decode to 16 bytes.
+/// Trim surrounding whitespace, remove colons, and decode exactly 16 bytes
+/// of hex. This checks representation and length, not a destination's identity
+/// or application binding; angle brackets and a `0x` prefix are not accepted.
 pub fn parse_dest_hash(input: &str) -> Result<[u8; 16], String> {
     let clean = input.trim().replace(':', "");
     let bytes = hex::decode(&clean).map_err(|e| format!("invalid hex: {e}"))?;

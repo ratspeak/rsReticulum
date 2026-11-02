@@ -10,10 +10,14 @@ pub const OVERHEAD: usize = 8;
 
 /// Stream frame for the Buffer protocol.
 ///
-/// Wire layout (2-byte big-endian header followed by payload):
-///   - bit 15:    EOF flag
-///   - bit 14:    compressed flag (payload is bz2)
-///   - bits 13..0: stream ID (0..=16_383)
+/// Wire layout (two-byte big-endian header followed by payload):
+/// - bit 15: EOF
+/// - bit 14: bzip2-compressed payload
+/// - bits 13..0: stream ID (`0..=16_383`)
+///
+/// `MessageBase::unpack` decompresses into `data` but retains the received
+/// `compressed` flag. `pack` only serializes the fields; before repacking a
+/// decoded compressed frame, clear the flag or recompress its data.
 #[derive(Debug, Clone)]
 pub struct StreamDataMessage {
     pub stream_id: u16,

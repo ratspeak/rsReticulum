@@ -206,8 +206,10 @@ impl<'de, const MAX: usize> serde::de::Visitor<'de> for SecretBytesVisitor<MAX> 
 /// On Unix the temp file is created with mode `0600` so that key material is
 /// not world-readable even during the write. The bytes are flushed, fsynced,
 /// and verified before the rename, then verified again at the final path. After
-/// the rename the parent directory is fsynced best-effort so the directory
-/// entry itself survives power loss.
+/// the rename, parent-directory fsync is best-effort on Unix; its failure does
+/// not fail this operation. This is not a guarantee of survival after power
+/// loss. Use [`durable_write`] when the caller needs its stricter receipt and
+/// recovery-path handling, subject to that helper's filesystem limits.
 pub fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let _write_guard = ATOMIC_WRITE_LOCK
         .lock()

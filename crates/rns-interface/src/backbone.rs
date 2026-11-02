@@ -1,8 +1,8 @@
-//! High-throughput HDLC-over-TCP backbone. Server accepts many peers
-//! (each its own [`InterfaceHandle`]); client auto-reconnects.
-//! Per-peer tuning: TCP keepalive + TCP_USER_TIMEOUT + NODELAY + large
-//! buffers. Inbound deframer is capped (vs Python's unbounded) to avoid
-//! malformed-peer memory blow-up.
+//! HDLC-over-TCP backbone. The server creates an [`InterfaceHandle`] for each
+//! accepted peer; the client reconnects after connection loss.
+//! Per-peer socket tuning requests keepalive, NODELAY, and large buffers, with
+//! TCP_USER_TIMEOUT where supported. The shared HDLC deframer caps each
+//! encoded frame; this is not a bound on total connection memory.
 
 use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::collections::HashMap;
@@ -26,13 +26,16 @@ use rns_transport::messages::{
     InboundPacket, InterfaceInspectionSnapshot, InterfaceInspectionSource, TransportMessage,
 };
 
-/// 1 MiB MTU — also the SO_RCVBUF/SNDBUF target (kernel clamps).
+/// 1 MiB ceiling for MTU selection and requested socket buffer size.
+/// Peer packet capacity is selected separately from the per-peer bitrate and
+/// the interface wire budget; the kernel may clamp the socket buffer request.
 pub const HW_MTU: u32 = 1_048_576;
 
 /// Listener-side bitrate guess advertised on the parent handle.
 pub const BITRATE_GUESS: u64 = 1_000_000_000;
 
-/// Per-peer guess (100 Mbps) — drives [`crate::traits::optimise_mtu`] → 64 KiB MTU.
+/// Per-peer bitrate guess (100 Mbps), selecting a 16 KiB MTU through
+/// [`crate::traits::optimise_mtu`].
 pub const CHILD_BITRATE_GUESS: u64 = 100_000_000;
 
 pub const RECONNECT_WAIT: u64 = 5;
@@ -41,7 +44,7 @@ pub const INITIAL_CONNECT_TIMEOUT: u64 = 5;
 pub const TCP_PROBE_AFTER: u32 = 5;
 pub const TCP_PROBE_INTERVAL: u32 = 2;
 pub const TCP_PROBES: u32 = 12;
-/// Linux TCP_USER_TIMEOUT — drops stuck conns when peer goes silent without RST.
+/// TCP_USER_TIMEOUT budget in seconds, applied best effort on supported platforms.
 pub const TCP_USER_TIMEOUT: u32 = 24;
 
 pub const BLOCK_FAST_FLAPPING: bool = true;
@@ -68,7 +71,9 @@ pub struct BackboneServerConfig {
     pub mode: InterfaceMode,
     /// Optional kernel ifname; binds to its current IP (falls back to `listen_ip`).
     pub device: Option<String>,
-    /// Reject an IP after more than `fast_flapping_grace` short connections.
+    /// Reject a tracked IP after more than `fast_flapping_grace` short connections.
+    /// The process-wide tracking table is bounded; a new IP is not tracked when
+    /// that table is full.
     pub block_fast_flapping: bool,
     /// Connections shorter than this duration count as fast flaps.
     pub fast_flapping_threshold: Duration,
@@ -104,7 +109,8 @@ pub struct BackboneClientConfig {
     pub connect_timeout_secs: u64,
     pub max_reconnect_tries: Option<usize>,
     pub mode: InterfaceMode,
-    /// Signs a tunnel synthesis for every connection; `None` sends none.
+    /// Identity used to request a signed tunnel synthesis for each connection.
+    /// `None`, or an identity without signing material, sends no synthesis.
     pub tunnel_identity: Option<TunnelIdentity>,
 }
 

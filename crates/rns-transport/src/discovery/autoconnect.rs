@@ -1,12 +1,19 @@
-//! Which discovered interfaces may be auto-connected
-//! (`InterfaceDiscovery.autoconnect_qualified`, Discovery.py:782-798).
+//! Interface-type and advertised-version filter for automatic connections.
+//! This module decides eligibility only; it does not open a connection.
 
 use super::app_data::DiscoveryInfo;
 use super::constants::{AUTOCONNECT_INTERFACE_TYPES, AUTOCONNECT_MINIMUM_VERSIONS};
 
-/// A Backbone interface whose stack is at least the trusted release of its
-/// implementation, or any Backbone interface when `allow_unverified`
-/// (`autoconnect_unverified_implementations`) is set.
+/// Check the advertised type and implementation/version against the local
+/// auto-connect policy. Currently only `BackboneInterface` is eligible.
+/// With `allow_unverified`, any advertised implementation/version qualifies
+/// for that type; otherwise `RNS` must advertise at least version `1.5.2`.
+/// `rsRNS`, unknown implementations and missing versions require the opt-in.
+///
+/// Comparison uses leading numeric components, not full semantic-version
+/// rules: for example, `1.5.2rc1` compares as `1.5.2`. These are sender-supplied
+/// claims, not attestation. This helper does not check transport-enabled state,
+/// freshness, endpoint validity, source permissions or available connection slots.
 pub fn qualifies(info: &DiscoveryInfo, allow_unverified: bool) -> bool {
     if !AUTOCONNECT_INTERFACE_TYPES.contains(&info.interface_type.as_str()) {
         return false;

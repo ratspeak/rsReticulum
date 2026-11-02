@@ -1,5 +1,6 @@
-//! HDLC-like framing shared by TCP, Serial, I2P, Local, Pipe, Backbone.
-//! Wire: `[FLAG][escaped_payload][FLAG]`. Encode ESC before FLAG; decode FLAG before ESC.
+//! HDLC-like framing shared by TCP, Serial, I2P, Local, Pipe, and Backbone.
+//! Wire: `[FLAG][escaped_payload][FLAG]`. Payload FLAG and ESC bytes are
+//! prefixed with ESC and XORed with [`ESC_MASK`].
 
 /// HDLC frame delimiter.
 pub const FLAG: u8 = 0x7E;
@@ -17,7 +18,8 @@ const MAX_FRAME_SIZE: usize = 524288;
 /// with headroom; larger frames grow the Vec normally.
 const DEFRAME_BUF_CAPACITY: usize = 2048;
 
-/// Append the escape-encoded form of `data` to `out`. No allocation if `out` has capacity.
+/// Append the escape-encoded form of `data` to `out`. No allocation is needed
+/// when `out` has enough spare capacity for the escaped output.
 pub fn escape_into(data: &[u8], out: &mut Vec<u8>) {
     let mut i = 0;
     while i < data.len() {

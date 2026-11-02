@@ -1,20 +1,19 @@
-//! A monotonic clock that keeps counting while the system is suspended.
+//! A monotonic clock for deadlines that account for system suspension.
 //!
-//! `std::time::Instant` stops while Apple, Linux and Android systems sleep,
-//! so a deadline measured on it ends late by the whole sleep. This clock
-//! counts that time: `CLOCK_BOOTTIME` on Linux and Android,
-//! `CLOCK_MONOTONIC_RAW` (`mach_continuous_time`) on Apple platforms, and the
-//! performance counter on Windows. On other targets it is best effort,
-//! `std::time::Instant` from the first reading in the process.
+//! Uses `CLOCK_BOOTTIME` on Linux and Android, `CLOCK_MONOTONIC_RAW` on Apple
+//! platforms, and the performance counter on Windows. Other targets fall back
+//! to `std::time::Instant` from the first reading, inheriting that platform
+//! clock's suspend behavior.
 //!
-//! Timers do not run on this clock: tokio and the operating system's waits
-//! count awake time only. Check a deadline against [`ContinuousInstant::now`]
-//! on a regular tick instead of arming a timer for it.
+//! This type does not schedule a wakeup or change the clock used by an async
+//! timer. Check deadlines against [`ContinuousInstant::now`] on a regular
+//! tick and after resuming. Link and request timing elsewhere in this crate
+//! still uses `std::time::Instant`.
 
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 use std::time::Duration;
 
-/// A reading of the suspend-counting clock, in signed nanoseconds from the
+/// A reading of this module's clock, in signed nanoseconds from the
 /// platform's origin, usually boot.
 ///
 /// Readings are process-local: never persist one or send it to another
@@ -49,7 +48,8 @@ impl ContinuousInstant {
         u64::try_from(nanos).ok().map(Duration::from_nanos)
     }
 
-    /// The time since this reading, including time the system was suspended.
+    /// The time since this reading, with the suspend behavior of the selected
+    /// backend described at module level.
     pub fn elapsed(self) -> Duration {
         Self::now().duration_since(self)
     }

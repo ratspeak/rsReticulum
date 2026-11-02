@@ -15,7 +15,8 @@ pub enum HeaderError {
     TooShort(usize),
 }
 
-/// Parsed packet header. `transport_id` is `Some` exactly for Header2 packets.
+/// Packet header. Parsing sets `transport_id` to `Some` exactly for Header2.
+/// Callers constructing or changing fields must preserve that relationship.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PacketHeader {
@@ -28,6 +29,9 @@ pub struct PacketHeader {
 
 impl PacketHeader {
     /// Serialize the header to wire bytes.
+    ///
+    /// Writes a transport ID whenever it is `Some`, without checking the
+    /// header-type flag. The caller must supply consistent fields.
     pub fn pack(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_MAXSIZE);
         out.push(self.flags.pack());
@@ -43,7 +47,8 @@ impl PacketHeader {
     /// Parse a header from the start of `raw`.
     ///
     /// Returns `(header, data_offset)` where `data_offset` is the first byte
-    /// of the payload.
+    /// of the payload. This checks header length, not MTU, authentication, or
+    /// payload semantics. The input must already have IFAC framing removed.
     pub fn unpack(raw: &[u8]) -> Result<(Self, usize), HeaderError> {
         if raw.len() < HEADER_MINSIZE {
             return Err(HeaderError::TooShort(raw.len()));

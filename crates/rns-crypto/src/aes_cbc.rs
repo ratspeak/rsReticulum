@@ -1,6 +1,7 @@
 //! AES-CBC, no padding (callers use [`crate::pkcs7`]). Key length selects:
-//! 16 → AES-128, 32 → AES-256. Wire negotiates AES-256; AES-128 kept for
-//! legacy Token material.
+//! 16 → AES-128, 32 → AES-256. AES-128 supports legacy Token material.
+//! These primitives do not negotiate a cipher or authenticate ciphertext;
+//! [`crate::token`] supplies the authenticated Token format.
 
 use aes::{Aes128, Aes256};
 use alloc::vec::Vec;
@@ -73,7 +74,10 @@ pub fn encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, AesCb
     Ok(core::mem::take(&mut *buf))
 }
 
-/// AES-CBC decrypt. Output is still PKCS7-padded; caller strips it.
+/// AES-CBC decrypt without checking authentication or removing padding.
+/// If the sender applied PKCS7 padding, the caller must validate and strip it.
+/// The key must be 16 or 32 bytes, the IV 16 bytes, and the ciphertext a
+/// non-zero multiple of 16 bytes.
 pub fn decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, AesCbcError> {
     if iv.len() != AES_BLOCK_SIZE {
         return Err(AesCbcError::InvalidIvLength(iv.len()));

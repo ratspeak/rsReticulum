@@ -1,11 +1,13 @@
-//! Reticulum transport: routing actor, path tables, announces, blackhole,
-//! rate limiting. The Rust replacement for Python's static `Transport` class
-//! ([Transport.py](https://github.com/markqvist/Reticulum/blob/master/RNS/Transport.py)).
-//! [`actor::TransportActor`] owns all mutable state; other crates send typed
-//! [`messages::TransportMessage`]s over a Tokio mpsc channel.
+//! Reticulum routing, announces, path tables, interface access control and
+//! traffic accounting. [`actor::TransportActor`] drives routing through typed
+//! [`messages::TransportMessage`]s on a Tokio mpsc channel. Queue admission
+//! alone does not confirm command completion or packet delivery; use each
+//! message's reply or protocol proof where available. Public helper tables can
+//! also be used independently of the actor.
 
-/// Unix time as f64 seconds — Python `time.time()` equivalent, the timebase
-/// used across path/reverse/rate/blackhole/tunnel tables.
+/// Wall-clock Unix time in fractional seconds, used by the transport tables.
+/// This is not monotonic: clock adjustments affect time comparisons. Returns
+/// zero when the system clock is before the Unix epoch.
 pub fn now_f64() -> f64 {
     #[cfg(test)]
     if let Some(now) = test_clock::NOW.with(std::cell::Cell::get) {

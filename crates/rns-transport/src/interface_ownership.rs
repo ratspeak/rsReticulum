@@ -6,8 +6,9 @@ use std::sync::{
 };
 use tokio::sync::{Notify, mpsc};
 
-/// Copyable provenance for a pending handshake. Only comparison with the
-/// current registration grants authority; it cannot revive a retired owner.
+/// Process-local registration token for matching a pending handshake to its
+/// current owner. It is not a network identity or peer authentication proof;
+/// comparing it cannot revive a retired registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InterfaceOwnerId {
     epoch: u64,
@@ -19,8 +20,10 @@ impl InterfaceOwnerId {
     }
 }
 
-/// Immutable identity captured before an interface starts producing events.
-/// Carrier reconnects retain it; replacement registrations always mint a new one.
+/// Registration identity captured before an interface starts producing events.
+/// Clones share retirement and revision state. Carrier reconnects retain the
+/// owner; replacements use a new epoch, while coordinated reconfiguration can
+/// advance its revision. Equality alone does not imply current registration.
 #[derive(Debug, Clone)]
 pub struct InterfaceOwner {
     epoch: u64,
@@ -41,6 +44,8 @@ impl PartialEq for InterfaceOwner {
 }
 impl Eq for InterfaceOwner {}
 impl InterfaceOwner {
+    /// Allocate a new process-local epoch, initially unregistered. Panics if
+    /// the epoch counter is exhausted.
     pub fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         // `try_update` is the Rust 1.99 spelling; retain the identical atomic
@@ -115,8 +120,10 @@ impl InterfaceOwner {
             notified.await;
         }
     }
-    /// A coordinated capacity/IFAC reconfiguration first invalidates the previous
-    /// revision, then binds producers and registers this returned identity.
+    /// Advance the revision and invalidate all clones of the old revision.
+    /// The returned owner is not registered yet: bind producers and install
+    /// its registration before use. Returns `None` if this owner is stale,
+    /// another caller advances it first, or the revision counter is exhausted.
     pub fn next_revision(&self) -> Option<Self> {
         if !self.is_current() {
             return None;
@@ -144,11 +151,16 @@ impl Default for InterfaceOwner {
     }
 }
 
-/// Complete Reticulum packet guarantees before framing/fragmentation.
+/// Declared complete-packet budgets before interface framing or fragmentation.
+/// Construction does not validate the numbers or measure hardware capability;
+/// use `effective_clear_mtu` and `link_ceiling` for the checked derived limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterfacePacketCapacity {
+    /// Complete inner Reticulum packet bytes, including its header, before IFAC.
     pub max_clear_packet_bytes: u32,
+    /// Complete packet bytes including an active IFAC tag, before framing.
     pub max_wire_packet_bytes: u32,
+    /// Permit a Link ceiling above the 500-byte base; this does not negotiate it.
     pub link_mtu_upgrade: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -167,6 +179,7 @@ pub enum InterfaceCapacityError {
     },
 }
 impl InterfacePacketCapacity {
+    /// Store declared budgets without validating them.
     pub const fn new(clear: u32, wire: u32, upgrade: bool) -> Self {
         Self {
             max_clear_packet_bytes: clear,
@@ -174,9 +187,14 @@ impl InterfacePacketCapacity {
             link_mtu_upgrade: upgrade,
         }
     }
+    /// Use the same clear/wire budget and disable Link MTU upgrades.
     pub const fn base(mtu: u32) -> Self {
         Self::new(mtu, mtu, false)
     }
+    /// Return the smaller of the clear budget and the wire budget minus IFAC.
+    /// Zero IFAC bytes means inactive; 1..=64 is active and also limits wire
+    /// size to the 8160-byte mask bound. Reject invalid tag sizes, zero budgets
+    /// and budgets with no room after the tag.
     pub fn effective_clear_mtu(
         self,
         active_ifac_bytes: usize,
@@ -206,6 +224,10 @@ impl InterfacePacketCapacity {
         }
         Ok(effective)
     }
+    /// Require at least 500 effective clear bytes. Return 500 with upgrades
+    /// disabled, or the effective clear budget capped at the 21-bit signalling
+    /// maximum with upgrades enabled. This is a complete packet ceiling,
+    /// not an application payload MDU or a measured end-to-end path limit.
     pub fn link_ceiling(
         self,
         interface_id: InterfaceId,
@@ -229,7 +251,10 @@ impl InterfacePacketCapacity {
 
 /// Sender owned by one registration. Bind before spawning any producer and keep
 /// it through ordinary reconnects. Accepted children bind a fresh owner to the
-/// underlying actor sender. The actor, not the sender, validates current ownership.
+/// underlying actor sender. The sender checks readiness, and the actor checks
+/// current ownership again when consuming each event. A successful send means
+/// queue admission only; the actor can still reject a stale or unsupported event.
+/// Capacity/closed queries describe the actor mailbox, not radio readiness.
 #[derive(Debug, Clone)]
 pub struct InterfaceTransportSender {
     id: InterfaceId,
@@ -269,6 +294,10 @@ impl InterfaceTransportSender {
     pub async fn closed(&self) {
         self.tx.closed().await
     }
+    /// Wrap an event without sending it or checking registration. The actor
+    /// admits only supported interface events: inbound packets, deregistration,
+    /// shared-connection state, RPC and tunnel synthesis. Interface IDs must
+    /// match where present; wrapping a general command does not make it valid.
     pub fn event(&self, message: TransportMessage) -> TransportMessage {
         TransportMessage::InterfaceEvent {
             interface_id: self.id,
@@ -276,8 +305,9 @@ impl InterfaceTransportSender {
             message: Box::new(message),
         }
     }
-    /// Wait for registration without losing the first received frame. Each
-    /// producer retains at most its current frame; no extra queue is created.
+    /// Wait for registration acknowledgment, returning false if the owner is
+    /// retired/revised or the actor mailbox closes. There is no timeout and
+    /// this method buffers no frames; a producer must retain its pending frame.
     pub async fn ready(&self) -> bool {
         tokio::select! {
             biased;
@@ -285,6 +315,9 @@ impl InterfaceTransportSender {
             ready = self.owner.wait_registered() => ready,
         }
     }
+    /// Wait for registration, then enqueue the owned event. No whole-call
+    /// timeout or actor-completion acknowledgment is provided. On failure,
+    /// return the caller's original message for retry or disposal.
     // Preserve Tokio's by-value failure contract, including the original
     // owned message for retry, without a failure-only heap allocation.
     #[allow(clippy::result_large_err)]
@@ -300,6 +333,10 @@ impl InterfaceTransportSender {
             .await
             .map_err(|e| mpsc::error::SendError(unwrap_event(e.0)))
     }
+    /// Attempt immediate admission. A stale owner returns `Closed`; a current
+    /// but unregistered owner returns `Full`, even if the mailbox has space.
+    /// Otherwise use the mailbox result, preserving the original message on
+    /// failure. Success still requires actor-side ownership and event checks.
     // Match Tokio's by-value failure contract so callers can retry the exact
     // original message without an additional heap allocation on refusal.
     #[allow(clippy::result_large_err)]

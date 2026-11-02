@@ -87,10 +87,11 @@ impl PacketContext {
         }
     }
 
-    /// Whether packets with this context are transmitted in plaintext.
+    /// Whether this context bypasses per-packet payload encryption.
     ///
-    /// Resource, ResourcePrf, Keepalive, and CacheRequest bypass `Packet.pack()`
-    /// encryption so they can be relayed by nodes without the link key.
+    /// This is the context classification used by the packet-encryption layer,
+    /// not a guarantee that the payload is readable. For example, a Resource
+    /// can be encrypted as a whole before its parts are put into packets.
     pub fn is_plaintext_context(self) -> bool {
         matches!(
             self,

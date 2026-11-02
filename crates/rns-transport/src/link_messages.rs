@@ -1,20 +1,23 @@
-//! Link-layer message types routed between the transport actor and the
-//! destinations that own registered identities. Kept in their own module so
-//! the main `messages.rs` actor enum stays focused on transport primitives.
+//! Destination events and Link request records used between transport and
+//! destination owners. Data records alone perform no networking; the dispatch
+//! helper reports local request admission, separately from Link establishment.
 
 use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use crate::messages::InterfaceId;
 
-/// Physical-layer measurements attached to one received packet.
+/// Optional interface-supplied measurements for one received packet. This
+/// record performs no normalization, range validation or freshness check.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PacketMetrics {
     pub rssi: Option<f32>,
     pub snr: Option<f32>,
+    /// Interface-defined quality value; do not assume a normalized 0–1 range.
     pub q: Option<f32>,
 }
 
+/// Metadata for asking a destination owner to construct an announce.
 #[derive(Debug, Clone)]
 pub struct AnnounceRequest {
     pub app_name: String,
@@ -24,6 +27,7 @@ pub struct AnnounceRequest {
 }
 
 impl AnnounceRequest {
+    /// Request an ordinary announce with no path-response flag, tag or attached interface.
     pub fn normal(app_name: String) -> Self {
         Self {
             app_name,
@@ -34,7 +38,9 @@ impl AnnounceRequest {
     }
 }
 
-/// Events the transport actor pushes out to a registered destination.
+/// Messages delivered to a registered destination owner. Packet bytes and
+/// events still require the destination/Link handler's protocol processing;
+/// constructing an event does not validate its contents.
 #[derive(Debug)]
 pub enum DestinationEvent {
     InboundPacket {
@@ -59,19 +65,22 @@ pub enum DestinationEvent {
         msg_id: String,
         rtt: Option<std::time::Duration>,
     },
-    /// Transport asks the destination to announce itself — used when a shared
-    /// instance connects and needs the peer's current identity map.
+    /// Ask the owner to construct an announce, including ordinary announcements
+    /// or path responses. This is a request, not proof of publication.
     AnnounceRequested(AnnounceRequest),
 }
 
-/// Request a new link to `dest_hash`. `result_tx` delivers either the link
-/// id or a diagnostic message explaining why establishment failed.
+/// Request record carrying a destination and a caller-owned establishment
+/// reply channel. Constructing it does not send a request; the consuming
+/// runtime must perform establishment and report the Link ID or an error.
 #[derive(Debug)]
 pub struct EstablishLinkRequest {
     pub dest_hash: [u8; 16],
     pub result_tx: oneshot::Sender<Result<[u8; 16], String>>,
 }
 
+/// Plain data record for a Link owner to process. It performs no encryption,
+/// framing or transmission by itself.
 #[derive(Debug)]
 pub struct LinkDataRequest {
     pub link_id: [u8; 16],
@@ -161,8 +170,8 @@ mod tests {
     }
 }
 
-/// Result of one locally owned Link request's actual transport admission.
-/// The oneshot reply belongs to that attempt, independently of Link ID reuse.
+/// Failure to submit or locally admit one Link request. A successful dispatch
+/// means local egress acceptance, not successful Link establishment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum LinkRequestDispatchError {
     #[error(transparent)]
@@ -175,8 +184,14 @@ pub enum LinkRequestDispatchError {
     TransportUnavailable,
 }
 
-/// Dispatch one Link request and await this exact attempt's admission result.
-/// Wrap this future in the caller's existing establishment deadline.
+/// Submit one Link request and await its exact attempt's local admission result.
+/// The actor checks the request header and supported endpoint signalling before
+/// egress. Success does not wait for a remote proof or Link establishment.
+///
+/// This future has no internal timeout; use the caller's establishment deadline
+/// around both submission and reply. Dropping it closes the reply receiver; the
+/// actor checks that before starting dispatch, but cannot recall bytes already
+/// admitted. The owned request is not returned on failure.
 pub async fn dispatch_link_request(
     transport: &tokio::sync::mpsc::Sender<crate::messages::TransportMessage>,
     request: crate::messages::OutboundRequest,

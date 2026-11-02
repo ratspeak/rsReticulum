@@ -10,9 +10,15 @@
 //!    drop types that are never listed,
 //! 5. upsert into [`DiscoveryStore`] and notify any observer.
 //!
-//! Mirrors Python `Discovery.InterfaceAnnounceHandler.received_announce`.
-//! The spawned path uses a bounded blocking-worker set so slow stamp
-//! validation cannot stall the transport actor or a Tokio runtime worker.
+//! The caller must supply correctly routed, validated outer announce events.
+//! This module does not verify their signature, aspect or relationship between
+//! the event identity and the transport ID claimed in app-data. Only the
+//! encrypted flag changes processing; other flag bits are not authenticated here.
+//!
+//! The spawned path uses bounded blocking workers and caches stamp-validation
+//! results. Decoded metadata, including any advertised IFAC passphrase, can be
+//! retained in the validation cache, store and observer event. Operational
+//! metrics contain counters only.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -34,45 +40,54 @@ const VALID_CACHE_CAPACITY: usize = 2_048;
 const INVALID_CACHE_CAPACITY: usize = 2_048;
 const MAX_IN_FLIGHT_EVENTS: usize = 32;
 
-/// Pluggable decryptor for discovery announces whose flags byte has
-/// `FLAG_ENCRYPTED` set. The concrete impl wraps the `network_identity`
-/// (Python `RNS.Identity.decrypt`).
+/// Body decryptor for announces with `FLAG_ENCRYPTED` set. Return the clear
+/// `packed_info || stamp` body, or `None` to reject it.
 ///
-/// Returning `None` means the ciphertext could not be decrypted with the
-/// held identity — the receiver treats that as "not for us" and drops the
-/// announce silently.
+/// Spawned receivers bind cached validation to the decryptor object's identity,
+/// not its internal key state. Keep that state stable for the receiver's lifetime;
+/// restart the receiver when changing keys so old cached plaintext is not reused.
 pub trait DiscoveryDecryptor: Send + Sync {
+    /// Decrypt synchronously. The callback determines encryption/authentication
+    /// semantics; `None` becomes [`Reason::DecryptFailed`].
     fn decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>>;
 }
 
-/// Configuration passed to [`spawn`]. Cheap to clone into the task.
+/// Owned configuration consumed by [`spawn`], or used directly through
+/// [`Self::process_event`]. Keep stamp-validation and decryptor behavior stable
+/// while a spawned receiver caches their results.
 pub struct ReceiverConfig {
+    /// Work validation and value calculation; a successful cache hit reuses
+    /// earlier results without calling this implementation again.
     pub stamper: Arc<dyn DiscoveryStamper>,
+    /// Local record store. The spawned receiver serializes its own writes;
+    /// direct callers or other store users need their own coordination.
     pub store: Arc<DiscoveryStore>,
-    /// Minimum stamp value required to accept an announce. Mirrors Python
-    /// `discover_interfaces_required_value`.
+    /// Work requirement passed to the stamper. It is independent of the
+    /// sender's configured generation target.
     pub required_value: u8,
-    /// When `Some`, only announces whose source transport-id is in the
-    /// list are accepted (Python `interface_discovery_sources`). `None`
-    /// accepts any stamped source.
+    /// Allowed source identities. The filter uses `event.identity_hash` when
+    /// present, otherwise the info map's claimed transport ID. `Some(vec![])`
+    /// rejects every source; `None` applies no source restriction. The caller
+    /// remains responsible for the trustworthiness of the supplied event.
     pub discovery_sources: Option<Vec<[u8; 16]>>,
-    /// Optional decryptor for `FLAG_ENCRYPTED` announces. `None` means
-    /// encrypted announces are silently ignored.
+    /// Body decryptor. Encrypted input without one is rejected as
+    /// [`Reason::EncryptedWithoutKey`].
     pub decryptor: Option<Arc<dyn DiscoveryDecryptor>>,
-    /// Optional observer channel — every successful upsert is published.
-    /// The sender is never blocked (uses `try_send`), so a slow consumer
-    /// drops events rather than stalling the receiver.
+    /// Best-effort observation after a successful store write. `try_send`
+    /// drops the event when full or closed without changing acceptance.
+    /// This is the newly received record, before the store merges history:
+    /// `heard_count` is zero and `status` is `None`; reload for stored totals.
+    /// Decoded fields, including any IFAC passphrase, are included.
     pub observer: Option<mpsc::Sender<DiscoveredInterface>>,
 }
 
-/// Result of a single announce classification. Returned by
-/// [`ReceiverConfig::process_event`] so tests can assert on decisions without
-/// needing a live tokio task.
+/// Result of synchronously processing one supplied announce event.
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
-    /// Announce accepted and upserted.
+    /// The record was written to the store. This does not guarantee observer
+    /// delivery, a reachable endpoint or an automatic connection.
     Accepted,
-    /// Announce rejected before upsert. `Reason` carries the why.
+    /// Input was rejected or its store write failed; the reason describes why.
     Rejected(Reason),
 }
 
@@ -81,11 +96,12 @@ pub enum Outcome {
 pub enum Reason {
     /// No `app_data` on the announce — discovery announces always carry one.
     MissingAppData,
-    /// `app_data` too small to even contain a flags byte + stamp.
+    /// Missing flags, or a body (after decryption when applicable) too short
+    /// to contain nonempty info followed by the 32-byte stamp.
     Malformed,
     /// `FLAG_ENCRYPTED` set without a configured decryptor.
     EncryptedWithoutKey,
-    /// Decryptor returned `None` (ciphertext not addressed to us).
+    /// Decryptor returned `None`; the specific cause is not available here.
     DecryptFailed,
     /// Another ingress worker is already performing stamp validation.
     ValidationBusy,
@@ -93,11 +109,11 @@ pub enum Reason {
     StampInvalid,
     /// Info map did not decode.
     DecodeFailed,
-    /// Source (transport_id) not in the configured discovery_sources list.
+    /// Selected source identity is absent from the configured allow-list.
     UnauthorizedSource,
     /// An announceable type that is never listed ([`DISCOVERED_INTERFACE_TYPES`]).
     UnlistedType,
-    /// Upsert into the on-disk store failed (io error).
+    /// Store encoding or filesystem write failed.
     StorageFailed,
 }
 
@@ -114,17 +130,24 @@ pub struct ReceiverMetrics {
     invalid_cache_evictions: AtomicU64,
 }
 
-/// Point-in-time snapshot of [`ReceiverMetrics`].
+/// Individually read counter values from [`ReceiverMetrics`]. Concurrent
+/// updates can occur between reads; this is not a single atomic snapshot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReceiverMetricsSnapshot {
+    /// Successful lookups of cached decoded/stamp-validated material.
     pub valid_cache_hits: u64,
+    /// Lookups of cached stamp-invalid material.
     pub invalid_cache_hits: u64,
+    /// Uncached validations rejected because the validation gate was busy.
     pub validation_busy_drops: u64,
+    /// Valid-cache insertions that evicted an older entry.
     pub valid_cache_evictions: u64,
+    /// Invalid-cache insertions that evicted an older entry.
     pub invalid_cache_evictions: u64,
 }
 
 impl ReceiverMetrics {
+    /// Read saturating counters without retaining event content.
     pub fn snapshot(&self) -> ReceiverMetricsSnapshot {
         ReceiverMetricsSnapshot {
             valid_cache_hits: self.valid_cache_hits.load(Ordering::Relaxed),
@@ -286,10 +309,12 @@ struct ReceiverState {
 }
 
 impl ReceiverConfig {
-    /// Classify a single announce event, upsert on accept, emit on observer.
+    /// Process one event synchronously, including decryption, stamp work and
+    /// filesystem I/O. Success writes the record and attempts observer delivery.
     ///
-    /// Synchronous so unit tests can drive it without a task. Returns an
-    /// [`Outcome`] describing the decision.
+    /// This direct path has no validation cache, worker bound or persistence
+    /// lock. Coordinate concurrent callers writing the same store. As with
+    /// [`spawn`], the caller supplies a validated outer announce event.
     pub fn process_event(&self, event: &AnnounceHandlerEvent) -> Outcome {
         self.process_event_inner(event, None)
     }
@@ -572,17 +597,30 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
 
-/// Spawn the receiver task. Returns the sender to register with
-/// `TransportMessage::RegisterAnnounceHandler { aspect_filter:
-/// Some("rnstransport.discovery.interface"), callback_tx }` and the
-/// [`JoinHandle`] for shutdown.
+/// Spawn a receiver inside a Tokio runtime. Register the returned sender with
+/// the transport announce handler using aspect filter
+/// `rnstransport.discovery.interface`; this helper does not register it.
+///
+/// To finish normally, unregister/drop every sender and await the task. It
+/// drains queued events and waits for its workers. A blocking callback can
+/// delay completion. See [`spawn_with_metrics`] for queue and cache behavior.
 pub fn spawn(config: ReceiverConfig) -> (JoinHandle<()>, mpsc::Sender<AnnounceHandlerEvent>) {
     let (handle, tx, _metrics) = spawn_with_metrics(config);
     (handle, tx)
 }
 
-/// Spawn the receiver and retain a handle to its payload-free operational
-/// counters.
+/// Spawn the receiver and expose its counter-only metrics.
+///
+/// The event channel holds 128 events, and at most 32 blocking workers are
+/// tracked at once. One uncached stamp validation runs at a time; another
+/// uncached attempt meeting a busy gate is rejected rather than queued there.
+/// Cache hits can proceed, and this receiver serializes its store writes.
+///
+/// Separate valid and stamp-invalid caches hold up to 2,048 entries each,
+/// keyed by exact wire app-data (plus decryptor object identity when encrypted).
+/// Successful hits still apply source/type filtering and update the store.
+/// These are entry-count bounds, not byte limits. Callbacks have no execution
+/// timeout here, and cached decoded fields remain until eviction or teardown.
 pub fn spawn_with_metrics(
     config: ReceiverConfig,
 ) -> (

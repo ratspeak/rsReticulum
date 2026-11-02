@@ -122,12 +122,14 @@ def render_contract() -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Compare current library Cargo metadata with api/snapshots/manifest-contract.json."
+    )
     parser.add_argument(
         "--print",
         action="store_true",
         dest="print_contract",
-        help="print the current canonical contract for reviewed application",
+        help="print current Cargo contract JSON instead of comparing it with the saved snapshot",
     )
     args = parser.parse_args()
     rendered = render_contract()

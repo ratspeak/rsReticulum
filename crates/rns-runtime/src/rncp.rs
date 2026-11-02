@@ -1,5 +1,7 @@
-//! Wire-compatible with Python `RNS.Utilities.rncp`. Supports `-l` (listen),
-//! send (default), and `-F` / `-f` (fetch serve / client).
+//! File transfer over Reticulum Links and Resources: send, receive and fetch.
+//! The default destination aspect is `rncp.receive`. See [`spawn_rncp_listener`]
+//! for its current authorization and shutdown limits; a Resource proof alone
+//! does not establish that the receiving application saved a file.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,7 +29,7 @@ use tokio::sync::oneshot;
 
 use crate::link_manager::{LinkManager, RequestOutcome, ResourceCompletion};
 
-/// Python `REQ_FETCH_NOT_ALLOWED` sentinel (rncp.py:70).
+/// Fetch-denial response byte (`0xF0`).
 pub const REQ_FETCH_NOT_ALLOWED: u8 = 0xF0;
 
 pub const FETCH_PATH_NAME: &str = "fetch_file";
@@ -110,7 +112,8 @@ pub enum RncpEvent {
     LinkEstablished {
         link_id: [u8; 16],
     },
-    /// Zero `identity_hash` = remote never identified; only accepted under `allow_all`.
+    /// An identified sender passed the listener's identity check. The hash is
+    /// from LinkIdentify; unidentified peers do not emit this event.
     SenderIdentified {
         link_id: [u8; 16],
         identity_hash: [u8; 16],
@@ -172,20 +175,33 @@ fn resolve_fetch_path(jail: Option<&Path>, data: &[u8]) -> Result<PathBuf, Strin
     }
 }
 
+/// Listener policy and file locations. Defaults generate a fresh identity,
+/// use `rncp.receive` and the current directory, disable fetch and overwrite,
+/// and leave the allow-list empty. Supply a persistent identity when the
+/// listener must retain its destination address.
+///
+/// Received filenames use their platform basename when available, or the
+/// original string otherwise. With overwrite disabled, an existing name gets
+/// a numeric suffix; the existence check and
+/// write are separate, so this is not exclusive creation. Use a save directory
+/// controlled by the listener, without untrusted symlinks or concurrent writers.
 pub struct RncpListenerConfig {
     pub identity: Identity,
     pub app_name: String,
     pub save_dir: PathBuf,
-    /// Python `allow_all` / `-n`.
+    /// Bypass identity allow-list checks for push and fetch. This also allows
+    /// unidentified fetch requests; see the listener's push-authorization limit.
     pub allow_all: bool,
-    /// Ignored when `allow_all` is set.
+    /// Allowed identity hashes, ignored when `allow_all` is true.
     pub allowed: Vec<[u8; 16]>,
     pub overwrite: bool,
-    /// Python `-F` / `--allow-fetch`.
+    /// Serve `fetch_file` requests as well as receiving pushed files.
     pub allow_fetch: bool,
-    /// Python `-j` / `--jail`.
+    /// Optional canonical-path containment check for fetched files. `None`
+    /// allows any readable path; this is not an OS sandbox or a race-free
+    /// filesystem boundary. Keep the jail tree under trusted local control.
     pub fetch_jail: Option<PathBuf>,
-    /// Python default on; `--no-compress` disables.
+    /// Try compression when serving fetched files; enabled by default.
     pub fetch_auto_compress: bool,
 }
 
@@ -214,12 +230,31 @@ impl RncpListenerHandle {
     pub fn destination_hash(&self) -> [u8; 16] {
         self.destination_hash
     }
+    /// Abort and join the listener's event/file-writing task. The separately
+    /// spawned LinkManager is not joined or stopped here, and the destination
+    /// is not deregistered. This is not a complete service shutdown.
     pub async fn shutdown(self) {
         self.task.abort();
         let _ = self.task.await;
     }
 }
 
+/// Register a file receiver and spawn its background tasks. This function
+/// does not announce the destination; the caller owns reachability/publication.
+/// Drain `events_tx` to avoid blocking completion processing. Fetch reads are
+/// synchronous and load the requested file into memory.
+///
+/// # Authorization limit
+///
+/// The current push path checks peers when they identify, and discards
+/// completions from links recorded as denied. It does not require identification
+/// before accepting an ordinary Resource, so `allowed` is not a complete push
+/// authorization boundary. Do not expose this receiver as an allow-list-enforced
+/// file service. Fetch requests do check for an allowed identity unless
+/// `allow_all` is enabled.
+///
+/// Keep the handle and read [`RncpListenerHandle::shutdown`] before embedding this
+/// listener in a longer-lived runtime.
 pub async fn spawn_rncp_listener(
     transport_tx: mpsc::Sender<TransportMessage>,
     cfg: RncpListenerConfig,
@@ -500,6 +535,15 @@ fn build_link_close(link: &mut Link) -> Option<Bytes> {
     ))
 }
 
+/// Send an in-memory file and its filename metadata, identifying the local
+/// identity on the Link. Success means all Resource segments received valid
+/// proofs, followed by a short settlement delay; it does not confirm a remote
+/// file write or durable storage.
+///
+/// `overall_timeout` covers protocol waits. Transport lookup/admission,
+/// settlement and cleanup can extend beyond it; use an outer deadline when
+/// the whole call needs a time bound. Progress notifications may be dropped
+/// when their channel is full.
 pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome, RncpError> {
     let RncpSendRequest {
         transport_tx,
@@ -1107,9 +1151,17 @@ pub struct RncpFetchRequest<'a> {
     pub progress_tx: Option<mpsc::Sender<f32>>,
 }
 
-/// Fetches a remote file via `rncp --fetch`. Wire flow:
-/// link + identify → REQUEST `fetch_file` → ack byte (`0xC3` ok, `0xC2` not
-/// found, [`REQ_FETCH_NOT_ALLOWED`] denied) → resource → write to `save_dir`.
+/// Fetch a file over a Link, identify the local identity, and request
+/// `fetch_file`. Responses use `0xC3` (ready), `0xC2` (unavailable) or
+/// [`REQ_FETCH_NOT_ALLOWED`] (denied). A Resource advertisement can arrive
+/// before the ready response.
+///
+/// Success means the assembled file was written under `save_dir`; the Resource
+/// proof is sent before this local write. Writes are not atomic or synced for
+/// crash durability. Filename collision handling follows [`RncpListenerConfig`].
+/// `overall_timeout` covers protocol waits, but not all transport admission,
+/// cleanup or file I/O. Use an outer deadline when the entire call must finish
+/// within a fixed time.
 pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchOutcome, RncpError> {
     use rns_protocol::resource::{
         InboundTransfer, MAX_SEGMENTS, MultiSegmentInbound, TransferAction,

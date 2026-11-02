@@ -20,7 +20,10 @@ pub fn encrypted_len(plaintext_len: usize) -> Result<usize, ResourceError> {
         .ok_or(ResourceError::TooLarge)
 }
 
-/// Check the actual Reticulum packet length before encryption or state admission.
+/// Check `header_len + body_len` against `mtu`, including CBC token overhead
+/// when `encrypted` is true. `header_len` is caller-supplied; any additional
+/// interface framing is outside this calculation. `context` labels errors,
+/// not a check that the payload matches that context.
 pub fn check_control_frame(
     context: PacketContext,
     payload_len: usize,

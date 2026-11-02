@@ -54,13 +54,15 @@ pub struct PacketFlags {
 impl PacketFlags {
     /// Pack flags into a single byte.
     ///
-    /// Bit layout (from Python Packet.py:168-174):
-    ///   Bit 7: unused/reserved (always 0)
-    ///   Bit 6: header_type
-    ///   Bit 5: context_flag
-    ///   Bit 4: transport_type
-    ///   Bits 3-2: destination_type
-    ///   Bits 1-0: packet_type
+    /// Bit 7 is left clear here; the interface IFAC layer owns that bit.
+    ///
+    /// ```text
+    /// Bit 6:    header_type
+    /// Bit 5:    context_flag
+    /// Bit 4:    transport_type
+    /// Bits 3-2: destination_type
+    /// Bits 1-0: packet_type
+    /// ```
     pub fn pack(&self) -> u8 {
         let ht = (self.header_type as u8) << 6;
         let cf = (self.context_flag as u8) << 5;
@@ -72,12 +74,16 @@ impl PacketFlags {
 
     /// Unpack flags from a single byte.
     ///
-    /// Follows Python's unpack masks (Packet.py:246-250):
-    ///   header_type      = (flags & 0b01000000) >> 6
-    ///   context_flag     = (flags & 0b00100000) >> 5
-    ///   transport_type   = (flags & 0b00010000) >> 4
-    ///   destination_type = (flags & 0b00001100) >> 2
-    ///   packet_type      = (flags & 0b00000011)
+    /// Every byte maps to `Some`; bit 7 is ignored. This does not validate or
+    /// remove an IFAC tag. Decode IFAC framing before parsing a packet header.
+    ///
+    /// ```text
+    /// header_type      = (flags & 0b01000000) >> 6
+    /// context_flag     = (flags & 0b00100000) >> 5
+    /// transport_type   = (flags & 0b00010000) >> 4
+    /// destination_type = (flags & 0b00001100) >> 2
+    /// packet_type      = (flags & 0b00000011)
+    /// ```
     pub fn unpack(byte: u8) -> Option<Self> {
         let header_type = match (byte & 0b0100_0000) >> 6 {
             0 => HeaderType::Header1,

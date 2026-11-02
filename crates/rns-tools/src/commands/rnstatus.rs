@@ -36,7 +36,7 @@ use rns_tools::RS_RETICULUM_VERSION;
     disable_version_flag = true
 )]
 struct Args {
-    /// Show all interfaces (including internal / disabled).
+    /// Include internal and peer interface entries normally hidden.
     #[arg(short, long)]
     all: bool,
 
@@ -52,7 +52,7 @@ struct Args {
     #[arg(short, long)]
     link_stats: bool,
 
-    /// Only show interfaces with active announce or path request bursts.
+    /// Show interfaces with active announce or path request bursts, plus FILTER matches.
     #[arg(short = 'B', long)]
     burst: bool,
 
@@ -101,7 +101,7 @@ struct Args {
     #[arg(short = 'm', long)]
     monitor: bool,
 
-    /// Refresh interval for monitor mode, in seconds.
+    /// Target monitor refresh interval in seconds; each refresh sleeps at least 0.2 seconds.
     #[arg(short = 'I', long = "monitor-interval", default_value_t = 1.0)]
     monitor_interval: f64,
 
@@ -109,7 +109,7 @@ struct Args {
     #[arg(long)]
     version: bool,
 
-    /// Increase verbosity (info level by default; `-vv` for debug).
+    /// Increase verbosity (default: warnings; -v for info, -vv for debug).
     #[arg(short, action = clap::ArgAction::Count)]
     verbose: u8,
 
@@ -117,7 +117,7 @@ struct Args {
     #[arg(short, action = clap::ArgAction::Count)]
     quiet: u8,
 
-    /// Only display interfaces with names including this filter.
+    /// Case-insensitive interface-name substring; with --burst, also include matching interfaces.
     filter: Option<String>,
 }
 

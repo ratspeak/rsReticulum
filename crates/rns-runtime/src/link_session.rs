@@ -1,8 +1,10 @@
 //! Persistent initiator-side Reticulum Link sessions for applications.
 //!
-//! Unlike [`crate::link_client::LinkClient`], which opens a Link for one
-//! request/response exchange, this module keeps the Link alive and exposes
-//! ordinary encrypted Link packets until either peer closes the session.
+//! A session carries encrypted packets, request/response exchanges, Channels
+//! and Resources until closed or timed out. [`crate::link_client::LinkClient`]
+//! provides a separate convenience API for one request/response exchange.
+//! Keep draining [`LinkSession::events`] while using the handles; a full event
+//! queue can stall the actor, including its protocol timers and close handling.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
@@ -43,6 +45,15 @@ const RESOURCE_OFFER_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOURCE_REJECTION_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
+/// Remote destination and establishment options. The caller must supply a
+/// trusted association between `destination_hash` and `remote_public_key`;
+/// connection verifies the Link proof with the supplied signing key, without
+/// re-deriving a destination from an application name.
+///
+/// `identified` defaults to one hop, a 30-second establishment timeout,
+/// LinkIdentify enabled and physical-stat tracking disabled. The timeout
+/// covers request admission and proof waiting, not every registration, binding
+/// or identification operation; see `LinkSession::connect`.
 pub struct LinkSessionConfig {
     pub destination_hash: [u8; 16],
     pub remote_public_key: [u8; 64],
@@ -80,6 +91,11 @@ pub enum LinkSessionCloseReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Session observations. Packet and state events can backpressure the actor;
+/// request/Resource lifecycle notifications use best-effort sends and may be
+/// dropped if the event queue is full. Use returned request/Resource handles
+/// for their terminal outcomes. `PacketDelivered` means a valid peer packet
+/// proof, not application processing or durable storage.
 pub enum LinkSessionEvent {
     Packet {
         data: Vec<u8>,
@@ -117,6 +133,9 @@ pub enum LinkSessionEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Local send result for an ordinary packet. The endpoint accepted it as sent
+/// or queued; this is not an on-air or peer-delivery acknowledgment. A later
+/// `LinkSessionEvent::PacketDelivered` carries a verified peer proof.
 pub struct LinkSessionPacketReceipt {
     pub link_id: [u8; 16],
     pub packet_hash: [u8; 32],
@@ -132,6 +151,9 @@ pub struct LinkSessionResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Local sent-or-queued result for a Channel packet. The Channel continues
+/// tracking proofs and retries after this return; this receipt does not
+/// establish peer application consumption.
 pub struct LinkSessionChannelReceipt {
     pub link_id: [u8; 16],
     pub sequence: u16,
@@ -145,6 +167,8 @@ pub enum LinkSessionResourceDirection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Successful outbound Resource conclusion after valid proofs for every
+/// segment. This does not attest to remote file writes or durable storage.
 pub struct LinkSessionResourceReceipt {
     pub link_id: [u8; 16],
     pub resource_id: [u8; 32],
@@ -157,6 +181,10 @@ pub struct LinkSessionResourceReceipt {
 /// The transfer itself remains owned by the Link session actor. Cloning the
 /// progress receiver does not duplicate transfer state, and dropping this
 /// handle does not implicitly cancel the transfer.
+///
+/// `cancel` reports whether the actor removed an active or queued transfer;
+/// it does not confirm cancellation at the peer. Progress can reach its end
+/// before final proof; use `concluded` for the protocol outcome.
 pub struct LinkSessionResourceHandle {
     link_id: [u8; 16],
     resource_id: [u8; 32],
@@ -223,11 +251,15 @@ pub struct LinkSessionReceivedResource {
     pub is_response: bool,
 }
 
-/// A bounded inbound Resource advertisement awaiting an application decision.
+/// An inbound Resource advertisement awaiting an application decision.
 ///
-/// Offers are rejected after 30 seconds if the application does not decide.
-/// Accepting creates a lifecycle handle; dropping an offer leaves that timeout
-/// in force rather than accepting data implicitly.
+/// The actor keeps up to eight undecided offers. Its periodic timer rejects
+/// undecided offers after 30 seconds; an occupied actor can delay that check.
+/// Dropping an offer leaves this expiry in force and does not accept data.
+/// Acceptance covers the logical transfer and valid follow-up segments.
+/// Response Resources for pending requests are accepted internally, without an
+/// offer. Inspect advertised size before accepting; completed inbound data is
+/// assembled in memory.
 pub struct LinkSessionResourceOffer {
     link_id: [u8; 16],
     resource_id: [u8; 32],
@@ -322,6 +354,12 @@ impl LinkSessionResourceOffer {
     }
 }
 
+/// Lifecycle handle for an accepted inbound Resource. `concluded` returns the
+/// complete in-memory payload after assembly and local proof admission; the
+/// application still owns processing and persistence. Dropping this handle
+/// does not cancel reception. `cancel` returns whether a live logical transfer
+/// was removed locally, not an acknowledgment from its sender. Progress is a
+/// coalescing estimate; only `concluded` establishes success.
 pub struct LinkSessionInboundResourceHandle {
     link_id: [u8; 16],
     resource_id: [u8; 32],
@@ -664,9 +702,12 @@ impl MessageBase for PackedChannelMessage {
     }
 }
 
-/// Cloneable app-facing handle for the reliable channel owned by a Link
-/// session. Sequencing, proofs, retransmissions, and callbacks remain
-/// serialized inside the session actor.
+/// Cloneable handle to the session's reliable Channel. Sequencing, proofs,
+/// retransmissions and callbacks run in the session actor. Register incoming
+/// message types and a handler before expecting application delivery.
+/// Callbacks run synchronously in registration order; returning true stops the
+/// callback chain. They must not block or wait for another command on this
+/// session. Peer packet proofs do not establish application consumption.
 #[derive(Clone)]
 pub struct LinkSessionChannelHandle {
     link_id: [u8; 16],
@@ -778,12 +819,16 @@ impl LinkSessionChannelHandle {
             .await
     }
 
-    /// True when all previously-sent channel messages have been acknowledged.
+    /// True when the Channel's transmit ring is empty. Normal acknowledgments
+    /// empty it, but `shutdown` also discards the ring. This result alone does
+    /// not prove delivery or application consumption.
     pub async fn is_drained(&self) -> Result<bool, LinkSessionChannelError> {
         self.invoke(|result_tx| LinkSessionChannelCommand::IsDrained { result_tx })
             .await
     }
 
+    /// Shut down this Channel and discard buffered messages and handlers.
+    /// This does not drain delivery or close the containing Link session.
     pub async fn shutdown(&self) -> Result<(), LinkSessionChannelError> {
         self.invoke(|result_tx| LinkSessionChannelCommand::Shutdown { result_tx })
             .await
@@ -815,7 +860,8 @@ impl LinkSessionHandle {
         *self.phy_stats_rx.borrow()
     }
 
-    /// Subscribe to physical-layer measurement updates for this Link.
+    /// Subscribe to the latest physical-layer snapshot. Watch receivers may
+    /// coalesce updates; this is not a record of every received packet.
     pub fn watch_phy_stats(&self) -> watch::Receiver<LinkPhyStats> {
         self.phy_stats_rx.clone()
     }
@@ -828,6 +874,9 @@ impl LinkSessionHandle {
         }
     }
 
+    /// Encrypt and submit one ordinary packet within the Link MDU. The result
+    /// is local sent-or-queued admission; observe packet proofs separately.
+    /// This path does not retransmit ordinary packets automatically.
     pub async fn send_packet(
         &self,
         payload: Vec<u8>,
@@ -848,10 +897,15 @@ impl LinkSessionHandle {
             .map_err(|_| LinkSessionError::SessionClosed)?
     }
 
-    /// Send a request and wait for its response.
+    /// Send a request and wait for its response. A packed request above the
+    /// Link MDU uses a Resource; matching response Resources are accepted
+    /// internally without an application Resource offer.
     ///
-    /// Requests and responses larger than the current Link MDU transparently
-    /// use Reticulum Resource transfer, matching Python RNS.
+    /// `None` selects the Link's RTT-based response timeout. For a Resource
+    /// request, that timeout starts after the request Resource is proved; it
+    /// does not bound queueing, transfer or every transport wait. Apply a caller
+    /// deadline when needed. Dropping this future does not cancel an admitted
+    /// request or its remote work. At most 64 requests may be pending.
     pub async fn request(
         &self,
         path: &str,
@@ -873,11 +927,17 @@ impl LinkSessionHandle {
             .map_err(|_| LinkSessionError::SessionClosed)?
     }
 
-    /// Start a bounded-memory Link Resource transfer.
+    /// Prepare and start or queue a Link Resource transfer. Source inspection
+    /// and hashing run on the blocking pool before queue admission. The actor
+    /// allows one active outbound Resource and up to eight queued Resources.
     ///
-    /// Source inspection and hashing run on the blocking pool. Large sources
-    /// are then read one bounded segment at a time as each preceding segment
-    /// is proved by the peer.
+    /// Each queued transfer retains its source and first prepared segment.
+    /// Later segments are read synchronously in the session actor after the
+    /// previous segment is proved; use a stable, finite source whose reads do
+    /// not stall the actor. This bounds segment buffering per transfer, not
+    /// memory across concurrent preparation calls or caller-owned sources.
+    /// Dropping the returned handle does not cancel the transfer; use its
+    /// `cancel` and `concluded` methods for explicit lifecycle handling.
     pub async fn send_resource<S>(
         &self,
         source: S,
@@ -926,11 +986,19 @@ impl LinkSessionHandle {
         self.send_resource(Cursor::new(data), options).await
     }
 
+    /// Queue a request to close the session. Return does not wait for teardown,
+    /// cleanup or the `Closed` event; it also hides an already-closed command
+    /// channel. Continue draining events while waiting for closure.
     pub async fn close(&self) {
         let _ = self.command_tx.send(LinkSessionCommand::Close).await;
     }
 }
 
+/// Session handles and receive queues. The background actor retains its own
+/// command sender, so dropping application handles alone does not reliably
+/// stop it. Call `handle.close()` explicitly and keep draining `events`.
+/// Ordinary inbound packets are proved before application event delivery;
+/// this API does not provide application-controlled packet proof receipts.
 pub struct LinkSession {
     pub handle: LinkSessionHandle,
     pub events: mpsc::Receiver<LinkSessionEvent>,
@@ -938,6 +1006,14 @@ pub struct LinkSession {
 }
 
 impl LinkSession {
+    /// Establish a Link using the configured remote key and spawn its actor.
+    /// No destination discovery is performed here. When `identify` is enabled,
+    /// the local identity must be able to sign; success is not remote application
+    /// authorization of that identity.
+    ///
+    /// The establishment timeout bounds request admission and proof waiting.
+    /// Some transport operations and identification delays are outside it; use
+    /// an outer timeout for a deadline on the entire call.
     pub async fn connect(
         transport_tx: mpsc::Sender<TransportMessage>,
         identity: Identity,
@@ -1097,6 +1173,10 @@ impl LinkSession {
     }
 }
 
+/// Resolve destination identity metadata, requesting a path if needed, then
+/// read the announce-cache entry with its public key. Cache hits do not prove
+/// current reachability or perform fresh signature verification. The final
+/// cache lookup has no timeout; use an outer deadline to bound the whole call.
 pub async fn discover_destination(
     transport_tx: &mpsc::Sender<TransportMessage>,
     destination_hash: [u8; 16],
@@ -1130,6 +1210,9 @@ pub async fn discover_destination(
     Ok(entry)
 }
 
+/// Read matching metadata from the transport's recent-announce cache. This
+/// issues no path request, performs no fresh signature verification, and has
+/// no timeout of its own. `None` can also mean an unexpected RPC response.
 pub async fn lookup_destination(
     transport_tx: &mpsc::Sender<TransportMessage>,
     destination_hash: [u8; 16],

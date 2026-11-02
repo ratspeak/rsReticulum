@@ -8,7 +8,7 @@
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
 [![Release baseline: Reticulum 1.4.2](https://img.shields.io/badge/release%20baseline-Reticulum%201.4.2-success.svg)](https://reticulum.network/)
-[![Status](https://img.shields.io/badge/status-experimental-yellow.svg)](#feature-status)
+[![Status](https://img.shields.io/badge/status-experimental-yellow.svg)](#compatibility-notes)
 
 [Reticulum Manual](https://reticulum.network/manual/) |
 [Ratspeak](https://github.com/ratspeak/Ratspeak) |
@@ -39,6 +39,18 @@ rsReticulum can live beside other Reticulum tools on `PATH` without worry.
 
 ## Build It
 
+This guide describes the 1.4.0 source line at `5b38cae702a5b3984adf12a435f6d3012fcf90e1`, also used by Ratspeak 1.0.37. The published standalone tool download is [v1.3.0](https://github.com/ratspeak/rsReticulum/releases/tag/v1.3.0); use [its README](https://github.com/ratspeak/rsReticulum/blob/v1.3.0/README.md) and bundled `--help` for that build. A Cargo version in the current source is not a separate binary release.
+
+From a new working directory:
+
+```bash
+git clone https://github.com/ratspeak/rsReticulum.git
+git -C rsReticulum checkout --detach 5b38cae702a5b3984adf12a435f6d3012fcf90e1
+cd rsReticulum
+```
+
+Run the build commands below from that directory. The host crates require Rust 1.89 or newer.
+
 ### macOS
 
 Install Rust with `rustup`, then install Apple's command-line build tools:
@@ -50,13 +62,12 @@ xcode-select --install
 Build the tools:
 
 ```bash
-cd rsReticulum
 cargo build --release --locked
 ```
 
 ### Linux, Raspberry Pi, and VPS Hosts
 
-##### Install Rust with `rustup`, then install the needed packages:
+Install Rust with `rustup`, then install the build packages:
 
 Debian, Ubuntu, and Raspberry Pi OS:
 
@@ -77,10 +88,9 @@ Arch:
 sudo pacman -S --needed base-devel pkgconf
 ```
 
-##### Build the tools:
+Build the tools:
 
 ```bash
-cd rsReticulum
 cargo build --release --locked
 ```
 
@@ -92,7 +102,6 @@ Build Tools, install the "Desktop development with C++" workload.
 Build from PowerShell:
 
 ```powershell
-cd rsReticulum
 cargo build --release --locked
 ```
 
@@ -111,10 +120,10 @@ The `rns-tools` crate builds Rust-namespaced Reticulum utilities:
 | rnid-rs | Identity generation, inspection, public/private import/export, hashing, signing, verification, encryption, and decryption. |
 | rnprobe-rs | Destination probe utility with loss and round-trip reporting. |
 | rncp-rs | File transfer utility with send, listen, and authenticated fetch modes. |
-| rnodeconf-rs | RNode inspection, safe configuration, EEPROM backup, and trust utility. |
+| rnodeconf-rs | RNode inspection, EEPROM backup, and saved TNC/normal startup configuration. |
 | rnsh-rs | Reticulum shell listener/client. |
 
-#### Commands:
+Common command forms (use each binary’s `--help` for the complete option list):
 
 ```text
 rnsd-rs     [-c CONFIG_DIR] [-v|-q]... [-i] [--service] [--exampleconfig] [--version]
@@ -132,9 +141,9 @@ rncp-rs     <file> <destination_hash>
 rncp-rs     -l [-b SECONDS] [-s DEST_DIR] [-a <allowed_hash>]...
 rncp-rs     -l -F [-j <jail_dir>] [-a <allowed_hash>|-n]...
 rncp-rs     -f <destination_hash> <remote_path> [-s DEST_DIR]
-rnodeconf-rs [-i] [-N|-T] [-b|-B|-p] [-w MODE] [-D N] [-t N] [-R N] [--freq HZ]
-            [--bw HZ] [--txp DBM] [--sf SF] [--cr CR] [-x|-X]
-            [--eeprom-backup|--eeprom-dump] [--trust-key HASH] [--version] [PORT]
+rnodeconf-rs [-i] [--config] [--eeprom-backup|--eeprom-dump] [--version] [PORT]
+rnodeconf-rs -T --freq HZ --bw HZ --txp DBM --sf SF --cr CR PORT
+rnodeconf-rs -N PORT
 rnsh-rs     -l [-i FILE] [-s NAME] [-b PERIOD] [-a HASH]... [-n] [-A|-C] [-- CMD...]
 rnsh-rs     [-i FILE] [-s NAME] [-N] [-m] [-w SECONDS] <destination_hash> [-- CMD...]
 ```
@@ -142,14 +151,21 @@ rnsh-rs     [-i FILE] [-s NAME] [-N] [-m] [-w SECONDS] <destination_hash> [-- CM
 Add the release `bin/` directory or `target/release` to `PATH` if
 you want to call them without a path prefix.
 
-`rncp-rs` follows the established listener authentication model: without `-n`,
-incoming senders must match `-a <hash>` or an `allowed_identities` file.
-`rncp-rs -F` can serve fetch requests to authenticated clients; use
-`-j <jail>` to bound file access unless unrestricted fetch paths are
-intentional.
+`rncp-rs` has a listener authorization limitation in both the current source
+and standalone 1.3.0: `-a <hash>` and `allowed_identities` are checked when a
+peer identifies, but identification is not required before receiving a pushed
+file. Do not rely on the allowlist to exclude unidentified senders.
 
-`rnodeconf-rs` in the current build only covers safe inspection/device setting paths, EEPROM
-dump/backup, and trusted-key storage.
+Without `-n`, fetch requests require an identified peer on the allowlist.
+`rncp-rs -F` enables fetch service and leaves push reception enabled. Use
+`-j <jail>` to constrain fetched paths to a directory under trusted local
+control; it is not an operating-system sandbox.
+
+`rnodeconf-rs` in both the current source and standalone 1.3.0 supports inspection,
+EEPROM dump/backup, and saving TNC/normal startup settings. `-T` requires all five
+RF values shown above. Firmware installation, signing/trust enrollment and
+Bluetooth, Wi-Fi, display and interference-avoidance changes are disabled.
+Their options remain in the parser but return an error.
 
 `rnid-rs` tracks the Reticulum 1.4.2 identity utility surface for normal
 software identities: public/private import and export, destination hashing,
@@ -157,10 +173,11 @@ software identities: public/private import and export, destination hashing,
 hardware-backed `rnid-rs hw` path is a Rust extension behind the `hardware`
 feature and should still be treated as experimental.
 
-Common `rnid-rs` flows:
+Common `rnid-rs` flows for a POSIX shell. Replace uppercase placeholders with your values. Private exports and imported private data grant control of the identity; keep them out of shared terminals, logs and shell history.
 
 ```bash
 # Generate and inspect an identity.
+mkdir -p ~/.rsReticulum/identities
 rnid-rs -g ~/.rsReticulum/identities/mgmt
 rnid-rs -i ~/.rsReticulum/identities/mgmt -p
 rnid-rs -i ~/.rsReticulum/identities/mgmt -H lxmf.delivery
@@ -172,13 +189,13 @@ rnid-rs -i ~/.rsReticulum/identities/mgmt -X -B
 # Write identity files. Without -X, -w writes a public .pub file.
 rnid-rs -i ~/.rsReticulum/identities/mgmt -w mgmt.pub
 rnid-rs -i ~/.rsReticulum/identities/mgmt -X -w mgmt.rid
-rnid-rs -m <public_identity_data> -w peer.pub
-rnid-rs -M <private_identity_data> -X -w restored_identity
+rnid-rs -m "PUBLIC_IDENTITY_DATA" -w peer.pub
+rnid-rs -M "PRIVATE_IDENTITY_DATA" -X -w restored_identity
 
 # Sign and validate. New signatures are Reticulum 1.4.2-compatible .rsg envelopes.
 rnid-rs -i ~/.rsReticulum/identities/mgmt -s message.txt
 rnid-rs -V message.txt.rsg
-rnid-rs -i <signer_hash> -N -V message.txt.rsg
+rnid-rs -i "SIGNER_IDENTITY_HASH" -N -V message.txt.rsg
 
 # Encrypt to a public identity, decrypt with the matching private identity.
 rnid-rs -i mgmt.pub -e message.txt
@@ -199,13 +216,15 @@ directory is supplied, the default is:
 | Linux/macOS | `/etc/rsReticulum/config`, then `~/.config/rsReticulum/config`, then `~/.rsReticulum/config` |
 | Windows | `%APPDATA%\rsReticulum\config` |
 
-Generate the annotated starter file:
+On Linux/macOS, the first two locations are selected only when their `config` file exists; otherwise the home-directory fallback is used.
+
+Print the annotated starter configuration to standard output:
 
 ```bash
 rnsd-rs --exampleconfig
 ```
 
-Minimal TCP client example:
+Minimal TCP client example. Replace `reticulum.example.org` and the port with the endpoint supplied by your network operator:
 
 ```ini
 [reticulum]
@@ -218,17 +237,15 @@ enable_transport = no
   [[Default TCP]]
     type = TCPClientInterface
     enabled = yes
-    target_host = rns.ratspeak.org
+    target_host = reticulum.example.org
     target_port = 4242
 ```
 
-Existing Python Reticulum configs should work if every requested interface
-is implemented here. Unknown or not-yet-wired interfaces should be removed or
-disabled until support lands.
+Review an imported Python or older Rust config before starting it. Each interface needs a supported type and an explicit `enabled = yes` or `interface_enabled = yes`. For an explicit IFAC size, use `ifac_size_unit = bits` with `ifac_size`, or the separate `ifac_size_bytes` key. Unmarked values from 1 to 64 are rejected as ambiguous; larger valid values are interpreted as bits. See the [configuration migration](api/migrations/capacity-and-receipts.md#explicit-ifac-units). The published 1.3.0 tools use the older byte convention. Keep unsupported interfaces disabled.
 
 The default shared-instance data/control ports are `37428`/`37429`. Ratspeak
 uses app-private `37430`/`37431` ports. If you run two daemons at the same
-time, give one config a distinct port pair to avoid confliction, like:
+time, give one config a distinct port pair to avoid a port conflict:
 
 ```ini
 [reticulum]
@@ -244,13 +261,13 @@ a password and give it only to programs you trust.
 
 ## Interface Support
 
-###### Note: This is alpha, if something doesn't work, open an issue with enough context/information to help contribute to fixing it.
+This stack is experimental. Include the source revision or binary version, platform, interface type and relevant logs when reporting a problem.
 
 | Interface | Current behavior |
 | --- | --- |
 | TCP client/server | Config-backed IPv4 and IPv6 paths. |
-| UDP | Config-backed unicast and multicast paths. |
-| Auto | Config-backed UDP discovery plus TCP fallback. |
+| UDP | Unicast and IPv4 broadcast datagrams; this driver does not join multicast groups. |
+| Auto | IPv6 multicast discovery with unicast UDP data on the local network. |
 | Local shared instance | Config-backed TCP loopback or Unix socket depending on platform. |
 | I2P | Config-backed SAM v3.1 path. |
 | Pipe | Config-backed subprocess stdio pipe. |
@@ -273,8 +290,8 @@ different path or interface; loss of the selected interface closes that Link.
 
 Reliable Link control uses a bounded ordered queue, while realtime media has a
 separate bounded best-effort path that cannot overtake retained control
-traffic. Initiator packet proofs use the temporary signing key advertised in
-the Link Request, and responder packet proofs use the accepting destination
+traffic. A proof sent by the initiator uses its temporary signing key from
+the Link Request; a proof sent by the responder uses the accepting destination
 identity.
 
 ## Compatibility Notes
@@ -283,15 +300,17 @@ Most daemon and utility flows are implemented for the public `*-rs` tools:
 `rnsd-rs`, `rnstatus-rs`, `rnpath-rs`, `rnid-rs`, `rnprobe-rs`, `rncp-rs`,
 `rnsh-rs`, and `rnodeconf-rs`.
 
-The release baseline is Reticulum 1.4.2. The complete byte-exact corpus,
+The standalone 1.3.0 release baseline is Python Reticulum 1.4.2. The complete byte-exact corpus,
 utility vectors, source-truth oracles, and live Python interoperability matrix
 are pinned to its exact source commit. Historical 1.3.8 audits and fixtures
 retain their original provenance as backward-compatibility evidence. RNS 1.5.0
-is intentionally deferred and is not a current support claim.
+was not part of that complete release gate. The current source includes
+selected later Python compatibility changes; those do not establish complete
+parity with a later Python release.
 
 Known gaps and intentional limits:
 
-- `rnx`, `rnir`, `rnpkg`, `rngit`, and `git-remote-rns` are not implemented. There is on-going work in progress for supporting these.
+- `rnx`, `rnir`, `rnpkg`, `rngit`, and `git-remote-rns` are not implemented.
 - `rnodeconf-rs` is partial; safe inspection/configuration and EEPROM
   dump/backup are furthest along. Firmware flashing, autoinstall/update, ROM
   bootstrap, destructive EEPROM wipe, and full signing-key management are not
@@ -308,7 +327,7 @@ Known gaps and intentional limits:
   yes` in its `[reticulum]` section. `rnsd-rs` follows the same rule, and the
   same option lets it auto-connect to any announced Backbone interface.
 - `rncp-rs` implements the listener `-b` announce interval. `-P/--phy-rates`
-  is not supported for the time being.
+  is not supported.
 - `rns-ratkey` hardware identity support is feature-gated and still has known
   hardware-verification gaps before it should be described as release-ready.
 

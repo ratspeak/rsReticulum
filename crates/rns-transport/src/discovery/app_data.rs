@@ -1,7 +1,6 @@
 //! Discovery announce app_data — msgpack encode/decode.
 //!
-//! Wire format (matches Python `Discovery.py` `get_interface_announce_data`
-//! / `InterfaceAnnounceHandler.received_announce`):
+//! Python-compatible discovery framing:
 //!
 //! ```text
 //! app_data = flags_byte(1) || payload
@@ -13,9 +12,9 @@
 //! stamp = STAMP_SIZE (32) bytes, produced by the configured DiscoveryStamper
 //! ```
 //!
-//! The map keys are byte values (not strings). Python encodes them via
-//! `umsgpack.packb`, which uses fixint or uint8 depending on range; rmpv
-//! produces the same bytes in both cases.
+//! Map keys are unsigned integer values, not strings. These helpers perform
+//! framing and field conversion; they do not validate the outer Reticulum
+//! announce, its signature or the stamp. Callers must supply those checks.
 
 use std::io::Cursor;
 
@@ -24,16 +23,17 @@ use thiserror::Error;
 
 use super::constants::{DISCOVERABLE_INTERFACE_TYPES, FLAG_ENCRYPTED, STAMP_SIZE, key};
 
-/// A decoded discovery info payload. Mirrors the Python `info` dict.
+/// Advertised interface metadata, before any endpoint or identity trust decision.
 ///
-/// Location keys are always emitted, with `nil` for each unknown component.
-/// Missing location keys and integer numbers are accepted for compatibility
-/// with older Rust callers; Python requires present keys with nil or floats.
+/// Encoding always emits location keys, using `nil` for unknown components.
+/// Decoding also accepts missing locations and integer coordinates. This type
+/// can hold out-of-range radio/location values; encoding is not validation.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DiscoveryInfo {
     /// Human-readable interface name (key `0xFF`).
     pub name: String,
-    /// Transport identity hash of the announcer (key `0xFE`, 16 bytes).
+    /// Claimed transport identity hash (key `0xFE`, 16 bytes). Decoding does
+    /// not authenticate its association with the announce sender.
     pub transport_id: [u8; 16],
     /// The announcing stack and its version (keys `0xFD` / `0xFC`), when it
     /// names them as strings.
@@ -50,15 +50,21 @@ pub struct DiscoveryInfo {
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub height: Option<f64>,
-    /// TCP/Backbone bind port (key `0x06`).
+    /// Advertised TCP/Backbone port (key `0x06`), not necessarily a local bind port.
     pub port: Option<u16>,
-    /// IFAC virtual-network overlay (keys `0x07` / `0x08`).
+    /// Advertised IFAC network name (key `0x07`).
     pub ifac_netname: Option<String>,
+    /// Advertised IFAC network passphrase (key `0x08`). It is serialized in
+    /// the info map; use appropriate discovery encryption or omit it when
+    /// it must not be disclosed to every recipient of the announce.
     pub ifac_netkey: Option<String>,
-    /// Radio-link parameters (keys `0x09` / `0x0A` / `0x0B` / `0x0C`).
+    /// Radio frequency in Hz (key `0x09`). Encoding does not validate RF settings.
     pub frequency: Option<u64>,
+    /// Radio bandwidth in Hz (key `0x0A`).
     pub bandwidth: Option<u64>,
+    /// LoRa spreading-factor value (key `0x0B`).
     pub spreading_factor: Option<u8>,
+    /// LoRa coding-rate parameter (key `0x0C`).
     pub coding_rate: Option<u8>,
     /// Modulation name for Weave / KISS (key `0x0D`).
     pub modulation: Option<String>,
@@ -88,9 +94,9 @@ pub enum AppDataError {
     InvalidReachableOn(String),
 }
 
-/// Encoded payload — separates the stamp from the raw msgpack map so the
-/// caller can stamp it separately (stamper wraps the info-hash, not the full
-/// app_data). Call [`Encoded::assemble`] once a stamp is in hand.
+/// Serialized info bytes and their hash, ready for a separately generated
+/// stamp. Call [`Encoded::assemble`] to add framing. The fields are public;
+/// after changing `packed`, recompute its hash and stamp before assembling.
 pub struct Encoded {
     /// The msgpack-encoded info map.
     pub packed: Vec<u8>,
@@ -99,13 +105,14 @@ pub struct Encoded {
 }
 
 impl Encoded {
-    /// Combine `packed_info || stamp`, optionally encrypt, prefix flags byte.
+    /// Append a 32-byte stamp to `packed`, optionally encrypt that body, and
+    /// prefix one flags byte. Returns `None` for another stamp length, a missing
+    /// required encryptor or an encryptor returning `None`.
     ///
-    /// `encrypt` is a closure so discovery doesn't need to carry the network
-    /// identity type — the caller composes with
-    /// `Identity::encrypt(&self.network_identity, ...)` when
-    /// `flag_encrypted` is set. When `encrypt` is `None` and
-    /// `flag_encrypted` is true, the function returns `None`.
+    /// `flag_signed` only sets a bit; it neither creates nor verifies a
+    /// signature. The stamp's work value and `infohash` are not checked here.
+    /// When encryption is disabled, the encryptor is not called and all info
+    /// fields remain cleartext. The callback determines encryption semantics.
     pub fn assemble(
         self,
         stamp: &[u8],
@@ -139,11 +146,14 @@ impl Encoded {
     }
 }
 
-/// Optional network-identity encryptor used when assembling discovery app-data.
+/// Optional body-encryption callback for discovery app-data. Receives
+/// `packed_info || stamp`; return `None` to fail assembly.
 pub type DiscoveryEncryptor<'a> = dyn Fn(&[u8]) -> Option<Vec<u8>> + 'a;
 
-/// Serialize the info dict to the `(packed, infohash)` pair used by the
-/// stamper. Matches Python `msgpack.packb(info)` + `Identity.full_hash(packed)`.
+/// Serialize an info map and compute its full SHA-256 hash for stamping.
+/// Unknown location components and unset parameters required by the selected
+/// radio type are emitted as `nil`. Fields are not range-checked or sanitized;
+/// this can encode metadata that [`decode_info`] would reject.
 pub fn encode_info(info: &DiscoveryInfo) -> Result<Encoded, AppDataError> {
     let map = info_to_map(info);
     let value = Value::Map(map);
@@ -252,14 +262,16 @@ fn u8_key(k: u8) -> Value {
 
 /// Split an inbound app_data blob into `(flags, payload_body)` where
 /// `payload_body` is everything after the flags byte. The body is still
-/// `msgpack_info || stamp` (optionally still-encrypted).
+/// `msgpack_info || stamp` (optionally encrypted). Only empty input fails;
+/// flag bits and body contents are not validated.
 pub fn split_flags(app_data: &[u8]) -> Result<(u8, &[u8]), AppDataError> {
     let (first, rest) = app_data.split_first().ok_or(AppDataError::Empty)?;
     Ok((*first, rest))
 }
 
 /// Split the decrypted/cleartext body into `(packed_info, stamp)`. The
-/// stamp is always the trailing [`STAMP_SIZE`] bytes.
+/// stamp is always the trailing [`STAMP_SIZE`] bytes. At least one preceding
+/// info byte is required; neither portion is decoded or authenticated here.
 pub fn split_stamp(body: &[u8]) -> Result<(&[u8], &[u8]), AppDataError> {
     if body.len() <= STAMP_SIZE {
         return Err(AppDataError::TooSmall {
@@ -271,7 +283,19 @@ pub fn split_stamp(body: &[u8]) -> Result<(&[u8], &[u8]), AppDataError> {
     Ok((&body[..split_at], &body[split_at..]))
 }
 
-/// Decode a msgpack info map back into [`DiscoveryInfo`].
+/// Decode the first MessagePack value as an info map. Interface type and a
+/// 16-byte transport ID are required; absent other fields retain defaults.
+/// Unknown/non-numeric keys are ignored. Recognized keys are processed in
+/// order, so later values replace earlier ones. Most recognized-field type
+/// errors reject the entire decode; a nonstring implementation name/version
+/// instead clears that optional field. Trailing bytes after the first map
+/// are not rejected.
+///
+/// The type must be in `DISCOVERABLE_INTERFACE_TYPES`, the name is sanitized,
+/// and a supplied endpoint must pass the local IP/hostname syntax check.
+/// This does not resolve the endpoint, authenticate the transport ID, validate
+/// radio/location ranges or verify a stamp. Oversized port/channel and SF/CR
+/// integers are clamped to their destination integer width, not rejected.
 pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
     let value = rmpv::decode::read_value(&mut Cursor::new(packed))
         .map_err(|e| AppDataError::Msgpack(e.to_string()))?;
@@ -361,6 +385,9 @@ pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
     Ok(info)
 }
 
+/// Remove non-ASCII and control characters, collapse remaining whitespace,
+/// trim, and remove trailing characters after the final ASCII letter, digit
+/// or `)`. This is display cleanup, not general HTML or shell escaping.
 pub fn sanitize_name(name: &str) -> String {
     let ascii = name
         .chars()

@@ -1,17 +1,17 @@
-//! On-network interface discovery — Rust port of Python `RNS/Discovery.py`.
+//! Interface-discovery metadata, publication scheduling and reception.
 //!
-//! The announcer periodically posts PoW-stamped discovery announces on
-//! `rnstransport.discovery.interface`. The receiver validates stamps, stores
-//! learned interfaces, and (optionally) auto-connects to eligible transport
-//! nodes. A separate blackhole updater fetches blackhole manifests from
-//! configured sources via link request.
+//! The announcer prepares stamped app-data for
+//! `rnstransport.discovery.interface`; its runtime owner supplies the timer,
+//! signed outer announce and transmission. The receiver validates work and
+//! stores observations. Auto-connect helpers check advertised eligibility;
+//! the runtime owns actual connections. Blackhole manifest codecs and update
+//! cursors support the separate `rnstransport.info.blackhole` service.
 //!
-//! # Stamper indirection
-//!
-//! Python imports `LXMF.LXStamper` at startup. rsReticulum avoids an upward
-//! dependency on rsLXMF, so discovery takes a [`DiscoveryStamper`] trait object;
-//! the concrete implementation lives in `lxmf-core::discovery_stamper`.
-//! Without a stamper installed, discovery is silent.
+//! Discovery accepts a [`DiscoveryStamper`] so transport need not depend on
+//! LXMF. An embedding application can supply the concrete implementation from
+//! `lxmf-core::discovery_stamper`. [`NullStamper`] generates no work and rejects
+//! inbound stamps; it does not disable the separate blackhole helpers or erase
+//! previously stored discovery records.
 
 pub mod announcer;
 pub mod app_data;

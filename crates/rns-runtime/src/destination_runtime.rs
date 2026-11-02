@@ -1,10 +1,9 @@
 //! App-facing ownership for an inbound SINGLE destination.
 //!
-//! Python binds Destination construction, transport registration, Link
-//! handling, and callbacks to process-global state. This facade keeps those
-//! responsibilities explicit: one registration owns one responder
-//! [`LinkManager`], exposes bounded event receivers, and deregisters when
-//! closed.
+//! One registration owns one responder [`LinkManager`] and its event receivers.
+//! Most receivers are bounded; ordinary Link packet delivery uses an unbounded
+//! queue. Close the registration explicitly to wait for manager shutdown and
+//! submission of destination deregistration.
 
 use rns_identity::destination::{
     AllowPolicy, DefaultAppData, DestType, Destination, DestinationError, Direction, ProofStrategy,
@@ -41,7 +40,7 @@ pub struct DestinationRuntimeOptions {
     /// Announce app data used whenever an announce (including a path
     /// response) carries none explicitly.
     pub default_app_data: Option<Vec<u8>>,
-    /// Per-advertisement acceptance policy consulted when
+    /// Per-advertisement acceptance policy for ordinary Resources, consulted when
     /// `resource_strategy` is `AcceptApp`.
     pub resource_accept: Option<ResourceAcceptPolicy>,
     /// Synchronous LinkIdentify gate; returning false closes the link.
@@ -65,7 +64,10 @@ impl Default for DestinationRuntimeOptions {
     }
 }
 
-/// Clonable per-advertisement inbound Resource acceptance policy.
+/// Clonable per-advertisement acceptance policy for ordinary inbound Resources.
+/// Request/response transfers use their own handling. The callback
+/// receives `(link_id, advertisement)` and runs synchronously on the manager;
+/// it is consulted only with `ResourceStrategy::AcceptApp`.
 #[derive(Clone)]
 pub struct ResourceAcceptPolicy(Arc<ResourceAcceptCallback>);
 
@@ -83,8 +85,10 @@ impl fmt::Debug for ResourceAcceptPolicy {
     }
 }
 
-/// Clonable synchronous LinkIdentify gate, consulted before any later
-/// resource advertisement can race the admission decision.
+/// Clonable synchronous gate for a verified LinkIdentify message. The callback
+/// receives `(link_id, identity_hash)`; false closes that Link before later
+/// packets are processed. This does not require peers to identify before
+/// sending data or Resource advertisements; enforce that separately.
 #[derive(Clone)]
 pub struct IdentityGatePolicy(Arc<dyn Fn([u8; 16], [u8; 16]) -> bool + Send + Sync>);
 
@@ -100,10 +104,13 @@ impl fmt::Debug for IdentityGatePolicy {
     }
 }
 
-/// Persistent forward-secrecy settings for a live inbound destination.
+/// Persistent ratchet settings for inbound destination packets. Key retention
+/// and expiry determine the history exposed by compromise of the stored ring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DestinationRatchetOptions {
-    /// Signed Python-compatible ratchet-ring file.
+    /// Persistent ratchet-ring file. Legacy files may authenticate only the
+    /// current public key; see `PersistentRatchetRing::open` before accepting
+    /// an existing file.
     pub path: PathBuf,
     /// Reject packets encrypted only to the base identity key.
     pub enforce: bool,
@@ -125,9 +132,11 @@ pub struct DestinationPacket {
     pub raw: Vec<u8>,
 }
 
-/// Event receivers owned by one registered destination. All are bounded by
-/// `event_capacity` except `link_packets`: inbound link data is proved to the
-/// peer on receipt, so its local delivery is lossless and must be drained.
+/// Event receivers owned by one registered destination. Receivers are bounded
+/// by `event_capacity` except `link_packets`, which is unbounded and must be
+/// drained to avoid memory growth. Notification queues can drop events when
+/// full. Link proof policy is independent of application consumption; receipt
+/// of a proof does not establish that the application processed the payload.
 pub struct DestinationEvents {
     pub packets: mpsc::Receiver<DestinationPacket>,
     pub links_established: mpsc::Receiver<[u8; 16]>,
@@ -384,6 +393,9 @@ impl DestinationHandle {
 }
 
 /// Owns one live inbound destination and its responder Link manager.
+/// Use `close` to await shutdown; dropping requests it on a best-effort basis.
+/// These mailbox-based registration methods reject `ProofStrategy::ProveApp`
+/// because they do not carry exact endpoint-dispatch authority.
 pub struct RegisteredDestination {
     pub handle: DestinationHandle,
     pub events: DestinationEvents,
@@ -400,8 +412,10 @@ impl RegisteredDestination {
         Self::register_inner(transport_tx, identity, app_name, options, None).await
     }
 
-    /// Register a live destination whose announce rotation and inbound
-    /// decryption are backed by one verified persistent ratchet ring.
+    /// Register a destination whose announce rotation and inbound decryption
+    /// use a persistent ratchet ring. A current ratchet is ensured before use.
+    /// Existing legacy files are accepted with the authentication limits of
+    /// `PersistentRatchetRing::open`; this method does not expose their format.
     pub async fn register_ratcheted(
         transport_tx: mpsc::Sender<TransportMessage>,
         identity: Identity,

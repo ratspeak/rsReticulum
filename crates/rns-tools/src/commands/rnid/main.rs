@@ -59,11 +59,11 @@ struct Args {
     #[arg(short = 'g', long)]
     generate: Option<PathBuf>,
 
-    /// Import public Identity data in hex, base32 or base64 format, or from file.
+    /// Import 64 public-key bytes from a raw file, hex, base32 or URL-safe base64.
     #[arg(short = 'm', long = "import-pub", value_name = "identity_data")]
     import_pub: Option<String>,
 
-    /// Import private Identity data in hex, base32 or base64 format, or from file.
+    /// Import 64 private-key bytes from a raw file, hex, base32 or URL-safe base64.
     #[arg(
         short = 'M',
         long = "import-prv",
@@ -94,7 +94,7 @@ struct Args {
     #[arg(short = 'q', long, action = clap::ArgAction::Count)]
     quiet: u8,
 
-    /// Announce a destination based on this Identity.
+    /// Queue a destination announce for this private Identity (default aspects: rns.id).
     #[arg(short = 'a', long, num_args = 0..=1, default_missing_value = DEFAULT_ASPECTS)]
     announce: Option<String>,
 
@@ -114,27 +114,29 @@ struct Args {
     #[arg(short = 's', long, num_args = 0.., value_name = "path")]
     sign: Option<Vec<PathBuf>>,
 
-    /// Validate signature.
+    /// Validate an RSG signature or RSM signed message. Use --identity to require a particular signer.
     #[arg(short = 'V', long = "validate", num_args = 0.., value_name = "path")]
     validate: Option<Vec<PathBuf>>,
 
-    /// Create embedded signed message.
+    /// Sign embedded message text, a --read file, or editor input if neither is supplied.
+    /// Binary output requires --write; an encoding option prints an armored message.
     #[arg(short = 'S', long = "sign-message", num_args = 0..=1, value_name = "text")]
     sign_message: Option<Option<String>>,
 
-    /// Embed metadata structure from file.
+    /// Embed metadata from a file with --sign-message.
     #[arg(short = 'E', long = "embed-meta", value_name = "path")]
     embed_meta: Option<PathBuf>,
 
-    /// Validate metadata for embedding with spec from file.
+    /// Metadata specification for --sign-message/--embed-meta; defaults to <metadata-file>.spec.
+    /// A missing specification file skips validation, including when an explicit path is supplied.
     #[arg(long = "meta-spec", num_args = 0..=1, value_name = "path")]
     meta_spec: Option<Option<PathBuf>>,
 
-    /// Sign raw input data instead of hashing first.
+    /// With --sign, sign file bytes directly instead of an RSG envelope containing the file hash.
     #[arg(long)]
     raw: bool,
 
-    /// Input file path for operations with optional file input.
+    /// UTF-8 input file for --sign-message; cannot be combined with inline message text.
     #[arg(short = 'r', long, value_name = "path")]
     read: Option<PathBuf>,
 
@@ -146,39 +148,40 @@ struct Args {
     #[arg(short = 'f', long)]
     force: bool,
 
-    /// Request unknown Identities from the network.
+    /// Request an unknown --identity hash from the network (unless --no-cache is set).
     #[arg(short = 'R', long = "request")]
     request: bool,
 
-    /// Never use cached or network-sourced information.
+    /// Skip cached/network resolution of --identity; explicit identity files and imports still work.
     #[arg(short = 'N', long = "no-cache")]
     no_cache: bool,
 
-    /// Identity request timeout before giving up.
+    /// Identity-request polling budget in seconds after requests are submitted.
+    /// Runtime startup and awaited transport queries can add time.
     #[arg(short = 't', value_name = "seconds", default_value_t = rns_transport::constants::PATH_REQUEST_TIMEOUT)]
     timeout: f64,
 
-    /// Print identity info and exit.
+    /// Print identity information; other selected operations may still run.
     #[arg(short = 'p', long = "print-identity")]
     print_identity: bool,
 
-    /// Allow displaying private keys.
+    /// Include private keys in --print-identity output; --export-prv has its own output.
     #[arg(short = 'P', long = "print-private")]
     print_private: bool,
 
-    /// Use base64-encoded input and output.
+    /// Use URL-safe base64 for key display/export and armored signature/message output.
     #[arg(short = 'b', long)]
     base64: bool,
 
-    /// Use base32-encoded input and output.
+    /// Use base32 for key display/export and armored signature/message output.
     #[arg(short = 'B', long)]
     base32: bool,
 
-    /// Use base256-encoded input and output.
+    /// Use base256 for armored signature/message output; key display/export stays hexadecimal.
     #[arg(short = 'U', long)]
     base256: bool,
 
-    /// Use hex-encoded input and output.
+    /// Use hexadecimal key display/export and armored signature/message output.
     #[arg(short = 'F', long)]
     hex: bool,
 
@@ -190,11 +193,11 @@ struct Args {
     #[arg(long)]
     version: bool,
 
-    /// Parsed for Python CLI parity.
+    /// Compatibility flag; file operations still read their named paths.
     #[arg(short = 'I', long = "stdin", hide = true)]
     stdin: bool,
 
-    /// Parsed for Python CLI parity.
+    /// Compatibility flag; file operations still write their named paths.
     #[arg(short = 'O', long = "stdout", hide = true)]
     stdout: bool,
 }
@@ -202,35 +205,52 @@ struct Args {
 #[cfg(feature = "hardware")]
 #[derive(Subcommand)]
 enum HwCommands {
+    /// List recognized PC/SC PIV readers and metadata availability; this is not a capability test.
     Detect,
+    /// Generate Ed25519/X25519 keys in slots 9A/9D of the selected token.
+    /// This writes the slots without an overwrite confirmation; existing keys can be replaced.
+    /// Use --output to save public .hwid metadata; no hardware-key backup is created.
     Provision {
+        /// Current token PIN, required by this command; no interactive PIN prompt.
         #[arg(long)]
         pin: Option<String>,
+        /// Nickname stored in the optional .hwid output.
         #[arg(short, long)]
         nickname: Option<String>,
+        /// Output directory; writes <identity-hash>/identity.hwid. Omit to save no file.
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// PIV management key (hex). Defaults to the factory key.
         #[arg(long)]
         mgmt_key: Option<String>,
     },
+    /// List saved identity.hwid files in the immediate subdirectories of --dir.
     List {
+        /// Parent directory of identity folders; required by the command.
         #[arg(short, long)]
         dir: Option<PathBuf>,
     },
+    /// Show saved .hwid metadata without contacting a token or verifying attestation.
     Info {
+        /// Path to a saved public .hwid metadata file.
         hwid: PathBuf,
     },
+    /// Compare the token's 9A/9D public keys with a .hwid file; no signing or attestation test.
     Verify {
+        /// Path to a saved public .hwid metadata file.
         hwid: PathBuf,
     },
+    /// Test signing, X25519 agreement and decryption against a .hwid identity; requires --pin.
     Test {
+        /// Path to a saved public .hwid metadata file.
         hwid: PathBuf,
+        /// Current token PIN, required by this command; no interactive PIN prompt.
         #[arg(long)]
         pin: Option<String>,
     },
     /// Fetch the on-card attestation (slots 9A/9D + device F9) and verify the
     /// certificate chain to a bundled Yubico root. No PIN required.
+    /// Checks certificate signatures and validity, not revocation or binding to an expected identity.
     Attest,
 }
 

@@ -22,7 +22,8 @@ use crate::link_session::{LinkSessionChannelError, LinkSessionChannelHandle};
 /// Maximum unread data retained by the default channel Buffer reader.
 pub const DEFAULT_READER_CAPACITY: usize = 1024 * 1024;
 
-/// Maximum time an orderly writer shutdown waits for channel headroom.
+/// Maximum wait to enqueue EOF once earlier writer frames have been queued.
+/// This does not bound an earlier pending write or wait for remote delivery.
 pub const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 
 const CHANNEL_RETRY_INTERVAL: Duration = Duration::from_millis(10);
@@ -181,9 +182,11 @@ enum WriterState {
 
 /// Write half of a channel-backed Reticulum Buffer stream.
 ///
-/// Writes are split and compressed by the protocol layer. Shutdown queues EOF
-/// only after all earlier writer frames have entered the reliable channel
-/// sequence and the channel has headroom for EOF.
+/// Writes are split and compressed by the protocol layer. Flush waits for
+/// local channel admission, not remote delivery. Shutdown then queues EOF
+/// when the channel has headroom; it does not wait for an EOF receipt.
+/// The close timeout covers EOF admission only. Apply an outer deadline if
+/// an earlier pending write must also be bounded.
 pub struct LinkSessionBufferWriter {
     channel: LinkSessionChannelHandle,
     writer: StreamWriter,

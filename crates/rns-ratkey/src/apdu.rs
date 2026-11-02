@@ -1,6 +1,14 @@
-//! PIV APDU build/parse. Specs: ISO 7816-4 (APDU), NIST SP 800-73-4 (PIV),
-//! Yubico Ed25519 (0xE0) / X25519 (0xE1) extensions.
-//! Ref: <https://docs.yubico.com/yesdk/users-manual/application-piv/commands.html>
+//! Build and parse PIV APDUs using ISO 7816-4, NIST SP 800-73-4 and the
+//! Yubico Ed25519 (`0xE0`)/X25519 (`0xE1`) extensions. Builders return command
+//! bytes; they do not transmit, authenticate, or validate every input.
+//!
+//! Call [`check_response`] on a full response before passing its body to a
+//! parser. PIN/PUK fields truncate to eight bytes and pad with `0xFF`; callers
+//! must validate their permitted length and character set. Returned command
+//! buffers can contain secrets and are ordinary `Vec<u8>` values: wipe them
+//! after use. Large-message builders do not enforce card/APDU length limits.
+//!
+//! Reference: <https://docs.yubico.com/yesdk/users-manual/application-piv/commands.html>
 
 use crate::error::RatkeyError;
 
@@ -171,7 +179,9 @@ pub fn select_piv() -> Vec<u8> {
     build_apdu(INS_SELECT, 0x04, 0x00, PIV_AID)
 }
 
-/// PIN is ASCII, 0xFF-padded to 8 bytes (NIST SP 800-73-4 §2.4.3).
+/// Build VERIFY with at most eight input bytes, padded with `0xFF`.
+/// The caller must validate ASCII and the card's PIN-length policy first;
+/// this builder neither rejects oversized input nor sends the command.
 pub fn verify_pin(pin: &str) -> Vec<u8> {
     use zeroize::Zeroize;
     let mut pin_data = [0xFFu8; 8];
@@ -198,7 +208,9 @@ pub fn change_pin(old_pin: &str, new_pin: &str) -> Vec<u8> {
     cmd
 }
 
-/// RESET RETRY COUNTER: unblock a locked PIN with the PUK and set a new PIN.
+/// Build RESET RETRY COUNTER to set a new PIN using the PUK, whether or not
+/// the PIN is already blocked. Validate both inputs before building; each
+/// field is truncated to eight bytes.
 pub fn reset_retry(puk: &str, new_pin: &str) -> Vec<u8> {
     use zeroize::Zeroize;
     let mut data = [0xFFu8; 16];
@@ -213,9 +225,11 @@ pub fn reset_retry(puk: &str, new_pin: &str) -> Vec<u8> {
     cmd
 }
 
-/// RESET PIV: erase all PIV data and restore factory PIV secrets.
-///
-/// YubiKey only accepts this command after both the PIN and PUK are blocked.
+/// Build the destructive Yubico PIV reset command. It clears user keys,
+/// certificates and PIV data and restores PIV PIN/PUK/management-key defaults;
+/// slot F9 attestation material and other YubiKey applications are unaffected.
+/// Both PIN and PUK must already be blocked; this builder does not block them.
+/// YubiKey Bio MPE requires a different, device-wide reset workflow.
 pub fn reset_piv() -> Vec<u8> {
     build_apdu(INS_RESET_PIV, 0x00, 0x00, &[])
 }
@@ -295,7 +309,9 @@ fn import_key(
     build_apdu(INS_IMPORT_KEY, alg, slot, &data)
 }
 
-/// GENERAL AUTHENTICATE Ed25519 sign. Send raw message — device does SHA-512 internally; no pre-hash.
+/// Build an Ed25519 signing command for the raw message, not a caller-created
+/// prehash. The device performs Ed25519's hashing. The builder does not bound
+/// message length to the card's command capacity.
 pub fn sign_ed25519(slot: u8, message: &[u8]) -> Vec<u8> {
     let challenge = tlv(TAG_AUTH_CHALLENGE, message);
     // Empty response tag = request sig output.
@@ -328,12 +344,14 @@ pub fn get_metadata(slot: u8) -> Vec<u8> {
     build_apdu(INS_GET_METADATA, 0x00, slot, &[])
 }
 
-/// Yubico proprietary; unsupported on Nitrokey 3.
+/// Build the Yubico firmware-version command. Device detection uses this
+/// only for readers classified as YubiKey; support is not probed here.
 pub fn get_version() -> Vec<u8> {
     build_apdu(INS_GET_VERSION, 0x00, 0x00, &[])
 }
 
-/// Yubico proprietary; unsupported on Nitrokey 3.
+/// Build the Yubico serial-number command. Device detection uses this
+/// only for readers classified as YubiKey; support is not probed here.
 pub fn get_serial() -> Vec<u8> {
     build_apdu(INS_GET_SERIAL, 0x00, 0x00, &[])
 }
@@ -499,10 +517,10 @@ pub fn parse_ecdh_response(data: &[u8]) -> Result<[u8; 32], RatkeyError> {
     Ok(out)
 }
 
-/// GET METADATA public key: field tag 0x04, then EC point tag 0x86 → 32 bytes.
-/// `find_tlv_value` recurses into a `7F49` wrapper if present, so both the
-/// bare (`86 20 ..`) and wrapped (`7F49 .. 86 20 ..`) encodings resolve.
-/// Yubico 5.3+ extension; Nitrokey 3 does not implement GET METADATA.
+/// Read a 32-byte public key from Yubico GET METADATA field `0x04`, then
+/// point tag `0x86`. Both bare and `7F49`-wrapped points are accepted.
+/// This parser does not probe device/firmware support or validate the key
+/// algorithm; the caller must establish those separately.
 pub fn parse_metadata_public_key(metadata: &[u8]) -> Result<[u8; 32], RatkeyError> {
     let pubkey_field =
         find_tlv_value(metadata, TAG_METADATA_PUBLIC_KEY).ok_or(RatkeyError::Apdu {

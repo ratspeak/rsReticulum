@@ -2,7 +2,9 @@
 //!
 //! A receipt means the bound interface queue (or in-process peer queue)
 //! accepted the packet, never that a modem transmitted it or a peer received
-//! it. Legacy mailbox sends retain their existing immediate `Queued` result.
+//! it. Legacy mailbox sends can instead return `Queued` while the packet
+//! remains in the actor backlog, before interface admission. They return
+//! `Sent` when the interface accepts it immediately.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -19,14 +21,20 @@ use crate::messages::{
 };
 
 pub(crate) const DISPATCH_QUEUE_CAPACITY: usize = 64;
-/// Maximum local admission lifetime, independent of network RTT.
+/// Maximum future local-admission deadline (120 seconds), independent of
+/// network RTT. Expiry is observed when the actor processes or drains work.
 pub const LINK_ENDPOINT_ADMISSION_TIMEOUT_MAX: Duration = Duration::from_secs(120);
 
+/// Failure to enqueue a bind/send operation. These errors do not return owned
+/// packet bytes; retain a copy before calling if retry needs them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LinkEndpointDispatchError {
+    /// The actor generation's 64-slot dispatch-control queue is full.
     Full,
+    /// The dispatch-control channel is closed.
     Closed,
+    /// The deadline is more than 120 seconds in the future.
     InvalidDeadline,
 }
 
@@ -47,11 +55,16 @@ impl std::error::Error for LinkEndpointDispatchError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LinkEndpointDispatchOutcome {
+    /// The bound interface or in-process peer queue accepted this packet.
     Sent {
+        /// Protocol packet hash of the admitted inner packet, before IFAC framing.
         packet_hash: [u8; 32],
+        /// Local monotonic time observed immediately after queue admission.
         dispatched_at: Instant,
     },
+    /// The actor rejected the packet or its endpoint became terminal.
     Rejected(LinkEndpointSendResult),
+    /// The immutable deadline was observed before local admission.
     Expired,
     /// Explicit or receiver cancellation was observed before local admission.
     Cancelled,
@@ -108,16 +121,21 @@ impl LinkEndpointDispatchCompletion {
     }
 }
 
-/// Cloneable control lane belonging to one transport actor generation.
+/// Cloneable bounded control lane belonging to one actor generation. Obtaining
+/// a handle does not start that actor or ensure its continued availability.
 #[derive(Debug, Clone)]
 pub struct LinkEndpointDispatchHandle {
     pub(crate) tx: mpsc::Sender<LinkEndpointDispatchRequest>,
 }
 
 impl LinkEndpointDispatchHandle {
-    /// Bind a new endpoint and obtain exact-generation send authority. Existing
-    /// bindings are never adopted. Dropping an unread receipt cancels and
-    /// retires only this unpublished binding, including after actor execution.
+    /// Enqueue a new endpoint binding without waiting for actor admission.
+    /// Await the receipt to obtain generation-specific send authority. Existing
+    /// bindings are rejected rather than adopted, including identical bindings.
+    ///
+    /// There is no internal bind deadline. Dropping an unread receipt marks
+    /// this unpublished binding for retirement when the actor observes it,
+    /// including if the bind already executed.
     pub fn try_bind(
         &self,
         binding: LinkEndpointBinding,
@@ -173,6 +191,9 @@ impl LinkEndpointDispatchBindReceipt {
         }
     }
 
+    /// Consume an available reply without waiting. `Empty` keeps ownership
+    /// unpublished; consuming a successful token publishes it. Later dropping
+    /// the receipt or token does not unbind the endpoint.
     pub fn try_recv(
         &mut self,
     ) -> Result<
@@ -215,7 +236,8 @@ impl Drop for LinkEndpointDispatchBindReceipt {
 }
 
 /// Send authority for one immutable endpoint binding generation. A later bind
-/// with the same link ID, role and interface cannot revive an old token.
+/// with the same Link ID, role and interface cannot revive an old token.
+/// Clones share authority; dropping all token clones does not unbind the endpoint.
 #[derive(Debug, Clone)]
 pub struct LinkEndpointDispatchToken {
     pub(crate) handle: LinkEndpointDispatchHandle,
@@ -224,15 +246,25 @@ pub struct LinkEndpointDispatchToken {
 }
 
 impl LinkEndpointDispatchToken {
+    /// Copy the binding metadata; this does not check whether it is still active.
     pub fn binding(&self) -> LinkEndpointBinding {
         self.binding
     }
 
-    /// Retain one packet in the endpoint's existing bounded FIFO until actual
-    /// local admission, cancellation or the immutable deadline. The actor checks
-    /// receiver cancellation immediately before admission; a concurrent drop
-    /// after that check cannot recall bytes accepted by the driver. The deadline
-    /// includes mailbox wait and must be no more than 120 seconds in the future.
+    /// Enqueue a packet operation for the endpoint's bounded FIFO. A returned
+    /// receiver is not admission: await its terminal outcome. The actor checks
+    /// receiver cancellation immediately before admission; a later drop cannot
+    /// recall bytes already accepted by the driver or in-process peer.
+    ///
+    /// The deadline includes command-queue wait and must be at most 120 seconds
+    /// ahead. A past deadline is allowed and expires when actor processing
+    /// observes it. Oversized input instead returns an immediately rejected
+    /// receipt. Other packet/binding checks happen in the actor.
+    ///
+    /// At most 256 packets are retained per endpoint, each limited to the
+    /// 500-byte inner wire MTU. Exhausting that FIFO terminates the endpoint
+    /// and rejects its pending tracked operations. This method consumes the
+    /// request even when control-queue admission fails.
     pub fn try_send(
         &self,
         request: OutboundRequest,

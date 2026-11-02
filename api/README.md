@@ -1,5 +1,9 @@
 # Rust API
 
+This guide describes the 1.4.0 source API. For published standalone 1.3.0
+tools and libraries, use the documentation at that tag. The [1.4 migration
+guide](migrations/1.4.md) covers source and configuration changes.
+
 Application code should begin with `rns_runtime::prelude`. It collects the
 runtime handle and the commonly used identity, destination, packet, Link,
 request, Channel, Resource, interface, and shutdown types without wrapping or
@@ -69,7 +73,7 @@ endpoint, not the identity of the packet socket. Selecting a trustworthy matchin
 pair remains the application's responsibility. These policies do not move
 AutoInterface's interoperable UDP ports or alter Reticulum wire formats.
 
-The in-development [capacity, IFAC and receipt migration guide](migrations/capacity-and-receipts.md) describes the next coordinated source boundary. It does not select a release version.
+The [capacity, IFAC and receipt migration guide](migrations/capacity-and-receipts.md) describes the current 1.4 source boundary, including custom-driver ownership and application-controlled admission.
 
 ## Stability
 

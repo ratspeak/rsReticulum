@@ -100,10 +100,12 @@ impl AX25KISSConfig {
     }
 }
 
-/// 16-byte AX.25 UI header (AX.25 v2.2 §3.12):
+/// Build a 16-byte UI header:
 /// `dst_call(6) | dst_ssid(1) | src_call(6) | src_ssid(1) | CTRL | PID`.
-/// Callsign bytes left-shifted 1, space-padded to 6. SSID = `0x60 | (ssid<<1)`;
-/// src SSID also sets end-of-address bit.
+/// At most six input callsign bytes are copied and left-shifted by one; unused
+/// positions are filled with literal `0x20`. SSID is `0x60 | (ssid << 1)`;
+/// the source SSID also sets the end-of-address bit. This helper does not
+/// validate callsigns or SSID ranges.
 pub fn build_ax25_header(
     dst_call: &[u8],
     dst_ssid: u8,
@@ -151,7 +153,8 @@ pub fn frame_ax25_kiss(
     kiss::frame(&payload)
 }
 
-/// Payload after the 16-byte header, or `None` if too short.
+/// Return bytes after the fixed 16-byte header, or `None` for frames of
+/// 16 bytes or fewer. Addresses, control, and PID are not validated.
 pub fn strip_ax25_header(data: &[u8]) -> Option<&[u8]> {
     if data.len() > AX25_HEADER_SIZE {
         Some(&data[AX25_HEADER_SIZE..])

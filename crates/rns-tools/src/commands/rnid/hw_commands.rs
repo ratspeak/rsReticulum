@@ -57,7 +57,7 @@ fn cmd_attest() {
                 Ok(v) => {
                     println!("Slot {label}:");
                     println!("  chain_verified: {}", v.chain_verified);
-                    println!("  root CA:        {}", v.root_ca);
+                    println!("  firmware-derived CA label: {}", v.root_ca);
                     println!("  {}", v.description);
                     all_ok &= v.chain_verified;
                 }
@@ -88,13 +88,13 @@ fn cmd_detect() {
     match rns_ratkey::detect::detect_devices() {
         Ok(devices) => {
             if devices.is_empty() {
-                println!("No compatible hardware tokens found.");
-                println!("\nSupported devices:");
+                println!("No recognized PIV devices found.");
+                println!("\nReader families checked (capabilities vary):");
                 println!("  - YubiKey 5 (firmware 5.7.0+)");
                 println!("  - Nitrokey 3");
                 println!("\nOn Linux, ensure pcscd is running: sudo systemctl start pcscd");
             } else {
-                println!("Found {} device(s):\n", devices.len());
+                println!("Found {} recognized PIV device(s):\n", devices.len());
                 for (i, dev) in devices.iter().enumerate() {
                     println!("  {}. {} ({})", i + 1, dev.device_type, dev.reader_name);
                     if let Some(serial) = dev.serial {
@@ -106,17 +106,17 @@ fn cmd_detect() {
                     println!(
                         "     Slot 9A (signing): {}",
                         if dev.has_signing_key {
-                            "occupied"
+                            "metadata available"
                         } else {
-                            "empty"
+                            "metadata unavailable (empty slot or read failure)"
                         }
                     );
                     println!(
                         "     Slot 9D (encryption): {}",
                         if dev.has_encryption_key {
-                            "occupied"
+                            "metadata available"
                         } else {
-                            "empty"
+                            "metadata unavailable (empty slot or read failure)"
                         }
                     );
                     println!();
@@ -251,7 +251,7 @@ fn cmd_provision(
     println!("  Ed25519 public: {}", hex::encode(ed_pub));
     println!("  X25519 public:  {}", hex::encode(x_pub));
     println!("  Device:         {}", session.device_type().as_str());
-    println!("  Attestation:    chain_verified={}", attestation.verified);
+    println!("  Ed25519 attestation chain verified: {}", attestation.verified);
 
     if let Some(dir) = output {
         let identity_dir = dir.join(&hash_hex);
@@ -299,8 +299,8 @@ fn cmd_provision(
         }
     }
 
-    println!("\nWARNING: No backup exists. If you lose this device, this identity");
-    println!("is gone forever. Run `rnid-rs hw backup` to create a backup.");
+    println!("\nNo private-key backup was created. Losing this token can make the identity unusable.");
+    println!("This utility has no command to export or back up these on-device keys.");
 }
 
 fn cmd_list(dir: Option<PathBuf>) {
@@ -357,7 +357,7 @@ fn cmd_info(hwid_path: PathBuf) {
         }
     };
 
-    println!("Hardware Identity Information:");
+    println!("Saved Hardware Identity Metadata:");
     println!("  Hash:            {}", config.identity.hash);
     println!(
         "  Nickname:        {}",
@@ -372,7 +372,7 @@ fn cmd_info(hwid_path: PathBuf) {
         config.identity.created_at
     );
     println!();
-    println!("Device:");
+    println!("Device (saved metadata):");
     println!("  Type:            {}", config.device.device_type);
     println!("  Serial:          {}", config.device.serial);
     println!("  Firmware:        {}", config.device.firmware);
@@ -385,7 +385,7 @@ fn cmd_info(hwid_path: PathBuf) {
     println!("  Signing:         {}", config.slots.signing);
     println!("  Encryption:      {}", config.slots.encryption);
     println!();
-    println!("Policy:");
+    println!("Policy (saved metadata):");
     println!("  PIN cache:       {}s", config.policy.pin_cache_timeout);
     println!("  Touch (sign):    {}", config.policy.touch_signing);
     println!("  Touch (encrypt): {}", config.policy.touch_encryption);
@@ -394,11 +394,11 @@ fn cmd_info(hwid_path: PathBuf) {
     println!("  Tier:            {}", config.backup.tier);
     if !config.attestation.ed25519_cert.is_empty() {
         println!(
-            "  Attestation:     chain_verified={}",
+            "  Saved Ed25519 attestation flag: {} (not verified by this command)",
             config.attestation.verified
         );
     } else {
-        println!("  Attestation:     (none)");
+        println!("  Saved attestation: (none)");
     }
 }
 
@@ -464,9 +464,9 @@ fn cmd_verify(hwid_path: PathBuf) {
     }
 
     if ok {
-        println!("\nVerified: connected token matches this .hwid.");
+        println!("\nVerified: slot 9A/9D public keys match this .hwid.");
     } else {
-        println!("\nVerification FAILED: token does not match this .hwid.");
+        println!("\nPublic-key comparison failed; see the slot results above.");
         std::process::exit(1);
     }
 }

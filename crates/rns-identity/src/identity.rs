@@ -24,7 +24,7 @@ pub const RATCHETSIZE: usize = RATCHET_SIZE_BITS / 8;
 pub const HASH_LENGTH_BITS: usize = 128;
 /// Ratchet identifier size, in bytes.
 pub const RATCHET_ID_LENGTH: usize = 10;
-/// HKDF-derived key length: 32 bytes AES key || 32 bytes HMAC key.
+/// HKDF-derived token key length: 32-byte HMAC key || 32-byte AES key.
 pub const DERIVED_KEY_LENGTH: usize = 64;
 
 /// Per-message overhead of `Identity::encrypt` before PKCS7 padding:
@@ -57,7 +57,8 @@ pub trait LocalKeyBackend: Send + Sync {
     /// X25519 ECDH shared secret with `peer_pub`, or `None` if unavailable.
     fn ecdh(&self, peer_pub: &[u8; 32]) -> Option<[u8; 32]>;
     /// Drop any cached authentication so the next operation must re-authenticate
-    /// (e.g. a hardware token re-locks its PIN). No-op for software backends.
+    /// (e.g. a hardware token re-locks its PIN). The default is a no-op;
+    /// backends with cached authentication must implement their own reset.
     fn lock(&self) {}
 }
 
@@ -67,6 +68,10 @@ pub trait LocalKeyBackend: Send + Sync {
 /// - Private (64 B): `X25519_prv(32) || Ed25519_seed(32)`
 /// - Public  (64 B): `X25519_pub(32) || Ed25519_pub(32)`
 /// - Hash   (16 B): `SHA-256(public_64)[:16]`
+///
+/// Public-only identities can verify and encrypt. Hardware-backed identities
+/// delegate private operations without exposing a software private key. Keep
+/// the public `hash` unchanged: encryption derivation uses it as the HKDF salt.
 pub struct Identity {
     prv: Option<X25519PrivateKey>,
     sig_prv: Option<Ed25519PrivateKey>,
@@ -120,6 +125,7 @@ impl Identity {
     pub const RATCHETSIZE: usize = RATCHET_SIZE_BITS / 8;
     pub const HASH_LENGTH_BITS: usize = HASH_LENGTH_BITS;
 
+    /// Generate a software identity with fresh X25519 and Ed25519 keys.
     pub fn new() -> Self {
         let prv = X25519PrivateKey::generate();
         let sig_prv = Ed25519PrivateKey::generate();
@@ -137,6 +143,8 @@ impl Identity {
         }
     }
 
+    /// Load exactly 64 bytes: an X25519 private key followed by an Ed25519 seed.
+    /// The caller remains responsible for protecting and wiping its input.
     pub fn from_private_key(key: &[u8]) -> Result<Self, IdentityError> {
         if key.len() != 64 {
             return Err(IdentityError::InvalidPrivateKeyLength(key.len()));
@@ -163,6 +171,8 @@ impl Identity {
     }
 
     /// Construct a verify/encrypt-only identity from its 64-byte public key.
+    /// Checks the length and Ed25519 key encoding; it does not establish who
+    /// owns the key or reject low-order X25519 input.
     pub fn from_public_key(key: &[u8]) -> Result<Self, IdentityError> {
         if key.len() != 64 {
             return Err(IdentityError::InvalidPublicKeyLength(key.len()));
@@ -188,7 +198,9 @@ impl Identity {
 
     /// Construct an identity whose private operations are served by `backend`
     /// (e.g. a hardware token). Public-key-only in memory; `sign` and `decrypt`
-    /// delegate to the backend. Wire-identical to a software identity.
+    /// delegate to the backend for base-key operations. The caller must ensure
+    /// the backend owns the matching private keys and implements the trait
+    /// contract; construction does not perform a signing or ECDH challenge.
     pub fn from_backend(
         public_key: &[u8],
         backend: Arc<dyn LocalKeyBackend>,
@@ -215,7 +227,9 @@ impl Identity {
     }
 
     /// Persist the identity as the raw 64-byte private key used by the Python
-    /// reference implementation, so identity files are interchangeable.
+    /// reference implementation. This is an unencrypted secret-key file.
+    /// Fails for public-only and hardware-backed identities because their
+    /// private key is not extractable here. Uses [`persistence::atomic_write`].
     pub fn to_file(&self, path: &Path) -> Result<(), IdentityError> {
         let key = self
             .get_private_key()
@@ -230,7 +244,8 @@ impl Identity {
         Ok(())
     }
 
-    /// Return the 64-byte private key (`X25519_prv || Ed25519_seed`), zeroised on drop.
+    /// Return a copy of the software private key (`X25519_prv || Ed25519_seed`),
+    /// zeroised on drop. Returns `None` for public-only or backend identities.
     pub fn get_private_key(&self) -> Option<Zeroizing<[u8; 64]>> {
         let prv = self.prv.as_ref()?;
         let sig_prv = self.sig_prv.as_ref()?;
@@ -253,6 +268,8 @@ impl Identity {
         hex::encode(self.hash)
     }
 
+    /// Whether both software private keys are present. A hardware-backed
+    /// identity returns false even when its backend can sign or decrypt.
     pub fn has_private_key(&self) -> bool {
         self.prv.is_some() && self.sig_prv.is_some()
     }
@@ -262,14 +279,16 @@ impl Identity {
         self.backend.is_some()
     }
 
-    /// Re-lock the hardware backend (drop its cached authentication). No-op for
-    /// software identities. The next private operation will fail until re-auth.
+    /// Ask the backend to clear cached authentication; a no-op without a backend.
+    /// Subsequent authentication behavior is defined by [`LocalKeyBackend::lock`].
     pub fn lock(&self) {
         if let Some(b) = self.backend.as_ref() {
             b.lock();
         }
     }
 
+    /// Copy the software signing key; returns `None` for public-only and
+    /// backend identities. Use [`Self::sign`] to support either private backend.
     pub fn get_signing_key(&self) -> Option<Ed25519PrivateKey> {
         self.sig_prv
             .as_ref()
@@ -285,6 +304,7 @@ impl Identity {
         }
     }
 
+    /// Verify an Ed25519 signature with this identity's public signing key.
     pub fn verify(&self, message: &[u8], signature: &[u8; 64]) -> bool {
         self.sig_pub.verify(message, signature).is_ok()
     }
@@ -294,8 +314,10 @@ impl Identity {
     /// Output layout: `ephemeral_X25519_pub(32) || IV(16) || AES-256-CBC(PKCS7(pt)) || HMAC(32)`.
     ///
     /// Passing a `ratchet` public key substitutes it for the identity's X25519
-    /// public key in the ECDH, giving forward secrecy against later key
-    /// compromise.
+    /// public key in ECDH. Later compromise of the base identity key alone
+    /// does not reveal that ciphertext; compromise of a retained ratchet
+    /// private key still does. The caller must authenticate the target key.
+    /// Encryption does not sign the plaintext or identify its sender.
     pub fn encrypt(
         &self,
         plaintext: &[u8],
@@ -409,7 +431,8 @@ impl Identity {
     /// Sign `packet_hash` and return proof bytes.
     ///
     /// `implicit_proof = true` returns the 64-byte signature alone; `false`
-    /// returns `packet_hash(32) || signature(64)` (96 bytes).
+    /// returns `packet_hash || signature`. Pass a 32-byte packet hash for the
+    /// 96-byte wire form; this method accepts other input lengths without validation.
     pub fn prove(
         &self,
         packet_hash: &[u8],

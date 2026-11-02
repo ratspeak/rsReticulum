@@ -1,4 +1,4 @@
-//! KISS TNC framing — used by KISS, AX.25-KISS, RNode, RNodeMulti, TCP/I2P.
+//! KISS TNC framing for KISS, AX.25-KISS, RNode, RNodeMulti, and optionally TCP.
 //! Wire: `[FEND][CMD][escaped_payload][FEND]`.
 
 pub const FEND: u8 = 0xC0;

@@ -14,10 +14,11 @@ pub fn bz2_compress(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
         .map_err(|_| CompressionError::CompressFailed)
 }
 
-/// Decompress bzip2 `data`, failing once the output would exceed `max_size`.
+/// Decompress bzip2 `data`, checking `max_size` after each 8192-byte read.
 ///
-/// Decoding in chunks lets us stop early on a decompression bomb rather than
-/// allocating the full expanded buffer.
+/// Decoding stops when accumulated output exceeds the limit, at most one read
+/// chunk beyond it. This is an output-length check, not a strict bound on peak
+/// allocation or decoder working memory.
 pub fn bz2_decompress(data: &[u8], max_size: usize) -> Result<Vec<u8>, CompressionError> {
     let mut decoder = bzip2::read::BzDecoder::new(data);
     let mut output = Vec::new();

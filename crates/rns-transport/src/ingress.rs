@@ -1,13 +1,14 @@
 //! Per-interface ingress/egress control for announce and path-request floods.
 //!
-//! Each interface owns one `IngressController`. The inbound path consults it
-//! on every announce — when the incoming rate crosses the burst threshold the
-//! controller activates a hold state, shunts subsequent announces into a
-//! per-destination hold buffer, and the maintenance tick releases them later
-//! in hop-priority order. The split thresholds for freshly-seen vs. mature
-//! interfaces (`IC_BURST_FREQ_NEW` vs. `IC_BURST_FREQ`) give newly-online
-//! links time to catch up from the network backlog without triggering the
-//! limiter on the first burst of announces.
+//! A controller tracks explicitly recorded samples and provides limiter
+//! decisions and a destination-keyed announce hold buffer. The actor applies
+//! announce holding to unknown destinations, excluding local-client traffic
+//! and replies to pending path requests. Held entries are released one at a
+//! time by the caller, subject to a time gate, frequency and hop priority.
+//!
+//! New interfaces use lower default burst thresholds than established ones.
+//! Ingress and optional outgoing path-request control have separate switches;
+//! neither setting is a general packet bandwidth limit.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -21,8 +22,10 @@ use crate::constants::{
     MAX_HELD_ANNOUNCES, OA_FREQ_SAMPLES, OP_FREQ_SAMPLES, PATHFINDER_M, PR_FREQ_DECAY,
 };
 
-/// Per-interface ingress overrides parsed from `[interface.<name>] ic_*` keys.
-/// Any field left `None` falls back to the corresponding crate-level constant.
+/// Per-interface limiter settings. `None` keeps the controller default.
+/// Frequencies are events per second, durations are seconds, and `max_held`
+/// limits destination count rather than bytes. Validation accepts zero;
+/// disable ingress with `enabled = Some(false)`, not zero thresholds.
 #[derive(Debug, Clone, Default)]
 pub struct IngressOverrides {
     pub enabled: Option<bool>,
@@ -54,6 +57,9 @@ fn valid_time(value: f64) -> bool {
 }
 
 impl IngressOverrides {
+    /// Reject nonfinite or negative frequencies and durations that cannot be
+    /// added to the current monotonic clock. This does not cap `max_held` or
+    /// establish a maximum memory budget.
     pub fn validate(&self) -> Result<(), IngressOverrideError> {
         for (field, value) in [
             ("ic_burst_freq_new", self.burst_freq_new),
@@ -105,6 +111,10 @@ pub struct HeldAnnounce {
     pub receiving_interface_id: u64,
 }
 
+/// Monotonic-clock samples and limiter state for one interface. Record events
+/// through the `received_*`/`sent_*` methods before consulting limiters. Status
+/// frequency getters ignore stale samples without mutation; limiter checks
+/// trim at most one stale sample and can therefore calculate a different rate.
 #[derive(Debug)]
 pub struct IngressController {
     created: Instant,
@@ -177,23 +187,25 @@ impl IngressController {
         }
     }
 
-    /// Always-permissive controller — use when ingress control is switched off
-    /// at the transport or interface level. The state machine still compiles
-    /// samples so operators can read frequency stats, but `should_ingress_limit`
-    /// is hard-wired to `false`.
+    /// Create default settings with ingress limiting disabled. Explicit sample
+    /// recording still works; both inbound limiter checks return false. The
+    /// default outgoing path-request limiter is also disabled.
     pub fn disabled() -> Self {
         let mut ctrl = Self::new();
         ctrl.enabled = false;
         ctrl
     }
 
-    /// Controller with per-interface overrides applied; unset fields keep
-    /// their compile-time defaults.
+    /// Validate and apply settings to a new controller. Unset fields keep
+    /// defaults; ingress is enabled and outgoing path-request control is off.
     pub fn try_with_overrides(overrides: &IngressOverrides) -> Result<Self, IngressOverrideError> {
         overrides.validate()?;
         Ok(Self::apply_overrides(overrides))
     }
 
+    /// Compatibility constructor that discards invalid frequency/duration
+    /// overrides and keeps their defaults. Prefer [`Self::try_with_overrides`]
+    /// when invalid configuration must be reported.
     #[deprecated(note = "use try_with_overrides for configuration validation")]
     pub fn with_overrides(overrides: &IngressOverrides) -> Self {
         let mut safe = overrides.clone();
@@ -282,9 +294,9 @@ impl IngressController {
         self.held_release_interval
     }
 
-    /// Earliest instant at which the next held announce may be released. The
-    /// cooldown starts when burst mode activates (not deactivates) so a
-    /// prolonged burst cannot starve existing holds.
+    /// Time gate for the next held release, set on burst activation and after
+    /// each release. Reaching this instant is insufficient by itself: release
+    /// also requires the measured frequency to be below its threshold.
     pub fn held_release_at(&self) -> Instant {
         self.held_release
     }
@@ -365,10 +377,11 @@ impl IngressController {
         )
     }
 
-    /// Whether inbound announces should currently be held. Also updates the
-    /// internal burst state — an exit from burst only happens once the
-    /// frequency has dropped *and* `burst_hold` seconds have passed since
-    /// activation, preventing flapping on a noisy interface.
+    /// Update announce burst state and return whether selected inbound announces
+    /// should be held. Clearing a burst requires frequency below threshold,
+    /// elapsed time greater than `burst_hold`, and at least six samples in the
+    /// trimmed deque. The call that clears the state still returns true; a later
+    /// call can return false. Disabled ingress always returns false.
     pub fn should_ingress_limit(&mut self) -> bool {
         if !self.enabled {
             return false;
@@ -408,8 +421,10 @@ impl IngressController {
         }
     }
 
-    /// Whether unknown recursive path-request discovery should be suppressed
-    /// on this ingress interface.
+    /// Update the separate path-request burst state for unknown recursive
+    /// discovery. Clearing requires frequency below threshold and elapsed
+    /// time greater than `burst_hold`; that clearing call still returns true.
+    /// Disabled ingress always returns false.
     pub fn should_ingress_limit_pr(&mut self) -> bool {
         if !self.enabled {
             return false;
@@ -445,8 +460,9 @@ impl IngressController {
         }
     }
 
-    /// Whether outgoing path-request transmission should be skipped on this
-    /// interface. This limiter is off by default in Reticulum 1.2.5.
+    /// Whether outgoing path requests exceed `ec_pr_freq` with at least six
+    /// samples remaining. Controlled by `egress_control`, independently of
+    /// inbound `enabled`, and disabled by default in this implementation.
     pub fn should_egress_limit_pr(&mut self) -> bool {
         if !self.egress_control {
             return false;
@@ -460,6 +476,10 @@ impl IngressController {
         op_freq > self.ec_pr_freq && self.op_freq_deque.len() >= IC_BURST_MIN_SAMPLES
     }
 
+    /// Store or replace an announce by destination hash, without validating
+    /// its packet. Discard hop counts of 127 or more and new destinations when
+    /// `max_held` is reached; existing destinations can still be replaced.
+    /// This does not consult the enabled flag or a limiter decision.
     pub fn hold_announce(&mut self, announce: HeldAnnounce) {
         // Python 1.3.8 Interface.py:221-222: announces already at the hop cap
         // would be dropped by every receiver on release — don't hold them.
@@ -475,10 +495,11 @@ impl IngressController {
     }
 
     /// Release at most one held announce per call — the one with the lowest
-    /// hop count, so short-path announces win priority. This intentionally
-    /// does not consult `should_ingress_limit()`: upstream releases held
-    /// announces based on release time and current announce frequency, even if
-    /// the displayed burst state has not cleared yet.
+    /// hop count; ties have no defined order. Both the release time and a
+    /// frequency strictly below the current threshold are required. It does
+    /// not consult `should_ingress_limit` or the enabled flag, and can release
+    /// while burst state remains set. The returned entry is removed; the caller
+    /// must process it, since this helper does not send packets.
     pub fn try_release_held(&mut self) -> Option<HeldAnnounce> {
         if self.held_announces.is_empty() {
             return None;

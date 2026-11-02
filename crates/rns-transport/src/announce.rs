@@ -15,18 +15,23 @@ pub struct AnnounceEntry {
     pub received_from: [u8; 16],
     /// Hop count as observed on receipt.
     pub hops: u8,
-    /// Outbound packet bytes with the Python-parity inbound-adjusted hop count.
+    /// Complete inner announce packet with the actor-adjusted hop count.
+    /// Interface IFAC and framing are applied later on egress.
     pub packet_raw: Vec<u8>,
     /// Count of duplicate rebroadcasts heard from neighbours — used to suppress flooding.
     pub local_rebroadcasts: u32,
     pub block_rebroadcast: bool,
-    /// Restrict rebroadcast to one interface; `None` broadcasts on all.
+    /// Cached-response target when `block_rebroadcast` is true. Ordinary
+    /// rebroadcasts use the actor's eligible-interface policy instead.
     pub attached_interface: Option<InterfaceId>,
-    /// Interface the announce arrived on; excluded from rebroadcast to avoid echo.
+    /// Receiving interface used by egress policy. Shared IPC peers are excluded
+    /// from an echo; an eligible broadcast radio may relay on the same interface.
     pub source_interface: Option<InterfaceId>,
 }
 
-/// Table of pending announce rebroadcasts, keyed by destination hash.
+/// Destination-keyed rebroadcast records. Insertions replace matching entries;
+/// this helper neither sends packets nor validates their contents. Retry updates,
+/// interface selection and cleanup are performed by the caller.
 pub struct AnnounceTable {
     entries: HashMap<DestHash, AnnounceEntry>,
 }
@@ -62,8 +67,9 @@ impl AnnounceTable {
         self.entries.is_empty()
     }
 
-    /// Destination hashes whose retransmit_timeout has elapsed and whose
-    /// rebroadcast is not blocked.
+    /// Return hashes with `now >= retransmit_timeout` that are unblocked or
+    /// have an attached interface. This does not check retry exhaustion,
+    /// interface eligibility or packet validity, and does not update records.
     pub fn due_for_retransmit(&self, now: f64) -> Vec<DestHash> {
         self.entries
             .iter()

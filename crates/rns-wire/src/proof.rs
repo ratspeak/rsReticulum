@@ -3,7 +3,10 @@
 use crate::constants::{EXPL_LENGTH, IMPL_LENGTH};
 use alloc::vec::Vec;
 
-/// Body of a PROOF packet.
+/// Body of a packet-delivery proof.
+///
+/// These forms are distinct from a Link handshake proof. Parsing the body
+/// does not verify its signature or identify the signer.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProofData {

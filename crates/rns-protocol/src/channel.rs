@@ -17,7 +17,7 @@ pub const WINDOW_MAX_MEDIUM: usize = 12;
 pub const WINDOW_MAX_FAST: usize = 48;
 /// Upper ceiling on `window_max` across all tiers; also sizes pre-allocated guard regions.
 pub const WINDOW_MAX: usize = WINDOW_MAX_FAST;
-/// Consecutive rounds at a tier's RTT before `window_max` is promoted to that tier.
+/// RTT sample threshold used to promote the window ceiling; see [`ChannelWindow::grow`].
 pub const FAST_RATE_THRESHOLD: usize = 10;
 /// RTT at or below which a link is considered "fast" (seconds).
 pub const RTT_FAST: f64 = 0.18;
@@ -25,7 +25,8 @@ pub const RTT_FAST: f64 = 0.18;
 pub const RTT_MEDIUM: f64 = 0.75;
 /// RTT above which a fresh window starts at a single slot.
 pub const RTT_SLOW: f64 = 1.45;
-/// Minimum gap `shrink()` will leave between `window_max` and `window_min`.
+/// Gap threshold below which `shrink()` stops lowering the window ceiling.
+/// This does not establish a minimum gap for freshly constructed windows.
 pub const WINDOW_FLEXIBILITY: usize = 4;
 
 pub const SEQ_MAX: u16 = 0xFFFF;
@@ -34,7 +35,8 @@ pub const SEQ_MODULUS: u32 = 0x10000;
 /// Envelope header: `msgtype(2) || sequence(2) || length(2)`.
 pub const ENVELOPE_HEADER_SIZE: usize = 6;
 
-/// Retransmissions an envelope may absorb before the channel is torn down.
+/// Maximum send attempts per envelope, including its initial transmission.
+/// The next timeout tears down the channel after this limit is reached.
 pub const MAX_TRIES: usize = 5;
 
 /// Floor for the `rtt * 2.5` term used as the base of the retransmit backoff.
@@ -49,9 +51,11 @@ fn initial_rtt(rtt: f64) -> f64 {
     }
 }
 
-/// One outgoing or incoming channel frame.
+/// One outgoing or incoming Channel frame.
 ///
 /// Wire format: `msgtype(2 BE) || sequence(2 BE) || length(2 BE) || data`.
+/// Packing does not validate the payload length before casting it to `u16`;
+/// callers must enforce both the 65,535-byte field limit and their Link budget.
 #[derive(Debug, Clone)]
 pub struct Envelope {
     pub msg_type: u16,
@@ -134,9 +138,8 @@ pub struct ChannelWindow {
 }
 
 impl ChannelWindow {
-    /// Build a window sized to the initial `rtt`. Links slower than
-    /// `RTT_SLOW` start pinned at a single slot with zero flexibility so we
-    /// don't spray bursts onto a marginal path.
+    /// Build a window sized to the initial `rtt`. Links slower than `RTT_SLOW`
+    /// start with `window`, `window_min` and `window_max` all set to one.
     pub fn new(rtt: f64) -> Self {
         let rtt = initial_rtt(rtt);
         if rtt > RTT_SLOW {
@@ -160,12 +163,12 @@ impl ChannelWindow {
         }
     }
 
-    /// Record a successful delivery at `rtt` and open the window one notch.
+    /// Record a successful delivery and open the window one slot if possible.
     ///
-    /// Only after `FAST_RATE_THRESHOLD` *consecutive* rounds at the same tier
-    /// does the ceiling (`window_max`) get promoted — a single fast RTT can't
-    /// unlock the fast tier. Any measurement that falls out of a tier resets
-    /// that tier's counter.
+    /// Fast samples advance the fast counter without resetting the medium
+    /// counter. Medium samples advance the medium counter and reset the fast
+    /// counter; slower samples reset both. Promotion uses `FAST_RATE_THRESHOLD`.
+    /// A zero RTT can grow the window but does not update these counters.
     pub fn grow(&mut self, rtt: f64) {
         self.clamp_window();
         if !rtt.is_finite() || rtt < 0.0 {
@@ -203,9 +206,7 @@ impl ChannelWindow {
         }
     }
 
-    /// Pull the window in on retransmit. Also walks `window_max` downwards so
-    /// long-term packet loss actually demotes the link tier, stopping at the
-    /// configured `window_flexibility` gap above `window_min`.
+    /// Cap the public window fields at `WINDOW_MAX` before growth or shrinkage.
     fn clamp_window(&mut self) {
         self.window = self.window.min(WINDOW_MAX);
         self.window_min = self.window_min.min(WINDOW_MAX);
@@ -213,6 +214,8 @@ impl ChannelWindow {
         self.window_flexibility = self.window_flexibility.min(WINDOW_MAX);
     }
 
+    /// Reduce the window by one when above its minimum. In that case also
+    /// reduce the ceiling if it exceeds `window_min + window_flexibility`.
     pub fn shrink(&mut self) {
         self.clamp_window();
         if self.window > self.window_min {
@@ -225,22 +228,23 @@ impl ChannelWindow {
     }
 }
 
-/// Handler for inbound messages on a channel.
+/// Handler for inbound messages on a Channel.
 ///
-/// Invoked with `(msg_type, payload)`. Return `true` to consume the message
-/// (subsequent handlers are skipped) or `false` to fall through.
+/// Receives `(msg_type, payload)`. Returning `true` skips later handlers;
+/// `false` continues the chain. The message still appears in the tuples
+/// returned by [`Channel::receive`], regardless of this return value.
 pub type MessageCallback = Box<dyn Fn(u16, &[u8]) -> bool + Send>;
 
 /// Opaque token for removing one registered message handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HandlerId(u64);
 
-/// Sequenced, reliable message pipe over a Reticulum link.
+/// Sequenced message state machine for a Reticulum Link.
 ///
-/// The channel is passive: the owning runtime calls `send`/`receive`/
-/// `timeout`/`delivered` to step the state machine. When one or more message
-/// types are registered, inbound envelopes carrying an unregistered type are
-/// rejected rather than silently dropped.
+/// The owner drives `send`, `receive`, `timeout` and `delivered`, supplies
+/// authenticated delivery proofs, and sends the returned bytes. Register
+/// every inbound message type before receiving it; an empty registry accepts
+/// no types. The Channel itself provides neither encryption nor a scheduler.
 pub struct Channel {
     next_tx_sequence: u16,
     next_rx_sequence: u16,
@@ -249,7 +253,7 @@ pub struct Channel {
     pub window: ChannelWindow,
     pub active: bool,
     current_rtt: f64,
-    /// When non-empty, only these types are accepted on `receive`.
+    /// Only registered types are accepted on `receive`; an empty list accepts none.
     registered_types: Vec<u16>,
     /// Called in registration order on each delivered message; the first
     /// handler that returns `true` stops the chain.
@@ -288,7 +292,9 @@ impl Channel {
         Ok(())
     }
 
-    /// Register a reserved system type (`>= 0xF000`) for reception.
+    /// Register a reserved system type (`>= 0xF000`) for reception. This low-level
+    /// method does not enforce the reserved range; use `register_message_type`
+    /// for application-defined IDs.
     pub fn register_system_type(&mut self, msg_type: u16) {
         if !self.registered_types.contains(&msg_type) {
             self.registered_types.push(msg_type);
@@ -355,14 +361,19 @@ impl Channel {
         outstanding < self.window.window.min(WINDOW_MAX)
     }
 
-    /// True when every outbound envelope has been acknowledged and removed.
+    /// True when the TX ring is empty. During normal operation this follows
+    /// acknowledgement of every queued envelope; `shutdown` also empties the
+    /// ring by discarding it, so this alone is not a delivery guarantee.
     pub fn is_drained(&self) -> bool {
         self.tx_ring.is_empty()
     }
 
-    /// Pack `msg`, push it onto the TX ring, and return the raw envelope for
-    /// the transport to send. Fails when the channel is closed or its window
-    /// is already saturated.
+    /// Pack `msg`, enqueue it, and return the raw envelope to send. Fails when
+    /// closed or the window is saturated. This entry point does not enforce a
+    /// Link MDU or the `u16` payload limit. [`LinkChannel::prepare_send`] checks
+    /// its configured MDU, but an explicit budget above 65,541 bytes does not
+    /// protect the length field. Keep the serialized payload at most 65,535
+    /// bytes and within the transport budget before enqueueing.
     pub fn send(&mut self, msg: &dyn MessageBase) -> Result<Vec<u8>, ChannelError> {
         self.send_tracked(msg).map(|(_, raw)| raw)
     }
@@ -404,8 +415,10 @@ impl Channel {
         Ok((seq, raw))
     }
 
-    /// Mark a TX envelope as acknowledged and drain any in-order delivered
-    /// frames off the front of the ring, then open the window.
+    /// Mark a TX envelope acknowledged, drain delivered envelopes from the
+    /// front, and grow the window. The owner must authenticate the packet proof
+    /// and map it to the correct sequence. Even an unknown sequence grows the
+    /// window, so do not call this for unrelated or repeated proofs.
     pub fn delivered(&mut self, sequence: u16, rtt: f64) {
         if let Some(env) = self.tx_ring.iter_mut().find(|e| e.sequence == sequence) {
             env.state = MessageState::Delivered;
@@ -627,12 +640,13 @@ pub struct PreparedChannelData {
 }
 
 impl LinkChannel {
-    /// Plain-text channel (no transport-side encryption).
+    /// Channel without encryption in this wrapper. The owner supplies the
+    /// transport and is responsible for any required Link encryption.
     pub fn new(link_id: [u8; 16], rtt: f64) -> Self {
         Self::new_with_mdu(link_id, rtt, rns_wire::constants::LINK_MDU)
     }
 
-    /// Plain-text channel with an explicit Link MDU.
+    /// Channel without wrapper encryption, using an explicit Link MDU.
     pub fn new_with_mdu(link_id: [u8; 16], rtt: f64, link_mdu: usize) -> Self {
         Self {
             channel: Channel::new(rtt),
@@ -669,8 +683,13 @@ impl LinkChannel {
         }
     }
 
-    /// Pack `msg`, encrypt with the session keys if present, and return the
-    /// wire bytes.
+    /// Enforce the Link payload budget, enqueue `msg`, and encrypt its Channel
+    /// envelope if keys are present. Returns a packet body, not a complete
+    /// Reticulum packet. The caller must frame and send it, then route delivery
+    /// proofs back to the assigned sequence. With an explicit Link MDU above
+    /// 65,541 bytes, separately check that the serialized payload is at most
+    /// 65,535 bytes: this method does not validate the `u16` length field.
+    /// An encryption error occurs after enqueueing and does not roll back the envelope.
     pub fn prepare_send(&mut self, msg: &dyn MessageBase) -> Result<Vec<u8>, ChannelError> {
         self.prepare_send_tracked(msg).map(|prepared| prepared.data)
     }

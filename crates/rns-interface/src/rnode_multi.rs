@@ -206,9 +206,9 @@ impl RNodeMultiConfig {
     }
 }
 
-/// SEL_INT, push params, RADIO_STATE=ON, then frequency, bandwidth and TX
-/// power again: firmware maps them to what the hardware will use only while
-/// the radio is on, so these last echoes report the effective settings.
+/// Select a subinterface, send its radio parameters and configured airtime
+/// locks, then turn the radio on. Frequency, bandwidth and transmit power are
+/// reasserted after radio-on.
 pub fn build_subinterface_init(index: u8, config: &SubInterfaceConfig) -> Vec<u8> {
     let mut out = Vec::with_capacity(80);
 

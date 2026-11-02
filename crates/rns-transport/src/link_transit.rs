@@ -1,17 +1,26 @@
-//! Request attenuation without changing Link identity or coercing opaque modes.
+//! Internal transit checks for Link-request signalling. Capacity attenuation
+//! changes only the unsigned request trailer, preserving the 64-byte request
+//! body and Link identity. Unsupported opaque-mode transformations are rejected;
+//! authenticated proof trailers are not rewritten.
 use crate::{InterfaceCapacityError, messages::InterfaceEntry};
 use rns_wire::link_signalling::{
     DEFAULT_LINK_MODE, LinkSignallingError, SignallingData, parse_request_signalling,
 };
 
+/// Why a transit Link request cannot be forwarded under the checked interface
+/// generations and packet-capacity budgets.
 #[derive(Debug, thiserror::Error)]
 pub enum LinkTransitError {
+    /// Malformed or unsupported request signalling.
     #[error(transparent)]
     InvalidSignalling(#[from] LinkSignallingError),
+    /// An interface cannot carry the required Link packet capacity.
     #[error(transparent)]
     Capacity(#[from] InterfaceCapacityError),
+    /// Forwarding would change the raw MTU trailer of an opaque, non-default mode.
     #[error("non-default Link mode requires an unsupported transit transformation")]
     UnsupportedTransitModeTransform,
+    /// The ingress or egress interface owner is no longer current.
     #[error("interface registration no longer owns this route")]
     StaleInterface,
 }

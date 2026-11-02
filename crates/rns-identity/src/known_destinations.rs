@@ -5,7 +5,8 @@ use std::path::Path;
 use crate::persistence;
 use rmpv::Value;
 
-/// Record of a destination learnt from a validated announce.
+/// Record intended for a destination learned from a validated announce.
+/// Construction and file loading do not perform announce authentication.
 #[derive(Debug, Clone)]
 pub struct KnownDestination {
     /// Learn time as a Unix timestamp (seconds).
@@ -33,6 +34,8 @@ impl KnownDestinations {
 
     /// Insert or refresh the entry for `dest_hash`. The `retained` flag is
     /// preserved on update so a fresh announce never un-pins an entry.
+    /// The caller validates the announce, destination binding and key continuity;
+    /// this method can replace an existing key without checking them.
     pub fn remember(
         &mut self,
         dest_hash: [u8; 16],
@@ -147,7 +150,8 @@ impl KnownDestinations {
 
     /// Drop stale entries past `destination_timeout_secs`. `has_path` is a
     /// caller-supplied path-table lookup (this crate doesn't depend on
-    /// rns-transport). Returns the hashes that were dropped.
+    /// rns-transport). Pinned entries and entries with a current path are retained.
+    /// Returns the hashes that were dropped.
     pub fn cleanup(
         &mut self,
         now: f64,

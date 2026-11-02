@@ -1,6 +1,8 @@
-//! `HardwareIdentity`: a public-key-only `Identity` whose private ops are served
-//! by an `IdentityBackend` (real PIV session or mock). Wire-compatible with
-//! software identities.
+//! Wrapper pairing a public-only `Identity` with private operations supplied
+//! by an `IdentityBackend`. Call this wrapper's `sign`/`decrypt` methods for
+//! backend operations; its contained `Identity` and `as_identity()` remain
+//! public-only. The separate PC/SC `load_hardware_identity` adapter attaches a
+//! backend directly to an `Identity`.
 
 use std::path::Path;
 
@@ -25,7 +27,8 @@ pub trait IdentityBackend {
     fn read_ed25519_public(&mut self, slot: u8) -> Result<[u8; 32], RatkeyError>;
     fn read_x25519_public(&mut self, slot: u8) -> Result<[u8; 32], RatkeyError>;
     fn is_connected(&self) -> bool;
-    /// Re-lock the session (require PIN again on the next op).
+    /// Ask the backend to clear its authorization state. Handle errors; the
+    /// required next authentication depends on the backend and slot policy.
     fn lock(&mut self) -> Result<(), RatkeyError>;
 }
 
@@ -82,8 +85,10 @@ pub struct HardwareIdentity {
 }
 
 impl HardwareIdentity {
-    /// Build from a `.hwid` config + a backend. Fail-closed: the device's slot
-    /// public keys must match the published identity.
+    /// Compare the backend's fixed slot-9A/9D public keys with `.hwid` and build
+    /// the wrapper. This does not validate the file's declared identity hash,
+    /// serial, attestation status or policy fields; the runtime identity hash
+    /// is derived from the matched public keys. Slot overrides are not used.
     pub fn from_hwid(
         config: HwidConfig,
         mut backend: Box<dyn IdentityBackend>,
@@ -180,6 +185,8 @@ impl HardwareIdentity {
         &self.x25519_pub
     }
 
+    /// Borrow the public-only identity for hashing, encryption and verification.
+    /// This reference does not route signing or decryption through the backend.
     pub fn as_identity(&self) -> &Identity {
         &self.identity
     }
@@ -192,8 +199,13 @@ impl HardwareIdentity {
         self.backend.ecdh_x25519(SLOT_9D, peer_pub_bytes)
     }
 
-    /// Ciphertext = ephemeral_pub(32) || AES-256-CBC token. Mirrors `Identity::decrypt`
-    /// but does the ECDH on-device.
+    /// Decrypt `ephemeral_pub(32) || AES-256-CBC token` with on-device identity
+    /// ECDH and host-side HKDF/token decryption. Returned plaintext is caller-owned.
+    ///
+    /// Unlike `Identity::decrypt`, this wrapper does not try the
+    /// supplied ratchet keys. With `Some(ratchets)` and `enforce_ratchets`, it
+    /// fails; with `None`, the enforcement flag is ignored and identity ECDH
+    /// is attempted. Do not use this helper as a ratchet-only admission check.
     pub fn decrypt(
         &mut self,
         ciphertext: &[u8],
@@ -240,8 +252,9 @@ impl HardwareIdentity {
         self.backend.is_connected()
     }
 
-    /// Re-lock the session; the next sign/ECDH will require the PIN again.
-    /// The app calls this on its session timeout and on quit.
+    /// Delegate locking to the backend and return its result. The owner must
+    /// call this for its timeout/quit policy and handle a failed lock; this
+    /// wrapper has no automatic session timer.
     pub fn lock(&mut self) -> Result<(), RatkeyError> {
         self.backend.lock()
     }

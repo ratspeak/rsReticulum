@@ -1,9 +1,7 @@
-//! Apple central-role connect lifecycle. Sister to
-//! [`ble_central_apple`](crate::ble_central_apple) (which owns scanning).
-//!
-//! Apple-specific because btleplug's CoreBluetooth backend allocates its
-//! own manager, and two managers in the same process don't share peripheral
-//! caches on macOS, so `adapter.peripherals()` returns empty every cycle.
+//! Apple central-role connection lifecycle, using the manager and discovered
+//! peripherals owned by [`ble_central_apple`](crate::ble_central_apple).
+//! Scanning and connection setup share that manager rather than creating a
+//! separate btleplug adapter.
 
 #![cfg(any(target_os = "ios", target_os = "macos"))]
 
@@ -23,13 +21,12 @@ use crate::ble_peer::{
     RATSPEAK_SERVICE_UUID, RATSPEAK_TX_UUID,
 };
 
-/// `connectPeripheral:` does not self-time-out; iOS RPA rotation leaves
-/// ghost identifiers in `Connecting` state forever. 5s recycles ghosts
-/// before they block the scan-loop pipeline.
+/// Deadline for the connect callback. On timeout, partial connection state
+/// is cancelled and released.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Generous safety net for service / characteristic / notify discovery
-/// (CoreBluetooth normally responds in ~200 ms).
+/// Per-step deadline for service discovery, characteristic discovery, and
+/// notification subscription callbacks.
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 const DISCOVERED_TTL: Duration = Duration::from_secs(60);
@@ -65,9 +62,8 @@ static LAST_DISCONNECT_REASON: OnceLock<Mutex<HashMap<String, DisconnectReason>>
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisconnectReason {
-    /// `CBErrorPeripheralConnectionTimeout` — almost always an iPhone /
-    /// Pixel RPA rotating out from under our open link. The peer
-    /// re-advertises within ~1s.
+    /// Classification used for `CBErrorPeripheralConnectionTimeout`. The label
+    /// does not establish address rotation as the cause or guarantee rediscovery.
     Rotation,
     OtherError,
 }
@@ -122,9 +118,9 @@ pub fn take_last_disconnect_reason(address: &str) -> Option<DisconnectReason> {
         .and_then(|mut g| g.remove(address))
 }
 
-/// Drop frees the retained ObjC objects. Disconnect goes via
-/// [`disconnect_peer`] (`cancelPeripheralConnection:`); the delegate
-/// callback removes the map entry, dropping the last `Arc`.
+/// Owns retained Objective-C connection objects until the final `Arc` is
+/// dropped. [`disconnect_peer`] removes the registered peer and requests
+/// `cancelPeripheralConnection:`; other owners can outlive that request.
 pub struct ConnectedPeer {
     pub address: String,
     pub protocol: PeerProtocol,
@@ -519,15 +515,19 @@ pub fn disconnect_all() {
     }
 }
 
-/// Adopt a CBPeripheral handed back via `centralManager:willRestoreState:`.
-/// Apple guarantees `peripheral.services` is populated and prior TX-char
-/// subscriptions are preserved — only the delegate needs rebinding. On
-/// success ownership of the +1 retain passes to `ConnectedPeer::drop`; on
-/// Err the retain is released.
+/// Adopt a restored peripheral using its cached service and characteristic
+/// objects. This function rebinds the delegate; it does not rediscover services
+/// or resubscribe to notifications.
+///
+/// For a nonempty address and non-null pointer, the supplied +1 retain is
+/// consumed: success transfers it to the connection owner or releases it if
+/// already registered, and service/characteristic failures release it. Invalid
+/// arguments return early without releasing the pointer.
 ///
 /// # Safety
-/// `peripheral` must be a retained, non-null `CBPeripheral *` whose state
-/// is `Connected (= 2)`.
+/// `peripheral` must be a valid, retained `CBPeripheral *` in Connected state.
+/// The caller must ensure its cached services and notification subscriptions
+/// are usable; this function does not establish those conditions.
 pub unsafe fn adopt_restored_peer(
     address: String,
     peripheral: *mut AnyObject,
@@ -633,8 +633,8 @@ pub unsafe fn adopt_restored_peer(
     Ok(())
 }
 
-/// CB keeps connections alive thanks to `bluetooth-central`
-/// UIBackgroundMode + restore-identifier; this just logs inventory.
+/// Log connected-peer and pending-write counts when the app resigns active.
+/// This hook does not change connection state or guarantee background delivery.
 pub fn on_app_will_resign_active() {
     let connected = connected_peers().lock().map(|g| g.len()).unwrap_or(0);
     let pending = connected_peers()
@@ -654,8 +654,8 @@ pub fn on_app_will_resign_active() {
     );
 }
 
-/// Prune discovered pointers older than the discovery TTL — after a long
-/// background those are RPA-rotated ghosts.
+/// Prune discovered pointers older than the discovery TTL and log the
+/// remaining discovery and connection counts.
 pub fn on_app_did_become_active() {
     prune_discovered();
     let discovered_remaining = match discovered().lock() {

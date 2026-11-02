@@ -1,10 +1,9 @@
 //! Wait for a destination's path to be learned (or time out).
 //!
-//! Mirrors Python `Transport.await_path(destination_hash, timeout=None)`
-//! (RNS/Transport.py:2524). The helper sends an [`AwaitPath`] actor
-//! message and applies one caller-supplied deadline to both actor submission
-//! and the oneshot reply. The actor emits the upstream-compatible path request
-//! before parking the waiter.
+//! Sends an [`AwaitPath`] actor message with one caller-supplied deadline
+//! covering both channel admission and the reply. The actor answers from a
+//! nonexpired cached path when available; otherwise it requests discovery and
+//! parks a waiter. Success does not establish current end-to-end reachability.
 //!
 //! [`AwaitPath`]: crate::messages::TransportMessage::AwaitPath
 
@@ -17,23 +16,23 @@ use crate::messages::TransportMessage;
 /// Error returned by [`await_path`] when the path cannot be resolved.
 #[derive(Debug, Error, PartialEq)]
 pub enum AwaitPathError {
-    /// The transport actor's receive channel closed before we could
-    /// submit the request — the actor has shut down.
+    /// The transport command channel closed before request admission.
     #[error("transport actor is not running")]
     TransportDown,
-    /// The caller's timeout fired before the actor answered, or the
-    /// actor's internal 15s sweep expired the waiter first (returns
-    /// `Ok(false)` on the reply channel).
+    /// The caller's deadline elapsed, the actor replied `false`, or the reply
+    /// sender was dropped. Actor maintenance expires parked waiters after
+    /// at least 15 seconds; this is not a guaranteed sweep completion time.
     #[error("timed out waiting for path")]
     Timeout,
 }
 
-/// Wait up to `timeout` for the transport actor to resolve (or already
-/// know) a path to `destination_hash`.
+/// Wait up to `timeout` for a cached or newly learned path to `destination_hash`.
+/// The deadline includes waiting to submit the command, not just its reply.
+/// Success reflects actor path state and does not probe the remote application.
 ///
-/// Returns `Ok(())` as soon as the actor confirms the path exists. A
-/// dropped reply sender without a preceding `true` is indistinguishable
-/// from a timeout, so both surface as `Err(Timeout)`.
+/// A `false` reply or dropped reply sender is reported as [`AwaitPathError::Timeout`].
+/// Timing out drops this waiter receiver but does not retract an admitted actor
+/// command or path request; the actor later removes closed waiters.
 pub async fn await_path(
     tx: &mpsc::Sender<TransportMessage>,
     destination_hash: [u8; 16],

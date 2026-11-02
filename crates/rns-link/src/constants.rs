@@ -42,7 +42,7 @@ pub const TRAFFIC_TIMEOUT_FLOOR_MS: u64 = 5;
 pub const MODE_AES128_CBC: u8 = 0x00;
 /// Default: AES-256-CBC.
 pub const MODE_AES256_CBC: u8 = 0x01;
-/// Reserved for future AES-256-GCM support.
+/// Reserved AES-256-GCM identifier; not accepted by current Link endpoints.
 pub const MODE_AES256_GCM: u8 = 0x02;
 pub const MODE_OTP_RESERVED: u8 = 0x03;
 pub const MODE_PQ_RESERVED_1: u8 = 0x04;
@@ -50,7 +50,8 @@ pub const MODE_PQ_RESERVED_2: u8 = 0x05;
 pub const MODE_PQ_RESERVED_3: u8 = 0x06;
 pub const MODE_PQ_RESERVED_4: u8 = 0x07;
 
-/// Encryption modes accepted by this implementation; others are advertised-but-refused.
+/// Encryption modes accepted by [`crate::link::Link`] endpoints. Other mode
+/// identifiers are representable on the wire but rejected by those endpoints.
 pub const ENABLED_MODES: &[u8] = &[MODE_AES256_CBC];
 
 pub const DEFAULT_MODE: u8 = MODE_AES256_CBC;
@@ -67,13 +68,14 @@ pub const ACCEPT_ALL: u8 = 0x02;
 /// Low 21 bits of the 24-bit MTU signalling value carry the MTU.
 pub const MTU_BYTEMASK: u32 = 0x001F_FFFF;
 
-/// Bits 21-23 of the MTU signalling value carry the encryption mode.
+/// Mask for mode bits 5–7 of the first signalling byte. In the full 24-bit
+/// big-endian signalling value, those are bits 21–23 (mask `0xE00000`).
 pub const MODE_BYTEMASK: u32 = 0x00E0;
 
-/// Derived key length for AES-256-CBC: 32 bytes cipher key || 32 bytes HMAC key.
+/// Derived key length for AES-256-CBC: 32-byte HMAC key || 32-byte cipher key.
 pub const AES256_DERIVED_KEY_LENGTH: usize = 64;
 
-/// Derived key length for AES-128-CBC: 16 bytes cipher key || 16 bytes HMAC key.
+/// Derived key length for AES-128-CBC: 16-byte HMAC key || 16-byte cipher key.
 pub const AES128_DERIVED_KEY_LENGTH: usize = 32;
 
 /// Seconds of slack granted to a response beyond its nominal transfer time.

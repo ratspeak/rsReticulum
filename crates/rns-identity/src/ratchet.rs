@@ -91,7 +91,9 @@ pub enum RatchetRingFormat {
     LegacyRust,
 }
 
-/// A verified ratchet ring plus the format that was read from disk.
+/// A loaded ring and its accepted signature format. Inspect the format when
+/// requiring authentication of every retained key; legacy signatures cover
+/// only the current public key, not the whole historical ring.
 pub struct LoadedRatchetRing {
     ring: RatchetRing,
     format: RatchetRingFormat,
@@ -115,7 +117,9 @@ impl LoadedRatchetRing {
 ///
 /// Index 0 is the most recent key; older keys are retained so decryption can
 /// still succeed for in-flight ciphertexts. All key material is zeroised on
-/// drop and on truncation.
+/// drop and on truncation. Retained private keys still decrypt their historical
+/// ciphertext; forward secrecy after device compromise depends on erasing old
+/// keys and any copies, including persisted rings and backups.
 pub struct RatchetRing {
     keys: Vec<[u8; 32]>,
     last_rotation: f64,
@@ -166,7 +170,8 @@ impl RatchetRing {
         pub_key
     }
 
-    /// True when at least `rotation_interval` seconds have elapsed since the last rotate.
+    /// Whether rotation is due at the current wall time. An unknown age is
+    /// also due; see [`Self::needs_rotation_at`].
     pub fn needs_rotation(&self) -> bool {
         self.needs_rotation_at(wall_time_secs())
     }
@@ -209,7 +214,8 @@ impl RatchetRing {
         }
     }
 
-    /// Replace the live ring with a previously persisted candidate.
+    /// Replace the live ring with a candidate. The caller must persist it first
+    /// when durability is required; this method does not verify persistence.
     pub fn commit_prepared_rotation(&mut self, prepared: PreparedRatchetRotation) -> [u8; 32] {
         let PreparedRatchetRotation {
             mut candidate,
@@ -305,8 +311,9 @@ impl RatchetRing {
         self.save_verified_impl(path, identity, false)
     }
 
-    /// Acknowledge only the platform's strict file and namespace barriers.
-    /// An uncertain publication is an error, never a successful checkpoint.
+    /// Sign and persist using [`persistence::durable_write`], with its platform
+    /// barriers and filesystem limits. An uncertain publication is an error,
+    /// never a successful checkpoint.
     pub fn save_verified_durable(&self, path: &Path, identity: &Identity) -> std::io::Result<()> {
         self.save_verified_impl(path, identity, true)
     }
@@ -336,7 +343,9 @@ impl RatchetRing {
     }
 
     /// Load the ring, retrying with 1s/2s/4s backoff to ride out transient
-    /// read errors while another process is rewriting the file.
+    /// read or decode errors. Returns the ring and signature without verifying
+    /// that signature. Use [`Self::load_verified`] for authenticated loading.
+    /// This synchronous call can sleep for seven seconds across retries.
     pub fn load(path: &Path) -> std::io::Result<(Self, [u8; 64])> {
         let mut last_err = None;
         let delays_ms = [0, 1000, 2000, 4000];
@@ -370,7 +379,9 @@ impl RatchetRing {
     ///
     /// Canonical files are verified over the packed key list. Historical Rust
     /// files are accepted only when their old current-public-key signature is
-    /// valid; their unsigned rotation timestamp is deliberately ignored.
+    /// valid; that legacy signature does not authenticate the other retained
+    /// keys. The unsigned rotation timestamp is deliberately ignored. Inspect
+    /// [`LoadedRatchetRing::format`] if the caller requires canonical coverage.
     pub fn load_verified(path: &Path, identity: &Identity) -> std::io::Result<LoadedRatchetRing> {
         let data = persistence::read_secret_file(path, RATCHET_FILE_MAX_BYTES)?;
         let decoded = Self::decode(&data)?;
@@ -429,12 +440,15 @@ impl RatchetRing {
     }
 }
 
-/// A verified ratchet ring bound to one crash-safe persistence path.
+/// A signature-checked ratchet ring bound to one persistence path.
 ///
 /// This is the high-level counterpart to Python's
 /// `Destination.enable_ratchets(path)`: opening loads and verifies an existing
 /// Python-compatible ring or creates a signed empty one. Rotations persist a
-/// candidate before replacing the live secret state.
+/// candidate before replacing the live secret state, using
+/// [`persistence::atomic_write`] with best-effort parent-directory fsync.
+/// Callers needing the strict durable transaction path should manage a
+/// [`RatchetRing`] candidate with [`RatchetRing::save_verified_durable`].
 pub struct PersistentRatchetRing {
     path: PathBuf,
     ring: RatchetRing,
@@ -452,6 +466,12 @@ impl std::fmt::Debug for PersistentRatchetRing {
 
 impl PersistentRatchetRing {
     /// Load and verify `path`, or initialize it with a signed empty ring.
+    ///
+    /// Legacy files are accepted even though their signature authenticates
+    /// only the current public key, and this wrapper discards the format
+    /// label. If full-ring authentication is required, first call
+    /// [`RatchetRing::load_verified`] and inspect `LoadedRatchetRing::format`;
+    /// do not treat every successful `open` as canonical-format verification.
     pub fn open(path: impl AsRef<Path>, identity: &Identity) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let ring = if path.is_file() {
@@ -499,7 +519,8 @@ impl PersistentRatchetRing {
         self.ensure_current_at(identity, wall_time_secs())
     }
 
-    /// Deterministic form of [`Self::ensure_current`] for runtime/tests.
+    /// Form of [`Self::ensure_current`] with an explicit clock value. A rotation
+    /// still generates random key material.
     pub fn ensure_current_at(
         &mut self,
         identity: &Identity,
@@ -514,12 +535,13 @@ impl PersistentRatchetRing {
         }
     }
 
-    /// Force a crash-safe rotation now.
+    /// Persist a new rotation before replacing the live ring, using the current clock.
     pub fn rotate(&mut self, identity: &Identity) -> std::io::Result<[u8; 32]> {
         self.rotate_at(identity, wall_time_secs())
     }
 
-    /// Force a crash-safe rotation at an explicit wall-clock time.
+    /// Persist a new rotation before replacing the live ring, using an explicit clock.
+    /// Uses the atomic-write semantics described on [`PersistentRatchetRing`].
     pub fn rotate_at(&mut self, identity: &Identity, now: f64) -> std::io::Result<[u8; 32]> {
         if !now.is_finite() || now < 0.0 {
             return Err(std::io::Error::new(
@@ -641,7 +663,8 @@ impl ReceivedRatchet {
         get_ratchet_id(&self.ratchet_pub)
     }
 
-    /// Persist to `{ratchetdir}/{hex(dest_hash)}` in the shared msgpack format.
+    /// Persist in the shared MessagePack format at the supplied path, creating
+    /// missing parents. Stores conventionally use `{ratchetdir}/{hex(dest_hash)}`.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         self.save_impl(path, false)
     }
@@ -713,8 +736,9 @@ pub fn ratchet_public_bytes(ratchet_prv: &[u8; 32]) -> [u8; 32] {
     prv.public_key().to_bytes()
 }
 
-/// Sweep `dir`, deleting expired and unparseable ratchet files. Returns the
-/// number of files removed.
+/// Sweep `dir`, deleting expired ratchets and files that fail loading for any
+/// reason, including read errors. Returns the number successfully removed.
+/// Use only a directory dedicated to received-ratchet cache files.
 ///
 /// Only touches disk; pair with [`purge_expired_ratchets_in_memory`] when an
 /// in-memory cache is also kept.
@@ -756,6 +780,8 @@ pub fn purge_expired_ratchets_in_memory<K: Eq + std::hash::Hash>(
 }
 
 /// Per-destination cache of remote ratchet public keys, with optional disk backing.
+/// Callers validate announces before insertion. Disk writes are best-effort;
+/// errors are logged while the in-memory entry is still updated.
 pub struct ReceivedRatchetStore {
     entries: HashMap<[u8; 16], ReceivedRatchet>,
     storage_dir: Option<PathBuf>,
@@ -778,14 +804,16 @@ impl ReceivedRatchetStore {
         }
     }
 
-    /// Record `ratchet_pub` for `dest_hash`. Re-inserting the identical key is a no-op;
-    /// any other value replaces the entry and is written to disk when backed.
+    /// Record `ratchet_pub` for `dest_hash`. Re-inserting the identical key
+    /// already in memory is a no-op. Other values replace the entry and attempt
+    /// a disk write when backed; write errors are logged, not returned.
     pub fn remember(&mut self, dest_hash: [u8; 16], ratchet_pub: [u8; 32]) {
         self.remember_at(dest_hash, ratchet_pub, wall_time_secs());
     }
 
     /// Record a ratchet with an explicit local receive time. Re-inserting the
-    /// same key remains a no-op and therefore cannot extend its lifetime.
+    /// same key already in memory remains a no-op and cannot extend its lifetime.
+    /// This does not load an existing disk entry before comparing keys.
     pub fn remember_at(&mut self, dest_hash: [u8; 16], ratchet_pub: [u8; 32], received_at: f64) {
         if let Some(existing) = self.entries.get(&dest_hash)
             && existing.ratchet_pub == ratchet_pub
@@ -811,7 +839,8 @@ impl ReceivedRatchetStore {
     }
 
     /// Return the current ratchet public key for `dest_hash`, loading from
-    /// disk on miss. Yields `None` if the entry is expired or absent.
+    /// disk on miss. Yields `None` if the entry is expired, absent, or cannot be
+    /// loaded. Disk load failures are logged.
     pub fn get(&mut self, dest_hash: &[u8; 16]) -> Option<[u8; 32]> {
         self.get_at(dest_hash, wall_time_secs())
     }

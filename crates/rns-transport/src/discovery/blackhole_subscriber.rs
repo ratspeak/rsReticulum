@@ -1,40 +1,32 @@
-//! Pure-data subscriber state machine for the distributed blackhole list.
+//! Per-source scheduling state for distributed blackhole-list updates.
 //!
-//! Tracks per-source "last pulled at" timestamps and decides which sources
-//! are due for a refresh on the current tick. The actual link
-//! establishment + `/list` request lives in the runtime layer; this module
-//! is intentionally free of tokio so the due-source logic can be unit
-//! tested without timers or fakes.
-//!
-//! Mirrors the scheduling half of Python's `BlackholeUpdater.job()` loop
-//! (RNS/Discovery.py:693) with the same constants:
-//! `INITIAL_WAIT=20s`, `JOB_INTERVAL=60s`, `UPDATE_INTERVAL=3600s`.
+//! The runtime owns waiting, Link establishment, `/list` requests and applying
+//! the response. This module only compares caller-supplied timestamps and
+//! records caller-reported successful updates; it performs no network I/O.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use rns_wire::types::IdentityHash;
 
-/// Python `BlackholeUpdater.INITIAL_WAIT` — delay before the first job tick.
+/// Runtime delay before the first subscriber sweep (20 seconds).
 pub const INITIAL_WAIT: Duration = Duration::from_secs(20);
 
-/// Python `BlackholeUpdater.JOB_INTERVAL` — time between scheduling sweeps.
+/// Runtime scheduling interval (60 seconds), after processing the current
+/// sweep's sources; request time can extend the observed interval.
 pub const JOB_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Python `BlackholeUpdater.UPDATE_INTERVAL` — default minimum gap between
-/// successful pulls from the same source (1 hour). Python 1.3.8 makes this
-/// configurable via `blackhole_update_interval` (Reticulum.py:593-596,
-/// consumed at Discovery.py:749); the config-side minutes→seconds conversion
-/// and 2-minute clamp live at the parse site, this module takes seconds.
+/// Default minimum elapsed time after a source's last successful update
+/// (one hour). [`SubscriberState::with_update_interval`] overrides it.
 pub const UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// Python `BlackholeUpdater.SOURCE_TIMEOUT` — kept here for parity but
-/// currently unused; the runtime wrapper races it against the link
-/// establishment / request when it lands.
+/// Timeout budget supplied by the runtime to each blackhole `/list` query
+/// (25 seconds). This state machine itself does not enforce timeouts.
 pub const SOURCE_TIMEOUT: Duration = Duration::from_secs(25);
 
-/// Per-process subscriber state. Cheap to clone for inspection; the runtime
-/// owner holds the authoritative copy.
+/// In-memory per-source update cursors. Cloning copies the cursors and interval;
+/// clones do not share subsequent updates. Use finite Unix-second timestamps
+/// consistently; they are stored and compared without validation.
 #[derive(Debug, Clone)]
 pub struct SubscriberState {
     /// Unix-seconds timestamp of the most recent successful pull, keyed by
@@ -56,40 +48,42 @@ impl Default for SubscriberState {
 }
 
 impl SubscriberState {
+    /// Start with no update cursors and the one-hour default interval.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Override the per-source pull interval. The caller passes seconds
-    /// already clamped at config parse (min 2 minutes, Reticulum.py:593-596).
+    /// Set the minimum elapsed time after each successful update. No minimum
+    /// is enforced here; zero makes a source due whenever `now >= last_update`.
     pub fn with_update_interval(mut self, interval: Duration) -> Self {
         self.update_interval = interval;
         self
     }
 
+    /// Return the currently configured interval.
     pub fn update_interval(&self) -> Duration {
         self.update_interval
     }
 
-    /// Record a successful pull from `source` at `now` (Unix seconds).
+    /// Record caller-reported success at `now`, replacing any prior timestamp.
+    /// This does not validate or apply the source's manifest.
     pub fn mark_updated(&mut self, source: IdentityHash, now: f64) {
         self.last_updates.insert(source, now);
     }
 
-    /// Clear the last-update cursor for `source`, forcing the next tick
-    /// to re-pull even if `UPDATE_INTERVAL` has not elapsed. Useful when
-    /// an operator edits `blackhole_sources` and wants an immediate
-    /// refresh.
+    /// Remove a source's cursor. Subsequent scheduling treats its last update
+    /// as Unix time zero; no network request is issued by this method.
     pub fn forget(&mut self, source: &IdentityHash) {
         self.last_updates.remove(source);
     }
 
-    /// Returns the list of sources that should be pulled on this tick,
-    /// given the configured source list and the current time.
+    /// Return configured sources for which `now - last_update >= interval`,
+    /// sorted by identity hash and deduplicated. Missing cursors use zero, so
+    /// they are due only once `now >= interval`.
     ///
-    /// Order is deterministic (sorted by identity hash) so the runtime
-    /// does not accidentally thundering-herd one source ahead of another
-    /// after a restart.
+    /// This does not advance cursors, reserve in-flight work, back off failures
+    /// or stagger sources. Repeated calls can return the same due list until
+    /// the caller records successful updates.
     pub fn due_sources(&self, configured: &[IdentityHash], now: f64) -> Vec<IdentityHash> {
         let mut due: Vec<IdentityHash> = configured
             .iter()
@@ -104,9 +98,8 @@ impl SubscriberState {
         due
     }
 
-    /// Drop cursors for sources that no longer appear in `configured`.
-    /// Keeps the table bounded when an operator rotates their source
-    /// list.
+    /// Drop cursors whose identities are absent from `configured`. No source
+    /// count limit is otherwise enforced by this state machine.
     pub fn prune(&mut self, configured: &[IdentityHash]) {
         self.last_updates
             .retain(|src, _| configured.iter().any(|c| c == src));

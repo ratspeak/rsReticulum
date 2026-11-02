@@ -1,6 +1,11 @@
-//! Cryptographic primitives for Reticulum. Constants, derivation inputs, and
-//! wire-visible byte layouts match the Python reference (`RNS/Cryptography/`)
-//! exactly — downstream interop depends on it. `no_std + alloc` when `std` is off.
+//! Cryptographic primitives used by Reticulum identities, Links and Tokens.
+//! This crate exposes low-level ciphers, hashes, key derivation and key types;
+//! callers supply the protocol-specific salts, authentication and key lifecycle.
+//!
+//! Disabling this crate's `std` feature selects `no_std + alloc` for its code.
+//! Workspace dependencies retain their own default features, and random/key
+//! generation still requires an operating-system entropy source. This setting
+//! alone does not make the crate a bare-metal cryptographic backend.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
 extern crate alloc;

@@ -24,7 +24,7 @@ struct Args {
     #[arg(long)]
     config: Option<String>,
 
-    /// Size of probe packet payload in bytes
+    /// Plaintext probe payload size in bytes (default: 16)
     #[arg(short = 's', long)]
     size: Option<usize>,
 
@@ -32,15 +32,17 @@ struct Args {
     #[arg(short = 'n', long, default_value_t = 1)]
     probes: u32,
 
-    /// Timeout before giving up (seconds)
+    /// Seconds to wait separately for a path and each probe proof.
+    /// Default: 12 seconds plus the first-hop timeout; transport work can add time.
     #[arg(short = 't', long, value_name = "seconds")]
     timeout: Option<f64>,
 
-    /// Time between each probe (seconds)
+    /// Delay after one probe completes before starting the next (seconds)
     #[arg(short = 'w', long, default_value_t = 0.0, value_name = "seconds")]
     wait: f64,
 
-    /// Output one JSON object per probe to stdout (machine-readable)
+    /// Print probe results as JSON; some fatal errors are reported only on stderr.
+    /// Known limitation: destination and interface names are not JSON-escaped.
     #[arg(long)]
     json: bool,
 

@@ -1,9 +1,12 @@
 //! Actor-model interface for the transport.
 //!
-//! Every routing state mutation flows through `TransportMessage` into the
-//! single task that owns the routing tables. This eliminates shared mutable
-//! state and its locking on the hot path; other components interact with the
-//! transport exclusively via `mpsc` senders and `oneshot` reply channels.
+//! Commands and queries for the task that owns transport routing state.
+//! The actor also has dedicated control channels, public setup state and
+//! driver-shared counters. Sending a command only admits it to a mailbox;
+//! use the operation-specific reply when a local result is required.
+//!
+//! Debug output can contain packet bytes, names and query payloads. It is
+//! not a sanitized diagnostic or aggregate-only interface.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -21,29 +24,29 @@ pub use crate::interface_ownership::{
     InterfaceTransportSender,
 };
 
-/// Privacy-bounded, aggregate-only inspection values supplied by an
-/// interface driver.
+/// Optional aggregate counts supplied by an interface driver.
 ///
-/// This deliberately has no endpoint, address, name or free-form field. Keep
-/// that property when extending it: inspection snapshots cross shared-instance
-/// and authorized remote-management boundaries.
+/// This record contains no endpoint, address, name or free-form field. That
+/// restriction applies to this record, not to the surrounding interface stats,
+/// which include names and other configuration metadata.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InterfaceInspectionSnapshot {
     pub active_clients: Option<u64>,
     pub blocked_ips: Option<u64>,
 }
 
-/// A driver-owned source for a live aggregate interface snapshot.
+/// A driver-owned callback for live aggregate interface counts.
 ///
-/// The callback is invoked synchronously once for each transport stats
-/// snapshot. Implementations must therefore take only short-lived locks and
-/// must not perform I/O.
+/// `GetInterfaceStats` calls it synchronously once per inspected interface and
+/// substitutes empty counts if it panics. Keep locks short and do not perform
+/// I/O: the callback executes on the actor task.
 #[derive(Clone)]
 pub struct InterfaceInspectionSource {
     snapshot: Arc<dyn Fn() -> InterfaceInspectionSnapshot + Send + Sync>,
 }
 
 impl InterfaceInspectionSource {
+    /// Store a callback; this does not call it or start a polling task.
     pub fn new<F>(snapshot: F) -> Self
     where
         F: Fn() -> InterfaceInspectionSnapshot + Send + Sync + 'static,
@@ -53,6 +56,8 @@ impl InterfaceInspectionSource {
         }
     }
 
+    /// Call the callback synchronously. Unlike `GetInterfaceStats`, this method
+    /// does not catch callback panics.
     pub fn snapshot(&self) -> InterfaceInspectionSnapshot {
         (self.snapshot)()
     }
@@ -69,21 +74,23 @@ impl std::fmt::Debug for InterfaceInspectionSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AnnounceHandlerId(pub(crate) u64);
 
-/// Transport-level role of an interface. Python Reticulum distinguishes
-/// ordinary network interfaces, the local shared-instance listener, accepted
-/// local clients behind that listener, and the one interface a leaf process uses
-/// to reach an existing shared instance. Several routing rules depend on that
-/// distinction.
+/// Interface role used by routing and shared-instance policy. It is separate
+/// from `InterfaceMode`, which controls forwarding/discovery policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InterfaceRole {
+    /// Ordinary network interface.
     #[default]
     Normal,
+    /// Local shared-instance listener.
     SharedServer,
+    /// Accepted local client behind the shared listener.
     LocalClient,
+    /// Leaf process connection to an existing shared instance.
     SharedInstancePeer,
 }
 
 impl InterfaceRole {
+    /// Return the role label used by interface statistics.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Normal => "normal",
@@ -94,6 +101,10 @@ impl InterfaceRole {
     }
 }
 
+/// Raw driver input and optional physical-layer observations. Submit through
+/// the current `InterfaceTransportSender`; the actor rejects an unwrapped
+/// `TransportMessage::Inbound`. Metrics are interface-supplied, with no quality
+/// normalization performed by this record.
 #[derive(Debug)]
 pub struct InboundPacket {
     pub raw: Bytes,
@@ -103,13 +114,16 @@ pub struct InboundPacket {
     pub q: Option<f32>,
 }
 
+/// Packet bytes and destination supplied by the caller for local dispatch.
+/// This record does not construct, sign, encrypt or validate a packet.
 #[derive(Debug)]
 pub struct OutboundRequest {
     pub raw: Bytes,
     pub destination_hash: [u8; 16],
 }
 
-/// State update for one explicitly tracked outbound packet.
+/// Latest state of one explicitly tracked outbound packet. A watch channel
+/// retains the latest state, not an event history; a slow reader may skip updates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiptUpdate {
     Sent,
@@ -119,7 +133,11 @@ pub enum ReceiptUpdate {
     Culled,
 }
 
-/// Receipt metadata installed atomically with an outbound packet.
+/// Caller-supplied receipt metadata installed by `SendPacket` in the same
+/// actor turn as dispatch. The caller must provide hashes and a destination
+/// identity matching the packet; registration does not verify that binding.
+/// `None` timeout uses 180 seconds. Initialize the watch channel to `Sent`;
+/// terminal updates replace its current value.
 pub struct TrackedReceiptRegistration {
     pub truncated_hash: [u8; 16],
     pub full_hash: [u8; 32],
@@ -139,7 +157,11 @@ impl std::fmt::Debug for TrackedReceiptRegistration {
     }
 }
 
-/// Immediate outcome of dispatching a packet to the interface layer.
+/// Immediate local dispatch outcome. `Sent` means at least one eligible
+/// interface or in-process destination queue accepted the packet, not remote
+/// delivery. `NoInterface` also covers invalid packets and failed immediate
+/// admission; an announce may still be retained for a later retry.
+/// `ReceiptCollision` means the truncated receipt key was already registered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundDispatchResult {
     Sent,
@@ -194,28 +216,31 @@ pub enum LinkEndpointTerminalReason {
     TransportShutdown,
 }
 
-/// Exactly-once terminal notification for an established-Link binding.
+/// Terminal event attempted once when transport removes a Link binding.
+/// The notification can be lost if its receiver has closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkEndpointLifecycleEvent {
     pub binding: LinkEndpointBinding,
     pub reason: LinkEndpointTerminalReason,
-    /// Number of accepted packets that could not be emitted before teardown.
+    /// Packets retained in the endpoint FIFO, plus any packet counted during
+    /// terminal admission failure. This is not a count of over-the-air losses.
     pub dropped_packets: usize,
 }
 
-/// Immediate result of handing one established-Link packet to transport.
+/// Immediate result of handing an established-Link packet to transport.
 ///
-/// `Queued` is successful admission to the bounded, per-Link FIFO. It is not
-/// a claim that the interface driver has accepted the packet yet. Terminal
-/// interface failures are delivered through the lifecycle channel.
+/// `Sent` reports local driver/in-process queue admission. `Queued` reports
+/// admission to the bounded per-Link FIFO, before driver acceptance. Neither
+/// confirms remote delivery. Terminal interface failures use the lifecycle
+/// channel; transport does not reroute this binding to another interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkEndpointSendResult {
     Sent,
     Queued {
         depth: usize,
     },
-    /// A best-effort packet was intentionally discarded because ordered
-    /// control traffic or the exact interface queue was already full.
+    /// A best-effort packet was discarded because reliable traffic was
+    /// already queued or the exact interface queue was full.
     DroppedBackpressure,
     NotBound,
     RoleMismatch,
@@ -231,15 +256,16 @@ pub enum LinkEndpointUnbindResult {
     RoleMismatch,
 }
 
-/// Periodic maintenance tick. Drives cache culling, retransmit scheduling,
-/// and rate-limit decay so the actor needs no internal timer.
+/// Explicit maintenance trigger. The actor ignores `timestamp` and reads its
+/// own current time. `TransportActor::run` also schedules maintenance internally.
 #[derive(Debug)]
 pub struct TimerTick {
     pub timestamp: f64,
 }
 
-/// Metadata and TX handle for one registered interface. The actor owns the
-/// sender; driver code holds only the matching receiver.
+/// Registration metadata, capacity policy and TX sender for one interface.
+/// Public fields and builder methods store caller values; they do not start a
+/// driver. Registration and dispatch apply ownership/capacity checks separately.
 pub struct InterfaceEntry {
     pub owner: InterfaceOwner,
     pub packet_capacity: InterfacePacketCapacity,
@@ -249,11 +275,15 @@ pub struct InterfaceEntry {
     /// The listener that accepted this interface; `None` for configured ones.
     pub parent_id: Option<InterfaceId>,
     pub direction: InterfaceDirection,
+    /// Declared bitrate in bits per second, used for timing estimates.
     pub bitrate: u64,
+    /// Reported hardware MTU in bytes. Admission uses `packet_capacity`.
     pub mtu: u32,
     pub tx: mpsc::Sender<Bytes>,
     pub ifac_key: Option<rns_identity::ifac::IfacKey>,
+    /// Configured IFAC size in bytes; inactive when no key is set.
     pub ifac_size: usize,
+    /// Announce bitrate fraction: 0.02 represents 2%.
     pub announce_cap: f64,
     /// Earliest Unix time at which the next announce may be sent — enforces
     /// `ANNOUNCE_CAP` spacing in the outbound path.
@@ -269,36 +299,30 @@ pub struct InterfaceEntry {
     pub txb: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// Optional driver-owned aggregate inspection source.
     pub inspection: Option<InterfaceInspectionSource>,
-    /// Incremented when an outbound `try_send` cannot enqueue — surfaced in
-    /// interface stats to flag a driver whose receiver is falling behind.
+    /// Packets dropped by counted full-queue admission failures. This is not
+    /// a count of every send failure or of packets retained for later retry.
     pub tx_drops: Arc<std::sync::atomic::AtomicU64>,
-    /// Bytes of the packets counted in `tx_drops` (Python `tx_dropped_bytes`).
+    /// Pre-IFAC bytes of the packets counted by transport as full-queue drops.
     pub tx_dropped_bytes: u64,
-    /// Inbound packets dropped as malformed or invalid (Python
-    /// `Interface.protocol_violation`, Interface.py:327-330).
+    /// Inbound packets counted as malformed or invalid by transport.
     pub protocol_violations: u64,
     /// Inbound packets dropped for a missing, invalid or unexpected IFAC.
     pub ifac_violations: u64,
-    /// Inbound packets the packet filter rejected (Transport.py:1795).
+    /// Inbound packets rejected by the transport packet filter.
     pub packet_filter_hits: u64,
     pub ingress: IngressController,
     /// Announces awaiting bandwidth-capped retransmission. Drained in
     /// hop-priority order (lowest hops first, oldest among ties).
     pub announce_queue: Vec<QueuedAnnounce>,
-    /// Multipoint medium whose peers cannot hear each other (e.g. BLE Peer:
-    /// each peer is a separate point-to-point GATT link presented as one
-    /// interface). Unlike a shared broadcast medium, an announce arriving on
-    /// such an interface must be relayed back out the SAME interface to reach
-    /// its other peers. Loop safety comes from the announce-table dedup + hop
-    /// cap and the driver's own per-peer anti-loop filter.
+    /// Driver-supplied multipoint metadata. The current actor allows same-interface
+    /// announce relay for ordinary network roles independently of this flag;
+    /// setting it does not install a driver-level loop filter.
     pub multipoint: bool,
-    /// Python 1.3.8 `Interface.recursive_prs` (Interface.py:110): force
-    /// unknown-path discovery for path requests arriving on this interface,
-    /// independent of interface mode.
+    /// Enable unknown-path discovery for requests arriving on this interface,
+    /// independently of its mode.
     pub recursive_prs: bool,
-    /// Python 1.3.8 `Interface.announces_from_internal` (Interface.py:111):
-    /// when false, this interface does not rebroadcast announces whose
-    /// next-hop interface is `InterfaceMode::Internal`.
+    /// Whether to rebroadcast announces whose next-hop interface uses
+    /// `InterfaceMode::Internal`.
     pub announces_from_internal: bool,
 }
 
@@ -349,14 +373,17 @@ impl InterfaceEntry {
         }
     }
 
+    /// Replace admission capacity without changing the separately reported `mtu`.
     pub fn with_packet_capacity(mut self, capacity: InterfacePacketCapacity) -> Self {
         self.packet_capacity = capacity;
         self
     }
+    /// Replace the registration owner; current-generation checks occur at admission.
     pub fn with_owner(mut self, owner: InterfaceOwner) -> Self {
         self.owner = owner;
         self
     }
+    /// Return configured IFAC bytes when a key exists, or zero without a key.
     pub fn active_ifac_bytes(&self) -> usize {
         if self.ifac_key.is_some() {
             self.ifac_size
@@ -364,7 +391,8 @@ impl InterfaceEntry {
             0
         }
     }
-    /// Pre-allocation admission for a complete clear Reticulum packet.
+    /// Check current ownership and clear/wire byte capacity before allocation.
+    /// This does not parse a header or check direction or driver online state.
     pub fn accepts_clear_packet(&self, len: usize) -> bool {
         self.owner.is_current()
             && self
@@ -374,6 +402,8 @@ impl InterfaceEntry {
                 .checked_add(self.active_ifac_bytes())
                 .is_some_and(|wire| wire <= self.packet_capacity.max_wire_packet_bytes as usize)
     }
+    /// Compute clear-packet capacity after IFAC. An active key requires an IFAC
+    /// size in 1..=64 bytes; invalid capacity or IFAC returns an error.
     pub fn effective_clear_mtu(&self) -> Result<u32, InterfaceCapacityError> {
         if self.ifac_key.is_some() && !(1..=64).contains(&self.ifac_size) {
             return Err(InterfaceCapacityError::InvalidIfac);
@@ -382,17 +412,23 @@ impl InterfaceEntry {
             .effective_clear_mtu(self.active_ifac_bytes())
     }
 
+    /// Store the multipoint metadata flag.
     pub fn with_multipoint(mut self, multipoint: bool) -> Self {
         self.multipoint = multipoint;
         self
     }
 
+    /// Store an IFAC key and size in bytes. This builder does not validate the
+    /// size; `effective_clear_mtu` rejects active sizes outside 1..=64.
     pub fn with_ifac(mut self, key: [u8; 64], size: usize) -> Self {
         self.ifac_key = Some(key.into());
         self.ifac_size = size;
         self
     }
 
+    /// Store the minimum inter-announce interval and extra penalty in seconds,
+    /// plus the tolerated violation count. Values are not validated here. The
+    /// receive path uses these to suppress rebroadcast, not announce-cache updates.
     pub fn with_announce_rate(mut self, target: f64, grace: u32, penalty: f64) -> Self {
         self.announce_rate_target = Some(target);
         self.announce_rate_grace = Some(grace);
@@ -400,11 +436,13 @@ impl InterfaceEntry {
         self
     }
 
+    /// Store the role used by shared-instance routing policy.
     pub fn with_role(mut self, role: InterfaceRole) -> Self {
         self.role = role;
         self
     }
 
+    /// Attach driver-owned online state and cumulative RX/TX byte counters.
     pub fn with_counters(
         mut self,
         online: Arc<AtomicBool>,
@@ -461,16 +499,17 @@ pub struct AnnounceHandlerEvent {
     /// X25519 || Ed25519 public key from the announce payload.
     pub public_key: Option<[u8; 64]>,
     pub ratchet: Option<[u8; 32]>,
-    /// `SHA-256(app_name)[:10]` of the aspect this destination announced
-    /// under. Zero array if the announce arrived without a payload (degenerate
-    /// case — handlers with `aspect_filter == None` still receive it).
+    /// Ten-byte name hash from the destination's expanded hash name, including
+    /// any aspects or generated-identity suffix. The actor rejects missing or
+    /// invalid announce payloads before dispatching handlers.
     pub name_hash: [u8; 10],
 }
 
 /// Optional routing controls for an explicit path request.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PathRequestOptions {
-    /// Send only on this interface. `None` broadcasts on all outbound interfaces.
+    /// Restrict requests to this interface. `None` offers them to eligible
+    /// outbound interfaces; it does not guarantee queue admission.
     pub on_interface: Option<InterfaceId>,
     /// Caller-supplied request tag. At most the first 16 bytes are transmitted.
     pub tag: Option<Vec<u8>>,
@@ -478,9 +517,10 @@ pub struct PathRequestOptions {
     pub recursive: bool,
 }
 
-/// Every mutation of transport state enters through this enum — the actor
-/// dispatches on the variant, so adding a new operation is a matter of adding
-/// a variant and a match arm rather than exposing a new lock or shared type.
+/// Commands accepted by the transport actor. Some require a current
+/// producer-bound `InterfaceEvent`; others are trusted application operations.
+/// A mailbox send is not an operation acknowledgment. Unless a variant says
+/// otherwise, dropping its reply receiver does not cancel admitted work.
 // This is the transport actor's public message surface. Boxing individual
 // variants would churn all senders/receivers for little runtime benefit.
 #[allow(clippy::large_enum_variant)]
@@ -491,14 +531,21 @@ pub enum TransportMessage {
         owner: InterfaceOwner,
         message: Box<TransportMessage>,
     },
+    /// Driver input; requires a current owner-bound `InterfaceEvent`.
     Inbound(InboundPacket),
+    /// Dispatch without a result reply. Eligible Data packets receive an automatic
+    /// receipt, using any cached destination key; failures are not replied.
     Outbound(OutboundRequest),
+    /// Validate and dispatch a Link request, replying with local admission only.
+    /// A closed reply receiver is checked before processing; later cancellation
+    /// cannot retract transmitted bytes.
     SendLinkRequest {
         request: OutboundRequest,
         result_tx: tokio::sync::oneshot::Sender<
             Result<(), crate::link_messages::LinkRequestDispatchError>,
         >,
     },
+    /// Best-effort dispatch restricted to one interface, without a result reply.
     OutboundAttached {
         request: OutboundRequest,
         interface_id: InterfaceId,
@@ -531,10 +578,10 @@ pub enum TransportMessage {
         request: OutboundRequest,
         result_tx: tokio::sync::oneshot::Sender<LinkEndpointSendResult>,
     },
-    /// Reliably admit a final packet, then remove the endpoint and temporary
-    /// Link destination only after its ordered FIFO has drained. This prevents
-    /// a queued LINKCLOSE from being discarded by an immediately following
-    /// unbind or destination deregistration.
+    /// Use the reliable send path for a final packet, then remove the endpoint
+    /// and temporary Link destination after a successful FIFO drain or terminal
+    /// failure. Failure can discard queued bytes; `Queued` does not guarantee
+    /// eventual interface admission.
     SendLinkEndpointAndUnbind {
         link_id: [u8; 16],
         role: LinkEndpointRole,
@@ -549,44 +596,50 @@ pub enum TransportMessage {
         request: OutboundRequest,
         result_tx: tokio::sync::oneshot::Sender<LinkEndpointSendResult>,
     },
-    /// Dispatch an application packet and report whether an interface
-    /// accepted it. Optional receipt registration occurs in the same actor
-    /// turn, avoiding registration/send races.
+    /// Dispatch a packet and reply with its immediate local admission result.
+    /// Optional receipt registration occurs in the same actor turn. The result
+    /// is not remote delivery; see `OutboundDispatchResult` for retained announces.
     SendPacket {
         request: OutboundRequest,
         attached_interface: Option<InterfaceId>,
         receipt: Option<TrackedReceiptRegistration>,
         result_tx: tokio::sync::oneshot::Sender<OutboundDispatchResult>,
     },
-    /// Change the timeout of one still-pending tracked packet.
+    /// Change a still-pending receipt duration relative to its original send time,
+    /// without restarting the timer. Reply is false if no pending receipt matches.
     SetReceiptTimeout {
         truncated_hash: [u8; 16],
         timeout: std::time::Duration,
         result_tx: tokio::sync::oneshot::Sender<bool>,
     },
     Tick(TimerTick),
-    /// Read-only query paired with a oneshot reply channel — used for all
-    /// RPC and introspection so callers don't need direct state access.
+    /// Query or mutation paired with a reply. `TransportQuery` includes destructive
+    /// cache operations; admission is not an authorization check.
     Rpc {
         query: TransportQuery,
         response_tx: tokio::sync::oneshot::Sender<TransportQueryResponse>,
     },
+    /// Register a local destination without an acknowledgment. A supplied delivery
+    /// channel replaces the previous one; `None` leaves an existing channel intact.
     RegisterDestination {
         hash: [u8; 16],
         app_name: String,
         delivery_tx: Option<mpsc::Sender<crate::link_messages::DestinationEvent>>,
     },
+    /// Remove the local destination registration and its delivery channel.
     DeregisterDestination {
         hash: [u8; 16],
     },
+    /// Install a legacy bounded callback channel without a registration reply.
+    /// Full channels drop events; a closed channel is reaped.
     RegisterAnnounceHandler {
         aspect_filter: Option<String>,
         receive_path_responses: bool,
         callback_tx: mpsc::Sender<AnnounceHandlerEvent>,
     },
     /// Register one owned announce subscription and acknowledge once the actor
-    /// has installed it. `dropped_events` counts dispatches rejected by the
-    /// bounded callback channel.
+    /// has installed it. `dropped_events` counts full-channel dispatch failures.
+    /// If the registration reply cannot be delivered, the subscription is removed.
     RegisterAnnounceSubscription {
         aspect_filter: Option<String>,
         receive_path_responses: bool,
@@ -594,52 +647,72 @@ pub enum TransportMessage {
         dropped_events: Arc<AtomicU64>,
         result_tx: tokio::sync::oneshot::Sender<AnnounceHandlerId>,
     },
-    /// Remove legacy handler(s) whose `aspect_filter` matches; `None` removes
-    /// every legacy handler. Exact subscriptions are never affected. Handlers
-    /// with closed senders are also reaped on dispatch.
+    /// Remove matching legacy handlers; `None` selects all legacy handlers.
+    /// Active exact subscriptions are not selected by this filter. Closed handlers
+    /// of either kind are also reaped.
     DeregisterAnnounceHandler {
         aspect_filter: Option<String>,
     },
-    /// Remove exactly the subscription backed by `callback_tx`.
+    /// Remove the exact subscription identified by `id`, and reap closed handlers.
+    /// An optional reply reports whether that ID was present.
     DeregisterAnnounceSubscription {
         id: AnnounceHandlerId,
         result_tx: Option<tokio::sync::oneshot::Sender<bool>>,
     },
-    /// Ask the actor to satisfy a packet request: replay from its recent-
-    /// announce cache when possible, otherwise emit a CacheRequest packet.
+    /// Replay a matching packet from the local on-disk announce cache when
+    /// available. On a miss, a network CacheRequest is emitted only when transport
+    /// is enabled. This command has no success reply.
     CacheRequest {
         packet_hash: [u8; 32],
         destination_hash: [u8; 16],
     },
+    /// Request discovery using default explicit-request options; no reply is sent.
     RequestPath {
         destination_hash: [u8; 16],
     },
+    /// Request discovery with explicit interface/tag policy; no reply is sent.
     RequestPathWithOptions {
         destination_hash: [u8; 16],
         options: PathRequestOptions,
     },
+    /// Register an interface with current ownership and valid packet capacity.
+    /// Replacement requires a newer owner generation. Rejected entries are
+    /// ignored without a reply.
     RegisterInterface {
         id: InterfaceId,
         entry: InterfaceEntry,
     },
+    /// Remove an interface through its current owner-bound event; bare commands
+    /// are rejected so an old driver cannot remove a replacement.
     DeregisterInterface {
         id: InterfaceId,
     },
+    /// Set trusted local storage and synchronously load saved state. File errors
+    /// are logged, not returned; initialization may also migrate legacy cache data.
     SetStoragePaths {
         storage_dir: std::path::PathBuf,
     },
+    /// Change forwarding mode and identity/persistence policy. Disabling transport
+    /// also cancels pending background announce and recursive-discovery work.
     SetTransportEnabled {
         enabled: bool,
     },
+    /// Set the internal identity hash and recompute the visible transport hash
+    /// according to forwarding/static-identity policy.
     SetTransportIdentity {
         identity_hash: [u8; 16],
     },
+    /// Set accepted on-disk blackhole source filenames and load matching entries.
+    /// This does not purge entries already loaded from other sources.
     SetBlackholeSources {
         sources: Vec<[u8; 16]>,
     },
-    /// Shared-instance connection dropped; pause packet processing until the
-    /// matching `SharedConnectionRestored` arrives.
+    /// Handle loss of the current shared-instance peer: invalidate routing state
+    /// and terminate peer-bound Link endpoints. This is not a blanket pause of
+    /// all packet processing. Submit through the current interface owner.
     SharedConnectionLost,
+    /// Restore the current shared-instance peer and invalidate prior routing
+    /// state. Submit through that interface owner.
     SharedConnectionRestored {
         interface_id: InterfaceId,
     },
@@ -650,23 +723,25 @@ pub enum TransportMessage {
         interface_id: InterfaceId,
         raw_packet: Bytes,
     },
-    /// Register an outbound-packet receipt so the inbound path can match
-    /// arriving proofs back to `msg_id`.
+    /// Register a legacy receipt for later proof matching and destination fan-out.
+    /// An existing entry with the same truncated hash is replaced. The caller must
+    /// provide packet hashes and a trusted destination key that belong together.
     RegisterReceipt {
         truncated_hash: [u8; 16],
         full_hash: [u8; 32],
-        /// Destination and validated identity used to construct the outbound
-        /// packet. Delivery proofs must verify against this exact identity.
+        /// Destination used to construct the packet. The caller is responsible
+        /// for authenticating its supplied public key before registration.
         destination_hash: [u8; 16],
         destination_public_key: [u8; 64],
         msg_id: String,
         /// Override default 180s timeout when `Some`.
         timeout: Option<std::time::Duration>,
     },
-    /// Register an application-owned receipt with a direct, capacity-lossless
-    /// proof sink. Unlike the legacy destination fan-out, a validated terminal
-    /// proof cannot be discarded because an unrelated destination mailbox is
-    /// full.
+    /// Register a receipt with an unbounded direct proof sink, replacing an
+    /// existing entry with the same truncated hash. This avoids bounded mailbox
+    /// capacity loss, but a closed receiver can still lose the notification.
+    /// The caller must authenticate and bind the supplied key/hashes; `None`
+    /// timeout uses 180 seconds.
     RegisterReceiptWithProof {
         truncated_hash: [u8; 16],
         full_hash: [u8; 32],
@@ -676,8 +751,10 @@ pub enum TransportMessage {
         timeout: Option<std::time::Duration>,
         proof_tx: mpsc::UnboundedSender<crate::link_messages::DestinationEvent>,
     },
-    /// Record a new link in the table. `initiator=true` means we started the
-    /// handshake, so the entry is pending until `ActivateLink` arrives.
+    /// Record local Link bookkeeping after ownership/capacity checks. Initiators
+    /// remain pending until `ActivateLink`; responder entries start validated.
+    /// This command trusts the caller to have performed the corresponding protocol
+    /// checks and does not itself prove a handshake.
     RegisterLink {
         interface_owner: Option<InterfaceOwnerId>,
         link_id: [u8; 16],
@@ -687,17 +764,21 @@ pub enum TransportMessage {
         remaining_hops: u8,
         initiator: bool,
     },
-    /// Promote a pending (initiator) link to validated.
+    /// Mark an existing Link entry validated and established. This command
+    /// performs no cryptographic handshake verification itself.
     ActivateLink {
         link_id: [u8; 16],
     },
-    /// Block the caller until a path to `dest` is learned or the caller's
-    /// timeout fires. Used by request APIs that must not return before
-    /// forwarding is possible.
+    /// Reply true if a non-expired path is cached or subsequently learned, and
+    /// otherwise initiate discovery and park a waiter. Maintenance expires waiters
+    /// after 15 seconds; that is not a strict caller deadline or reachability proof.
+    /// Use `await_path` to bound command admission plus the reply wait.
     AwaitPath {
         dest: [u8; 16],
         reply: tokio::sync::oneshot::Sender<bool>,
     },
+    /// Request actor shutdown and its synchronous state-save path. There is no
+    /// completion reply, and this is not a durability acknowledgment.
     Shutdown,
 }
 
@@ -748,16 +829,23 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
     }
 }
 
-/// Read-mostly queries carried by `TransportMessage::Rpc`.
+/// Local introspection and mutation operations carried by `TransportMessage::Rpc`.
+/// These variants are not an access-control boundary. Responses describe local
+/// state and command results, not remote presence or persistence guarantees.
 #[derive(Debug, Clone)]
 pub enum TransportQuery {
+    /// Return currently non-expired paths; presence is not proof of reachability.
     GetPathTable,
+    /// Read metadata, counters and optional synchronous driver inspection.
+    /// Missing counters report zero; absent online state reports true. Rate fields
+    /// are currently zero placeholders, not measured throughput.
     GetInterfaceStats,
     GetRateTable,
     GetLinkCount,
     GetRecentAnnounces,
-    /// Recall one validated announce-cache entry without mutating its
-    /// `last_used` timestamp. Python: `Identity.recall(..., _no_use=True)`.
+    /// Return cached identity metadata without updating `last_used`. Locally
+    /// restored cache metadata is trusted; this query performs no fresh signature
+    /// verification, age check or network presence check.
     RecallDestination {
         dest: [u8; 16],
     },
@@ -793,31 +881,31 @@ pub enum TransportQuery {
     GetPacketQ {
         packet_hash: [u8; 32],
     },
-    /// First-hop timeout: `MTU * per_byte_latency + DEFAULT_PER_HOP_TIMEOUT`.
+    /// Return 500*8/declared first-hop bitrate + 6 seconds. A missing route,
+    /// interface or positive bitrate falls back to 6 seconds. This uses the
+    /// protocol 500-byte MTU, not the reported hardware MTU.
     FirstHopTimeout {
         dest: [u8; 16],
     },
-    /// Python-compatible slow-interface timing query: `MTU * per_byte_latency`.
-    ///
-    /// Link sessions may use this as establishment policy. Unvalidated
-    /// transport-table retention deliberately remains bitrate-independent.
+    /// Return 500*8/declared interface bitrate in seconds, or zero when no positive
+    /// bitrate is available. This is a caller timing estimate; unvalidated
+    /// transport-table retention is separately bitrate-independent.
     ExtraLinkProofTimeout {
         interface_id: InterfaceId,
     },
     DropPath {
         dest: [u8; 16],
     },
-    /// Temporarily reject path-table installs for `dest` learned through
-    /// `interface_id`. Used after link establishment failure so rediscovery can
-    /// consider alternate interfaces instead of immediately reselecting the
-    /// path that just failed.
+    /// Temporarily reject new path installs through this interface for the
+    /// destination. Duration must be positive and finite. This does not remove
+    /// the current route or guarantee that an alternative will be learned.
     SuppressPathInterface {
         dest: [u8; 16],
         interface_id: InterfaceId,
         duration: f64,
     },
-    /// Temporarily reject path-table installs for `dest` learned through the
-    /// interface that currently owns the path.
+    /// Apply suppression to the current non-expired path interface. Returns false
+    /// without such a path or for an invalid duration; the existing route remains.
     SuppressCurrentPathInterface {
         dest: [u8; 16],
         duration: f64,
@@ -841,38 +929,51 @@ pub enum TransportQuery {
     /// Separate from unblackhole-by-hash so operators can flush auto-populated
     /// entries without losing their explicit blocks.
     ClearSystemBlackholes,
-    /// Build this node's distributed blackhole `/list` manifest. Response is
-    /// `Data(msgpack)`.
+    /// Build a MessagePack manifest from local entries whose identity public keys
+    /// are present in the announce cache. `publisher` is caller-supplied. This
+    /// operation neither signs the manifest nor freshly verifies cached identities.
     BuildBlackholeManifest {
         publisher: [u8; 16],
     },
-    /// Merge a distributed blackhole `/list` manifest. Response is
-    /// `IntResult(count_applied)`.
+    /// Decode and merge a MessagePack manifest. Caller must authenticate its source
+    /// and apply authorization policy first: this query does not verify a publisher
+    /// or bind inner source fields to a trusted peer. Returns operation count or error.
     ApplyBlackholeManifest {
         payload: Vec<u8>,
     },
+    /// Set a registered interface's shared online flag false if present. This does
+    /// not invoke a driver shutdown; an absent flag is still reported as `Ok`.
     HaltInterface {
         id: InterfaceId,
     },
+    /// Set a registered interface's shared online flag true if present. This does
+    /// not reopen a driver; an absent flag is still reported as `Ok`.
     ResumeInterface {
         id: InterfaceId,
     },
+    /// Remove paths using a next hop and return the removed count. This operation
+    /// does not itself mark routing state dirty or confirm a disk save.
     DropAllVia {
         next_hop: [u8; 16],
     },
-    /// Drop every cached route from the path table and persist the empty table.
-    /// Response: `IntResult(count_cleared)`.
+    /// Clear cached routes and pending discovery state, then attempt a synchronous
+    /// routing-state save. `IntResult` is the removed route count; save failures
+    /// are logged and do not change that response.
     DropPathTable,
-    /// Drop every cached announce snapshot and persist the empty cache.
-    /// Response: `IntResult(count_cleared)`.
+    /// Clear cached announce metadata and attempt a synchronous routing-state
+    /// save. The returned count does not confirm persistence. Individual on-disk
+    /// packet-cache files are not removed by this operation.
     DropRecentAnnounces,
-    /// Remote-status RPC — interface stats + optional link count, wire-format
-    /// compatible with `Transport.remote_status_handler`.
+    /// Serialize the actor's status tuple: a list of interface key/value string
+    /// pairs and, optionally, Link count. This local helper is not the authenticated
+    /// remote-management service or a general wire-compatibility guarantee.
     RemoteStatus {
         include_link_count: bool,
     },
-    /// Remote-path RPC — path table filtered by destination and hop limit,
-    /// wire-format compatible with `Transport.remote_path_handler`.
+    /// Serialize local path entries filtered by destination and hop limit. Each
+    /// entry contains hex destination, hops, timestamp and interface name. Expired
+    /// entries can remain until culling; `command` is currently ignored. This is
+    /// not the authenticated remote-management service.
     RemotePath {
         command: String,
         destination: Option<[u8; 16]>,
@@ -888,10 +989,9 @@ pub enum TransportQuery {
     PathIsUnresponsive {
         dest: [u8; 16],
     },
-    /// Pin / unpin a destination from the cache. While retained, the
-    /// maintenance sweep will not reap the entry regardless of age.
-    /// Returns `BoolResult(true)` when the destination is known to the
-    /// cache, `false` when not.
+    /// Pin known announce metadata against age-based maintenance cleanup. Returns
+    /// false if unknown. Explicit cache clearing still removes retained entries;
+    /// use `UnretainDestination` to release the pin.
     RetainDestination {
         dest: [u8; 16],
     },
@@ -904,13 +1004,12 @@ pub enum TransportQuery {
     UnretainDestination {
         dest: [u8; 16],
     },
-    /// Immediate cleanup trigger. Returns `IntResult(entries_remaining)`.
-    /// The actor tick runs cleanup every 5 minutes regardless.
+    /// Run announce-metadata cleanup now and return the remaining count. Periodic
+    /// cleanup is additionally subject to its interval and startup-grace gates.
     CleanKnownDestinations,
-    /// Resolve a 16-byte hex blob — which may be either a destination hash or
-    /// an identity hash — to a canonical identity hash via `recent_announces`.
-    /// Returns `HashResult(Some(_))` on hit, `HashResult(None)` when the input
-    /// is neither a known destination nor a known identity. Read-only.
+    /// Resolve a raw 16-byte value as a destination first, then as an identity hash,
+    /// using cached public keys. Returns `HashResult(None)` on a miss. This does
+    /// not freshly authenticate the cache or contact a peer.
     ResolveIdentityHash {
         input: [u8; 16],
     },
@@ -921,12 +1020,14 @@ pub enum TransportQuery {
     FilterBlackholedDests {
         dests: Vec<[u8; 16]>,
     },
-    /// Drop every Manual blackhole entry whose identity is not currently in
-    /// `recent_announces`. Returns `IntResult(count_purged)`. Use sparingly —
-    /// this can drop legit-but-unseen entries.
+    /// Remove Manual blackhole entries whose identity has no matching cached
+    /// public key. The returned count reflects cache presence, not identity validity;
+    /// a legitimate but unseen or pruned identity can be removed.
     PurgeUnverifiedBlackholes,
 }
 
+/// Local actor results. `Ok` confirms handling only; individual operations
+/// define their own admission, cache and persistence limits.
 #[derive(Debug)]
 pub enum TransportQueryResponse {
     PathTable(Vec<PathTableRpcEntry>),
@@ -950,6 +1051,8 @@ pub enum TransportQueryResponse {
     Error(String),
 }
 
+/// Snapshot of a cached route. Times are Unix seconds; returned interface
+/// metadata can use fallback values if the interface is no longer registered.
 #[derive(Debug, Clone)]
 pub struct PathTableRpcEntry {
     pub hash: [u8; 16],
@@ -963,6 +1066,12 @@ pub struct PathTableRpcEntry {
     pub interface_role: InterfaceRole,
 }
 
+/// Interface metadata and sampled counters. Driver counters use independent
+/// atomic reads, so this is not a coherent instant across all fields. Missing
+/// counters become zero and missing online state becomes true; current
+/// `rx_rate`/`tx_rate` values are zero placeholders. `bitrate` is declared bits
+/// per second, `mtu` is reported bytes, `ifac_size` is configured bytes, and
+/// `announce_cap` is a fraction. Names can contain caller-supplied text.
 #[derive(Debug, Clone, Default)]
 pub struct InterfaceStatRpcEntry {
     pub id: InterfaceId,
@@ -995,7 +1104,7 @@ pub struct InterfaceStatRpcEntry {
     pub ifac_size: usize,
     pub tx_drops: u64,
     pub tx_dropped_bytes: u64,
-    /// Python `arxc`/`atxc`/`prxc`/`ptxc` (Interface.py:303-325).
+    /// Announces counted by the interface ingress controller.
     pub announces_received: u64,
     pub announces_sent: u64,
     pub path_requests_received: u64,
@@ -1007,6 +1116,8 @@ pub struct InterfaceStatRpcEntry {
     pub parent_id: Option<InterfaceId>,
 }
 
+/// Announce-rate state: rate is announces per second; timestamps, `last` and
+/// `blocked_until` are Unix seconds. A zero deadline means no active penalty.
 #[derive(Debug, Clone)]
 pub struct RateTableRpcEntry {
     pub hash: [u8; 16],
@@ -1017,6 +1128,8 @@ pub struct RateTableRpcEntry {
     pub timestamps: Vec<f64>,
 }
 
+/// Cached announce metadata, possibly restored from trusted local storage.
+/// This snapshot does not freshly verify a signature or establish a live path.
 #[derive(Debug, Clone)]
 pub struct AnnounceRpcEntry {
     pub dest_hash: [u8; 16],
@@ -1025,7 +1138,8 @@ pub struct AnnounceRpcEntry {
     pub timestamp: f64,
     pub public_key: Option<[u8; 64]>,
     pub ratchet: Option<[u8; 32]>,
-    /// `SHA-256(app_name)[:10]` for the announced aspect.
+    /// Ten-byte announce name hash from the destination's expanded hash name,
+    /// which can include aspects and a generated-identity suffix.
     pub name_hash: [u8; 10],
     /// True when the cached announce arrived as a path response instead of a
     /// fresh network announce.
@@ -1035,8 +1149,8 @@ pub struct AnnounceRpcEntry {
     pub retained: bool,
 }
 
-/// The identity-bearing subset of a cached announce returned by
-/// [`TransportQuery::RecallDestination`].
+/// Identity-bearing metadata returned by [`TransportQuery::RecallDestination`].
+/// It is trusted cache content, not a fresh signature or reachability result.
 #[derive(Debug, Clone)]
 pub struct RecalledDestinationRpcEntry {
     pub dest_hash: [u8; 16],
@@ -1047,6 +1161,8 @@ pub struct RecalledDestinationRpcEntry {
     pub timestamp: f64,
 }
 
+/// Blackhole-table snapshot. Times and TTL are seconds; source attribution
+/// can come from stored metadata or the local transport identity fallback.
 #[derive(Debug, Clone)]
 pub struct BlackholeRpcEntry {
     pub identity_hash: [u8; 16],
@@ -1056,10 +1172,9 @@ pub struct BlackholeRpcEntry {
     pub ttl: Option<f64>,
     pub reason: crate::blackhole::BlackholeReason,
     pub reason_label: Option<String>,
-    /// True if `recent_announces` currently contains an announce whose public
-    /// key hashes to `identity_hash`. False means we cannot confirm this entry
-    /// is a real identity — it may be garbage from a pre-fix caller, or a real
-    /// identity whose announce we have not yet received / has been pruned.
+    /// Whether a currently cached public key hashes to `identity_hash`. This is
+    /// a cache-presence test, not fresh signature validation, proof of reachability
+    /// or a judgment that an absent identity is invalid.
     pub verified: bool,
 }
 

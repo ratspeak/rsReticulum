@@ -1,7 +1,8 @@
 # Capacity, IFAC configuration, and application packet receipts
 
-These changes are part of the unreleased1.4.0 source line. They do not change
-the existing published1.3.0 release or establish a new release date.
+These changes are part of the 1.4.0 source line used by Ratspeak 1.0.37. They
+are not included in the published standalone 1.3.0 tools. The migration
+command below requires a matching 1.4 source build.
 
 ## Interface ownership and packet capacity
 
@@ -50,10 +51,12 @@ verification or the exact interface owner retained from the request/proof path.
 
 ## Explicit IFAC units
 
-An explicit `ifac_size` is interpreted as bits only when accompanied by
-`ifac_size_unit = bits`. The byte escape hatch is `ifac_size_bytes`; it cannot
-coexist with the bits fields. Supported effective sizes are 1–64 bytes. A bare
-old `ifac_size` requires migration; its historical meaning is not guessed.
+Use `ifac_size_unit = bits` with `ifac_size` to state the unit explicitly.
+Valid bit values are multiples of eight from 8 to 512. Without the unit key,
+values from 1 to 64 are rejected as ambiguous; valid values from 72 to 512
+are accepted as bits. The byte escape hatch is `ifac_size_bytes`, from 1 to 64;
+it cannot coexist with either bits field. Migrate ambiguous old values using
+their known source convention; the parser does not infer that convention.
 Omitting all size keys retains the interface class default. Explicit malformed
 sizes remain errors even when credentials are absent. Disabled interfaces may
 retain old settings, but must be migrated before enabling them.

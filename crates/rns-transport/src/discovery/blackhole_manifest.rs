@@ -1,8 +1,8 @@
 //! Wire-format codec for the distributed blackhole manifest.
 //!
-//! Mirrors the msgpack payload served by Python's
-//! `rnstransport.info.blackhole` request handler (Transport.py:3243) and
-//! consumed by the subscriber side of `BlackholeUpdater` (Discovery.py:658).
+//! Encodes and decodes the MessagePack body for the
+//! `rnstransport.info.blackhole` service's `/list` request. The codec does
+//! not authenticate a publisher or verify the truth of its blackhole reasons.
 //!
 //! # Wire shape
 //!
@@ -17,18 +17,17 @@
 //! }
 //! ```
 //!
-//! Python uses absolute-deadline `until` on the wire; the Rust table keeps
-//! relative `ttl`. Conversions happen at the boundary:
-//! - **encode**: `until = created + ttl` when `ttl.is_some()`, else `nil`.
-//! - **decode**: `created = now`, `ttl = max(0, until - now)`. This mirrors
-//!   the semantics in Transport.py:3212 — expired entries are skipped.
+//! The wire carries absolute `until` deadlines; the table keeps relative TTLs:
+//! - **build**: `until = created + ttl`, or `nil` without a TTL.
+//! - **apply**: skip deadlines at or before `now`, then use `created = now`
+//!   and `ttl = max(0, until - now)`. Decoding alone does not apply expiry.
 //!
 //! # Publication filter
 //!
-//! A node only publishes entries it issued itself. In-memory: entries with
-//! `source == None`. Python's equivalent filter (Transport.py:3256) is
-//! `source == Transport.identity.hash`; we keep `None` as a marker so the
-//! table does not need to know its own identity.
+//! [`build_local_manifest`] includes only entries with `source == None`.
+//! This marker is a caller-controlled provenance convention, not cryptographic
+//! evidence. Applying a manifest preserves its claimed inner source fields;
+//! callers must authorize the publisher and any delegated-source policy.
 
 use std::collections::BTreeMap;
 
@@ -38,15 +37,17 @@ use thiserror::Error;
 
 use crate::blackhole::{BlackholeEntry, BlackholeReason, BlackholeTable};
 
-/// A single manifest entry on the wire. `created` is not transmitted —
-/// Python stores `until` (absolute deadline) instead.
+/// One decoded manifest entry. The wire carries an absolute `until` deadline
+/// rather than `created`; field decoding does not establish trusted provenance.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlackholeManifestEntry {
     /// Absolute unix-second deadline, or `None` for permanent entries.
     pub until: Option<f64>,
-    /// Stable string identifier (see [`BlackholeReason::as_str`]).
+    /// Publisher-supplied reason label. Empty represents a wire `nil` reason;
+    /// unknown labels remain available alongside the parsed reason enum.
     pub reason: String,
-    /// Identity hash of the source that issued this entry.
+    /// Claimed source identity. The codec does not bind it to the responding
+    /// publisher or verify delegation.
     pub source: IdentityHash,
 }
 
@@ -68,19 +69,13 @@ pub enum ManifestError {
     Encode(String),
 }
 
-/// Build the msgpack manifest payload of **locally-issued** blackhole
-/// entries. Used by the `/list` request handler on
-/// `rnstransport.info.blackhole`.
+/// Build a manifest from entries marked local (`source == None`), writing
+/// `our_identity_hash` into every source field. Remote-marked entries are
+/// excluded, but expired entries are not filtered here.
 ///
-/// `our_identity_hash` is injected into every entry's `source` field so
-/// subscribers can correctly key entries by publisher.
-///
-/// `verified_ids`, when `Some(_)`, restricts the published entries to those
-/// whose identity hash is in the set — typically the set of identity hashes
-/// derivable from current `recent_announces` public keys. This refuses to
-/// republish unverifiable entries (e.g., garbage from a buggy caller, or
-/// identities whose announces have been pruned). When `None`, no filtering
-/// is applied — used by tests that want to inspect the raw round-trip.
+/// `verified_ids`, when supplied, restricts output to hashes in that set.
+/// The helper trusts the set; it does not verify identities itself. `None`
+/// disables this additional filter. The returned body is not signed here.
 pub fn build_local_manifest(
     table: &BlackholeTable,
     our_identity_hash: IdentityHash,
@@ -126,9 +121,15 @@ fn encode_entry_map(until: Option<f64>, reason: &str, source: IdentityHash) -> V
     ])
 }
 
-/// Parse a msgpack manifest payload into `(identity_hash, entry)` pairs.
-/// Sorted for deterministic iteration in tests; order is not load-bearing
-/// otherwise.
+/// Decode the first MessagePack map and return entries sorted by identity hash.
+/// Required field types and 16-byte hashes are checked; malformed entries fail
+/// the whole load. Repeated identities keep their last decoded entry, repeated
+/// recognized fields keep their last decoded value, and unknown fields are
+/// ignored. Trailing bytes after the map are not rejected.
+///
+/// This neither authenticates source claims nor filters expired entries.
+/// Floating-point deadlines need not be finite; validate that policy before
+/// applying untrusted input. No input-size or entry-count bound is imposed here.
 pub fn decode_manifest(
     bytes: &[u8],
 ) -> Result<Vec<([u8; 16], BlackholeManifestEntry)>, ManifestError> {
@@ -210,17 +211,18 @@ fn decode_entry_map(v: Value) -> Result<BlackholeManifestEntry, ManifestError> {
     })
 }
 
-/// Merge a decoded manifest into `table`. `source_identity_hash` is the
-/// publisher that answered the `/list` request; each entry's inner
-/// `source` field is preserved so a chain of republishers stays
-/// traceable (Python parity: Discovery.py:672-675).
+/// Merge entries into `table`, trusting their inner source fields. There is
+/// no publisher parameter or authentication check: the caller must authorize
+/// the manifest before applying it and supply finite time values.
 ///
-/// Skips:
-/// - entries whose local-table source is `None` (locally-issued always wins);
-/// - entries whose `until` deadline has already passed (matches
-///   Transport.py:3212).
+/// Entries with `until <= now` are skipped. Any existing entry marked local
+/// (`source == None`) wins, even if it is expired but not yet culled. Otherwise
+/// the incoming entry replaces the identity's record, retaining its reason
+/// label and claimed source and converting the deadline to a remaining TTL.
+/// Entries absent from the manifest are not removed.
 ///
-/// Returns the number of entries actually inserted or updated.
+/// Returns the number of insert/update operations, which can exceed the number
+/// of unique identities if the supplied slice repeats them.
 pub fn apply_manifest(
     table: &mut BlackholeTable,
     manifest: &[([u8; 16], BlackholeManifestEntry)],

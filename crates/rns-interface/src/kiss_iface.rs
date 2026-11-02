@@ -29,8 +29,14 @@ pub struct KissInterfaceConfig {
     pub txtail: Option<u8>,
     /// Honour CMD_READY from TNC.
     pub flow_control: bool,
-    /// Station-ID beacon: seconds between IDs, counted from the first data
-    /// TX after the previous beacon (Python `id_interval`/`id_callsign`).
+    /// Station-ID delay in seconds, armed by data transmission. Both this field
+    /// and `id_callsign` must be set to enable automatic beacons.
+    ///
+    /// In this implementation, callsigns shorter than 15 bytes are padded for
+    /// transmission but compared with the unpadded value when resetting the timer.
+    /// After becoming due, such a beacon can repeat on each one-second idle poll,
+    /// subject to flow control and successful writes. Set either option to `None`
+    /// to disable automatic beaconing.
     pub id_interval: Option<u64>,
     pub id_callsign: Option<Vec<u8>>,
 }
@@ -57,7 +63,7 @@ impl KissInterfaceConfig {
 }
 
 /// Beacon frame payload: callsign zero-padded to the 15-byte minimum
-/// (Python KISSInterface.py:350-353).
+/// (Python `KISSInterface.read_loop`).
 pub fn beacon_frame_payload(id_callsign: &[u8]) -> Vec<u8> {
     let mut frame = id_callsign.to_vec();
     while frame.len() < 15 {

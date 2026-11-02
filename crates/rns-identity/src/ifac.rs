@@ -24,7 +24,8 @@ pub enum IfacError {
 ///
 /// `ifac_origin` concatenates `SHA-256(network_name)` and `SHA-256(passphrase)`
 /// for whichever fields are `Some(_)` (a `None` field is omitted, so `None`
-/// and `Some("")` differ), then HKDF-SHA256 expands it under the fixed salt.
+/// and `Some("")` differ). HKDF-SHA256 expands `SHA-256(ifac_origin)` under
+/// the fixed salt.
 /// First 32 bytes → X25519 private; second 32 → Ed25519 seed.
 pub fn derive_ifac_key(
     network_name: Option<&str>,
@@ -131,7 +132,10 @@ pub fn ifac_signature(ifac_key: &[u8; 64]) -> Option<[u8; 64]> {
         .sign(&sha256(ifac_key))
 }
 
-/// Split IFAC key into `(signing_key, masking_key)`, each 32 bytes.
+/// Split the derived identity material into its first and second 32-byte halves.
+/// They are the X25519 private bytes and Ed25519 seed, respectively.
+/// IFAC packet masking uses the full 64-byte key as its HKDF salt; the first
+/// half is not a separate packet-signing key.
 pub fn split_ifac_key(key: &[u8; 64]) -> (&[u8], &[u8]) {
     (&key[..32], &key[32..])
 }

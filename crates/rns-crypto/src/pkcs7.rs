@@ -8,7 +8,8 @@ const BLOCK_SIZE: usize = 16;
 /// Errors surfaced by [`unpad`].
 #[derive(Debug, Error)]
 pub enum Pkcs7Error {
-    /// Trailing byte is zero or greater than the 16-byte block size.
+    /// Trailing byte is zero, greater than the 16-byte block size, or greater
+    /// than the input length.
     #[error("invalid padding: padding byte value {0} exceeds block size {BLOCK_SIZE}")]
     InvalidPaddingValue(u8),
     /// The declared padding length doesn't match the trailing bytes.
@@ -33,7 +34,8 @@ pub fn pad(data: &[u8]) -> Vec<u8> {
 
 /// Strip PKCS7 padding for a 16-byte block size.
 ///
-/// All padding bytes are validated; a mismatch returns an error.
+/// All padding bytes are validated; a mismatch returns an error. This helper
+/// checks the trailing padding only, not the input's total block alignment.
 pub fn unpad(data: &[u8]) -> Result<&[u8], Pkcs7Error> {
     if data.is_empty() {
         return Err(Pkcs7Error::EmptyInput);

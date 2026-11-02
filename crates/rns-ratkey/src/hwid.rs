@@ -1,5 +1,11 @@
-//! `.hwid` TOML: public metadata for a hardware identity. No private key material ever.
-//! Location: `<reticulum-config-dir>/identities/{hash_hex}/identity.hwid`.
+//! TOML metadata for a hardware identity. The defined fields contain public
+//! keys, device/policy annotations and optional certificates, not a private-key
+//! backup. Provisioning writes `<identities_dir>/<hash_hex>/identity.hwid`;
+//! the caller chooses that directory.
+//!
+//! Parsing checks the TOML shape, not key/hash binding, device authenticity,
+//! attestation validity or policy enforcement. Strings and status fields are
+//! caller-controlled; loaders must perform the checks they rely on.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -34,7 +40,8 @@ pub struct HwidIdentity {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HwidDevice {
-    /// "yubikey5" or "nitrokey3".
+    /// Device label, for example "yubikey5", "nitrokey3" or "unknown".
+    /// The label alone does not establish firmware or algorithm compatibility.
     #[serde(rename = "type")]
     pub device_type: String,
     pub serial: u32,
@@ -59,7 +66,9 @@ pub struct HwidSlots {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HwidPolicy {
-    /// Seconds; 0 = never cache.
+    /// Requested PIN-cache duration in seconds; zero conventionally disables
+    /// cache reuse. The current PivSession/PCSC identity loader does not apply
+    /// this field and uses its own five-minute cache.
     #[serde(default = "default_pin_cache_timeout")]
     pub pin_cache_timeout: u64,
     /// "always" | "cached" | "never".
@@ -87,8 +96,9 @@ pub struct HwidAttestation {
     pub ed25519_cert: String,
     #[serde(default)]
     pub x25519_cert: String,
-    /// Cryptographic attestation-chain verification status. Metadata
-    /// extraction alone must not set this true.
+    /// Stored attestation-chain verification claim. Metadata extraction alone
+    /// must not set it true; reading the TOML does not reverify the claim or
+    /// bind these certificates to the configured public keys.
     #[serde(default)]
     pub verified: bool,
 }
@@ -102,7 +112,8 @@ pub struct HwidApp {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HwidBackup {
-    /// 0=none, 1=device-clone, 2=encrypted-offline.
+    /// Backup annotation: 0=none, 1=device-clone, 2=encrypted-offline.
+    /// This field does not create, restore or verify a backup.
     #[serde(default)]
     pub tier: u8,
     /// Tier 1 only.
@@ -131,7 +142,7 @@ impl HwidConfig {
 
     pub fn to_string(&self) -> Result<String, RatkeyError> {
         let header = "# RATKEY Hardware Identity \u{2014} DO NOT EDIT MANUALLY\n\
-                      # Private keys exist ONLY on the hardware device.\n\n";
+                      # This file contains public metadata, not private keys.\n\n";
         let body =
             toml::to_string_pretty(self).map_err(|e| RatkeyError::InvalidHwid(e.to_string()))?;
         Ok(format!("{header}{body}"))

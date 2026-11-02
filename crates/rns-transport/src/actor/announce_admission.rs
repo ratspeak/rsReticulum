@@ -97,7 +97,8 @@ impl TransportActor {
         );
     }
 
-    /// Additive finite local-announcement admission lane. Obtain before run.
+    /// Obtain a handle to the bounded local-announcement admission queue before
+    /// moving this actor into `run`. The handle does not start actor processing.
     pub fn announce_dispatch_handle(&self) -> crate::announce_dispatch::AnnounceDispatchHandle {
         crate::announce_dispatch::AnnounceDispatchHandle {
             tx: self.announce_dispatch_tx.clone(),

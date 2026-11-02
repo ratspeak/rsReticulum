@@ -1,4 +1,4 @@
-//! Bounded recovery of a locally originated Link's route.
+//! Bounded recovery of routes used by local Links and tracked packet attempts.
 //!
 //! The transport records the route actually used at dispatch. Recovery may
 //! invalidate that unchanged route, never a replacement learned meanwhile.
@@ -13,8 +13,12 @@ pub(crate) const RECOVERY_QUEUE_CAPACITY: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PathRecoveryOutcome {
+    /// A matching observed local route was selected for expiry.
     pub path_dropped: bool,
+    /// An unexpired route remains after the comparison; no reachability check.
     pub has_path: bool,
+    /// New or existing discovery work was found in a local queue/admission
+    /// lane. This is not proof that a request will be transmitted.
     pub request_scheduled: bool,
 }
 
@@ -53,8 +57,10 @@ pub(crate) enum FailedRouteAttempt {
 
 /// Cloneable, transport-generation-owned admission handle. Obtain it before
 /// running the actor with [`crate::actor::TransportActor::path_recovery_handle`].
-/// This additive control lane does not change the existing exhaustive mailbox
-/// enums or the semantics of explicit interface-suppression APIs.
+/// Recovery does not suppress interfaces. Route comparisons require observations
+/// younger than one hour by wall-clock age. Observations share a 1024-attempt
+/// limit, so older attempts can be evicted before that age.
+/// Unknown observations may request discovery but cannot invalidate a route.
 #[derive(Debug, Clone)]
 pub struct PathRecoveryHandle {
     pub(crate) tx: mpsc::Sender<PathRecoveryRequest>,
@@ -94,9 +100,11 @@ impl PathRecoveryHandle {
     }
 
     /// Invalidate only the unchanged local route used by a tracked packet,
-    /// without scheduling discovery. Unknown, consumed, cancelled or replaced
-    /// attempts cannot invalidate a route. The returned `path_dropped` flag is
-    /// evidence of this local comparison, not permission or an atomic guarantee
+    /// without scheduling discovery. Unknown, expired, consumed or route-mismatched
+    /// attempts cannot invalidate a route. A request whose receiver is dropped
+    /// before execution is skipped without consuming its observation. The
+    /// returned `path_dropped` flag is evidence of this local comparison,
+    /// not permission or an atomic guarantee
     /// for another process' route table.
     ///
     /// Shared-client coordinators can use this before an authenticated owner

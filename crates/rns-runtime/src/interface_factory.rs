@@ -1,5 +1,7 @@
-//! Mirrors `Reticulum._synthesize_interface` in the Python reference but
-//! rejects external-program interfaces.
+//! Parse built-in interface configurations and shared post-construction
+//! settings. Driver availability depends on enabled Cargo features and the
+//! target platform. `PipeInterface` is supported and runs a configured
+//! subprocess when started; this factory itself only constructs configuration.
 
 use std::time::Duration;
 
@@ -68,14 +70,17 @@ pub struct KissSerialConfig {
     pub parity: String,
     pub stop_bits: u8,
     pub mode: InterfaceMode,
-    /// TNC timing, config units are milliseconds (Python defaults 350/20/64/20;
-    /// persistence is a raw 0-255 CSMA p-value, not ms).
+    /// TNC preamble in milliseconds. Parser defaults for preamble, TX tail,
+    /// persistence and slot time are 350 ms, 20 ms, 64 and 20 ms respectively;
+    /// persistence is a raw 0..=255 CSMA value, not a duration.
     pub preamble_ms: u32,
     pub txtail_ms: u32,
     pub persistence: u8,
     pub slottime_ms: u32,
     pub flow_control: bool,
-    /// Station-ID beacon: seconds between IDs, sent only after data TX.
+    /// Station-ID interval in seconds after data TX. Current KISS beacons
+    /// with callsigns shorter than 15 bytes can repeat on each one-second
+    /// idle poll. Omit either this option or `id_callsign` to disable beacons.
     pub id_interval: Option<u64>,
     pub id_callsign: Option<String>,
 }
@@ -99,8 +104,9 @@ pub struct AutoInterfaceConfig {
 pub struct RNodeInterfaceConfig {
     pub name: String,
     pub port: String,
-    /// Android USB stable identity. These are ignored for non-AndroidUSB
-    /// ports, and serial remains optional because Android hides it pre-grant.
+    /// Optional Android USB matching metadata. Vendor/product IDs must be
+    /// supplied together; the serial may be absent. Other backends do not
+    /// use these values for device selection.
     pub usb_vendor_id: Option<u16>,
     pub usb_product_id: Option<u16>,
     pub usb_serial_number: Option<String>,
@@ -111,11 +117,13 @@ pub struct RNodeInterfaceConfig {
     pub coding_rate: u8,
     pub tx_power: i8,
     pub mode: InterfaceMode,
-    /// Gate each TX on the radio's CMD_READY. Python default: off.
+    /// Gate TX on radio CMD_READY flow control. Parser default: false.
     pub flow_control: bool,
-    /// Short-term airtime cap, percent (0.0..=100.0). `None` = unlimited.
+    /// Short-term airtime cap, percent (0.0..=100.0). `None` sends no
+    /// command for this setting; it does not explicitly clear a prior limit.
     pub st_alock: Option<f32>,
-    /// Long-term airtime cap, percent (0.0..=100.0). `None` = unlimited.
+    /// Long-term airtime cap, percent (0.0..=100.0). `None` sends no
+    /// command for this setting; it does not explicitly clear a prior limit.
     pub lt_alock: Option<f32>,
     /// Station-ID beacon: seconds between IDs, sent only after data TX.
     pub id_interval: Option<u64>,
@@ -165,7 +173,10 @@ impl RNodeInterfaceConfig {
 #[derive(Debug, Clone)]
 pub struct BleRNodeInterfaceConfig {
     pub name: String,
-    /// `ble://` URI: MAC, adapter-local name, or empty for any RNode.
+    /// `ble://` followed by a platform peripheral identifier or advertised
+    /// name. An empty suffix selects a discovered NUS advertiser, or an
+    /// RNode-named peripheral whose service list is empty. Identifier forms
+    /// depend on the platform; this is discovery, not identity authentication.
     pub port: String,
     pub frequency: u32,
     pub bandwidth: u32,
@@ -173,11 +184,13 @@ pub struct BleRNodeInterfaceConfig {
     pub coding_rate: u8,
     pub tx_power: i8,
     pub mode: InterfaceMode,
-    /// Gate each TX on the radio's CMD_READY. Python default: off.
+    /// Gate TX on radio CMD_READY flow control. Parser default: false.
     pub flow_control: bool,
-    /// Short-term airtime cap, percent (0.0..=100.0). `None` = unlimited.
+    /// Short-term airtime cap, percent (0.0..=100.0). `None` sends no
+    /// command for this setting; it does not explicitly clear a prior limit.
     pub st_alock: Option<f32>,
-    /// Long-term airtime cap, percent (0.0..=100.0). `None` = unlimited.
+    /// Long-term airtime cap, percent (0.0..=100.0). `None` sends no
+    /// command for this setting; it does not explicitly clear a prior limit.
     pub lt_alock: Option<f32>,
     /// Station-ID beacon: seconds between IDs, sent only after data TX.
     pub id_interval: Option<u64>,
@@ -191,7 +204,8 @@ pub struct LocalInterfaceConfig {
     pub mode: InterfaceMode,
 }
 
-/// Requires a local I2P router reachable via the SAM API.
+/// Requires an I2P router reachable through its SAM API. The parser defaults
+/// to `127.0.0.1:7656`; the host and port can be configured.
 #[derive(Debug, Clone)]
 pub struct I2PInterfaceConfig {
     pub name: String,
@@ -202,12 +216,15 @@ pub struct I2PInterfaceConfig {
     pub mode: InterfaceMode,
 }
 
-/// Subprocess; frames carried over its stdio.
+/// Subprocess interface carrying HDLC-framed packets over stdin/stdout.
+/// The driver splits `command` on whitespace into executable and arguments;
+/// it does not interpret shell quoting, expansion or redirection.
 #[derive(Debug, Clone)]
 pub struct PipeInterfaceConfig {
     pub name: String,
     pub command: String,
-    /// Respawn delay after EOF, seconds.
+    /// Delay in seconds before retrying after spawn failure, stdout EOF or
+    /// read failure. Parser default: 5.
     pub respawn_delay: u64,
     pub mode: InterfaceMode,
 }
@@ -222,7 +239,8 @@ pub struct RNodeMultiInterfaceConfig {
     pub flow_control: bool,
     pub subinterfaces: Vec<RNodeSubInterfaceConfig>,
     pub mode: InterfaceMode,
-    /// Parent-level station-ID beacon (sent on all subinterfaces when due).
+    /// Parent-level station-ID interval in seconds. Due beacons target all
+    /// configured subinterfaces, including those with `outgoing = false`.
     pub id_interval: Option<u64>,
     pub id_callsign: Option<String>,
 }
@@ -245,8 +263,8 @@ pub struct RNodeSubInterfaceConfig {
     pub mode: InterfaceMode,
 }
 
-/// KISS serial wrapped in AX.25 frames for amateur-radio compliance; prefer
-/// plain `KISSInterface` when AX.25 isn't required.
+/// AX.25-framed packets carried over a KISS serial TNC, with a configured
+/// callsign and SSID.
 #[cfg(feature = "serial")]
 #[derive(Debug, Clone)]
 pub struct AX25KISSInterfaceConfig {
@@ -266,8 +284,8 @@ pub struct AX25KISSInterfaceConfig {
     pub mode: InterfaceMode,
 }
 
-/// Wire-compatible with Python `BackboneInterface`. Per-peer TCP keepalive +
-/// `TCP_USER_TIMEOUT` tuning matches Python `set_timeouts_linux()`.
+/// TCP Backbone configuration. `target_host` selects client mode; otherwise
+/// the interface listens. Socket timeout support is platform-dependent.
 #[derive(Debug, Clone)]
 pub struct BackboneInterfaceConfig {
     pub name: String,
@@ -277,19 +295,21 @@ pub struct BackboneInterfaceConfig {
     pub device: Option<String>,
     pub prefer_ipv6: bool,
     pub mode: InterfaceMode,
-    /// Initial connect timeout (seconds). Python default: 5.
+    /// Initial connect timeout in seconds. Parser default: 5.
     pub connect_timeout: u64,
-    /// Client reconnection budget. `None` = retry forever (Python default).
+    /// Client reconnection budget. `None` means retry without a count limit
+    /// while the interface remains active; this is the parser default.
     pub max_reconnect_tries: Option<usize>,
     /// Parsed for Python config compatibility; advisory only.
     pub i2p_tunneled: bool,
-    /// Listener-only fast-flap blocking switch. Python default: enabled.
+    /// Listener-only fast-flap blocking switch. Parser default: enabled.
     pub block_fast_flapping: bool,
-    /// Listener-only short-connection threshold. Python default: 20 seconds.
+    /// Listener-only short-connection threshold. Parser default: 20 seconds.
     pub fast_flapping_threshold: Duration,
-    /// Listener-only tolerated short-connection count. Python default: 5.
+    /// Listener-only tolerated short-connection count. Parser default: 5.
     pub fast_flapping_grace: u64,
-    /// Listener-only block time. Configured in minutes; Python default: 720.
+    /// Listener-only block duration. The configuration file uses minutes;
+    /// the runtime field is a `Duration`. Parser default: 720 minutes.
     pub fast_flapping_block_time: Duration,
 }
 
@@ -414,6 +434,10 @@ fn parse_duration_strict(
     })
 }
 
+/// Parse an enabled interface section into a built-in driver configuration.
+/// No device, socket or subprocess is opened here. Performs IFAC-size and
+/// ingress-override validation; callers starting a driver must also apply
+/// `InterfacePostInit` and the driver's own validation.
 pub fn synthesize_interface(
     name: &str,
     section: &ConfigSection,
@@ -594,9 +618,10 @@ fn synthesize_tcp_client(
     Ok(config)
 }
 
-/// Validate explicit capacity promises before starting a driver. Automatic
-/// budgets are attenuated by the registered wire/IFAC capacity; an explicit TCP
-/// fixed MTU must instead be wholly supportable or fail configuration.
+/// Validate explicit IFAC byte sizes and TCP client `fixed_mtu` before driver
+/// startup. A fixed MTU must be at least 500 and fit the driver wire budget
+/// after active IFAC overhead. This does not validate every interface field;
+/// automatic capacity selection happens during runtime registration.
 pub fn validate_config_capacity(
     config: &InterfaceConfig,
     post_init: &InterfacePostInit,
@@ -1102,7 +1127,7 @@ fn parse_generic_rnode_airtime_value(
 /// Radio parameters are deliberately required: Python errors when they are
 /// absent (RNodeInterface validation fails on the 0 fallbacks), and silently
 /// inventing RF parameters — especially TX power — risks misconfigured
-/// transmissions. Documented in fix-registry (final sweep decision items).
+/// transmissions.
 #[cfg(any(feature = "serial", feature = "ble"))]
 fn require_rnode_radio_params(
     name: &str,
@@ -1612,24 +1637,33 @@ fn synthesize_backbone(
 pub struct InterfacePostInit {
     pub outgoing: bool,
     pub bitrate: Option<u64>,
+    /// Normalized fraction of interface bitrate, parsed from file percentages.
+    /// `None` uses the runtime default; for example, file value `2` becomes `0.02`.
     pub announce_cap: Option<f64>,
     pub announce_rate_target: Option<u64>,
     pub announce_rate_grace: Option<u32>,
     pub announce_rate_penalty: Option<u64>,
     pub ifac_network_name: Option<String>,
-    /// Wiped when dropped.
+    /// This owned copy is wiped on drop. The input `ConfigSection` retains its
+    /// separate ordinary `String` copy.
     pub ifac_passphrase: Option<zeroize::Zeroizing<String>>,
+    /// Effective IFAC tag length in bytes, already decoded from file units.
     pub ifac_size: Option<usize>,
-    /// Fallback when `ifac_size` is unset; per-class in Python.
+    /// IFAC size in bytes used when `ifac_size` is unset. `try_from_section`
+    /// starts at 8; apply `with_default_ifac_size(default_ifac_size_for(config))`
+    /// for the selected interface class.
     pub default_ifac_size: usize,
     pub ingress_control: bool,
-    /// Per-interface overrides for Python `ic_*` ingress knobs.
+    /// Per-interface ingress/egress overrides parsed from `ic_*`, `ec_pr_freq`
+    /// and `egress_control` settings.
     pub ingress_overrides: rns_transport::ingress::IngressOverrides,
-    /// Python 1.3.8 `recursive_prs` (Reticulum.py:808-809, default false):
-    /// force unknown-path discovery on path requests regardless of mode.
+    /// Allow recursive discovery of unknown destinations regardless of interface
+    /// mode. Transport enablement, ingress limiting and discovery admission
+    /// still apply. Parser default: false.
     pub recursive_prs: bool,
-    /// Python 1.3.8 `announces_from_internal` (Reticulum.py:811-812, default
-    /// true): rebroadcast announces learned via MODE_INTERNAL interfaces.
+    /// Allow relaying non-local announces whose next hop is an Internal-mode
+    /// interface. Other relay policy gates still apply; locally originated
+    /// announces bypass this option. Parser default: true.
     pub announces_from_internal: bool,
 }
 
@@ -1728,7 +1762,8 @@ fn normalize_announce_cap_percent(value: f64) -> Option<f64> {
     }
 }
 
-/// Python `DEFAULT_IFAC_SIZE`: network interfaces 16 bytes, serial/packet-radio 8.
+/// Default IFAC tag length in bytes: 16 for TCP, UDP, Auto, I2P and Backbone;
+/// 8 for the remaining built-in interface classes. This does not activate IFAC.
 pub fn default_ifac_size_for(config: &InterfaceConfig) -> usize {
     match config {
         InterfaceConfig::TcpClient(_)

@@ -43,8 +43,10 @@ pub fn hkdf_sha256(
     Ok(okm)
 }
 
-/// Derive the 64-byte session key used for RNS link encryption:
-/// `HKDF-SHA256(length=64, ikm=shared_secret, salt=identity_hash, info=None)`.
+/// Derive 64 key bytes with the caller-provided salt:
+/// `HKDF-SHA256(length=64, ikm=shared_secret, salt=salt, info=None)`.
+/// Identity encryption passes the identity hash. Link key derivation instead
+/// selects its key length by mode and uses the Link ID as salt.
 /// The key is expanded straight into its return buffer, which is wiped on drop.
 pub fn derive_key_64(shared_secret: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 64]>, HkdfError> {
     let mut okm = Zeroizing::new([0u8; 64]);

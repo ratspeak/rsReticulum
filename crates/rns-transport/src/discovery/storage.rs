@@ -1,5 +1,8 @@
-//! Persistence for discovered interfaces — one msgpack file per learned
-//! interface named after `discovery_hash` hex (matches Python `InterfaceDiscovery`).
+//! Local discovered-interface records, stored as one MessagePack file per
+//! [`discovery_hash`]. Files contain advertised fields, including any IFAC
+//! passphrase, without storage encryption. Use a dedicated, trusted directory:
+//! loading does not revalidate announce signatures or proof of work, and
+//! [`DiscoveryStore::list`] may remove records while listing them.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,7 +16,8 @@ use super::constants::{
     THRESHOLD_UNKNOWN_SECS,
 };
 
-/// Freshness status for a learned interface.
+/// Age bucket for the last heard announce. Even `Available` does not establish
+/// a current connection or reachable endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoveryStatus {
     Stale,
@@ -31,6 +35,7 @@ impl DiscoveryStatus {
         }
     }
 
+    /// Lowercase status label: `stale`, `unknown` or `available`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Stale => "stale",
@@ -40,13 +45,16 @@ impl DiscoveryStatus {
     }
 }
 
-/// A single learned interface.
+/// Advertised interface metadata plus local observation history. Public fields
+/// can also be supplied directly; the store does not authenticate their source.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiscoveredInterface {
     pub info: DiscoveryInfo,
-    /// Source transport ID — lets a reader filter by `interface_discovery_sources`.
+    /// Source identity used by the receiver's source filter. The receiver uses
+    /// the announce event's identity hash when present, otherwise the claimed
+    /// `info.transport_id`; the two values need not be equal.
     pub network_id: [u8; 16],
-    /// Distance hint when the announce was received (0 if unknown).
+    /// Hop count copied from the announce event; not a current path measurement.
     pub hops: u8,
     /// Stamp value observed on the latest announce.
     pub stamp_value: u8,
@@ -56,14 +64,17 @@ pub struct DiscoveredInterface {
     pub discovered: u64,
     /// Unix seconds — most recent announce.
     pub last_heard: u64,
-    /// How many announces contributed to this record (includes the first).
+    /// Count of successful upserts for this key, including the first,
+    /// saturating at `u64::MAX`; not a count of distinct announce packets.
     pub heard_count: u64,
-    /// Cached status at read time (None until classified).
+    /// Age status assigned by [`DiscoveryStore::list`]. It is not persisted;
+    /// decoded records start with `None`.
     pub status: Option<DiscoveryStatus>,
 }
 
 impl DiscoveredInterface {
-    /// Filename stem on disk: hex of `discovery_hash`.
+    /// Raw 32-byte storage key derived from `info.transport_id` and `info.name`.
+    /// Use [`Self::filename`] for the hexadecimal filename.
     pub fn discovery_hash(&self) -> [u8; 32] {
         discovery_hash(&self.info.transport_id, &self.info.name)
     }
@@ -74,7 +85,9 @@ impl DiscoveredInterface {
     }
 }
 
-/// `SHA-256(transport_id_hex_ascii || name_utf8)`.
+/// `SHA-256(lowercase_hex(transport_id) || name_utf8)`, with no separator.
+/// The name is used exactly as supplied; this helper does not sanitize it.
+/// Changing the advertised name gives the same transport a different record key.
 pub fn discovery_hash(transport_id: &[u8; 16], name: &str) -> [u8; 32] {
     let mut material = String::with_capacity(32 + name.len());
     material.push_str(&hex::encode(transport_id));
@@ -94,15 +107,19 @@ pub enum StorageError {
     Shape,
 }
 
-/// Persistent store rooted at `<storagepath>/discovery/interfaces/`.
+/// File store rooted at `<storage_root>/discovery/interfaces/`.
 ///
-/// Writes atomically via a `.tmp` sidecar + rename.
+/// Writes use a fixed `.tmp` sibling and rename, without fsync or an internal
+/// writer lock. Serialize updates to the same key to avoid sidecar and merge
+/// races. This is not a crash-durable transaction. Reads trust local field
+/// values and load complete files without a size bound.
 pub struct DiscoveryStore {
     root: PathBuf,
 }
 
 impl DiscoveryStore {
-    /// Open (and create if absent) the store under `storage_root`.
+    /// Create the store directory if absent and return its path wrapper.
+    /// Existing records are not scanned or validated by this call.
     pub fn open(storage_root: &Path) -> Result<Self, StorageError> {
         let root = storage_root.join("discovery").join("interfaces");
         std::fs::create_dir_all(&root)?;
@@ -114,7 +131,13 @@ impl DiscoveryStore {
         &self.root
     }
 
-    /// Write or update; existing `discovered` + `heard_count` are merged in.
+    /// Write the record, preserving a readable existing record's `discovered`
+    /// time and incrementing its count with saturation. If the previous file
+    /// cannot be read or decoded, use the supplied discovery time and count 1.
+    /// Other fields replace the old values; `status` is not serialized.
+    ///
+    /// This does not verify the stamp or prevent an older observation replacing
+    /// a newer one. Changing the key leaves any prior record under its old key.
     pub fn upsert(&self, mut record: DiscoveredInterface) -> Result<(), StorageError> {
         let path = self.root.join(record.filename());
 
@@ -137,7 +160,8 @@ impl DiscoveryStore {
         }
     }
 
-    /// Remove a single record; returns `true` if one was present.
+    /// Delete the exact transport/name record. Returns `false` when absent,
+    /// `true` after removal, and an error for other filesystem failures.
     pub fn remove(&self, transport_id: &[u8; 16], name: &str) -> Result<bool, StorageError> {
         let fname = hex::encode(discovery_hash(transport_id, name));
         let path = self.root.join(fname);
@@ -148,10 +172,18 @@ impl DiscoveryStore {
         }
     }
 
-    /// List records sorted desc by `(status_code, stamp_value, last_heard)`.
-    /// Expired records, records of a type Python does not list, and records
-    /// whose `network_id` is not in `discovery_sources` (when set) are culled
-    /// from disk (Discovery.py:536-547).
+    /// Read and maintain the store, returning records sorted descending by
+    /// `(status_code, stamp_value, last_heard)`. This call mutates the directory.
+    ///
+    /// Files with extensions and non-files are skipped. Unreadable/undecodable
+    /// records, records older than seven days, unlisted interface types and
+    /// sources excluded by `discovery_sources` are omitted and removal is
+    /// attempted. Removal errors are ignored. `Some(&[])` excludes every source;
+    /// `None` applies no source filter. A missing directory returns an empty list.
+    ///
+    /// Field decoding supplies defaults for missing or invalid values; filenames,
+    /// signatures and stamps are not verified. Future `last_heard` values have
+    /// age zero. Age labels describe observations, not endpoint health.
     pub fn list(
         &self,
         discovery_sources: Option<&[[u8; 16]]>,
@@ -220,8 +252,9 @@ impl DiscoveryStore {
     }
 }
 
-/// Classify a (now - last_heard) delta into a status bucket. Exposed so
-/// callers that already have a record in hand can avoid a re-read.
+/// Classify elapsed seconds: `Available` through 24 hours, `Unknown` above
+/// 24 hours through three days, and `Stale` above three days. This helper does
+/// not apply the separate seven-day removal rule or probe an endpoint.
 pub fn classify(heard_delta_secs: u64) -> DiscoveryStatus {
     if heard_delta_secs > THRESHOLD_STALE_SECS {
         DiscoveryStatus::Stale

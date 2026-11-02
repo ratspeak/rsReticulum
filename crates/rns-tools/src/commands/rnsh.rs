@@ -38,43 +38,61 @@ const IDENTITY_HASH_HEX_LEN: usize = 32;
     after_help = "When specifying a command to execute, separate rnsh-rs options from the command and its arguments with --\n\nFor example:\n  rnsh-rs -l -- /bin/bash --login\n  rnsh-rs <destination> -- ls -la /tmp"
 )]
 struct Args {
+    /// Alternative Reticulum config directory.
     #[arg(short = 'c', long = "config")]
     config: Option<PathBuf>,
+    /// Identity file to load or create; overrides the default stored identity.
     #[arg(short = 'i', long = "identity")]
     identity: Option<PathBuf>,
+    /// Increase log verbosity (repeatable).
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
     verbose: u8,
+    /// Decrease log verbosity (repeatable).
     #[arg(short = 'q', long = "quiet", action = ArgAction::Count)]
     quiet: u8,
+    /// Print identity information and exit; creates the identity if absent.
     #[arg(short = 'p', long = "print-identity")]
     print_identity: bool,
+    /// Print version and exit.
     #[arg(long = "version")]
     version: bool,
 
+    /// Listen for remote commands using this process's privileges.
     #[arg(short = 'l', long = "listen")]
     listen: bool,
+    /// Listener identity suffix (default: default); keeps only ASCII letters, digits and underscores.
     #[arg(short = 's', long = "service")]
     service: Option<String>,
+    /// Listener announce interval in seconds; 0 announces once, omitted disables scheduled announces.
     #[arg(short = 'b', long = "announce", value_name = "PERIOD")]
     announce: Option<u64>,
+    /// Listener: allow this client identity hash (32 hex characters); repeat for multiple clients.
     #[arg(short = 'a', long = "allowed", value_name = "HASH")]
     allowed: Vec<String>,
+    /// Listener: accept clients without identity authorization.
     #[arg(short = 'n', long = "no-auth")]
     no_auth: bool,
+    /// Listener: append the remote argument vector to the configured command.
     #[arg(short = 'A', long = "remote-command-as-args")]
     remote_command_as_args: bool,
+    /// Listener: reject client-supplied commands; run the configured command only.
     #[arg(short = 'C', long = "no-remote-command")]
     no_remote_command: bool,
 
+    /// Client: do not identify to the listener; a local identity is still loaded or created.
     #[arg(short = 'N', long = "no-id")]
     no_id: bool,
+    /// Return the remote exit code clamped to 0-255; otherwise completed sessions return 0.
     #[arg(short = 'm', long = "mirror")]
     mirror: bool,
+    /// Client protocol wait budget in seconds (default: 15, minimum: 1); I/O can add time.
     #[arg(short = 'w', long = "timeout", value_name = "SECONDS")]
     timeout: Option<f64>,
 
+    /// Remote rnsh destination hash (32 hex characters); omit in listen mode.
     destination: Option<String>,
 
+    /// Command and arguments after --; in listen mode this sets the default command (otherwise the local shell).
     #[arg(last = true)]
     command: Vec<String>,
 }

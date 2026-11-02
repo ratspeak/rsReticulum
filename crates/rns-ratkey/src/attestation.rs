@@ -1,37 +1,24 @@
-//! YubiKey PIV attestation verification. Bundled root CAs — never fetched at runtime.
+//! Verify Yubico PIV attestation paths using bundled roots and intermediates;
+//! no certificates are fetched at runtime. The pool contains the legacy PIV
+//! root and the newer Attestation Root 1 with A/B/B2 PIV branches. It does
+//! not cover every preview, replacement or future attestation chain.
 //!
-//! Legacy chain (firmware < 5.7.4):
-//!   per-key attestation cert → device intermediate (slot F9)
-//!     → `Yubico PIV Root CA Serial 263751` (bundled root).
+//! A successful `chain_verified` means each child signature on the selected
+//! path verifies with RSA PKCS#1 v1.5 (SHA-256 or SHA-512), its terminal root
+//! matches a pinned DER SHA-256 fingerprint, and all selected certificates
+//! are within their validity windows. The pinned root's self-signature is not
+//! checked. Issuer names are compared as DER, not by full RFC 5280 name rules.
 //!
-//! New chain (firmware >= 5.7.4):
-//!   per-key attestation cert → device intermediate (slot F9)
-//!     → `Yubico PIV Attestation {A,B,B2} 1` (bundled intermediate)
-//!     → `Yubico Attestation Intermediate {A,B} 1` (bundled intermediate)
-//!     → `Yubico Attestation Root 1` (bundled root).
-//! The two tiers of intermediate CAs are not present on the device; they are
-//! bundled here from Yubico's published attestation PKI (yubico-intermediate.pem).
-//! Both A and B branches plus the 2025 B2 PIV intermediate are bundled, so any
-//! firmware-5.7.4+ YubiKey PIV attestation chains to the bundled root.
+//! This is not full PKIX validation: revocation, constraints, key usage and
+//! path-length enforcement are not checked. It also does not compare the leaf
+//! public key or serial with an expected token/identity. The caller must bind
+//! the certificate to the key it intends to trust. Metadata extraction alone
+//! is not verification; metadata and firmware-derived labels are returned
+//! even when the chain fails. `supports_attestation` is only a device-label
+//! filter, not a live capability probe.
 //!
-//! Nitrokey 3 does not support PIV attestation (firmware 1.8) — verification skipped.
-//!
-//! ## What `chain_verified == true` means here
-//!
-//! Every link from the per-key attestation cert up to (and including) a bundled
-//! trust anchor has a valid RSA PKCS#1 v1.5 signature (issuer public key over the
-//! child's TBS bytes), the terminal issuer's DER SHA-256 matches a pinned
-//! fingerprint constant, and every certificate in the walked path is inside its
-//! notBefore/notAfter validity window at verification time.
-//!
-//! ## Explicit non-goals (NOT checked)
-//!
-//! Revocation (CRL/OCSP), name constraints, basicConstraints/keyUsage/pathlen
-//! enforcement, and the remainder of RFC 5280 path validation are intentionally
-//! out of scope. The root's own self-signature is not verified — the root is
-//! trusted by pinned fingerprint plus validity window. All required chain links
-//! are sha256WithRSAEncryption; the per-cert signature OID is still inspected so
-//! a sha512WithRSA link would be honored rather than silently mis-verified.
+//! See [Yubico PIV attestation](https://developers.yubico.com/PIV/Introduction/PIV_attestation.html)
+//! for the device-generation requirement and published certificate chains.
 
 use crate::error::RatkeyError;
 
@@ -114,22 +101,25 @@ pub struct AttestationVerification {
     /// True only when the attestation certificate chain has been
     /// cryptographically verified to a bundled trusted root.
     pub verified: bool,
-    /// True when Yubico attestation metadata could be extracted from the cert.
+    /// True when a firmware-version value was found by the metadata scanner.
+    /// It does not mean every metadata field is present or authenticated.
     pub metadata_extracted: bool,
     /// Explicit chain-verification label for UI/CLI surfaces.
     pub chain_verified: bool,
     pub info: AttestationInfo,
-    /// "legacy" or "new".
+    /// Firmware-derived label: "legacy", "new", or "unknown". This is not the
+    /// identity of the trust anchor actually selected by chain verification.
     pub root_ca: String,
     pub description: String,
 }
 
-/// Verify chain: attestation cert (from ATTEST F9) + device intermediate (slot F9).
+/// Check a per-key attestation statement (ATTEST command `F9` targeting its
+/// key slot) and the device certificate read from slot F9 against the bundled
+/// chain pool. `Ok(result)` can contain `verified == false`; inspect that field.
 ///
-/// Sets `verified`/`chain_verified == true` only when every signature from the
-/// per-key cert up to a bundled, fingerprint-pinned Yubico root validates and
-/// all walked certs are inside their validity window. See module docs for the
-/// precise meaning and the explicit non-goals.
+/// This verifies the selected certificate signatures and validity windows,
+/// not binding to an expected public key or device serial. See the module
+/// documentation for the precise trust checks and remaining caller duties.
 pub fn verify_attestation(
     attestation_cert_der: &[u8],
     device_cert_der: &[u8],
@@ -194,7 +184,9 @@ fn build_description(
     }
 }
 
-/// YubiKey 5 (firmware >= 4.3.0) only. Nitrokey 3 has no PIV attestation.
+/// Return true only for the exact device label `"yubikey5"`. This function
+/// does not inspect firmware, key origin, certificate availability or a card;
+/// all other labels, including `"nitrokey3"`, return false.
 pub fn supports_attestation(device_type: &str) -> bool {
     device_type == "yubikey5"
 }

@@ -1,5 +1,5 @@
-//! HDLC-framed data over a serial port. Uses `serialport` with
-//! `spawn_blocking` because no mature async driver exists yet.
+//! HDLC-framed data over a serial port. Requires feature `serial`. Blocking
+//! `serialport` reads and writes run through Tokio's `spawn_blocking`.
 
 use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::sync::Arc;

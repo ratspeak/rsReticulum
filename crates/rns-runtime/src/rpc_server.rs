@@ -1,5 +1,7 @@
-//! Local control port for CLI tools (rnstatus, rnpath). Default 37429.
-//! Wire-compatible with Python `multiprocessing.connection`.
+//! Local control servers for CLI tools such as `rnstatus-rs` and `rnpath-rs`.
+//! TCP binds to IPv4 loopback; Unix sockets are also supported. Connections
+//! use mutual RPC-key authentication and framed MessagePack, with a 30-second
+//! session budget and up to 64 concurrent clients. RPC frames are not encrypted.
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -143,8 +145,9 @@ pub(crate) fn stat_entries(
         .collect()
 }
 
-/// Serve the control port from a bare transport; interface stats then carry
-/// no IFAC fields.
+/// Serve a TCP control endpoint on IPv4 loopback using a bare transport.
+/// IFAC fields in interface stats are absent because no runtime IFAC records
+/// are supplied; that does not establish whether an interface uses IFAC.
 pub async fn run_rpc_server(
     port: u16,
     rpc_key: Vec<u8>,
@@ -166,8 +169,10 @@ pub(crate) async fn serve_rpc_port(
     run_rpc_server_with_listener(listener, rpc_key, backend, shutdown).await
 }
 
-/// Serve the control socket from a bare transport; interface stats then carry
-/// no IFAC fields.
+/// Serve a Unix control endpoint using a bare transport, without runtime IFAC
+/// records in interface stats. A filesystem socket path is removed before
+/// binding; supply a path owned by this service. A leading NUL selects an
+/// abstract name, supported on Linux and Android.
 #[cfg(unix)]
 pub async fn run_unix_rpc_server(
     socket_path: &str,

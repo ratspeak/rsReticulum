@@ -1,6 +1,13 @@
-//! Higher-level protocol layers over Links: resource transfer, channels,
-//! buffers, and stream I/O. Python reference: `RNS/Resource.py`,
-//! `RNS/Channel.py`, `RNS/Buffer.py`.
+//! Resource transfer, Channels and byte streams over Reticulum Links.
+//!
+//! The state machines are passive: their owner supplies packet I/O, Link keys,
+//! proof routing and timeout polling. Use [`resource::OutboundTransfer`] and
+//! [`resource::InboundTransfer`] for request-driven Resource transfer,
+//! [`channel::LinkChannel`] for sequenced messages, and [`buffer::ChannelBuffer`]
+//! for byte-stream framing on a Channel. Codec helpers do not establish Links
+//! or authorize application actions.
+//!
+//! Python reference formats: `RNS/Resource.py`, `RNS/Channel.py`, `RNS/Buffer.py`.
 
 pub mod buffer;
 pub mod channel;

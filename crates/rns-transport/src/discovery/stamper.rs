@@ -1,38 +1,40 @@
 //! Pluggable proof-of-work stamper for discovery announces.
 //!
-//! Python `RNS.Discovery.InterfaceAnnouncer` imports `LXMF.LXStamper`.
-//! rsReticulum avoids an upward dependency on rsLXMF, so discovery accepts a
-//! trait object. The concrete implementation lives in
-//! `lxmf-core::discovery_stamper::LxmfDiscoveryStamper` and is wired at startup
-//! by the embedding application.
+//! Discovery accepts a trait object so transport does not depend on LXMF.
+//! Embedding applications can install
+//! `lxmf-core::discovery_stamper::LxmfDiscoveryStamper`, which supplies the
+//! discovery workblock and stamp algorithm. These methods are synchronous;
+//! callers choose where to run potentially expensive generation/validation.
 
 /// Minimal PoW stamp interface consumed by the discovery subsystem.
 ///
-/// A stamper must be **deterministic for a given `(infohash, target_value)`
-/// pair** and independent across calls — the announcer caches its last
-/// successful stamp per info-hash and reuses it until the payload changes.
+/// Generation may search randomly and return different valid stamps for the
+/// same inputs. Validation and value calculation must use the same discovery
+/// algorithm: the announcer caches a successful stamp for unchanged info bytes,
+/// and receivers must be able to validate it independently.
 pub trait DiscoveryStamper: Send + Sync {
-    /// Generate a `STAMP_SIZE`-byte stamp whose SHA-256-derived value meets
-    /// or exceeds `target_value` (number of leading zero bits, as in the
-    /// Python `LXStamper.generate_stamp` contract).
+    /// Generate a 32-byte stamp meeting `target_value` for this info hash.
+    /// The discovery algorithm hashes a derived workblock with the stamp;
+    /// the target is the required number of leading zero bits.
     ///
-    /// Returns `None` if generation was cancelled or failed.
+    /// Return `None` when generation fails or its implementation-specific
+    /// budget is exhausted. This trait supplies no cancellation or time limit.
     fn generate(&self, infohash: &[u8; 32], target_value: u8) -> Option<Vec<u8>>;
 
-    /// Compute the stamp's current value (Python `LXStamper.stamp_value`).
-    /// Used by the receiver to log the learned stamp quality.
+    /// Compute the stamp's value for this info hash, expressed as leading
+    /// zero bits and limited to this method's `u8` range. This describes work
+    /// quality, not the trustworthiness of the advertised endpoint.
     fn value(&self, infohash: &[u8; 32], stamp: &[u8]) -> u8;
 
-    /// Validate a stamp against `required_value` (Python
-    /// `LXStamper.stamp_valid`). Returns true iff the stamp meets the bar.
+    /// Decide whether the stamp meets the required work value for this info
+    /// hash. Implementations define zero-cost and malformed-stamp handling;
+    /// callers must still validate framing and the advertised fields.
     fn valid(&self, infohash: &[u8; 32], stamp: &[u8], required_value: u8) -> bool;
 }
 
-/// A no-op stamper used when on-network discovery is not enabled.
-///
-/// Never generates a stamp — so the announcer short-circuits each tick and
-/// the receiver rejects every inbound stamp. This keeps discovery silent
-/// when no stamper is installed (Python panics in this case; we don't).
+/// Disabled stamper: generation always returns `None`, value is always zero,
+/// and validation always returns `false`, including at a zero requirement.
+/// It supplies no usable stamp for publication or accepted inbound work.
 pub struct NullStamper;
 
 impl DiscoveryStamper for NullStamper {

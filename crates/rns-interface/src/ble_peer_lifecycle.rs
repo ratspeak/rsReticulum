@@ -1,23 +1,11 @@
-//! BLE peripheral lifecycle state machine. Platform adapters (Apple
-//! `CBPeripheralManager`, Linux `bluer`, Android `BluetoothGattServer`,
-//! Windows `GattServiceProvider`) drive it via [`PeripheralLifecycle::apply`].
+//! BLE peripheral lifecycle state machine. Adapters report platform events
+//! through [`PeripheralLifecycle::apply`] and perform side effects after the
+//! transition returns.
 //!
-//! Two invariants this encodes that are easy to violate by hand:
-//!
-//! 1. **Teardown waits for platform confirmation.** iOS has no
-//!    `peripheralManagerDidStopAdvertising:` callback; the only reliable
-//!    "stopped" signal is polling `CBPeripheralManager.isAdvertising` until
-//!    `NO`. Calling `removeAllServices` while still advertising leaves
-//!    CoreBluetooth in a dirty state that breaks subsequent enables.
-//!
-//! 2. **Mid-session platform transitions rewind.** A `Resetting` →
-//!    `PoweredOff` → `PoweredOn` cycle (user toggling Bluetooth, OS stack
-//!    crash recovery) must drop back to `StartingWaitingPlatform` so the
-//!    next `PlatformReady` re-registers.
-//!
-//! Invalid transitions return an error; adapters log and continue rather
-//! than panic — BLE backends occasionally deliver out-of-order or redundant
-//! callbacks.
+//! Teardown waits for advertising to stop before service removal. Starting
+//! and advertising states rewind to `StartingWaitingPlatform` after
+//! `PlatformUnavailable`; stopping states are not rewound. Invalid transitions
+//! return an error rather than changing state.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -45,7 +33,8 @@ pub enum PeripheralState {
 }
 
 impl PeripheralState {
-    /// True when the peripheral holds platform resources needing release on teardown.
+    /// True in starting, advertising, or stopping states. This classifies
+    /// lifecycle state; it does not inspect platform resource ownership.
     pub fn is_active(self) -> bool {
         !matches!(self, Self::Idle | Self::Stopped | Self::Failed)
     }
@@ -72,19 +61,16 @@ pub enum LifecycleEvent {
     StartRequested,
     /// Platform ready for service registration + advertising.
     PlatformReady,
-    /// Platform blocked (BT off, permission denied, adapter resetting).
-    /// Rewinds active states to `StartingWaitingPlatform` to preserve user
-    /// intent across recovery.
+    /// The platform became unavailable. Starting and advertising states rewind
+    /// to `StartingWaitingPlatform`; stopping states reject this event.
     PlatformUnavailable {
         reason: String,
     },
     ServicesAdded,
     AdvertiseStarted,
     StopRequested,
-    /// `stopAdvertising` completed. On iOS this comes from polling
-    /// `isAdvertising` since no delegate callback exists. Skipping this and
-    /// going straight to `removeAllServices` was the root cause of the
-    /// "disable doesn't fully tear down" bug.
+    /// `stopAdvertising` completed. The Apple adapter reports this after
+    /// checking `isAdvertising`; service removal follows this transition.
     AdvertiseStopped,
     ServicesRemoved,
     FatalError {

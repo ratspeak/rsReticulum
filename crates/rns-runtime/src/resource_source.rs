@@ -1,4 +1,6 @@
-//! Bounded-memory sources for Link Resource transfers.
+//! Seekable sources for Link Resource transfers, prepared one segment at a
+//! time for large inputs. The source must satisfy the stability contract in
+//! [`ResourceSource`]; custom reader allocations are outside this memory bound.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::time::Duration;
@@ -11,6 +13,12 @@ use rns_protocol::resource::{
 use sha2::{Digest, Sha256};
 
 /// Seekable source accepted by the high-level Resource API.
+///
+/// Keep contents and length stable throughout preparation and transfer. The
+/// runtime seeks to the end to measure length, rewinds to zero, and may read
+/// the entire source to hash it before reading segments again. It does not
+/// snapshot or lock a file against concurrent writers. `Read` and `Seek` are
+/// synchronous; implementations must return finite, consistent data.
 pub trait ResourceSource: Read + Seek + Send {}
 
 impl<T> ResourceSource for T where T: Read + Seek + Send {}

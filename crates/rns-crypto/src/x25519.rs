@@ -4,7 +4,8 @@ use rand_core::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
-/// X25519 private key (32 bytes, clamped scalar).
+/// X25519 private key material (32 bytes). Scalar clamping occurs during
+/// public-key derivation and Diffie-Hellman, not when these bytes are stored.
 ///
 /// Key material is zeroized on drop.
 pub struct X25519PrivateKey {
@@ -38,14 +39,14 @@ impl X25519PrivateKey {
         }
     }
 
-    /// Construct from a 32-byte scalar.
+    /// Store 32 bytes of private key material without changing their encoding.
     pub fn from_bytes(bytes: &[u8; 32]) -> Self {
         Self {
             secret: StaticSecret::from(*bytes),
         }
     }
 
-    /// Return the 32-byte scalar.
+    /// Return the stored 32-byte private key material.
     pub fn to_bytes(&self) -> [u8; 32] {
         self.secret.to_bytes()
     }
@@ -58,13 +59,15 @@ impl X25519PrivateKey {
     }
 
     /// Compute the shared secret with `peer` via X25519 Diffie-Hellman.
+    /// This primitive does not reject an all-zero result; a protocol requiring
+    /// a contributory-behavior check must validate the returned secret.
     pub fn exchange(&self, peer: &X25519PublicKey) -> [u8; 32] {
         self.secret.diffie_hellman(&peer.key).to_bytes()
     }
 }
 
 impl X25519PublicKey {
-    /// Parse a 32-byte u-coordinate.
+    /// Store a 32-byte u-coordinate without rejecting low-order public inputs.
     pub fn from_bytes(bytes: &[u8; 32]) -> Self {
         Self {
             key: PublicKey::from(*bytes),

@@ -32,7 +32,7 @@
 - Remote management Links refuse Resources other than requests and responses, as Python Reticulum's do.
 - `rnsd-rs` never auto-connects a discovered interface at an onion address, at 127.0.0.1 or 0.0.0.0, or at a host and port that an interface already connects to, as in Python Reticulum.
 - Interface stats name the network an auto-connected interface was discovered through (`autoconnect_source`), as in Python Reticulum.
-- Decryption, key derivation and identity and ratchet file handling no longer leave copies of keys or plaintext in freed memory, and identity files larger than 1 KiB are refused.
+- Decryption, key derivation and identity and ratchet file handling wipe temporary sensitive buffers, and decryption avoids an extra plaintext copy. Returned plaintext remains caller-owned and must be wrapped in `Zeroizing` when it needs wiping on drop. Identity files larger than 1 KiB are refused.
 - A 64-byte identity file always loads as a raw key, as in Python Reticulum. About one key in 29,000 began with bytes that were misread as the older envelope format, and its identity failed to load.
 - Writing, verifying and recovering state files retries a read that a signal interrupts instead of failing.
 - Interface options wipe their IFAC passphrase when dropped, and the debug output of IFAC settings no longer shows it.
@@ -46,12 +46,15 @@
 
 ## 1.4.0 - 2026-10-12
 
+This section records the source-version transition. It is not a standalone
+1.4.0 binary release; the published standalone release remains 1.3.0.
+
 - Corrected packet-size limits across interfaces and Links, including IFAC overhead, and reject unsupported Link setups before sending them.
 - Added application-controlled acknowledgements so propagation nodes can confirm a message only after safely storing it.
 - Prevent stale interface or Link callbacks from acknowledging a different connection after reconnect or cancellation.
 - Reject malformed Resource metadata and invalid timeout values without panics or excessive allocation.
 - Added checked durable file operations for identities, ratchets, and application storage, with explicit recovery after interrupted writes.
-- Updated public interface, Link, and storage APIs. This source-breaking release uses the `~1.4.0` compatibility line.
+- Updated public interface, Link, and storage APIs. Use the `~1.4.0` compatibility line for these source-breaking APIs.
 
 ## 1.3.0 - 2026-10-12
 

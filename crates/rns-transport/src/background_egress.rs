@@ -1,9 +1,11 @@
 //! Optional complete-packet background handoff to an interface's final writer.
 //!
 //! The scheduler retains the bulk backlog. This lane owns at most one offer or
-//! started packet, independently of all ordinary packet FIFOs. Drivers apply
-//! KISS/BLE framing exactly once after selection. Registration uses weak exact
-//! channel identities and does not change exhaustive interface structures.
+//! started packet, independently of ordinary packet queues. The caller must
+//! check ordinary backlog and carrier readiness before selection, then apply
+//! its interface framing. Selection records a local start time, not a write,
+//! radio acknowledgment or delivery. Registration uses weak references to an
+//! exact channel and is limited to 4096 live lanes per process.
 use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -16,6 +18,7 @@ fn registry() -> &'static Registry {
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// A lane already exists for this channel, or the process-wide registry is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BackgroundRegistrationError {
@@ -41,8 +44,9 @@ struct Offer {
     generation: u64,
 }
 
-/// Driver-owned final-writer endpoint. Clone only for a joined physical writer;
-/// call `retire_generation` before handing a reconnected carrier any offers.
+/// Driver-owned final-writer endpoint. Clones share one lane; they do not create
+/// separate packet queues. Call `retire_generation` before handing a reconnected
+/// carrier any offers, and coordinate all clones with the physical writer.
 #[derive(Clone)]
 pub struct BackgroundAnnounceReceiver {
     shared: Arc<Shared>,
@@ -64,7 +68,8 @@ impl Drop for BackgroundOfferReceipt {
 }
 
 /// Owns one already-selected complete RNS/IFAC packet. Keep this guard until
-/// the whole write/acknowledgement (including an ambiguous retry) retires.
+/// the whole write/acknowledgment (including an ambiguous retry) retires.
+/// Dropping it releases the lane; it neither writes nor cancels a driver write.
 pub struct BackgroundPacket {
     raw: Bytes,
     shared: Arc<Shared>,
@@ -81,8 +86,9 @@ impl Drop for BackgroundPacket {
 }
 
 impl BackgroundAnnounceReceiver {
-    /// Attach a background lane to exactly `ordinary`. Failure is explicit;
-    /// built-in drivers must fail startup rather than silently omit this lane.
+    /// Attach one lane to exactly this ordinary channel, removing dead weak
+    /// registrations first. Duplicate channels and a full registry return an
+    /// error. This does not start a driver or drain the ordinary channel.
     pub fn register(ordinary: &mpsc::Sender<Bytes>) -> Result<Self, BackgroundRegistrationError> {
         let mut registry = registry().lock().unwrap();
         registry.retain(|(channel, owner)| channel.strong_count() > 0 && owner.strong_count() > 0);
@@ -118,14 +124,19 @@ impl BackgroundAnnounceReceiver {
         }
     }
 
-    /// Select only after ordinary work, carrier readiness and the radio permit
-    /// have been checked, immediately before a complete packet write.
+    /// Take a valid offer using an always-true permit predicate. The caller
+    /// must first check ordinary work, carrier readiness and any radio permit;
+    /// this method does not perform those checks. Supply wall-clock Unix seconds
+    /// consistent with the scheduler's expiry values.
     pub fn try_start(&self, now: f64) -> Option<BackgroundPacket> {
         self.try_start_when(now, || true)
     }
 
-    /// Atomically select a still-valid offer only when the final writer can
-    /// consume its permit. A false predicate leaves the offer unstarted.
+    /// Check expiry, cancellation, generation and owner validity, then call
+    /// `permit` while holding the lane mutex. A false predicate retains the
+    /// offer; the callback must not reenter this lane. Ordinary backlog and
+    /// carrier readiness remain caller responsibilities. Returning a packet
+    /// signals its local selection time to the scheduler before any write.
     pub fn try_start_when(
         &self,
         now: f64,
@@ -156,7 +167,9 @@ impl BackgroundAnnounceReceiver {
         })
     }
 
-    /// Ordinary outer-channel backlog has priority over background selection.
+    /// Whether the ordinary channel still exists and all its capacity is free.
+    /// This is a snapshot, not a reservation; in-progress driver work is not
+    /// represented. The caller must use it to prioritize ordinary traffic.
     pub fn ordinary_is_empty(&self) -> bool {
         self.shared
             .ordinary
@@ -164,7 +177,8 @@ impl BackgroundAnnounceReceiver {
             .is_some_and(|tx| tx.capacity() == tx.max_capacity())
     }
 
-    /// Whether a non-cancelled offer exists. Selection still rechecks expiry.
+    /// Whether an offer occupies the slot, even if expired, cancelled or stale.
+    /// Selection rechecks those conditions; a started packet is not an offer.
     pub fn has_offer(&self) -> bool {
         self.shared.state.lock().unwrap().offer.is_some()
     }

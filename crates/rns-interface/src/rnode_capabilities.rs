@@ -1,10 +1,11 @@
-//! Privacy-bounded, read-only RNode capability parsing.
+//! Read-only RNode capability parsing without retaining device identity bytes.
 //!
-//! RNode EEPROM identity information contains serial, manufacturing, checksum,
-//! signature, and other device-specific bytes. This module validates the
-//! immutable identity prefix in place, then returns only copyable product/model
-//! codes and reviewed radio limits. It never retains the source image or
-//! exposes identity, signature, configuration, or raw EEPROM fields.
+//! This module checks the EEPROM information lock and MD5 identity-prefix
+//! checksum, then returns product/model codes and limits from a static code
+//! table. It ignores device signatures: checksum validation is not device
+//! authentication. The value retains no source image, identity, signature,
+//! configuration, or raw EEPROM fields. Code-table limits are not a hardware
+//! measurement or permission to transmit.
 
 use md5::{Digest, Md5};
 
@@ -203,10 +204,10 @@ pub enum RNodeRadioAdmissionError {
 
 /// Bounded classification of a full-length RNode EEPROM image.
 ///
-/// `Provisioned` carries validated capabilities from a locked, checksummed
-/// identity. `Unprovisioned` means the info lock at `0x9b` is absent: the
-/// device carries no attested identity, so product, model, and checksum bytes
-/// are deliberately never read.
+/// `Provisioned` carries capabilities from a locked, checksummed identity
+/// prefix. `Unprovisioned` means the info lock at `0x9b` is absent, so product,
+/// model, and checksum bytes are not consulted. Neither state authenticates a
+/// device signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RNodeEepromImage {
@@ -216,13 +217,11 @@ pub enum RNodeEepromImage {
 
 /// Classify an EEPROM image, admitting unprovisioned devices as a typed state.
 ///
-/// The image must still span the identity-information lock at `0x9b`. An
-/// unlocked image classifies as [`RNodeEepromImage::Unprovisioned`] without
-/// consulting the checksum or identity bytes — an unattested model byte must
-/// never impose or relax model-specific limits. A locked image validates the
-/// MD5 checksum over the exact stored bytes `0x00..0x0b` (model aliases are
-/// deliberately not normalised first); bytes after the identity prefix,
-/// including the signature region, are ignored.
+/// The image must span the information lock at `0x9b`. An unlocked image is
+/// [`RNodeEepromImage::Unprovisioned`] without reading product, model, or
+/// checksum bytes. A locked image must match the MD5 checksum over stored
+/// bytes `0x00..0x0b`; model aliases are not normalised first. Signature bytes
+/// are ignored, so this check does not authenticate the device.
 pub fn classify_rnode_eeprom_image(
     eeprom: &[u8],
 ) -> Result<RNodeEepromImage, RNodeCapabilityParseError> {
@@ -324,9 +323,8 @@ pub fn admit_rnode_radio_settings(
 
 /// Admit radio settings for a device that presented no locked EEPROM identity.
 ///
-/// Only generic RNode validation applies: with no attested model there are no
-/// model-specific limits to consult, matching the treatment of unknown and
-/// quarantined model codes.
+/// Only generic RNode validation applies. No model-specific profile is
+/// inferred, as with unknown and quarantined model codes.
 pub fn admit_unprovisioned_rnode_radio_settings(
     settings: RNodeRadioSettings,
 ) -> Result<RNodeRadioAdmission, RNodeRadioAdmissionError> {

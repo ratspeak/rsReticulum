@@ -1,6 +1,7 @@
-//! Initiator-side Link client for `rnstatus -R` / `rnpath -R`. Each `query`
-//! does the full handshake (pubkey discovery → link → identify → request →
-//! response → close) over its own destination channel.
+//! Initiator-side Link client used by `rnstatus-rs -R` and `rnpath-rs -R`.
+//! Each query recalls or discovers remote identity metadata, establishes a
+//! Link, identifies the local identity, sends one request and attempts teardown.
+//! It uses its own temporary destination channel; it does not reuse a Link.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -68,8 +69,14 @@ impl LinkClient {
         }
     }
 
-    /// Open a Link to `app_name` on `remote_transport_hash`, send one
-    /// request, return the response.
+    /// Open a Link to `app_name` on the supplied identity hash, identify the local
+    /// identity, send one request and return its response bytes. For the current
+    /// remote-management service, this is the remote transport identity hash.
+    ///
+    /// `overall_timeout` supplies remaining budgets for discovery, Link proof and
+    /// response waits. Registration, endpoint binding, sends and teardown can
+    /// await transport admission/replies outside that budget. Wrap the call in
+    /// an outer timeout when the entire operation needs a deadline.
     pub async fn query(
         &self,
         remote_transport_hash: [u8; 16],

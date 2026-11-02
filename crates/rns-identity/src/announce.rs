@@ -35,7 +35,9 @@ pub enum AnnounceError {
     InvalidWireTime(u64),
 }
 
-/// Parsed announce data.
+/// Parsed announce fields; parsing alone does not authenticate them.
+/// Call [`Self::validate`] or [`Self::validate_with_known_key`] before learning
+/// a destination. Replay, age and ingress policy belong to the caller.
 #[derive(Debug, Clone)]
 pub struct AnnounceData {
     pub public_key: [u8; 64],
@@ -49,8 +51,9 @@ pub struct AnnounceData {
 impl AnnounceData {
     /// Create and sign an announce for a destination.
     ///
-    /// The `random_hash` is `random(5) || timestamp_be(5)` so receivers can
-    /// detect replays without a shared clock.
+    /// The `random_hash` is `random(5) || timestamp_be(5)`, using current Unix
+    /// seconds. This supplies randomness and ordering information; replay
+    /// rejection requires receiver state and is not performed by this type.
     pub fn create(
         identity: &Identity,
         app_name: &str,
@@ -64,8 +67,9 @@ impl AnnounceData {
         Self::create_at(identity, app_name, app_data, ratchet_pub, ts)
     }
 
-    /// Create and sign an announce with an explicit persisted 40-bit ordering
-    /// value. Rotation and expiry clocks must be managed separately.
+    /// Create and sign an announce with an explicit 40-bit ordering value.
+    /// The caller manages persistence before transmission, and manages rotation
+    /// and expiry clocks separately. No state is persisted by this method.
     pub fn create_at(
         identity: &Identity,
         app_name: &str,
@@ -149,7 +153,8 @@ impl AnnounceData {
     /// Parse an announce from packet payload bytes.
     ///
     /// `has_ratchet` must match the packet header's context flag; the ratchet
-    /// field is not self-delimiting.
+    /// field is not self-delimiting. This checks minimum length only; use the
+    /// validation methods before trusting a parsed announce.
     pub fn unpack(data: &[u8], has_ratchet: bool) -> Result<Self, AnnounceError> {
         let min_size = if has_ratchet {
             MIN_ANNOUNCE_SIZE + RATCHET_SIZE
@@ -261,7 +266,8 @@ impl AnnounceData {
     }
 
     /// Validate destination-hash binding and first-seen public-key continuity
-    /// after [`Self::verify_signature`] has succeeded.
+    /// after [`Self::verify_signature`] has succeeded. Pass the identity
+    /// returned by that call; this method does not repeat signature validation.
     pub fn validate_destination_binding(
         &self,
         packet_dest_hash: &[u8; 16],

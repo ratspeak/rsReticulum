@@ -1,6 +1,9 @@
 //! Shared protocol constants (MTU, hash sizes, header bounds).
 
-/// Maximum Transmission Unit — hard protocol limit.
+/// Base packet MTU in bytes, enforced by [`crate::packet::Packet::new`].
+///
+/// Raw parsing does not impose this limit. Link signalling can represent
+/// larger offers; acceptance and forwarding limits belong to endpoint policy.
 pub const MTU: usize = 500;
 
 /// Truncated hash length in bits (128 bits = 16 bytes).

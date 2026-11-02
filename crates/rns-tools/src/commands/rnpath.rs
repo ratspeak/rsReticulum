@@ -36,7 +36,7 @@ use rns_tools::RS_RETICULUM_VERSION;
     disable_version_flag = true
 )]
 struct Args {
-    /// Destination hash to request a path to.
+    /// Destination hash for a path request or table/rate filter; with -p, the remote transport hash.
     destination: Option<String>,
 
     /// Show the full path table.
@@ -67,7 +67,7 @@ struct Args {
     #[arg(short, long)]
     blackholed: bool,
 
-    /// View published blackhole list for remote transport instance.
+    /// View a remote transport's published blackhole list; supply its hash as DESTINATION or with -R.
     #[arg(short = 'p', long = "blackholed-list")]
     blackholed_list: bool,
 
@@ -87,7 +87,8 @@ struct Args {
     #[arg(long)]
     reason: Option<String>,
 
-    /// JSON output (machine-readable).
+    /// Print table and list results as JSON.
+    /// Known limitation: interface names and blackhole reasons are not fully JSON-escaped.
     #[arg(short, long)]
     json: bool,
 
@@ -96,20 +97,21 @@ struct Args {
     config: Option<String>,
 
     /// Remote transport hash (32 hex chars). Query that node over Reticulum.
-    /// Only `--table` and `--rates` are supported in remote mode; mutations
-    /// are local-only.
+    /// Remote management supports --table and --rates; -p queries the published
+    /// blackhole list instead. Mutations are local-only.
     #[arg(short = 'R', long = "remote")]
     remote: Option<String>,
 
-    /// Identity file for remote authentication (used with `-R`).
+    /// Identity for remote authentication (required for -R management; optional with -p).
     #[arg(short = 'i', long)]
     identity: Option<PathBuf>,
 
-    /// Seconds to wait for local shared-instance responses.
+    /// Local RPC wait in seconds; also sets path-request wait and the remote-query fallback.
+    /// Defaults without this option: 5 seconds for local RPC, 15 for path requests, 30 remote.
     #[arg(short = 'w', long)]
     timeout: Option<u64>,
 
-    /// Seconds to wait for remote management responses.
+    /// Remote query protocol budget in seconds; overrides -w. Transport work can add time.
     #[arg(short = 'W', long = "remote-timeout")]
     remote_timeout: Option<u64>,
 
@@ -121,7 +123,7 @@ struct Args {
     #[arg(short, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Filter for remote blackhole list view.
+    /// Case-sensitive substring in identity, reason or source for the remote blackhole list.
     list_filter: Option<String>,
 }
 

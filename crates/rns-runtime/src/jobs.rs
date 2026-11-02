@@ -1,5 +1,7 @@
-//! Cache cleaning every 15 minutes, persistence every 12 hours (or next
-//! 5-minute gracious interval on explicit request). Python: `Reticulum.py`.
+//! Poll-driven scheduling of cache cleaning after 15 minutes and persistence
+//! after 12 hours. Explicit persistence requests can emit a job once five
+//! minutes have elapsed since the last gracious persist. Callers must poll
+//! `tick` and execute the returned jobs; this module starts no timer or I/O.
 
 use std::time::{Duration, Instant};
 

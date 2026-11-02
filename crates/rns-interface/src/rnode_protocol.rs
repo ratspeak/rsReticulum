@@ -1,16 +1,14 @@
 //! Deterministic state reduction for the generic, single-radio RNode protocol.
 //!
-//! This module deliberately does not drive an interface. It gives serial, TCP,
-//! USB, and BLE implementations one strict grammar and one order-independent
-//! readiness decision to adopt in a later integration step. Callers pass
-//! already-deframed extended-KISS command payloads to
-//! [`RNodeProtocolState::apply_frame`].
+//! Serial, TCP, USB, and BLE drivers pass already-deframed extended-KISS
+//! payloads to [`RNodeProtocolState::apply_frame`]. The reducer performs no
+//! I/O. Readiness uses the latest accepted evidence in a stable blocker order;
+//! effective-setting mode also requires a transmit-power echo after radio-on.
 //!
-//! The reducer is intentionally limited to generic single-radio readiness and
-//! flow-control evidence. It must not be used for `RNodeMultiInterface`: multi
-//! virtual-port command bytes overlap generic commands (notably `0x90`). It
-//! also does not retain opaque errors, EEPROM contents, hashes, Wi-Fi
-//! credentials, signatures, or other administration data.
+//! This grammar is not suitable for `RNodeMultiInterface`: its virtual-port
+//! command bytes overlap generic commands, notably `0x90`. The reducer retains
+//! no opaque errors, EEPROM contents, hashes, Wi-Fi credentials, signatures,
+//! or other administration data.
 
 use crate::rnode;
 
@@ -41,7 +39,8 @@ impl RNodeFirmwareVersion {
     }
 }
 
-/// Radio settings whose exact echoes establish that configuration completed.
+/// Radio settings used to check configuration echoes. Frequency allows
+/// [`FREQUENCY_TOLERANCE_HZ`]; the other settings require exact matches.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RNodeProtocolTarget {
     pub frequency: u32,
@@ -313,8 +312,10 @@ pub enum RNodeProtocolEffect {
 
 /// Pure reducer for generic single-radio readiness.
 ///
-/// Order-independent unless created with
-/// [`RNodeProtocolState::with_effective_settings`].
+/// Different evidence categories can arrive in any order; a later value
+/// replaces earlier evidence for the same category, and reset clears evidence.
+/// [`RNodeProtocolState::with_effective_settings`] additionally requires a
+/// transmit-power echo after radio-on.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RNodeProtocolState {
     target: RNodeProtocolTarget,
@@ -356,11 +357,10 @@ impl RNodeProtocolState {
     /// Like [`Self::new`], but readiness also waits for a transmit-power echo
     /// that follows `RADIO_STATE_ON`.
     ///
-    /// RNode firmware maps frequency, bandwidth and amplifier-backed transmit
-    /// power to what the hardware will use only while the radio is on; a cold
-    /// radio echoes the request. Callers re-assert those settings after
-    /// `RADIO_STATE_ON` (as `rnode::build_init_sequence` does), so readiness
-    /// and [`Self::definitive_rejection`] judge the effective values.
+    /// `crate::rnode::build_init_sequence` reasserts frequency, bandwidth and
+    /// transmit power after `RADIO_STATE_ON`. In this mode, readiness requires
+    /// the later transmit-power echo, and [`Self::definitive_rejection`] returns
+    /// `None` until it arrives. The reducer checks device-reported values.
     pub const fn with_effective_settings(target: RNodeProtocolTarget) -> Self {
         let mut state = Self::new(target);
         state.effective = Some(EffectiveSettings {

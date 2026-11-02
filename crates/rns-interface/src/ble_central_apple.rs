@@ -1,9 +1,6 @@
-//! Apple CBCentralManager scan driver.
-//!
-//! Exists to pass `CBCentralManagerScanOptionAllowDuplicatesKey = YES` to
-//! `scanForPeripheralsWithServices:options:` — btleplug does not expose
-//! that key, and without it CoreBluetooth reports each peripheral at most
-//! once per scan session.
+//! Apple CBCentralManager scan driver. Requests repeated advertisement
+//! callbacks with `CBCentralManagerScanOptionAllowDuplicatesKey = YES` and
+//! reuses its native manager between scan cycles.
 
 #![cfg(any(target_os = "ios", target_os = "macos"))]
 
@@ -77,8 +74,10 @@ fn manager_slot() -> &'static Mutex<SendPtr> {
     MANAGER_PTR.get_or_init(|| Mutex::new(SendPtr(std::ptr::null_mut())))
 }
 
-/// Start a CBCentralManager scan with `AllowDuplicatesKey = YES`. Empty
-/// `services` scans for all advertisements.
+/// Request a CBCentralManager scan with `AllowDuplicatesKey = YES`. Empty
+/// `services` removes the service filter. On first startup, manager creation
+/// and the wait for PoweredOn continue on a worker thread after this function
+/// returns; `Ok` is not confirmation that scanning has started.
 pub async fn start_scan(
     services: Vec<Uuid>,
 ) -> Result<mpsc::UnboundedReceiver<DiscoveryEvent>, String> {
@@ -228,8 +227,9 @@ pub async fn stop_scan() -> Result<(), String> {
     Ok(())
 }
 
-/// Full teardown — interface shutdown only. Per-cycle stops use
-/// [`stop_scan`] to keep the manager alive (macOS alloc-cycle bug).
+/// Detach the delegate, release this module's explicit manager retain, and
+/// clear its manager slot during interface shutdown. Per-cycle stops use
+/// [`stop_scan`] and retain the manager for reuse.
 pub async fn teardown_central() -> Result<(), String> {
     let _ = stop_scan().await;
 
@@ -275,9 +275,9 @@ pub fn current_state() -> CentralState {
     lifecycle().current()
 }
 
-/// Persistent `CBCentralManager` pointer. Apple central peripheral caches
-/// are per-manager, not per-process — `ble_central_apple_connect` must
-/// drive `connectPeripheral:` against the same manager that scanned.
+/// Borrow the current `CBCentralManager` pointer without retaining it.
+/// Connection setup uses the manager that performed discovery. Callers must
+/// coordinate teardown; this accessor does not extend the pointer's lifetime.
 pub fn central_manager_ptr() -> Option<*mut AnyObject> {
     let lock = MANAGER_PTR.get()?;
     let g = lock.lock().ok()?;

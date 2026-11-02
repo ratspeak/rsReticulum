@@ -9,7 +9,9 @@ use zeroize::Zeroizing;
 use crate::identity::{DecryptionResult, Identity};
 use crate::name_hash::name_hash;
 
-/// Callback invoked on incoming data packets: `fn(plaintext, raw_packet)`.
+/// Callback invoked on incoming DATA: `fn(plaintext, raw_packet)`.
+/// [`Destination::receive`] supplies only the payload as its second argument;
+/// use [`Destination::receive_packet`] when the callback needs the full packet.
 pub type PacketCallback = Box<dyn Fn(&[u8], &[u8]) + Send + Sync>;
 /// Callback invoked when a new link is established: `fn(link_id)`.
 pub type LinkEstablishedCallback = Box<dyn Fn([u8; 16]) + Send + Sync>;
@@ -191,12 +193,13 @@ pub struct Destination {
     pub hash: [u8; 16],
     pub name_hash: [u8; 10],
     pub app_name: String,
-    /// Human-readable full destination name, including the identity hash.
+    /// Human-readable full destination name, including an identity hash when applicable.
     pub name: String,
     /// Identity hash bound into this destination address, when applicable.
     pub identity_hash: Option<[u8; 16]>,
     pub proof_strategy: ProofStrategy,
-    /// If set, incoming data is signature-checked but not decrypted.
+    /// Compatibility flag stored by the setter. The current receive methods
+    /// do not consult it; setting it does not enable signature-only validation.
     pub only_validate_signature: bool,
     group_key: Option<Zeroizing<Vec<u8>>>,
 
@@ -218,12 +221,15 @@ pub struct Destination {
     default_app_data: Option<DefaultAppData>,
 
     pub ratchets_enabled: bool,
-    /// When set, non-ratchet ciphertexts are rejected.
+    /// For SINGLE decryption, reject ciphertext not authenticated by a supplied
+    /// retained ratchet key. Does not change Plain or GROUP decryption.
     pub ratchets_enforced: bool,
 
-    /// OUT: remote peer's most recent ratchet public key, used for forward-secret encryption.
+    /// Remote ratchet public key selected by [`Self::pack_packet`] unless
+    /// explicitly overridden. The caller validates its announce and expiry.
     pub remote_ratchet_pub: Option<[u8; 32]>,
-    /// IN: our current ratchet public key, advertised in announces.
+    /// Local ratchet public key returned by [`Self::get_ratchet_for_announce`].
+    /// Announce builders use their explicit ratchet argument.
     pub local_ratchet_pub: Option<[u8; 32]>,
 
     path_responses: HashMap<Vec<u8>, PathResponseCache>,
@@ -285,7 +291,10 @@ impl Destination {
     ///
     /// For SINGLE/GROUP inbound destinations, a new identity is generated
     /// automatically when `identity` is `None`; retrieve it via
-    /// [`Destination::auto_identity`].
+    /// [`Destination::auto_identity`]. In that case the generated identity hash
+    /// is also appended to `app_name` before computing the name hash. Supply
+    /// an identity explicitly when addressing a fixed application/aspect name.
+    /// This constructor neither registers with a runtime nor creates a GROUP key.
     ///
     /// See [`Destination::compute_hash`] for the hash derivation.
     pub fn new(
@@ -437,7 +446,8 @@ impl Destination {
         self.proof_strategy = strategy;
     }
 
-    /// Set the pre-shared key used for GROUP encryption.
+    /// Store a pre-shared key without checking its length or destination type.
+    /// Prefer [`Self::load_group_key`] for validated GROUP key installation.
     pub fn set_group_key(&mut self, key: Vec<u8>) {
         self.group_key = Some(Zeroizing::new(key));
     }
@@ -493,7 +503,8 @@ impl Destination {
     /// Produce a proof over `packet_hash` for this (SINGLE) destination.
     ///
     /// `implicit_proof = true` emits the 64-byte signature alone; otherwise
-    /// the output is `packet_hash || signature`.
+    /// the output is `packet_hash || signature`. Pass a 32-byte packet hash;
+    /// its length is not checked here.
     pub fn prove(
         &self,
         packet_hash: &[u8],
@@ -524,8 +535,8 @@ impl Destination {
     ///
     /// Announce and LinkRequest packets are plaintext. Resource payload,
     /// Resource proof, keepalive, cache-request, and LRPROOF contexts are also
-    /// already protected or intentionally plaintext and therefore bypass
-    /// destination encryption. Other SINGLE/GROUP packets are encrypted here.
+    /// exempt from destination encryption. The caller must provide any
+    /// protection those payloads require. Other SINGLE/GROUP packets are encrypted here.
     ///
     /// Ordinary Link packets remain owned by `LinkSession`; LRPROOF is the
     /// sole Link context accepted by this stateless builder.
@@ -625,7 +636,9 @@ impl Destination {
     /// Encrypt data for this destination.
     ///
     /// For SINGLE destinations a `remote_ratchet_pub` replaces the identity's
-    /// X25519 key in the ECDH exchange, giving forward secrecy.
+    /// X25519 key in ECDH. See [`Identity::encrypt`] for its key-compromise
+    /// boundaries. This method uses only the ratchet argument, not the stored
+    /// `remote_ratchet_pub` field; [`Self::pack_packet`] selects that fallback.
     pub fn encrypt(
         &self,
         plaintext: &[u8],
@@ -659,7 +672,8 @@ impl Destination {
         self.decrypt_with_ratchets(ciphertext, identity, None)
     }
 
-    /// Decrypt data, trying each ratchet private key before the identity key.
+    /// Decrypt data. For SINGLE, try supplied ratchet keys only when ratchets
+    /// are enabled, then the identity key unless ratchets are enforced.
     pub fn decrypt_with_ratchets(
         &self,
         ciphertext: &[u8],
@@ -710,12 +724,14 @@ impl Destination {
         }
     }
 
-    /// Record the remote peer's ratchet public key, learnt from an announce.
+    /// Record the remote peer's ratchet public key after the caller validates
+    /// its announce. This setter performs no authentication or expiry check.
     pub fn set_remote_ratchet(&mut self, pub_key: [u8; 32]) {
         self.remote_ratchet_pub = Some(pub_key);
     }
 
-    /// Set our outbound ratchet public key from the ratchet ring.
+    /// Set the local public key that peers can use for ratcheted encryption to us.
+    /// The caller retains the corresponding private key in its ratchet ring.
     pub fn set_local_ratchet(&mut self, pub_key: [u8; 32]) {
         self.local_ratchet_pub = Some(pub_key);
     }
@@ -737,7 +753,8 @@ impl Destination {
         self.link_established_callback = Some(callback);
     }
 
-    /// Callback invoked under `ProveApp` strategy; returning `true` emits a proof.
+    /// Callback queried by [`Self::should_prove`] under `ProveApp`. Returning
+    /// true asks the runtime to emit a proof; the callback does not send one.
     pub fn set_proof_requested_callback(&mut self, callback: ProofRequestedCallback) {
         self.proof_requested_callback = Some(callback);
     }
@@ -807,9 +824,9 @@ impl Destination {
 
     /// Decrypt and dispatch an incoming packet.
     ///
-    /// LINKREQUEST (`0x02`) bypasses decryption and is handled by
-    /// [`Destination::incoming_link_request`]; DATA (`0x00`) packets
-    /// additionally fire the packet callback.
+    /// LINKREQUEST (`0x02`) is returned unchanged; the caller must handle Link
+    /// admission separately. DATA (`0x00`) also invokes the packet callback,
+    /// passing `data` as its raw-packet argument because no full packet was supplied.
     pub fn receive(
         &self,
         packet_type: u8,
@@ -891,7 +908,9 @@ impl Destination {
         self.accept_link_requests
     }
 
-    /// Enable ratchet forward secrecy. If `enforce`, non-ratchet inbound ciphertext is rejected.
+    /// Enable use of supplied ratchet keys for SINGLE decryption. If `enforce`,
+    /// reject ciphertext that no supplied ratchet key can authenticate.
+    /// This only changes flags; the caller generates, persists and advertises keys.
     pub fn enable_ratchets(&mut self, enforce: bool) {
         self.ratchets_enabled = true;
         self.ratchets_enforced = enforce;
@@ -949,6 +968,11 @@ impl Destination {
     }
 
     /// Build announce data with independent wire-ordering and cache clocks.
+    ///
+    /// Requires an inbound SINGLE destination. The caller must supply its matching
+    /// signing identity; this builder does not check that binding. A cached tag
+    /// returns its prior body even if the supplied app data or ratchet changed.
+    /// Use the explicit ratchet argument; stored ratchet fields are not selected here.
     pub fn create_announce_at(
         &mut self,
         identity: &Identity,

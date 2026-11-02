@@ -1,7 +1,14 @@
-//! Reticulum runtime singleton, init and lifecycle. Three operating modes:
-//! **Shared** owns hardware and serves RPC to siblings; **Client** connects
-//! to a Shared instance over a local socket; **Standalone** owns its
-//! interfaces and exposes no IPC. Python: `RNS/Reticulum.py`.
+//! Runtime construction, application operations and interface lifecycle.
+//! Shared mode owns interfaces and serves local packet IPC and control RPC;
+//! Client mode uses an existing shared owner; Standalone owns its interfaces
+//! without serving shared-instance IPC.
+//!
+//! Start with [`init`] or [`init_with_policy`], retain the returned handle and
+//! call [`ReticulumHandle::shutdown_and_wait`] before stopping Tokio. Configure
+//! receivers before sending application traffic. Runtime interface creation
+//! is rejected in Client mode and once shutdown begins. Successful interface
+//! registration does not promise a connected peer or RNode protocol readiness,
+//! and runtime-spawned interfaces are not written back to the config file.
 
 use rns_identity::ifac::IfacKey;
 use std::collections::HashMap;
@@ -440,6 +447,10 @@ impl Drop for TransportActorCompletionGuard {
 }
 
 #[derive(Clone)]
+/// Cloneable access to one running runtime. Clones share actor and interface
+/// ownership; configuration fields are snapshots, not a general live
+/// reconfiguration API. Dropping handles alone does not stop a runtime;
+/// use `shutdown_and_wait` while Tokio is still running.
 pub struct ReticulumHandle {
     pub transport_tx: mpsc::Sender<TransportMessage>,
     path_recovery: rns_transport::path_recovery::PathRecoveryHandle,
@@ -459,10 +470,9 @@ pub struct ReticulumHandle {
     /// Mobile builds throttle tick rates when the app is backgrounded.
     pub is_foreground: Arc<AtomicBool>,
     pub shutdown: ShutdownSignal,
-    /// Wire-facing transport identity (Python `Transport.identity`): on
-    /// non-transport nodes this is a fresh per-boot identity unless
-    /// `static_transport_identity` is set (Transport.py:234-238); RPC-key
-    /// derivation stays on the persisted identity.
+    /// Wire-facing identity. A non-transport node gets a fresh identity on
+    /// startup unless `static_transport_identity` is enabled. The default
+    /// local RPC key is derived from the separate persisted identity.
     pub transport_identity: Arc<Identity>,
     pub network_identity: Option<Arc<Identity>>,
     /// Present even when `discover_interfaces = No` so a downstream can
@@ -477,7 +487,9 @@ pub struct ReticulumHandle {
     started_at: std::time::Instant,
 }
 
-/// Identity and announce metadata recalled from the live transport cache.
+/// Identity and announce metadata from this process's transport cache.
+/// Entries can have been restored from storage; this value does not establish
+/// fresh signature verification or current reachability.
 #[derive(Clone)]
 pub struct RecalledDestination {
     pub destination_hash: [u8; 16],
@@ -515,7 +527,9 @@ impl AnnounceSubscription {
         self.dropped_events.load(Ordering::Relaxed)
     }
 
-    /// Deterministically deregister this subscription.
+    /// Request exact deregistration and wait for the actor's acknowledgment.
+    /// False means already closed or no matching subscription. This has no
+    /// whole-call timeout and does not consume events already in the queue.
     pub async fn close(&mut self) -> Result<bool, AnnounceSubscriptionError> {
         let Some(id) = self.id else {
             return Ok(false);
@@ -641,10 +655,11 @@ impl RNodeRuntimeObserver {
         self.state.changed().await
     }
 
-    /// Wait up to `timeout` for complete protocol readiness.
-    ///
-    /// One absolute deadline spans reconnects. Dropping this future has no
-    /// effect on the driver or registry.
+    /// Wait for this driver's current `Ready` phase with a nonzero connection
+    /// generation. One absolute deadline spans reconnects; dropping the future
+    /// does not affect the driver. A currently ready snapshot returns immediately.
+    /// A duration too large for Tokio's deadline representation waits without
+    /// a timeout. Readiness does not attest to RF range or peer reachability.
     pub async fn await_ready(
         &self,
         timeout: Duration,
@@ -807,9 +822,11 @@ impl RNodeReadinessError {
 /// Options for [`ReticulumHandle::send_to`].
 #[derive(Debug, Clone)]
 pub struct SendOptions {
-    /// Track the packet until a proof arrives or its receipt expires.
+    /// Request a receipt for a non-PLAIN packet. PLAIN ignores this option;
+    /// tracked destinations must have identity metadata in the local cache.
     pub create_receipt: bool,
-    /// Override the route-derived receipt timeout.
+    /// Override the receipt's proof timeout, not the duration of `send_to`.
+    /// `None` uses route timing, with a 180-second fallback if lookup fails.
     pub timeout: Option<Duration>,
     /// Restrict dispatch to one interface.
     pub attached_interface: Option<rns_transport::messages::InterfaceId>,
@@ -825,7 +842,9 @@ impl Default for SendOptions {
     }
 }
 
-/// Immediate result of a successful packet dispatch.
+/// Local dispatch result: an interface queue accepted the packet. This is
+/// not on-air confirmation or a peer-delivery proof; inspect `receipt` when
+/// present for a terminal protocol outcome.
 #[derive(Debug, Clone)]
 pub struct SendResult {
     pub packet_hash: [u8; 32],
@@ -833,9 +852,10 @@ pub struct SendResult {
 }
 
 /// Stateful non-Link application packet that can be sent and re-sent.
-///
-/// Re-sending runs the normal destination encryption path again, producing
-/// fresh ciphertext, a new packet hash, and a new receipt when requested.
+/// Re-sending repeats destination packet construction. Encrypted destinations
+/// produce fresh ciphertext; PLAIN data is not encrypted and can retain its
+/// packet hash. A new receipt is requested only when the options and
+/// destination type support one.
 pub struct OutboundPacket<'a> {
     runtime: &'a ReticulumHandle,
     destination: &'a Destination,
@@ -856,6 +876,8 @@ impl std::fmt::Debug for OutboundPacket<'_> {
 }
 
 impl OutboundPacket<'_> {
+    /// Whether the wrapper's latest send state is successful local dispatch.
+    /// This is not peer delivery; a failed `resend` resets the flag.
     pub fn is_sent(&self) -> bool {
         self.sent
     }
@@ -873,7 +895,9 @@ impl OutboundPacket<'_> {
         Ok(result)
     }
 
-    /// Re-send a previously-sent packet with fresh destination encryption.
+    /// Repeat a previously successful send using destination packet construction.
+    /// On failure this wrapper resets its sent flag; call `send` for the next
+    /// attempt. Success still means local dispatch, not remote delivery.
     pub async fn resend(&mut self) -> Result<SendResult, SendError> {
         if !self.sent {
             return Err(SendError::NotSent);
@@ -924,10 +948,9 @@ impl PacketReceiptHandle {
         self.status_rx.clone()
     }
 
-    /// Change the timeout of this receipt while it is still pending.
-    ///
-    /// The new duration is measured from the original send time, matching
-    /// Python `PacketReceipt.set_timeout`.
+    /// Change the timeout while the receipt remains pending, measured from
+    /// its original actor-side receipt creation time. This does not restart
+    /// the clock. Admission and acknowledgment have no timeout of their own.
     pub async fn set_timeout(&self, timeout: Duration) -> Result<(), ReceiptError> {
         if self.status() != ReceiptUpdate::Sent {
             return Err(ReceiptError::NoLongerTracked);
@@ -948,7 +971,9 @@ impl PacketReceiptHandle {
         }
     }
 
-    /// Wait until the packet is delivered or reaches another terminal state.
+    /// Wait for a valid destination-signed proof or another terminal receipt
+    /// state. Delivery does not attest to application processing or persistence.
+    /// This waiter relies on the actor's receipt timer; it adds no outer deadline.
     pub async fn delivered(mut self) -> Result<Duration, ReceiptError> {
         loop {
             match self.status() {
@@ -1014,13 +1039,13 @@ pub enum SendError {
 /// Options for opening a persistent application Link.
 #[derive(Debug, Clone)]
 pub struct LinkConnectOptions {
-    /// How long path discovery may run when no validated announce is cached.
+    /// Path-resolution budget when required identity/path metadata is absent.
+    /// A cache hit need not trigger fresh discovery or signature verification.
     pub path_timeout: Duration,
-    /// Explicit deadline for the Link handshake itself.
-    ///
-    /// When omitted, the runtime derives Python-compatible timing from the
-    /// destination's first-hop timeout and current path hop count.
-    /// `Some(Duration::ZERO)` deliberately requests an immediate deadline.
+    /// Timeout for Link request admission and proof waiting, not the entire
+    /// connection call. When omitted, it is first-hop timeout plus the default
+    /// per-hop timeout times at least one hop. `Some(Duration::ZERO)` selects
+    /// zero for this phase; other setup/cleanup work can still take time.
     pub establishment_timeout: Option<Duration>,
     /// Registration label used for the temporary Link destination.
     pub client_label: String,
@@ -1107,9 +1132,10 @@ pub enum ControlError {
     InvalidIdentity(#[from] rns_identity::identity::IdentityError),
 }
 
-/// Shared discovery state behind one `Arc` so cloning [`ReticulumHandle`]
-/// doesn't proliferate state. Holds inputs for the eventual announce tick /
-/// subscriber loop.
+/// Discovery state shared by cloned runtime handles. Install a
+/// [`DiscoveryStamper`] through [`ReticulumHandle::enable_on_network_discovery`]
+/// to start configured receiving and publication; constructing this state
+/// alone does not start either service.
 pub struct DiscoveryRuntime {
     stamper: Mutex<Option<Arc<dyn DiscoveryStamper + Send + Sync>>>,
     store: Mutex<Option<Arc<DiscoveryStore>>>,
@@ -1163,9 +1189,10 @@ impl ReticulumHandle {
         self.link_endpoint_dispatch.clone()
     }
 
-    /// Non-fatal configured-interface startup failures, as `(name, reason)`.
-    /// Other interfaces remain usable. Empty for shared clients, which do not
-    /// start the caller's configured interfaces.
+    /// Recorded non-fatal failures after interface configuration synthesis,
+    /// as `(name, reason)`. Other interfaces can remain usable. Earlier parsing
+    /// or synthesis failures may be logged without appearing here. Shared
+    /// clients do not spawn configured interfaces and return an empty slice.
     pub fn startup_interface_failures(&self) -> &[(String, String)] {
         &self.startup_interface_failures
     }
@@ -1294,15 +1321,20 @@ impl ReticulumHandle {
         self.config.link_mtu_discovery
     }
 
-    /// Trigger orderly runtime shutdown and wait until the transport actor has
-    /// synchronously flushed its persisted state. Dropping this future does
-    /// not cancel the runtime-owned drain operation.
+    /// Start runtime-owned shutdown and wait for interface ownership cleanup
+    /// and transport termination. Normal transport shutdown attempts synchronous
+    /// state persistence; this API returns no persistence error or durability
+    /// receipt. Dropping the future does not cancel cleanup. Some stop/transport
+    /// waits are outside the interface-task join deadline; there is no whole-call
+    /// timeout.
     pub async fn shutdown_and_wait(&self) {
         self.shutdown_coordinator.start_and_wait().await;
     }
 
-    /// Wait up to `timeout` for the transport actor to resolve a path.
-    /// Python: `Transport.await_path` (RNS/Transport.py:2524).
+    /// Wait for the local actor to confirm a current path, requesting one if
+    /// needed. One deadline covers mailbox admission and reply waiting. Success
+    /// is a routing observation, not proof that the destination application
+    /// will respond.
     pub async fn await_path(
         &self,
         destination_hash: [u8; 16],
@@ -1311,12 +1343,14 @@ impl ReticulumHandle {
         await_path(&self.transport_tx, destination_hash, timeout).await
     }
 
-    /// Resolve a destination and open a persistent encrypted Link.
+    /// Resolve cached identity/path metadata and open a persistent encrypted
+    /// [`LinkSession`], requesting a path when needed. Cache data is trusted
+    /// without fresh announce-signature verification. The Link proof is checked
+    /// against the resolved signing key.
     ///
-    /// This is the app-facing counterpart to Python's `Link(destination)`:
-    /// it uses the validated announce cache for the remote public key, starts
-    /// path discovery when necessary, and then hands ownership to
-    /// [`LinkSession`].
+    /// Path and establishment options bound particular phases, not the complete
+    /// call. Use a caller deadline when needed, and keep draining the returned
+    /// session's events.
     pub async fn connect_link(
         &self,
         destination_hash: [u8; 16],
@@ -1363,6 +1397,9 @@ impl ReticulumHandle {
         })
     }
 
+    /// Subscribe to matching validated announce events with capacity 128.
+    /// Use the returned stream's dropped counter to detect capacity loss.
+    /// Registration waits for acknowledgment without a whole-call deadline.
     pub async fn subscribe_announces(
         &self,
         aspect_filter: Option<String>,
@@ -1376,6 +1413,10 @@ impl ReticulumHandle {
         .await
     }
 
+    /// Register an announce subscription with nonzero capacity. The actor
+    /// verifies matching announces before dispatch; a full receiver drops events
+    /// and increments its counter. Registration waits for actor acknowledgment
+    /// without an outer timeout. Drop or close the subscription when finished.
     pub async fn subscribe_announces_with_capacity(
         &self,
         aspect_filter: Option<String>,
@@ -1409,12 +1450,9 @@ impl ReticulumHandle {
         })
     }
 
-    /// Prepare one stateful non-Link application packet.
-    ///
-    /// [`OutboundPacket::send`] performs the same validated destination
-    /// resolution, encryption, receipt registration, and dispatch as
-    /// [`Self::send_to`]. [`OutboundPacket::resend`] repeats that complete
-    /// path so each attempt receives fresh ciphertext and receipt state.
+    /// Prepare a stateful wrapper around [`Self::send_to`]. No packet is sent
+    /// until `send` or `resend` is called. Each attempt repeats cache lookup and
+    /// packet construction; only encrypted destinations get fresh ciphertext.
     pub fn outbound_packet<'a>(
         &'a self,
         destination: &'a Destination,
@@ -1430,10 +1468,15 @@ impl ReticulumHandle {
         }
     }
 
-    /// Encrypt and dispatch one non-Link application packet.
+    /// Build and dispatch a non-Link packet for an outbound destination.
+    /// SINGLE always needs identity metadata in this process's announce cache;
+    /// other tracked destinations also need it. This method does not discover a
+    /// missing identity. PLAIN is unencrypted and never gets a receipt.
     ///
-    /// Call [`Self::outbound_packet`] when the same logical packet may need
-    /// to be re-sent with fresh ciphertext.
+    /// Success means an interface queue accepted the packet. The optional receipt
+    /// reports a later peer proof, not application consumption. `options.timeout`
+    /// applies to that receipt; transport submission and dispatch reply have no
+    /// whole-call deadline. Use [`Self::outbound_packet`] for explicit resend state.
     pub async fn send_to(
         &self,
         destination: &Destination,
@@ -1553,7 +1596,9 @@ impl ReticulumHandle {
         rns_wire::receipt::receipt_timeout_for_route(first_hop, hops)
     }
 
-    /// Query this process' transport actor directly.
+    /// Query this process's actor with a five-second admission-and-reply budget.
+    /// Errors become `None`; even in Client mode this does not query the shared
+    /// owner. Use `query_control_result` for typed control errors.
     pub async fn query_transport(&self, query: TransportQuery) -> Option<TransportQueryResponse> {
         self.query_transport_result(query).await.ok()
     }
@@ -1603,14 +1648,14 @@ impl ReticulumHandle {
         result
     }
 
-    /// Recall the identity and latest announce metadata for `destination_hash`.
+    /// Read identity and announce metadata from this process's transport cache
+    /// without extending its lifetime. This remains a local lookup in Client
+    /// mode, even when the shared owner knows more.
     ///
-    /// This reads this process' live, validated replicated announce cache in
-    /// O(1) without extending the entry's lifetime. In shared-instance client
-    /// mode it intentionally remains a process-local cache lookup, not an
-    /// authoritative control-plane query. It mirrors
-    /// `Identity.recall(destination_hash, _no_use=True)` and returns `None`
-    /// when no identity-bearing announce is known.
+    /// The helper does not verify a fresh signature or check current presence.
+    /// Stored cache metadata can be restored with structural checks alone; keep
+    /// its storage within the application's trust boundary. `None` means no
+    /// identity-bearing entry, not a failed on-network lookup.
     pub async fn recall(
         &self,
         destination_hash: [u8; 16],
@@ -1715,11 +1760,10 @@ impl ReticulumHandle {
         }
     }
 
-    /// Return the effective MTU of the next-hop interface.
-    ///
-    /// Rust interfaces normalize fixed and auto-configured hardware MTUs into
-    /// one concrete value, so this is the counterpart to Python's
-    /// `next_hop_interface_hw_mtu()`.
+    /// Return the next-hop interface MTU in bytes, when available. In Client
+    /// mode the owner is queried by interface name; an ambiguous name or a zero
+    /// MTU yields `None`. This interface value is not a negotiated Link payload
+    /// budget or the MTU of every hop on the path.
     pub async fn next_hop_hardware_mtu(
         &self,
         destination_hash: [u8; 16],
@@ -1774,10 +1818,10 @@ impl ReticulumHandle {
             .map(|latency| latency * 8.0))
     }
 
-    /// Return the first-hop transmission timeout for `destination_hash`.
-    ///
-    /// Shared-instance clients include the configured simulated local-link
-    /// latency from `force_shared_instance_bitrate`, matching Python.
+    /// Return the first-hop timeout estimate. In Client mode, a positive
+    /// `force_shared_instance_bitrate` adds the estimated transmission time
+    /// of one Reticulum MTU over the shared link. This is a protocol timing
+    /// input, not a measured or guaranteed transmission duration.
     pub async fn first_hop_timeout(
         &self,
         destination_hash: [u8; 16],
@@ -1801,7 +1845,9 @@ impl ReticulumHandle {
         }
     }
 
-    /// Request a network path, optionally on one interface with an explicit tag.
+    /// Enqueue a path request, optionally restricted to an interface and tag.
+    /// Success means mailbox admission, not path resolution. This method has
+    /// no submission timeout; use `await_path` to wait with a deadline.
     pub async fn request_path(
         &self,
         destination_hash: [u8; 16],
@@ -1816,7 +1862,10 @@ impl ReticulumHandle {
             .map_err(|_| ControlError::ChannelClosed)
     }
 
-    /// Return the authoritative path table, optionally limited by hop count.
+    /// Return the control-plane path snapshot, optionally limited by hop count.
+    /// Client mode queries the shared owner, but its RPC format omits local
+    /// interface id/mode/role: these fields become `0`, `Full` and `Normal`.
+    /// Do not treat those fallback fields as observed owner configuration.
     pub async fn path_table(
         &self,
         max_hops: Option<u8>,
@@ -1837,11 +1886,13 @@ impl ReticulumHandle {
         }
     }
 
-    /// Return a normalized interface-stat snapshot.
+    /// Return interface statistics from the local actor or shared owner's RPC.
+    /// Aggregate traffic counters use saturating sums of returned interface records.
     ///
-    /// Aggregate counters are calculated with saturating sums. Metadata that
-    /// the current runtime or a shared-instance RPC cannot supply remains
-    /// `None` rather than being replaced with sentinel values.
+    /// Transport identity/uptime metadata is available here only for a local
+    /// transport node; probe and process-memory fields are `None`. The RPC bridge
+    /// uses `0` for an absent IFAC size and does not retain parent ids, so it cannot
+    /// preserve every distinction present in local runtime records.
     pub async fn interface_stats(&self) -> Result<InterfaceStats, ControlError> {
         let interfaces = match self
             .query_control_result(TransportQuery::GetInterfaceStats)
@@ -1940,10 +1991,10 @@ impl ReticulumHandle {
         Ok(matched)
     }
 
-    /// Result-returning control-plane query used by the typed facade.
-    ///
-    /// In client mode, a failed or unsupported shared-instance request never
-    /// falls back to this process' local actor.
+    /// Query the local actor, or the shared owner's authenticated control RPC
+    /// in Client mode. A failed or unsupported shared request does not fall back
+    /// to the local actor. Local queries have one five-second deadline; shared
+    /// RPC uses per-operation timeouts, not one whole-call deadline.
     pub async fn query_control_result(
         &self,
         query: TransportQuery,
@@ -1979,21 +2030,20 @@ impl ReticulumHandle {
         Ok(self.apply_shared_instance_latency(&query, response))
     }
 
-    /// Query the authoritative control plane.
-    ///
-    /// In client mode, Python proxies Reticulum control methods to the local
-    /// shared instance over the RPC listener. Only operations exposed by that
-    /// listener are available here; failures and unsupported queries return
-    /// `None` without consulting this process' local actor. Use
+    /// Query the local actor or shared-owner control plane, converting all errors
+    /// to `None`. Client mode supports only queries exposed by the RPC mapping.
+    /// Use [`Self::query_control_result`] to distinguish failures and
     /// [`Self::query_transport`] for explicit process-local access.
     pub async fn query_control(&self, query: TransportQuery) -> Option<TransportQueryResponse> {
         self.query_control_result(query).await.ok()
     }
 
-    /// Install a [`DiscoveryStamper`] so this node can emit PoW-stamped
-    /// discovery announces. Inverts Python's hard `LXMF.LXStamper` import
-    /// (RNS/Discovery.py:41) — downstream apps install at startup. Idempotent;
-    /// without a stamper, discovery stays silently inert.
+    /// Install a [`DiscoveryStamper`] and start the configured discovery workers.
+    /// `discover_interfaces` enables receiving; discoverable local interfaces
+    /// can publish independently of that flag. Both need the stamp provider and
+    /// an available discovery store. Repeated calls do not duplicate running
+    /// workers, but replacing the provider does not replace their captured copy.
+    /// This method returns no worker-startup or publication acknowledgment.
     pub async fn enable_on_network_discovery(
         &self,
         stamper: Arc<dyn DiscoveryStamper + Send + Sync>,
@@ -2002,12 +2052,16 @@ impl ReticulumHandle {
         start_on_network_discovery(self.clone()).await;
     }
 
+    /// Return whether a stamp provider is installed. True does not mean a
+    /// receiver/publisher started successfully or that any interface was found.
     pub async fn discovery_enabled(&self) -> bool {
         self.discovery.stamper.lock().await.is_some()
     }
 
-    /// Snapshot of currently-known interfaces. Stale + disallowed entries
-    /// are purged on read. Python: `discovered_interfaces()`.
+    /// List stored discovery records. Listing removes corrupt, expired,
+    /// unlisted-type and disallowed-publisher records from disk; merely stale
+    /// records remain until the removal threshold. Missing storage or a listing
+    /// error returns an empty vector. This is not a live reachability probe.
     pub async fn discovered_interfaces(&self) -> Vec<DiscoveredInterface> {
         let store = self.discovery.store.lock().await.clone();
         let Some(store) = store else {
@@ -2021,8 +2075,8 @@ impl ReticulumHandle {
         store.list(sources).unwrap_or_default()
     }
 
-    /// Identity hashes whose blackhole manifest this node subscribes to.
-    /// Python: `Reticulum.blackhole_sources()`.
+    /// Configured publisher identity hashes for blackhole-manifest pulls.
+    /// This slice does not establish whether a pull succeeded.
     pub fn blackhole_sources(&self) -> &[[u8; 16]] {
         &self.config.blackhole_sources
     }
@@ -2290,9 +2344,9 @@ pub enum InstanceMode {
     Standalone,
 }
 
-/// Shared-instance transport: TCP loopback or AF_UNIX socket. Python uses
-/// AF_UNIX only on Linux/Android and TCP elsewhere. Python config key:
-/// `shared_instance_type`.
+/// Shared-instance transport. The default is AF_UNIX on Linux/Android and
+/// TCP loopback elsewhere. Explicit Unix selection uses filesystem sockets
+/// on other supported Unix hosts; abstract names are Linux/Android-specific.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharedInstanceType {
     /// TCP loopback on [`ReticulumConfig::shared_instance_port`].
@@ -2358,6 +2412,9 @@ fn shared_unix_rpc_socket_path(instance_name: &str, socket_base: &Path) -> Strin
     }
 }
 
+/// Build the RPC Unix-socket name. Linux/Android names begin with a NUL
+/// byte for the abstract namespace; other hosts use a path under `socket_base`.
+/// This function neither creates nor validates a socket.
 pub fn shared_instance_rpc_socket_path(instance_name: &str, socket_base: &Path) -> String {
     shared_unix_rpc_socket_path(instance_name, socket_base)
 }
@@ -2385,6 +2442,9 @@ fn socket_path_display(path: &str) -> String {
 }
 
 #[derive(Debug, Clone)]
+/// Parsed runtime settings. `Default` supplies values; `try_from_config`
+/// overlays supported keys. Editing this struct after initialization does
+/// not reconfigure already-running actors or interface tasks.
 pub struct ReticulumConfig {
     pub share_instance: bool,
     pub instance_name: String,
@@ -2392,13 +2452,12 @@ pub struct ReticulumConfig {
     pub shared_instance_port: u16,
     pub control_port: u16,
     pub enable_transport: bool,
-    /// Python 1.3.8 `static_transport_identity` (Reticulum.py:255,502-504,
-    /// default false): opts a non-transport node out of the per-boot
-    /// ephemeral wire-facing transport identity.
+    /// Keep the persisted wire-facing transport identity on a non-transport
+    /// node instead of creating a fresh one at startup. Default false.
     pub static_transport_identity: bool,
-    /// Python 1.3.8 `local_hops_delta` (Reticulum.py:256,506-508, default
-    /// false): apply a per-boot random 2..=7 hop offset to locally-originated
-    /// packets (Transport.py:240,1356-1365).
+    /// Use a per-startup random hop offset of 2..=7 for eligible locally
+    /// originated packets. PLAIN/GROUP and shared-instance edges are excluded;
+    /// this is not a general anonymity guarantee. Default false.
     pub local_hops_delta: bool,
     pub respond_to_probes: bool,
     pub use_implicit_proof: bool,
@@ -2407,8 +2466,9 @@ pub struct ReticulumConfig {
     pub enable_remote_management: bool,
     pub remote_management_allowed: Vec<Vec<u8>>,
     pub rpc_key: Option<Vec<u8>>,
-    /// Python `force_shared_instance_bitrate` (bps). Caps announce rate /
-    /// token bucket regardless of real link bitrate.
+    /// Simulated shared-link bitrate in bits per second. A positive value
+    /// replaces the reported bitrate/derived MTU and affects announce pacing
+    /// and first-hop timeout estimates; it does not throttle all socket traffic.
     pub force_shared_instance_bitrate: Option<u64>,
     pub default_ar_target: Option<u64>,
     pub default_ar_penalty: Option<u64>,
@@ -2417,22 +2477,27 @@ pub struct ReticulumConfig {
     pub ingress_overrides: rns_transport::ingress::IngressOverrides,
     pub loglevel: i32,
 
-    /// Optional "network identity" file: discovery announce app_data is
-    /// encrypted to this identity's pubkey. Python `network_identity`.
+    /// Optional identity file, loaded or created at startup. It signs discovery
+    /// announces and supplies the key for per-interface `discovery_encrypt`.
+    /// Providing this path alone does not encrypt every discovery announce.
     pub network_identity_path: Option<PathBuf>,
-    /// Publish periodic discovery announces. Python `discover_interfaces`.
+    /// Receive on-network interface discovery when a stamper is installed.
+    /// Publication is controlled separately by each interface's `discoverable`.
     pub discover_interfaces: bool,
-    /// Maximum number of discovered interfaces to auto-connect to. Python
-    /// `autoconnect_discovered_interfaces`.
+    /// Maximum discovered Backbone connections to retain; zero disables
+    /// auto-connect. Receiving discovery and installing a stamper are also
+    /// required. Other discovered interface types are not auto-connected.
     pub autoconnect_discovered_interfaces: usize,
-    /// Python `autoconnect_unverified_implementations`: also auto-connect
-    /// interfaces whose stack is not a trusted release, rsRNS included.
+    /// Permit Backbone auto-connect when advertised implementation/version
+    /// metadata does not pass the configured release floor, including rsRNS.
+    /// The default check is metadata matching, not software attestation.
     pub autoconnect_unverified_implementations: bool,
-    /// Minimum stamp value (leading-zero bits). Default 16 (LXStamper
-    /// `DEFAULT_STAMP_VALUE`). Python `required_discovery_value`.
+    /// Minimum received discovery stamp value in leading-zero bits; default 16.
+    /// This does not set generation cost, which comes from each interface's
+    /// `discovery_stamp_value` (or `stamp_value`).
     pub discover_interfaces_required_value: u8,
-    /// Accepted discovery publisher identities. Python
-    /// `interface_discovery_sources`.
+    /// Accepted discovery publisher identity hashes. An empty list permits
+    /// any publisher that otherwise passes receiver checks.
     pub interface_discovery_sources: Vec<[u8; 16]>,
 
     /// Identity hashes whose `rnstransport.info.blackhole` manifests this
@@ -2441,15 +2506,17 @@ pub struct ReticulumConfig {
     /// Publish this node's local blackhole table on
     /// `rnstransport.info.blackhole`. Python `publish_blackhole`.
     pub publish_blackhole: bool,
-    /// Seconds between blackhole-source pulls. Python 1.3.8
-    /// `blackhole_update_interval` (Reticulum.py:266,593-596): parsed as
-    /// float minutes, clamped to min 2, stored as seconds; default 3600.
+    /// Seconds between blackhole-source pulls. The configuration-file value
+    /// `blackhole_update_interval` is in minutes, clamped to at least two and
+    /// converted to seconds. The default is 3600 seconds.
     pub blackhole_update_interval: f64,
-    /// Python 1.3.8 `[logging] logtimestamps` (Reticulum.py:459-461,
-    /// RNS/__init__.py:85 default True): log lines carry a timestamp prefix.
+    /// Parsed `[logging] logtimestamps` preference, default true. The
+    /// application or CLI must apply it when configuring its logging subscriber.
     pub log_timestamps: bool,
 
-    /// Bootstrap config files loaded on startup. Python `bootstrap_configs`.
+    /// Parsed `bootstrap_configs` paths, retained in configuration. The current
+    /// runtime does not load or merge these files; declare active interfaces
+    /// in the primary configuration.
     pub bootstrap_configs: Vec<PathBuf>,
 }
 
@@ -2677,6 +2744,9 @@ fn expand_home_path(path: &str) -> PathBuf {
 }
 
 impl ReticulumConfig {
+    /// Overlay supported configuration keys onto defaults. Typed value errors
+    /// can fail parsing; unknown keys and unrecognized shared-instance transport
+    /// names are not rejected universally. No interfaces or services are started.
     pub fn try_from_config(config: &Config) -> Result<Self, ConfigError> {
         let mut rc = ReticulumConfig::default();
 
@@ -2801,6 +2871,8 @@ impl ReticulumConfig {
         Ok(rc)
     }
 
+    /// Parse configuration, panicking on a value error. Use `try_from_config`
+    /// when configuration comes from users or requires recoverable validation.
     pub fn from_config(config: &Config) -> Self {
         Self::try_from_config(config).expect("valid Reticulum configuration")
     }
@@ -2819,8 +2891,11 @@ fn generate_local_hops_delta() -> u8 {
     (rns_crypto::random::random_bytes(1)[0] % 6) + 2
 }
 
-/// Bring up the Reticulum runtime: config dir, transport actor, interfaces,
-/// instance mode, jobs runner, and optional RPC / remote-management / probe.
+/// Create a runtime from the selected configuration directory, creating
+/// default configuration, storage and identities as needed. Startup chooses
+/// shared-owner, client or standalone mode and starts configured services.
+/// A successful return does not mean every configured interface is online;
+/// inspect startup failures and use RNode observers when readiness matters.
 pub async fn init(
     configdir: Option<&str>,
     socket_dir: Option<PathBuf>,
@@ -5735,6 +5810,11 @@ fn derive_ifac_key_from_post_init(
 }
 
 #[derive(Clone, Default)]
+/// Optional IFAC settings for runtime-spawned TCP/Backbone interfaces.
+/// `ifac_size` is bytes (1..=64), default 16 when active. Empty name and
+/// passphrase disable IFAC. IFAC restricts interface access; it does not
+/// provide application end-to-end encryption. `Debug` redacts the passphrase,
+/// but the owned `String` is not itself a zeroizing container.
 pub struct RuntimeInterfaceIfacConfig {
     pub network_name: Option<String>,
     pub passphrase: Option<String>,
@@ -5757,6 +5837,9 @@ impl std::fmt::Debug for RuntimeInterfaceIfacConfig {
 }
 
 #[derive(Clone, Debug)]
+/// Runtime Backbone client options. `connect_timeout` is seconds for a
+/// connection attempt, not the lifetime of the reconnect loop or this whole
+/// registration call. Optional IFAC uses a 16-byte default tag.
 pub struct RuntimeBackboneClientConfig<'a> {
     pub name: &'a str,
     pub host: &'a str,
@@ -7294,7 +7377,8 @@ pub async fn spawn_backbone_server_runtime_with_ifac(
 pub struct BleRnodeRuntimeArgs<'a> {
     /// Interface name registered with the transport actor.
     pub name: &'a str,
-    /// BLE device path or address.
+    /// BLE platform identifier, address or advertised name used by the driver.
+    /// This selector is not cryptographic device authentication.
     pub port: &'a str,
     /// Radio frequency in Hz.
     pub frequency: u32,
@@ -7308,16 +7392,19 @@ pub struct BleRnodeRuntimeArgs<'a> {
     pub tx_power: i8,
     /// Reticulum interface routing/announce propagation mode.
     pub mode: rns_interface::traits::InterfaceMode,
-    /// Short-term airtime limit in percent (0.0..=100.0), None = no limit.
+    /// Short-term airtime limit in percent (0.0..=100.0). `None` sends no
+    /// limit command and does not clear a limit retained on the radio.
     pub st_alock: Option<f32>,
-    /// Long-term airtime limit in percent (0.0..=100.0), None = no limit.
+    /// Long-term airtime limit in percent (0.0..=100.0). `None` sends no
+    /// limit command and does not clear a limit retained on the radio.
     pub lt_alock: Option<f32>,
     /// Enable KISS flow control.
     pub flow_control: bool,
 }
 
-/// Returns `(interface_id, online_flag)`; `online_flag` flips to `true`
-/// after the first successful connect.
+/// Return the interface id and compatibility online flag. This flag alone
+/// is not a cross-transport protocol-readiness contract; use the observed
+/// variant and [`RNodeRuntimeObserver::await_ready`] when readiness matters.
 #[cfg(feature = "ble")]
 pub async fn spawn_ble_rnode_runtime(
     handle: &ReticulumHandle,
@@ -7448,9 +7535,11 @@ pub struct RnodeRuntimeArgs<'a> {
     pub tx_power: i8,
     /// Reticulum interface routing/announce propagation mode.
     pub mode: rns_interface::traits::InterfaceMode,
-    /// Short-term airtime limit in percent (0.0..=100.0), None = no limit.
+    /// Short-term airtime limit in percent (0.0..=100.0). `None` sends no
+    /// limit command and does not clear a limit retained on the radio.
     pub st_alock: Option<f32>,
-    /// Long-term airtime limit in percent (0.0..=100.0), None = no limit.
+    /// Long-term airtime limit in percent (0.0..=100.0). `None` sends no
+    /// limit command and does not clear a limit retained on the radio.
     pub lt_alock: Option<f32>,
     /// Enable KISS flow control.
     pub flow_control: bool,
@@ -7763,8 +7852,10 @@ pub async fn spawn_auto_interface_runtime_with_config(
     Ok(id)
 }
 
-/// Spawns an AutoInterface with defaults (Link scope, Temporary address,
-/// no NIC filter, 10 Mbps bitrate); only the four positional knobs differ.
+/// Spawn AutoInterface with Link scope, Temporary multicast address type,
+/// no explicit NIC allow-list, and the default 10 Mbps bitrate estimate.
+/// Platform NIC exclusions still apply. Name, group id and ports come from
+/// the arguments.
 pub async fn spawn_auto_interface_runtime(
     handle: &ReticulumHandle,
     name: &str,
@@ -7782,7 +7873,9 @@ pub async fn spawn_auto_interface_runtime(
     spawn_auto_interface_runtime_with_config(handle, config).await
 }
 
-/// `event_tx` is a process-singleton dispatcher; each call replaces the prior sender.
+/// Spawn BLE Peer using the process-wide driver. `Some(event_tx)` replaces
+/// the global event dispatcher; `None` leaves the existing dispatcher in
+/// place. Registration success does not establish a connected peer.
 #[cfg(feature = "ble")]
 pub async fn spawn_ble_peer_runtime(
     handle: &ReticulumHandle,
@@ -7844,20 +7937,26 @@ pub fn teardown_ble_peer_events() {
     rns_interface::ble_peer::clear_event_dispatcher();
 }
 
-/// Stop peripheral (advertising + GATT server), clear dispatcher, deregister.
+/// Tear down the current registration at `id` through [`teardown_interface`].
+/// For a BLE Peer registration this stops the process-wide peripheral and
+/// clears its event dispatcher, affecting the singleton's users.
 #[cfg(feature = "ble")]
 pub async fn teardown_ble_peer_interface(handle: &ReticulumHandle, id: u64) {
     teardown_interface(handle, id).await;
 }
 
-/// Stop per-id reconnect loop, then deregister. Per-id (multiple BLE RNode
-/// interfaces coexist, each with its own `AtomicBool`); idempotent.
+/// Tear down the current registration at `id` through [`teardown_interface`].
+/// Once acquired, cleanup stays bound to that driver rather than looking up
+/// a later replacement. Keep the runtime's own id, not an id from a different
+/// runtime or a stale registration.
 #[cfg(feature = "ble")]
 pub async fn teardown_ble_rnode_interface(handle: &ReticulumHandle, id: u64) {
     teardown_interface(handle, id).await;
 }
 
-/// Stop the exact serial/TCP RNode driver before generic deregistration.
+/// Stop the current serial/TCP RNode registration through
+/// [`teardown_interface`], joining its captured driver before enqueuing
+/// deregistration.
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 pub async fn teardown_rnode_interface(handle: &ReticulumHandle, id: u64) {
     teardown_interface(handle, id).await;
@@ -8036,6 +8135,13 @@ pub async fn teardown_android_usb_rnode_interface(handle: &ReticulumHandle, id: 
     teardown_interface(handle, id).await;
 }
 
+/// Start retained cleanup for the current registration selected by `id`.
+/// Driver shutdown/join precedes the deregistration command. Cancelling this
+/// waiter does not cancel cleanup; the function has no whole-call timeout and
+/// returns no cleanup error. If the whole runtime already owns the drain,
+/// this can return before that drain finishes; use `shutdown_and_wait` for it.
+/// Numeric ids are runtime-local and can be reused; a stale id is not an
+/// exact ownership capability.
 pub async fn teardown_interface(handle: &ReticulumHandle, id: u64) {
     let transport_tx = handle.transport_tx.clone();
     let interface_controls = handle.interface_controls.clone();
@@ -8558,6 +8664,10 @@ async fn spawn_interface_with_rnode_startup_options(
     }
 }
 
+/// Return the first successfully initialized runtime retained in the
+/// process-wide cell. Later `init` calls still construct separate runtimes;
+/// this reference is not replaced or cleared on shutdown. Prefer the handle
+/// returned by the initialization call that owns your runtime.
 pub fn get_instance() -> Option<&'static ReticulumHandle> {
     INSTANCE.get()
 }

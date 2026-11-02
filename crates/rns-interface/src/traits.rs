@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 pub type InterfaceId = u64;
 
-/// Handle returned by every `spawn_*`: write channel, status flag, and read task.
+/// Common transport handle: write channel, status flag, and read task.
 pub struct InterfaceHandle {
     pub owner: rns_transport::messages::InterfaceOwner,
     pub packet_capacity: rns_transport::messages::InterfacePacketCapacity,
@@ -22,9 +22,7 @@ pub struct InterfaceHandle {
     pub online: Arc<AtomicBool>,
     pub rxb: Option<Arc<AtomicU64>>,
     pub txb: Option<Arc<AtomicU64>>,
-    /// Optional live aggregate inspection source carried into the transport
-    /// actor. This field intentionally makes pre-freeze struct literals update
-    /// explicitly so new interface drivers choose whether they expose stats.
+    /// Optional live aggregate inspection source carried into the transport actor.
     pub inspection: Option<rns_transport::messages::InterfaceInspectionSource>,
     pub tx: mpsc::Sender<Bytes>,
     pub read_task: tokio::task::JoinHandle<()>,
@@ -58,8 +56,8 @@ pub(crate) async fn handoff_accepted_interface(
 pub struct TunnelIdentity(pub Arc<rns_identity::identity::Identity>);
 
 impl TunnelIdentity {
-    /// A fresh synthesis for the interface whose Python `str()` is
-    /// `python_name` (Transport.py:2764-2785).
+    /// Build a fresh synthesis using `python_name` as the Python-compatible
+    /// interface name. Returns `None` when the identity cannot sign.
     pub fn synthesis(&self, python_name: &str) -> Option<Bytes> {
         rns_transport::tunnel::build_tunnel_synthesis_packet(
             &self.0,
@@ -113,7 +111,7 @@ pub(crate) async fn open_client_connection(
     online.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Interface operating mode. Byte values are on-wire constants.
+/// Interface operating mode. Numeric values match Reticulum interface mode constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[derive(Default)]
@@ -169,7 +167,8 @@ pub struct InterfaceDirection {
     pub repeat: bool,
 }
 
-/// Select an MTU for the given bitrate; `None` below 62.5 kbps minimum.
+/// Select an MTU for the given bitrate in bits per second. Returns `None`
+/// for rates at or below 62,500 bps.
 pub fn optimise_mtu(bitrate: u64) -> Option<u32> {
     if bitrate >= 1_000_000_000 {
         Some(524_288)

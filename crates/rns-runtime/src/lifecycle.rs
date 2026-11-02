@@ -1,5 +1,6 @@
-//! Ctrl-C / SIGTERM flip a shared flag that all runtime tasks observe,
-//! allowing them to detach interfaces and flush state cleanly before exit.
+//! Shared shutdown signalling and process-signal integration. Consumers must
+//! observe the signal and perform their own interface teardown and persistence;
+//! triggering the flag does not itself wait for cleanup.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,15 +81,13 @@ impl Default for ExitHandler {
     }
 }
 
-/// Install process-signal handlers that trip `shutdown`. On Unix this covers
-/// both SIGINT and SIGTERM; other platforms use the runtime's Ctrl-C handler.
-/// The returned receiver yields once on the first signal for await-based
-/// callers.
-///
-/// On unix the OS-level registration happens synchronously in this call — a
-/// handler registered inside a spawned task only takes effect once that task
-/// is first polled, leaving a window where a signal kills the process via the
-/// default disposition.
+/// Install signal handlers that trigger `shutdown` and try to notify the
+/// returned receiver. Requires an active Tokio runtime with signal support.
+/// On Unix, SIGINT and SIGTERM registrations are attempted synchronously;
+/// each spawned handler waits once, so callers may receive more than one
+/// notification. SIGINT registration failure falls back to Ctrl-C; SIGTERM
+/// registration failure is logged. Other platforms use Ctrl-C. A Ctrl-C
+/// listener error also triggers shutdown.
 pub fn install_signal_handlers(shutdown: ShutdownSignal) -> mpsc::Receiver<()> {
     let (tx, rx) = mpsc::channel(1);
 

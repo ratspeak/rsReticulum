@@ -70,9 +70,14 @@ def verify(directory: Path, tag: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--tag", required=True)
-    parser.add_argument("--directory", type=Path, required=True)
+    parser = argparse.ArgumentParser(
+        description="Check the three release archives, then write SHA256SUMS."
+    )
+    parser.add_argument("--tag", required=True, help="release version in vX.Y.Z form, as used in archive names")
+    parser.add_argument(
+        "--directory", type=Path, required=True,
+        help="directory containing only the three platform archives; SHA256SUMS is written here after validation",
+    )
     args = parser.parse_args()
     verify(args.directory, args.tag)
 

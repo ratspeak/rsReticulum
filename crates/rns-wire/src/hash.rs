@@ -1,5 +1,6 @@
-//! Packet hashing — the bytes that contribute to a packet's identity hash
-//! (excludes hop counter and routing-only fields so it's stable across hops).
+//! Packet hashes exclude the hop counter and routing-only fields, so forwarding
+//! does not change them. These helpers do not validate packet shape: pass a
+//! parsed, nonempty packet and its matching header type.
 
 use alloc::vec::Vec;
 use rns_crypto::sha::truncated_hash;
@@ -9,9 +10,12 @@ use crate::flags::HeaderType;
 
 /// Extract the portion of a raw packet that contributes to its hash.
 ///
-/// Per Packet.py:345-361 the hop counter, routing-only flag bits, and
-/// (for Header2) the transport id are excluded so a packet's hash is stable
-/// across forwarding.
+/// The hop counter, routing-only flag bits, and (for Header2) the transport
+/// ID are excluded so a packet's hash is stable across forwarding.
+///
+/// # Panics
+///
+/// Panics if `raw` is empty. Short nonempty inputs are hashed without validation.
 pub fn get_hashable_part(raw: &[u8], header_type: HeaderType) -> Vec<u8> {
     let mut hashable = Vec::new();
 
@@ -41,6 +45,10 @@ pub fn get_hashable_part(raw: &[u8], header_type: HeaderType) -> Vec<u8> {
 ///
 /// Equivalent to `sha256(get_hashable_part(raw, header_type))` but streams
 /// directly into the hasher to avoid an intermediate allocation.
+///
+/// # Panics
+///
+/// Panics if `raw` is empty. See the module-level input requirements.
 pub fn packet_hash(raw: &[u8], header_type: HeaderType) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -56,6 +64,10 @@ pub fn packet_hash(raw: &[u8], header_type: HeaderType) -> [u8; 32] {
 }
 
 /// [`packet_hash`] truncated to the first 16 bytes.
+///
+/// # Panics
+///
+/// Panics if `raw` is empty. See the module-level input requirements.
 pub fn truncated_packet_hash(raw: &[u8], header_type: HeaderType) -> [u8; 16] {
     let full = packet_hash(raw, header_type);
     let mut out = [0u8; 16];
@@ -64,6 +76,10 @@ pub fn truncated_packet_hash(raw: &[u8], header_type: HeaderType) -> [u8; 16] {
 }
 
 /// Return both full and truncated packet hashes from a single SHA-256 pass.
+///
+/// # Panics
+///
+/// Panics if `raw` is empty. See the module-level input requirements.
 pub fn packet_hash_pair(raw: &[u8], header_type: HeaderType) -> ([u8; 32], [u8; 16]) {
     let full = packet_hash(raw, header_type);
     let mut trunc = [0u8; 16];
@@ -73,9 +89,17 @@ pub fn packet_hash_pair(raw: &[u8], header_type: HeaderType) -> ([u8; 32], [u8; 
 
 /// Derive the link id of a link-request packet.
 ///
-/// Mirrors Python `Link.link_id_from_lr_packet`: take the hashable part,
-/// clip the payload to the 64-byte ECPUBSIZE (X25519 || Ed25519 public keys)
-/// so trailing padding doesn't change the id, then truncate SHA-256 to 16 bytes.
+/// Hashes the lower flags nibble, destination hash, context, and the first
+/// 64 payload bytes (X25519 || Ed25519 public keys), then truncates SHA-256 to
+/// 16 bytes. A trailing signalling field does not change the ID.
+///
+/// This helper does not validate request length or cipher policy. Use
+/// [`crate::link_signalling::parse_request_signalling`] to check the payload
+/// shape and signalling domain before admitting a request.
+///
+/// # Panics
+///
+/// Panics if `raw` is empty. See the module-level input requirements.
 pub fn link_id_from_raw(raw: &[u8], header_type: HeaderType) -> [u8; 16] {
     const ECPUBSIZE: usize = 64;
     let mut hashable = get_hashable_part(raw, header_type);

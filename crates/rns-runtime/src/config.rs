@@ -74,8 +74,9 @@ impl ConfigSection {
         self.get_bool(key).unwrap_or(default)
     }
 
-    /// Upstream's interface rule (Reticulum.py): enabled only when
-    /// `interface_enabled` or `enabled` is present and true.
+    /// Whether either `interface_enabled` or `enabled` parses as true. Missing
+    /// or invalid boolean values do not enable an interface; callers that reject
+    /// malformed enable settings must also check `invalid_enable_key`.
     pub fn interface_enabled(&self) -> bool {
         self.get_bool("interface_enabled") == Some(true) || self.get_bool("enabled") == Some(true)
     }
@@ -85,7 +86,8 @@ impl ConfigSection {
         self.has("interface_enabled") || self.has("enabled")
     }
 
-    /// An enable key whose value is not a boolean, which upstream rejects.
+    /// The first present enable key that does not parse as a boolean, including
+    /// a list value. Returns `None` when both are absent or valid.
     pub fn invalid_enable_key(&self) -> Option<&'static str> {
         ["interface_enabled", "enabled"]
             .into_iter()
@@ -182,8 +184,9 @@ impl Config {
         Self::default()
     }
 
-    /// Mirrors Python ConfigObj file loading, including normal OS symlink
-    /// following. Security policy for config paths must be enforced by callers.
+    /// Read and parse a UTF-8 config, then validate the configured remote
+    /// management, blackhole and interface-discovery identity hash lists.
+    /// Normal OS symlink following applies; callers enforce config-path policy.
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
         let mut config = Self::parse(&content)?;

@@ -169,10 +169,10 @@ def check_candidate_tag(tag: str, version: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     tags = parser.add_mutually_exclusive_group()
-    tags.add_argument("--release-tag")
-    tags.add_argument("--candidate-tag")
+    tags.add_argument("--release-tag", help="also verify the existing annotated vX.Y.Z tag matches the workspace version and HEAD")
+    tags.add_argument("--candidate-tag", help="also verify vX.Y.Z matches the workspace version and has no local tag yet")
     args = parser.parse_args()
 
     version = check_packages(metadata())

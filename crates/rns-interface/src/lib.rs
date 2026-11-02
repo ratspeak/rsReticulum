@@ -1,7 +1,7 @@
-//! Network interface implementations for Reticulum.
-//! Each module provides a spawn function returning a Tokio task driving a
-//! concrete transport; [`traits::InterfaceHandle`] is the common handle the
-//! runtime registers with the transport actor.
+//! Network interface implementations and framing helpers for Reticulum.
+//! Transport drivers expose [`traits::InterfaceHandle`] for registration with
+//! the transport actor; helper modules provide codecs, settings, and lifecycle
+//! state. Serial, BLE, and Android USB APIs have feature or platform gates.
 
 #[cfg(target_os = "android")]
 pub mod android_usb;

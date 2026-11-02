@@ -1,5 +1,6 @@
 //! Semantic newtypes for fixed-length hashes and identifiers — distinct types
 //! prevent silently mixing values with different meanings at call sites.
+//! Construction checks length only, not derivation, authenticity, or existence.
 
 use core::fmt;
 
@@ -121,12 +122,15 @@ macro_rules! hash_newtype {
 }
 
 hash_newtype! {
-    /// Destination hash: `SHA-256(name_hash || identity_hash)[..16]`.
+    /// Destination hash. Identity-bound destinations use
+    /// `SHA-256(name_hash || identity_hash)[..16]`; Plain destinations use
+    /// `SHA-256(name_hash)[..16]`.
     pub struct DestHash([u8; 16]);
 }
 
 hash_newtype! {
-    /// Identifier for an active or pending link, derived from the link-request keys.
+    /// Link identifier derived from the hashable Link request header and keys.
+    /// See [`crate::hash::link_id_from_raw`].
     pub struct LinkId([u8; 16]);
 }
 
@@ -151,7 +155,9 @@ hash_newtype! {
 }
 
 hash_newtype! {
-    /// SHA-256 of an LXMF message, used for tracking and receipts.
+    /// LXMF protocol message ID, used for tracking and receipts. Obtain it
+    /// from the LXMF message API: its hashable bytes exclude the signature,
+    /// so hashing the complete wire image does not produce this ID.
     pub struct MessageHash([u8; 32]);
 }
 

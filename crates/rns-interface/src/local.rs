@@ -1,5 +1,6 @@
-//! Shared-instance IPC. Unix domain sockets where available, TCP on
-//! 127.0.0.1 as fallback. HDLC-framed.
+//! Shared-instance IPC with HDLC framing. Uses Unix domain sockets on Unix
+//! and TCP on non-Unix platforms. TCP defaults to loopback; a `tcp://` value
+//! in `socket_path` overrides that endpoint.
 
 use rns_transport::messages::{InterfaceOwner, InterfacePacketCapacity, InterfaceTransportSender};
 use std::sync::Arc;
@@ -17,10 +18,12 @@ use rns_transport::messages::{InboundPacket, TransportMessage};
 
 pub const LOCAL_MTU: u32 = 262_144;
 
-/// Default filesystem socket path for non-Linux fallback use.
+/// Default filesystem socket path for local IPC.
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/rns_reticulum.sock";
 
-/// On Android `/tmp` isn't writable; falls back to caller's data directory.
+/// Return `data_dir/cache/rns_reticulum.sock` on Android when `data_dir` is
+/// provided; otherwise return [`DEFAULT_SOCKET_PATH`]. This helper creates no
+/// directories and does not check whether the returned path is writable.
 pub fn socket_path(data_dir: Option<&std::path::Path>) -> std::path::PathBuf {
     if cfg!(target_os = "android")
         && let Some(dir) = data_dir
@@ -62,7 +65,8 @@ fn display_socket_path(path: &str) -> String {
 
 #[derive(Debug, Clone)]
 pub struct LocalServerConfig {
-    /// Unix socket path (ignored on non-Unix).
+    /// Unix socket path. On non-Unix platforms, a nonempty `tcp://host:port`
+    /// value selects the TCP endpoint; other values use the loopback default.
     pub socket_path: String,
     pub name: String,
 }

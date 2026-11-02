@@ -6,25 +6,32 @@ use rns_wire::types::DestHash;
 
 /// Announces-per-second above which a destination is counted as violating.
 pub const RATE_VIOLATION_THRESHOLD: f64 = 1.0;
-/// Violations tolerated before a penalty kicks in.
+/// Violation count at which `RateTable::record` first applies a penalty.
 pub const RATE_VIOLATIONS_BEFORE_PENALTY: u32 = 3;
 /// Base penalty in seconds; doubles with each additional violation.
 pub const RATE_PENALTY_BASE: f64 = 60.0;
-/// Penalty cap (1 hour) so a persistent offender never stays blocked forever.
+/// Maximum duration of each `RateTable::record` penalty (one hour). Later
+/// violations can start another penalty.
 pub const RATE_PENALTY_MAX: f64 = 3600.0;
 
 #[derive(Debug, Clone)]
 pub struct RateEntry {
     pub timestamps: Vec<f64>,
-    /// Announces per second across the window.
+    /// Rate last computed by `record` across its timestamp window. It does
+    /// not decay with elapsed time; `check_interface_rate` does not update it.
     pub rate: f64,
-    /// Most recent announce (Unix seconds).
+    /// Last accepted accounting timestamp (Unix seconds). Calls rejected
+    /// during a penalty do not advance it.
     pub last: f64,
     pub violations: u32,
-    /// `0.0` means no active penalty; otherwise the Unix-seconds deadline.
+    /// Unix-seconds penalty deadline; zero is the initial value. An expired
+    /// nonzero deadline can remain stored.
     pub blocked_until: f64,
 }
 
+/// Destination-keyed announce accounting using wall-clock time. Both rate
+/// methods mutate the same entry even when interface-specific settings are
+/// supplied. There is no automatic expiry or entry-count cap; use `cull`.
 pub struct RateTable {
     entries: HashMap<DestHash, RateEntry>,
 }
@@ -36,9 +43,11 @@ impl RateTable {
         }
     }
 
-    /// Record an announce and return the current rate. A destination under
-    /// active penalty gets `f64::MAX` so callers can treat "over the limit"
-    /// and "blocked" as a single numeric comparison.
+    /// Record an announce and return the stored rate, computed over at most
+    /// 16 timestamps when their span is positive. During an active penalty,
+    /// return `f64::MAX` without updating timestamps. Violations accumulate;
+    /// this method does not decay their count. Crossing the threshold starts
+    /// a penalty but still returns the computed rate for that call.
     pub fn record(&mut self, dest_hash: impl Into<DestHash>) -> f64 {
         let dest_hash = dest_hash.into();
         let now = crate::now_f64();
@@ -119,6 +128,8 @@ impl RateTable {
         self.entries.is_empty()
     }
 
+    /// Remove entries whose stored `last` is at or before the Unix-seconds
+    /// cutoff, even if a penalty is still active.
     pub fn cull(&mut self, cutoff: f64) {
         self.entries.retain(|_, e| e.last > cutoff);
     }
@@ -127,15 +138,19 @@ impl RateTable {
         self.entries.iter()
     }
 
-    /// Per-interface announce rate limit.
+    /// Apply interface-supplied announce interval settings to this destination.
     ///
     /// Uses the interface-level triplet `(rate_target, rate_grace, rate_penalty)`:
     /// any interval shorter than `rate_target` is a violation, violations
-    /// decay when the interval is long enough, and exceeding the grace count
-    /// parks the destination for `rate_target + rate_penalty` seconds.
+    /// decay by one when the interval is long enough, and exceeding the grace
+    /// count sets a deadline at the previous `last + rate_target + rate_penalty`.
+    /// Both durations are seconds. This call is suppressed when grace is
+    /// exceeded, even if that calculated deadline has already passed.
     ///
     /// Returns `true` when rebroadcast should be suppressed. Path-table
-    /// storage is unaffected — only the outbound announce is held back.
+    /// storage is unaffected by this helper; the actor uses the result to
+    /// suppress rebroadcast. There is one entry per destination, not per
+    /// interface, and this method shares state with [`Self::record`].
     pub fn check_interface_rate(
         &mut self,
         dest_hash: impl Into<DestHash>,

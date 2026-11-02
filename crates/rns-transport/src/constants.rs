@@ -1,5 +1,6 @@
-/// Maximum hop count. Announces and forwarded packets exceeding this are
-/// dropped at the inbound boundary. Mirrors Python `Transport.PATHFINDER_M`.
+/// Exclusive upper bound for the on-wire hop count. Inbound packets of every
+/// packet type are rejected when their raw hop count is at least 128, before
+/// the receiving hop adjustment.
 pub const PATHFINDER_M: u8 = 128;
 
 /// Number of retransmit retries for announces.
@@ -8,7 +9,7 @@ pub const PATHFINDER_R: u8 = 1;
 /// Grace period (seconds) before announce retry.
 pub const PATHFINDER_G: f64 = 5.0;
 
-/// Random window for announce rebroadcast jitter.
+/// Announce rebroadcast jitter window, in seconds.
 pub const PATHFINDER_RW: f64 = 0.5;
 
 /// Default path expiry (7 days, in seconds).
@@ -20,13 +21,14 @@ pub const AP_PATH_TIME: u64 = 86_400;
 /// Roaming path expiry (6 hours).
 pub const ROAMING_PATH_TIME: u64 = 21_600;
 
-/// Default destination timeout (7 days). Matches Python
-/// `Transport.DESTINATION_TIMEOUT`. Drives both `path_table` and
-/// `recent_announces` eviction.
+/// Default path lifetime, in seconds (7 days), except for interface modes
+/// with shorter lifetimes. Announce metadata cleanup also uses this value:
+/// steady-state cleanup allows 1.25 times this duration for used, pathless
+/// entries, while loading applies the base duration to stale, unretained entries.
 pub const DESTINATION_TIMEOUT: u64 = 604_800;
 
-/// Transport link-table timeout for validated links (15 min).
-/// Equals `Link::STALE_TIME (720s) * 1.25`.
+/// Transport link-table timeout for validated links, in seconds (15 minutes).
+/// This is transport bookkeeping, not an application-level Link keepalive deadline.
 pub const LINK_TIMEOUT: f64 = 900.0;
 
 /// Maximum packets retained for one locally-owned established Link while its
@@ -37,7 +39,8 @@ pub const LINK_ENDPOINT_EGRESS_QUEUE_CAPACITY: usize = 256;
 /// Reverse table entry timeout (8 minutes).
 pub const REVERSE_TIMEOUT: u64 = 480;
 
-/// Maximum packet receipts tracked.
+/// Receipt-count ceiling applied during periodic maintenance. Registration can
+/// temporarily exceed it; maintenance culls the oldest receipts.
 pub const MAX_RECEIPTS: usize = 1024;
 
 /// Rate timestamps per destination.
@@ -52,7 +55,8 @@ pub const MAX_RANDOM_BLOBS: usize = 64;
 /// Max local rebroadcasts before stopping.
 pub const LOCAL_REBROADCASTS_MAX: u32 = 2;
 
-/// Path request timeout (seconds).
+/// Base timeout for recursive path discovery, in seconds. A discovered
+/// slow-media return budget can extend the actual admission deadline.
 pub const PATH_REQUEST_TIMEOUT: f64 = 15.0;
 
 /// Duplicate inbound path request tag retention (seconds).
@@ -61,7 +65,8 @@ pub const PATH_REQUEST_GATE_TIMEOUT: f64 = 120.0;
 /// Maximum queued automatic discovery path requests after failed link setup.
 pub const MAX_QUEUED_DISCOVERY_PRS: usize = 32;
 
-/// Minimum spacing between queued discovery path-request transmissions.
+/// Minimum spacing in seconds between dequeuing automatic discovery requests.
+/// One dequeued request can be offered to several eligible interfaces.
 pub const DISCOVERY_PR_TX_THROTTLE: f64 = 0.5;
 
 /// Grace before path response (seconds).
@@ -70,107 +75,100 @@ pub const PATH_REQUEST_GRACE: f64 = 0.4;
 /// Extra grace for roaming interfaces (seconds).
 pub const PATH_REQUEST_RG: f64 = 1.5;
 
-/// Minimum interval between path requests (seconds).
+/// Minimum interval in seconds used to suppress repeated automatic path
+/// requests. Explicit caller requests have their own admission rules.
 pub const PATH_REQUEST_MI: f64 = 20.0;
 
-/// Maximum packet hashes retained across both generations.
-///
-/// Python retains roughly one million hashes. Rust deliberately retains up
-/// to two million for a longer bounded replay window; see RNS-D0056.
+/// Default two-generation duplicate-packet hash capacity used by normal
+/// insertion. Restoring saved generations does not enforce this bound.
 pub const HASHLIST_MAXSIZE: usize = 2_000_000;
 
 /// Job loop period (250ms).
 pub const JOB_INTERVAL_MS: u64 = 250;
 
-/// Job loop period in background mode (2s). Inbound packet processing is
-/// unaffected — it runs on the channel branch at full speed.
+/// Maintenance tick period in background mode, in milliseconds (2 seconds),
+/// when the `mobile-throttle` feature is enabled. Message channels remain
+/// serviced; this constant does not impose a packet-processing rate.
 pub const JOB_INTERVAL_BG_MS: u64 = 2000;
 
-/// Cadence at which `on_tick` flushes routing-state files (path_table,
-/// announce_cache, blackhole, tunnel_table) when dirty. Hashlist is excluded
-/// (multi-MB on busy hubs); it saves on shutdown + foreground→background.
-/// Matches Python `Reticulum.GRACIOUS_PERSIST_INTERVAL` (5 min). On a live
-/// announce feed the dirty bit is effectively always set, so this interval
-/// IS the flush rate — at 10s the full-state clone+serialize+fsync cycle
-/// dominated daemon RSS via allocator churn. Abrupt-exit safety comes from
-/// the falling-edge save and `on_shutdown`, not from this cadence.
+/// Minimum interval in seconds between dirty routing-state save requests.
+/// Periodic saves cover paths, announce metadata, blackholes and tunnels, but
+/// exclude the packet hash list. Saves can run on a blocking worker; requesting
+/// one is not confirmation of completion or durability. Shutdown and observed
+/// foreground-to-background transitions also request saves. Only the background
+/// tick cadence change is gated by `mobile-throttle`.
 pub const STATE_SAVE_INTERVAL_SECS: f64 = 300.0;
 
-/// Python `Transport.UNUSED_DESTINATION_LINGER`: never-used destinations
-/// without a path are dropped from the announce cache after this idle time.
+/// Age in seconds after which never-used, pathless, unretained destinations
+/// are eligible for announce-metadata cleanup.
 pub const UNUSED_DESTINATION_LINGER: f64 = 360.0;
 
-/// Python `Transport.max_pr_tags`: hard count cap on the discovery
-/// path-request tag gate, on top of the time-based retain.
+/// Discovery path-request tag count ceiling applied during maintenance, in
+/// addition to time-based expiry. It is not an insertion-time hard bound.
 pub const MAX_DISCOVERY_PR_TAGS: usize = 32_000;
 
-/// Link table check interval.
+/// Traffic-rate sampling interval, in seconds. Despite the name, transport
+/// link-table culling uses `TABLES_CULL_INTERVAL`.
 pub const LINKS_CHECK_INTERVAL: f64 = 1.0;
 
-/// Receipt timeout check interval.
+/// Receipt timeout and count-limit check interval, in seconds.
 pub const RECEIPTS_CHECK_INTERVAL: f64 = 1.0;
 
-/// Announce rebroadcast check interval.
+/// Announce rebroadcast check interval, in seconds.
 pub const ANNOUNCES_CHECK_INTERVAL: f64 = 1.0;
 
-/// Pending path request cleanup interval.
+/// Exported pending-path-request interval, in seconds. The current transport
+/// actor does not use this constant to schedule cleanup.
 pub const PENDING_PRS_CHECK_INTERVAL: f64 = 30.0;
 
-/// Cache cleanup interval (5 minutes).
+/// In-memory hash rotation and announce-metadata cleanup interval, in seconds
+/// (5 minutes), after the interface-startup grace period has completed.
 pub const CACHE_CLEAN_INTERVAL: f64 = 300.0;
 
-/// On-disk announce cache sweep cadence — Python's 15-minute
-/// `clean_announce_cache` interval. Independent of the RAM-cache clean
-/// gate: Python's jobs thread cleans regardless of interface presence, so a
-/// node that boots with no interfaces still collects backlog.
+/// On-disk announce cache sweep interval, in seconds (15 minutes). Scheduling
+/// does not require the interface-startup grace period; it requires storage,
+/// non-client ownership and no sweep already in flight.
 pub const ANNOUNCE_CACHE_SWEEP_INTERVAL: f64 = 900.0;
 
-/// Never delete announce-cache files younger than this. The keep-set is
-/// snapshotted on the actor while the cache writer keeps running on the
-/// blocking pool, so a fresh announce can exist on disk before its path
-/// entry does. Python accepts that race; we close it.
+/// Minimum age in seconds before an unreferenced announce-cache file is
+/// eligible for removal. This grace reduces races with a keep-set snapshot;
+/// it is not a transaction between cache writers and the sweep.
 pub const ANNOUNCE_CACHE_SWEEP_GRACE_SECS: u64 = 300;
 
-/// Table culling interval.
+/// Routing-table and link-table culling interval, in seconds.
 pub const TABLES_CULL_INTERVAL: f64 = 5.0;
 
-/// Interface job processing interval.
+/// Exported interface-job interval, in seconds. The current transport actor
+/// does not use this constant to schedule interface work.
 pub const INTERFACE_JOBS_INTERVAL: f64 = 5.0;
 
-/// Management announce interval (2 hours).
+/// Exported management-announce interval, in seconds (2 hours). The current
+/// transport actor does not schedule management announces from this constant.
 pub const MGMT_ANNOUNCE_INTERVAL: f64 = 7200.0;
 
-/// Blackhole expiry check interval.
+/// Blackhole expiry check interval, in seconds.
 pub const BLACKHOLE_CHECK_INTERVAL: f64 = 60.0;
 
-/// Announce bandwidth cap as a fraction of interface bitrate (2%).
-///
-/// The Python reference stores `ANNOUNCE_CAP = 2` and divides by 100 at use
-/// sites; we store the fraction directly. UIs may show the percentage.
+/// Default announce bandwidth fraction of the declared interface bitrate
+/// (0.02 means 2%). Supply a fraction, not a percentage, to transport APIs.
 pub const ANNOUNCE_CAP: f64 = 0.02;
 
 /// Maximum ingress-limited announces to hold per interface.
-/// Matches Python `Interface.MAX_HELD_ANNOUNCES = 256`.
 pub const MAX_HELD_ANNOUNCES: usize = 256;
 
 /// Held announce release interval (seconds).
-/// Matches Python 1.2.5 `Interface.IC_HELD_RELEASE_INTERVAL = 5`.
 pub const IC_HELD_RELEASE_INTERVAL: f64 = 5.0;
 
 /// Incoming announce frequency window samples.
-/// Matches Python 1.2.5 `Interface.IA_FREQ_SAMPLES = 48`.
 pub const IA_FREQ_SAMPLES: usize = 48;
 
 /// Outgoing announce frequency window samples.
-/// Matches Python 1.2.5 `Interface.OA_FREQ_SAMPLES = 48`.
 pub const OA_FREQ_SAMPLES: usize = 48;
 
 /// Incoming path-request frequency window samples.
-/// Matches Python 1.2.5 `Interface.IP_FREQ_SAMPLES = 48`.
 pub const IP_FREQ_SAMPLES: usize = 48;
 
 /// Outgoing path-request frequency window samples.
-/// Matches Python 1.2.5 `Interface.OP_FREQ_SAMPLES = 48`.
 pub const OP_FREQ_SAMPLES: usize = 48;
 
 /// Minimum non-zero announce frequency represented by the decay window.
@@ -186,23 +184,18 @@ pub const AR_FREQ_DECAY: f64 = 1.0 / AR_MINFREQ_HZ;
 pub const PR_FREQ_DECAY: f64 = 1.0 / PR_MINFREQ_HZ;
 
 /// Minimum samples required before frequency is considered defined.
-/// Matches Python 1.2.5 `Interface.IC_DEQUE_MIN_SAMPLE = 2`.
 pub const IC_DEQUE_MIN_SAMPLE: usize = 2;
 
 /// Minimum samples required for burst state clearing / egress PR limiting.
-/// Matches Python 1.2.5 `Interface.IC_BURST_MIN_SAMPLES = 6`.
 pub const IC_BURST_MIN_SAMPLES: usize = 6;
 
 /// Duration interface is treated as "new" (seconds).
-/// Matches Python `Interface.IC_NEW_TIME = 2*60*60`.
 pub const IC_NEW_TIME: f64 = 7200.0;
 
 /// Burst threshold for new interfaces (announces/sec).
-/// Matches Python 1.2.5 `Interface.IC_BURST_FREQ_NEW = 3`.
 pub const IC_BURST_FREQ_NEW: f64 = 3.0;
 
 /// Burst threshold for established interfaces (announces/sec).
-/// Matches Python 1.2.5 `Interface.IC_BURST_FREQ = 10`.
 pub const IC_BURST_FREQ: f64 = 10.0;
 
 /// Path-request burst threshold for new interfaces (requests/sec).
@@ -212,11 +205,9 @@ pub const IC_PR_BURST_FREQ_NEW: f64 = 3.0;
 pub const IC_PR_BURST_FREQ: f64 = 8.0;
 
 /// Burst detection active duration (seconds).
-/// Matches Python 1.2.5 `Interface.IC_BURST_HOLD = 15`.
 pub const IC_BURST_HOLD: f64 = 15.0;
 
 /// Burst penalty delay (seconds).
-/// Matches Python 1.2.5 `Interface.IC_BURST_PENALTY = 15`.
 pub const IC_BURST_PENALTY: f64 = 15.0;
 
 /// Optional outgoing path-request limiter threshold (requests/sec).
@@ -226,29 +217,26 @@ pub const EC_PR_FREQ: f64 = 5.0;
 pub const EGRESS_CONTROL: bool = false;
 
 /// Tunnel timeout (8 hours, in seconds).
-/// Matches Python 1.1.6 `Transport.TUNNEL_TIMEOUT = 60*60*8`.
 pub const TUNNEL_TIMEOUT: u64 = 28_800;
 
 /// Tunnel path timeout (8 hours, in seconds).
-/// Matches Python 1.1.6 `Transport.TUNNEL_PATH_TIMEOUT = 60*60*8`.
 pub const TUNNEL_PATH_TIMEOUT: u64 = 28_800;
 
-/// Announce queue processing interval (seconds).
+/// Exported announce-queue interval, in seconds. The current actor processes
+/// interface announce queues on its maintenance tick instead.
 pub const ANNOUNCE_QUEUE_INTERVAL: f64 = 1.0;
 
-/// Local client cache max size.
+/// Maximum number of packet-metric cache entries retained by the actor.
 pub const LOCAL_CLIENT_CACHE_MAXSIZE: usize = 512;
 
 /// Maximum lifetime for queued announces (24 hours, in seconds).
-/// Matches Python `Reticulum.QUEUED_ANNOUNCE_LIFE = 60*60*24`.
 pub const QUEUED_ANNOUNCE_LIFE: f64 = 86_400.0;
 
 /// Maximum number of queued announces per interface.
-/// Matches Python `Reticulum.MAX_QUEUED_ANNOUNCES = 16384`.
 pub const MAX_QUEUED_ANNOUNCES: usize = 16_384;
 
-/// Startup grace period (seconds) before cache cleaning runs.
-/// Allows interfaces to come online before pruning stale cache entries.
+/// Grace period in seconds after the first interface registration before
+/// startup-gated in-memory cache cleanup becomes eligible.
 pub const STARTUP_GRACE_PERIOD: f64 = 3.0;
 
 /// Wire transport mode carried in the packet header.
@@ -261,7 +249,8 @@ pub enum TransportMode {
     Tunnel = 0x03,
 }
 
-/// Reachability state recorded for a destination.
+/// Exported reachability labels. The current transport actor does not
+/// maintain a value of this enum for each destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Reachability {
@@ -270,7 +259,8 @@ pub enum Reachability {
     Transport = 0x02,
 }
 
-/// Liveness state for a known path.
+/// Locally recorded path response state. A stored value alone does not
+/// establish present reachability or authenticate a peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PathState {
@@ -279,7 +269,8 @@ pub enum PathState {
     Responsive = 0x02,
 }
 
-/// Configured operating mode for an interface.
+/// Local interface policy used for announce forwarding and path discovery.
+/// These modes are not a reachability signal transmitted to upstream peers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterfaceMode {
     Full,
@@ -288,20 +279,23 @@ pub enum InterfaceMode {
     AccessPoint,
     Roaming,
     Boundary,
-    /// Python 1.3.8 `MODE_INTERNAL` (Interface.py:51) — local/shared-instance
-    /// interfaces. Default path expiry (`path_expiry` wildcard arm) and a
-    /// discovery mode (`mode_discovers_unknown_paths`), like upstream.
+    /// Internal-interface policy: default path expiry and eligibility for
+    /// unknown-path discovery. Interface role separately identifies IPC peers.
     Internal,
 }
 
-/// Which directions an interface carries traffic in.
+/// Configured traffic-direction flags. These flags do not open an interface
+/// or establish that its driver is online.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterfaceDirection {
+    /// Whether inbound traffic is enabled.
     pub inbound: bool,
+    /// Whether outbound traffic is enabled.
     pub outbound: bool,
 }
 
 impl InterfaceDirection {
+    /// Enable both direction flags.
     pub fn bidirectional() -> Self {
         Self {
             inbound: true,
@@ -309,6 +303,7 @@ impl InterfaceDirection {
         }
     }
 
+    /// Enable inbound traffic and disable outbound traffic.
     pub fn inbound_only() -> Self {
         Self {
             inbound: true,
@@ -316,6 +311,7 @@ impl InterfaceDirection {
         }
     }
 
+    /// Enable outbound traffic and disable inbound traffic.
     pub fn outbound_only() -> Self {
         Self {
             inbound: false,

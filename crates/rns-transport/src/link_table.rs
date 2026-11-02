@@ -3,21 +3,24 @@ use std::collections::HashMap;
 use crate::messages::InterfaceId;
 use rns_wire::types::LinkId;
 
-/// Transport-level state for one forwarded or terminated link.
+/// Transport bookkeeping for a forwarded Link or local endpoint. Fields are
+/// supplied by callers; this record does not itself verify a handshake.
 #[derive(Debug, Clone)]
 pub struct LinkEntry {
-    /// Registration time (Unix seconds).
+    /// Registration or last routed-traffic timestamp (Unix seconds).
     pub timestamp: f64,
-    /// Next-hop transport id for a routed link; `None` when this node is the endpoint.
+    /// Optional next-hop transport ID copied from route metadata. `None` alone
+    /// does not distinguish a direct route from a local endpoint.
     pub next_hop: Option<[u8; 16]>,
     pub interface_id: InterfaceId,
     pub remaining_hops: u8,
     pub destination_hash: [u8; 16],
-    /// Handshake complete.
+    /// Local establishment bookkeeping flag. Transit proof processing updates
+    /// `validated` separately, so this is not a universal Link-health check.
     pub established: bool,
-    /// Proof received. Forwarding does not require this — unvalidated links
-    /// still forward while `now < proof_timeout` so in-flight traffic is not
-    /// stranded during the establishment window.
+    /// Transport validation state. A pending transit Link may still forward
+    /// before its finite `proof_timeout`, subject to owner, packet-size, hop
+    /// and interface checks. This is separate from application authorization.
     pub validated: bool,
     pub proof_timeout: f64,
     /// Interface the initial link request arrived on.
@@ -86,6 +89,9 @@ pub(crate) fn transit_link_proof_deadline(
 /// Privileged callers retain the existing explicit LinkTable::insert API.
 pub(crate) const MAX_TRANSIT_LINK_TABLE_ENTRIES: usize = 4096;
 
+/// Link-keyed metadata with explicit cleanup. `insert` does not validate fields
+/// or enforce the actor's transit admission cap; getters include expired
+/// entries. Callers must enforce ownership, forwarding and lifecycle policy.
 pub struct LinkTable {
     entries: HashMap<LinkId, LinkEntry>,
 }
@@ -135,10 +141,11 @@ impl LinkTable {
         self.entries.iter()
     }
 
-    /// Cull stale links with two different clocks:
-    /// - Validated links drop after `timeout` seconds of inactivity.
-    /// - Unvalidated links drop once their own `proof_timeout` elapses, since
-    ///   proof never arrived during the establishment window.
+    /// Cull entries using two expiry rules on the wall clock:
+    /// - Validated entries are retained only while `timestamp > now - timeout`;
+    ///   a NaN timestamp or timeout therefore removes a validated entry.
+    /// - Unvalidated entries drop once their own `proof_timeout` elapses,
+    ///   or when that deadline is nonfinite. `established` is not consulted.
     ///
     /// Returns `(total_culled, expired_unvalidated_links)` — the caller can
     /// apply failed-link rediscovery rules using the retained route metadata.
