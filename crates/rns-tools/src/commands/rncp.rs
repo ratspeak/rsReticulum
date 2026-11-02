@@ -584,7 +584,9 @@ async fn run_listen(args: Args) -> ! {
     };
     let allow_all = args.no_auth;
     if allowed.is_empty() && !allow_all && !args.print_identity {
-        eprintln!("Warning: No allowed identities configured. This listener does not require identification before receiving pushed files; do not rely on the allow-list to exclude unidentified senders.");
+        eprintln!(
+            "Warning: No allowed identities configured. This listener does not require identification before receiving pushed files; do not rely on the allow-list to exclude unidentified senders."
+        );
     }
 
     let handle = start_reticulum(args.config.as_deref(), shutdown.clone()).await;

@@ -23,7 +23,9 @@ pub enum RatkeyError {
     /// PUK retries are exhausted. It can no longer recover the PIN; restoring
     /// PIV recovery requires a destructive reset. An otherwise valid PIN may
     /// still work until its own retry counter is exhausted.
-    #[error("PIV recovery counter locked; a working PIN may still be usable. Resetting PIV erases user keys")]
+    #[error(
+        "PIV recovery counter locked; a working PIN may still be usable. Resetting PIV erases user keys"
+    )]
     PukLocked,
 
     #[error("PIV reset requires both retry counters to be blocked")]

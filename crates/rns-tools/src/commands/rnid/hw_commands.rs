@@ -251,7 +251,10 @@ fn cmd_provision(
     println!("  Ed25519 public: {}", hex::encode(ed_pub));
     println!("  X25519 public:  {}", hex::encode(x_pub));
     println!("  Device:         {}", session.device_type().as_str());
-    println!("  Ed25519 attestation chain verified: {}", attestation.verified);
+    println!(
+        "  Ed25519 attestation chain verified: {}",
+        attestation.verified
+    );
 
     if let Some(dir) = output {
         let identity_dir = dir.join(&hash_hex);
@@ -299,7 +302,9 @@ fn cmd_provision(
         }
     }
 
-    println!("\nNo private-key backup was created. Losing this token can make the identity unusable.");
+    println!(
+        "\nNo private-key backup was created. Losing this token can make the identity unusable."
+    );
     println!("This utility has no command to export or back up these on-device keys.");
 }
 
