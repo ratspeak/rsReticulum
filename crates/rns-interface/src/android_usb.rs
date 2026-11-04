@@ -1,8 +1,8 @@
 //! RNode over Android USB host access through JNI to `UsbManager`. The
-//! driver selects a CDC data (`0x0A`) or vendor-specific (`0xFF`) interface
-//! with IN and OUT endpoints on that same interface. It requests 8N1 line
-//! coding, defaulting to 115200 baud. That control request is best effort;
-//! enumeration alone does not establish chipset compatibility.
+//! driver supports a single CDC-ACM function or CP2102-compatible USB UART
+//! (`10c4:ea60`), with bulk IN and OUT endpoints on the same data interface.
+//! Setup requires successful 8N1 configuration and matched DTR/RTS assertion,
+//! defaulting to 115200 baud; enumeration alone does not establish compatibility.
 
 use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::collections::HashMap;
@@ -21,6 +21,9 @@ use crate::android_usb_lifecycle::{
     UsbTxGate, UsbTxPumpExit, UsbWriterBackend, drain_usb_reader_tail, forward_usb_read_chunk,
     resolve_usb_device, run_usb_rnode_capability_startup, run_usb_rnode_startup, run_usb_tx_pump,
     spawn_owned_usb_io, usb_bulk_read_size,
+};
+use crate::android_usb_setup::{
+    UsbEndpointDescriptor, UsbInterfaceDescriptor, configure_serial_port, select_serial_port,
 };
 #[cfg(test)]
 use crate::kiss;
@@ -48,8 +51,8 @@ const USB_WORKER_JOIN_DEADLINE: Duration = Duration::from_millis(1_250);
 const USB_RECONNECT_DELAY: Duration = Duration::from_secs(rnode::RECONNECT_WAIT);
 
 /// Vendor-ID allowlist used to filter and label enumerated USB devices.
-/// Connection still requires a suitable CDC-data or vendor-specific interface
-/// and a device compatible with this driver's line control and RNode protocol.
+/// This is an enumeration inventory, not a driver compatibility promise.
+/// Connection requires CDC-ACM or supported CP210x setup and RNode protocol.
 pub const KNOWN_VIDS: &[(u16, &str)] = &[
     (0x0403, "FTDI"),
     (0x10C4, "Silicon Labs CP210x"),
@@ -650,10 +653,16 @@ fn jni_failure(env: &jni::JNIEnv, context: &str, error: impl std::fmt::Display) 
     format!("{context}: {error}")
 }
 
+fn usb_int_property(env: &jni::JNIEnv, object: JObject<'_>, method: &str) -> Result<i32, String> {
+    env.call_method(object, method, "()I", &[])
+        .map_err(|error| jni_failure(env, method, error))?
+        .i()
+        .map_err(|error| jni_failure(env, method, error))
+}
+
 struct JniUsbConnectionOwner {
     connection: Option<GlobalRef>,
-    data_interface: Option<GlobalRef>,
-    interface_claimed: bool,
+    claimed_interfaces: Vec<GlobalRef>,
     device_name: String,
     lease_phase: JniUsbLeasePhase,
     attached: Arc<AtomicBool>,
@@ -847,13 +856,13 @@ fn drop_worker_global_refs_attached(
 ) {
     let connection = connection.take();
     let endpoint = endpoint.take();
-    if let Some(vm) = JAVA_VM.get() {
-        if let Ok(env) = vm.attach_current_thread() {
-            drop(endpoint);
-            drop(connection);
-            drop(env);
-            return;
-        }
+    if let Some(vm) = JAVA_VM.get()
+        && let Ok(env) = vm.attach_current_thread()
+    {
+        drop(endpoint);
+        drop(connection);
+        drop(env);
+        return;
     }
     drop(endpoint);
     drop(connection);
@@ -1042,30 +1051,34 @@ impl UsbConnectionLifecycle for JniUsbConnectionOwner {
                 close_connection: error,
             };
         };
-        let release_interface = if self.interface_claimed {
-            match self.data_interface.as_ref() {
-                Some(data_interface) => env
-                    .call_method(
-                        connection.as_obj(),
-                        "releaseInterface",
-                        "(Landroid/hardware/usb/UsbInterface;)Z",
-                        &[JValue::Object(data_interface.as_obj())],
-                    )
-                    .map_err(|error| jni_failure(&env, "releaseInterface", error))
-                    .and_then(|value| {
-                        value
-                            .z()
-                            .map_err(|error| jni_failure(&env, "releaseInterface result", error))
-                    })
-                    .and_then(|released| {
-                        released
-                            .then_some(())
-                            .ok_or_else(|| "Java releaseInterface returned false".into())
-                    }),
-                None => Err("claimed USB interface reference is missing".into()),
+        let mut release_errors = Vec::new();
+        for interface in self.claimed_interfaces.iter().rev() {
+            let release = env
+                .call_method(
+                    connection.as_obj(),
+                    "releaseInterface",
+                    "(Landroid/hardware/usb/UsbInterface;)Z",
+                    &[JValue::Object(interface.as_obj())],
+                )
+                .map_err(|error| jni_failure(&env, "releaseInterface", error))
+                .and_then(|value| {
+                    value
+                        .z()
+                        .map_err(|error| jni_failure(&env, "releaseInterface result", error))
+                })
+                .and_then(|released| {
+                    released
+                        .then_some(())
+                        .ok_or_else(|| "Java releaseInterface returned false".to_string())
+                });
+            if let Err(error) = release {
+                release_errors.push(error);
             }
-        } else {
+        }
+        let release_interface = if release_errors.is_empty() {
             Ok(())
+        } else {
+            Err(release_errors.join("; "))
         };
         // close is unconditional, including releaseInterface(false/error).
         let close_connection = env
@@ -1106,9 +1119,9 @@ impl UsbConnectionLifecycle for JniUsbConnectionOwner {
         // The joined workers have already dropped their temporary refs. Only
         // a proven close releases the canonical refs, and does so while this
         // cleanup thread is still JNI-attached.
-        let data_interface = self.data_interface.take();
+        let interfaces = std::mem::take(&mut self.claimed_interfaces);
         let connection = self.connection.take();
-        drop(data_interface);
+        drop(interfaces);
         drop(connection);
         drop(env);
         UsbConnectionCleanup::Closed { release_interface }
@@ -1223,24 +1236,18 @@ fn open_usb_serial_attached(
         let attached = Arc::new(AtomicBool::new(true));
         let mut owner = JniUsbConnectionOwner {
             connection: Some(connection_ref),
-            data_interface: None,
-            interface_claimed: false,
+            claimed_interfaces: Vec::new(),
             device_name: dev_name.to_string(),
             lease_phase: JniUsbLeasePhase::Opening,
             attached: attached.clone(),
         };
 
         let setup = (|| -> Result<(GlobalRef, GlobalRef, i32), String> {
-            // CDC-Data (0x0A) or vendor-specific (0xFF), with a matched
-            // IN/OUT endpoint pair from one interface.
-            let iface_count = env
-                .call_method(device, "getInterfaceCount", "()I", &[])
-                .map_err(|error| jni_failure(env, "getInterfaceCount", error))?
-                .i()
-                .map_err(|error| jni_failure(env, "USB interface count", error))?;
-            let mut data_iface = JObject::null();
-            let mut ep_in = JObject::null();
-            let mut ep_out = JObject::null();
+            let vendor_id = usb_int_property(env, device, "getVendorId")?;
+            let product_id = usb_int_property(env, device, "getProductId")?;
+            let iface_count = usb_int_property(env, device, "getInterfaceCount")?;
+            let mut interfaces = Vec::new();
+            let mut descriptors = Vec::new();
             for interface_index in 0..iface_count {
                 let interface = env
                     .call_method(
@@ -1252,22 +1259,13 @@ fn open_usb_serial_attached(
                     .map_err(|error| jni_failure(env, "getInterface", error))?
                     .l()
                     .map_err(|error| jni_failure(env, "USB interface object", error))?;
-                let class = env
-                    .call_method(interface, "getInterfaceClass", "()I", &[])
-                    .map_err(|error| jni_failure(env, "getInterfaceClass", error))?
-                    .i()
-                    .map_err(|error| jni_failure(env, "USB interface class", error))?;
-                if class != 0x0A && class != 0xFF {
-                    continue;
-                }
-
-                let endpoint_count = env
-                    .call_method(interface, "getEndpointCount", "()I", &[])
-                    .map_err(|error| jni_failure(env, "getEndpointCount", error))?
-                    .i()
-                    .map_err(|error| jni_failure(env, "USB endpoint count", error))?;
-                let mut candidate_in = JObject::null();
-                let mut candidate_out = JObject::null();
+                let number = u16::try_from(usb_int_property(env, interface, "getId")?)
+                    .map_err(|_| "Invalid USB interface number".to_string())?;
+                let alternate_setting = usb_int_property(env, interface, "getAlternateSetting")?;
+                let class = usb_int_property(env, interface, "getInterfaceClass")?;
+                let subclass = usb_int_property(env, interface, "getInterfaceSubclass")?;
+                let endpoint_count = usb_int_property(env, interface, "getEndpointCount")?;
+                let mut endpoints = Vec::new();
                 for endpoint_index in 0..endpoint_count {
                     let endpoint = env
                         .call_method(
@@ -1279,68 +1277,89 @@ fn open_usb_serial_attached(
                         .map_err(|error| jni_failure(env, "getEndpoint", error))?
                         .l()
                         .map_err(|error| jni_failure(env, "USB endpoint object", error))?;
-                    let direction = env
-                        .call_method(endpoint, "getDirection", "()I", &[])
-                        .map_err(|error| jni_failure(env, "getEndpointDirection", error))?
-                        .i()
-                        .map_err(|error| jni_failure(env, "USB endpoint direction", error))?;
-                    if direction == 0x80 {
-                        candidate_in = endpoint;
-                    } else {
-                        candidate_out = endpoint;
-                    }
+                    endpoints.push(UsbEndpointDescriptor {
+                        direction: usb_int_property(env, endpoint, "getDirection")?,
+                        transfer_type: usb_int_property(env, endpoint, "getType")?,
+                    });
+                    env.delete_local_ref(endpoint).map_err(|error| {
+                        jni_failure(env, "USB descriptor endpoint release", error)
+                    })?;
                 }
-                if !candidate_in.is_null() && !candidate_out.is_null() {
-                    data_iface = interface;
-                    ep_in = candidate_in;
-                    ep_out = candidate_out;
-                    break;
-                }
+                interfaces.push(interface);
+                descriptors.push(UsbInterfaceDescriptor {
+                    number,
+                    alternate_setting,
+                    class,
+                    subclass,
+                    endpoints,
+                });
             }
-            if data_iface.is_null() {
-                return Err("No CDC-ACM interface found".into());
+            let port = select_serial_port(vendor_id, product_id, &descriptors)?;
+            // CDC control and data claims belong to the same cleanup owner.
+            // A partial claim or setup failure closes this whole connection.
+            for index in [
+                Some(port.control_interface),
+                (port.data_interface != port.control_interface).then_some(port.data_interface),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let interface = interfaces[index];
+                let reference = env
+                    .new_global_ref(interface)
+                    .map_err(|error| jni_failure(env, "USB interface global reference", error))?;
+                let claimed = env
+                    .call_method(
+                        connection,
+                        "claimInterface",
+                        "(Landroid/hardware/usb/UsbInterface;Z)Z",
+                        &[JValue::Object(interface), JValue::Bool(1)],
+                    )
+                    .map_err(|error| jni_failure(env, "claimInterface", error))?
+                    .z()
+                    .map_err(|error| jni_failure(env, "claimInterface result", error))?;
+                if !claimed {
+                    return Err("Java claimInterface returned false".into());
+                }
+                owner.claimed_interfaces.push(reference);
             }
 
-            owner.data_interface = Some(
-                env.new_global_ref(data_iface)
-                    .map_err(|error| jni_failure(env, "USB interface global reference", error))?,
-            );
-            let claimed = env
-                .call_method(
-                    connection,
-                    "claimInterface",
-                    "(Landroid/hardware/usb/UsbInterface;Z)Z",
-                    &[JValue::Object(data_iface), JValue::Bool(1)],
-                )
-                .map_err(|error| jni_failure(env, "claimInterface", error))?
-                .z()
-                .map_err(|error| jni_failure(env, "claimInterface result", error))?;
-            if !claimed {
-                return Err("Java claimInterface returned false".into());
-            }
-            owner.interface_claimed = true;
-
-            // CDC SET_LINE_CODING remains best-effort for vendor chipsets.
-            let mut line_coding = [0u8; 7];
-            line_coding[0..4].copy_from_slice(&baud_rate.to_le_bytes());
-            line_coding[6] = 8;
-            if let Ok(line_coding_array) = env.byte_array_from_slice(&line_coding) {
-                let _ = env.call_method(
+            configure_serial_port(&port, baud_rate, |request| {
+                let payload = env
+                    .byte_array_from_slice(request.payload)
+                    .map_err(|error| jni_failure(env, "USB setup payload", error))?;
+                env.call_method(
                     connection,
                     "controlTransfer",
                     "(IIII[BII)I",
                     &[
-                        JValue::Int(0x21),
-                        JValue::Int(0x20),
-                        JValue::Int(0),
-                        JValue::Int(0),
-                        JValue::Object(line_coding_array.into()),
-                        JValue::Int(7),
+                        JValue::Int(i32::from(request.request_type)),
+                        JValue::Int(i32::from(request.request)),
+                        JValue::Int(i32::from(request.value)),
+                        JValue::Int(i32::from(request.index)),
+                        JValue::Object(payload.into()),
+                        JValue::Int(request.payload.len() as i32),
                         JValue::Int(USB_WRITE_TIMEOUT_MS),
                     ],
-                );
-            }
-            clear_pending_jni_exception(env);
+                )
+                .map_err(|error| jni_failure(env, "USB serial controlTransfer", error))?
+                .i()
+                .map_err(|error| jni_failure(env, "USB serial controlTransfer result", error))
+            })?;
+
+            let endpoint_at = |index: usize| {
+                env.call_method(
+                    interfaces[port.data_interface],
+                    "getEndpoint",
+                    "(I)Landroid/hardware/usb/UsbEndpoint;",
+                    &[JValue::Int(index as i32)],
+                )
+                .map_err(|error| jni_failure(env, "getEndpoint", error))?
+                .l()
+                .map_err(|error| jni_failure(env, "USB selected endpoint", error))
+            };
+            let ep_in = endpoint_at(port.input_endpoint)?;
+            let ep_out = endpoint_at(port.output_endpoint)?;
 
             let max_packet_size = env
                 .call_method(ep_in, "getMaxPacketSize", "()I", &[])
@@ -1402,8 +1421,8 @@ fn open_usb_serial_attached(
     result
 }
 
-/// Open the device and claim its CDC data interface. The returned owner is the
-/// only component allowed to release the interface and close the connection;
+/// Open the device, claim its serial interfaces, and configure its USB UART.
+/// The returned owner alone releases those interfaces and closes the connection;
 /// its read/write workers hold temporary global references only until joined.
 async fn open_usb_serial(
     device_name: &str,
