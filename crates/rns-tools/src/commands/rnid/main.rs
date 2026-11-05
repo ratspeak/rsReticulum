@@ -127,7 +127,7 @@ struct Args {
     #[arg(short = 'E', long = "embed-meta", value_name = "path")]
     embed_meta: Option<PathBuf>,
 
-    /// Metadata specification for --sign-message/--embed-meta; defaults to <metadata-file>.spec.
+    /// Metadata specification for --sign-message/--embed-meta; defaults to `<metadata-file>.spec`.
     /// A missing specification file skips validation, including when an explicit path is supplied.
     #[arg(long = "meta-spec", num_args = 0..=1, value_name = "path")]
     meta_spec: Option<Option<PathBuf>>,
