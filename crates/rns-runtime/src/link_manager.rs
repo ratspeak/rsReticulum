@@ -1105,14 +1105,51 @@ impl LinkManager {
                 break;
             }
 
+            // Endpoint results without a waker are polled; an idle manager sleeps
+            // until an event, a command, an inbound deadline or the next tick.
+            let wake_at = if self.has_polled_endpoint_work() {
+                std::time::Instant::now() + std::time::Duration::from_millis(10)
+            } else {
+                (last_tick + std::time::Duration::from_secs(1)).min(self.inbound_packet_deadline())
+            };
             tokio::select! {
                 _ = self.deferred_request_notify.notified() => { self.poll_deferred_requests(); }
-            _ = self.inbound_packet_notify.notified() => {},
+                _ = self.inbound_packet_notify.notified() => {},
                 _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => {},
-                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {},
+                command = command_rx.recv() => {
+                    if let Some(command) = command
+                        && !self.handle_command(command)
+                    {
+                        break 'run;
+                    }
+                }
+                event = self.event_rx.recv(), if !events_closed => {
+                    if let Some(event) = event {
+                        self.handle_event(event);
+                    }
+                }
+                lifecycle = self.endpoint_lifecycle_rx.recv() => {
+                    if let Some(event) = lifecycle {
+                        self.handle_endpoint_terminal(event);
+                    }
+                }
+                _ = tokio::time::sleep_until(wake_at.into()) => {},
             }
         }
         self.drain_shutdown_link_ownership().await;
+    }
+
+    fn has_polled_endpoint_work(&self) -> bool {
+        !self.pending_packet_dispatches.is_empty()
+            || !self.pending_endpoint_binds.is_empty()
+            || !self.pending_endpoint_sends.is_empty()
+            || !self.pending_endpoint_cleanups.is_empty()
+            || !self.pending_inbound_packets.is_empty()
+            || !self.pending_deferred_requests.is_empty()
+            || self
+                .endpoint_tombstones
+                .values()
+                .any(|tombstone| tombstone.finalization_rx.is_some())
     }
 
     fn inbound_packet_deadline(&self) -> std::time::Instant {
