@@ -142,7 +142,7 @@ pub const RNODE_CODING_RATE_MAX: u8 = 8;
 pub const RNODE_TX_POWER_MIN_DBM: u8 = 0;
 pub const RNODE_TX_POWER_MAX_DBM: u8 = 37;
 
-/// Default TCP port for RNode-over-IP.
+/// Port RNode firmware listens on when a `tcp://` URL gives none.
 pub const DEFAULT_TCP_PORT: u16 = 7633;
 
 /// Startup policy for an RNode transport.
@@ -1427,52 +1427,29 @@ struct RNodeWriterContext {
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 struct RNodeWriteInterrupt {
-    #[cfg(feature = "serial")]
-    serial: Option<Mutex<Box<dyn serialport::SerialPort>>>,
-    tcp: Option<std::net::TcpStream>,
+    link: Option<Mutex<Box<dyn RNodeLink>>>,
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 impl RNodeWriteInterrupt {
     fn none() -> Self {
-        Self {
-            #[cfg(feature = "serial")]
-            serial: None,
-            tcp: None,
-        }
+        Self { link: None }
     }
 
     fn from_stream(stream: &RNodeStream) -> std::io::Result<Self> {
-        match stream {
-            #[cfg(feature = "serial")]
-            RNodeStream::Serial(stream) => Ok(Self {
-                serial: Some(Mutex::new(
-                    stream.try_clone().map_err(std::io::Error::other)?,
-                )),
-                tcp: None,
-            }),
-            RNodeStream::Tcp(stream) => Ok(Self {
-                #[cfg(feature = "serial")]
-                serial: None,
-                tcp: Some(stream.try_clone()?),
-            }),
-        }
+        Ok(Self {
+            link: Some(Mutex::new(stream.link.duplicate()?)),
+        })
     }
 
     fn interrupt(&mut self) {
-        #[cfg(feature = "serial")]
-        if let Some(stream) = self.serial.take()
-            && let Err(error) = stream
+        if let Some(link) = self.link.take()
+            && let Err(error) = link
                 .into_inner()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear(serialport::ClearBuffer::Output)
+                .abort_writes()
         {
-            tracing::debug!(error = %error, "RNode serial output purge during writer cleanup");
-        }
-        if let Some(stream) = self.tcp.take()
-            && let Err(error) = stream.shutdown(std::net::Shutdown::Both)
-        {
-            tracing::debug!(error = %error, "RNode TCP shutdown during writer cleanup");
+            tracing::debug!(error = %error, "RNode write abort during writer cleanup");
         }
     }
 }
@@ -2209,38 +2186,37 @@ async fn send_detach_request(
     result
 }
 
-// Transport abstraction
+// Transport selection
 
-/// Parsed representation of the `port` config field.
+/// Where the RNode is reached, parsed from the `port` config field.
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 #[derive(Debug, Clone)]
 pub enum PortConfig {
-    /// A local serial device path, e.g. `/dev/ttyUSB0` or `COM3`.
+    /// A serial device such as `/dev/ttyUSB0` or `COM3`, opened at `baud`.
     #[cfg(feature = "serial")]
     Serial { path: String, baud: u32 },
-    /// A TCP endpoint, e.g. `tcp://192.168.1.1` or `tcp://192.168.1.1:9000`.
+    /// A normalized `host:port` socket address from a `tcp://` URL.
     Tcp { addr: String },
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 impl PortConfig {
     pub fn parse(port: &str, baud: u32) -> Result<Self, String> {
-        #[cfg(not(feature = "serial"))]
-        let _ = baud;
-
-        if let Some(rest) = strip_tcp_scheme(port) {
-            let addr = parse_tcp_endpoint(rest)?;
-            Ok(Self::Tcp { addr })
-        } else {
+        match strip_tcp_scheme(port) {
+            Some(endpoint) => parse_tcp_endpoint(endpoint).map(|addr| Self::Tcp { addr }),
             #[cfg(feature = "serial")]
-            {
-                Ok(Self::Serial {
-                    path: port.to_string(),
-                    baud,
-                })
-            }
+            None => Ok(Self::Serial {
+                path: port.to_string(),
+                baud,
+            }),
             #[cfg(not(feature = "serial"))]
-            Err("RNode serial ports require the 'serial' feature; use tcp://host[:port] for TCP RNodes".to_string())
+            None => {
+                let _ = baud;
+                Err(
+                    "RNode serial ports require the 'serial' feature; use tcp://host[:port] for TCP RNodes"
+                        .to_string(),
+                )
+            }
         }
     }
 }
@@ -2305,30 +2281,107 @@ fn parse_tcp_port(port: &str) -> Result<u16, String> {
         .map_err(|_| format!("invalid TCP port: {port}"))
 }
 
-/// A unified sync I/O stream for either a serial port or a TCP socket.
+/// One transport behind the RNode byte stream: a serial port or a TCP socket.
 ///
-/// Both variants support `Read + Write + Send + 'static` so the existing
-/// `spawn_blocking` read/write loops require minimal changes.
+/// The read and write loops run on blocking threads, so a transport must hand
+/// out a second handle to the same device and be able to break a write that
+/// is stuck on the other thread.
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-pub enum RNodeStream {
-    #[cfg(feature = "serial")]
-    Serial(Box<dyn serialport::SerialPort>),
-    Tcp(std::net::TcpStream),
+trait RNodeLink: std::io::Read + std::io::Write + Send {
+    fn duplicate(&self) -> std::io::Result<Box<dyn RNodeLink>>;
+    fn class(&self) -> RNodeTransportClass;
+    /// Device path or peer address, for logs.
+    fn label(&self) -> String;
+    /// Unblock a writer on another thread and drop whatever it had queued.
+    fn abort_writes(&self) -> std::io::Result<()>;
+}
+
+#[cfg(feature = "serial")]
+struct SerialLink(Box<dyn serialport::SerialPort>);
+
+#[cfg(feature = "serial")]
+impl std::io::Read for SerialLink {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+#[cfg(feature = "serial")]
+impl std::io::Write for SerialLink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+#[cfg(feature = "serial")]
+impl RNodeLink for SerialLink {
+    fn duplicate(&self) -> std::io::Result<Box<dyn RNodeLink>> {
+        let port = self.0.try_clone().map_err(std::io::Error::other)?;
+        Ok(Box::new(SerialLink(port)))
+    }
+
+    fn class(&self) -> RNodeTransportClass {
+        RNodeTransportClass::Serial
+    }
+
+    fn label(&self) -> String {
+        self.0
+            .name()
+            .unwrap_or_else(|| "<unknown serial>".to_string())
+    }
+
+    fn abort_writes(&self) -> std::io::Result<()> {
+        self.0
+            .clear(serialport::ClearBuffer::Output)
+            .map_err(std::io::Error::other)
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl RNodeLink for std::net::TcpStream {
+    fn duplicate(&self) -> std::io::Result<Box<dyn RNodeLink>> {
+        Ok(Box::new(self.try_clone()?))
+    }
+
+    fn class(&self) -> RNodeTransportClass {
+        RNodeTransportClass::Tcp
+    }
+
+    fn label(&self) -> String {
+        self.peer_addr()
+            .map_or_else(|_| "<unknown tcp>".to_string(), |addr| addr.to_string())
+    }
+
+    fn abort_writes(&self) -> std::io::Result<()> {
+        self.shutdown(std::net::Shutdown::Both)
+    }
+}
+
+/// The open byte stream to an RNode, whichever transport carries it.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+pub struct RNodeStream {
+    link: Box<dyn RNodeLink>,
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 impl RNodeStream {
-    /// Open a serial port.
+    /// Open a serial device at `baud` with the shared read timeout.
     #[cfg(feature = "serial")]
     pub fn open_serial(path: &str, baud: u32) -> std::io::Result<Self> {
         let port = serialport::new(path, baud)
             .timeout(Duration::from_millis(RNODE_READ_TIMEOUT_MS))
             .open()
             .map_err(std::io::Error::other)?;
-        Ok(Self::Serial(port))
+        Ok(Self {
+            link: Box::new(SerialLink(port)),
+        })
     }
 
-    /// Connect to a TCP socket (blocking).
+    /// Connect to a `host:port` RNode, trying each resolved address in turn.
     pub fn connect_tcp(addr: &str) -> std::io::Result<Self> {
         Self::connect_tcp_with_timeout(addr, Duration::from_secs(RNODE_TCP_CONNECT_TIMEOUT_SECS))
     }
@@ -2336,24 +2389,22 @@ impl RNodeStream {
     fn connect_tcp_with_timeout(addr: &str, timeout: Duration) -> std::io::Result<Self> {
         use std::net::ToSocketAddrs;
 
-        let mut last_error = None;
-        for socket_addr in addr.to_socket_addrs()? {
-            match std::net::TcpStream::connect_timeout(&socket_addr, timeout) {
-                Ok(stream) => return Self::from_tcp_stream(stream),
-                Err(e) => last_error = Some(e),
+        let mut failure = std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("no socket addresses resolved for {addr}"),
+        );
+        for candidate in addr.to_socket_addrs()? {
+            match std::net::TcpStream::connect_timeout(&candidate, timeout) {
+                Ok(stream) => return Self::adopt_tcp(stream),
+                Err(error) => failure = error,
             }
         }
-
-        Err(last_error.unwrap_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::AddrNotAvailable,
-                format!("no socket addresses resolved for {addr}"),
-            )
-        }))
+        Err(failure)
     }
 
-    fn from_tcp_stream(stream: std::net::TcpStream) -> std::io::Result<Self> {
-        // Mirror the serial timeout so the read loop doesn't block forever.
+    fn adopt_tcp(stream: std::net::TcpStream) -> std::io::Result<Self> {
+        // The read loop checks for shutdown between reads, so the socket gets
+        // the same read timeout as a serial port.
         stream.set_read_timeout(Some(Duration::from_millis(RNODE_READ_TIMEOUT_MS)))?;
         stream.set_nodelay(true)?;
         crate::socket_tuning::set_keepalive_tuned(
@@ -2364,65 +2415,43 @@ impl RNodeStream {
             Duration::from_secs(RNODE_TCP_USER_TIMEOUT_SECS),
         );
         crate::socket_tuning::set_socket_buffers(&stream, RNODE_TCP_BUFFER_BYTES);
-        Ok(Self::Tcp(stream))
+        Ok(Self {
+            link: Box::new(stream),
+        })
     }
 
-    /// Clone an I/O handle for the write half.
-    ///
-    /// - Serial uses `SerialPort::try_clone`.
-    /// - TCP uses `TcpStream::try_clone`; the handles refer to the same socket.
+    /// A second handle to the same device, for the write thread.
     pub fn try_clone(&self) -> std::io::Result<Self> {
-        match self {
-            #[cfg(feature = "serial")]
-            Self::Serial(p) => Ok(Self::Serial(p.try_clone().map_err(std::io::Error::other)?)),
-            Self::Tcp(s) => Ok(Self::Tcp(s.try_clone()?)),
-        }
+        Ok(Self {
+            link: self.link.duplicate()?,
+        })
     }
 
-    /// Human-readable description for log messages.
+    /// Device path or peer address, for logs.
     pub fn description(&self) -> String {
-        match self {
-            #[cfg(feature = "serial")]
-            Self::Serial(p) => p.name().unwrap_or_else(|| "<unknown serial>".to_string()),
-            Self::Tcp(s) => s
-                .peer_addr()
-                .map(|a| a.to_string())
-                .unwrap_or_else(|_| "<unknown tcp>".to_string()),
-        }
+        self.link.label()
     }
 
     fn is_tcp(&self) -> bool {
-        matches!(self, Self::Tcp(_))
+        matches!(self.link.class(), RNodeTransportClass::Tcp)
     }
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 impl std::io::Read for RNodeStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            #[cfg(feature = "serial")]
-            Self::Serial(p) => p.read(buf),
-            Self::Tcp(s) => s.read(buf),
-        }
+        self.link.read(buf)
     }
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 impl std::io::Write for RNodeStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            #[cfg(feature = "serial")]
-            Self::Serial(p) => p.write(buf),
-            Self::Tcp(s) => s.write(buf),
-        }
+        self.link.write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            #[cfg(feature = "serial")]
-            Self::Serial(p) => p.flush(),
-            Self::Tcp(s) => s.flush(),
-        }
+        self.link.flush()
     }
 }
 
@@ -2433,22 +2462,26 @@ fn read_rnode_stream(
 ) -> Result<(RNodeStream, [u8; 1024], usize), (RNodeStream, std::io::Error)> {
     use std::io::Read;
 
-    match stream.read(&mut buf) {
-        Ok(0) if stream.is_tcp() => Err((
-            stream,
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "RNode TCP socket closed"),
-        )),
-        Ok(n) => Ok((stream, buf, n)),
-        // Serial returns TimedOut; TCP returns WouldBlock on non-blocking
-        // or TimedOut on a read-timeout. Treat both as "no data yet".
-        Err(e)
-            if e.kind() == std::io::ErrorKind::TimedOut
-                || e.kind() == std::io::ErrorKind::WouldBlock =>
-        {
-            Ok((stream, buf, 0))
+    let received = match stream.read(&mut buf) {
+        Ok(0) if stream.is_tcp() => {
+            let closed =
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "RNode TCP socket closed");
+            return Err((stream, closed));
         }
-        Err(e) => Err((stream, e)),
-    }
+        Ok(count) => count,
+        // A read timeout is the idle case on both transports: a serial port
+        // reports TimedOut, a socket TimedOut or WouldBlock.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            0
+        }
+        Err(error) => return Err((stream, error)),
+    };
+    Ok((stream, buf, received))
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -2502,39 +2535,22 @@ async fn open_configured_rnode_stream(
     let port = match port_cfg {
         #[cfg(feature = "serial")]
         PortConfig::Serial { path, baud } => {
-            tracing::info!(
-                name = %config.name,
-                port = %path,
-                baud = baud,
-                "RNode serial interface opening"
-            );
-            RNodeStream::open_serial(path, *baud).map_err(|e| {
-                RNodePortOpenError::new(serial_port_failure(&e), "rnode serial open", e)
+            tracing::info!(name = %config.name, port = %path, baud = *baud, "opening RNode serial port");
+            RNodeStream::open_serial(path, *baud).map_err(|error| {
+                RNodePortOpenError::new(serial_port_failure(&error), "rnode serial open", error)
             })?
         }
         PortConfig::Tcp { addr } => {
-            tracing::info!(
-                name = %config.name,
-                addr = %addr,
-                "RNode TCP interface connecting"
-            );
-            let addr = addr.clone();
-            tokio::task::spawn_blocking(move || RNodeStream::connect_tcp(&addr))
-                .await
-                .map_err(|e| {
-                    RNodePortOpenError::new(
-                        RNodePortFailureClass::Unavailable,
-                        "rnode tcp spawn",
-                        e,
-                    )
-                })?
-                .map_err(|e| {
-                    RNodePortOpenError::new(
-                        RNodePortFailureClass::Unavailable,
-                        "rnode tcp connect",
-                        e,
-                    )
-                })?
+            tracing::info!(name = %config.name, addr = %addr, "connecting to RNode over TCP");
+            let target = addr.clone();
+            let unavailable = |context: &str, error: &dyn std::fmt::Display| {
+                RNodePortOpenError::new(RNodePortFailureClass::Unavailable, context, error)
+            };
+            match tokio::task::spawn_blocking(move || RNodeStream::connect_tcp(&target)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => return Err(unavailable("rnode tcp connect", &error)),
+                Err(error) => return Err(unavailable("rnode tcp spawn", &error)),
+            }
         }
     };
 
@@ -2882,7 +2898,7 @@ impl RNodeRadioSettings {
 #[derive(Debug, Clone)]
 pub struct RNodeConfig {
     pub name: String,
-    /// Serial device path (`/dev/ttyUSB0`) **or** TCP URL (`tcp://host[:port]`).
+    /// Serial device path or `tcp://host[:port]` URL; see [`PortConfig`].
     pub port: String,
     pub baud_rate: u32,
     /// Hz.
@@ -6387,114 +6403,47 @@ mod tests {
 
     #[cfg(feature = "serial")]
     #[test]
-    fn test_port_config_serial() {
+    fn port_config_without_scheme_is_serial() {
         let cfg = PortConfig::parse("/dev/ttyUSB0", 115200).unwrap();
-        assert!(matches!(cfg, PortConfig::Serial { path, .. } if path == "/dev/ttyUSB0"));
+        assert!(matches!(
+            cfg,
+            PortConfig::Serial { path, baud } if path == "/dev/ttyUSB0" && baud == 115200
+        ));
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
-    fn test_port_config_tcp_default_port() {
-        let cfg = PortConfig::parse("tcp://192.168.1.1", 115200).unwrap();
-        match cfg {
-            PortConfig::Tcp { addr } => assert_eq!(addr, "192.168.1.1:7633"),
-            #[cfg(feature = "serial")]
-            _ => panic!("expected Tcp variant"),
+    fn port_config_tcp_endpoints_normalize_to_host_and_port() {
+        let cases = [
+            ("tcp://192.168.1.1", "192.168.1.1:7633"),
+            ("tcp://192.168.1.1:9000", "192.168.1.1:9000"),
+            ("tcp://rnode.local", "rnode.local:7633"),
+            ("TCP://rnode.local", "rnode.local:7633"),
+            ("tcp://[2001:db8::1]", "[2001:db8::1]:7633"),
+            ("tcp://[2001:db8::1]:9000", "[2001:db8::1]:9000"),
+            ("tcp://2001:db8::1", "[2001:db8::1]:7633"),
+        ];
+        for (port, expected) in cases {
+            match PortConfig::parse(port, 115200) {
+                Ok(PortConfig::Tcp { addr }) => assert_eq!(addr, expected, "{port}"),
+                other => panic!("{port}: expected a TCP endpoint, got {other:?}"),
+            }
         }
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     #[test]
-    fn test_port_config_tcp_explicit_port() {
-        let cfg = PortConfig::parse("tcp://192.168.1.1:9000", 115200).unwrap();
-        match cfg {
-            PortConfig::Tcp { addr } => assert_eq!(addr, "192.168.1.1:9000"),
-            #[cfg(feature = "serial")]
-            _ => panic!("expected Tcp variant"),
+    fn port_config_rejects_malformed_tcp_endpoints() {
+        let cases = [
+            ("tcp://", "missing TCP host"),
+            ("tcp://rnode.local:notaport", "invalid TCP port"),
+            ("tcp://rnode.local:", "missing TCP port"),
+            ("tcp://[2001:db8::1", "missing closing"),
+        ];
+        for (port, expected) in cases {
+            let error = PortConfig::parse(port, 115200).unwrap_err();
+            assert!(error.contains(expected), "{port}: {error}");
         }
-    }
-
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-    #[test]
-    fn test_port_config_tcp_hostname() {
-        let cfg = PortConfig::parse("tcp://rnode.local", 115200).unwrap();
-        match cfg {
-            PortConfig::Tcp { addr } => assert_eq!(addr, "rnode.local:7633"),
-            #[cfg(feature = "serial")]
-            _ => panic!("expected Tcp variant"),
-        }
-    }
-
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-    #[test]
-    fn test_port_config_tcp_case_insensitive_scheme() {
-        let cfg = PortConfig::parse("TCP://rnode.local", 115200).unwrap();
-        match cfg {
-            PortConfig::Tcp { addr } => assert_eq!(addr, "rnode.local:7633"),
-            #[cfg(feature = "serial")]
-            _ => panic!("expected Tcp variant"),
-        }
-    }
-
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-    #[test]
-    fn test_port_config_tcp_empty_host_rejected() {
-        let err = PortConfig::parse("tcp://", 115200).unwrap_err();
-        assert!(err.contains("missing TCP host"));
-    }
-
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-    #[test]
-    fn test_port_config_tcp_invalid_port_rejected() {
-        let err = PortConfig::parse("tcp://rnode.local:notaport", 115200).unwrap_err();
-        assert!(err.contains("invalid TCP port"));
-    }
-
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-    #[test]
-    fn test_port_config_tcp_missing_port_rejected() {
-        let err = PortConfig::parse("tcp://rnode.local:", 115200).unwrap_err();
-        assert!(err.contains("missing TCP port"));
-    }
-
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-    #[test]
-    fn test_port_config_tcp_bracketed_ipv6_default_port() {
-        let cfg = PortConfig::parse("tcp://[2001:db8::1]", 115200).unwrap();
-        match cfg {
-            PortConfig::Tcp { addr } => assert_eq!(addr, "[2001:db8::1]:7633"),
-            #[cfg(feature = "serial")]
-            _ => panic!("expected Tcp variant"),
-        }
-    }
-
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-    #[test]
-    fn test_port_config_tcp_bracketed_ipv6_explicit_port() {
-        let cfg = PortConfig::parse("tcp://[2001:db8::1]:9000", 115200).unwrap();
-        match cfg {
-            PortConfig::Tcp { addr } => assert_eq!(addr, "[2001:db8::1]:9000"),
-            #[cfg(feature = "serial")]
-            _ => panic!("expected Tcp variant"),
-        }
-    }
-
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-    #[test]
-    fn test_port_config_tcp_unbracketed_ipv6_default_port() {
-        let cfg = PortConfig::parse("tcp://2001:db8::1", 115200).unwrap();
-        match cfg {
-            PortConfig::Tcp { addr } => assert_eq!(addr, "[2001:db8::1]:7633"),
-            #[cfg(feature = "serial")]
-            _ => panic!("expected Tcp variant"),
-        }
-    }
-
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-    #[test]
-    fn test_port_config_tcp_malformed_bracketed_ipv6_rejected() {
-        let err = PortConfig::parse("tcp://[2001:db8::1", 115200).unwrap_err();
-        assert!(err.contains("missing closing"));
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
