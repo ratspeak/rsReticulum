@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.4.0 - 2026-11-08
+
 - RNode drivers confirm the settings the radio applies once it is on, on every transport, and stop with the rejected setting named (for example TX power below an amplifier's minimum) instead of transmitting at other settings or retrying forever.
 - Serial and TCP RNodes keep retrying a port that is missing, busy or not permitted every 5 seconds, as in Python Reticulum, and report which.
 - Android Bluetooth RNode sessions wait for the bridge before starting, so a slow reconnect no longer drops a healthy link.
@@ -43,12 +45,6 @@
 - AutoInterface's `devices` and `ignored_devices` take effect, and they and I2P `peers` are read as Python Reticulum reads lists: a quoted name that contains a comma stays one name, and `devices = ,` allows every interface.
 - TCP client interfaces read `i2p_tunneled`, as Python Reticulum does, and give a connection tunneled over I2P its longer I2P socket timeouts.
 - TCP server and Backbone interfaces are announced for discovery only with `reachable_on` set, and Backbone clients never, as in Python Reticulum. A discoverable server without `reachable_on` logs a warning and is not announced, so set `reachable_on` to keep announcing it. The `discovery_reachable_on` key is no longer read.
-
-## 1.4.0 - 2026-10-12
-
-This section records the source-version transition. It is not a standalone
-1.4.0 binary release; the published standalone release remains 1.3.0.
-
 - Corrected packet-size limits across interfaces and Links, including IFAC overhead, and reject unsupported Link setups before sending them.
 - Added application-controlled acknowledgements so propagation nodes can confirm a message only after safely storing it.
 - Prevent stale interface or Link callbacks from acknowledging a different connection after reconnect or cancellation.

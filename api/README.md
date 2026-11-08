@@ -1,6 +1,6 @@
 # Rust API
 
-This guide describes the 1.4.0 source API. For published standalone 1.3.0
+This guide describes the 1.4.0 API, published as v1.4.0. For the 1.3.0
 tools and libraries, use the documentation at that tag. The [1.4 migration
 guide](migrations/1.4.md) covers source and configuration changes.
 

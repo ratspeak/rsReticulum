@@ -1,8 +1,8 @@
 # Capacity, IFAC configuration, and application packet receipts
 
-These changes are part of the 1.4.0 source line used by Ratspeak 1.0.37. They
-are not included in the published standalone 1.3.0 tools. The migration
-command below requires a matching 1.4 source build.
+These changes are part of the 1.4.0 line, published as v1.4.0 and used by
+Ratspeak. They are not in the 1.3.0 tools. The migration command below
+requires a 1.4 build.
 
 ## Interface ownership and packet capacity
 

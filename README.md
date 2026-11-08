@@ -42,7 +42,7 @@ rsReticulum can live beside other Reticulum tools on `PATH` without worry.
 
 ## Build It
 
-This guide describes the 1.4.0 source line at `5b38cae702a5b3984adf12a435f6d3012fcf90e1`, also used by Ratspeak 1.0.37. The published standalone tool download is [v1.3.0](https://github.com/ratspeak/rsReticulum/releases/tag/v1.3.0); use [its README](https://github.com/ratspeak/rsReticulum/blob/v1.3.0/README.md) and bundled `--help` for that build. A Cargo version in the current source is not a separate binary release.
+This guide describes the 1.4.0 release, [v1.4.0](https://github.com/ratspeak/rsReticulum/releases/tag/v1.4.0), the source line Ratspeak builds from. For the 1.3.0 tools, use [the v1.3.0 README](https://github.com/ratspeak/rsReticulum/blob/v1.3.0/README.md) and that build's `--help`.
 
 From a new working directory:
 
@@ -154,8 +154,7 @@ rnsh-rs     [-i FILE] [-s NAME] [-N] [-m] [-w SECONDS] <destination_hash> [-- CM
 Add the release `bin/` directory or `target/release` to `PATH` if
 you want to call them without a path prefix.
 
-`rncp-rs` has a listener authorization limitation in both the current source
-and standalone 1.3.0: `-a <hash>` and `allowed_identities` are checked when a
+`rncp-rs` has a listener authorization limitation in 1.4.0 and 1.3.0: `-a <hash>` and `allowed_identities` are checked when a
 peer identifies, but identification is not required before receiving a pushed
 file. Do not rely on the allowlist to exclude unidentified senders.
 
@@ -164,7 +163,7 @@ Without `-n`, fetch requests require an identified peer on the allowlist.
 `-j <jail>` to constrain fetched paths to a directory under trusted local
 control; it is not an operating-system sandbox.
 
-`rnodeconf-rs` in both the current source and standalone 1.3.0 supports inspection,
+`rnodeconf-rs` in 1.4.0 and 1.3.0 supports inspection,
 EEPROM dump/backup, and saving TNC/normal startup settings. `-T` requires all five
 RF values shown above. Firmware installation, signing/trust enrollment and
 Bluetooth, Wi-Fi, display and interference-avoidance changes are disabled.
@@ -303,7 +302,7 @@ Most daemon and utility flows are implemented for the public `*-rs` tools:
 `rnsd-rs`, `rnstatus-rs`, `rnpath-rs`, `rnid-rs`, `rnprobe-rs`, `rncp-rs`,
 `rnsh-rs`, and `rnodeconf-rs`.
 
-The standalone 1.3.0 release baseline is Python Reticulum 1.4.2. The complete byte-exact corpus,
+The release baseline for 1.3.0 and 1.4.0 is Python Reticulum 1.4.2. The complete byte-exact corpus,
 utility vectors, source-truth oracles, and live Python interoperability matrix
 are pinned to its exact source commit. Historical 1.3.8 audits and fixtures
 retain their original provenance as backward-compatibility evidence. RNS 1.5.0
