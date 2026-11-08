@@ -697,19 +697,6 @@ pub rns_interface::rnode::RNodeRuntimeReason::TransportConsumerClosed
 #[non_exhaustive] pub enum rns_interface::rnode::RNodeSpawnError
 pub rns_interface::rnode::RNodeSpawnError::CapabilityAdmission(rns_interface::rnode::RNodeCapabilityAdmissionError)
 pub rns_interface::rnode::RNodeSpawnError::Interface(rns_interface::traits::InterfaceError)
-pub enum rns_interface::rnode::RNodeStream
-pub rns_interface::rnode::RNodeStream::Serial(alloc::boxed::Box<dyn serialport::SerialPort>)
-pub rns_interface::rnode::RNodeStream::Tcp(std::net::tcp::TcpStream)
-impl rns_interface::rnode::RNodeStream
-pub fn rns_interface::rnode::RNodeStream::connect_tcp(&str) -> core::io::error::Result<Self>
-pub fn rns_interface::rnode::RNodeStream::description(&self) -> alloc::string::String
-pub fn rns_interface::rnode::RNodeStream::open_serial(&str, u32) -> core::io::error::Result<Self>
-pub fn rns_interface::rnode::RNodeStream::try_clone(&self) -> core::io::error::Result<Self>
-impl alloc::io::read::Read for rns_interface::rnode::RNodeStream
-pub fn rns_interface::rnode::RNodeStream::read(&mut self, &mut [u8]) -> core::io::error::Result<usize>
-impl core::io::write::Write for rns_interface::rnode::RNodeStream
-pub fn rns_interface::rnode::RNodeStream::flush(&mut self) -> core::io::error::Result<()>
-pub fn rns_interface::rnode::RNodeStream::write(&mut self, &[u8]) -> core::io::error::Result<usize>
 #[non_exhaustive] pub enum rns_interface::rnode::RNodeTransmitFlowState
 pub rns_interface::rnode::RNodeTransmitFlowState::Blocked
 pub rns_interface::rnode::RNodeTransmitFlowState::Permitted
@@ -790,6 +777,17 @@ pub const fn rns_interface::rnode::RNodeStartupOptions::require_capability_admis
 pub const fn rns_interface::rnode::RNodeStartupOptions::with_persisted_bluetooth_enabled(self) -> Self
 impl core::default::Default for rns_interface::rnode::RNodeStartupOptions
 pub fn rns_interface::rnode::RNodeStartupOptions::default() -> Self
+pub struct rns_interface::rnode::RNodeStream
+impl rns_interface::rnode::RNodeStream
+pub fn rns_interface::rnode::RNodeStream::connect_tcp(&str) -> core::io::error::Result<Self>
+pub fn rns_interface::rnode::RNodeStream::description(&self) -> alloc::string::String
+pub fn rns_interface::rnode::RNodeStream::open_serial(&str, u32) -> core::io::error::Result<Self>
+pub fn rns_interface::rnode::RNodeStream::try_clone(&self) -> core::io::error::Result<Self>
+impl alloc::io::read::Read for rns_interface::rnode::RNodeStream
+pub fn rns_interface::rnode::RNodeStream::read(&mut self, &mut [u8]) -> core::io::error::Result<usize>
+impl core::io::write::Write for rns_interface::rnode::RNodeStream
+pub fn rns_interface::rnode::RNodeStream::flush(&mut self) -> core::io::error::Result<()>
+pub fn rns_interface::rnode::RNodeStream::write(&mut self, &[u8]) -> core::io::error::Result<usize>
 #[non_exhaustive] pub struct rns_interface::rnode::SpawnedRNodeInterface
 pub rns_interface::rnode::SpawnedRNodeInterface::driver: rns_interface::rnode::RNodeDriverHandle
 pub rns_interface::rnode::SpawnedRNodeInterface::interface: rns_interface::traits::InterfaceHandle

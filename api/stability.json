@@ -78,8 +78,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-interface.txt",
-      "itemCount": 1442,
-      "sha256": "df12bc60622557e874c96c70cada3a778f4533e05317a22fb5c98c3510f03033"
+      "itemCount": 1440,
+      "sha256": "2954226f79c76dd7f3e743d5a36e6895ef5e21dcd16b4fd5544be2932953e7a8"
     },
     {
       "name": "rns-runtime",
@@ -153,7 +153,10 @@
       ],
       "rns-interface": [
         "pub async fn rns_interface::i2p::spawn_i2p_server(rns_interface::i2p::I2PServerConfig, alloc::sync::Arc<core::sync::atomic::AtomicU64>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Sender<rns_interface::traits::InterfaceHandle>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>",
-        "pub async fn rns_interface::local::spawn_local_server(rns_interface::local::LocalServerConfig, alloc::sync::Arc<core::sync::atomic::AtomicU64>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Sender<rns_interface::traits::InterfaceHandle>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>"
+        "pub async fn rns_interface::local::spawn_local_server(rns_interface::local::LocalServerConfig, alloc::sync::Arc<core::sync::atomic::AtomicU64>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Sender<rns_interface::traits::InterfaceHandle>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>",
+        "pub enum rns_interface::rnode::RNodeStream",
+        "pub rns_interface::rnode::RNodeStream::Serial(alloc::boxed::Box<dyn serialport::SerialPort>)",
+        "pub rns_interface::rnode::RNodeStream::Tcp(std::net::tcp::TcpStream)"
       ],
       "rns-runtime": [
         "pub fn rns_runtime::interface_factory::InterfacePostInit::from_section(&rns_runtime::config::ConfigSection) -> Self",
