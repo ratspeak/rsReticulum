@@ -5,7 +5,7 @@
 **A Rust implementation of Reticulum.**
 
 
-[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
+[![License: Reticulum License](https://img.shields.io/badge/license-Reticulum%20License-blue.svg)](LICENSE)
 [![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
 [![Release baseline: Reticulum 1.4.2](https://img.shields.io/badge/release%20baseline-Reticulum%201.4.2-success.svg)](https://reticulum.network/)
 [![Status](https://img.shields.io/badge/status-experimental-yellow.svg)](#compatibility-notes)
@@ -19,9 +19,12 @@
 
 ---
 
-rsReticulum is a Rust implementation of Reticulum. This is not a fork of
-Reticulum; it is Reticulum written in a different language, focused on staying
-interoperable. It is not the source-of-truth implementation, do not treat it as one.
+rsReticulum is a Rust port of
+[Reticulum](https://github.com/markqvist/Reticulum), the reference
+implementation by Mark Qvist. It was written from the reference source, not from
+a specification, and tracks the reference's wire behavior release by release.
+The Python reference implementation remains the source of truth. See
+[License](#license).
 
 Commands are intentionally namespaced for Rust with `*-rs` command names, so
 rsReticulum can live beside other Reticulum tools on `PATH` without worry.
@@ -340,4 +343,12 @@ PRs are closed for now until I have time to catch up on everything. I'm tired.
 
 ## License
 
-GNU Affero General Public License v3.0 or later. See [LICENSE](LICENSE).
+rsReticulum is licensed under the [Reticulum License](LICENSE), the license of
+the reference implementation it is ported from. Copyright (c) 2016-2026 Mark
+Qvist, unless otherwise noted; additions and modifications Copyright (c) 2026
+Ratspeak LLC.
+
+The license is permissive with two conditions: no use in systems built to
+purposefully harm people, and no use in or contribution to AI or language-model
+training. The copyright and permission notice must stay in every copy.
+[LICENSE](LICENSE) is the binding text.
