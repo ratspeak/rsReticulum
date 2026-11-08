@@ -2372,10 +2372,10 @@ impl RNodeStream {
     /// Open a serial device at `baud` with the shared read timeout.
     #[cfg(feature = "serial")]
     pub fn open_serial(path: &str, baud: u32) -> std::io::Result<Self> {
-        let port = serialport::new(path, baud)
-            .timeout(Duration::from_millis(RNODE_READ_TIMEOUT_MS))
-            .open()
-            .map_err(std::io::Error::other)?;
+        let port = crate::serial::open_port(
+            serialport::new(path, baud).timeout(Duration::from_millis(RNODE_READ_TIMEOUT_MS)),
+        )
+        .map_err(std::io::Error::other)?;
         Ok(Self {
             link: Box::new(SerialLink(port)),
         })

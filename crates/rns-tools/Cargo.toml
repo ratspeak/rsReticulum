@@ -14,7 +14,7 @@ hardware = ["dep:rns-ratkey"]
 
 [dependencies]
 rns-runtime = { workspace = true, features = ["serial"] }
-rns-interface = { workspace = true }
+rns-interface = { workspace = true, features = ["serial"] }
 rns-identity = { workspace = true }
 rns-transport = { workspace = true }
 rns-crypto = { workspace = true, features = ["std"] }

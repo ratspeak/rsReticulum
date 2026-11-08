@@ -331,10 +331,9 @@ pub(crate) fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
-    let port = match serialport::new(port_path.to_string_lossy(), 115200)
-        .timeout(Duration::from_millis(250))
-        .open()
-    {
+    let port = match rns_interface::serial::open_port(
+        serialport::new(port_path.to_string_lossy(), 115200).timeout(Duration::from_millis(250)),
+    ) {
         Ok(port) => port,
         Err(e) => {
             eprintln!("rnodeconf-rs: could not open {}: {e}", port_path.display());

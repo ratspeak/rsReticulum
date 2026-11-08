@@ -1152,6 +1152,7 @@ impl rns_interface::serial::SerialConfig
 pub fn rns_interface::serial::SerialConfig::baud(self, u32) -> Self
 pub fn rns_interface::serial::SerialConfig::new(&str, &str) -> Self
 pub const rns_interface::serial::DEFAULT_BAUD: u32
+pub fn rns_interface::serial::open_port(serialport::SerialPortBuilder) -> serialport::Result<alloc::boxed::Box<dyn serialport::SerialPort>>
 pub fn rns_interface::serial::serial_params_from(u8, &str, u8) -> (serialport::DataBits, serialport::Parity, serialport::StopBits)
 pub async fn rns_interface::serial::spawn_serial_interface(rns_interface::serial::SerialConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
 pub mod rns_interface::socket_tuning

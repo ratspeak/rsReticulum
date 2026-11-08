@@ -720,10 +720,11 @@ pub async fn spawn_rnode_multi_interface(
         }
     }
 
-    let port = serialport::new(&config.port, config.baud_rate)
-        .timeout(Duration::from_millis(RNODE_READ_TIMEOUT_MS))
-        .open()
-        .map_err(|e| InterfaceError::SendFailed(format!("RNodeMulti open: {}", e)))?;
+    let port = crate::serial::open_port(
+        serialport::new(&config.port, config.baud_rate)
+            .timeout(Duration::from_millis(RNODE_READ_TIMEOUT_MS)),
+    )
+    .map_err(|e| InterfaceError::SendFailed(format!("RNodeMulti open: {}", e)))?;
 
     tracing::info!(
         name = %config.name,

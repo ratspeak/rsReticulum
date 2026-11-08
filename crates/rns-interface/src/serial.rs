@@ -17,6 +17,18 @@ pub const DEFAULT_BAUD: u32 = 9600;
 
 const SERIAL_READ_TIMEOUT_MS: u64 = 100;
 
+/// Open with DTR and RTS asserted, as POSIX `open()` and pyserial do. Windows
+/// otherwise leaves both low, and TinyUSB CDC (nRF52 RNodes) sends nothing
+/// until DTR is up. DTR rises first: RTS alone resets ESP32 auto-reset wiring.
+pub fn open_port(
+    builder: serialport::SerialPortBuilder,
+) -> serialport::Result<Box<dyn serialport::SerialPort>> {
+    let mut port = builder.dtr_on_open(true).open()?;
+    // Best effort, like `dtr_on_open`: some adapters have no RTS line.
+    let _ = port.write_request_to_send(true);
+    Ok(port)
+}
+
 #[derive(Debug, Clone)]
 pub struct SerialConfig {
     pub name: String,
@@ -84,13 +96,14 @@ pub async fn spawn_serial_interface(
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
     let transport_tx = InterfaceTransportSender::new(id, transport_tx);
     let owner = transport_tx.owner();
-    let port = serialport::new(&config.port, config.baud_rate)
-        .data_bits(config.data_bits)
-        .parity(config.parity)
-        .stop_bits(config.stop_bits)
-        .timeout(Duration::from_millis(SERIAL_READ_TIMEOUT_MS))
-        .open()
-        .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("serial open: {}", e)))?;
+    let port = open_port(
+        serialport::new(&config.port, config.baud_rate)
+            .data_bits(config.data_bits)
+            .parity(config.parity)
+            .stop_bits(config.stop_bits)
+            .timeout(Duration::from_millis(SERIAL_READ_TIMEOUT_MS)),
+    )
+    .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("serial open: {}", e)))?;
 
     tracing::info!(
         name = %config.name,

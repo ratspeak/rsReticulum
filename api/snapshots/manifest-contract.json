@@ -1677,7 +1677,9 @@
           "requirement": "~1.4.0",
           "optional": false,
           "defaultFeatures": true,
-          "features": [],
+          "features": [
+            "serial"
+          ],
           "sourceKind": "path"
         },
         {

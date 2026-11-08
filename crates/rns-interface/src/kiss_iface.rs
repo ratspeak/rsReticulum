@@ -77,15 +77,14 @@ pub async fn spawn_kiss_interface(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-    let port = serialport::new(&config.port, config.baud_rate)
-        .data_bits(config.data_bits)
-        .parity(config.parity)
-        .stop_bits(config.stop_bits)
-        .timeout(Duration::from_millis(KISS_READ_TIMEOUT_MS))
-        .open()
-        .map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("kiss serial open: {}", e))
-        })?;
+    let port = crate::serial::open_port(
+        serialport::new(&config.port, config.baud_rate)
+            .data_bits(config.data_bits)
+            .parity(config.parity)
+            .stop_bits(config.stop_bits)
+            .timeout(Duration::from_millis(KISS_READ_TIMEOUT_MS)),
+    )
+    .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("kiss serial open: {}", e)))?;
 
     spawn_kiss_with_port(config, id, transport_tx, port).await
 }

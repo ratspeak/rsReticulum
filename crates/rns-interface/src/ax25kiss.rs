@@ -245,15 +245,16 @@ pub async fn spawn_ax25kiss_interface(
 
     let (data_bits, parity, stop_bits) =
         crate::serial::serial_params_from(config.data_bits, &config.parity, config.stop_bits);
-    let port = serialport::new(&config.port, config.baud_rate)
-        .data_bits(data_bits)
-        .parity(parity)
-        .stop_bits(stop_bits)
-        .timeout(Duration::from_millis(AX25_READ_TIMEOUT_MS))
-        .open()
-        .map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("ax25kiss serial open: {}", e))
-        })?;
+    let port = crate::serial::open_port(
+        serialport::new(&config.port, config.baud_rate)
+            .data_bits(data_bits)
+            .parity(parity)
+            .stop_bits(stop_bits)
+            .timeout(Duration::from_millis(AX25_READ_TIMEOUT_MS)),
+    )
+    .map_err(|e| {
+        crate::traits::InterfaceError::SendFailed(format!("ax25kiss serial open: {}", e))
+    })?;
 
     tracing::info!(
         name = %config.name,
