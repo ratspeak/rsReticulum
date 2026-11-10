@@ -426,14 +426,15 @@ mod tests {
         config.flow_control = true;
         // macOS pseudo terminals cannot accept the hardware baud ioctl;
         // inject the already-open pair into the same production driver.
-        let driver = spawn_kiss_with_port(config, 1, inbound, Box::new(slave))
-            .await
-            .unwrap();
-        driver.owner.mark_registered();
+        // A macOS pty slave drains only as the master reads, so read the
+        // configuration frames while the driver is still starting.
+        let spawning = tokio::spawn(spawn_kiss_with_port(config, 1, inbound, Box::new(slave)));
         let init = build_kiss_init(None, None, None, None);
         let mut actual_init = vec![0; init.len()];
         master.read_exact(&mut actual_init).unwrap();
         assert_eq!(actual_init, init);
+        let driver = spawning.await.unwrap().unwrap();
+        driver.owner.mark_registered();
         // The initial permit goes to the first packet; later ones wait for READY.
         driver.tx.send(Bytes::from_static(b"first")).await.unwrap();
         let expected = kiss::frame(b"first");
