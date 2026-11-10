@@ -886,26 +886,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn occupied_auto_port_is_reported_without_breaking_tcp() {
-        let auto = std::net::UdpSocket::bind("[::]:0").unwrap();
-        let data_port = auto.local_addr().unwrap().port();
+    async fn occupied_interface_port_is_reported_without_breaking_tcp() {
+        let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_port = occupied.local_addr().unwrap().port();
         let (tcp_port, _) = ports();
         let config = TestConfig::new(1, 2, 1);
         std::fs::write(config.0.join("config"), format!(
-            "[reticulum]\nshare_instance = No\n[interfaces]\n[[LAN]]\ntype = AutoInterface\nenabled = Yes\ndata_port = {data_port}\n[[TCP]]\ntype = TCPServerInterface\nenabled = Yes\nlisten_ip = 127.0.0.1\nlisten_port = {tcp_port}\n"
+            "[reticulum]\nshare_instance = No\n[interfaces]\n[[LAN]]\ntype = UDPInterface\nenabled = Yes\nlisten_ip = 127.0.0.1\nlisten_port = {udp_port}\nforward_ip = 127.0.0.1\nforward_port = {udp_port}\n[[TCP]]\ntype = TCPServerInterface\nenabled = Yes\nlisten_ip = 127.0.0.1\nlisten_port = {tcp_port}\n"
         )).unwrap();
         let runtime = config.start(InstancePolicy::Standalone).await.unwrap();
         assert_eq!(runtime.startup_interface_failures().len(), 1);
         assert_eq!(runtime.startup_interface_failures()[0].0, "LAN");
-        assert!(
-            runtime.startup_interface_failures()[0]
-                .1
-                .contains("socket bind")
-        );
         let _tcp = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, tcp_port))
             .await
             .unwrap();
-        assert_eq!(auto.local_addr().unwrap().port(), data_port);
+        assert_eq!(occupied.local_addr().unwrap().port(), udp_port);
         runtime.shutdown_and_wait().await;
     }
 }

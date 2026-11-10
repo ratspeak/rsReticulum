@@ -985,15 +985,10 @@ fn synthesize_auto(
     let discovery_port = parse_port_opt(name, "discovery_port", section)?.unwrap_or(29716);
     let data_port = parse_port_opt(name, "data_port", section)?.unwrap_or(42671);
 
-    let multicast_address_type = match section.get("multicast_address_type") {
-        Some(s) => rns_interface::auto::McastAddrType::from_str(s).map_err(|message| {
-            InterfaceFactoryError::InvalidValue {
-                field: "multicast_address_type".to_string(),
-                message,
-            }
-        })?,
-        None => rns_interface::auto::McastAddrType::Temporary,
-    };
+    let multicast_address_type = section
+        .get("multicast_address_type")
+        .map(rns_interface::auto::McastAddrType::parse)
+        .unwrap_or(rns_interface::auto::McastAddrType::Temporary);
 
     // Python `as_list`; an empty whitelist allows every interface
     // (AutoInterface.py:111-112, :229).
@@ -1002,9 +997,11 @@ fn synthesize_auto(
         .filter(|devices| !devices.is_empty());
     let ignored_devices = section.get_list("ignored_devices").unwrap_or_default();
 
+    // Reticulum.py:1018-1020, :1204: only `bitrate` counts, and only from
+    // MINIMUM_BITRATE up; a user `configured_bitrate` key is overwritten.
     let configured_bitrate = section
-        .get_uint("configured_bitrate")
-        .or_else(|| section.get_uint("bitrate"));
+        .get_uint("bitrate")
+        .filter(|bitrate| *bitrate >= crate::constants::MINIMUM_BITRATE);
 
     Ok(InterfaceConfig::Auto(AutoInterfaceConfig {
         name: name.to_string(),
@@ -2671,7 +2668,7 @@ mod tests {
             vec!["eth0".into(), "wlan0".into(), "br-lan".into()],
         );
         section.set_list("ignored_devices", vec!["vmnet1".into(), "docker0".into()]);
-        section.set("configured_bitrate", "100000000");
+        section.set("bitrate", "100000000");
 
         let config = synthesize_interface("campus_auto", &section).unwrap();
         match config {

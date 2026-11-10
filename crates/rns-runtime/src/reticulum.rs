@@ -8842,7 +8842,9 @@ pub async fn spawn_auto_interface_runtime_with_config(
     let iface_handle = rns_interface::auto::spawn_auto_interface(
         config,
         id,
+        handle.id_gen.clone(),
         handle.transport_tx.clone(),
+        handle.handle_tx.clone(),
         handle.is_foreground.clone(),
     )
     .await
@@ -9381,10 +9383,17 @@ async fn spawn_interface_with_rnode_startup_options(
                 configured_bitrate: c.configured_bitrate,
                 mode: c.mode,
             };
-            rns_interface::auto::spawn_auto_interface(auto_config, id, transport_tx, is_foreground)
-                .await
-                .map(|h| vec![h.into()])
-                .map_err(|e| format!("Auto: {e}"))
+            rns_interface::auto::spawn_auto_interface(
+                auto_config,
+                id,
+                id_gen,
+                transport_tx,
+                handle_tx,
+                is_foreground,
+            )
+            .await
+            .map(|h| vec![h.into()])
+            .map_err(|e| format!("Auto: {e}"))
         }
         #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
         interface_factory::InterfaceConfig::RNode(c) => {
