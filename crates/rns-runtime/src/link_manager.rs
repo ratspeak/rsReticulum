@@ -3239,6 +3239,28 @@ impl LinkManager {
             return;
         }
 
+        // Link.validate_request (Link.py:193-195@1.6.0): the cost is read now, so
+        // a changed set_link_cost applies to the next request.
+        let policy = crate::destination_stamper::policy();
+        if policy.lr_stamps_enforced {
+            let cost = self
+                .destination
+                .as_ref()
+                .map_or(policy.lr_cost, |dest| dest.link_cost(policy.lr_cost));
+            if !rns_link::stamp::link_request_stamp_valid(
+                &self.destination_hash,
+                request_data,
+                cost,
+            ) {
+                tracing::debug!(
+                    value = ?rns_link::stamp::link_request_stamp_value(&self.destination_hash, request_data),
+                    cost,
+                    "link request rejected — insufficient link request stamp value"
+                );
+                return;
+            }
+        }
+
         let responder = match (&self.identity_key, &self.identity) {
             (Some(identity_key), _) => {
                 Link::new_responder(request_data, identity_key, self.destination_hash, hops)

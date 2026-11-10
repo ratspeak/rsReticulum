@@ -59,6 +59,7 @@ pub const DEFAULT_MODE: u8 = MODE_AES256_CBC;
 pub const TIMEOUT: u8 = 0x01;
 pub const INITIATOR_CLOSED: u8 = 0x02;
 pub const DESTINATION_CLOSED: u8 = 0x03;
+pub const STAMP_FAILURE: u8 = 0x04;
 
 pub const ACCEPT_NONE: u8 = 0x00;
 /// Defer acceptance to an application callback.

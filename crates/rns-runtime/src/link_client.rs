@@ -46,6 +46,8 @@ pub enum LinkClientError {
     LinkCrypto(String),
     #[error("unexpected response from remote: {0}")]
     UnexpectedResponse(String),
+    #[error("link request stamp failed: {0}")]
+    StampFailure(#[from] rns_link::stamp::LinkStampError),
 }
 
 #[derive(Clone)]
@@ -104,7 +106,8 @@ impl LinkClient {
         .map_err(map_destination_resolve_error)?
         .public_key;
 
-        let (mut link, request_data) = Link::new_initiator(dest_hash, hops);
+        let (mut link, request_data) =
+            crate::link_stamp::new_initiator(&self.transport_tx, dest_hash, hops).await?;
         let link_id = link.link_id;
 
         // Register link_id as a destination so inbound LRPROOF / Response

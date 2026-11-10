@@ -63,10 +63,13 @@ pub struct TimeoutError;
 
 /// Reason for link closure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CloseReason {
     Timeout,
     InitiatorClosed,
     DestinationClosed,
+    /// The link request stamp could not be generated; never sent to the peer.
+    StampFailure,
 }
 
 /// Latest physical-layer measurements observed for a Link.
@@ -224,6 +227,8 @@ pub struct Link {
     pub expected_hops: Option<u8>,
 
     pub destination_hash: [u8; 16],
+    /// Responder side: the link request's stamp value (Python `link.stamp_cost`).
+    pub stamp_value: Option<f64>,
 
     remote_identity_pub: Option<[u8; 64]>,
     pub identified: bool,
@@ -291,7 +296,34 @@ impl Link {
         ),
     )]
     pub fn new_initiator(destination_hash: [u8; 16], hops: u8) -> (Self, Vec<u8>) {
-        let ephemeral_keys = EphemeralKeys::generate();
+        Self::new_initiator_with_keys(destination_hash, hops, EphemeralKeys::generate())
+    }
+
+    /// Create an outbound link whose request is stamped at `cost`, as Python's
+    /// initiator does; `None` gives unstamped keys. Grinding blocks the calling
+    /// thread until `ctl` stops it.
+    pub fn new_stamped_initiator(
+        destination_hash: [u8; 16],
+        hops: u8,
+        cost: Option<f64>,
+        ctl: &rns_identity::stamps::StampControl,
+    ) -> Result<(Self, Vec<u8>), crate::stamp::LinkStampError> {
+        let keys = match cost {
+            Some(cost) => {
+                crate::stamp::generate_stamped_ephemeral_keys(&destination_hash, cost, ctl)?
+            }
+            None => EphemeralKeys::generate(),
+        };
+        Ok(Self::new_initiator_with_keys(destination_hash, hops, keys))
+    }
+
+    /// Create an outbound link with caller-supplied ephemeral keys, such as
+    /// keys from [`crate::stamp::generate_stamped_ephemeral_keys`].
+    pub fn new_initiator_with_keys(
+        destination_hash: [u8; 16],
+        hops: u8,
+        ephemeral_keys: EphemeralKeys,
+    ) -> (Self, Vec<u8>) {
         let signalling = SignallingData::new(DEFAULT_MODE, rns_wire::constants::MTU as u32);
         let request_data = LinkRequestData::pack(&ephemeral_keys, signalling);
         let link_id = compute_link_id(&destination_hash, &request_data);
@@ -335,6 +367,7 @@ impl Link {
             expected_rate: None,
             expected_hops: Some(hops),
             destination_hash,
+            stamp_value: None,
             remote_identity_pub: None,
             identified: false,
             tx_bytes: 0,
@@ -609,6 +642,7 @@ impl Link {
             // Populated by the runtime from the LRRTT packet hops (Link.py:525).
             expected_hops: None,
             destination_hash,
+            stamp_value: crate::stamp::link_request_stamp_value(&destination_hash, request_data),
             remote_identity_pub: None,
             identified: false,
             tx_bytes: 0,

@@ -237,13 +237,13 @@ pub(crate) async fn wait_for_valid_proof(
     Err(LinkProofWaitError::DeliveryClosed)
 }
 
-/// Create an initiator Link the way Link.py does (Link.py:304-309): hops from
-/// the path table and an establishment timeout of the first-hop timeout plus
-/// `ESTABLISHMENT_TIMEOUT_PER_HOP` per hop.
-pub(crate) async fn new_initiator_link(
+/// What Link.py takes from the path table for a new initiator Link
+/// (Link.py:304-309): the hops and the first-hop timeout that extends the
+/// establishment timeout.
+pub(crate) async fn initiator_path_timing(
     transport_tx: &mpsc::Sender<TransportMessage>,
     destination_hash: [u8; 16],
-) -> Result<(Link, Vec<u8>), LinkEndpointError> {
+) -> Result<(u8, f64), LinkEndpointError> {
     let hops = match query(
         transport_tx,
         TransportQuery::HopsTo {
@@ -266,9 +266,7 @@ pub(crate) async fn new_initiator_link(
         TransportQueryResponse::FloatResult(Some(seconds)) => seconds,
         _ => rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT,
     };
-    let (mut link, request_data) = Link::new_initiator(destination_hash, hops);
-    let _ = link.try_extend_establishment_timeout(first_hop_timeout);
-    Ok((link, request_data))
+    Ok((hops, first_hop_timeout))
 }
 
 async fn query(

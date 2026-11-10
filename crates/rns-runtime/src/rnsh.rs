@@ -69,9 +69,12 @@ const CLIENT_WINCH_RTT_FACTOR: f64 = 25.0;
 const CLIENT_PRE_EOF_DRAIN: Duration = Duration::from_secs(3);
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RnshError {
     #[error("link request admission failed: {0}")]
     RequestDispatch(#[from] rns_transport::link_messages::LinkRequestDispatchError),
+    #[error("link request stamp failed: {0}")]
+    StampFailure(#[from] rns_link::stamp::LinkStampError),
     #[error("transport channel unavailable")]
     TransportUnavailable,
     #[error("timed out waiting for {0}")]
@@ -103,6 +106,23 @@ pub enum RnshError {
     ProtocolError,
     #[error("session terminated locally")]
     Terminated,
+    /// The established link closed or timed out.
+    #[error("link closed: {0}")]
+    LinkClosed(String),
+    /// A local failure after the command was started.
+    #[error("{0}")]
+    ClientException(String),
+}
+
+/// Client setup progress, reported through `RnshClientConfig::progress_tx`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RnshClientProgress {
+    /// No path was known; a path request was sent.
+    RequestingPath,
+    /// A link request was sent.
+    EstablishingLink,
+    /// The link proof was validated.
+    LinkEstablished,
 }
 
 impl From<ChannelError> for RnshError {
@@ -144,6 +164,7 @@ pub struct RnshClientConfig {
     pub tcflags: Option<rmpv::Value>,
     /// Resolving (or dropping the sender) ends the session and tears the link down.
     pub terminate_rx: Option<oneshot::Receiver<()>>,
+    pub progress_tx: Option<mpsc::UnboundedSender<RnshClientProgress>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +288,11 @@ async fn run_rnsh_listener_inner(
     let (exited_tx, mut exited_rx) = mpsc::unbounded_channel::<[u8; 16]>();
     let mut sessions: HashMap<[u8; 16], ListenerSession> = HashMap::new();
     let mut file_allowed = read_allowed_identity_files(&cfg.allowed_identity_files);
+    if !cfg.allow_all && cfg.allowed.is_empty() && file_allowed.is_empty() {
+        tracing::warn!(
+            "Warning: No allowed identities configured, rnsh will not accept any connections!"
+        );
+    }
 
     loop {
         tokio::select! {
@@ -351,6 +377,7 @@ async fn run_rnsh_listener_inner(
                     std::future::pending::<()>().await;
                 }
             } => {
+                rns_transport::notice!("Shutting down");
                 for (link_id, session) in sessions.iter_mut() {
                     send_manager_message_once(
                         &command_tx,
@@ -416,14 +443,28 @@ pub async fn rnsh_client_execute(
     mut cfg: RnshClientConfig,
 ) -> Result<RnshClientOutcome, RnshError> {
     let destination_hash = cfg.destination_hash;
+    let mut terminate_rx = cfg.terminate_rx.take();
+    let progress_tx = cfg.progress_tx.take();
+    let progress = |step: RnshClientProgress| {
+        if let Some(tx) = progress_tx.as_ref() {
+            let _ = tx.send(step);
+        }
+    };
 
-    let pubkey = discover_pubkey(&transport_tx, destination_hash, cfg.timeout).await?;
+    let pubkey = tokio::select! {
+        result = discover_pubkey(&transport_tx, destination_hash, cfg.timeout, &progress) => result?,
+        _ = wait_terminate(&mut terminate_rx) => return Err(RnshError::Terminated),
+    };
 
+    progress(RnshClientProgress::EstablishingLink);
     let link_deadline = Some(Instant::now() + cfg.timeout);
-    let (mut link, request_data) =
-        crate::link_endpoint::new_initiator_link(&transport_tx, destination_hash)
+    let (hops, first_hop_timeout) =
+        crate::link_endpoint::initiator_path_timing(&transport_tx, destination_hash)
             .await
             .map_err(|_| RnshError::TransportUnavailable)?;
+    let (mut link, request_data) =
+        crate::link_stamp::new_initiator(&transport_tx, destination_hash, hops).await?;
+    let _ = link.try_extend_establishment_timeout(first_hop_timeout);
     let link_id = link.link_id;
     let (lpkt_tx, mut lpkt_rx) = mpsc::channel::<DestinationEvent>(256);
     transport_tx
@@ -459,14 +500,18 @@ pub async fn rnsh_client_execute(
         .map_err(|_| RnshError::ProofInvalid("remote public key length".into()))?;
     let verify_key = Ed25519PublicKey::from_bytes(&identity_ed25519_pub)
         .map_err(|e| RnshError::ProofInvalid(format!("verify key: {e}")))?;
-    let proof = wait_for_valid_link_proof(
-        &mut lpkt_rx,
-        &mut link,
-        &verify_key,
-        &identity_ed25519_pub,
-        link_deadline,
-    )
-    .await?;
+    let proof = tokio::select! {
+        result = wait_for_valid_link_proof(
+            &mut lpkt_rx,
+            &mut link,
+            &verify_key,
+            &identity_ed25519_pub,
+            link_deadline,
+        ) => result?,
+        _ = wait_terminate(&mut terminate_rx) => return Err(RnshError::Terminated),
+    };
+    progress(RnshClientProgress::LinkEstablished);
+    cfg.terminate_rx = terminate_rx;
     let attached_interface = proof.interface_id;
     let interface_owner = proof.interface_owner;
     let rtt_data = proof.rtt_data;
@@ -509,6 +554,16 @@ pub async fn rnsh_client_execute(
     }
 
     result
+}
+
+/// Resolves when `rx` fires or its sender is dropped; never without a receiver.
+async fn wait_terminate(rx: &mut Option<oneshot::Receiver<()>>) {
+    match rx.as_mut() {
+        Some(rx) => {
+            let _ = rx.await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 async fn run_client_session(
@@ -600,7 +655,10 @@ async fn run_client_session(
     .await;
     match version_result {
         Ok(()) => {}
-        Err(RnshError::Timeout(_)) => return Err(RnshError::ProtocolError),
+        // Upstream only notices a link closed during the version wait as a timeout.
+        Err(RnshError::Timeout(_) | RnshError::LinkClosed(_)) => {
+            return Err(RnshError::ProtocolError);
+        }
         Err(error) => return Err(error),
     }
     tokio::time::sleep(Duration::from_millis(75)).await;
@@ -640,7 +698,11 @@ async fn run_client_session(
             cfg,
         },
     )
-    .await?;
+    .await
+    .map_err(|error| match error {
+        RnshError::Remote(_) | RnshError::LinkClosed(_) | RnshError::Terminated => error,
+        other => RnshError::ClientException(other.to_string()),
+    })?;
 
     Ok(RnshClientOutcome {
         stdout,
@@ -812,7 +874,7 @@ async fn run_client_io_loop(
         tokio::select! {
             maybe_event = endpoint.packet_rx.recv() => {
                 let Some(event) = maybe_event else {
-                    return Err(RnshError::HandshakeFailed("link channel closed".into()));
+                    return Err(RnshError::LinkClosed("link channel closed".into()));
                 };
                 process_client_destination_event(
                     transport_tx,
@@ -825,7 +887,7 @@ async fn run_client_io_loop(
                 ).await?;
             }
             terminal = endpoint.lifecycle_rx.recv() => {
-                return Err(RnshError::HandshakeFailed(format!(
+                return Err(RnshError::LinkClosed(format!(
                     "link endpoint terminated: {terminal:?}"
                 )));
             }
@@ -1192,11 +1254,8 @@ fn configure_pty_child(cmd: &mut Command, pty: &ProcessPty) {
             if nix::libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
-            #[cfg(target_os = "android")]
-            let tiocsctty = nix::libc::TIOCSCTTY as nix::libc::c_int;
-            #[cfg(not(target_os = "android"))]
-            let tiocsctty = nix::libc::TIOCSCTTY as nix::libc::c_ulong;
-            if nix::libc::ioctl(slave_fd, tiocsctty, 0) == -1 {
+            // The request parameter type differs between glibc, musl, bionic and Darwin.
+            if nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
             let pid = nix::libc::getpid();
@@ -2015,10 +2074,10 @@ async fn service_client_link(
             let raw =
                 build_data_packet(link_id, rns_wire::context::PacketContext::LinkClose, &data);
             let _ = send_client_endpoint_packet(transport_tx, link_id, raw).await;
-            return Err(RnshError::HandshakeFailed("link timed out".into()));
+            return Err(RnshError::LinkClosed("link timed out".into()));
         }
         LinkAction::Closed(_) => {
-            return Err(RnshError::HandshakeFailed("link timed out".into()));
+            return Err(RnshError::LinkClosed("link timed out".into()));
         }
         LinkAction::None => {}
     }
@@ -2069,9 +2128,9 @@ async fn receive_client_messages(
     let event = match tokio::time::timeout(wait, async {
         tokio::select! {
             event = endpoint.packet_rx.recv() => event.ok_or_else(|| {
-                RnshError::HandshakeFailed("link channel closed".into())
+                RnshError::LinkClosed("link channel closed".into())
             }),
-            terminal = endpoint.lifecycle_rx.recv() => Err(RnshError::HandshakeFailed(
+            terminal = endpoint.lifecycle_rx.recv() => Err(RnshError::LinkClosed(
                 format!("link endpoint terminated: {terminal:?}")
             )),
         }
@@ -2147,7 +2206,7 @@ async fn process_client_destination_event(
                 send_keepalive_response(transport_tx, *channel.link_id()).await?;
             }
             rns_wire::context::PacketContext::LinkClose if link.receive_teardown(body) => {
-                return Err(RnshError::HandshakeFailed("link closed by remote".into()));
+                return Err(RnshError::LinkClosed("link closed by remote".into()));
             }
             rns_wire::context::PacketContext::Channel => {
                 let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
@@ -2178,10 +2237,12 @@ async fn discover_pubkey(
     transport_tx: &mpsc::Sender<TransportMessage>,
     dest_hash: [u8; 16],
     path_wait: Duration,
+    progress: &impl Fn(RnshClientProgress),
 ) -> Result<[u8; 64], RnshError> {
     if let Some(pk) = lookup_pubkey(transport_tx, dest_hash).await? {
         return Ok(pk);
     }
+    progress(RnshClientProgress::RequestingPath);
 
     transport_tx
         .send(TransportMessage::RequestPath {

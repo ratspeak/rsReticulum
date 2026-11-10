@@ -69,6 +69,8 @@ pub fn default_rncp_app_name() -> &'static str {
 pub enum RncpError {
     #[error("link request admission failed: {0}")]
     RequestDispatch(#[from] rns_transport::link_messages::LinkRequestDispatchError),
+    #[error("link request stamp failed: {0}")]
+    StampFailure(#[from] rns_link::stamp::LinkStampError),
     #[error("transport channel unavailable")]
     TransportUnavailable,
     #[error("timed out waiting for {0}")]
@@ -877,7 +879,8 @@ async fn establish(
         TransportQueryResponse::FloatResult(Some(t)) if t.is_finite() && t >= 0.0 => t,
         _ => rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT,
     };
-    let (mut link, link_request_data) = Link::new_initiator(dest_hash, hops);
+    let (mut link, link_request_data) =
+        crate::link_stamp::new_initiator(transport_tx, dest_hash, hops).await?;
     let _ = link.try_extend_establishment_timeout(first_hop);
     let link_id = link.link_id;
     let deadline = path_deadline.max(Instant::now() + link.establishment_timeout);

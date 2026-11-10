@@ -545,6 +545,8 @@ pub enum LinkSessionError {
     ResponseRejected { size: u64, max: usize },
     #[error("Link session task is no longer running")]
     SessionClosed,
+    #[error("link request stamp failed: {0}")]
+    StampFailure(#[from] rns_link::stamp::LinkStampError),
 }
 
 enum LinkSessionCommand {
@@ -1195,7 +1197,8 @@ impl LinkSession {
     /// the local identity must be able to sign; success is not remote application
     /// authorization of that identity.
     ///
-    /// The establishment timeout bounds request admission and proof waiting.
+    /// The establishment timeout bounds request admission and proof waiting;
+    /// generating a link request stamp is bounded by `lr_stamp_timeout` before it.
     /// Some transport operations and identification delays are outside it; use
     /// an outer timeout for a deadline on the entire call.
     pub async fn connect(
@@ -1203,10 +1206,13 @@ impl LinkSession {
         identity: Identity,
         config: LinkSessionConfig,
     ) -> Result<Self, LinkSessionError> {
+        let (mut link, request_data) =
+            crate::link_stamp::new_initiator(&transport_tx, config.destination_hash, config.hops)
+                .await?;
+        // Python starts the establishment watchdog after stamping (Link.py:404-405).
         let deadline = Instant::now()
             .checked_add(config.establishment_timeout)
             .ok_or_else(|| LinkSessionError::HandshakeFailed("unrepresentable timeout".into()))?;
-        let (mut link, request_data) = Link::new_initiator(config.destination_hash, config.hops);
         link.track_phy_stats(config.track_phy_stats);
         let link_id = link.link_id;
         let (delivery_tx, mut delivery_rx) = mpsc::channel::<DestinationEvent>(EVENT_BUFFER);
@@ -5847,6 +5853,18 @@ mod tests {
         );
     }
 
+    async fn answer_no_link_cost(rx: &mut mpsc::Receiver<TransportMessage>) {
+        match rx.recv().await.unwrap() {
+            TransportMessage::Rpc {
+                query: TransportQuery::RecallLinkCost { .. },
+                response_tx,
+            } => {
+                let _ = response_tx.send(TransportQueryResponse::FloatResult(None));
+            }
+            other => panic!("expected link cost recall, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn capacity_rejection_finishes_handshake_before_proof_timeout() {
         let (tx, mut rx) = mpsc::channel(8);
@@ -5866,6 +5884,7 @@ mod tests {
                 inbound_reassembly_limit: None,
             },
         ));
+        answer_no_link_cost(&mut rx).await;
         let link_id = match rx.recv().await.unwrap() {
             TransportMessage::RegisterDestination { hash, .. } => hash,
             other => panic!("unexpected registration: {other:?}"),
@@ -5918,6 +5937,7 @@ mod tests {
             },
         ));
 
+        answer_no_link_cost(&mut transport_rx).await;
         let link_id = match transport_rx.recv().await.unwrap() {
             TransportMessage::RegisterDestination { hash, .. } => hash,
             other => panic!("unexpected transport message: {other:?}"),
@@ -5963,6 +5983,7 @@ mod tests {
             },
         ));
 
+        answer_no_link_cost(&mut transport_rx).await;
         let (link_id, delivery_tx) = match transport_rx.recv().await.unwrap() {
             TransportMessage::RegisterDestination {
                 hash,
@@ -6071,6 +6092,7 @@ mod tests {
                 inbound_reassembly_limit: None,
             },
         ));
+        answer_no_link_cost(&mut transport_rx).await;
         let delivery_tx = match transport_rx.recv().await.unwrap() {
             TransportMessage::RegisterDestination {
                 delivery_tx: Some(tx),
@@ -6167,6 +6189,7 @@ mod tests {
             },
         ));
 
+        answer_no_link_cost(&mut transport_rx).await;
         let delivery_tx = match transport_rx.recv().await.unwrap() {
             TransportMessage::RegisterDestination {
                 hash,

@@ -45,6 +45,18 @@ impl EphemeralKeys {
             ed25519_pub,
         }
     }
+
+    /// Assemble ephemeral keys from existing private keys, such as a stamped X25519 key.
+    pub fn from_parts(x25519_prv: X25519PrivateKey, ed25519_prv: Ed25519PrivateKey) -> Self {
+        let x25519_pub = x25519_prv.public_key();
+        let ed25519_pub = ed25519_prv.public_key();
+        Self {
+            x25519_prv,
+            x25519_pub,
+            ed25519_prv,
+            ed25519_pub,
+        }
+    }
 }
 
 /// Link request payload (Message 1: initiator -> destination).

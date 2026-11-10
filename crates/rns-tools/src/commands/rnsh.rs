@@ -3,8 +3,8 @@
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 #[cfg(test)]
@@ -18,8 +18,8 @@ use rns_identity::identity::Identity;
 use rns_runtime::lifecycle::{ShutdownSignal, install_signal_handlers};
 use rns_runtime::platform::{StoragePaths, resolve_config_dir};
 use rns_runtime::rnsh::{
-    RnshClientConfig, RnshError, RnshListenerConfig, RnshWindowSize, rnsh_client_execute,
-    run_rnsh_listener_with_shutdown,
+    RnshClientConfig, RnshClientOutcome, RnshClientProgress, RnshError, RnshListenerConfig,
+    RnshWindowSize, rnsh_client_execute, run_rnsh_listener_with_shutdown,
 };
 use tokio::sync::mpsc;
 
@@ -28,6 +28,8 @@ use rns_tools::RS_RETICULUM_VERSION;
 const RNSH_PROTOCOL_VERSION: &str = "0.3.0";
 const APP_NAME: &str = "rnsh";
 const DEFAULT_SERVICE_NAME: &str = "default";
+/// Rust counterpart of upstream's `rnsh` directory name (`~/.config/rnsh`, `~/.rnsh`).
+const RNSH_CONFIG_DIR_NAME: &str = "rnsh-rs";
 const IDENTITY_HASH_HEX_LEN: usize = 32;
 
 #[derive(Debug, Parser, Clone)]
@@ -38,58 +40,71 @@ const IDENTITY_HASH_HEX_LEN: usize = 32;
     after_help = "When specifying a command to execute, separate rnsh-rs options from the command and its arguments with --\n\nFor example:\n  rnsh-rs -l -- /bin/bash --login\n  rnsh-rs <destination> -- ls -la /tmp"
 )]
 struct Args {
-    /// Alternative Reticulum config directory.
+    /// path to config directory
     #[arg(short = 'c', long = "config")]
     config: Option<PathBuf>,
-    /// Identity file to load or create; overrides the default stored identity.
+    /// path to alternative Reticulum config directory
+    #[arg(long = "rnsconfig")]
+    rnsconfig: Option<PathBuf>,
+    /// path to identity file to use
     #[arg(short = 'i', long = "identity")]
     identity: Option<PathBuf>,
-    /// Increase log verbosity (repeatable).
+    /// increase verbosity
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
     verbose: u8,
-    /// Decrease log verbosity (repeatable).
+    /// decrease verbosity
     #[arg(short = 'q', long = "quiet", action = ArgAction::Count)]
     quiet: u8,
-    /// Print identity information and exit; creates the identity if absent.
+    /// print identity and destination info and exit
     #[arg(short = 'p', long = "print-identity")]
     print_identity: bool,
-    /// Print version and exit.
+    /// show program's version number and exit
     #[arg(long = "version")]
     version: bool,
 
-    /// Listen for remote commands using this process's privileges.
+    /// listen (server) mode; any command specified after -- will be used as the default command when the initiator does not provide one or when remote command execution is disabled; if no command is specified, the default shell of the user running rnsh will be used
     #[arg(short = 'l', long = "listen")]
     listen: bool,
-    /// Listener identity suffix (default: default); keeps only ASCII letters, digits and underscores.
+    /// service name for identity file if not the default
     #[arg(short = 's', long = "service")]
     service: Option<String>,
-    /// Listener announce interval in seconds; 0 announces once, omitted disables scheduled announces.
-    #[arg(short = 'b', long = "announce", value_name = "PERIOD")]
-    announce: Option<u64>,
-    /// Listener: allow this client identity hash (32 hex characters); repeat for multiple clients.
+    /// announce on startup and every PERIOD seconds; specify 0 to announce on startup only
+    #[arg(
+        short = 'b',
+        long = "announce",
+        value_name = "PERIOD",
+        allow_negative_numbers = true
+    )]
+    announce: Option<i64>,
+    /// allow this identity to connect (may be specified multiple times); allowed identities can also be specified in ~/.rnsh-rs/allowed_identities or ~/.config/rnsh-rs/allowed_identities, one hash per line
     #[arg(short = 'a', long = "allowed", value_name = "HASH")]
     allowed: Vec<String>,
-    /// Listener: accept clients without identity authorization.
+    /// disable authentication (allow any identity to connect)
     #[arg(short = 'n', long = "no-auth")]
     no_auth: bool,
-    /// Listener: append the remote argument vector to the configured command.
+    /// concatenate remote command to the argument list of the default program or shell
     #[arg(short = 'A', long = "remote-command-as-args")]
     remote_command_as_args: bool,
-    /// Listener: reject client-supplied commands; run the configured command only.
+    /// disable executing command lines received from the remote initiator
     #[arg(short = 'C', long = "no-remote-command")]
     no_remote_command: bool,
 
-    /// Client: do not identify to the listener; a local identity is still loaded or created.
+    /// disable identity announcement on connect
     #[arg(short = 'N', long = "no-id")]
     no_id: bool,
-    /// Return the remote exit code clamped to 0-255; otherwise completed sessions return 0.
+    /// return with the exit code of the remote process
     #[arg(short = 'm', long = "mirror")]
     mirror: bool,
-    /// Client protocol wait budget in seconds (default: 15, minimum: 1); I/O can add time.
-    #[arg(short = 'w', long = "timeout", value_name = "SECONDS")]
+    /// connect and request timeout in seconds
+    #[arg(
+        short = 'w',
+        long = "timeout",
+        value_name = "SECONDS",
+        allow_negative_numbers = true
+    )]
     timeout: Option<f64>,
 
-    /// Remote rnsh destination hash (32 hex characters); omit in listen mode.
+    /// hexadecimal hash of the destination to connect to
     destination: Option<String>,
 
     /// Command and arguments after --; in listen mode this sets the default command (otherwise the local shell).
@@ -99,36 +114,47 @@ struct Args {
 
 #[tokio::main]
 pub(crate) async fn main() -> ExitCode {
-    let args = Args::parse();
+    // Upstream main() swallows argparse's SystemExit, so help and usage errors exit 1.
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(e) => {
+            let _ = e.print();
+            return ExitCode::from(1);
+        }
+    };
     run(args).await
 }
 
 async fn run(mut args: Args) -> ExitCode {
     if args.version {
+        // The Rust tools report their own name and package version.
         println!("rnsh-rs {RS_RETICULUM_VERSION} (protocol {RNSH_PROTOCOL_VERSION})");
         return ExitCode::SUCCESS;
     }
 
-    if args.listen && args.service.is_none() {
+    if args.listen && args.service.as_deref().is_none_or(str::is_empty) {
         args.service = Some(DEFAULT_SERVICE_NAME.to_string());
     }
 
+    let Some(config_dir) = ensure_config_directory(args.config.as_deref()) else {
+        eprintln!("Could not get or create rnsh configuration directory, aborting");
+        return ExitCode::from(1);
+    };
+
     if args.print_identity {
-        return match print_identity(&args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("rnsh-rs: {e}");
-                ExitCode::from(1)
-            }
-        };
+        if let Err(e) = print_identity(&args, &config_dir) {
+            println!("{e}");
+        }
+        // Upstream print_identity() ends in exit(0), which main() turns into 1.
+        return ExitCode::from(1);
     }
 
     if args.listen {
-        return run_listener(args).await;
+        return run_listener(args, config_dir).await;
     }
 
     if args.destination.is_some() {
-        return run_initiator(args).await;
+        return run_initiator(args, config_dir).await;
     }
 
     let mut cmd = Args::command();
@@ -138,49 +164,91 @@ async fn run(mut args: Args) -> ExitCode {
     ExitCode::from(1)
 }
 
-async fn run_listener(args: Args) -> ExitCode {
+async fn run_listener(args: Args, config_dir: PathBuf) -> ExitCode {
     // Register before any slow init so an early SIGINT exits cleanly.
     let shutdown = ShutdownSignal::new();
     let _signal_rx = install_signal_handlers(shutdown.clone());
-    init_logging(args.verbose, args.quiet, args.config.as_deref());
+    let log = LogDestination::console();
+    init_logging(
+        args.verbose,
+        args.quiet,
+        args.rnsconfig.as_deref(),
+        log.clone(),
+    );
+    let service = args.service.clone().unwrap_or_default();
+    tracing::info!("Using service name {service}");
+    let logfile = config_dir.join("logfile");
+    rns_transport::notice!("Logging to {}", logfile.display());
 
     // The runtime stops only after the listener has sent "Shutting down".
     let runtime_shutdown = ShutdownSignal::new();
-    let handle = match start_reticulum(args.config.as_deref(), runtime_shutdown.clone()).await {
+    let handle = match start_reticulum(args.rnsconfig.as_deref(), runtime_shutdown.clone()).await {
         Ok(handle) => handle,
         Err(e) => {
-            eprintln!("rnsh-rs: failed to start reticulum: {e}");
+            println!("{e}");
             return ExitCode::from(1);
         }
     };
     let paths = StoragePaths::from_config_dir(&handle.config_dir);
-    let identity_path = identity_path(args.identity.as_deref(), &paths, args.service.as_deref());
-    let identity = match load_or_create_identity(&identity_path) {
+    let identity = match prepare_identity(
+        args.identity.as_deref(),
+        &config_dir,
+        Some(&service),
+        &paths,
+    ) {
         Ok(identity) => identity,
         Err(e) => {
-            eprintln!("rnsh-rs: {e}");
+            println!("{e}");
+            stop_reticulum(&handle, &runtime_shutdown).await;
             return ExitCode::from(1);
         }
     };
+    if let Ok(destination) =
+        Destination::new(Some(&identity), Direction::In, DestType::Single, APP_NAME)
+    {
+        rns_transport::notice!(
+            "rnsh listening for commands on <{}>",
+            hex::encode(destination.hash)
+        );
+    }
+    log.switch_to_file(logfile);
 
-    let allowed = match parse_allowed_identities(&args.allowed) {
-        Ok(allowed) => allowed,
-        Err(e) => {
-            eprintln!("rnsh-rs: {e}");
-            return ExitCode::from(1);
+    let command = listener_default_command(&args.command);
+    if args.command.is_empty() {
+        tracing::info!("Using {} for default command.", command.join(" "));
+    } else {
+        tracing::info!("Using command {}", shell_join(&command));
+    }
+
+    let allowed = if args.no_auth {
+        Vec::new()
+    } else {
+        match parse_allowed_identities(&args.allowed) {
+            Ok(allowed) => allowed,
+            Err(e) => {
+                tracing::error!("Unhandled error: {e}");
+                stop_reticulum(&handle, &runtime_shutdown).await;
+                return ExitCode::from(1);
+            }
         }
     };
-    let allowed_identity_files = allowed_identity_file().into_iter().collect();
+    let allowed_file = config_dir.join("allowed_identities");
+    let allowed_identity_files = if allowed_file.is_file() {
+        vec![allowed_file]
+    } else {
+        Vec::new()
+    };
 
     let cfg = RnshListenerConfig {
         identity,
-        command: listener_default_command(&args.command),
+        command,
         allow_all: args.no_auth,
         allowed,
         allowed_identity_files,
         allow_remote_command: !args.no_remote_command,
         remote_command_as_args: args.remote_command_as_args,
-        announce_period: args.announce,
+        // argparse takes any int; zero or negative announces once at startup.
+        announce_period: args.announce.map(|period| period.max(0) as u64),
     };
 
     let result = run_rnsh_listener_with_shutdown(handle.transport_tx.clone(), cfg, shutdown).await;
@@ -188,8 +256,8 @@ async fn run_listener(args: Args) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("rnsh-rs: {e}");
-            ExitCode::from(error_exit_code(&e))
+            println!("{e}");
+            ExitCode::from(1)
         }
     }
 }
@@ -202,35 +270,41 @@ async fn stop_reticulum(
     let _ = tokio::time::timeout(Duration::from_secs(5), handle.shutdown_and_wait()).await;
 }
 
-async fn run_initiator(args: Args) -> ExitCode {
+async fn run_initiator(args: Args, config_dir: PathBuf) -> ExitCode {
     // Register before any slow init so an early SIGINT exits cleanly.
     let shutdown = ShutdownSignal::new();
     let _signal_rx = install_signal_handlers(shutdown.clone());
-    init_logging(args.verbose, args.quiet, args.config.as_deref());
 
-    let destination = match args.destination.as_deref().and_then(parse_hash16) {
-        Some(hash) => hash,
-        None => {
-            eprintln!("Invalid destination entered. Check your input.");
+    let destination = match parse_destination(args.destination.as_deref().unwrap_or_default()) {
+        Ok(hash) => hash,
+        Err(message) => {
+            println!("{message}");
             return ExitCode::from(1);
         }
     };
 
+    init_logging(
+        args.verbose,
+        args.quiet,
+        args.rnsconfig.as_deref(),
+        LogDestination::file(config_dir.join("logfile.initiator")),
+    );
+
     // The runtime stops only after the session has torn its link down.
     let runtime_shutdown = ShutdownSignal::new();
-    let handle = match start_reticulum(args.config.as_deref(), runtime_shutdown.clone()).await {
+    let handle = match start_reticulum(args.rnsconfig.as_deref(), runtime_shutdown.clone()).await {
         Ok(handle) => handle,
         Err(e) => {
-            eprintln!("rnsh-rs: failed to start reticulum: {e}");
+            println!("{e}");
             return ExitCode::from(1);
         }
     };
     let paths = StoragePaths::from_config_dir(&handle.config_dir);
-    let identity_path = identity_path(args.identity.as_deref(), &paths, None);
-    let identity = match load_or_create_identity(&identity_path) {
+    let identity = match prepare_identity(args.identity.as_deref(), &config_dir, None, &paths) {
         Ok(identity) => identity,
         Err(e) => {
-            eprintln!("rnsh-rs: {e}");
+            println!("{e}");
+            stop_reticulum(&handle, &runtime_shutdown).await;
             return ExitCode::from(1);
         }
     };
@@ -261,15 +335,20 @@ async fn run_initiator(args: Args) -> ExitCode {
         let _ = terminate_tx.send(());
     });
     let window_rx = spawn_window_size_watcher();
+    let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+    let progress_task = tokio::spawn(report_progress(
+        progress_rx,
+        destination,
+        args.quiet == 0 && !pipe_stdout,
+    ));
 
-    // Upstream defaults to RNS.Transport.PATH_REQUEST_TIMEOUT.
-    let timeout = Duration::from_secs_f64(args.timeout.unwrap_or(15.0).max(0.0));
     let cfg = RnshClientConfig {
         identity,
         destination_hash: destination,
         command: args.command.clone(),
         no_id: args.no_id,
-        timeout,
+        // Upstream defaults to RNS.Transport.PATH_REQUEST_TIMEOUT.
+        timeout: client_timeout(args.timeout.unwrap_or(15.0)),
         stdin_data: Vec::new(),
         stdin_rx,
         stdout_tx: Some(stdout_tx),
@@ -285,32 +364,116 @@ async fn run_initiator(args: Args) -> ExitCode {
         vpix,
         tcflags,
         terminate_rx: Some(terminate_rx),
+        progress_tx: Some(progress_tx),
     };
 
     let result = rnsh_client_execute(handle.transport_tx.clone(), cfg).await;
     terminate_task.abort();
+    let _ = progress_task.await;
     stop_reticulum(&handle, &runtime_shutdown).await;
-    match result {
-        Ok(outcome) => {
-            if let Err(e) = finish_output_writers(stdout_writer, stderr_writer).await {
-                eprintln!("rnsh-rs: {e}");
-                return ExitCode::from(1);
-            }
-            ExitCode::from(remote_exit_code(outcome.return_code, args.mirror))
+    let writers = finish_output_writers(stdout_writer, stderr_writer).await;
+    if result.is_ok()
+        && let Err(e) = writers
+    {
+        println!("Client exception: {e}");
+        return ExitCode::from(if args.mirror { 127 } else { 0 });
+    }
+    let (message, code) = client_exit(&result, &destination, args.mirror);
+    if let Some(message) = message {
+        println!("{message}");
+    }
+    ExitCode::from(code)
+}
+
+/// Message and exit code for a finished client run, as upstream `initiate()`
+/// returns them and `main()` reports them. Setup failures exit 1; codes from
+/// the running session only reach the exit status with `-m`.
+fn client_exit(
+    result: &Result<RnshClientOutcome, RnshError>,
+    destination: &[u8; 16],
+    mirror: bool,
+) -> (Option<String>, u8) {
+    let mirrored = |code: u8| if mirror { code } else { 0 };
+    let error = match result {
+        Ok(outcome) => return (None, remote_exit_code(outcome.return_code, mirror)),
+        Err(error) => error,
+    };
+    match error {
+        RnshError::PathTimeout => (Some("Path not found".into()), 1),
+        RnshError::Timeout(_)
+        | RnshError::HandshakeFailed(_)
+        | RnshError::ProofInvalid(_)
+        | RnshError::RequestDispatch(_) => (
+            Some(format!(
+                "Could not establish link with <{}>",
+                hex::encode(destination)
+            )),
+            1,
+        ),
+        RnshError::Denied(msg) => (Some(format!("Remote error: {msg}")), 1),
+        RnshError::ProtocolError => (Some("Protocol error".into()), mirrored(254)),
+        RnshError::Remote(msg) => (Some(format!("Remote error: {msg}")), mirrored(255)),
+        RnshError::ClientException(msg) => {
+            (Some(format!("Client exception: {msg}")), mirrored(127))
         }
-        Err(RnshError::Terminated) => {
-            let _ = finish_output_writers(stdout_writer, stderr_writer).await;
-            // Upstream's initiator loop ends with return 0 after `~.` or SIGINT.
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            let _ = finish_output_writers(stdout_writer, stderr_writer).await;
-            if matches!(e, RnshError::ProtocolError) {
-                println!("{e}");
-            } else {
-                eprintln!("rnsh-rs: {e}");
+        RnshError::LinkClosed(_) | RnshError::Terminated => (None, 0),
+        other => (Some(other.to_string()), 1),
+    }
+}
+
+/// The `-w` budget; argparse's float accepts zero, negatives and infinity.
+fn client_timeout(seconds: f64) -> Duration {
+    const MAX_TIMEOUT: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+    if seconds > 0.0 {
+        Duration::try_from_secs_f64(seconds).map_or(MAX_TIMEOUT, |d| d.min(MAX_TIMEOUT))
+    } else {
+        Duration::ZERO
+    }
+}
+
+const SPINNER_SYMBOLS: [char; 7] = ['⢄', '⢂', '⢁', '⡁', '⡈', '⡐', '⡠'];
+
+/// Logs client setup progress and, on a TTY, draws upstream's `_spin_tty` spinner.
+async fn report_progress(
+    mut rx: mpsc::UnboundedReceiver<RnshClientProgress>,
+    destination: [u8; 16],
+    spin: bool,
+) {
+    let hash = format!("<{}>", hex::encode(destination));
+    let mut current: Option<String> = None;
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut symbol = 0;
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                if let Some(message) = current.take() {
+                    print!("\r{}  \r", " ".repeat(message.chars().count()));
+                    let _ = std::io::stdout().flush();
+                }
+                let message = match event {
+                    Some(RnshClientProgress::RequestingPath) => format!("Requesting path to {hash}"),
+                    Some(RnshClientProgress::EstablishingLink) => {
+                        format!("Establishing link with {hash}")
+                    }
+                    Some(RnshClientProgress::LinkEstablished) => {
+                        tracing::info!("Link established with {hash}");
+                        return;
+                    }
+                    None => return,
+                };
+                tracing::info!("{message}");
+                if spin {
+                    print!("{message}   ");
+                    let _ = std::io::stdout().flush();
+                    current = Some(message);
+                    tick.reset();
+                }
             }
-            ExitCode::from(error_exit_code(&e))
+            _ = tick.tick(), if current.is_some() => {
+                print!("\x08\x08{} ", SPINNER_SYMBOLS[symbol]);
+                let _ = std::io::stdout().flush();
+                symbol = (symbol + 1) % SPINNER_SYMBOLS.len();
+            }
         }
     }
 }
@@ -324,15 +487,112 @@ async fn start_reticulum(
     rns_runtime::reticulum::init(config, None, shutdown, is_foreground).await
 }
 
-fn init_logging(verbose: u8, quiet: u8, config_dir: Option<&Path>) {
+fn init_logging(verbose: u8, quiet: u8, rns_config_dir: Option<&Path>, writer: LogDestination) {
     let level = rns_tools::Utility::Rnsh.loglevel(None, verbose, quiet, false);
-    let resolved = resolve_config_dir(config_dir.and_then(|path| path.to_str()));
+    let resolved = resolve_config_dir(rns_config_dir.and_then(|path| path.to_str()));
     rns_tools::init_tracing(
         level,
         rns_tools::config_log_timestamps(&resolved),
-        true,
-        std::io::stderr,
+        false,
+        writer,
     );
+}
+
+/// `RNS.LOG_MAXSIZE`: past this size the logfile moves to `<logfile>.1`.
+const LOG_MAXSIZE: u64 = 5 * 1024 * 1024;
+
+/// Where `RNS.log` output goes: the console until a logfile is set, then the
+/// file; back to the console for good if the file cannot be written.
+#[derive(Clone)]
+struct LogDestination(Arc<Mutex<LogTarget>>);
+
+#[derive(Default)]
+struct LogTarget {
+    path: Option<PathBuf>,
+    file: Option<std::fs::File>,
+    size: u64,
+}
+
+impl LogDestination {
+    fn console() -> Self {
+        Self(Arc::new(Mutex::new(LogTarget::default())))
+    }
+
+    fn file(path: PathBuf) -> Self {
+        let destination = Self::console();
+        destination.switch_to_file(path);
+        destination
+    }
+
+    fn switch_to_file(&self, path: PathBuf) {
+        let mut target = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        target.path = Some(path);
+        target.file = None;
+        if target.open().is_err() {
+            target.path = None;
+        }
+    }
+}
+
+impl LogTarget {
+    fn open(&mut self) -> std::io::Result<&mut std::fs::File> {
+        if self.file.is_none() {
+            let path = self.path.as_ref().ok_or(std::io::ErrorKind::NotFound)?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            self.size = file.metadata().map(|m| m.len()).unwrap_or(0);
+            self.file = Some(file);
+        }
+        Ok(self.file.as_mut().expect("log file was just opened"))
+    }
+
+    fn append(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.open()?.write_all(buf)?;
+        self.size += buf.len() as u64;
+        if self.size > LOG_MAXSIZE
+            && let Some(path) = self.path.clone()
+        {
+            self.file = None;
+            let mut rotated = path.clone().into_os_string();
+            rotated.push(".1");
+            let _ = std::fs::remove_file(&rotated);
+            std::fs::rename(&path, &rotated)?;
+            self.size = 0;
+        }
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogDestination {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter(self.0.clone())
+    }
+}
+
+struct LogWriter(Arc<Mutex<LogTarget>>);
+
+impl Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut target = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if target.path.is_some() {
+            if target.append(buf).is_ok() {
+                return Ok(buf.len());
+            }
+            target.path = None;
+            target.file = None;
+        }
+        drop(target);
+        std::io::stderr().write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn terminal_window_size() -> (Option<u32>, Option<u32>, Option<u32>, Option<u32>) {
@@ -698,39 +958,99 @@ fn terminal_window_size_for_fds(
     (None, None, None, None)
 }
 
-fn error_exit_code(error: &RnshError) -> u8 {
-    match error {
-        RnshError::PathTimeout | RnshError::NoIdentity | RnshError::Timeout(_) => 1,
-        RnshError::Remote(_) => 255,
-        RnshError::ProtocolError => 254,
-        _ => 1,
-    }
-}
-
-fn print_identity(args: &Args) -> Result<(), String> {
-    let config_dir = resolve_config_dir(args.config.as_deref().and_then(Path::to_str));
-    let paths = StoragePaths::from_config_dir(&config_dir);
+fn print_identity(args: &Args, config_dir: &Path) -> Result<(), String> {
+    let rns_config_dir = resolve_config_dir(args.rnsconfig.as_deref().and_then(Path::to_str));
+    let paths = StoragePaths::from_config_dir(&rns_config_dir);
     paths
         .ensure_dirs()
         .map_err(|e| format!("could not prepare Reticulum storage: {e}"))?;
 
-    let identity_path = identity_path(args.identity.as_deref(), &paths, args.service.as_deref());
-    let identity = load_or_create_identity(&identity_path)?;
-    let destination = Destination::new(Some(&identity), Direction::In, DestType::Single, APP_NAME)
-        .map_err(|e| format!("could not create rnsh destination: {e}"))?;
-
-    if let Some(service) = args
+    let service = args
         .service
         .as_deref()
-        .filter(|service| !service.is_empty())
-    {
+        .filter(|service| !service.is_empty());
+    if let Some(service) = service {
         println!("Using service name \"{service}\"");
     }
-    println!("Identity     : {}", hex::encode(identity.hash));
+    let identity = prepare_identity(args.identity.as_deref(), config_dir, service, &paths)?;
+    let destination = Destination::new(Some(&identity), Direction::In, DestType::Single, APP_NAME)
+        .map_err(|e| format!("could not create rnsh destination: {e}"))?;
+    println!("Identity     : <{}>", hex::encode(identity.hash));
     if args.listen {
-        println!("Listening on : {}", hex::encode(destination.hash));
+        println!("Listening on : <{}>", hex::encode(destination.hash));
     }
     Ok(())
+}
+
+/// Upstream `ensure_config_directory`: the `-c` directory, else
+/// `~/.config/rnsh-rs` if it exists, else `~/.rnsh-rs`, created when missing.
+fn ensure_config_directory(explicit: Option<&Path>) -> Option<PathBuf> {
+    let home = home_dir();
+    let dir = match explicit {
+        Some(dir) => expand_user(dir, home.as_deref()),
+        None => default_config_dir(home.as_deref().unwrap_or(Path::new(""))),
+    };
+    if dir.is_dir() {
+        return Some(dir);
+    }
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+fn default_config_dir(home: &Path) -> PathBuf {
+    let xdg = home.join(".config").join(RNSH_CONFIG_DIR_NAME);
+    if xdg.is_dir() {
+        xdg
+    } else {
+        home.join(format!(".{RNSH_CONFIG_DIR_NAME}"))
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .find(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `os.path.expanduser` for `~` and `~/...`.
+fn expand_user(path: &Path, home: Option<&Path>) -> PathBuf {
+    match (path.strip_prefix("~"), home) {
+        (Ok(rest), Some(home)) => home.join(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Upstream `prepare_identity`, plus a one-time copy of the identity older
+/// rnsh-rs releases kept under Reticulum storage, so destination hashes survive.
+fn prepare_identity(
+    explicit: Option<&Path>,
+    config_dir: &Path,
+    service: Option<&str>,
+    rns_paths: &StoragePaths,
+) -> Result<Identity, String> {
+    let path = identity_path(explicit, config_dir, service);
+    if explicit.is_none() && !path.exists() {
+        let legacy = rns_paths
+            .identity_dir
+            .join(suffixed(APP_NAME, service.unwrap_or("")));
+        if legacy.is_file() {
+            match std::fs::copy(&legacy, &path) {
+                Ok(_) => eprintln!(
+                    "Copied rnsh identity {} to {}",
+                    legacy.display(),
+                    path.display()
+                ),
+                Err(e) => eprintln!(
+                    "Could not copy rnsh identity {} to {}: {e}",
+                    legacy.display(),
+                    path.display()
+                ),
+            }
+        }
+    }
+    load_or_create_identity(&path)
 }
 
 fn load_or_create_identity(path: &Path) -> Result<Identity, String> {
@@ -754,24 +1074,44 @@ fn load_or_create_identity(path: &Path) -> Result<Identity, String> {
     Ok(identity)
 }
 
-fn identity_path(explicit: Option<&Path>, paths: &StoragePaths, service: Option<&str>) -> PathBuf {
-    if let Some(path) = explicit {
-        return path.to_path_buf();
+/// `<configdir>/identity[.<service>]` unless `-i` names a file.
+fn identity_path(explicit: Option<&Path>, config_dir: &Path, service: Option<&str>) -> PathBuf {
+    match explicit {
+        Some(path) => path.to_path_buf(),
+        None => config_dir.join(suffixed("identity", service.unwrap_or(""))),
     }
-    let mut name = APP_NAME.to_string();
-    let service = sanitize_service_name(service.unwrap_or(""));
-    if !service.is_empty() {
-        name.push('.');
-        name.push_str(&service);
-    }
-    paths.identity_dir.join(name)
 }
 
+fn suffixed(name: &str, service: &str) -> String {
+    let service = sanitize_service_name(service);
+    if service.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}.{service}")
+    }
+}
+
+/// `re.sub(r'\W+', '', service)` on a Unicode string.
 fn sanitize_service_name(service: &str) -> String {
     service
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .filter(|c| c.is_alphanumeric() || *c == '_')
         .collect()
+}
+
+/// `shlex.join`, for the listener's command notice.
+fn shell_join(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
+            if !arg.is_empty() && arg.chars().all(safe) {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\"'\"'"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -907,27 +1247,21 @@ impl ListenerAuth {
     }
 }
 
+const DESTINATION_LENGTH_ERROR: &str =
+    "Allowed destination length is invalid, must be 32 hexadecimal characters (16 bytes).";
+const DESTINATION_HEX_ERROR: &str = "Invalid destination entered. Check your input.";
+
 fn parse_identity_hash(input: &str) -> Result<[u8; 16], String> {
-    let trimmed = input;
-    if trimmed.len() != IDENTITY_HASH_HEX_LEN {
-        return Err(format!(
-            "identity hash must be {IDENTITY_HASH_HEX_LEN} hexadecimal characters"
-        ));
-    }
-    let decoded = hex::decode(trimmed).map_err(|_| "identity hash is not valid hex".to_string())?;
-    let mut hash = [0u8; 16];
-    hash.copy_from_slice(&decoded);
-    Ok(hash)
+    parse_destination(input).map_err(str::to_string)
 }
 
-fn parse_hash16(input: &str) -> Option<[u8; 16]> {
+/// Upstream checks the length first, then the hex digits.
+fn parse_destination(input: &str) -> Result<[u8; 16], &'static str> {
     if input.len() != IDENTITY_HASH_HEX_LEN {
-        return None;
+        return Err(DESTINATION_LENGTH_ERROR);
     }
-    let decoded = hex::decode(input).ok()?;
-    let mut hash = [0u8; 16];
-    hash.copy_from_slice(decoded.get(..16)?);
-    Some(hash)
+    let decoded = hex::decode(input).map_err(|_| DESTINATION_HEX_ERROR)?;
+    decoded.try_into().map_err(|_| DESTINATION_HEX_ERROR)
 }
 
 fn parse_allowed_identities(values: &[String]) -> Result<Vec<[u8; 16]>, String> {
@@ -935,19 +1269,6 @@ fn parse_allowed_identities(values: &[String]) -> Result<Vec<[u8; 16]>, String> 
         .iter()
         .map(|value| parse_identity_hash(value))
         .collect()
-}
-
-/// `<configdir>/allowed_identities`, used only when it is a file at startup
-/// (rnsh.py). The listener rereads it for every new link.
-fn allowed_identity_file() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let config_dir = rnsh_config_dir(
-        &home,
-        home.join(".config/rnsh").is_dir(),
-        home.join(".rnsh").is_dir(),
-    );
-    let path = config_dir.join("allowed_identities");
-    path.is_file().then_some(path)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1010,19 +1331,12 @@ fn run_local_process_once(
     })
 }
 
+/// `sys.exit(code)` keeps the low byte of the remote exit code.
 fn remote_exit_code(return_code: i64, mirror: bool) -> u8 {
     if mirror {
-        return_code.clamp(0, u8::MAX as i64) as u8
+        (return_code & 0xff) as u8
     } else {
         0
-    }
-}
-
-fn rnsh_config_dir(home: &Path, dot_config_exists: bool, _dot_rnsh_exists: bool) -> PathBuf {
-    if dot_config_exists {
-        home.join(".config/rnsh")
-    } else {
-        home.join(".rnsh")
     }
 }
 
@@ -1054,6 +1368,8 @@ mod tests {
     fn parser_accepts_upstream_flag_surface() {
         let args = parse(&[
             "--config",
+            "/tmp/rnsh",
+            "--rnsconfig",
             "/tmp/rns",
             "--identity",
             "/tmp/id",
@@ -1082,7 +1398,8 @@ mod tests {
             "echo hi",
         ]);
 
-        assert_eq!(args.config, Some(PathBuf::from("/tmp/rns")));
+        assert_eq!(args.config, Some(PathBuf::from("/tmp/rnsh")));
+        assert_eq!(args.rnsconfig, Some(PathBuf::from("/tmp/rns")));
         assert_eq!(args.identity, Some(PathBuf::from("/tmp/id")));
         assert_eq!(args.verbose, 2);
         assert_eq!(args.quiet, 1);
@@ -1123,28 +1440,74 @@ mod tests {
     }
 
     #[test]
-    fn identity_paths_match_upstream_service_suffix() {
-        let paths = StoragePaths::from_config_dir(Path::new("/tmp/reticulum"));
+    fn identity_paths_live_in_the_rnsh_config_dir() {
+        let dir = Path::new("/tmp/rnsh");
         assert_eq!(
-            identity_path(None, &paths, Some("default")),
-            PathBuf::from("/tmp/reticulum/storage/identities/rnsh.default")
+            identity_path(None, dir, Some("default")),
+            PathBuf::from("/tmp/rnsh/identity.default")
         );
         assert_eq!(
-            identity_path(None, &paths, Some("svc/name!")),
-            PathBuf::from("/tmp/reticulum/storage/identities/rnsh.svcname")
+            identity_path(None, dir, Some("svc/name!")),
+            PathBuf::from("/tmp/rnsh/identity.svcname")
         );
         assert_eq!(
-            identity_path(Some(Path::new("/tmp/custom")), &paths, None),
+            identity_path(None, dir, None),
+            PathBuf::from("/tmp/rnsh/identity")
+        );
+        assert_eq!(
+            identity_path(Some(Path::new("/tmp/custom")), dir, None),
             PathBuf::from("/tmp/custom")
         );
     }
 
     #[test]
-    fn version_string_uses_rust_command_name() {
+    fn client_exit_codes_follow_the_session_phase() {
+        let dest = [0xab; 16];
+        let err = |e: RnshError, mirror| client_exit(&Err(e), &dest, mirror);
         assert_eq!(
-            format!("rnsh-rs {RS_RETICULUM_VERSION} (protocol {RNSH_PROTOCOL_VERSION})"),
-            format!("rnsh-rs {} (protocol 0.3.0)", env!("CARGO_PKG_VERSION"))
+            err(RnshError::PathTimeout, true),
+            (Some("Path not found".into()), 1)
         );
+        assert_eq!(
+            err(RnshError::Denied("Identity not allowed".into()), true),
+            (Some("Remote error: Identity not allowed".into()), 1)
+        );
+        assert_eq!(
+            err(RnshError::Timeout("link proof"), false),
+            (
+                Some(format!(
+                    "Could not establish link with <{}>",
+                    "ab".repeat(16)
+                )),
+                1
+            )
+        );
+        for mirror in [false, true] {
+            let m = |code: u8| if mirror { code } else { 0 };
+            assert_eq!(err(RnshError::ProtocolError, mirror).1, m(254));
+            assert_eq!(err(RnshError::Remote("x".into()), mirror).1, m(255));
+            assert_eq!(
+                err(RnshError::ClientException("x".into()), mirror).1,
+                m(127)
+            );
+            assert_eq!(err(RnshError::LinkClosed("x".into()), mirror), (None, 0));
+            assert_eq!(err(RnshError::Terminated, mirror), (None, 0));
+        }
+    }
+
+    #[test]
+    fn negative_and_zero_timeouts_are_accepted() {
+        assert_eq!(parse(&["-w", "-1", "x"]).timeout, Some(-1.0));
+        assert_eq!(client_timeout(-1.0), Duration::ZERO);
+        assert_eq!(client_timeout(0.5), Duration::from_millis(500));
+        assert!(client_timeout(f64::INFINITY) > Duration::from_secs(1 << 30));
+        assert_eq!(parse(&["-l", "-b", "-1"]).announce, Some(-1));
+    }
+
+    #[test]
+    fn shell_join_quotes_like_shlex() {
+        let args = ["/bin/sh", "-c", "echo it's"].map(String::from);
+        assert_eq!(shell_join(&args), r#"/bin/sh -c 'echo it'"'"'s'"#);
     }
 
     #[test]
@@ -1262,8 +1625,8 @@ mod tests {
     fn mirrored_remote_exit_matches_upstream_cli_flag() {
         assert_eq!(remote_exit_code(7, false), 0);
         assert_eq!(remote_exit_code(7, true), 7);
-        assert_eq!(remote_exit_code(300, true), 255);
-        assert_eq!(remote_exit_code(-1, true), 0);
+        assert_eq!(remote_exit_code(300, true), 44);
+        assert_eq!(remote_exit_code(-1, true), 255);
     }
 
     #[test]
