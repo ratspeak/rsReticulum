@@ -30,6 +30,40 @@ pub struct ResourceOptions {
     pub metadata: Option<Vec<u8>>,
 }
 
+/// Compression policy for request and response Resources, as Resource's
+/// `auto_compress` option: a bool, or an int byte limit that enables
+/// compression only for data no larger than the limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutoCompress {
+    Off,
+    /// Compress data up to Resource.AUTO_COMPRESS_MAX_SIZE.
+    #[default]
+    On,
+    /// Compress data no larger than this many bytes.
+    Limit(usize),
+}
+
+impl AutoCompress {
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Whether data of `data_size` bytes is compressed under this policy.
+    pub fn applies_to(self, data_size: usize) -> bool {
+        match self {
+            Self::Off => false,
+            Self::On => data_size <= rns_protocol::compression::AUTO_COMPRESS_MAX_SIZE,
+            Self::Limit(limit) => data_size <= limit,
+        }
+    }
+}
+
+impl From<bool> for AutoCompress {
+    fn from(value: bool) -> Self {
+        if value { Self::On } else { Self::Off }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ResourceSourceError {
     #[error("resource source I/O failed: {0}")]
@@ -56,13 +90,28 @@ pub(crate) enum ResourcePurpose {
     #[default]
     Ordinary,
     Request([u8; 16]),
+    Response([u8; 16]),
 }
 
 impl ResourcePurpose {
     fn apply(self, resource: &mut OutboundResource) {
-        if let Self::Request(request_id) = self {
-            resource.flags.is_request = true;
-            resource.request_id = Some(request_id.to_vec());
+        match self {
+            Self::Ordinary => {}
+            Self::Request(request_id) => {
+                resource.flags.is_request = true;
+                resource.request_id = Some(request_id.to_vec());
+            }
+            Self::Response(request_id) => {
+                resource.flags.is_response = true;
+                resource.request_id = Some(request_id.to_vec());
+            }
+        }
+    }
+
+    fn request_id(&self) -> Option<&[u8]> {
+        match self {
+            Self::Ordinary => None,
+            Self::Request(id) | Self::Response(id) => Some(id.as_slice()),
         }
     }
 }
@@ -93,9 +142,10 @@ impl PreparedResourceSource {
     where
         S: ResourceSource + 'static,
     {
-        Self::prepare_with_purpose(source, options, ResourcePurpose::Ordinary)
+        Self::prepare_with_purpose(source, options, None, ResourcePurpose::Ordinary)
     }
 
+    /// Request bodies use Resource's default `auto_compress=True`.
     pub(crate) fn prepare_request<S>(
         source: S,
         request_id: [u8; 16],
@@ -106,13 +156,50 @@ impl PreparedResourceSource {
         Self::prepare_with_purpose(
             source,
             ResourceOptions::default(),
+            Some(AutoCompress::On),
             ResourcePurpose::Request(request_id),
         )
     }
 
+    /// A response Resource correlated with `request_id`, as Link.handle_request
+    /// sends a file response. Compression is judged against the whole source
+    /// size, as Resource does for file input.
+    pub(crate) fn prepare_response<S>(
+        source: S,
+        request_id: [u8; 16],
+        metadata: Option<Vec<u8>>,
+        auto_compress: AutoCompress,
+    ) -> Result<Self, ResourceSourceError>
+    where
+        S: ResourceSource + 'static,
+    {
+        Self::prepare_with_purpose(
+            source,
+            ResourceOptions {
+                auto_compress: false,
+                metadata,
+            },
+            Some(auto_compress),
+            ResourcePurpose::Response(request_id),
+        )
+    }
+
+    /// Whether every segment has been produced.
+    pub(crate) fn is_exhausted(&self) -> bool {
+        match self {
+            Self::Single { data, .. } => data.is_none(),
+            Self::Split {
+                total_segments,
+                next_segment,
+                ..
+            } => next_segment >= total_segments,
+        }
+    }
+
     fn prepare_with_purpose<S>(
         mut source: S,
-        options: ResourceOptions,
+        mut options: ResourceOptions,
+        auto_compress: Option<AutoCompress>,
         purpose: ResourcePurpose,
     ) -> Result<Self, ResourceSourceError>
     where
@@ -124,21 +211,20 @@ impl PreparedResourceSource {
         }
         source.seek(SeekFrom::Start(0))?;
         let data_size = data_size as usize;
+        if let Some(policy) = auto_compress {
+            options.auto_compress = policy.applies_to(data_size);
+        }
         let metadata_wire_size = options
             .metadata
             .as_ref()
             .map(|metadata| 3usize.saturating_add(metadata.len()))
             .unwrap_or(0);
 
-        let request_id = match &purpose {
-            ResourcePurpose::Request(id) => Some(id.as_slice()),
-            ResourcePurpose::Ordinary => None,
-        };
         rns_protocol::resource_control::preflight_outbound(
             data_size,
             options.metadata.as_ref().map(Vec::len),
-            request_id,
-            false,
+            purpose.request_id(),
+            matches!(purpose, ResourcePurpose::Response(_)),
             true,
             rns_wire::constants::MTU,
         )?;
@@ -281,6 +367,8 @@ impl PreparedResourceSource {
                 )?;
                 purpose.apply(&mut resource);
                 resource.flags.split = true;
+                // Later segments advertise the metadata flag without carrying metadata.
+                resource.flags.has_metadata |= *metadata_wire_size > 0;
                 resource.segment_index = segment_index;
                 resource.total_segments = *total_segments;
                 resource.original_hash = Some(*original_hash);
@@ -315,6 +403,29 @@ mod tests {
         let local = X25519PrivateKey::generate();
         let remote = X25519PrivateKey::generate();
         LinkKeys::derive(&local, &remote.public_key(), &[0xA5; 16], MODE_AES256_CBC).unwrap()
+    }
+
+    #[test]
+    fn auto_compress_limit_follows_resource_option_types() {
+        assert!(!AutoCompress::from(false).applies_to(10));
+        assert!(AutoCompress::from(true).applies_to(10));
+        assert!(AutoCompress::Limit(1024).applies_to(1024));
+        assert!(!AutoCompress::Limit(1024).applies_to(1025));
+        assert!(
+            !AutoCompress::On.applies_to(rns_protocol::compression::AUTO_COMPRESS_MAX_SIZE + 1)
+        );
+    }
+
+    #[test]
+    fn request_source_is_compressed_by_default() {
+        let mut prepared =
+            PreparedResourceSource::prepare_request(Cursor::new(vec![0u8; 4096]), [7; 16]).unwrap();
+        let segment = prepared
+            .next_segment(&test_keys(), Duration::from_millis(100))
+            .unwrap()
+            .unwrap();
+        assert!(segment.transfer.resource.flags.compressed);
+        assert!(segment.transfer.resource.flags.is_request);
     }
 
     #[test]

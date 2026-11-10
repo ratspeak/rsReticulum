@@ -20,6 +20,7 @@ pub use crate::inbound_link_packet::{
     InboundLinkPacket, LinkPacketConfigurationError, LinkPacketReceipt, LinkPacketReceiptOutcome,
     LinkPacketRejection,
 };
+use crate::resource_source::{AutoCompress, PreparedResourceSource, ResourceSource};
 use bytes::Bytes;
 use rns_identity::destination::ProofStrategy;
 use tokio::sync::{mpsc, oneshot};
@@ -65,6 +66,37 @@ enum LegacyTerminalNotification {
     LinkClosed([u8; 16]),
 }
 
+/// Remaining segments of an outbound split Resource: prepared up front, or
+/// read from a source one segment at a time as each segment is proved.
+enum OutboundSplitQueue {
+    Prebuilt(VecDeque<OutboundTransfer>),
+    Source(Box<PreparedResourceSource>),
+}
+
+impl OutboundSplitQueue {
+    /// Next segment transfer and whether the queue is now exhausted. An error
+    /// means a remaining segment could not be produced.
+    fn next(&mut self, link: &Link) -> Result<(Option<OutboundTransfer>, bool), String> {
+        match self {
+            Self::Prebuilt(queue) => {
+                let next = queue.pop_front();
+                Ok((next, queue.is_empty()))
+            }
+            Self::Source(source) => {
+                let rtt = link.rtt.unwrap_or(std::time::Duration::from_millis(500));
+                let keys = link
+                    .session_keys()
+                    .ok_or_else(|| "link keys are unavailable".to_string())?;
+                let segment = source
+                    .next_segment(&keys, rtt)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "Resource source ended early".to_string())?;
+                Ok((Some(segment.transfer), source.is_exhausted()))
+            }
+        }
+    }
+}
+
 struct ActiveLink {
     link: Link,
     _interface_id: u64,
@@ -74,7 +106,7 @@ struct ActiveLink {
     channel: Option<LinkChannel>,
     inbound_resources: HashMap<[u8; 32], InboundTransfer>,
     outbound_resources: HashMap<[u8; 32], OutboundTransfer>,
-    outbound_split_queues: HashMap<[u8; 32], VecDeque<OutboundTransfer>>,
+    outbound_split_queues: HashMap<[u8; 32], OutboundSplitQueue>,
     /// Split-resource reassembly keyed by `original_hash`; dropped on full delivery or cancel.
     inbound_split_resources: HashMap<[u8; 32], MultiSegmentInbound>,
     /// Reverse index per-segment `resource_hash` → coordinator; routes assembled
@@ -363,9 +395,14 @@ pub enum LinkManagerCommand {
         path: String,
         allow: AllowPolicy,
         allowed_list: Vec<[u8; 16]>,
-        auto_compress: bool,
+        auto_compress: AutoCompress,
         handler: DestinationRequestHandler,
         result_tx: Option<oneshot::Sender<bool>>,
+    },
+    /// Set or clear Destination.max_request_size.
+    SetMaxRequestSize {
+        limit: Option<usize>,
+        result_tx: Option<oneshot::Sender<()>>,
     },
     /// Remove a per-path request handler.
     DeregisterRequestHandler {
@@ -511,15 +548,29 @@ impl std::fmt::Debug for LinkManagerAccountingEvent {
     }
 }
 
-/// Request-handler response. `Reply` uses a RESPONSE packet or, when the packed
-/// response exceeds the Link MDU, a response Resource. `ReplyWithResource`
-/// stages the acknowledgment and a separate ordinary Resource, as used by rncp
-/// fetch. Neither staging
-/// operation confirms delivery; arrival order is not guaranteed.
-#[derive(Debug, Clone)]
+/// Request-handler response, packed as Link.handle_request packs a handler's
+/// return value. `ReplyBytes` and `ReplyValue` use a RESPONSE packet or, when
+/// the packed response exceeds the Link MDU, a response Resource.
+/// `ReplyWithResource` stages the acknowledgment and a separate ordinary
+/// Resource, as used by rncp fetch. Neither staging operation confirms
+/// delivery; arrival order is not guaranteed.
 pub enum RequestOutcome {
-    Reply(Vec<u8>),
+    /// A byte string, received by a Python requester as `bytes`.
+    ReplyBytes(Vec<u8>),
+    /// Exactly one already-encoded MessagePack value (a list, map, int, bool,
+    /// nil, ...). A reply that is not one complete value is not sent.
+    ReplyValue(Vec<u8>),
+    /// A file response: one response Resource correlated with the request,
+    /// as a handler returning `[file, metadata]` sends. The source is read one
+    /// segment at a time. `metadata` is the packed MessagePack metadata; with
+    /// `None` the requester receives a plain response Resource, as for a
+    /// handler returning `[file]`.
+    ReplyFile {
+        source: Box<dyn ResourceSource>,
+        metadata: Option<Vec<u8>>,
+    },
     ReplyWithResource {
+        /// One already-encoded MessagePack value sent as the response.
         ack: Vec<u8>,
         data: Vec<u8>,
         /// Optional opaque Resource metadata. rncp expects a MessagePack map
@@ -532,6 +583,32 @@ pub enum RequestOutcome {
     Drop,
 }
 
+impl std::fmt::Debug for RequestOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReplyBytes(data) => f.debug_tuple("ReplyBytes").field(&data.len()).finish(),
+            Self::ReplyValue(data) => f.debug_tuple("ReplyValue").field(&data.len()).finish(),
+            Self::ReplyFile { metadata, .. } => f
+                .debug_struct("ReplyFile")
+                .field("metadata_len", &metadata.as_ref().map(Vec::len))
+                .finish_non_exhaustive(),
+            Self::ReplyWithResource {
+                ack,
+                data,
+                metadata,
+                auto_compress,
+            } => f
+                .debug_struct("ReplyWithResource")
+                .field("ack_len", &ack.len())
+                .field("data_len", &data.len())
+                .field("metadata_len", &metadata.as_ref().map(Vec::len))
+                .field("auto_compress", auto_compress)
+                .finish(),
+            Self::Drop => f.write_str("Drop"),
+        }
+    }
+}
+
 /// Context for a per-path Destination request handler. `remote_identity`
 /// comes from verified LinkIdentify, when present; the registered `AllowPolicy`
 /// is applied separately. `requested_at` is the sender's timestamp, not a
@@ -539,7 +616,11 @@ pub enum RequestOutcome {
 #[derive(Clone)]
 pub struct DestinationRequest {
     pub path: String,
+    /// Byte view of the request data: binary and string contents as-is, any
+    /// other value re-encoded as MessagePack. Use `value` to tell them apart.
     pub data: Vec<u8>,
+    /// The request data as sent, e.g. `Value::Binary` for Python `bytes`.
+    pub value: rmpv::Value,
     pub request_id: [u8; 16],
     pub link_id: [u8; 16],
     pub remote_identity: Option<Identity>,
@@ -569,7 +650,7 @@ struct PendingDeferredRequest {
     path_hash: [u8; 16],
     generation: u64,
     owner: Option<rns_transport::messages::InterfaceOwnerId>,
-    auto_compress: bool,
+    auto_compress: AutoCompress,
     response: crate::deferred_request::PendingResponse,
 }
 struct DeferredResourceLease {
@@ -581,7 +662,7 @@ struct RegisteredRequestHandler {
     path: String,
     allow: AllowPolicy,
     allowed_list: Vec<[u8; 16]>,
-    auto_compress: bool,
+    auto_compress: AutoCompress,
     handler: RegisteredHandler,
 }
 
@@ -637,8 +718,10 @@ pub struct LinkManager {
     /// Private ratchets for a live inbound destination. The manager owns this
     /// alongside `destination` so enforced decryption cannot outlive its keys.
     destination_ratchets: Option<PersistentRatchetRing>,
-    /// `(link_id, path_hash, data) -> Option<response>`.
+    /// `(link_id, path_hash, data) -> Option<packed MessagePack response>`.
     request_handler: Option<RequestHandler>,
+    /// Destination.max_request_size: larger requests are ignored or rejected.
+    max_request_size: Option<usize>,
     deferred_request_notify: Arc<tokio::sync::Notify>,
     pending_deferred_requests: Vec<PendingDeferredRequest>,
     deferred_resource_leases: Vec<DeferredResourceLease>,
@@ -763,6 +846,7 @@ impl LinkManager {
             identity: None,
             destination_ratchets: None,
             request_handler: None,
+            max_request_size: None,
             deferred_request_notify: Arc::new(tokio::sync::Notify::new()),
             pending_deferred_requests: Vec::new(),
             deferred_resource_leases: Vec::new(),
@@ -857,6 +941,7 @@ impl LinkManager {
             identity: manager_identity,
             destination_ratchets: None,
             request_handler: None,
+            max_request_size: None,
             deferred_request_notify: Arc::new(tokio::sync::Notify::new()),
             pending_deferred_requests: Vec::new(),
             deferred_resource_leases: Vec::new(),
@@ -2020,6 +2105,13 @@ impl LinkManager {
                 );
                 if let Some(tx) = result_tx {
                     let _ = tx.send(result);
+                }
+                true
+            }
+            LinkManagerCommand::SetMaxRequestSize { limit, result_tx } => {
+                self.set_max_request_size(limit);
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(());
                 }
                 true
             }
@@ -3344,6 +3436,31 @@ impl LinkManager {
                                 break 'adv;
                             }
 
+                            if is_request
+                                && self
+                                    .max_request_size
+                                    .is_some_and(|limit| adv.data_size > limit)
+                            {
+                                Self::reject_inbound_advertisement(
+                                    &self.transport_tx,
+                                    &mut self.pending_link_control,
+                                    &mut self.pending_endpoint_sends,
+                                    active,
+                                    &mut self.active_inbound_lifecycles,
+                                    &mut self.pending_inbound_request_resources,
+                                    &self.resource_event_tx,
+                                    &self.accounting_event_tx,
+                                    link_id,
+                                    resource_id,
+                                    adv.resource_hash,
+                                    format!(
+                                        "rejected request with excessive size {}",
+                                        adv.data_size
+                                    ),
+                                );
+                                break 'adv;
+                            }
+
                             // Preserve AcceptNone as a cheap first-offer drop: it
                             // invokes no application code and allocates no Resource
                             // state. A strategy change during a split concludes the
@@ -4121,44 +4238,53 @@ impl LinkManager {
                             let mut next_segment_failed = false;
                             let completed_resource_hash = queue_key.unwrap_or(rh);
                             if let Some(key) = queue_key {
-                                let (next, empty) = if let Some(queue) =
-                                    active.outbound_split_queues.get_mut(&key)
-                                {
-                                    let next = queue.pop_front();
-                                    (next, queue.is_empty())
-                                } else {
-                                    (None, false)
+                                let step = match active.outbound_split_queues.get_mut(&key) {
+                                    Some(queue) => queue.next(&active.link),
+                                    None => Ok((None, false)),
                                 };
-                                if empty {
-                                    active.outbound_split_queues.remove(&key);
-                                }
-                                if let Some(next) = next {
-                                    started_next_segment = Self::start_outbound_transfer(
-                                        &self.transport_tx,
-                                        &mut self.pending_link_control,
-                                        &mut self.pending_endpoint_sends,
-                                        active,
-                                        &link_id,
-                                        next,
-                                    )
-                                    .is_some();
-                                    next_segment_failed = !started_next_segment;
-                                    if next_segment_failed {
-                                        active.outbound_split_queues.remove(&key);
-                                        Self::emit_resource_event(
-                                            &self.resource_event_tx,
-                                            &self.accounting_event_tx,
-                                            LinkResourceEvent::Concluded {
-                                                link_id,
-                                                resource_id: completed_resource_hash,
-                                                direction: LinkResourceDirection::Outbound,
-                                                conclusion: LinkResourceConclusion::Failed(
+                                let mut failure = None;
+                                match step {
+                                    Ok((next, empty)) => {
+                                        if empty {
+                                            active.outbound_split_queues.remove(&key);
+                                        }
+                                        if let Some(next) = next {
+                                            started_next_segment = Self::start_outbound_transfer(
+                                                &self.transport_tx,
+                                                &mut self.pending_link_control,
+                                                &mut self.pending_endpoint_sends,
+                                                active,
+                                                &link_id,
+                                                next,
+                                            )
+                                            .is_some();
+                                            if !started_next_segment {
+                                                failure = Some(
                                                     "could not retain next Resource segment advertisement"
-                                                        .into(),
-                                                ),
-                                            },
-                                        );
+                                                        .to_string(),
+                                                );
+                                            }
+                                        }
                                     }
+                                    Err(reason) => {
+                                        failure = Some(format!(
+                                            "next Resource segment could not be prepared: {reason}"
+                                        ));
+                                    }
+                                }
+                                if let Some(reason) = failure {
+                                    next_segment_failed = true;
+                                    active.outbound_split_queues.remove(&key);
+                                    Self::emit_resource_event(
+                                        &self.resource_event_tx,
+                                        &self.accounting_event_tx,
+                                        LinkResourceEvent::Concluded {
+                                            link_id,
+                                            resource_id: completed_resource_hash,
+                                            direction: LinkResourceDirection::Outbound,
+                                            conclusion: LinkResourceConclusion::Failed(reason),
+                                        },
+                                    );
                                 }
                             }
                             if !started_next_segment && !next_segment_failed {
@@ -4188,13 +4314,23 @@ impl LinkManager {
                 }
             }
             rns_wire::context::PacketContext::Request => {
+                let max_request_size = self.max_request_size;
                 let parsed = self.active_links.get_mut(&link_id).and_then(|active| {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
-                    active.link.handle_request(data).ok()
+                    let plaintext = active.link.decrypt(data).ok()?;
+                    if max_request_size.is_some_and(|limit| plaintext.len() > limit) {
+                        tracing::debug!(
+                            link_id = hex::encode(link_id),
+                            size = plaintext.len(),
+                            "ignored request with excessive size"
+                        );
+                        return None;
+                    }
+                    Link::parse_request_value(&plaintext).ok()
                 });
 
-                if let Some((_packed_request_id, path_hash, requested_at, request_data)) = parsed {
+                if let Some(request) = parsed {
                     // Packet-sized requests use the truncated RNS packet hash.
                     // Resource-sized requests use the packed-request hash.
                     let request_id =
@@ -4202,9 +4338,9 @@ impl LinkManager {
                     self.handle_parsed_request(
                         link_id,
                         request_id,
-                        path_hash,
-                        requested_at,
-                        request_data,
+                        request.path_hash,
+                        request.requested_at,
+                        request.data,
                     );
                 }
             }
@@ -4240,14 +4376,14 @@ impl LinkManager {
         }
 
         if let Some(payload) = completed_request_resource {
-            match Link::parse_request(&payload) {
-                Ok((request_id, path_hash, requested_at, request_data)) => {
+            match Link::parse_request_value(&payload) {
+                Ok(request) => {
                     self.handle_parsed_request(
                         link_id,
-                        request_id,
-                        path_hash,
-                        requested_at,
-                        request_data,
+                        request.request_id,
+                        request.path_hash,
+                        request.requested_at,
+                        request.data,
                     );
                 }
                 Err(error) => {
@@ -5391,8 +5527,9 @@ impl LinkManager {
         request_id: [u8; 16],
         path_hash: [u8; 16],
         requested_at: f64,
-        data: Vec<u8>,
+        value: rmpv::Value,
     ) {
+        let data = rns_link::link::value_bytes_view(&value).unwrap_or_default();
         let request_ready = self.active_links.get(&link_id).is_some_and(|active| {
             active.link.state == LinkState::Active
                 || (!active.link.is_initiator && active.link.state == LinkState::Handshake)
@@ -5412,7 +5549,7 @@ impl LinkManager {
             .and_then(|active| active.link.remote_identity())
             .and_then(|public_key| Identity::from_public_key(public_key).ok());
 
-        let mut response_auto_compress = false;
+        let mut response_auto_compress = AutoCompress::Off;
         let outcome = if let Some(registered) = self.destination_request_handlers.get(&path_hash) {
             let allowed = match registered.allow {
                 AllowPolicy::AllowNone => false,
@@ -5430,6 +5567,7 @@ impl LinkManager {
                 let request = DestinationRequest {
                     path: registered.path.clone(),
                     data,
+                    value,
                     request_id,
                     link_id,
                     remote_identity,
@@ -5490,7 +5628,7 @@ impl LinkManager {
             handler(link_id, path_hash, data.clone())
         } else if let Some(ref handler) = self.request_handler {
             match handler(link_id, path_hash, data) {
-                Some(response) => RequestOutcome::Reply(response),
+                Some(response) => RequestOutcome::ReplyValue(response),
                 None => RequestOutcome::Drop,
             }
         } else {
@@ -5512,24 +5650,46 @@ impl LinkManager {
         link_id: [u8; 16],
         request_id: [u8; 16],
         path_hash: [u8; 16],
-        response_auto_compress: bool,
+        response_auto_compress: AutoCompress,
         outcome: RequestOutcome,
         lease: Option<Arc<crate::deferred_request::RequestLease>>,
     ) -> bool {
         let mut sent = false;
         let (response, fetch_spec) = match outcome {
-            RequestOutcome::Reply(response) => (Some(response), None),
+            RequestOutcome::ReplyBytes(bytes) => (
+                Some(Link::pack_response_value(
+                    &request_id,
+                    &rmpv::Value::Binary(bytes),
+                )),
+                None,
+            ),
+            RequestOutcome::ReplyValue(value) => {
+                (Some(Link::pack_response(&request_id, &value)), None)
+            }
+            RequestOutcome::ReplyFile { source, metadata } => {
+                return self.start_file_response(
+                    link_id,
+                    request_id,
+                    source,
+                    metadata,
+                    response_auto_compress,
+                    lease,
+                );
+            }
             RequestOutcome::ReplyWithResource {
                 ack,
                 data,
                 metadata,
                 auto_compress,
-            } => (Some(ack), Some((data, metadata, auto_compress))),
+            } => (
+                Some(Link::pack_response(&request_id, &ack)),
+                Some((data, metadata, auto_compress)),
+            ),
             RequestOutcome::Drop => (None, None),
         };
 
-        if let Some(response) = response {
-            match Link::pack_response(&request_id, &response) {
+        if let Some(packed) = response {
+            match packed {
                 Ok(packed_response) => {
                     let mdu = self
                         .active_links
@@ -5569,16 +5729,21 @@ impl LinkManager {
                             tracing::debug!(
                                 link_id = hex::encode(link_id),
                                 request_id = hex::encode(request_id),
-                                response_len = response.len(),
+                                response_len = packed_response.len(),
                                 "link request handled — response sent"
                             );
                         }
-                    } else if let Some(resource_id) = self.start_response_resource(
-                        &link_id,
-                        packed_response,
-                        request_id,
-                        response_auto_compress,
-                    ) {
+                    } else if let Some(resource_id) = {
+                        let auto_compress =
+                            response_auto_compress.applies_to(packed_response.len());
+                        self.start_response_resource(
+                            &link_id,
+                            packed_response,
+                            None,
+                            request_id,
+                            auto_compress,
+                        )
+                    } {
                         sent = true;
                         if let Some(lease) = &lease {
                             self.deferred_resource_leases.push(DeferredResourceLease {
@@ -5605,7 +5770,7 @@ impl LinkManager {
                         link_id = hex::encode(link_id),
                         request_id = hex::encode(request_id),
                         error = %error,
-                        "link request response could not be packed"
+                        "link request response is not one MessagePack value; not sent"
                     );
                 }
             }
@@ -5642,6 +5807,90 @@ impl LinkManager {
             }
         }
         sent
+    }
+
+    /// Link.handle_request file response: the file is the only response,
+    /// sent as one Resource carrying the request id and metadata. Later
+    /// segments are read from the source as earlier ones are proved.
+    fn start_file_response(
+        &mut self,
+        link_id: [u8; 16],
+        request_id: [u8; 16],
+        source: Box<dyn ResourceSource>,
+        metadata: Option<Vec<u8>>,
+        auto_compress: AutoCompress,
+        lease: Option<Arc<crate::deferred_request::RequestLease>>,
+    ) -> bool {
+        let Some(resource_id) =
+            self.start_streamed_response(&link_id, request_id, source, metadata, auto_compress)
+        else {
+            tracing::warn!(
+                link_id = hex::encode(link_id),
+                request_id = hex::encode(request_id),
+                "link request file response could not be started"
+            );
+            return false;
+        };
+        if let Some(lease) = lease {
+            self.deferred_resource_leases.push(DeferredResourceLease {
+                link_id,
+                resource_id,
+                _lease: lease,
+            });
+        }
+        true
+    }
+
+    fn start_streamed_response(
+        &mut self,
+        link_id: &[u8; 16],
+        request_id: [u8; 16],
+        source: Box<dyn ResourceSource>,
+        metadata: Option<Vec<u8>>,
+        auto_compress: AutoCompress,
+    ) -> Option<[u8; 32]> {
+        let active = self.active_links.get_mut(link_id)?;
+        if !matches!(active.link.state, LinkState::Active | LinkState::Stale) {
+            return None;
+        }
+        let keys = active.link.session_keys()?;
+        let rtt = active
+            .link
+            .rtt
+            .unwrap_or(std::time::Duration::from_millis(500));
+        let mut prepared =
+            PreparedResourceSource::prepare_response(source, request_id, metadata, auto_compress)
+                .map_err(|error| tracing::warn!(%error, "file response source refused"))
+                .ok()?;
+        let first = prepared.next_segment(&keys, rtt).ok()??;
+        let resource_key = first.logical_hash;
+        let total_segments = first.total_segments;
+        let data_size = first.data_size;
+        Self::start_outbound_transfer(
+            &self.transport_tx,
+            &mut self.pending_link_control,
+            &mut self.pending_endpoint_sends,
+            active,
+            link_id,
+            first.transfer,
+        )?;
+        if !prepared.is_exhausted() {
+            active
+                .outbound_split_queues
+                .insert(resource_key, OutboundSplitQueue::Source(Box::new(prepared)));
+        }
+        Self::emit_resource_event(
+            &self.resource_event_tx,
+            &self.accounting_event_tx,
+            LinkResourceEvent::Started {
+                link_id: *link_id,
+                resource_id: resource_key,
+                direction: LinkResourceDirection::Outbound,
+                data_size,
+                total_segments,
+            },
+        );
+        Some(resource_key)
     }
 
     fn poll_deferred_requests(&mut self) -> bool {
@@ -5709,6 +5958,8 @@ impl LinkManager {
     /// Install a synchronous fallback `(link_id, path_hash, data)` handler.
     /// Per-path handlers and `set_request_handler_ex` take precedence. This
     /// fallback must check authorization itself; `None` sends no response.
+    /// `Some` must hold exactly one encoded MessagePack value, sent as
+    /// [`RequestOutcome::ReplyValue`].
     pub fn set_request_handler<F>(&mut self, handler: F)
     where
         F: Fn([u8; 16], [u8; 16], Vec<u8>) -> Option<Vec<u8>> + Send + 'static,
@@ -5740,7 +5991,7 @@ impl LinkManager {
         path: &str,
         allow: AllowPolicy,
         allowed_list: Option<Vec<[u8; 16]>>,
-        auto_compress: bool,
+        auto_compress: impl Into<AutoCompress>,
         handler: F,
     ) -> bool
     where
@@ -5750,7 +6001,7 @@ impl LinkManager {
             path,
             allow,
             allowed_list.unwrap_or_default(),
-            auto_compress,
+            auto_compress.into(),
             Box::new(handler),
         )
     }
@@ -5760,7 +6011,7 @@ impl LinkManager {
         path: &str,
         allow: AllowPolicy,
         allowed_list: Vec<[u8; 16]>,
-        auto_compress: bool,
+        auto_compress: AutoCompress,
         handler: DestinationRequestHandler,
     ) -> bool {
         if path.is_empty() {
@@ -5772,7 +6023,7 @@ impl LinkManager {
                 path,
                 allow,
                 Some(allowed_list.clone()),
-                auto_compress,
+                auto_compress.is_enabled(),
             );
         }
 
@@ -5803,7 +6054,7 @@ impl LinkManager {
         path: &str,
         allow: AllowPolicy,
         allowed_list: Option<Vec<[u8; 16]>>,
-        auto_compress: bool,
+        auto_compress: impl Into<AutoCompress>,
         response_byte_limit: usize,
         handler: F,
     ) -> bool
@@ -5818,12 +6069,13 @@ impl LinkManager {
             return false;
         }
         let allowed_list = allowed_list.unwrap_or_default();
+        let auto_compress = auto_compress.into();
         if let Some(destination) = self.destination.as_mut() {
             destination.register_request_handler(
                 path,
                 allow,
                 Some(allowed_list.clone()),
-                auto_compress,
+                auto_compress.is_enabled(),
             );
         }
         self.destination_request_handlers.insert(
@@ -5840,6 +6092,13 @@ impl LinkManager {
             },
         );
         true
+    }
+
+    /// Destination.set_max_request_size: REQUEST packets larger than `limit`
+    /// are ignored and larger request Resources are rejected. `None` accepts
+    /// any size.
+    pub fn set_max_request_size(&mut self, limit: Option<usize>) {
+        self.max_request_size = limit;
     }
 
     /// Remove the request handler registered for `path`.
@@ -6731,15 +6990,16 @@ impl LinkManager {
     fn start_response_resource(
         &mut self,
         link_id: &[u8; 16],
-        packed_response: Vec<u8>,
+        data: Vec<u8>,
+        metadata: Option<Vec<u8>>,
         request_id: [u8; 16],
         auto_compress: bool,
     ) -> Option<[u8; 32]> {
         self.start_resource_transfer_inner(
             link_id,
             ResourceTransferStart {
-                data: packed_response,
-                metadata: None,
+                data,
+                metadata,
                 auto_compress,
                 request_id: Some(request_id.to_vec()),
                 is_response: true,
@@ -6846,7 +7106,9 @@ impl LinkManager {
             first,
         )?;
         if !transfers.is_empty() {
-            active.outbound_split_queues.insert(resource_key, transfers);
+            active
+                .outbound_split_queues
+                .insert(resource_key, OutboundSplitQueue::Prebuilt(transfers));
         }
         Self::emit_resource_event(
             &self.resource_event_tx,
@@ -8298,7 +8560,9 @@ mod tests {
         let transfer = active.outbound_resources.get_mut(&failed).unwrap();
         transfer.resource.request_id = Some(vec![0; 500]);
         transfer.started_at = ago_or_skip!(std::time::Duration::from_secs(60));
-        active.outbound_split_queues.insert(failed, VecDeque::new());
+        active
+            .outbound_split_queues
+            .insert(failed, OutboundSplitQueue::Prebuilt(VecDeque::new()));
         manager.on_tick();
         let active = &manager.active_links[&id];
         assert_eq!(active.link.state, LinkState::Active);
@@ -8432,14 +8696,14 @@ mod tests {
             false,
             move |_| {
                 handler_calls.fetch_add(1, Ordering::SeqCst);
-                RequestOutcome::Reply(b"ready".to_vec())
+                RequestOutcome::ReplyBytes(b"ready".to_vec())
             },
         ));
 
         let (encrypted_request, _) = initiator
-            .request(
+            .request_value(
                 "fetch",
-                Some(b"file.bin"),
+                &rmpv::Value::Binary(b"file.bin".to_vec()),
                 std::time::Duration::from_secs(5),
             )
             .unwrap();
@@ -8552,6 +8816,55 @@ mod tests {
     fn handshaken_link_pair() -> (Link, Link) {
         let (initiator, responder, _identity_key) = handshaken_link_pair_with_identity();
         (initiator, responder)
+    }
+
+    #[test]
+    fn streamed_split_queue_reports_a_source_that_fails_mid_transfer() {
+        use std::io::{Cursor, Read, Seek, SeekFrom};
+
+        struct FailingSource {
+            inner: Cursor<Vec<u8>>,
+            budget: usize,
+        }
+        impl Read for FailingSource {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.inner.read(buf)?;
+                if read > self.budget {
+                    return Err(std::io::Error::other("source went away"));
+                }
+                self.budget -= read;
+                Ok(read)
+            }
+        }
+        impl Seek for FailingSource {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(pos)
+            }
+        }
+
+        let size = rns_protocol::resource::MAX_EFFICIENT_SIZE + 1024;
+        // Enough for the hashing pass and the first segment only.
+        let source = FailingSource {
+            inner: Cursor::new(vec![0x5A; size]),
+            budget: size + rns_protocol::resource::MAX_EFFICIENT_SIZE,
+        };
+        let (link, _) = handshaken_link_pair();
+        let keys = link.session_keys().unwrap();
+        let mut prepared =
+            PreparedResourceSource::prepare_response(source, [3; 16], None, AutoCompress::Off)
+                .unwrap();
+        let first = prepared
+            .next_segment(&keys, std::time::Duration::from_millis(100))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.total_segments, 2);
+        assert!(!prepared.is_exhausted());
+
+        let mut queue = OutboundSplitQueue::Source(Box::new(prepared));
+        let Err(error) = queue.next(&link) else {
+            panic!("a failed read must not end the transfer as complete");
+        };
+        assert!(error.contains("source went away"), "{error}");
     }
 
     fn active_link_entry_at(link: Link, interface_id: InterfaceId) -> ActiveLink {
@@ -9738,17 +10051,23 @@ mod tests {
             }
         ));
         let path = truncated_hash(b"/get");
-        manager.handle_parsed_request(link_id, [1; 16], path, 0.0, b"request".to_vec());
+        manager.handle_parsed_request(
+            link_id,
+            [1; 16],
+            path,
+            0.0,
+            rmpv::Value::Binary(b"request".to_vec()),
+        );
         assert_eq!(manager.pending_deferred_requests.len(), 1);
         assert!(transport_rx.try_recv().is_err());
         // The worker may remain blocked while an unrelated synchronous handler
         // still progresses through the same manager.
-        manager.set_request_handler(|_, _, _| Some(b"live".to_vec()));
-        manager.handle_parsed_request(link_id, [2; 16], [9; 16], 0.0, Vec::new());
+        manager.set_request_handler(|_, _, _| Some(b"\xa4live".to_vec()));
+        manager.handle_parsed_request(link_id, [2; 16], [9; 16], 0.0, rmpv::Value::Nil);
         assert!(next_transport_message(&mut transport_rx).is_ok());
         let worker = jobs.lock().unwrap().pop().unwrap();
         let mut ack = worker
-            .respond(RequestOutcome::Reply(b"done".to_vec()))
+            .respond(RequestOutcome::ReplyBytes(b"done".to_vec()))
             .unwrap();
         assert!(manager.try_step());
         assert_eq!(ack.try_recv().unwrap(), DeferredResponseOutcome::Sent);
@@ -9762,10 +10081,16 @@ mod tests {
         assert_eq!(response, b"done");
 
         // A reused Link ID with a new generation cannot consume an old result.
-        manager.handle_parsed_request(link_id, [3; 16], path, 0.0, b"request".to_vec());
+        manager.handle_parsed_request(
+            link_id,
+            [3; 16],
+            path,
+            0.0,
+            rmpv::Value::Binary(b"request".to_vec()),
+        );
         let worker = jobs.lock().unwrap().pop().unwrap();
         let mut ack = worker
-            .respond(RequestOutcome::Reply(b"stale".to_vec()))
+            .respond(RequestOutcome::ReplyBytes(b"stale".to_vec()))
             .unwrap();
         manager.active_endpoint_generations.insert(link_id, 8);
         manager.poll_deferred_requests();
@@ -9774,10 +10099,16 @@ mod tests {
 
         // A response beyond packet MDU owns its credit until the Resource is
         // terminal, even though the worker and completion receiver are gone.
-        manager.handle_parsed_request(link_id, [4; 16], path, 0.0, b"request".to_vec());
+        manager.handle_parsed_request(
+            link_id,
+            [4; 16],
+            path,
+            0.0,
+            rmpv::Value::Binary(b"request".to_vec()),
+        );
         let worker = jobs.lock().unwrap().pop().unwrap();
         let mut ack = worker
-            .respond(RequestOutcome::Reply(vec![0x37; 3000]))
+            .respond(RequestOutcome::ReplyBytes(vec![0x37; 3000]))
             .unwrap();
         manager.poll_deferred_requests();
         assert_eq!(ack.try_recv().unwrap(), DeferredResponseOutcome::Sent);
@@ -9794,7 +10125,13 @@ mod tests {
         manager.poll_deferred_requests();
         assert!(manager.deferred_resource_leases.is_empty());
 
-        manager.handle_parsed_request(link_id, [5; 16], path, 0.0, b"request".to_vec());
+        manager.handle_parsed_request(
+            link_id,
+            [5; 16],
+            path,
+            0.0,
+            rmpv::Value::Binary(b"request".to_vec()),
+        );
         let worker = jobs.lock().unwrap().pop().unwrap();
         drop(manager);
         assert!(worker.is_cancelled());
@@ -9933,12 +10270,16 @@ mod tests {
                     remote_hash,
                     request.requested_at,
                 ));
-                RequestOutcome::Reply(b"ok".to_vec())
+                RequestOutcome::ReplyBytes(b"ok".to_vec())
             },
         ));
 
         let (encrypted_request, _) = sender_link
-            .request("status", Some(b"hello"), std::time::Duration::from_secs(5))
+            .request_value(
+                "status",
+                &rmpv::Value::Binary(b"hello".to_vec()),
+                std::time::Duration::from_secs(5),
+            )
             .unwrap();
         let request_header = rns_wire::header::PacketHeader {
             flags: rns_wire::flags::PacketFlags {
@@ -9993,12 +10334,16 @@ mod tests {
             false,
             move |_| {
                 denied_calls_handler.fetch_add(1, Ordering::SeqCst);
-                RequestOutcome::Reply(b"must not run".to_vec())
+                RequestOutcome::ReplyBytes(b"must not run".to_vec())
             },
         ));
 
         let (denied_request, _) = sender_link
-            .request("status", Some(b"denied"), std::time::Duration::from_secs(5))
+            .request_value(
+                "status",
+                &rmpv::Value::Binary(b"denied".to_vec()),
+                std::time::Duration::from_secs(5),
+            )
             .unwrap();
         let mut denied_raw = request_header.pack();
         denied_raw.extend_from_slice(&denied_request);
@@ -10060,7 +10405,7 @@ mod tests {
             move |request| {
                 *observed_handler.lock().unwrap() =
                     Some((request.request_id, request.data, request.requested_at));
-                RequestOutcome::Reply(b"accepted".to_vec())
+                RequestOutcome::ReplyBytes(b"accepted".to_vec())
             },
         ));
 

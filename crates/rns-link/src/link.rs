@@ -119,15 +119,18 @@ pub enum RequestSendMode {
     Resource(Vec<u8>),
 }
 
-fn msgpack_value_from_bytes_or_binary(data: &[u8]) -> rmpv::Value {
-    let mut cursor = std::io::Cursor::new(data);
+/// Decode exactly one complete MessagePack value, rejecting trailing bytes.
+pub fn decode_single_value(packed: &[u8]) -> Option<rmpv::Value> {
+    let mut cursor = std::io::Cursor::new(packed);
     match rmpv::decode::read_value(&mut cursor) {
-        Ok(value) if cursor.position() as usize == data.len() => value,
-        _ => rmpv::Value::Binary(data.to_vec()),
+        Ok(value) if cursor.position() as usize == packed.len() => Some(value),
+        _ => None,
     }
 }
 
-fn msgpack_value_to_bytes(value: &rmpv::Value) -> Result<Vec<u8>, LinkCryptoError> {
+/// Byte view of a decoded request or response value: binary and string
+/// contents as-is, any other value re-encoded as MessagePack.
+pub fn value_bytes_view(value: &rmpv::Value) -> Result<Vec<u8>, LinkCryptoError> {
     if let Some(bytes) = value.as_slice() {
         Ok(bytes.to_vec())
     } else if let Some(text) = value.as_str() {
@@ -259,6 +262,16 @@ pub type RemoteIdentifiedCallback = Box<dyn Fn(&Link, &[u8; 64]) + Send + Sync>;
 pub type LinkCallback = Box<dyn Fn(&Link) + Send + Sync>;
 /// Parsed REQUEST data: `(request_id, path_hash, timestamp, payload)`.
 pub type ParsedRequestData = ([u8; 16], [u8; 16], f64, Vec<u8>);
+
+/// A parsed Link request with its data as the decoded MessagePack value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedRequest {
+    /// Truncated hash of the packed request body.
+    pub request_id: [u8; 16],
+    pub path_hash: [u8; 16],
+    pub requested_at: f64,
+    pub data: rmpv::Value,
+}
 
 impl Link {
     /// Create an outbound link and return `(link, request_data)` to transmit.
@@ -782,13 +795,13 @@ impl Link {
         self.remote_identity_pub.as_ref()
     }
 
-    /// Build a REQUEST payload and return `(encrypted, request_id)`.
+    /// Build a REQUEST payload from pre-encoded data and return
+    /// `(encrypted, request_id)`.
     ///
-    /// Plaintext is msgpack `[timestamp_f64, sha256_trunc(path), data]`. Send with
-    /// context REQUEST (0x09). The initial ID hashes the plaintext body. For an
-    /// inline packet, the owner must replace it with that packet's truncated
-    /// hash via [`Self::update_pending_request_id`]. Resource requests retain
-    /// the body hash. This method does not enforce the MDU or send data.
+    /// `data` is one already-encoded MessagePack value placed in the request
+    /// as-is; anything else is refused. `None` sends nil. Use
+    /// [`Self::request_value`] to pass a value, e.g. `Value::Binary` for bytes.
+    /// See [`Self::request_value`] for request ID handling.
     pub fn request(
         &mut self,
         path: &str,
@@ -796,33 +809,25 @@ impl Link {
         timeout: Duration,
     ) -> Result<(Vec<u8>, [u8; 16]), LinkCryptoError> {
         let (packed, request_id) = self.prepare_request(path, data, timeout)?;
-        match self.encrypt(&packed) {
-            Ok(encrypted) => Ok((encrypted, request_id)),
-            Err(error) => {
-                self.discard_pending_request(&request_id);
-                Err(error)
-            }
-        }
+        self.encrypt_request(packed, request_id)
     }
 
-    /// Build the plaintext MsgPack request body and register its receipt.
+    /// Build a REQUEST payload whose data is `data`, packed by type as
+    /// Link.request packs `[time.time(), path_hash, data]`.
     ///
-    /// Packet-sized callers encrypt the returned body directly. Bodies larger
-    /// than the Link MDU are passed to Resource with the returned request ID.
-    /// A complete MessagePack value in `data` is embedded as that value; other
-    /// bytes become a binary field. `None` becomes nil. Inline packet callers
-    /// replace the initial body-hash ID after packing the packet, as described
-    /// on [`Self::request`].
-    pub fn prepare_request(
+    /// Send with context REQUEST (0x09). The initial ID hashes the plaintext
+    /// body. For an inline packet, the owner must replace it with that
+    /// packet's truncated hash via [`Self::update_pending_request_id`].
+    /// Resource requests retain the body hash. This method does not enforce
+    /// the MDU or send data.
+    pub fn request_value(
         &mut self,
         path: &str,
-        data: Option<&[u8]>,
+        data: &rmpv::Value,
         timeout: Duration,
     ) -> Result<(Vec<u8>, [u8; 16]), LinkCryptoError> {
-        let data_value = data
-            .map(msgpack_value_from_bytes_or_binary)
-            .unwrap_or(rmpv::Value::Nil);
-        self.prepare_request_value(path, data_value, timeout)
+        let (packed, request_id) = self.prepare_request_value(path, data, timeout)?;
+        self.encrypt_request(packed, request_id)
     }
 
     /// Build a REQUEST payload with a MsgPack string body.
@@ -835,8 +840,14 @@ impl Link {
         data: &str,
         timeout: Duration,
     ) -> Result<(Vec<u8>, [u8; 16]), LinkCryptoError> {
-        let (packed, request_id) =
-            self.prepare_request_value(path, rmpv::Value::String(data.into()), timeout)?;
+        self.request_value(path, &rmpv::Value::String(data.into()), timeout)
+    }
+
+    fn encrypt_request(
+        &mut self,
+        packed: Vec<u8>,
+        request_id: [u8; 16],
+    ) -> Result<(Vec<u8>, [u8; 16]), LinkCryptoError> {
         match self.encrypt(&packed) {
             Ok(encrypted) => Ok((encrypted, request_id)),
             Err(error) => {
@@ -846,10 +857,32 @@ impl Link {
         }
     }
 
-    fn prepare_request_value(
+    /// Build the plaintext MsgPack request body from one already-encoded
+    /// MessagePack value (`None` for nil) and register its receipt. Refuses
+    /// `data` unless it is exactly one complete value.
+    pub fn prepare_request(
         &mut self,
         path: &str,
-        data_value: rmpv::Value,
+        data: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<(Vec<u8>, [u8; 16]), LinkCryptoError> {
+        let value = match data {
+            None => rmpv::Value::Nil,
+            Some(packed) => decode_single_value(packed).ok_or(LinkCryptoError::EncryptionFailed)?,
+        };
+        self.prepare_request_value(path, &value, timeout)
+    }
+
+    /// Build the plaintext MsgPack request body and register its receipt.
+    ///
+    /// Packet-sized callers encrypt the returned body directly. Bodies larger
+    /// than the Link MDU are passed to Resource with the returned request ID.
+    /// Inline packet callers replace the initial body-hash ID after packing
+    /// the packet, as described on [`Self::request_value`].
+    pub fn prepare_request_value(
+        &mut self,
+        path: &str,
+        data: &rmpv::Value,
         timeout: Duration,
     ) -> Result<(Vec<u8>, [u8; 16]), LinkCryptoError> {
         if self.state != LinkState::Active {
@@ -865,7 +898,7 @@ impl Link {
         let array = rmpv::Value::Array(vec![
             rmpv::Value::F64(timestamp),
             rmpv::Value::Binary(path_hash.to_vec()),
-            data_value,
+            data.clone(),
         ]);
         let mut packed = Vec::new();
         rmpv::encode::write_value(&mut packed, &array)
@@ -907,6 +940,20 @@ impl Link {
         };
         receipt.mark_resource_sent();
         true
+    }
+
+    /// Move a pending request to `Receiving` once its response Resource is
+    /// accepted; the request deadline no longer applies after that. Returns
+    /// `false` when no pending receipt matches.
+    pub fn mark_request_receiving(&mut self, request_id: &[u8; 16]) -> bool {
+        let Some(receipt) = self
+            .pending_requests
+            .iter_mut()
+            .find(|receipt| receipt.request_id[..16] == request_id[..])
+        else {
+            return false;
+        };
+        receipt.mark_receiving()
     }
 
     /// Fail and remove a pending request by its truncated request ID.
@@ -969,6 +1016,19 @@ impl Link {
     /// not authorize a handler or validate timestamp freshness. Binary/string
     /// payloads become raw bytes; other MessagePack values are re-encoded.
     pub fn parse_request(plaintext: &[u8]) -> Result<ParsedRequestData, LinkCryptoError> {
+        let request = Self::parse_request_value(plaintext)?;
+        let data = value_bytes_view(&request.data)?;
+        Ok((
+            request.request_id,
+            request.path_hash,
+            request.requested_at,
+            data,
+        ))
+    }
+
+    /// As [`Self::parse_request`], keeping the request data as its decoded
+    /// value so bytes and structured request data stay distinct.
+    pub fn parse_request_value(plaintext: &[u8]) -> Result<ParsedRequest, LinkCryptoError> {
         // request_id = SHA-256(packed_request)[:16]
         let request_id = truncated_hash(plaintext);
 
@@ -992,39 +1052,74 @@ impl Link {
         let mut path_hash = [0u8; 16];
         path_hash.copy_from_slice(path_hash_bytes);
 
-        let data = msgpack_value_to_bytes(&array[2])?;
-
-        Ok((request_id, path_hash, timestamp, data))
+        Ok(ParsedRequest {
+            request_id,
+            path_hash,
+            requested_at: timestamp,
+            data: array[2].clone(),
+        })
     }
 
-    /// Build a RESPONSE payload: `encrypt(msgpack([request_id, response_data]))`.
-    ///
-    /// Send with context RESPONSE (0x0A).
+    /// Build a RESPONSE payload: `encrypt(msgpack([request_id, response]))`,
+    /// with `response` one already-encoded MessagePack value (refused
+    /// otherwise). Send with context RESPONSE (0x0A).
     pub fn create_response(
         &self,
         request_id: &[u8; 16],
-        response_data: &[u8],
+        response: &[u8],
     ) -> Result<Vec<u8>, LinkCryptoError> {
-        let packed = Self::pack_response(request_id, response_data)?;
+        let packed = Self::pack_response(request_id, response)?;
         self.encrypt(&packed)
     }
 
-    /// Build plaintext msgpack `[request_id, response_data]` for a Link
-    /// response packet or response resource. A complete MessagePack value in
-    /// `response_data` is embedded as that value; other bytes become binary.
-    pub fn pack_response(
+    /// As [`Self::create_response`], packing `response` by type.
+    pub fn create_response_value(
+        &self,
         request_id: &[u8; 16],
-        response_data: &[u8],
+        response: &rmpv::Value,
     ) -> Result<Vec<u8>, LinkCryptoError> {
-        let response_value = msgpack_value_from_bytes_or_binary(response_data);
-        let array = rmpv::Value::Array(vec![
-            rmpv::Value::Binary(request_id.to_vec()),
-            response_value,
-        ]);
+        let packed = Self::pack_response_value(request_id, response)?;
+        self.encrypt(&packed)
+    }
+
+    /// Build plaintext msgpack `[request_id, response]` for a Link response
+    /// packet or response resource, as Link.handle_request packs a handler's
+    /// return value. Use `Value::Binary` for a bytes response.
+    pub fn pack_response_value(
+        request_id: &[u8; 16],
+        response: &rmpv::Value,
+    ) -> Result<Vec<u8>, LinkCryptoError> {
         let mut packed = Vec::new();
-        rmpv::encode::write_value(&mut packed, &array)
+        Self::write_response_prefix(&mut packed, request_id)?;
+        rmpv::encode::write_value(&mut packed, response)
             .map_err(|_| LinkCryptoError::EncryptionFailed)?;
         Ok(packed)
+    }
+
+    /// As [`Self::pack_response_value`], with the response supplied as one
+    /// already-encoded MessagePack value. Fails unless `packed_value` is
+    /// exactly one complete value.
+    pub fn pack_response(
+        request_id: &[u8; 16],
+        packed_value: &[u8],
+    ) -> Result<Vec<u8>, LinkCryptoError> {
+        if decode_single_value(packed_value).is_none() {
+            return Err(LinkCryptoError::EncryptionFailed);
+        }
+        let mut packed = Vec::with_capacity(19 + packed_value.len());
+        Self::write_response_prefix(&mut packed, request_id)?;
+        packed.extend_from_slice(packed_value);
+        Ok(packed)
+    }
+
+    fn write_response_prefix(
+        packed: &mut Vec<u8>,
+        request_id: &[u8; 16],
+    ) -> Result<(), LinkCryptoError> {
+        // fixarray(2) header, then the request id as bin.
+        packed.push(0x92);
+        rmpv::encode::write_value(packed, &rmpv::Value::Binary(request_id.to_vec()))
+            .map_err(|_| LinkCryptoError::EncryptionFailed)
     }
 
     /// Decrypt a RESPONSE payload, deliver it to the matching receipt, and return
@@ -1060,10 +1155,21 @@ impl Link {
     pub fn parse_response_plaintext(
         plaintext: &[u8],
     ) -> Result<([u8; 16], Vec<u8>), LinkCryptoError> {
+        let (request_id, response) = Self::parse_response_value(plaintext)?;
+        Ok((request_id, value_bytes_view(&response)?))
+    }
+
+    /// Parse plaintext MsgPack `[request_id, response]`, keeping the response
+    /// as its decoded value so bytes and structured responses stay distinct.
+    pub fn parse_response_value(
+        plaintext: &[u8],
+    ) -> Result<([u8; 16], rmpv::Value), LinkCryptoError> {
         let value = rmpv::decode::read_value(&mut &plaintext[..])
             .map_err(|_| LinkCryptoError::DecryptionFailed)?;
 
-        let array = value.as_array().ok_or(LinkCryptoError::DecryptionFailed)?;
+        let rmpv::Value::Array(mut array) = value else {
+            return Err(LinkCryptoError::DecryptionFailed);
+        };
         if array.len() < 2 {
             return Err(LinkCryptoError::DecryptionFailed);
         }
@@ -1077,9 +1183,9 @@ impl Link {
         let mut request_id = [0u8; 16];
         request_id.copy_from_slice(id_bytes);
 
-        let response_data = msgpack_value_to_bytes(&array[1])?;
+        let response = array.swap_remove(1);
 
-        Ok((request_id, response_data))
+        Ok((request_id, response))
     }
 
     /// Deliver already-decoded response bytes to a pending request.
@@ -2685,7 +2791,11 @@ mod tests {
         let (mut initiator, responder, _) = make_active_link();
 
         let (request_data, request_id) = initiator
-            .request("test.path", Some(b"request data"), Duration::from_secs(10))
+            .request_value(
+                "test.path",
+                &rmpv::Value::Binary(b"request data".to_vec()),
+                Duration::from_secs(10),
+            )
             .unwrap();
 
         assert!(!initiator.pending_requests.is_empty());
@@ -2698,7 +2808,7 @@ mod tests {
         assert_eq!(path_hash, expected_path_hash);
 
         let response_data = responder
-            .create_response(&request_id, b"response data")
+            .create_response_value(&request_id, &rmpv::Value::Binary(b"response data".to_vec()))
             .unwrap();
 
         let (resp_id, resp_data) = initiator.handle_response(&response_data).unwrap();
@@ -2714,9 +2824,9 @@ mod tests {
         let (mut initiator, responder, _) = make_active_link();
 
         let (encrypted, request_id) = initiator
-            .request(
+            .request_value(
                 "resource.path",
-                Some(b"resource request data"),
+                &rmpv::Value::Binary(b"resource request data".to_vec()),
                 Duration::from_secs(10),
             )
             .unwrap();
@@ -2782,13 +2892,11 @@ mod tests {
         let (mut initiator, responder, _) = make_active_link();
 
         let request_body = Value::Array(vec![Value::Nil, Value::Nil]);
-        let mut request_body_bytes = Vec::new();
-        rmpv::encode::write_value(&mut request_body_bytes, &request_body).unwrap();
 
         let (request_data, request_id) = initiator
-            .request(
+            .request_value(
                 "lxmf.propagation.get",
-                Some(&request_body_bytes),
+                &request_body,
                 Duration::from_secs(10),
             )
             .unwrap();
@@ -2799,11 +2907,9 @@ mod tests {
         assert_eq!(decoded_request, request_body);
 
         let response_body = Value::Array(vec![Value::Binary(vec![0xAA; 32])]);
-        let mut response_body_bytes = Vec::new();
-        rmpv::encode::write_value(&mut response_body_bytes, &response_body).unwrap();
 
         let response_data = responder
-            .create_response(&request_id, &response_body_bytes)
+            .create_response_value(&request_id, &response_body)
             .unwrap();
 
         let (resp_id, resp_data) = initiator.handle_response(&response_data).unwrap();
@@ -2811,6 +2917,74 @@ mod tests {
         let decoded_response: Value = rmpv::decode::read_value(&mut &resp_data[..]).unwrap();
         assert_eq!(decoded_response, response_body);
         assert!(initiator.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn bytes_response_is_packed_as_bin_even_when_it_looks_like_msgpack() {
+        let request_id: [u8; 16] = core::array::from_fn(|i| i as u8);
+        let packed =
+            Link::pack_response_value(&request_id, &rmpv::Value::Binary(vec![0x0a])).unwrap();
+        assert_eq!(
+            hex::encode(packed),
+            "92c410000102030405060708090a0b0c0d0e0fc4010a"
+        );
+    }
+
+    #[test]
+    fn packed_response_value_is_embedded_and_validated() {
+        let request_id: [u8; 16] = core::array::from_fn(|i| i as u8);
+        let packed = Link::pack_response(&request_id, &[0xcc, 0xf0]).unwrap();
+        assert_eq!(
+            hex::encode(&packed),
+            "92c410000102030405060708090a0b0c0d0e0fccf0"
+        );
+        assert_eq!(
+            Link::parse_response_value(&packed).unwrap().1,
+            rmpv::Value::from(240u8)
+        );
+        assert!(Link::pack_response(&request_id, &[0x81]).is_err());
+        assert!(Link::pack_response(&request_id, &[0xc3, 0xc3]).is_err());
+        assert!(Link::pack_response(&request_id, &[]).is_err());
+    }
+
+    #[test]
+    fn bytes_request_data_reaches_parser_as_binary() {
+        let (mut initiator, responder, _) = make_active_link();
+        let (encrypted, _) = initiator
+            .request_value(
+                "p",
+                &rmpv::Value::Binary(vec![0xc3]),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        let plaintext = responder.decrypt(&encrypted).unwrap();
+        let parsed = Link::parse_request_value(&plaintext).unwrap();
+        assert_eq!(parsed.data, rmpv::Value::Binary(vec![0xc3]));
+    }
+
+    #[test]
+    fn packed_request_data_must_be_one_complete_value() {
+        let (mut initiator, responder, _) = make_active_link();
+        assert!(
+            initiator
+                .request("p", Some(b"not msgpack \xc1"), Duration::from_secs(10))
+                .is_err()
+        );
+        assert!(initiator.pending_requests.is_empty());
+        let (encrypted, _) = initiator
+            .request("p", Some(&[0x92, 0x01, 0x02]), Duration::from_secs(10))
+            .unwrap();
+        let parsed = Link::parse_request_value(&responder.decrypt(&encrypted).unwrap()).unwrap();
+        assert_eq!(parsed.data, rmpv::Value::Array(vec![1.into(), 2.into()]));
+    }
+
+    #[test]
+    fn receiving_request_survives_tick_past_deadline() {
+        let (mut initiator, _responder, _) = make_active_link();
+        let (_, request_id) = initiator.request("p", None, Duration::ZERO).unwrap();
+        assert!(initiator.mark_request_receiving(&request_id));
+        initiator.tick();
+        assert_eq!(initiator.pending_requests.len(), 1);
     }
 
     #[test]

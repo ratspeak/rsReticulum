@@ -95,7 +95,13 @@ impl DeferredRequestResponder {
             return Err(DeferredResponseError::Closed);
         }
         let capacity = match &outcome {
-            RequestOutcome::Reply(data) => Some(data.capacity()),
+            RequestOutcome::ReplyBytes(data) | RequestOutcome::ReplyValue(data) => {
+                Some(data.capacity())
+            }
+            // The file source is streamed; only the metadata is held here.
+            RequestOutcome::ReplyFile { metadata, .. } => {
+                Some(metadata.as_ref().map_or(0, Vec::capacity))
+            }
             RequestOutcome::ReplyWithResource {
                 ack,
                 data,
@@ -232,7 +238,9 @@ mod tests {
         assert_eq!(counts.lock().unwrap().jobs, 1);
         assert!(worker.is_cancelled());
         assert_eq!(
-            worker.respond(RequestOutcome::Reply(vec![1])).unwrap_err(),
+            worker
+                .respond(RequestOutcome::ReplyBytes(vec![1]))
+                .unwrap_err(),
             DeferredResponseError::Closed
         );
         assert_eq!(counts.lock().unwrap().jobs, 0);
@@ -248,7 +256,9 @@ mod tests {
         let (worker, pending) = jobs.pop().unwrap();
         let bytes = Vec::with_capacity(101);
         assert_eq!(
-            worker.respond(RequestOutcome::Reply(bytes)).unwrap_err(),
+            worker
+                .respond(RequestOutcome::ReplyBytes(bytes))
+                .unwrap_err(),
             DeferredResponseError::TooLarge
         );
         drop(pending);
@@ -270,7 +280,9 @@ mod tests {
         .unwrap();
         assert!(worker.is_cancelled());
         assert_eq!(
-            worker.respond(RequestOutcome::Reply(vec![1])).unwrap_err(),
+            worker
+                .respond(RequestOutcome::ReplyBytes(vec![1]))
+                .unwrap_err(),
             DeferredResponseError::Closed
         );
         drop(pending);
@@ -282,7 +294,7 @@ mod tests {
         let counts = Arc::new(Mutex::new(Counts::default()));
         let (worker, mut pending) =
             reserve_with(counts.clone(), 10, 100, Arc::new(Notify::new())).unwrap();
-        let mut ack = worker.respond(RequestOutcome::Reply(vec![1])).unwrap();
+        let mut ack = worker.respond(RequestOutcome::ReplyBytes(vec![1])).unwrap();
         assert_eq!(counts.lock().unwrap().jobs, 1);
         let resolution = pending.try_recv().unwrap();
         let resource_lease = pending.lease();

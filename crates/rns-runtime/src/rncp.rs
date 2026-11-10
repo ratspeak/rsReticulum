@@ -334,7 +334,7 @@ pub async fn spawn_rncp_listener(
                             link_id,
                             reason: "not in allow-list".into(),
                         });
-                        return RequestOutcome::Reply(vec![REQ_FETCH_NOT_ALLOWED]);
+                        return RequestOutcome::ReplyValue(vec![REQ_FETCH_NOT_ALLOWED]);
                     }
                 }
             }
@@ -358,11 +358,11 @@ pub async fn spawn_rncp_listener(
                             auto_compress,
                         }
                     }
-                    Err(_) => RequestOutcome::Reply(vec![0xC2]), // msgpack `false`
+                    Err(_) => RequestOutcome::ReplyValue(vec![0xC2]), // msgpack `false`
                 },
                 Err(reason) => {
                     let _ = fetch_events.try_send(RncpEvent::FetchDenied { link_id, reason });
-                    RequestOutcome::Reply(vec![REQ_FETCH_NOT_ALLOWED])
+                    RequestOutcome::ReplyValue(vec![REQ_FETCH_NOT_ALLOWED])
                 }
             }
         });

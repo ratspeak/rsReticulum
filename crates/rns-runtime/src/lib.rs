@@ -44,9 +44,9 @@ pub mod prelude {
     pub use crate::link_session::{
         LinkSession, LinkSessionChannelError, LinkSessionChannelHandle, LinkSessionCloseReason,
         LinkSessionError, LinkSessionEvent, LinkSessionHandle, LinkSessionResourceError,
-        LinkSessionResourceOffer, LinkSessionResponse,
+        LinkSessionResourceOffer, LinkSessionResponse, RequestOptions,
     };
-    pub use crate::resource_source::{ResourceOptions, ResourceSource};
+    pub use crate::resource_source::{AutoCompress, ResourceOptions, ResourceSource};
     pub use crate::reticulum::{
         AnnounceSubscription, ControlError, InitOptions, InterfaceStats, LinkConnectError,
         LinkConnectOptions, OutboundPacket, PacketReceiptHandle, PacketReceiptStatus,

@@ -72,6 +72,7 @@ impl LinkClient {
     /// Open a Link to `app_name` on the supplied identity hash, identify the local
     /// identity, send one request and return its response bytes. For the current
     /// remote-management service, this is the remote transport identity hash.
+    /// `payload` is one encoded MessagePack value, or empty to send nil.
     ///
     /// `overall_timeout` supplies remaining budgets for discovery, Link proof and
     /// response waits. Registration, endpoint binding, sends and teardown can
@@ -200,8 +201,10 @@ impl LinkClient {
         self.send_link_packet(link_id, identify_pkt).await?;
 
         let req_timeout = Duration::from_secs(5);
+        // An empty payload sends nil, as Link.request(path) does.
+        let packed_data = (!payload.is_empty()).then_some(payload.as_slice());
         let (encrypted_req, request_id) = link
-            .request(path, Some(&payload), req_timeout)
+            .request(path, packed_data, req_timeout)
             .map_err(|e| LinkClientError::LinkCrypto(format!("request: {e:?}")))?;
         let request_pkt = build_data_packet(
             link_id,
@@ -303,10 +306,26 @@ async fn wait_for_response(
     request_id: [u8; 16],
     deadline: Duration,
 ) -> Result<Vec<u8>, LinkClientError> {
-    let fut = async {
-        let mut inbound_resources: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
-
+    // The request deadline applies until a response Resource is accepted;
+    // after that the Resource watchdog ends a stalled transfer (Link.py:1475-1522).
+    let deadline_at = Instant::now() + deadline;
+    let mut inbound_resources: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
+    // Split response: segment payloads in order, file metadata flag of segment 1.
+    let mut split_response: Vec<u8> = Vec::new();
+    let mut segments: HashMap<[u8; 32], (usize, usize, bool)> = HashMap::new();
+    let mut completed_segments = 0usize;
+    let mut receiving = false;
+    {
         loop {
+            let wait = if !receiving {
+                let remaining = deadline_at.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(LinkClientError::Timeout("response"));
+                }
+                remaining.min(WATCHDOG_TICK)
+            } else {
+                WATCHDOG_TICK
+            };
             let ev = tokio::select! {
                 event = endpoint.delivery_rx.recv() => event.ok_or_else(|| LinkClientError::HandshakeFailed(
                     "destination channel closed".into(),
@@ -315,6 +334,11 @@ async fn wait_for_response(
                     return Err(LinkClientError::HandshakeFailed(format!(
                         "link endpoint terminated: {terminal:?}"
                     )));
+                }
+                _ = tokio::time::sleep(wait) => {
+                    poll_response_resources(transport_tx, link, link_id, &mut inbound_resources)
+                        .await?;
+                    continue;
                 }
             };
             match ev {
@@ -372,19 +396,31 @@ async fn wait_for_response(
                             {
                                 continue;
                             }
+                            // Segments are appended as they complete, so only the next one fits.
+                            if adv.total_segments > rns_protocol::resource::MAX_SEGMENTS
+                                || adv.segment_index != completed_segments + 1
+                                || adv.segment_index > adv.total_segments
+                            {
+                                continue;
+                            }
 
                             let mut random_hash = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
                             let copy_len = adv.random_hash.len().min(random_hash.len());
                             random_hash[..copy_len].copy_from_slice(&adv.random_hash[..copy_len]);
 
                             let rtt = link.rtt.unwrap_or(Duration::from_millis(500));
+                            let mut flags = adv.flags;
+                            // Only segment 1 carries metadata bytes (Resource.py:718).
+                            if adv.segment_index > 1 {
+                                flags.has_metadata = false;
+                            }
                             let mut transfer = InboundTransfer::from_advertisement(
                                 adv.num_parts,
                                 adv.transfer_size,
                                 adv.data_size,
                                 random_hash,
                                 adv.resource_hash,
-                                adv.flags,
+                                flags,
                                 adv.get_map_hashes(),
                                 rtt,
                             )
@@ -406,6 +442,15 @@ async fn wait_for_response(
                                 .await?;
                             }
 
+                            receiving = true;
+                            segments.insert(
+                                adv.resource_hash,
+                                (
+                                    adv.segment_index,
+                                    adv.total_segments,
+                                    adv.flags.has_metadata,
+                                ),
+                            );
                             inbound_resources.insert(adv.resource_hash, transfer);
                         }
                         rns_wire::context::PacketContext::Resource => {
@@ -487,6 +532,19 @@ async fn wait_for_response(
 
                                 send_link_proof(transport_tx, link_id, &proof).await?;
                                 inbound_resources.remove(&rh);
+                                let (segment_index, total_segments, file_response) =
+                                    segments.remove(&rh).unwrap_or((1, 1, false));
+                                split_response.extend_from_slice(&assembled);
+                                completed_segments = segment_index;
+                                if segment_index < total_segments {
+                                    continue;
+                                }
+                                let assembled = std::mem::take(&mut split_response);
+                                // Link.response_resource_concluded: metadata marks a file response.
+                                if file_response {
+                                    link.deliver_response_data(&request_id, Vec::new());
+                                    return Ok(assembled);
+                                }
                                 match link.handle_response_plaintext(&assembled) {
                                     Ok((id, response_data)) => {
                                         if id == request_id {
@@ -566,10 +624,54 @@ async fn wait_for_response(
                 _ => {}
             }
         }
-    };
-    timeout(deadline, fut)
-        .await
-        .map_err(|_| LinkClientError::Timeout("response"))?
+    }
+}
+
+const WATCHDOG_TICK: Duration = Duration::from_secs(1);
+
+async fn poll_response_resources(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    link: &mut Link,
+    link_id: [u8; 16],
+    inbound_resources: &mut HashMap<[u8; 32], InboundTransfer>,
+) -> Result<(), LinkClientError> {
+    let actions: Vec<TransferAction> = inbound_resources
+        .values_mut()
+        .map(InboundTransfer::check_timeout)
+        .collect();
+    for action in actions {
+        match action {
+            TransferAction::Failed(reason) => {
+                return Err(LinkClientError::UnexpectedResponse(format!(
+                    "resource transfer failed: {reason}"
+                )));
+            }
+            TransferAction::SendRequest(req) => {
+                send_link_data(
+                    transport_tx,
+                    link,
+                    link_id,
+                    rns_wire::context::PacketContext::ResourceReq,
+                    &req,
+                    true,
+                )
+                .await?;
+            }
+            TransferAction::SendHmu(hmu) => {
+                send_link_data(
+                    transport_tx,
+                    link,
+                    link_id,
+                    rns_wire::context::PacketContext::ResourceHmu,
+                    &hmu,
+                    true,
+                )
+                .await?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 async fn send_link_data(

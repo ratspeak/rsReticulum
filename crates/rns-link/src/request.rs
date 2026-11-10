@@ -94,9 +94,21 @@ impl RequestReceipt {
         }
     }
 
+    /// Only a request still waiting for its response can time out. Once a
+    /// response Resource is being received, its own watchdogs end it.
     pub fn is_timed_out(&self) -> bool {
-        matches!(self.state, RequestState::Sent | RequestState::Receiving)
-            && self.sent_at.elapsed() >= self.timeout
+        self.state == RequestState::Sent && self.sent_at.elapsed() >= self.timeout
+    }
+
+    /// Enter `Receiving` when a response Resource is accepted. Returns `false`
+    /// if the receipt is no longer pending, so the caller cancels the Resource.
+    pub fn mark_receiving(&mut self) -> bool {
+        if self.is_pending() {
+            self.state = RequestState::Receiving;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn is_pending(&self) -> bool {
@@ -326,21 +338,20 @@ mod tests {
     }
 
     #[test]
-    fn test_receiving_request_times_out_and_fires_failure_callback() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let fired = Arc::new(AtomicBool::new(false));
-        let callback_fired = fired.clone();
+    fn receiving_request_is_not_timed_out() {
         let mut receipt = RequestReceipt::new([0x77; 32], [0x88; 16], Duration::ZERO);
-        receipt.state = RequestState::Receiving;
-        receipt.set_failed_callback(move |receipt| {
-            assert_eq!(receipt.state, RequestState::Failed);
-            callback_fired.store(true, Ordering::SeqCst);
-        });
+        assert!(receipt.mark_receiving());
+        assert_eq!(receipt.state, RequestState::Receiving);
 
-        assert!(receipt.check_timeout());
-        assert!(fired.load(Ordering::SeqCst));
-        assert!(!receipt.is_pending());
+        assert!(!receipt.check_timeout());
+        assert!(receipt.is_pending());
+    }
+
+    #[test]
+    fn failed_request_does_not_enter_receiving() {
+        let mut receipt = RequestReceipt::new([0x77; 32], [0x88; 16], Duration::ZERO);
+        receipt.fail();
+        assert!(!receipt.mark_receiving());
+        assert_eq!(receipt.state, RequestState::Failed);
     }
 }

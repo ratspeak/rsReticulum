@@ -7,7 +7,8 @@
 //! queue can stall the actor, including its protocol timers and close handling.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Cursor;
+use std::io::{Cursor, Write};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -141,13 +142,47 @@ pub struct LinkSessionPacketReceipt {
     pub packet_hash: [u8; 32],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LinkSessionResponse {
     pub request_id: [u8; 16],
+    /// Byte view of the response: binary and string contents as-is, any other
+    /// value re-encoded as MessagePack. For a file response, the file bytes,
+    /// unless they were spooled to `file`.
     pub data: Vec<u8>,
-    /// Metadata attached to a file-style Resource response.
+    /// The response value as sent, e.g. `Value::Binary` for Python `bytes`.
+    /// `Value::Nil` for a file response.
+    pub value: rmpv::Value,
+    /// Packed metadata of a file response; `None` for ordinary responses.
     pub metadata: Option<Vec<u8>>,
+    /// Spooled response data: always for a file response (one with
+    /// metadata), and for other Resource responses when
+    /// [`RequestOptions::spool_dir`] is set. The caller owns and removes it.
+    pub file: Option<PathBuf>,
     pub response_time: Duration,
+    /// RequestReceipt.response_size: the advertised response data size.
+    pub response_size: Option<u64>,
+    /// RequestReceipt.response_transfer_size: bytes on the wire.
+    pub response_transfer_size: Option<u64>,
+    /// RequestReceipt.started_at: request sent, or request Resource delivered.
+    pub started_at: Option<Instant>,
+    /// RequestReceipt.response_concluded_at.
+    pub response_concluded_at: Option<Instant>,
+}
+
+/// Options for [`LinkSessionHandle::request_with_options`], as the optional
+/// arguments of Link.request.
+#[derive(Debug, Clone, Default)]
+pub struct RequestOptions {
+    /// `None` selects the Link's RTT-based response timeout.
+    pub timeout: Option<Duration>,
+    /// Larger responses are rejected and fail the request.
+    pub max_response_size: Option<usize>,
+    /// Receives response Resource progress in `[0.0, 1.0]`.
+    pub progress: Option<watch::Sender<f64>>,
+    /// Directory for spooled responses. File responses are always spooled,
+    /// by default to the system temporary directory; with this set, other
+    /// Resource responses are spooled too instead of held in memory.
+    pub spool_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +279,8 @@ pub struct LinkSessionReceivedResource {
     pub link_id: [u8; 16],
     pub resource_id: [u8; 32],
     pub data: Vec<u8>,
+    /// Set instead of `data` when a request response was spooled to disk.
+    pub file: Option<PathBuf>,
     pub metadata: Option<Vec<u8>>,
     pub total_segments: usize,
     pub request_id: Option<Vec<u8>>,
@@ -484,6 +521,8 @@ pub enum LinkSessionError {
     RequestResourceFailed(String),
     #[error("too many Link requests are already pending")]
     TooManyPendingRequests,
+    #[error("response of {size} bytes exceeds the {max}-byte limit")]
+    ResponseRejected { size: u64, max: usize },
     #[error("Link session task is no longer running")]
     SessionClosed,
 }
@@ -495,8 +534,8 @@ enum LinkSessionCommand {
     },
     Request {
         path: String,
-        data: Vec<u8>,
-        timeout: Option<Duration>,
+        data: rmpv::Value,
+        options: RequestOptions,
         result_tx: oneshot::Sender<Result<LinkSessionResponse, LinkSessionError>>,
     },
     RequestResourceConcluded {
@@ -586,6 +625,72 @@ struct ResourceStartInfo {
 struct PendingSessionRequest {
     sent_at: Instant,
     result_tx: oneshot::Sender<Result<LinkSessionResponse, LinkSessionError>>,
+    max_response_size: Option<usize>,
+    progress_tx: Option<watch::Sender<f64>>,
+    spool_dir: Option<PathBuf>,
+    response_size: Option<u64>,
+    response_transfer_size: Option<u64>,
+    started_at: Option<Instant>,
+}
+
+impl PendingSessionRequest {
+    fn new(
+        result_tx: oneshot::Sender<Result<LinkSessionResponse, LinkSessionError>>,
+        options: RequestOptions,
+        sent_as_packet: bool,
+    ) -> Self {
+        let now = Instant::now();
+        Self {
+            sent_at: now,
+            result_tx,
+            max_response_size: options.max_response_size,
+            progress_tx: options.progress,
+            spool_dir: options.spool_dir,
+            response_size: None,
+            response_transfer_size: None,
+            started_at: sent_as_packet.then_some(now),
+        }
+    }
+
+    fn add_transfer_size(&mut self, size: usize) {
+        let total = self.response_transfer_size.get_or_insert(0);
+        *total = total.saturating_add(size as u64);
+    }
+
+    fn into_response(
+        self,
+        request_id: [u8; 16],
+        body: ResponseBody,
+    ) -> (
+        oneshot::Sender<Result<LinkSessionResponse, LinkSessionError>>,
+        LinkSessionResponse,
+    ) {
+        let response = LinkSessionResponse {
+            request_id,
+            data: body.data,
+            value: body.value,
+            metadata: body.metadata,
+            file: body.file,
+            response_time: self.sent_at.elapsed(),
+            response_size: self.response_size,
+            response_transfer_size: self.response_transfer_size,
+            started_at: self.started_at,
+            response_concluded_at: Some(Instant::now()),
+        };
+        (self.result_tx, response)
+    }
+}
+
+struct ResponseBody {
+    data: Vec<u8>,
+    value: rmpv::Value,
+    metadata: Option<Vec<u8>>,
+    file: Option<PathBuf>,
+}
+
+struct ResponseSpool {
+    path: PathBuf,
+    file: std::fs::File,
 }
 
 struct SessionOutboundResource {
@@ -627,11 +732,13 @@ struct SessionInboundLogical {
     current_segment: Option<[u8; 32]>,
     reported_bytes: usize,
     reported_progress: f64,
+    spool: Option<ResponseSpool>,
 }
 
 struct InboundResourceLifecycle {
     progress_tx: watch::Sender<f64>,
     conclusion_tx: oneshot::Sender<Result<LinkSessionReceivedResource, LinkSessionResourceError>>,
+    spool: Option<ResponseSpool>,
 }
 
 struct InboundResourceSinks<'a> {
@@ -906,18 +1013,42 @@ impl LinkSessionHandle {
     /// does not bound queueing, transfer or every transport wait. Apply a caller
     /// deadline when needed. Dropping this future does not cancel an admitted
     /// request or its remote work. At most 64 requests may be pending.
+    /// `data` is sent as a byte string (Python `bytes`); use
+    /// [`Self::request_with_options`] to send another MessagePack value.
     pub async fn request(
         &self,
         path: &str,
         data: &[u8],
         timeout: Option<Duration>,
     ) -> Result<LinkSessionResponse, LinkSessionError> {
+        self.request_with_options(
+            path,
+            rmpv::Value::Binary(data.to_vec()),
+            RequestOptions {
+                timeout,
+                ..RequestOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Send a request whose data is packed by type, as Link.request packs
+    /// `data` (`Value::Nil` for none), and wait for its response.
+    ///
+    /// Once a response Resource is accepted the request timeout no longer
+    /// applies; the Resource's own watchdogs end a stalled transfer.
+    pub async fn request_with_options(
+        &self,
+        path: &str,
+        data: rmpv::Value,
+        options: RequestOptions,
+    ) -> Result<LinkSessionResponse, LinkSessionError> {
         let (result_tx, result_rx) = oneshot::channel();
         self.command_tx
             .send(LinkSessionCommand::Request {
                 path: path.to_string(),
-                data: data.to_vec(),
-                timeout,
+                data,
+                options,
                 result_tx,
             })
             .await
@@ -1287,7 +1418,7 @@ async fn run_session_actor(
                     Some(LinkSessionCommand::Request {
                         path,
                         data,
-                        timeout,
+                        options,
                         result_tx,
                     }) => {
                         if state.requests.len() >= MAX_PENDING_REQUESTS {
@@ -1305,15 +1436,12 @@ async fn run_session_actor(
                             },
                             &path,
                             &data,
-                            timeout,
+                            options.timeout,
                         ).await {
-                            Ok(request_id) => {
+                            Ok((request_id, sent_as_packet)) => {
                                 state.requests.insert(
                                     request_id,
-                                    PendingSessionRequest {
-                                        sent_at: Instant::now(),
-                                        result_tx,
-                                    },
+                                    PendingSessionRequest::new(result_tx, options, sent_as_packet),
                                 );
                             }
                             Err(error) => {
@@ -1340,6 +1468,9 @@ async fn run_session_actor(
                             );
                         } else {
                             let _ = link.mark_request_resource_sent(&request_id);
+                            if let Some(pending) = state.requests.get_mut(&request_id) {
+                                pending.started_at.get_or_insert_with(Instant::now);
+                            }
                         }
                     }
                     Some(LinkSessionCommand::RequestResourceReceived {
@@ -1506,6 +1637,10 @@ async fn run_session_actor(
         }
     };
 
+    command_rx.close();
+    while let Ok(command) = command_rx.try_recv() {
+        discard_undelivered_spool(&command);
+    }
     state.channel.shutdown();
     fail_pending_requests(&mut state.requests, &event_tx);
     fail_outbound_resources(&mut link, &mut state.resources, &event_tx);
@@ -1748,6 +1883,7 @@ async fn handle_resource_command(
                 InboundResourceLifecycle {
                     progress_tx,
                     conclusion_tx,
+                    spool: None,
                 },
             )
             .await;
@@ -2422,6 +2558,7 @@ async fn accept_inbound_offer(
             current_segment: Some(segment_hash),
             reported_bytes: 0,
             reported_progress: 0.0,
+            spool: lifecycle.spool,
         },
     );
     resources.inbound.insert(
@@ -2493,6 +2630,11 @@ fn conclude_inbound_resource(
     let Some(logical) = resources.inbound_logicals.remove(&resource_id) else {
         return;
     };
+    if result.is_err()
+        && let Some(spool) = logical.spool
+    {
+        let _ = std::fs::remove_file(spool.path);
+    }
     let succeeded = result.is_ok();
     let _ = logical.conclusion_tx.send(result);
     let _ = event_tx.try_send(LinkSessionEvent::ResourceConcluded {
@@ -2606,7 +2748,7 @@ async fn process_inbound_resource_advertisement(
     attached_interface: InterfaceId,
     link: &mut Link,
     resources: &mut SessionResources,
-    pending_requests: &HashMap<[u8; 16], PendingSessionRequest>,
+    pending_requests: &mut HashMap<[u8; 16], PendingSessionRequest>,
     sinks: InboundResourceSinks<'_>,
     encrypted_advertisement: &[u8],
 ) -> bool {
@@ -2667,6 +2809,15 @@ async fn process_inbound_resource_advertisement(
     }
 
     if resources.inbound_logicals.contains_key(&resource_id) {
+        if advertisement.flags.is_response
+            && let Some(pending) = advertisement
+                .request_id
+                .as_deref()
+                .and_then(|id| <[u8; 16]>::try_from(id).ok())
+                .and_then(|id| pending_requests.get_mut(&id))
+        {
+            pending.add_transfer_size(advertisement.transfer_size);
+        }
         return match accept_followup_inbound_segment(
             transport_tx,
             attached_interface,
@@ -2723,6 +2874,53 @@ async fn process_inbound_resource_advertisement(
         {
             return false;
         }
+        let pending = pending_requests
+            .get_mut(&request_id)
+            .expect("pending request checked above");
+        if let Some(max) = pending.max_response_size
+            && advertisement.data_size > max
+        {
+            let size = advertisement.data_size as u64;
+            let transport_failed = matches!(
+                send_resource_action(
+                    transport_tx,
+                    attached_interface,
+                    link,
+                    TransferAction::SendCancel(CancelType::Rcl, segment_hash),
+                )
+                .await,
+                Err(LinkSessionResourceError::TransportUnavailable)
+            );
+            tracing::debug!(size, max, "rejected response with excessive size");
+            fail_session_request(
+                link,
+                pending_requests,
+                sinks.event_tx,
+                request_id,
+                LinkSessionError::ResponseRejected { size, max },
+            );
+            return transport_failed;
+        }
+        if !link.mark_request_receiving(&request_id) {
+            return false;
+        }
+        pending
+            .response_size
+            .get_or_insert(advertisement.data_size as u64);
+        pending.add_transfer_size(advertisement.transfer_size);
+        pending.started_at.get_or_insert_with(Instant::now);
+        let progress_tx = pending
+            .progress_tx
+            .clone()
+            .unwrap_or_else(|| watch::channel(0.0).0);
+        // A file response is handed over as a file, as Resource.assemble does;
+        // other responses are unpacked in memory unless a spool dir is given.
+        let spool = pending
+            .spool_dir
+            .clone()
+            .or_else(|| advertisement.flags.has_metadata.then(std::env::temp_dir))
+            .and_then(|dir| open_response_spool(&dir, &resource_id));
+        let spool_path = spool.as_ref().map(|spool| spool.path.clone());
 
         resources.pending_inbound.insert(
             segment_hash,
@@ -2731,7 +2929,6 @@ async fn process_inbound_resource_advertisement(
                 offered_at: Instant::now(),
             },
         );
-        let (progress_tx, _progress_rx) = watch::channel(0.0);
         let (conclusion_tx, conclusion_rx) = oneshot::channel();
         let result = accept_inbound_offer(
             transport_tx,
@@ -2743,17 +2940,26 @@ async fn process_inbound_resource_advertisement(
             InboundResourceLifecycle {
                 progress_tx,
                 conclusion_tx,
+                spool,
             },
         )
         .await;
+        if result.is_err()
+            && let Some(path) = spool_path
+        {
+            let _ = std::fs::remove_file(path);
+        }
         let completion_tx = sinks.command_tx.clone();
         tokio::spawn(async move {
             let result = conclusion_rx
                 .await
                 .unwrap_or(Err(LinkSessionResourceError::SessionClosed));
-            let _ = completion_tx
+            if let Err(mpsc::error::SendError(command)) = completion_tx
                 .send(LinkSessionCommand::RequestResourceReceived { request_id, result })
-                .await;
+                .await
+            {
+                discard_undelivered_spool(&command);
+            }
         });
         return matches!(result, Err(LinkSessionResourceError::TransportUnavailable));
     }
@@ -2935,7 +3141,18 @@ async fn complete_inbound_segment(
     let mut coordinator_error = None;
     if let Some(logical) = resources.inbound_logicals.get_mut(&resource_id) {
         logical.current_segment = None;
-        if let Some(coordinator) = logical.coordinator.as_mut() {
+        // A spooled response keeps only segment order in memory.
+        let data = match logical.spool.as_mut() {
+            Some(spool) => {
+                if let Err(error) = spool.file.write_all(&data) {
+                    coordinator_error = Some(error.to_string());
+                }
+                Vec::new()
+            }
+            None => data,
+        };
+        if coordinator_error.is_some() {
+        } else if let Some(coordinator) = logical.coordinator.as_mut() {
             if let Err(error) = coordinator.set_segment_data(segment_index, data) {
                 coordinator_error = Some(error.to_string());
             } else {
@@ -2973,10 +3190,12 @@ async fn complete_inbound_segment(
     let Some(logical) = resources.inbound_logicals.get(&resource_id) else {
         return false;
     };
+    let file = logical.spool.as_ref().map(|spool| spool.path.clone());
     let received = LinkSessionReceivedResource {
         link_id: link.link_id,
         resource_id,
         data,
+        file,
         metadata: complete_metadata,
         total_segments: logical.total_segments,
         request_id: logical.request_id.clone(),
@@ -3354,9 +3573,9 @@ async fn resend_timed_out_channel_messages(
 async fn send_link_request(
     context: SessionRequestContext<'_>,
     path: &str,
-    data: &[u8],
+    data: &rmpv::Value,
     timeout: Option<Duration>,
-) -> Result<[u8; 16], LinkSessionError> {
+) -> Result<([u8; 16], bool), LinkSessionError> {
     let SessionRequestContext {
         transport_tx,
         attached_interface,
@@ -3370,7 +3589,7 @@ async fn send_link_request(
     }
     let timeout = timeout.unwrap_or_else(|| link.default_request_timeout());
     let (packed, initial_request_id) = link
-        .prepare_request(path, Some(data), timeout)
+        .prepare_request_value(path, data, timeout)
         .map_err(|_| LinkSessionError::LinkCrypto)?;
 
     if packed.len() > link.mdu {
@@ -3391,7 +3610,7 @@ async fn send_link_request(
             return Err(LinkSessionError::LinkCrypto);
         };
         let rtt = Duration::from_secs_f64(link.rtt_secs().max(0.001));
-        let segment = source
+        let mut segment = source
             .next_segment(&keys, rtt)
             .map_err(|error| {
                 link.fail_pending_request(&initial_request_id);
@@ -3403,6 +3622,8 @@ async fn send_link_request(
                     "request Resource source produced no segment".into(),
                 )
             })?;
+        // Link.request passes its timeout to the request Resource.
+        segment.transfer.advertisement_timeout = Some(timeout);
         let (progress_tx, _progress_rx) = watch::channel(0.0);
         let (conclusion_tx, conclusion_rx) = oneshot::channel();
         let mut outbound =
@@ -3441,7 +3662,7 @@ async fn send_link_request(
                 })
                 .await;
         });
-        return Ok(initial_request_id);
+        return Ok((initial_request_id, false));
     }
 
     let encrypted = match link.encrypt(&packed) {
@@ -3467,7 +3688,7 @@ async fn send_link_request(
         return Err(error);
     }
     link.record_tx(encrypted.len());
-    Ok(request_id)
+    Ok((request_id, true))
 }
 
 fn reap_concluded_requests(
@@ -3510,6 +3731,7 @@ fn conclude_request_resource_response(
     result: Result<LinkSessionReceivedResource, LinkSessionResourceError>,
 ) {
     if !pending_requests.contains_key(&request_id) {
+        remove_spooled_response(&result);
         return;
     }
     let received = match result {
@@ -3521,6 +3743,7 @@ fn conclude_request_resource_response(
             received
         }
         Ok(_) => {
+            remove_spooled_response(&result);
             fail_session_request(
                 link,
                 pending_requests,
@@ -3544,11 +3767,36 @@ fn conclude_request_resource_response(
         }
     };
 
-    let (response_data, metadata) = if received.metadata.is_some() {
-        (received.data, received.metadata)
+    let body = if received.metadata.is_some() {
+        // Link.response_resource_concluded: metadata marks a file response.
+        ResponseBody {
+            data: received.data,
+            value: rmpv::Value::Nil,
+            metadata: received.metadata,
+            file: received.file,
+        }
     } else {
-        let Ok((packed_request_id, response_data)) = Link::parse_response_plaintext(&received.data)
-        else {
+        let packed = match &received.file {
+            Some(path) => {
+                let read = std::fs::read(path);
+                let _ = std::fs::remove_file(path);
+                match read {
+                    Ok(packed) => packed,
+                    Err(error) => {
+                        fail_session_request(
+                            link,
+                            pending_requests,
+                            event_tx,
+                            request_id,
+                            LinkSessionError::RequestResourceFailed(error.to_string()),
+                        );
+                        return;
+                    }
+                }
+            }
+            None => received.data,
+        };
+        let Ok((packed_request_id, value)) = Link::parse_response_value(&packed) else {
             fail_session_request(
                 link,
                 pending_requests,
@@ -3572,10 +3820,71 @@ fn conclude_request_resource_response(
             );
             return;
         }
-        (response_data, None)
+        ResponseBody {
+            data: rns_link::link::value_bytes_view(&value).unwrap_or_default(),
+            value,
+            metadata: None,
+            file: None,
+        }
     };
 
-    if !link.deliver_response_data(&request_id, response_data.clone()) {
+    deliver_session_response(link, pending_requests, event_tx, request_id, body);
+}
+
+/// Link.handle_response for a single-packet response, with the
+/// max_response_size check applied to `len(packb(response)) - 2`.
+fn conclude_packet_response(
+    link: &mut Link,
+    pending_requests: &mut HashMap<[u8; 16], PendingSessionRequest>,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+    request_id: [u8; 16],
+    value: rmpv::Value,
+) {
+    let Some(pending) = pending_requests.get_mut(&request_id) else {
+        return;
+    };
+    let mut packed = Vec::new();
+    let _ = rmpv::encode::write_value(&mut packed, &value);
+    let size = packed.len().saturating_sub(2);
+    pending.response_size = Some(size as u64);
+    pending.add_transfer_size(size);
+    if let Some(max) = pending.max_response_size
+        && size > max
+    {
+        tracing::debug!(size, max, "rejected response with excessive size");
+        fail_session_request(
+            link,
+            pending_requests,
+            event_tx,
+            request_id,
+            LinkSessionError::ResponseRejected {
+                size: size as u64,
+                max,
+            },
+        );
+        return;
+    }
+    let body = ResponseBody {
+        data: rns_link::link::value_bytes_view(&value).unwrap_or_default(),
+        value,
+        metadata: None,
+        file: None,
+    };
+    deliver_session_response(link, pending_requests, event_tx, request_id, body);
+}
+
+fn deliver_session_response(
+    link: &mut Link,
+    pending_requests: &mut HashMap<[u8; 16], PendingSessionRequest>,
+    event_tx: &mpsc::Sender<LinkSessionEvent>,
+    request_id: [u8; 16],
+    body: ResponseBody,
+) {
+    // The response goes to the caller directly; the receipt keeps no copy.
+    if !link.deliver_response_data(&request_id, Vec::new()) {
+        if let Some(path) = &body.file {
+            let _ = std::fs::remove_file(path);
+        }
         fail_session_request(
             link,
             pending_requests,
@@ -3586,19 +3895,61 @@ fn conclude_request_resource_response(
         return;
     }
     let Some(pending) = pending_requests.remove(&request_id) else {
+        if let Some(path) = &body.file {
+            let _ = std::fs::remove_file(path);
+        }
         return;
     };
-    let response = LinkSessionResponse {
-        request_id,
-        data: response_data,
-        metadata,
-        response_time: pending.sent_at.elapsed(),
-    };
-    let _ = pending.result_tx.send(Ok(response));
+    if let Some(progress_tx) = &pending.progress_tx {
+        progress_tx.send_replace(1.0);
+    }
+    let (result_tx, response) = pending.into_response(request_id, body);
+    if let Err(Ok(response)) = result_tx.send(Ok(response))
+        && let Some(path) = response.file
+    {
+        // The requester is gone, so nobody else can remove the file.
+        let _ = std::fs::remove_file(path);
+    }
     let _ = event_tx.try_send(LinkSessionEvent::RequestConcluded {
         request_id,
         succeeded: true,
     });
+}
+
+fn open_response_spool(dir: &std::path::Path, resource_id: &[u8; 32]) -> Option<ResponseSpool> {
+    // The id is chosen by the peer and the directory may be shared: never
+    // reuse or follow an existing entry.
+    let nonce = rns_crypto::random::random_bytes(8);
+    let path = dir.join(format!(
+        "{}-{}",
+        hex::encode(resource_id),
+        hex::encode(nonce)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    match options.open(&path) {
+        Ok(file) => Some(ResponseSpool { path, file }),
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "response spool unavailable; receiving in memory");
+            None
+        }
+    }
+}
+
+fn remove_spooled_response(result: &Result<LinkSessionReceivedResource, LinkSessionResourceError>) {
+    if let Ok(received) = result
+        && let Some(path) = &received.file
+    {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn discard_undelivered_spool(command: &LinkSessionCommand) {
+    if let LinkSessionCommand::RequestResourceReceived { result, .. } = command {
+        remove_spooled_response(result);
+    }
 }
 
 fn fail_session_request(
@@ -3794,20 +4145,17 @@ async fn process_destination_event(
                 rns_wire::context::PacketContext::Response => {
                     link.record_inbound();
                     link.record_rx(body.len());
-                    if let Ok((request_id, data)) = link.handle_response(body)
-                        && let Some(request) = state.requests.remove(&request_id)
+                    if let Ok(plaintext) = link.decrypt(body)
+                        && let Ok((request_id, value)) = Link::parse_response_value(&plaintext)
+                        && state.requests.contains_key(&request_id)
                     {
-                        let response = LinkSessionResponse {
+                        conclude_packet_response(
+                            link,
+                            &mut state.requests,
+                            event_tx,
                             request_id,
-                            data,
-                            metadata: None,
-                            response_time: request.sent_at.elapsed(),
-                        };
-                        let _ = request.result_tx.send(Ok(response));
-                        let _ = event_tx.try_send(LinkSessionEvent::RequestConcluded {
-                            request_id,
-                            succeeded: true,
-                        });
+                            value,
+                        );
                     }
                 }
                 rns_wire::context::PacketContext::None => {
@@ -3859,7 +4207,7 @@ async fn process_destination_event(
                         attached_interface,
                         link,
                         &mut state.resources,
-                        &state.requests,
+                        &mut state.requests,
                         InboundResourceSinks {
                             event_tx,
                             command_tx,
@@ -4363,7 +4711,7 @@ mod tests {
         let (command_tx, _command_rx) = mpsc::channel::<LinkSessionCommand>(4);
         let mut resources = SessionResources::default();
 
-        let request_id = send_link_request(
+        let (request_id, _) = send_link_request(
             SessionRequestContext {
                 transport_tx: &transport_tx,
                 attached_interface: 1,
@@ -4373,7 +4721,7 @@ mod tests {
                 command_tx: &command_tx,
             },
             "/large",
-            &payload,
+            &rmpv::Value::Binary(payload.clone()),
             Some(Duration::from_secs(1)),
         )
         .await
@@ -4414,18 +4762,23 @@ mod tests {
         responder.receive_rtt_packet(&rtt_data).unwrap();
 
         let (_packed_request, request_id) = initiator
-            .prepare_request("/large-response", Some(b""), Duration::from_secs(5))
+            .prepare_request_value(
+                "/large-response",
+                &rmpv::Value::Binary(Vec::new()),
+                Duration::from_secs(5),
+            )
             .unwrap();
         let (result_tx, result_rx) = oneshot::channel();
         let mut pending_requests = HashMap::from([(
             request_id,
-            PendingSessionRequest {
-                sent_at: Instant::now(),
-                result_tx,
-            },
+            PendingSessionRequest::new(result_tx, RequestOptions::default(), true),
         )]);
 
-        let packed_response = Link::pack_response(&request_id, b"resource response").unwrap();
+        let packed_response = Link::pack_response_value(
+            &request_id,
+            &rmpv::Value::Binary(b"resource response".to_vec()),
+        )
+        .unwrap();
         let mut response_sender = OutboundTransfer::new_encrypted(
             packed_response,
             false,
@@ -4451,7 +4804,7 @@ mod tests {
                 1,
                 &mut initiator,
                 &mut resources,
-                &pending_requests,
+                &mut pending_requests,
                 InboundResourceSinks {
                     event_tx: &event_tx,
                     command_tx: &command_tx,
@@ -4521,6 +4874,88 @@ mod tests {
         assert_eq!(response.metadata, None);
         assert!(pending_requests.is_empty());
         assert!(initiator.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn spooled_response_is_removed_unless_a_requester_receives_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "rns-response-spool-{}",
+            hex::encode(rns_crypto::random::random_bytes(8))
+        ));
+        std::fs::create_dir(&dir).unwrap();
+
+        let queued = open_response_spool(&dir, &[7; 32]).unwrap();
+        let orphaned = open_response_spool(&dir, &[7; 32]).unwrap();
+        assert_ne!(queued.path, orphaned.path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&queued.path)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        // A completion still queued when the session ends.
+        discard_undelivered_spool(&LinkSessionCommand::RequestResourceReceived {
+            request_id: [1; 16],
+            result: Ok(LinkSessionReceivedResource {
+                link_id: [0; 16],
+                resource_id: [7; 32],
+                data: Vec::new(),
+                file: Some(queued.path.clone()),
+                metadata: Some(vec![0x80]),
+                total_segments: 1,
+                request_id: Some(vec![1; 16]),
+                is_request: false,
+                is_response: true,
+            }),
+        });
+        assert!(!queued.path.exists());
+
+        // A requester that stopped waiting.
+        let destination_hash = [0xBE; 16];
+        let server_signing = Ed25519PrivateKey::generate();
+        let server_public = server_signing.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        let (_responder, proof_data) =
+            Link::new_responder(&request_data, &server_signing, destination_hash, 1).unwrap();
+        initiator
+            .validate_proof(&proof_data, &server_public, &server_public.to_bytes())
+            .unwrap();
+        let (_packed, request_id) = initiator
+            .prepare_request_value("/file", &rmpv::Value::Nil, Duration::from_secs(5))
+            .unwrap();
+        let (result_tx, result_rx) = oneshot::channel();
+        drop(result_rx);
+        let (progress_tx, progress_rx) = watch::channel(0.0);
+        let options = RequestOptions {
+            progress: Some(progress_tx),
+            ..RequestOptions::default()
+        };
+        let mut pending_requests = HashMap::from([(
+            request_id,
+            PendingSessionRequest::new(result_tx, options, true),
+        )]);
+        let (event_tx, _event_rx) = mpsc::channel::<LinkSessionEvent>(8);
+        deliver_session_response(
+            &mut initiator,
+            &mut pending_requests,
+            &event_tx,
+            request_id,
+            ResponseBody {
+                data: Vec::new(),
+                value: rmpv::Value::Nil,
+                metadata: Some(vec![0x80]),
+                file: Some(orphaned.path.clone()),
+            },
+        );
+        assert!(!orphaned.path.exists());
+        assert!(pending_requests.is_empty());
+        assert_eq!(*progress_rx.borrow(), 1.0);
+
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[tokio::test]
@@ -5112,7 +5547,7 @@ mod tests {
         let request_id =
             rns_wire::hash::truncated_packet_hash(&request.raw, request_header.flags.header_type);
         let response = responder
-            .create_response(&request_id, b"response body")
+            .create_response_value(&request_id, &rmpv::Value::Binary(b"response body".to_vec()))
             .unwrap();
         delivery_tx
             .send(DestinationEvent::InboundPacket {

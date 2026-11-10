@@ -1080,6 +1080,8 @@ impl LazyMultiSegmentOutbound {
         )?;
         resource.flags.split = true;
         resource.flags.is_response = self.is_response;
+        // Later segments advertise the metadata flag without carrying metadata.
+        resource.flags.has_metadata |= self.metadata_wire_size > 0;
         resource.segment_index = segment_index;
         resource.total_segments = self.total_segments;
         resource.request_id = self.request_id.clone();
@@ -1442,6 +1444,9 @@ pub struct OutboundTransfer {
     // requests and local polling are not Resource progress.
     last_progress: Instant,
     last_request_parts: usize,
+    /// Advertisement wait per attempt before PROCESSING_GRACE; `None` uses
+    /// `rtt * TRAFFIC_TIMEOUT_FACTOR`, as Resource does without a timeout.
+    pub advertisement_timeout: Option<Duration>,
 }
 
 impl OutboundTransfer {
@@ -1497,7 +1502,17 @@ impl OutboundTransfer {
             req_hashlist: HashSet::new(),
             last_progress: Instant::now(),
             last_request_parts: 0,
+            advertisement_timeout: None,
         }
+    }
+
+    fn advertisement_attempt_timeout(&self) -> Duration {
+        self.advertisement_timeout
+            .unwrap_or_else(|| {
+                self.rtt
+                    .saturating_mul(rns_link::constants::TRAFFIC_TIMEOUT_FACTOR as u32)
+            })
+            .saturating_add(Duration::from_secs_f64(PROCESSING_GRACE))
     }
 
     /// Advertise and drive bounded phase timeouts. Parts are emitted only in
@@ -1571,10 +1586,7 @@ impl OutboundTransfer {
             return TransferAction::None;
         }
 
-        let timeout = self
-            .rtt
-            .saturating_mul(rns_link::constants::TRAFFIC_TIMEOUT_FACTOR as u32)
-            .saturating_add(Duration::from_secs_f64(PROCESSING_GRACE));
+        let timeout = self.advertisement_attempt_timeout();
         if self.started_at.elapsed() <= timeout {
             return TransferAction::None;
         }
@@ -1606,10 +1618,7 @@ impl OutboundTransfer {
     pub fn timeout_window(&self) -> Option<(Instant, Duration)> {
         match self.resource.state {
             ResourceState::Advertised => {
-                let attempt = self
-                    .rtt
-                    .saturating_mul(rns_link::constants::TRAFFIC_TIMEOUT_FACTOR as u32)
-                    .saturating_add(Duration::from_secs_f64(PROCESSING_GRACE));
+                let attempt = self.advertisement_attempt_timeout();
                 Some((
                     self.started_at,
                     attempt.saturating_mul(
@@ -3071,6 +3080,26 @@ mod tests {
     }
 
     #[test]
+    fn explicit_advertisement_timeout_delays_readvertisement() {
+        let mut transfer =
+            OutboundTransfer::new(b"request body".to_vec(), false, Duration::from_millis(1))
+                .unwrap();
+        transfer.advertisement_timeout = Some(Duration::from_secs(30));
+        transfer.tick();
+
+        transfer.started_at = ago_or_skip!(Duration::from_secs(20));
+        assert!(matches!(transfer.check_timeout(), TransferAction::None));
+        assert_eq!(transfer.retries, 0);
+
+        transfer.started_at = ago_or_skip!(Duration::from_secs(32));
+        assert!(matches!(
+            transfer.check_timeout(),
+            TransferAction::SendAdvertisement(_)
+        ));
+        assert_eq!(transfer.retries, 1);
+    }
+
+    #[test]
     fn test_outbound_advertisement_watchdog_fails_after_retry_limit() {
         let mut transfer = OutboundTransfer::new(
             b"failed advertisement".to_vec(),
@@ -3953,7 +3982,8 @@ mod tests {
                 .is_some_and(|wire| wire.ends_with(&metadata))
         );
         assert_eq!(first.metadata_size, metadata.len() + 3);
-        assert!(!second.flags.has_metadata);
+        assert!(second.flags.has_metadata);
+        assert!(second.metadata.is_none());
         assert_eq!(first.request_id, Some(request_id.clone()));
         assert_eq!(second.request_id, Some(request_id));
         assert!(first.flags.is_response);
@@ -4367,20 +4397,24 @@ mod tests {
             multi_out.segments[0].metadata_size + multi_out.segments[0].data.len()
                 <= MAX_EFFICIENT_SIZE
         );
-        assert!(!multi_out.segments[1].flags.has_metadata);
+        assert!(multi_out.segments[1].flags.has_metadata);
+        assert!(multi_out.segments[1].metadata.is_none());
 
         let total_segments = multi_out.total_segments;
         let original_hash = multi_out.original_hash;
         let mut multi_in = MultiSegmentInbound::new(total_segments, original_hash);
 
         for mut segment in multi_out.segments {
+            // Receivers strip metadata from segment 1 only (Resource.py:718).
+            let mut flags = segment.flags;
+            flags.has_metadata &= segment.segment_index == 1;
             let mut inbound = InboundTransfer::from_advertisement(
                 segment.num_parts(),
                 segment.total_size,
                 segment.data.len(),
                 segment.random_hash,
                 segment.resource_hash,
-                segment.flags,
+                flags,
                 segment.map_hashes.clone(),
                 Duration::from_millis(500),
             )

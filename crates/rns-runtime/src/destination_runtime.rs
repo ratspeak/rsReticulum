@@ -244,7 +244,7 @@ impl DestinationHandle {
         path: impl Into<String>,
         allow: AllowPolicy,
         allowed_list: Vec<[u8; 16]>,
-        auto_compress: bool,
+        auto_compress: impl Into<crate::resource_source::AutoCompress>,
         handler: F,
     ) -> Result<bool, DestinationRuntimeError>
     where
@@ -256,8 +256,28 @@ impl DestinationHandle {
                 path: path.into(),
                 allow,
                 allowed_list,
-                auto_compress,
+                auto_compress: auto_compress.into(),
                 handler: Box::new(handler),
+                result_tx: Some(result_tx),
+            })
+            .await
+            .map_err(|_| DestinationRuntimeError::ManagerUnavailable)?;
+        result_rx
+            .await
+            .map_err(|_| DestinationRuntimeError::ManagerUnavailable)
+    }
+
+    /// Destination.set_max_request_size: REQUEST packets larger than `limit`
+    /// bytes are ignored and larger request Resources are rejected. `None`
+    /// accepts any size.
+    pub async fn set_max_request_size(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<(), DestinationRuntimeError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.command_tx
+            .send(LinkManagerCommand::SetMaxRequestSize {
+                limit,
                 result_tx: Some(result_tx),
             })
             .await

@@ -41,7 +41,7 @@ async fn server(args: ExampleArgs) -> ExampleResult {
                     request.data.len(),
                     request.path,
                 );
-                RequestOutcome::Reply(request.data)
+                RequestOutcome::ReplyBytes(request.data)
             },
         )
         .await?;
