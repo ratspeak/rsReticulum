@@ -36,9 +36,17 @@ fn hold(actor: &mut TransportActor, raw: Bytes, destination_hash: [u8; 16]) {
         });
 }
 
+/// The tick queues the release as ingress limited; the actor then drains it.
 fn release_held(actor: &mut TransportActor) {
     actor.last_held_announce_check = 0.0;
     actor.on_tick();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    while let std::task::Poll::Ready((class, item)) =
+        actor.inbound_rx.poll_recv(&mut cx, &actor.inbound_queues)
+    {
+        assert_eq!(class, crate::inbound_queues::TrafficClass::IngressLimited);
+        actor.handle_inbound_event(class, item);
+    }
 }
 
 #[test]

@@ -4,18 +4,23 @@
 use super::app_data::DiscoveryInfo;
 use super::constants::{AUTOCONNECT_INTERFACE_TYPES, AUTOCONNECT_MINIMUM_VERSIONS};
 
-/// Check the advertised type and implementation/version against the local
-/// auto-connect policy. Currently only `BackboneInterface` is eligible.
-/// With `allow_unverified`, any advertised implementation/version qualifies
-/// for that type; otherwise `RNS` must advertise at least version `1.5.2`.
+/// Check the advertised type, transport state and implementation/version
+/// against the local auto-connect policy. Only a transport-enabled
+/// `BackboneInterface` is eligible. With `allow_unverified`, any advertised
+/// implementation/version qualifies; otherwise `RNS` must advertise at least
+/// version `1.5.7`.
 /// `rsRNS`, unknown implementations and missing versions require the opt-in.
 ///
 /// Comparison uses leading numeric components, not full semantic-version
 /// rules: for example, `1.5.2rc1` compares as `1.5.2`. These are sender-supplied
-/// claims, not attestation. This helper does not check transport-enabled state,
+/// claims, not attestation. This helper does not check
 /// freshness, endpoint validity, source permissions or available connection slots.
 pub fn qualifies(info: &DiscoveryInfo, allow_unverified: bool) -> bool {
     if !AUTOCONNECT_INTERFACE_TYPES.contains(&info.interface_type.as_str()) {
+        return false;
+    }
+    // Upstream checks transport before the unverified bypass (Discovery.py:781).
+    if !info.transport_enabled {
         return false;
     }
     if allow_unverified {
@@ -60,19 +65,20 @@ mod tests {
             interface_type: "BackboneInterface".into(),
             impl_name: impl_name.map(str::to_string),
             impl_version: impl_version.map(str::to_string),
+            transport_enabled: true,
             ..Default::default()
         }
     }
 
-    /// Python 1.5.5 auto-connects only to "RNS" 1.5.2 or later
-    /// (Discovery.py:486-487, :782-790).
+    /// Python 1.6.0 auto-connects only to "RNS" 1.5.7 or later
+    /// (Discovery.py:486, :782-790).
     #[test]
-    fn python_backbones_qualify_from_1_5_2() {
-        assert!(qualifies(&backbone(Some("RNS"), Some("1.5.2")), false));
+    fn python_backbones_qualify_from_1_5_7() {
+        assert!(qualifies(&backbone(Some("RNS"), Some("1.5.7")), false));
         assert!(qualifies(&backbone(Some("RNS"), Some("1.5.10")), false));
         assert!(qualifies(&backbone(Some("RNS"), Some("1.6")), false));
-        assert!(qualifies(&backbone(Some("RNS"), Some("1.5.2rc1")), false));
-        assert!(!qualifies(&backbone(Some("RNS"), Some("1.5.1")), false));
+        assert!(qualifies(&backbone(Some("RNS"), Some("1.5.7rc1")), false));
+        assert!(!qualifies(&backbone(Some("RNS"), Some("1.5.6")), false));
         assert!(!qualifies(&backbone(Some("RNS"), Some("1.5")), false));
         assert!(!qualifies(&backbone(Some("RNS"), Some("")), false));
         assert!(!qualifies(&backbone(Some("RNS"), Some("next")), false));
@@ -93,6 +99,16 @@ mod tests {
             assert!(!qualifies(&info, false), "{info:?}");
             assert!(qualifies(&info, true), "{info:?}");
         }
+    }
+
+    /// The transport requirement holds even with the unverified opt-in
+    /// (Discovery.py:781).
+    #[test]
+    fn non_transport_interfaces_never_qualify() {
+        let mut info = backbone(Some("RNS"), Some("1.6.0"));
+        info.transport_enabled = false;
+        assert!(!qualifies(&info, false));
+        assert!(!qualifies(&info, true));
     }
 
     /// Python auto-connects only Backbone interfaces (Discovery.py:483, :798).

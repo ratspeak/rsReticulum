@@ -1261,8 +1261,30 @@ pub struct DiscoveryRuntime {
     announcer_started: Mutex<bool>,
     subscriber_started: Mutex<bool>,
     local_interfaces: Mutex<Vec<LocalDiscoveryInterface>>,
-    autoconnected: Mutex<HashMap<[u8; 32], u64>>,
+    autoconnected: Mutex<HashMap<[u8; 32], AutoconnectedInterface>>,
     bootstrap_interfaces: Mutex<Vec<u64>>,
+    /// Configs of `bootstrap_only` interfaces, re-spawned when no
+    /// auto-connected interface is online (Reticulum.py:1275).
+    bootstrap_configs: Mutex<Vec<BootstrapConfig>>,
+    /// A bootstrap-only I2P interface stays attached (Reticulum.py:888), so
+    /// Python never re-enables bootstrap interfaces beside it.
+    i2p_bootstrap: AtomicBool,
+    autoconnect_lock: Mutex<()>,
+    autoconnect_monitor_started: AtomicBool,
+    initial_autoconnect_ran: AtomicBool,
+}
+
+/// An auto-connected interface under the monitor (Discovery.py:651-718).
+struct AutoconnectedInterface {
+    /// `None` while the interface is still being spawned.
+    id: Option<u64>,
+    online: Option<Arc<AtomicBool>>,
+    down_since: Option<std::time::Instant>,
+}
+
+struct BootstrapConfig {
+    config: interface_factory::InterfaceConfig,
+    post_init: interface_factory::InterfacePostInit,
 }
 
 impl Default for DiscoveryRuntime {
@@ -1276,6 +1298,11 @@ impl Default for DiscoveryRuntime {
             local_interfaces: Mutex::new(Vec::new()),
             autoconnected: Mutex::new(HashMap::new()),
             bootstrap_interfaces: Mutex::new(Vec::new()),
+            bootstrap_configs: Mutex::new(Vec::new()),
+            i2p_bootstrap: AtomicBool::new(false),
+            autoconnect_lock: Mutex::new(()),
+            autoconnect_monitor_started: AtomicBool::new(false),
+            initial_autoconnect_ran: AtomicBool::new(false),
         }
     }
 }
@@ -1287,6 +1314,8 @@ struct LocalDiscoveryInterface {
     online: Option<Arc<AtomicBool>>,
     /// Overrides `config.reachable_on` once the interface learns its address.
     reachable_on: Option<tokio::sync::watch::Receiver<Option<String>>>,
+    /// Python `location_cmd` (Reticulum.py:1096).
+    location_cmd: Option<String>,
 }
 
 impl ReticulumHandle {
@@ -2838,26 +2867,7 @@ fn socket_path_display(path: &str) -> String {
     }
 }
 
-/// Inbound queue lengths per traffic class, Python `Transport.INBOUND_*_QUEUE_LENGTH`
-/// (Transport.py:186-189) overridden by `[reticulum] qlen_in_*`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InboundQueueLengths {
-    pub data: usize,
-    pub announce: usize,
-    pub pr: usize,
-    pub il: usize,
-}
-
-impl Default for InboundQueueLengths {
-    fn default() -> Self {
-        Self {
-            data: 1024,
-            announce: 128,
-            pr: 128,
-            il: 8,
-        }
-    }
-}
+pub use rns_transport::inbound_queues::InboundQueueLengths;
 
 #[derive(Debug, Clone)]
 /// Parsed runtime settings. `Default` supplies values; `try_from_config`
@@ -2896,8 +2906,7 @@ pub struct ReticulumConfig {
     /// `[logging] loglevel`, 0 (critical) to 8 (extreme). Python's module
     /// default is 3 (notice) when the key is absent.
     pub loglevel: i32,
-    /// `qlen_in_*` inbound queue lengths per traffic class. Parsed only: the
-    /// transport actor does not have per-class inbound queues yet.
+    /// `qlen_in_*` inbound queue lengths per traffic class.
     pub inbound_queue_lengths: InboundQueueLengths,
 
     /// Optional identity file, loaded or created at startup. It signs discovery
@@ -2915,6 +2924,13 @@ pub struct ReticulumConfig {
     /// metadata does not pass the configured release floor, including rsRNS.
     /// The default check is metadata matching, not software attestation.
     pub autoconnect_unverified_implementations: bool,
+    /// Python `autoconnect_interface_mode`. Unset gives auto-connected
+    /// interfaces Gateway mode on transport nodes and Full mode otherwise.
+    pub autoconnect_interface_mode: Option<rns_interface::traits::InterfaceMode>,
+    /// Python `autoconnect_interface_gravity`, parsed but not yet applied.
+    pub autoconnect_interface_gravity: Option<i64>,
+    /// Python `autoconnect_announces_to_internal`, parsed but not yet applied.
+    pub autoconnect_announces_to_internal: Option<bool>,
     /// Minimum fractional stamp value for received discovery announces
     /// (`required_discovery_value`); unset or not positive means 16. This does
     /// not set generation cost, which comes from each interface's
@@ -2978,6 +2994,9 @@ impl Default for ReticulumConfig {
             discover_interfaces: false,
             autoconnect_discovered_interfaces: 0,
             autoconnect_unverified_implementations: false,
+            autoconnect_interface_mode: None,
+            autoconnect_interface_gravity: None,
+            autoconnect_announces_to_internal: None,
             discover_interfaces_required_value: rns_transport::discovery::DEFAULT_STAMP_VALUE,
             interface_discovery_sources: Vec::new(),
             blackhole_sources: Vec::new(),
@@ -3173,6 +3192,22 @@ fn warn_deprecated_alias(alias: &str, key: &str) {
     tracing::warn!("The configuration option {alias} is deprecated, use {key} instead");
 }
 
+/// The aliases Python accepts for `autoconnect_interface_mode`; any other
+/// value is ignored (Reticulum.py:715-728).
+fn parse_autoconnect_interface_mode(value: &str) -> Option<rns_interface::traits::InterfaceMode> {
+    use rns_interface::traits::InterfaceMode;
+    match value.to_lowercase().as_str() {
+        "full" => Some(InterfaceMode::Full),
+        "access_point" | "accesspoint" | "ap" => Some(InterfaceMode::AccessPoint),
+        "pointtopoint" | "ptp" => Some(InterfaceMode::PointToPoint),
+        "roaming" => Some(InterfaceMode::Roaming),
+        "boundary" => Some(InterfaceMode::Boundary),
+        "gateway" | "gw" => Some(InterfaceMode::Gateway),
+        "internal" => Some(InterfaceMode::Internal),
+        _ => None,
+    }
+}
+
 fn parse_autoconnect_limit(sec: &ConfigSection) -> Result<Option<usize>, ConfigError> {
     if let Some(v) = config_uint("reticulum", sec, "autoconnect_discovered_interfaces")? {
         return Ok(Some(v as usize));
@@ -3339,6 +3374,17 @@ impl ReticulumConfig {
             {
                 rc.autoconnect_unverified_implementations = value;
             }
+            if let Some(mode) = sec.get("autoconnect_interface_mode") {
+                rc.autoconnect_interface_mode = parse_autoconnect_interface_mode(mode);
+            }
+            if let Some(gravity) = config_int("reticulum", sec, "autoconnect_interface_gravity")? {
+                tracing::warn!("autoconnect_interface_gravity is parsed but not applied");
+                rc.autoconnect_interface_gravity = Some(gravity);
+            }
+            if config_bool("reticulum", sec, "autoconnect_announces_to_internal")? == Some(true) {
+                tracing::warn!("autoconnect_announces_to_internal is parsed but not applied");
+                rc.autoconnect_announces_to_internal = Some(true);
+            }
             if sec.has("discover_interfaces_required_value") {
                 warn_deprecated_alias(
                     "discover_interfaces_required_value",
@@ -3373,6 +3419,21 @@ impl ReticulumConfig {
             if let Some(list) = sec.get_list("bootstrap_configs") {
                 rc.bootstrap_configs = list.iter().map(|s| PathBuf::from(s.trim())).collect();
             }
+        }
+
+        // Python promotes the identity while synthesizing a discoverable
+        // interface (Reticulum.py:1078-1083).
+        if !rc.enable_transport
+            && !rc.static_transport_identity
+            && config
+                .subsections("interfaces")
+                .iter()
+                .any(|(_, section)| section.get_bool("discoverable") == Some(true))
+        {
+            tracing::warn!(
+                "Discoverable interface was configured, enabling static transport identity on non-transport instance"
+            );
+            rc.static_transport_identity = true;
         }
 
         if let Some(sec) = config.section("logging") {
@@ -3533,7 +3594,12 @@ pub async fn init_with_policy(
         InstancePolicy::SharedClient(credentials) => credentials.apply(&mut rc),
     }
 
-    let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new();
+    let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new_with_queues(
+        4096,
+        rns_transport::constants::HASHLIST_MAXSIZE,
+        rc.inbound_queue_lengths,
+    );
+    let inbound_queues = actor.inbound_queues();
     let persistence_trigger = actor.persistence_trigger();
     let path_recovery = actor.path_recovery_handle();
     let link_endpoint_dispatch = actor.link_endpoint_dispatch_handle();
@@ -3750,7 +3816,8 @@ pub async fn init_with_policy(
                         transport_tx.clone(),
                         Some(InterfaceIfacStats(interface_controls.clone())),
                     )
-                    .with_transport(transport_stats.clone()),
+                    .with_transport(transport_stats.clone())
+                    .with_inbound_queues(inbound_queues.clone()),
                     shutdown.clone(),
                 ),
             ));
@@ -4264,6 +4331,9 @@ pub async fn init_with_policy(
                                             reachable_on: discovery_addresses
                                                 .get(&registered_id)
                                                 .cloned(),
+                                            location_cmd: interface_section(&config, iface_config)
+                                                .and_then(|section| section.get("location_cmd"))
+                                                .map(ToString::to_string),
                                         },
                                     );
                                 }
@@ -4280,6 +4350,23 @@ pub async fn init_with_policy(
                                         .lock()
                                         .await
                                         .push(registered_id);
+                                }
+                            }
+                            if bootstrap_only {
+                                if matches!(
+                                    iface_config,
+                                    interface_factory::InterfaceConfig::I2P(_)
+                                ) {
+                                    discovery_runtime
+                                        .i2p_bootstrap
+                                        .store(true, Ordering::Release);
+                                } else {
+                                    discovery_runtime.bootstrap_configs.lock().await.push(
+                                        BootstrapConfig {
+                                            config: iface_config.clone(),
+                                            post_init: clone_interface_post_init(&post_init),
+                                        },
+                                    );
                                 }
                             }
                         }
@@ -4381,7 +4468,8 @@ pub async fn init_with_policy(
             transport_tx.clone(),
             Some(InterfaceIfacStats(interface_controls.clone())),
         )
-        .with_transport(transport_stats.clone());
+        .with_transport(transport_stats.clone())
+        .with_inbound_queues(inbound_queues.clone());
         let rpc_shutdown = shutdown.clone();
         if rc.shared_instance_type == SharedInstanceType::Unix {
             let rpc_socket = shared_unix_rpc_socket_path(&rc.instance_name, &socket_base);
@@ -4437,6 +4525,7 @@ pub async fn init_with_policy(
             allowed,
             Some(InterfaceIfacStats(interface_controls.clone())),
             transport_stats.clone(),
+            Some(inbound_queues.clone()),
         )
         .await
         {
@@ -4608,7 +4697,9 @@ fn child_registration_from_parent(
 fn discovered_backbone_client_mode(
     config: &ReticulumConfig,
 ) -> rns_interface::traits::InterfaceMode {
-    if config.enable_transport {
+    if let Some(mode) = config.autoconnect_interface_mode {
+        mode
+    } else if config.enable_transport {
         rns_interface::traits::InterfaceMode::Gateway
     } else {
         rns_interface::traits::InterfaceMode::Full
@@ -7247,7 +7338,7 @@ async fn run_discovery_publisher(
         prepared: PreparedAnnounce,
         pending: Option<oneshot::Receiver<AnnounceDispatchResult>>,
         last_failure: Option<AnnounceDispatchResult>,
-        retry_at: std::time::Instant,
+        retry_at: tokio::time::Instant,
     }
     let mut publications: HashMap<u64, Publication> = HashMap::new();
     struct CancelOnDrop(Arc<AtomicBool>);
@@ -7277,7 +7368,10 @@ async fn run_discovery_publisher(
     crate::destination_stamper::load_stored_stamp(&mut discovery_destination, announce_identity);
     let mut discovery_stamps = crate::destination_stamper::DestinationStamps::<()>::new();
     let mut registered: HashMap<u64, Option<String>> = HashMap::new();
-    let mut next_prepare = std::time::Instant::now();
+    // Python's last_discovery_announce and job sleep (Discovery.py:103-119).
+    let mut last_announce: HashMap<u64, tokio::time::Instant> = HashMap::new();
+    let mut next_prepare = tokio::time::Instant::now()
+        + Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -7288,7 +7382,7 @@ async fn run_discovery_publisher(
             _ = handle.transport_tx.closed() => break,
             _ = tick.tick() => {}
         }
-        let now = std::time::Instant::now();
+        let now = tokio::time::Instant::now();
         if preparing.as_ref().is_some_and(|job| job.is_finished()) {
             let job = preparing.take().expect("checked above");
             match job.await {
@@ -7340,12 +7434,14 @@ async fn run_discovery_publisher(
                 if let Some(reachable_on) = reachable_on.clone() {
                     config.reachable_on = reachable_on;
                 }
+                // The runtime picks what is due; the announcer only builds it.
+                config.discoverable = false;
+                config.announce_interval_secs = 0;
                 if registered
                     .insert(local.id, reachable_on.flatten())
                     .is_none()
                 {
                     announcer.register(local.id, handle.transport_identity.hash, config);
-                    next_prepare = now;
                 } else {
                     // A new address goes out with the next due announce, as
                     // Python announces discovery only on its interval.
@@ -7354,21 +7450,69 @@ async fn run_discovery_publisher(
                 }
             }
         }
-        if now >= next_prepare
-            && let Some(mut owned) = announcer.take()
-        {
-            let network_identity = handle.network_identity.clone();
-            preparing = Some(tokio::task::spawn_blocking(move || {
-                let encrypt = |plaintext: &[u8]| {
-                    network_identity
-                        .as_ref()
-                        .and_then(|identity| identity.encrypt(plaintext, None).ok())
-                };
-                let (prepared, _) = owned.prepare(unix_now(), Some(&encrypt));
-                (owned, prepared)
-            }));
+        if now >= next_prepare && announcer.is_some() {
             next_prepare =
                 now + Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
+            // Python announces only the most overdue due interface per pass.
+            let selected = locals
+                .iter()
+                .filter(|local| registered.contains_key(&local.id))
+                .filter(|local| {
+                    last_announce.get(&local.id).is_none_or(|last| {
+                        now.duration_since(*last).as_secs_f64()
+                            > local.config.announce_interval_secs as f64
+                    })
+                })
+                // First of the most overdue, as Python's stable sort keeps.
+                .min_by_key(|local| {
+                    std::cmp::Reverse(
+                        last_announce
+                            .get(&local.id)
+                            .map_or(Duration::MAX, |last| now.duration_since(*last)),
+                    )
+                });
+            if let Some(local) = selected {
+                last_announce.insert(local.id, now);
+                let mut config = local.config.clone();
+                if let Some(reachable_on) = &local.reachable_on {
+                    config.reachable_on = reachable_on.borrow().clone();
+                }
+                let resolved = tokio::select! {
+                    _ = handle.shutdown.wait() => break,
+                    resolved = resolve_discovery_inputs(config, local.location_cmd.as_deref()) => resolved,
+                };
+                if let (Some(mut config), Some(mut owned)) = (resolved, announcer.take()) {
+                    for other in &locals {
+                        if other.id != local.id && registered.contains_key(&other.id) {
+                            let mut idle = other.config.clone();
+                            if let Some(reachable_on) = &other.reachable_on {
+                                idle.reachable_on = reachable_on.borrow().clone();
+                            }
+                            idle.discoverable = false;
+                            idle.announce_interval_secs = 0;
+                            owned.reconfigure(other.id, idle);
+                        }
+                    }
+                    config.discoverable = true;
+                    config.announce_interval_secs = 0;
+                    owned.reconfigure(local.id, config);
+                    let network_identity = handle.network_identity.clone();
+                    preparing = Some(tokio::task::spawn_blocking(move || {
+                        let encrypt = |plaintext: &[u8]| {
+                            network_identity
+                                .as_ref()
+                                .and_then(|identity| identity.encrypt(plaintext, None).ok())
+                        };
+                        let (prepared, _) = owned.prepare(unix_now(), Some(&encrypt));
+                        (owned, prepared)
+                    }));
+                } else {
+                    tracing::error!(
+                        interface_id = local.id,
+                        "Could not generate interface discovery announce data"
+                    );
+                }
+            }
         }
         let mut admitted = Vec::new();
         for local in &locals {
@@ -7483,6 +7627,142 @@ async fn run_discovery_publisher(
     }
 }
 
+/// Evaluate executable `reachable_on` and `location_cmd` values and validate
+/// the address before an announce, as Python does; `None` aborts this
+/// announce (Discovery.py:136-207).
+async fn resolve_discovery_inputs(
+    mut config: DiscoveryInterfaceConfig,
+    location_cmd: Option<&str>,
+) -> Option<DiscoveryInterfaceConfig> {
+    let sanitize = |value: &str| value.replace(['\n', '\r'], "").trim().to_string();
+    #[cfg(unix)]
+    if let Some(location_cmd) = location_cmd {
+        let path = expand_home_path(&sanitize(location_cmd));
+        if is_executable_file(&path) {
+            tracing::debug!(path = %path.display(), "Evaluating discovery location from executable");
+            match run_discovery_command(&path)
+                .await
+                .and_then(|output| parse_discovery_location(&sanitize(&output)))
+            {
+                Ok((lat, lon, height)) => {
+                    config.latitude = Some(lat);
+                    config.longitude = Some(lon);
+                    config.height = Some(height);
+                }
+                Err(error) => {
+                    tracing::error!(%error, "Error while getting discovery location from executable, aborting discovery announce");
+                    return None;
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = location_cmd;
+
+    if matches!(
+        config.interface_type.as_str(),
+        "BackboneInterface" | "TCPServerInterface"
+    ) {
+        let mut reachable_on = sanitize(config.reachable_on.as_deref()?);
+        #[cfg(unix)]
+        {
+            let path = expand_home_path(&reachable_on);
+            if is_executable_file(&path) {
+                tracing::debug!(path = %path.display(), "Evaluating reachable_on from executable");
+                match run_discovery_command(&path).await {
+                    Ok(output) => reachable_on = sanitize(&output),
+                    Err(error) => {
+                        tracing::error!(%error, "Error while getting reachable_on from executable, aborting discovery announce");
+                        return None;
+                    }
+                }
+            }
+        }
+        if !(is_ip_address(&reachable_on) || is_hostname(&reachable_on)) {
+            tracing::error!(
+                "The configured reachable_on parameter \"{reachable_on}\" is not a valid IP address or hostname, aborting discovery announce"
+            );
+            return None;
+        }
+        config.reachable_on = Some(reachable_on);
+    }
+    Some(config)
+}
+
+/// Python's `lat,lon,height` checks for `location_cmd` output
+/// (Discovery.py:146-155).
+// Plain comparisons let NaN through, as upstream's do.
+#[allow(clippy::manual_range_contains)]
+fn parse_discovery_location(output: &str) -> Result<(f64, f64, f64), String> {
+    let output = output.replace(' ', "");
+    let parts: Vec<&str> = output.split(',').collect();
+    if parts.len() != 3 {
+        return Err(format!("Invalid location component count: {}", parts.len()));
+    }
+    let number = |part: &str| {
+        part.parse::<f64>()
+            .map_err(|_| format!("could not convert string to float: '{part}'"))
+    };
+    let (lat, lon, height) = (number(parts[0])?, number(parts[1])?, number(parts[2])?);
+    if lat < -90.0 || lat > 90.0 {
+        return Err(format!("Invalid latitude: {lat}"));
+    }
+    // Upstream tests the latitude, not the longitude, against 180.
+    if lon < -180.0 || lat > 180.0 {
+        return Err(format!("Invalid longitude: {lon}"));
+    }
+    if height < -4000.0 || height > 1e6 {
+        return Err(format!("Invalid height: {height}"));
+    }
+    Ok((lat, lon, height))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file() && nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok()
+}
+
+#[cfg(unix)]
+async fn run_discovery_command(path: &Path) -> Result<String, String> {
+    let output = tokio::process::Command::new(path)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .await
+        .map_err(|error| error.to_string())?;
+    let stdout = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("Non-zero exit code from subprocess".to_string());
+    }
+    Ok(stdout)
+}
+
+/// Python's `is_ip_address` (Discovery.py:982-986).
+fn is_ip_address(value: &str) -> bool {
+    value.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// Python's `is_hostname` (Discovery.py:1001-1007).
+fn is_hostname(hostname: &str) -> bool {
+    let hostname = hostname.strip_suffix('.').unwrap_or(hostname);
+    if hostname.len() > 253 {
+        return false;
+    }
+    let last = hostname.rsplit('.').next().unwrap_or_default();
+    if !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    hostname.split('.').all(|label| {
+        (1..=63).contains(&label.len())
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    })
+}
+
+/// Python's `connect_discovered` (Discovery.py:732-743): one pass over the
+/// stored transport records, then each new discovery.
 async fn run_discovery_autoconnect(
     handle: ReticulumHandle,
     mut rx: mpsc::Receiver<DiscoveredInterface>,
@@ -7498,9 +7778,21 @@ async fn run_discovery_autoconnect(
             .list_filtered(sources, &blackholed)
             .unwrap_or_default()
         {
+            if !record.info.transport_enabled {
+                continue;
+            }
+            if handle.discovery.autoconnected.lock().await.len()
+                >= handle.config.autoconnect_discovered_interfaces
+            {
+                break;
+            }
             maybe_autoconnect_discovered(&handle, record).await;
         }
     }
+    handle
+        .discovery
+        .initial_autoconnect_ran
+        .store(true, Ordering::Release);
 
     loop {
         tokio::select! {
@@ -7517,7 +7809,11 @@ async fn maybe_autoconnect_discovered(handle: &ReticulumHandle, record: Discover
         return;
     }
     let limit = handle.config.autoconnect_discovered_interfaces;
-    if limit == 0 || !autoconnect_admits(&record, &handle.config) {
+    if limit == 0
+        || handle.discovery.autoconnected.lock().await.len() >= limit
+        || !autoconnect_admits(&record, &handle.config)
+        || !autoconnect_costs_acceptable(&record, &handle.config.stamps)
+    {
         return;
     }
     let Some(host) = record.info.reachable_on.clone() else {
@@ -7539,6 +7835,10 @@ async fn maybe_autoconnect_discovered(handle: &ReticulumHandle, record: Discover
         return;
     }
 
+    let _autoconnecting = handle.discovery.autoconnect_lock.lock().await;
+    if discovered_endpoint_exists(handle, &host, port).await {
+        return;
+    }
     // Python's `endpoint_hash` (Discovery.py:747-752).
     let key = rns_crypto::sha::sha256(format!("{host}:{port}").as_bytes());
     {
@@ -7546,13 +7846,30 @@ async fn maybe_autoconnect_discovered(handle: &ReticulumHandle, record: Discover
         if connected.contains_key(&key) || connected.len() >= limit {
             return;
         }
-        connected.insert(key, u64::MAX);
+        connected.insert(
+            key,
+            AutoconnectedInterface {
+                id: None,
+                online: None,
+                down_since: None,
+            },
+        );
     }
 
-    match spawn_discovered_backbone_client(handle, &record, &host, port).await {
-        Ok(id) => {
-            handle.discovery.autoconnected.lock().await.insert(key, id);
-            maybe_teardown_bootstrap_interfaces(handle).await;
+    let name = autoconnect_interface_name(handle, &record.info.name).await;
+    match spawn_discovered_backbone_client(handle, &record, &name, &host, port).await {
+        Ok((id, online)) => {
+            if let Some(entry) = handle.discovery.autoconnected.lock().await.get_mut(&key) {
+                entry.id = Some(id);
+                entry.online = Some(online);
+            }
+            if !handle
+                .discovery
+                .autoconnect_monitor_started
+                .swap(true, Ordering::AcqRel)
+            {
+                tokio::spawn(run_autoconnect_monitor(handle.clone()));
+            }
         }
         Err(e) => {
             handle.discovery.autoconnected.lock().await.remove(&key);
@@ -7566,8 +7883,9 @@ async fn maybe_autoconnect_discovered(handle: &ReticulumHandle, record: Discover
     }
 }
 
-/// Python auto-connects only Backbone interfaces of a trusted stack and
-/// release, unless unverified stacks are allowed (Discovery.py:782-798).
+/// Python auto-connects only Backbone interfaces of a transport node running
+/// a trusted stack and release, unless unverified stacks are allowed; the
+/// transport requirement holds either way (Discovery.py:780-802).
 fn autoconnect_admits(record: &DiscoveredInterface, config: &ReticulumConfig) -> bool {
     let admitted = rns_transport::discovery::autoconnect::qualifies(
         &record.info,
@@ -7593,24 +7911,70 @@ fn discovered_ifac_value(value: &Option<String>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Python refuses an interface whose advertised costs exceed the stamp values
+/// this node generates (Discovery.py:804-813).
+fn autoconnect_costs_acceptable(
+    record: &DiscoveredInterface,
+    stamps: &rns_transport::stamps::StampPolicy,
+) -> bool {
+    let quantize = |cost: f64| rns_identity::stamps::quantize_cost(cost).unwrap_or(0.0);
+    let dst_value = quantize(stamps.destination_value);
+    let pr_value = quantize(stamps.pr_value);
+    let dst_cost = quantize(record.info.dst_cost.unwrap_or(0.0));
+    let pr_cost = quantize(record.info.pr_cost.unwrap_or(0.0));
+    if dst_cost > dst_value {
+        tracing::debug!(
+            name = %record.info.name,
+            "Destination cost {dst_cost} higher than configured value {dst_value}, not auto-connecting"
+        );
+    }
+    if pr_cost > pr_value {
+        tracing::debug!(
+            name = %record.info.name,
+            "Path request cost {pr_cost} higher than configured value {pr_value}, not auto-connecting"
+        );
+    }
+    dst_cost <= dst_value && pr_cost <= pr_value
+}
+
+/// Python's `autoconnect_interface_name` (Discovery.py:771-779).
+async fn autoconnect_interface_name(handle: &ReticulumHandle, name: &str) -> String {
+    let names: std::collections::HashSet<String> = match handle
+        .query_transport(TransportQuery::GetInterfaceStats)
+        .await
+    {
+        Some(TransportQueryResponse::InterfaceStats(entries)) => {
+            entries.into_iter().map(|entry| entry.name).collect()
+        }
+        _ => Default::default(),
+    };
+    let chosen = unique_interface_name(&names, name);
+    if chosen != name {
+        tracing::info!("Auto-connect name collision for \"{name}\", connecting as \"{chosen}\"");
+    }
+    chosen
+}
+
+fn unique_interface_name(names: &std::collections::HashSet<String>, name: &str) -> String {
+    if !names.contains(name) {
+        return name.to_string();
+    }
+    (2..)
+        .map(|n| format!("{name} ({n})"))
+        .find(|candidate| !names.contains(candidate))
+        .expect("an unused suffix exists")
+}
+
 async fn spawn_discovered_backbone_client(
     handle: &ReticulumHandle,
     record: &DiscoveredInterface,
+    name: &str,
     host: &str,
     port: u16,
-) -> Result<u64, String> {
+) -> Result<(u64, Arc<AtomicBool>), String> {
     let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let id = next_id(&handle.id_gen);
-    let name = format!(
-        "Discovered/{}",
-        record
-            .info
-            .name
-            .chars()
-            .map(|c| if c == '/' { '_' } else { c })
-            .collect::<String>()
-    );
-    let mut config = rns_interface::backbone::BackboneClientConfig::new(&name, host, port);
+    let mut config = rns_interface::backbone::BackboneClientConfig::new(name, host, port);
     config.mode = discovered_backbone_client_mode(&handle.config);
     config.tunnel_identity = Some(rns_interface::traits::TunnelIdentity(
         handle.transport_identity.clone(),
@@ -7619,12 +7983,15 @@ async fn spawn_discovered_backbone_client(
         rns_interface::backbone::spawn_backbone_client(config, id, handle.transport_tx.clone())
             .await
             .map_err(|e| format!("Backbone client spawn failed: {e}"))?;
+    let online = iface_handle.online.clone();
 
     let mut post_init =
         interface_factory::InterfacePostInit::try_from_section(&ConfigSection::new())
             .expect("empty interface defaults are valid")
             .with_default_ifac_size(16);
     finalize_post_init(&mut post_init, &handle.config);
+    // Python's `configured_bitrate=5E6` (Discovery.py:884).
+    post_init.bitrate = Some(5_000_000);
     post_init.ifac_network_name = discovered_ifac_value(&record.info.ifac_netname);
     post_init.ifac_passphrase =
         discovered_ifac_value(&record.info.ifac_netkey).map(zeroize::Zeroizing::new);
@@ -7646,7 +8013,236 @@ async fn spawn_discovered_backbone_client(
         control.autoconnect_source = Some(hex::encode(record.network_id));
     });
     tracing::info!(name = %name, id, endpoint = %format!("{host}:{port}"), "auto-connected discovered interface");
-    Ok(id)
+    Ok((id, online))
+}
+
+/// Python's `__monitor_job` (Discovery.py:659-718): detach interfaces that
+/// stay down, forget ones detached elsewhere, trade bootstrap interfaces for
+/// online auto-connected ones and refill free slots.
+async fn run_autoconnect_monitor(handle: ReticulumHandle) {
+    let interval = Duration::from_secs(rns_transport::discovery::MONITOR_INTERVAL_SECS);
+    loop {
+        tokio::select! {
+            _ = handle.shutdown.wait() => break,
+            _ = tokio::time::sleep(interval) => {}
+        }
+        if !handle.interface_registry.is_open() {
+            break;
+        }
+        autoconnect_monitor_tick(&handle).await;
+    }
+}
+
+async fn autoconnect_monitor_tick(handle: &ReticulumHandle) {
+    // Upstream DETACH_THRESHOLD is in seconds (Discovery.py:476, :684).
+    let threshold = Duration::from_secs(rns_transport::discovery::DETACH_THRESHOLD_TICKS);
+    let limit = handle.config.autoconnect_discovered_interfaces;
+    let registered: std::collections::HashSet<u64> = handle
+        .interface_controls
+        .lock()
+        .expect("interface_controls mutex poisoned")
+        .keys()
+        .copied()
+        .collect();
+    let mut detached = Vec::new();
+    let mut online = 0;
+    let autoconnected_count = {
+        let now = std::time::Instant::now();
+        let mut connected = handle.discovery.autoconnected.lock().await;
+        for (key, entry) in connected.iter_mut() {
+            let Some(id) = entry.id else {
+                continue;
+            };
+            if !registered.contains(&id) {
+                tracing::debug!(
+                    "A monitored auto-connected interface was manually detached, removing from monitoring"
+                );
+                detached.push((*key, None));
+            } else if entry
+                .online
+                .as_ref()
+                .is_none_or(|flag| flag.load(Ordering::Acquire))
+            {
+                online += 1;
+                if entry.down_since.take().is_some() {
+                    tracing::info!(id, "Auto-discovered interface reconnected");
+                }
+            } else if let Some(since) = entry.down_since {
+                if now.duration_since(since) >= threshold {
+                    tracing::debug!(
+                        id,
+                        "Auto-discovered interface has been down too long, detaching"
+                    );
+                    detached.push((*key, Some(id)));
+                }
+            } else {
+                tracing::debug!(id, "Auto-discovered interface disconnected");
+                entry.down_since = Some(now);
+            }
+        }
+        connected.len()
+    };
+
+    let free_slots = limit.saturating_sub(autoconnected_count);
+    let reserved_slots = limit / 4;
+    let bootstrap: Vec<u64> = handle
+        .discovery
+        .bootstrap_interfaces
+        .lock()
+        .await
+        .iter()
+        .copied()
+        .filter(|id| registered.contains(id))
+        .collect();
+    let teardown_bootstrap = online >= limit;
+    if teardown_bootstrap && !bootstrap.is_empty() {
+        tracing::info!(
+            "Tearing down bootstrap-only interfaces since target connected auto-discovered interface count has been reached"
+        );
+    }
+    if online == 0
+        && bootstrap.is_empty()
+        && !handle.discovery.i2p_bootstrap.load(Ordering::Acquire)
+    {
+        respawn_bootstrap_interfaces(handle).await;
+    }
+
+    if handle
+        .discovery
+        .initial_autoconnect_ran
+        .load(Ordering::Acquire)
+        && free_slots > reserved_slots
+        && let Some(store) = handle.discovery.store.lock().await.clone()
+    {
+        let sources = (!handle.config.interface_discovery_sources.is_empty())
+            .then_some(handle.config.interface_discovery_sources.as_slice());
+        let blackholed = handle.blackholed_identity_set().await;
+        let candidates: Vec<DiscoveredInterface> = store
+            .list_filtered(sources, &blackholed)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| {
+                record.info.transport_enabled
+                    && record.status == Some(rns_transport::discovery::DiscoveryStatus::Available)
+            })
+            .collect();
+        if !candidates.is_empty() {
+            let mut random = [0u8; 8];
+            random.copy_from_slice(&rns_crypto::random::random_bytes(8));
+            let pick = (u64::from_le_bytes(random) % candidates.len() as u64) as usize;
+            let selected = candidates.into_iter().nth(pick).expect("index in range");
+            autoconnect_from_monitor(handle, selected).await;
+        }
+    }
+
+    for (key, id) in detached {
+        if let Some(id) = id {
+            teardown_interface(handle, id).await;
+        }
+        handle.discovery.autoconnected.lock().await.remove(&key);
+    }
+    if teardown_bootstrap && !bootstrap.is_empty() {
+        handle
+            .discovery
+            .bootstrap_interfaces
+            .lock()
+            .await
+            .retain(|id| !bootstrap.contains(id));
+        for id in bootstrap {
+            teardown_interface(handle, id).await;
+        }
+    }
+}
+
+// Boxed to break the type cycle with the monitor that auto-connecting starts.
+fn autoconnect_from_monitor(
+    handle: &ReticulumHandle,
+    record: DiscoveredInterface,
+) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    Box::pin(maybe_autoconnect_discovered(handle, record))
+}
+
+/// Python re-synthesizes every bootstrap-only interface config once no
+/// auto-connected interface is online (Discovery.py:701-705).
+async fn respawn_bootstrap_interfaces(handle: &ReticulumHandle) {
+    let configs: Vec<(
+        interface_factory::InterfaceConfig,
+        interface_factory::InterfacePostInit,
+    )> = handle
+        .discovery
+        .bootstrap_configs
+        .lock()
+        .await
+        .iter()
+        .map(|bootstrap| {
+            (
+                bootstrap.config.clone(),
+                clone_interface_post_init(&bootstrap.post_init),
+            )
+        })
+        .collect();
+    if configs.is_empty() {
+        return;
+    }
+    tracing::info!("No auto-discovered interfaces connected, re-enabling bootstrap interfaces");
+    for (config, post_init) in configs {
+        match spawn_configured_interface(handle, &config, &post_init).await {
+            Ok(ids) => handle
+                .discovery
+                .bootstrap_interfaces
+                .lock()
+                .await
+                .extend(ids),
+            Err(error) => tracing::warn!(
+                interface = %interface_config_name(&config),
+                %error,
+                "failed to re-enable bootstrap interface"
+            ),
+        }
+    }
+}
+
+/// Spawn and register an interface from its configuration after startup.
+async fn spawn_configured_interface(
+    handle: &ReticulumHandle,
+    config: &interface_factory::InterfaceConfig,
+    post_init: &interface_factory::InterfacePostInit,
+) -> Result<Vec<u64>, String> {
+    let spawn_permit = ensure_runtime_interface_admission(handle)?;
+    let id = next_id(&handle.id_gen);
+    let storage_dir = StoragePaths::from_config_dir(&handle.config_dir).storage_dir;
+    let tunnel_identity = rns_interface::traits::TunnelIdentity(handle.transport_identity.clone());
+    let handles = spawn_interface_with_rnode_startup_options(
+        config,
+        id,
+        handle.transport_tx.clone(),
+        handle.id_gen.clone(),
+        handle.handle_tx.clone(),
+        &handle.socket_base,
+        &storage_dir,
+        handle.is_foreground.clone(),
+        Default::default(),
+        &tunnel_identity,
+    )
+    .await?;
+    let ids = register_interfaces_with_post_init_batch(
+        &handle.transport_tx,
+        handles,
+        post_init,
+        derive_ifac_key_from_post_init(post_init),
+        &handle.interface_controls,
+        &handle.interface_registry,
+        interface_kind_for_config(config),
+        Some(spawn_permit),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if let Some((host, port)) = configured_client_target(config) {
+        for &id in &ids {
+            record_client_target(&handle.interface_controls, id, &host, port);
+        }
+    }
+    Ok(ids)
 }
 
 /// Python's `interface_exists` (Discovery.py:754-770): a client interface
@@ -7723,24 +8319,6 @@ fn is_yggdrasil_ipv6(host: &str) -> bool {
     };
     let first = addr.octets()[0];
     first == 0x02 || first == 0x03
-}
-
-async fn maybe_teardown_bootstrap_interfaces(handle: &ReticulumHandle) {
-    let limit = handle.config.autoconnect_discovered_interfaces;
-    let connected = handle.discovery.autoconnected.lock().await.len();
-    if limit == 0 || connected < limit {
-        return;
-    }
-    let ids = {
-        let mut bootstrap = handle.discovery.bootstrap_interfaces.lock().await;
-        if bootstrap.is_empty() {
-            return;
-        }
-        std::mem::take(&mut *bootstrap)
-    };
-    for id in ids {
-        teardown_interface(handle, id).await;
-    }
 }
 
 /// Link-request cost of the blackhole list destination.
@@ -13303,6 +13881,7 @@ loglevel = 7
             config,
             online: None,
             reachable_on: None,
+            location_cmd: None,
         }
     }
 
@@ -13341,68 +13920,83 @@ loglevel = 7
         info
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn discovery_publisher_registers_selected_signer_and_multiple_services() {
         use rns_interface::traits::InterfaceMode;
+        let mut runs = Vec::new();
         for (mode, network, encrypted) in [
             (InterfaceMode::Full, false, false),
             (InterfaceMode::Gateway, true, false),
             (InterfaceMode::Boundary, true, true),
         ] {
-            let (mut handle, actor) = discovery_actor();
-            if network {
-                handle.network_identity = Some(Arc::new(Identity::new()));
-            }
-            let (_, mut sink) = discovery_egress(&handle, 1, mode, 8).await;
-            let mut radio = advertised_service(43, encrypted);
-            radio.config.interface_type = "RNodeInterface".into();
-            radio.config.reachable_on = None;
-            radio.config.port = None;
-            radio.config.frequency = Some(915_000_000);
-            radio.config.bandwidth = Some(125_000);
-            radio.config.spreading_factor = Some(8);
-            radio.config.coding_rate = Some(5);
-            let publisher = tokio::spawn(run_discovery_announcer(
-                handle.clone(),
-                Arc::new(StaticStamper),
-                vec![advertised_service(42, encrypted), radio],
-            ));
-            let mut names = HashSet::new();
-            for _ in 0..2 {
-                let raw = tokio::time::timeout(Duration::from_secs(3), sink.recv())
+            runs.push(tokio::spawn(async move {
+                let (mut handle, actor) = discovery_actor();
+                if network {
+                    handle.network_identity = Some(Arc::new(Identity::new()));
+                }
+                let (_, mut sink) = discovery_egress(&handle, 1, mode, 8).await;
+                let mut radio = advertised_service(43, encrypted);
+                radio.config.interface_type = "RNodeInterface".into();
+                radio.config.reachable_on = None;
+                radio.config.port = None;
+                radio.config.frequency = Some(915_000_000);
+                radio.config.bandwidth = Some(125_000);
+                radio.config.spreading_factor = Some(8);
+                radio.config.coding_rate = Some(5);
+                let publisher = tokio::spawn(run_discovery_announcer(
+                    handle.clone(),
+                    Arc::new(StaticStamper),
+                    vec![advertised_service(42, encrypted), radio],
+                ));
+                // Python waits one job interval, then announces one interface per pass.
+                let started = tokio::time::Instant::now();
+                let mut names = HashSet::new();
+                let mut arrivals = Vec::new();
+                for _ in 0..2 {
+                    let raw = tokio::time::timeout(Duration::from_secs(70), sink.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    arrivals.push(started.elapsed());
+                    names.insert(read_discovery_packet(&raw, &handle).name);
+                }
+                assert!(arrivals[0] >= Duration::from_secs(60), "{arrivals:?}");
+                assert!(
+                    arrivals[1] - arrivals[0] >= Duration::from_secs(60),
+                    "{arrivals:?}"
+                );
+                assert_eq!(
+                    names,
+                    HashSet::from(["service-42".to_string(), "service-43".to_string()])
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(1200), sink.recv())
+                        .await
+                        .is_err(),
+                    "admitted services must not replay"
+                );
+                handle.shutdown.trigger();
+                tokio::time::timeout(Duration::from_secs(2), publisher)
                     .await
                     .unwrap()
                     .unwrap();
-                names.insert(read_discovery_packet(&raw, &handle).name);
-            }
-            assert_eq!(
-                names,
-                HashSet::from(["service-42".to_string(), "service-43".to_string()])
-            );
-            assert!(
-                tokio::time::timeout(Duration::from_millis(1200), sink.recv())
+                handle
+                    .transport_tx
+                    .send(TransportMessage::Shutdown)
                     .await
-                    .is_err(),
-                "admitted services must not replay"
-            );
-            handle.shutdown.trigger();
-            tokio::time::timeout(Duration::from_secs(2), publisher)
-                .await
-                .unwrap()
-                .unwrap();
-            handle
-                .transport_tx
-                .send(TransportMessage::Shutdown)
-                .await
-                .unwrap();
-            actor.await.unwrap();
+                    .unwrap();
+                actor.await.unwrap();
+            }));
+        }
+        for run in runs {
+            run.await.unwrap();
         }
     }
 
     /// An interface announces the address it learns at runtime
     /// (Discovery.py:215-216); a later change waits for the interval instead
     /// of announcing at once, so a flapping address cannot flood announces.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn discovery_publisher_announces_a_learned_address_on_its_interval() {
         use rns_interface::traits::InterfaceMode;
         let (handle, actor) = discovery_actor();
@@ -13418,7 +14012,7 @@ loglevel = 7
             Arc::new(StaticStamper),
             vec![i2p],
         ));
-        let raw = tokio::time::timeout(Duration::from_secs(3), sink.recv())
+        let raw = tokio::time::timeout(Duration::from_secs(70), sink.recv())
             .await
             .unwrap()
             .unwrap();
@@ -13446,7 +14040,7 @@ loglevel = 7
         actor.await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn discovery_publisher_recovers_eligibility_fifo_and_services_attached_path_requests() {
         use rns_interface::traits::InterfaceMode;
         let (mut handle, actor) = discovery_actor();
@@ -13474,7 +14068,7 @@ loglevel = 7
         );
         let (full_tx, mut full) = discovery_egress(&handle, 2, InterfaceMode::Full, 1).await;
         full_tx.send(Bytes::from_static(b"busy")).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        tokio::time::sleep(Duration::from_secs(61)).await;
         assert_eq!(full.recv().await.unwrap(), Bytes::from_static(b"busy"));
         let raw = tokio::time::timeout(Duration::from_secs(3), full.recv())
             .await
@@ -13563,7 +14157,7 @@ loglevel = 7
         actor.await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn discovery_publisher_recalls_pending_service_when_it_goes_offline() {
         struct CountedStamper(AtomicU64);
         impl DiscoveryStamper for CountedStamper {
@@ -13596,7 +14190,7 @@ loglevel = 7
             stamper.clone(),
             vec![local],
         ));
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        tokio::time::sleep(Duration::from_secs(61)).await;
         assert_eq!(stamper.0.load(Ordering::Relaxed), 1);
         online.store(false, Ordering::Release);
         tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -13676,7 +14270,7 @@ loglevel = 7
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn discovery_publisher_sends_once_when_admitted_during_generation() {
         let (handle, actor) = discovery_actor();
         let (tx, mut sink) =
@@ -13692,9 +14286,10 @@ loglevel = 7
             vec![advertised_service(42, false), second],
         ));
         // The first service is prepared and waits behind the full egress.
-        tokio::time::sleep(Duration::from_millis(2200)).await;
+        tokio::time::sleep(Duration::from_secs(61)).await;
         second_online.store(true, Ordering::Release);
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        // The next pass picks the never-announced second service.
+        tokio::time::sleep(Duration::from_secs(65)).await;
         assert_eq!(stamper.calls.load(Ordering::Relaxed), 2);
         // It is admitted while the second service's stamp is still generating.
         assert_eq!(sink.recv().await.unwrap(), Bytes::from_static(b"busy"));
@@ -13729,7 +14324,7 @@ loglevel = 7
         actor.await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn discovery_publisher_cancels_generation_when_it_stops() {
         for abort in [false, true] {
             let (handle, actor) = discovery_actor();
@@ -13739,7 +14334,7 @@ loglevel = 7
                 stamper.clone(),
                 vec![advertised_service(42, false)],
             ));
-            tokio::time::sleep(Duration::from_millis(1200)).await;
+            tokio::time::sleep(Duration::from_secs(61)).await;
             assert_eq!(stamper.calls.load(Ordering::Relaxed), 1);
             if abort {
                 publisher.abort();
@@ -13767,7 +14362,7 @@ loglevel = 7
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn discovery_enable_is_single_owner_and_clients_do_not_publish() {
         use rns_interface::traits::InterfaceMode;
         let (mut handle, actor) = discovery_actor();
@@ -13800,7 +14395,7 @@ loglevel = 7
             .enable_on_network_discovery(Arc::new(StaticStamper))
             .await;
         read_discovery_packet(
-            &tokio::time::timeout(Duration::from_secs(3), sink.recv())
+            &tokio::time::timeout(Duration::from_secs(70), sink.recv())
                 .await
                 .unwrap()
                 .unwrap(),
@@ -14056,7 +14651,7 @@ loglevel = 7
         assert!(rc.autoconnect_unverified_implementations);
     }
 
-    /// Only Backbone interfaces from Python 1.5.2 or later, unless unverified
+    /// Only Backbone interfaces from Python 1.5.7 or later, unless unverified
     /// stacks are allowed (Discovery.py:782-798).
     #[test]
     fn discovered_interfaces_auto_connect_like_python() {
@@ -14066,6 +14661,7 @@ loglevel = 7
                     interface_type: interface_type.into(),
                     impl_name: impl_name.map(str::to_string),
                     impl_version: version.map(str::to_string),
+                    transport_enabled: true,
                     reachable_on: Some("192.0.2.10".into()),
                     port: Some(4242),
                     ..Default::default()
@@ -14082,12 +14678,12 @@ loglevel = 7
         };
         let mut config = ReticulumConfig::default();
         assert!(autoconnect_admits(
-            &record("BackboneInterface", Some("RNS"), Some("1.5.2")),
+            &record("BackboneInterface", Some("RNS"), Some("1.6.0")),
             &config
         ));
         for rejected in [
             record("TCPServerInterface", Some("RNS"), Some("1.5.5")),
-            record("BackboneInterface", Some("RNS"), Some("1.5.1")),
+            record("BackboneInterface", Some("RNS"), Some("1.5.6")),
             record(
                 "BackboneInterface",
                 Some("rsRNS"),

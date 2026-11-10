@@ -1631,7 +1631,10 @@ pub rns_runtime::reticulum::RecalledDestination::ratchet: core::option::Option<[
 impl core::fmt::Debug for rns_runtime::reticulum::RecalledDestination
 pub fn rns_runtime::reticulum::RecalledDestination::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct rns_runtime::reticulum::ReticulumConfig
+pub rns_runtime::reticulum::ReticulumConfig::autoconnect_announces_to_internal: core::option::Option<bool>
 pub rns_runtime::reticulum::ReticulumConfig::autoconnect_discovered_interfaces: usize
+pub rns_runtime::reticulum::ReticulumConfig::autoconnect_interface_gravity: core::option::Option<i64>
+pub rns_runtime::reticulum::ReticulumConfig::autoconnect_interface_mode: core::option::Option<rns_interface::traits::InterfaceMode>
 pub rns_runtime::reticulum::ReticulumConfig::autoconnect_unverified_implementations: bool
 pub rns_runtime::reticulum::ReticulumConfig::blackhole_sources: alloc::vec::Vec<[u8; 16]>
 pub rns_runtime::reticulum::ReticulumConfig::blackhole_update_interval: f64

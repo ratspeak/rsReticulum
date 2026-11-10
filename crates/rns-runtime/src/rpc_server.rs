@@ -26,6 +26,7 @@ pub(crate) struct RpcBackend {
     transport_tx: mpsc::Sender<TransportMessage>,
     ifac: Option<InterfaceIfacStats>,
     transport: Option<TransportStatsSource>,
+    inbound_queues: Option<Arc<rns_transport::inbound_queues::InboundQueues>>,
     lowest_interface_bitrate: Arc<Mutex<Option<u64>>>,
 }
 
@@ -38,12 +39,21 @@ impl RpcBackend {
             transport_tx,
             ifac,
             transport: None,
+            inbound_queues: None,
             lowest_interface_bitrate: Arc::default(),
         }
     }
 
     pub(crate) fn with_transport(mut self, transport: Option<TransportStatsSource>) -> Self {
         self.transport = transport;
+        self
+    }
+
+    pub(crate) fn with_inbound_queues(
+        mut self,
+        queues: Arc<rns_transport::inbound_queues::InboundQueues>,
+    ) -> Self {
+        self.inbound_queues = Some(queues);
         self
     }
 }
@@ -437,6 +447,11 @@ async fn respond(request: RpcRequest, backend: &RpcBackend) -> Result<Vec<u8>, R
                 .transport
                 .as_ref()
                 .map(TransportStatsSource::snapshot)
+                .as_ref(),
+            backend
+                .inbound_queues
+                .as_ref()
+                .map(|q| q.snapshot())
                 .as_ref(),
         ),
         response => rpc::encode_response(&response),

@@ -1,0 +1,63 @@
+{
+ "generator": "crates/rns-runtime/tests/fixtures/discovery_autoconnect/gen_decisions.py",
+ "rns_version": "1.6.0",
+ "rns_commit": "cb1260891d1b6da8f6e9b21542c4f0cc0725cac4",
+ "qualified": [
+  {"impl_name": "RNS", "version": "1.6.0", "transport": true, "allow_unverified": false, "qualified": true},
+  {"impl_name": "RNS", "version": "1.6.0", "transport": false, "allow_unverified": false, "qualified": false},
+  {"impl_name": "RNS", "version": "1.5.10", "transport": true, "allow_unverified": false, "qualified": true},
+  {"impl_name": "RNS", "version": "1.5.7", "transport": true, "allow_unverified": false, "qualified": true},
+  {"impl_name": "RNS", "version": "1.5.6", "transport": true, "allow_unverified": false, "qualified": false},
+  {"impl_name": "rsRNS", "version": "1.4.0", "transport": true, "allow_unverified": false, "qualified": false},
+  {"impl_name": "rsRNS", "version": "1.4.0", "transport": true, "allow_unverified": true, "qualified": true},
+  {"impl_name": "rsRNS", "version": "1.4.0", "transport": false, "allow_unverified": true, "qualified": false},
+  {"impl_name": "RNS", "version": "1.5.5", "transport": false, "allow_unverified": true, "qualified": false}
+ ],
+ "costs": [
+  {"dst_cost": 23.5, "pr_cost": 15.8, "dst_value": 25.0, "pr_value": 15.8, "accepted": true},
+  {"dst_cost": 25.0, "pr_cost": 15.8, "dst_value": 25.0, "pr_value": 15.8, "accepted": true},
+  {"dst_cost": 25.002, "pr_cost": 15.8, "dst_value": 25.0, "pr_value": 15.8, "accepted": false},
+  {"dst_cost": 30.0, "pr_cost": 15.8, "dst_value": 25.0, "pr_value": 15.8, "accepted": false},
+  {"dst_cost": 23.5, "pr_cost": 16.0, "dst_value": 25.0, "pr_value": 15.8, "accepted": false},
+  {"dst_cost": null, "pr_cost": null, "dst_value": 0.0, "pr_value": 0.0, "accepted": true},
+  {"dst_cost": 0.0, "pr_cost": 0.0, "dst_value": 0.0, "pr_value": 0.0, "accepted": true},
+  {"dst_cost": 8.0, "pr_cost": 8.0, "dst_value": 8.0, "pr_value": 8.0, "accepted": true},
+  {"dst_cost": 8.0, "pr_cost": 8.0, "dst_value": 7.99, "pr_value": 8.0, "accepted": false}
+ ],
+ "hosts": [
+  {"value": "relay.example.org", "valid": true},
+  {"value": "relay.example.org.", "valid": true},
+  {"value": "10.0.0.1", "valid": true},
+  {"value": "fe80::1", "valid": true},
+  {"value": "localhost", "valid": true},
+  {"value": "not a host!", "valid": false},
+  {"value": "1.2.3", "valid": false},
+  {"value": "host_name.example", "valid": false},
+  {"value": "-bad.example", "valid": false},
+  {"value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example", "valid": false},
+  {"value": "xn--bcher-kva.example", "valid": true},
+  {"value": "example.123", "valid": false},
+  {"value": "", "valid": false},
+  {"value": "a.b-.c", "valid": false}
+ ],
+ "locations": [
+  {"output": "51.5,-0.1,30", "location": [51.5, -0.1, 30.0]},
+  {"output": "1,2", "location": null},
+  {"output": "91,0,0", "location": null},
+  {"output": "0,181,0", "location": [0.0, 181.0, 0.0]},
+  {"output": "0,-181,0", "location": null},
+  {"output": "0,0,-5000", "location": null},
+  {"output": "abc,0,0", "location": null},
+  {"output": " 10 , 20 , 30 \n", "location": [10.0, 20.0, 30.0]},
+  {"output": "0,0,1000001", "location": null},
+  {"output": "-90,180,-4000", "location": [-90.0, 180.0, -4000.0]}
+ ],
+ "modes": {"full": 1, "access_point": 3, "accesspoint": 3, "ap": 3, "pointtopoint": 2, "ptp": 2, "roaming": 4, "boundary": 5, "gateway": 6, "gw": 6, "internal": 7, "Gateway": 6, "point_to_point": null, "bogus": null},
+ "names": [
+  {"existing": [], "name": "Hub", "result": "Hub"},
+  {"existing": ["Hub"], "name": "Hub", "result": "Hub (2)"},
+  {"existing": ["Hub", "Hub (2)"], "name": "Hub", "result": "Hub (3)"},
+  {"existing": ["Hub", "Hub (3)"], "name": "Hub", "result": "Hub (2)"},
+  {"existing": ["Hub (2)"], "name": "Hub", "result": "Hub"}
+ ]
+}

@@ -316,8 +316,12 @@ async fn packet_capacity_first_producer_frame_waits_for_exact_registration() {
     actor.handle_message(TransportMessage::RegisterInterface { id: 1, entry });
     assert!(owner.is_registered());
     assert!(pending.await.unwrap().is_ok());
-    let event = actor.rx.try_recv().unwrap();
-    assert!(matches!(event,TransportMessage::InterfaceEvent{owner:o,..} if o==owner));
+    let (class, event) =
+        std::future::poll_fn(|cx| actor.inbound_rx.poll_recv(cx, &actor.inbound_queues)).await;
+    assert_eq!(class, crate::inbound_queues::TrafficClass::Data);
+    assert!(
+        matches!(event, crate::inbound_queues::Queued::Message(m) if matches!(&*m, TransportMessage::InterfaceEvent{owner:o,..} if *o==owner))
+    );
 }
 
 #[test]

@@ -34,6 +34,7 @@ pub mod destination_filter;
 pub mod discovery;
 pub mod hashlist;
 pub mod ifac;
+pub mod inbound_queues;
 pub mod ingress;
 pub mod interface_ownership;
 pub use interface_ownership::{

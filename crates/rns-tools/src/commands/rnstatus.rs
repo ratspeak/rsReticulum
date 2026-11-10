@@ -21,7 +21,7 @@ use rns_runtime::platform::resolve_config_dir;
 use rns_runtime::reticulum::{ReticulumConfig, SharedInstanceRpcEndpoint, init};
 use rns_runtime::rpc::{self, RpcRequest, RpcResponse};
 use rns_tools::{format, hash};
-use rns_transport::discovery::{DiscoveredInterface, DiscoveryStore};
+use rns_transport::discovery::{DiscoveredInterface, DiscoveryStatus, DiscoveryStore};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
 const REMOTE_TIMEOUT_SECS: u64 = 30;
@@ -96,6 +96,14 @@ struct Args {
     /// Show details and config data for discovered interfaces.
     #[arg(short = 'D')]
     discovered_details: bool,
+
+    /// Show stale discovery entries.
+    #[arg(long)]
+    show_stale: bool,
+
+    /// Show discovery entries without version info.
+    #[arg(long)]
+    show_unknown: bool,
 
     /// Continuously monitor status.
     #[arg(short = 'm', long)]
@@ -744,15 +752,16 @@ fn print_discovered_interfaces(config_dir: &Path, rc: &ReticulumConfig, args: &A
     } else {
         Some(rc.interface_discovery_sources.as_slice())
     };
-    let mut records = match store.list(sources) {
+    let records = match store.list(sources) {
         Ok(records) => records,
         Err(e) => {
             eprintln!("rnstatus-rs: could not read discovered interfaces: {e}");
             return ExitCode::from(1);
         }
     };
-    records.retain(|record| interface_matches_filter(&record.info.name, args.filter.as_deref()));
+    println!();
 
+    // Python lists every record as JSON, without the name filter (rnstatus.py:227-233).
     if args.json {
         let value = records
             .iter()
@@ -762,90 +771,192 @@ fn print_discovered_interfaces(config_dir: &Path, rc: &ReticulumConfig, args: &A
         return ExitCode::SUCCESS;
     }
 
+    let filtered: Vec<&DiscoveredInterface> = records
+        .iter()
+        .filter(|record| interface_matches_filter(&record.info.name, args.filter.as_deref()))
+        .collect();
     if args.discovered_details {
-        print_discovered_details(&records);
+        print_discovered_details(&filtered, args.show_stale, args.show_unknown);
     } else {
-        print_discovered_summary(&records);
+        print_discovered_summary(&filtered, args.show_stale, args.show_unknown);
     }
     ExitCode::SUCCESS
 }
 
+/// The record as Python's `list_discovered_interfaces` returns it, bytes as
+/// hex (Discovery.py:357-450, :549-556; rnstatus.py:227-233).
 fn discovered_json(record: &DiscoveredInterface) -> serde_json::Value {
     let info = &record.info;
-    json!({
-        "name": info.name,
+    let status = record.status.unwrap_or(DiscoveryStatus::Unknown);
+    let mut value = json!({
         "type": info.interface_type,
-        "status": record.status.map(|s| s.as_str()).unwrap_or("unknown"),
+        "impl_name": info.impl_name,
+        "version": info.impl_version,
         "transport": info.transport_enabled,
+        "name": info.name,
+        "received": record.last_heard,
+        "stamp": hex::encode(&record.stamp),
+        "value": record.stamp_value,
         "transport_id": hex::encode(info.transport_id),
         "network_id": hex::encode(record.network_id),
+        "dst_cost": info.dst_cost,
+        "pr_cost": info.pr_cost,
         "hops": record.hops,
-        "value": record.stamp_value,
-        "discovered": record.discovered,
-        "last_heard": record.last_heard,
-        "heard_count": record.heard_count,
         "latitude": finite_location(info.latitude),
         "longitude": finite_location(info.longitude),
         "height": finite_location(info.height),
-        "reachable_on": info.reachable_on,
-        "port": info.port,
-        "frequency": info.frequency,
-        "bandwidth": info.bandwidth,
-        "sf": info.spreading_factor,
-        "cr": info.coding_rate,
-        "modulation": info.modulation,
-        "channel": info.channel,
-        "config_entry": discovered_config_entry(record),
-    })
+        "discovery_hash": hex::encode(record.discovery_hash()),
+        "discovered": record.discovered,
+        "last_heard": record.last_heard,
+        "heard_count": record.heard_count,
+        "status": status.as_str(),
+        "status_code": status.code(),
+    });
+    let map = value.as_object_mut().expect("object literal");
+    let mut optional = |key: &str, field: Option<serde_json::Value>| {
+        if let Some(field) = field {
+            map.insert(key.to_string(), field);
+        }
+    };
+    optional("ifac_netname", info.ifac_netname.clone().map(Into::into));
+    optional("ifac_netkey", info.ifac_netkey.clone().map(Into::into));
+    optional("reachable_on", info.reachable_on.clone().map(Into::into));
+    optional("port", info.port.map(Into::into));
+    optional("frequency", info.frequency.map(Into::into));
+    optional("bandwidth", info.bandwidth.map(Into::into));
+    optional("sf", info.spreading_factor.map(Into::into));
+    optional("cr", info.coding_rate.map(Into::into));
+    optional(
+        "modulation",
+        info.modulation
+            .as_ref()
+            .and_then(|m| serde_json::to_value(m).ok()),
+    );
+    optional("channel", info.channel.map(Into::into));
+    optional(
+        "operator_lxmf_address",
+        info.operator_lxmf_address.map(|a| hex::encode(a).into()),
+    );
+    let config_entry = discovered_config_entry(record);
+    if !config_entry.is_empty() {
+        map.insert("config_entry".to_string(), config_entry.into());
+    }
+    value
 }
 
 fn finite_location(value: Option<f64>) -> Option<f64> {
     value.filter(|number| number.is_finite())
 }
 
-fn print_discovered_summary(records: &[DiscoveredInterface]) {
-    if records.is_empty() {
-        println!("No discovered interfaces.");
-        return;
+/// Python's `impl_name version`, when the record names both (rnstatus.py:250-251).
+fn discovered_stack(record: &DiscoveredInterface) -> Option<String> {
+    match (&record.info.impl_name, &record.info.impl_version) {
+        (Some(name), Some(version)) if !name.is_empty() && !version.is_empty() => {
+            Some(format!("{name} {version}"))
+        }
+        _ => None,
     }
+}
+
+/// Whether Python lists this record: stale and stack-less records are hidden
+/// unless asked for (rnstatus.py:255-256).
+fn discovered_shown(record: &DiscoveredInterface, show_stale: bool, show_unknown: bool) -> bool {
+    (show_stale || record.status != Some(DiscoveryStatus::Stale))
+        && (show_unknown || discovered_stack(record).is_some())
+}
+
+fn print_discovered_summary(
+    records: &[&DiscoveredInterface],
+    show_stale: bool,
+    show_unknown: bool,
+) {
     println!(
-        "{:<25} {:<18} {:<10} {:<12} {:<8} Location",
-        "Name", "Type", "Status", "Last Heard", "Value"
+        "{:<25} {:<10}   {:<10} {:<12} {:<7} {:<16} {:<15}",
+        "Name", "Type", "Status", "Last Heard", "Value", "Running", "Location"
     );
-    println!("{}", "-".repeat(92));
+    println!("{}", "-".repeat(110));
     let now = unix_now_secs();
     for record in records {
+        if !discovered_shown(record, show_stale, show_unknown) {
+            continue;
+        }
         let info = &record.info;
-        let status = record.status.map(|s| s.as_str()).unwrap_or("unknown");
-        let location = location_summary(info.latitude, info.longitude, info.height);
+        let name = truncate_ellipsis(&info.name, 24);
+        let mut stack = discovered_stack(record).unwrap_or_else(|| "Unknown".into());
+        if stack.chars().count() > 16 {
+            stack = stack.chars().take(15).collect::<String>() + "…";
+        }
+        let status = match record.status {
+            Some(DiscoveryStatus::Available) => "✓ Available",
+            Some(DiscoveryStatus::Unknown) => "? Unknown",
+            Some(DiscoveryStatus::Stale) => "× Stale",
+            None => "? Unknown",
+        };
+        let diff = now.saturating_sub(record.last_heard);
+        let last_heard = if diff < 60 {
+            "Just now".to_string()
+        } else if diff < 3600 {
+            format!("{}m ago", diff / 60)
+        } else if diff < 86400 {
+            format!("{}h ago", diff / 3600)
+        } else {
+            format!("{}d ago", diff / 86400)
+        };
+        let location = match (
+            finite_location(info.latitude),
+            finite_location(info.longitude),
+        ) {
+            (Some(lat), Some(lon)) => format!("{}, {}", py_round4(lat), py_round4(lon)),
+            _ => "N/A".to_string(),
+        };
         println!(
-            "{:<25} {:<18} {:<10} {:<12} {:<8} {}",
-            truncate_ascii(&info.name, 25),
-            truncate_ascii(&info.interface_type.replace("Interface", ""), 18),
+            "{:<25} {:<10} {:<12} {:<12} {:<7} {:<16} {:<15}",
+            name,
+            info.interface_type.replace("Interface", ""),
             status,
-            age_label(now, record.last_heard),
-            record.stamp_value,
+            last_heard,
+            pretty_cost(Some(record.stamp_value)),
+            stack,
             location
         );
     }
 }
 
-fn print_discovered_details(records: &[DiscoveredInterface]) {
-    if records.is_empty() {
-        println!("No discovered interfaces.");
-        return;
-    }
+fn print_discovered_details(
+    records: &[&DiscoveredInterface],
+    show_stale: bool,
+    show_unknown: bool,
+) {
     let now = unix_now_secs();
     for (idx, record) in records.iter().enumerate() {
-        if idx > 0 {
-            println!("\n{}\n", "=".repeat(32));
+        if !discovered_shown(record, show_stale, show_unknown) {
+            continue;
         }
         let info = &record.info;
+        // Python numbers the separator by the filtered list, hidden records included.
+        if idx > 0 {
+            println!("\n{}\n", "=".repeat(47));
+        }
+        if record.network_id != info.transport_id {
+            println!("Network   ID : {}", hex::encode(record.network_id));
+        }
+        println!("Transport ID : {}", hex::encode(info.transport_id));
+        if let Some(address) = info.operator_lxmf_address {
+            println!("LXMF address : {}", hex::encode(address));
+        }
         println!("Name         : {}", info.name);
         println!("Type         : {}", info.interface_type);
         println!(
+            "Stack        : {}",
+            discovered_stack(record).unwrap_or_else(|| "Unknown".into())
+        );
+        println!(
             "Status       : {}",
-            record.status.map(|s| s.as_str()).unwrap_or("unknown")
+            match record.status {
+                Some(DiscoveryStatus::Available) => "Available",
+                Some(DiscoveryStatus::Stale) => "Stale",
+                _ => "Unknown",
+            }
         );
         println!(
             "Transport    : {}",
@@ -855,26 +966,44 @@ fn print_discovered_details(records: &[DiscoveredInterface]) {
                 "Disabled"
             }
         );
-        println!("Transport ID : {}", hex::encode(info.transport_id));
-        if record.network_id != info.transport_id {
-            println!("Network ID   : {}", hex::encode(record.network_id));
-        }
+        println!("Stamp Value  : {}", pretty_cost(Some(record.stamp_value)));
+        // Stored records always carry both cost keys, possibly nil (Discovery.py:357-358).
+        println!(
+            "Costs        : Dst {}, PR {}",
+            pretty_cost(info.dst_cost),
+            pretty_cost(info.pr_cost)
+        );
         println!(
             "Distance     : {} hop{}",
             record.hops,
             if record.hops == 1 { "" } else { "s" }
         );
-        println!("Discovered   : {} ago", age_label(now, record.discovered));
-        println!("Last Heard   : {} ago", age_label(now, record.last_heard));
         println!(
-            "Location     : {}",
-            location_summary(info.latitude, info.longitude, info.height)
+            "Discovered   : {} ago",
+            pretty_time_compact(now.saturating_sub(record.discovered))
         );
+        println!(
+            "Last Heard   : {} ago",
+            pretty_time_compact(now.saturating_sub(record.last_heard))
+        );
+        let location = match (
+            finite_location(info.latitude),
+            finite_location(info.longitude),
+        ) {
+            (Some(lat), Some(lon)) => {
+                let height = finite_location(info.height)
+                    .map(|height| format!(", {}m h", py_float(height)))
+                    .unwrap_or_default();
+                format!("{}, {}{height}", py_round4(lat), py_round4(lon))
+            }
+            _ => "Unknown".to_string(),
+        };
+        println!("Location     : {location}");
         if let Some(freq) = info.frequency {
-            println!("Frequency    : {freq} Hz");
+            println!("Frequency    : {} Hz", thousands(freq));
         }
         if let Some(bw) = info.bandwidth {
-            println!("Bandwidth    : {bw} Hz");
+            println!("Bandwidth    : {} Hz", thousands(bw));
         }
         if let Some(sf) = info.spreading_factor {
             println!("Sprd. Factor : {sf}");
@@ -885,103 +1014,141 @@ fn print_discovered_details(records: &[DiscoveredInterface]) {
         if let Some(modu) = &info.modulation {
             println!("Modulation   : {modu}");
         }
-        if let Some(ch) = info.channel {
-            println!("Channel      : {ch}");
-        }
         if let Some(addr) = &info.reachable_on {
             println!("Address      : {addr}");
         }
         if let Some(port) = info.port {
             println!("Port         : {port}");
         }
-        println!("Stamp Value  : {}", record.stamp_value);
         println!("\nConfiguration Entry:");
-        for line in discovered_config_entry(record).lines() {
+        for line in discovered_config_entry(record).split('\n') {
             println!("  {line}");
         }
     }
 }
 
+/// The config entry Python stores with a discovered interface
+/// (Discovery.py:380-450).
 fn discovered_config_entry(record: &DiscoveredInterface) -> String {
     let info = &record.info;
-    let mut lines = vec![
-        format!("[[{}]]", info.name),
-        format!("type = {}", info.interface_type),
-        "interface_enabled = True".to_string(),
-        format!(
-            "transport = {}",
-            if info.transport_enabled {
-                "True"
+    let name = &info.name;
+    let identity = format!(
+        "\n  transport_identity = {}",
+        hex::encode(info.transport_id)
+    );
+    let netname = info
+        .ifac_netname
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("\n  network_name = {value}"))
+        .unwrap_or_default();
+    let netkey = info
+        .ifac_netkey
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("\n  passphrase = {value}"))
+        .unwrap_or_default();
+    let opt = |value: Option<String>| value.unwrap_or_else(|| "None".to_string());
+    match info.interface_type.as_str() {
+        "BackboneInterface" | "TCPServerInterface" => {
+            let (kind, remote) = if cfg!(any(windows, target_os = "macos")) {
+                ("TCPClientInterface", "target_host")
             } else {
-                "False"
-            }
+                ("BackboneInterface", "remote")
+            };
+            format!(
+                "[[{name}]]\n  type = {kind}\n  enabled = yes\n  {remote} = {}\n  target_port = {}{identity}{netname}{netkey}",
+                opt(info.reachable_on.clone()),
+                opt(info.port.map(|port| port.to_string())),
+            )
+        }
+        "I2PInterface" => format!(
+            "[[{name}]]\n  type = I2PInterface\n  enabled = yes\n  peers = {}.b32.i2p{identity}{netname}{netkey}",
+            opt(info.reachable_on.clone()),
         ),
+        "RNodeInterface" => format!(
+            "[[{name}]]\n  type = RNodeInterface\n  enabled = yes\n  port = \n  frequency = {}\n  bandwidth = {}\n  spreadingfactor = {}\n  codingrate = {}\n  txpower = {netname}{netkey}",
+            opt(info.frequency.map(|v| v.to_string())),
+            opt(info.bandwidth.map(|v| v.to_string())),
+            opt(info.spreading_factor.map(|v| v.to_string())),
+            opt(info.coding_rate.map(|v| v.to_string())),
+        ),
+        "WeaveInterface" => format!(
+            "[[{name}]]\n  type = WeaveInterface\n  enabled = yes\n  port = {netname}{netkey}"
+        ),
+        "KISSInterface" => format!(
+            "[[{name}]]\n  type = KISSInterface\n  enabled = yes\n  port = \n  # Frequency: {}\n  # Bandwidth: {}\n  # Modulation: {}{identity}{netname}{netkey}",
+            opt(info.frequency.map(|v| v.to_string())),
+            opt(info.bandwidth.map(|v| v.to_string())),
+            opt(info.modulation.as_ref().map(ToString::to_string)),
+        ),
+        _ => String::new(),
+    }
+}
+
+/// Python's `RNS.prettycost`: the quantized cost to three places, or `n`.
+fn pretty_cost(cost: Option<f64>) -> String {
+    match cost.map(rns_identity::stamps::quantize_cost) {
+        Some(Ok(cost)) => format!("{cost:.3}"),
+        _ => "n".to_string(),
+    }
+}
+
+/// Python's `RNS.prettytime(t, compact=True)` for whole seconds.
+fn pretty_time_compact(seconds: u64) -> String {
+    let parts = [
+        (seconds / 86400, "d"),
+        ((seconds % 86400) / 3600, "h"),
+        ((seconds % 3600) / 60, "m"),
+        (seconds % 60, "s"),
     ];
-    if let Some(addr) = &info.reachable_on {
-        lines.push(format!("target_host = {addr}"));
-    }
-    if let Some(port) = info.port {
-        lines.push(format!("target_port = {port}"));
-    }
-    if let Some(freq) = info.frequency {
-        lines.push(format!("frequency = {freq}"));
-    }
-    if let Some(bw) = info.bandwidth {
-        lines.push(format!("bandwidth = {bw}"));
-    }
-    if let Some(sf) = info.spreading_factor {
-        lines.push(format!("spreading_factor = {sf}"));
-    }
-    if let Some(cr) = info.coding_rate {
-        lines.push(format!("coding_rate = {cr}"));
-    }
-    if let Some(modu) = &info.modulation {
-        lines.push(format!("modulation = {modu}"));
-    }
-    if let Some(ch) = info.channel {
-        lines.push(format!("channel = {ch}"));
-    }
-    if let Some(netname) = &info.ifac_netname {
-        lines.push(format!("ifac_netname = {netname}"));
-    }
-    lines.join("\n")
-}
-
-fn location_summary(latitude: Option<f64>, longitude: Option<f64>, height: Option<f64>) -> String {
-    let latitude = finite_location(latitude);
-    let longitude = finite_location(longitude);
-    let height = finite_location(height);
-    if latitude.is_none() && longitude.is_none() && height.is_none() {
-        return "N/A".to_string();
-    }
-    let latitude = latitude.map_or_else(|| "N/A".into(), |v| format!("{v:.4}"));
-    let longitude = longitude.map_or_else(|| "N/A".into(), |v| format!("{v:.4}"));
-    match height {
-        Some(height) => format!("{latitude}, {longitude}, {height:.0}m h"),
-        None => format!("{latitude}, {longitude}"),
+    let components: Vec<String> = parts
+        .iter()
+        .filter(|(value, _)| *value > 0)
+        .take(2)
+        .map(|(value, unit)| format!("{value}{unit}"))
+        .collect();
+    match components.as_slice() {
+        [] => "0s".to_string(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} and {second}"),
+        _ => unreachable!("at most two components"),
     }
 }
 
-fn truncate_ascii(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    s.chars()
-        .take(max_chars.saturating_sub(3))
-        .collect::<String>()
-        + "..."
-}
-
-fn age_label(now: u64, timestamp: u64) -> String {
-    let diff = now.saturating_sub(timestamp);
-    if diff < 60 {
-        "0s".to_string()
-    } else if diff < 3600 {
-        format!("{}m", diff / 60)
-    } else if diff < 86400 {
-        format!("{}h", diff / 3600)
+/// Python's `str(float)` for ordinary magnitudes.
+fn py_float(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < 1e16 {
+        format!("{value:.1}")
     } else {
-        format!("{}d", diff / 86400)
+        format!("{value}")
+    }
+}
+
+/// Python's `str(round(value, 4))`.
+fn py_round4(value: f64) -> String {
+    py_float(format!("{value:.4}").parse().unwrap_or(value))
+}
+
+/// Python's `f"{value:,}"` for integers.
+fn thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (idx, digit) in digits.chars().enumerate() {
+        if idx > 0 && (digits.len() - idx).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// Python cuts long names to `limit` characters plus an ellipsis.
+fn truncate_ellipsis(s: &str, limit: usize) -> String {
+    if s.chars().count() > limit {
+        s.chars().take(limit).collect::<String>() + "…"
+    } else {
+        s.to_string()
     }
 }
 
@@ -1668,16 +1835,6 @@ mod tests {
 
     #[test]
     fn discovery_location_display_preserves_absence_and_real_zero() {
-        assert_eq!(location_summary(None, None, None), "N/A");
-        assert_eq!(
-            location_summary(Some(0.0), Some(0.0), Some(0.0)),
-            "0.0000, 0.0000, 0m h"
-        );
-        assert_eq!(
-            location_summary(Some(0.0), None, Some(0.0)),
-            "0.0000, N/A, 0m h"
-        );
-        assert_eq!(location_summary(None, None, Some(0.0)), "N/A, N/A, 0m h");
         assert_eq!(finite_location(None), None);
         assert_eq!(finite_location(Some(0.0)), Some(0.0));
         assert_eq!(finite_location(Some(f64::NAN)), None);
@@ -1718,6 +1875,8 @@ mod tests {
             timeout: None,
             discovered: false,
             discovered_details: false,
+            show_stale: false,
+            show_unknown: false,
             monitor: false,
             monitor_interval: 1.0,
             version: false,

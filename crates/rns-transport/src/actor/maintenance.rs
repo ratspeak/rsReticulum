@@ -582,7 +582,11 @@ impl TransportActor {
                     "releasing held announce"
                 );
 
-                self.on_released_announce(announce);
+                // Released announces re-enter as ingress limited (Interface.py:300).
+                self.inbound_rx.push_ingress_limited(
+                    &self.inbound_queues,
+                    crate::inbound_queues::Queued::ReleasedAnnounce(announce),
+                );
             }
         }
     }

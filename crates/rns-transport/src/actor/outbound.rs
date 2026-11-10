@@ -810,10 +810,11 @@ impl TransportActor {
                 false,
             );
         } else if self.is_transport_enabled && should_search_unknown {
-            let ingress_limited = self
-                .interfaces
-                .get_mut(&interface_id)
-                .is_some_and(|iface| iface.ingress.should_ingress_limit_pr());
+            let ingress_limited = self.processing_ingress_limited
+                || self
+                    .interfaces
+                    .get_mut(&interface_id)
+                    .is_some_and(|iface| iface.ingress.should_ingress_limit_pr());
             if ingress_limited {
                 pathing!(
                     dest = %hex::encode(requested_dest),

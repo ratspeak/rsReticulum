@@ -6,6 +6,7 @@
 //! Authentication proves possession of the shared RPC key. It does not encrypt
 //! request/response frames or authenticate the separate packet-IPC socket.
 
+use rns_transport::inbound_queues::InboundQueueSnapshot;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MP_CHALLENGE: &[u8] = b"#CHALLENGE#";
@@ -771,7 +772,7 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                 })
                 .collect(),
         ),
-        RpcResponse::InterfaceStats(entries) => interface_stats_value(entries, None),
+        RpcResponse::InterfaceStats(entries) => interface_stats_value(entries, None, None),
         RpcResponse::RateTable(entries) => PyValue::List(
             entries
                 .iter()
@@ -839,8 +840,9 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
 pub(crate) fn encode_interface_stats(
     entries: &[InterfaceStatEntry],
     transport: Option<&TransportStats>,
+    queues: Option<&InboundQueueSnapshot>,
 ) -> Result<Vec<u8>, RpcError> {
-    encode_umsgpack(&interface_stats_value(entries, transport))
+    encode_umsgpack(&interface_stats_value(entries, transport, queues))
 }
 
 /// Remote management's `/status` answer: `[stats]`, then the link count and
@@ -848,10 +850,11 @@ pub(crate) fn encode_interface_stats(
 pub(crate) fn encode_remote_status(
     entries: &[InterfaceStatEntry],
     transport: Option<&TransportStats>,
+    queues: Option<&InboundQueueSnapshot>,
     link_count: Option<u64>,
     profiling: bool,
 ) -> Result<Vec<u8>, RpcError> {
-    let mut response = vec![interface_stats_value(entries, transport)];
+    let mut response = vec![interface_stats_value(entries, transport, queues)];
     if let Some(link_count) = link_count {
         response.push(PyValue::Int(i128::from(link_count)));
     }
@@ -861,13 +864,48 @@ pub(crate) fn encode_remote_status(
     encode_umsgpack(&PyValue::List(response))
 }
 
+/// The inbound queue keys of `get_interface_stats()` (Reticulum.py:1829-1843@1.6.0).
+fn queue_stats(q: &InboundQueueSnapshot) -> Vec<(&'static str, PyValue)> {
+    let int = |n: u64| PyValue::Int(i128::from(n));
+    let height = |n: usize| int(n as u64);
+    // Python divides only a nonzero height, so an idle queue reports int 0.
+    let pressure = |height: usize, length: usize| {
+        if height == 0 || length == 0 {
+            PyValue::Int(0)
+        } else {
+            PyValue::Float(height as f64 / length as f64)
+        }
+    };
+    let total = q.heights.iter().sum::<usize>();
+    let total_length = q.lengths.iter().fold(0usize, |a, n| a.saturating_add(*n));
+    let dropped = q.dropped.iter().fold(0u64, |a, n| a.saturating_add(*n));
+    vec![
+        ("rxqt", height(total)),
+        ("rxqd", height(q.heights[0])),
+        ("rxqa", height(q.heights[1])),
+        ("rxqp", height(q.heights[2])),
+        ("rxqil", height(q.heights[3])),
+        ("rxqtd", int(dropped)),
+        ("rxqdd", int(q.dropped[0])),
+        ("rxqad", int(q.dropped[1])),
+        ("rxqpd", int(q.dropped[2])),
+        ("rxqild", int(q.dropped[3])),
+        ("tqpressure", pressure(total, total_length)),
+        ("dqpressure", pressure(q.heights[0], q.lengths[0])),
+        ("aqpressure", pressure(q.heights[1], q.lengths[1])),
+        ("pqpressure", pressure(q.heights[2], q.lengths[2])),
+        ("ilqpressure", pressure(q.heights[3], q.lengths[3])),
+    ]
+}
+
 /// Python 1.5.5 `Reticulum.get_interface_stats()` (Reticulum.py:1494-1716)
-/// for the control port and remote management alike. Rust keeps no inbound
-/// queues, packet rates, announce or path request byte counters, transmit
-/// buffer or gravity, so those keys carry Python's idle values.
+/// for the control port and remote management alike. Rust keeps no packet
+/// rates, announce or path request byte counters, transmit buffer or
+/// gravity, so those keys carry Python's idle values.
 fn interface_stats_value(
     entries: &[InterfaceStatEntry],
     transport: Option<&TransportStats>,
+    queues: Option<&InboundQueueSnapshot>,
 ) -> PyValue {
     let sum = |select: fn(&InterfaceStatEntry) -> u64| {
         entries.iter().map(select).fold(0u64, u64::saturating_add)
@@ -883,38 +921,12 @@ fn interface_stats_value(
         ("txs", PyValue::Int(i128::from(sum(|e| e.tx_rate)))),
     ];
     for key in [
-        "arxb",
-        "atxb",
-        "arxs",
-        "atxs",
-        "arxf",
-        "atxf",
-        "prxb",
-        "ptxb",
-        "prxs",
-        "ptxs",
-        "prxf",
-        "ptxf",
-        "rxpps",
-        "txpps",
-        "rxqt",
-        "rxqd",
-        "rxqa",
-        "rxqp",
-        "rxqil",
-        "rxqtd",
-        "rxqdd",
-        "rxqad",
-        "rxqpd",
-        "rxqild",
-        "tqpressure",
-        "dqpressure",
-        "aqpressure",
-        "pqpressure",
-        "ilqpressure",
+        "arxb", "atxb", "arxs", "atxs", "arxf", "atxf", "prxb", "ptxb", "prxs", "ptxs", "prxf",
+        "ptxf", "rxpps", "txpps",
     ] {
         stats.push((key, PyValue::Int(0)));
     }
+    stats.extend(queue_stats(&queues.copied().unwrap_or_default()));
     stats.push(("txq", PyValue::None));
     if let Some(transport) = transport {
         let hash = |hash: Option<[u8; 16]>| {
@@ -2571,6 +2583,25 @@ mod tests {
     }
 
     #[test]
+    fn inbound_queue_stats_follow_python_heights_drops_and_pressures() {
+        let queues = InboundQueueSnapshot {
+            heights: [256, 0, 32, 2],
+            dropped: [0, 7, 1, 3],
+            lengths: [1024, 128, 128, 8],
+        };
+        let stats = stats_dict(&encode_interface_stats(&[], None, Some(&queues)).unwrap());
+        let get = |k| dict_get(&stats, k).cloned().unwrap();
+        assert_eq!(get("rxqt"), PyValue::Int(290));
+        assert_eq!(get("rxqil"), PyValue::Int(2));
+        assert_eq!(get("rxqtd"), PyValue::Int(11));
+        assert_eq!(get("rxqad"), PyValue::Int(7));
+        assert_eq!(get("tqpressure"), PyValue::Float(290.0 / 1288.0));
+        assert_eq!(get("dqpressure"), PyValue::Float(0.25));
+        assert_eq!(get("aqpressure"), PyValue::Int(0));
+        assert_eq!(get("ilqpressure"), PyValue::Float(0.25));
+    }
+
+    #[test]
     fn transport_instance_stats_carry_python_transport_fields() {
         let transport = TransportStats {
             transport_id: [0x11; 16],
@@ -2578,7 +2609,8 @@ mod tests {
             uptime: 12.5,
             probe_responder: Some([0x33; 16]),
         };
-        let encoded = encode_interface_stats(&[interface_stat_entry()], Some(&transport)).unwrap();
+        let encoded =
+            encode_interface_stats(&[interface_stat_entry()], Some(&transport), None).unwrap();
         let stats = stats_dict(&encoded);
         assert_eq!(
             dict_get(&stats, "transport_id"),
@@ -2602,7 +2634,7 @@ mod tests {
             probe_responder: None,
             ..transport
         };
-        let stats = stats_dict(&encode_interface_stats(&[], Some(&bare)).unwrap());
+        let stats = stats_dict(&encode_interface_stats(&[], Some(&bare), None).unwrap());
         assert_eq!(dict_get(&stats, "network_id"), Some(&PyValue::None));
         assert_eq!(dict_get(&stats, "probe_responder"), Some(&PyValue::None));
     }

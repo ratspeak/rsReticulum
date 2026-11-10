@@ -33,7 +33,7 @@ pub async fn start_remote_management(
     identity: &Identity,
     allowed_identities: Vec<[u8; 16]>,
 ) -> Result<[u8; 16], String> {
-    start_remote_management_with_stats(transport_tx, identity, allowed_identities, None, None)
+    start_remote_management_with_stats(transport_tx, identity, allowed_identities, None, None, None)
         .await
         .map(|(dest_hash, _)| dest_hash)
 }
@@ -47,6 +47,7 @@ pub(crate) async fn start_remote_management_with_stats(
     allowed_identities: Vec<[u8; 16]>,
     ifac: Option<InterfaceIfacStats>,
     transport: Option<TransportStatsSource>,
+    inbound_queues: Option<Arc<rns_transport::inbound_queues::InboundQueues>>,
 ) -> Result<([u8; 16], crate::reticulum::ManagementAnnounce), String> {
     let signing_key = identity
         .get_signing_key()
@@ -99,7 +100,13 @@ pub(crate) async fn start_remote_management_with_stats(
         }
 
         if path_hash == status_hash {
-            handle_status(&tx, &data, ifac.as_ref(), transport.as_ref())
+            handle_status(
+                &tx,
+                &data,
+                ifac.as_ref(),
+                transport.as_ref(),
+                inbound_queues.as_deref(),
+            )
         } else if path_hash == paths_hash {
             handle_path(&tx, &data)
         } else {
@@ -140,6 +147,7 @@ fn handle_status(
     data: &[u8],
     ifac: Option<&InterfaceIfacStats>,
     transport: Option<&TransportStatsSource>,
+    inbound_queues: Option<&rns_transport::inbound_queues::InboundQueues>,
 ) -> Option<Vec<u8>> {
     let request = parse_status_request(data)?;
 
@@ -160,6 +168,7 @@ fn handle_status(
     rpc::encode_remote_status(
         &stat_entries(iface_stats, ifac),
         transport.map(TransportStatsSource::snapshot).as_ref(),
+        inbound_queues.map(|q| q.snapshot()).as_ref(),
         link_count,
         request.profiling,
     )
@@ -481,7 +490,7 @@ mod tests {
         let tx = spawn_mock_transport();
 
         let req = rmp_serde::to_vec(&(true,)).unwrap();
-        let resp = handle_status(&tx, &req, None, None).expect("handler produced a response");
+        let resp = handle_status(&tx, &req, None, None, None).expect("handler produced a response");
 
         let decoded: rmpv::Value = rmp_serde::from_slice(&resp).unwrap();
         let arr = decoded.as_array().expect("response is an array");
@@ -593,7 +602,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_status_carries_every_python_155_key() {
         let tx = spawn_mock_transport();
-        let resp = handle_status(&tx, &rmp_serde::to_vec(&(true,)).unwrap(), None, None).unwrap();
+        let resp =
+            handle_status(&tx, &rmp_serde::to_vec(&(true,)).unwrap(), None, None, None).unwrap();
         let decoded: rmpv::Value = rmp_serde::from_slice(&resp).unwrap();
         let stats = decoded.as_array().unwrap()[0].as_map().unwrap();
         for key in crate::rpc::PYTHON_TOTAL_KEYS {
@@ -619,7 +629,14 @@ mod tests {
         let mut internal = mock_stat_entry();
         internal.mode = "Internal".to_string();
         let tx = spawn_mock_transport_with(vec![internal]);
-        let resp = handle_status(&tx, &rmp_serde::to_vec(&(false,)).unwrap(), None, None).unwrap();
+        let resp = handle_status(
+            &tx,
+            &rmp_serde::to_vec(&(false,)).unwrap(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let decoded: rmpv::Value = rmp_serde::from_slice(&resp).unwrap();
         let interface = &remote_interfaces(decoded.as_array().unwrap()[0].as_map().unwrap())[0];
         assert_eq!(
@@ -665,7 +682,7 @@ mod tests {
         let tx = spawn_mock_transport();
 
         let req = rmp_serde::to_vec(&(false,)).unwrap();
-        let resp = handle_status(&tx, &req, None, None).unwrap();
+        let resp = handle_status(&tx, &req, None, None, None).unwrap();
         let decoded: rmpv::Value = rmp_serde::from_slice(&resp).unwrap();
         let arr = decoded.as_array().unwrap();
         assert_eq!(arr.len(), 1, "response is [stats_dict] with no link count");
@@ -678,7 +695,7 @@ mod tests {
     ) -> Option<Vec<rmpv::Value>> {
         let mut data = Vec::new();
         rmpv::encode::write_value(&mut data, request).unwrap();
-        let response = handle_status(tx, &data, None, None)?;
+        let response = handle_status(tx, &data, None, None, None)?;
         let decoded: rmpv::Value = rmp_serde::from_slice(&response).unwrap();
         let reply = decoded.as_array().expect("response is a list");
         assert!(reply[0].is_map(), "the stats dict comes first");

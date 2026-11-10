@@ -85,6 +85,11 @@ struct LinkEndpointQueuedPacket {
 /// that the entire transport has no shared state or locking.
 pub struct TransportActor {
     rx: mpsc::Receiver<TransportMessage>,
+    inbound_queues: Arc<crate::inbound_queues::InboundQueues>,
+    inbound_rx: crate::inbound_queues::InboundReceivers,
+    /// Set while an ingress-limited queue item is processed.
+    processing_ingress_limited: bool,
+    mailbox: mpsc::WeakSender<TransportMessage>,
     announce_dispatch_tx: mpsc::Sender<crate::announce_dispatch::AnnounceDispatchRequest>,
     announce_dispatch_rx: mpsc::Receiver<crate::announce_dispatch::AnnounceDispatchRequest>,
     pending_announce_admissions: VecDeque<announce_admission::PendingAnnounce>,
@@ -408,7 +413,22 @@ impl TransportActor {
         channel_cap: usize,
         hashlist_cap: usize,
     ) -> (Self, mpsc::Sender<TransportMessage>) {
+        Self::new_with_queues(
+            channel_cap,
+            hashlist_cap,
+            crate::inbound_queues::InboundQueueLengths::default(),
+        )
+    }
+
+    /// As [`Self::new_with_capacity`], with per-class inbound queue lengths
+    /// for registered interfaces (`qlen_in_*`, Transport.py:420-427).
+    pub fn new_with_queues(
+        channel_cap: usize,
+        hashlist_cap: usize,
+        queue_lengths: crate::inbound_queues::InboundQueueLengths,
+    ) -> (Self, mpsc::Sender<TransportMessage>) {
         let (tx, rx) = mpsc::channel(channel_cap);
+        let (inbound_queues, inbound_rx) = crate::inbound_queues::InboundQueues::new(queue_lengths);
         let (announce_dispatch_tx, announce_dispatch_rx) =
             mpsc::channel(crate::announce_dispatch::CAPACITY);
         let (persistence_tx, persistence_rx) = mpsc::channel(1);
@@ -419,6 +439,10 @@ impl TransportActor {
 
         let actor = Self {
             rx,
+            inbound_queues,
+            inbound_rx,
+            processing_ingress_limited: false,
+            mailbox: tx.downgrade(),
             announce_dispatch_tx,
             announce_dispatch_rx,
             pending_announce_admissions: VecDeque::new(),
@@ -516,6 +540,11 @@ impl TransportActor {
         (actor, tx)
     }
 
+    /// Shared view of the inbound queue heights, drop counters and lengths.
+    pub fn inbound_queues(&self) -> Arc<crate::inbound_queues::InboundQueues> {
+        Arc::clone(&self.inbound_queues)
+    }
+
     /// Obtain a cloneable lifecycle handle for scheduled persistence.
     pub fn persistence_trigger(&self) -> PersistenceTrigger {
         PersistenceTrigger {
@@ -567,6 +596,9 @@ impl TransportActor {
                         Some(msg) => self.handle_message(msg),
                     }
                 }
+                (class, msg) = std::future::poll_fn(|cx| self.inbound_rx.poll_recv(cx, &self.inbound_queues)) => {
+                    self.handle_inbound_event(class, msg);
+                }
                 Some(request) = self.announce_dispatch_rx.recv() => {
                     self.handle_announce_dispatch(request);
                 }
@@ -604,6 +636,36 @@ impl TransportActor {
                     }
                     self.on_tick();
                 }
+            }
+        }
+    }
+
+    /// Path requests from an interface in a path-request burst wait in the
+    /// ingress-limited queue, behind every other class (Transport.py:2133-2134).
+    fn handle_inbound_event(
+        &mut self,
+        class: crate::inbound_queues::TrafficClass,
+        item: crate::inbound_queues::Queued,
+    ) {
+        use crate::inbound_queues::{Queued, TrafficClass};
+        match item {
+            Queued::ReleasedAnnounce(announce) => self.on_released_announce(announce),
+            Queued::Message(msg)
+                if class == TrafficClass::PathRequest
+                    && matches!(&*msg, TransportMessage::InterfaceEvent { interface_id, .. }
+                        if self
+                            .interfaces
+                            .get_mut(interface_id)
+                            .is_some_and(|entry| entry.ingress.should_ingress_limit_pr())) =>
+            {
+                self.inbound_rx
+                    .push_ingress_limited(&self.inbound_queues, Queued::Message(msg));
+            }
+            Queued::Message(msg) => {
+                // Python carries the class on the packet into path_request (Transport.py:3761).
+                self.processing_ingress_limited = class == TrafficClass::IngressLimited;
+                self.handle_message(*msg);
+                self.processing_ingress_limited = false;
             }
         }
     }
@@ -1114,6 +1176,13 @@ impl TransportActor {
                         crate::messages::LinkEndpointTerminalReason::InterfaceRemoved,
                     );
                 }
+                entry
+                    .owner
+                    .set_intake(crate::inbound_queues::InboundIntake {
+                        queues: Arc::clone(&self.inbound_queues),
+                        ifac: entry.ifac_key.clone().map(|key| (key, entry.ifac_size)),
+                        mailbox: self.mailbox.clone(),
+                    });
                 self.interfaces.insert(id, entry);
                 self.interfaces[&id].owner.mark_registered();
                 if !self.startup_complete && self.startup_time == 0.0 {
@@ -2343,6 +2412,7 @@ mod tests {
     mod bitrate_timing;
     mod discovery_api;
     mod held_announces;
+    mod inbound_queues;
     mod interface_stats;
     mod link_endpoint_dispatch;
     mod packet_capacity;

@@ -36,6 +36,7 @@ struct RegistrationState {
     revision: AtomicU64,
     registered_revision: AtomicU64,
     changed: Notify,
+    intake: std::sync::RwLock<Option<crate::inbound_queues::InboundIntake>>,
 }
 impl PartialEq for InterfaceOwner {
     fn eq(&self, other: &Self) -> bool {
@@ -62,6 +63,7 @@ impl InterfaceOwner {
                 revision: AtomicU64::new(0),
                 registered_revision: AtomicU64::new(u64::MAX),
                 changed: Notify::new(),
+                intake: Default::default(),
             }),
         }
     }
@@ -139,6 +141,15 @@ impl InterfaceOwner {
             revision: next,
             validity: Arc::clone(&self.validity),
         })
+    }
+    /// Route this registration's inbound frames into the actor's per-class queues.
+    pub(crate) fn set_intake(&self, intake: crate::inbound_queues::InboundIntake) {
+        if let Ok(mut slot) = self.validity.intake.write() {
+            *slot = Some(intake);
+        }
+    }
+    fn intake(&self) -> Option<crate::inbound_queues::InboundIntake> {
+        self.validity.intake.read().ok()?.clone()
     }
     pub(crate) fn retire(&self) {
         self.validity.retired.store(true, Ordering::Release);
@@ -322,10 +333,14 @@ impl InterfaceTransportSender {
         if !self.ready().await {
             return Err(mpsc::error::SendError(message));
         }
-        self.tx
-            .send(self.event(message))
-            .await
-            .map_err(|e| mpsc::error::SendError(unwrap_event(e.0)))
+        let result = match self.owner.intake().filter(|i| i.serves(&self.tx)) {
+            Some(intake) => {
+                let class = inbound_class(&intake, &message);
+                intake.queues.send(class, self.event(message)).await
+            }
+            None => self.tx.send(self.event(message)).await,
+        };
+        result.map_err(|e| mpsc::error::SendError(unwrap_event(e.0)))
     }
     /// Attempt immediate admission. A stale owner returns `Closed`; a current
     /// but unregistered owner returns `Full`, even if the mailbox has space.
@@ -344,12 +359,30 @@ impl InterfaceTransportSender {
         if !self.owner.is_registered() {
             return Err(mpsc::error::TrySendError::Full(message));
         }
-        self.tx.try_send(self.event(message)).map_err(|e| match e {
+        let result = match self.owner.intake().filter(|i| i.serves(&self.tx)) {
+            Some(intake) => {
+                let class = inbound_class(&intake, &message);
+                intake.queues.try_send(class, self.event(message))
+            }
+            None => self.tx.try_send(self.event(message)),
+        };
+        result.map_err(|e| match e {
             mpsc::error::TrySendError::Full(m) => mpsc::error::TrySendError::Full(unwrap_event(m)),
             mpsc::error::TrySendError::Closed(m) => {
                 mpsc::error::TrySendError::Closed(unwrap_event(m))
             }
         })
+    }
+}
+/// Interface control events share the data queue so they stay ordered with
+/// the data around them.
+fn inbound_class(
+    intake: &crate::inbound_queues::InboundIntake,
+    message: &TransportMessage,
+) -> crate::inbound_queues::TrafficClass {
+    match message {
+        TransportMessage::Inbound(packet) => intake.traffic_class(&packet.raw),
+        _ => crate::inbound_queues::TrafficClass::Data,
     }
 }
 fn unwrap_event(message: TransportMessage) -> TransportMessage {
