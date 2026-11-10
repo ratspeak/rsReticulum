@@ -3071,7 +3071,11 @@ mod tests {
         let messages = Arc::new(Mutex::new(Vec::new()));
         spawn_ack_manager(command_rx, messages.clone());
         let (exited_tx, mut exited_rx) = mpsc::unbounded_channel();
-        let command = vec!["/bin/true".to_string()];
+        let command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 0".to_string(),
+        ];
         let _process = start_listener_process(
             command_tx,
             [0x45; 16],
