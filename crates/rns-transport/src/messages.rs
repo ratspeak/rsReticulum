@@ -725,6 +725,11 @@ pub enum TransportMessage {
     SetStampPolicy {
         policy: crate::stamps::StampPolicy,
     },
+    /// Apply the `[filter]` configuration: required-only mode, ignored and
+    /// allowed destination types and the hop limiter.
+    SetFilterPolicy {
+        policy: crate::destination_filter::FilterPolicy,
+    },
     /// Handle loss of the current shared-instance peer: invalidate routing state
     /// and terminate peer-bound Link endpoints. This is not a blanket pause of
     /// all packet processing. Submit through the current interface owner.
@@ -836,6 +841,7 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::SetTransportIdentity { .. } => "SetTransportIdentity",
         TransportMessage::SetBlackholeSources { .. } => "SetBlackholeSources",
         TransportMessage::SetStampPolicy { .. } => "SetStampPolicy",
+        TransportMessage::SetFilterPolicy { .. } => "SetFilterPolicy",
         TransportMessage::SharedConnectionLost => "SharedConnectionLost",
         TransportMessage::SharedConnectionRestored { .. } => "SharedConnectionRestored",
         TransportMessage::SynthesizeTunnel { .. } => "SynthesizeTunnel",
@@ -1053,6 +1059,26 @@ pub enum TransportQuery {
     /// public key. The returned count reflects cache presence, not identity validity;
     /// a legitimate but unseen or pruned identity can be removed.
     PurgeUnverifiedBlackholes,
+    /// Python `Transport.required_destinations_only`; answered `BoolResult(true)`.
+    SetRequiredOnly {
+        enabled: bool,
+    },
+    /// Python `Transport._wants_destination_type`: `BoolResult(false)` for a
+    /// blocked type.
+    WantsDestinationType {
+        full_name: String,
+        requester: Vec<u8>,
+    },
+    /// Python `Transport._unwants_destination_type`: whether the requester
+    /// was registered.
+    UnwantsDestinationType {
+        full_name: String,
+        requester: Vec<u8>,
+    },
+    /// Python `Transport._unwants_all_destination_types`; always `BoolResult(true)`.
+    UnwantsAllDestinationTypes {
+        requester: Vec<u8>,
+    },
 }
 
 /// Local actor results. `Ok` confirms handling only; individual operations
@@ -1387,6 +1413,10 @@ impl std::fmt::Debug for TransportMessage {
                 .finish(),
             Self::SetStampPolicy { policy } => f
                 .debug_struct("SetStampPolicy")
+                .field("policy", policy)
+                .finish(),
+            Self::SetFilterPolicy { policy } => f
+                .debug_struct("SetFilterPolicy")
                 .field("policy", policy)
                 .finish(),
             Self::SharedConnectionLost => f.debug_struct("SharedConnectionLost").finish(),

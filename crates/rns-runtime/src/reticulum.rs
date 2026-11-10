@@ -139,6 +139,44 @@ struct TransportCompletion {
 
 const RUNTIME_INTERFACE_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Python `Transport.application_identity.hash`: one random requester per
+/// process for destination type requests (Transport.py:449).
+fn application_requester() -> [u8; 16] {
+    static REQUESTER: OnceLock<[u8; 16]> = OnceLock::new();
+    *REQUESTER.get_or_init(|| Identity::new().hash)
+}
+
+/// A shared instance's control RPC endpoint and key.
+#[derive(Clone)]
+struct SharedRpcTarget {
+    endpoint: SharedInstanceRpcEndpoint,
+    rpc_key: Vec<u8>,
+}
+
+impl SharedRpcTarget {
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    async fn request(
+        &self,
+        request: &crate::rpc::RpcRequest,
+    ) -> Result<crate::rpc::RpcResponse, crate::rpc::RpcError> {
+        match &self.endpoint {
+            SharedInstanceRpcEndpoint::Tcp(port) => {
+                crate::rpc::connect_and_request(*port, &self.rpc_key, request, Self::TIMEOUT).await
+            }
+            SharedInstanceRpcEndpoint::Unix(socket_path) => {
+                crate::rpc::connect_unix_and_request(
+                    socket_path,
+                    &self.rpc_key,
+                    request,
+                    Self::TIMEOUT,
+                )
+                .await
+            }
+        }
+    }
+}
+
 /// One cancellation-independent shutdown operation shared by explicit API
 /// callers and the process-signal watcher. The coordinator intentionally owns
 /// the accepted-child pump and all runtime-local interface ownership; callers
@@ -160,6 +198,7 @@ struct RuntimeShutdownInner {
     accepted_child_pump: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     owned_control_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     interface_panic: Arc<std::sync::OnceLock<String>>,
+    exit_unwants: std::sync::Mutex<Option<SharedRpcTarget>>,
 }
 
 impl RuntimeShutdownCoordinator {
@@ -183,6 +222,7 @@ impl RuntimeShutdownCoordinator {
                 accepted_child_pump: std::sync::Mutex::new(None),
                 owned_control_task: std::sync::Mutex::new(None),
                 interface_panic: Arc::default(),
+                exit_unwants: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -195,6 +235,16 @@ impl RuntimeShutdownCoordinator {
             .expect("accepted child pump mutex poisoned");
         debug_assert!(slot.is_none(), "accepted child pump installed twice");
         *slot = Some(pump);
+    }
+
+    /// Python's exit handler deregisters this process's destination types
+    /// from the shared instance first (Reticulum.py:189).
+    fn install_exit_unwants(&self, target: SharedRpcTarget) {
+        *self
+            .inner
+            .exit_unwants
+            .lock()
+            .expect("exit unwants mutex poisoned") = Some(target);
     }
 
     fn is_started(&self) -> bool {
@@ -244,6 +294,21 @@ impl RuntimeShutdownCoordinator {
     }
 
     async fn run(&self) {
+        let exit_unwants = self
+            .inner
+            .exit_unwants
+            .lock()
+            .expect("exit unwants mutex poisoned")
+            .take();
+        if let Some(target) = exit_unwants {
+            let request = crate::rpc::RpcRequest::UnwantsAllDestinationTypes {
+                requester: application_requester().to_vec(),
+                signature: None,
+            };
+            if let Err(error) = target.request(&request).await {
+                tracing::debug!(%error, "shared instance RPC failed while deregistering destination types");
+            }
+        }
         let drain = match self.inner.interface_registry.begin_drain() {
             DrainStart::Acquired(drain) => drain,
             DrainStart::AlreadyDraining | DrainStart::Closed => {
@@ -2116,6 +2181,141 @@ impl ReticulumHandle {
         Ok(self.apply_shared_instance_latency(&query, response))
     }
 
+    fn shared_rpc_target(&self) -> Option<SharedRpcTarget> {
+        Some(SharedRpcTarget {
+            endpoint: self.config.shared_rpc_endpoint(&self.socket_base),
+            rpc_key: self.config.rpc_key.clone()?,
+        })
+    }
+
+    async fn local_filter_query(&self, query: TransportQuery) -> bool {
+        matches!(
+            self.query_transport_result(query).await,
+            Ok(TransportQueryResponse::BoolResult(true))
+        )
+    }
+
+    /// A destination type request: registered locally, and on a shared-instance
+    /// client also with the shared instance, whose answer is returned. A failed
+    /// RPC answers false (Reticulum.py:2224-2267).
+    async fn destination_type_request(
+        &self,
+        local: TransportQuery,
+        remote: crate::rpc::RpcRequest,
+    ) -> bool {
+        if self.instance_mode != InstanceMode::Client {
+            return self.local_filter_query(local).await;
+        }
+        self.local_filter_query(local).await;
+        let Some(target) = self.shared_rpc_target() else {
+            return false;
+        };
+        match target.request(&remote).await {
+            Ok(crate::rpc::RpcResponse::BoolResult(v)) => v,
+            Ok(other) => {
+                tracing::debug!(
+                    ?other,
+                    "unexpected shared instance reply to a destination type request"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::debug!(%error, "shared instance RPC failed while setting destination type filters");
+                false
+            }
+        }
+    }
+
+    /// Python `Reticulum.required_announces_only`: only shared-instance
+    /// clients may restrict their own announce ingress (Reticulum.py:2216-2222).
+    pub async fn required_announces_only(&self, enabled: bool) -> bool {
+        if self.instance_mode != InstanceMode::Client {
+            return false;
+        }
+        self.local_filter_query(TransportQuery::SetRequiredOnly { enabled })
+            .await
+    }
+
+    /// Python `Reticulum.wants_destination_type` with this process's requester.
+    pub async fn wants_destination_type(&self, full_name: &str) -> bool {
+        self.wants_destination_type_as(full_name, &application_requester(), None)
+            .await
+    }
+
+    /// Python `Reticulum.wants_destination_type` with an explicit requester;
+    /// the signature is forwarded but, as upstream, never verified.
+    pub async fn wants_destination_type_as(
+        &self,
+        full_name: &str,
+        requester: &[u8],
+        signature: Option<&[u8]>,
+    ) -> bool {
+        self.destination_type_request(
+            TransportQuery::WantsDestinationType {
+                full_name: full_name.to_string(),
+                requester: requester.to_vec(),
+            },
+            crate::rpc::RpcRequest::WantsDestinationType {
+                full_name: full_name.to_string(),
+                requester: requester.to_vec(),
+                signature: signature.map(<[u8]>::to_vec),
+            },
+        )
+        .await
+    }
+
+    /// Python `Reticulum.unwants_destination_type` with this process's requester.
+    pub async fn unwants_destination_type(&self, full_name: &str) -> bool {
+        self.unwants_destination_type_as(full_name, &application_requester(), None)
+            .await
+    }
+
+    /// Python `Reticulum.unwants_destination_type` with an explicit requester.
+    pub async fn unwants_destination_type_as(
+        &self,
+        full_name: &str,
+        requester: &[u8],
+        signature: Option<&[u8]>,
+    ) -> bool {
+        self.destination_type_request(
+            TransportQuery::UnwantsDestinationType {
+                full_name: full_name.to_string(),
+                requester: requester.to_vec(),
+            },
+            crate::rpc::RpcRequest::UnwantsDestinationType {
+                full_name: full_name.to_string(),
+                requester: requester.to_vec(),
+                signature: signature.map(<[u8]>::to_vec),
+            },
+        )
+        .await
+    }
+
+    /// Python `Reticulum.unwants_all_destination_types` with this process's
+    /// requester. Runtime shutdown also does this on a shared-instance client.
+    pub async fn unwants_all_destination_types(&self) -> bool {
+        self.unwants_all_destination_types_as(&application_requester(), None)
+            .await
+    }
+
+    /// Python `Reticulum.unwants_all_destination_types` with an explicit requester.
+    pub async fn unwants_all_destination_types_as(
+        &self,
+        requester: &[u8],
+        signature: Option<&[u8]>,
+    ) -> bool {
+        self.destination_type_request(
+            TransportQuery::UnwantsAllDestinationTypes {
+                requester: requester.to_vec(),
+            },
+            crate::rpc::RpcRequest::UnwantsAllDestinationTypes {
+                requester: requester.to_vec(),
+                signature: signature.map(<[u8]>::to_vec),
+            },
+        )
+        .await
+    }
+
     /// Query the local actor or shared-owner control plane, converting all errors
     /// to `None`. Client mode supports only queries exposed by the RPC mapping.
     /// Use [`Self::query_control_result`] to distinguish failures and
@@ -2679,6 +2879,8 @@ pub struct ReticulumConfig {
 
     /// Network stamp policy from the `[stamps]` section.
     pub stamps: rns_transport::stamps::StampPolicy,
+    /// Destination-type filter and hop limiter from the `[filter]` section.
+    pub filter: rns_transport::destination_filter::FilterPolicy,
 }
 
 impl Default for ReticulumConfig {
@@ -2719,6 +2921,7 @@ impl Default for ReticulumConfig {
             log_timestamps: true,
             bootstrap_configs: Vec::new(),
             stamps: rns_transport::stamps::StampPolicy::default(),
+            filter: rns_transport::destination_filter::FilterPolicy::default(),
         }
     }
 }
@@ -2965,6 +3168,7 @@ impl ReticulumConfig {
         if let Some(sec) = config.section("stamps") {
             apply_stamps_section(&mut rc.stamps, sec)?;
         }
+        rc.filter = config.filter_policy()?;
 
         if let Some(sec) = config.section("reticulum") {
             if let Some(value) = config_bool("reticulum", sec, "share_instance")? {
@@ -3352,6 +3556,9 @@ pub async fn init_with_policy(
         policy: rc.stamps.clone(),
     });
     crate::destination_stamper::configure(rc.stamps.clone(), Some(paths.storage_dir.clone()));
+    let _ = transport_tx.try_send(TransportMessage::SetFilterPolicy {
+        policy: rc.filter.clone(),
+    });
 
     // Python defaults the local shared-instance RPC key to a hash of the
     // PERSISTENT transport identity (internal_identity(), Reticulum.py:352),
@@ -3781,6 +3988,12 @@ pub async fn init_with_policy(
         rc.autoconnect_discovered_interfaces = 0;
         rc.publish_blackhole = false;
         rc.blackhole_sources.clear();
+        if let Some(rpc_key) = rc.rpc_key.clone() {
+            shutdown_coordinator.install_exit_unwants(SharedRpcTarget {
+                endpoint: rc.shared_rpc_endpoint(&socket_base),
+                rpc_key,
+            });
+        }
     }
 
     // Rebroadcast / path forwarding / reverse-path proof routing requires
@@ -7406,6 +7619,10 @@ async fn start_blackhole_subscriber(handle: ReticulumHandle) {
     }
     *started = true;
     drop(started);
+    // BlackholeUpdater.start registers its announce type (Discovery.py:908).
+    handle
+        .wants_destination_type("rnstransport.info.blackhole")
+        .await;
 
     let identity = match clone_identity(&handle.transport_identity) {
         Some(identity) => identity,

@@ -25,6 +25,7 @@ pub mod announce_validation;
 pub mod await_path;
 pub mod blackhole;
 pub mod constants;
+pub mod destination_filter;
 pub mod discovery;
 pub mod hashlist;
 pub mod ifac;

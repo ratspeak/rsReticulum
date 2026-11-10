@@ -229,6 +229,26 @@ impl TransportActor {
             return;
         }
 
+        // Packet.unpack rejects a zero-length data field (Packet.py:275).
+        if data_offset >= raw.len() {
+            debug!(
+                interface_id = packet.interface_id,
+                "inbound packet dropped: zero-length data field"
+            );
+            self.protocol_violation(packet.interface_id);
+            return;
+        }
+
+        // Transport.HOP_LIMITER, on wire hops (Transport.py:2022).
+        if parsed.hops >= self.hop_limiter {
+            trace!(
+                hops = parsed.hops,
+                interface_id = packet.interface_id,
+                "inbound packet dropped by hop limiter"
+            );
+            return;
+        }
+
         // The canonical packet hash excludes the next-hop transport address
         // and survives final-hop H2-to-H1 rewriting. An overheard packet for
         // another transport must therefore not enter our accepted hashlist:
@@ -332,7 +352,8 @@ impl TransportActor {
             || parsed.flags.packet_type == rns_wire::flags::PacketType::LinkRequest
             || parsed.context == rns_wire::context::PacketContext::Lrproof;
 
-        if !skip_hashlist && !defer_hashlist && !self.packet_hashlist.insert(pkt_hash) {
+        let check_hashlist = !skip_hashlist && !defer_hashlist;
+        if check_hashlist && self.packet_hashlist.contains(&pkt_hash) {
             // SINGLE announces are retransmitted to refresh paths, so an
             // exact duplicate is expected and must not be dropped.
             if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce
@@ -343,6 +364,18 @@ impl TransportActor {
                 self.packet_filter_hit(packet.interface_id);
                 return;
             }
+        }
+
+        // Destination-type filtering runs after the packet filter and before
+        // the hash is remembered (Transport.py:2030-2041, :2235).
+        if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce
+            && !self.admit_announce_type(&raw[data_offset..], parsed.hops, packet.interface_id)
+        {
+            return;
+        }
+
+        if check_hashlist {
+            self.packet_hashlist.insert(pkt_hash);
         }
 
         parsed.hops = self.adjusted_inbound_hops(parsed.hops, packet.interface_id);
@@ -370,6 +403,48 @@ impl TransportActor {
                 self.process_data(&raw, &parsed, packet.interface_id, packet_metrics);
             }
         }
+    }
+
+    /// Python's announce ingress filter: a short name hash is a protocol
+    /// violation, blocked and unrequired types are dropped silently.
+    fn admit_announce_type(
+        &mut self,
+        payload: &[u8],
+        wire_hops: u8,
+        interface_id: InterfaceId,
+    ) -> bool {
+        use crate::destination_filter::{AnnounceSource, NAME_HASH_LEN, NameHash};
+        const KEYSIZE: usize = 64;
+        let Some(name_hash) = payload
+            .get(KEYSIZE..KEYSIZE + NAME_HASH_LEN)
+            .and_then(|bytes| NameHash::try_from(bytes).ok())
+        else {
+            debug!(
+                interface_id,
+                size = payload.len(),
+                "malformed announce packet"
+            );
+            self.protocol_violation(interface_id);
+            return false;
+        };
+        let source = if self.is_local_client_interface(interface_id) {
+            AnnounceSource::LocalClient
+        } else if self.is_shared_instance_peer_interface(interface_id) {
+            AnnounceSource::SharedInstance
+        } else {
+            AnnounceSource::Other
+        };
+        let admitted = self
+            .destination_filter
+            .admits(&name_hash, source, wire_hops);
+        if !admitted {
+            trace!(
+                interface_id,
+                destination_type = self.destination_filter.type_name(&name_hash),
+                "announce dropped by destination type filter"
+            );
+        }
+        admitted
     }
 
     fn process_announce(

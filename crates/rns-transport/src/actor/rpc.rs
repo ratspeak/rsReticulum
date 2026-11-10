@@ -709,6 +709,37 @@ impl TransportActor {
                 }
                 TransportQueryResponse::IntResult(purged as i64)
             }
+            TransportQuery::SetRequiredOnly { enabled } => {
+                self.destination_filter.set_required_only(enabled);
+                debug!(enabled, "required-only announce filtering");
+                TransportQueryResponse::BoolResult(true)
+            }
+            TransportQuery::WantsDestinationType {
+                full_name,
+                requester,
+            } => {
+                let wanted = self.destination_filter.wants(&full_name, requester.clone());
+                if wanted {
+                    debug!(
+                        "Registered <{full_name}> destinations requirement for {}",
+                        hex::encode(&requester)
+                    );
+                }
+                TransportQueryResponse::BoolResult(wanted)
+            }
+            TransportQuery::UnwantsDestinationType {
+                full_name,
+                requester,
+            } => TransportQueryResponse::BoolResult(
+                self.destination_filter.unwants(&full_name, &requester),
+            ),
+            TransportQuery::UnwantsAllDestinationTypes { requester } => {
+                debug!(
+                    "Deregistered all destination requirements for {}",
+                    hex::encode(&requester)
+                );
+                TransportQueryResponse::BoolResult(self.destination_filter.unwants_all(&requester))
+            }
         }
     }
 

@@ -320,6 +320,41 @@ impl Config {
         self.sections.get(name)
     }
 
+    /// The `[filter]` section as Python `Reticulum.__apply_config` reads it
+    /// (Reticulum.py:487-503); malformed values are errors.
+    pub fn filter_policy(
+        &self,
+    ) -> Result<rns_transport::destination_filter::FilterPolicy, ConfigError> {
+        use rns_transport::destination_filter::FilterPolicy;
+        let mut policy = FilterPolicy::default();
+        let Some(sec) = self.section("filter") else {
+            return Ok(policy);
+        };
+        let invalid = |key: &str, message: &str| ConfigError::InvalidValue {
+            section: "filter".to_string(),
+            key: key.to_string(),
+            message: message.to_string(),
+        };
+        if sec.has("required_only") {
+            policy.required_only = sec
+                .get_bool("required_only")
+                .ok_or_else(|| invalid("required_only", "value is neither True nor False"))?;
+        }
+        if let Some(entries) = sec.get_list("ignored_types") {
+            policy.ignored_types = entries;
+        }
+        if let Some(entries) = sec.get_list("allowed_types") {
+            policy.allowed_types = entries;
+        }
+        if sec.has("hop_limiter") {
+            let value = sec
+                .get_int("hop_limiter")
+                .ok_or_else(|| invalid("hop_limiter", "value is not an integer"))?;
+            policy.hop_limiter = FilterPolicy::clamp_hop_limiter(value);
+        }
+        Ok(policy)
+    }
+
     pub fn section_mut(&mut self, name: &str) -> Option<&mut ConfigSection> {
         self.sections.get_mut(name)
     }
@@ -794,6 +829,28 @@ mod tests {
     fn test_parse_empty() {
         let config = Config::parse("").unwrap();
         assert!(config.sections.is_empty());
+    }
+
+    #[test]
+    fn filter_section_follows_upstream_keys() {
+        let config = Config::parse(
+            "[filter]\n  required_only = Yes\n  ignored_types = a.b, c.d\n  \
+             allowed_types = lxmf.delivery\n  hop_limiter = 300\n",
+        )
+        .unwrap();
+        let policy = config.filter_policy().unwrap();
+        assert!(policy.required_only);
+        assert_eq!(policy.ignored_types, vec!["a.b", "c.d"]);
+        assert_eq!(policy.allowed_types, vec!["lxmf.delivery"]);
+        assert_eq!(policy.hop_limiter, 128);
+        let negative = Config::parse("[filter]\nhop_limiter = -4\n").unwrap();
+        assert_eq!(negative.filter_policy().unwrap().hop_limiter, 0);
+        let empty = Config::parse("[reticulum]\n").unwrap();
+        assert_eq!(empty.filter_policy().unwrap(), Default::default());
+        for bad in ["required_only = maybe", "hop_limiter = many"] {
+            let config = Config::parse(&format!("[filter]\n{bad}\n")).unwrap();
+            assert!(config.filter_policy().is_err(), "{bad}");
+        }
     }
 
     #[test]

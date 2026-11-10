@@ -215,6 +215,11 @@ pub struct TransportActor {
     pub blackhole_sources: Vec<[u8; 16]>,
     /// Network stamp policy from configuration and constructor switches.
     pub stamp_policy: crate::stamps::StampPolicy,
+    /// Destination-type announce filter from `[filter]` and application requests.
+    pub destination_filter: crate::destination_filter::DestinationTypeFilter,
+    /// Python `Transport.HOP_LIMITER`: inbound packets with this many wire hops
+    /// or more are dropped.
+    pub hop_limiter: u8,
     /// Shared set of currently blackholed identity hashes for runtime Link checks.
     /// Managed mutation/cull paths rebuild it and filter expired entries. Direct
     /// public table mutation does not publish a snapshot; a poisoned snapshot
@@ -470,6 +475,8 @@ impl TransportActor {
             local_hops_delta: 0,
             blackhole_sources: Vec::new(),
             stamp_policy: crate::stamps::StampPolicy::default(),
+            destination_filter: Default::default(),
+            hop_limiter: PATHFINDER_M,
             blackholed_snapshot: Arc::new(std::sync::RwLock::new(HashSet::new())),
             announce_validation: crate::announce_validation::AnnounceValidationCache::new(),
             pr_stamper: crate::pr_stamper::PathRequestStamper::new(),
@@ -1016,6 +1023,11 @@ impl TransportActor {
             TransportMessage::SetStampPolicy { policy } => {
                 debug!(?policy, "setting stamp policy");
                 self.stamp_policy = policy;
+            }
+            TransportMessage::SetFilterPolicy { policy } => {
+                debug!(?policy, "setting destination filter policy");
+                self.hop_limiter = policy.hop_limiter;
+                self.destination_filter.apply_policy(&policy);
             }
             TransportMessage::SharedConnectionLost => {
                 tracing::warn!("shared instance connection lost — suspending transport");

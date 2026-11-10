@@ -3,7 +3,6 @@
 //! use mutual RPC-key authentication and framed MessagePack, with a 30-second
 //! session budget and up to 64 concurrent clients. RPC frames are not encrypted.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -28,7 +27,6 @@ pub(crate) struct RpcBackend {
     ifac: Option<InterfaceIfacStats>,
     transport: Option<TransportStatsSource>,
     lowest_interface_bitrate: Arc<Mutex<Option<u64>>>,
-    destination_types: DestinationTypeRequests,
 }
 
 impl RpcBackend {
@@ -41,61 +39,12 @@ impl RpcBackend {
             ifac,
             transport: None,
             lowest_interface_bitrate: Arc::default(),
-            destination_types: DestinationTypeRequests::default(),
         }
     }
 
     pub(crate) fn with_transport(mut self, transport: Option<TransportStatsSource>) -> Self {
         self.transport = transport;
         self
-    }
-}
-
-/// Shared-instance clients' destination type requirements, keyed by name
-/// hash, as Python's `Transport.client_destination_types` (Transport.py:4648-4692).
-type DestinationTypeRequirements = HashMap<[u8; 10], HashSet<Vec<u8>>>;
-
-#[derive(Clone, Default)]
-struct DestinationTypeRequests {
-    requirements: Arc<Mutex<DestinationTypeRequirements>>,
-}
-
-impl DestinationTypeRequests {
-    fn wants(&self, full_name: &str, requester: Vec<u8>) -> bool {
-        self.requirements
-            .lock()
-            .expect("destination type requirements mutex poisoned")
-            .entry(rns_identity::name_hash::name_hash(full_name))
-            .or_default()
-            .insert(requester);
-        true
-    }
-
-    fn unwants(&self, full_name: &str, requester: Vec<u8>) -> bool {
-        let name_hash = rns_identity::name_hash::name_hash(full_name);
-        let mut requirements = self
-            .requirements
-            .lock()
-            .expect("destination type requirements mutex poisoned");
-        let Some(requesters) = requirements.get_mut(&name_hash) else {
-            return false;
-        };
-        let was_registered = requesters.remove(&requester);
-        if requesters.is_empty() {
-            requirements.remove(&name_hash);
-        }
-        was_registered
-    }
-
-    fn unwants_all(&self, requester: Vec<u8>) -> bool {
-        self.requirements
-            .lock()
-            .expect("destination type requirements mutex poisoned")
-            .retain(|_, requesters| {
-                requesters.remove(&requester);
-                !requesters.is_empty()
-            });
-        true
     }
 }
 
@@ -479,26 +428,6 @@ async fn respond(request: RpcRequest, backend: &RpcBackend) -> Result<Vec<u8>, R
         // answers as Python does with `enable_interface_management = no`
         // (Reticulum.py:851, 878, 907).
         RpcRequest::ManageInterface { .. } => return rpc::encode_optional_bool(Some(false)),
-        RpcRequest::WantsDestinationType {
-            full_name,
-            requester,
-            ..
-        } => {
-            let wanted = backend.destination_types.wants(&full_name, requester);
-            return rpc::encode_response(&RpcResponse::BoolResult(wanted));
-        }
-        RpcRequest::UnwantsDestinationType {
-            full_name,
-            requester,
-            ..
-        } => {
-            let unwanted = backend.destination_types.unwants(&full_name, requester);
-            return rpc::encode_response(&RpcResponse::BoolResult(unwanted));
-        }
-        RpcRequest::UnwantsAllDestinationTypes { requester, .. } => {
-            let unwanted = backend.destination_types.unwants_all(requester);
-            return rpc::encode_response(&RpcResponse::BoolResult(unwanted));
-        }
         _ => {}
     }
     match process_rpc_request(request, &backend.transport_tx, backend.ifac.as_ref()).await {
@@ -760,12 +689,44 @@ async fn process_rpc_request(
         | RpcRequest::GetMediumPathTimeout
         | RpcRequest::GetLinkDistribution
         | RpcRequest::GetProfilingResults
-        | RpcRequest::ManageInterface { .. }
-        | RpcRequest::WantsDestinationType { .. }
-        | RpcRequest::UnwantsDestinationType { .. }
-        | RpcRequest::UnwantsAllDestinationTypes { .. } => {
+        | RpcRequest::ManageInterface { .. } => {
             RpcResponse::Error("request needs the control server's state".to_string())
         }
+        RpcRequest::WantsDestinationType {
+            full_name,
+            requester,
+            ..
+        } => match authoritative_query!(
+            TransportQuery::WantsDestinationType {
+                full_name,
+                requester
+            },
+            "destination type request"
+        ) {
+            TransportQueryResponse::BoolResult(v) => RpcResponse::BoolResult(v),
+            _ => unexpected_transport_response("destination type request"),
+        },
+        RpcRequest::UnwantsDestinationType {
+            full_name,
+            requester,
+            ..
+        } => match authoritative_query!(
+            TransportQuery::UnwantsDestinationType {
+                full_name,
+                requester
+            },
+            "destination type request"
+        ) {
+            TransportQueryResponse::BoolResult(v) => RpcResponse::BoolResult(v),
+            _ => unexpected_transport_response("destination type request"),
+        },
+        RpcRequest::UnwantsAllDestinationTypes { requester, .. } => match authoritative_query!(
+            TransportQuery::UnwantsAllDestinationTypes { requester },
+            "destination type request"
+        ) {
+            TransportQueryResponse::BoolResult(v) => RpcResponse::BoolResult(v),
+            _ => unexpected_transport_response("destination type request"),
+        },
         RpcRequest::GetNextHopIfName { destination_hash } => {
             let Some(dest) = hash_to_array(&destination_hash) else {
                 return invalid_request_hash("destination");
@@ -1778,7 +1739,15 @@ listener.close()
     /// The sequence and results of an upstream 1.6.0 live run, without filters.
     #[tokio::test]
     async fn destination_type_requests_follow_upstream_bookkeeping() {
-        let backend = RpcBackend::new(stats_transport(Vec::new()), None);
+        let (mut actor, tx) = rns_transport::actor::TransportActor::new();
+        actor
+            .destination_filter
+            .apply_policy(&rns_transport::destination_filter::FilterPolicy {
+                ignored_types: vec!["blocked.type".into()],
+                ..Default::default()
+            });
+        tokio::spawn(actor.run());
+        let backend = RpcBackend::new(tx, None);
         let requester = vec![0x11; 16];
         let wants = |name: &str| RpcRequest::WantsDestinationType {
             full_name: name.to_string(),
@@ -1798,6 +1767,7 @@ listener.close()
         let f = "c2";
         for (request, want) in [
             (wants("lxmf.delivery"), t),
+            (wants("blocked.type"), f),
             (unwants("lxmf.delivery"), t),
             (unwants("lxmf.delivery"), f),
             (unwants("never.registered"), f),
