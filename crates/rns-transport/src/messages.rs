@@ -327,6 +327,12 @@ pub struct InterfaceEntry {
     /// Whether to rebroadcast announces whose next-hop interface uses
     /// `InterfaceMode::Internal`.
     pub announces_from_internal: bool,
+    /// Relay non-local announces learned here onto Internal-mode interfaces,
+    /// even from a Boundary interface, when `Some(true)`.
+    pub announces_to_internal: Option<bool>,
+    /// Path preference among equal announces; a copy of the same emission
+    /// heard on a higher-gravity interface replaces the path.
+    pub gravity: i64,
     /// Configured announce stamp requirement; `None` follows
     /// `StampPolicy::destination_cost`. Resolve with `StampPolicy::interface_destination_cost`.
     pub destination_cost: Option<f64>,
@@ -380,6 +386,8 @@ impl InterfaceEntry {
             multipoint: false,
             recursive_prs: false,
             announces_from_internal: true,
+            announces_to_internal: None,
+            gravity: 0,
             destination_cost: None,
             pr_cost: None,
         }
@@ -664,6 +672,8 @@ pub enum TransportMessage {
         receive_path_responses: bool,
         callback_tx: mpsc::Sender<AnnounceHandlerEvent>,
         dropped_events: Arc<AtomicU64>,
+        /// While set, matching announces are skipped for this subscription.
+        paused: Arc<std::sync::atomic::AtomicBool>,
         result_tx: tokio::sync::oneshot::Sender<AnnounceHandlerId>,
     },
     /// Remove matching legacy handlers; `None` selects all legacy handlers.
@@ -1187,6 +1197,8 @@ pub struct InterfaceStatRpcEntry {
     pub protocol_violations: u64,
     pub ifac_violations: u64,
     pub packet_filter_hits: u64,
+    pub gravity: i64,
+    pub announces_to_internal: Option<bool>,
     /// The listener that accepted this interface.
     pub parent_id: Option<InterfaceId>,
 }

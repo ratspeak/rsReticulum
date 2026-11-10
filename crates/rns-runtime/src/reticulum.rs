@@ -100,6 +100,8 @@ struct SpawnInheritance {
     announce_rate_penalty: Option<f64>,
     recursive_prs: bool,
     announces_from_internal: bool,
+    announces_to_internal: Option<bool>,
+    gravity: i64,
 }
 
 impl SpawnInheritance {
@@ -612,6 +614,7 @@ pub struct AnnounceSubscription {
     id: Option<AnnounceHandlerId>,
     events: mpsc::Receiver<AnnounceHandlerEvent>,
     dropped_events: Arc<AtomicU64>,
+    paused: Arc<AtomicBool>,
     transport_tx: mpsc::Sender<TransportMessage>,
 }
 
@@ -628,6 +631,20 @@ impl AnnounceSubscription {
     /// bounded event channel was full.
     pub fn dropped_events(&self) -> u64 {
         self.dropped_events.load(Ordering::Relaxed)
+    }
+
+    /// Stop delivering matching announces until [`Self::resume`]. Announces
+    /// arriving meanwhile are skipped, not queued; path learning is unaffected.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Relaxed);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
     }
 
     /// Request exact deregistration and wait for the actor's acknowledgment.
@@ -1587,6 +1604,7 @@ impl ReticulumHandle {
         }
         let (callback_tx, events) = mpsc::channel(capacity);
         let dropped_events = Arc::new(AtomicU64::new(0));
+        let paused = Arc::new(AtomicBool::new(false));
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         self.transport_tx
             .send(TransportMessage::RegisterAnnounceSubscription {
@@ -1594,6 +1612,7 @@ impl ReticulumHandle {
                 receive_path_responses,
                 callback_tx,
                 dropped_events: Arc::clone(&dropped_events),
+                paused: Arc::clone(&paused),
                 result_tx,
             })
             .await
@@ -1605,6 +1624,7 @@ impl ReticulumHandle {
             id: Some(id),
             events,
             dropped_events,
+            paused,
             transport_tx: self.transport_tx.clone(),
         })
     }
@@ -2649,6 +2669,8 @@ fn rpc_response_to_transport_response(
                     protocol_violations: entry.protocol_violations,
                     ifac_violations: entry.ifac_violations,
                     packet_filter_hits: entry.packet_filter_hits,
+                    gravity: entry.gravity,
+                    announces_to_internal: entry.announces_to_internal,
                     parent_id: None,
                 })
                 .collect();
@@ -2902,6 +2924,8 @@ pub struct ReticulumConfig {
     pub default_ar_target: Option<u64>,
     pub default_ar_penalty: Option<u64>,
     pub default_ar_grace: Option<u32>,
+    /// `[reticulum] default_gravity`, for interfaces without a `gravity` key.
+    pub default_gravity: Option<i64>,
     /// Global Reticulum defaults for per-interface ingress/egress control.
     pub ingress_overrides: rns_transport::ingress::IngressOverrides,
     /// `[logging] loglevel`, 0 (critical) to 8 (extreme). Python's module
@@ -2928,9 +2952,9 @@ pub struct ReticulumConfig {
     /// Python `autoconnect_interface_mode`. Unset gives auto-connected
     /// interfaces Gateway mode on transport nodes and Full mode otherwise.
     pub autoconnect_interface_mode: Option<rns_interface::traits::InterfaceMode>,
-    /// Python `autoconnect_interface_gravity`, parsed but not yet applied.
+    /// Python `autoconnect_interface_gravity`; unset gives auto-connected interfaces gravity 0.
     pub autoconnect_interface_gravity: Option<i64>,
-    /// Python `autoconnect_announces_to_internal`, parsed but not yet applied.
+    /// Python `autoconnect_announces_to_internal`; only `Some(true)` is ever stored.
     pub autoconnect_announces_to_internal: Option<bool>,
     /// Minimum fractional stamp value for received discovery announces
     /// (`required_discovery_value`); unset or not positive means 16. This does
@@ -2988,6 +3012,7 @@ impl Default for ReticulumConfig {
             default_ar_target: None,
             default_ar_penalty: None,
             default_ar_grace: None,
+            default_gravity: None,
             ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
             loglevel: 3,
             inbound_queue_lengths: InboundQueueLengths::default(),
@@ -3335,6 +3360,7 @@ impl ReticulumConfig {
             rc.default_ar_penalty = positive("default_ar_penalty")?;
             rc.default_ar_grace =
                 positive("default_ar_grace")?.map(|v| u32::try_from(v).unwrap_or(u32::MAX));
+            rc.default_gravity = config_int("reticulum", sec, "default_gravity")?;
             rc.ingress_overrides = parse_global_ingress_overrides(sec)?;
             let queues = &mut rc.inbound_queue_lengths;
             for (key, length) in [
@@ -3379,11 +3405,9 @@ impl ReticulumConfig {
                 rc.autoconnect_interface_mode = parse_autoconnect_interface_mode(mode);
             }
             if let Some(gravity) = config_int("reticulum", sec, "autoconnect_interface_gravity")? {
-                tracing::warn!("autoconnect_interface_gravity is parsed but not applied");
                 rc.autoconnect_interface_gravity = Some(gravity);
             }
             if config_bool("reticulum", sec, "autoconnect_announces_to_internal")? == Some(true) {
-                tracing::warn!("autoconnect_announces_to_internal is parsed but not applied");
                 rc.autoconnect_announces_to_internal = Some(true);
             }
             if sec.has("discover_interfaces_required_value") {
@@ -3576,7 +3600,7 @@ pub async fn init_with_policy(
     let config_path = config_dir.join("config");
     let (config, config_created) = load_or_create_config(&config_path)?;
     if config_created {
-        tracing::info!(
+        rns_transport::notice!(
             path = %config_path.display(),
             "created default Reticulum config; continuing after first-run grace period"
         );
@@ -3960,7 +3984,7 @@ pub async fn init_with_policy(
                 if is_abstract || std::path::Path::new(&socket_path).exists() {
                     match tokio::net::UnixStream::connect(&socket_path).await {
                         Ok(_) => {
-                            tracing::info!(
+                            tracing::debug!(
                                 "existing shared instance detected on {}",
                                 socket_path_display(&socket_path)
                             );
@@ -4117,7 +4141,7 @@ pub async fn init_with_policy(
             || rc.publish_blackhole
             || !rc.blackhole_sources.is_empty()
         {
-            tracing::info!(
+            tracing::debug!(
                 "shared-instance client mode suppresses local transport, management and discovery features"
             );
         }
@@ -4163,7 +4187,7 @@ pub async fn init_with_policy(
         }
     };
     if !interfaces.is_empty() {
-        tracing::info!("synthesized {} interfaces from config", interfaces.len());
+        tracing::debug!("synthesized {} interfaces from config", interfaces.len());
     }
     for iface_config in &mut interfaces {
         apply_discovery_mode_autocorrect(&config, iface_config);
@@ -4442,7 +4466,7 @@ pub async fn init_with_policy(
         match start_blackhole_publisher(&handle).await {
             Ok((dest, announce)) => {
                 blackhole_announce = Some(announce);
-                tracing::info!(dest = %hex::encode(dest), "blackhole publisher started")
+                rns_transport::notice!(dest = %hex::encode(dest), "blackhole publisher started")
             }
             Err(e) => tracing::warn!("failed to start blackhole publisher: {}", e),
         }
@@ -4532,7 +4556,7 @@ pub async fn init_with_policy(
         {
             Ok((dest, announce)) => {
                 management_announces.push(announce);
-                tracing::info!(
+                rns_transport::notice!(
                     dest = %hex::encode(dest),
                     transport_identity = %hex::encode(handle.transport_identity.hash),
                     "remote management started"
@@ -4551,23 +4575,12 @@ pub async fn init_with_policy(
         management_announces.extend(start_network_destinations(&transport_tx, network_identity));
     }
 
-    // Transport.py:534,645-650@1.6.0: only a transport instance has a probe destination.
+    // Transport.py:534,645-650@1.6.0: only a transport instance has a probe destination,
+    // and it is built on Transport.identity.
     if instance_mode != InstanceMode::Client && rc.enable_transport && rc.respond_to_probes {
-        let probe_path = paths.storage_dir.join("probe_identity");
-        let probe_identity = match rns_identity::identity::Identity::from_file(&probe_path) {
-            Ok(id) => id,
-            Err(_) => {
-                let id = rns_identity::identity::Identity::new();
-                if let Err(e) = id.to_file(&probe_path) {
-                    tracing::warn!(path = %probe_path.display(), error = %e,
-                        "failed to persist probe identity — destination hash will change on restart");
-                }
-                id
-            }
-        };
         match crate::probe::spawn_announced_probe_responder(
             transport_tx.clone(),
-            probe_identity,
+            (*handle.transport_identity).clone(),
             crate::probe::default_probe_app_name(),
         )
         .await
@@ -4577,7 +4590,10 @@ pub async fn init_with_policy(
                 if let Some(transport_stats) = &transport_stats {
                     transport_stats.set_probe_responder(dest);
                 }
-                tracing::info!(dest = %hex::encode(dest), "probe responder started");
+                rns_transport::notice!(
+                    dest = %hex::encode(dest),
+                    "Transport Instance will respond to probe requests"
+                );
             }
             Err(e) => {
                 tracing::warn!("failed to start probe responder: {}", e);
@@ -5547,6 +5563,10 @@ async fn prepare_interface_with_role_and_overrides(
         announces_from_internal: inherited
             .as_ref()
             .is_none_or(|parent| parent.announces_from_internal),
+        announces_to_internal: inherited
+            .as_ref()
+            .and_then(|parent| parent.announces_to_internal),
+        gravity: inherited.as_ref().map_or(0, |parent| parent.gravity),
         destination_cost: child_stamp_costs.0,
         pr_cost: child_stamp_costs.1,
     };
@@ -5683,6 +5703,8 @@ fn clone_interface_post_init(
         ingress_overrides: post_init.ingress_overrides.clone(),
         recursive_prs: post_init.recursive_prs,
         announces_from_internal: post_init.announces_from_internal,
+        announces_to_internal: post_init.announces_to_internal,
+        gravity: post_init.gravity,
         destination_cost: post_init.destination_cost,
         pr_cost: post_init.pr_cost,
     }
@@ -5842,6 +5864,8 @@ async fn prepare_interface_with_post_init(
                     announce_rate_penalty,
                     recursive_prs: post_init.recursive_prs,
                     announces_from_internal: post_init.announces_from_internal,
+                    announces_to_internal: post_init.announces_to_internal,
+                    gravity: post_init.gravity.unwrap_or(0),
                 }),
             },
         );
@@ -5878,6 +5902,8 @@ async fn prepare_interface_with_post_init(
         multipoint: false,
         recursive_prs: post_init.recursive_prs,
         announces_from_internal: post_init.announces_from_internal,
+        announces_to_internal: post_init.announces_to_internal,
+        gravity: post_init.gravity.unwrap_or(0),
         destination_cost: post_init.destination_cost,
         pr_cost: post_init.pr_cost,
     };
@@ -6758,6 +6784,9 @@ fn finalize_post_init(
 ) {
     apply_default_announce_rate(post_init, config);
     apply_reticulum_ingress_defaults(post_init, config);
+    if post_init.gravity.is_none() {
+        post_init.gravity = Some(config.default_gravity.unwrap_or(0));
+    }
 }
 
 fn interface_config_name(iface_config: &interface_factory::InterfaceConfig) -> &str {
@@ -6877,7 +6906,7 @@ fn apply_discovery_mode_autocorrect(
     } else {
         InterfaceMode::Gateway
     };
-    tracing::warn!(
+    rns_transport::notice!(
         interface = %name,
         mode = ?*mode,
         "discovery enabled without gateway or AP mode — auto-configured; \
@@ -7993,6 +8022,10 @@ async fn spawn_discovered_backbone_client(
     finalize_post_init(&mut post_init, &handle.config);
     // Python's `configured_bitrate=5E6` (Discovery.py:884).
     post_init.bitrate = Some(5_000_000);
+    // Discovery.py:881: autoconnect_interface_gravity, else AC_GRAVITY (0).
+    post_init.gravity = Some(handle.config.autoconnect_interface_gravity.unwrap_or(0));
+    // Discovery.py:880: True when configured, otherwise None.
+    post_init.announces_to_internal = handle.config.autoconnect_announces_to_internal;
     post_init.ifac_network_name = discovered_ifac_value(&record.info.ifac_netname);
     post_init.ifac_passphrase =
         discovered_ifac_value(&record.info.ifac_netkey).map(zeroize::Zeroizing::new);
@@ -8013,7 +8046,7 @@ async fn spawn_discovered_backbone_client(
         control.client_target = Some((host.to_string(), port));
         control.autoconnect_source = Some(hex::encode(record.network_id));
     });
-    tracing::info!(name = %name, id, endpoint = %format!("{host}:{port}"), "auto-connected discovered interface");
+    rns_transport::notice!(name = %name, id, endpoint = %format!("{host}:{port}"), "auto-connected discovered interface");
     Ok((id, online))
 }
 
@@ -10326,7 +10359,7 @@ fn synthesize_interfaces(
     for (name, section) in config.subsections("interfaces") {
         match interface_factory::synthesize_interface(name, section) {
             Ok(iface) => {
-                tracing::info!("configured interface: {name}");
+                tracing::debug!("configured interface: {name}");
                 interfaces.push(iface);
             }
             Err(interface_factory::InterfaceFactoryError::Disabled(_)) => {
@@ -10716,6 +10749,7 @@ mod tests {
                 receive_path_responses: false,
                 callback_tx,
                 dropped_events: Arc::clone(&dropped_events),
+                paused: Arc::new(AtomicBool::new(false)),
                 result_tx,
             })
             .await
@@ -10725,6 +10759,7 @@ mod tests {
             id: Some(id),
             events,
             dropped_events,
+            paused: Arc::new(AtomicBool::new(false)),
             transport_tx: transport_tx.clone(),
         };
 
@@ -14735,6 +14770,7 @@ loglevel = 7
                      default_ar_target = 7200\n\
                      default_ar_penalty = 30\n\
                      default_ar_grace = 9\n\
+                     autoconnect_announces_to_internal = Yes\n\
                      publish_blackhole = Yes\n\
                      network_identity = /opt/rnsd/network.identity\n";
         let config = Config::parse(input).unwrap();
@@ -14746,6 +14782,7 @@ loglevel = 7
         assert_eq!(rc.default_ar_target, Some(7200));
         assert_eq!(rc.default_ar_penalty, Some(30));
         assert_eq!(rc.default_ar_grace, Some(9));
+        assert_eq!(rc.autoconnect_announces_to_internal, Some(true));
         assert!(rc.publish_blackhole);
         assert_eq!(
             rc.network_identity_path,
@@ -14971,13 +15008,16 @@ egress_control = Yes
                 .expect("empty interface defaults are valid");
         assert!(!post_init.recursive_prs);
         assert!(post_init.announces_from_internal);
+        assert_eq!(post_init.announces_to_internal, None);
 
         let mut section = ConfigSection::new();
         section.set("recursive_prs", "yes");
         section.set("announces_from_internal", "no");
+        section.set("announces_to_internal", "yes");
         let post_init = interface_factory::InterfacePostInit::try_from_section(&section).unwrap();
         assert!(post_init.recursive_prs);
         assert!(!post_init.announces_from_internal);
+        assert_eq!(post_init.announces_to_internal, Some(true));
     }
 
     #[test]

@@ -212,10 +212,7 @@ impl TransportActor {
             self.last_receipts_check = now;
         }
 
-        if self.startup_complete && now - self.last_cache_clean >= CACHE_CLEAN_INTERVAL {
-            self.packet_hashlist.force_rotate();
-            self.last_cache_clean = now;
-        }
+        self.packet_hashlist.rotate_if_full();
 
         if now - self.last_known_destinations_clean >= KNOWN_DESTINATIONS_INTERVAL {
             self.cleanup_known_destinations(now);
@@ -241,21 +238,8 @@ impl TransportActor {
         self.path_requests
             .retain(|_, last| now - *last < PATH_REQUEST_GATE_TIMEOUT);
         self.cull_recursive_discovery(now);
-        self.discovery_pr_tags
-            .retain(|_, last| now - *last < PATH_REQUEST_GATE_TIMEOUT);
-        // Python `max_pr_tags` hard cap on top of the time gate: a tag storm
-        // inside the gate window must not grow the map without bound.
         if self.discovery_pr_tags.len() > MAX_DISCOVERY_PR_TAGS {
-            let mut by_age: Vec<(Vec<u8>, f64)> = self
-                .discovery_pr_tags
-                .iter()
-                .map(|(tag, last)| (tag.clone(), *last))
-                .collect();
-            by_age.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-            let excess = self.discovery_pr_tags.len() - MAX_DISCOVERY_PR_TAGS;
-            for (tag, _) in by_age.into_iter().take(excess) {
-                self.discovery_pr_tags.remove(&tag);
-            }
+            self.discovery_pr_tags_prev = std::mem::take(&mut self.discovery_pr_tags);
         }
 
         self.process_pending_discovery_path_requests(now);
@@ -403,7 +387,6 @@ impl TransportActor {
         self.last_links_check = 0.0;
         self.last_receipts_check = 0.0;
         self.last_announces_check = 0.0;
-        self.last_cache_clean = 0.0;
         self.last_announce_cache_sweep = 0.0;
         self.last_known_destinations_clean = 0.0;
         self.last_blackhole_check = 0.0;
@@ -678,6 +661,23 @@ impl TransportActor {
                 "known-destinations cleanup swept pathless entries"
             );
         }
+
+        // Identity.py:466-470: expire remembered ratchets past RATCHET_EXPIRY.
+        let mut expired = 0usize;
+        for announce in self.recent_announces.values_mut() {
+            if announce.ratchet.is_some() && announce.live_ratchet(now).is_none() {
+                announce.ratchet = None;
+                announce.ratchet_received = None;
+                expired += 1;
+            }
+        }
+        if expired > 0 {
+            self.state_dirty = true;
+            debug!(
+                expired,
+                "known-destinations cleanup expired remembered ratchets"
+            );
+        }
     }
 
     /// Trim announce queues to age (QUEUED_ANNOUNCE_LIFE) and size
@@ -728,6 +728,7 @@ mod cleanup_tests {
             timestamp,
             public_key: None,
             ratchet: None,
+            ratchet_received: None,
             packet_hash: None,
             is_path_response: false,
             retained,
@@ -853,22 +854,35 @@ mod cleanup_tests {
     }
 
     #[test]
-    fn discovery_pr_tags_capped_at_max() {
+    fn discovery_pr_tags_rotate_generations_above_max() {
         let (mut actor, _tx) = TransportActor::new();
-        let now = crate::now_f64();
-        // All inside PATH_REQUEST_GATE_TIMEOUT, so only the count cap trims.
-        for i in 0..=MAX_DISCOVERY_PR_TAGS {
-            let tag = (i as u64).to_be_bytes().to_vec();
-            actor.discovery_pr_tags.insert(tag, now - (i as f64) * 1e-4);
-        }
-        assert_eq!(actor.discovery_pr_tags.len(), MAX_DISCOVERY_PR_TAGS + 1);
-
+        let tag = |i: usize| {
+            let mut tag = [0u8; 32];
+            tag[24..].copy_from_slice(&(i as u64).to_be_bytes());
+            tag
+        };
+        actor
+            .discovery_pr_tags
+            .extend((0..MAX_DISCOVERY_PR_TAGS).map(tag));
         actor.on_tick();
-
         assert_eq!(actor.discovery_pr_tags.len(), MAX_DISCOVERY_PR_TAGS);
-        let oldest = (MAX_DISCOVERY_PR_TAGS as u64).to_be_bytes().to_vec();
-        assert!(!actor.discovery_pr_tags.contains_key(&oldest));
-        let newest = 0u64.to_be_bytes();
-        assert!(actor.discovery_pr_tags.contains_key(newest.as_slice()));
+        assert!(actor.discovery_pr_tags_prev.is_empty());
+
+        actor.discovery_pr_tags.insert(tag(MAX_DISCOVERY_PR_TAGS));
+        actor.on_tick();
+        assert!(actor.discovery_pr_tags.is_empty());
+        assert_eq!(
+            actor.discovery_pr_tags_prev.len(),
+            MAX_DISCOVERY_PR_TAGS + 1
+        );
+        assert!(actor.discovery_pr_tags_prev.contains(&tag(0)));
+
+        let next = MAX_DISCOVERY_PR_TAGS + 1;
+        actor
+            .discovery_pr_tags
+            .extend((next..=next + MAX_DISCOVERY_PR_TAGS).map(tag));
+        actor.on_tick();
+        assert!(!actor.discovery_pr_tags_prev.contains(&tag(0)));
+        assert!(actor.discovery_pr_tags_prev.contains(&tag(next)));
     }
 }

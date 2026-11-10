@@ -21,6 +21,7 @@ fn recent_announce_from_cached_packet(
         timestamp,
         public_key: None,
         ratchet: None,
+        ratchet_received: None,
         packet_hash: None,
         is_path_response: false,
         retained: false,
@@ -53,6 +54,7 @@ fn recent_announce_from_cached_packet(
             recent.lr_cost = stamp.lr_cost;
             recent.public_key = Some(announce.public_key);
             recent.ratchet = announce.ratchet;
+            recent.ratchet_received = announce.ratchet.map(|_| timestamp);
             recent.name_hash = announce.name_hash;
         }
     }
@@ -1037,6 +1039,9 @@ impl TransportActor {
                                 app_data: ae.app_data,
                                 timestamp: ae.timestamp,
                                 public_key,
+                                // Entries saved without a receive time count from load.
+                                ratchet_received: ratchet
+                                    .map(|_| ae.ratchet_received.unwrap_or_else(now)),
                                 ratchet,
                                 packet_hash,
                                 is_path_response: ae.is_path_response,
@@ -1321,6 +1326,7 @@ mod announce_sweep_actor_tests {
             timestamp: crate::now_f64(),
             public_key: None,
             ratchet: None,
+            ratchet_received: None,
             packet_hash: Some(hash),
             is_path_response: false,
             retained: true,
@@ -1522,6 +1528,7 @@ mod async_save_tests {
                 timestamp: crate::now_f64(),
                 public_key: Some([0x25; 64]),
                 ratchet: None,
+                ratchet_received: None,
                 packet_hash: None,
                 is_path_response: false,
                 retained: false,

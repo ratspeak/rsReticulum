@@ -1440,6 +1440,8 @@ impl Link {
         self.tx_bytes += bytes as u64;
         self.tx_count += 1;
         self.keepalive.record_outbound();
+        // Link.had_outbound: non-keepalive traffic refreshes `no_data_for`.
+        self.keepalive.last_data = std::time::Instant::now();
     }
 
     /// Count an outbound keepalive beat and retain its send time.
@@ -1628,6 +1630,12 @@ impl Link {
             self.state = LinkState::Active;
             self.stale_since = None;
         }
+    }
+
+    /// Record that an inbound packet other than a keepalive arrived; refreshes
+    /// `no_data_for` (Link.py:1030).
+    pub fn record_inbound_data(&mut self) {
+        self.keepalive.last_data = std::time::Instant::now();
     }
 
     /// Initiate link teardown and return the encrypted teardown payload to send.
@@ -2389,6 +2397,24 @@ mod tests {
         assert!(result.is_err(), "validate_proof on Closed link must reject");
         assert_eq!(initiator.state, LinkState::Closed);
         assert!(!initiator.has_keys(), "keys stay purged");
+    }
+
+    #[test]
+    fn data_clock_counts_payload_traffic_but_not_keepalives() {
+        let (mut link, _) = Link::new_initiator([0x42; 16], 1);
+        let idle = Duration::from_secs(200);
+        let Some(past) = std::time::Instant::now().checked_sub(idle) else {
+            return;
+        };
+        link.keepalive.last_data = past;
+        link.record_tx_keepalive(1);
+        link.record_inbound();
+        assert!(link.no_data_for() >= idle);
+        link.record_inbound_data();
+        assert!(link.no_data_for() < idle);
+        link.keepalive.last_data = past;
+        link.record_tx(10);
+        assert!(link.no_data_for() < idle);
     }
 
     /// `record_inbound` must refresh keepalive even on an already-Active

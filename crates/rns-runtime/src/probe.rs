@@ -60,9 +60,8 @@ pub struct ProbeOutcome {
 
 /// Register a SINGLE destination that attempts an implicit signed proof for
 /// received DATA packets. The responder hashes and signs the packet without
-/// decrypting or validating its application payload. Persist `identity`
-/// (normally `<storage_dir>/probe_identity`) to retain its destination hash
-/// across restarts.
+/// decrypting or validating its application payload. rnsd-rs passes the
+/// transport identity, as Python does.
 pub async fn spawn_probe_responder(
     transport_tx: mpsc::Sender<TransportMessage>,
     identity: Identity,

@@ -2,13 +2,12 @@ use std::collections::HashSet;
 
 use crate::constants::HASHLIST_MAXSIZE;
 
-/// Two-generation rotating hash set used for packet deduplication.
+/// Two-generation hash set used for packet deduplication.
 ///
-/// A new insertion rotates `current` into `previous` once `current` has at
-/// least `max_size / 2` entries. With `max_size >= 2`, normal insertions retain
-/// at most twice that half-capacity; capacities zero and one can retain two
-/// entries. [`Self::load_from`] does not enforce this bound. The window is
-/// count-based, with no time expiry, and lookups check both generations.
+/// The owner calls [`Self::rotate_if_full`] from its periodic job; it moves
+/// `current` into `previous` once `current` holds more than `max_size / 2`
+/// entries. The window is count-based, with no time expiry, and lookups check
+/// both generations. [`Self::load_from`] does not enforce the bound.
 #[derive(Clone)]
 pub struct PacketHashlist {
     current: HashSet<[u8; 32]>,
@@ -42,13 +41,24 @@ impl PacketHashlist {
         if self.contains(&hash) {
             return false;
         }
-
-        if self.current.len() >= self.max_size / 2 {
-            self.force_rotate();
-        }
-
         self.current.insert(hash);
         true
+    }
+
+    /// Rotate generations when `current` holds more than `max_size / 2`
+    /// entries. Returns whether a rotation happened.
+    pub fn rotate_if_full(&mut self) -> bool {
+        if self.current.len() > self.max_size / 2 {
+            self.force_rotate();
+            return true;
+        }
+        false
+    }
+
+    /// Forget a hash from both generations.
+    pub fn remove(&mut self, hash: &[u8; 32]) {
+        self.current.remove(hash);
+        self.previous.remove(hash);
     }
 
     /// Discard the old previous generation, move current to previous and
@@ -123,27 +133,29 @@ mod tests {
     }
 
     #[test]
-    fn test_rotation() {
-        let mut hl = PacketHashlist {
-            current: HashSet::new(),
-            previous: HashSet::new(),
-            max_size: 10,
-        };
-
-        // Rotation triggers at current.len() >= max_size/2, so the 6th insert
-        // promotes the first five into `previous` and lands alone in `current`.
-        for i in 0..6 {
-            let mut hash = [0u8; 32];
-            hash[0] = i;
-            hl.insert(hash);
+    fn rotation_happens_only_above_half_capacity() {
+        let mut hl = PacketHashlist::new_with_capacity(10);
+        for i in 0..5 {
+            hl.insert([i; 32]);
         }
+        assert!(!hl.rotate_if_full());
+        hl.insert([5; 32]);
+        assert_eq!(hl.current.len(), 6);
+        assert!(hl.rotate_if_full());
+        assert_eq!((hl.previous.len(), hl.current.len()), (6, 0));
+        assert!(hl.contains(&[0; 32]));
+    }
 
-        assert_eq!(hl.previous.len(), 5);
-        assert_eq!(hl.current.len(), 1);
-
-        let mut old_hash = [0u8; 32];
-        old_hash[0] = 0;
-        assert!(hl.contains(&old_hash));
+    #[test]
+    fn remove_forgets_both_generations() {
+        let mut hl = PacketHashlist::new_with_capacity(10);
+        hl.insert([1; 32]);
+        hl.force_rotate();
+        hl.insert([2; 32]);
+        hl.remove(&[1; 32]);
+        hl.remove(&[2; 32]);
+        assert!(hl.is_empty());
+        assert!(hl.insert([1; 32]));
     }
 
     #[test]
@@ -161,7 +173,9 @@ mod tests {
         let mut hl = PacketHashlist::new_with_capacity(4);
         hl.insert([0x01; 32]);
         hl.insert([0x02; 32]);
-        // The third insertion rotates the first two hashes into `previous`.
+        hl.insert([0x04; 32]);
+        assert!(hl.rotate_if_full());
+        hl.remove(&[0x04; 32]);
         hl.insert([0x03; 32]);
 
         assert_eq!(hl.current_hashes(), vec![[0x03; 32]]);

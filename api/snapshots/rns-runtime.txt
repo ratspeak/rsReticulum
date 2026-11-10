@@ -330,8 +330,10 @@ pub rns_runtime::interface_factory::InterfacePostInit::announce_rate_grace: core
 pub rns_runtime::interface_factory::InterfacePostInit::announce_rate_penalty: core::option::Option<u64>
 pub rns_runtime::interface_factory::InterfacePostInit::announce_rate_target: core::option::Option<u64>
 pub rns_runtime::interface_factory::InterfacePostInit::announces_from_internal: bool
+pub rns_runtime::interface_factory::InterfacePostInit::announces_to_internal: core::option::Option<bool>
 pub rns_runtime::interface_factory::InterfacePostInit::bitrate: core::option::Option<u64>
 pub rns_runtime::interface_factory::InterfacePostInit::default_ifac_size: usize
+pub rns_runtime::interface_factory::InterfacePostInit::gravity: core::option::Option<i64>
 pub rns_runtime::interface_factory::InterfacePostInit::ifac_network_name: core::option::Option<alloc::string::String>
 pub rns_runtime::interface_factory::InterfacePostInit::ifac_passphrase: core::option::Option<zeroize::Zeroizing<alloc::string::String>>
 pub rns_runtime::interface_factory::InterfacePostInit::ifac_size: core::option::Option<usize>
@@ -685,6 +687,7 @@ pub fn rns_runtime::link_manager::LinkManager::set_accounting_event_channel(&mut
 pub fn rns_runtime::link_manager::LinkManager::set_announce_handler<F>(&mut self, F) where F: core::ops::function::FnMut() + core::marker::Send + 'static
 pub fn rns_runtime::link_manager::LinkManager::set_channel_message_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::LinkChannelMessage>)
 pub fn rns_runtime::link_manager::LinkManager::set_destination_delivery_proof_channel(&mut self, tokio::sync::mpsc::unbounded::UnboundedSender<rns_runtime::link_manager::DestinationDeliveryProof>)
+pub fn rns_runtime::link_manager::LinkManager::set_data_inactivity_timeout(&mut self, core::option::Option<core::time::Duration>)
 pub fn rns_runtime::link_manager::LinkManager::set_inbound_link_packet_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::InboundLinkPacket>) -> core::result::Result<(), rns_runtime::link_manager::LinkPacketConfigurationError>
 pub fn rns_runtime::link_manager::LinkManager::set_inbound_raw_channel(&mut self, tokio::sync::mpsc::bounded::Sender<alloc::vec::Vec<u8>>)
 pub fn rns_runtime::link_manager::LinkManager::set_link_closed_channel(&mut self, tokio::sync::mpsc::bounded::Sender<[u8; 16]>)
@@ -696,6 +699,7 @@ pub fn rns_runtime::link_manager::LinkManager::set_link_packet_channel(&mut self
 pub fn rns_runtime::link_manager::LinkManager::set_link_packet_proof_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::LinkPacketProof>)
 pub fn rns_runtime::link_manager::LinkManager::set_ordinary_packet_proof_strategy(&mut self, rns_identity::destination::ProofStrategy) -> core::result::Result<(), rns_runtime::link_manager::LinkPacketConfigurationError>
 pub fn rns_runtime::link_manager::LinkManager::set_outbound_resource_proof_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::LinkResourceProof>)
+pub fn rns_runtime::link_manager::LinkManager::set_ratchet_interval(&mut self, u64) -> bool
 pub fn rns_runtime::link_manager::LinkManager::set_request_handler<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], [u8; 16], alloc::vec::Vec<u8>) -> core::option::Option<alloc::vec::Vec<u8>> + core::marker::Send + 'static
 pub fn rns_runtime::link_manager::LinkManager::set_request_handler_ex<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], [u8; 16], alloc::vec::Vec<u8>) -> rns_runtime::link_manager::RequestOutcome + core::marker::Send + 'static
 pub fn rns_runtime::link_manager::LinkManager::set_resource_accept_handler<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], &rns_protocol::resource_adv::ResourceAdvertisement) -> bool + core::marker::Send + 'static
@@ -704,6 +708,7 @@ pub fn rns_runtime::link_manager::LinkManager::set_resource_completion_channel(&
 pub fn rns_runtime::link_manager::LinkManager::set_resource_event_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::LinkResourceEvent>)
 pub fn rns_runtime::link_manager::LinkManager::set_resource_strategy(&mut self, rns_link::link::ResourceStrategy)
 pub fn rns_runtime::link_manager::LinkManager::set_response_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::LinkResponse>)
+pub fn rns_runtime::link_manager::LinkManager::set_retained_ratchets(&mut self, usize) -> bool
 pub fn rns_runtime::link_manager::LinkManager::set_use_implicit_proof(&mut self, bool)
 pub fn rns_runtime::link_manager::LinkManager::start_resource_transfer(&mut self, &[u8; 16], alloc::vec::Vec<u8>, bool) -> core::option::Option<[u8; 32]>
 pub fn rns_runtime::link_manager::LinkManager::start_resource_transfer_with_metadata(&mut self, &[u8; 16], alloc::vec::Vec<u8>, core::option::Option<alloc::vec::Vec<u8>>, bool) -> core::option::Option<[u8; 32]>
@@ -737,6 +742,7 @@ pub rns_runtime::link_manager::LinkResponse::link_id: [u8; 16]
 pub rns_runtime::link_manager::LinkResponse::request_id: [u8; 16]
 pub struct rns_runtime::link_manager::ResourceCompletion
 pub rns_runtime::link_manager::ResourceCompletion::data: alloc::vec::Vec<u8>
+pub rns_runtime::link_manager::ResourceCompletion::last_segment_hash: [u8; 32]
 pub rns_runtime::link_manager::ResourceCompletion::link_id: [u8; 16]
 pub rns_runtime::link_manager::ResourceCompletion::metadata: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_runtime::link_manager::ResourceCompletion::resource_hash: [u8; 32]
@@ -911,6 +917,7 @@ pub fn rns_runtime::link_session::LinkSessionResourceOffer::total_segments(&self
 pub fn rns_runtime::link_session::LinkSessionResourceOffer::transfer_size(&self) -> usize
 pub struct rns_runtime::link_session::LinkSessionResourceReceipt
 pub rns_runtime::link_session::LinkSessionResourceReceipt::data_size: usize
+pub rns_runtime::link_session::LinkSessionResourceReceipt::last_segment_hash: [u8; 32]
 pub rns_runtime::link_session::LinkSessionResourceReceipt::link_id: [u8; 16]
 pub rns_runtime::link_session::LinkSessionResourceReceipt::resource_id: [u8; 32]
 pub rns_runtime::link_session::LinkSessionResourceReceipt::total_segments: usize
@@ -1146,7 +1153,10 @@ impl rns_runtime::reticulum::AnnounceSubscription
 pub async fn rns_runtime::reticulum::AnnounceSubscription::close(&mut self) -> core::result::Result<bool, rns_runtime::reticulum::AnnounceSubscriptionError>
 pub fn rns_runtime::reticulum::AnnounceSubscription::dropped_events(&self) -> u64
 pub fn rns_runtime::reticulum::AnnounceSubscription::events(&mut self) -> &mut tokio::sync::mpsc::bounded::Receiver<rns_transport::messages::AnnounceHandlerEvent>
+pub fn rns_runtime::reticulum::AnnounceSubscription::is_paused(&self) -> bool
+pub fn rns_runtime::reticulum::AnnounceSubscription::pause(&self)
 pub async fn rns_runtime::reticulum::AnnounceSubscription::recv(&mut self) -> core::option::Option<rns_transport::messages::AnnounceHandlerEvent>
+pub fn rns_runtime::reticulum::AnnounceSubscription::resume(&self)
 impl core::ops::drop::Drop for rns_runtime::reticulum::AnnounceSubscription
 pub fn rns_runtime::reticulum::AnnounceSubscription::drop(&mut self)
 pub struct rns_runtime::prelude::DestinationAnnounceOptions
@@ -1558,7 +1568,10 @@ impl rns_runtime::reticulum::AnnounceSubscription
 pub async fn rns_runtime::reticulum::AnnounceSubscription::close(&mut self) -> core::result::Result<bool, rns_runtime::reticulum::AnnounceSubscriptionError>
 pub fn rns_runtime::reticulum::AnnounceSubscription::dropped_events(&self) -> u64
 pub fn rns_runtime::reticulum::AnnounceSubscription::events(&mut self) -> &mut tokio::sync::mpsc::bounded::Receiver<rns_transport::messages::AnnounceHandlerEvent>
+pub fn rns_runtime::reticulum::AnnounceSubscription::is_paused(&self) -> bool
+pub fn rns_runtime::reticulum::AnnounceSubscription::pause(&self)
 pub async fn rns_runtime::reticulum::AnnounceSubscription::recv(&mut self) -> core::option::Option<rns_transport::messages::AnnounceHandlerEvent>
+pub fn rns_runtime::reticulum::AnnounceSubscription::resume(&self)
 impl core::ops::drop::Drop for rns_runtime::reticulum::AnnounceSubscription
 pub fn rns_runtime::reticulum::AnnounceSubscription::drop(&mut self)
 pub struct rns_runtime::reticulum::BleRnodeRuntimeArgs<'a>
@@ -1643,6 +1656,7 @@ pub rns_runtime::reticulum::ReticulumConfig::control_port: u16
 pub rns_runtime::reticulum::ReticulumConfig::default_ar_grace: core::option::Option<u32>
 pub rns_runtime::reticulum::ReticulumConfig::default_ar_penalty: core::option::Option<u64>
 pub rns_runtime::reticulum::ReticulumConfig::default_ar_target: core::option::Option<u64>
+pub rns_runtime::reticulum::ReticulumConfig::default_gravity: core::option::Option<i64>
 pub rns_runtime::reticulum::ReticulumConfig::discover_interfaces: bool
 pub rns_runtime::reticulum::ReticulumConfig::discover_interfaces_required_value: u8
 pub rns_runtime::reticulum::ReticulumConfig::enable_remote_management: bool
@@ -2044,12 +2058,14 @@ pub rns_runtime::rpc::InterfaceStatEntry::announce_rate_penalty: core::option::O
 pub rns_runtime::rpc::InterfaceStatEntry::announce_rate_target: core::option::Option<f64>
 pub rns_runtime::rpc::InterfaceStatEntry::announces_received: u64
 pub rns_runtime::rpc::InterfaceStatEntry::announces_sent: u64
+pub rns_runtime::rpc::InterfaceStatEntry::announces_to_internal: core::option::Option<bool>
 pub rns_runtime::rpc::InterfaceStatEntry::autoconnect_source: core::option::Option<alloc::string::String>
 pub rns_runtime::rpc::InterfaceStatEntry::bitrate: u64
 pub rns_runtime::rpc::InterfaceStatEntry::blocked_ips: core::option::Option<u64>
 pub rns_runtime::rpc::InterfaceStatEntry::burst_activated: f64
 pub rns_runtime::rpc::InterfaceStatEntry::burst_active: bool
 pub rns_runtime::rpc::InterfaceStatEntry::clients: core::option::Option<u64>
+pub rns_runtime::rpc::InterfaceStatEntry::gravity: i64
 pub rns_runtime::rpc::InterfaceStatEntry::held_announces: u64
 pub rns_runtime::rpc::InterfaceStatEntry::id: u64
 pub rns_runtime::rpc::InterfaceStatEntry::ifac_netname: core::option::Option<alloc::string::String>

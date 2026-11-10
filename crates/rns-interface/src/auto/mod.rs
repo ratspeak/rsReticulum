@@ -1086,6 +1086,7 @@ struct Teardown {
 impl Drop for Teardown {
     fn drop(&mut self) {
         self.shared.online.store(false, Ordering::SeqCst);
+        rns_transport::notice!("Shutting down all UDP listeners for {}", self.shared);
         if let Some(jobs) = self.jobs.take() {
             jobs.abort();
         }
@@ -1146,7 +1147,7 @@ pub async fn spawn_auto_interface(
     shared.bitrate.store(bitrate, Ordering::SeqCst);
 
     teardown.jobs = Some(tokio::spawn(shared.clone().run_jobs()));
-    tracing::info!(
+    tracing::debug!(
         "{} discovering peers for {} seconds...",
         shared,
         (PEERING_WAIT * 100.0).round() / 100.0

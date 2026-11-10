@@ -220,13 +220,14 @@ fn poll_shared_server(
 }
 
 fn read_probe_hash(responder: &mut ChildGuard, tmp: &TempDir) -> Result<[u8; 16], String> {
-    let path = tmp.join("storage").join("probe_identity");
+    // The probe destination is derived from the transport identity, as in Python.
+    let path = tmp.join("storage").join("transport_identity");
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut last_error = String::new();
     while Instant::now() < deadline {
         if let Some(status) = responder.try_wait() {
             return Err(format!(
-                "{} exited before probe identity was ready: {status}",
+                "{} exited before transport identity was ready: {status}",
                 responder.label
             ));
         }
@@ -243,7 +244,7 @@ fn read_probe_hash(responder: &mut ChildGuard, tmp: &TempDir) -> Result<[u8; 16]
         thread::sleep(Duration::from_millis(100));
     }
     Err(format!(
-        "probe identity was not readable at {}\nlast error: {last_error}",
+        "transport identity was not readable at {}\nlast error: {last_error}",
         path.display()
     ))
 }

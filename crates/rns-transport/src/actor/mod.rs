@@ -157,9 +157,10 @@ pub struct TransportActor {
     pub path_requests: HashMap<[u8; 16], f64>,
     // One canonical owner; detached public snapshots cannot mutate registrations.
     discovery_path_requests: HashMap<[u8; 16], recursive_discovery::DiscoveryOperation>,
-    /// Destination hash plus truncated request tag, mapped to observation time
-    /// in Unix seconds for duplicate-request admission.
-    pub discovery_pr_tags: HashMap<Vec<u8>, f64>,
+    /// Destination hash plus request tag, current generation.
+    pub discovery_pr_tags: HashSet<[u8; 32]>,
+    /// Previous tag generation; a tag in either generation is a duplicate.
+    pub discovery_pr_tags_prev: HashSet<[u8; 32]>,
     /// Failed-Link rediscovery requests awaiting throttled emission.
     pub pending_discovery_prs: VecDeque<PendingDiscoveryPathRequest>,
     // Only rejected driver admissions live here; successfully admitted targets
@@ -186,7 +187,6 @@ pub struct TransportActor {
     last_links_check: f64,
     last_receipts_check: f64,
     last_announces_check: f64,
-    last_cache_clean: f64,
     /// Last on-disk announce-cache sweep. Storage init sets it 60 s ahead so
     /// the first sweep is deferred like Python's.
     last_announce_cache_sweep: f64,
@@ -326,6 +326,8 @@ pub struct RecentAnnounce {
     pub timestamp: f64,
     pub public_key: Option<[u8; 64]>,
     pub ratchet: Option<[u8; 32]>,
+    /// When `ratchet` was first received; it expires `RATCHET_EXPIRY` later.
+    pub ratchet_received: Option<f64>,
     /// Disk-cache key for the raw announce. `None` for legacy entries whose
     /// cache file could not be recovered; replay paths treat that as a miss.
     pub packet_hash: Option<[u8; 32]>,
@@ -350,6 +352,27 @@ pub struct RecentAnnounce {
     pub lr_cost: Option<f64>,
 }
 
+impl RecentAnnounce {
+    /// Remember a ratchet carried by an announce. Re-receiving the same ratchet
+    /// keeps its first receive time (Identity.py:535-551, Storage.py:429-451).
+    pub(crate) fn remember_ratchet(&mut self, ratchet: Option<[u8; 32]>, now: f64) {
+        if let Some(ratchet) = ratchet
+            && self.ratchet != Some(ratchet)
+        {
+            self.ratchet = Some(ratchet);
+            self.ratchet_received = Some(now);
+        }
+    }
+
+    /// The remembered ratchet, unless it is older than `RATCHET_EXPIRY`.
+    pub(crate) fn live_ratchet(&self, now: f64) -> Option<[u8; 32]> {
+        let received = self.ratchet_received.unwrap_or(now);
+        (now < received + rns_wire::constants::RATCHET_EXPIRY as f64)
+            .then_some(self.ratchet)
+            .flatten()
+    }
+}
+
 /// One automatic rediscovery queue entry after a failed Link attempt.
 /// `blocked_interface` is excluded from that queued request's targets; this
 /// record does not send traffic or remove a cached route by itself.
@@ -366,6 +389,7 @@ struct AnnounceHandlerRegistration {
     receive_path_responses: bool,
     tx: tokio::sync::mpsc::Sender<crate::messages::AnnounceHandlerEvent>,
     dropped_events: Arc<AtomicU64>,
+    paused: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,7 +507,8 @@ impl TransportActor {
             link_endpoints: HashMap::new(),
             path_requests: HashMap::new(),
             discovery_path_requests: HashMap::new(),
-            discovery_pr_tags: HashMap::new(),
+            discovery_pr_tags: HashSet::new(),
+            discovery_pr_tags_prev: HashSet::new(),
             pending_discovery_prs: VecDeque::new(),
             pending_path_request_admissions: VecDeque::new(),
             path_interface_suppressions: HashMap::new(),
@@ -495,7 +520,6 @@ impl TransportActor {
             last_links_check: 0.0,
             last_receipts_check: 0.0,
             last_announces_check: 0.0,
-            last_cache_clean: 0.0,
             last_announce_cache_sweep: 0.0,
             last_known_destinations_clean: now_f64(),
             last_known_destinations_flush: 0.0,
@@ -1021,6 +1045,7 @@ impl TransportActor {
                     receive_path_responses,
                     tx: callback_tx,
                     dropped_events: Arc::new(AtomicU64::new(0)),
+                    paused: Arc::new(AtomicBool::new(false)),
                 });
             }
             TransportMessage::RegisterAnnounceSubscription {
@@ -1028,6 +1053,7 @@ impl TransportActor {
                 receive_path_responses,
                 callback_tx,
                 dropped_events,
+                paused,
                 result_tx,
             } => {
                 let id = self.allocate_announce_handler_id();
@@ -1038,6 +1064,7 @@ impl TransportActor {
                     receive_path_responses,
                     tx: callback_tx,
                     dropped_events,
+                    paused,
                 });
                 if result_tx.send(id).is_err() {
                     self.announce_handlers
@@ -1117,7 +1144,7 @@ impl TransportActor {
                 self.clear_shared_connection_state();
             }
             TransportMessage::SharedConnectionRestored { interface_id } => {
-                tracing::info!(interface_id, "shared instance connection restored");
+                tracing::debug!(interface_id, "shared instance connection restored");
                 self.terminate_shared_peer_link_endpoints();
                 self.shared_instance_client_mode = true;
                 self.clear_shared_connection_state();
@@ -2102,6 +2129,11 @@ impl TransportActor {
             .path_table
             .get_live(destination_hash)
             .map(|path| self.interfaces.get(&path.interface_id).map(|i| i.mode));
+        let from_to_internal = self
+            .path_table
+            .get_live(destination_hash)
+            .and_then(|path| self.interfaces.get(&path.interface_id))
+            .is_some_and(|i| i.announces_to_internal == Some(true));
 
         // Mode-independent gate: a non-local announce whose next-hop interface
         // doesn't exist is never rebroadcast (Transport.py:1216-1218).
@@ -2131,13 +2163,15 @@ impl TransportActor {
         match entry.mode {
             InterfaceMode::AccessPoint => false,
             InterfaceMode::Internal => {
-                // Internal egress relays everything except boundary-origin and
-                // mode-less-origin announces (Transport.py:1228-1236).
+                // Internal egress relays everything except mode-less-origin
+                // announces and, unless the origin sets announces_to_internal,
+                // boundary-origin ones (Transport.py:1706-1714@1.6.0).
                 local
-                    || !matches!(
-                        from_iface_mode,
-                        Some(None) | Some(Some(InterfaceMode::Boundary))
-                    )
+                    || match from_iface_mode {
+                        Some(None) => false,
+                        Some(Some(InterfaceMode::Boundary)) => from_to_internal,
+                        _ => true,
+                    }
             }
             InterfaceMode::Roaming => {
                 local
@@ -2746,6 +2780,8 @@ mod tests {
             multipoint: false,
             recursive_prs: false,
             announces_from_internal: true,
+            announces_to_internal: None,
+            gravity: 0,
             destination_cost: None,
             pr_cost: None,
             ingress: crate::ingress::IngressController::new(),
@@ -2876,6 +2912,7 @@ mod tests {
             receive_path_responses: false,
             callback_tx: first_tx,
             dropped_events: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
             result_tx: first_result_tx,
         });
         actor.handle_message(TransportMessage::RegisterAnnounceSubscription {
@@ -2883,6 +2920,7 @@ mod tests {
             receive_path_responses: false,
             callback_tx: second_tx,
             dropped_events: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
             result_tx: second_result_tx,
         });
         let first_id = first_result_rx.try_recv().unwrap();
@@ -2915,6 +2953,7 @@ mod tests {
             receive_path_responses: true,
             callback_tx: subscription_tx,
             dropped_events: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
             result_tx,
         });
         let subscription_id = result_rx.try_recv().unwrap();
@@ -2943,6 +2982,7 @@ mod tests {
             receive_path_responses: false,
             callback_tx,
             dropped_events: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
             result_tx,
         });
 
@@ -2960,6 +3000,7 @@ mod tests {
             receive_path_responses: false,
             tx: callback_tx,
             dropped_events: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
         });
         actor.next_announce_handler_id = 0;
 
@@ -3123,6 +3164,7 @@ mod tests {
                 timestamp: now_f64(),
                 public_key: None,
                 ratchet: None,
+                ratchet_received: None,
                 packet_hash: Some([0xAB; 32]),
                 is_path_response: false,
                 retained: false,
@@ -3208,6 +3250,7 @@ mod tests {
                     timestamp: i as f64,
                     public_key: None,
                     ratchet: None,
+                    ratchet_received: None,
                     packet_hash: None,
                     is_path_response: false,
                     retained: false,
@@ -3303,6 +3346,7 @@ mod tests {
                     timestamp: i as f64,
                     public_key: None,
                     ratchet: None,
+                    ratchet_received: None,
                     packet_hash: None,
                     is_path_response: false,
                     retained: false,
@@ -3333,6 +3377,7 @@ mod tests {
                 timestamp: cached_announces as f64,
                 public_key: None,
                 ratchet: None,
+                ratchet_received: None,
                 packet_hash: Some(target_ph),
                 is_path_response: false,
                 retained: false,
@@ -4835,6 +4880,51 @@ mod tests {
     }
 
     #[test]
+    fn link_packet_on_unbound_interface_is_unclaimed_for_the_attached_copy() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (tcp, _tcp_rx) = make_test_interface("attached");
+        let (rnode, _rnode_rx) = make_test_interface("failed over");
+        actor.interfaces.insert(1, tcp);
+        actor.interfaces.insert(2, rnode);
+        let link_id = [0xB4; 16];
+        let (dtx, mut drx) = mpsc::channel(8);
+        actor.local_destinations.insert(link_id);
+        actor.destination_channels.insert(link_id, dtx);
+        let binding = LinkEndpointBinding {
+            interface_owner: actor.interfaces.get(&1).map(|entry| entry.owner.id()),
+            link_id,
+            interface_id: 1,
+            role: LinkEndpointRole::Initiator,
+        };
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::unbounded_channel();
+        actor.bind_link_endpoint(binding, lifecycle_tx);
+        let raw =
+            make_link_data_packet_with_context(link_id, 0, rns_wire::context::PacketContext::None);
+        let inbound = |actor: &mut TransportActor, interface_id| {
+            actor.on_inbound(InboundPacket {
+                raw: raw.clone(),
+                interface_id,
+                rssi: None,
+                snr: None,
+                q: None,
+            })
+        };
+
+        inbound(&mut actor, 2);
+        assert!(drx.try_recv().is_err());
+        inbound(&mut actor, 1);
+        assert!(matches!(
+            drx.try_recv(),
+            Ok(crate::link_messages::DestinationEvent::InboundPacket {
+                interface_id: 1,
+                ..
+            })
+        ));
+        inbound(&mut actor, 1);
+        assert!(drx.try_recv().is_err(), "the attached copy is remembered");
+    }
+
+    #[test]
     fn bound_link_endpoint_rejects_packets_larger_than_the_wire_mtu() {
         let (mut actor, _tx) = TransportActor::new();
         let (interface, mut interface_rx) = make_test_interface("bounded endpoint");
@@ -6087,6 +6177,7 @@ mod tests {
                 timestamp: 1.0,
                 public_key: Some(other_public_key),
                 ratchet: None,
+                ratchet_received: None,
                 packet_hash: Some([0xAB; 32]),
                 is_path_response: false,
                 retained: false,
@@ -6140,6 +6231,7 @@ mod tests {
                     timestamp: 1.0,
                     public_key,
                     ratchet: None,
+                    ratchet_received: None,
                     packet_hash: None,
                     is_path_response: false,
                     retained: false,
@@ -6182,6 +6274,7 @@ mod tests {
             receive_path_responses: false,
             tx: htx,
             dropped_events: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
         });
 
         actor.on_inbound(InboundPacket {
@@ -8382,6 +8475,7 @@ mod tests {
                 timestamp: 1.0,
                 public_key: Some(manual_public_key),
                 ratchet: None,
+                ratchet_received: None,
                 packet_hash: None,
                 is_path_response: false,
                 retained: false,
@@ -9093,6 +9187,7 @@ mod tests {
             timestamp: 1234567890.0,
             public_key: Some([0x42; 64]),
             ratchet: None,
+            ratchet_received: None,
             packet_hash: Some([0x55; 32]),
             is_path_response: true,
             retained: false,
@@ -9473,6 +9568,7 @@ mod tests {
                 timestamp: 1.0,
                 public_key: Some([0x11; 64]),
                 ratchet: None,
+                ratchet_received: None,
                 packet_hash: None,
                 is_path_response: false,
                 retained: false,
@@ -9729,6 +9825,7 @@ mod tests {
                 timestamp: 1.0,
                 public_key: Some([0x22; 64]),
                 ratchet: None,
+                ratchet_received: None,
                 packet_hash: None,
                 is_path_response: false,
                 retained: false,
@@ -10690,6 +10787,20 @@ mod tests {
             "full egress relays boundary-origin announces"
         );
 
+        // Transport.py:1711@1.6.0: a boundary origin with announces_to_internal
+        // set passes internal egress.
+        actor.interfaces.get_mut(&1).unwrap().announces_to_internal = Some(true);
+        actor.broadcast_announce_on_interfaces(&raw_b, None);
+        assert_eq!(actor.interfaces.get(&2).unwrap().announce_queue.len(), 1);
+        actor.interfaces.get_mut(&1).unwrap().announces_to_internal = None;
+        actor.interfaces.get_mut(&2).unwrap().announce_queue.clear();
+        actor
+            .interfaces
+            .get_mut(&3)
+            .unwrap()
+            .announce_queue
+            .truncate(1);
+
         // Full-origin announce: allowed on internal egress.
         let (raw_f, dest_f) = make_valid_announce("test.internal.from_full", 1);
         actor.path_table.insert(
@@ -11232,6 +11343,17 @@ mod tests {
             "duplicate destination+tag should be suppressed"
         );
 
+        let mut first_key = [0u8; 32];
+        first_key[..16].copy_from_slice(&requested);
+        first_key[16..].copy_from_slice(&[0xA5; 16]);
+        actor.discovery_pr_tags.clear();
+        actor.discovery_pr_tags_prev.insert(first_key);
+        actor.handle_inbound_path_request(&first, 1);
+        assert!(
+            boundary_rx.try_recv().is_err() && actor.discovery_pr_tags.is_empty(),
+            "a tag in the previous generation is still a duplicate"
+        );
+
         let second_tag = make_path_request_payload_with_tag(requested, None, [0xB6; 16]);
         actor.handle_inbound_path_request(&second_tag, 1);
         assert!(
@@ -11239,7 +11361,7 @@ mod tests {
             "same destination with a new tag should not forward while discovery is already waiting"
         );
         assert_eq!(
-            actor.discovery_pr_tags.len(),
+            actor.discovery_pr_tags.len() + actor.discovery_pr_tags_prev.len(),
             2,
             "Python remembers the new tag even when the waiting destination suppresses forwarding"
         );
@@ -11261,7 +11383,10 @@ mod tests {
         boundary_rx.try_recv().expect(
             "same destination should forward again after the waiting discovery entry expires",
         );
-        assert_eq!(actor.discovery_pr_tags.len(), 3);
+        assert_eq!(
+            actor.discovery_pr_tags.len() + actor.discovery_pr_tags_prev.len(),
+            3
+        );
     }
 
     /// Python 1.5 counts a path request only once its tag passes the
@@ -11395,6 +11520,7 @@ mod tests {
                 timestamp: now_f64(),
                 public_key: None,
                 ratchet: None,
+                ratchet_received: None,
                 packet_hash: Some(ph),
                 is_path_response: false,
                 retained: false,
@@ -11984,15 +12110,13 @@ mod tests {
     }
 
     #[test]
-    fn path_request_markers_survive_30s_and_expire_after_120s() {
+    fn path_request_markers_survive_30s_and_expire_after_45s() {
         let (mut actor, _tx) = TransportActor::new();
         let keep = [0xB8; 16];
         let expire = [0xB9; 16];
         let now = now_f64();
-        actor.path_requests.insert(keep, now - 31.0);
-        actor
-            .path_requests
-            .insert(expire, now - PATH_REQUEST_GATE_TIMEOUT - 1.0);
+        actor.path_requests.insert(keep, now - 44.0);
+        actor.path_requests.insert(expire, now - 46.0);
 
         actor.on_tick();
 
@@ -12039,6 +12163,7 @@ mod tests {
                 timestamp: now_f64(),
                 public_key: None,
                 ratchet: None,
+                ratchet_received: None,
                 packet_hash: Some(ph),
                 is_path_response: false,
                 retained: false,
@@ -12133,6 +12258,7 @@ mod tests {
                 timestamp: now_f64(),
                 public_key: None,
                 ratchet: None,
+                ratchet_received: None,
                 packet_hash: Some(ph),
                 is_path_response: false,
                 retained: false,
@@ -12226,6 +12352,7 @@ mod tests {
                 timestamp: now_f64(),
                 public_key: None,
                 ratchet: None,
+                ratchet_received: None,
                 packet_hash: Some(ph),
                 is_path_response: false,
                 retained: false,
@@ -12371,6 +12498,7 @@ mod tests {
                 timestamp: now_f64(),
                 public_key: None,
                 ratchet: None,
+                ratchet_received: None,
                 packet_hash: None,
                 is_path_response: false,
                 retained: false,
@@ -12566,6 +12694,7 @@ mod tests {
             receive_path_responses: false,
             tx: htx,
             dropped_events: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
         });
 
         let identity = rns_identity::identity::Identity::new();
@@ -12602,6 +12731,7 @@ mod tests {
             receive_path_responses: false,
             callback_tx,
             dropped_events: Arc::clone(&dropped_events),
+            paused: Arc::new(AtomicBool::new(false)),
             result_tx,
         });
         let _id = result_rx.try_recv().unwrap();
@@ -12647,6 +12777,7 @@ mod tests {
             receive_path_responses: false,
             tx: htx,
             dropped_events: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
         });
 
         let identity = rns_identity::identity::Identity::new();
@@ -12695,6 +12826,7 @@ mod tests {
             receive_path_responses: false,
             tx: h_del_tx,
             dropped_events: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
         });
         actor.announce_handlers.push(AnnounceHandlerRegistration {
             id: crate::messages::AnnounceHandlerId(1),
@@ -12703,6 +12835,7 @@ mod tests {
             receive_path_responses: false,
             tx: h_prop_tx,
             dropped_events: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
         });
 
         let identity = rns_identity::identity::Identity::new();
@@ -12742,6 +12875,7 @@ mod tests {
             receive_path_responses: false,
             tx: default_tx,
             dropped_events: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
         });
         let (opt_in_tx, mut opt_in_rx) = mpsc::channel(8);
         actor.announce_handlers.push(AnnounceHandlerRegistration {
@@ -12751,6 +12885,7 @@ mod tests {
             receive_path_responses: true,
             tx: opt_in_tx,
             dropped_events: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
         });
 
         let identity = rns_identity::identity::Identity::new();
@@ -12800,6 +12935,7 @@ mod tests {
             receive_path_responses: true,
             tx: handler_tx,
             dropped_events: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
         });
 
         let identity = rns_identity::identity::Identity::new();
@@ -13064,6 +13200,7 @@ mod tests {
                 timestamp: 1.0,
                 public_key: Some(identity.get_public_key()),
                 ratchet: None,
+                ratchet_received: None,
                 packet_hash: None,
                 is_path_response: false,
                 retained: false,

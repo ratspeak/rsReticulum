@@ -203,8 +203,8 @@ impl TransportActor {
         raw: &[u8],
         timestamp: f64,
     ) {
-        let remaining = (timestamp + PATH_REQUEST_GATE_TIMEOUT - now_f64())
-            .clamp(0.0, PATH_REQUEST_GATE_TIMEOUT);
+        let remaining =
+            (timestamp + PR_ADMISSION_DEADLINE - now_f64()).clamp(0.0, PR_ADMISSION_DEADLINE);
         let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(remaining);
         self.admit_announce(
             id,

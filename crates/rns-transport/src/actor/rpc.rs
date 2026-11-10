@@ -136,6 +136,8 @@ impl TransportActor {
                             protocol_violations: entry.protocol_violations,
                             ifac_violations: entry.ifac_violations,
                             packet_filter_hits: entry.packet_filter_hits,
+                            gravity: entry.gravity,
+                            announces_to_internal: entry.announces_to_internal,
                             parent_id: entry.parent_id,
                         }
                     })
@@ -198,12 +200,13 @@ impl TransportActor {
                 TransportQueryResponse::Announces(entries)
             }
             TransportQuery::RecallDestination { dest } => {
+                let now = crate::actor::now_f64();
                 let recalled = self.recent_announces.get(&dest).and_then(|entry| {
                     Some(RecalledDestinationRpcEntry {
                         dest_hash: entry.dest_hash,
                         public_key: entry.public_key?,
                         app_data: entry.app_data.clone(),
-                        ratchet: entry.ratchet,
+                        ratchet: entry.live_ratchet(now),
                         hops: entry.hops,
                         timestamp: entry.timestamp,
                     })

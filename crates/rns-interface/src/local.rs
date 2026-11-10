@@ -695,7 +695,7 @@ pub async fn spawn_local_client(
     let owner = transport_tx.owner();
     let endpoint = LocalEndpoint::parse(&config.socket_path);
     let initial = endpoint.connect().await?;
-    tracing::info!(name = %config.name, endpoint = %endpoint.display(), "local client connected");
+    tracing::debug!(name = %config.name, endpoint = %endpoint.display(), "local client connected");
 
     let online = Arc::new(AtomicBool::new(true));
     let rxb = Arc::new(AtomicU64::new(0));

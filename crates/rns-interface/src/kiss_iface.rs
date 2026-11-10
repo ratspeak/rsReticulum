@@ -126,7 +126,7 @@ async fn spawn_kiss_with_port(
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
     let transport_tx = InterfaceTransportSender::new(id, transport_tx);
     let owner = transport_tx.owner();
-    tracing::info!(
+    rns_transport::notice!(
         name = %config.name,
         port = %config.port,
         baud = config.baud_rate,

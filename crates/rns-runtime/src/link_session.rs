@@ -216,7 +216,10 @@ pub enum LinkSessionResourceDirection {
 /// segment. This does not attest to remote file writes or durable storage.
 pub struct LinkSessionResourceReceipt {
     pub link_id: [u8; 16],
+    /// Logical hash: Python's `original_hash`.
     pub resource_id: [u8; 32],
+    /// Hash of the final segment: Python's `get_hash()` in the concluded callback.
+    pub last_segment_hash: [u8; 32],
     pub data_size: usize,
     pub total_segments: usize,
 }
@@ -2474,6 +2477,7 @@ async fn handle_outbound_resource_proof(
             let receipt = LinkSessionResourceReceipt {
                 link_id: link.link_id,
                 resource_id: outbound.resource_id,
+                last_segment_hash: outbound.transfer.resource.resource_hash,
                 data_size: outbound.data_size,
                 total_segments: outbound.total_segments,
             };
@@ -4249,6 +4253,9 @@ async fn process_destination_event(
             };
             if header.destination_hash != link.link_id || raw.len() < data_offset {
                 return Ok(None);
+            }
+            if header.context != rns_wire::context::PacketContext::Keepalive {
+                link.record_inbound_data();
             }
             update_link_phy_stats(link, metrics);
             publish_link_phy_stats(link, phy_stats_tx);

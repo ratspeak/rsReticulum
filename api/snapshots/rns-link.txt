@@ -283,6 +283,7 @@ pub fn rns_link::link::Link::ready_for_new_resource(&self) -> bool
 pub fn rns_link::link::Link::receive_rtt_packet(&mut self, &[u8]) -> core::result::Result<(), rns_link::handshake::HandshakeError>
 pub fn rns_link::link::Link::receive_teardown(&mut self, &[u8]) -> bool
 pub fn rns_link::link::Link::record_inbound(&mut self)
+pub fn rns_link::link::Link::record_inbound_data(&mut self)
 pub fn rns_link::link::Link::record_rx(&mut self, usize)
 pub fn rns_link::link::Link::record_tx(&mut self, usize)
 pub fn rns_link::link::Link::record_tx_keepalive(&mut self, usize)

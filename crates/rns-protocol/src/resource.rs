@@ -1023,7 +1023,8 @@ impl LazyMultiSegmentOutbound {
 
         Ok(Self {
             data,
-            auto_compress,
+            // The compression gate applies to the whole input, not each segment.
+            auto_compress: auto_compress && data_size <= compression::AUTO_COMPRESS_MAX_SIZE,
             metadata,
             metadata_wire_size,
             request_id,

@@ -545,7 +545,7 @@ async fn backbone_write_loop(
             _ = tick.tick() => {
                 let now = started.elapsed().as_secs_f64();
                 if control.evaluate(sent, buffered, buffered, now) {
-                    tracing::info!(
+                    rns_transport::notice!(
                         name = %name,
                         "No egress control drain progress for {}s on {}, tearing down",
                         DP_EC_DEAD_TIME,

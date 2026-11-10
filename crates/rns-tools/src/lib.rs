@@ -24,6 +24,9 @@ pub fn config_log_timestamps(config_dir: &std::path::Path) -> bool {
 /// Target of the events Python logs at `LOG_PATHING`.
 pub const PATHING_TARGET: &str = "rns::pathing";
 
+/// Target of the events Python logs at `LOG_NOTICE` (`rns_transport::notice!`).
+pub const NOTICE_TARGET: &str = "rns::notice";
+
 /// Python RNS log levels (`RNS/__init__.py` `LOG_CRITICAL`..`LOG_EXTREME`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
@@ -75,14 +78,16 @@ impl LogLevel {
         }
     }
 
-    /// Tracing filter for this level: `Pathing` adds the [`PATHING_TARGET`]
-    /// debug events to `Debug`, and only `Extreme` enables trace events.
+    /// Tracing filter for this level: `Notice` shows only the [`NOTICE_TARGET`]
+    /// info events, `Info` adds every other info event, `Pathing` adds the
+    /// [`PATHING_TARGET`] debug events to `Debug`, and only `Extreme` enables
+    /// trace events.
     pub fn filter(self) -> tracing_subscriber::filter::Targets {
         use tracing_subscriber::filter::{LevelFilter, Targets};
         let default = match self {
             LogLevel::Critical | LogLevel::Error => LevelFilter::ERROR,
-            LogLevel::Warning => LevelFilter::WARN,
-            LogLevel::Notice | LogLevel::Info => LevelFilter::INFO,
+            LogLevel::Warning | LogLevel::Notice => LevelFilter::WARN,
+            LogLevel::Info => LevelFilter::INFO,
             LogLevel::Verbose | LogLevel::Debug | LogLevel::Pathing => LevelFilter::DEBUG,
             LogLevel::Extreme => LevelFilter::TRACE,
         };
@@ -91,9 +96,15 @@ impl LogLevel {
         } else {
             LevelFilter::OFF
         };
+        let notice = if self >= LogLevel::Notice {
+            default.max(LevelFilter::INFO)
+        } else {
+            default
+        };
         Targets::new()
             .with_default(default)
             .with_target(PATHING_TARGET, pathing)
+            .with_target(NOTICE_TARGET, notice)
     }
 }
 

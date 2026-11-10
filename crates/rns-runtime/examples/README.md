@@ -46,7 +46,7 @@ below follow the `--`; networked examples also accept `--config DIRECTORY`.
 | `identify` | `server`, or `client HASH`. Demonstrates initiator identification on a Link. |
 | `request` | `server`, or `client HASH [MESSAGE]`. Requests `/echo`; the example handler allows all callers. |
 | `channel` | `server`, or `client HASH [MESSAGE]`. Exchanges a custom Channel message. |
-| `buffer` | `server`, or `client HASH [MESSAGE]`. Exchanges a short UTF-8 string using Buffer/stream frames. Use the default short message; this example adds a reply prefix per received frame and is not an arbitrary-length echo protocol. |
+| `buffer` | `server`, or `client HASH [MESSAGE]`. Exchanges a short UTF-8 string using Buffer/stream frames and interoperates with upstream `Examples/Buffer.py`. Use the default short message; the server replies `I received "<text>" over the buffer` per received frame and is not an arbitrary-length echo protocol. |
 | `resource` | `server`, or `client HASH [MESSAGE]`. Transfers a Resource with progress reporting. |
 | `filetransfer` | `server NEW_OUTPUT_FILE`, or `client HASH INPUT_FILE`. Writes the first completed Resource to a new file and refuses to replace an existing file. |
 | `speedtest` | `server`, or `client HASH [BYTE_COUNT]`. Queues Link packets; the default is 2 MiB. |

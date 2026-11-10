@@ -197,7 +197,7 @@ impl PreparedResourceSource {
     }
 
     fn prepare_with_purpose<S>(
-        mut source: S,
+        source: S,
         mut options: ResourceOptions,
         auto_compress: Option<AutoCompress>,
         purpose: ResourcePurpose,
@@ -205,14 +205,28 @@ impl PreparedResourceSource {
     where
         S: ResourceSource + 'static,
     {
-        let data_size = source.seek(SeekFrom::End(0))?;
+        let mut source: Box<dyn ResourceSource> = Box::new(source);
+        let data_size = match source.seek(SeekFrom::End(0)) {
+            Ok(0) => {
+                source.seek(SeekFrom::Start(0))?;
+                source = proxy_stream(source)?;
+                source.seek(SeekFrom::End(0))?
+            }
+            Ok(size) => size,
+            // Pipes and procfs files cannot report a length (ESPIPE, EINVAL).
+            Err(_) => {
+                source = proxy_stream(source)?;
+                source.seek(SeekFrom::End(0))?
+            }
+        };
         if data_size > MAX_RESOURCE_SIZE as u64 {
             return Err(ResourceSourceError::TooLarge);
         }
         source.seek(SeekFrom::Start(0))?;
         let data_size = data_size as usize;
-        if let Some(policy) = auto_compress {
-            options.auto_compress = policy.applies_to(data_size);
+        match auto_compress {
+            Some(policy) => options.auto_compress = policy.applies_to(data_size),
+            None => options.auto_compress &= AutoCompress::On.applies_to(data_size),
         }
         let metadata_wire_size = options
             .metadata
@@ -269,7 +283,7 @@ impl PreparedResourceSource {
         source.seek(SeekFrom::Start(0))?;
 
         Ok(Self::Split {
-            source: Box::new(source),
+            source,
             options,
             purpose,
             data_size,
@@ -387,6 +401,20 @@ impl PreparedResourceSource {
             }
         }
     }
+}
+
+/// Copy a zero-size or unseekable source (pipe, procfs) into a temporary file,
+/// as Resource proxies a zero-size reader.
+fn proxy_stream(
+    source: Box<dyn ResourceSource>,
+) -> Result<Box<dyn ResourceSource>, ResourceSourceError> {
+    let mut spool = tempfile::tempfile()?;
+    let copied = io::copy(&mut source.take(MAX_RESOURCE_SIZE as u64 + 1), &mut spool)?;
+    if copied > MAX_RESOURCE_SIZE as u64 {
+        return Err(ResourceSourceError::TooLarge);
+    }
+    spool.seek(SeekFrom::Start(0))?;
+    Ok(Box::new(spool))
 }
 
 #[cfg(test)]

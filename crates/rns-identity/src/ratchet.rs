@@ -10,8 +10,11 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::identity::Identity;
 use crate::persistence::{self, SecretBytes};
 
-const RATCHET_FILE_MAX_BYTES: usize = 64 * 1024;
-const RATCHET_PACKED_MAX_BYTES: usize = 32 * 1024;
+/// Upper bound on retained ring keys. Python has none; this bounds loading
+/// an untrusted ring file.
+pub const RATCHET_RING_MAX_KEYS: usize = 4096;
+const RATCHET_PACKED_MAX_BYTES: usize = RATCHET_RING_MAX_KEYS * 34 + 8;
+const RATCHET_FILE_MAX_BYTES: usize = RATCHET_PACKED_MAX_BYTES + 1024;
 const RECEIVED_RATCHET_FILE_MAX_BYTES: usize = 1024;
 
 fn wall_time_secs() -> f64 {
@@ -61,9 +64,9 @@ fn unpack_ratchet_keys(packed: &[u8]) -> std::io::Result<Vec<[u8; 32]>> {
     }
     let encoded_keys: Vec<SecretBytes<'_, RATCHET_PACKED_MAX_BYTES>> =
         rmp_serde::from_slice(packed).map_err(|e| std::io::Error::other(e.to_string()))?;
-    if encoded_keys.len() > RATCHET_COUNT {
+    if encoded_keys.len() > RATCHET_RING_MAX_KEYS {
         return Err(invalid_data(format!(
-            "ratchet ring contains {} keys; maximum is {RATCHET_COUNT}",
+            "ratchet ring contains {} keys; maximum is {RATCHET_RING_MAX_KEYS}",
             encoded_keys.len()
         )));
     }
@@ -72,7 +75,7 @@ fn unpack_ratchet_keys(packed: &[u8]) -> std::io::Result<Vec<[u8; 32]>> {
         return Err(invalid_data("ratchet private key must be exactly 32 bytes"));
     }
 
-    let mut keys = Vec::with_capacity(RATCHET_COUNT);
+    let mut keys = Vec::with_capacity(RATCHET_COUNT.max(encoded_keys.len()));
     keys.resize(encoded_keys.len(), [0u8; 32]);
     for (key, encoded) in keys.iter_mut().zip(&encoded_keys) {
         key.copy_from_slice(encoded);
@@ -226,7 +229,7 @@ impl RatchetRing {
     }
 
     fn duplicate(&self) -> Self {
-        let mut keys = Vec::with_capacity(RATCHET_COUNT);
+        let mut keys = Vec::with_capacity(self.keys.capacity().max(self.retained_count));
         keys.extend_from_slice(&self.keys);
         Self {
             keys,
@@ -257,11 +260,19 @@ impl RatchetRing {
         self.keys.is_empty()
     }
 
-    /// Set `retained_count`; returns `false` outside `1..=RATCHET_COUNT`.
+    /// Set `retained_count`; returns `false` outside `1..=RATCHET_RING_MAX_KEYS`.
     pub fn set_retained_ratchets(&mut self, count: usize) -> bool {
-        if (1..=RATCHET_COUNT).contains(&count) {
+        if (1..=RATCHET_RING_MAX_KEYS).contains(&count) {
             self.retained_count = count;
             self.clean();
+            if self.keys.capacity() < count {
+                // Move into a buffer that holds the full ring, wiping the old one,
+                // so later rotations never reallocate uncleared key storage.
+                let mut keys = Vec::with_capacity(count);
+                keys.extend_from_slice(&self.keys);
+                self.keys.zeroize();
+                self.keys = keys;
+            }
             true
         } else {
             false
@@ -512,6 +523,36 @@ impl PersistentRatchetRing {
     /// Whether no ratchet has been generated yet.
     pub fn is_empty(&self) -> bool {
         self.ring.is_empty()
+    }
+
+    /// Python `Destination.set_retained_ratchets`: truncates the live ring now
+    /// and persists with the next rotation.
+    pub fn set_retained_ratchets(&mut self, count: usize) -> bool {
+        self.ring.set_retained_ratchets(count)
+    }
+
+    /// Python `Destination.set_ratchet_interval`.
+    pub fn set_ratchet_interval(&mut self, interval: u64) -> bool {
+        self.ring.set_ratchet_interval(interval)
+    }
+
+    /// Re-read the ring from its file, as Python `Destination._reload_ratchets`
+    /// does after a failed decryption. Retention, interval and rotation age are
+    /// kept; a missing file starts an empty ring; on error the live ring is left unchanged.
+    pub fn reload(&mut self, identity: &Identity) -> std::io::Result<()> {
+        let mut ring = if self.path.is_file() {
+            RatchetRing::load_verified(&self.path, identity)?.into_ring()
+        } else {
+            // Destination.py:569-573: a missing file is re-initialised as an empty ring.
+            let ring = RatchetRing::new();
+            ring.save_verified(&self.path, identity)?;
+            ring
+        };
+        ring.set_ratchet_interval(self.ring.ratchet_interval());
+        ring.set_retained_ratchets(self.ring.retained_ratchets());
+        ring.anchor_rotation_at(self.ring.last_rotation());
+        self.ring = ring;
+        Ok(())
     }
 
     /// Return a usable current public key, rotating first when due.
@@ -1032,6 +1073,11 @@ mod tests {
             Some(second)
         );
 
+        std::fs::remove_file(&path).unwrap();
+        reloaded.reload(&identity).unwrap();
+        assert!(reloaded.is_empty());
+        assert!(path.is_file());
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1172,7 +1218,7 @@ mod tests {
             std::io::ErrorKind::InvalidData
         );
 
-        let keys = vec![[0x44; 32]; RATCHET_COUNT + 1];
+        let keys = vec![[0x44; 32]; RATCHET_RING_MAX_KEYS + 1];
         let packed = rmp_serde::to_vec(&keys).unwrap();
         let envelope = RatchetRingPersistedWrite {
             signature: &[0u8; 64],

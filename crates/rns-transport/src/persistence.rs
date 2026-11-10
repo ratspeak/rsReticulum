@@ -1036,6 +1036,9 @@ pub struct PersistedAnnounceEntry {
     pub stamp_value: f64,
     #[serde(default)]
     pub lr_cost: Option<f64>,
+    /// When `ratchet` was received; absent in caches written before it existed.
+    #[serde(default)]
+    pub ratchet_received: Option<f64>,
 }
 
 /// Version-5 on-disk entry shape with raw announce bytes inline, accepted by
@@ -1085,6 +1088,7 @@ where
             timestamp: a.timestamp,
             public_key: a.public_key.map(|k| k.to_vec()),
             ratchet: a.ratchet.map(|r| r.to_vec()),
+            ratchet_received: a.ratchet_received,
             packet_hash: a.packet_hash.map(|h| h.to_vec()),
             retained: a.retained,
             name_hash: a.name_hash.to_vec(),
@@ -1181,6 +1185,7 @@ pub fn migrate_legacy_announce_entries(
                 timestamp: e.timestamp,
                 public_key: e.public_key,
                 ratchet: e.ratchet,
+                ratchet_received: None,
                 packet_hash,
                 retained: e.retained,
                 name_hash: e.name_hash,
@@ -1808,7 +1813,10 @@ mod tests {
         let cc = [0xCC; 32];
         hashlist.insert(aa);
         hashlist.insert(bb);
-        // Rotate aa/bb into the transient previous generation.
+        hashlist.insert([0xDD; 32]);
+        // Rotate into the transient previous generation.
+        assert!(hashlist.rotate_if_full());
+        hashlist.remove(&[0xDD; 32]);
         hashlist.insert(cc);
 
         let dir = unique_temp_dir("raw-hashlist-current");
@@ -2133,6 +2141,7 @@ mod tests {
             timestamp: 1000.0,
             public_key: None,
             ratchet: Some([0xDD; 32]),
+            ratchet_received: Some(999.0),
             packet_hash: Some([0xEE; 32]),
             is_path_response: true,
             retained: false,
@@ -2154,6 +2163,7 @@ mod tests {
         assert_eq!(loaded[0].destination_hash, [0xCC; 16].to_vec());
         assert_eq!(loaded[0].hops, 3);
         assert_eq!(loaded[0].ratchet, Some(vec![0xDD; 32]));
+        assert_eq!(loaded[0].ratchet_received, Some(999.0));
         assert_eq!(loaded[0].packet_hash, Some([0xEE; 32].to_vec()));
         assert!(loaded[0].is_path_response);
         assert_eq!(loaded[0].last_used, Some(1234.0));
@@ -2170,6 +2180,7 @@ mod tests {
             timestamp: 1000.0,
             public_key: None,
             ratchet: None,
+            ratchet_received: None,
             packet_hash: None,
             is_path_response: false,
             retained: false,

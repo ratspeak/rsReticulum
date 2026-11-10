@@ -74,9 +74,7 @@ fn wait_for_ready_log(child: &mut Child, log: &Path, timeout: Duration) -> bool 
         if child.try_wait().expect("poll child readiness").is_some() {
             return false;
         }
-        if fs::read_to_string(log)
-            .is_ok_and(|text| text.contains("reticulum started in Standalone mode"))
-        {
+        if fs::read_to_string(log).is_ok_and(|text| text.contains("Started rnsd-rs version")) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -270,7 +268,7 @@ fn daemon_readiness_requires_completed_initialization_and_a_live_child() {
     // The starting message is not a promise of completed runtime initialization.
     fs::write(&log, "rnsd-rs 1.3.0 starting\n").expect("write starting log");
     assert!(!wait_for_ready_log(&mut child, &log, Duration::ZERO));
-    fs::write(&log, "reticulum started in Standalone mode\n").expect("write ready log");
+    fs::write(&log, "Started rnsd-rs version 1.4.0 (Reticulum 1.4.2)\n").expect("write ready log");
     assert!(wait_for_ready_log(&mut child, &log, Duration::ZERO));
 
     child.kill().expect("stop control");

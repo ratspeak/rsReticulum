@@ -256,7 +256,7 @@ pub async fn spawn_ax25kiss_interface(
         crate::traits::InterfaceError::SendFailed(format!("ax25kiss serial open: {}", e))
     })?;
 
-    tracing::info!(
+    rns_transport::notice!(
         name = %config.name,
         port = %config.port,
         baud = config.baud_rate,

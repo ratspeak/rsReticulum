@@ -179,7 +179,7 @@ pub async fn spawn_pipe_interface(
                 tokio::select! {
                     read = stdout.read(&mut buf) => match read {
                         Ok(0) => {
-                            tracing::info!(name = %config.name, "PipeInterface: subprocess terminated");
+                            rns_transport::notice!(name = %config.name, "PipeInterface: subprocess terminated");
                             break;
                         }
                         Ok(n) => {
@@ -253,7 +253,7 @@ pub async fn spawn_pipe_interface(
                         (child, stdin, stdout) = spawned;
                         while rx.try_recv().is_ok() {}
                         online_task.store(true, Ordering::SeqCst);
-                        tracing::info!(name = %config.name, "PipeInterface: reconnected pipe");
+                        rns_transport::notice!(name = %config.name, "PipeInterface: reconnected pipe");
                         break;
                     }
                     Err(e) => {

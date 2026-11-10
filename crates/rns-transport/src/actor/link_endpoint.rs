@@ -490,6 +490,25 @@ impl TransportActor {
         }
     }
 
+    /// True for a Link DATA packet whose established endpoint is bound to
+    /// another interface.
+    pub(super) fn link_packet_on_unbound_interface(
+        &self,
+        header: &rns_wire::header::PacketHeader,
+        interface_id: InterfaceId,
+    ) -> bool {
+        use crate::messages::LinkEndpointRole;
+        if header.flags.destination_type != rns_wire::flags::DestinationType::Link {
+            return false;
+        }
+        let mut bound = [LinkEndpointRole::Initiator, LinkEndpointRole::Responder]
+            .into_iter()
+            .filter_map(|role| self.link_endpoints.get(&(header.destination_hash, role)))
+            .map(|entry| entry.binding.interface_id)
+            .peekable();
+        bound.peek().is_some() && bound.all(|id| id != interface_id)
+    }
+
     fn link_endpoint_interface_available(
         &self,
         binding: crate::messages::LinkEndpointBinding,

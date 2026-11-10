@@ -103,8 +103,9 @@ fn packet_capacity_checks_clear_and_wire_with_ifac_before_admission() {
     let (tx, mut messages) = mpsc::channel(4);
     actor.local_destinations.insert(dest);
     actor.destination_channels.insert(dest, tx);
+    // Transport.py:2014@1.6.0 bounds the IFAC-stripped frame by HW_MTU + ifac_size.
     let mut clear = make_data_packet(dest, 0).to_vec();
-    clear.resize(500, 0);
+    clear.resize(508 + 8, 0);
     ingress(
         &mut actor,
         1,

@@ -189,7 +189,7 @@ impl TransportActor {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             pkt_type = ?parsed.flags.packet_type,
             dest = %hex::encode(request.destination_hash),
             has_path = self.path_table.has_path(&request.destination_hash),
@@ -215,7 +215,7 @@ impl TransportActor {
                         .get(&target_interface)
                         .map(|e| e.name.as_str())
                         .unwrap_or("unknown");
-                    tracing::info!(
+                    tracing::debug!(
                         dest = %hex::encode(request.destination_hash),
                         interface_id = target_interface,
                         interface_name = %iface_name,
@@ -286,7 +286,7 @@ impl TransportActor {
                         .filter(|e| e.direction.outbound)
                         .map(|e| e.name.as_str())
                         .collect();
-                    tracing::info!(
+                    tracing::debug!(
                         dest = %hex::encode(request.destination_hash),
                         broadcast_to = ?iface_names,
                         "outbound: no path, broadcasting"
@@ -638,16 +638,15 @@ impl TransportActor {
         let tag_bytes = Some(tag);
 
         let now = now_f64();
-        let mut unique_tag = Vec::with_capacity(32);
-        unique_tag.extend_from_slice(&requested_dest);
-        unique_tag.extend_from_slice(tag);
-        if let Some(last) = self.discovery_pr_tags.get(&unique_tag)
-            && now - last < PATH_REQUEST_GATE_TIMEOUT
+        let mut unique_tag = [0u8; 32];
+        unique_tag[..16].copy_from_slice(&requested_dest);
+        unique_tag[16..].copy_from_slice(tag);
+        if self.discovery_pr_tags_prev.contains(&unique_tag)
+            || !self.discovery_pr_tags.insert(unique_tag)
         {
             trace!(dest = %hex::encode(requested_dest), "ignoring duplicate path request");
             return;
         }
-        self.discovery_pr_tags.insert(unique_tag, now);
         // Transport.py:2099-2129: the flags byte is not consulted, so the
         // lenient 0xC1 0xFF marker fails like any invalid stamp.
         if self.stamp_policy.stamps_enabled {

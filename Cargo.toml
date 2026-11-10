@@ -69,6 +69,7 @@ tracing-subscriber = "0.3"
 
 # Error handling
 thiserror = "2"
+tempfile = "3"
 
 # Misc
 hex = "0.4"

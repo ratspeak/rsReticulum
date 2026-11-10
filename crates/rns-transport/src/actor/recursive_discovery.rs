@@ -94,9 +94,10 @@ impl TransportActor {
         let admission = self.admit_discovery_requester(destination, requester, now)?;
         if admission.started {
             let tag = rns_crypto::random::random_bytes(16);
-            let mut unique_tag = destination.to_vec();
-            unique_tag.extend_from_slice(&tag);
-            self.discovery_pr_tags.insert(unique_tag, now);
+            let mut unique_tag = [0u8; 32];
+            unique_tag[..16].copy_from_slice(&destination);
+            unique_tag[16..].copy_from_slice(&tag);
+            self.discovery_pr_tags.insert(unique_tag);
             self.forward_path_request(destination, Some(requester), Some(&tag), true);
         }
         Ok(admission)

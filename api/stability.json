@@ -42,8 +42,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-identity.txt",
-      "itemCount": 431,
-      "sha256": "377cb3b72a97b071e0d590c399d0cc0433b60fe5a6ae37a73657283d3622f037"
+      "itemCount": 435,
+      "sha256": "4556179c0b25e454b01bbc6668a7b54c8fcb3b30087a0a2b13f78db955260fef"
     },
     {
       "name": "rns-transport",
@@ -51,8 +51,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-transport.txt",
-      "itemCount": 1947,
-      "sha256": "79cd60b1cde9c92e97f58ded693d3754b53311ec16f161ffa5b90775ec3c4a45"
+      "itemCount": 1956,
+      "sha256": "983d4b839158e4406ae0b350d063022918e7db6979e5b33409ba357ebf338dee"
     },
     {
       "name": "rns-link",
@@ -60,8 +60,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-link.txt",
-      "itemCount": 384,
-      "sha256": "6c7db32623681ef8b2fdce0c54edbb992d307f0fae8b361c65109a6d262d9389"
+      "itemCount": 385,
+      "sha256": "0260f33132ed0a2b57b6f5a3e9fab97a904e3ac391cc63aa3005c50a3f642c2e"
     },
     {
       "name": "rns-protocol",
@@ -87,8 +87,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-runtime.txt",
-      "itemCount": 2153,
-      "sha256": "517558f62c4542e47a91a1e090ea8b8e6c6112a66b24278a622ba987638b5864"
+      "itemCount": 2167,
+      "sha256": "f8a09abb8c8c12f09965ca263b9808078efff153c245cdc42220b9a2c314dff0"
     },
     {
       "name": "rns-tools",
@@ -124,6 +124,7 @@
         "pub rns_transport::actor::DiscoveryPathRequest::requesting_interface: rns_transport::messages::InterfaceId",
         "pub rns_transport::actor::DiscoveryPathRequest::timeout: f64",
         "pub rns_transport::actor::TransportActor::discovery_path_requests: std::collections::hash::map::HashMap<[u8; 16], rns_transport::actor::DiscoveryPathRequest>",
+        "pub rns_transport::actor::TransportActor::discovery_pr_tags: std::collections::hash::map::HashMap<alloc::vec::Vec<u8>, f64>",
         "pub rns_transport::actor::TransportActor::pending_tunnel_entries: alloc::vec::Vec<rns_transport::persistence::PersistedTunnelEntry>",
         "pub rns_transport::discovery::DiscoveryInterfaceConfig::height: f64",
         "pub rns_transport::discovery::DiscoveryInterfaceConfig::latitude: f64",

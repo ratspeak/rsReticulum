@@ -24,6 +24,16 @@ macro_rules! pathing {
     ($($arg:tt)*) => { tracing::debug!(target: "rns::pathing", $($arg)*) };
 }
 
+/// Events Python logs at `LOG_NOTICE` (3): info events on the `rns::notice`
+/// target, which the tools show from loglevel 3 while plain `info!` needs 4.
+#[macro_export]
+macro_rules! notice {
+    ($($arg:tt)*) => { $crate::__tracing::info!(target: "rns::notice", $($arg)*) };
+}
+
+#[doc(hidden)]
+pub use tracing as __tracing;
+
 pub mod actor;
 pub mod announce;
 pub mod announce_validation;

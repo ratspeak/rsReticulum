@@ -59,8 +59,12 @@ pub const LOCAL_REBROADCASTS_MAX: u32 = 2;
 /// slow-media return budget can extend the actual admission deadline.
 pub const PATH_REQUEST_TIMEOUT: f64 = 15.0;
 
-/// Duplicate inbound path request tag retention (seconds).
-pub const PATH_REQUEST_GATE_TIMEOUT: f64 = 120.0;
+/// Retention of outbound path request markers (seconds).
+pub const PATH_REQUEST_GATE_TIMEOUT: f64 = 45.0;
+
+/// Deadline for path request and cached path response driver admission
+/// retries (seconds). Rust-internal; upstream has no admission queue.
+pub const PR_ADMISSION_DEADLINE: f64 = 120.0;
 
 /// Maximum queued automatic discovery path requests after failed link setup.
 pub const MAX_QUEUED_DISCOVERY_PRS: usize = 32;
@@ -79,9 +83,9 @@ pub const PATH_REQUEST_RG: f64 = 1.5;
 /// requests. Explicit caller requests have their own admission rules.
 pub const PATH_REQUEST_MI: f64 = 20.0;
 
-/// Default two-generation duplicate-packet hash capacity used by normal
-/// insertion. Restoring saved generations does not enforce this bound.
-pub const HASHLIST_MAXSIZE: usize = 2_000_000;
+/// Duplicate-packet hashlist capacity; the job loop rotates generations once
+/// the current one holds more than half of it.
+pub const HASHLIST_MAXSIZE: usize = 1_000_000;
 
 /// Job loop period (250ms).
 pub const JOB_INTERVAL_MS: u64 = 250;
@@ -103,9 +107,9 @@ pub const STATE_SAVE_INTERVAL_SECS: f64 = 300.0;
 /// are eligible for announce-metadata cleanup.
 pub const UNUSED_DESTINATION_LINGER: f64 = 360.0;
 
-/// Discovery path-request tag count ceiling applied during maintenance, in
-/// addition to time-based expiry. It is not an insertion-time hard bound.
-pub const MAX_DISCOVERY_PR_TAGS: usize = 32_000;
+/// Path request tag count above which maintenance rotates the current tag
+/// generation into the previous one. Tags have no time expiry.
+pub const MAX_DISCOVERY_PR_TAGS: usize = 16_000;
 
 /// Traffic-rate sampling interval, in seconds. Despite the name, transport
 /// link-table culling uses `TABLES_CULL_INTERVAL`.
@@ -121,8 +125,8 @@ pub const ANNOUNCES_CHECK_INTERVAL: f64 = 1.0;
 /// actor does not use this constant to schedule cleanup.
 pub const PENDING_PRS_CHECK_INTERVAL: f64 = 30.0;
 
-/// In-memory hash rotation and announce-metadata cleanup interval, in seconds
-/// (5 minutes), after the interface-startup grace period has completed.
+/// Cache cleaning interval, in seconds (5 minutes). The transport actor does
+/// not use it; packet hashlist rotation is count-based.
 pub const CACHE_CLEAN_INTERVAL: f64 = 300.0;
 
 /// On-disk announce cache sweep interval, in seconds (5 minutes, Python

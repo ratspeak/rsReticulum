@@ -138,7 +138,14 @@ impl TransportActor {
                 .record_rx(packet.interface_id, packet.raw.len() as u64);
         }
 
-        // Check the complete wire budget before IFAC allocates an unmasked copy.
+        // Transport.py:1990-2010: frames of two bytes or less are protocol
+        // violations before any IFAC handling.
+        if packet.raw.len() <= 2 {
+            self.protocol_violation(packet.interface_id);
+            return;
+        }
+        // Upstream bounds the frame only after IFAC (Transport.py:2014,
+        // HW_MTU + ifac_size, the default IFAC size without IFAC).
         let clear_limit = if origin == InboundOrigin::CachedAnnounce {
             500
         } else {
@@ -148,16 +155,16 @@ impl TransportActor {
             if !entry.owner.is_current() {
                 return;
             }
-            let oversized = packet.raw.len() > entry.packet_capacity.max_wire_packet_bytes as usize;
-            let clear_mtu = entry.effective_clear_mtu();
-            if oversized {
+            if entry.effective_clear_mtu().is_err() {
+                return;
+            }
+            let limit = entry.packet_capacity.max_wire_packet_bytes as usize + entry.ifac_size;
+            // Allocation guard before IFAC unmasks a copy; drivers deframe far below it.
+            if packet.raw.len() > 2 * limit {
                 self.protocol_violation(packet.interface_id);
                 return;
             }
-            match clear_mtu {
-                Ok(n) => n as usize,
-                Err(_) => return,
-            }
+            limit
         };
 
         // Strip the IFAC tag if the interface gates membership on one; packets
@@ -371,6 +378,13 @@ impl TransportActor {
         if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce
             && !self.admit_announce_type(&raw[data_offset..], parsed.hops, packet.interface_id)
         {
+            return;
+        }
+        // Transport.py:2044: announce frames above the base MTU.
+        if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce
+            && raw.len() > rns_wire::constants::MTU
+        {
+            self.protocol_violation(packet.interface_id);
             return;
         }
 
@@ -670,9 +684,7 @@ impl TransportActor {
                 e.timestamp = now_f64();
                 e.public_key = announce_public_key;
                 e.app_data = announce_app_data.clone();
-                if announce_ratchet.is_some() {
-                    e.ratchet = announce_ratchet;
-                }
+                e.remember_ratchet(announce_ratchet, now_f64());
                 e.stamp = validated.stamp;
                 e.stamp_value = announce_stamp_value;
                 e.lr_cost = validated.lr_cost;
@@ -686,6 +698,7 @@ impl TransportActor {
                     timestamp: now_f64(),
                     public_key: announce_public_key,
                     ratchet: announce_ratchet,
+                    ratchet_received: announce_ratchet.map(|_| now_f64()),
                     packet_hash: None,
                     is_path_response: header.context
                         == rns_wire::context::PacketContext::PathResponse,
@@ -801,7 +814,19 @@ impl TransportActor {
             let random_seen = existing.has_random_blob(&announce_random_hash);
             let path_timebase = path_timebase_from_random_blobs(existing.random_blobs.iter());
             if header.hops <= existing.hops {
-                !random_seen && announce_emitted > path_timebase
+                if !random_seen && announce_emitted > path_timebase {
+                    true
+                } else if announce_emitted != path_timebase {
+                    false
+                } else {
+                    // Transport.py:2522-2532: the same emission heard on a
+                    // higher-gravity interface replaces the path.
+                    let gravity = |id| self.interfaces.get(&id).map(|entry| entry.gravity);
+                    matches!(
+                        (gravity(interface_id), gravity(existing.interface_id)),
+                        (Some(announce), Some(current)) if announce > current
+                    )
+                }
             } else if existing.is_expired() || announce_emitted > path_timebase {
                 !random_seen
             } else if announce_emitted == path_timebase {
@@ -940,7 +965,7 @@ impl TransportActor {
         self.cache_announce_to_disk(&announce_packet_hash, raw, interface_id);
         if let Some(e) = self.recent_announces.get_mut(&header.destination_hash) {
             e.hops = header.hops;
-            e.ratchet = announce_ratchet;
+            e.remember_ratchet(announce_ratchet, now_f64());
             e.packet_hash = Some(announce_packet_hash);
             e.is_path_response = is_path_response;
         }
@@ -973,6 +998,12 @@ impl TransportActor {
             let handler_app_data = app_data_for_handlers;
             let is_path_response = header.context == rns_wire::context::PacketContext::PathResponse;
             for registration in &self.announce_handlers {
+                if registration
+                    .paused
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    continue;
+                }
                 if is_path_response && !registration.receive_path_responses {
                     continue;
                 }
@@ -1125,6 +1156,13 @@ impl TransportActor {
             "data packet routing"
         );
         if self.local_destinations.contains(&header.destination_hash) {
+            if self.link_packet_on_unbound_interface(header, interface_id) {
+                // Transport.py:2858-2866: un-claim the hash so the copy arriving
+                // over the Link's attached interface is still accepted.
+                self.packet_hashlist
+                    .remove(&rns_wire::hash::packet_hash(raw, header.flags.header_type));
+                return;
+            }
             if let Some(tx) = self.destination_channels.get(&header.destination_hash)
                 && let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
                     interface_owner: self

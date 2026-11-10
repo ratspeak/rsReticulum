@@ -1839,6 +1839,10 @@ pub struct InterfacePostInit {
     /// interface. Other relay policy gates still apply; locally originated
     /// announces bypass this option. Parser default: true.
     pub announces_from_internal: bool,
+    /// Configured `announces_to_internal`; unset is Python's `None`.
+    pub announces_to_internal: Option<bool>,
+    /// Configured `gravity`; `None` takes `[reticulum] default_gravity`.
+    pub gravity: Option<i64>,
     /// Required announce stamp value on this interface, clamped to the stamp
     /// cost cap. `None` follows the global `[stamps] destination_cost`.
     pub destination_cost: Option<f64>,
@@ -1916,6 +1920,8 @@ impl InterfacePostInit {
             ingress_overrides,
             recursive_prs,
             announces_from_internal,
+            announces_to_internal: config_bool(section, "announces_to_internal")?,
+            gravity: config_int(section, "gravity")?,
             destination_cost: section
                 .get_float("destination_cost")
                 .map(rns_transport::stamps::StampPolicy::clamp_cost),

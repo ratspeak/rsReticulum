@@ -52,7 +52,7 @@ async fn server(args: ExampleArgs) -> ExampleResult {
                         }
                         let text = String::from_utf8_lossy(&data[..n]).into_owned();
                         println!("Received over Buffer: {text}");
-                        let reply = format!("Received: {text}");
+                        let reply = format!("I received \"{text}\" over the buffer");
                         if buffer.write_all(reply.as_bytes()).await.is_err()
                             || buffer.flush().await.is_err()
                         {
@@ -86,7 +86,7 @@ async fn client(args: ExampleArgs) -> ExampleResult {
 
     buffer.write_all(message.as_bytes()).await?;
     buffer.flush().await?;
-    let expected_len = "Received: ".len() + message.len();
+    let expected_len = format!("I received \"{message}\" over the buffer").len();
     let mut reply = vec![0; expected_len];
     tokio::time::timeout(Duration::from_secs(30), buffer.read_exact(&mut reply)).await??;
     println!("Reply: {}", String::from_utf8_lossy(&reply));

@@ -360,9 +360,12 @@ pub fn rns_identity::ratchet::PersistentRatchetRing::len(&self) -> usize
 pub fn rns_identity::ratchet::PersistentRatchetRing::open(impl core::convert::AsRef<std::path::Path>, &rns_identity::identity::Identity) -> core::io::error::Result<Self>
 pub fn rns_identity::ratchet::PersistentRatchetRing::path(&self) -> &std::path::Path
 pub fn rns_identity::ratchet::PersistentRatchetRing::private_keys(&self) -> &[[u8; 32]]
+pub fn rns_identity::ratchet::PersistentRatchetRing::reload(&mut self, &rns_identity::identity::Identity) -> core::io::error::Result<()>
 pub fn rns_identity::ratchet::PersistentRatchetRing::ring(&self) -> &rns_identity::ratchet::RatchetRing
 pub fn rns_identity::ratchet::PersistentRatchetRing::rotate(&mut self, &rns_identity::identity::Identity) -> core::io::error::Result<[u8; 32]>
 pub fn rns_identity::ratchet::PersistentRatchetRing::rotate_at(&mut self, &rns_identity::identity::Identity, f64) -> core::io::error::Result<[u8; 32]>
+pub fn rns_identity::ratchet::PersistentRatchetRing::set_ratchet_interval(&mut self, u64) -> bool
+pub fn rns_identity::ratchet::PersistentRatchetRing::set_retained_ratchets(&mut self, usize) -> bool
 impl core::fmt::Debug for rns_identity::ratchet::PersistentRatchetRing
 pub fn rns_identity::ratchet::PersistentRatchetRing::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct rns_identity::ratchet::PreparedRatchetRotation
@@ -425,6 +428,7 @@ pub fn rns_identity::ratchet::ReceivedRatchetStore::remember_at(&mut self, [u8; 
 pub fn rns_identity::ratchet::ReceivedRatchetStore::with_storage(std::path::PathBuf) -> Self
 impl core::default::Default for rns_identity::ratchet::ReceivedRatchetStore
 pub fn rns_identity::ratchet::ReceivedRatchetStore::default() -> Self
+pub const rns_identity::ratchet::RATCHET_RING_MAX_KEYS: usize
 pub fn rns_identity::ratchet::clean_received_ratchets_dir(&std::path::Path) -> usize
 pub fn rns_identity::ratchet::get_ratchet_id(&[u8; 32]) -> alloc::vec::Vec<u8>
 pub fn rns_identity::ratchet::purge_expired_ratchets_in_memory<K: core::cmp::Eq + core::hash::Hash>(&mut std::collections::hash::map::HashMap<K, rns_identity::ratchet::ReceivedRatchet>) -> usize

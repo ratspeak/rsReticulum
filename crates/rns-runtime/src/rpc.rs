@@ -271,6 +271,10 @@ pub struct InterfaceStatEntry {
     pub ifac_violations: u64,
     #[serde(default)]
     pub packet_filter_hits: u64,
+    #[serde(default)]
+    pub gravity: i64,
+    #[serde(default)]
+    pub announces_to_internal: Option<bool>,
     /// Name of the listener that accepted this interface.
     #[serde(default)]
     pub parent_interface_name: Option<String>,
@@ -900,8 +904,8 @@ fn queue_stats(q: &InboundQueueSnapshot) -> Vec<(&'static str, PyValue)> {
 
 /// Python 1.5.5 `Reticulum.get_interface_stats()` (Reticulum.py:1494-1716)
 /// for the control port and remote management alike. Rust keeps no packet
-/// rates, announce or path request byte counters, transmit buffer or
-/// gravity, so those keys carry Python's idle values.
+/// rates, announce or path request byte counters or transmit buffer, so
+/// those keys carry Python's idle values.
 fn interface_stats_value(
     entries: &[InterfaceStatEntry],
     transport: Option<&TransportStats>,
@@ -1038,8 +1042,11 @@ fn interface_stat_value(e: &InterfaceStatEntry) -> PyValue {
         ("txstalled", PyValue::Bool(false)),
         ("txbuffered", int(0)),
         ("tx_drops", int(e.tx_drops)),
-        ("gravity", int(0)),
-        ("announces_to_internal", PyValue::None),
+        ("gravity", PyValue::Int(i128::from(e.gravity))),
+        (
+            "announces_to_internal",
+            optional(e.announces_to_internal.map(PyValue::Bool)),
+        ),
         ("protocol_violations", int(e.protocol_violations)),
         ("ifac_violations", int(e.ifac_violations)),
         ("packet_filter_hits", int(e.packet_filter_hits)),
@@ -1331,6 +1338,14 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, Rpc
                 packet_filter_hits: dict_get(m, "packet_filter_hits")
                     .and_then(py_u64)
                     .unwrap_or(0),
+                gravity: match dict_get(m, "gravity") {
+                    Some(PyValue::Int(v)) => i64::try_from(*v).unwrap_or(0),
+                    _ => 0,
+                },
+                announces_to_internal: match dict_get(m, "announces_to_internal") {
+                    Some(PyValue::Bool(v)) => Some(*v),
+                    _ => None,
+                },
                 parent_interface_name: dict_get(m, "parent_interface_name").and_then(py_string),
                 autoconnect_source: dict_get(m, "autoconnect_source").and_then(py_string),
             })
@@ -2465,9 +2480,11 @@ mod tests {
         entry.ifac_violations = 16;
         entry.packet_filter_hits = 17;
         entry.tx_dropped_bytes = 18;
+        entry.gravity = -3;
         let encoded = encode_response(&RpcResponse::InterfaceStats(vec![entry])).unwrap();
         let interface = &interface_dicts(&stats_dict(&encoded))[0];
         for (key, value) in [
+            ("gravity", -3),
             ("arxc", 11),
             ("atxc", 12),
             ("prxc", 13),
@@ -2500,8 +2517,9 @@ mod tests {
                 decoded[0].packet_filter_hits,
                 decoded[0].tx_drops,
                 decoded[0].tx_dropped_bytes,
+                decoded[0].gravity,
             ),
-            (11, 12, 13, 14, 15, 16, 17, 1, 18)
+            (11, 12, 13, 14, 15, 16, 17, 1, 18, -3)
         );
     }
 

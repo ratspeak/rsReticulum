@@ -722,7 +722,7 @@ pub(crate) async fn main() {
                     "Started rnsd-rs version {RS_RETICULUM_VERSION} (Reticulum {RETICULUM_COMPAT_VERSION}) connected to another shared local instance, this is probably NOT what you want!"
                 );
             } else {
-                tracing::info!(
+                rns_transport::notice!(
                     "Started rnsd-rs version {RS_RETICULUM_VERSION} (Reticulum {RETICULUM_COMPAT_VERSION})"
                 );
             }

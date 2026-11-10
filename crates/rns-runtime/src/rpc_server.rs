@@ -154,6 +154,8 @@ pub(crate) fn stat_entries(
                 protocol_violations: e.protocol_violations,
                 ifac_violations: e.ifac_violations,
                 packet_filter_hits: e.packet_filter_hits,
+                gravity: e.gravity,
+                announces_to_internal: e.announces_to_internal,
             }
         })
         .collect()

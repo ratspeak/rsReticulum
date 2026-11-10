@@ -610,7 +610,10 @@ pub enum DestinationControlError {
 #[derive(Debug, Clone)]
 pub struct ResourceCompletion {
     pub link_id: [u8; 16],
+    /// Logical hash: Python's `original_hash`.
     pub resource_hash: [u8; 32],
+    /// Hash of the final segment: Python's `get_hash()` in the concluded callback.
+    pub last_segment_hash: [u8; 32],
     pub data: Vec<u8>,
     /// Opaque metadata bytes, if supplied by the sender. Applications such
     /// as rncp use MessagePack; this type does not validate that encoding.
@@ -891,7 +894,7 @@ pub struct LinkManager {
     identity: Option<Identity>,
     /// Private ratchets for a live inbound destination. The manager owns this
     /// alongside `destination` so enforced decryption cannot outlive its keys.
-    destination_ratchets: Option<PersistentRatchetRing>,
+    destination_ratchets: std::sync::RwLock<Option<PersistentRatchetRing>>,
     /// `(link_id, path_hash, data) -> Option<packed MessagePack response>`.
     request_handler: Option<RequestHandler>,
     /// Destination.max_request_size: larger requests are ignored or rejected.
@@ -964,6 +967,8 @@ pub struct LinkManager {
     inbound_raw_tx: Option<mpsc::Sender<Vec<u8>>>,
     /// Whether destination delivery proofs contain only the signature.
     use_implicit_proof: bool,
+    /// Tear down active Links with no payload data for this long (LXMRouter.clean_links).
+    data_inactivity_timeout: Option<std::time::Duration>,
     /// Remote identity hash → link_id; populated on LinkIdentify for outbound reuse.
     backchannel_links: HashMap<[u8; 16], [u8; 16]>,
     /// Shared reverse map so sync request handlers can look up the authenticated peer.
@@ -1021,7 +1026,7 @@ impl LinkManager {
             destination_hash,
             destination: None,
             identity: None,
-            destination_ratchets: None,
+            destination_ratchets: std::sync::RwLock::new(None),
             request_handler: None,
             max_request_size: None,
             deferred_request_notify: Arc::new(tokio::sync::Notify::new()),
@@ -1054,6 +1059,7 @@ impl LinkManager {
             link_closed_tx: None,
             inbound_raw_tx: None,
             use_implicit_proof: true,
+            data_inactivity_timeout: None,
             backchannel_links: HashMap::new(),
             link_identities: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1121,7 +1127,7 @@ impl LinkManager {
             destination_hash,
             destination: dest,
             identity: manager_identity,
-            destination_ratchets: None,
+            destination_ratchets: std::sync::RwLock::new(None),
             request_handler: None,
             max_request_size: None,
             deferred_request_notify: Arc::new(tokio::sync::Notify::new()),
@@ -1154,6 +1160,7 @@ impl LinkManager {
             link_closed_tx: None,
             inbound_raw_tx: None,
             use_implicit_proof: true,
+            data_inactivity_timeout: None,
             backchannel_links: HashMap::new(),
             link_identities: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1188,8 +1195,29 @@ impl LinkManager {
         let current = ratchets.ensure_current(identity)?;
         destination.enable_ratchets(enforce);
         destination.set_local_ratchet(current);
-        self.destination_ratchets = Some(ratchets);
+        *self
+            .destination_ratchets
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner()) = Some(ratchets);
         Ok(current)
+    }
+
+    /// Python `Destination.set_retained_ratchets`; false without a ring or for 0.
+    pub fn set_retained_ratchets(&mut self, count: usize) -> bool {
+        self.destination_ratchets
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .is_some_and(|ring| ring.set_retained_ratchets(count))
+    }
+
+    /// Python `Destination.set_ratchet_interval`; false without a ring or for 0.
+    pub fn set_ratchet_interval(&mut self, interval: u64) -> bool {
+        self.destination_ratchets
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .is_some_and(|ring| ring.set_ratchet_interval(interval))
     }
 
     /// Destination owned by a manager created with [`Self::with_destination`].
@@ -1201,6 +1229,13 @@ impl LinkManager {
     /// selecting the destination proof strategy before the manager is run.
     pub fn destination_mut(&mut self) -> Option<&mut Destination> {
         self.destination.as_mut()
+    }
+
+    /// Tear down, with LINKCLOSE, every active Link whose `no_data_for` exceeds
+    /// `timeout`, as LXMRouter.clean_links does for propagation links
+    /// (LXMRouter.py:1072-1080). Keepalives do not count as data.
+    pub fn set_data_inactivity_timeout(&mut self, timeout: Option<std::time::Duration>) {
+        self.data_inactivity_timeout = timeout;
     }
 
     /// Match the runtime `use_implicit_proof` setting for destination proofs.
@@ -2514,7 +2549,12 @@ impl LinkManager {
             .as_ref()
             .ok_or(DestinationControlError::IdentityUnavailable)?;
 
-        let managed_ratchet = match self.destination_ratchets.as_mut() {
+        let managed_ratchet = match self
+            .destination_ratchets
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
             Some(ratchets) => {
                 let current = ratchets.ensure_current(identity)?;
                 if ratchet.is_some_and(|supplied| supplied != &current) {
@@ -3277,6 +3317,9 @@ impl LinkManager {
             return;
         }
         if let Some(active) = self.active_links.get_mut(&link_id) {
+            if header.context != rns_wire::context::PacketContext::Keepalive {
+                active.link.record_inbound_data();
+            }
             active.link.update_phy_stats(
                 metrics.rssi.map(f64::from),
                 metrics.snr.map(f64::from),
@@ -4210,6 +4253,7 @@ impl LinkManager {
                                                             ResourceCompletion {
                                                                 link_id,
                                                                 resource_hash: route.original_hash,
+                                                                last_segment_hash: rh,
                                                                 data: blob,
                                                                 metadata,
                                                             },
@@ -4301,6 +4345,7 @@ impl LinkManager {
                                                     ResourceCompletion {
                                                         link_id,
                                                         resource_hash: rh,
+                                                        last_segment_hash: rh,
                                                         data: assembled_data,
                                                         metadata,
                                                     },
@@ -5047,6 +5092,28 @@ impl LinkManager {
                 LinkRole::Responder => CloseReason::DestinationClosed,
             };
             self.close_active_link(link_id, reason, true);
+        }
+
+        if let Some(timeout) = self.data_inactivity_timeout {
+            let idle: Vec<([u8; 16], LinkRole)> = self
+                .active_links
+                .iter()
+                .filter(|(_, active)| {
+                    matches!(active.link.state, LinkState::Active | LinkState::Stale)
+                        && active.link.no_data_for() > timeout
+                })
+                .map(|(link_id, active)| (*link_id, active.link.role()))
+                .collect();
+            for (link_id, role) in idle {
+                // Link.teardown records the reason from the local role (Link.py:756-757).
+                let reason = match role {
+                    LinkRole::Initiator => CloseReason::InitiatorClosed,
+                    LinkRole::Responder => CloseReason::DestinationClosed,
+                };
+                if self.close_active_link(link_id, reason, true) {
+                    tracing::debug!(link_id = hex::encode(link_id), "inactive link torn down");
+                }
+            }
         }
     }
 
@@ -7469,14 +7536,56 @@ impl LinkManager {
         let data = &raw[data_offset..];
         let packet_type = header.flags.packet_type as u8;
 
-        let ratchet_keys = self
-            .destination_ratchets
-            .as_ref()
-            .map(PersistentRatchetRing::private_keys);
-        match dest.receive_packet_with_ratchets(packet_type, data, raw, identity, ratchet_keys) {
-            Ok(Some(plaintext)) => Some(plaintext),
-            _ => None,
+        let receive = |keys: Option<&[[u8; 32]]>| {
+            dest.receive_packet_with_ratchets(packet_type, data, raw, identity, keys)
+                .ok()
+                .flatten()
+        };
+        {
+            let ratchets = self
+                .destination_ratchets
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            match ratchets.as_ref() {
+                Some(ring) if !ring.is_empty() => {
+                    if let Some(plaintext) = receive(Some(ring.private_keys())) {
+                        return Some(plaintext);
+                    }
+                }
+                ring => return receive(ring.map(PersistentRatchetRing::private_keys)),
+            }
         }
+
+        // Destination.py:730-749: another writer may have rotated the ring file.
+        let mut ratchets = self
+            .destination_ratchets
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let ring = ratchets.as_mut()?;
+        tracing::error!(
+            destination = hex::encode(dest.hash),
+            "decryption with ratchets failed, reloading ratchets from storage and retrying"
+        );
+        let reloaded = ring.reload(identity).or_else(|error| {
+            tracing::error!(%error, "first ratchet reload attempt failed, retrying in 500ms");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            ring.reload(identity)
+        });
+        if let Err(error) = reloaded {
+            // Destination.py:559-568: an unreadable ring file disables ratchets.
+            tracing::error!(
+                path = %ring.path().display(),
+                %error,
+                "the ratchet file could not be loaded; remove it to have it recreated, then announce"
+            );
+            *ratchets = None;
+            return None;
+        }
+        let plaintext = receive(Some(ring.private_keys()));
+        if plaintext.is_some() {
+            tracing::info!("decryption succeeded after ratchet reload");
+        }
+        plaintext
     }
 
     fn dispatch_destination_packet(&self, raw: &[u8], interface_id: u64) -> bool {
@@ -7831,6 +7940,7 @@ impl LinkManager {
                             ResourceCompletion {
                                 link_id: *link_id,
                                 resource_hash: *resource_hash,
+                                last_segment_hash: *resource_hash,
                                 data: data.clone(),
                                 metadata,
                             },
@@ -8226,6 +8336,95 @@ mod tests {
         ));
 
         let _ = identity_key;
+    }
+
+    #[test]
+    fn data_inactivity_timeout_tears_down_idle_links_and_ignores_keepalives() {
+        let dest_hash = [0xD2; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+        let link_id = responder.link_id;
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(64);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, dest_hash, Some(identity_key));
+        let (closed_tx, mut closed_rx) = mpsc::channel(1);
+        lm.set_link_closed_channel(closed_tx);
+        lm.set_data_inactivity_timeout(Some(std::time::Duration::from_secs(180)));
+        lm.active_links
+            .insert(link_id, active_link_entry_at(responder, 1));
+        own_test_endpoint(&mut lm, link_id);
+
+        let packet = |context, body: &[u8]| {
+            let mut raw = rns_wire::header::PacketHeader {
+                flags: rns_wire::flags::PacketFlags {
+                    header_type: rns_wire::flags::HeaderType::Header1,
+                    context_flag: false,
+                    transport_type: rns_wire::flags::TransportType::Broadcast,
+                    destination_type: rns_wire::flags::DestinationType::Link,
+                    packet_type: rns_wire::flags::PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: link_id,
+                context,
+            }
+            .pack();
+            raw.extend_from_slice(body);
+            raw
+        };
+        let idle = std::time::Duration::from_secs(181);
+
+        // A keepalive does not refresh the data clock (Link.py:1030).
+        lm.active_links
+            .get_mut(&link_id)
+            .unwrap()
+            .link
+            .keepalive
+            .last_data = ago_or_skip!(idle);
+        lm.handle_inbound_packet(
+            &packet(
+                rns_wire::context::PacketContext::Keepalive,
+                &[rns_link::constants::KEEPALIVE_REQUEST],
+            ),
+            1,
+        );
+        assert!(lm.active_links[&link_id].link.no_data_for() >= idle);
+
+        // Any other inbound packet does, and keeps the link.
+        let data = initiator.encrypt(b"payload").unwrap();
+        lm.handle_inbound_packet(&packet(rns_wire::context::PacketContext::None, &data), 1);
+        assert!(lm.active_links[&link_id].link.no_data_for() < idle);
+        lm.on_tick();
+        assert_eq!(lm.active_link_count(), 1);
+
+        lm.active_links
+            .get_mut(&link_id)
+            .unwrap()
+            .link
+            .keepalive
+            .last_data = ago_or_skip!(idle);
+        lm.on_tick();
+        assert_eq!(lm.active_link_count(), 0);
+        assert_eq!(closed_rx.try_recv().unwrap(), link_id);
+        let mut sent_close = false;
+        while let Ok(message) = transport_rx.try_recv() {
+            let raw = match message {
+                TransportMessage::Outbound(request) => request.raw,
+                TransportMessage::SendLinkEndpointAndUnbind { request, .. } => request.raw,
+                _ => continue,
+            };
+            let (header, _) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+            sent_close |= header.context == rns_wire::context::PacketContext::LinkClose;
+        }
+        assert!(sent_close, "an idle link is torn down with LINKCLOSE");
     }
 
     #[test]
@@ -14464,6 +14663,7 @@ mod tests {
             .try_send(ResourceCompletion {
                 link_id: [0xEE; 16],
                 resource_hash: [0xEE; 32],
+                last_segment_hash: [0xEE; 32],
                 data: b"already queued".to_vec(),
                 metadata: None,
             })
@@ -14496,6 +14696,7 @@ mod tests {
             ResourceCompletion {
                 link_id,
                 resource_hash: resource_id,
+                last_segment_hash: resource_id,
                 data: payload.clone(),
                 metadata: Some(b"metadata".to_vec()),
             },
@@ -14560,6 +14761,7 @@ mod tests {
         let event = LinkManagerAccountingEvent::ResourceCompletion(ResourceCompletion {
             link_id: [0xD6; 16],
             resource_hash: [0xD7; 32],
+            last_segment_hash: [0xD7; 32],
             data: b"secret payload".to_vec(),
             metadata: Some(b"secret metadata".to_vec()),
         });
@@ -14707,6 +14909,7 @@ mod tests {
             ResourceCompletion {
                 link_id: [0xD4; 16],
                 resource_hash: [0xD5; 32],
+                last_segment_hash: [0xD5; 32],
                 data: vec![1],
                 metadata: None,
             },

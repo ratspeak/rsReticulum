@@ -2586,13 +2586,13 @@ async fn open_configured_rnode_stream(
     let port = match port_cfg {
         #[cfg(feature = "serial")]
         PortConfig::Serial { path, baud } => {
-            tracing::info!(name = %config.name, port = %path, baud = *baud, "opening RNode serial port");
+            rns_transport::notice!(name = %config.name, port = %path, baud = *baud, "opening RNode serial port");
             RNodeStream::open_serial(path, *baud).map_err(|error| {
                 RNodePortOpenError::new(serial_port_failure(&error), "rnode serial open", error)
             })?
         }
         PortConfig::Tcp { addr } => {
-            tracing::info!(name = %config.name, addr = %addr, "connecting to RNode over TCP");
+            rns_transport::notice!(name = %config.name, addr = %addr, "connecting to RNode over TCP");
             let target = addr.clone();
             let unavailable = |context: &str, error: &dyn std::fmt::Display| {
                 RNodePortOpenError::new(RNodePortFailureClass::Unavailable, context, error)
@@ -3427,7 +3427,7 @@ pub fn process_rnode_response(
         }
         CMD_RADIO_STATE => {
             if frame.first().copied() == Some(RADIO_STATE_ON) {
-                tracing::info!(id, "RNode radio online");
+                rns_transport::notice!(id, "RNode radio online");
             } else {
                 tracing::warn!(id, "RNode radio offline");
             }

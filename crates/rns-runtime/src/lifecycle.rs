@@ -135,7 +135,7 @@ fn spawn_ctrl_c_handler(shutdown: ShutdownSignal, tx: mpsc::Sender<()>) {
 }
 
 fn signal_shutdown(shutdown: ShutdownSignal, tx: mpsc::Sender<()>, signal: &'static str) {
-    tracing::info!(signal, "received shutdown signal");
+    tracing::debug!(signal, "received shutdown signal");
     shutdown.trigger();
     let _ = tx.try_send(());
 }

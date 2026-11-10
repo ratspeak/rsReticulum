@@ -500,8 +500,8 @@ impl TransportActor {
         let discovery = recursive
             .then(|| self.discovery_path_requests.get(&destination))
             .flatten();
-        let deadline = discovery.map_or(now + PATH_REQUEST_GATE_TIMEOUT, |owner| {
-            owner.timeout.min(now + PATH_REQUEST_GATE_TIMEOUT)
+        let deadline = discovery.map_or(now + PR_ADMISSION_DEADLINE, |owner| {
+            owner.timeout.min(now + PR_ADMISSION_DEADLINE)
         });
         let discovery_owner = discovery.map(|owner| owner.id.clone());
         self.pending_path_request_admissions
