@@ -68,6 +68,9 @@ pub struct LinkSessionConfig {
     /// is an OUT destination, which Python leaves at `PROVE_NONE`; `ProveApp`
     /// has no callback here and proves nothing.
     pub proof_strategy: ProofStrategy,
+    /// Where file responses are spooled by default, as Reticulum.resourcepath;
+    /// the system temp dir when unset.
+    pub resource_dir: Option<PathBuf>,
 }
 
 impl LinkSessionConfig {
@@ -85,6 +88,7 @@ impl LinkSessionConfig {
             identify: true,
             track_phy_stats: false,
             proof_strategy: ProofStrategy::ProveNone,
+            resource_dir: None,
         }
     }
 }
@@ -481,6 +485,8 @@ pub enum LinkSessionResourceError {
     Control(#[from] rns_protocol::resource::ResourceError),
     #[error("resource transfer failed: {0}")]
     Failed(String),
+    #[error("resource of {size} bytes exceeds the {max}-byte limit")]
+    TooLarge { size: u64, max: usize },
     #[error(transparent)]
     Source(#[from] ResourceSourceError),
     #[error("Link session task is no longer running")]
@@ -633,6 +639,9 @@ struct ResourceStartInfo {
 
 struct PendingSessionRequest {
     sent_at: Instant,
+    /// The request timeout, re-applied while a split response waits for its
+    /// next segment.
+    timeout: Duration,
     result_tx: oneshot::Sender<Result<LinkSessionResponse, LinkSessionError>>,
     max_response_size: Option<usize>,
     progress_tx: Option<watch::Sender<f64>>,
@@ -646,11 +655,13 @@ impl PendingSessionRequest {
     fn new(
         result_tx: oneshot::Sender<Result<LinkSessionResponse, LinkSessionError>>,
         options: RequestOptions,
+        timeout: Duration,
         sent_as_packet: bool,
     ) -> Self {
         let now = Instant::now();
         Self {
             sent_at: now,
+            timeout,
             result_tx,
             max_response_size: options.max_response_size,
             progress_tx: options.progress,
@@ -697,9 +708,11 @@ struct ResponseBody {
     file: Option<PathBuf>,
 }
 
+/// A response written to disk by a blocking writer, so the actor never
+/// touches the file. Dropping it ends the writer.
 struct ResponseSpool {
     path: PathBuf,
-    file: std::fs::File,
+    segments: std::sync::mpsc::Sender<Vec<u8>>,
 }
 
 struct SessionOutboundResource {
@@ -742,12 +755,22 @@ struct SessionInboundLogical {
     reported_bytes: usize,
     reported_progress: f64,
     spool: Option<ResponseSpool>,
+    /// Payload bytes assembled so far.
+    received_bytes: usize,
+    /// RequestReceipt.max_response_size, enforced on received bytes too.
+    max_bytes: Option<usize>,
+    /// When the last segment completed while more are due.
+    segment_gap_since: Option<Instant>,
+    /// Longest wait for the next segment's advertisement.
+    segment_gap_timeout: Option<Duration>,
 }
 
 struct InboundResourceLifecycle {
     progress_tx: watch::Sender<f64>,
     conclusion_tx: oneshot::Sender<Result<LinkSessionReceivedResource, LinkSessionResourceError>>,
     spool: Option<ResponseSpool>,
+    max_bytes: Option<usize>,
+    segment_gap_timeout: Option<Duration>,
 }
 
 struct InboundResourceSinks<'a> {
@@ -789,6 +812,7 @@ struct SessionResources {
     inbound: HashMap<[u8; 32], SessionInboundResource>,
     inbound_logicals: HashMap<[u8; 32], SessionInboundLogical>,
     rejected_inbound: HashMap<[u8; 32], Instant>,
+    resource_dir: Option<PathBuf>,
 }
 
 struct SessionActorState {
@@ -1298,7 +1322,7 @@ impl LinkSession {
             phy_stats_rx,
         };
         tokio::spawn(run_session_actor(
-            (link, channel, config.proof_strategy),
+            (link, channel, config.proof_strategy, config.resource_dir),
             attached_interface,
             interface_owner,
             delivery_rx,
@@ -1387,7 +1411,7 @@ pub async fn lookup_destination(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_session_actor(
-    link_and_channel: (Link, LinkChannel, ProofStrategy),
+    link_and_channel: (Link, LinkChannel, ProofStrategy, Option<PathBuf>),
     attached_interface: InterfaceId,
     interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
     mut delivery_rx: mpsc::Receiver<DestinationEvent>,
@@ -1405,7 +1429,7 @@ async fn run_session_actor(
         resource_offer_tx,
         phy_stats_tx,
     } = channels;
-    let (mut link, channel, proof_strategy) = link_and_channel;
+    let (mut link, channel, proof_strategy, resource_dir) = link_and_channel;
     let link_id = link.link_id;
     let mut state = SessionActorState {
         packets: HashSet::new(),
@@ -1413,7 +1437,10 @@ async fn run_session_actor(
         channel,
         channel_open: false,
         proof_strategy,
-        resources: SessionResources::default(),
+        resources: SessionResources {
+            resource_dir,
+            ..SessionResources::default()
+        },
     };
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let mut endpoint_closing = false;
@@ -1445,6 +1472,9 @@ async fn run_session_actor(
                             let _ = result_tx.send(Err(LinkSessionError::TooManyPendingRequests));
                             continue;
                         }
+                        let timeout = options
+                            .timeout
+                            .unwrap_or_else(|| link.default_request_timeout());
                         match send_link_request(
                             SessionRequestContext {
                                 transport_tx: &transport_tx,
@@ -1456,12 +1486,17 @@ async fn run_session_actor(
                             },
                             &path,
                             &data,
-                            options.timeout,
+                            Some(timeout),
                         ).await {
                             Ok((request_id, sent_as_packet)) => {
                                 state.requests.insert(
                                     request_id,
-                                    PendingSessionRequest::new(result_tx, options, sent_as_packet),
+                                    PendingSessionRequest::new(
+                                        result_tx,
+                                        options,
+                                        timeout,
+                                        sent_as_packet,
+                                    ),
                                 );
                             }
                             Err(error) => {
@@ -1497,6 +1532,16 @@ async fn run_session_actor(
                         request_id,
                         result,
                     }) => {
+                        // Another response Resource for this request may still
+                        // complete it, as response_resource_concluded allows.
+                        if result.is_err()
+                            && state.resources.inbound_logicals.values().any(|logical| {
+                                logical.is_response
+                                    && logical.request_id.as_deref() == Some(request_id.as_slice())
+                            })
+                        {
+                            continue;
+                        }
                         conclude_request_resource_response(
                             &mut link,
                             &mut state.requests,
@@ -1910,6 +1955,8 @@ async fn handle_resource_command(
                     progress_tx,
                     conclusion_tx,
                     spool: None,
+                    max_bytes: None,
+                    segment_gap_timeout: None,
                 },
             )
             .await;
@@ -2585,6 +2632,10 @@ async fn accept_inbound_offer(
             reported_bytes: 0,
             reported_progress: 0.0,
             spool: lifecycle.spool,
+            received_bytes: 0,
+            max_bytes: lifecycle.max_bytes,
+            segment_gap_since: None,
+            segment_gap_timeout: lifecycle.segment_gap_timeout,
         },
     );
     resources.inbound.insert(
@@ -2656,11 +2707,7 @@ fn conclude_inbound_resource(
     let Some(logical) = resources.inbound_logicals.remove(&resource_id) else {
         return;
     };
-    if result.is_err()
-        && let Some(spool) = logical.spool
-    {
-        let _ = std::fs::remove_file(spool.path);
-    }
+    // A failed spool is removed by its writer's owner once the writer ends.
     let succeeded = result.is_ok();
     let _ = logical.conclusion_tx.send(result);
     let _ = event_tx.try_send(LinkSessionEvent::ResourceConcluded {
@@ -2734,6 +2781,14 @@ async fn accept_followup_inbound_segment(
             advertisement.segment_index
         )));
     }
+    if let Some(max) = logical.max_bytes
+        && advertisement.data_size > max
+    {
+        return Err(LinkSessionResourceError::TooLarge {
+            size: advertisement.data_size as u64,
+            max,
+        });
+    }
 
     let rtt = Duration::from_secs_f64(link.rtt_secs().max(0.001));
     let mut transfer = inbound_transfer_from_advertisement(&advertisement, rtt)?;
@@ -2764,6 +2819,7 @@ async fn accept_followup_inbound_segment(
     );
     if let Some(logical) = resources.inbound_logicals.get_mut(&resource_id) {
         logical.current_segment = Some(segment_hash);
+        logical.segment_gap_since = None;
     }
     link.track_incoming_resource(segment_hash);
     Ok(())
@@ -2944,9 +3000,20 @@ async fn process_inbound_resource_advertisement(
         let spool = pending
             .spool_dir
             .clone()
-            .or_else(|| advertisement.flags.has_metadata.then(std::env::temp_dir))
+            .or_else(|| {
+                advertisement
+                    .flags
+                    .has_metadata
+                    .then(|| default_spool_dir(resources.resource_dir.as_deref()))
+            })
             .and_then(|dir| open_response_spool(&dir, &resource_id));
+        let (spool, writer) = match spool {
+            Some((spool, writer)) => (Some(spool), Some(writer)),
+            None => (None, None),
+        };
         let spool_path = spool.as_ref().map(|spool| spool.path.clone());
+        let max_bytes = pending.max_response_size;
+        let segment_gap_timeout = Some(pending.timeout);
 
         resources.pending_inbound.insert(
             segment_hash,
@@ -2967,19 +3034,17 @@ async fn process_inbound_resource_advertisement(
                 progress_tx,
                 conclusion_tx,
                 spool,
+                max_bytes,
+                segment_gap_timeout,
             },
         )
         .await;
-        if result.is_err()
-            && let Some(path) = spool_path
-        {
-            let _ = std::fs::remove_file(path);
-        }
         let completion_tx = sinks.command_tx.clone();
         tokio::spawn(async move {
             let result = conclusion_rx
                 .await
                 .unwrap_or(Err(LinkSessionResourceError::SessionClosed));
+            let result = finish_response_spool(result, writer, spool_path).await;
             if let Err(mpsc::error::SendError(command)) = completion_tx
                 .send(LinkSessionCommand::RequestResourceReceived { request_id, result })
                 .await
@@ -3167,11 +3232,30 @@ async fn complete_inbound_segment(
     let mut coordinator_error = None;
     if let Some(logical) = resources.inbound_logicals.get_mut(&resource_id) {
         logical.current_segment = None;
+        let metadata_size = metadata.as_ref().map_or(0, |metadata| 3 + metadata.len());
+        logical.received_bytes = logical
+            .received_bytes
+            .saturating_add(data.len())
+            .saturating_add(metadata_size);
+        if let Some(max) = logical.max_bytes
+            && logical.received_bytes > max
+        {
+            let size = logical.received_bytes as u64;
+            tracing::debug!(size, max, "rejected response with excessive received size");
+            fail_inbound_logical(
+                link,
+                resources,
+                event_tx,
+                resource_id,
+                LinkSessionResourceError::TooLarge { size, max },
+            );
+            return false;
+        }
         // A spooled response keeps only segment order in memory.
-        let data = match logical.spool.as_mut() {
+        let data = match logical.spool.as_ref() {
             Some(spool) => {
-                if let Err(error) = spool.file.write_all(&data) {
-                    coordinator_error = Some(error.to_string());
+                if spool.segments.send(data).is_err() {
+                    coordinator_error = Some("response spool writer stopped".to_string());
                 }
                 Vec::new()
             }
@@ -3193,6 +3277,8 @@ async fn complete_inbound_segment(
                         }
                         Err(error) => coordinator_error = Some(error.to_string()),
                     }
+                } else {
+                    logical.segment_gap_since = Some(Instant::now());
                 }
             }
         } else {
@@ -3455,6 +3541,26 @@ async fn poll_inbound_resources(
         ) {
             return true;
         }
+    }
+
+    // A sender that stops between segments of a split response: no Resource
+    // watchdog runs then, so the request timeout bounds each gap.
+    let stalled: Vec<[u8; 32]> = resources
+        .inbound_logicals
+        .iter()
+        .filter_map(|(resource_id, logical)| {
+            let since = logical.segment_gap_since?;
+            (since.elapsed() > logical.segment_gap_timeout?).then_some(*resource_id)
+        })
+        .collect();
+    for resource_id in stalled {
+        fail_inbound_logical(
+            link,
+            resources,
+            event_tx,
+            resource_id,
+            LinkSessionResourceError::Failed("next response segment was not advertised".into()),
+        );
     }
 
     let watchdog_actions: Vec<([u8; 32], [u8; 32], TransferAction)> = resources
@@ -3781,6 +3887,16 @@ fn conclude_request_resource_response(
             );
             return;
         }
+        Err(LinkSessionResourceError::TooLarge { size, max }) => {
+            fail_session_request(
+                link,
+                pending_requests,
+                event_tx,
+                request_id,
+                LinkSessionError::ResponseRejected { size, max },
+            );
+            return;
+        }
         Err(error) => {
             fail_session_request(
                 link,
@@ -3802,26 +3918,8 @@ fn conclude_request_resource_response(
             file: received.file,
         }
     } else {
-        let packed = match &received.file {
-            Some(path) => {
-                let read = std::fs::read(path);
-                let _ = std::fs::remove_file(path);
-                match read {
-                    Ok(packed) => packed,
-                    Err(error) => {
-                        fail_session_request(
-                            link,
-                            pending_requests,
-                            event_tx,
-                            request_id,
-                            LinkSessionError::RequestResourceFailed(error.to_string()),
-                        );
-                        return;
-                    }
-                }
-            }
-            None => received.data,
-        };
+        // A spooled response was read back off the actor.
+        let packed = received.data;
         let Ok((packed_request_id, value)) = Link::parse_response_value(&packed) else {
             fail_session_request(
                 link,
@@ -3942,7 +4040,21 @@ fn deliver_session_response(
     });
 }
 
-fn open_response_spool(dir: &std::path::Path, resource_id: &[u8; 32]) -> Option<ResponseSpool> {
+type SpoolWriter = oneshot::Receiver<std::io::Result<()>>;
+
+/// Resource.storagepath's directory: the runtime's `storage/resources`,
+/// or the system temporary directory without a runtime.
+fn default_spool_dir(resource_dir: Option<&std::path::Path>) -> PathBuf {
+    resource_dir
+        .filter(|dir| dir.is_dir())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn open_response_spool(
+    dir: &std::path::Path,
+    resource_id: &[u8; 32],
+) -> Option<(ResponseSpool, SpoolWriter)> {
     // The id is chosen by the peer and the directory may be shared: never
     // reuse or follow an existing entry.
     let nonce = rns_crypto::random::random_bytes(8);
@@ -3955,13 +4067,65 @@ fn open_response_spool(dir: &std::path::Path, resource_id: &[u8; 32]) -> Option<
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    match options.open(&path) {
-        Ok(file) => Some(ResponseSpool { path, file }),
+    let mut file = match options.open(&path) {
+        Ok(file) => file,
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "response spool unavailable; receiving in memory");
-            None
+            return None;
         }
-    }
+    };
+    let (segments, segment_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (written_tx, written) = oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let mut result = Ok(());
+        for segment in segment_rx {
+            if result.is_ok() {
+                result = file.write_all(&segment);
+            }
+        }
+        let _ = written_tx.send(result);
+    });
+    Some((ResponseSpool { path, segments }, written))
+}
+
+/// Wait for the spool writer, then hand over the file, read a spooled
+/// MessagePack response back into memory, or remove a failed spool. The file
+/// work runs on the blocking pool.
+async fn finish_response_spool(
+    result: Result<LinkSessionReceivedResource, LinkSessionResourceError>,
+    writer: Option<SpoolWriter>,
+    path: Option<PathBuf>,
+) -> Result<LinkSessionReceivedResource, LinkSessionResourceError> {
+    let (Some(writer), Some(path)) = (writer, path) else {
+        return result;
+    };
+    let written = writer
+        .await
+        .unwrap_or_else(|_| Err(std::io::Error::other("response spool writer stopped")));
+    let result = match (result, written) {
+        (Ok(_), Err(error)) => Err(LinkSessionResourceError::Failed(format!(
+            "response spool write failed: {error}"
+        ))),
+        (result, _) => result,
+    };
+    tokio::task::spawn_blocking(move || match result {
+        Ok(mut received) if received.metadata.is_none() => {
+            let read = std::fs::read(&path);
+            let _ = std::fs::remove_file(&path);
+            received.data = read.map_err(|error| {
+                LinkSessionResourceError::Failed(format!("response spool read failed: {error}"))
+            })?;
+            received.file = None;
+            Ok(received)
+        }
+        Ok(received) => Ok(received),
+        Err(error) => {
+            let _ = std::fs::remove_file(&path);
+            Err(error)
+        }
+    })
+    .await
+    .unwrap_or(Err(LinkSessionResourceError::SessionClosed))
 }
 
 fn remove_spooled_response(result: &Result<LinkSessionReceivedResource, LinkSessionResourceError>) {
@@ -4804,7 +4968,12 @@ mod tests {
         let (result_tx, result_rx) = oneshot::channel();
         let mut pending_requests = HashMap::from([(
             request_id,
-            PendingSessionRequest::new(result_tx, RequestOptions::default(), true),
+            PendingSessionRequest::new(
+                result_tx,
+                RequestOptions::default(),
+                Duration::from_secs(5),
+                true,
+            ),
         )]);
 
         let packed_response = Link::pack_response_value(
@@ -4909,16 +5078,289 @@ mod tests {
         assert!(initiator.pending_requests.is_empty());
     }
 
-    #[test]
-    fn spooled_response_is_removed_unless_a_requester_receives_it() {
+    #[tokio::test]
+    async fn response_resource_larger_than_advertised_is_rejected_on_received_bytes() {
+        let destination_hash = [0xBF; 16];
+        let server_signing = Ed25519PrivateKey::generate();
+        let server_public = server_signing.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &server_signing, destination_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &server_public, &server_public.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+
+        let (_packed_request, request_id) = initiator
+            .prepare_request_value(
+                "/large-response",
+                &rmpv::Value::Binary(Vec::new()),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        let (result_tx, result_rx) = oneshot::channel();
+        let mut pending_requests = HashMap::from([(
+            request_id,
+            PendingSessionRequest::new(
+                result_tx,
+                RequestOptions {
+                    max_response_size: Some(10),
+                    ..RequestOptions::default()
+                },
+                Duration::from_secs(5),
+                true,
+            ),
+        )]);
+
+        let packed_response = Link::pack_response_value(
+            &request_id,
+            &rmpv::Value::Binary(b"resource response".to_vec()),
+        )
+        .unwrap();
+        let mut response_sender = OutboundTransfer::new_encrypted(
+            packed_response,
+            false,
+            Duration::from_secs_f64(responder.rtt_secs().max(0.001)),
+            responder.session_keys().unwrap(),
+        )
+        .unwrap();
+        response_sender.resource.flags.is_response = true;
+        response_sender.resource.request_id = Some(request_id.to_vec());
+        let advertisement = match response_sender.tick() {
+            TransferAction::SendAdvertisement(advertisement) => advertisement,
+            other => panic!("unexpected responder Resource action: {other:?}"),
+        };
+        // The sender under-reports its size to pass the advertisement check.
+        let mut lying = ResourceAdvertisement::unpack(&advertisement).unwrap();
+        lying.data_size = 8;
+        let advertisement = lying.pack();
+
+        let mut resources = SessionResources::default();
+        let (transport_tx, mut transport_rx) = test_transport_channel(8);
+        let (command_tx, mut command_rx) = mpsc::channel::<LinkSessionCommand>(8);
+        let (event_tx, _event_rx) = mpsc::channel::<LinkSessionEvent>(8);
+        let (offer_tx, mut offer_rx) = mpsc::channel::<LinkSessionResourceOffer>(1);
+        assert!(
+            !process_inbound_resource_advertisement(
+                &transport_tx,
+                1,
+                &mut initiator,
+                &mut resources,
+                &mut pending_requests,
+                InboundResourceSinks {
+                    event_tx: &event_tx,
+                    command_tx: &command_tx,
+                    offer_tx: &offer_tx,
+                },
+                &responder.encrypt(&advertisement).unwrap(),
+            )
+            .await
+        );
+        assert!(
+            offer_rx.try_recv().is_err(),
+            "response Resources must not be surfaced as application offers"
+        );
+
+        let request = next_initiator_endpoint(&mut transport_rx).await;
+        let (request_header, request_offset) =
+            rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(
+            request_header.context,
+            rns_wire::context::PacketContext::ResourceReq
+        );
+        let request_plaintext = responder.decrypt(&request.raw[request_offset..]).unwrap();
+        let request_hash =
+            rns_wire::hash::packet_hash(&request.raw, request_header.flags.header_type);
+        let actions = response_sender.handle_request_packet(request_hash, &request_plaintext);
+        assert!(!actions.is_empty());
+        for action in actions {
+            let TransferAction::SendPart(_, part) = action else {
+                continue;
+            };
+            assert!(
+                !handle_inbound_resource_part(
+                    &transport_tx,
+                    1,
+                    &mut initiator,
+                    &mut resources,
+                    &event_tx,
+                    &part,
+                )
+                .await
+            );
+        }
+
+        let command = tokio::time::timeout(Duration::from_secs(1), command_rx.recv())
+            .await
+            .expect("response Resource conclusion timeout")
+            .expect("response Resource command channel closed");
+        let LinkSessionCommand::RequestResourceReceived {
+            request_id: concluded_id,
+            result,
+        } = command
+        else {
+            panic!("unexpected Link session command");
+        };
+        assert_eq!(concluded_id, request_id);
+        conclude_request_resource_response(
+            &mut initiator,
+            &mut pending_requests,
+            &event_tx,
+            concluded_id,
+            result,
+        );
+
+        let result = result_rx.await.unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(LinkSessionError::ResponseRejected { max: 10, .. })
+            ),
+            "{result:?}"
+        );
+        assert!(pending_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_responses_and_request_limits_between_runtime_peers() {
+        use crate::destination_runtime::{DestinationRuntimeOptions, RegisteredDestination};
+        use crate::link_manager::RequestOutcome;
+        use rns_identity::destination::AllowPolicy;
+
+        let (actor, transport_tx) = rns_transport::actor::TransportActor::new();
+        let actor_task = tokio::spawn(actor.run());
+        let server_identity = Identity::new();
+        let server_public_key = server_identity.get_public_key();
+        let registration = RegisteredDestination::register(
+            transport_tx.clone(),
+            server_identity,
+            "example.runtime.requests",
+            DestinationRuntimeOptions::default(),
+        )
+        .await
+        .unwrap();
+        // Two segments: the second one is read while the first transfers.
+        let file: Vec<u8> = (0..rns_protocol::resource::MAX_EFFICIENT_SIZE + 4096)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect();
+        let metadata = vec![0x81, 0xa4, b'n', b'a', b'm', b'e', 0xc4, 0x01, b'f'];
+        let (served, served_metadata) = (file.clone(), metadata.clone());
+        let handle = &registration.handle;
+        handle
+            .register_request_handler("/file", AllowPolicy::AllowAll, vec![], false, move |_| {
+                RequestOutcome::ReplyFile {
+                    source: Box::new(Cursor::new(served.clone())),
+                    metadata: Some(served_metadata.clone()),
+                }
+            })
+            .await
+            .unwrap();
+        handle
+            .register_request_handler("/big", AllowPolicy::AllowAll, vec![], false, |_| {
+                RequestOutcome::ReplyBytes(vec![0x55; 2000])
+            })
+            .await
+            .unwrap();
+        handle.set_max_request_size(Some(100)).await.unwrap();
+
+        let session = LinkSession::connect(
+            transport_tx.clone(),
+            Identity::new(),
+            LinkSessionConfig {
+                destination_hash: handle.destination_hash(),
+                remote_public_key: server_public_key,
+                hops: 1,
+                establishment_timeout: Duration::from_secs(2),
+                client_label: "test.requests".into(),
+                identify: false,
+                track_phy_stats: false,
+                proof_strategy: ProofStrategy::ProveNone,
+                resource_dir: None,
+            },
+        )
+        .await
+        .unwrap();
+        let spool = std::env::temp_dir().join(format!(
+            "rns-request-spool-{}",
+            hex::encode(rns_crypto::random::random_bytes(8))
+        ));
+        std::fs::create_dir(&spool).unwrap();
+
+        let response = session
+            .handle
+            .request_with_options(
+                "/file",
+                rmpv::Value::Nil,
+                RequestOptions {
+                    timeout: Some(Duration::from_secs(60)),
+                    spool_dir: Some(spool.clone()),
+                    ..RequestOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.metadata, Some(metadata));
+        let path = response.file.expect("a file response is spooled");
+        assert!(path.starts_with(&spool));
+        assert!(std::fs::read(&path).unwrap() == file);
+        std::fs::remove_file(path).unwrap();
+
+        // Destination.max_request_size: a larger request is ignored.
+        let ignored = session
+            .handle
+            .request_with_options(
+                "/big",
+                rmpv::Value::Binary(vec![0; 200]),
+                RequestOptions {
+                    timeout: Some(Duration::from_secs(1)),
+                    ..RequestOptions::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(ignored, Err(LinkSessionError::Timeout(_))),
+            "{ignored:?}"
+        );
+
+        // RequestReceipt.max_response_size: a larger response is rejected.
+        let rejected = session
+            .handle
+            .request_with_options(
+                "/big",
+                rmpv::Value::Nil,
+                RequestOptions {
+                    timeout: Some(Duration::from_secs(10)),
+                    max_response_size: Some(1000),
+                    ..RequestOptions::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                rejected,
+                Err(LinkSessionError::ResponseRejected { max: 1000, .. })
+            ),
+            "{rejected:?}"
+        );
+        assert_eq!(std::fs::read_dir(&spool).unwrap().count(), 0);
+        std::fs::remove_dir(&spool).unwrap();
+
+        session.handle.close().await;
+        registration.close().await.unwrap();
+        transport_tx.send(TransportMessage::Shutdown).await.unwrap();
+        actor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spooled_response_is_removed_unless_a_requester_receives_it() {
         let dir = std::env::temp_dir().join(format!(
             "rns-response-spool-{}",
             hex::encode(rns_crypto::random::random_bytes(8))
         ));
         std::fs::create_dir(&dir).unwrap();
 
-        let queued = open_response_spool(&dir, &[7; 32]).unwrap();
-        let orphaned = open_response_spool(&dir, &[7; 32]).unwrap();
+        let (queued, _) = open_response_spool(&dir, &[7; 32]).unwrap();
+        let (orphaned, _) = open_response_spool(&dir, &[7; 32]).unwrap();
         assert_ne!(queued.path, orphaned.path);
         #[cfg(unix)]
         {
@@ -4969,7 +5411,7 @@ mod tests {
         };
         let mut pending_requests = HashMap::from([(
             request_id,
-            PendingSessionRequest::new(result_tx, options, true),
+            PendingSessionRequest::new(result_tx, options, Duration::from_secs(5), true),
         )]);
         let (event_tx, _event_rx) = mpsc::channel::<LinkSessionEvent>(8);
         deliver_session_response(
@@ -5040,7 +5482,7 @@ mod tests {
         registration.endpoint_bound();
 
         tokio::spawn(run_session_actor(
-            (initiator, channel, ProofStrategy::ProveNone),
+            (initiator, channel, ProofStrategy::ProveNone, None),
             7,
             None,
             delivery_rx,
@@ -5156,6 +5598,7 @@ mod tests {
                 identify: false,
                 track_phy_stats: false,
                 proof_strategy: ProofStrategy::ProveNone,
+                resource_dir: None,
             },
         ));
         let link_id = match rx.recv().await.unwrap() {
@@ -5205,6 +5648,7 @@ mod tests {
                 identify: false,
                 track_phy_stats: false,
                 proof_strategy: ProofStrategy::ProveNone,
+                resource_dir: None,
             },
         ));
 
@@ -5248,6 +5692,7 @@ mod tests {
                 identify: false,
                 track_phy_stats: false,
                 proof_strategy: ProofStrategy::ProveNone,
+                resource_dir: None,
             },
         ));
 
@@ -5355,6 +5800,7 @@ mod tests {
                 identify: false,
                 track_phy_stats: false,
                 proof_strategy: ProofStrategy::ProveNone,
+                resource_dir: None,
             },
         ));
         let delivery_tx = match transport_rx.recv().await.unwrap() {
@@ -5448,6 +5894,7 @@ mod tests {
                 identify: true,
                 track_phy_stats: true,
                 proof_strategy: ProofStrategy::ProveAll,
+                resource_dir: None,
             },
         ));
 

@@ -139,6 +139,8 @@ pub struct TransportActor {
     pub interfaces: HashMap<InterfaceId, InterfaceEntry>,
 
     pub local_destinations: HashSet<[u8; 16]>,
+    /// Public keys of registered local destinations, for recall.
+    pub local_destination_keys: HashMap<[u8; 16], [u8; 64]>,
     pub destination_channels:
         HashMap<[u8; 16], mpsc::Sender<crate::link_messages::DestinationEvent>>,
     /// Duplex routes for Links whose initiator and responder are registered
@@ -474,6 +476,7 @@ impl TransportActor {
             receipt_updates: HashMap::new(),
             interfaces: HashMap::new(),
             local_destinations: HashSet::new(),
+            local_destination_keys: HashMap::new(),
             destination_channels: HashMap::new(),
             local_link_routes: HashMap::new(),
             pending_local_link_requests: HashMap::new(),
@@ -899,6 +902,11 @@ impl TransportActor {
             TransportMessage::Tick(_) => {
                 self.on_tick();
             }
+            TransportMessage::SetLocalDestinationKey { hash, public_key } => {
+                if self.local_destinations.contains(&hash) {
+                    self.local_destination_keys.insert(hash, public_key);
+                }
+            }
             TransportMessage::RegisterDestination {
                 hash,
                 app_name,
@@ -1125,7 +1133,8 @@ impl TransportActor {
                     len = raw_packet.len(),
                     "sending tunnel synthesis packet"
                 );
-                self.send_to_interface(interface_id, &raw_packet);
+                // The driver queues the synthesis just before it reports online.
+                self.send_to_interface_unchecked(interface_id, &raw_packet);
             }
             TransportMessage::RegisterInterface { id, entry } => {
                 if !entry.owner.is_current() {
@@ -1827,6 +1836,7 @@ impl TransportActor {
     fn deregister_destination(&mut self, hash: [u8; 16]) {
         self.pending_local_link_requests.remove(&hash);
         self.local_destinations.remove(&hash);
+        self.local_destination_keys.remove(&hash);
         self.destination_channels.remove(&hash);
         if self.local_link_routes.remove(&hash).is_some() {
             self.terminate_link_endpoints_for_link(
@@ -1944,6 +1954,14 @@ impl TransportActor {
     }
 
     fn send_to_interface(&mut self, id: InterfaceId, raw: &[u8]) -> bool {
+        // Transport.transmit has no online check; the driver's process_outgoing drops it.
+        if self.interfaces.get(&id).is_some_and(offline_for_send) {
+            return true;
+        }
+        self.send_to_interface_unchecked(id, raw)
+    }
+
+    fn send_to_interface_unchecked(&mut self, id: InterfaceId, raw: &[u8]) -> bool {
         match self.try_send_to_interface(id, raw) {
             InterfaceSendOutcome::Sent => true,
             InterfaceSendOutcome::Full => {
@@ -2007,6 +2025,14 @@ impl TransportActor {
         }
     }
 
+    /// Transport.prioritize_interfaces (Transport.py:704-706): fastest first,
+    /// registration order among equal bitrates.
+    fn prioritized_interface_ids(&self) -> Vec<InterfaceId> {
+        let mut ids: Vec<InterfaceId> = self.interfaces.keys().copied().collect();
+        ids.sort_by_key(|id| (std::cmp::Reverse(self.interfaces[id].bitrate), *id));
+        ids
+    }
+
     #[tracing::instrument(
         level = "trace",
         name = "actor.broadcast_on_interfaces",
@@ -2017,14 +2043,12 @@ impl TransportActor {
         // Collect ids first so the borrow on self.interfaces ends before
         // send_to_interface (which may mutate it via auto-deregister) runs.
         let ids: Vec<InterfaceId> = self
-            .interfaces
-            .iter()
-            .filter_map(|(&id, entry)| {
-                if except == Some(id) || !entry.direction.outbound {
-                    None
-                } else {
-                    Some(id)
-                }
+            .prioritized_interface_ids()
+            .into_iter()
+            .filter(|id| {
+                let entry = &self.interfaces[id];
+                // Transport.py:1676: broadcast only where OUT and online.
+                except != Some(*id) && entry.direction.outbound && !offline_for_send(entry)
             })
             .collect();
         // Python 1.3.8 Transport.py:1342-1344: locally-originated non-announce
@@ -2148,10 +2172,12 @@ impl TransportActor {
             .map(|h| h.destination_hash)
             .unwrap_or([0u8; 16]);
         let ids: Vec<InterfaceId> = self
-            .interfaces
-            .keys()
-            .copied()
-            .filter(|id| self.interface_allows_announce(*id, &destination_hash, except))
+            .prioritized_interface_ids()
+            .into_iter()
+            .filter(|id| {
+                !offline_for_send(&self.interfaces[id])
+                    && self.interface_allows_announce(*id, &destination_hash, except)
+            })
             .collect();
         let mut accepted = false;
         for id in ids {
@@ -2350,6 +2376,11 @@ impl TransportActor {
             }
         }
     }
+}
+
+/// Offline, and not a local client (whose offline state means a dead handle to reap).
+fn offline_for_send(entry: &InterfaceEntry) -> bool {
+    entry.role != InterfaceRole::LocalClient && interface_marked_offline(entry)
 }
 
 fn interface_marked_offline(entry: &InterfaceEntry) -> bool {
@@ -3139,15 +3170,25 @@ mod tests {
             "shared-instance peers must remain registered while reconnecting"
         );
         actor.send_to_interface(44, &[0xA5, 0x5A]);
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            Bytes::from_static(&[0xA5, 0x5A]),
-            "offline shared peer should not use local-client stale-handle reaping"
-        );
+        assert!(rx.try_recv().is_err(), "nothing is queued while offline");
         assert!(
             actor.interfaces.contains_key(&44),
             "offline shared peer should not be auto-deregistered"
         );
+    }
+
+    #[test]
+    fn tunnel_synthesis_is_queued_before_the_interface_reports_online() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut entry, mut rx) = make_test_interface("TCPClient");
+        entry.online = Some(Arc::new(AtomicBool::new(false)));
+        actor.interfaces.insert(45, entry);
+
+        actor.handle_message(TransportMessage::SynthesizeTunnel {
+            interface_id: 45,
+            raw_packet: Bytes::from_static(&[0x08, 0x00]),
+        });
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(&[0x08, 0x00]));
     }
 
     #[test]
@@ -7166,6 +7207,7 @@ mod tests {
                 for packet_type in [PacketType::Data, PacketType::LinkRequest] {
                     let (mut actor, _) = TransportActor::new();
                     actor.shared_instance_client_mode = client_mode;
+                    actor.is_shared_instance = client_mode;
                     let (entry, mut rx) = make_test_interface("shared-peer");
                     actor.interfaces.insert(1, entry);
                     let destination = [0x55; 16];
@@ -7194,18 +7236,16 @@ mod tests {
                     });
                     let sent = rx.try_recv().unwrap();
                     let (header, _) = rns_wire::header::PacketHeader::unpack(&sent).unwrap();
+                    let wrapped = hops > 1 || (hops == 1 && client_mode);
                     assert_eq!(
                         header.flags.header_type,
-                        if hops == 0 {
-                            HeaderType::Header1
-                        } else {
+                        if wrapped {
                             HeaderType::Header2
+                        } else {
+                            HeaderType::Header1
                         }
                     );
-                    assert_eq!(
-                        header.transport_id,
-                        if hops == 0 { None } else { Some([0x66; 16]) }
-                    );
+                    assert_eq!(header.transport_id, wrapped.then_some([0x66; 16]));
                 }
             }
         }
@@ -7587,7 +7627,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_shared_instance_wraps_at_1_hop_with_next_hop() {
+    fn test_non_shared_instance_sends_1_hop_path_unwrapped() {
         let (mut actor, _tx) = TransportActor::new();
         actor.is_shared_instance = false;
 
@@ -7597,8 +7637,7 @@ mod tests {
         let dest_hash = [0xAA; 16];
         let next_hop = [0xBB; 16];
 
-        // Path with 1 hop and next_hop: MUST wrap even without shared instance,
-        // because transport nodes only forward Header2 packets.
+        // Transport.py:1659-1664: a one-hop neighbour is sent the raw packet.
         let path_entry =
             crate::path_table::PathEntry::new(Some(next_hop), 1, 1, InterfaceMode::Gateway);
         actor.path_table.insert(dest_hash, path_entry);
@@ -7613,9 +7652,9 @@ mod tests {
         let (sent_hdr, _) = rns_wire::header::PacketHeader::unpack(&sent).unwrap();
         assert_eq!(
             sent_hdr.flags.header_type,
-            rns_wire::flags::HeaderType::Header2
+            rns_wire::flags::HeaderType::Header1
         );
-        assert_eq!(sent_hdr.transport_id, Some(next_hop));
+        assert_eq!(sent_hdr.transport_id, None);
     }
 
     #[test]
@@ -7807,6 +7846,27 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn interface_stats_follow_bitrate_order() {
+        let (mut actor, _tx) = TransportActor::new();
+        for (id, name, bitrate) in [
+            (1, "slow", 1_200),
+            (2, "fast", 10_000_000),
+            (3, "fast-b", 10_000_000),
+        ] {
+            let (mut entry, _rx) = make_test_interface(name);
+            entry.bitrate = bitrate;
+            actor.interfaces.insert(id, entry);
+        }
+        let TransportQueryResponse::InterfaceStats(stats) =
+            actor.handle_query(TransportQuery::GetInterfaceStats)
+        else {
+            panic!("unexpected interface stats response");
+        };
+        let names: Vec<&str> = stats.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["fast", "fast-b", "slow"]);
     }
 
     #[test]

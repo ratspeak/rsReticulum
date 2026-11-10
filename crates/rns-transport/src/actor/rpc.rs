@@ -49,10 +49,12 @@ impl TransportActor {
             }
             TransportQuery::GetInterfaceStats => {
                 let now = now_f64();
+                // Reticulum.py:1620: stats follow Transport.interfaces, bitrate order.
                 let stats: Vec<InterfaceStatRpcEntry> = self
-                    .interfaces
-                    .iter()
-                    .map(|(&iface_id, entry)| {
+                    .prioritized_interface_ids()
+                    .into_iter()
+                    .map(|iface_id| (iface_id, &self.interfaces[&iface_id]))
+                    .map(|(iface_id, entry)| {
                         let online = entry
                             .online
                             .as_ref()
@@ -204,6 +206,19 @@ impl TransportActor {
                         ratchet: entry.ratchet,
                         hops: entry.hops,
                         timestamp: entry.timestamp,
+                    })
+                });
+                // Identity.py:164-170: fall back to a registered local destination.
+                let recalled = recalled.or_else(|| {
+                    self.local_destination_keys.get(&dest).map(|public_key| {
+                        RecalledDestinationRpcEntry {
+                            dest_hash: dest,
+                            public_key: *public_key,
+                            app_data: None,
+                            ratchet: None,
+                            hops: 0,
+                            timestamp: now_f64(),
+                        }
                     })
                 });
                 TransportQueryResponse::RecalledDestination(recalled)

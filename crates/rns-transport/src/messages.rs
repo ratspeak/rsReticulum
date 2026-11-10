@@ -639,6 +639,12 @@ pub enum TransportMessage {
         app_name: String,
         delivery_tx: Option<mpsc::Sender<crate::link_messages::DestinationEvent>>,
     },
+    /// Public key of a registered local destination, so recall answers for it
+    /// as `Identity.recall` does from `Transport.destinations`.
+    SetLocalDestinationKey {
+        hash: [u8; 16],
+        public_key: [u8; 64],
+    },
     /// Remove the local destination registration and its delivery channel.
     DeregisterDestination {
         hash: [u8; 16],
@@ -826,6 +832,7 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::Tick(_) => "Tick",
         TransportMessage::Rpc { .. } => "Rpc",
         TransportMessage::RegisterDestination { .. } => "RegisterDestination",
+        TransportMessage::SetLocalDestinationKey { .. } => "SetLocalDestinationKey",
         TransportMessage::DeregisterDestination { .. } => "DeregisterDestination",
         TransportMessage::RegisterAnnounceHandler { .. } => "RegisterAnnounceHandler",
         TransportMessage::RegisterAnnounceSubscription { .. } => "RegisterAnnounceSubscription",
@@ -1348,6 +1355,10 @@ impl std::fmt::Debug for TransportMessage {
                 .field("hash", hash)
                 .field("app_name", app_name)
                 .finish(),
+            Self::SetLocalDestinationKey { hash, .. } => f
+                .debug_struct("SetLocalDestinationKey")
+                .field("hash", hash)
+                .finish_non_exhaustive(),
             Self::DeregisterDestination { hash } => f
                 .debug_struct("DeregisterDestination")
                 .field("hash", hash)

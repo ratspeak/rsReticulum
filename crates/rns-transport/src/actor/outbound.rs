@@ -117,6 +117,9 @@ impl TransportActor {
             Ok((header, _)) => header,
             Err(_) => return false,
         };
+        if parsed.hops >= PATHFINDER_M {
+            return false;
+        }
 
         if parsed.flags.packet_type == rns_wire::flags::PacketType::LinkRequest
             && !rns_wire::link_signalling::parse_request_signalling(&request.raw[parsed.size()..])
@@ -141,6 +144,7 @@ impl TransportActor {
         let pkt_hash = rns_wire::hash::packet_hash(&request.raw, parsed.flags.header_type);
         self.packet_hashlist.insert(pkt_hash);
 
+        let mut new_receipt = None;
         // Generate a general-purpose receipt for every outbound Data packet to a
         // non-Plain destination so callers can observe delivery / timeout.
         // Link- and resource-level contexts manage their own receipts.
@@ -167,6 +171,7 @@ impl TransportActor {
                     receipt
                         .set_destination_identity(request.destination_hash, destination_public_key);
                     entry.insert(receipt);
+                    new_receipt = Some(trunc_hash);
                     trace!(
                         trunc = hex::encode(trunc_hash),
                         "generated receipt for outbound packet"
@@ -196,7 +201,7 @@ impl TransportActor {
             return self.broadcast_local_announce_on_interfaces(&request.raw, None);
         }
 
-        match parsed.flags.destination_type {
+        let sent = match parsed.flags.destination_type {
             rns_wire::flags::DestinationType::Plain | rns_wire::flags::DestinationType::Group => {
                 self.broadcast_on_interfaces(&request.raw, None)
             }
@@ -223,12 +228,10 @@ impl TransportActor {
                     // replaces the zero hops byte on the way out.
                     let apply_delta = self.should_apply_delta(&parsed, target_interface);
 
-                    // A shared owner's announces may include its next-hop ID
-                    // even for a zero-hop local client. That client is directly
-                    // reachable: wrapping would leave the owner's transport ID
-                    // on the delivered Link request, which the client rejects.
-                    // Preserve directed-relay wrapping for positive-hop paths.
-                    let sent = if let Some(next_hop) = path_next_hop.filter(|_| path_hops > 0) {
+                    // Transport.py:1625-1654: wrap beyond one hop, or at one hop
+                    // when this node sits behind a shared instance.
+                    let wrap = path_hops > 1 || (path_hops == 1 && self.is_shared_instance);
+                    let sent = if let Some(next_hop) = path_next_hop.filter(|_| wrap) {
                         if parsed.flags.header_type == rns_wire::flags::HeaderType::Header1 {
                             let new_flags = rns_wire::flags::PacketFlags {
                                 header_type: rns_wire::flags::HeaderType::Header2,
@@ -257,11 +260,9 @@ impl TransportActor {
                                 "outbound: wrapped Header1 -> Header2 for transport"
                             );
                             self.send_to_interface(target_interface, &new_raw)
-                        } else if apply_delta {
-                            let mangled = self.mangle_hops(&request.raw, &parsed, false);
-                            self.send_to_interface(target_interface, &mangled)
                         } else {
-                            self.send_to_interface(target_interface, &request.raw)
+                            // Transport.py:1626,1646: an already-wrapped packet is not sent.
+                            false
                         }
                     } else if apply_delta {
                         let mangled = self.mangle_hops(&request.raw, &parsed, false);
@@ -290,11 +291,7 @@ impl TransportActor {
                         broadcast_to = ?iface_names,
                         "outbound: no path, broadcasting"
                     );
-                    let sent = self.broadcast_on_interfaces(&request.raw, None);
-                    if parsed.flags.packet_type != rns_wire::flags::PacketType::Proof {
-                        self.on_automatic_path_request(request.destination_hash);
-                    }
-                    sent
+                    self.broadcast_on_interfaces(&request.raw, None)
                 }
             }
             rns_wire::flags::DestinationType::Link => {
@@ -310,7 +307,12 @@ impl TransportActor {
                 );
                 false
             }
+        };
+        // Packet.py:309-311: a packet that went nowhere keeps no receipt.
+        if !sent && let Some(hash) = new_receipt {
+            self.receipt_table.remove(&hash);
         }
+        sent
     }
 
     pub(super) fn on_outbound_attached(
@@ -323,8 +325,19 @@ impl TransportActor {
         if let Some(sent) = self.dispatch_local_link_attached(&request, interface_id) {
             return sent;
         }
+        // Transport.py:1672-1676: an attached interface is used only while online.
+        if self
+            .interfaces
+            .get(&interface_id)
+            .is_some_and(offline_for_send)
+        {
+            return false;
+        }
 
         if let Ok((parsed, _)) = rns_wire::header::PacketHeader::unpack(&request.raw) {
+            if parsed.hops >= PATHFINDER_M {
+                return false;
+            }
             if parsed.flags.destination_type == rns_wire::flags::DestinationType::Link {
                 let current = self.interfaces.get(&interface_id).map(|entry| &entry.owner);
                 let table_owned =
@@ -1064,15 +1077,9 @@ impl TransportActor {
             return;
         };
         let ids: Vec<InterfaceId> = self
-            .interfaces
-            .iter()
-            .filter_map(|(&id, entry)| {
-                if except == Some(id) || !entry.direction.outbound {
-                    None
-                } else {
-                    Some(id)
-                }
-            })
+            .prioritized_interface_ids()
+            .into_iter()
+            .filter(|id| except != Some(*id) && self.interfaces[id].direction.outbound)
             .collect();
         for id in ids {
             self.send_path_request_ext(destination_hash, id, Some(&tag), ext.as_ref(), recursive);
@@ -1109,18 +1116,6 @@ impl TransportActor {
             recursive = options.recursive,
             "explicit path request processed for driver admission"
         );
-    }
-
-    pub(super) fn on_automatic_path_request(&mut self, destination_hash: [u8; 16]) {
-        if self.path_table.has_path(&destination_hash) {
-            return;
-        }
-        if let Some(last) = self.path_requests.get(&destination_hash)
-            && now_f64() - last < PATH_REQUEST_MI
-        {
-            return;
-        }
-        self.broadcast_path_request(destination_hash);
     }
 
     fn broadcast_path_request(&mut self, destination_hash: [u8; 16]) {

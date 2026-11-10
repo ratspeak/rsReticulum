@@ -225,6 +225,7 @@ impl LinkClient {
             link_id,
             packet_request_id,
             time_remaining(deadline)?,
+            req_timeout,
         )
         .await;
 
@@ -305,10 +306,13 @@ async fn wait_for_response(
     link_id: [u8; 16],
     request_id: [u8; 16],
     deadline: Duration,
+    req_timeout: Duration,
 ) -> Result<Vec<u8>, LinkClientError> {
     // The request deadline applies until a response Resource is accepted;
     // after that the Resource watchdog ends a stalled transfer (Link.py:1475-1522).
+    // Between segments no watchdog runs, so the request timeout bounds each gap.
     let deadline_at = Instant::now() + deadline;
+    let mut segment_gap_since: Option<Instant> = None;
     let mut inbound_resources: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
     // Split response: segment payloads in order, file metadata flag of segment 1.
     let mut split_response: Vec<u8> = Vec::new();
@@ -321,6 +325,12 @@ async fn wait_for_response(
                 let remaining = deadline_at.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Err(LinkClientError::Timeout("response"));
+                }
+                remaining.min(WATCHDOG_TICK)
+            } else if let Some(since) = segment_gap_since {
+                let remaining = req_timeout.saturating_sub(since.elapsed());
+                if remaining.is_zero() {
+                    return Err(LinkClientError::Timeout("next response segment"));
                 }
                 remaining.min(WATCHDOG_TICK)
             } else {
@@ -443,6 +453,7 @@ async fn wait_for_response(
                             }
 
                             receiving = true;
+                            segment_gap_since = None;
                             segments.insert(
                                 adv.resource_hash,
                                 (
@@ -537,6 +548,7 @@ async fn wait_for_response(
                                 split_response.extend_from_slice(&assembled);
                                 completed_segments = segment_index;
                                 if segment_index < total_segments {
+                                    segment_gap_since = Some(Instant::now());
                                     continue;
                                 }
                                 let assembled = std::mem::take(&mut split_response);

@@ -89,54 +89,12 @@ mod tests {
         actor.on_path_request(dest);
         let raw = ready.try_recv().unwrap();
         let due = actor.pending_path_request_admissions[0].next_try;
-        actor.on_automatic_path_request(dest);
-        assert!(ready.try_recv().is_err());
         blocked.try_recv().unwrap();
         actor.process_pending_path_request_admissions(due);
         assert_eq!(blocked.try_recv().unwrap(), raw);
         assert!(ready.try_recv().is_err());
         actor.process_pending_path_request_admissions(due + 1.0);
         assert!(blocked.try_recv().is_err());
-    }
-
-    #[test]
-    fn refused_target_does_not_extend_healthy_automatic_discovery_cooldown() {
-        let (mut actor, _) = TransportActor::new();
-        let mut blocked = interface(&mut actor, 1, 1);
-        let mut ready = interface(&mut actor, 2, 8);
-        fill(&actor, 1);
-        let dest = [0xDA; 16];
-        actor.on_automatic_path_request(dest);
-        let first = ready.try_recv().unwrap();
-        let deadline = actor.pending_path_request_admissions[0].deadline;
-        let pending_raw = actor.pending_path_request_admissions[0].raw.clone();
-        assert_eq!(first.as_ref(), pending_raw.as_slice());
-
-        actor.on_automatic_path_request(dest);
-        assert!(
-            ready.try_recv().is_err(),
-            "an immediate repeat is throttled"
-        );
-        // Model elapsed Sent cooldown without changing the blocked target's
-        // immutable request owner. Its first attempt is still unadmitted.
-        actor
-            .path_requests
-            .insert(dest, now_f64() - PATH_REQUEST_MI - 1.0);
-        actor.on_automatic_path_request(dest);
-        let second = ready.try_recv().unwrap();
-        assert_ne!(second, first, "a later discovery intent gets a fresh tag");
-        assert_eq!(actor.pending_path_request_admissions.len(), 1);
-        assert_eq!(actor.pending_path_request_admissions[0].raw, pending_raw);
-        assert_eq!(actor.pending_path_request_admissions[0].deadline, deadline);
-        actor.on_automatic_path_request(dest);
-        assert!(ready.try_recv().is_err());
-
-        blocked.try_recv().unwrap();
-        let due = actor.pending_path_request_admissions[0].next_try;
-        actor.process_pending_path_request_admissions(due);
-        assert_eq!(blocked.try_recv().unwrap(), first);
-        assert!(ready.try_recv().is_err());
-        assert!(actor.pending_path_request_admissions.is_empty());
     }
 
     #[test]
@@ -578,7 +536,8 @@ impl TransportActor {
         let Some(entry) = self.interfaces.get_mut(&interface) else {
             return Admission::Retired;
         };
-        if !entry.direction.outbound {
+        // Transport.py:3940 and :1676: offline interfaces get no request.
+        if !entry.direction.outbound || offline_for_send(entry) {
             return Admission::Retired;
         }
         if recursive

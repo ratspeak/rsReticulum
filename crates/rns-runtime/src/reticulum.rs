@@ -1552,6 +1552,7 @@ impl ReticulumHandle {
             identify: options.identify,
             track_phy_stats: options.track_phy_stats,
             proof_strategy: rns_identity::destination::ProofStrategy::ProveNone,
+            resource_dir: Some(StoragePaths::from_config_dir(&self.config_dir).resource_dir),
         })
     }
 

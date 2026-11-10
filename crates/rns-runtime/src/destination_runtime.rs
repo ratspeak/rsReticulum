@@ -565,6 +565,13 @@ impl RegisteredDestination {
             })
             .await
             .map_err(|_| DestinationRuntimeError::ManagerUnavailable)?;
+        transport_tx
+            .send(TransportMessage::SetLocalDestinationKey {
+                hash: destination_hash,
+                public_key: identity.get_public_key(),
+            })
+            .await
+            .map_err(|_| DestinationRuntimeError::ManagerUnavailable)?;
 
         let capacity = options.event_capacity;
         let (packet_tx, packets) = mpsc::channel(capacity);
@@ -728,6 +735,7 @@ mod tests {
     #[tokio::test]
     async fn registration_announces_and_deregisters_exact_destination() {
         let identity = Identity::new();
+        let public = identity.get_public_key();
         let (transport_tx, mut transport_rx) = mpsc::channel(16);
         let registration = RegisteredDestination::register(
             transport_tx,
@@ -742,6 +750,11 @@ mod tests {
         assert!(matches!(
             transport_rx.recv().await,
             Some(TransportMessage::RegisterDestination { hash, .. }) if hash == destination_hash
+        ));
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::SetLocalDestinationKey { hash, public_key })
+                if hash == destination_hash && public_key == public
         ));
         registration
             .handle
@@ -795,6 +808,7 @@ mod tests {
                     identify: true,
                     track_phy_stats: false,
                     proof_strategy: rns_identity::destination::ProofStrategy::ProveNone,
+                    resource_dir: None,
                 },
             ),
         )
@@ -894,6 +908,10 @@ mod tests {
             }
             other => panic!("expected destination registration, got {other:?}"),
         };
+        assert!(matches!(
+            transport_rx.recv().await,
+            Some(TransportMessage::SetLocalDestinationKey { hash, .. }) if hash == destination_hash
+        ));
 
         registration
             .handle

@@ -21,7 +21,8 @@ pub use crate::inbound_link_packet::{
     LinkPacketRejection,
 };
 use crate::resource_source::{
-    AutoCompress, PreparedResourceSource, ResourceOptions, ResourceSource,
+    AutoCompress, PreparedResourceSegment, PreparedResourceSource, ResourceOptions, ResourceSource,
+    ResourceSourceError,
 };
 use bytes::Bytes;
 use rns_identity::destination::ProofStrategy;
@@ -69,34 +70,158 @@ enum LegacyTerminalNotification {
 }
 
 /// Remaining segments of an outbound split Resource: prepared up front, or
-/// read from a source one segment at a time as each segment is proved.
+/// read from a source on the blocking pool one segment ahead of the transfer.
 enum OutboundSplitQueue {
     Prebuilt(VecDeque<OutboundTransfer>),
-    Source(Box<PreparedResourceSource>),
+    Source(Box<StreamedSegments>),
+}
+
+/// A streamed source between segments. The source is absent while a blocking
+/// job prepares the next segment, as Resource prepares it while advertising.
+#[derive(Default)]
+struct StreamedSegments {
+    source: Option<Box<PreparedResourceSource>>,
+    ready: Option<Box<OutboundTransfer>>,
+    /// The current segment was proved before the next one was ready.
+    proved: bool,
+    failed: Option<String>,
+}
+
+enum NextSegment {
+    Start {
+        transfer: Box<OutboundTransfer>,
+        prepare: Option<Box<PreparedResourceSource>>,
+        exhausted: bool,
+    },
+    Pending,
+    Done,
+    Failed(String),
 }
 
 impl OutboundSplitQueue {
-    /// Next segment transfer and whether the queue is now exhausted. An error
-    /// means a remaining segment could not be produced.
-    fn next(&mut self, link: &Link) -> Result<(Option<OutboundTransfer>, bool), String> {
+    /// What to do once the current segment is proved.
+    fn next(&mut self) -> NextSegment {
         match self {
-            Self::Prebuilt(queue) => {
-                let next = queue.pop_front();
-                Ok((next, queue.is_empty()))
-            }
-            Self::Source(source) => {
-                let rtt = link.rtt.unwrap_or(std::time::Duration::from_millis(500));
-                let keys = link
-                    .session_keys()
-                    .ok_or_else(|| "link keys are unavailable".to_string())?;
-                let segment = source
-                    .next_segment(&keys, rtt)
-                    .map_err(|error| error.to_string())?
-                    .ok_or_else(|| "Resource source ended early".to_string())?;
-                Ok((Some(segment.transfer), source.is_exhausted()))
+            Self::Prebuilt(queue) => match queue.pop_front() {
+                Some(transfer) => NextSegment::Start {
+                    transfer: Box::new(transfer),
+                    prepare: None,
+                    exhausted: queue.is_empty(),
+                },
+                None => NextSegment::Done,
+            },
+            Self::Source(streamed) => {
+                if let Some(reason) = streamed.failed.take() {
+                    return NextSegment::Failed(reason);
+                }
+                let Some(transfer) = streamed.ready.take() else {
+                    streamed.proved = true;
+                    return NextSegment::Pending;
+                };
+                let prepare = streamed
+                    .source
+                    .take()
+                    .filter(|source| !source.is_exhausted());
+                NextSegment::Start {
+                    transfer,
+                    exhausted: prepare.is_none(),
+                    prepare,
+                }
             }
         }
     }
+}
+
+enum SegmentJobOutput {
+    First(Result<(Box<PreparedResourceSource>, PreparedResourceSegment), String>),
+    Next(
+        Box<PreparedResourceSource>,
+        Result<PreparedResourceSegment, String>,
+    ),
+}
+
+enum SegmentJobKind {
+    First {
+        request_id: [u8; 16],
+        lease: Option<Arc<crate::deferred_request::RequestLease>>,
+    },
+    Next {
+        resource_id: [u8; 32],
+    },
+}
+
+/// File response work running on the blocking pool.
+struct SegmentJob {
+    link_id: [u8; 16],
+    kind: SegmentJobKind,
+    output: oneshot::Receiver<SegmentJobOutput>,
+}
+
+const NIL: u8 = 0xc0;
+
+/// Why a request handler's reply was not sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ReplyError {
+    #[error("reply is not exactly one MessagePack value")]
+    NotOneValue,
+    #[error("reply could not be packed")]
+    Pack,
+}
+
+fn pack_reply(request_id: &[u8; 16], packed_value: &[u8]) -> Result<Vec<u8>, ReplyError> {
+    if rns_link::link::decode_single_value(packed_value).is_none() {
+        return Err(ReplyError::NotOneValue);
+    }
+    Link::pack_response(request_id, packed_value).map_err(|_| ReplyError::Pack)
+}
+
+/// Run a request handler on the manager task. A panic fails only that request
+/// with no response, as an exception ends Link.handle_request's thread.
+fn run_request_handler(
+    link_id: [u8; 16],
+    request_id: [u8; 16],
+    handler: impl FnOnce() -> RequestOutcome,
+) -> RequestOutcome {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(handler)).unwrap_or_else(|_| {
+        tracing::error!(
+            link_id = hex::encode(link_id),
+            request_id = hex::encode(request_id),
+            "link request handler panicked; no response sent"
+        );
+        RequestOutcome::Drop
+    })
+}
+
+fn prepare_next_segment(
+    source: &mut PreparedResourceSource,
+    keys: &rns_link::key_derivation::LinkKeys,
+    rtt: std::time::Duration,
+) -> Result<PreparedResourceSegment, String> {
+    source
+        .next_segment(keys, rtt)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Resource source ended early".to_string())
+}
+
+/// Run `job` on the blocking pool and wake the manager when it is done.
+fn spawn_segment_job(
+    notify: &Arc<tokio::sync::Notify>,
+    job: impl FnOnce() -> SegmentJobOutput + Send + 'static,
+) -> oneshot::Receiver<SegmentJobOutput> {
+    let (output_tx, output) = oneshot::channel();
+    let notify = Arc::clone(notify);
+    let run = move || {
+        let _ = output_tx.send(job());
+        notify.notify_one();
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn_blocking(run);
+        }
+        // Manual loops without a runtime prepare inline.
+        Err(_) => run(),
+    }
+    output
 }
 
 struct ActiveLink {
@@ -598,7 +723,8 @@ pub enum RequestOutcome {
     /// A byte string, received by a Python requester as `bytes`.
     ReplyBytes(Vec<u8>),
     /// Exactly one already-encoded MessagePack value (a list, map, int, bool,
-    /// nil, ...). A reply that is not one complete value is not sent.
+    /// ...). Nil sends no response, as a handler returning None. A reply that
+    /// is not one complete value is not sent ([`ReplyError::NotOneValue`]).
     ReplyValue(Vec<u8>),
     /// A file response: one response Resource correlated with the request,
     /// as a handler returning `[file, metadata]` sends. The source is read one
@@ -773,6 +899,8 @@ pub struct LinkManager {
     deferred_request_notify: Arc<tokio::sync::Notify>,
     pending_deferred_requests: Vec<PendingDeferredRequest>,
     deferred_resource_leases: Vec<DeferredResourceLease>,
+    /// File response segments being prepared on the blocking pool.
+    segment_jobs: Vec<SegmentJob>,
     /// Wins over `request_handler` when set; can schedule a resource transfer.
     request_handler_ex: Option<RequestHandlerEx>,
     /// Python-compatible Destination handlers keyed by truncated path hash.
@@ -899,6 +1027,7 @@ impl LinkManager {
             deferred_request_notify: Arc::new(tokio::sync::Notify::new()),
             pending_deferred_requests: Vec::new(),
             deferred_resource_leases: Vec::new(),
+            segment_jobs: Vec::new(),
             request_handler_ex: None,
             destination_request_handlers: HashMap::new(),
             pending_inbound_request_resources: HashSet::new(),
@@ -998,6 +1127,7 @@ impl LinkManager {
             deferred_request_notify: Arc::new(tokio::sync::Notify::new()),
             pending_deferred_requests: Vec::new(),
             deferred_resource_leases: Vec::new(),
+            segment_jobs: Vec::new(),
             request_handler_ex: None,
             destination_request_handlers: HashMap::new(),
             pending_inbound_request_resources: HashSet::new(),
@@ -1149,6 +1279,7 @@ impl LinkManager {
         self.flush_pending_link_control();
         self.flush_pending_destination_announces();
         self.flush_pending_legacy_terminal_notifications();
+        self.poll_segment_jobs();
         self.on_tick();
         self.observe_outbound_resource_waits();
     }
@@ -4439,34 +4570,66 @@ impl LinkManager {
                             let completed_resource_hash = queue_key.unwrap_or(rh);
                             if let Some(key) = queue_key {
                                 let step = match active.outbound_split_queues.get_mut(&key) {
-                                    Some(queue) => queue.next(&active.link),
-                                    None => Ok((None, false)),
+                                    Some(queue) => queue.next(),
+                                    None => NextSegment::Done,
                                 };
                                 let mut failure = None;
                                 match step {
-                                    Ok((next, empty)) => {
-                                        if empty {
+                                    NextSegment::Start {
+                                        transfer,
+                                        prepare,
+                                        exhausted,
+                                    } => {
+                                        if exhausted {
                                             active.outbound_split_queues.remove(&key);
                                         }
-                                        if let Some(next) = next {
-                                            started_next_segment = Self::start_outbound_transfer(
-                                                &self.transport_tx,
-                                                &mut self.pending_link_control,
-                                                &mut self.pending_endpoint_sends,
-                                                active,
-                                                &link_id,
-                                                next,
-                                            )
-                                            .is_some();
-                                            if !started_next_segment {
-                                                failure = Some(
-                                                    "could not retain next Resource segment advertisement"
-                                                        .to_string(),
-                                                );
+                                        started_next_segment = Self::start_outbound_transfer(
+                                            &self.transport_tx,
+                                            &mut self.pending_link_control,
+                                            &mut self.pending_endpoint_sends,
+                                            active,
+                                            &link_id,
+                                            *transfer,
+                                        )
+                                        .is_some();
+                                        if !started_next_segment {
+                                            failure = Some(
+                                                "could not retain next Resource segment advertisement"
+                                                    .to_string(),
+                                            );
+                                        } else if let Some(source) = prepare {
+                                            match Self::spawn_next_segment(
+                                                &self.deferred_request_notify,
+                                                &active.link,
+                                                source,
+                                            ) {
+                                                Some(output) => {
+                                                    self.segment_jobs.push(SegmentJob {
+                                                        link_id,
+                                                        kind: SegmentJobKind::Next {
+                                                            resource_id: key,
+                                                        },
+                                                        output,
+                                                    })
+                                                }
+                                                None => {
+                                                    if let Some(OutboundSplitQueue::Source(
+                                                        streamed,
+                                                    )) =
+                                                        active.outbound_split_queues.get_mut(&key)
+                                                    {
+                                                        streamed.failed = Some(
+                                                            "link keys are unavailable".into(),
+                                                        );
+                                                    }
+                                                }
                                             }
                                         }
                                     }
-                                    Err(reason) => {
+                                    // The next segment is still being read; it starts when ready.
+                                    NextSegment::Pending => started_next_segment = true,
+                                    NextSegment::Done => {}
+                                    NextSegment::Failed(reason) => {
                                         failure = Some(format!(
                                             "next Resource segment could not be prepared: {reason}"
                                         ));
@@ -5787,7 +5950,9 @@ impl LinkManager {
                     requested_at,
                 };
                 match &registered.handler {
-                    RegisteredHandler::Immediate(handler) => handler(request),
+                    RegisteredHandler::Immediate(handler) => {
+                        run_request_handler(link_id, request_id, || handler(request))
+                    }
                     RegisteredHandler::Deferred {
                         response_byte_limit,
                         handler,
@@ -5824,7 +5989,11 @@ impl LinkManager {
                             auto_compress: response_auto_compress,
                             response,
                         });
-                        handler(request, responder);
+                        // A panicking handler drops its responder, which closes the request.
+                        let _ = run_request_handler(link_id, request_id, || {
+                            handler(request, responder);
+                            RequestOutcome::Drop
+                        });
                         return;
                     }
                 }
@@ -5838,12 +6007,16 @@ impl LinkManager {
                 RequestOutcome::Drop
             }
         } else if let Some(ref handler) = self.request_handler_ex {
-            handler(link_id, path_hash, data.clone())
+            run_request_handler(link_id, request_id, || {
+                handler(link_id, path_hash, data.clone())
+            })
         } else if let Some(ref handler) = self.request_handler {
-            match handler(link_id, path_hash, data) {
-                Some(response) => RequestOutcome::ReplyValue(response),
-                None => RequestOutcome::Drop,
-            }
+            run_request_handler(link_id, request_id, || {
+                match handler(link_id, path_hash, data) {
+                    Some(response) => RequestOutcome::ReplyValue(response),
+                    None => RequestOutcome::Drop,
+                }
+            })
         } else {
             RequestOutcome::Drop
         };
@@ -5870,15 +6043,15 @@ impl LinkManager {
         let mut sent = false;
         let (response, fetch_spec) = match outcome {
             RequestOutcome::ReplyBytes(bytes) => (
-                Some(Link::pack_response_value(
-                    &request_id,
-                    &rmpv::Value::Binary(bytes),
-                )),
+                Some(
+                    Link::pack_response_value(&request_id, &rmpv::Value::Binary(bytes))
+                        .map_err(|_| ReplyError::Pack),
+                ),
                 None,
             ),
-            RequestOutcome::ReplyValue(value) => {
-                (Some(Link::pack_response(&request_id, &value)), None)
-            }
+            // Link.handle_request sends nothing for a handler that returns None.
+            RequestOutcome::ReplyValue(value) if value == [NIL] => (None, None),
+            RequestOutcome::ReplyValue(value) => (Some(pack_reply(&request_id, &value)), None),
             RequestOutcome::ReplyFile { source, metadata } => {
                 return self.start_file_response(
                     link_id,
@@ -5895,7 +6068,7 @@ impl LinkManager {
                 metadata,
                 auto_compress,
             } => (
-                Some(Link::pack_response(&request_id, &ack)),
+                Some(pack_reply(&request_id, &ack)),
                 Some((source, metadata, auto_compress)),
             ),
             RequestOutcome::Drop => (None, None),
@@ -5983,7 +6156,7 @@ impl LinkManager {
                         link_id = hex::encode(link_id),
                         request_id = hex::encode(request_id),
                         error = %error,
-                        "link request response is not one MessagePack value; not sent"
+                        "link request response not sent"
                     );
                 }
             }
@@ -5997,35 +6170,20 @@ impl LinkManager {
         }
 
         if let Some((source, metadata, auto_compress)) = fetch_spec {
-            let prepared = PreparedResourceSource::prepare(
-                source,
-                ResourceOptions {
-                    auto_compress,
-                    metadata,
-                },
-            )
-            .map_err(|error| tracing::warn!(%error, "request Resource source refused"))
-            .ok();
-            if let Some(resource_id) =
-                prepared.and_then(|prepared| self.start_prepared_resource(&link_id, prepared))
-            {
-                if let Some(lease) = lease {
-                    self.deferred_resource_leases.push(DeferredResourceLease {
-                        link_id,
-                        resource_id,
-                        _lease: lease,
-                    });
-                }
-            } else {
-                sent = false;
-            }
+            let options = ResourceOptions {
+                auto_compress,
+                metadata,
+            };
+            sent &= self.start_streamed_resource(link_id, request_id, lease, move || {
+                PreparedResourceSource::prepare(source, options)
+            });
         }
         sent
     }
 
     /// Link.handle_request file response: the file is the only response,
-    /// sent as one Resource carrying the request id and metadata. Later
-    /// segments are read from the source as earlier ones are proved.
+    /// sent as one Resource carrying the request id and metadata. Hashing
+    /// and reading the source run on the blocking pool, one segment ahead.
     fn start_file_response(
         &mut self,
         link_id: [u8; 16],
@@ -6035,89 +6193,263 @@ impl LinkManager {
         auto_compress: AutoCompress,
         lease: Option<Arc<crate::deferred_request::RequestLease>>,
     ) -> bool {
-        let Some(resource_id) =
-            self.start_streamed_response(&link_id, request_id, source, metadata, auto_compress)
-        else {
-            tracing::warn!(
-                link_id = hex::encode(link_id),
-                request_id = hex::encode(request_id),
-                "link request file response could not be started"
-            );
+        self.start_streamed_resource(link_id, request_id, lease, move || {
+            PreparedResourceSource::prepare_response(source, request_id, metadata, auto_compress)
+        })
+    }
+
+    /// Prepare a source and its first segment on the blocking pool, then start
+    /// it; later segments are prepared one ahead of the transfer.
+    fn start_streamed_resource(
+        &mut self,
+        link_id: [u8; 16],
+        request_id: [u8; 16],
+        lease: Option<Arc<crate::deferred_request::RequestLease>>,
+        prepare: impl FnOnce() -> Result<PreparedResourceSource, ResourceSourceError> + Send + 'static,
+    ) -> bool {
+        let Some(active) = self.active_links.get(&link_id) else {
             return false;
         };
-        if let Some(lease) = lease {
-            self.deferred_resource_leases.push(DeferredResourceLease {
-                link_id,
-                resource_id,
-                _lease: lease,
-            });
-        }
-        true
-    }
-
-    fn start_streamed_response(
-        &mut self,
-        link_id: &[u8; 16],
-        request_id: [u8; 16],
-        source: Box<dyn ResourceSource>,
-        metadata: Option<Vec<u8>>,
-        auto_compress: AutoCompress,
-    ) -> Option<[u8; 32]> {
-        let prepared =
-            PreparedResourceSource::prepare_response(source, request_id, metadata, auto_compress)
-                .map_err(|error| tracing::warn!(%error, "file response source refused"))
-                .ok()?;
-        self.start_prepared_resource(link_id, prepared)
-    }
-
-    /// Start the first segment of a prepared source; later segments are read
-    /// as earlier ones are proved.
-    fn start_prepared_resource(
-        &mut self,
-        link_id: &[u8; 16],
-        mut prepared: PreparedResourceSource,
-    ) -> Option<[u8; 32]> {
-        let active = self.active_links.get_mut(link_id)?;
         if !matches!(active.link.state, LinkState::Active | LinkState::Stale) {
-            return None;
+            return false;
         }
-        let keys = active.link.session_keys()?;
+        let Some(keys) = active.link.session_keys() else {
+            return false;
+        };
         let rtt = active
             .link
             .rtt
             .unwrap_or(std::time::Duration::from_millis(500));
-        let first = prepared.next_segment(&keys, rtt).ok()??;
+        let output = spawn_segment_job(&self.deferred_request_notify, move || {
+            SegmentJobOutput::First(prepare().map_err(|error| error.to_string()).and_then(
+                |mut prepared| {
+                    let first = prepare_next_segment(&mut prepared, &keys, rtt)?;
+                    Ok((Box::new(prepared), first))
+                },
+            ))
+        });
+        self.segment_jobs.push(SegmentJob {
+            link_id,
+            kind: SegmentJobKind::First { request_id, lease },
+            output,
+        });
+        true
+    }
+
+    fn spawn_next_segment(
+        notify: &Arc<tokio::sync::Notify>,
+        link: &Link,
+        mut source: Box<PreparedResourceSource>,
+    ) -> Option<oneshot::Receiver<SegmentJobOutput>> {
+        let keys = link.session_keys()?;
+        let rtt = link.rtt.unwrap_or(std::time::Duration::from_millis(500));
+        Some(spawn_segment_job(notify, move || {
+            let result = prepare_next_segment(&mut source, &keys, rtt);
+            SegmentJobOutput::Next(source, result)
+        }))
+    }
+
+    fn poll_segment_jobs(&mut self) -> bool {
+        let mut progressed = false;
+        for job in std::mem::take(&mut self.segment_jobs) {
+            let SegmentJob {
+                link_id,
+                kind,
+                mut output,
+            } = job;
+            let result = match output.try_recv() {
+                Ok(result) => result,
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    self.segment_jobs.push(SegmentJob {
+                        link_id,
+                        kind,
+                        output,
+                    });
+                    continue;
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    progressed = true;
+                    continue;
+                }
+            };
+            progressed = true;
+            match (kind, result) {
+                (
+                    SegmentJobKind::First { request_id, lease },
+                    SegmentJobOutput::First(prepared),
+                ) => self.start_prepared_file_response(link_id, request_id, lease, prepared),
+                (SegmentJobKind::Next { resource_id }, SegmentJobOutput::Next(source, segment)) => {
+                    self.next_segment_prepared(link_id, resource_id, source, segment)
+                }
+                _ => {}
+            }
+        }
+        progressed
+    }
+
+    fn start_prepared_file_response(
+        &mut self,
+        link_id: [u8; 16],
+        request_id: [u8; 16],
+        lease: Option<Arc<crate::deferred_request::RequestLease>>,
+        prepared: Result<(Box<PreparedResourceSource>, PreparedResourceSegment), String>,
+    ) {
+        let warn = |error: &str| {
+            tracing::warn!(
+                link_id = hex::encode(link_id),
+                request_id = hex::encode(request_id),
+                error,
+                "link request Resource could not be started"
+            );
+        };
+        let (source, first) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return warn(&error),
+        };
+        let Some(active) = self.active_links.get_mut(&link_id) else {
+            return;
+        };
+        if !matches!(active.link.state, LinkState::Active | LinkState::Stale) {
+            return warn("link is not active");
+        }
         let resource_key = first.logical_hash;
         let total_segments = first.total_segments;
         let data_size = first.data_size;
-        Self::start_outbound_transfer(
+        if Self::start_outbound_transfer(
             &self.transport_tx,
             &mut self.pending_link_control,
             &mut self.pending_endpoint_sends,
             active,
-            link_id,
+            &link_id,
             first.transfer,
-        )?;
-        if !prepared.is_exhausted() {
+        )
+        .is_none()
+        {
+            return warn("could not retain the Resource advertisement");
+        }
+        if !source.is_exhausted() {
+            let mut streamed = StreamedSegments::default();
+            match Self::spawn_next_segment(&self.deferred_request_notify, &active.link, source) {
+                Some(output) => self.segment_jobs.push(SegmentJob {
+                    link_id,
+                    kind: SegmentJobKind::Next {
+                        resource_id: resource_key,
+                    },
+                    output,
+                }),
+                None => streamed.failed = Some("link keys are unavailable".into()),
+            }
             active
                 .outbound_split_queues
-                .insert(resource_key, OutboundSplitQueue::Source(Box::new(prepared)));
+                .insert(resource_key, OutboundSplitQueue::Source(Box::new(streamed)));
         }
         Self::emit_resource_event(
             &self.resource_event_tx,
             &self.accounting_event_tx,
             LinkResourceEvent::Started {
-                link_id: *link_id,
+                link_id,
                 resource_id: resource_key,
                 direction: LinkResourceDirection::Outbound,
                 data_size,
                 total_segments,
             },
         );
-        Some(resource_key)
+        if let Some(lease) = lease {
+            self.deferred_resource_leases.push(DeferredResourceLease {
+                link_id,
+                resource_id: resource_key,
+                _lease: lease,
+            });
+        }
+    }
+
+    /// A streamed segment is ready: keep it until the current one is proved,
+    /// or start it now if that proof already arrived.
+    fn next_segment_prepared(
+        &mut self,
+        link_id: [u8; 16],
+        resource_id: [u8; 32],
+        source: Box<PreparedResourceSource>,
+        segment: Result<PreparedResourceSegment, String>,
+    ) {
+        let Some(active) = self.active_links.get_mut(&link_id) else {
+            return;
+        };
+        let Some(OutboundSplitQueue::Source(streamed)) =
+            active.outbound_split_queues.get_mut(&resource_id)
+        else {
+            return;
+        };
+        let proved = streamed.proved;
+        let mut failure = None;
+        match segment {
+            Err(reason) if proved => {
+                failure = Some(format!(
+                    "next Resource segment could not be prepared: {reason}"
+                ));
+            }
+            Err(reason) => streamed.failed = Some(reason),
+            Ok(segment) if !proved => {
+                streamed.ready = Some(Box::new(segment.transfer));
+                streamed.source = Some(source);
+            }
+            Ok(segment) => {
+                streamed.proved = false;
+                let more = !source.is_exhausted();
+                if !more {
+                    active.outbound_split_queues.remove(&resource_id);
+                }
+                if Self::start_outbound_transfer(
+                    &self.transport_tx,
+                    &mut self.pending_link_control,
+                    &mut self.pending_endpoint_sends,
+                    active,
+                    &link_id,
+                    segment.transfer,
+                )
+                .is_none()
+                {
+                    failure =
+                        Some("could not retain next Resource segment advertisement".to_string());
+                } else if more {
+                    match Self::spawn_next_segment(
+                        &self.deferred_request_notify,
+                        &active.link,
+                        source,
+                    ) {
+                        Some(output) => self.segment_jobs.push(SegmentJob {
+                            link_id,
+                            kind: SegmentJobKind::Next { resource_id },
+                            output,
+                        }),
+                        None => {
+                            if let Some(OutboundSplitQueue::Source(streamed)) =
+                                active.outbound_split_queues.get_mut(&resource_id)
+                            {
+                                streamed.failed = Some("link keys are unavailable".into());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(reason) = failure {
+            active.outbound_split_queues.remove(&resource_id);
+            Self::emit_resource_event(
+                &self.resource_event_tx,
+                &self.accounting_event_tx,
+                LinkResourceEvent::Concluded {
+                    link_id,
+                    resource_id,
+                    direction: LinkResourceDirection::Outbound,
+                    conclusion: LinkResourceConclusion::Failed(reason),
+                },
+            );
+        }
     }
 
     fn poll_deferred_requests(&mut self) -> bool {
+        let segments_progressed = self.poll_segment_jobs();
         self.deferred_resource_leases.retain(|pending| {
             self.active_links
                 .get(&pending.link_id)
@@ -6151,7 +6483,11 @@ impl LinkManager {
             }
             match pending.response.try_recv() {
                 Ok(resolution) => {
-                    let dropped = matches!(resolution.outcome, RequestOutcome::Drop);
+                    let dropped = match &resolution.outcome {
+                        RequestOutcome::Drop => true,
+                        RequestOutcome::ReplyValue(value) => value == &[NIL],
+                        _ => false,
+                    };
                     let sent = self.complete_request_response(
                         pending.link_id,
                         pending.request_id,
@@ -6176,7 +6512,7 @@ impl LinkManager {
             }
         }
         self.pending_deferred_requests = waiting;
-        progressed
+        progressed || segments_progressed
     }
 
     /// Install a synchronous fallback `(link_id, path_hash, data)` handler.
@@ -9121,8 +9457,16 @@ mod tests {
         assert_eq!(first.total_segments, 2);
         assert!(!prepared.is_exhausted());
 
-        let mut queue = OutboundSplitQueue::Source(Box::new(prepared));
-        let Err(error) = queue.next(&link) else {
+        let Err(reason) =
+            prepare_next_segment(&mut prepared, &keys, std::time::Duration::from_millis(100))
+        else {
+            panic!("a failed read must not produce a segment");
+        };
+        let mut queue = OutboundSplitQueue::Source(Box::new(StreamedSegments {
+            failed: Some(reason),
+            ..StreamedSegments::default()
+        }));
+        let NextSegment::Failed(error) = queue.next() else {
             panic!("a failed read must not end the transfer as complete");
         };
         assert!(error.contains("source went away"), "{error}");
@@ -10613,6 +10957,83 @@ mod tests {
         assert!(next_transport_message(&mut transport_rx).is_err());
         assert!(manager.deregister_request_handler("status"));
         assert!(!manager.deregister_request_handler("status"));
+    }
+
+    #[test]
+    fn handler_replies_follow_upstream_and_a_panic_fails_only_its_request() {
+        let (mut sender_link, receiver_link) = handshaken_link_pair();
+        let link_id = receiver_link.link_id;
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::new(transport_tx, event_rx, [0xA2; 16], None);
+        manager
+            .active_links
+            .insert(link_id, active_link_entry_at(receiver_link, 1));
+        let replies: [(&str, RequestOutcome); 4] = [
+            ("nil", RequestOutcome::ReplyValue(vec![0xc0])),
+            ("partial", RequestOutcome::ReplyValue(vec![0x92, 0x01])),
+            ("trailing", RequestOutcome::ReplyValue(vec![0x01, 0x02])),
+            ("value", RequestOutcome::ReplyValue(vec![0xcc, 0xf0])),
+        ];
+        for (path, reply) in replies {
+            let reply = std::sync::Mutex::new(Some(reply));
+            assert!(manager.register_request_handler(
+                path,
+                AllowPolicy::AllowAll,
+                None,
+                true,
+                move |_| reply.lock().unwrap().take().unwrap_or(RequestOutcome::Drop),
+            ));
+        }
+        assert!(manager.register_request_handler(
+            "panic",
+            AllowPolicy::AllowAll,
+            None,
+            true,
+            |_| panic!("handler failure"),
+        ));
+
+        let mut request = |manager: &mut LinkManager, path: &str| {
+            let (encrypted, _) = sender_link
+                .request_value(path, &rmpv::Value::Nil, std::time::Duration::from_secs(5))
+                .unwrap();
+            let header = rns_wire::header::PacketHeader {
+                flags: rns_wire::flags::PacketFlags {
+                    header_type: rns_wire::flags::HeaderType::Header1,
+                    context_flag: false,
+                    transport_type: rns_wire::flags::TransportType::Broadcast,
+                    destination_type: rns_wire::flags::DestinationType::Link,
+                    packet_type: rns_wire::flags::PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: link_id,
+                context: rns_wire::context::PacketContext::Request,
+            };
+            let mut raw = header.pack();
+            raw.extend_from_slice(&encrypted);
+            manager.handle_inbound_packet(&raw, 1);
+        };
+
+        // None, and anything that is not exactly one value, send no response.
+        for path in ["nil", "partial", "trailing", "panic"] {
+            request(&mut manager, path);
+            assert!(
+                next_transport_message(&mut transport_rx).is_err(),
+                "{path} must send no response"
+            );
+        }
+        // The manager survives the panic and answers the next request.
+        request(&mut manager, "value");
+        let TransportMessage::Outbound(response) =
+            next_transport_message(&mut transport_rx).expect("response")
+        else {
+            panic!("expected a response packet");
+        };
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&response.raw).unwrap();
+        let plaintext = sender_link.decrypt(&response.raw[offset..]).unwrap();
+        let (_, value) = Link::parse_response_value(&plaintext).unwrap();
+        assert_eq!(value, rmpv::Value::from(240));
     }
 
     #[test]

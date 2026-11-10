@@ -423,9 +423,9 @@ fn disabling_transport_revokes_recursive_work_but_preserves_leaf_discovery() {
     assert_requested(blocked_rx.try_recv().unwrap(), local);
     actor.process_pending_discovery_path_requests(now_f64() + 1.0);
     assert_requested(blocked_rx.try_recv().unwrap(), queued_local);
-    let automatic = [0xEC; 16];
-    actor.on_automatic_path_request(automatic);
-    assert_requested(blocked_rx.try_recv().unwrap(), automatic);
+    let explicit = [0xEC; 16];
+    actor.on_path_request(explicit);
+    assert_requested(blocked_rx.try_recv().unwrap(), explicit);
     request(&mut actor, remote, 2, 1);
     assert!(blocked_rx.try_recv().is_err());
     assert!(actor.discovery_path_requests.is_empty());
