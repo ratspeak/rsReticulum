@@ -144,7 +144,9 @@ async fn run_listener(args: Args) -> ExitCode {
     let _signal_rx = install_signal_handlers(shutdown.clone());
     init_logging(args.verbose, args.quiet, args.config.as_deref());
 
-    let handle = match start_reticulum(args.config.as_deref(), shutdown.clone()).await {
+    // The runtime stops only after the listener has sent "Shutting down".
+    let runtime_shutdown = ShutdownSignal::new();
+    let handle = match start_reticulum(args.config.as_deref(), runtime_shutdown.clone()).await {
         Ok(handle) => handle,
         Err(e) => {
             eprintln!("rnsh-rs: failed to start reticulum: {e}");
@@ -161,15 +163,14 @@ async fn run_listener(args: Args) -> ExitCode {
         }
     };
 
-    let mut allowed = match parse_allowed_identities(&args.allowed) {
+    let allowed = match parse_allowed_identities(&args.allowed) {
         Ok(allowed) => allowed,
         Err(e) => {
             eprintln!("rnsh-rs: {e}");
             return ExitCode::from(1);
         }
     };
-    let allowed_identity_files = allowed_identity_file_candidates();
-    allowed.extend(load_allowed_identity_files(&allowed_identity_files));
+    let allowed_identity_files = allowed_identity_file().into_iter().collect();
 
     let cfg = RnshListenerConfig {
         identity,
@@ -182,15 +183,23 @@ async fn run_listener(args: Args) -> ExitCode {
         announce_period: args.announce,
     };
 
-    match run_rnsh_listener_with_shutdown(handle.transport_tx.clone(), cfg, handle.shutdown.clone())
-        .await
-    {
+    let result = run_rnsh_listener_with_shutdown(handle.transport_tx.clone(), cfg, shutdown).await;
+    stop_reticulum(&handle, &runtime_shutdown).await;
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("rnsh-rs: {e}");
             ExitCode::from(error_exit_code(&e))
         }
     }
+}
+
+async fn stop_reticulum(
+    handle: &rns_runtime::reticulum::ReticulumHandle,
+    runtime_shutdown: &ShutdownSignal,
+) {
+    runtime_shutdown.trigger();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle.shutdown_and_wait()).await;
 }
 
 async fn run_initiator(args: Args) -> ExitCode {
@@ -207,7 +216,9 @@ async fn run_initiator(args: Args) -> ExitCode {
         }
     };
 
-    let handle = match start_reticulum(args.config.as_deref(), shutdown.clone()).await {
+    // The runtime stops only after the session has torn its link down.
+    let runtime_shutdown = ShutdownSignal::new();
+    let handle = match start_reticulum(args.config.as_deref(), runtime_shutdown.clone()).await {
         Ok(handle) => handle,
         Err(e) => {
             eprintln!("rnsh-rs: failed to start reticulum: {e}");
@@ -228,17 +239,31 @@ async fn run_initiator(args: Args) -> ExitCode {
     let pipe_stdout = !std::io::stdout().is_terminal();
     let pipe_stderr = !std::io::stderr().is_terminal();
     let (rows, cols, hpix, vpix) = terminal_window_size();
+    let tcflags = terminal_tcflags();
     let _terminal_mode = if pipe_stdin {
         None
     } else {
         enter_raw_stdin_mode()
     };
-    let stdin_rx = Some(spawn_stdin_reader());
     let (stdout_tx, stdout_writer) = spawn_output_writer(false);
     let (stderr_tx, stderr_writer) = spawn_output_writer(true);
+    let (escape_tx, mut escape_rx) = mpsc::channel::<()>(1);
+    let stdin_rx = Some(spawn_stdin_reader(
+        (!pipe_stdin).then(|| (escape_tx, stdout_tx.downgrade())),
+    ));
+    let (terminate_tx, terminate_rx) = tokio::sync::oneshot::channel::<()>();
+    let terminate_signal = shutdown.clone();
+    let terminate_task = tokio::spawn(async move {
+        tokio::select! {
+            _ = terminate_signal.wait() => {}
+            Some(()) = escape_rx.recv() => {}
+        }
+        let _ = terminate_tx.send(());
+    });
     let window_rx = spawn_window_size_watcher();
 
-    let timeout = Duration::from_secs_f64(args.timeout.unwrap_or(15.0).max(1.0));
+    // Upstream defaults to RNS.Transport.PATH_REQUEST_TIMEOUT.
+    let timeout = Duration::from_secs_f64(args.timeout.unwrap_or(15.0).max(0.0));
     let cfg = RnshClientConfig {
         identity,
         destination_hash: destination,
@@ -258,9 +283,14 @@ async fn run_initiator(args: Args) -> ExitCode {
         cols,
         hpix,
         vpix,
+        tcflags,
+        terminate_rx: Some(terminate_rx),
     };
 
-    match rnsh_client_execute(handle.transport_tx.clone(), cfg).await {
+    let result = rnsh_client_execute(handle.transport_tx.clone(), cfg).await;
+    terminate_task.abort();
+    stop_reticulum(&handle, &runtime_shutdown).await;
+    match result {
         Ok(outcome) => {
             if let Err(e) = finish_output_writers(stdout_writer, stderr_writer).await {
                 eprintln!("rnsh-rs: {e}");
@@ -268,9 +298,18 @@ async fn run_initiator(args: Args) -> ExitCode {
             }
             ExitCode::from(remote_exit_code(outcome.return_code, args.mirror))
         }
+        Err(RnshError::Terminated) => {
+            let _ = finish_output_writers(stdout_writer, stderr_writer).await;
+            // Upstream's initiator loop ends with return 0 after `~.` or SIGINT.
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             let _ = finish_output_writers(stdout_writer, stderr_writer).await;
-            eprintln!("rnsh-rs: {e}");
+            if matches!(e, RnshError::ProtocolError) {
+                println!("{e}");
+            } else {
+                eprintln!("rnsh-rs: {e}");
+            }
             ExitCode::from(error_exit_code(&e))
         }
     }
@@ -338,11 +377,17 @@ fn enter_raw_stdin_mode() -> Option<()> {
     None
 }
 
-fn spawn_stdin_reader() -> mpsc::Receiver<Vec<u8>> {
+/// Read local stdin on a thread. With `escape` (a TTY), input passes through
+/// the rnsh escape filter: local echo goes to the stdout writer and `~.`
+/// signals the escape sender.
+fn spawn_stdin_reader(
+    escape: Option<(mpsc::Sender<()>, mpsc::WeakSender<Vec<u8>>)>,
+) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel(16);
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 1024];
+        let mut buf = [0u8; 4096];
+        let mut filter = EscapeFilter::default();
         loop {
             match stdin.read(&mut buf) {
                 Ok(0) => {
@@ -350,7 +395,22 @@ fn spawn_stdin_reader() -> mpsc::Receiver<Vec<u8>> {
                     break;
                 }
                 Ok(n) => {
-                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                    let data = if let Some((escape_tx, echo_tx)) = escape.as_ref() {
+                        let out = filter.process(&buf[..n]);
+                        // Weak, so a blocked stdin read never keeps the writer open.
+                        if !out.echo.is_empty()
+                            && let Some(echo_tx) = echo_tx.upgrade()
+                        {
+                            let _ = echo_tx.blocking_send(out.echo);
+                        }
+                        if out.terminate {
+                            let _ = escape_tx.blocking_send(());
+                        }
+                        out.send
+                    } else {
+                        buf[..n].to_vec()
+                    };
+                    if !data.is_empty() && tx.blocking_send(data).is_err() {
                         break;
                     }
                 }
@@ -365,6 +425,119 @@ fn spawn_stdin_reader() -> mpsc::Receiver<Vec<u8>> {
     rx
 }
 
+const ESCAPE_HELP: &str = concat!(
+    "\n\r\n\rSupported rnsh escape sequences:",
+    "\n\r  ~~  Send the escape character by typing it twice",
+    "\n\r  ~.  Terminate session and exit immediately",
+    "\n\r  ~L  Toggle line-interactive mode",
+    "\n\r  ~?  Display this quick reference\n\r",
+    "\n\r(Escape sequences are only recognized immediately after newline)\n\r",
+);
+const LINE_FLUSH_CHARS: &[u8] = &[
+    0x01, 0x03, 0x04, 0x05, 0x0c, 0x11, 0x13, 0x15, 0x19, b'\t', 0x1a, 0x1b,
+];
+
+/// Client escape handling from rnsh/initiator.py: `~` right after CR (or at
+/// session start) begins an escape; `~L` toggles local line editing.
+#[derive(Debug)]
+struct EscapeFilter {
+    pre_esc: bool,
+    esc: bool,
+    line_mode: bool,
+    line_flush: bool,
+    blind_write_count: i64,
+    line_buffer: Vec<u8>,
+}
+
+impl Default for EscapeFilter {
+    fn default() -> Self {
+        Self {
+            pre_esc: true,
+            esc: false,
+            line_mode: false,
+            line_flush: false,
+            blind_write_count: 0,
+            line_buffer: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct EscapeOutput {
+    /// Bytes to send to the remote stdin.
+    send: Vec<u8>,
+    /// Bytes to write to the local terminal.
+    echo: Vec<u8>,
+    terminate: bool,
+}
+
+impl EscapeFilter {
+    fn process(&mut self, input: &[u8]) -> EscapeOutput {
+        let mut out = EscapeOutput::default();
+        let mut data = Vec::new();
+        for &b in input {
+            if b == b'\r' {
+                self.pre_esc = true;
+                self.line_flush = true;
+                data.push(b);
+            } else if self.line_mode && LINE_FLUSH_CHARS.contains(&b) {
+                self.pre_esc = false;
+                self.line_flush = true;
+                data.push(b);
+            } else if self.line_mode && (b == 0x08 || b == 0x7f) {
+                self.pre_esc = false;
+                if self.line_buffer.pop().is_some() {
+                    self.blind_write_count -= 1;
+                    out.echo.extend_from_slice(b"\x08 \x08");
+                }
+            } else if self.pre_esc && b == b'~' {
+                self.pre_esc = false;
+                self.esc = true;
+            } else if self.esc {
+                match b {
+                    b'?' => out.echo.extend_from_slice(ESCAPE_HELP.as_bytes()),
+                    b'.' => out.terminate = true,
+                    b'L' => {
+                        self.line_mode = !self.line_mode;
+                        out.echo.extend_from_slice(if self.line_mode {
+                            b"\n\rLine-interactive mode enabled\n\r".as_slice()
+                        } else {
+                            b"\n\rLine-interactive mode disabled\n\r".as_slice()
+                        });
+                    }
+                    b'~' => data.push(b'~'),
+                    other => {
+                        data.push(b'~');
+                        data.push(other);
+                    }
+                }
+                self.esc = false;
+            } else {
+                self.pre_esc = false;
+                data.push(b);
+            }
+        }
+
+        if !self.line_mode {
+            out.send = data;
+        } else {
+            self.line_buffer.extend_from_slice(&data);
+            if self.line_flush {
+                out.send = std::mem::take(&mut self.line_buffer);
+                for _ in 0..self.blind_write_count.max(0) {
+                    out.echo.extend_from_slice(b"\x08 \x08");
+                }
+                self.line_flush = false;
+                self.blind_write_count = 0;
+            } else {
+                self.blind_write_count += data.len() as i64;
+                out.echo.extend_from_slice(&data);
+            }
+        }
+        out
+    }
+}
+
 fn spawn_output_writer(
     stderr: bool,
 ) -> (
@@ -372,29 +545,23 @@ fn spawn_output_writer(
     tokio::task::JoinHandle<Result<(), String>>,
 ) {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    // Lock per chunk: tracing also writes to stderr and must never wait on this task.
     let task = tokio::task::spawn_blocking(move || {
-        if stderr {
-            let stderr = std::io::stderr();
-            let mut handle = stderr.lock();
-            while let Some(chunk) = rx.blocking_recv() {
-                handle
-                    .write_all(&chunk)
-                    .map_err(|e| format!("could not write stderr: {e}"))?;
-                handle
-                    .flush()
-                    .map_err(|e| format!("could not flush stderr: {e}"))?;
-            }
-        } else {
-            let stdout = std::io::stdout();
-            let mut handle = stdout.lock();
-            while let Some(chunk) = rx.blocking_recv() {
-                handle
-                    .write_all(&chunk)
-                    .map_err(|e| format!("could not write stdout: {e}"))?;
-                handle
-                    .flush()
-                    .map_err(|e| format!("could not flush stdout: {e}"))?;
-            }
+        while let Some(chunk) = rx.blocking_recv() {
+            let (name, result) = if stderr {
+                let mut handle = std::io::stderr().lock();
+                (
+                    "stderr",
+                    handle.write_all(&chunk).and_then(|()| handle.flush()),
+                )
+            } else {
+                let mut handle = std::io::stdout().lock();
+                (
+                    "stdout",
+                    handle.write_all(&chunk).and_then(|()| handle.flush()),
+                )
+            };
+            result.map_err(|e| format!("could not write {name}: {e}"))?;
         }
         Ok(())
     });
@@ -421,17 +588,10 @@ fn spawn_window_size_watcher() -> Option<mpsc::Receiver<RnshWindowSize>> {
             return;
         };
         while sigwinch.recv().await.is_some() {
-            let (rows, cols, hpix, vpix) = terminal_window_size();
-            if tx
-                .send(RnshWindowSize {
-                    rows,
-                    cols,
-                    hpix,
-                    vpix,
-                })
-                .await
-                .is_err()
-            {
+            let Some(window) = stdin_window_size() else {
+                continue;
+            };
+            if tx.send(window).await.is_err() {
                 break;
             }
         }
@@ -441,6 +601,69 @@ fn spawn_window_size_watcher() -> Option<mpsc::Receiver<RnshWindowSize>> {
 
 #[cfg(not(unix))]
 fn spawn_window_size_watcher() -> Option<mpsc::Receiver<RnshWindowSize>> {
+    None
+}
+
+/// `tty_get_winsize(0)`, used for window-change updates.
+#[cfg(unix)]
+fn stdin_window_size() -> Option<RnshWindowSize> {
+    let mut winsize = nix::libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe { nix::libc::ioctl(0, nix::libc::TIOCGWINSZ, &mut winsize) };
+    (rc == 0).then_some(RnshWindowSize {
+        rows: Some(u32::from(winsize.ws_row)),
+        cols: Some(u32::from(winsize.ws_col)),
+        hpix: Some(u32::from(winsize.ws_xpixel)),
+        vpix: Some(u32::from(winsize.ws_ypixel)),
+    })
+}
+
+/// `termios.tcgetattr` of the first TTY among fds 0, 1 and 2, in Python's list
+/// form `[iflag, oflag, cflag, lflag, ispeed, ospeed, cc]`.
+#[cfg(unix)]
+fn terminal_tcflags() -> Option<rmpv::Value> {
+    use rmpv::Value;
+    for fd in [0, 1, 2] {
+        let mut attrs = std::mem::MaybeUninit::<nix::libc::termios>::uninit();
+        if unsafe { nix::libc::tcgetattr(fd, attrs.as_mut_ptr()) } == -1 {
+            continue;
+        }
+        let attrs = unsafe { attrs.assume_init() };
+        let canonical = attrs.c_lflag & nix::libc::ICANON != 0;
+        let cc = attrs
+            .c_cc
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                // Python returns VMIN/VTIME as ints in non-canonical mode.
+                if !canonical && (index == nix::libc::VMIN || index == nix::libc::VTIME) {
+                    Value::from(value)
+                } else {
+                    Value::Binary(vec![value])
+                }
+            })
+            .collect();
+        let ispeed = unsafe { nix::libc::cfgetispeed(&attrs) };
+        let ospeed = unsafe { nix::libc::cfgetospeed(&attrs) };
+        return Some(Value::Array(vec![
+            Value::from(attrs.c_iflag),
+            Value::from(attrs.c_oflag),
+            Value::from(attrs.c_cflag),
+            Value::from(attrs.c_lflag),
+            Value::from(ispeed),
+            Value::from(ospeed),
+            Value::Array(cc),
+        ]));
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn terminal_tcflags() -> Option<rmpv::Value> {
     None
 }
 
@@ -479,6 +702,7 @@ fn error_exit_code(error: &RnshError) -> u8 {
     match error {
         RnshError::PathTimeout | RnshError::NoIdentity | RnshError::Timeout(_) => 1,
         RnshError::Remote(_) => 255,
+        RnshError::ProtocolError => 254,
         _ => 1,
     }
 }
@@ -566,6 +790,7 @@ fn local_process_mode(pipe_stdin: bool, pipe_stdout: bool, pipe_stderr: bool) ->
     }
 }
 
+#[cfg(windows)]
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
@@ -577,9 +802,42 @@ fn default_shell_command() -> Vec<String> {
         .unwrap_or_else(|| "cmd.exe".to_string());
 
     #[cfg(not(windows))]
-    let shell = env_nonempty("SHELL").unwrap_or_else(|| "/bin/sh".to_string());
+    let shell = passwd_shell().unwrap_or_else(|| "/bin/sh".to_string());
 
     vec![shell]
+}
+
+/// Login shell of the current user, as `pwd.getpwuid(os.getuid()).pw_shell`.
+#[cfg(unix)]
+fn passwd_shell() -> Option<String> {
+    let mut pwd = std::mem::MaybeUninit::<nix::libc::passwd>::uninit();
+    let mut result: *mut nix::libc::passwd = std::ptr::null_mut();
+    let mut buf = vec![0 as nix::libc::c_char; 16384];
+    let rc = unsafe {
+        nix::libc::getpwuid_r(
+            nix::libc::getuid(),
+            pwd.as_mut_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+    let shell = unsafe { (*result).pw_shell };
+    if shell.is_null() {
+        return None;
+    }
+    let shell = unsafe { std::ffi::CStr::from_ptr(shell) }
+        .to_string_lossy()
+        .into_owned();
+    (!shell.is_empty()).then_some(shell)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn passwd_shell() -> Option<String> {
+    None
 }
 
 fn listener_default_command(command: &[String]) -> Vec<String> {
@@ -650,7 +908,7 @@ impl ListenerAuth {
 }
 
 fn parse_identity_hash(input: &str) -> Result<[u8; 16], String> {
-    let trimmed = input.trim();
+    let trimmed = input;
     if trimmed.len() != IDENTITY_HASH_HEX_LEN {
         return Err(format!(
             "identity hash must be {IDENTITY_HASH_HEX_LEN} hexadecimal characters"
@@ -679,28 +937,17 @@ fn parse_allowed_identities(values: &[String]) -> Result<Vec<[u8; 16]>, String> 
         .collect()
 }
 
-fn allowed_identity_file_candidates() -> Vec<PathBuf> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return Vec::new();
-    };
-    vec![
-        home.join(".config/rnsh/allowed_identities"),
-        home.join(".rnsh/allowed_identities"),
-    ]
-}
-
-fn load_allowed_identity_files(candidates: &[PathBuf]) -> Vec<[u8; 16]> {
-    let Some(path) = candidates.iter().find(|path| path.is_file()) else {
-        return Vec::new();
-    };
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    content
-        .replace('\r', "")
-        .lines()
-        .filter_map(|line| parse_hash16(line.trim()))
-        .collect()
+/// `<configdir>/allowed_identities`, used only when it is a file at startup
+/// (rnsh.py). The listener rereads it for every new link.
+fn allowed_identity_file() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let config_dir = rnsh_config_dir(
+        &home,
+        home.join(".config/rnsh").is_dir(),
+        home.join(".rnsh").is_dir(),
+    );
+    let path = config_dir.join("allowed_identities");
+    path.is_file().then_some(path)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -771,7 +1018,7 @@ fn remote_exit_code(return_code: i64, mirror: bool) -> u8 {
     }
 }
 
-fn _rnsh_config_dir(home: &Path, dot_config_exists: bool, _dot_rnsh_exists: bool) -> PathBuf {
+fn rnsh_config_dir(home: &Path, dot_config_exists: bool, _dot_rnsh_exists: bool) -> PathBuf {
     if dot_config_exists {
         home.join(".config/rnsh")
     } else {
@@ -1017,5 +1264,50 @@ mod tests {
         assert_eq!(remote_exit_code(7, true), 7);
         assert_eq!(remote_exit_code(300, true), 255);
         assert_eq!(remote_exit_code(-1, true), 0);
+    }
+
+    #[test]
+    fn escape_after_cr_terminates_or_shows_help() {
+        let mut filter = EscapeFilter::default();
+        let out = filter.process(b"ls\r~?");
+        assert_eq!(out.send, b"ls\r");
+        assert_eq!(out.echo, ESCAPE_HELP.as_bytes());
+        assert!(!out.terminate);
+        let out = filter.process(b"\r~.");
+        assert_eq!(out.send, b"\r");
+        assert!(out.terminate);
+    }
+
+    #[test]
+    fn escape_is_recognised_at_session_start_only_after_cr() {
+        let mut filter = EscapeFilter::default();
+        assert!(filter.process(b"~.").terminate);
+        let mut filter = EscapeFilter::default();
+        let out = filter.process(b"a~.");
+        assert_eq!(out.send, b"a~.");
+        assert!(!out.terminate);
+    }
+
+    #[test]
+    fn double_tilde_sends_one_and_unknown_escape_passes_through() {
+        let mut filter = EscapeFilter::default();
+        assert_eq!(filter.process(b"~~").send, b"~");
+        let mut filter = EscapeFilter::default();
+        assert_eq!(filter.process(b"~x").send, b"~x");
+    }
+
+    #[test]
+    fn line_mode_buffers_until_flush_with_local_editing() {
+        let mut filter = EscapeFilter::default();
+        let out = filter.process(b"~L");
+        assert_eq!(out.echo, b"\n\rLine-interactive mode enabled\n\r");
+        let out = filter.process(b"ab");
+        assert!(out.send.is_empty());
+        assert_eq!(out.echo, b"ab");
+        let out = filter.process(b"\x7f");
+        assert_eq!(out.echo, b"\x08 \x08");
+        let out = filter.process(b"c\r");
+        assert_eq!(out.send, b"ac\r");
+        assert_eq!(out.echo, b"\x08 \x08");
     }
 }

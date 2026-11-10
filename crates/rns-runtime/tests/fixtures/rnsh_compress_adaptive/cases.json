@@ -1,0 +1,11 @@
+{"meta": {"generator": "crates/rns-runtime/tests/fixtures/rnsh_compress_adaptive/generate.py", "upstream": "RNS 1.6.0", "commit": "cb1260891d1b6da8f6e9b21542c4f0cc0725cac4", "channel_mdu": 425},
+ "cases": [
+  {"name": "lcg_20", "rule": "at most 32 bytes: never compressed", "expect": [20, false, 20]},
+  {"name": "lcg_33", "rule": "incompressible, under max_data_len: sent whole", "expect": [33, false, 33]},
+  {"name": "lcg_1000", "rule": "incompressible: raw chunk capped at max_data_len", "expect": [423, false, 423]},
+  {"name": "lcg_20000", "rule": "over MAX_CHUNK_LEN and incompressible", "expect": [423, false, 423]},
+  {"name": "a_33", "rule": "compressible but bz2 output not shorter than the segment", "expect": [33, false, 33]},
+  {"name": "a_20000", "rule": "compressible: segment capped at MAX_CHUNK_LEN", "expect": [16384, true, 46]},
+  {"name": "a600_lcg600", "rule": "first try too large, half segment compresses", "expect": [600, true, 44]},
+  {"name": "lcg600_a600", "rule": "no try fits: raw fallback", "expect": [423, false, 423]}
+]}

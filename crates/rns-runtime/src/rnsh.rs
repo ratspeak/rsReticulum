@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use rns_crypto::ed25519::Ed25519PublicKey;
 use rns_identity::destination::{DestType, Destination, Direction};
 use rns_identity::identity::Identity;
-use rns_link::link::{CloseReason, Link};
+use rns_link::link::{CloseReason, Link, LinkAction};
 use rns_protocol::buffer::{MAX_CHUNK_LEN, StreamWriter};
 use rns_protocol::channel::{ChannelError, LinkChannel};
 use rns_protocol::channel_message::MessageBase;
@@ -45,11 +45,28 @@ use crate::link_manager::{
 pub const RNSH_APP_NAME: &str = "rnsh";
 pub const RNSH_SOFTWARE_VERSION: &str = "0.3.0";
 const CHANNEL_SEND_RETRY: Duration = Duration::from_millis(20);
-const CLIENT_PRE_EOF_DRAIN_MIN: Duration = Duration::from_secs(3);
-const CLIENT_PRE_EOF_DRAIN_MAX: Duration = Duration::from_secs(3);
-const CLIENT_PRE_EOF_DRAIN_POLL: Duration = Duration::from_millis(25);
 const SIGTERM_NUM: i32 = 15;
 const SIGKILL_NUM: i32 = 9;
+const SIGHUP_NUM: i32 = 1;
+/// `StreamDataMessage.HEADER_LEN` in RNS.Buffer.
+const STREAM_HEADER_LEN: usize = 2;
+/// Process output read size (`tty_read` reads 4096 bytes in rnsh/process.py).
+const PROCESS_READ_LEN: usize = 4096;
+/// Session prune delay floor: `max(rtt*3, PROCESS_PIPE_TIME+5)` in rnsh/session.py.
+const LISTENER_PRUNE_DELAY: Duration = Duration::from_secs(6);
+/// Post-CommandExited check floor: `max(rtt*5, 10)` in rnsh/session.py.
+const COMMAND_EXITED_TIMEOUT: Duration = Duration::from_secs(10);
+/// Grace between "Shutting down" and link teardown in rnsh/listener.py.
+const LISTENER_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+/// Version reply floor: `max(rtt*20, 5)` in rnsh/initiator.py.
+const CLIENT_VERSION_TIMEOUT_MIN: Duration = Duration::from_secs(5);
+const CLIENT_VERSION_TIMEOUT_RTT_FACTOR: f64 = 20.0;
+/// Window-size updates are rate limited to one per `rtt*25` in rnsh/initiator.py.
+const CLIENT_WINCH_RTT_FACTOR: f64 = 25.0;
+/// Hold piped-stdin EOF until the remote exits or this long has passed. A
+/// Python listener kills the child 50 ms after EOF and can then lose its exit
+/// status (rnsh/process.py ECHILD race), so a prompt EOF can hang the session.
+const CLIENT_PRE_EOF_DRAIN: Duration = Duration::from_secs(3);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RnshError {
@@ -82,6 +99,10 @@ pub enum RnshError {
     /// The listener answered the version exchange with an error message.
     #[error("remote error: {0}")]
     Denied(String),
+    #[error("Protocol error")]
+    ProtocolError,
+    #[error("session terminated locally")]
+    Terminated,
 }
 
 impl From<ChannelError> for RnshError {
@@ -99,7 +120,7 @@ impl From<ChannelError> for RnshError {
 /// channel close means EOF. Without it, `stdin_data` is sent only with
 /// `pipe_stdin`. Drain supplied output channels: they apply backpressure, and
 /// all received stdout/stderr bytes are also retained in the returned outcome.
-/// `timeout` is a protocol deadline, not a bound on every channel/transport wait.
+/// `timeout` bounds the path wait and the link establishment wait, each in full.
 pub struct RnshClientConfig {
     pub identity: Identity,
     pub destination_hash: [u8; 16],
@@ -119,6 +140,10 @@ pub struct RnshClientConfig {
     pub cols: Option<u32>,
     pub hpix: Option<u32>,
     pub vpix: Option<u32>,
+    /// Terminal attributes in `termios.tcgetattr` list form, sent in ExecuteCommand.
+    pub tcflags: Option<rmpv::Value>,
+    /// Resolving (or dropping the sender) ends the session and tears the link down.
+    pub terminate_rx: Option<oneshot::Receiver<()>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,9 +163,10 @@ pub struct RnshClientOutcome {
 
 /// Command and admission policy for a remote shell listener. With `allow_all`
 /// false, a session must identify with a hash in `allowed` or in an identity
-/// file before commands are accepted. Identity files are reread on identification;
-/// each valid line is a 32-character hex hash. Unreadable files and invalid lines
-/// are ignored. `allow_all` also admits unidentified sessions.
+/// file before commands are accepted. Identity files are reread for every new
+/// link and replace the previous file entries; a valid line is exactly 32 hex
+/// characters. Unreadable files and invalid lines are ignored. `allow_all` also
+/// admits unidentified sessions.
 ///
 /// `command` contains the executable and arguments; no implicit shell is used.
 /// `allow_remote_command` permits a client-supplied argument vector to replace
@@ -233,58 +259,46 @@ async fn run_rnsh_listener_inner(
     let mut announce_interval = cfg
         .announce_period
         .filter(|period| *period > 0)
-        .map(|period| tokio::time::interval(Duration::from_secs(period.max(1))));
+        .map(|period| {
+            let period = Duration::from_secs(period);
+            tokio::time::interval_at(tokio::time::Instant::now() + period, period)
+        });
 
+    let (exited_tx, mut exited_rx) = mpsc::unbounded_channel::<[u8; 16]>();
     let mut sessions: HashMap<[u8; 16], ListenerSession> = HashMap::new();
+    let mut file_allowed = read_allowed_identity_files(&cfg.allowed_identity_files);
 
     loop {
         tokio::select! {
             maybe_link = established_rx.recv() => {
                 let Some(link_id) = maybe_link else { break };
+                file_allowed = read_allowed_identity_files(&cfg.allowed_identity_files);
                 // or_insert (not insert) so a rare identification processed ahead
                 // of this establishment event is never clobbered.
                 sessions.entry(link_id).or_insert_with(|| ListenerSession::new(cfg.allow_all));
             }
             maybe_identified = identified_rx.recv() => {
                 let Some((link_id, identity_hash)) = maybe_identified else { break };
-                let allowed = listener_allowed_identities(&cfg);
-                if cfg.allow_all || allowed.contains(&identity_hash) {
-                    // Identification is a legitimate session creator (it may race
-                    // ahead of the establishment event), so create-or-get here.
-                    let session = sessions
-                        .entry(link_id)
-                        .or_insert_with(|| ListenerSession::new(cfg.allow_all));
-                    // First-identification-wins: only a freshly-established
-                    // (WaitIdent) authenticated session may be authorized and
-                    // advanced — a repeat identification cannot regress a session
-                    // that has already moved on.
-                    if session.state == ListenerState::WaitIdent {
-                        session.authorized = true;
-                        session.remote_identity_hash = Some(identity_hash);
-                        session.state = ListenerState::WaitVersion;
-                    } else if cfg.allow_all && session.remote_identity_hash.is_none() {
-                        // allow_all sessions start authorized in WaitVersion;
-                        // record the first identity without regressing state.
-                        session.remote_identity_hash = Some(identity_hash);
-                    }
+                // Identification may race ahead of the establishment event.
+                let session = sessions
+                    .entry(link_id)
+                    .or_insert_with(|| ListenerSession::new(cfg.allow_all));
+                if session.state == ListenerState::Closed {
+                    continue;
+                }
+                if !matches!(session.state, ListenerState::WaitIdent | ListenerState::WaitVersion) {
+                    terminate_session(&command_tx, link_id, session, Some("Protocol error (LSSTATE_WAIT_IDENT)")).await;
+                } else if cfg.allow_all
+                    || cfg.allowed.contains(&identity_hash)
+                    || file_allowed.contains(&identity_hash)
+                {
+                    session.authorized = true;
+                    session.remote_identity_hash = Some(identity_hash);
+                    session.state = ListenerState::WaitVersion;
                 } else {
-                    // Denial is terminal: mark the session Closed so a message that
-                    // lands before CloseLink completes cannot resurrect it.
-                    let session = sessions
-                        .entry(link_id)
-                        .or_insert_with(|| ListenerSession::new(cfg.allow_all));
                     session.authorized = false;
-                    session.state = ListenerState::Closed;
-                    send_manager_message(
-                        &command_tx,
-                        link_id,
-                        ErrorMessage::new(Some("Identity is not allowed.".into()), true, None),
-                    ).await?;
-                    // Keep the already-closed session around just long enough
-                    // for the peer to receive the protocol-level denial. The
-                    // channel-message gate drops every subsequent message, so
-                    // this grace period cannot advance or run the session.
-                    close_link_after_error(command_tx.clone(), link_id);
+                    terminate_session(&command_tx, link_id, session, Some("Identity not allowed")).await;
+                    tracing::info!(identity = %hex::encode(identity_hash), "rnsh identity not allowed");
                 }
             }
             maybe_closed = closed_rx.recv() => {
@@ -293,12 +307,33 @@ async fn run_rnsh_listener_inner(
             }
             maybe_msg = channel_rx.recv() => {
                 let Some(msg) = maybe_msg else { break };
-                handle_listener_channel_message(
+                let link_id = msg.link_id;
+                match handle_listener_channel_message(
                     &command_tx,
                     &cfg,
                     &mut sessions,
                     msg,
-                ).await?;
+                    &exited_tx,
+                ).await {
+                    Ok(()) => {}
+                    Err(RnshError::TransportUnavailable) => return Err(RnshError::TransportUnavailable),
+                    Err(error) => {
+                        tracing::warn!(link_id = %hex::encode(link_id), %error, "rnsh session message handling failed");
+                    }
+                }
+            }
+            Some(link_id) = exited_rx.recv() => {
+                if let Some(session) = sessions.get_mut(&link_id)
+                    && session.state == ListenerState::Running
+                {
+                    terminate_session(
+                        &command_tx,
+                        link_id,
+                        session,
+                        Some("Protocol timeout error: CommandExitedMessage"),
+                    )
+                    .await;
+                }
             }
             _ = async {
                 if let Some(interval) = announce_interval.as_mut() {
@@ -316,6 +351,25 @@ async fn run_rnsh_listener_inner(
                     std::future::pending::<()>().await;
                 }
             } => {
+                for (link_id, session) in sessions.iter_mut() {
+                    send_manager_message_once(
+                        &command_tx,
+                        *link_id,
+                        ErrorMessage::new(Some("Shutting down".into()), true, None),
+                    )
+                    .await;
+                    session.close();
+                }
+                tokio::time::sleep(LISTENER_SHUTDOWN_GRACE).await;
+                for link_id in sessions.keys() {
+                    let _ = command_tx
+                        .send(LinkManagerCommand::CloseLink {
+                            link_id: *link_id,
+                            reason: CloseReason::DestinationClosed,
+                            send_teardown: true,
+                        })
+                        .await;
+                }
                 break;
             }
         }
@@ -326,30 +380,46 @@ async fn run_rnsh_listener_inner(
     Ok(())
 }
 
+/// End one listener session as `ListenerSession.terminate` does: report a fatal
+/// error if given, stop the process, and tear the link down after the prune delay.
+async fn terminate_session(
+    command_tx: &mpsc::Sender<LinkManagerCommand>,
+    link_id: [u8; 16],
+    session: &mut ListenerSession,
+    error: Option<&str>,
+) {
+    tracing::debug!(link_id = %hex::encode(link_id), error, "terminating rnsh session");
+    if let Some(error) = error {
+        send_manager_message_once(
+            command_tx,
+            link_id,
+            ErrorMessage::new(Some(error.to_string()), true, None),
+        )
+        .await;
+    }
+    session.close();
+    close_link_after(command_tx.clone(), link_id, LISTENER_PRUNE_DELAY);
+}
+
 /// Open a Link, negotiate rnsh and execute one remote command session. Return
 /// captured stdout/stderr and the remote exit code; a nonzero exit code is still
 /// an `Ok` outcome. Optional output channels receive the same bytes while the
 /// received output is retained in memory.
 ///
-/// The configured timeout applies to protocol waits, but some transport and
-/// output-channel operations are awaited without it. Use an outer deadline
-/// when the entire call needs a time bound. An error or cancellation is not an
-/// acknowledgment that the remote process has stopped.
+/// As in upstream rnsh, `timeout` bounds the path wait and the link
+/// establishment wait separately; the version exchange waits `max(rtt*20, 5 s)`
+/// and the running session has no deadline. Once the link is established, every
+/// exit path tears it down. An error or cancellation is not an acknowledgment
+/// that the remote process has stopped.
 pub async fn rnsh_client_execute(
     transport_tx: mpsc::Sender<TransportMessage>,
     mut cfg: RnshClientConfig,
 ) -> Result<RnshClientOutcome, RnshError> {
-    let started = Instant::now();
-    let deadline = started + cfg.timeout;
     let destination_hash = cfg.destination_hash;
 
-    let pubkey = discover_pubkey(
-        &transport_tx,
-        destination_hash,
-        remaining(deadline).min(cfg.timeout),
-    )
-    .await?;
+    let pubkey = discover_pubkey(&transport_tx, destination_hash, cfg.timeout).await?;
 
+    let link_deadline = Some(Instant::now() + cfg.timeout);
     let (mut link, request_data) = Link::new_initiator(destination_hash, 1);
     let link_id = link.link_id;
     let (lpkt_tx, mut lpkt_rx) = mpsc::channel::<DestinationEvent>(256);
@@ -369,7 +439,7 @@ pub async fn rnsh_client_execute(
 
     let link_req_pkt = build_link_request_packet(destination_hash, &request_data);
     tokio::time::timeout(
-        remaining(deadline),
+        remaining(link_deadline),
         rns_transport::link_messages::dispatch_link_request(
             &transport_tx,
             OutboundRequest {
@@ -391,7 +461,7 @@ pub async fn rnsh_client_execute(
         &mut link,
         &verify_key,
         &identity_ed25519_pub,
-        deadline,
+        link_deadline,
     )
     .await?;
     let attached_interface = proof.interface_id;
@@ -413,123 +483,9 @@ pub async fn rnsh_client_execute(
         lifecycle_rx: &mut endpoint_lifecycle_rx,
         packet_rx: &mut lpkt_rx,
     };
-    let rtt_pkt = build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data);
-    send_client_endpoint_packet(&transport_tx, link_id, rtt_pkt).await?;
 
-    let signing_key = cfg
-        .identity
-        .get_signing_key()
-        .ok_or(RnshError::NoSigningKey)?;
-    if !cfg.no_id {
-        let identify_delay = (link.rtt_secs() * 1.1 + 0.05).min(1.0);
-        let post_identify_delay = identify_delay.clamp(0.25, 1.0);
-        tokio::time::sleep(Duration::from_secs_f64(post_identify_delay)).await;
-        let identify_data = link
-            .identify(&cfg.identity.get_public_key(), &signing_key)
-            .map_err(|e| RnshError::LinkCrypto(format!("identify: {e:?}")))?;
-        let identify_pkt = build_data_packet(
-            link_id,
-            rns_wire::context::PacketContext::LinkIdentify,
-            &identify_data,
-        );
-        send_client_endpoint_packet(&transport_tx, link_id, identify_pkt).await?;
-        tokio::time::sleep(Duration::from_secs_f64(post_identify_delay)).await;
-    }
-
-    let session_keys = link
-        .session_keys()
-        .ok_or_else(|| RnshError::LinkCrypto("no session keys".into()))?;
-    let mut channel =
-        LinkChannel::new_encrypted_with_mdu(link_id, link.rtt_secs(), link.mdu, session_keys);
-    register_rnsh_message_types(&mut channel)?;
-    link.mark_channel_created();
-    let mut pending_messages = VecDeque::new();
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-
-    send_client_message_when_ready(
-        &transport_tx,
-        &mut endpoint,
-        &mut link,
-        &mut channel,
-        &mut pending_messages,
-        VersionInfoMessage::new(RNSH_SOFTWARE_VERSION),
-        deadline,
-    )
-    .await?;
-
-    loop {
-        if let Some(message) = pop_or_receive_client_message(
-            &transport_tx,
-            &mut endpoint,
-            &mut link,
-            &mut channel,
-            &mut pending_messages,
-            deadline,
-        )
-        .await?
-        {
-            match message {
-                RnshMessage::VersionInfo(version) => {
-                    if version.protocol_version != PROTOCOL_VERSION {
-                        return Err(RnshError::Remote("incompatible rnsh protocol".into()));
-                    }
-                    tokio::time::sleep(Duration::from_millis(75)).await;
-                    break;
-                }
-                RnshMessage::Error(err) => {
-                    return Err(RnshError::Denied(
-                        err.msg.unwrap_or_else(|| "remote error".into()),
-                    ));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let execute = ExecuteCommandMessage::new(
-        Some(cfg.command.clone()),
-        cfg.pipe_stdin,
-        cfg.pipe_stdout,
-        cfg.pipe_stderr,
-        None,
-        cfg.term.clone(),
-        cfg.rows,
-        cfg.cols,
-        cfg.hpix,
-        cfg.vpix,
-    );
-    send_client_message_when_ready(
-        &transport_tx,
-        &mut endpoint,
-        &mut link,
-        &mut channel,
-        &mut pending_messages,
-        execute,
-        deadline,
-    )
-    .await?;
-
-    let return_code = match run_client_io_loop(
-        &transport_tx,
-        &mut endpoint,
-        &mut link,
-        &mut channel,
-        &mut pending_messages,
-        ClientIoState {
-            stdout: &mut stdout,
-            stderr: &mut stderr,
-            cfg: &mut cfg,
-        },
-        deadline,
-    )
-    .await
-    {
-        Ok(return_code) => return_code,
-        Err(error) => {
-            return Err(error);
-        }
-    };
+    let result =
+        run_client_session(&transport_tx, &mut endpoint, &mut link, &mut cfg, &rtt_data).await;
 
     let endpoint_closing = if let Some(close_pkt) = build_link_close(&mut link) {
         crate::link_endpoint::send_and_unbind(
@@ -548,6 +504,140 @@ pub async fn rnsh_client_execute(
     } else {
         registration.disarm();
     }
+
+    result
+}
+
+async fn run_client_session(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    endpoint: &mut ClientLinkEndpoint<'_>,
+    link: &mut Link,
+    cfg: &mut RnshClientConfig,
+    rtt_data: &[u8],
+) -> Result<RnshClientOutcome, RnshError> {
+    let link_id = link.link_id;
+    let rtt_pkt = build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, rtt_data);
+    send_client_endpoint_packet(transport_tx, link_id, rtt_pkt).await?;
+
+    let signing_key = cfg
+        .identity
+        .get_signing_key()
+        .ok_or(RnshError::NoSigningKey)?;
+    if !cfg.no_id {
+        let identify_delay = (link.rtt_secs() * 1.1 + 0.05).min(1.0);
+        let post_identify_delay = identify_delay.clamp(0.25, 1.0);
+        tokio::time::sleep(Duration::from_secs_f64(post_identify_delay)).await;
+        let identify_data = link
+            .identify(&cfg.identity.get_public_key(), &signing_key)
+            .map_err(|e| RnshError::LinkCrypto(format!("identify: {e:?}")))?;
+        let identify_pkt = build_data_packet(
+            link_id,
+            rns_wire::context::PacketContext::LinkIdentify,
+            &identify_data,
+        );
+        send_client_endpoint_packet(transport_tx, link_id, identify_pkt).await?;
+        link.record_tx(identify_data.len());
+        tokio::time::sleep(Duration::from_secs_f64(post_identify_delay)).await;
+    }
+
+    let session_keys = link
+        .session_keys()
+        .ok_or_else(|| RnshError::LinkCrypto("no session keys".into()))?;
+    let mut channel =
+        LinkChannel::new_encrypted_with_mdu(link_id, link.rtt_secs(), link.mdu, session_keys);
+    register_rnsh_message_types(&mut channel)?;
+    link.mark_channel_created();
+    let mut pending_messages = VecDeque::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let version_timeout =
+        Duration::from_secs_f64(link.rtt_secs() * CLIENT_VERSION_TIMEOUT_RTT_FACTOR)
+            .max(CLIENT_VERSION_TIMEOUT_MIN);
+    let version_deadline = Some(Instant::now() + version_timeout);
+    let version_result: Result<(), RnshError> = async {
+        send_client_message_when_ready(
+            transport_tx,
+            endpoint,
+            link,
+            &mut channel,
+            &mut pending_messages,
+            VersionInfoMessage::new(RNSH_SOFTWARE_VERSION),
+            version_deadline,
+        )
+        .await?;
+        loop {
+            if let Some(message) = pop_or_receive_client_message(
+                transport_tx,
+                endpoint,
+                link,
+                &mut channel,
+                &mut pending_messages,
+                version_deadline,
+            )
+            .await?
+            {
+                match message {
+                    RnshMessage::VersionInfo(version) => {
+                        if version.protocol_version != PROTOCOL_VERSION {
+                            return Err(RnshError::Remote("incompatible rnsh protocol".into()));
+                        }
+                        return Ok(());
+                    }
+                    RnshMessage::Error(err) => {
+                        return Err(RnshError::Denied(
+                            err.msg.unwrap_or_else(|| "remote error".into()),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    .await;
+    match version_result {
+        Ok(()) => {}
+        Err(RnshError::Timeout(_)) => return Err(RnshError::ProtocolError),
+        Err(error) => return Err(error),
+    }
+    tokio::time::sleep(Duration::from_millis(75)).await;
+
+    let execute = ExecuteCommandMessage::new(
+        Some(cfg.command.clone()),
+        cfg.pipe_stdin,
+        cfg.pipe_stdout,
+        cfg.pipe_stderr,
+        cfg.tcflags.clone(),
+        cfg.term.clone(),
+        cfg.rows,
+        cfg.cols,
+        cfg.hpix,
+        cfg.vpix,
+    );
+    send_client_message_when_ready(
+        transport_tx,
+        endpoint,
+        link,
+        &mut channel,
+        &mut pending_messages,
+        execute,
+        None,
+    )
+    .await?;
+
+    let return_code = run_client_io_loop(
+        transport_tx,
+        endpoint,
+        link,
+        &mut channel,
+        &mut pending_messages,
+        ClientIoState {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+            cfg,
+        },
+    )
+    .await?;
 
     Ok(RnshClientOutcome {
         stdout,
@@ -602,7 +692,6 @@ async fn run_client_io_loop(
     channel: &mut LinkChannel,
     pending_messages: &mut VecDeque<RnshMessage>,
     io: ClientIoState<'_>,
-    deadline: Instant,
 ) -> Result<i64, RnshError> {
     let ClientIoState {
         stdout,
@@ -611,30 +700,24 @@ async fn run_client_io_loop(
     } = io;
 
     let mut stdin_rx = cfg.stdin_rx.take();
+    let mut stdin_buffer = Vec::new();
+    let mut stdin_eof = false;
     if stdin_rx.is_none() && cfg.pipe_stdin {
-        let (tx, rx) = mpsc::channel(16);
-        let stdin_data = std::mem::take(&mut cfg.stdin_data);
-        tokio::spawn(async move {
-            for chunk in stdin_data.chunks(MAX_CHUNK_LEN) {
-                if tx.send(chunk.to_vec()).await.is_err() {
-                    return;
-                }
-            }
-            let _ = tx.send(Vec::new()).await;
-        });
-        stdin_rx = Some(rx);
+        stdin_buffer = std::mem::take(&mut cfg.stdin_data);
+        stdin_eof = true;
     }
-    let mut stdin_eof_sent = stdin_rx.is_none();
+    let mut stdin_eof_sent = stdin_rx.is_none() && !stdin_eof;
     let stdout_tx = cfg.stdout_tx.take();
     let stderr_tx = cfg.stderr_tx.take();
     let mut window_rx = cfg.window_rx.take();
+    let mut terminate_rx = cfg.terminate_rx.take();
+    let mut pending_window: Option<RnshWindowSize> = None;
+    let mut last_winch = Instant::now();
+    let mut eof_due: Option<Instant> = None;
 
     loop {
         while let Some(message) = pending_messages.pop_front() {
             if let Some(return_code) = handle_client_message(
-                transport_tx,
-                link,
-                channel,
                 ClientMessageOutput {
                     stdout,
                     stderr,
@@ -649,17 +732,79 @@ async fn run_client_io_loop(
             }
         }
 
-        resend_timed_out_client_channel_messages(transport_tx, link, channel).await?;
-        if Instant::now() >= deadline {
-            return Err(RnshError::Timeout("rnsh channel"));
+        service_client_link(transport_tx, link, channel).await?;
+
+        if !stdin_buffer.is_empty() && !pending_has_remote_terminal(pending_messages) {
+            let max_data_len = channel.mdu().saturating_sub(STREAM_HEADER_LEN).max(1);
+            let (compressed, consumed, data) = compress_adaptive(&stdin_buffer, max_data_len);
+            let mut message = RnshStreamDataMessage::new(STREAM_ID_STDIN, data, false);
+            message.compressed = compressed;
+            send_client_message_when_ready(
+                transport_tx,
+                endpoint,
+                link,
+                channel,
+                pending_messages,
+                message,
+                None,
+            )
+            .await?;
+            stdin_buffer.drain(..consumed);
+            continue;
+        }
+        if stdin_eof && !stdin_eof_sent && stdin_buffer.is_empty() && eof_due.is_none() {
+            eof_due = Some(Instant::now() + CLIENT_PRE_EOF_DRAIN);
+        }
+        if !stdin_eof_sent
+            && eof_due.is_some_and(|due| Instant::now() >= due)
+            && !pending_has_remote_terminal(pending_messages)
+        {
+            send_client_message_when_ready(
+                transport_tx,
+                endpoint,
+                link,
+                channel,
+                pending_messages,
+                RnshStreamDataMessage::new(STREAM_ID_STDIN, Vec::new(), true),
+                None,
+            )
+            .await?;
+            stdin_eof_sent = true;
+            continue;
         }
 
-        let retry_wait = channel
+        let winch_interval = Duration::from_secs_f64(link.rtt_secs() * CLIENT_WINCH_RTT_FACTOR);
+        if let Some(window) = pending_window
+            && last_winch.elapsed() > winch_interval
+        {
+            last_winch = Instant::now();
+            pending_window = None;
+            send_client_message_when_ready(
+                transport_tx,
+                endpoint,
+                link,
+                channel,
+                pending_messages,
+                WindowSizeMessage::new(window.rows, window.cols, window.hpix, window.vpix),
+                None,
+            )
+            .await?;
+            continue;
+        }
+
+        let mut wait = channel
             .next_timeout_duration()
-            .unwrap_or_else(|| Duration::from_secs(1))
-            .min(Duration::from_secs(1))
-            .min(remaining(deadline));
-        let deadline_wait = remaining(deadline);
+            .unwrap_or(Duration::from_secs(1))
+            .min(Duration::from_secs(1));
+        if let Some(due) = eof_due.filter(|_| !stdin_eof_sent) {
+            wait =
+                wait.min(due.saturating_duration_since(Instant::now()) + Duration::from_millis(1));
+        }
+        if pending_window.is_some() {
+            let due = (last_winch + winch_interval).saturating_duration_since(Instant::now())
+                + Duration::from_millis(1);
+            wait = wait.min(due);
+        }
 
         tokio::select! {
             maybe_event = endpoint.packet_rx.recv() => {
@@ -681,94 +826,42 @@ async fn run_client_io_loop(
                     "link endpoint terminated: {terminal:?}"
                 )));
             }
-            maybe_chunk = recv_optional_stdin_chunk(&mut stdin_rx), if !stdin_eof_sent => {
-                let mut maybe_chunk = maybe_chunk;
-                let mut stdin_ended = false;
-                // Python rnsh frames from its whole pending stdin buffer, not per read.
-                if let (Some(data), Some(rx)) = (maybe_chunk.as_mut(), stdin_rx.as_mut()) {
-                    while !data.is_empty() && data.len() < MAX_CHUNK_LEN {
-                        match rx.try_recv() {
-                            Ok(more) if !more.is_empty() => data.extend_from_slice(&more),
-                            Ok(_) | Err(mpsc::error::TryRecvError::Disconnected) => {
-                                stdin_ended = true;
-                                break;
-                            }
-                            Err(mpsc::error::TryRecvError::Empty) => break,
-                        }
-                    }
-                }
-                if stdin_ended {
-                    // Replay the end of stdin so the EOF branch runs next.
-                    let (tx, rx) = mpsc::channel(1);
-                    let _ = tx.try_send(Vec::new());
-                    stdin_rx = Some(rx);
-                }
+            maybe_chunk = recv_optional_stdin_chunk(&mut stdin_rx), if !stdin_eof => {
                 match maybe_chunk {
                     Some(data) if !data.is_empty() => {
-                        for frame in stream_frames(STREAM_ID_STDIN, &data, channel.mdu()) {
-                            if pending_has_remote_terminal(pending_messages) {
-                                break;
+                        stdin_buffer.extend_from_slice(&data);
+                        // Fill whole chunks from input that is already queued.
+                        while stdin_buffer.len() < MAX_CHUNK_LEN {
+                            match stdin_rx.as_mut().map(|rx| rx.try_recv()) {
+                                Some(Ok(more)) if !more.is_empty() => stdin_buffer.extend_from_slice(&more),
+                                Some(Ok(_)) | Some(Err(mpsc::error::TryRecvError::Disconnected)) => {
+                                    stdin_eof = true;
+                                    break;
+                                }
+                                _ => break,
                             }
-                            send_client_message_when_ready(
-                                transport_tx,
-                                endpoint,
-                                link,
-                                channel,
-                                pending_messages,
-                                frame,
-                                deadline,
-                            ).await?;
                         }
                     }
-                    Some(_) | None => {
-                        if !pending_has_remote_terminal(pending_messages) {
-                            drain_client_messages_before_stdin_eof(
-                                transport_tx,
-                                endpoint,
-                                link,
-                                channel,
-                                pending_messages,
-                                deadline,
-                            )
-                            .await?;
-                        }
-                        if !pending_has_remote_terminal(pending_messages) {
-                            send_client_message_when_ready(
-                                transport_tx,
-                                endpoint,
-                                link,
-                                channel,
-                                pending_messages,
-                                RnshStreamDataMessage::new(STREAM_ID_STDIN, Vec::new(), true),
-                                deadline,
-                            ).await?;
-                        }
-                        stdin_eof_sent = true;
-                    }
+                    Some(_) | None => stdin_eof = true,
                 }
             }
             maybe_window = recv_optional_window_size(&mut window_rx) => {
                 match maybe_window {
-                    Some(window) => {
-                        send_client_message_when_ready(
-                            transport_tx,
-                            endpoint,
-                            link,
-                            channel,
-                            pending_messages,
-                            WindowSizeMessage::new(window.rows, window.cols, window.hpix, window.vpix),
-                            deadline,
-                        ).await?;
-                    }
-                    None => {
-                        window_rx = None;
-                    }
+                    Some(window) => pending_window = Some(window),
+                    None => window_rx = None,
                 }
             }
-            _ = tokio::time::sleep(retry_wait) => {}
-            _ = tokio::time::sleep(deadline_wait) => {
-                return Err(RnshError::Timeout("rnsh channel"));
+            _ = async {
+                match terminate_rx.as_mut() {
+                    Some(rx) => {
+                        let _ = rx.await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                return Err(RnshError::Terminated);
             }
+            _ = tokio::time::sleep(wait) => {}
         }
     }
 }
@@ -797,9 +890,6 @@ struct ClientMessageOutput<'a> {
 }
 
 async fn handle_client_message(
-    transport_tx: &mpsc::Sender<TransportMessage>,
-    link: &mut Link,
-    channel: &mut LinkChannel,
     output: ClientMessageOutput<'_>,
     message: RnshMessage,
 ) -> Result<Option<i64>, RnshError> {
@@ -840,10 +930,7 @@ async fn handle_client_message(
         RnshMessage::Error(err) => Err(RnshError::Remote(
             err.msg.unwrap_or_else(|| "remote error".into()),
         )),
-        RnshMessage::Noop(_) => {
-            let _ = send_client_channel_message(transport_tx, link, channel, &NoopMessage).await;
-            Ok(None)
-        }
+        // The initiator ignores Noop; only the listener echoes it.
         _ => Ok(None),
     }
 }
@@ -865,6 +952,8 @@ struct ListenerSession {
     stdin: Option<ProcessInput>,
     window: Option<PtyWindowTarget>,
     process_cleanup: Option<ListenerProcessCleanup>,
+    /// Pipe-in/TTY-out sessions echo stdin into the stdout stream.
+    stdin_echo: Option<mpsc::Sender<ProcessOutput>>,
 }
 
 impl ListenerSession {
@@ -880,6 +969,52 @@ impl ListenerSession {
             stdin: None,
             window: None,
             process_cleanup: None,
+            stdin_echo: None,
+        }
+    }
+
+    /// Mark the session terminal and stop its process.
+    fn close(&mut self) {
+        self.state = ListenerState::Closed;
+        self.stdin = None;
+        self.window = None;
+        self.process_cleanup = None;
+        self.stdin_echo = None;
+    }
+
+    async fn receive_stdin(&mut self, data: Vec<u8>, eof: bool) {
+        if !data.is_empty()
+            && let Some(stdin) = self.stdin.as_mut()
+        {
+            match stdin.write_all(&data).await {
+                Ok(()) => {
+                    if let Some(echo) = self.stdin_echo.as_ref()
+                        && data != [0x03]
+                        && data != [0x04]
+                    {
+                        let _ = echo.send(ProcessOutput::Data(STREAM_ID_STDOUT, data)).await;
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "rnsh process stdin closed");
+                    self.stdin = None;
+                }
+            }
+        }
+        if eof {
+            if let Some(stdin) = self.stdin.as_mut()
+                && let Err(error) = stdin.eof().await
+            {
+                tracing::debug!(%error, "rnsh process stdin eof failed");
+                self.stdin = None;
+            }
+            if self
+                .stdin
+                .as_ref()
+                .is_some_and(|stdin| matches!(stdin, ProcessInput::Pipe(_)))
+            {
+                self.stdin.take();
+            }
         }
     }
 }
@@ -956,9 +1091,10 @@ impl PtyWindowTarget {
 }
 
 struct ListenerProcess {
-    stdin: ProcessInput,
+    stdin: Option<ProcessInput>,
     window: Option<PtyWindowTarget>,
     cleanup: ListenerProcessCleanup,
+    stdin_echo: Option<mpsc::Sender<ProcessOutput>>,
 }
 
 struct ListenerProcessCleanup {
@@ -1119,15 +1255,23 @@ async fn handle_listener_channel_message(
     cfg: &RnshListenerConfig,
     sessions: &mut HashMap<[u8; 16], ListenerSession>,
     msg: LinkChannelMessage,
+    exited_tx: &mpsc::UnboundedSender<[u8; 16]>,
 ) -> Result<(), RnshError> {
-    // Sessions are created only on link establishment or on an allowed
-    // identification — a stray channel message must never fabricate one.
-    let Some(session) = sessions.get_mut(&msg.link_id) else {
+    let link_id = msg.link_id;
+    // Sessions are created only on link establishment or identification; a
+    // stray channel message must never fabricate one.
+    let Some(session) = sessions.get_mut(&link_id) else {
         return Ok(());
     };
-
-    // Drop everything on an unauthorized or terminally-closed session.
-    if !session.authorized || session.state == ListenerState::Closed {
+    // Messages are ignored until identification, and dropped once terminated.
+    if matches!(
+        session.state,
+        ListenerState::WaitIdent | ListenerState::Closed
+    ) {
+        return Ok(());
+    }
+    if !session.authorized {
+        terminate_session(command_tx, link_id, session, Some("Invalid state")).await;
         return Ok(());
     }
 
@@ -1135,43 +1279,35 @@ async fn handle_listener_channel_message(
         .map_err(|e| RnshError::Channel(e.to_string()))?;
 
     match session.state {
-        ListenerState::Closed => Ok(()),
-        ListenerState::WaitIdent => Ok(()),
+        ListenerState::WaitIdent | ListenerState::Closed => {}
         ListenerState::WaitVersion => match decoded {
             RnshMessage::VersionInfo(version) => {
                 if version.protocol_version != PROTOCOL_VERSION {
-                    send_manager_message(
-                        command_tx,
-                        msg.link_id,
-                        ErrorMessage::new(Some("Incompatible protocol".into()), true, None),
-                    )
-                    .await?;
-                    return Err(RnshError::Remote("incompatible rnsh protocol".into()));
+                    terminate_session(command_tx, link_id, session, Some("Incompatible protocol"))
+                        .await;
+                    return Ok(());
                 }
                 send_manager_message(
                     command_tx,
-                    msg.link_id,
+                    link_id,
                     VersionInfoMessage::new(RNSH_SOFTWARE_VERSION),
                 )
                 .await?;
                 session.state = ListenerState::WaitCommand;
-                Ok(())
             }
             _ => {
-                send_manager_message(
+                terminate_session(
                     command_tx,
-                    msg.link_id,
-                    ErrorMessage::new(
-                        Some("Protocol error (LSSTATE_WAIT_VERS)".into()),
-                        true,
-                        None,
-                    ),
+                    link_id,
+                    session,
+                    Some("Protocol error (LSSTATE_WAIT_VERS)"),
                 )
-                .await
+                .await;
             }
         },
         ListenerState::WaitCommand => match decoded {
             RnshMessage::ExecuteCommand(execute) => {
+                session.state = ListenerState::Running;
                 let command = match select_listener_command(
                     &cfg.command,
                     execute.cmdline.as_deref(),
@@ -1180,19 +1316,13 @@ async fn handle_listener_channel_message(
                 ) {
                     Ok(command) => command,
                     Err(reason) => {
-                        send_manager_message(
-                            command_tx,
-                            msg.link_id,
-                            ErrorMessage::new(Some(reason), true, None),
-                        )
-                        .await?;
-                        close_link_after_error(command_tx.clone(), msg.link_id);
+                        terminate_session(command_tx, link_id, session, Some(&reason)).await;
                         return Ok(());
                     }
                 };
-                let stdin = match start_listener_process(
+                let process = match start_listener_process(
                     command_tx.clone(),
-                    msg.link_id,
+                    link_id,
                     ListenerProcessRequest {
                         command: &command,
                         pipe_stdin: execute.pipe_stdin,
@@ -1204,83 +1334,68 @@ async fn handle_listener_channel_message(
                         hpix: execute.hpix,
                         vpix: execute.vpix,
                         remote_identity_hash: session.remote_identity_hash,
+                        exited_tx: exited_tx.clone(),
                     },
                 )
                 .await
                 {
-                    Ok(stdin) => stdin,
+                    Ok(process) => process,
                     Err(error) => {
-                        send_manager_message(
+                        tracing::error!(link_id = %hex::encode(link_id), %error, "unable to start rnsh process");
+                        terminate_session(
                             command_tx,
-                            msg.link_id,
-                            ErrorMessage::new(Some(error.to_string()), true, None),
+                            link_id,
+                            session,
+                            Some("Unable to start process"),
                         )
-                        .await?;
-                        close_link_after_error(command_tx.clone(), msg.link_id);
+                        .await;
                         return Ok(());
                     }
                 };
-                session.stdin = Some(stdin.stdin);
-                session.window = stdin.window;
-                session.process_cleanup = Some(stdin.cleanup);
-                session.state = ListenerState::Running;
-                Ok(())
+                session.stdin = process.stdin;
+                session.window = process.window;
+                session.process_cleanup = Some(process.cleanup);
+                session.stdin_echo = process.stdin_echo;
             }
             _ => {
-                send_manager_message(
+                terminate_session(
                     command_tx,
-                    msg.link_id,
-                    ErrorMessage::new(Some("Protocol error (LSSTATE_WAIT_CMD)".into()), true, None),
+                    link_id,
+                    session,
+                    Some("Protocol error (LSSTATE_WAIT_CMD)"),
                 )
-                .await
+                .await;
             }
         },
         ListenerState::Running => match decoded {
             RnshMessage::StreamData(stream) => {
                 if stream.stream_id != STREAM_ID_STDIN {
-                    send_manager_message(
+                    terminate_session(
                         command_tx,
-                        msg.link_id,
-                        ErrorMessage::new(
-                            Some("Protocol error (LSSTATE_RUNNING)".into()),
-                            true,
-                            None,
-                        ),
+                        link_id,
+                        session,
+                        Some("Protocol error (LSSTATE_RUNNING)"),
                     )
-                    .await?;
+                    .await;
                     return Ok(());
                 }
-                if let Some(stdin) = session.stdin.as_mut()
-                    && !stream.data.is_empty()
-                {
-                    stdin.write_all(&stream.data).await?;
-                }
-                if stream.eof {
-                    if let Some(stdin) = session.stdin.as_mut() {
-                        stdin.eof().await?;
-                    }
-                    if session
-                        .stdin
-                        .as_ref()
-                        .is_some_and(|stdin| matches!(stdin, ProcessInput::Pipe(_)))
-                    {
-                        session.stdin.take();
-                    }
-                }
-                Ok(())
+                session.receive_stdin(stream.data, stream.eof).await;
             }
             RnshMessage::WindowSize(window) => {
-                if let Some(target) = session.window.as_ref() {
-                    target.set_size(window.rows, window.cols, window.hpix, window.vpix)?;
+                if let Some(target) = session.window.as_ref()
+                    && let Err(error) =
+                        target.set_size(window.rows, window.cols, window.hpix, window.vpix)
+                {
+                    tracing::debug!(%error, "rnsh window size not applied");
                 }
-                Ok(())
             }
             RnshMessage::Noop(_) => {
-                send_manager_message(command_tx, msg.link_id, NoopMessage).await
+                send_manager_message(command_tx, link_id, NoopMessage).await?;
             }
-            _ => Ok(()),
+            _ => {}
         },
     }
+    Ok(())
 }
 
 struct ListenerProcessRequest<'a> {
@@ -1294,6 +1409,12 @@ struct ListenerProcessRequest<'a> {
     hpix: Option<u32>,
     vpix: Option<u32>,
     remote_identity_hash: Option<[u8; 16]>,
+    exited_tx: mpsc::UnboundedSender<[u8; 16]>,
+}
+
+enum ProcessOutput {
+    Data(u16, Vec<u8>),
+    Closed,
 }
 
 async fn start_listener_process(
@@ -1312,6 +1433,7 @@ async fn start_listener_process(
         hpix,
         vpix,
         remote_identity_hash,
+        exited_tx,
     } = request;
 
     if command.is_empty() {
@@ -1321,7 +1443,12 @@ async fn start_listener_process(
     let uses_pty = !(pipe_stdin && pipe_stdout && pipe_stderr);
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..])
-        .env("TERM", term.unwrap_or("xterm"))
+        .env(
+            "TERM",
+            term.map(str::to_string)
+                .or_else(|| std::env::var("TERM").ok().filter(|t| !t.is_empty()))
+                .unwrap_or_else(|| "xterm".to_string()),
+        )
         .env(
             "RNS_REMOTE_IDENTITY",
             remote_identity_hash
@@ -1363,9 +1490,35 @@ async fn start_listener_process(
         configure_pty_child(&mut cmd, pty);
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| RnshError::Process(format!("could not start {}: {e}", command[0])))?;
+    let (output_tx, output_rx) = mpsc::channel::<ProcessOutput>(16);
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let cleanup = ListenerProcessCleanup {
+        stop_tx: Some(stop_tx),
+    };
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            // Upstream reports exec failure from the forked child: a line on
+            // stdout and exit status 255.
+            let _ = output_tx
+                .send(ProcessOutput::Data(
+                    STREAM_ID_STDOUT,
+                    format!("Unable to start {}: {error}\n", command[0]).into_bytes(),
+                ))
+                .await;
+            drop(output_tx);
+            tokio::spawn(pump_listener_process(
+                command_tx, link_id, None, None, output_rx, 0, stop_rx, exited_tx,
+            ));
+            return Ok(ListenerProcess {
+                stdin: None,
+                window: None,
+                cleanup,
+                stdin_echo: None,
+            });
+        }
+    };
 
     let stdin = if pipe_stdin {
         ProcessInput::Pipe(
@@ -1381,30 +1534,30 @@ async fn start_listener_process(
         pty_input(pty)?
     };
 
-    let mut reader_tasks = Vec::new();
+    let mut readers = 0usize;
     if pipe_stdout {
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| RnshError::Process("could not open process stdout".into()))?;
-        reader_tasks.push(tokio::spawn(stream_reader_task(
-            command_tx.clone(),
-            link_id,
+        tokio::spawn(process_output_reader(
+            output_tx.clone(),
             STREAM_ID_STDOUT,
             stdout,
-        )));
+        ));
+        readers += 1;
     }
     if pipe_stderr {
         let stderr = child
             .stderr
             .take()
             .ok_or_else(|| RnshError::Process("could not open process stderr".into()))?;
-        reader_tasks.push(tokio::spawn(stream_reader_task(
-            command_tx.clone(),
-            link_id,
+        tokio::spawn(process_output_reader(
+            output_tx.clone(),
             STREAM_ID_STDERR,
             stderr,
-        )));
+        ));
+        readers += 1;
     }
     if let Some(ref pty) = pty
         && (!pipe_stdout || !pipe_stderr)
@@ -1414,56 +1567,238 @@ async fn start_listener_process(
         } else {
             STREAM_ID_STDERR
         };
-        reader_tasks.push(tokio::spawn(stream_reader_task(
-            command_tx.clone(),
-            link_id,
+        tokio::spawn(process_output_reader(
+            output_tx.clone(),
             stream_id,
             pty_reader_file(pty)?,
-        )));
+        ));
+        readers += 1;
     }
+    let stdin_echo = (pipe_stdin && !pipe_stdout).then(|| output_tx.clone());
+    drop(output_tx);
 
     let window = pty.take().map(pty_window_target);
     let child_pid = if uses_pty { child.id() } else { None };
-    let (stop_tx, stop_rx) = oneshot::channel();
-    tokio::spawn(async move {
-        let mut stopped = false;
-        let code = tokio::select! {
-            status = child.wait() => {
-                match status {
-                    Ok(status) => status.code().unwrap_or(255) as i64,
-                    Err(_) => 255,
+    tokio::spawn(pump_listener_process(
+        command_tx,
+        link_id,
+        Some(child),
+        child_pid,
+        output_rx,
+        readers,
+        stop_rx,
+        exited_tx,
+    ));
+
+    Ok(ListenerProcess {
+        stdin: Some(stdin),
+        window,
+        cleanup,
+        stdin_echo,
+    })
+}
+
+async fn process_output_reader<R>(tx: mpsc::Sender<ProcessOutput>, stream_id: u16, mut reader: R)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = vec![0u8; PROCESS_READ_LEN];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if tx
+                    .send(ProcessOutput::Data(stream_id, buf[..n].to_vec()))
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
             }
-            _ = stop_rx => {
-                stopped = true;
-                terminate_child_process_group(child_pid, SIGTERM_NUM);
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                match tokio::time::timeout(Duration::from_millis(500), child.wait()).await {
-                    Ok(Ok(status)) => status.code().unwrap_or(255) as i64,
-                    _ => {
-                        terminate_child_process_group(child_pid, SIGKILL_NUM);
-                        let _ = child.kill().await;
-                        255
+        }
+    }
+    let _ = tx.send(ProcessOutput::Closed).await;
+}
+
+/// Port of `ListenerSession.pump`: drain stderr before stdout in adaptively
+/// compressed chunks, then send `CommandExited` once output is flushed, and
+/// arm the post-exit check.
+#[allow(clippy::too_many_arguments)]
+async fn pump_listener_process(
+    command_tx: mpsc::Sender<LinkManagerCommand>,
+    link_id: [u8; 16],
+    mut child: Option<tokio::process::Child>,
+    child_pid: Option<u32>,
+    mut output_rx: mpsc::Receiver<ProcessOutput>,
+    mut open_readers: usize,
+    mut stop_rx: oneshot::Receiver<()>,
+    exited_tx: mpsc::UnboundedSender<[u8; 16]>,
+) {
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    let mut return_code: Option<i64> = if child.is_none() { Some(255) } else { None };
+    let mut pipes_deadline: Option<tokio::time::Instant> = None;
+    let mut writer = ManagerStreamWriter::new(command_tx.clone(), link_id);
+    let mut output_open = true;
+
+    loop {
+        while output_open && stdout_buf.len() + stderr_buf.len() < MAX_CHUNK_LEN {
+            match output_rx.try_recv() {
+                Ok(ProcessOutput::Data(STREAM_ID_STDERR, data)) => stderr_buf.extend(data),
+                Ok(ProcessOutput::Data(_, data)) => stdout_buf.extend(data),
+                Ok(ProcessOutput::Closed) => open_readers = open_readers.saturating_sub(1),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    output_open = false;
+                    open_readers = 0;
+                }
+            }
+        }
+
+        let next = if !stderr_buf.is_empty() {
+            Some((STREAM_ID_STDERR, &mut stderr_buf))
+        } else if !stdout_buf.is_empty() {
+            Some((STREAM_ID_STDOUT, &mut stdout_buf))
+        } else {
+            None
+        };
+        if let Some((stream_id, buf)) = next {
+            tokio::select! {
+                biased;
+                _ = &mut stop_rx => break,
+                sent = writer.send(stream_id, buf) => {
+                    if sent.is_err() {
+                        break;
                     }
                 }
             }
-        };
-        for task in reader_tasks {
-            let _ = task.await;
+            continue;
         }
-        if !stopped {
+
+        if let Some(code) = return_code
+            && (open_readers == 0
+                || pipes_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline))
+        {
             let _ =
                 send_manager_message(&command_tx, link_id, CommandExitedMessage::new(code)).await;
+            tokio::select! {
+                _ = &mut stop_rx => {}
+                _ = tokio::time::sleep(COMMAND_EXITED_TIMEOUT) => {
+                    let _ = exited_tx.send(link_id);
+                }
+            }
+            return;
         }
-    });
 
-    Ok(ListenerProcess {
-        stdin,
-        window,
-        cleanup: ListenerProcessCleanup {
-            stop_tx: Some(stop_tx),
-        },
-    })
+        let pipes_wait = async {
+            match pipes_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let child_wait = async {
+            match child.as_mut() {
+                Some(child) if return_code.is_none() => child.wait().await,
+                _ => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = &mut stop_rx => break,
+            event = output_rx.recv(), if output_open => match event {
+                Some(ProcessOutput::Data(STREAM_ID_STDERR, data)) => stderr_buf.extend(data),
+                Some(ProcessOutput::Data(_, data)) => stdout_buf.extend(data),
+                Some(ProcessOutput::Closed) => open_readers = open_readers.saturating_sub(1),
+                None => {
+                    output_open = false;
+                    open_readers = 0;
+                }
+            },
+            status = child_wait => {
+                return_code = Some(match status {
+                    Ok(status) => status.code().unwrap_or(255) as i64,
+                    Err(_) => 255,
+                });
+                // Upstream closes the process pipes PROCESS_PIPE_TIME after exit.
+                pipes_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+            }
+            _ = pipes_wait => {}
+        }
+    }
+
+    // Session terminated: stop the process without reporting an exit.
+    if let Some(mut child) = child
+        && return_code.is_none()
+    {
+        // CallbackSubprocess.terminate: SIGTERM, then SIGHUP and SIGKILL after 1 s.
+        signal_child(child.id(), child_pid, SIGTERM_NUM);
+        if tokio::time::timeout(Duration::from_secs(1), child.wait())
+            .await
+            .is_err()
+        {
+            signal_child(child.id(), child_pid, SIGHUP_NUM);
+            terminate_child_process_group(child_pid, SIGKILL_NUM);
+            let _ = child.kill().await;
+        }
+    }
+}
+
+/// Stream writer over a LinkManager channel; chunks fill `channel.mdu - HEADER_LEN`.
+struct ManagerStreamWriter {
+    command_tx: mpsc::Sender<LinkManagerCommand>,
+    link_id: [u8; 16],
+    max_data_len: Option<usize>,
+}
+
+impl ManagerStreamWriter {
+    fn new(command_tx: mpsc::Sender<LinkManagerCommand>, link_id: [u8; 16]) -> Self {
+        Self {
+            command_tx,
+            link_id,
+            max_data_len: None,
+        }
+    }
+
+    async fn send(&mut self, stream_id: u16, buf: &mut Vec<u8>) -> Result<(), RnshError> {
+        let max_data_len = match self.max_data_len {
+            Some(max) => max,
+            None => {
+                let (result_tx, result_rx) = oneshot::channel();
+                self.command_tx
+                    .send(LinkManagerCommand::ChannelMdu {
+                        link_id: self.link_id,
+                        result_tx,
+                    })
+                    .await
+                    .map_err(|_| RnshError::TransportUnavailable)?;
+                let channel_mdu = result_rx
+                    .await
+                    .map_err(|_| RnshError::TransportUnavailable)?
+                    .ok_or_else(|| RnshError::Channel("link closed".into()))?;
+                let max = channel_mdu.saturating_sub(STREAM_HEADER_LEN).max(1);
+                self.max_data_len = Some(max);
+                max
+            }
+        };
+        let (compressed, consumed, data) = compress_adaptive(buf, max_data_len);
+        let mut message = RnshStreamDataMessage::new(stream_id, data, false);
+        message.compressed = compressed;
+        match send_manager_message_result(&self.command_tx, self.link_id, message).await? {
+            Ok(()) => {
+                buf.drain(..consumed);
+                Ok(())
+            }
+            Err(error) => Err(RnshError::Channel(error.to_string())),
+        }
+    }
+}
+
+/// rnsh's `compress_adaptive`, which is `RawChannelWriter.write`'s chunking.
+/// Returns `(compressed, consumed, data)`.
+fn compress_adaptive(buf: &[u8], max_data_len: usize) -> (bool, usize, Vec<u8>) {
+    match StreamWriter::new(0, max_data_len).write_once(buf) {
+        Ok(Some((frame, consumed))) => (frame.compressed, consumed, frame.data),
+        _ => (false, 0, Vec::new()),
+    }
 }
 
 #[cfg(unix)]
@@ -1480,9 +1815,26 @@ fn terminate_child_process_group(child_pid: Option<u32>, signal: i32) {
 #[cfg(not(unix))]
 fn terminate_child_process_group(_child_pid: Option<u32>, _signal: i32) {}
 
-fn close_link_after_error(command_tx: mpsc::Sender<LinkManagerCommand>, link_id: [u8; 16]) {
+/// Signal the child itself and, for PTY sessions, its process group.
+fn signal_child(pid: Option<u32>, group_pid: Option<u32>, signal: i32) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        unsafe {
+            nix::libc::kill(pid as i32, signal);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+    terminate_child_process_group(group_pid, signal);
+}
+
+fn close_link_after(
+    command_tx: mpsc::Sender<LinkManagerCommand>,
+    link_id: [u8; 16],
+    delay: Duration,
+) {
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(750)).await;
+        tokio::time::sleep(delay).await;
         let _ = command_tx
             .send(LinkManagerCommand::CloseLink {
                 link_id,
@@ -1493,75 +1845,13 @@ fn close_link_after_error(command_tx: mpsc::Sender<LinkManagerCommand>, link_id:
     });
 }
 
-async fn stream_reader_task<R>(
-    command_tx: mpsc::Sender<LinkManagerCommand>,
-    link_id: [u8; 16],
-    stream_id: u16,
-    mut reader: R,
-) where
-    R: AsyncRead + Unpin,
-{
-    let Some(channel_mdu) = manager_channel_mdu(&command_tx, link_id).await else {
-        return;
-    };
-    let mut buf = vec![0u8; MAX_CHUNK_LEN];
-    loop {
-        match reader.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                for msg in stream_frames(stream_id, &buf[..n], channel_mdu) {
-                    if send_manager_message(&command_tx, link_id, msg)
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    let _ = send_manager_message(
-        &command_tx,
-        link_id,
-        RnshStreamDataMessage::new(stream_id, Vec::new(), true),
-    )
-    .await;
-}
-
-/// Python rnsh `compress_adaptive`: frames of at most `channel.mdu - 2`
-/// bytes, bz2-compressed when that helps (session.py `pump`, initiator.py).
-fn stream_frames(stream_id: u16, data: &[u8], channel_mdu: usize) -> Vec<RnshStreamDataMessage> {
-    let max_data_len = channel_mdu.saturating_sub(2).max(1);
-    let mut writer = StreamWriter::new(stream_id, max_data_len);
-    let mut frames = Vec::new();
-    let mut offset = 0;
-    while let Ok(Some((frame, consumed))) = writer.write_once(&data[offset..]) {
-        let mut message = RnshStreamDataMessage::new(stream_id, frame.data, false);
-        message.compressed = frame.compressed;
-        frames.push(message);
-        offset += consumed;
-    }
-    frames
-}
-
-async fn manager_channel_mdu(
-    command_tx: &mpsc::Sender<LinkManagerCommand>,
-    link_id: [u8; 16],
-) -> Option<usize> {
-    let (result_tx, result_rx) = oneshot::channel();
-    command_tx
-        .send(LinkManagerCommand::ChannelMdu { link_id, result_tx })
-        .await
-        .ok()?;
-    result_rx.await.ok()?
-}
-
-async fn send_manager_message<M>(
+/// Send one channel message, retrying while the channel window is full. The
+/// outer error means the LinkManager is gone; the inner one is the send result.
+async fn send_manager_message_result<M>(
     command_tx: &mpsc::Sender<LinkManagerCommand>,
     link_id: [u8; 16],
     message: M,
-) -> Result<(), RnshError>
+) -> Result<Result<(), ChannelSendError>, RnshError>
 where
     M: MessageBase + Clone + 'static,
 {
@@ -1579,15 +1869,47 @@ where
             .await
             .map_err(|_| RnshError::TransportUnavailable)?
         {
-            Ok(_) => return Ok(()),
+            Ok(_) => return Ok(Ok(())),
             Err(ChannelSendError::Channel(ChannelError::NotReady)) => {
                 tokio::time::sleep(CHANNEL_SEND_RETRY).await;
             }
-            Err(ChannelSendError::LinkNotFound) => {
-                return Err(RnshError::Channel("link not found".into()));
-            }
-            Err(e) => return Err(RnshError::Channel(e.to_string())),
+            Err(error) => return Ok(Err(error)),
         }
+    }
+}
+
+async fn send_manager_message<M>(
+    command_tx: &mpsc::Sender<LinkManagerCommand>,
+    link_id: [u8; 16],
+    message: M,
+) -> Result<(), RnshError>
+where
+    M: MessageBase + Clone + 'static,
+{
+    send_manager_message_result(command_tx, link_id, message)
+        .await?
+        .map_err(|error| RnshError::Channel(error.to_string()))
+}
+
+/// Best-effort single send, as `channel.send` under `contextlib.suppress`.
+async fn send_manager_message_once<M>(
+    command_tx: &mpsc::Sender<LinkManagerCommand>,
+    link_id: [u8; 16],
+    message: M,
+) where
+    M: MessageBase + 'static,
+{
+    let (result_tx, result_rx) = oneshot::channel();
+    if command_tx
+        .send(LinkManagerCommand::SendChannelMessage {
+            link_id,
+            message: Box::new(message),
+            result_tx: Some(result_tx),
+        })
+        .await
+        .is_ok()
+    {
+        let _ = result_rx.await;
     }
 }
 
@@ -1598,15 +1920,24 @@ async fn send_client_message_when_ready<M>(
     channel: &mut LinkChannel,
     pending_messages: &mut VecDeque<RnshMessage>,
     message: M,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<(), RnshError>
 where
     M: MessageBase,
 {
     loop {
-        match send_client_channel_message(transport_tx, link, channel, &message).await {
-            Ok(()) => return Ok(()),
-            Err(RnshError::Channel(err)) if err.contains("not ready") => {
+        match channel.prepare_send_tracked(&message) {
+            Ok(prepared) => {
+                return send_client_channel_data(
+                    transport_tx,
+                    link,
+                    channel,
+                    prepared.sequence,
+                    &prepared.data,
+                )
+                .await;
+            }
+            Err(ChannelError::NotReady) => {
                 let _ = receive_client_messages(
                     transport_tx,
                     endpoint,
@@ -1618,26 +1949,9 @@ where
                 )
                 .await?;
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
-}
-
-async fn send_client_channel_message(
-    transport_tx: &mpsc::Sender<TransportMessage>,
-    link: &mut Link,
-    channel: &mut LinkChannel,
-    message: &dyn MessageBase,
-) -> Result<(), RnshError> {
-    let prepared = channel.prepare_send_tracked(message)?;
-    send_client_channel_data(
-        transport_tx,
-        link,
-        channel,
-        prepared.sequence,
-        &prepared.data,
-    )
-    .await
 }
 
 async fn send_client_channel_data(
@@ -1669,7 +1983,9 @@ async fn send_client_channel_data(
     send_client_endpoint_packet(transport_tx, link_id, Bytes::from(raw)).await
 }
 
-async fn resend_timed_out_client_channel_messages(
+/// Retransmit timed-out channel messages and drive the Link watchdog, which
+/// sends the initiator keepalives and closes a stale link.
+async fn service_client_link(
     transport_tx: &mpsc::Sender<TransportMessage>,
     link: &mut Link,
     channel: &mut LinkChannel,
@@ -1681,6 +1997,28 @@ async fn resend_timed_out_client_channel_messages(
         };
         send_client_channel_data(transport_tx, link, channel, sequence, &data).await?;
     }
+    let link_id = link.link_id;
+    match link.tick() {
+        LinkAction::SendKeepalive | LinkAction::TransitionedToStale => {
+            let raw = build_data_packet(
+                link_id,
+                rns_wire::context::PacketContext::Keepalive,
+                &[rns_link::constants::KEEPALIVE_REQUEST],
+            );
+            send_client_endpoint_packet(transport_tx, link_id, raw).await?;
+            link.record_tx_keepalive(1);
+        }
+        LinkAction::SendTeardownAndClose(data) => {
+            let raw =
+                build_data_packet(link_id, rns_wire::context::PacketContext::LinkClose, &data);
+            let _ = send_client_endpoint_packet(transport_tx, link_id, raw).await;
+            return Err(RnshError::HandshakeFailed("link timed out".into()));
+        }
+        LinkAction::Closed(_) => {
+            return Err(RnshError::HandshakeFailed("link timed out".into()));
+        }
+        LinkAction::None => {}
+    }
     Ok(())
 }
 
@@ -1690,7 +2028,7 @@ async fn pop_or_receive_client_message(
     link: &mut Link,
     channel: &mut LinkChannel,
     pending_messages: &mut VecDeque<RnshMessage>,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<Option<RnshMessage>, RnshError> {
     if let Some(message) = pending_messages.pop_front() {
         return Ok(Some(message));
@@ -1702,46 +2040,10 @@ async fn pop_or_receive_client_message(
         channel,
         pending_messages,
         deadline,
-        remaining(deadline),
+        Duration::from_secs(1),
     )
     .await?;
     Ok(pending_messages.pop_front())
-}
-
-async fn drain_client_messages_before_stdin_eof(
-    transport_tx: &mpsc::Sender<TransportMessage>,
-    endpoint: &mut ClientLinkEndpoint<'_>,
-    link: &mut Link,
-    channel: &mut LinkChannel,
-    pending_messages: &mut VecDeque<RnshMessage>,
-    deadline: Instant,
-) -> Result<(), RnshError> {
-    let rtt_scaled = Duration::from_secs_f64((link.rtt_secs() * 5.0).max(0.0));
-    let drain_for = rtt_scaled
-        .max(CLIENT_PRE_EOF_DRAIN_MIN)
-        .min(CLIENT_PRE_EOF_DRAIN_MAX)
-        .min(remaining(deadline));
-    let drain_until = Instant::now() + drain_for;
-
-    while Instant::now() < drain_until && !pending_has_remote_terminal(pending_messages) {
-        let wait =
-            CLIENT_PRE_EOF_DRAIN_POLL.min(drain_until.saturating_duration_since(Instant::now()));
-        if wait.is_zero() {
-            break;
-        }
-        receive_client_messages(
-            transport_tx,
-            endpoint,
-            link,
-            channel,
-            pending_messages,
-            deadline,
-            wait,
-        )
-        .await?;
-    }
-
-    Ok(())
 }
 
 async fn receive_client_messages(
@@ -1750,13 +2052,13 @@ async fn receive_client_messages(
     link: &mut Link,
     channel: &mut LinkChannel,
     pending_messages: &mut VecDeque<RnshMessage>,
-    deadline: Instant,
+    deadline: Option<Instant>,
     wait: Duration,
 ) -> Result<bool, RnshError> {
-    if Instant::now() >= deadline {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err(RnshError::Timeout("rnsh channel"));
     }
-    resend_timed_out_client_channel_messages(transport_tx, link, channel).await?;
+    service_client_link(transport_tx, link, channel).await?;
     let wait = wait
         .min(channel.next_timeout_duration().unwrap_or(wait))
         .min(remaining(deadline));
@@ -1775,7 +2077,7 @@ async fn receive_client_messages(
         Ok(Ok(event)) => event,
         Ok(Err(error)) => return Err(error),
         Err(_) => {
-            resend_timed_out_client_channel_messages(transport_tx, link, channel).await?;
+            service_client_link(transport_tx, link, channel).await?;
             return Ok(false);
         }
     };
@@ -1821,6 +2123,7 @@ async fn process_client_destination_event(
         return Ok(false);
     }
     let body = &raw[data_offset..];
+    link.record_inbound();
     match header.flags.packet_type {
         rns_wire::flags::PacketType::Proof if body.len() >= 96 => {
             let mut packet_hash = [0u8; 32];
@@ -1927,7 +2230,7 @@ async fn wait_for_valid_link_proof(
     link: &mut Link,
     verify_key: &Ed25519PublicKey,
     identity_ed25519_pub: &[u8; 32],
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<crate::link_endpoint::ValidatedLinkProof, RnshError> {
     tokio::time::timeout(
         remaining(deadline),
@@ -2041,8 +2344,10 @@ async fn send_announce(command_tx: &mpsc::Sender<LinkManagerCommand>) -> Result<
         .map_err(|_| RnshError::TransportUnavailable)
 }
 
-fn remaining(deadline: Instant) -> Duration {
-    deadline.saturating_duration_since(Instant::now())
+fn remaining(deadline: Option<Instant>) -> Duration {
+    deadline.map_or(Duration::MAX, |deadline| {
+        deadline.saturating_duration_since(Instant::now())
+    })
 }
 
 fn select_listener_command(
@@ -2075,14 +2380,16 @@ fn select_listener_command(
     }
 }
 
-fn listener_allowed_identities(cfg: &RnshListenerConfig) -> HashSet<[u8; 16]> {
-    let mut allowed: HashSet<[u8; 16]> = cfg.allowed.iter().copied().collect();
-    for path in &cfg.allowed_identity_files {
+/// Read the allowed identity files as `_reload_allowed_file` does: drop `\r`,
+/// split on `\n`, and accept only lines of exactly 32 hex characters.
+fn read_allowed_identity_files(paths: &[PathBuf]) -> HashSet<[u8; 16]> {
+    let mut allowed = HashSet::new();
+    for path in paths {
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };
-        for line in content.replace('\r', "").lines() {
-            if let Some(hash) = parse_identity_hash16(line.trim()) {
+        for line in content.replace('\r', "").split('\n') {
+            if let Some(hash) = parse_identity_hash16(line) {
                 allowed.insert(hash);
             }
         }
@@ -2224,12 +2531,19 @@ mod tests {
                 hpix: None,
                 vpix: None,
                 remote_identity_hash: None,
+                exited_tx: mpsc::unbounded_channel().0,
             },
         )
         .await
         .expect("start pty process");
 
-        process.stdin.write_all(&[0x04]).await.expect("send ctrl-d");
+        process
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(&[0x04])
+            .await
+            .expect("send ctrl-d");
         wait_for_stream_text(&messages, "eof-ok\n").await;
         wait_for_exit_code(&messages, 0).await;
     }
@@ -2259,13 +2573,20 @@ mod tests {
                 hpix: None,
                 vpix: None,
                 remote_identity_hash: None,
+                exited_tx: mpsc::unbounded_channel().0,
             },
         )
         .await
         .expect("start pty process");
 
         wait_for_stream_text(&messages, "ready\n").await;
-        process.stdin.write_all(&[0x03]).await.expect("send ctrl-c");
+        process
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(&[0x03])
+            .await
+            .expect("send ctrl-c");
         wait_for_stream_text(&messages, "interrupted\n").await;
         wait_for_exit_code(&messages, 23).await;
     }
@@ -2306,6 +2627,7 @@ mod tests {
                 hpix: None,
                 vpix: None,
                 remote_identity_hash: None,
+                exited_tx: mpsc::unbounded_channel().0,
             },
         )
         .await
@@ -2411,6 +2733,7 @@ mod tests {
             &cfg,
             &mut sessions,
             version_channel_msg(link_id),
+            &mpsc::unbounded_channel().0,
         )
         .await
         .expect("handler ok");
@@ -2419,6 +2742,7 @@ mod tests {
             &cfg,
             &mut sessions,
             execute_command_channel_msg(link_id),
+            &mpsc::unbounded_channel().0,
         )
         .await
         .expect("handler ok");
@@ -2462,6 +2786,7 @@ mod tests {
             &cfg,
             &mut sessions,
             version_channel_msg(link_id),
+            &mpsc::unbounded_channel().0,
         )
         .await
         .expect("handler ok");
@@ -2470,6 +2795,7 @@ mod tests {
             &cfg,
             &mut sessions,
             execute_command_channel_msg(link_id),
+            &mpsc::unbounded_channel().0,
         )
         .await
         .expect("handler ok");
@@ -2511,6 +2837,7 @@ mod tests {
             &cfg,
             &mut sessions,
             execute_command_channel_msg(link_id),
+            &mpsc::unbounded_channel().0,
         )
         .await
         .expect("handler ok");
@@ -2530,5 +2857,265 @@ mod tests {
 
         drop(sessions); // reap the spawned child
         let _ = std::fs::remove_file(&marker);
+    }
+
+    fn lcg(n: usize) -> Vec<u8> {
+        let mut x: u64 = 1;
+        (0..n)
+            .map(|_| {
+                x = (x * 1103515245 + 12345) & 0x7fff_ffff;
+                ((x >> 16) & 0xff) as u8
+            })
+            .collect()
+    }
+
+    /// Cases generated by `tests/fixtures/rnsh_compress_adaptive/generate.py` from upstream
+    /// `RawChannelWriter.write`, the same algorithm as rnsh's `compress_adaptive`.
+    #[test]
+    fn adaptive_compression_matches_upstream_chunking() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/rnsh_compress_adaptive/cases.json"
+        ))
+        .unwrap();
+        let max = fixture["meta"]["channel_mdu"].as_u64().unwrap() as usize - STREAM_HEADER_LEN;
+        for case in fixture["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let input = match name {
+                "lcg_20" => lcg(20),
+                "lcg_33" => lcg(33),
+                "lcg_1000" => lcg(1000),
+                "lcg_20000" => lcg(20000),
+                "a_33" => vec![b'A'; 33],
+                "a_20000" => vec![b'A'; 20000],
+                "a600_lcg600" => [vec![b'A'; 600], lcg(600)].concat(),
+                "lcg600_a600" => [lcg(600), vec![b'A'; 600]].concat(),
+                other => panic!("unknown case {other}"),
+            };
+            let expect = &case["expect"];
+            let (c, n, data) = compress_adaptive(&input, max);
+            assert_eq!(
+                (n as u64, c, data.len() as u64),
+                (
+                    expect[0].as_u64().unwrap(),
+                    expect[1].as_bool().unwrap(),
+                    expect[2].as_u64().unwrap()
+                ),
+                "{name}: {}",
+                case["rule"]
+            );
+            if c {
+                assert_eq!(
+                    &data[..4],
+                    b"BZh9",
+                    "{name}: bz2.compress defaults to level 9"
+                );
+                let plain =
+                    rns_protocol::compression::bz2_decompress(&data, MAX_CHUNK_LEN).unwrap();
+                assert_eq!(plain, input[..n], "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn allowed_identity_file_accepts_only_exact_hash_lines() {
+        let path = unique_marker("allowed");
+        std::fs::write(
+            &path,
+            "00112233445566778899aabbccddeeff\r\n ffeeddccbbaa99887766554433221100\n11112222333344445555666677778888 \nzz112233445566778899aabbccddeeff\n",
+        )
+        .unwrap();
+        let allowed = read_allowed_identity_files(std::slice::from_ref(&path));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(allowed.len(), 1);
+        assert!(
+            allowed.contains(&parse_identity_hash16("00112233445566778899aabbccddeeff").unwrap())
+        );
+    }
+
+    fn error_texts(messages: &Arc<Mutex<Vec<RnshMessage>>>) -> Vec<String> {
+        messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m {
+                RnshMessage::Error(e) if e.fatal => e.msg.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn incompatible_protocol_terminates_only_that_session() {
+        let cfg = marker_listener_config(&unique_marker("proto"));
+        let (command_tx, command_rx) = mpsc::channel(64);
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        spawn_ack_manager(command_rx, messages.clone());
+        let mut sessions = HashMap::new();
+        sessions.insert([1; 16], ListenerSession::new(true));
+        sessions.insert([2; 16], ListenerSession::new(true));
+        let mut version = VersionInfoMessage::new(RNSH_SOFTWARE_VERSION);
+        version.protocol_version = 2;
+        let msg = LinkChannelMessage {
+            link_id: [1; 16],
+            msg_type: version.msg_type(),
+            payload: version.pack(),
+        };
+        handle_listener_channel_message(
+            &command_tx,
+            &cfg,
+            &mut sessions,
+            msg,
+            &mpsc::unbounded_channel().0,
+        )
+        .await
+        .expect("session error stays in the session");
+        assert_eq!(
+            error_texts(&messages),
+            vec!["Incompatible protocol".to_string()]
+        );
+        assert_eq!(sessions[&[1; 16]].state, ListenerState::Closed);
+        assert_eq!(sessions[&[2; 16]].state, ListenerState::WaitVersion);
+    }
+
+    #[tokio::test]
+    async fn wrong_state_message_closes_session_and_link_after_prune_delay() {
+        tokio::time::pause();
+        let cfg = marker_listener_config(&unique_marker("state"));
+        let (command_tx, mut command_rx) = mpsc::channel(64);
+        let link_id = [3; 16];
+        let mut sessions = HashMap::new();
+        sessions.insert(link_id, ListenerSession::new(true));
+        let (exited_tx, _exited_rx) = mpsc::unbounded_channel();
+        let handler = handle_listener_channel_message(
+            &command_tx,
+            &cfg,
+            &mut sessions,
+            execute_command_channel_msg(link_id),
+            &exited_tx,
+        );
+        let manager = async {
+            match command_rx.recv().await {
+                Some(LinkManagerCommand::SendChannelMessage {
+                    message, result_tx, ..
+                }) => {
+                    let decoded = RnshMessage::decode(message.msg_type(), &message.pack()).unwrap();
+                    let _ = result_tx
+                        .unwrap()
+                        .send(Ok(crate::link_manager::ChannelSendReceipt {
+                            link_id,
+                            sequence: 0,
+                            packet_hash: [0; 32],
+                        }));
+                    decoded
+                }
+                _ => panic!("expected an ErrorMessage"),
+            }
+        };
+        let (result, sent) = tokio::join!(handler, manager);
+        result.unwrap();
+        assert!(
+            matches!(sent, RnshMessage::Error(e) if e.msg.as_deref() == Some("Protocol error (LSSTATE_WAIT_VERS)") && e.fatal)
+        );
+        assert_eq!(sessions[&link_id].state, ListenerState::Closed);
+        let started = tokio::time::Instant::now();
+        match command_rx.recv().await {
+            Some(LinkManagerCommand::CloseLink {
+                link_id: closed,
+                send_teardown,
+                ..
+            }) => {
+                assert_eq!(closed, link_id);
+                assert!(send_teardown);
+            }
+            _ => panic!("expected CloseLink"),
+        }
+        assert!(started.elapsed() >= LISTENER_PRUNE_DELAY);
+    }
+
+    #[tokio::test]
+    async fn spawn_failure_reports_on_stdout_and_exits_255() {
+        let (command_tx, command_rx) = mpsc::channel(64);
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        spawn_ack_manager(command_rx, messages.clone());
+        let command = vec!["/nonexistent/rnsh-test-command".to_string()];
+        let _process = start_listener_process(
+            command_tx,
+            [0x44; 16],
+            ListenerProcessRequest {
+                command: &command,
+                pipe_stdin: true,
+                pipe_stdout: true,
+                pipe_stderr: true,
+                term: None,
+                rows: None,
+                cols: None,
+                hpix: None,
+                vpix: None,
+                remote_identity_hash: None,
+                exited_tx: mpsc::unbounded_channel().0,
+            },
+        )
+        .await
+        .expect("spawn failure is reported in-band");
+        wait_for_stream_text(
+            &messages,
+            "Unable to start /nonexistent/rnsh-test-command: ",
+        )
+        .await;
+        wait_for_exit_code(&messages, 255).await;
+    }
+
+    #[tokio::test]
+    async fn command_exited_arms_post_exit_session_check() {
+        let (command_tx, command_rx) = mpsc::channel(64);
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        spawn_ack_manager(command_rx, messages.clone());
+        let (exited_tx, mut exited_rx) = mpsc::unbounded_channel();
+        let command = vec!["/bin/true".to_string()];
+        let _process = start_listener_process(
+            command_tx,
+            [0x45; 16],
+            ListenerProcessRequest {
+                command: &command,
+                pipe_stdin: true,
+                pipe_stdout: true,
+                pipe_stderr: true,
+                term: None,
+                rows: None,
+                cols: None,
+                hpix: None,
+                vpix: None,
+                remote_identity_hash: None,
+                exited_tx,
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_exit_code(&messages, 0).await;
+        let exited_at = Instant::now();
+        let link_id = tokio::time::timeout(Duration::from_secs(15), exited_rx.recv())
+            .await
+            .expect("post-exit check fires")
+            .unwrap();
+        assert_eq!(link_id, [0x45; 16]);
+        assert!(exited_at.elapsed() >= COMMAND_EXITED_TIMEOUT - Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn client_ignores_noop() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let result = handle_client_message(
+            ClientMessageOutput {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+                stdout_tx: None,
+                stderr_tx: None,
+            },
+            RnshMessage::Noop(NoopMessage),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, None);
     }
 }

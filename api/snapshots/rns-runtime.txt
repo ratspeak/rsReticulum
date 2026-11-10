@@ -1915,8 +1915,10 @@ pub rns_runtime::rnsh::RnshError::NoSigningKey
 pub rns_runtime::rnsh::RnshError::PathTimeout
 pub rns_runtime::rnsh::RnshError::Process(alloc::string::String)
 pub rns_runtime::rnsh::RnshError::ProofInvalid(alloc::string::String)
+pub rns_runtime::rnsh::RnshError::ProtocolError
 pub rns_runtime::rnsh::RnshError::Remote(alloc::string::String)
 pub rns_runtime::rnsh::RnshError::RequestDispatch(rns_transport::link_messages::LinkRequestDispatchError)
+pub rns_runtime::rnsh::RnshError::Terminated
 pub rns_runtime::rnsh::RnshError::Timeout(&'static str)
 pub rns_runtime::rnsh::RnshError::TransportUnavailable
 impl core::convert::From<rns_protocol::channel::ChannelError> for rns_runtime::rnsh::RnshError
@@ -1936,7 +1938,9 @@ pub rns_runtime::rnsh::RnshClientConfig::stderr_tx: core::option::Option<tokio::
 pub rns_runtime::rnsh::RnshClientConfig::stdin_data: alloc::vec::Vec<u8>
 pub rns_runtime::rnsh::RnshClientConfig::stdin_rx: core::option::Option<tokio::sync::mpsc::bounded::Receiver<alloc::vec::Vec<u8>>>
 pub rns_runtime::rnsh::RnshClientConfig::stdout_tx: core::option::Option<tokio::sync::mpsc::bounded::Sender<alloc::vec::Vec<u8>>>
+pub rns_runtime::rnsh::RnshClientConfig::tcflags: core::option::Option<rmpv::Value>
 pub rns_runtime::rnsh::RnshClientConfig::term: core::option::Option<alloc::string::String>
+pub rns_runtime::rnsh::RnshClientConfig::terminate_rx: core::option::Option<tokio::sync::oneshot::Receiver<()>>
 pub rns_runtime::rnsh::RnshClientConfig::timeout: core::time::Duration
 pub rns_runtime::rnsh::RnshClientConfig::vpix: core::option::Option<u32>
 pub rns_runtime::rnsh::RnshClientConfig::window_rx: core::option::Option<tokio::sync::mpsc::bounded::Receiver<rns_runtime::rnsh::RnshWindowSize>>

@@ -3,9 +3,9 @@ use std::io::{Read, Write};
 /// Maximum size for auto-compression (64 MiB).
 pub const AUTO_COMPRESS_MAX_SIZE: usize = 67_108_864;
 
-/// Compress `data` with bzip2 at the default level.
+/// Compress `data` with bzip2 at level 9, the default of Python's `bz2.compress`.
 pub fn bz2_compress(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
-    let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+    let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
     encoder
         .write_all(data)
         .map_err(|_| CompressionError::CompressFailed)?;
