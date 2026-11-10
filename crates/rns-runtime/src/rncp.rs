@@ -32,6 +32,9 @@ use crate::link_manager::{LinkManager, RequestOutcome, ResourceCompletion};
 /// Fetch-denial response byte (`0xF0`).
 pub const REQ_FETCH_NOT_ALLOWED: u8 = 0xF0;
 
+/// [`REQ_FETCH_NOT_ALLOWED`] as upstream packs it on the wire: a MessagePack uint 8.
+const REQ_FETCH_NOT_ALLOWED_PACKED: [u8; 2] = [0xCC, REQ_FETCH_NOT_ALLOWED];
+
 pub const FETCH_PATH_NAME: &str = "fetch_file";
 
 pub const DEFAULT_RNCP_APP_NAME: &str = "rncp.receive";
@@ -334,7 +337,7 @@ pub async fn spawn_rncp_listener(
                             link_id,
                             reason: "not in allow-list".into(),
                         });
-                        return RequestOutcome::ReplyValue(vec![REQ_FETCH_NOT_ALLOWED]);
+                        return RequestOutcome::ReplyValue(REQ_FETCH_NOT_ALLOWED_PACKED.to_vec());
                     }
                 }
             }
@@ -362,7 +365,7 @@ pub async fn spawn_rncp_listener(
                 },
                 Err(reason) => {
                     let _ = fetch_events.try_send(RncpEvent::FetchDenied { link_id, reason });
-                    RequestOutcome::ReplyValue(vec![REQ_FETCH_NOT_ALLOWED])
+                    RequestOutcome::ReplyValue(REQ_FETCH_NOT_ALLOWED_PACKED.to_vec())
                 }
             }
         });
@@ -1330,10 +1333,10 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                 let Ok((_req_id, resp)) = link.handle_response(body) else {
                     continue;
                 };
-                match resp.first().copied() {
-                    Some(0xC3) => ack_seen = true,
-                    Some(0xC2) => break Err(RncpError::ResourceFailed("remote: not found".into())),
-                    Some(REQ_FETCH_NOT_ALLOWED) => break Err(RncpError::Denied),
+                match resp.as_slice() {
+                    [0xC3] => ack_seen = true,
+                    [0xC2] => break Err(RncpError::ResourceFailed("remote: not found".into())),
+                    r if r == REQ_FETCH_NOT_ALLOWED_PACKED => break Err(RncpError::Denied),
                     _ => break Err(RncpError::ResourceFailed("unknown ack".into())),
                 }
             }

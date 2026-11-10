@@ -15,7 +15,7 @@ use tracing::{debug, trace};
 
 use crate::messages::InterfaceId;
 
-use super::app_data::{self, DiscoveryInfo, Encoded};
+use super::app_data::{self, DiscoveryInfo, DiscoveryModulation, Encoded};
 use super::constants::{
     ANNOUNCE_JOB_INTERVAL_SECS, DEFAULT_STAMP_VALUE, DISCOVERABLE_INTERFACE_TYPES,
     IMPLEMENTATION_NAME, IMPLEMENTATION_VERSION, STAMP_SIZE,
@@ -29,8 +29,9 @@ pub struct DiscoveryInterfaceConfig {
     pub interface_type: String,
     /// Whether preparation may publish this interface's metadata.
     pub discoverable: bool,
-    /// Name advertised in the announce.
-    pub name: String,
+    /// Name advertised in the announce; `None` sends nil, as upstream does
+    /// without `discovery_name`.
+    pub name: Option<String>,
     /// Advertised routing state; this does not enable transport itself.
     pub transport_enabled: bool,
     /// Minimum seconds after the last successful commit. The backbone helper
@@ -59,8 +60,10 @@ pub struct DiscoveryInterfaceConfig {
     pub bandwidth: Option<u64>,
     pub spreading_factor: Option<u8>,
     pub coding_rate: Option<u8>,
-    pub modulation: Option<String>,
+    pub modulation: Option<DiscoveryModulation>,
     pub channel: Option<u16>,
+    /// Operator LXMF delivery address, advertised as `OP_ADDR`.
+    pub operator_lxmf_address: Option<[u8; 16]>,
     /// Independent optional geolocation (unknown by default).
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
@@ -78,7 +81,7 @@ impl DiscoveryInterfaceConfig {
     /// 60-second interval, stamp target 16, signed flag set and no body
     /// encryption. Optional IFAC, radio and location fields start absent.
     /// This does not open an interface or validate the endpoint.
-    pub fn backbone(name: String, reachable_on: String, port: u16) -> Self {
+    pub fn backbone(name: Option<String>, reachable_on: String, port: u16) -> Self {
         Self {
             interface_type: "BackboneInterface".into(),
             discoverable: true,
@@ -98,6 +101,7 @@ impl DiscoveryInterfaceConfig {
             coding_rate: None,
             modulation: None,
             channel: None,
+            operator_lxmf_address: None,
             latitude: None,
             longitude: None,
             height: None,
@@ -351,7 +355,10 @@ impl Announcer {
 
             let target_value = state.config.effective_stamp_value();
             if !(0.0..=STAMP_COST_CAP).contains(&target_value) {
-                tracing::warn!(
+                // Upstream consumes the interval before generating, so this is
+                // reported once per interval (Discovery.py:110-121).
+                state.last_announce_at = Some(now);
+                tracing::error!(
                     interface_id = id,
                     target_value,
                     "discovery stamp value cannot be generated, not announcing"
@@ -415,7 +422,7 @@ impl Announcer {
             let stamp_value = self.stamper.value(&infohash, &stamp);
             trace!(
                 interface_id = id,
-                name = %state.config.name,
+                name = ?state.config.name,
                 stamp_value,
                 "discovery announce prepared"
             );
@@ -473,7 +480,7 @@ impl Announcer {
 
 fn config_to_info(cfg: &DiscoveryInterfaceConfig, transport_id: [u8; 16]) -> DiscoveryInfo {
     DiscoveryInfo {
-        name: cfg.name.clone(),
+        name: cfg.name.clone().unwrap_or_default(),
         transport_id,
         impl_name: Some(IMPLEMENTATION_NAME.to_string()),
         impl_version: Some(IMPLEMENTATION_VERSION.to_string()),
@@ -494,6 +501,7 @@ fn config_to_info(cfg: &DiscoveryInterfaceConfig, transport_id: [u8; 16]) -> Dis
         coding_rate: cfg.coding_rate,
         modulation: cfg.modulation.clone(),
         channel: cfg.channel,
+        operator_lxmf_address: cfg.operator_lxmf_address,
     }
 }
 
@@ -534,7 +542,7 @@ mod tests {
     }
 
     fn sample_backbone() -> DiscoveryInterfaceConfig {
-        DiscoveryInterfaceConfig::backbone("relay-a".into(), "10.0.0.1".into(), 4965)
+        DiscoveryInterfaceConfig::backbone(Some("relay-a".into()), "10.0.0.1".into(), 4965)
     }
 
     fn static_stamper() -> Arc<dyn DiscoveryStamper> {
@@ -564,7 +572,7 @@ mod tests {
         let mut a = Announcer::new(recorder.clone());
         for (id, value) in [(1, 0.0), (2, 16.5)] {
             let mut cfg = sample_backbone();
-            cfg.name = format!("relay-{id}");
+            cfg.name = Some(format!("relay-{id}"));
             cfg.stamp_value = value;
             a.register(id, [0x11; 16], cfg);
         }
@@ -585,6 +593,9 @@ mod tests {
         assert!(prepared.is_empty());
         assert_eq!(skips, vec![(1, SkipReason::StampValueOutOfRange)]);
         assert!(recorder.0.lock().unwrap().is_empty());
+        // Reported once per announce interval, as upstream does.
+        let (_, skips) = a.prepare(1.0, None);
+        assert!(matches!(skips[..], [(1, SkipReason::RateLimited { .. })]));
     }
 
     #[test]
@@ -842,7 +853,7 @@ mod tests {
 
         // Re-register with a new name — different infohash.
         let mut cfg = sample_backbone();
-        cfg.name = "relay-a-renamed".into();
+        cfg.name = Some("relay-a-renamed".into());
         a.register(1, [0x11; 16], cfg);
         let _ = a.tick(2000.0 + ANNOUNCE_JOB_INTERVAL_SECS as f64, None);
         assert_eq!(*count_probe.count.lock().unwrap(), 2);
@@ -890,9 +901,9 @@ mod tests {
     fn multiple_interfaces_each_tick_independently() {
         let mut a = Announcer::new(static_stamper());
         let mut cfg1 = sample_backbone();
-        cfg1.name = "a".into();
+        cfg1.name = Some("a".into());
         let mut cfg2 = sample_backbone();
-        cfg2.name = "b".into();
+        cfg2.name = Some("b".into());
         cfg2.announce_interval_secs = 30; // shorter interval
         a.register(1, [0x11; 16], cfg1);
         a.register(2, [0x22; 16], cfg2);

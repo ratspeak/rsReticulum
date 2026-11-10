@@ -115,6 +115,8 @@ pub enum Reason {
     UnlistedType,
     /// Store encoding or filesystem write failed.
     StorageFailed,
+    /// The announce arrived from beyond the transport hop limit.
+    HopLimit,
 }
 
 /// Monotonic, payload-free counters for receiver cache and admission behavior.
@@ -327,6 +329,10 @@ impl ReceiverConfig {
         let Some(raw) = event.app_data.as_ref() else {
             return Outcome::Rejected(Reason::MissingAppData);
         };
+        // Upstream ignores discovery from beyond the hop limit (Discovery.py:296-298).
+        if event.hops > crate::constants::PATHFINDER_M - 1 {
+            return Outcome::Rejected(Reason::HopLimit);
+        }
 
         let (flags, body) = match app_data::split_flags(raw) {
             Ok(p) => p,

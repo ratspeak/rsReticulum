@@ -1899,7 +1899,7 @@ pub async fn rns_runtime::rncp::spawn_rncp_listener(tokio::sync::mpsc::bounded::
 pub mod rns_runtime::rnsh
 pub enum rns_runtime::rnsh::RnshError
 pub rns_runtime::rnsh::RnshError::Channel(alloc::string::String)
-pub rns_runtime::rnsh::RnshError::Denied
+pub rns_runtime::rnsh::RnshError::Denied(alloc::string::String)
 pub rns_runtime::rnsh::RnshError::HandshakeFailed(alloc::string::String)
 pub rns_runtime::rnsh::RnshError::InvalidDestination
 pub rns_runtime::rnsh::RnshError::LinkCrypto(alloc::string::String)

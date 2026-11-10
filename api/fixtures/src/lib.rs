@@ -152,7 +152,7 @@ pub mod nullable_discovery {
 
     pub fn configured() -> DiscoveryInterfaceConfig {
         let mut config =
-            DiscoveryInterfaceConfig::backbone("relay".into(), "127.0.0.1".into(), 4965);
+            DiscoveryInterfaceConfig::backbone(Some("relay".into()), "127.0.0.1".into(), 4965);
         config.latitude = Some(0.0);
         config.longitude = None;
         config.height = Some(0.0);

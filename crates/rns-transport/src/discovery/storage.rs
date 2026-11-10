@@ -4,13 +4,14 @@
 //! loading does not revalidate announce signatures or proof of work, and
 //! [`DiscoveryStore::list`] may remove records while listing them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rmpv::Value;
 use thiserror::Error;
 
-use super::app_data::DiscoveryInfo;
+use super::address;
+use super::app_data::{DiscoveryInfo, DiscoveryModulation, sanitize_name};
 use super::constants::{
     DISCOVERED_INTERFACE_TYPES, STAMP_SIZE, THRESHOLD_REMOVE_SECS, THRESHOLD_STALE_SECS,
     THRESHOLD_UNKNOWN_SECS,
@@ -64,8 +65,8 @@ pub struct DiscoveredInterface {
     pub discovered: u64,
     /// Unix seconds — most recent announce.
     pub last_heard: u64,
-    /// Count of successful upserts for this key, including the first,
-    /// saturating at `u64::MAX`; not a count of distinct announce packets.
+    /// Sightings after the first, as upstream counts them: 0 when first
+    /// written, then one more per upsert, saturating at `u64::MAX`.
     pub heard_count: u64,
     /// Age status assigned by [`DiscoveryStore::list`]. It is not persisted;
     /// decoded records start with `None`.
@@ -131,9 +132,9 @@ impl DiscoveryStore {
         &self.root
     }
 
-    /// Write the record, preserving a readable existing record's `discovered`
-    /// time and incrementing its count with saturation. If the previous file
-    /// cannot be read or decoded, use the supplied discovery time and count 1.
+    /// Write the record as upstream's `interface_discovered` does: a new file
+    /// gets `heard_count` 0; an existing one keeps its `discovered` time and
+    /// counts one more, starting again from 0 when it cannot be read.
     /// Other fields replace the old values; `status` is not serialized.
     ///
     /// This does not verify the stamp or prevent an older observation replacing
@@ -141,11 +142,20 @@ impl DiscoveryStore {
     pub fn upsert(&self, mut record: DiscoveredInterface) -> Result<(), StorageError> {
         let path = self.root.join(record.filename());
 
-        if let Ok(existing) = self.load_raw(&path) {
-            record.discovered = existing.discovered;
-            record.heard_count = existing.heard_count.saturating_add(1);
-        } else {
-            record.heard_count = 1;
+        record.heard_count = 0;
+        if path.is_file() {
+            let existing = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| decode_lookup(&bytes).ok())
+                .filter(|l| l.contains_key("discovered") && l.contains_key("heard_count"));
+            if let Some(existing) = existing {
+                let discovered = timestamp(&existing, "discovered");
+                if discovered != 0 {
+                    record.discovered = discovered;
+                }
+                record.heard_count = u64_opt(&existing, "heard_count").unwrap_or(0);
+            }
+            record.heard_count = record.heard_count.saturating_add(1);
         }
 
         let tmp = path.with_extension("tmp");
@@ -172,21 +182,28 @@ impl DiscoveryStore {
         }
     }
 
-    /// Read and maintain the store, returning records sorted descending by
-    /// `(status_code, stamp_value, last_heard)`. This call mutates the directory.
-    ///
-    /// Files with extensions and non-files are skipped. Unreadable/undecodable
-    /// records, records older than seven days, unlisted interface types and
-    /// sources excluded by `discovery_sources` are omitted and removal is
-    /// attempted. Removal errors are ignored. `Some(&[])` excludes every source;
-    /// `None` applies no source filter. A missing directory returns an empty list.
-    ///
-    /// Field decoding supplies defaults for missing or invalid values; filenames,
-    /// signatures and stamps are not verified. Future `last_heard` values have
-    /// age zero. Age labels describe observations, not endpoint health.
+    /// [`Self::list_filtered`] with no blackholed identities.
     pub fn list(
         &self,
         discovery_sources: Option<&[[u8; 16]]>,
+    ) -> Result<Vec<DiscoveredInterface>, StorageError> {
+        self.list_filtered(discovery_sources, &HashSet::new())
+    }
+
+    /// Read and maintain the store as upstream's `list_discovered_interfaces`
+    /// does (RNS/Discovery.py:524-581@1.6.0), returning records sorted
+    /// descending by `(status_code, stamp_value, last_heard)`.
+    ///
+    /// A record is deleted when it is older than seven days, lacks a transport
+    /// or network ID, comes from a source outside `discovery_sources`, has an
+    /// unlisted type, names a `blackholed` network or transport identity, or
+    /// carries an invalid `reachable_on`. Files that cannot be read are kept
+    /// and skipped. Names are sanitized again and `"None"` IFAC values dropped.
+    /// `Some(&[])` excludes every source; `None` applies no source filter.
+    pub fn list_filtered(
+        &self,
+        discovery_sources: Option<&[[u8; 16]]>,
+        blackholed: &HashSet<[u8; 16]>,
     ) -> Result<Vec<DiscoveredInterface>, StorageError> {
         let now = unix_now();
         let mut out: Vec<DiscoveredInterface> = Vec::new();
@@ -207,32 +224,81 @@ impl DiscoveryStore {
             if path.extension().is_some() {
                 continue;
             }
-            let rec = match self.load_raw(&path) {
-                Ok(r) => r,
-                Err(_) => {
-                    // Corrupt file: remove so future reads don't keep failing.
-                    let _ = std::fs::remove_file(&path);
+            // Upstream logs and keeps a record it cannot read (Discovery.py:578-581).
+            let corrupt = |path: &Path| {
+                tracing::warn!(path = %path.display(), "discovered interface data file may be corrupt");
+            };
+            let remove = |path: &Path| {
+                let _ = std::fs::remove_file(path);
+            };
+            let lookup = match std::fs::read(&path)
+                .map_err(StorageError::from)
+                .and_then(|bytes| decode_lookup(&bytes))
+            {
+                Ok(lookup) if lookup.contains_key("last_heard") && lookup.contains_key("name") => {
+                    lookup
+                }
+                _ => {
+                    corrupt(&path);
                     continue;
                 }
             };
-
+            let mut rec = record_from_lookup(&lookup);
             let heard_delta = now.saturating_sub(rec.last_heard);
-            let mut should_remove = heard_delta > THRESHOLD_REMOVE_SECS
-                || !DISCOVERED_INTERFACE_TYPES.contains(&rec.info.interface_type.as_str());
-            if let Some(sources) = discovery_sources
-                && !sources.iter().any(|s| s == &rec.network_id)
+            if heard_delta > THRESHOLD_REMOVE_SECS
+                || !id_present(&lookup, "transport_id")
+                || !id_present(&lookup, "network_id")
             {
-                should_remove = true;
-            }
-            if should_remove {
-                let _ = std::fs::remove_file(&path);
+                remove(&path);
                 continue;
             }
-
-            let status = classify(heard_delta);
-            let mut enriched = rec;
-            enriched.status = Some(status);
-            out.push(enriched);
+            // Upstream's order matters: an ID that is not hex raises, which
+            // keeps the file, unless an earlier rule already removed it.
+            if let Some(sources) = discovery_sources {
+                let Some(network_id) = hex16(&lookup, "network_id") else {
+                    corrupt(&path);
+                    continue;
+                };
+                if !sources.contains(&network_id) {
+                    remove(&path);
+                    continue;
+                }
+            }
+            if !DISCOVERED_INTERFACE_TYPES.contains(&rec.info.interface_type.as_str()) {
+                remove(&path);
+                continue;
+            }
+            let (Some(network_id), Some(transport_id)) =
+                (hex16(&lookup, "network_id"), hex16(&lookup, "transport_id"))
+            else {
+                corrupt(&path);
+                continue;
+            };
+            if blackholed.contains(&network_id) || blackholed.contains(&transport_id) {
+                remove(&path);
+                continue;
+            }
+            if let Some(addr) = rec.info.reachable_on.as_deref() {
+                match address::is_valid_address(addr) {
+                    Some(true) => {}
+                    Some(false) => {
+                        remove(&path);
+                        continue;
+                    }
+                    None => {
+                        corrupt(&path);
+                        continue;
+                    }
+                }
+            }
+            rec.info.name = sanitize_name(&rec.info.name);
+            for ifac in [&mut rec.info.ifac_netname, &mut rec.info.ifac_netkey] {
+                if ifac.as_deref() == Some("None") {
+                    *ifac = None;
+                }
+            }
+            rec.status = Some(classify(heard_delta));
+            out.push(rec);
         }
 
         out.sort_by(|a, b| {
@@ -246,6 +312,7 @@ impl DiscoveryStore {
         Ok(out)
     }
 
+    #[cfg(test)]
     fn load_raw(&self, path: &Path) -> Result<DiscoveredInterface, StorageError> {
         let bytes = std::fs::read(path)?;
         decode_record(&bytes)
@@ -284,6 +351,7 @@ fn encode_record(rec: &DiscoveredInterface) -> Result<Vec<u8>, StorageError> {
     }
     map.push((s("transport"), Value::from(i.transport_enabled)));
     map.push((s("name"), Value::from(i.name.clone())));
+    map.push((s("received"), Value::from(rec.last_heard)));
     map.push((s("transport_id"), Value::from(hex::encode(i.transport_id))));
     map.push((s("network_id"), Value::from(hex::encode(rec.network_id))));
     map.push((s("hops"), Value::from(rec.hops)));
@@ -319,10 +387,20 @@ fn encode_record(rec: &DiscoveredInterface) -> Result<Vec<u8>, StorageError> {
         map.push((s("cr"), Value::from(cr)));
     }
     if let Some(m) = &i.modulation {
-        map.push((s("modulation"), Value::from(m.clone())));
+        map.push((s("modulation"), m.to_value()));
     }
     if let Some(ch) = i.channel {
         map.push((s("channel"), Value::from(ch)));
+    }
+    if let Some(entry) = config_entry(rec) {
+        map.push((s("config_entry"), Value::from(entry)));
+    }
+    map.push((
+        s("discovery_hash"),
+        Value::Binary(rec.discovery_hash().to_vec()),
+    ));
+    if let Some(addr) = i.operator_lxmf_address {
+        map.push((s("operator_lxmf_address"), Value::from(hex::encode(addr))));
     }
     map.push((s("discovered"), Value::from(rec.discovered)));
     map.push((s("last_heard"), Value::from(rec.last_heard)));
@@ -334,7 +412,22 @@ fn encode_record(rec: &DiscoveredInterface) -> Result<Vec<u8>, StorageError> {
     Ok(buf)
 }
 
+#[cfg(test)]
 fn decode_record(bytes: &[u8]) -> Result<DiscoveredInterface, StorageError> {
+    decode_lookup(bytes).map(|lookup| record_from_lookup(&lookup))
+}
+
+/// Upstream treats a missing or empty ID as absent (RNS/Discovery.py:549-550).
+fn id_present(lookup: &HashMap<String, Value>, k: &str) -> bool {
+    match lookup.get(k) {
+        None | Some(Value::Nil) => false,
+        Some(Value::String(s)) => !s.as_bytes().is_empty(),
+        Some(Value::Binary(b)) => !b.is_empty(),
+        Some(_) => true,
+    }
+}
+
+fn decode_lookup(bytes: &[u8]) -> Result<HashMap<String, Value>, StorageError> {
     let mut cur = std::io::Cursor::new(bytes);
     let value =
         rmpv::decode::read_value(&mut cur).map_err(|e| StorageError::Decode(e.to_string()))?;
@@ -352,7 +445,11 @@ fn decode_record(bytes: &[u8]) -> Result<DiscoveredInterface, StorageError> {
             lookup.insert(key, v);
         }
     }
+    Ok(lookup)
+}
 
+fn record_from_lookup(lookup: &HashMap<String, Value>) -> DiscoveredInterface {
+    let lookup = lookup.clone();
     let info = DiscoveryInfo {
         interface_type: str_or_default(&lookup, "type"),
         impl_name: str_opt(&lookup, "impl_name"),
@@ -373,8 +470,11 @@ fn decode_record(bytes: &[u8]) -> Result<DiscoveredInterface, StorageError> {
         bandwidth: u64_opt(&lookup, "bandwidth"),
         spreading_factor: u64_opt(&lookup, "sf").map(|n| n.min(u8::MAX as u64) as u8),
         coding_rate: u64_opt(&lookup, "cr").map(|n| n.min(u8::MAX as u64) as u8),
-        modulation: str_opt(&lookup, "modulation"),
+        modulation: lookup
+            .get("modulation")
+            .and_then(DiscoveryModulation::from_value),
         channel: u64_opt(&lookup, "channel").map(|n| n.min(u16::MAX as u64) as u16),
+        operator_lxmf_address: hex16(&lookup, "operator_lxmf_address"),
     };
 
     let stamp = lookup
@@ -385,7 +485,7 @@ fn decode_record(bytes: &[u8]) -> Result<DiscoveredInterface, StorageError> {
         })
         .unwrap_or_else(|| vec![0; STAMP_SIZE]);
 
-    Ok(DiscoveredInterface {
+    DiscoveredInterface {
         info,
         network_id: hex16(&lookup, "network_id").unwrap_or([0; 16]),
         hops: u64_opt(&lookup, "hops").unwrap_or(0).min(u8::MAX as u64) as u8,
@@ -395,6 +495,59 @@ fn decode_record(bytes: &[u8]) -> Result<DiscoveredInterface, StorageError> {
         last_heard: timestamp(&lookup, "last_heard"),
         heard_count: u64_opt(&lookup, "heard_count").unwrap_or(0),
         status: None,
+    }
+}
+
+/// The configuration snippet upstream stores with each record and
+/// `rnstatus -D` prints (RNS/Discovery.py:380-455@1.6.0).
+pub fn config_entry(rec: &DiscoveredInterface) -> Option<String> {
+    let i = &rec.info;
+    let opt = |v: Option<String>| v.unwrap_or_else(|| "None".to_string());
+    let num = |v: Option<u64>| opt(v.map(|n| n.to_string()));
+    let netname = i
+        .ifac_netname
+        .as_deref()
+        .map_or(String::new(), |n| format!("\n  network_name = {n}"));
+    let netkey = i
+        .ifac_netkey
+        .as_deref()
+        .map_or(String::new(), |k| format!("\n  passphrase = {k}"));
+    let identity = format!("\n  transport_identity = {}", hex::encode(i.transport_id));
+    let name = &i.name;
+    Some(match i.interface_type.as_str() {
+        "BackboneInterface" | "TCPServerInterface" => {
+            let (kind, remote) = if cfg!(any(windows, target_vendor = "apple")) {
+                ("TCPClientInterface", "target_host")
+            } else {
+                ("BackboneInterface", "remote")
+            };
+            format!(
+                "[[{name}]]\n  type = {kind}\n  enabled = yes\n  {remote} = {}\n  target_port = {}{identity}{netname}{netkey}",
+                opt(i.reachable_on.clone()),
+                num(i.port.map(u64::from))
+            )
+        }
+        "I2PInterface" => format!(
+            "[[{name}]]\n  type = I2PInterface\n  enabled = yes\n  peers = {}.b32.i2p{identity}{netname}{netkey}",
+            opt(i.reachable_on.clone())
+        ),
+        "RNodeInterface" => format!(
+            "[[{name}]]\n  type = RNodeInterface\n  enabled = yes\n  port = \n  frequency = {}\n  bandwidth = {}\n  spreadingfactor = {}\n  codingrate = {}\n  txpower = {netname}{netkey}",
+            num(i.frequency),
+            num(i.bandwidth),
+            num(i.spreading_factor.map(u64::from)),
+            num(i.coding_rate.map(u64::from))
+        ),
+        "WeaveInterface" => format!(
+            "[[{name}]]\n  type = WeaveInterface\n  enabled = yes\n  port = {netname}{netkey}"
+        ),
+        "KISSInterface" => format!(
+            "[[{name}]]\n  type = KISSInterface\n  enabled = yes\n  port = \n  # Frequency: {}\n  # Bandwidth: {}\n  # Modulation: {}{identity}{netname}{netkey}",
+            num(i.frequency),
+            num(i.bandwidth),
+            opt(i.modulation.as_ref().map(ToString::to_string))
+        ),
+        _ => return None,
     })
 }
 
@@ -528,7 +681,7 @@ mod tests {
             assert_eq!(read.info, original.info);
             assert_eq!(read.discovered, original.discovered);
             assert_eq!(read.last_heard, original.last_heard);
-            assert_eq!(read.heard_count, 1);
+            assert_eq!(read.heard_count, 0);
             assert_eq!(read.network_id, original.network_id);
             let mut update = original.clone();
             update.discovered += 123;
@@ -537,7 +690,7 @@ mod tests {
                 .load_raw(&reopened.root().join(original.filename()))
                 .unwrap();
             assert_eq!(read.discovered, original.discovered);
-            assert_eq!(read.heard_count, 2);
+            assert_eq!(read.heard_count, 1);
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -641,7 +794,7 @@ mod tests {
 
         let listed = store.list(None).unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].heard_count, 1);
+        assert_eq!(listed[0].heard_count, 0);
         assert_eq!(listed[0].status, Some(DiscoveryStatus::Available));
     }
 
@@ -663,7 +816,7 @@ mod tests {
         let listed = store.list(None).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].discovered, 42);
-        assert_eq!(listed[0].heard_count, 2);
+        assert_eq!(listed[0].heard_count, 1);
     }
 
     #[test]
@@ -805,12 +958,14 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_file_is_culled_on_read() {
+    fn corrupt_file_is_skipped_and_kept() {
+        // Upstream only logs an unreadable record (Discovery.py:578-581).
         let dir = tmpdir("corrupt");
         let store = DiscoveryStore::open(&dir).unwrap();
-        let garbage_name = hex::encode([0xAB; 32]);
-        std::fs::write(store.root().join(garbage_name), b"not valid msgpack").unwrap();
+        let garbage = store.root().join(hex::encode([0xAB; 32]));
+        std::fs::write(&garbage, b"not valid msgpack").unwrap();
         assert!(store.list(None).unwrap().is_empty());
+        assert!(garbage.is_file());
     }
 
     #[test]

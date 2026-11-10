@@ -1206,11 +1206,11 @@ async fn run_remote(args: Args) -> ExitCode {
              path mutations and blackhole management are local-only \
              (no remote endpoint exists in the Reticulum management protocol)."
         );
-        return ExitCode::from(2);
+        return ExitCode::from(255);
     }
     if args.blackholed {
         eprintln!("rnpath-rs: --blackholed is local-only (no remote endpoint).");
-        return ExitCode::from(2);
+        return ExitCode::from(255);
     }
     if !args.table && !args.rates {
         if args.destination.is_some() {
@@ -1220,7 +1220,7 @@ async fn run_remote(args: Args) -> ExitCode {
         } else {
             eprintln!("rnpath-rs: remote mode requires --table or --rates.");
         }
-        return ExitCode::from(2);
+        return ExitCode::from(255);
     }
 
     let identity_path = match args.identity.as_ref() {

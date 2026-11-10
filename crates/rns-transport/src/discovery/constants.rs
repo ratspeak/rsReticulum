@@ -127,4 +127,5 @@ pub mod key {
     pub const CODING_RATE: u8 = 0x0C;
     pub const MODULATION: u8 = 0x0D;
     pub const CHANNEL: u8 = 0x0E;
+    pub const OP_ADDR: u8 = 0xF0;
 }

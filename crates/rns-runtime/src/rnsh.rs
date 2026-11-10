@@ -79,8 +79,9 @@ pub enum RnshError {
     Process(String),
     #[error("local identity has no signing key")]
     NoSigningKey,
-    #[error("listener denied the connection")]
-    Denied,
+    /// The listener answered the version exchange with an error message.
+    #[error("remote error: {0}")]
+    Denied(String),
 }
 
 impl From<ChannelError> for RnshError {
@@ -477,7 +478,7 @@ pub async fn rnsh_client_execute(
                     break;
                 }
                 RnshMessage::Error(err) => {
-                    return Err(RnshError::Remote(
+                    return Err(RnshError::Denied(
                         err.msg.unwrap_or_else(|| "remote error".into()),
                     ));
                 }

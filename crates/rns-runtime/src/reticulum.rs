@@ -2406,7 +2406,24 @@ impl ReticulumHandle {
         } else {
             Some(self.config.interface_discovery_sources.as_slice())
         };
-        store.list(sources).unwrap_or_default()
+        let blackholed = self.blackholed_identity_set().await;
+        store
+            .list_filtered(sources, &blackholed)
+            .unwrap_or_default()
+    }
+
+    /// Blackholed identity hashes, which listing discovered interfaces culls
+    /// (Discovery.py:528, :554-555); empty when the query fails.
+    async fn blackholed_identity_set(&self) -> std::collections::HashSet<[u8; 16]> {
+        match self
+            .query_control_result(TransportQuery::GetBlackholedIdentities)
+            .await
+        {
+            Ok(TransportQueryResponse::BlackholeList(entries)) => {
+                entries.into_iter().map(|e| e.identity_hash).collect()
+            }
+            _ => std::collections::HashSet::new(),
+        }
     }
 
     /// Configured publisher identity hashes for blackhole-manifest pulls.
@@ -4151,7 +4168,8 @@ pub async fn init_with_policy(
                 &post_init,
                 rc.enable_transport,
                 &rc.stamps,
-            );
+            )
+            .map_err(ReticulumError::Config)?;
             let bootstrap_only = interface_bootstrap_only(&config, iface_config);
             let ifac_key = derive_ifac_key_from_post_init(&post_init);
 
@@ -6768,22 +6786,42 @@ fn discovery_config_for_interface(
     post_init: &interface_factory::InterfacePostInit,
     transport_enabled: bool,
     stamps: &rns_transport::stamps::StampPolicy,
-) -> Option<DiscoveryInterfaceConfig> {
-    let section = interface_section(config, iface_config)?;
-    if !section.get_bool("discoverable").unwrap_or(false) {
-        return None;
+) -> Result<Option<DiscoveryInterfaceConfig>, ConfigError> {
+    let Some(section) = interface_section(config, iface_config) else {
+        return Ok(None);
+    };
+    let iface_name = interface_config_name(iface_config);
+    // Upstream parses these only for a discoverable interface, and a bad value
+    // stops startup (Reticulum.py:1077-1106@1.6.0).
+    let key_error = |key: &str, what: &str| {
+        invalid_config_value(&format!("interfaces.{iface_name}"), key, what)
+    };
+    let bool_key = |key: &str| config_bool(&format!("interfaces.{iface_name}"), section, key);
+    let float_key = |key: &str| config_float(&format!("interfaces.{iface_name}"), section, key);
+    let uint_key = |key: &str| {
+        section
+            .has(key)
+            .then(|| {
+                section
+                    .get_uint(key)
+                    .ok_or_else(|| key_error(key, "value is not an integer"))
+            })
+            .transpose()
+    };
+    if bool_key("discoverable")? != Some(true) {
+        return Ok(None);
     }
 
-    let name = section
-        .get("discovery_name")
-        .unwrap_or_else(|| interface_config_name(iface_config))
-        .to_string();
+    let name = section.get("discovery_name").map(sanitize_discovery_value);
 
     let (interface_type, reachable_on, port, frequency, bandwidth, spreading_factor, coding_rate) =
         match iface_config {
             interface_factory::InterfaceConfig::TcpServer(c) => (
                 "TCPServerInterface",
-                Some(server_reachable_on(section, iface_config)?),
+                match server_reachable_on(section, iface_config) {
+                    Some(reachable_on) => Some(reachable_on),
+                    None => return Ok(None),
+                },
                 Some(c.listen_port),
                 None,
                 None,
@@ -6798,11 +6836,14 @@ fn discovery_config_for_interface(
             // A target host makes a BackboneClientInterface, which Python never
             // announces (Reticulum.py:1120-1122, BackboneInterface.py:154).
             interface_factory::InterfaceConfig::Backbone(c) if c.target_host.is_some() => {
-                return None;
+                return Ok(None);
             }
             interface_factory::InterfaceConfig::Backbone(c) => (
                 "BackboneInterface",
-                Some(server_reachable_on(section, iface_config)?),
+                match server_reachable_on(section, iface_config) {
+                    Some(reachable_on) => Some(reachable_on),
+                    None => return Ok(None),
+                },
                 Some(c.port),
                 None,
                 None,
@@ -6862,21 +6903,50 @@ fn discovery_config_for_interface(
                     .get_uint("discovery_coding_rate")
                     .map(|v| v.min(u8::MAX as u64) as u8),
             ),
-            _ => return None,
+            _ => return Ok(None),
         };
 
-    let publish_ifac = section
-        .get_bool("discovery_publish_ifac")
-        .or_else(|| section.get_bool("publish_ifac"))
+    let publish_ifac = bool_key("discovery_publish_ifac")?
+        .or(bool_key("publish_ifac")?)
         .unwrap_or(false);
+    let modulation = if section.has("discovery_modulation") {
+        let value = section
+            .get_int("discovery_modulation")
+            .ok_or_else(|| key_error("discovery_modulation", "value is not an integer"))?;
+        Some(rns_transport::discovery::app_data::DiscoveryModulation::Int(value))
+    } else {
+        None
+    };
+    let operator_lxmf_address = section.get("discovery_lxmf_address").and_then(|hex| {
+        let address = (hex.len() == 32).then(|| hex_to_16(hex)).flatten();
+        if address.is_none() {
+            tracing::error!(interface = %iface_name, address = %hex, "invalid interface discovery LXMF address");
+        }
+        address
+    });
+    let frequency = uint_key("discovery_frequency")?.or(frequency);
+    let bandwidth = uint_key("discovery_bandwidth")?.or(bandwidth);
+    let spreading_factor = uint_key("discovery_spreading_factor")?
+        .map(|v| v.min(u8::MAX as u64) as u8)
+        .or(spreading_factor);
+    let coding_rate = uint_key("discovery_coding_rate")?
+        .map(|v| v.min(u8::MAX as u64) as u8)
+        .or(coding_rate);
+    let channel = uint_key("discovery_channel")?.map(|v| v.min(u16::MAX as u64) as u16);
+    let latitude = float_key("discovery_latitude")?.or(float_key("latitude")?);
+    let longitude = float_key("discovery_longitude")?.or(float_key("longitude")?);
+    let height = float_key("discovery_height")?.or(float_key("height")?);
+    let encrypt = bool_key("discovery_encrypt")?.unwrap_or(false);
+    let announce_interval_secs = discovery_announce_interval_secs(section, &key_error)?;
+    let stamp_value = discovery_stamp_value(&float_key)?;
 
-    Some(DiscoveryInterfaceConfig {
+    Ok(Some(DiscoveryInterfaceConfig {
         interface_type: interface_type.to_string(),
         discoverable: true,
         name,
         transport_enabled,
-        announce_interval_secs: discovery_announce_interval_secs(section),
-        stamp_value: discovery_stamp_value(section),
+        announce_interval_secs,
+        stamp_value,
         dst_cost: Some(stamps.interface_destination_cost(post_init.destination_cost)),
         pr_cost: Some(stamps.interface_pr_cost(post_init.pr_cost)),
         reachable_on,
@@ -6887,55 +6957,62 @@ fn discovery_config_for_interface(
         ifac_netkey: publish_ifac
             .then(|| post_init.ifac_passphrase.as_deref().cloned())
             .flatten(),
-        frequency: section.get_uint("discovery_frequency").or(frequency),
-        bandwidth: section.get_uint("discovery_bandwidth").or(bandwidth),
-        spreading_factor: section
-            .get_uint("discovery_spreading_factor")
-            .map(|v| v.min(u8::MAX as u64) as u8)
-            .or(spreading_factor),
-        coding_rate: section
-            .get_uint("discovery_coding_rate")
-            .map(|v| v.min(u8::MAX as u64) as u8)
-            .or(coding_rate),
-        modulation: section.get("discovery_modulation").map(ToString::to_string),
-        channel: section
-            .get_uint("discovery_channel")
-            .map(|v| v.min(u16::MAX as u64) as u16),
-        latitude: section
-            .get_float("discovery_latitude")
-            .or_else(|| section.get_float("latitude")),
-        longitude: section
-            .get_float("discovery_longitude")
-            .or_else(|| section.get_float("longitude")),
-        height: section
-            .get_float("discovery_height")
-            .or_else(|| section.get_float("height")),
-        encrypt: section.get_bool("discovery_encrypt").unwrap_or(false),
+        frequency,
+        bandwidth,
+        spreading_factor,
+        coding_rate,
+        modulation,
+        channel,
+        operator_lxmf_address,
+        latitude,
+        longitude,
+        height,
+        encrypt,
         signed: false,
-    })
+    }))
+}
+
+/// Upstream's announcer `sanitize`: drop CR and LF, then strip (Discovery.py:123-128).
+fn sanitize_discovery_value(value: &str) -> String {
+    value.replace(['\n', '\r'], "").trim().to_string()
+}
+
+fn hex_to_16(hex: &str) -> Option<[u8; 16]> {
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Python reads `discovery_stamp_value` with `as_float` and generates at 16
 /// when it is unset or 0 (Reticulum.py:1090, Discovery.py:134).
-fn discovery_stamp_value(section: &ConfigSection) -> f64 {
-    let legacy = || {
-        let value = section.get_float("stamp_value");
-        if value.is_some() {
-            tracing::warn!("interface key stamp_value is deprecated, use discovery_stamp_value");
-        }
-        value
-    };
-    section
-        .get_float("discovery_stamp_value")
-        .or_else(legacy)
-        .unwrap_or(0.0)
+fn discovery_stamp_value(
+    float_key: &dyn Fn(&str) -> Result<Option<f64>, ConfigError>,
+) -> Result<f64, ConfigError> {
+    if let Some(value) = float_key("discovery_stamp_value")? {
+        return Ok(value);
+    }
+    let legacy = float_key("stamp_value")?;
+    if legacy.is_some() {
+        tracing::warn!("interface key stamp_value is deprecated, use discovery_stamp_value");
+    }
+    Ok(legacy.unwrap_or(0.0))
 }
 
+/// Upstream announces only an IP address or hostname and logs an error for
+/// anything else (Discovery.py:203-206@1.6.0).
 fn configured_reachable_on(section: &ConfigSection) -> Option<String> {
-    section
-        .get("reachable_on")
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    let reachable_on = sanitize_discovery_value(section.get("reachable_on")?);
+    if rns_transport::discovery::address::is_valid_address(&reachable_on) == Some(true) {
+        Some(reachable_on)
+    } else {
+        tracing::error!(
+            reachable_on = %reachable_on,
+            "the configured reachable_on is not a valid IP address or hostname, not announcing it for discovery"
+        );
+        None
+    }
 }
 
 /// Python announces a server only with a configured `reachable_on`, and logs
@@ -6954,15 +7031,25 @@ fn server_reachable_on(
     reachable_on
 }
 
-fn discovery_announce_interval_secs(section: &ConfigSection) -> u64 {
+fn discovery_announce_interval_secs(
+    section: &ConfigSection,
+    key_error: &dyn Fn(&str, &str) -> ConfigError,
+) -> Result<u64, ConfigError> {
     if let Some(seconds) = section.get_uint("discovery_announce_interval_secs") {
-        return seconds.max(1);
+        return Ok(seconds.max(1));
     }
-    section
-        .get_float("discovery_announce_interval")
-        .or_else(|| section.get_float("announce_interval"))
-        .map(|minutes| (minutes.max(0.0) * 60.0).round().max(1.0) as u64)
-        .unwrap_or(6 * 60 * 60)
+    if let Some(minutes) = section.get_float("discovery_announce_interval") {
+        return Ok((minutes.max(0.0) * 60.0).round().max(1.0) as u64);
+    }
+    // Upstream: whole minutes, at least five, six hours when unset (Reticulum.py:1085-1089).
+    match section.get("announce_interval") {
+        None => Ok(6 * 60 * 60),
+        Some(value) => value
+            .trim()
+            .parse::<i64>()
+            .map(|minutes| minutes.saturating_mul(60).max(5 * 60) as u64)
+            .map_err(|_| key_error("announce_interval", "value is not an integer")),
+    }
 }
 
 struct IdentityDiscoveryDecryptor {
@@ -7384,7 +7471,11 @@ async fn run_discovery_autoconnect(
         } else {
             Some(handle.config.interface_discovery_sources.as_slice())
         };
-        for record in store.list(sources).unwrap_or_default() {
+        let blackholed = handle.blackholed_identity_set().await;
+        for record in store
+            .list_filtered(sources, &blackholed)
+            .unwrap_or_default()
+        {
             maybe_autoconnect_discovered(&handle, record).await;
         }
     }
@@ -13039,7 +13130,7 @@ loglevel = 7
 
     fn advertised_service(id: u64, encrypted: bool) -> LocalDiscoveryInterface {
         let mut config = DiscoveryInterfaceConfig::backbone(
-            format!("service-{id}"),
+            Some(format!("service-{id}")),
             "relay.example.org".into(),
             4242,
         );
@@ -13595,6 +13686,7 @@ loglevel = 7
                     true,
                     &rns_transport::stamps::StampPolicy::default(),
                 )
+                .unwrap()
                 .is_none()
             );
         }
@@ -13619,6 +13711,7 @@ loglevel = 7
                 true,
                 &rns_transport::stamps::StampPolicy::default(),
             )
+            .unwrap()
         };
         for server in [
             "type = TCPServerInterface\nlisten_ip = 192.0.2.10\nlisten_port = 4242\n",
@@ -13656,6 +13749,7 @@ loglevel = 7
                 true,
                 &rns_transport::stamps::StampPolicy::default(),
             )
+            .unwrap()
             .unwrap();
             assert_eq!(
                 [discovery.latitude, discovery.longitude, discovery.height],
@@ -13664,11 +13758,61 @@ loglevel = 7
         }
     }
 
+    /// Upstream sends a nil name without `discovery_name`, announces only a
+    /// valid `reachable_on`, and fails startup on a discovery key it cannot
+    /// parse (Reticulum.py:1077-1106, Discovery.py:173, :203-206@1.6.0).
+    #[test]
+    fn discovery_keys_parse_like_upstream() {
+        let discovery = |extra: &str| {
+            let config = Config::parse(&format!("[interfaces]\n[[relay]]\ntype = TCPServerInterface\nenabled = yes\nlisten_ip = 127.0.0.1\nlisten_port = 4242\ndiscoverable = yes\n{extra}")).unwrap();
+            let interfaces = synthesize_interfaces(&config, false).unwrap();
+            let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
+            discovery_config_for_interface(
+                &config,
+                &interfaces[0],
+                &post_init,
+                true,
+                &rns_transport::stamps::StampPolicy::default(),
+            )
+        };
+        let unnamed = discovery("reachable_on = relay.example.org\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unnamed.name, None);
+        assert_eq!(unnamed.announce_interval_secs, 6 * 60 * 60);
+        let named = discovery("reachable_on = relay.example.org.\ndiscovery_name =  Relay \nannounce_interval = 1\ndiscovery_lxmf_address = 000102030405060708090a0b0c0d0e0f\n").unwrap().unwrap();
+        assert_eq!(named.name.as_deref(), Some("Relay"));
+        assert_eq!(named.reachable_on.as_deref(), Some("relay.example.org."));
+        assert_eq!(named.announce_interval_secs, 5 * 60);
+        assert_eq!(
+            named.operator_lxmf_address,
+            Some(std::array::from_fn(|i| i as u8))
+        );
+        for invalid in ["1.2.3.999", "my_host.example.org", "not a host"] {
+            let skipped = discovery(&format!("reachable_on = {invalid}\n")).unwrap();
+            assert!(skipped.is_none(), "{invalid}");
+        }
+        for bad in [
+            "discovery_stamp_value = abc",
+            "discovery_modulation = AFSK",
+            "discovery_frequency = 868e6",
+            "latitude = north",
+            "announce_interval = 1.5",
+            "discovery_encrypt = maybe",
+            "publish_ifac = sometimes",
+        ] {
+            assert!(
+                discovery(&format!("reachable_on = relay.example.org\n{bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
     /// Python announces a KISS-framed TCP client as a KISS interface with its
     /// discovery radio parameters and no address (Discovery.py:182-185, :230-234).
     #[test]
     fn a_kiss_framed_tcp_client_is_discovered_as_a_kiss_interface() {
-        let config = Config::parse("[interfaces]\n[[kiss tnc]]\ntype = TCPClientInterface\nenabled = yes\nkiss_framing = yes\ntarget_host = 10.0.0.2\ntarget_port = 8001\ndiscoverable = yes\ndiscovery_frequency = 433775000\ndiscovery_modulation = AFSK\n").unwrap();
+        let config = Config::parse("[interfaces]\n[[kiss tnc]]\ntype = TCPClientInterface\nenabled = yes\nkiss_framing = yes\ntarget_host = 10.0.0.2\ntarget_port = 8001\ndiscoverable = yes\ndiscovery_frequency = 433775000\ndiscovery_modulation = 2\n").unwrap();
         let interfaces = synthesize_interfaces(&config, false).unwrap();
         let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
         let discovery = discovery_config_for_interface(
@@ -13678,11 +13822,15 @@ loglevel = 7
             true,
             &rns_transport::stamps::StampPolicy::default(),
         )
+        .unwrap()
         .unwrap();
         assert_eq!(discovery.interface_type, "KISSInterface");
         assert_eq!((discovery.reachable_on, discovery.port), (None, None));
         assert_eq!(discovery.frequency, Some(433_775_000));
-        assert_eq!(discovery.modulation.as_deref(), Some("AFSK"));
+        assert_eq!(
+            discovery.modulation,
+            Some(rns_transport::discovery::app_data::DiscoveryModulation::Int(2))
+        );
     }
 
     #[tokio::test]
@@ -15813,8 +15961,8 @@ egress_control = Yes
                 section.set(k, v);
             }
             let cfg = DiscoveryInterfaceConfig {
-                stamp_value: discovery_stamp_value(&section),
-                ..DiscoveryInterfaceConfig::backbone("x".into(), "127.0.0.1".into(), 1)
+                stamp_value: discovery_stamp_value(&|k| config_float("i", &section, k)).unwrap(),
+                ..DiscoveryInterfaceConfig::backbone(None, "127.0.0.1".into(), 1)
             };
             assert_eq!(cfg.effective_stamp_value(), expected, "{line}");
         }

@@ -16,21 +16,24 @@
 //! framing and field conversion; they do not validate the outer Reticulum
 //! announce, its signature or the stamp. Callers must supply those checks.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 
 use rmpv::Value;
 use thiserror::Error;
 
+use super::address;
 use super::constants::{DISCOVERABLE_INTERFACE_TYPES, FLAG_ENCRYPTED, STAMP_SIZE, key};
 
 /// Advertised interface metadata, before any endpoint or identity trust decision.
 ///
 /// Encoding always emits location keys, using `nil` for unknown components.
-/// Decoding also accepts missing locations and integer coordinates. This type
-/// can hold out-of-range radio/location values; encoding is not validation.
+/// This type can hold out-of-range radio/location values; encoding is not
+/// validation.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DiscoveryInfo {
-    /// Human-readable interface name (key `0xFF`).
+    /// Human-readable interface name (key `0xFF`). Decoding yields the
+    /// sanitized name or `Discovered <type>`; an empty name encodes as nil.
     pub name: String,
     /// Claimed transport identity hash (key `0xFE`, 16 bytes). Decoding does
     /// not authenticate its association with the announce sender.
@@ -70,10 +73,56 @@ pub struct DiscoveryInfo {
     pub spreading_factor: Option<u8>,
     /// LoRa coding-rate parameter (key `0x0C`).
     pub coding_rate: Option<u8>,
-    /// Modulation name for Weave / KISS (key `0x0D`).
-    pub modulation: Option<String>,
+    /// Weave / KISS modulation (key `0x0D`).
+    pub modulation: Option<DiscoveryModulation>,
     /// Weave channel number (key `0x0E`).
     pub channel: Option<u16>,
+    /// Operator's LXMF delivery address (key `0xF0`).
+    pub operator_lxmf_address: Option<[u8; 16]>,
+}
+
+/// Modulation as announced: upstream configures it as an integer and stores
+/// whatever a receiver gets without a type check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveryModulation {
+    Int(i64),
+    Str(String),
+}
+
+impl DiscoveryModulation {
+    /// An integer or string value; anything else is not representable.
+    pub fn from_value(v: &Value) -> Option<Self> {
+        match v {
+            Value::Integer(n) => n.as_i64().map(Self::Int),
+            Value::String(s) => s.as_str().map(|s| Self::Str(s.to_string())),
+            _ => None,
+        }
+    }
+
+    pub fn to_value(&self) -> Value {
+        match self {
+            Self::Int(n) => Value::from(*n),
+            Self::Str(s) => Value::from(s.as_str()),
+        }
+    }
+}
+
+impl std::fmt::Display for DiscoveryModulation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Int(n) => write!(f, "{n}"),
+            Self::Str(s) => f.write_str(s),
+        }
+    }
+}
+
+impl serde::Serialize for DiscoveryModulation {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Int(n) => serializer.serialize_i64(*n),
+            Self::Str(s) => serializer.serialize_str(s),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -199,7 +248,14 @@ fn info_to_map(info: &DiscoveryInfo) -> Vec<(Value, Value)> {
         }
     }
     entries.extend([
-        (u8_key(key::NAME), Value::from(info.name.clone())),
+        (
+            u8_key(key::NAME),
+            if info.name.is_empty() {
+                Value::Nil
+            } else {
+                Value::from(info.name.clone())
+            },
+        ),
         (
             u8_key(key::LATITUDE),
             info.latitude.map_or(Value::Nil, Value::F64),
@@ -213,6 +269,9 @@ fn info_to_map(info: &DiscoveryInfo) -> Vec<(Value, Value)> {
             info.height.map_or(Value::Nil, Value::F64),
         ),
     ]);
+    if let Some(addr) = info.operator_lxmf_address {
+        entries.push((u8_key(key::OP_ADDR), Value::Binary(addr.to_vec())));
+    }
 
     if let Some(addr) = &info.reachable_on {
         entries.push((u8_key(key::REACHABLE_ON), Value::from(addr.clone())));
@@ -246,7 +305,10 @@ fn info_to_map(info: &DiscoveryInfo) -> Vec<(Value, Value)> {
         ),
         (key::CODING_RATE, info.coding_rate.map(Value::from)),
         (key::CHANNEL, info.channel.map(Value::from)),
-        (key::MODULATION, info.modulation.clone().map(Value::from)),
+        (
+            key::MODULATION,
+            info.modulation.as_ref().map(DiscoveryModulation::to_value),
+        ),
     ];
     entries.extend(radio.into_iter().filter_map(|(k, value)| {
         value
@@ -290,150 +352,232 @@ pub fn split_stamp(body: &[u8]) -> Result<(&[u8], &[u8]), AppDataError> {
     Ok((&body[..split_at], &body[split_at..]))
 }
 
-/// Decode the first MessagePack value as an info map. Interface type and a
-/// 16-byte transport ID are required; absent other fields retain defaults.
-/// Unknown/non-numeric keys are ignored. Recognized keys are processed in
-/// order, so later values replace earlier ones. Most recognized-field type
-/// errors reject the entire decode; a nonstring implementation name/version
-/// instead clears that optional field. Trailing bytes after the first map
-/// are not rejected.
+/// Decode the first MessagePack value as an info map, accepting exactly what
+/// upstream's handler accepts (RNS/Discovery.py:338-466@1.6.0). Trailing bytes
+/// after the first value are ignored, as upstream's unpacker does.
 ///
-/// The type must be in `DISCOVERABLE_INTERFACE_TYPES`, the name is sanitized,
-/// and a supplied endpoint must pass the local IP/hostname syntax check.
-/// This does not resolve the endpoint, authenticate the transport ID, validate
-/// radio/location ranges or verify a stamp. Oversized port/channel and SF/CR
-/// integers are clamped to their destination integer width, not rejected.
+/// The name falls back to `Discovered <type>` when it is unset or sanitizes to
+/// nothing. Unset or non-string IFAC fields are omitted rather than rejected.
+/// This does not resolve the endpoint, authenticate the transport ID or verify
+/// a stamp. Oversized port/channel and SF/CR integers are clamped.
 pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
     let value = rmpv::decode::read_value(&mut Cursor::new(packed))
         .map_err(|e| AppDataError::Msgpack(e.to_string()))?;
+    if !python_unpackable(&value) {
+        return Err(AppDataError::Msgpack("map upstream cannot unpack".into()));
+    }
     let map = match value {
         Value::Map(m) => m,
         _ => return Err(AppDataError::NotAMap),
     };
+    let fields: HashMap<u8, Value> = map
+        .into_iter()
+        .filter_map(|(k, v)| value_as_u8(&k).map(|k| (k, v)))
+        .collect();
+    let get = |k: u8| fields.get(&k).ok_or(AppDataError::MissingKey(k));
 
-    let mut info = DiscoveryInfo::default();
-    let mut saw_interface_type = false;
-    let mut saw_transport_id = false;
-
-    for (k, v) in map {
-        let Some(kb) = value_as_u8(&k) else {
-            continue; // unknown/non-numeric keys are ignored for forward compat
-        };
-        match kb {
-            key::NAME => {
-                info.name = unset_or(&v, |v| value_as_string(v, kb))?.unwrap_or_default();
-            }
-            key::TRANSPORT_ID => {
-                let bytes = value_as_bytes(&v, kb)?;
-                if bytes.len() != 16 {
-                    return Err(AppDataError::BadTransportId(bytes.len()));
-                }
-                info.transport_id.copy_from_slice(&bytes);
-                saw_transport_id = true;
-            }
-            key::INTERFACE_TYPE => {
-                info.interface_type = value_as_string(&v, kb)?;
-                saw_interface_type = true;
-            }
-            key::TRANSPORT_IMPL => info.impl_name = v.as_str().map(str::to_string),
-            key::TRANSPORT_VERS => info.impl_version = v.as_str().map(str::to_string),
-            key::DST_COST => info.dst_cost = Some(value_as_cost(&v, kb)?),
-            key::PR_COST => info.pr_cost = Some(value_as_cost(&v, kb)?),
-            key::TRANSPORT => {
-                info.transport_enabled = value_as_bool(&v, kb)?;
-            }
-            key::REACHABLE_ON => {
-                info.reachable_on = Some(value_as_string(&v, kb)?);
-            }
-            key::LATITUDE => info.latitude = value_as_f64(&v, kb)?,
-            key::LONGITUDE => info.longitude = value_as_f64(&v, kb)?,
-            key::HEIGHT => info.height = value_as_f64(&v, kb)?,
-            key::PORT => {
-                let n = value_as_u64(&v, kb)?;
-                info.port = Some(n.min(u16::MAX as u64) as u16);
-            }
-            key::IFAC_NETNAME => info.ifac_netname = Some(value_as_string(&v, kb)?),
-            key::IFAC_NETKEY => info.ifac_netkey = Some(value_as_string(&v, kb)?),
-            key::FREQUENCY => info.frequency = unset_or(&v, |v| value_as_u64(v, kb))?,
-            key::BANDWIDTH => info.bandwidth = unset_or(&v, |v| value_as_u64(v, kb))?,
-            key::SPREADING_FACTOR => {
-                info.spreading_factor = unset_or(&v, |v| {
-                    value_as_u64(v, kb).map(|n| n.min(u8::MAX as u64) as u8)
-                })?;
-            }
-            key::CODING_RATE => {
-                info.coding_rate = unset_or(&v, |v| {
-                    value_as_u64(v, kb).map(|n| n.min(u8::MAX as u64) as u8)
-                })?;
-            }
-            key::MODULATION => info.modulation = unset_or(&v, |v| value_as_string(v, kb))?,
-            key::CHANNEL => {
-                info.channel = unset_or(&v, |v| {
-                    value_as_u64(v, kb).map(|n| n.min(u16::MAX as u64) as u16)
-                })?;
-            }
-            _ => { /* unknown key: ignore for forward compat */ }
+    let mut info = DiscoveryInfo {
+        interface_type: value_as_string(get(key::INTERFACE_TYPE)?, key::INTERFACE_TYPE)?,
+        ..Default::default()
+    };
+    let name = get(key::NAME)?;
+    let name = if is_falsy(name) {
+        String::new()
+    } else {
+        sanitize_name(&value_as_string(name, key::NAME)?)
+    };
+    info.impl_name = fields
+        .get(&key::TRANSPORT_IMPL)
+        .and_then(|v| v.as_str().map(str::to_string));
+    info.impl_version = fields
+        .get(&key::TRANSPORT_VERS)
+        .and_then(|v| v.as_str().map(str::to_string));
+    if let Some(v) = fields.get(&key::DST_COST) {
+        info.dst_cost = Some(value_as_cost(v, key::DST_COST)?);
+    }
+    if let Some(v) = fields.get(&key::PR_COST) {
+        info.pr_cost = Some(value_as_cost(v, key::PR_COST)?);
+    }
+    info.transport_enabled = value_as_bool(get(key::TRANSPORT)?, key::TRANSPORT)?;
+    info.latitude = value_as_f64(get(key::LATITUDE)?, key::LATITUDE)?;
+    info.longitude = value_as_f64(get(key::LONGITUDE)?, key::LONGITUDE)?;
+    info.height = value_as_f64(get(key::HEIGHT)?, key::HEIGHT)?;
+    let transport_id = match get(key::TRANSPORT_ID)? {
+        Value::Binary(b) => b,
+        _ => {
+            return Err(AppDataError::TypeMismatch {
+                key: key::TRANSPORT_ID,
+                expected: "bytes",
+            });
         }
-    }
-
-    if !saw_interface_type {
-        return Err(AppDataError::MissingKey(key::INTERFACE_TYPE));
-    }
-    if !saw_transport_id {
-        return Err(AppDataError::MissingKey(key::TRANSPORT_ID));
-    }
-    info.name = sanitize_name(&info.name);
-    if info.name.is_empty() {
-        info.name = format!("Discovered {}", info.interface_type);
-    }
+    };
+    info.transport_id = transport_id
+        .as_slice()
+        .try_into()
+        .map_err(|_| AppDataError::BadTransportId(transport_id.len()))?;
     if !DISCOVERABLE_INTERFACE_TYPES.contains(&info.interface_type.as_str()) {
         return Err(AppDataError::UnsupportedInterfaceType(info.interface_type));
     }
-    if let Some(reachable_on) = info.reachable_on.as_deref()
-        && !valid_reachable_on(reachable_on)
-    {
-        return Err(AppDataError::InvalidReachableOn(reachable_on.to_string()));
+    let reachable_on = match fields.get(&key::REACHABLE_ON) {
+        Some(v) => {
+            let reachable_on = value_as_string(v, key::REACHABLE_ON)?;
+            if address::is_valid_address(&reachable_on) != Some(true) {
+                return Err(AppDataError::InvalidReachableOn(reachable_on));
+            }
+            Some(reachable_on)
+        }
+        None => None,
+    };
+    info.name = if name.is_empty() {
+        format!("Discovered {}", info.interface_type)
+    } else {
+        name
+    };
+    info.ifac_netname = fields.get(&key::IFAC_NETNAME).and_then(ifac_value);
+    info.ifac_netkey = fields.get(&key::IFAC_NETKEY).and_then(ifac_value);
+
+    // Upstream indexes each type's own keys, so a missing one drops the
+    // announce, but stores their values unchecked.
+    for k in type_keys(&info.interface_type) {
+        let v = get(*k)?;
+        let n = v.as_u64();
+        match *k {
+            key::REACHABLE_ON => info.reachable_on = reachable_on.clone(),
+            key::PORT => info.port = n.map(|n| n.min(u16::MAX as u64) as u16),
+            key::FREQUENCY => info.frequency = n,
+            key::BANDWIDTH => info.bandwidth = n,
+            key::SPREADING_FACTOR => info.spreading_factor = n.map(|n| n.min(u8::MAX as u64) as u8),
+            key::CODING_RATE => info.coding_rate = n.map(|n| n.min(u8::MAX as u64) as u8),
+            key::CHANNEL => info.channel = n.map(|n| n.min(u16::MAX as u64) as u16),
+            key::MODULATION => info.modulation = DiscoveryModulation::from_value(v),
+            _ => {}
+        }
+    }
+
+    if let Some(v) = fields.get(&key::OP_ADDR) {
+        match v {
+            Value::Nil => {}
+            Value::Binary(b) => info.operator_lxmf_address = b.as_slice().try_into().ok(),
+            _ => {
+                return Err(AppDataError::TypeMismatch {
+                    key: key::OP_ADDR,
+                    expected: "bytes or nil",
+                });
+            }
+        }
     }
     Ok(info)
 }
 
-/// Remove non-ASCII and control characters, collapse remaining whitespace,
-/// trim, and remove trailing characters after the final ASCII letter, digit
-/// or `)`. This is display cleanup, not general HTML or shell escaping.
-pub fn sanitize_name(name: &str) -> String {
-    let ascii = name
-        .chars()
-        .filter(|c| c.is_ascii() && !c.is_ascii_control())
-        .collect::<String>();
-    let collapsed = ascii.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = collapsed.trim();
-    let end = trimmed
-        .char_indices()
-        .rev()
-        .find(|(_, c)| c.is_ascii_alphanumeric() || *c == ')')
-        .map(|(idx, c)| idx + c.len_utf8())
-        .unwrap_or(0);
-    trimmed[..end].to_string()
+/// The keys upstream's handler reads unconditionally for an interface type
+/// (RNS/Discovery.py:380-455@1.6.0).
+fn type_keys(interface_type: &str) -> &'static [u8] {
+    match interface_type {
+        "BackboneInterface" | "TCPServerInterface" => &[key::REACHABLE_ON, key::PORT],
+        "I2PInterface" => &[key::REACHABLE_ON],
+        "RNodeInterface" => &[
+            key::FREQUENCY,
+            key::BANDWIDTH,
+            key::SPREADING_FACTOR,
+            key::CODING_RATE,
+        ],
+        "WeaveInterface" => &[
+            key::FREQUENCY,
+            key::BANDWIDTH,
+            key::CHANNEL,
+            key::MODULATION,
+        ],
+        "KISSInterface" => &[key::FREQUENCY, key::BANDWIDTH, key::MODULATION],
+        _ => &[],
+    }
 }
 
-fn valid_reachable_on(value: &str) -> bool {
-    let value = value.trim();
-    if value.is_empty() {
-        return false;
+/// Upstream keeps an IFAC field only when it is a non-empty `str`.
+fn ifac_value(v: &Value) -> Option<String> {
+    v.as_str().filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// Python truthiness of an unpacked value.
+fn is_falsy(v: &Value) -> bool {
+    match v {
+        Value::Nil => true,
+        Value::Boolean(b) => !b,
+        Value::Integer(n) => n.as_i64() == Some(0) || n.as_u64() == Some(0),
+        Value::F32(f) => *f == 0.0,
+        Value::F64(f) => *f == 0.0,
+        Value::String(s) => s.as_bytes().is_empty(),
+        Value::Binary(b) => b.is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Map(m) => m.is_empty(),
+        Value::Ext(..) => false,
     }
-    if value.parse::<std::net::IpAddr>().is_ok() {
-        return true;
+}
+
+/// Upstream's unpacker rejects invalid UTF-8 strings, map keys that are maps,
+/// and keys that compare equal in Python (so `1` and `true` collide).
+fn python_unpackable(v: &Value) -> bool {
+    #[derive(PartialEq, Eq, Hash)]
+    enum PyKey {
+        Int(i128),
+        Float(u64),
+        Str(Vec<u8>),
+        Bin(Vec<u8>),
+        Other(String),
     }
-    value.len() <= 253
-        && value.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                && !label.starts_with('-')
-                && !label.ends_with('-')
+    fn py_key(k: &Value) -> PyKey {
+        let int = |f: f64| (f.fract() == 0.0 && f.abs() < 1e30).then_some(f as i128);
+        match k {
+            Value::Integer(n) => PyKey::Int(
+                n.as_i64()
+                    .map(i128::from)
+                    .or(n.as_u64().map(i128::from))
+                    .unwrap_or(0),
+            ),
+            Value::Boolean(b) => PyKey::Int(i128::from(*b)),
+            Value::F64(f) => int(*f).map_or(PyKey::Float(f.to_bits()), PyKey::Int),
+            Value::F32(f) => {
+                int(f64::from(*f)).map_or(PyKey::Float(f64::from(*f).to_bits()), PyKey::Int)
+            }
+            Value::String(s) => PyKey::Str(s.as_bytes().to_vec()),
+            Value::Binary(b) => PyKey::Bin(b.clone()),
+            other => PyKey::Other(format!("{other:?}")),
+        }
+    }
+    match v {
+        Value::String(s) => s.is_str(),
+        Value::Array(items) => items.iter().all(python_unpackable),
+        Value::Map(entries) => {
+            let mut seen = std::collections::HashSet::new();
+            entries.iter().all(|(k, v)| {
+                !matches!(k, Value::Map(_))
+                    && seen.insert(py_key(k))
+                    && python_unpackable(k)
+                    && python_unpackable(v)
+            })
+        }
+        _ => true,
+    }
+}
+
+/// Upstream `InterfaceAnnounceHandler.sanitize_name` (RNS/Discovery.py:272-279
+/// @1.6.0) on a string: drop non-ASCII, strip whitespace, collapse runs of 5, 3
+/// and then 2 spaces, then strip leading characters that are not ASCII letters
+/// or digits and trailing ones that are not those or `)`. May return "".
+pub fn sanitize_name(name: &str) -> String {
+    let ascii: String = name.chars().filter(char::is_ascii).collect();
+    let mut name = ascii
+        .trim_matches(|c: char| {
+            c.is_ascii_whitespace()
+                || ('\x0b'..='\x0d').contains(&c)
+                || ('\x1c'..='\x1f').contains(&c)
         })
+        .to_string();
+    for run in [5, 3, 2] {
+        name = name.replace(&" ".repeat(run), " ");
+    }
+    name.trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
+        .trim_end_matches(|c: char| !(c.is_ascii_alphanumeric() || c == ')'))
+        .to_string()
 }
 
 fn value_as_u8(v: &Value) -> Option<u8> {
@@ -452,22 +596,10 @@ fn value_as_bool(v: &Value, kb: u8) -> Result<bool, AppDataError> {
 
 fn value_as_string(v: &Value, kb: u8) -> Result<String, AppDataError> {
     match v {
-        Value::String(s) => Ok(s.as_str().unwrap_or("").to_string()),
-        Value::Binary(b) => Ok(String::from_utf8_lossy(b).into_owned()),
+        Value::String(s) if s.is_str() => Ok(s.as_str().unwrap_or("").to_string()),
         _ => Err(AppDataError::TypeMismatch {
             key: kb,
             expected: "string",
-        }),
-    }
-}
-
-fn value_as_bytes(v: &Value, kb: u8) -> Result<Vec<u8>, AppDataError> {
-    match v {
-        Value::Binary(b) => Ok(b.clone()),
-        Value::String(s) => Ok(s.as_bytes().to_vec()),
-        _ => Err(AppDataError::TypeMismatch {
-            key: kb,
-            expected: "bytes",
         }),
     }
 }
@@ -477,7 +609,6 @@ fn value_as_f64(v: &Value, kb: u8) -> Result<Option<f64>, AppDataError> {
         Value::Nil => Ok(None),
         Value::F64(f) => Ok(Some(*f)),
         Value::F32(f) => Ok(Some(*f as f64)),
-        Value::Integer(n) => Ok(n.as_f64()),
         _ => Err(AppDataError::TypeMismatch {
             key: kb,
             expected: "float or nil",
@@ -496,30 +627,16 @@ fn value_as_cost(v: &Value, kb: u8) -> Result<f64, AppDataError> {
         Value::F32(f) => f64::from(*f),
         Value::Integer(n) => n.as_f64().ok_or(mismatch)?,
         Value::Boolean(b) => f64::from(u8::from(*b)),
+        // Python `float()` also takes a numeric string.
+        Value::String(s) => s
+            .as_str()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or(mismatch)?,
         _ => return Err(mismatch),
     };
     rns_identity::stamps::quantize_cost(cost).map_err(|_| AppDataError::TypeMismatch {
         key: kb,
         expected: "finite number",
-    })
-}
-
-/// A radio parameter Python leaves unset arrives as nil.
-fn unset_or<T>(
-    v: &Value,
-    read: impl FnOnce(&Value) -> Result<T, AppDataError>,
-) -> Result<Option<T>, AppDataError> {
-    if v.is_nil() {
-        Ok(None)
-    } else {
-        read(v).map(Some)
-    }
-}
-
-fn value_as_u64(v: &Value, kb: u8) -> Result<u64, AppDataError> {
-    v.as_u64().ok_or(AppDataError::TypeMismatch {
-        key: kb,
-        expected: "uint",
     })
 }
 
@@ -617,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn nullable_decoder_preserves_existing_leniencies_and_rejects_wrong_types() {
+    fn nullable_decoder_requires_locations_as_float_or_nil() {
         let info = sample_backbone();
         let encode_map = |coordinate: Option<Value>| {
             let mut entries = info_to_map(&info);
@@ -629,18 +746,17 @@ mod tests {
             rmpv::encode::write_value(&mut bytes, &Value::Map(entries)).unwrap();
             bytes
         };
-        assert_eq!(decode_info(&encode_map(None)).unwrap().latitude, None);
+        // Upstream requires the key and a float or nil (Discovery.py:349).
+        assert!(matches!(
+            decode_info(&encode_map(None)),
+            Err(AppDataError::MissingKey(key::LATITUDE))
+        ));
         assert_eq!(
             decode_info(&encode_map(Some(Value::Nil))).unwrap().latitude,
             None
         );
-        assert_eq!(
-            decode_info(&encode_map(Some(Value::from(0))))
-                .unwrap()
-                .latitude,
-            Some(0.0)
-        );
         for value in [
+            Value::from(0),
             Value::Boolean(false),
             Value::from("0"),
             Value::Array(vec![]),
@@ -790,6 +906,8 @@ mod tests {
                 (u8_key(key::LATITUDE), Value::Nil),
                 (u8_key(key::LONGITUDE), Value::Nil),
                 (u8_key(key::HEIGHT), Value::Nil),
+                (u8_key(key::REACHABLE_ON), Value::from("10.0.0.1")),
+                (u8_key(key::PORT), Value::from(4242)),
             ]);
             let mut packed = Vec::new();
             rmpv::encode::write_value(&mut packed, &map).unwrap();
@@ -844,7 +962,7 @@ mod tests {
         let weave = DiscoveryInfo {
             interface_type: "WeaveInterface".into(),
             channel: Some(6),
-            modulation: Some("OFDM".into()),
+            modulation: Some(DiscoveryModulation::Int(1)),
             ..Default::default()
         };
         assert_eq!(

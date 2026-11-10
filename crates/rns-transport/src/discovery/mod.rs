@@ -11,6 +11,7 @@
 //! the [`DiscoveryStamper`] trait lets an embedder substitute another.
 //! [`NullStamper`] generates no work and rejects inbound stamps.
 
+pub mod address;
 pub mod announcer;
 pub mod app_data;
 pub mod autoconnect;
