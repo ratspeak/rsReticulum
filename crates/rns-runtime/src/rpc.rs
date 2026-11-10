@@ -3086,8 +3086,7 @@ mod tests {
         assert!(decode_umsgpack(&data).is_err());
     }
 
-    /// Requests upstream RNS 1.6.0 clients send, from the harness generator
-    /// `reticulum/support/rpc_parity/gen_rpc_1_6_wire.py`.
+    /// Requests upstream RNS 1.6.0 clients send.
     const UPSTREAM_1_6_REQUESTS: &[(&str, &str)] = &[
         (
             "lowest_interface_bitrate",

@@ -1047,7 +1047,7 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     /// Replays the stub scenarios of the upstream `_dp_ec_evaluate` golden
-    /// (tests fixtures/t16/k74_egress.py, RNS 1.6.0); expectations are its output.
+    /// (RNS 1.6.0); expectations are its output.
     fn replay_egress(steps: &[(f64, u64, u64)]) -> Vec<(u64, bool, bool)> {
         let mut control = EgressControl::new(0.0);
         let (mut appended, mut sent) = (0u64, 0u64);

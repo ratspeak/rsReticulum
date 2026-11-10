@@ -1695,8 +1695,7 @@ listener.close()
         tx
     }
 
-    /// Expected bytes are upstream 1.6.0 replies
-    /// (reticulum/support/rpc_parity/gen_rpc_1_6_wire.py).
+    /// Expected bytes are upstream 1.6.0 replies.
     #[tokio::test]
     async fn lowest_bitrate_and_medium_path_timeout_answer_as_upstream() {
         let backend = RpcBackend::new(
@@ -1776,8 +1775,7 @@ listener.close()
         }
     }
 
-    /// The sequence and results of upstream's live run
-    /// (reticulum/vectors/rpc_manage/destination_types.json), without filters.
+    /// The sequence and results of an upstream 1.6.0 live run, without filters.
     #[tokio::test]
     async fn destination_type_requests_follow_upstream_bookkeeping() {
         let backend = RpcBackend::new(stats_transport(Vec::new()), None);
