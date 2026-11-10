@@ -174,9 +174,11 @@ pub fn interface_hash_from_name(name: &str) -> [u8; 32] {
     rns_crypto::sha::full_hash(name.as_bytes())
 }
 
-/// Save the Python-compatible eight-field destination rows. Entries without a
+/// Save the Python-compatible nine-field destination rows. Entries without a
 /// supplied interface name or cached announce hash are skipped; expired entries
-/// are retained. Each row includes at most the last 32 random blobs.
+/// are retained. Rows carry every in-memory random blob, as Python does. The
+/// ninth field is Python's path `used` time; Rust does not track path use, so
+/// it writes the path timestamp, as a Python loader assumes for legacy rows.
 pub fn save_python_destination_table(
     table: &PathTable,
     interface_names: &HashMap<u64, String>,
@@ -192,7 +194,7 @@ pub fn save_python_destination_table(
         };
         let received_from = entry.next_hop.unwrap_or(*hash.as_bytes());
         let random_blobs = entry
-            .blobs_for_persist()
+            .random_blobs
             .iter()
             .map(|b| Value::Binary(b.to_vec()))
             .collect();
@@ -205,6 +207,7 @@ pub fn save_python_destination_table(
             Value::Array(random_blobs),
             Value::Binary(interface_hash_from_name(interface_name).to_vec()),
             Value::Binary(packet_hash.to_vec()),
+            Value::F64(entry.timestamp),
         ]));
     }
 
@@ -298,10 +301,23 @@ pub fn write_python_cached_announce_if_absent(
     raw_packet: &[u8],
     interface_name: Option<&str>,
 ) -> Result<(), PersistenceError> {
-    let path = announce_cache_dir.join(hex::encode(packet_hash));
-    if path.exists() {
+    if announce_cache_dir.join(hex::encode(packet_hash)).exists() {
         return Ok(());
     }
+    write_python_cached_announce(announce_cache_dir, packet_hash, raw_packet, interface_name)
+}
+
+/// Write raw packet bytes and an optional interface reference under the
+/// supplied packet hash, replacing any earlier entry, like Python's
+/// `AnnounceCache.store`. Same tmp-and-rename, no-fsync contract as
+/// [`write_python_cached_announce_if_absent`].
+pub fn write_python_cached_announce(
+    announce_cache_dir: &Path,
+    packet_hash: &[u8; 32],
+    raw_packet: &[u8],
+    interface_name: Option<&str>,
+) -> Result<(), PersistenceError> {
+    let path = announce_cache_dir.join(hex::encode(packet_hash));
     std::fs::create_dir_all(announce_cache_dir).map_err(PersistenceError::Io)?;
     let interface_reference = interface_name
         .map(|name| Value::String(name.into()))
@@ -363,7 +379,8 @@ pub fn load_python_cached_announce(
 
 /// Save Python-compatible tunnel rows, retaining expired tunnels and paths.
 /// Nested paths without a cached announce hash are omitted; each saved path
-/// keeps at most the last 32 random blobs. An unknown interface has no hash.
+/// keeps at most the last 32 random blobs and, as its ninth field, the path
+/// timestamp in place of Python's `used` time. An unknown interface has no hash.
 pub fn save_python_tunnel_table(
     table: &crate::tunnel::TunnelTable,
     interface_names: &HashMap<u64, String>,
@@ -402,6 +419,7 @@ pub fn save_python_tunnel_table(
                 Value::Array(random_blobs),
                 interface_hash.clone(),
                 Value::Binary(packet_hash.to_vec()),
+                Value::F64(tunnel_path.timestamp),
             ]));
         }
 
@@ -1599,6 +1617,34 @@ mod tests {
             Some("Interface[Test]")
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cached_announce_write_replaces_bytes_and_interface() {
+        let dir = std::env::temp_dir().join(format!(
+            "reticulum_rs_test_announce_upsert_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let packet_hash = [0xCD; 32];
+        write_python_cached_announce(&dir, &packet_hash, &[0x01; 40], Some("TCPInterface[first]"))
+            .unwrap();
+        write_python_cached_announce(
+            &dir,
+            &packet_hash,
+            &[0x02; 40],
+            Some("TCPInterface[second]"),
+        )
+        .unwrap();
+        let cached = load_python_cached_announce(&dir, &packet_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.raw_packet, vec![0x02; 40]);
+        assert_eq!(
+            cached.interface_reference.as_deref(),
+            Some("TCPInterface[second]")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

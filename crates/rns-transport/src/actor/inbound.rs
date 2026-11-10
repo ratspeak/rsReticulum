@@ -890,6 +890,9 @@ impl TransportActor {
                 tunnel.expires = now_f64() + TUNNEL_TIMEOUT as f64;
             }
             self.state_dirty = true;
+            if self.path_requests.contains_key(&header.destination_hash) {
+                self.use_destination(&header.destination_hash);
+            }
             // Wake any callers waiting on a path for this destination.
             self.fire_path_waiters(&header.destination_hash);
 

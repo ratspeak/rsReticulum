@@ -1777,14 +1777,33 @@ impl ReticulumHandle {
     }
 
     /// Read identity and announce metadata from this process's transport cache
-    /// without extending its lifetime. This remains a local lookup in Client
-    /// mode, even when the shared owner knows more.
+    /// and mark the destination used, like Python's `Identity.recall`. The
+    /// lookup stays local in Client mode; the use mark goes to the shared owner
+    /// over RPC, as Python's `_used_destination_data` does. A failed use mark
+    /// does not fail the recall.
     ///
     /// The helper does not verify a fresh signature or check current presence.
     /// Stored cache metadata can be restored with structural checks alone; keep
     /// its storage within the application's trust boundary. `None` means no
     /// identity-bearing entry, not a failed on-network lookup.
     pub async fn recall(
+        &self,
+        destination_hash: [u8; 16],
+    ) -> Result<Option<RecalledDestination>, ControlError> {
+        let recalled = self.recall_without_use(destination_hash).await?;
+        if recalled.is_some() {
+            let _ = self
+                .query_control_result(TransportQuery::UseDestination {
+                    dest: destination_hash,
+                })
+                .await;
+        }
+        Ok(recalled)
+    }
+
+    /// `recall` without marking the destination used (Python `_no_use=True`),
+    /// for displays and internal lookups that must not extend retention.
+    pub async fn recall_without_use(
         &self,
         destination_hash: [u8; 16],
     ) -> Result<Option<RecalledDestination>, ControlError> {
@@ -9544,7 +9563,8 @@ fn clean_cache_dir_at(cache_dir: &Path, ttl: std::time::Duration, now: std::time
     if let Ok(entries) = std::fs::read_dir(cache_dir) {
         for entry in entries.flatten() {
             let file_name = entry.file_name();
-            if file_name.as_encoded_bytes().len() != 32 {
+            // Python matches names of full-hash hex length, (HASHLENGTH//8)*2.
+            if file_name.as_encoded_bytes().len() != 64 {
                 continue;
             }
             if let Ok(metadata) = entry.metadata()
@@ -11951,6 +11971,18 @@ loglevel = 7
                     .send(TransportQueryResponse::FloatResult(value))
                     .expect("stamp response receiver");
             }
+            let TransportMessage::Rpc { query, response_tx } =
+                transport_rx.recv().await.expect("use query")
+            else {
+                panic!("expected transport RPC");
+            };
+            assert!(matches!(
+                query,
+                TransportQuery::UseDestination { dest } if dest == destination_hash
+            ));
+            response_tx
+                .send(TransportQueryResponse::BoolResult(true))
+                .expect("use response receiver");
         });
 
         let mut handle = dummy_handle();
@@ -16989,7 +17021,10 @@ port = 37428
         fs::create_dir_all(&cache_dir).unwrap();
         fs::create_dir_all(&resource_dir).unwrap();
 
-        let hash_name = "0123456789abcdef0123456789abcdef";
+        let hash_name = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let short_name = "0123456789abcdef0123456789abcdef";
+        let short_path = resource_dir.join(short_name);
+        fs::write(&short_path, b"keep").unwrap();
         let packet_path = cache_dir.join(hash_name);
         let resource_path = resource_dir.join(hash_name);
         let unrelated_path = resource_dir.join("unrelated");
@@ -17017,6 +17052,10 @@ port = 37428
         assert!(
             unrelated_path.exists(),
             "non-hash files are not cache entries"
+        );
+        assert!(
+            short_path.exists(),
+            "names shorter than a full hash are not cache entries"
         );
 
         let packet_modified = fs::metadata(&packet_path).unwrap().modified().unwrap();

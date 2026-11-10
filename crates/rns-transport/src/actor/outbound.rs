@@ -709,6 +709,7 @@ impl TransportActor {
         {
             self.pending_local_path_requests
                 .insert(requested_dest, interface_id);
+            self.use_destination(&requested_dest);
         }
 
         // Python Transport.py: local shared clients are allowed to use the
@@ -793,6 +794,9 @@ impl TransportActor {
                         source_interface: None,
                     },
                 );
+                if !self.shared_instance_client_mode {
+                    self.use_destination(&requested_dest);
+                }
                 return;
             }
         }

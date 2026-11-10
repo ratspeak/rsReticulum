@@ -180,10 +180,13 @@ pub struct TransportActor {
     last_receipts_check: f64,
     last_announces_check: f64,
     last_cache_clean: f64,
-    /// Last on-disk announce-cache sweep. 0.0 until the first sweep is
-    /// actually scheduled, so a tick that fires before storage init doesn't
-    /// consume the boot slot.
+    /// Last on-disk announce-cache sweep. Storage init sets it 60 s ahead so
+    /// the first sweep is deferred like Python's.
     last_announce_cache_sweep: f64,
+    last_known_destinations_clean: f64,
+    last_known_destinations_flush: f64,
+    /// Last full persist (scheduled or requested by a departing local client).
+    last_data_persist: f64,
     last_blackhole_check: f64,
     last_rate_cull: f64,
     last_held_announce_check: f64,
@@ -255,6 +258,9 @@ pub struct TransportActor {
     /// set it; queued/synchronous save paths can clear it before success is known.
     /// It is not a reliable comparison between memory and durable disk state.
     pub state_dirty: bool,
+    /// A known-destination flush took `state_dirty`; the routing tables still
+    /// wait for their periodic save.
+    routing_save_pending: bool,
     /// Whether an asynchronous routing writer is in flight. The separate
     /// publication lock and generation counter coordinate queued and synchronous
     /// snapshots; this flag alone is not a cross-process writer lock.
@@ -464,6 +470,9 @@ impl TransportActor {
             last_announces_check: 0.0,
             last_cache_clean: 0.0,
             last_announce_cache_sweep: 0.0,
+            last_known_destinations_clean: now_f64(),
+            last_known_destinations_flush: 0.0,
+            last_data_persist: now_f64(),
             last_blackhole_check: 0.0,
             last_rate_cull: 0.0,
             last_held_announce_check: 0.0,
@@ -486,6 +495,7 @@ impl TransportActor {
             hashlist_load_attempted: false,
             last_state_save: 0.0,
             state_dirty: false,
+            routing_save_pending: false,
             routing_save_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             routing_save_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             routing_save_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
@@ -561,7 +571,7 @@ impl TransportActor {
                     self.handle_announce_dispatch(request);
                 }
                 Some(()) = self.persistence_rx.recv() => {
-                    self.save_state_async();
+                    self.persist_data_async();
                 }
                 Some(request) = self.path_recovery_rx.recv() => {
                     self.recover_local_link_path(request);
@@ -1602,7 +1612,9 @@ impl TransportActor {
     /// `timestamp` stays the announce time (Python keeps announce time and
     /// use time as separate fields); the linger sweep reads `last_used`.
     pub(super) fn use_destination(&mut self, dest_hash: &[u8; 16]) -> bool {
-        if let Some(entry) = self.recent_announces.get_mut(dest_hash) {
+        if let Some(entry) = self.recent_announces.get_mut(dest_hash)
+            && !entry.retained
+        {
             entry.last_used = Some(now_f64());
             self.state_dirty = true;
             true
@@ -1611,11 +1623,11 @@ impl TransportActor {
         }
     }
 
-    /// Release a pin set by `retain_destination`; cleanup runs by `timestamp` again.
-    #[allow(dead_code)]
+    /// Release a pin set by `retain_destination`; the release counts as a use.
     pub(super) fn unretain_destination(&mut self, dest_hash: &[u8; 16]) -> bool {
         if let Some(entry) = self.recent_announces.get_mut(dest_hash) {
             entry.retained = false;
+            entry.last_used = Some(now_f64());
             self.state_dirty = true;
             true
         } else {
@@ -1691,6 +1703,9 @@ impl TransportActor {
         self.retire_path_request_admissions(id);
         self.retire_announce_interface(id);
         self.interfaces.remove(&id);
+        if role == Some(InterfaceRole::LocalClient) {
+            self.maybe_gracious_persist();
+        }
         if role == Some(InterfaceRole::SharedInstancePeer) {
             tracing::warn!(
                 interface_id = id,
@@ -7856,6 +7871,10 @@ mod tests {
             held_after_bypass, held_before,
             "an announce whose destination is in path_requests must NOT be held"
         );
+        assert!(
+            actor.recent_announces[&dest_match].last_used.is_some(),
+            "an announce answering our path request marks the destination used"
+        );
 
         // Discovery requests on behalf of another peer use the same bypass.
         let (raw_discovery, dest_discovery) = make_valid_announce("test.path_req.discovery", 1);
@@ -11597,6 +11616,10 @@ mod tests {
             !actor.discovery_path_requests.contains_key(&dest),
             "a validated discovery response consumes its live requesters once"
         );
+        assert!(
+            actor.recent_announces[&dest].last_used.is_some(),
+            "answering a discovery path request marks the destination used"
+        );
     }
 
     #[test]
@@ -11902,6 +11925,7 @@ mod tests {
             requestor_rx.try_recv().is_err(),
             "must not answer a path request when the requestor is our next hop"
         );
+        assert!(actor.recent_announces[&dest].last_used.is_none());
 
         actor.handle_inbound_path_request(
             &make_path_request_payload_with_tag(dest, Some([0xCD; 16]), [0xB6; 16]),
@@ -11917,6 +11941,10 @@ mod tests {
             .expect("known path response should be queued");
         assert!(queued.block_rebroadcast);
         assert_eq!(queued.attached_interface, Some(1));
+        assert!(
+            actor.recent_announces[&dest].last_used.is_some(),
+            "answering a path request marks the destination used"
+        );
 
         actor.flush_pending_announces();
         let response = requestor_rx
@@ -12204,10 +12232,34 @@ mod tests {
             crate::path_table::PathEntry::new(None, 0, 1, InterfaceMode::Gateway),
         );
 
+        actor.recent_announces.insert(
+            dest,
+            RecentAnnounce {
+                dest_hash: dest,
+                hops: 0,
+                app_data: None,
+                timestamp: now_f64(),
+                public_key: None,
+                ratchet: None,
+                packet_hash: None,
+                is_path_response: false,
+                retained: false,
+                last_used: None,
+                name_hash: [0u8; 10],
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
+            },
+        );
+
         actor.handle_inbound_path_request(&make_path_request_payload(dest, None), 2);
         assert!(
             actor.pending_local_path_requests.contains_key(&dest),
             "external request for a local-client destination should be tracked"
+        );
+        assert!(
+            actor.recent_announces[&dest].last_used.is_some(),
+            "a path request for a local client's destination marks it used"
         );
         assert!(
             local_rx.try_recv().is_ok(),

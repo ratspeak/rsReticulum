@@ -27,13 +27,20 @@ impl TransportActor {
         // addition to `on_shutdown` because mobile force-quit kills the
         // process without delivering Shutdown. Hashlist is saved separately.
         if self.storage_dir.is_some()
-            && self.state_dirty
+            && (self.state_dirty || self.routing_save_pending)
             && now - self.last_state_save >= STATE_SAVE_INTERVAL_SECS
         {
             // Async: the fsync chain (F_FULLFSYNC per file on macOS) stalls
             // the actor for seconds if run inline, starving control queries
             // and inbound routing.
             self.save_routing_state_async();
+        }
+
+        if self.storage_dir.is_some()
+            && self.state_dirty
+            && now - self.last_known_destinations_flush >= KD_FLUSH_INTERVAL
+        {
+            self.flush_known_destinations_async();
         }
 
         if now - self.last_tables_cull >= TABLES_CULL_INTERVAL {
@@ -207,8 +214,12 @@ impl TransportActor {
 
         if self.startup_complete && now - self.last_cache_clean >= CACHE_CLEAN_INTERVAL {
             self.packet_hashlist.force_rotate();
-            self.cleanup_known_destinations(now);
             self.last_cache_clean = now;
+        }
+
+        if now - self.last_known_destinations_clean >= KNOWN_DESTINATIONS_INTERVAL {
+            self.cleanup_known_destinations(now);
+            self.last_known_destinations_clean = now;
         }
 
         // On-disk announce-cache prune. Deliberately outside the
@@ -216,8 +227,8 @@ impl TransportActor {
         // registration, and a node with no interfaces must still collect
         // backlog (Python's jobs thread cleans unconditionally). Safe before
         // interfaces exist — pending re-registration entries are in the
-        // keep-set and the mtime grace covers fresh writes. First sweep runs
-        // on the first tick after storage init, then every 15 minutes.
+        // keep-set and the mtime grace covers fresh writes. Storage init
+        // defers the first sweep, which then repeats every 5 minutes.
         if now - self.last_announce_cache_sweep >= ANNOUNCE_CACHE_SWEEP_INTERVAL
             && self.maybe_sweep_announce_cache()
         {
@@ -393,6 +404,7 @@ impl TransportActor {
         self.last_announces_check = 0.0;
         self.last_cache_clean = 0.0;
         self.last_announce_cache_sweep = 0.0;
+        self.last_known_destinations_clean = 0.0;
         self.last_blackhole_check = 0.0;
         self.last_rate_cull = 0.0;
         self.last_held_announce_check = 0.0;
@@ -612,13 +624,21 @@ impl TransportActor {
 
     /// Sweep `recent_announces`, mirroring Python
     /// `Identity.clean_known_destinations`: retained + pathed entries are
-    /// kept; pathless never-used entries die after `UNUSED_DESTINATION_LINGER`
-    /// (6 min); pathless used entries die after `DESTINATION_TIMEOUT * 1.25`
-    /// idle since last use.
+    /// kept; a pathless entry is stale when never used and announced more than
+    /// `UNUSED_DESTINATION_LINGER` ago, or when more than
+    /// `DESTINATION_TIMEOUT * 1.25` has passed since its use marker. A
+    /// never-used entry's marker is 0, so it is stale on any pass.
     pub(super) fn cleanup_known_destinations(&mut self, now: f64) {
         let used_threshold = DESTINATION_TIMEOUT as f64 * 1.25;
 
         let before = self.recent_announces.len();
+        // Python loads persisted paths at start; Rust stages them until their
+        // interface registers, so a staged path counts as a path here.
+        let pending: HashSet<&[u8]> = self
+            .pending_path_entries
+            .iter()
+            .map(|pe| pe.destination_hash.as_slice())
+            .collect();
         // Collect into a Vec; the has-path borrow on path_table fights an
         // in-place `retain` closure on recent_announces.
         let to_drop: Vec<[u8; 16]> = self
@@ -628,13 +648,15 @@ impl TransportActor {
                 if a.retained {
                     return None;
                 }
-                if self.path_table.has_path(&a.dest_hash) {
+                if self.path_table.has_path(&a.dest_hash)
+                    || pending.contains(a.dest_hash.as_slice())
+                {
                     return None;
                 }
-                let stale = match a.last_used {
-                    None => now - a.timestamp > UNUSED_DESTINATION_LINGER,
-                    Some(last_used) => now - last_used.max(a.timestamp) > used_threshold,
-                };
+                let unused_for = now - a.last_used.unwrap_or(0.0);
+                let stale = (a.last_used.is_none()
+                    && now - a.timestamp > UNUSED_DESTINATION_LINGER)
+                    || unused_for > used_threshold;
                 if stale { Some(a.dest_hash) } else { None }
             })
             .collect();
@@ -643,6 +665,7 @@ impl TransportActor {
             for hash in &to_drop {
                 self.recent_announces.remove(hash);
             }
+            self.state_dirty = true;
             debug!(
                 removed = to_drop.len(),
                 remaining = self.recent_announces.len(),
@@ -738,6 +761,29 @@ mod cleanup_tests {
         actor
             .path_table
             .insert(dest, PathEntry::new(None, 1, 0, InterfaceMode::Gateway));
+        actor.cleanup_known_destinations(now);
+        assert_eq!(actor.recent_announces.len(), 1);
+    }
+
+    #[test]
+    fn staged_persisted_path_keeps_entry_through_cleanup() {
+        let (mut actor, _tx) = TransportActor::new();
+        let now = 10_000_000.0;
+        insert_entry(&mut actor, 0x04, 0.0, /*retained=*/ false);
+        actor
+            .pending_path_entries
+            .push(crate::persistence::PersistedPathEntry {
+                destination_hash: vec![0x04; 16],
+                timestamp: now,
+                next_hop: None,
+                hops: 1,
+                expires: now + 1_000.0,
+                random_blobs: Vec::new(),
+                interface_id: 0,
+                interface_name: Some("not yet registered".into()),
+                interface_hash: None,
+                packet_hash: None,
+            });
         actor.cleanup_known_destinations(now);
         assert_eq!(actor.recent_announces.len(), 1);
     }

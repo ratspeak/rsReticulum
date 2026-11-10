@@ -125,10 +125,27 @@ pub const PENDING_PRS_CHECK_INTERVAL: f64 = 30.0;
 /// (5 minutes), after the interface-startup grace period has completed.
 pub const CACHE_CLEAN_INTERVAL: f64 = 300.0;
 
-/// On-disk announce cache sweep interval, in seconds (15 minutes). Scheduling
-/// does not require the interface-startup grace period; it requires storage,
+/// On-disk announce cache sweep interval, in seconds (5 minutes, Python
+/// `cache_clean_interval`). The first sweep runs one interval after a
+/// 60-second deferral from storage init. Scheduling requires storage,
 /// non-client ownership and no sweep already in flight.
-pub const ANNOUNCE_CACHE_SWEEP_INTERVAL: f64 = 900.0;
+pub const ANNOUNCE_CACHE_SWEEP_INTERVAL: f64 = 300.0;
+
+/// Deferral added to the first announce-cache sweep after storage init
+/// (Python `cache_last_cleaned = time.time() + 60`).
+pub const ANNOUNCE_CACHE_SWEEP_DEFER: f64 = 60.0;
+
+/// Interval in seconds between known-destination cleaning passes, the first
+/// one interval after the actor starts (Python `known_destinations_interval`).
+pub const KNOWN_DESTINATIONS_INTERVAL: f64 = 300.0;
+
+/// Interval in seconds between flushes of changed known-destination metadata
+/// (Python `kd_flush_interval`).
+pub const KD_FLUSH_INTERVAL: f64 = 10.0;
+
+/// Minimum spacing in seconds between a full persist and one requested by a
+/// local client disconnecting (Python `GRACIOUS_PERSIST_INTERVAL`).
+pub const GRACIOUS_PERSIST_INTERVAL: f64 = 300.0;
 
 /// Minimum age in seconds before an unreferenced announce-cache file is
 /// eligible for removal. This grace reduces races with a keep-set snapshot;

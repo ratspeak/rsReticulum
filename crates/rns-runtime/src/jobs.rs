@@ -1,7 +1,7 @@
-//! Poll-driven scheduling of cache cleaning after 15 minutes and persistence
-//! after 12 hours. Explicit persistence requests can emit a job once five
-//! minutes have elapsed since the last gracious persist. Callers must poll
-//! `tick` and execute the returned jobs; this module starts no timer or I/O.
+//! Poll-driven scheduling of cache cleaning at start and every 15 minutes, and
+//! persistence after 12 hours. The transport actor owns the gracious persist on
+//! local client disconnect. Callers must poll `tick` and execute the returned
+//! jobs; this module starts no timer or I/O.
 
 use std::time::{Duration, Instant};
 
@@ -10,18 +10,17 @@ use crate::constants::*;
 pub struct JobScheduler {
     last_clean: Instant,
     last_persist: Instant,
-    persist_requested: bool,
-    last_gracious_persist: Instant,
 }
 
 impl JobScheduler {
     pub fn new() -> Self {
         let now = Instant::now();
         Self {
-            last_clean: now,
+            // Python starts with `last_cache_clean = 0`, so the first tick cleans.
+            last_clean: now
+                .checked_sub(Duration::from_secs(CLEAN_INTERVAL))
+                .unwrap_or(now),
             last_persist: now,
-            persist_requested: false,
-            last_gracious_persist: now,
         }
     }
 
@@ -40,23 +39,9 @@ impl JobScheduler {
         if now.duration_since(self.last_persist) >= Duration::from_secs(PERSIST_INTERVAL) {
             jobs.push(Job::PersistData);
             self.last_persist = now;
-            self.persist_requested = false;
-        }
-
-        if self.persist_requested
-            && now.duration_since(self.last_gracious_persist)
-                >= Duration::from_secs(GRACIOUS_PERSIST_INTERVAL)
-        {
-            jobs.push(Job::PersistData);
-            self.last_gracious_persist = now;
-            self.persist_requested = false;
         }
 
         jobs
-    }
-
-    pub fn request_persist(&mut self) {
-        self.persist_requested = true;
     }
 }
 
@@ -77,30 +62,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_scheduler_initial_tick() {
+    fn test_scheduler_initial_tick_cleans_caches() {
         let mut scheduler = JobScheduler::new();
-        let jobs = scheduler.tick();
-        assert!(jobs.is_empty());
-    }
-
-    #[test]
-    fn test_scheduler_persist_request() {
-        let mut scheduler = JobScheduler::new();
-        assert!(!scheduler.persist_requested);
-        scheduler.request_persist();
-        assert!(scheduler.persist_requested);
-    }
-
-    #[test]
-    fn test_scheduler_forced_persist() {
-        let mut scheduler = JobScheduler::new();
-        let now = Instant::now();
-        scheduler.last_gracious_persist = now;
-        scheduler.request_persist();
-
-        let jobs = scheduler.tick_at(now + Duration::from_secs(GRACIOUS_PERSIST_INTERVAL + 1));
-        assert!(jobs.contains(&Job::PersistData));
-        assert!(!scheduler.persist_requested);
+        assert_eq!(scheduler.tick(), vec![Job::CleanCache]);
+        assert!(scheduler.tick().is_empty());
     }
 
     #[test]

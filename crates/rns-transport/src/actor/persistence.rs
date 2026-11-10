@@ -111,6 +111,16 @@ pub(super) struct RoutingSnapshot {
     pub transport_identity_hash: Option<[u8; 16]>,
 }
 
+/// Persist known-destination metadata (`announce_cache.msgpack`).
+pub(super) fn write_announce_metadata(dir: &std::path::Path, announces: &[RecentAnnounce]) {
+    let announce_path = dir.join("announce_cache.msgpack");
+    if let Err(e) = crate::persistence::save_announce_cache(announces.iter(), &announce_path) {
+        trace!("failed to save announce cache: {}", e);
+    } else {
+        debug!("saved announce cache ({} entries)", announces.len());
+    }
+}
+
 /// Persist a routing snapshot. Runs on the blocking pool for periodic saves
 /// and inline for shutdown; must not touch the actor.
 pub(super) fn write_routing_snapshot(dir: &std::path::Path, snapshot: &RoutingSnapshot) {
@@ -157,17 +167,7 @@ pub(super) fn write_routing_snapshot(dir: &std::path::Path, snapshot: &RoutingSn
         }
     }
 
-    let announce_path = dir.join("announce_cache.msgpack");
-    if let Err(e) =
-        crate::persistence::save_announce_cache(snapshot.recent_announces.iter(), &announce_path)
-    {
-        trace!("failed to save announce cache: {}", e);
-    } else {
-        debug!(
-            "saved announce cache ({} entries)",
-            snapshot.recent_announces.len()
-        );
-    }
+    write_announce_metadata(dir, &snapshot.recent_announces);
 
     // Per-announce Python cache files are written event-driven at receive
     // (`cache_announce_to_disk`), not re-serialized here every cycle.
@@ -229,10 +229,11 @@ impl TransportActor {
 
     /// Event-driven announce cache write at receive (Python parity:
     /// `Transport.cache(packet, force_cache=True)` on announce ingest).
-    /// One file per announce packet; skipped when the file already exists
-    /// (SINGLE announces are retransmitted byte-identical). No fsync — the
-    /// cache is best-effort and rebuilt from live traffic, and an fsync
-    /// chain here would stall the actor on every announce.
+    /// One file per announce packet; a later write for the same packet hash
+    /// replaces the bytes and interface reference, like Python's
+    /// `AnnounceCache.store`. No fsync — the cache is best-effort and rebuilt
+    /// from live traffic, and an fsync chain here would stall the actor on
+    /// every announce.
     pub(super) fn cache_announce_to_disk(
         &self,
         packet_hash: &[u8; 32],
@@ -250,7 +251,7 @@ impl TransportActor {
             .interfaces
             .get(&interface_id)
             .map(|entry| entry.name.clone());
-        if let Err(e) = crate::persistence::write_python_cached_announce_if_absent(
+        if let Err(e) = crate::persistence::write_python_cached_announce(
             &announce_cache_dir,
             packet_hash,
             raw,
@@ -274,6 +275,70 @@ impl TransportActor {
                 .map(|(&id, entry)| (id, entry.name.clone()))
                 .collect(),
             transport_identity_hash: self.transport_identity_hash,
+        }
+    }
+
+    /// Flush known-destination metadata (`announce_cache.msgpack`) on the
+    /// `KD_FLUSH_INTERVAL` cadence, off-actor and behind the routing writer's
+    /// in-flight guard. The routing tables keep their own periodic save.
+    pub(super) fn flush_known_destinations_async(&mut self) {
+        if self.shared_instance_client_mode {
+            self.last_known_destinations_flush = now();
+            return;
+        }
+        let Some(dir) = self.storage_dir.clone() else {
+            return;
+        };
+        if self
+            .routing_save_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        self.routing_save_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+        let announces: Vec<RecentAnnounce> = self.recent_announces.values().cloned().collect();
+        // A newer synchronous snapshot bumps the generation and supersedes this one.
+        let generation = self
+            .routing_save_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let latest_generation = self.routing_save_generation.clone();
+        let write_lock = self.routing_save_lock.clone();
+        let in_flight = self.routing_save_in_flight.clone();
+        let write = move || {
+            let _guard = write_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if latest_generation.load(std::sync::atomic::Ordering::Acquire) == generation {
+                write_announce_metadata(&dir, &announces);
+            }
+            in_flight.store(false, std::sync::atomic::Ordering::Release);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(write);
+            }
+            Err(_) => write(),
+        }
+        if self.state_dirty {
+            self.state_dirty = false;
+            self.routing_save_pending = true;
+        }
+        self.last_known_destinations_flush = now();
+    }
+
+    /// Full persist of routing state, known destinations and the hashlist
+    /// (Python `Reticulum.__persist_data`), off-actor.
+    pub(super) fn persist_data_async(&mut self) {
+        self.save_state_async();
+        self.last_data_persist = now();
+    }
+
+    /// Python `Reticulum._should_persist_data`, called when a local client
+    /// disconnects: persist unless one ran within `GRACIOUS_PERSIST_INTERVAL`.
+    pub(super) fn maybe_gracious_persist(&mut self) {
+        if now() > self.last_data_persist + GRACIOUS_PERSIST_INTERVAL {
+            self.persist_data_async();
         }
     }
 
@@ -331,14 +396,15 @@ impl TransportActor {
             }
         }
         self.state_dirty = false;
+        self.routing_save_pending = false;
         self.last_state_save = now();
     }
 
     /// Reference-counted prune of the on-disk announce cache — Python
     /// `Transport.clean_announce_cache` parity. The keep-set is every packet
     /// hash a path response could still be served from: live paths, tunnel
-    /// paths, RPC-retained announces (Rust pin extension), and persisted
-    /// entries still waiting for their interface to re-register. The walk
+    /// paths, and persisted entries still waiting for their interface to
+    /// re-register (Rust restores paths lazily). The walk
     /// and unlinks run on the blocking pool; the actor only snapshots.
     /// Returns true when a sweep was scheduled (or ran inline).
     pub(super) fn maybe_sweep_announce_cache(&mut self) -> bool {
@@ -365,12 +431,6 @@ impl TransportActor {
             self.tunnel_table
                 .tunnel_paths()
                 .filter_map(|(_, p)| p.packet_hash),
-        );
-        keep.extend(
-            self.recent_announces
-                .values()
-                .filter(|a| a.retained)
-                .filter_map(|a| a.packet_hash),
         );
         keep.extend(
             self.pending_path_entries
@@ -456,6 +516,7 @@ impl TransportActor {
             write_routing_snapshot(&dir, &snapshot);
         }
         self.state_dirty = false;
+        self.routing_save_pending = false;
         self.last_state_save = now();
     }
 
@@ -634,6 +695,8 @@ impl TransportActor {
             return;
         };
         let now_ts = now();
+        // Python defers the first announce-cache clean (Transport.py:509).
+        self.last_announce_cache_sweep = now_ts + ANNOUNCE_CACHE_SWEEP_DEFER;
 
         // Python destination_table — canonical interop shape. Defer interface
         // hash remap until matching interfaces register.
@@ -926,18 +989,11 @@ impl TransportActor {
             };
             if let Some(entries) = loaded {
                 let count = entries.len();
-                let mut expired = 0usize;
+                // Python loads every known destination; cleaning decides retention.
                 for ae in entries {
                     if ae.destination_hash.len() == 16 {
                         let mut hash = [0u8; 16];
                         hash.copy_from_slice(&ae.destination_hash);
-                        let stale_pathless = !ae.retained
-                            && !self.recent_announces.contains_key(&hash)
-                            && now_ts - ae.timestamp > DESTINATION_TIMEOUT as f64;
-                        if stale_pathless {
-                            expired += 1;
-                            continue;
-                        }
                         let public_key = ae.public_key.and_then(|k| {
                             if k.len() == 64 {
                                 let mut arr = [0u8; 64];
@@ -992,7 +1048,7 @@ impl TransportActor {
                             });
                     }
                 }
-                debug!(count, expired, "loaded announce cache entries from disk");
+                debug!(count, "loaded announce cache entries from disk");
             }
         }
     }
@@ -1231,10 +1287,9 @@ mod announce_sweep_actor_tests {
         }
     }
 
-    /// Keep-set covers every source a path response can be served from:
-    /// live paths, tunnel paths, retained pins, and persisted entries still
-    /// waiting for interface re-registration. Everything else, aged past the
-    /// grace window, is removed. No tokio runtime → the sweep runs inline,
+    /// Keep-set covers live paths, tunnel paths and persisted entries still
+    /// waiting for interface re-registration. Everything else, a retained
+    /// destination's announce included, is removed once past the grace window. No tokio runtime → the sweep runs inline,
     /// making the test fully deterministic.
     #[test]
     fn sweep_keeps_all_reference_sources_and_removes_orphans() {
@@ -1307,7 +1362,6 @@ mod announce_sweep_actor_tests {
         for (h, why) in [
             (path_hash, "live path"),
             (tunnel_hash, "tunnel path"),
-            (pin_hash, "retained pin"),
             (pending_path_hash, "pending path entry"),
         ] {
             assert!(
@@ -1315,10 +1369,9 @@ mod announce_sweep_actor_tests {
                 "{why} announce must survive the sweep"
             );
         }
-        assert!(
-            !dir.join(hex::encode(orphan_hash)).exists(),
-            "orphan must be removed"
-        );
+        for (h, why) in [(orphan_hash, "orphan"), (pin_hash, "retained pin")] {
+            assert!(!dir.join(hex::encode(h)).exists(), "{why} must be removed");
+        }
         assert!(
             !actor
                 .announce_sweep_in_flight
@@ -1407,6 +1460,95 @@ mod async_save_tests {
         );
         actor.state_dirty = true;
         actor
+    }
+
+    /// Changed known-destination metadata reaches disk on the 10 s cadence
+    /// without waiting for the routing tables' periodic save.
+    #[test]
+    fn known_destinations_flush_on_their_own_cadence() {
+        let dir = temp_storage();
+        let mut actor = dirty_actor(&dir);
+        actor.recent_announces.insert(
+            [0x11; 16],
+            RecentAnnounce {
+                dest_hash: [0x11; 16],
+                hops: 1,
+                app_data: None,
+                timestamp: crate::now_f64(),
+                public_key: Some([0x25; 64]),
+                ratchet: None,
+                packet_hash: None,
+                is_path_response: false,
+                retained: false,
+                last_used: None,
+                name_hash: [0u8; 10],
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
+            },
+        );
+        let now = crate::now_f64();
+        actor.last_state_save = now;
+        actor.last_known_destinations_flush = now - KD_FLUSH_INTERVAL - 1.0;
+
+        actor.on_tick();
+
+        let announces =
+            crate::persistence::load_announce_cache(&dir.join("announce_cache.msgpack")).unwrap();
+        assert_eq!(announces.len(), 1);
+        assert!(
+            !dir.join("path_table.msgpack").exists(),
+            "routing tables wait for their own interval"
+        );
+        actor.last_state_save = now - STATE_SAVE_INTERVAL_SECS - 1.0;
+        actor.on_tick();
+        assert!(dir.join("path_table.msgpack").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A departing local client triggers a full persist once
+    /// `GRACIOUS_PERSIST_INTERVAL` has passed since the last one.
+    #[test]
+    fn local_client_disconnect_persists_after_gracious_interval() {
+        let dir = temp_storage();
+        let mut actor = dirty_actor(&dir);
+        for id in [8, 9] {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let mut client = crate::messages::InterfaceEntry::new(
+                "local client".to_string(),
+                crate::constants::InterfaceMode::Gateway,
+                crate::constants::InterfaceDirection::bidirectional(),
+                1_000_000,
+                rns_wire::constants::MTU as u32,
+                tx,
+            );
+            client.role = InterfaceRole::LocalClient;
+            actor.interfaces.insert(id, client);
+        }
+        let path = dir.join("path_table.msgpack");
+
+        actor.last_data_persist = crate::now_f64() - GRACIOUS_PERSIST_INTERVAL + 5.0;
+        actor.deregister_interface(8);
+        assert!(
+            !path.exists(),
+            "inside the gracious interval nothing persists"
+        );
+
+        actor.last_data_persist = crate::now_f64() - GRACIOUS_PERSIST_INTERVAL - 1.0;
+        actor.deregister_interface(9);
+        assert!(path.exists(), "a late disconnect persists");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Storage init defers the first announce-cache sweep by 60 s.
+    #[test]
+    fn storage_init_defers_the_first_announce_cache_sweep() {
+        let dir = temp_storage();
+        let (mut actor, _tx) = TransportActor::new();
+        let before = crate::now_f64();
+        actor.initialize_storage(dir.clone());
+        assert!(actor.last_announce_cache_sweep >= before + ANNOUNCE_CACHE_SWEEP_DEFER);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The periodic save must never run the fsync chain on the actor: the

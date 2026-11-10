@@ -270,6 +270,10 @@ impl TransportActor {
         if !now.is_finite() || now >= operation.timeout {
             return;
         }
+        // Python recalls the answered identity with use marking (Transport.py:2696).
+        if !operation.requesters.is_empty() {
+            self.use_destination(&destination);
+        }
         for waiter in operation.requesters {
             let id = waiter.token.interface;
             let eligible = self.discovery_waiter_registered(&waiter)
