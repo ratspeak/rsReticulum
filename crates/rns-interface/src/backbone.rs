@@ -5,7 +5,7 @@
 //! encoded frame; this is not a bound on total connection memory.
 
 use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -53,6 +53,19 @@ pub const FAST_FLAPPING_GRACE: u64 = 5;
 pub const FAST_FLAPPING_BLOCK_TIME: Duration = Duration::from_secs(12 * 60 * 60);
 
 const TX_CHANNEL_DEPTH: usize = 1024;
+
+/// Dataplane egress control (BackboneInterface.py DP_EC_*, Interface.py tx_hwm).
+pub const DP_EC_INTERVAL: Duration = Duration::from_secs(1);
+pub const DP_EC_MID_WM: u64 = 128 * 1024;
+pub const DP_EC_HIGH_WM: u64 = 4 * 1024 * 1024;
+pub const DP_EC_STALL_TICKS: u32 = 3;
+pub const DP_EC_MAX_ETA: f64 = 10.0;
+pub const DP_EC_RELEASE_ETA: f64 = 5.0;
+pub const DP_EC_DEAD_TIME: f64 = 12.0;
+/// Per-connection transmit high-water mark in framed bytes.
+pub const TX_HWM: u64 = 4 * 1024 * 1024;
+/// Receive buffer requested on accepted sockets (BackboneInterface.py DP_IC_RCVBUF).
+pub const DP_IC_RCVBUF: usize = 32768;
 
 /// Bounds process-global fast-flap state to a conservative few hundred KiB.
 ///
@@ -371,6 +384,11 @@ fn tune_stream(stream: &TcpStream) {
     set_socket_buffers(stream, HW_MTU as usize);
 }
 
+fn tune_accepted_stream(stream: &TcpStream) {
+    tune_stream(stream);
+    let _ = socket2::SockRef::from(stream).set_recv_buffer_size(DP_IC_RCVBUF);
+}
+
 fn child_mtu() -> u32 {
     crate::traits::optimise_mtu(CHILD_BITRATE_GUESS)
         .map(|m| m.min(HW_MTU))
@@ -422,19 +440,176 @@ async fn backbone_read_loop(
     online.store(false, Ordering::SeqCst);
 }
 
-async fn backbone_write_loop(
-    mut writer: tokio::net::tcp::OwnedWriteHalf,
-    mut rx: mpsc::Receiver<Bytes>,
-    online: Arc<AtomicBool>,
-    txb: Arc<AtomicU64>,
-) {
-    while let Some(data) = rx.recv().await {
-        let framed = hdlc::frame(&data);
-        txb.fetch_add(framed.len() as u64, Ordering::Relaxed);
-        if let Err(e) = writer.write_all(&framed).await {
-            tracing::warn!(error = %e, "backbone write error");
-            break;
+/// Per-connection dataplane egress control state (Python `_dp_ec_*`).
+///
+/// Times are seconds on any monotonic clock; the driver evaluates once per
+/// [`DP_EC_INTERVAL`] with the connection's cumulative sent and buffered bytes.
+#[derive(Debug, Clone, PartialEq)]
+struct EgressControl {
+    prev_sent: u64,
+    zero_ticks: u32,
+    last_drain: f64,
+    stalled: bool,
+}
+
+impl EgressControl {
+    fn new(now: f64) -> Self {
+        Self {
+            prev_sent: 0,
+            zero_ticks: 0,
+            last_drain: now,
+            stalled: false,
         }
+    }
+
+    /// Whether outbound frames are currently gated (Python `tx_stalled`).
+    fn stalled(&self) -> bool {
+        self.stalled
+    }
+
+    /// One evaluation tick; `true` means the connection must be torn down.
+    fn evaluate(&mut self, tx_sent: u64, buffered: u64, sendable: u64, now: f64) -> bool {
+        let drained = tx_sent.saturating_sub(self.prev_sent);
+        self.prev_sent = tx_sent;
+
+        if buffered == 0 || sendable == 0 {
+            self.zero_ticks = 0;
+            self.last_drain = now;
+            self.stalled = false;
+            return false;
+        }
+
+        if now - self.last_drain >= DP_EC_DEAD_TIME {
+            *self = Self::new(now);
+            return true;
+        }
+
+        if drained > 0 {
+            self.last_drain = now;
+            self.zero_ticks = 0;
+            let drain_rate = drained as f64 / DP_EC_INTERVAL.as_secs_f64();
+            let clear_eta = buffered as f64 / drain_rate;
+            if buffered > DP_EC_MID_WM && clear_eta > DP_EC_MAX_ETA {
+                if !self.stalled {
+                    tracing::debug!(
+                        clear_eta,
+                        "egress control drain ETA exceeds maximum, gating outbound"
+                    );
+                }
+                self.stalled = true;
+            } else if clear_eta < DP_EC_RELEASE_ETA || buffered <= DP_EC_MID_WM {
+                if self.stalled {
+                    tracing::debug!("egress control drain recovered, resuming outbound");
+                }
+                self.stalled = false;
+            }
+        } else if buffered > DP_EC_MID_WM {
+            self.zero_ticks += 1;
+            if self.zero_ticks >= DP_EC_STALL_TICKS {
+                if !self.stalled {
+                    tracing::debug!("no egress control drain progress, gating outbound");
+                }
+                self.stalled = true;
+            }
+        } else {
+            self.zero_ticks = 0;
+            self.stalled = false;
+        }
+        false
+    }
+}
+
+/// HDLC-frames outbound packets into a byte-bounded transmit queue drained to
+/// the socket, applying egress control. Returns when the connection must close.
+async fn backbone_write_loop(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    rx: &mut mpsc::Receiver<Bytes>,
+    txb: &AtomicU64,
+    name: &str,
+) {
+    let started = tokio::time::Instant::now();
+    let mut control = EgressControl::new(0.0);
+    let mut tick = tokio::time::interval_at(started + DP_EC_INTERVAL, DP_EC_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut queue: VecDeque<Bytes> = VecDeque::new();
+    let mut buffered: u64 = 0;
+    let mut sent: u64 = 0;
+    let mut tx_drops: u64 = 0;
+    loop {
+        let chunk = queue.front().cloned();
+        tokio::select! {
+            _ = tick.tick() => {
+                let now = started.elapsed().as_secs_f64();
+                if control.evaluate(sent, buffered, buffered, now) {
+                    tracing::info!(
+                        name = %name,
+                        "No egress control drain progress for {}s on {}, tearing down",
+                        DP_EC_DEAD_TIME,
+                        name,
+                    );
+                    return;
+                }
+            }
+            result = async { writer.write(chunk.as_deref().unwrap_or_default()).await }, if chunk.is_some() => {
+                match result {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        let written = n as u64;
+                        sent += written;
+                        buffered -= written;
+                        txb.fetch_add(written, Ordering::Relaxed);
+                        if let Some(front) = queue.front_mut() {
+                            if n >= front.len() {
+                                queue.pop_front();
+                            } else {
+                                *front = front.slice(n..);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(name = %name, error = %e, "backbone write error");
+                        return;
+                    }
+                }
+            }
+            item = rx.recv() => {
+                let Some(data) = item else { return };
+                let frame = Bytes::from(hdlc::frame(&data));
+                let len = frame.len() as u64;
+                if control.stalled() || buffered + len > TX_HWM {
+                    tx_drops += 1;
+                    tracing::debug!(
+                        name = %name,
+                        frame_len = len,
+                        tx_drops,
+                        "egress control dropping outbound frame",
+                    );
+                } else {
+                    buffered += len;
+                    queue.push_back(frame);
+                }
+            }
+        }
+    }
+}
+
+/// Run one connection: the reader and the egress-controlled writer share a
+/// task, so either side ending (or the task being aborted) closes the socket.
+#[allow(clippy::too_many_arguments)]
+async fn backbone_connection(
+    stream: TcpStream,
+    rx: &mut mpsc::Receiver<Bytes>,
+    interface_id: InterfaceId,
+    transport_tx: InterfaceTransportSender,
+    online: Arc<AtomicBool>,
+    rxb: Arc<AtomicU64>,
+    txb: Arc<AtomicU64>,
+    name: &str,
+) {
+    let (reader, mut writer) = stream.into_split();
+    tokio::select! {
+        _ = backbone_read_loop(reader, interface_id, transport_tx, online.clone(), rxb) => {}
+        _ = backbone_write_loop(&mut writer, rx, &txb, name) => {}
     }
     online.store(false, Ordering::SeqCst);
 }
@@ -591,20 +766,16 @@ fn spawn_backbone_server_on_listener(
                         "backbone: accepted connection",
                     );
 
-                    tune_stream(&stream);
+                    tune_accepted_stream(&stream);
 
                     let c_online = Arc::new(AtomicBool::new(true));
                     let c_rxb = Arc::new(AtomicU64::new(0));
                     let c_txb = Arc::new(AtomicU64::new(0));
-                    let (c_tx, c_rx) = mpsc::channel::<Bytes>(TX_CHANNEL_DEPTH);
-                    let (reader, writer) = stream.into_split();
-
-                    let c_online_w = c_online.clone();
-                    let c_txb_w = c_txb.clone();
-                    tokio::spawn(backbone_write_loop(writer, c_rx, c_online_w, c_txb_w));
+                    let (c_tx, mut c_rx) = mpsc::channel::<Bytes>(TX_CHANNEL_DEPTH);
 
                     let c_online_r = c_online.clone();
                     let c_rxb_r = c_rxb.clone();
+                    let c_txb_w = c_txb.clone();
                     let transport_tx2 =
                         InterfaceTransportSender::new(client_id, transport_tx.actor_sender());
                     let child_owner = transport_tx2.owner();
@@ -614,8 +785,17 @@ fn spawn_backbone_server_on_listener(
                         ActiveClientGuard::new(Arc::clone(&task_active_clients));
                     let read_handle = tokio::spawn(async move {
                         let _active_client_guard = active_client_guard;
-                        backbone_read_loop(reader, client_id, transport_tx2, c_online_r, c_rxb_r)
-                            .await;
+                        backbone_connection(
+                            stream,
+                            &mut c_rx,
+                            client_id,
+                            transport_tx2,
+                            c_online_r,
+                            c_rxb_r,
+                            c_txb_w,
+                            &cname,
+                        )
+                        .await;
                         fast_flap_connection.disconnected();
                         tracing::info!(name = %cname, "backbone client disconnected");
                         // Proactive notify so broadcasts don't target dead tx.
@@ -803,34 +983,21 @@ pub async fn spawn_backbone_client(
                 .and_then(|identity| identity.synthesis(&python_name));
             open_client_connection(&rx, after_outage, &transport_tx, synthesis, &online2).await;
 
-            let c_online = Arc::new(AtomicBool::new(true));
-            let (reader, writer) = stream.into_split();
-
-            let (conn_tx, conn_rx) = mpsc::channel::<Bytes>(TX_CHANNEL_DEPTH);
-            let c_online_w = c_online.clone();
-            let c_txb = task_txb.clone();
-            let write_handle =
-                tokio::spawn(backbone_write_loop(writer, conn_rx, c_online_w, c_txb));
-
-            let rx_ref = rx.clone();
-            let fwd_handle = tokio::spawn(async move {
-                let mut guard = rx_ref.lock().await;
-                while let Some(data) = guard.recv().await {
-                    if conn_tx.send(data).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            let c_online_r = c_online.clone();
-            let c_rxb = task_rxb.clone();
-            backbone_read_loop(reader, id, transport_tx.clone(), c_online_r, c_rxb).await;
-
+            {
+                let mut outbound = rx.lock().await;
+                backbone_connection(
+                    stream,
+                    &mut outbound,
+                    id,
+                    transport_tx.clone(),
+                    online2.clone(),
+                    task_rxb.clone(),
+                    task_txb.clone(),
+                    &python_name,
+                )
+                .await;
+            }
             online2.store(false, Ordering::SeqCst);
-            fwd_handle.abort();
-            let _ = fwd_handle.await;
-            write_handle.abort();
-            let _ = write_handle.await;
 
             if let Some(max) = max_tries {
                 tries += 1;
@@ -878,6 +1045,184 @@ pub async fn spawn_backbone_client(
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddr};
+
+    /// Replays the stub scenarios of the upstream `_dp_ec_evaluate` golden
+    /// (tests fixtures/t16/k74_egress.py, RNS 1.6.0); expectations are its output.
+    fn replay_egress(steps: &[(f64, u64, u64)]) -> Vec<(u64, bool, bool)> {
+        let mut control = EgressControl::new(0.0);
+        let (mut appended, mut sent) = (0u64, 0u64);
+        steps
+            .iter()
+            .map(|&(t, append, drain)| {
+                appended += append;
+                sent += drain;
+                let buffered = appended - sent;
+                let teardown = control.evaluate(sent, buffered, buffered, t);
+                if teardown {
+                    appended = 0;
+                    sent = 0;
+                }
+                (appended - sent, control.stalled(), teardown)
+            })
+            .collect()
+    }
+
+    const K: u64 = 1024;
+
+    #[test]
+    fn egress_slow_drain_above_mid_gates() {
+        assert_eq!(
+            replay_egress(&[(1.0, 64 * 16 * K, 0), (2.0, 0, 50 * K)]),
+            [(1048576, false, false), (997376, true, false)]
+        );
+    }
+
+    #[test]
+    fn egress_three_zero_drain_ticks_above_mid_gate() {
+        assert_eq!(
+            replay_egress(&[(1.0, 256 * K, 0), (2.0, 0, 0), (3.0, 0, 0), (4.0, 0, 0)]),
+            [
+                (262144, false, false),
+                (262144, false, false),
+                (262144, true, false),
+                (262144, true, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn egress_twelve_seconds_without_drain_tears_down() {
+        let mut steps = vec![(0.5, 64 * K, 0)];
+        steps.extend((1..14).map(|t| (t as f64, 0, 0)));
+        let out = replay_egress(&steps);
+        assert!(out[..12].iter().all(|&(b, s, d)| b == 65536 && !s && !d));
+        assert_eq!(out[12], (0, false, true));
+        assert_eq!(out[13], (0, false, false));
+    }
+
+    #[test]
+    fn egress_fast_drain_releases_gate() {
+        assert_eq!(
+            replay_egress(&[(1.0, 1024 * K, 0), (2.0, 0, 50 * K), (3.0, 0, 400 * K)]),
+            [
+                (1048576, false, false),
+                (997376, true, false),
+                (587776, false, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn egress_drain_to_mid_unstalls() {
+        assert_eq!(
+            replay_egress(&[
+                (1.0, 256 * K, 0),
+                (2.0, 0, 0),
+                (3.0, 0, 0),
+                (4.0, 0, 160 * K)
+            ]),
+            [
+                (262144, false, false),
+                (262144, false, false),
+                (262144, true, false),
+                (98304, false, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn egress_empty_buffer_resets_gate_and_dead_clock() {
+        assert_eq!(
+            replay_egress(&[
+                (1.0, 256 * K, 0),
+                (2.0, 0, 0),
+                (3.0, 0, 0),
+                (4.0, 0, 256 * K),
+                (15.0, K, 0)
+            ]),
+            [
+                (262144, false, false),
+                (262144, false, false),
+                (262144, true, false),
+                (0, false, false),
+                (1024, false, false)
+            ]
+        );
+    }
+
+    async fn assert_peer_sees_close(peer: &mut TcpStream) {
+        let mut buf = [0u8; 1024];
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match peer.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "socket stayed open after the interface task was aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_client_task_closes_its_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, _rx) = mpsc::channel(64);
+        let handle =
+            spawn_backbone_client(BackboneClientConfig::new("abort", "127.0.0.1", port), 3, tx)
+                .await
+                .unwrap();
+        handle.owner.mark_registered();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        while !handle.online.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.read_task.abort();
+        assert_peer_sees_close(&mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn aborting_accepted_child_task_closes_its_socket() {
+        let (tx, _rx) = mpsc::channel(64);
+        let (handle_tx, mut handle_rx) = mpsc::channel(4);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (runtime, _clock) = test_runtime(16);
+        let parent = spawn_backbone_server_on_listener(
+            BackboneServerConfig::new("abort-srv", "127.0.0.1", addr.port()),
+            10,
+            Arc::new(AtomicU64::new(11)),
+            tx,
+            handle_tx,
+            runtime,
+            listener,
+        )
+        .unwrap();
+        let mut peer = TcpStream::connect(addr).await.unwrap();
+        let child = handle_rx.recv().await.unwrap();
+        child.read_task.abort();
+        assert_peer_sees_close(&mut peer).await;
+        parent.read_task.abort();
+    }
+
+    #[tokio::test]
+    async fn accepted_socket_requests_small_receive_buffer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        tune_accepted_stream(&accepted);
+        let rcvbuf = socket2::SockRef::from(&accepted)
+            .recv_buffer_size()
+            .unwrap();
+        // Linux doubles the request for bookkeeping overhead.
+        assert!(rcvbuf <= 2 * DP_IC_RCVBUF, "rcvbuf {rcvbuf}");
+    }
 
     #[test]
     fn client_python_names_match_python() {

@@ -551,9 +551,11 @@ async fn i2p_server_peers_register_under_their_server() {
         .expect("the I2P server accepts a SAM stream")
         .unwrap();
     assert!(command.starts_with("STREAM ACCEPT"), "{command}");
-    let peer = wait_for_interface(&handle, |entry| entry.name.starts_with("Golden I2P/peer_"))
-        .await
-        .expect("the accepted peer registers");
+    let peer = wait_for_interface(&handle, |entry| {
+        entry.name == "Connected peer on Golden I2P"
+    })
+    .await
+    .expect("the accepted peer registers");
     let server = interfaces(&handle)
         .await
         .into_iter()
