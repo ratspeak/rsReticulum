@@ -13,6 +13,24 @@ macro_rules! pr_log {
     };
 }
 
+/// Path-request lengths (Transport.py:3975-3980).
+pub(super) const PR_LEGACY_LENGTH: usize = 32;
+pub(super) const PR_LENGTH: usize = 48;
+pub(super) const PR_STAMPED_LENGTH: usize = 64;
+pub(super) const PR_EXT_HEADER_LENGTH: usize = 2;
+pub(super) const PR_EXT_PAYLOAD_LENGTH: usize = 16;
+
+/// Transport.validate_pr_stamp (Transport.py:4011-4016): material `dst || tag`.
+fn path_request_stamp_valid(destination: &[u8; 16], tag: &[u8], stamp: &[u8], cost: f64) -> bool {
+    if stamp.len() != rns_identity::stamps::NETWORK_STAMP_SIZE {
+        return false;
+    }
+    let mut material = [0u8; 32];
+    material[..16].copy_from_slice(destination);
+    material[16..].copy_from_slice(tag);
+    rns_identity::stamps::stamp_valid(stamp, cost, &material).unwrap_or(false)
+}
+
 impl TransportActor {
     pub(super) fn dispatch_link_request_checked(
         &mut self,
@@ -570,29 +588,14 @@ impl TransportActor {
 
         let is_from_local_client = self.is_local_client_interface(interface_id);
 
+        // Transport.py:2071-2086 and parse_path_request (:3982-4005).
+        if data.len() > PR_STAMPED_LENGTH {
+            self.protocol_violation(interface_id);
+            return;
+        }
         let mut requested_dest = [0u8; 16];
         requested_dest.copy_from_slice(&data[..16]);
-
-        // Python transport nodes send destination(16) + requestor transport
-        // id(16) + tag(16). Leaf nodes normally send destination(16) + tag(16).
-        // On receive, Python treats payloads longer than 32 bytes as transport
-        // requests and truncates any remaining tag bytes to 16.
-        let requestor_transport_id = if data.len() > 32 {
-            let mut id = [0u8; 16];
-            id.copy_from_slice(&data[16..32]);
-            Some(id)
-        } else {
-            None
-        };
-        let tag_bytes = if data.len() > 32 {
-            Some(&data[32..data.len().min(48)])
-        } else if data.len() > 16 {
-            Some(&data[16..data.len().min(32)])
-        } else {
-            None
-        };
-
-        let Some(tag) = tag_bytes else {
+        if data.len() == 16 {
             pr_log!(
                 self,
                 dest = %hex::encode(requested_dest),
@@ -600,11 +603,21 @@ impl TransportActor {
             );
             self.protocol_violation(interface_id);
             return;
-        };
-        // Python counts a tag cut to 16 bytes as a violation (Transport.py:1843-1845).
-        if data.len() > 48 {
-            self.protocol_violation(interface_id);
         }
+        if !matches!(data.len(), PR_LEGACY_LENGTH | PR_LENGTH | PR_STAMPED_LENGTH) {
+            self.protocol_violation(interface_id);
+            return;
+        }
+        let (requestor_transport_id, tag, ext) = if data.len() == PR_LEGACY_LENGTH {
+            (None, &data[16..32], None)
+        } else {
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&data[16..32]);
+            let ext: Option<[u8; PR_EXT_PAYLOAD_LENGTH]> =
+                data.get(PR_LENGTH..).and_then(|ext| ext.try_into().ok());
+            (Some(id), &data[32..48], ext)
+        };
+        let tag_bytes = Some(tag);
 
         let now = now_f64();
         let mut unique_tag = Vec::with_capacity(32);
@@ -617,8 +630,25 @@ impl TransportActor {
             return;
         }
         self.discovery_pr_tags.insert(unique_tag, now);
-        // Python counts a path request once its tag passes this gate
-        // (Transport.py:1847-1858).
+        if crate::announce_validation::STAMPS_ENABLED {
+            let stamp_ok = ext.as_ref().is_some_and(|ext| {
+                ext[0] == rns_identity::announce::ANNOUNCE_EXT_MARKER
+                    && path_request_stamp_valid(
+                        &requested_dest,
+                        tag,
+                        &ext[PR_EXT_HEADER_LENGTH..],
+                        crate::announce_validation::PR_COST,
+                    )
+            });
+            if !stamp_ok {
+                trace!(dest = %hex::encode(requested_dest), stamped = ext.is_some(), "path request without a valid stamp");
+                if crate::announce_validation::STAMPS_ENFORCED {
+                    return;
+                }
+            }
+        }
+        // Python counts a path request once its tag and stamp pass these gates
+        // (Transport.py:2088-2131).
         if let Some(entry) = self.interfaces.get_mut(&interface_id) {
             entry.ingress.received_path_request();
         }
@@ -754,7 +784,13 @@ impl TransportActor {
                 dest = %hex::encode(requested_dest),
                 "forwarding path request from local shared client"
             );
-            self.forward_path_request(requested_dest, Some(interface_id), tag_bytes, false);
+            self.forward_path_request_ext(
+                requested_dest,
+                Some(interface_id),
+                tag_bytes,
+                ext.as_ref(),
+                false,
+            );
         } else if self.is_transport_enabled && should_search_unknown {
             let ingress_limited = self
                 .interfaces
@@ -769,8 +805,19 @@ impl TransportActor {
                 return;
             }
 
+            // Transport.py:3893-3897: never reached while enforcement drops
+            // unstamped requests above.
+            if ext.is_none() && crate::announce_validation::STAMPS_ENFORCED {
+                return;
+            }
             if self.begin_or_join_recursive_discovery(requested_dest, interface_id, now) {
-                self.forward_path_request(requested_dest, Some(interface_id), tag_bytes, true);
+                self.forward_path_request_ext(
+                    requested_dest,
+                    Some(interface_id),
+                    tag_bytes,
+                    ext.as_ref(),
+                    true,
+                );
             }
         } else if self.has_local_client_interfaces() {
             pr_log!(
@@ -779,7 +826,13 @@ impl TransportActor {
                 "forwarding path request to local shared clients"
             );
             for local_id in self.local_client_interface_ids_except(Some(interface_id)) {
-                self.send_path_request(requested_dest, local_id, None, false);
+                self.send_path_request_ext(
+                    requested_dest,
+                    local_id,
+                    Some(tag),
+                    ext.as_ref(),
+                    false,
+                );
             }
         } else {
             pr_log!(
@@ -791,18 +844,27 @@ impl TransportActor {
         }
     }
 
-    fn build_path_request_packet(&self, destination_hash: [u8; 16], tag: Option<&[u8]>) -> Vec<u8> {
-        let mut request_data = Vec::with_capacity(48);
+    /// Transport.py:3699-3704: destination, transport id, tag, then any
+    /// received extension unchanged.
+    fn build_path_request_packet(
+        &self,
+        destination_hash: [u8; 16],
+        tag: Option<&[u8]>,
+        ext: Option<&[u8; PR_EXT_PAYLOAD_LENGTH]>,
+    ) -> Vec<u8> {
+        let mut request_data = Vec::with_capacity(PR_STAMPED_LENGTH);
         request_data.extend_from_slice(&destination_hash);
-        if self.is_transport_enabled
-            && let Some(identity_hash) = self.transport_identity_hash
-        {
+        // Leaves use their ephemeral identity; only a bare actor has none.
+        if let Some(identity_hash) = self.transport_identity_hash {
             request_data.extend_from_slice(&identity_hash);
         }
         if let Some(tag) = tag {
             request_data.extend_from_slice(&tag[..tag.len().min(16)]);
         } else {
             request_data.extend_from_slice(&rns_crypto::random::random_bytes(16));
+        }
+        if let Some(ext) = ext {
+            request_data.extend_from_slice(ext);
         }
 
         let flags = rns_wire::flags::PacketFlags {
@@ -835,7 +897,18 @@ impl TransportActor {
         tag: Option<&[u8]>,
         recursive: bool,
     ) {
-        let raw = self.build_path_request_packet(destination_hash, tag);
+        self.send_path_request_ext(destination_hash, interface_id, tag, None, recursive);
+    }
+
+    pub(super) fn send_path_request_ext(
+        &mut self,
+        destination_hash: [u8; 16],
+        interface_id: InterfaceId,
+        tag: Option<&[u8]>,
+        ext: Option<&[u8; PR_EXT_PAYLOAD_LENGTH]>,
+        recursive: bool,
+    ) {
+        let raw = self.build_path_request_packet(destination_hash, tag, ext);
         self.admit_path_request(destination_hash, interface_id, raw, recursive);
     }
 
@@ -844,6 +917,17 @@ impl TransportActor {
         destination_hash: [u8; 16],
         except: Option<InterfaceId>,
         tag: Option<&[u8]>,
+        recursive: bool,
+    ) {
+        self.forward_path_request_ext(destination_hash, except, tag, None, recursive);
+    }
+
+    pub(super) fn forward_path_request_ext(
+        &mut self,
+        destination_hash: [u8; 16],
+        except: Option<InterfaceId>,
+        tag: Option<&[u8]>,
+        ext: Option<&[u8; PR_EXT_PAYLOAD_LENGTH]>,
         recursive: bool,
     ) {
         let ids: Vec<InterfaceId> = self
@@ -858,7 +942,7 @@ impl TransportActor {
             })
             .collect();
         for id in ids {
-            self.send_path_request(destination_hash, id, tag, recursive);
+            self.send_path_request_ext(destination_hash, id, tag, ext, recursive);
         }
     }
 

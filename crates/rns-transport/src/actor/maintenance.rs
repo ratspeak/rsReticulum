@@ -292,6 +292,8 @@ impl TransportActor {
         self.last_discovery_pr_tx = now;
 
         if let Some(blocked_interface) = request.blocked_interface {
+            // Transport.py:4072-4081: one tag for every interface but the blocked one.
+            let request_tag = rns_crypto::random::random_bytes(16);
             let ids: Vec<InterfaceId> = self
                 .interfaces
                 .iter()
@@ -304,7 +306,7 @@ impl TransportActor {
                 })
                 .collect();
             for id in ids {
-                self.send_path_request(request.destination_hash, id, None, false);
+                self.send_path_request(request.destination_hash, id, Some(&request_tag), false);
             }
         } else {
             let mut request_tag = [0u8; 16];
@@ -726,6 +728,9 @@ mod cleanup_tests {
             retained,
             last_used,
             name_hash: [0u8; 10],
+            stamp: None,
+            stamp_value: 0.0,
+            lr_cost: None,
         };
         actor.recent_announces.insert(entry.dest_hash, entry);
     }

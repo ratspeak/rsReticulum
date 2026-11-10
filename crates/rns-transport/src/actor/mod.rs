@@ -220,6 +220,8 @@ pub struct TransportActor {
     /// public table mutation does not publish a snapshot; a poisoned snapshot
     /// lock prevents publication.
     pub blackholed_snapshot: Arc<std::sync::RwLock<HashSet<[u8; 16]>>>,
+    /// Per-packet announce validation results (Identity.py:676-715).
+    pub announce_validation: crate::announce_validation::AnnounceValidationCache,
 
     /// Whether this actor currently uses a shared-instance peer. Routing policy
     /// uses that peer and reconnect handling invalidates prior routing state.
@@ -319,6 +321,13 @@ pub struct RecentAnnounce {
     /// entries can contain zero when metadata is unavailable; fresh announces
     /// without valid payloads are rejected.
     pub name_hash: [u8; 10],
+    /// Network stamp from the announce extension, kept even when it is below
+    /// the required value (Identity.py:109-126).
+    pub stamp: Option<[u8; rns_identity::stamps::NETWORK_STAMP_SIZE]>,
+    /// Stamp value; 0 for an unstamped announce, as upstream stores it.
+    pub stamp_value: f64,
+    /// Announced link-request cost, recorded only with a valid stamp.
+    pub lr_cost: Option<f64>,
 }
 
 /// One automatic rediscovery queue entry after a failed Link attempt.
@@ -460,6 +469,7 @@ impl TransportActor {
             blackhole_sources: Vec::new(),
             stamp_policy: crate::stamps::StampPolicy::default(),
             blackholed_snapshot: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            announce_validation: crate::announce_validation::AnnounceValidationCache::new(),
             is_shared_instance: false,
             shared_instance_client_mode: false,
             storage_dir: None,
@@ -1420,7 +1430,9 @@ impl TransportActor {
     /// Called after every blackhole-table mutation; TTL-expired entries drop
     /// out here and on the periodic cull (Python parity: the 60s expiry job,
     /// Transport.py:986-1002).
-    fn publish_blackhole_snapshot(&self) {
+    fn publish_blackhole_snapshot(&mut self) {
+        // Identity._reset_validation_caches on every blackhole change.
+        self.announce_validation.reset();
         let now = now_f64();
         let set: HashSet<[u8; 16]> = self
             .blackhole_table
@@ -2981,6 +2993,9 @@ mod tests {
                 retained: false,
                 last_used: None,
                 name_hash: [0u8; 10],
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
             },
         );
 
@@ -3053,6 +3068,9 @@ mod tests {
                     retained: false,
                     last_used: None,
                     name_hash: [0; 10],
+                    stamp: None,
+                    stamp_value: 0.0,
+                    lr_cost: None,
                 },
             );
         }
@@ -3145,6 +3163,9 @@ mod tests {
                     retained: false,
                     last_used: None,
                     name_hash: [0; 10],
+                    stamp: None,
+                    stamp_value: 0.0,
+                    lr_cost: None,
                 },
             );
         }
@@ -3172,6 +3193,9 @@ mod tests {
                 retained: false,
                 last_used: None,
                 name_hash: [0; 10],
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
             },
         );
         let mut target_path =
@@ -5923,6 +5947,9 @@ mod tests {
                 retained: false,
                 last_used: None,
                 name_hash: [0xCC; 10],
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
             },
         );
 
@@ -5973,6 +6000,9 @@ mod tests {
                     retained: false,
                     last_used: None,
                     name_hash: [0; 10],
+                    stamp: None,
+                    stamp_value: 0.0,
+                    lr_cost: None,
                 },
             );
         }
@@ -8188,6 +8218,9 @@ mod tests {
                 retained: false,
                 last_used: None,
                 name_hash: [0; 10],
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
             },
         );
         actor.blackhole_table.add_with_reason(
@@ -8894,6 +8927,9 @@ mod tests {
             retained: false,
             last_used: Some(1234567999.0),
             name_hash: [0x77; 10],
+            stamp: None,
+            stamp_value: 0.0,
+            lr_cost: None,
         }];
 
         let dir = std::env::temp_dir().join("reticulum_rs_test_announce_cache");
@@ -9271,6 +9307,9 @@ mod tests {
                 retained: false,
                 last_used: None,
                 name_hash: [0; 10],
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
             },
         );
 
@@ -9524,6 +9563,9 @@ mod tests {
                 retained: false,
                 last_used: None,
                 name_hash: [0; 10],
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
             },
         );
 
@@ -10822,8 +10864,17 @@ mod tests {
             )
         );
         let payload = &raw[offset..];
+        // A bare actor has no transport identity; every runtime sets one.
         assert_eq!(payload.len(), 32);
         assert_eq!(&payload[..16], &requested);
+
+        actor.transport_identity_hash = Some([0x44; 16]);
+        actor.path_requests.clear();
+        actor.on_path_request([0x34; 16]);
+        let raw = gateway_rx.try_recv().expect("second path request");
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        assert_eq!(raw.len() - offset, 48);
+        assert_eq!(&raw[offset + 16..offset + 32], &[0x44; 16]);
     }
 
     #[test]
@@ -11178,6 +11229,9 @@ mod tests {
                 retained: false,
                 last_used: None,
                 name_hash: [0u8; 10],
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
             },
         );
 
@@ -11815,6 +11869,9 @@ mod tests {
                 retained: false,
                 last_used: None,
                 name_hash: [0u8; 10],
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
             },
         );
 
@@ -11901,6 +11958,9 @@ mod tests {
                 retained: false,
                 last_used: None,
                 name_hash: [0u8; 10],
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
             },
         );
 
@@ -11991,6 +12051,9 @@ mod tests {
                 retained: false,
                 last_used: None,
                 name_hash: [0u8; 10],
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
             },
         );
 
@@ -12802,6 +12865,9 @@ mod tests {
                 retained: false,
                 last_used: None,
                 name_hash: [0; 10],
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
             },
         );
     }

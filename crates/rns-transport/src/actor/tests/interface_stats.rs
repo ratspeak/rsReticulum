@@ -283,7 +283,7 @@ fn malformed_and_invalid_packets_count_as_protocol_violations() {
     assert_eq!(
         stats(&mut actor, 1).protocol_violations,
         6,
-        "a tag longer than 16 bytes is truncated and counted (Transport.py:1843-1845)"
+        "a 36-byte request is outside the 32/48/64 whitelist (Transport.py:2084-2086@1.6.0)"
     );
     assert_eq!(stats(&mut actor, 1).packet_filter_hits, 0);
     assert_eq!(stats(&mut actor, 1).ifac_violations, 0);

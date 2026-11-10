@@ -25,6 +25,9 @@ fn recent_announce_from_cached_packet(
         retained: false,
         last_used: None,
         name_hash: [0u8; 10],
+        stamp: None,
+        stamp_value: 0.0,
+        lr_cost: None,
     };
 
     if let Ok((header, offset)) = rns_wire::header::PacketHeader::unpack(&raw_packet)
@@ -41,7 +44,14 @@ fn recent_announce_from_cached_packet(
             &raw_packet[offset..],
             header.flags.context_flag,
         ) {
-            recent.app_data = announce.app_data;
+            let stamp =
+                announce.check_stamp(&dest_hash, crate::announce_validation::DESTINATION_COST);
+            recent.app_data = stamp
+                .app_data(announce.app_data.as_deref())
+                .map(<[u8]>::to_vec);
+            recent.stamp = stamp.stamp;
+            recent.stamp_value = stamp.value.unwrap_or(0.0);
+            recent.lr_cost = stamp.lr_cost;
             recent.public_key = Some(announce.public_key);
             recent.ratchet = announce.ratchet;
             recent.name_hash = announce.name_hash;
@@ -974,6 +984,9 @@ impl TransportActor {
                                 retained: ae.retained,
                                 last_used: ae.last_used,
                                 name_hash,
+                                stamp: ae.stamp.and_then(|stamp| stamp.try_into().ok()),
+                                stamp_value: ae.stamp_value,
+                                lr_cost: ae.lr_cost,
                             });
                     }
                 }
@@ -1210,6 +1223,9 @@ mod announce_sweep_actor_tests {
             retained: true,
             last_used: None,
             name_hash: [0u8; 10],
+            stamp: None,
+            stamp_value: 0.0,
+            lr_cost: None,
         }
     }
 

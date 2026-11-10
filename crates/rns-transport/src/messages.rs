@@ -863,6 +863,14 @@ pub enum TransportQuery {
     RecallDestination {
         dest: [u8; 16],
     },
+    /// Identity.recall_stamp_value: `None` when unknown, 0 when known but unstamped.
+    RecallStampValue {
+        dest: [u8; 16],
+    },
+    /// Identity.recall_link_cost: the announced link-request cost, if any.
+    RecallLinkCost {
+        dest: [u8; 16],
+    },
     /// Whether a non-expired path currently exists for `dest`.
     HasPath {
         dest: [u8; 16],

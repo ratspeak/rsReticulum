@@ -1,4 +1,5 @@
 use super::*;
+use crate::announce_validation::{CachedAnnounce, InvalidAnnounce, ValidatedAnnounce};
 use crate::now_f64;
 
 /// Where an inbound packet comes from. Python re-injects held and cached
@@ -51,6 +52,29 @@ impl TransportActor {
     pub(super) fn protocol_violation(&mut self, interface_id: InterfaceId) {
         if let Some(entry) = self.interfaces.get_mut(&interface_id) {
             entry.protocol_violations = entry.protocol_violations.saturating_add(1);
+        }
+    }
+
+    /// Upstream drops stamp and blackhole rejections silently; anything else
+    /// is a protocol violation (Transport.py:2046-2051, :2450-2451).
+    fn reject_announce(
+        &mut self,
+        header: &rns_wire::header::PacketHeader,
+        interface_id: InterfaceId,
+        packet_hash: [u8; 32],
+        reason: InvalidAnnounce,
+        cache: bool,
+    ) {
+        if cache {
+            self.announce_validation.insert_invalid(packet_hash, reason);
+        }
+        trace!(
+            dest = hex::encode(header.destination_hash),
+            ?reason,
+            "announce rejected"
+        );
+        if reason == InvalidAnnounce::Invalid {
+            self.protocol_violation(interface_id);
         }
     }
 
@@ -331,45 +355,106 @@ impl TransportActor {
             return;
         }
 
-        let (announce_data, validated_identity) = {
-            if data_offset >= raw.len() {
+        if data_offset >= raw.len() {
+            tracing::warn!(
+                dest = hex::encode(header.destination_hash),
+                "announce missing payload, dropping"
+            );
+            self.protocol_violation(interface_id);
+            return;
+        }
+        let payload = &raw[data_offset..];
+        let has_ratchet = header.flags.context_flag;
+        let announce_data = match rns_identity::announce::AnnounceData::unpack(payload, has_ratchet)
+        {
+            Ok(announce_data) => announce_data,
+            Err(e) => {
                 tracing::warn!(
                     dest = hex::encode(header.destination_hash),
-                    "announce missing payload, dropping"
+                    payload_len = payload.len(),
+                    has_ratchet = has_ratchet,
+                    error = %e,
+                    "announce unpack failed, dropping"
                 );
                 self.protocol_violation(interface_id);
                 return;
             }
+        };
 
-            let payload = &raw[data_offset..];
-            let has_ratchet = header.flags.context_flag;
-            tracing::debug!(
-                dest = hex::encode(header.destination_hash),
-                payload_len = payload.len(),
-                has_ratchet = has_ratchet,
-                header_type = ?header.flags.header_type,
-                "announce payload received"
-            );
-            match rns_identity::announce::AnnounceData::unpack(payload, has_ratchet) {
-                Ok(announce_data) => {
-                    tracing::debug!(
-                        dest = hex::encode(header.destination_hash),
-                        app_data_len = announce_data.app_data.as_ref().map(|d| d.len()),
-                        has_ratchet_key = announce_data.ratchet.is_some(),
-                        "announce unpacked"
+        // Identity.validate_announce (Identity.py:749-889): the cache, then
+        // the stamp, then the blackhole check, then the signature.
+        let announce_packet_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
+        let cost_target = crate::announce_validation::DESTINATION_COST;
+        let cached = self.announce_validation.lookup(
+            &announce_packet_hash,
+            cost_target,
+            crate::announce_validation::STAMPS_ENFORCED,
+        );
+        let (validated, validated_identity, cache_hit) = match cached {
+            CachedAnnounce::Rejected(reason) => {
+                self.reject_announce(header, interface_id, announce_packet_hash, reason, false);
+                return;
+            }
+            CachedAnnounce::Valid(validated) => {
+                let Ok(identity) =
+                    rns_identity::identity::Identity::from_public_key(&validated.public_key)
+                else {
+                    return;
+                };
+                (validated, identity, true)
+            }
+            CachedAnnounce::Miss => {
+                let stamp = if crate::announce_validation::STAMPS_ENABLED {
+                    announce_data.check_stamp(&header.destination_hash, cost_target)
+                } else {
+                    rns_identity::announce::AnnounceStampCheck::default()
+                };
+                if crate::announce_validation::STAMPS_ENABLED
+                    && crate::announce_validation::STAMPS_ENFORCED
+                {
+                    let reason = if !stamp.stamped {
+                        Some(InvalidAnnounce::NoStamp)
+                    } else if !stamp.validated {
+                        Some(InvalidAnnounce::InvalidStamp(stamp.value))
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = reason {
+                        self.reject_announce(
+                            header,
+                            interface_id,
+                            announce_packet_hash,
+                            reason,
+                            true,
+                        );
+                        return;
+                    }
+                }
+                let Ok(announced_identity) =
+                    rns_identity::identity::Identity::from_public_key(&announce_data.public_key)
+                else {
+                    self.reject_announce(
+                        header,
+                        interface_id,
+                        announce_packet_hash,
+                        InvalidAnnounce::Invalid,
+                        true,
                     );
+                    return;
+                };
+                if self.blackhole_table.is_blackholed(&announced_identity.hash) {
+                    self.reject_announce(
+                        header,
+                        interface_id,
+                        announce_packet_hash,
+                        InvalidAnnounce::Blackholed,
+                        true,
+                    );
+                    return;
+                }
+                let validated_identity =
                     match announce_data.verify_signature(&header.destination_hash) {
-                        Ok(validated_identity) => {
-                            if self.blackhole_table.is_blackholed(&validated_identity.hash) {
-                                trace!(
-                                    identity = hex::encode(validated_identity.hash),
-                                    dest = hex::encode(header.destination_hash),
-                                    "announce from blackholed identity, dropping"
-                                );
-                                return;
-                            }
-                            (announce_data, validated_identity)
-                        }
+                        Ok(identity) => identity,
                         Err(e) => {
                             tracing::warn!(
                                 dest = hex::encode(header.destination_hash),
@@ -377,22 +462,27 @@ impl TransportActor {
                                 error = %e,
                                 "announce validation failed, dropping"
                             );
-                            self.protocol_violation(interface_id);
+                            self.reject_announce(
+                                header,
+                                interface_id,
+                                announce_packet_hash,
+                                InvalidAnnounce::Invalid,
+                                true,
+                            );
                             return;
                         }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        dest = hex::encode(header.destination_hash),
-                        payload_len = payload.len(),
-                        has_ratchet = has_ratchet,
-                        error = %e,
-                        "announce unpack failed, dropping"
-                    );
-                    self.protocol_violation(interface_id);
-                    return;
-                }
+                    };
+                let validated = ValidatedAnnounce {
+                    public_key: announce_data.public_key,
+                    app_data: stamp
+                        .app_data(announce_data.app_data.as_deref())
+                        .map(<[u8]>::to_vec),
+                    ratchet: announce_data.ratchet,
+                    stamp: stamp.stamp,
+                    stamp_value: stamp.value,
+                    lr_cost: stamp.lr_cost,
+                };
+                (validated, validated_identity, false)
             }
         };
 
@@ -428,42 +518,58 @@ impl TransportActor {
             }
         }
 
-        let known_public_key = self
-            .recent_announces
-            .get(&header.destination_hash)
-            .and_then(|entry| entry.public_key);
-        if let Err(e) = announce_data.validate_destination_binding(
-            &header.destination_hash,
-            &validated_identity,
-            known_public_key.as_ref(),
-        ) {
-            tracing::warn!(
-                dest = hex::encode(header.destination_hash),
-                error = %e,
-                "announce validation failed, dropping"
-            );
-            self.protocol_violation(interface_id);
-            return;
+        if !cache_hit {
+            let known_public_key = self
+                .recent_announces
+                .get(&header.destination_hash)
+                .and_then(|entry| entry.public_key);
+            if let Err(e) = announce_data.validate_destination_binding(
+                &header.destination_hash,
+                &validated_identity,
+                known_public_key.as_ref(),
+            ) {
+                tracing::warn!(
+                    dest = hex::encode(header.destination_hash),
+                    error = %e,
+                    "announce validation failed, dropping"
+                );
+                self.reject_announce(
+                    header,
+                    interface_id,
+                    announce_packet_hash,
+                    InvalidAnnounce::Invalid,
+                    true,
+                );
+                return;
+            }
         }
 
         tracing::debug!(
             dest = hex::encode(header.destination_hash),
-            app_data_present = announce_data.app_data.is_some(),
+            app_data_present = validated.app_data.is_some(),
+            stamp_value = ?validated.stamp_value,
+            cache_hit,
             "announce validated"
         );
+        if !cache_hit {
+            self.announce_validation
+                .insert_valid(announce_packet_hash, validated.clone());
+        }
 
-        let announce_app_data = announce_data.app_data.clone();
+        let announce_app_data = validated.app_data.clone();
         let announce_public_key = Some(validated_identity.get_public_key());
         let announce_ratchet = announce_data.ratchet;
         let announce_name_hash = announce_data.name_hash;
         let announce_identity_hash = Some(validated_identity.hash);
         let announce_random_hash = announce_data.random_hash;
+        let announce_stamp_value = validated.stamp_value.unwrap_or(0.0);
 
-        // Python remembers every validated announce, replays included, before
-        // it decides whether the path changes (Transport.py:2172,
-        // Identity.py:101-113, :597).
+        // Python remembers every freshly validated announce, replays included,
+        // before it decides whether the path changes; a validation-cache hit
+        // only re-remembers a destination that was forgotten
+        // (Identity.py:109-126, :717-727).
         match self.recent_announces.entry(header.destination_hash) {
-            std::collections::hash_map::Entry::Occupied(mut o) => {
+            std::collections::hash_map::Entry::Occupied(mut o) if !cache_hit => {
                 let e = o.get_mut();
                 e.timestamp = now_f64();
                 e.public_key = announce_public_key;
@@ -471,7 +577,11 @@ impl TransportActor {
                 if announce_ratchet.is_some() {
                     e.ratchet = announce_ratchet;
                 }
+                e.stamp = validated.stamp;
+                e.stamp_value = announce_stamp_value;
+                e.lr_cost = validated.lr_cost;
             }
+            std::collections::hash_map::Entry::Occupied(_) => {}
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(RecentAnnounce {
                     dest_hash: header.destination_hash,
@@ -486,6 +596,9 @@ impl TransportActor {
                     retained: false,
                     last_used: None,
                     name_hash: announce_name_hash,
+                    stamp: validated.stamp,
+                    stamp_value: announce_stamp_value,
+                    lr_cost: validated.lr_cost,
                 });
                 self.state_dirty = true;
             }
@@ -724,7 +837,6 @@ impl TransportActor {
         // `retained` pins survive re-announce so a fresh announce never
         // silently un-pins an RPC-retained destination. Swept by
         // `cleanup_known_destinations` (linger + 7-day eviction).
-        let announce_packet_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
         let is_path_response = header.context == rns_wire::context::PacketContext::PathResponse;
         self.cache_announce_to_disk(&announce_packet_hash, raw, interface_id);
         if let Some(e) = self.recent_announces.get_mut(&header.destination_hash) {
@@ -761,7 +873,6 @@ impl TransportActor {
         if !self.announce_handlers.is_empty() {
             let handler_app_data = app_data_for_handlers;
             let is_path_response = header.context == rns_wire::context::PacketContext::PathResponse;
-            let announce_packet_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
             for registration in &self.announce_handlers {
                 if is_path_response && !registration.receive_path_responses {
                     continue;

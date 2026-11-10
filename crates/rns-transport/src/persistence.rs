@@ -964,6 +964,12 @@ pub struct PersistedAnnounceEntry {
     pub is_path_response: bool,
     #[serde(default)]
     pub last_used: Option<f64>,
+    #[serde(default)]
+    pub stamp: Option<Vec<u8>>,
+    #[serde(default)]
+    pub stamp_value: f64,
+    #[serde(default)]
+    pub lr_cost: Option<f64>,
 }
 
 /// Version-5 on-disk entry shape with raw announce bytes inline, accepted by
@@ -1018,6 +1024,9 @@ where
             name_hash: a.name_hash.to_vec(),
             is_path_response: a.is_path_response,
             last_used: a.last_used,
+            stamp: a.stamp.map(|stamp| stamp.to_vec()),
+            stamp_value: a.stamp_value,
+            lr_cost: a.lr_cost,
         })
         .collect();
 
@@ -1111,6 +1120,9 @@ pub fn migrate_legacy_announce_entries(
                 name_hash: e.name_hash,
                 is_path_response,
                 last_used: None,
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
             }
         })
         .collect()
@@ -2032,6 +2044,9 @@ mod tests {
             retained: false,
             last_used: Some(1234.0),
             name_hash: [0xAB; 10],
+            stamp: None,
+            stamp_value: 0.0,
+            lr_cost: None,
         }];
 
         let dir = std::env::temp_dir().join("reticulum_rs_test_announce_persist");
@@ -2049,6 +2064,81 @@ mod tests {
         assert!(loaded[0].is_path_response);
         assert_eq!(loaded[0].last_used, Some(1234.0));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn announce_cache_keeps_stamp_fields_and_loads_entries_without_them() {
+        let mut announce = crate::actor::RecentAnnounce {
+            dest_hash: [0xC1; 16],
+            hops: 1,
+            app_data: None,
+            timestamp: 1000.0,
+            public_key: None,
+            ratchet: None,
+            packet_hash: None,
+            is_path_response: false,
+            retained: false,
+            last_used: None,
+            name_hash: [0; 10],
+            stamp: Some([0x5A; 14]),
+            stamp_value: 25.5,
+            lr_cost: Some(12.5),
+        };
+        let dir =
+            std::env::temp_dir().join(format!("rns_announce_stamp_fields_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("announce_cache.msgpack");
+        save_announce_cache(std::slice::from_ref(&announce), &path).unwrap();
+        let loaded = load_announce_cache(&path).unwrap();
+        assert_eq!(loaded[0].stamp, Some(vec![0x5A; 14]));
+        assert_eq!(loaded[0].stamp_value, 25.5);
+        assert_eq!(loaded[0].lr_cost, Some(12.5));
+
+        #[derive(Serialize)]
+        struct OldEntry {
+            destination_hash: Vec<u8>,
+            hops: u8,
+            app_data: Option<Vec<u8>>,
+            timestamp: f64,
+            public_key: Option<Vec<u8>>,
+            ratchet: Option<Vec<u8>>,
+            packet_hash: Option<Vec<u8>>,
+            retained: bool,
+            name_hash: Vec<u8>,
+            is_path_response: bool,
+            last_used: Option<f64>,
+        }
+        #[derive(Serialize)]
+        struct OldCache {
+            entries: Vec<OldEntry>,
+            version: u32,
+        }
+        announce.stamp = None;
+        atomic_write(
+            &path,
+            &OldCache {
+                entries: vec![OldEntry {
+                    destination_hash: announce.dest_hash.to_vec(),
+                    hops: 1,
+                    app_data: None,
+                    timestamp: 1000.0,
+                    public_key: None,
+                    ratchet: None,
+                    packet_hash: None,
+                    retained: false,
+                    name_hash: vec![0; 10],
+                    is_path_response: false,
+                    last_used: None,
+                }],
+                version: PersistedAnnounceCache::CURRENT_VERSION,
+            },
+        )
+        .unwrap();
+        let loaded = load_announce_cache(&path).unwrap();
+        assert_eq!(loaded[0].stamp, None);
+        assert_eq!(loaded[0].stamp_value, 0.0);
+        assert_eq!(loaded[0].lr_cost, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

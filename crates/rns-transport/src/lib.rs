@@ -21,6 +21,7 @@ pub fn now_f64() -> f64 {
 
 pub mod actor;
 pub mod announce;
+pub mod announce_validation;
 pub mod await_path;
 pub mod blackhole;
 pub mod constants;

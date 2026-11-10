@@ -194,6 +194,16 @@ impl TransportActor {
                 });
                 TransportQueryResponse::RecalledDestination(recalled)
             }
+            TransportQuery::RecallStampValue { dest } => TransportQueryResponse::FloatResult(
+                self.recent_announces
+                    .get(&dest)
+                    .map(|entry| entry.stamp_value),
+            ),
+            TransportQuery::RecallLinkCost { dest } => TransportQueryResponse::FloatResult(
+                self.recent_announces
+                    .get(&dest)
+                    .and_then(|entry| entry.lr_cost),
+            ),
             TransportQuery::HasPath { dest } => {
                 TransportQueryResponse::BoolResult(self.path_table.has_path(&dest))
             }

@@ -310,6 +310,114 @@ impl AnnounceData {
     }
 }
 
+/// Trailing announce stamp extension: marker, flags, stamp, lr_cost (Identity.py:86-90).
+pub const ANNOUNCE_EXT_LENGTH: usize = 18;
+pub const ANNOUNCE_EXT_HEADER_LENGTH: usize = 2;
+pub const ANNOUNCE_EXT_MARKER: u8 = 0xC1;
+
+/// A known-format stamp extension, borrowed from the announce app_data.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnnounceExt<'a> {
+    pub flags: u8,
+    pub stamp: &'a [u8; crate::stamps::NETWORK_STAMP_SIZE],
+    pub lr_cost: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AnnounceExtParse<'a> {
+    /// Fewer than 18 bytes of app_data.
+    Absent,
+    /// Wrong marker, reserved anchor bit set, or lr_cost above the cap.
+    Unknown,
+    Present(AnnounceExt<'a>),
+}
+
+/// Parse the last 18 bytes of app_data as a stamp extension (Identity.py:840-856).
+pub fn parse_announce_ext(app_data: Option<&[u8]>) -> AnnounceExtParse<'_> {
+    let Some(app_data) = app_data else {
+        return AnnounceExtParse::Absent;
+    };
+    if app_data.len() < ANNOUNCE_EXT_LENGTH {
+        return AnnounceExtParse::Absent;
+    }
+    let ext = &app_data[app_data.len() - ANNOUNCE_EXT_LENGTH..];
+    let anchor = ext[ANNOUNCE_EXT_LENGTH - 1];
+    let extended = anchor & 0x80 != 0;
+    let lr_cost = crate::stamps::cost_from_bytes([anchor & 0x7F, ext[ANNOUNCE_EXT_LENGTH - 2]]);
+    if ext[0] != ANNOUNCE_EXT_MARKER || extended || lr_cost > crate::stamps::STAMP_COST_CAP {
+        return AnnounceExtParse::Unknown;
+    }
+    let stamp = ext[ANNOUNCE_EXT_HEADER_LENGTH
+        ..ANNOUNCE_EXT_HEADER_LENGTH + crate::stamps::NETWORK_STAMP_SIZE]
+        .try_into()
+        .expect("slice is exactly the stamp length");
+    AnnounceExtParse::Present(AnnounceExt {
+        flags: ext[1],
+        stamp,
+        lr_cost,
+    })
+}
+
+/// Outcome of the announce stamp check, as upstream records it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AnnounceStampCheck {
+    /// A known-format extension was present.
+    pub stamped: bool,
+    /// The stamp met the required value; the extension is stripped.
+    pub validated: bool,
+    /// Recorded for any known-format extension, valid or not.
+    pub stamp: Option<[u8; crate::stamps::NETWORK_STAMP_SIZE]>,
+    pub value: Option<f64>,
+    /// Recorded only when the stamp is valid.
+    pub lr_cost: Option<f64>,
+}
+
+impl AnnounceStampCheck {
+    /// The app_data upstream remembers and hands to handlers: the extension is
+    /// removed only when the stamp validated, and empty app_data becomes `None`.
+    pub fn app_data<'a>(&self, raw_app_data: Option<&'a [u8]>) -> Option<&'a [u8]> {
+        let data = raw_app_data?;
+        let data = if self.validated {
+            &data[..data.len() - ANNOUNCE_EXT_LENGTH]
+        } else {
+            data
+        };
+        (!data.is_empty()).then_some(data)
+    }
+}
+
+impl AnnounceData {
+    /// Check the stamp extension against `required_value` (Identity.py:840-870).
+    /// The workblock is `destination_hash || public_key || name_hash`, unexpanded.
+    pub fn check_stamp(
+        &self,
+        destination_hash: &[u8; 16],
+        required_value: f64,
+    ) -> AnnounceStampCheck {
+        let mut check = AnnounceStampCheck::default();
+        let AnnounceExtParse::Present(ext) = parse_announce_ext(self.app_data.as_deref()) else {
+            return check;
+        };
+        check.stamped = true;
+        check.stamp = Some(*ext.stamp);
+        let mut material = [0u8; 16 + PUBKEY_SIZE + NAME_HASH_SIZE];
+        material[..16].copy_from_slice(destination_hash);
+        material[16..16 + PUBKEY_SIZE].copy_from_slice(&self.public_key);
+        material[16 + PUBKEY_SIZE..].copy_from_slice(&self.name_hash);
+        match crate::stamps::stamp_valid(ext.stamp, required_value, &material) {
+            Ok(valid) => {
+                check.value = Some(crate::stamps::stamp_value(&material, ext.stamp));
+                if valid {
+                    check.validated = true;
+                    check.lr_cost = Some(ext.lr_cost);
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "announce stamp parsing failed"),
+        }
+        check
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +555,91 @@ mod tests {
         let dest_hash =
             crate::destination::Destination::hash_from_name_and_identity(app_name, Some(&id.hash));
         assert!(announce.validate_with_known_key(&dest_hash, None).is_ok());
+    }
+
+    fn ext(marker: u8, anchor: u8, frac: u8) -> Vec<u8> {
+        let mut data = b"app".to_vec();
+        data.extend_from_slice(&[marker, 0x00]);
+        data.extend_from_slice(&[0x5A; 14]);
+        data.extend_from_slice(&[frac, anchor]);
+        data
+    }
+
+    #[test]
+    fn extension_needs_eighteen_trailing_bytes() {
+        assert_eq!(parse_announce_ext(None), AnnounceExtParse::Absent);
+        let data = ext(ANNOUNCE_EXT_MARKER, 12, 0x80);
+        assert_eq!(
+            parse_announce_ext(Some(&data[4..])),
+            AnnounceExtParse::Absent
+        );
+        assert!(matches!(
+            parse_announce_ext(Some(&data[3..])),
+            AnnounceExtParse::Present(_)
+        ));
+        assert!(matches!(
+            parse_announce_ext(Some(&data)),
+            AnnounceExtParse::Present(_)
+        ));
+    }
+
+    #[test]
+    fn extension_fields_are_read_from_the_tail() {
+        let data = ext(ANNOUNCE_EXT_MARKER, 12, 0x80);
+        let AnnounceExtParse::Present(parsed) = parse_announce_ext(Some(&data)) else {
+            panic!("extension not parsed");
+        };
+        assert_eq!(parsed.stamp, &[0x5A; 14]);
+        assert_eq!(parsed.lr_cost, 12.5);
+        assert_eq!(parsed.flags, 0);
+    }
+
+    #[test]
+    fn unknown_marker_reserved_bit_and_excess_cost_are_unknown_format() {
+        for data in [
+            ext(0xC0, 12, 0),
+            ext(ANNOUNCE_EXT_MARKER, 0x80 | 12, 0),
+            ext(ANNOUNCE_EXT_MARKER, 100, 1),
+        ] {
+            assert_eq!(parse_announce_ext(Some(&data)), AnnounceExtParse::Unknown);
+        }
+        assert!(matches!(
+            parse_announce_ext(Some(&ext(ANNOUNCE_EXT_MARKER, 100, 0))),
+            AnnounceExtParse::Present(p) if p.lr_cost == 100.0
+        ));
+    }
+
+    #[test]
+    fn invalid_stamp_is_recorded_but_app_data_is_kept() {
+        let id = Identity::new();
+        let data = ext(ANNOUNCE_EXT_MARKER, 12, 0x80);
+        let announce = AnnounceData::create(&id, "test.stamp", Some(&data), None).unwrap();
+        let dest = crate::destination::Destination::hash_from_name_and_identity(
+            "test.stamp",
+            Some(&id.hash),
+        );
+        let check = announce.check_stamp(&dest, 100.0);
+        assert!(check.stamped && !check.validated);
+        assert_eq!(check.stamp, Some([0x5A; 14]));
+        assert!(check.value.is_some());
+        assert_eq!(check.lr_cost, None);
+        assert_eq!(check.app_data(Some(&data)), Some(&data[..]));
+    }
+
+    #[test]
+    fn valid_stamp_strips_extension_and_records_link_cost() {
+        let id = Identity::new();
+        let data = ext(ANNOUNCE_EXT_MARKER, 12, 0x80);
+        let announce = AnnounceData::create(&id, "test.stamp", Some(&data), None).unwrap();
+        let dest = crate::destination::Destination::hash_from_name_and_identity(
+            "test.stamp",
+            Some(&id.hash),
+        );
+        let check = announce.check_stamp(&dest, 0.0);
+        assert!(check.stamped && check.validated);
+        assert_eq!(check.lr_cost, Some(12.5));
+        assert_eq!(check.app_data(Some(&data)), Some(&b"app"[..]));
+        assert_eq!(check.app_data(Some(&data[3..])), None);
     }
 
     use proptest::prelude::*;
