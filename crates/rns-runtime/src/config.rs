@@ -104,9 +104,9 @@ impl ConfigSection {
         v.parse().ok()
     }
 
+    /// Parses like Python `float()`, which ConfigObj `as_float` uses.
     pub fn get_float(&self, key: &str) -> Option<f64> {
-        let v = self.get(key)?;
-        v.parse().ok()
+        parse_python_float(self.get(key)?)
     }
 
     pub fn get_list(&self, key: &str) -> Option<Vec<String>> {
@@ -558,6 +558,25 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
+/// Python `float()` also accepts single underscores between digits (PEP 515).
+fn parse_python_float(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if !s.contains('_') {
+        return s.parse().ok();
+    }
+    let bytes = s.as_bytes();
+    let grouped = bytes.iter().enumerate().all(|(i, &b)| {
+        b != b'_'
+            || (i > 0
+                && bytes[i - 1].is_ascii_digit()
+                && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+    });
+    if !grouped {
+        return None;
+    }
+    s.replace('_', "").parse().ok()
+}
+
 fn parse_bool(s: &str) -> Option<bool> {
     match s.to_lowercase().as_str() {
         "true" | "yes" | "on" | "1" => Some(true),
@@ -611,6 +630,23 @@ enable_transport = False
 share_instance = Yes
 instance_name = default
 
+##########################################################
+# This section configures stamping behaviour and defaults.
+# In most cases, you do not need to change this, but on
+# constrained systems especially, tuning these parameters
+# can be very beneficial. See "rnsd --exampleconfig" or
+# the manual for a full explanation of these parameters.
+
+[stamps]
+
+# destination_cost = 23.5
+# destination_value = 25.0
+# pr_cost = 15.8
+# pr_value = 15.8
+# lr_cost = 12.5
+# lr_stamp_timeout = 15
+# pr_stamp_timeout = 15
+
 [logging]
 loglevel = 4
 
@@ -625,6 +661,30 @@ enabled = Yes
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn get_float_accepts_python_float_syntax() {
+        let mut sec = ConfigSection::new();
+        for (raw, expected) in [
+            ("1_0", Some(10.0)),
+            ("1_0_0", Some(100.0)),
+            ("1e1_0", Some(1e10)),
+            ("+2", Some(2.0)),
+            (".5", Some(0.5)),
+            ("1e400", Some(f64::INFINITY)),
+            ("1__0", None),
+            ("_1", None),
+            ("1_", None),
+            ("1_.5", None),
+            ("abc", None),
+            ("", None),
+        ] {
+            sec.set("k", raw);
+            assert_eq!(sec.get_float("k"), expected, "{raw:?}");
+        }
+        sec.set("k", "-nan");
+        assert!(sec.get_float("k").unwrap().is_nan());
+    }
 
     #[test]
     fn test_parse_empty() {

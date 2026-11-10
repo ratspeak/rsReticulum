@@ -324,6 +324,12 @@ pub struct InterfaceEntry {
     /// Whether to rebroadcast announces whose next-hop interface uses
     /// `InterfaceMode::Internal`.
     pub announces_from_internal: bool,
+    /// Configured announce stamp requirement; `None` follows
+    /// `StampPolicy::destination_cost`. Resolve with `StampPolicy::interface_destination_cost`.
+    pub destination_cost: Option<f64>,
+    /// Configured path request stamp requirement; `None` follows
+    /// `StampPolicy::pr_cost`. Resolve with `StampPolicy::interface_pr_cost`.
+    pub pr_cost: Option<f64>,
 }
 
 impl InterfaceEntry {
@@ -370,6 +376,8 @@ impl InterfaceEntry {
             multipoint: false,
             recursive_prs: false,
             announces_from_internal: true,
+            destination_cost: None,
+            pr_cost: None,
         }
     }
 
@@ -707,6 +715,11 @@ pub enum TransportMessage {
     SetBlackholeSources {
         sources: Vec<[u8; 16]>,
     },
+    /// Replace the network stamp policy. The runtime sends it before any
+    /// interface is registered.
+    SetStampPolicy {
+        policy: crate::stamps::StampPolicy,
+    },
     /// Handle loss of the current shared-instance peer: invalidate routing state
     /// and terminate peer-bound Link endpoints. This is not a blanket pause of
     /// all packet processing. Submit through the current interface owner.
@@ -817,6 +830,7 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::SetTransportEnabled { .. } => "SetTransportEnabled",
         TransportMessage::SetTransportIdentity { .. } => "SetTransportIdentity",
         TransportMessage::SetBlackholeSources { .. } => "SetBlackholeSources",
+        TransportMessage::SetStampPolicy { .. } => "SetStampPolicy",
         TransportMessage::SharedConnectionLost => "SharedConnectionLost",
         TransportMessage::SharedConnectionRestored { .. } => "SharedConnectionRestored",
         TransportMessage::SynthesizeTunnel { .. } => "SynthesizeTunnel",
@@ -1344,6 +1358,10 @@ impl std::fmt::Debug for TransportMessage {
             Self::SetBlackholeSources { sources } => f
                 .debug_struct("SetBlackholeSources")
                 .field("sources", sources)
+                .finish(),
+            Self::SetStampPolicy { policy } => f
+                .debug_struct("SetStampPolicy")
+                .field("policy", policy)
                 .finish(),
             Self::SharedConnectionLost => f.debug_struct("SharedConnectionLost").finish(),
             Self::SharedConnectionRestored { interface_id } => f

@@ -213,6 +213,8 @@ pub struct TransportActor {
     /// Allowed external source hashes for on-disk blackhole loading. Changing
     /// this vector alone does not reload or purge the table.
     pub blackhole_sources: Vec<[u8; 16]>,
+    /// Network stamp policy from configuration and constructor switches.
+    pub stamp_policy: crate::stamps::StampPolicy,
     /// Shared set of currently blackholed identity hashes for runtime Link checks.
     /// Managed mutation/cull paths rebuild it and filter expired entries. Direct
     /// public table mutation does not publish a snapshot; a poisoned snapshot
@@ -456,6 +458,7 @@ impl TransportActor {
             static_transport_identity: false,
             local_hops_delta: 0,
             blackhole_sources: Vec::new(),
+            stamp_policy: crate::stamps::StampPolicy::default(),
             blackholed_snapshot: Arc::new(std::sync::RwLock::new(HashSet::new())),
             is_shared_instance: false,
             shared_instance_client_mode: false,
@@ -993,6 +996,10 @@ impl TransportActor {
                 debug!(count = sources.len(), "setting blackhole sources");
                 self.blackhole_sources = sources;
                 self.load_python_blackhole_if_ready();
+            }
+            TransportMessage::SetStampPolicy { policy } => {
+                debug!(?policy, "setting stamp policy");
+                self.stamp_policy = policy;
             }
             TransportMessage::SharedConnectionLost => {
                 tracing::warn!("shared instance connection lost — suspending transport");
@@ -2592,6 +2599,8 @@ mod tests {
             multipoint: false,
             recursive_prs: false,
             announces_from_internal: true,
+            destination_cost: None,
+            pr_cost: None,
             ingress: crate::ingress::IngressController::new(),
             announce_queue: Vec::new(),
         };

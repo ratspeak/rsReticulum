@@ -28,6 +28,76 @@ instance_name = default
 # disabled.
 # static_transport_identity = no
 
+[stamps]
+# This section configures stamping behaviour and defaults.
+# In most cases, you do not need to change this, but on
+# constrained systems especially, tuning these parameters
+# can be very beneficial
+
+# During the 1.6.x phased transition to network stamp usage,
+# it is possible to enable early opt-in on stamp generation
+# and enforcement. RNS 1.6.0 includes all the required stamp
+# generation and verification functionality, and actively
+# validates stamps, while leaving generation, emission and
+# enforcement disabled by default for destinations and PRs.
+# Link requests will be stamped already from 1.6.0 if a cost
+# has been announced by the destination. Version 1.6.1 will
+# enable generation and emission by default, and version
+# 1.6.2 will finally activate enforcement. Any of these
+# options can be enabled early by configuration:
+
+# stamp_destinations = yes
+# stamp_prs = yes
+# enforce_stamps = yes
+
+
+# The default required stamp cost for an announce, and its
+# destination to be considered valid. This applies both to
+# announces received directly, and transported by this node,
+# if transport is enabled. Any announced destination not
+# meeting the cost will be ignored.
+
+# destination_cost = 23.5
+
+
+# The default value this instance will target when generating
+# new destination stamps. An application may set a higher
+# target, but applications requesting a lower value than the
+# default will always generate at least the default value.
+# Destination stamps are cached and reused, so a one-time
+# high-value generation is usually a good idea.
+
+# destination_value = 25.0
+
+
+# The default required path request stamp cost. Path requests
+# that do not meet the requirement are ignored.
+
+# pr_cost = 15.8
+
+
+# The default target value of path request stamps generated
+# by this instance.
+
+# pr_value = 15.8
+
+
+# The default link request stamp cost to use, if one has not
+# been announced by the destination the link is established
+# to, or if it is unknown. In practice, all destinations will
+# include their required link cost in each announce, and this
+# option is rarely necessary.
+
+# lr_cost = 12.5
+
+
+# The maximum amount of time to spend attempting to generate
+# a link request and path request stamps, in seconds.
+
+# lr_stamp_timeout = 15
+# pr_stamp_timeout = 15
+
+
 [logging]
 loglevel = 4
 

@@ -1633,6 +1633,23 @@ fn synthesize_backbone(
     }))
 }
 
+/// Python parses the stamp cost keys before checking `enabled`, so a bad value
+/// aborts startup even on a disabled interface (Reticulum.py:963-971).
+pub fn validate_stamp_costs(
+    name: &str,
+    section: &ConfigSection,
+) -> Result<(), InterfaceFactoryError> {
+    for field in ["destination_cost", "pr_cost"] {
+        if section.has(field) && section.get_float(field).is_none() {
+            return Err(InterfaceFactoryError::InvalidValue {
+                field: format!("{name}.{field}"),
+                message: "value is not a float".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Options shared across interface variants, applied post-construction.
 pub struct InterfacePostInit {
     pub outgoing: bool,
@@ -1665,6 +1682,12 @@ pub struct InterfacePostInit {
     /// interface. Other relay policy gates still apply; locally originated
     /// announces bypass this option. Parser default: true.
     pub announces_from_internal: bool,
+    /// Required announce stamp value on this interface, clamped to the stamp
+    /// cost cap. `None` follows the global `[stamps] destination_cost`.
+    pub destination_cost: Option<f64>,
+    /// Required path request stamp value on this interface, clamped to the
+    /// stamp cost cap. `None` follows the global `[stamps] pr_cost`.
+    pub pr_cost: Option<f64>,
 }
 
 impl InterfacePostInit {
@@ -1685,6 +1708,8 @@ impl InterfacePostInit {
             "ic_burst_penalty",
             "ic_held_release_interval",
             "ec_pr_freq",
+            "destination_cost",
+            "pr_cost",
         ] {
             if section.has(field) && section.get_float(field).is_none() {
                 return Err(InterfaceFactoryError::InvalidValue {
@@ -1745,6 +1770,12 @@ impl InterfacePostInit {
             ingress_overrides,
             recursive_prs: section.get_bool("recursive_prs").unwrap_or(false),
             announces_from_internal: section.get_bool("announces_from_internal").unwrap_or(true),
+            destination_cost: section
+                .get_float("destination_cost")
+                .map(rns_transport::stamps::StampPolicy::clamp_cost),
+            pr_cost: section
+                .get_float("pr_cost")
+                .map(rns_transport::stamps::StampPolicy::clamp_cost),
         })
     }
 

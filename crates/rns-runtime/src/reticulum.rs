@@ -78,6 +78,9 @@ struct InterfaceControlMetadata {
     /// The network identity, in hex, that announced an auto-connected
     /// interface (Python `autoconnect_source`, Discovery.py:865).
     autoconnect_source: Option<String>,
+    // Per-interface stamp costs, copied raw to spawned children (TCPInterface.py:608-609).
+    destination_cost: Option<f64>,
+    pr_cost: Option<f64>,
 }
 
 type InterfaceControlMap = Arc<std::sync::Mutex<HashMap<u64, InterfaceControlMetadata>>>;
@@ -2373,6 +2376,12 @@ pub struct InitOptions {
     pub require_shared_instance: bool,
     /// Override the configured shared-instance transport for this process.
     pub shared_instance_type: Option<SharedInstanceType>,
+    /// Python `Reticulum(enable_stamping=True)`: stamp emitted announces, path
+    /// requests and link requests. `false` never clears a configured switch.
+    pub enable_stamping: bool,
+    /// Python `Reticulum(enforce_stamps=True)`: enforce announce, path request
+    /// and link request stamps. `false` never clears a configured switch.
+    pub enforce_stamps: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2518,6 +2527,9 @@ pub struct ReticulumConfig {
     /// runtime does not load or merge these files; declare active interfaces
     /// in the primary configuration.
     pub bootstrap_configs: Vec<PathBuf>,
+
+    /// Network stamp policy from the `[stamps]` section.
+    pub stamps: rns_transport::stamps::StampPolicy,
 }
 
 impl Default for ReticulumConfig {
@@ -2556,6 +2568,7 @@ impl Default for ReticulumConfig {
                 rns_transport::discovery::blackhole_subscriber::UPDATE_INTERVAL.as_secs_f64(),
             log_timestamps: true,
             bootstrap_configs: Vec::new(),
+            stamps: rns_transport::stamps::StampPolicy::default(),
         }
     }
 }
@@ -2633,6 +2646,50 @@ fn config_float(
         .get_float(key)
         .map(Some)
         .ok_or_else(|| invalid_config_value(section_name, key, "value is not a float"))
+}
+
+/// Python `Reticulum.__apply_config` `[stamps]` keys. Booleans only switch
+/// features on; unknown keys are ignored.
+fn apply_stamps_section(
+    policy: &mut rns_transport::stamps::StampPolicy,
+    sec: &ConfigSection,
+) -> Result<(), ConfigError> {
+    use rns_transport::stamps::StampPolicy;
+    const S: &str = "stamps";
+    if config_bool(S, sec, "enforce_stamps")? == Some(true) {
+        policy.enforce();
+    }
+    if config_bool(S, sec, "stamp_destinations")? == Some(true) {
+        policy.stamp_destinations = true;
+    }
+    if config_bool(S, sec, "stamp_prs")? == Some(true) {
+        policy.stamp_prs = true;
+    }
+    if config_bool(S, sec, "always_stamp_lrs")? == Some(true) {
+        policy.always_stamp_lrs = true;
+    }
+    if let Some(v) = config_float(S, sec, "destination_cost")? {
+        policy.destination_cost = StampPolicy::clamp_cost(v);
+    }
+    if let Some(v) = config_float(S, sec, "destination_value")? {
+        policy.destination_value = StampPolicy::clamp_cost(v);
+    }
+    if let Some(v) = config_float(S, sec, "pr_cost")? {
+        policy.pr_cost = StampPolicy::clamp_cost(v);
+    }
+    if let Some(v) = config_float(S, sec, "pr_value")? {
+        policy.pr_value = StampPolicy::clamp_cost(v);
+    }
+    if let Some(v) = config_float(S, sec, "lr_cost")? {
+        policy.lr_cost = StampPolicy::clamp_link_cost(v);
+    }
+    if let Some(v) = config_float(S, sec, "lr_stamp_timeout")? {
+        policy.lr_stamp_timeout = StampPolicy::clamp_timeout(v);
+    }
+    if let Some(v) = config_float(S, sec, "pr_stamp_timeout")? {
+        policy.pr_stamp_timeout = StampPolicy::clamp_timeout(v);
+    }
+    Ok(())
 }
 
 fn config_u16(
@@ -2749,6 +2806,10 @@ impl ReticulumConfig {
     /// names are not rejected universally. No interfaces or services are started.
     pub fn try_from_config(config: &Config) -> Result<Self, ConfigError> {
         let mut rc = ReticulumConfig::default();
+
+        if let Some(sec) = config.section("stamps") {
+            apply_stamps_section(&mut rc.stamps, sec)?;
+        }
 
         if let Some(sec) = config.section("reticulum") {
             if let Some(value) = config_bool("reticulum", sec, "share_instance")? {
@@ -2871,6 +2932,22 @@ impl ReticulumConfig {
         Ok(rc)
     }
 
+    /// Apply constructor overrides after the configuration file, in Python's
+    /// order (Reticulum.py:349-362).
+    pub fn apply_init_options(&mut self, options: &InitOptions) {
+        if options.enable_stamping {
+            tracing::debug!("Network stamp generation activated");
+            self.stamps.enable_stamping();
+        }
+        if options.enforce_stamps {
+            tracing::debug!("Network stamp enforcement activated");
+            self.stamps.enforce();
+        }
+        if let Some(shared_instance_type) = options.shared_instance_type {
+            self.shared_instance_type = shared_instance_type;
+        }
+    }
+
     /// Parse configuration, panicking on a value error. Use `try_from_config`
     /// when configuration comes from users or requires recoverable validation.
     pub fn from_config(config: &Config) -> Self {
@@ -2989,9 +3066,7 @@ pub async fn init_with_policy(
         tokio::time::sleep(Duration::from_millis(1500)).await;
     }
     let mut rc = ReticulumConfig::try_from_config(&config).map_err(ReticulumError::Config)?;
-    if let Some(shared_instance_type) = options.shared_instance_type {
-        rc.shared_instance_type = shared_instance_type;
-    }
+    rc.apply_init_options(&options);
     match &policy {
         InstancePolicy::Configured => {}
         InstancePolicy::Standalone => rc.share_instance = false,
@@ -3093,6 +3168,9 @@ pub async fn init_with_policy(
     });
     let _ = transport_tx.try_send(TransportMessage::SetBlackholeSources {
         sources: rc.blackhole_sources.clone(),
+    });
+    let _ = transport_tx.try_send(TransportMessage::SetStampPolicy {
+        policy: rc.stamps.clone(),
     });
 
     // Python defaults the local shared-instance RPC key to a hash of the
@@ -3521,6 +3599,17 @@ pub async fn init_with_policy(
         tracing::info!("transport node mode enabled");
     }
 
+    if instance_mode != InstanceMode::Client {
+        for (name, section) in config.subsections("interfaces") {
+            if let Err(e) = interface_factory::validate_stamp_costs(name, section) {
+                shutdown_coordinator.start_and_wait().await;
+                return Err(ReticulumError::Interface(format!(
+                    "failed to synthesize interface {name}: {e}"
+                ))
+                .into());
+            }
+        }
+    }
     let mut interfaces = match synthesize_interfaces(&config, rc.panic_on_interface_error) {
         Ok(interfaces) => interfaces,
         Err(e) => {
@@ -4697,6 +4786,7 @@ async fn prepare_interface_with_role_and_overrides(
         }
     };
     let registry_owner = registration.owner();
+    let child_stamp_costs;
     {
         let mut controls = interface_controls
             .lock()
@@ -4707,6 +4797,12 @@ async fn prepare_interface_with_role_and_overrides(
             .and(handle.parent_id)
             .and_then(|parent| controls.get(&parent))
             .and_then(|parent| parent.ifac_netname.clone());
+        let (destination_cost, pr_cost) = handle
+            .parent_id
+            .and_then(|parent| controls.get(&parent))
+            .map(|parent| (parent.destination_cost, parent.pr_cost))
+            .unwrap_or_default();
+        child_stamp_costs = (destination_cost, pr_cost);
         controls.insert(
             id,
             InterfaceControlMetadata {
@@ -4719,6 +4815,8 @@ async fn prepare_interface_with_role_and_overrides(
                 ifac_netname,
                 client_target: None,
                 autoconnect_source: None,
+                destination_cost,
+                pr_cost,
             },
         );
     }
@@ -4759,6 +4857,8 @@ async fn prepare_interface_with_role_and_overrides(
         // inherit recursive_prs/announces_from_internal (TCPInterface.py:579+).
         recursive_prs: false,
         announces_from_internal: true,
+        destination_cost: child_stamp_costs.0,
+        pr_cost: child_stamp_costs.1,
     };
     Ok(PreparedInterfaceRegistration {
         transport_owner: handle.owner.clone(),
@@ -4865,6 +4965,8 @@ fn clone_interface_post_init(
         ingress_overrides: post_init.ingress_overrides.clone(),
         recursive_prs: post_init.recursive_prs,
         announces_from_internal: post_init.announces_from_internal,
+        destination_cost: post_init.destination_cost,
+        pr_cost: post_init.pr_cost,
     }
 }
 
@@ -4910,6 +5012,9 @@ fn configured_peer_post_init(
         ingress_overrides: ingress_overrides.clone(),
         recursive_prs: false,
         announces_from_internal: true,
+        // I2PInterface.py:854-855 copies these to configured peers.
+        destination_cost: post_init.destination_cost,
+        pr_cost: post_init.pr_cost,
     }
 }
 
@@ -5026,6 +5131,8 @@ async fn prepare_interface_with_post_init(
                 ifac_size: post_init.ifac_size.unwrap_or(post_init.default_ifac_size),
                 client_target: None,
                 autoconnect_source: None,
+                destination_cost: post_init.destination_cost,
+                pr_cost: post_init.pr_cost,
             },
         );
     let entry = rns_transport::messages::InterfaceEntry {
@@ -5060,6 +5167,8 @@ async fn prepare_interface_with_post_init(
         multipoint: false,
         recursive_prs: post_init.recursive_prs,
         announces_from_internal: post_init.announces_from_internal,
+        destination_cost: post_init.destination_cost,
+        pr_cost: post_init.pr_cost,
     };
     Ok(PreparedInterfaceRegistration {
         transport_owner: handle.owner.clone(),
@@ -8925,6 +9034,8 @@ mod tests {
                 ifac_netname: None,
                 client_target: None,
                 autoconnect_source: None,
+                destination_cost: None,
+                pr_cost: None,
             },
         );
 
@@ -9072,6 +9183,8 @@ mod tests {
                 ifac_netname: None,
                 client_target: None,
                 autoconnect_source: None,
+                destination_cost: None,
+                pr_cost: None,
             },
         );
         drop(registration);
@@ -14391,6 +14504,8 @@ egress_control = Yes
                     ifac_netname: None,
                     client_target: None,
                     autoconnect_source: None,
+                    destination_cost: None,
+                    pr_cost: None,
                 },
             );
 
@@ -14483,6 +14598,98 @@ egress_control = Yes
         assert_eq!(stats.lookup(parent_id), expected);
         assert_eq!(stats.lookup(child_id), expected);
         assert_eq!(stats.lookup(930_003), InterfaceIfac::default());
+    }
+
+    #[tokio::test]
+    async fn server_children_inherit_parent_stamp_costs_unresolved() {
+        let parent_id = 930_011;
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let interface_registry = InterfaceRegistry::default();
+
+        let mut section = ConfigSection::new();
+        section.set("destination_cost", "150");
+        let post_init = interface_factory::InterfacePostInit::try_from_section(&section).unwrap();
+        assert_eq!(post_init.destination_cost, Some(100.0));
+        assert_eq!(post_init.pr_cost, None);
+        register_interface_with_post_init(
+            &transport_tx,
+            test_interface_handle(parent_id, None, "cost-parent"),
+            &post_init,
+            None,
+            &interface_controls,
+            &interface_registry,
+            InterfaceKind::Standard,
+        )
+        .await
+        .unwrap();
+        let Some(TransportMessage::RegisterInterface { entry, .. }) =
+            transport_rx.recv().await.map(unwrap_owned_event)
+        else {
+            panic!("expected parent RegisterInterface");
+        };
+        assert_eq!((entry.destination_cost, entry.pr_cost), (Some(100.0), None));
+
+        let (role, inherited, key, size) =
+            child_registration_from_parent(&interface_controls, Some(parent_id));
+        register_interface_handle_with_role_and_overrides(
+            &transport_tx,
+            test_interface_handle(930_012, Some(parent_id), "cost-child"),
+            role,
+            inherited,
+            key,
+            size,
+            &interface_controls,
+            &interface_registry,
+            InterfaceKind::Standard,
+            false,
+        )
+        .await
+        .unwrap();
+        let Some(TransportMessage::RegisterInterface { entry, .. }) =
+            transport_rx.recv().await.map(unwrap_owned_event)
+        else {
+            panic!("expected child RegisterInterface");
+        };
+        // None stays None so the child keeps following the global pr_cost.
+        assert_eq!((entry.destination_cost, entry.pr_cost), (Some(100.0), None));
+    }
+
+    #[test]
+    fn stamps_section_booleans_only_switch_on() {
+        let config = Config::parse("[stamps]\nstamp_prs = no\nenforce_stamps = no\n").unwrap();
+        let mut policy = rns_transport::stamps::StampPolicy {
+            stamp_prs: true,
+            stamps_enforced: true,
+            ..Default::default()
+        };
+        apply_stamps_section(&mut policy, config.section("stamps").unwrap()).unwrap();
+        assert!(policy.stamp_prs);
+        assert!(policy.stamps_enforced);
+        assert!(!policy.lr_stamps_enforced);
+    }
+
+    #[test]
+    fn stamps_section_bad_values_fail_config() {
+        for body in ["stamp_prs = maybe", "pr_cost = abc", "lr_stamp_timeout = "] {
+            let config = Config::parse(&format!("[stamps]\n{body}\n")).unwrap();
+            assert!(
+                matches!(
+                    ReticulumConfig::try_from_config(&config),
+                    Err(ConfigError::InvalidValue { ref section, .. }) if section == "stamps"
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_config_parses_to_default_stamp_policy() {
+        let config = Config::parse(Config::default_config()).unwrap();
+        assert!(config.section("stamps").is_some());
+        let rc = ReticulumConfig::try_from_config(&config).unwrap();
+        assert_eq!(rc.stamps, rns_transport::stamps::StampPolicy::default());
     }
 
     #[tokio::test]
@@ -15080,6 +15287,7 @@ enabled = yes
             InitOptions {
                 require_shared_instance: true,
                 shared_instance_type: Some(SharedInstanceType::Tcp),
+                ..InitOptions::default()
             },
         )
         .await;
@@ -15099,6 +15307,7 @@ enabled = yes
             InitOptions {
                 require_shared_instance: false,
                 shared_instance_type: Some(SharedInstanceType::Tcp),
+                ..InitOptions::default()
             },
         )
         .await
