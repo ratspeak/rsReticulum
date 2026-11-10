@@ -112,6 +112,61 @@ pub enum RpcRequest {
     UnretainDestination {
         destination_hash: Vec<u8>,
     },
+    /// Reply: the slowest online interface bitrate, or nil before one exists.
+    GetLowestInterfaceBitrate,
+    /// Reply: seconds as a float, or integer 0 without a known bitrate.
+    GetMediumPathTimeout,
+    GetActiveLinkCount,
+    /// Reply: a dictionary; upstream's implementation is a stub answering `{}`.
+    GetLinkDistribution,
+    /// Reply: profiler results, or nil when no profiler ran.
+    GetProfilingResults,
+    /// Reply: true, false, or nil when the interface does not exist.
+    ManageInterface {
+        operation: ManageOperation,
+        name: String,
+    },
+    WantsDestinationType {
+        full_name: String,
+        requester: Vec<u8>,
+        signature: Option<Vec<u8>>,
+    },
+    UnwantsDestinationType {
+        full_name: String,
+        requester: Vec<u8>,
+        signature: Option<Vec<u8>>,
+    },
+    UnwantsAllDestinationTypes {
+        requester: Vec<u8>,
+        signature: Option<Vec<u8>>,
+    },
+}
+
+/// Interface management operations of the `manage` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ManageOperation {
+    Attach,
+    Detach,
+    Reload,
+}
+
+impl ManageOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attach => "attach_interface",
+            Self::Detach => "detach_interface",
+            Self::Reload => "reload_interface",
+        }
+    }
+
+    fn parse(operation: &str) -> Option<Self> {
+        match operation {
+            "attach_interface" => Some(Self::Attach),
+            "detach_interface" => Some(Self::Detach),
+            "reload_interface" => Some(Self::Reload),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -417,7 +472,49 @@ fn request_to_py_value(req: &RpcRequest) -> PyValue {
             ("destination_data", PyValue::String("unretain".to_string())),
             ("destination_hash", PyValue::Bytes(destination_hash.clone())),
         ]),
+        RpcRequest::GetLowestInterfaceBitrate => py_get("lowest_interface_bitrate"),
+        RpcRequest::GetMediumPathTimeout => py_get("medium_path_timeout"),
+        RpcRequest::GetActiveLinkCount => py_get("active_link_count"),
+        RpcRequest::GetLinkDistribution => py_get("link_distribution"),
+        RpcRequest::GetProfilingResults => py_get("profiling_results"),
+        RpcRequest::ManageInterface { operation, name } => py_dict(vec![
+            ("manage", PyValue::String(operation.as_str().to_string())),
+            ("name", PyValue::String(name.clone())),
+        ]),
+        RpcRequest::WantsDestinationType {
+            full_name,
+            requester,
+            signature,
+        } => py_dict(vec![
+            ("wants_destination_type", PyValue::String(full_name.clone())),
+            ("requester", PyValue::Bytes(requester.clone())),
+            ("signature", optional_bytes_value(signature)),
+        ]),
+        RpcRequest::UnwantsDestinationType {
+            full_name,
+            requester,
+            signature,
+        } => py_dict(vec![
+            (
+                "unwants_destination_type",
+                PyValue::String(full_name.clone()),
+            ),
+            ("requester", PyValue::Bytes(requester.clone())),
+            ("signature", optional_bytes_value(signature)),
+        ]),
+        RpcRequest::UnwantsAllDestinationTypes {
+            requester,
+            signature,
+        } => py_dict(vec![
+            ("unwants_all_destination_types", PyValue::Bool(true)),
+            ("requester", PyValue::Bytes(requester.clone())),
+            ("signature", optional_bytes_value(signature)),
+        ]),
     }
+}
+
+fn optional_bytes_value(value: &Option<Vec<u8>>) -> PyValue {
+    value.clone().map(PyValue::Bytes).unwrap_or(PyValue::None)
 }
 
 fn py_get(path: &str) -> PyValue {
@@ -465,10 +562,25 @@ fn py_value_to_request(value: &PyValue) -> Result<RpcRequest, RpcError> {
             "is_blackholed" => Ok(RpcRequest::IsBlackholed {
                 identity_hash: dict_bytes(entries, "identity_hash")?,
             }),
+            "lowest_interface_bitrate" => Ok(RpcRequest::GetLowestInterfaceBitrate),
+            "medium_path_timeout" => Ok(RpcRequest::GetMediumPathTimeout),
+            "active_link_count" => Ok(RpcRequest::GetActiveLinkCount),
+            "link_distribution" => Ok(RpcRequest::GetLinkDistribution),
+            "profiling_results" => Ok(RpcRequest::GetProfilingResults),
             other => Err(RpcError::Deserialize(format!(
                 "unknown Python RPC get path: {other}"
             ))),
         };
+    }
+
+    if let Some(PyValue::String(operation)) = dict_get(entries, "manage") {
+        let operation = ManageOperation::parse(operation).ok_or_else(|| {
+            RpcError::Deserialize(format!("unknown Python RPC manage operation: {operation}"))
+        })?;
+        let name = dict_get(entries, "name")
+            .and_then(py_string)
+            .ok_or_else(|| RpcError::Deserialize("manage request has no name".to_string()))?;
+        return Ok(RpcRequest::ManageInterface { operation, name });
     }
 
     if let Some(PyValue::String(path)) = dict_get(entries, "drop") {
@@ -514,6 +626,29 @@ fn py_value_to_request(value: &PyValue) -> Result<RpcRequest, RpcError> {
         });
     }
 
+    if let Some(full_name) = dict_get(entries, "wants_destination_type") {
+        return Ok(RpcRequest::WantsDestinationType {
+            full_name: destination_type_name(full_name)?,
+            requester: dict_requester(entries)?,
+            signature: dict_signature(entries)?,
+        });
+    }
+
+    if let Some(full_name) = dict_get(entries, "unwants_destination_type") {
+        return Ok(RpcRequest::UnwantsDestinationType {
+            full_name: destination_type_name(full_name)?,
+            requester: dict_requester(entries)?,
+            signature: dict_signature(entries)?,
+        });
+    }
+
+    if dict_get(entries, "unwants_all_destination_types").is_some() {
+        return Ok(RpcRequest::UnwantsAllDestinationTypes {
+            requester: dict_requester(entries)?,
+            signature: dict_signature(entries)?,
+        });
+    }
+
     if let Some(PyValue::String(operation)) = dict_get(entries, "destination_data") {
         let destination_hash = dict_bytes(entries, "destination_hash")?;
         return match operation.as_str() {
@@ -539,6 +674,64 @@ fn py_value_to_request(value: &PyValue) -> Result<RpcRequest, RpcError> {
     Err(RpcError::Deserialize(
         "Python RPC request dictionary has no known operation".to_string(),
     ))
+}
+
+fn destination_type_name(value: &PyValue) -> Result<String, RpcError> {
+    py_string(value)
+        .ok_or_else(|| RpcError::Deserialize("destination type name is not a string".to_string()))
+}
+
+/// Python requires the `requester` key and keys requirements by it as sent;
+/// a nil requester is kept as an empty one.
+fn dict_requester(entries: &[(PyDictKey, PyValue)]) -> Result<Vec<u8>, RpcError> {
+    match dict_get(entries, "requester") {
+        Some(PyValue::Bytes(requester)) => Ok(requester.clone()),
+        Some(PyValue::None) => Ok(Vec::new()),
+        _ => Err(RpcError::Deserialize(
+            "destination type request has no requester".to_string(),
+        )),
+    }
+}
+
+/// Python requires the `signature` key but never validates its value, so a
+/// value other than bytes is kept as `None`.
+fn dict_signature(entries: &[(PyDictKey, PyValue)]) -> Result<Option<Vec<u8>>, RpcError> {
+    match dict_get(entries, "signature") {
+        Some(PyValue::Bytes(signature)) => Ok(Some(signature.clone())),
+        Some(_) => Ok(None),
+        None => Err(RpcError::Deserialize(
+            "destination type request has no signature".to_string(),
+        )),
+    }
+}
+
+/// Python `None`, as `profiling_results` answers when no profiler ran.
+pub(crate) fn encode_none() -> Result<Vec<u8>, RpcError> {
+    encode_umsgpack(&PyValue::None)
+}
+
+/// An integer or `None`, as `lowest_interface_bitrate` answers.
+pub(crate) fn encode_optional_int(value: Option<u64>) -> Result<Vec<u8>, RpcError> {
+    encode_umsgpack(
+        &value
+            .map(|v| PyValue::Int(i128::from(v)))
+            .unwrap_or(PyValue::None),
+    )
+}
+
+/// `True`, `False` or `None`, as the `manage` request answers.
+pub(crate) fn encode_optional_bool(value: Option<bool>) -> Result<Vec<u8>, RpcError> {
+    encode_umsgpack(&value.map(PyValue::Bool).unwrap_or(PyValue::None))
+}
+
+/// A float, or integer 0 when the timeout is unknown (Transport.py:3552).
+pub(crate) fn encode_medium_path_timeout(seconds: Option<f64>) -> Result<Vec<u8>, RpcError> {
+    encode_umsgpack(&seconds.map(PyValue::Float).unwrap_or(PyValue::Int(0)))
+}
+
+/// An empty dictionary, as upstream's stub `link_distribution` answers.
+pub(crate) fn encode_empty_dict() -> Result<Vec<u8>, RpcError> {
+    encode_umsgpack(&PyValue::Dict(Vec::new()))
 }
 
 fn response_to_py_value(resp: &RpcResponse) -> PyValue {
@@ -895,15 +1088,48 @@ fn py_value_to_response_for_request(
         | RpcRequest::DropAnnounceQueues
         | RpcRequest::BlackholeIdentity { .. }
         | RpcRequest::UnblackholeIdentity { .. } => Ok(RpcResponse::Ok),
+        RpcRequest::GetLowestInterfaceBitrate => match value {
+            PyValue::None => Ok(RpcResponse::StringResult(None)),
+            _ => Ok(RpcResponse::IntResult(py_required_int(value)?)),
+        },
+        RpcRequest::GetMediumPathTimeout => Ok(RpcResponse::FloatResult(Some(
+            py_optional_float(value)?.unwrap_or(0.0),
+        ))),
+        RpcRequest::GetActiveLinkCount => Ok(RpcResponse::IntResult(py_required_int(value)?)),
+        // Upstream's link distribution is a stub that answers `{}`.
+        RpcRequest::GetLinkDistribution => match value {
+            PyValue::Dict(_) => Ok(RpcResponse::Ok),
+            _ => Err(RpcError::Deserialize(
+                "expected link distribution dictionary".to_string(),
+            )),
+        },
+        // `None` means no profiler ran; results themselves are not decoded.
+        RpcRequest::GetProfilingResults => Ok(match value {
+            PyValue::None => RpcResponse::StringResult(None),
+            _ => RpcResponse::Ok,
+        }),
+        // `None` (no such interface) decodes as `StringResult(None)`.
+        RpcRequest::ManageInterface { .. } => match value {
+            PyValue::Bool(v) => Ok(RpcResponse::BoolResult(*v)),
+            PyValue::None => Ok(RpcResponse::StringResult(None)),
+            _ => Err(RpcError::Deserialize(
+                "expected True, False or None".to_string(),
+            )),
+        },
         RpcRequest::IsBlackholed { .. }
         | RpcRequest::UseDestination { .. }
         | RpcRequest::RetainDestination { .. }
         | RpcRequest::RetainIdentity { .. }
-        | RpcRequest::UnretainDestination { .. } => Ok(RpcResponse::BoolResult(match value {
-            PyValue::Bool(v) => *v,
-            PyValue::None => false,
-            _ => py_required_int(value)? != 0,
-        })),
+        | RpcRequest::UnretainDestination { .. }
+        | RpcRequest::WantsDestinationType { .. }
+        | RpcRequest::UnwantsDestinationType { .. }
+        | RpcRequest::UnwantsAllDestinationTypes { .. } => {
+            Ok(RpcResponse::BoolResult(match value {
+                PyValue::Bool(v) => *v,
+                PyValue::None => false,
+                _ => py_required_int(value)? != 0,
+            }))
+        }
     }
 }
 
@@ -2858,5 +3084,242 @@ mod tests {
         let mut data = vec![0x91u8; 200];
         data.push(0xc0);
         assert!(decode_umsgpack(&data).is_err());
+    }
+
+    /// Requests upstream RNS 1.6.0 clients send, from the harness generator
+    /// `reticulum/support/rpc_parity/gen_rpc_1_6_wire.py`.
+    const UPSTREAM_1_6_REQUESTS: &[(&str, &str)] = &[
+        (
+            "lowest_interface_bitrate",
+            "81a3676574b86c6f776573745f696e746572666163655f62697472617465",
+        ),
+        (
+            "medium_path_timeout",
+            "81a3676574b36d656469756d5f706174685f74696d656f7574",
+        ),
+        (
+            "active_link_count",
+            "81a3676574b16163746976655f6c696e6b5f636f756e74",
+        ),
+        (
+            "link_distribution",
+            "81a3676574b16c696e6b5f646973747269627574696f6e",
+        ),
+        (
+            "profiling_results",
+            "81a3676574b170726f66696c696e675f726573756c7473",
+        ),
+        (
+            "attach_interface",
+            "82a66d616e616765b06174746163685f696e74657266616365a46e616d65ac44697361626c656420544350",
+        ),
+        (
+            "detach_interface",
+            "82a66d616e616765b06465746163685f696e74657266616365a46e616d65ac44697361626c656420544350",
+        ),
+        (
+            "reload_interface",
+            "82a66d616e616765b072656c6f61645f696e74657266616365a46e616d65ac44697361626c656420544350",
+        ),
+        (
+            "wants_destination_type",
+            "83b677616e74735f64657374696e6174696f6e5f74797065ad6c786d662e64656c6976657279a9726571756573746572c41000112233445566778899aabbccddeeffa97369676e6174757265c0",
+        ),
+        (
+            "unwants_destination_type",
+            "83b8756e77616e74735f64657374696e6174696f6e5f74797065ad6c786d662e64656c6976657279a9726571756573746572c41000112233445566778899aabbccddeeffa97369676e6174757265c0",
+        ),
+        (
+            "unwants_all_destination_types",
+            "83bd756e77616e74735f616c6c5f64657374696e6174696f6e5f7479706573c3a9726571756573746572c41000112233445566778899aabbccddeeffa97369676e6174757265c0",
+        ),
+    ];
+
+    fn upstream_request(name: &str) -> Vec<u8> {
+        let (_, hex) = UPSTREAM_1_6_REQUESTS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap();
+        hex::decode(hex).unwrap()
+    }
+
+    #[test]
+    fn upstream_1_6_requests_decode_and_reencode_byte_identically() {
+        for (name, hex) in UPSTREAM_1_6_REQUESTS {
+            let bytes = hex::decode(hex).unwrap();
+            let request =
+                decode_request(&bytes).unwrap_or_else(|e| panic!("{name}: decode failed: {e:?}"));
+            assert_eq!(
+                hex::encode(encode_request(&request).unwrap()),
+                *hex,
+                "{name}: re-encoded bytes differ from upstream"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_1_6_requests_decode_to_their_operations() {
+        assert!(matches!(
+            decode_request(&upstream_request("lowest_interface_bitrate")).unwrap(),
+            RpcRequest::GetLowestInterfaceBitrate
+        ));
+        assert!(matches!(
+            decode_request(&upstream_request("medium_path_timeout")).unwrap(),
+            RpcRequest::GetMediumPathTimeout
+        ));
+        assert!(matches!(
+            decode_request(&upstream_request("active_link_count")).unwrap(),
+            RpcRequest::GetActiveLinkCount
+        ));
+        assert!(matches!(
+            decode_request(&upstream_request("link_distribution")).unwrap(),
+            RpcRequest::GetLinkDistribution
+        ));
+        assert!(matches!(
+            decode_request(&upstream_request("profiling_results")).unwrap(),
+            RpcRequest::GetProfilingResults
+        ));
+        for (name, op) in [
+            ("attach_interface", ManageOperation::Attach),
+            ("detach_interface", ManageOperation::Detach),
+            ("reload_interface", ManageOperation::Reload),
+        ] {
+            match decode_request(&upstream_request(name)).unwrap() {
+                RpcRequest::ManageInterface { operation, name } => {
+                    assert_eq!(operation, op);
+                    assert_eq!(name, "Disabled TCP");
+                }
+                other => panic!("{name}: decoded as {other:?}"),
+            }
+        }
+        let requester = hex::decode("00112233445566778899aabbccddeeff").unwrap();
+        match decode_request(&upstream_request("wants_destination_type")).unwrap() {
+            RpcRequest::WantsDestinationType {
+                full_name,
+                requester: r,
+                signature,
+            } => {
+                assert_eq!(full_name, "lxmf.delivery");
+                assert_eq!(r, requester);
+                assert_eq!(signature, None);
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+        assert!(matches!(
+            decode_request(&upstream_request("unwants_destination_type")).unwrap(),
+            RpcRequest::UnwantsDestinationType { full_name, .. } if full_name == "lxmf.delivery"
+        ));
+        assert!(matches!(
+            decode_request(&upstream_request("unwants_all_destination_types")).unwrap(),
+            RpcRequest::UnwantsAllDestinationTypes { requester: r, .. } if r == requester
+        ));
+    }
+
+    #[test]
+    fn destination_type_request_without_requester_or_signature_is_rejected() {
+        // Python's rpc_loop indexes both keys and drops the call without them.
+        let no_signature = py_dict(vec![
+            ("wants_destination_type", PyValue::String("a.b".to_string())),
+            ("requester", PyValue::Bytes(vec![1; 16])),
+        ]);
+        assert!(decode_request(&encode_umsgpack(&no_signature).unwrap()).is_err());
+        let no_requester = py_dict(vec![
+            ("unwants_all_destination_types", PyValue::Bool(true)),
+            ("signature", PyValue::None),
+        ]);
+        assert!(decode_request(&encode_umsgpack(&no_requester).unwrap()).is_err());
+    }
+
+    #[test]
+    fn unknown_manage_operation_is_rejected() {
+        let request = py_dict(vec![
+            ("manage", PyValue::String("restart_interface".to_string())),
+            ("name", PyValue::String("x".to_string())),
+        ]);
+        assert!(decode_request(&encode_umsgpack(&request).unwrap()).is_err());
+    }
+
+    /// Replies upstream 1.6.0 packs, from the same generator.
+    #[test]
+    fn new_replies_encode_as_upstream_packs_them() {
+        assert_eq!(hex::encode(encode_optional_int(None).unwrap()), "c0");
+        assert_eq!(
+            hex::encode(encode_optional_int(Some(500)).unwrap()),
+            "cd01f4"
+        );
+        assert_eq!(
+            hex::encode(encode_optional_int(Some(1200)).unwrap()),
+            "cd04b0"
+        );
+        assert_eq!(hex::encode(encode_optional_int(Some(3)).unwrap()), "03");
+        assert_eq!(hex::encode(encode_medium_path_timeout(None).unwrap()), "00");
+        assert_eq!(
+            hex::encode(encode_medium_path_timeout(Some(22.0)).unwrap()),
+            "cb4036000000000000"
+        );
+        assert_eq!(hex::encode(encode_empty_dict().unwrap()), "80");
+        assert_eq!(hex::encode(encode_none().unwrap()), "c0");
+        assert_eq!(hex::encode(encode_optional_bool(Some(true)).unwrap()), "c3");
+        assert_eq!(
+            hex::encode(encode_optional_bool(Some(false)).unwrap()),
+            "c2"
+        );
+        assert_eq!(hex::encode(encode_optional_bool(None).unwrap()), "c0");
+    }
+
+    #[test]
+    fn new_replies_decode_for_their_requests() {
+        let decode = |hex: &str, request: RpcRequest| {
+            decode_response_for_request(&hex::decode(hex).unwrap(), &request).unwrap()
+        };
+        assert!(matches!(
+            decode("cd01f4", RpcRequest::GetLowestInterfaceBitrate),
+            RpcResponse::IntResult(500)
+        ));
+        assert!(matches!(
+            decode("c0", RpcRequest::GetLowestInterfaceBitrate),
+            RpcResponse::StringResult(None)
+        ));
+        assert!(matches!(
+            decode("cb4036000000000000", RpcRequest::GetMediumPathTimeout),
+            RpcResponse::FloatResult(Some(v)) if v == 22.0
+        ));
+        assert!(matches!(
+            decode("00", RpcRequest::GetMediumPathTimeout),
+            RpcResponse::FloatResult(Some(v)) if v == 0.0
+        ));
+        assert!(matches!(
+            decode("01", RpcRequest::GetActiveLinkCount),
+            RpcResponse::IntResult(1)
+        ));
+        assert!(matches!(
+            decode("80", RpcRequest::GetLinkDistribution),
+            RpcResponse::Ok
+        ));
+        assert!(matches!(
+            decode("c0", RpcRequest::GetProfilingResults),
+            RpcResponse::StringResult(None)
+        ));
+        let manage = || RpcRequest::ManageInterface {
+            operation: ManageOperation::Attach,
+            name: "x".to_string(),
+        };
+        assert!(matches!(
+            decode("c3", manage()),
+            RpcResponse::BoolResult(true)
+        ));
+        assert!(matches!(
+            decode("c2", manage()),
+            RpcResponse::BoolResult(false)
+        ));
+        assert!(matches!(
+            decode("c0", manage()),
+            RpcResponse::StringResult(None)
+        ));
+        let wants = RpcRequest::UnwantsAllDestinationTypes {
+            requester: vec![0; 16],
+            signature: None,
+        };
+        assert!(matches!(decode("c3", wants), RpcResponse::BoolResult(true)));
     }
 }

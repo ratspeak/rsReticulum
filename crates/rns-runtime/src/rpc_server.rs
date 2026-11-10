@@ -3,6 +3,9 @@
 //! use mutual RPC-key authentication and framed MessagePack, with a 30-second
 //! session budget and up to 64 concurrent clients. RPC frames are not encrypted.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -24,6 +27,8 @@ pub(crate) struct RpcBackend {
     transport_tx: mpsc::Sender<TransportMessage>,
     ifac: Option<InterfaceIfacStats>,
     transport: Option<TransportStatsSource>,
+    lowest_interface_bitrate: Arc<Mutex<Option<u64>>>,
+    destination_types: DestinationTypeRequests,
 }
 
 impl RpcBackend {
@@ -35,12 +40,62 @@ impl RpcBackend {
             transport_tx,
             ifac,
             transport: None,
+            lowest_interface_bitrate: Arc::default(),
+            destination_types: DestinationTypeRequests::default(),
         }
     }
 
     pub(crate) fn with_transport(mut self, transport: Option<TransportStatsSource>) -> Self {
         self.transport = transport;
         self
+    }
+}
+
+/// Shared-instance clients' destination type requirements, keyed by name
+/// hash, as Python's `Transport.client_destination_types` (Transport.py:4648-4692).
+type DestinationTypeRequirements = HashMap<[u8; 10], HashSet<Vec<u8>>>;
+
+#[derive(Clone, Default)]
+struct DestinationTypeRequests {
+    requirements: Arc<Mutex<DestinationTypeRequirements>>,
+}
+
+impl DestinationTypeRequests {
+    fn wants(&self, full_name: &str, requester: Vec<u8>) -> bool {
+        self.requirements
+            .lock()
+            .expect("destination type requirements mutex poisoned")
+            .entry(rns_identity::name_hash::name_hash(full_name))
+            .or_default()
+            .insert(requester);
+        true
+    }
+
+    fn unwants(&self, full_name: &str, requester: Vec<u8>) -> bool {
+        let name_hash = rns_identity::name_hash::name_hash(full_name);
+        let mut requirements = self
+            .requirements
+            .lock()
+            .expect("destination type requirements mutex poisoned");
+        let Some(requesters) = requirements.get_mut(&name_hash) else {
+            return false;
+        };
+        let was_registered = requesters.remove(&requester);
+        if requesters.is_empty() {
+            requirements.remove(&name_hash);
+        }
+        was_registered
+    }
+
+    fn unwants_all(&self, requester: Vec<u8>) -> bool {
+        self.requirements
+            .lock()
+            .expect("destination type requirements mutex poisoned")
+            .retain(|_, requesters| {
+                requesters.remove(&requester);
+                !requesters.is_empty()
+            });
+        true
     }
 }
 
@@ -405,6 +460,47 @@ async fn handle_rpc_client(
 }
 
 async fn respond(request: RpcRequest, backend: &RpcBackend) -> Result<Vec<u8>, RpcError> {
+    match request {
+        RpcRequest::GetLowestInterfaceBitrate => {
+            return match lowest_interface_bitrate(backend).await {
+                Ok(bitrate) => rpc::encode_optional_int(bitrate),
+                Err(response) => rpc::encode_response(&response),
+            };
+        }
+        RpcRequest::GetMediumPathTimeout => {
+            return match lowest_interface_bitrate(backend).await {
+                Ok(bitrate) => rpc::encode_medium_path_timeout(bitrate.map(medium_path_timeout)),
+                Err(response) => rpc::encode_response(&response),
+            };
+        }
+        RpcRequest::GetLinkDistribution => return rpc::encode_empty_dict(),
+        RpcRequest::GetProfilingResults => return rpc::encode_none(),
+        // The runtime cannot attach or detach configured interfaces yet, so it
+        // answers as Python does with `enable_interface_management = no`
+        // (Reticulum.py:851, 878, 907).
+        RpcRequest::ManageInterface { .. } => return rpc::encode_optional_bool(Some(false)),
+        RpcRequest::WantsDestinationType {
+            full_name,
+            requester,
+            ..
+        } => {
+            let wanted = backend.destination_types.wants(&full_name, requester);
+            return rpc::encode_response(&RpcResponse::BoolResult(wanted));
+        }
+        RpcRequest::UnwantsDestinationType {
+            full_name,
+            requester,
+            ..
+        } => {
+            let unwanted = backend.destination_types.unwants(&full_name, requester);
+            return rpc::encode_response(&RpcResponse::BoolResult(unwanted));
+        }
+        RpcRequest::UnwantsAllDestinationTypes { requester, .. } => {
+            let unwanted = backend.destination_types.unwants_all(requester);
+            return rpc::encode_response(&RpcResponse::BoolResult(unwanted));
+        }
+        _ => {}
+    }
     match process_rpc_request(request, &backend.transport_tx, backend.ifac.as_ref()).await {
         RpcResponse::InterfaceStats(entries) => rpc::encode_interface_stats(
             &entries,
@@ -416,6 +512,41 @@ async fn respond(request: RpcRequest, backend: &RpcBackend) -> Result<Vec<u8>, R
         ),
         response => rpc::encode_response(&response),
     }
+}
+
+/// Python's `Transport.lowest_interface_bitrate`: the minimum over online
+/// interfaces with a bitrate, keeping the last value when none qualifies
+/// (Transport.py:708).
+async fn lowest_interface_bitrate(backend: &RpcBackend) -> Result<Option<u64>, RpcResponse> {
+    use rns_transport::messages::{TransportQuery, TransportQueryResponse};
+    let interfaces =
+        match query_transport(&backend.transport_tx, TransportQuery::GetInterfaceStats).await {
+            Ok(TransportQueryResponse::InterfaceStats(interfaces)) => interfaces,
+            Ok(_) => return Err(unexpected_transport_response("interface stats query")),
+            Err(failure) => {
+                return Err(transport_failure_response("interface stats query", failure));
+            }
+        };
+    let mut cached = backend
+        .lowest_interface_bitrate
+        .lock()
+        .expect("lowest interface bitrate mutex poisoned");
+    if let Some(lowest) = interfaces
+        .iter()
+        .filter(|interface| interface.online && interface.bitrate > 0)
+        .map(|interface| interface.bitrate)
+        .min()
+    {
+        *cached = Some(lowest);
+    }
+    Ok(*cached)
+}
+
+/// Python's `Transport.medium_path_timeout()` for a known bitrate (Transport.py:3550-3553).
+fn medium_path_timeout(lowest_bitrate: u64) -> f64 {
+    let bits = (rns_wire::constants::MTU * 8) as f64;
+    2.0 * (bits / lowest_bitrate.max(crate::constants::MINIMUM_BITRATE) as f64)
+        + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT
 }
 
 const TRANSPORT_QUERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
@@ -612,6 +743,25 @@ async fn process_rpc_request(
                 TransportQueryResponse::IntResult(n) => RpcResponse::IntResult(n),
                 _ => unexpected_transport_response("link count query"),
             }
+        }
+        RpcRequest::GetActiveLinkCount => {
+            match authoritative_query!(
+                TransportQuery::GetActiveLinkCount,
+                "active link count query"
+            ) {
+                TransportQueryResponse::IntResult(n) => RpcResponse::IntResult(n),
+                _ => unexpected_transport_response("active link count query"),
+            }
+        }
+        RpcRequest::GetLowestInterfaceBitrate
+        | RpcRequest::GetMediumPathTimeout
+        | RpcRequest::GetLinkDistribution
+        | RpcRequest::GetProfilingResults
+        | RpcRequest::ManageInterface { .. }
+        | RpcRequest::WantsDestinationType { .. }
+        | RpcRequest::UnwantsDestinationType { .. }
+        | RpcRequest::UnwantsAllDestinationTypes { .. } => {
+            RpcResponse::Error("request needs the control server's state".to_string())
         }
         RpcRequest::GetNextHopIfName { destination_hash } => {
             let Some(dest) = hash_to_array(&destination_hash) else {
@@ -1514,5 +1664,151 @@ listener.close()
             }
         }
         panic!("failed to connect to RPC server on {addr}: {last_err:?}");
+    }
+
+    /// A transport that answers interface stats with `(online, bitrate)` pairs.
+    fn stats_transport(interfaces: Vec<(bool, u64)>) -> mpsc::Sender<TransportMessage> {
+        use rns_transport::messages::{
+            InterfaceStatRpcEntry, TransportQuery, TransportQueryResponse,
+        };
+        let (tx, mut rx) = mpsc::channel::<TransportMessage>(8);
+        tokio::spawn(async move {
+            while let Some(TransportMessage::Rpc { query, response_tx }) = rx.recv().await {
+                let response = match query {
+                    TransportQuery::GetInterfaceStats => TransportQueryResponse::InterfaceStats(
+                        interfaces
+                            .iter()
+                            .enumerate()
+                            .map(|(id, &(online, bitrate))| InterfaceStatRpcEntry {
+                                id: id as u64,
+                                online,
+                                bitrate,
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
+                    _ => TransportQueryResponse::Error("unexpected".into()),
+                };
+                let _ = response_tx.send(response);
+            }
+        });
+        tx
+    }
+
+    /// Expected bytes are upstream 1.6.0 replies
+    /// (reticulum/support/rpc_parity/gen_rpc_1_6_wire.py).
+    #[tokio::test]
+    async fn lowest_bitrate_and_medium_path_timeout_answer_as_upstream() {
+        let backend = RpcBackend::new(
+            stats_transport(vec![(true, 1200), (true, 115_200), (false, 300), (true, 0)]),
+            None,
+        );
+        let bitrate = respond(RpcRequest::GetLowestInterfaceBitrate, &backend)
+            .await
+            .unwrap();
+        assert_eq!(hex::encode(bitrate), "cd04b0");
+        let timeout = respond(RpcRequest::GetMediumPathTimeout, &backend)
+            .await
+            .unwrap();
+        assert_eq!(hex::encode(timeout), "cb4029555555555556");
+
+        let slow = RpcBackend::new(stats_transport(vec![(true, 3)]), None);
+        let timeout = respond(RpcRequest::GetMediumPathTimeout, &slow)
+            .await
+            .unwrap();
+        assert_eq!(hex::encode(timeout), "cb4099180000000000");
+    }
+
+    #[tokio::test]
+    async fn lowest_bitrate_is_none_until_an_interface_qualifies_then_kept() {
+        let backend = RpcBackend::new(stats_transport(vec![(true, 0), (false, 500)]), None);
+        let bitrate = respond(RpcRequest::GetLowestInterfaceBitrate, &backend)
+            .await
+            .unwrap();
+        assert_eq!(hex::encode(bitrate), "c0");
+        let timeout = respond(RpcRequest::GetMediumPathTimeout, &backend)
+            .await
+            .unwrap();
+        assert_eq!(hex::encode(timeout), "00");
+
+        // Python keeps the last qualifying value when none qualifies any more.
+        let kept = RpcBackend {
+            transport_tx: stats_transport(vec![(false, 500)]),
+            ..backend.clone()
+        };
+        *backend.lowest_interface_bitrate.lock().unwrap() = Some(500);
+        let bitrate = respond(RpcRequest::GetLowestInterfaceBitrate, &kept)
+            .await
+            .unwrap();
+        assert_eq!(hex::encode(bitrate), "cd01f4");
+    }
+
+    #[tokio::test]
+    async fn stub_replies_match_upstream() {
+        let backend = RpcBackend::new(stats_transport(Vec::new()), None);
+        let reply = |request| respond(request, &backend);
+        assert_eq!(
+            hex::encode(reply(RpcRequest::GetLinkDistribution).await.unwrap()),
+            "80"
+        );
+        assert_eq!(
+            hex::encode(reply(RpcRequest::GetProfilingResults).await.unwrap()),
+            "c0"
+        );
+    }
+
+    #[tokio::test]
+    async fn manage_answers_as_upstream_with_management_disabled() {
+        let backend = RpcBackend::new(stats_transport(Vec::new()), None);
+        for operation in [
+            rpc::ManageOperation::Attach,
+            rpc::ManageOperation::Detach,
+            rpc::ManageOperation::Reload,
+        ] {
+            for name in ["Managed TCP", "Nope"] {
+                let request = RpcRequest::ManageInterface {
+                    operation,
+                    name: name.to_string(),
+                };
+                let got = respond(request, &backend).await.unwrap();
+                assert_eq!(hex::encode(got), "c2", "{operation:?} {name}");
+            }
+        }
+    }
+
+    /// The sequence and results of upstream's live run
+    /// (reticulum/vectors/rpc_manage/destination_types.json), without filters.
+    #[tokio::test]
+    async fn destination_type_requests_follow_upstream_bookkeeping() {
+        let backend = RpcBackend::new(stats_transport(Vec::new()), None);
+        let requester = vec![0x11; 16];
+        let wants = |name: &str| RpcRequest::WantsDestinationType {
+            full_name: name.to_string(),
+            requester: requester.clone(),
+            signature: None,
+        };
+        let unwants = |name: &str| RpcRequest::UnwantsDestinationType {
+            full_name: name.to_string(),
+            requester: requester.clone(),
+            signature: None,
+        };
+        let all = RpcRequest::UnwantsAllDestinationTypes {
+            requester: requester.clone(),
+            signature: None,
+        };
+        let t = "c3";
+        let f = "c2";
+        for (request, want) in [
+            (wants("lxmf.delivery"), t),
+            (unwants("lxmf.delivery"), t),
+            (unwants("lxmf.delivery"), f),
+            (unwants("never.registered"), f),
+            (wants("lxmf.delivery"), t),
+            (all, t),
+            (unwants("lxmf.delivery"), f),
+        ] {
+            let got = respond(request.clone(), &backend).await.unwrap();
+            assert_eq!(hex::encode(got), want, "{request:?}");
+        }
     }
 }

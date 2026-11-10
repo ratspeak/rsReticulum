@@ -856,6 +856,8 @@ pub enum TransportQuery {
     GetInterfaceStats,
     GetRateTable,
     GetLinkCount,
+    /// Python's `Transport.active_link_count()`, answered as `IntResult`.
+    GetActiveLinkCount,
     GetRecentAnnounces,
     /// Return cached identity metadata without updating `last_used`. Locally
     /// restored cache metadata is trusted; this query performs no fresh signature

@@ -152,6 +152,14 @@ impl TransportActor {
             TransportQuery::GetLinkCount => {
                 TransportQueryResponse::IntResult(self.link_table.len() as i64)
             }
+            // Counts validated links. Python 1.6.0 means to, but indexes the
+            // link id instead of the entry (Transport.py:3577).
+            TransportQuery::GetActiveLinkCount => TransportQueryResponse::IntResult(
+                self.link_table
+                    .iter()
+                    .filter(|(_, entry)| entry.validated)
+                    .count() as i64,
+            ),
             TransportQuery::GetRecentAnnounces => {
                 let mut entries: Vec<AnnounceRpcEntry> = self
                     .recent_announces
@@ -710,5 +718,47 @@ fn activation_epoch(now: f64, active: bool, activated: std::time::Instant) -> f6
         now - activated.elapsed().as_secs_f64()
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::messages::{TransportQuery, TransportQueryResponse};
+
+    fn link_entry() -> crate::link_table::LinkEntry {
+        crate::link_table::LinkEntry {
+            timestamp: now_f64(),
+            next_hop: None,
+            interface_id: 1,
+            remaining_hops: 1,
+            destination_hash: [0xCC; 16],
+            established: true,
+            validated: true,
+            proof_timeout: now_f64() + 120.0,
+            receiving_interface: 1,
+            taken_hops: 0,
+            interface_owner: None,
+            receiving_owner: None,
+            requested_mode: 1,
+            accepted_mtu_ceiling: 500,
+        }
+    }
+
+    #[test]
+    fn active_link_count_counts_validated_links() {
+        let (mut actor, _tx) = TransportActor::new();
+        let mut unvalidated = link_entry();
+        unvalidated.validated = false;
+        actor.link_table.insert([0u8; 16], link_entry());
+        actor.link_table.insert([1u8; 16], unvalidated);
+        assert!(matches!(
+            actor.handle_query(TransportQuery::GetActiveLinkCount),
+            TransportQueryResponse::IntResult(1)
+        ));
+        assert!(matches!(
+            actor.handle_query(TransportQuery::GetLinkCount),
+            TransportQueryResponse::IntResult(2)
+        ));
     }
 }
