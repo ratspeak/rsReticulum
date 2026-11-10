@@ -11,21 +11,221 @@ use tracing_subscriber::fmt::MakeWriter;
 
 use rns_tools::{RETICULUM_COMPAT_VERSION, RS_RETICULUM_VERSION};
 const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
+// Upstream `rnsd --exampleconfig` output, including print()'s trailing newline.
 const RNSD_EXAMPLE_CONFIG: &str = r#"# This is an example Reticulum config file.
+# You should probably edit it to include any additional,
+# interfaces and settings you might need.
 
 [reticulum]
+
+# If you enable Transport, your system will route traffic
+# for other peers, pass announces and serve path requests.
+# This should be done for systems that are suited to act
+# as transport nodes, ie. if they are stationary and
+# always-on. This directive is optional and can be removed
+# for brevity.
+
 enable_transport = no
+
+
+# By default, the first program to launch the Reticulum
+# Network Stack will create a shared instance, that other
+# programs can communicate with. Only the shared instance
+# opens all the configured interfaces directly, and other
+# local programs communicate with the shared instance over
+# a local socket. This is completely transparent to the
+# user, and should generally be turned on. This directive
+# is optional and can be removed for brevity.
+
 share_instance = yes
+
+
+# If you want to run multiple *different* shared instances
+# on the same system, you will need to specify different
+# instance names for each. On platforms supporting domain
+# sockets, this can be done with the instance_name option:
+
 instance_name = default
 
-# Interval in minutes at which remote blackhole sources
-# are updated. Defaults to one hour.
+
+# Some platforms don't support domain sockets, and if that
+# is the case, you can isolate different instances by
+# specifying a unique set of ports for each:
+
+# shared_instance_port = 37428
+# instance_control_port = 37429
+
+
+# If you want to explicitly use TCP for shared instance
+# communication, instead of domain sockets, this is also
+# possible, by using the following option:
+
+# shared_instance_type = tcp
+
+
+# On systems where running instances may not have access
+# to the same shared Reticulum configuration directory,
+# it is still possible to allow full interactivity for
+# running instances, by manually specifying a shared RPC
+# key. In almost all cases, this option is not needed, but
+# it can be useful on operating systems such as Android.
+# The key must be specified as bytes in hexadecimal.
+
+# rpc_key = e5c032d3ec4e64a6aca9927ba8ab73336780f6d71790
+
+
+# It is possible to allow remote management of Reticulum
+# systems using the various built-in utilities, such as
+# rnstatus and rnpath. You will need to specify one or
+# more Reticulum Identity hashes for authenticating the
+# queries from client programs. For this purpose, you can
+# use existing identity files, or generate new ones with
+# the rnid utility.
+
+# enable_remote_management = yes
+# remote_management_allowed = 9fb6d773498fb3feda407ed8ef2c3229, 2d882c5586e548d79b5af27bca1776dc
+
+
+# For easier management, discovery and configuration of
+# networks with many individual transport instances,
+# you can specify a network identity to be used across
+# a set of instances. If sending interface discovery
+# announces, these will all be signed by the specified
+# network identity, and other nodes discovering your
+# interfaces will be able to identify that they belong
+# to the same network, even though they exist on different
+# transport nodes.
+
+# network_identity = ~/.reticulum/storage/identity/network
+
+
+# It is possible to configure the global default interface
+# gravity. This value will be used if an interface does
+# not have a specific gravity value in its configuration.
+
+# default_gravity = 0
+
+# You can configure whether Reticulum should discover
+# available interfaces from other Transport Instances over
+# the network. If this option is enabled, Reticulum will
+# collect interface information discovered from the network.
+
+# discover_interfaces = no
+
+
+# If you only want to discover interfaces from specific
+# networks, you can provide a list of network identities
+# from which to discover interfaces. If this option is not
+# provided, interfaces will be discovered from all transport
+# instances on all connected networks.
+
+# interface_discovery_sources = 78616ff7c4b8d3886d67d494b440f333, cb127015e13aa6ea1e0a606cdc9123d0
+
+
+# It is possible to automatically bring up and connect new
+# interfaces discovered over the network. This option is
+# disabled by default, but allows you to specify a maximum
+# number of discovered interfaces to automatically connect.
+# Additionally, if this option is enabled, Reticulum will
+# also try to autoconnect available auto-discovered inter-
+# faces on startup, up to the maximum number specified.
+
+# autoconnect_discovered_interfaces = 0
+
+
+# To prevent interface discovery spamming, a valid crypto-
+# graphic stamp is required per announced interface. You
+# can configure the minimum required value to accept as
+# valid for discovered interfaces.
+
+# required_discovery_value = 14
+
+
+# You can disable allowing interfaces to be attached, de-
+# tached or reloaded via rnstatus, for example if running
+# on a shared system where users with normal RPC access
+# should not be allowed to control interface states.
+
+# enable_interface_management = no
+
+
+# You can configure Reticulum to panic and forcibly close
+# if an unrecoverable interface error occurs, such as the
+# hardware device for an interface disappearing. This is
+# an optional directive, and can be left out for brevity.
+# This behaviour is disabled by default.
+
+# panic_on_interface_error = no
+
+# You can specify which mode discovered interfaces should
+# be created with when auto-connecting.
+
+# autoconnect_interface_mode = gw
+
+
+# It is possible to allow announces from auto-connected
+# interfaces to propagate announces to internal-mode
+# interfaces, even if the auto-connected interface's mode
+# would normally not allow for this.
+
+# autoconnect_announces_to_internal = yes
+
+
+# You can configure the gravity for discovered interfaces
+# that are auto-connected.
+
+# autoconnect_interface_gravity = 0
+
+
+# When Transport is enabled, it is possible to allow the
+# Transport Instance to respond to probe requests from
+# the rnprobe utility. This can be a useful tool to test
+# connectivity. When this option is enabled, the probe
+# destination will be generated from the Identity of the
+# Transport Instance, and printed to the log at startup.
+# Optional, and disabled by default.
+
+# respond_to_probes = no
+
+
+# You can publish your local list of blackholed identities
+# for other transport instances to use for automatic,
+# network-wide blackhole management.
+
+# publish_blackhole = no
+
+
+# List of remote transport identities from which to auto-
+# matically source lists of blackholed identities.
+#
+# If you're connecting to a large external network, you
+# can use one or more external blackhole list to block
+# spammy and excessive announces onto your network. This
+# funtionality is especially useful if you're hosting public
+# entrypoints or gateways. The list source below provides a
+# functional example, but better, more timely maintained
+# lists probably exist in the community.
+
+# blackhole_sources = 521c87a83afb8f29e4455e77930b973b
+
+
+# You can set the interval in minutes at which remote
+# blackhole sources are updated. Defaults to one hour.
+
 # blackhole_update_interval = 60
 
-# When not running as a transport node, force the same,
-# static transport identity at every instance start.
-# Defaults to a new identity per start if transport is
-# disabled.
+
+# You can enable a hop limiter, that will drop all packets
+# exceeding the specified maximum hop count.
+
+# hop_limiter = 16
+
+
+# When not running as a transport node, it is possible to
+# force the use of the same, static transport identity
+# for every instance start. Defaults to using a new identity
+# at every instance start, if transport is disabled.
+
 # static_transport_identity = no
 
 [stamps]
@@ -99,89 +299,322 @@ instance_name = default
 
 
 [logging]
+# Valid log levels are 0 through 8:
+#   0: Log only critical information
+#   1: Log errors and lower log levels
+#   2: Log warnings and lower log levels
+#   3: Log notices and lower log levels
+#   4: Log info and lower (this is the default)
+#   5: Verbose logging
+#   6: Debug logging
+#   7: Path logging
+#   8: Extreme logging
+
 loglevel = 4
 
-# You can disable timestamp inclusion in logs.
+# You can disable timestamp inclusion in logs. Useful if
+# you want to use an external logging tool that provides
+# its own timestamps or custom formatting.
+
 # logtimestamps = no
+
+
+# The interfaces section defines the physical and virtual
+# interfaces Reticulum will use to communicate on. This
+# section will contain examples for a variety of interface
+# types. You can modify these or use them as a basis for
+# your own config, or simply remove the unused ones.
 
 [interfaces]
 
-# IFAC sizes are in bits when explicitly configured. For an 8-byte tag, use
-# ifac_size = 64 and ifac_size_unit = bits in the interface section.
-# Omit both to keep the interface's default. Existing unmarked Rust sizes need
-# an explicit offline migration: rnsd-rs config ifac-units --source-units bytes
-# --interface NAME (preview), then repeat with --write after checking it.
+  # This interface enables communication with other
+  # link-local Reticulum nodes over UDP. It does not
+  # need any functional IP infrastructure like routers
+  # or DHCP servers, but will require that at least link-
+  # local IPv6 is enabled in your operating system, which
+  # should be enabled by default in almost any OS. See
+  # the Reticulum Manual for more configuration options.
 
-[[Default Interface]]
-type = AutoInterface
-enabled = yes
+  [[Default Interface]]
+    type = AutoInterface
+    enabled = yes
 
-[[UDP Interface]]
-type = UDPInterface
-enabled = no
-listen_ip = 0.0.0.0
-listen_port = 4242
-forward_ip = 255.255.255.255
-forward_port = 4242
 
-[[TCP Server Interface]]
-type = TCPServerInterface
-enabled = no
-listen_ip = 0.0.0.0
-listen_port = 4242
+  # The following example enables communication with other
+  # local Reticulum peers using UDP broadcasts.
+  
+  [[UDP Interface]]
+    type = UDPInterface
+    enabled = no
+    listen_ip = 0.0.0.0
+    listen_port = 4242
+    forward_ip = 255.255.255.255
+    forward_port = 4242
 
-[[TCP Client Interface]]
-type = TCPClientInterface
-enabled = no
-target_host = 127.0.0.1
-target_port = 4242
+    # The above configuration will allow communication
+    # within the local broadcast domains of all local
+    # IP interfaces.
 
-[[I2P]]
-type = I2PInterface
-enabled = no
-connectable = yes
-peers = ykzlw5ujbaqc2xkec4cpvgyxj257wcrmmgkuxqmqcur7cq3w3lha.b32.i2p
+    # Instead of specifying listen_ip, listen_port,
+    # forward_ip and forward_port, you can also bind
+    # to a specific network device like below.
 
-[[RNode LoRa Interface]]
-type = RNodeInterface
-enabled = no
-port = /dev/ttyUSB0
-frequency = 867200000
-bandwidth = 125000
-txpower = 7
-spreadingfactor = 8
-codingrate = 5
-flow_control = false
+    # device = eth0
+    # port = 4242
 
-[[Packet Radio KISS Interface]]
-type = KISSInterface
-enabled = no
-port = /dev/ttyUSB1
-speed = 115200
-databits = 8
-parity = none
-stopbits = 1
-preamble = 150
-txtail = 10
-persistence = 200
-slottime = 20
-flow_control = false
+    # Assuming the eth0 device has the address
+    # 10.55.0.72/24, the above configuration would
+    # be equivalent to the following manual setup.
+    # Note that we are both listening and forwarding to
+    # the broadcast address of the network segments.
 
-[[Packet Radio AX.25 KISS Interface]]
-type = AX25KISSInterface
-callsign = NO1CLL
-ssid = 0
-enabled = no
-port = /dev/ttyUSB2
-speed = 115200
-databits = 8
-parity = none
-stopbits = 1
-flow_control = false
-preamble = 150
-txtail = 10
-persistence = 200
-slottime = 20
+    # listen_ip = 10.55.0.255
+    # listen_port = 4242
+    # forward_ip = 10.55.0.255
+    # forward_port = 4242
+
+    # You can of course also communicate only with
+    # a single IP address
+
+    # listen_ip = 10.55.0.15
+    # listen_port = 4242
+    # forward_ip = 10.55.0.16
+    # forward_port = 4242
+
+
+  # This example demonstrates a TCP server interface.
+  # It will listen for incoming connections on the
+  # specified IP address and port number.
+  
+  [[TCP Server Interface]]
+    type = TCPServerInterface
+    enabled = no
+
+    # This configuration will listen on all IP
+    # interfaces on port 4242
+    
+    listen_ip = 0.0.0.0
+    listen_port = 4242
+
+    # Alternatively you can bind to a specific IP
+    
+    # listen_ip = 10.0.0.88
+    # listen_port = 4242
+
+    # Or a specific network device
+    
+    # device = eth0
+    # port = 4242
+
+
+  # To connect to a TCP server interface, you would
+  # naturally use the TCP client interface. Here's
+  # an example. The target_host can either be an IP
+  # address or a hostname
+
+  [[TCP Client Interface]]
+    type = TCPClientInterface
+    enabled = no
+    target_host = 127.0.0.1
+    target_port = 4242
+
+
+  # This example shows how to make your Reticulum
+  # instance available over I2P, and connect to
+  # another I2P peer. Please be aware that you
+  # must have an I2P router running on your system
+  # with the SAMv3 API enabled for this to work.
+
+  [[I2P]]
+    type = I2PInterface
+    enabled = no
+    connectable = yes
+    peers = ykzlw5ujbaqc2xkec4cpvgyxj257wcrmmgkuxqmqcur7cq3w3lha.b32.i2p
+
+
+  # Here's an example of how to add a LoRa interface
+  # using the RNode LoRa transceiver.
+
+  [[RNode LoRa Interface]]
+    type = RNodeInterface
+
+    # Enable interface if you want use it!
+    enabled = no
+
+    # Serial port for the device
+    port = /dev/ttyUSB0
+
+    # It is also possible to use BLE devices
+    # instead of wired serial ports. The
+    # target RNode must be paired with the
+    # host device before connecting. BLE
+    # devices can be connected by name,
+    # BLE MAC address or by any available.
+    
+    # Connect to specific device by name
+    # port = ble://RNode 3B87
+
+    # Or by BLE MAC address
+    # port = ble://F4:12:73:29:4E:89
+
+    # Or connect to the first available,
+    # paired device
+    # port = ble://
+
+    # Set frequency to 867.2 MHz
+    frequency = 867200000
+
+    # Set LoRa bandwidth to 125 KHz
+    bandwidth = 125000
+
+    # Set TX power to 7 dBm (5 mW)
+    txpower = 7
+
+    # Select spreading factor 8. Valid 
+    # range is 7 through 12, with 7
+    # being the fastest and 12 having
+    # the longest range.
+    spreadingfactor = 8
+
+    # Select coding rate 5. Valid range
+    # is 5 throough 8, with 5 being the
+    # fastest, and 8 the longest range.
+    codingrate = 5
+
+    # You can configure the RNode to send
+    # out identification on the channel with
+    # a set interval by configuring the
+    # following two parameters. The trans-
+    # ceiver will only ID if the set
+    # interval has elapsed since it's last
+    # actual transmission. The interval is
+    # configured in seconds.
+    # This option is commented out and not
+    # used by default.
+    # id_callsign = MYCALL-0
+    # id_interval = 600
+
+    # For certain homebrew RNode interfaces
+    # with low amounts of RAM, using packet
+    # flow control can be useful. By default
+    # it is disabled.
+    flow_control = False
+    
+    
+  # An example KISS modem interface. Useful for running
+  # Reticulum over packet radio hardware.
+
+  [[Packet Radio KISS Interface]]
+    type = KISSInterface
+
+    # Enable interface if you want use it!
+    enabled = no
+
+    # Serial port for the device
+    port = /dev/ttyUSB1
+
+    # Set the serial baud-rate and other
+    # configuration parameters.
+    speed = 115200    
+    databits = 8
+    parity = none
+    stopbits = 1
+
+    # Set the modem preamble. A 150ms
+    # preamble should be a reasonable
+    # default, but may need to be
+    # increased for radios with slow-
+    # opening squelch and long TX/RX
+    # turnaround
+    preamble = 150
+
+    # Set the modem TX tail. In most
+    # cases this should be kept as low
+    # as possible to not waste airtime.
+    txtail = 10
+
+    # Configure CDMA parameters. These
+    # settings are reasonable defaults.
+    persistence = 200
+    slottime = 20
+
+    # You can configure the interface to send
+    # out identification on the channel with
+    # a set interval by configuring the
+    # following two parameters. The KISS
+    # interface will only ID if the set
+    # interval has elapsed since it's last
+    # actual transmission. The interval is
+    # configured in seconds.
+    # This option is commented out and not
+    # used by default.
+    # id_callsign = MYCALL-0
+    # id_interval = 600
+
+    # Whether to use KISS flow-control.
+    # This is useful for modems that have
+    # a small internal packet buffer, but
+    # support packet flow control instead.
+    flow_control = false
+
+
+  # If you're using Reticulum on amateur radio spectrum,
+  # you might want to use the AX.25 KISS interface. This
+  # way, Reticulum will automatically encapsulate it's
+  # traffic in AX.25 and also identify your stations
+  # transmissions with your callsign and SSID.
+  # 
+  # Only do this if you really need to! Reticulum doesn't
+  # need the AX.25 layer for anything, and it incurs extra
+  # overhead on every packet to encapsulate in AX.25.
+  #
+  # A more efficient way is to use the plain KISS interface
+  # with the beaconing functionality described above.
+
+  [[Packet Radio AX.25 KISS Interface]]
+    type = AX25KISSInterface
+
+    # Set the station callsign and SSID
+    callsign = NO1CLL
+    ssid = 0
+
+    # Enable interface if you want use it!
+    enabled = no
+
+    # Serial port for the device
+    port = /dev/ttyUSB2
+
+    # Set the serial baud-rate and other
+    # configuration parameters.
+    speed = 115200    
+    databits = 8
+    parity = none
+    stopbits = 1
+
+    # Whether to use KISS flow-control.
+    # This is useful for modems with a
+    # small internal packet buffer.
+    flow_control = false
+
+    # Set the modem preamble. A 150ms
+    # preamble should be a reasonable
+    # default, but may need to be
+    # increased for radios with slow-
+    # opening squelch and long TX/RX
+    # turnaround
+    preamble = 150
+
+    # Set the modem TX tail. In most
+    # cases this should be kept as low
+    # as possible to not waste airtime.
+    txtail = 10
+
+    # Configure CDMA parameters. These
+    # settings are reasonable defaults.
+    persistence = 200
+    slottime = 20
+
+
 "#;
 
 #[derive(Parser)]
@@ -229,7 +662,7 @@ pub(crate) async fn main() {
     let args = Args::parse();
 
     if args.version {
-        println!("rnsd-rs {RS_RETICULUM_VERSION}");
+        println!("rnsd-rs {RS_RETICULUM_VERSION} (Reticulum {RETICULUM_COMPAT_VERSION})");
         return;
     }
 
@@ -247,13 +680,8 @@ pub(crate) async fn main() {
         return;
     }
 
-    let config_loglevel = read_config_loglevel(&config_dir).unwrap_or(4);
-    let verbosity = if args.service {
-        config_loglevel
-    } else {
-        config_loglevel + args.verbose as i32 - args.quiet as i32
-    };
-    let level = tracing_level(verbosity);
+    let verbosity = (!args.service).then(|| args.verbose as i32 - args.quiet as i32);
+    let level = tracing_level(effective_loglevel(&config_dir, verbosity));
     let log_timestamps = rns_tools::config_log_timestamps(&config_dir);
 
     if args.service {
@@ -277,8 +705,6 @@ pub(crate) async fn main() {
         rns_tools::init_tracing(level, log_timestamps, true, std::io::stdout);
     }
 
-    tracing::info!("rnsd-rs {RS_RETICULUM_VERSION} starting");
-
     let shutdown = rns_runtime::lifecycle::ShutdownSignal::new();
     let _signal_rx = rns_runtime::lifecycle::install_signal_handlers(shutdown.clone());
 
@@ -292,6 +718,15 @@ pub(crate) async fn main() {
     .await
     {
         Ok(handle) => {
+            if handle.instance_mode == rns_runtime::reticulum::InstanceMode::Client {
+                tracing::warn!(
+                    "Started rnsd-rs version {RS_RETICULUM_VERSION} (Reticulum {RETICULUM_COMPAT_VERSION}) connected to another shared local instance, this is probably NOT what you want!"
+                );
+            } else {
+                tracing::info!(
+                    "Started rnsd-rs version {RS_RETICULUM_VERSION} (Reticulum {RETICULUM_COMPAT_VERSION})"
+                );
+            }
             tracing::info!("reticulum started in {:?} mode", handle.instance_mode);
             if args.interactive {
                 run_interactive_shell(handle.clone()).await;
@@ -462,10 +897,25 @@ fn parse_string_literal(value: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn read_config_loglevel(config_dir: &Path) -> Option<i32> {
-    let config = rns_runtime::config::Config::from_file(&config_dir.join("config")).ok()?;
-    let section = config.section("logging")?;
-    section.get_int("loglevel").map(|v| v as i32)
+/// Python `Reticulum.__apply_config`: the configured level plus the `-v`/`-q`
+/// delta, clamped to 0..=8; without a `loglevel` key the level stays at 3.
+/// A missing file is read as the default config the runtime writes first.
+fn effective_loglevel(config_dir: &Path, verbosity: Option<i32>) -> i32 {
+    let path = config_dir.join("config");
+    let config = if path.exists() {
+        rns_runtime::config::Config::from_file(&path).ok()
+    } else {
+        rns_runtime::config::Config::parse(rns_runtime::config::Config::default_config()).ok()
+    };
+    match config
+        .as_ref()
+        .and_then(|c| c.section("logging")?.get_int("loglevel"))
+    {
+        Some(level) => level
+            .saturating_add(verbosity.unwrap_or(0).into())
+            .clamp(0, 8) as i32,
+        None => 3,
+    }
 }
 
 fn tracing_level(verbosity: i32) -> tracing::Level {
@@ -474,7 +924,7 @@ fn tracing_level(verbosity: i32) -> tracing::Level {
         2 => tracing::Level::WARN,
         3..=4 => tracing::Level::INFO,
         5..=6 => tracing::Level::DEBUG,
-        _ => tracing::Level::TRACE,
+        7.. => tracing::Level::TRACE,
     }
 }
 
@@ -601,6 +1051,19 @@ impl Write for RotatingLogFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verbosity_is_added_to_configured_loglevel_and_clamped() {
+        let dir = std::env::temp_dir().join(format!("rnsd-loglevel-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config"), "[logging]\nloglevel = 4\n").unwrap();
+        assert_eq!(effective_loglevel(&dir, Some(5)), 8);
+        assert_eq!(effective_loglevel(&dir, Some(-9)), 0);
+        assert_eq!(effective_loglevel(&dir, None), 4);
+        fs::write(dir.join("config"), "[reticulum]\n").unwrap();
+        assert_eq!(effective_loglevel(&dir, Some(4)), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn ifac_units_cli_requires_explicit_units_and_selection() {

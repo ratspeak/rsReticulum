@@ -2450,6 +2450,27 @@ fn socket_path_display(path: &str) -> String {
     }
 }
 
+/// Inbound queue lengths per traffic class, Python `Transport.INBOUND_*_QUEUE_LENGTH`
+/// (Transport.py:186-189) overridden by `[reticulum] qlen_in_*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboundQueueLengths {
+    pub data: usize,
+    pub announce: usize,
+    pub pr: usize,
+    pub il: usize,
+}
+
+impl Default for InboundQueueLengths {
+    fn default() -> Self {
+        Self {
+            data: 1024,
+            announce: 128,
+            pr: 128,
+            il: 8,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 /// Parsed runtime settings. `Default` supplies values; `try_from_config`
 /// overlays supported keys. Editing this struct after initialization does
@@ -2484,7 +2505,12 @@ pub struct ReticulumConfig {
     pub default_ar_grace: Option<u32>,
     /// Global Reticulum defaults for per-interface ingress/egress control.
     pub ingress_overrides: rns_transport::ingress::IngressOverrides,
+    /// `[logging] loglevel`, 0 (critical) to 8 (extreme). Python's module
+    /// default is 3 (notice) when the key is absent.
     pub loglevel: i32,
+    /// `qlen_in_*` inbound queue lengths per traffic class. Parsed only: the
+    /// transport actor does not have per-class inbound queues yet.
+    pub inbound_queue_lengths: InboundQueueLengths,
 
     /// Optional identity file, loaded or created at startup. It signs discovery
     /// announces and supplies the key for per-interface `discovery_encrypt`.
@@ -2555,7 +2581,8 @@ impl Default for ReticulumConfig {
             default_ar_penalty: None,
             default_ar_grace: None,
             ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
-            loglevel: 4,
+            loglevel: 3,
+            inbound_queue_lengths: InboundQueueLengths::default(),
             network_identity_path: None,
             discover_interfaces: false,
             autoconnect_discovered_interfaces: 0,
@@ -2745,6 +2772,10 @@ fn merge_ingress_overrides(
     }
 }
 
+fn warn_deprecated_alias(alias: &str, key: &str) {
+    tracing::warn!("The configuration option {alias} is deprecated, use {key} instead");
+}
+
 fn parse_autoconnect_limit(sec: &ConfigSection) -> Result<Option<usize>, ConfigError> {
     if let Some(v) = config_uint("reticulum", sec, "autoconnect_discovered_interfaces")? {
         return Ok(Some(v as usize));
@@ -2755,6 +2786,7 @@ fn parse_autoconnect_limit(sec: &ConfigSection) -> Result<Option<usize>, ConfigE
     // rejects `Yes`/`No` like ConfigObj `as_int()`.
     let key = "discover_interfaces_autoconnect";
     if sec.has(key) {
+        warn_deprecated_alias(key, "autoconnect_discovered_interfaces");
         if let Some(v) = sec.get_uint(key) {
             return Ok(Some(v as usize));
         }
@@ -2867,6 +2899,17 @@ impl ReticulumConfig {
                 rc.default_ar_grace = Some(v.min(u32::MAX as u64) as u32);
             }
             rc.ingress_overrides = parse_ingress_overrides("reticulum", sec)?;
+            let queues = &mut rc.inbound_queue_lengths;
+            for (key, length) in [
+                ("qlen_in_data", &mut queues.data),
+                ("qlen_in_announce", &mut queues.announce),
+                ("qlen_in_pr", &mut queues.pr),
+                ("qlen_in_il", &mut queues.il),
+            ] {
+                if let Some(v) = config_int("reticulum", sec, key)?.filter(|v| *v > 0) {
+                    *length = usize::try_from(v).unwrap_or(usize::MAX);
+                }
+            }
 
             if let Some(list) = sec.get_list("remote_management_allowed") {
                 rc.remote_management_allowed =
@@ -2895,6 +2938,12 @@ impl ReticulumConfig {
             {
                 rc.autoconnect_unverified_implementations = value;
             }
+            if sec.has("discover_interfaces_required_value") {
+                warn_deprecated_alias(
+                    "discover_interfaces_required_value",
+                    "required_discovery_value",
+                );
+            }
             if let Some(v) = config_uint("reticulum", sec, "required_discovery_value")?.or(
                 config_uint("reticulum", sec, "discover_interfaces_required_value")?,
             ) {
@@ -2922,7 +2971,7 @@ impl ReticulumConfig {
 
         if let Some(sec) = config.section("logging") {
             if let Some(level) = config_int("logging", sec, "loglevel")? {
-                rc.loglevel = (level as i32).clamp(0, 7);
+                rc.loglevel = level.clamp(0, 8) as i32;
             }
             if let Some(value) = config_bool("logging", sec, "logtimestamps")? {
                 rc.log_timestamps = value;
@@ -10973,7 +11022,32 @@ mod tests {
         assert_eq!(rc.control_port, 37429);
         assert!(!rc.enable_transport);
         assert!(rc.use_implicit_proof);
-        assert_eq!(rc.loglevel, 4);
+        assert_eq!(rc.loglevel, 3);
+        assert_eq!(rc.inbound_queue_lengths, InboundQueueLengths::default());
+    }
+
+    #[test]
+    fn test_loglevel_clamps_to_extreme() {
+        for (raw, expected) in [("8", 8), ("9", 8), ("-1", 0), ("7", 7)] {
+            let config = Config::parse(&format!("[logging]\nloglevel = {raw}\n")).unwrap();
+            assert_eq!(
+                ReticulumConfig::from_config(&config).loglevel,
+                expected,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_inbound_queue_lengths_apply_only_positive_values() {
+        let config = Config::parse(
+            "[reticulum]\nqlen_in_data = 10\nqlen_in_announce = 0\nqlen_in_pr = -1\nqlen_in_il = 3\n",
+        )
+        .unwrap();
+        let q = ReticulumConfig::from_config(&config).inbound_queue_lengths;
+        assert_eq!((q.data, q.announce, q.pr, q.il), (10, 128, 128, 3));
+        let config = Config::parse("[reticulum]\nqlen_in_il = abc\n").unwrap();
+        assert!(ReticulumConfig::try_from_config(&config).is_err());
     }
 
     #[test]
