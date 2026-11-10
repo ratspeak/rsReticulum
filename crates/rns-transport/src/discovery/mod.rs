@@ -7,11 +7,9 @@
 //! the runtime owns actual connections. Blackhole manifest codecs and update
 //! cursors support the separate `rnstransport.info.blackhole` service.
 //!
-//! Discovery accepts a [`DiscoveryStamper`] so transport need not depend on
-//! LXMF. An embedding application can supply the concrete implementation from
-//! `lxmf-core::discovery_stamper`. [`NullStamper`] generates no work and rejects
-//! inbound stamps; it does not disable the separate blackhole helpers or erase
-//! previously stored discovery records.
+//! Stamps use [`RnsDiscoveryStamper`], upstream's `RNS.Stamps` construction;
+//! the [`DiscoveryStamper`] trait lets an embedder substitute another.
+//! [`NullStamper`] generates no work and rejects inbound stamps.
 
 pub mod announcer;
 pub mod app_data;
@@ -34,5 +32,5 @@ pub use blackhole_subscriber::{
 };
 pub use constants::*;
 pub use receiver::{DiscoveryDecryptor, Outcome, Reason, ReceiverConfig};
-pub use stamper::{DiscoveryStamper, NullStamper};
+pub use stamper::{DiscoveryStamper, NullStamper, RnsDiscoveryStamper};
 pub use storage::{DiscoveredInterface, DiscoveryStatus, DiscoveryStore, discovery_hash};

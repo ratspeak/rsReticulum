@@ -62,9 +62,9 @@ pub struct ReceiverConfig {
     /// Local record store. The spawned receiver serializes its own writes;
     /// direct callers or other store users need their own coordination.
     pub store: Arc<DiscoveryStore>,
-    /// Work requirement passed to the stamper. It is independent of the
-    /// sender's configured generation target.
-    pub required_value: u8,
+    /// Work requirement passed to the stamper (`required_discovery_value`).
+    /// It is independent of the sender's configured generation target.
+    pub required_value: f64,
     /// Allowed source identities. The filter uses `event.identity_hash` when
     /// present, otherwise the info map's claimed transport ID. `Some(vec![])`
     /// rejects every source; `None` applies no source restriction. The caller
@@ -208,7 +208,7 @@ struct CacheKey([u8; 32]);
 struct ValidatedMaterial {
     info: DiscoveryInfo,
     stamp: Vec<u8>,
-    stamp_value: u8,
+    stamp_value: f64,
 }
 
 enum CacheLookup {
@@ -676,17 +676,18 @@ mod tests {
     use super::*;
     use crate::discovery::app_data::{Encoded, encode_info};
     use crate::discovery::constants::STAMP_SIZE;
+    use rns_identity::stamps::StampControl;
 
     /// Trivial stamper: `generate` returns a zero-filled stamp; `valid`
     /// accepts iff the caller's stamp matches `generate`. Used to drive
     /// receiver tests without pulling LXStamper into rns-transport.
     struct MockStamper {
         ok_stamp: Vec<u8>,
-        value: u8,
+        value: f64,
     }
 
     impl MockStamper {
-        fn new(stamp: Vec<u8>, value: u8) -> Self {
+        fn new(stamp: Vec<u8>, value: f64) -> Self {
             assert_eq!(stamp.len(), STAMP_SIZE);
             Self {
                 ok_stamp: stamp,
@@ -696,13 +697,13 @@ mod tests {
     }
 
     impl DiscoveryStamper for MockStamper {
-        fn generate(&self, _ih: &[u8; 32], _tv: u8) -> Option<Vec<u8>> {
+        fn generate(&self, _ih: &[u8; 32], _tv: f64, _: &StampControl) -> Option<Vec<u8>> {
             Some(self.ok_stamp.clone())
         }
-        fn value(&self, _ih: &[u8; 32], _s: &[u8]) -> u8 {
+        fn value(&self, _ih: &[u8; 32], _s: &[u8]) -> f64 {
             self.value
         }
-        fn valid(&self, _ih: &[u8; 32], stamp: &[u8], required: u8) -> bool {
+        fn valid(&self, _ih: &[u8; 32], stamp: &[u8], required: f64) -> bool {
             self.value >= required && stamp == self.ok_stamp.as_slice()
         }
     }
@@ -723,13 +724,13 @@ mod tests {
 
     struct CountingStamper {
         valid_result: bool,
-        value: u8,
+        value: f64,
         valid_calls: AtomicU64,
         value_calls: AtomicU64,
     }
 
     impl CountingStamper {
-        fn new(valid_result: bool, value: u8) -> Self {
+        fn new(valid_result: bool, value: f64) -> Self {
             Self {
                 valid_result,
                 value,
@@ -740,16 +741,16 @@ mod tests {
     }
 
     impl DiscoveryStamper for CountingStamper {
-        fn generate(&self, _ih: &[u8; 32], _tv: u8) -> Option<Vec<u8>> {
+        fn generate(&self, _ih: &[u8; 32], _tv: f64, _: &StampControl) -> Option<Vec<u8>> {
             None
         }
 
-        fn value(&self, _ih: &[u8; 32], _stamp: &[u8]) -> u8 {
+        fn value(&self, _ih: &[u8; 32], _stamp: &[u8]) -> f64 {
             self.value_calls.fetch_add(1, Ordering::Relaxed);
             self.value
         }
 
-        fn valid(&self, _ih: &[u8; 32], _stamp: &[u8], _required: u8) -> bool {
+        fn valid(&self, _ih: &[u8; 32], _stamp: &[u8], _required: f64) -> bool {
             self.valid_calls.fetch_add(1, Ordering::Relaxed);
             self.valid_result
         }
@@ -824,7 +825,7 @@ mod tests {
         ReceiverConfig {
             stamper,
             store,
-            required_value: 14,
+            required_value: 14.0,
             discovery_sources: sources,
             decryptor,
             observer: None,
@@ -850,7 +851,7 @@ mod tests {
         let dir = tmpdir("accept");
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
         let stamp = vec![0xAB; STAMP_SIZE];
-        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20));
+        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20.0));
         let info = sample_info();
         let (blob, _ih) = stamped_blob(&info, &stamp);
 
@@ -861,7 +862,7 @@ mod tests {
         let listed = store.list(None).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].info, info);
-        assert_eq!(listed[0].stamp_value, 20);
+        assert_eq!(listed[0].stamp_value, 20.0);
         assert_eq!(listed[0].hops, 3);
         assert_eq!(listed[0].network_id, [0x11; 16]);
     }
@@ -872,7 +873,7 @@ mod tests {
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
         let good = vec![0xAB; STAMP_SIZE];
         let bad = vec![0xCD; STAMP_SIZE];
-        let stamper = Arc::new(MockStamper::new(good, 20));
+        let stamper = Arc::new(MockStamper::new(good, 20.0));
         let info = sample_info();
         let (blob, _) = stamped_blob(&info, &bad);
 
@@ -890,7 +891,7 @@ mod tests {
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
         let stamp = vec![0xAB; STAMP_SIZE];
         // value only 5, required 14
-        let stamper = Arc::new(MockStamper::new(stamp.clone(), 5));
+        let stamper = Arc::new(MockStamper::new(stamp.clone(), 5.0));
         let info = sample_info();
         let (blob, _) = stamped_blob(&info, &stamp);
 
@@ -905,7 +906,7 @@ mod tests {
     fn rejects_missing_app_data() {
         let dir = tmpdir("noapp");
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
-        let stamper = Arc::new(MockStamper::new(vec![0; STAMP_SIZE], 20));
+        let stamper = Arc::new(MockStamper::new(vec![0; STAMP_SIZE], 20.0));
         let cfg = make_cfg(stamper, store.clone(), None, None);
 
         let event = AnnounceHandlerEvent {
@@ -929,7 +930,7 @@ mod tests {
     fn rejects_malformed_payload() {
         let dir = tmpdir("malformed");
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
-        let stamper = Arc::new(MockStamper::new(vec![0; STAMP_SIZE], 20));
+        let stamper = Arc::new(MockStamper::new(vec![0; STAMP_SIZE], 20.0));
         let cfg = make_cfg(stamper, store.clone(), None, None);
 
         // Flag byte present but body too small for a stamp.
@@ -946,7 +947,7 @@ mod tests {
         let dir = tmpdir("encnokey");
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
         let stamp = vec![0xAB; STAMP_SIZE];
-        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20));
+        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20.0));
         let info = sample_info();
         let (blob, _) = encrypted_blob(&info, &stamp);
 
@@ -962,7 +963,7 @@ mod tests {
         let dir = tmpdir("decfail");
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
         let stamp = vec![0xAB; STAMP_SIZE];
-        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20));
+        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20.0));
         let info = sample_info();
         let (blob, _) = encrypted_blob(&info, &stamp);
 
@@ -983,7 +984,7 @@ mod tests {
         let dir = tmpdir("encok");
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
         let stamp = vec![0xAB; STAMP_SIZE];
-        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20));
+        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20.0));
         let info = sample_info();
         let (blob, _) = encrypted_blob(&info, &stamp);
 
@@ -997,7 +998,7 @@ mod tests {
         let dir = tmpdir("unauth");
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
         let stamp = vec![0xAB; STAMP_SIZE];
-        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20));
+        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20.0));
         let mut info = sample_info();
         info.transport_id = [0x55; 16];
         let (blob, _) = stamped_blob(&info, &stamp);
@@ -1016,7 +1017,7 @@ mod tests {
         let dir = tmpdir("auth");
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
         let stamp = vec![0xAB; STAMP_SIZE];
-        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20));
+        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20.0));
         let mut info = sample_info();
         info.transport_id = [0x55; 16];
         let (blob, _) = stamped_blob(&info, &stamp);
@@ -1035,13 +1036,13 @@ mod tests {
         // "info" so the decoder errors.
         struct PermissiveStamper(Vec<u8>);
         impl DiscoveryStamper for PermissiveStamper {
-            fn generate(&self, _: &[u8; 32], _: u8) -> Option<Vec<u8>> {
+            fn generate(&self, _: &[u8; 32], _: f64, _: &StampControl) -> Option<Vec<u8>> {
                 Some(self.0.clone())
             }
-            fn value(&self, _: &[u8; 32], _: &[u8]) -> u8 {
-                20
+            fn value(&self, _: &[u8; 32], _: &[u8]) -> f64 {
+                20.0
             }
-            fn valid(&self, _: &[u8; 32], _: &[u8], _: u8) -> bool {
+            fn valid(&self, _: &[u8; 32], _: &[u8], _: f64) -> bool {
                 true
             }
         }
@@ -1064,7 +1065,7 @@ mod tests {
         let dir = tmpdir("obs");
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
         let stamp = vec![0xAB; STAMP_SIZE];
-        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20));
+        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20.0));
         let info = sample_info();
         let (blob, _) = stamped_blob(&info, &stamp);
 
@@ -1072,7 +1073,7 @@ mod tests {
         let cfg = ReceiverConfig {
             stamper,
             store: store.clone(),
-            required_value: 14,
+            required_value: 14.0,
             discovery_sources: None,
             decryptor: None,
             observer: Some(obs_tx),
@@ -1090,7 +1091,7 @@ mod tests {
         let dir = tmpdir("client");
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
         let stamp = vec![0xAB; STAMP_SIZE];
-        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20));
+        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20.0));
         let mut info = sample_info();
         info.interface_type = "TCPClientInterface".into();
         let (blob, _) = stamped_blob(&info, &stamp);
@@ -1099,7 +1100,7 @@ mod tests {
         let cfg = ReceiverConfig {
             stamper,
             store: store.clone(),
-            required_value: 14,
+            required_value: 14.0,
             discovery_sources: None,
             decryptor: None,
             observer: Some(obs_tx),
@@ -1117,7 +1118,7 @@ mod tests {
         let dir = tmpdir("valid-cache");
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
         let stamp = vec![0xAB; STAMP_SIZE];
-        let stamper = Arc::new(CountingStamper::new(true, 20));
+        let stamper = Arc::new(CountingStamper::new(true, 20.0));
         let (blob, _) = stamped_blob(&sample_info(), &stamp);
         let metrics = Arc::new(ReceiverMetrics::default());
         let state = ReceiverState::new(
@@ -1138,7 +1139,7 @@ mod tests {
         let dir = tmpdir("invalid-cache");
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
         let stamp = vec![0xAB; STAMP_SIZE];
-        let stamper = Arc::new(CountingStamper::new(false, 0));
+        let stamper = Arc::new(CountingStamper::new(false, 0.0));
         let (blob, _) = stamped_blob(&sample_info(), &stamp);
         let metrics = Arc::new(ReceiverMetrics::default());
         let state = ReceiverState::new(
@@ -1168,7 +1169,7 @@ mod tests {
         let material = ValidatedMaterial {
             info: sample_info(),
             stamp: vec![0; STAMP_SIZE],
-            stamp_value: 20,
+            stamp_value: 20.0,
         };
         let one = CacheKey([1; 32]);
         let two = CacheKey([2; 32]);
@@ -1198,7 +1199,7 @@ mod tests {
         let dir = tmpdir("busy-drop");
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
         let stamp = vec![0xAB; STAMP_SIZE];
-        let stamper = Arc::new(CountingStamper::new(true, 20));
+        let stamper = Arc::new(CountingStamper::new(true, 20.0));
         let (blob, _) = stamped_blob(&sample_info(), &stamp);
         let metrics = Arc::new(ReceiverMetrics::default());
         let state = ReceiverState::new(
@@ -1221,7 +1222,7 @@ mod tests {
         let dir = tmpdir("encrypted-isolation");
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
         let stamp = vec![0xAB; STAMP_SIZE];
-        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20));
+        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20.0));
         let (blob, _) = encrypted_blob(&sample_info(), &stamp);
         let decryptor_a: Arc<dyn DiscoveryDecryptor> = Arc::new(MaskDecryptor { mask: 0xFF });
         let decryptor_b: Arc<dyn DiscoveryDecryptor> = Arc::new(MaskDecryptor { mask: 0xFF });
@@ -1243,7 +1244,7 @@ mod tests {
         let dir = tmpdir("spawn");
         let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
         let stamp = vec![0xAB; STAMP_SIZE];
-        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20));
+        let stamper = Arc::new(MockStamper::new(stamp.clone(), 20.0));
         let info = sample_info();
         let (blob, _) = stamped_blob(&info, &stamp);
 

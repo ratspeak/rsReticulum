@@ -2594,10 +2594,11 @@ pub struct ReticulumConfig {
     /// metadata does not pass the configured release floor, including rsRNS.
     /// The default check is metadata matching, not software attestation.
     pub autoconnect_unverified_implementations: bool,
-    /// Minimum received discovery stamp value in leading-zero bits; default 16.
-    /// This does not set generation cost, which comes from each interface's
-    /// `discovery_stamp_value` (or `stamp_value`).
-    pub discover_interfaces_required_value: u8,
+    /// Minimum fractional stamp value for received discovery announces
+    /// (`required_discovery_value`); unset or not positive means 16. This does
+    /// not set generation cost, which comes from each interface's
+    /// `discovery_stamp_value`.
+    pub discover_interfaces_required_value: f64,
     /// Accepted discovery publisher identity hashes. An empty list permits
     /// any publisher that otherwise passes receiver checks.
     pub interface_discovery_sources: Vec<[u8; 16]>,
@@ -3011,10 +3012,15 @@ impl ReticulumConfig {
                     "required_discovery_value",
                 );
             }
-            if let Some(v) = config_uint("reticulum", sec, "required_discovery_value")?.or(
-                config_uint("reticulum", sec, "discover_interfaces_required_value")?,
+            // Reticulum.py:674-677 keeps only a positive value; Discovery.py:495 defaults the rest.
+            if let Some(v) = config_float("reticulum", sec, "required_discovery_value")?.or(
+                config_float("reticulum", sec, "discover_interfaces_required_value")?,
             ) {
-                rc.discover_interfaces_required_value = v.min(u8::MAX as u64) as u8;
+                rc.discover_interfaces_required_value = if v > 0.0 {
+                    v
+                } else {
+                    rns_transport::discovery::DEFAULT_STAMP_VALUE
+                };
             }
             rc.interface_discovery_sources = parse_hash16_list(
                 "interface_discovery_sources",
@@ -3807,6 +3813,7 @@ pub async fn init_with_policy(
                 iface_config,
                 &post_init,
                 rc.enable_transport,
+                &rc.stamps,
             );
             let bootstrap_only = interface_bootstrap_only(&config, iface_config);
             let ifac_key = derive_ifac_key_from_post_init(&post_init);
@@ -6317,6 +6324,7 @@ fn discovery_config_for_interface(
     iface_config: &interface_factory::InterfaceConfig,
     post_init: &interface_factory::InterfacePostInit,
     transport_enabled: bool,
+    stamps: &rns_transport::stamps::StampPolicy,
 ) -> Option<DiscoveryInterfaceConfig> {
     let section = interface_section(config, iface_config)?;
     if !section.get_bool("discoverable").unwrap_or(false) {
@@ -6425,11 +6433,9 @@ fn discovery_config_for_interface(
         name,
         transport_enabled,
         announce_interval_secs: discovery_announce_interval_secs(section),
-        stamp_value: section
-            .get_uint("discovery_stamp_value")
-            .or_else(|| section.get_uint("stamp_value"))
-            .map(|v| v.min(u8::MAX as u64) as u8)
-            .unwrap_or(rns_transport::discovery::DEFAULT_STAMP_VALUE),
+        stamp_value: discovery_stamp_value(section),
+        dst_cost: Some(stamps.interface_destination_cost(post_init.destination_cost)),
+        pr_cost: Some(stamps.interface_pr_cost(post_init.pr_cost)),
         reachable_on,
         port,
         ifac_netname: publish_ifac
@@ -6464,6 +6470,22 @@ fn discovery_config_for_interface(
         encrypt: section.get_bool("discovery_encrypt").unwrap_or(false),
         signed: false,
     })
+}
+
+/// Python reads `discovery_stamp_value` with `as_float` and generates at 16
+/// when it is unset or 0 (Reticulum.py:1090, Discovery.py:134).
+fn discovery_stamp_value(section: &ConfigSection) -> f64 {
+    let legacy = || {
+        let value = section.get_float("stamp_value");
+        if value.is_some() {
+            tracing::warn!("interface key stamp_value is deprecated, use discovery_stamp_value");
+        }
+        value
+    };
+    section
+        .get_float("discovery_stamp_value")
+        .or_else(legacy)
+        .unwrap_or(0.0)
 }
 
 fn configured_reachable_on(section: &ConfigSection) -> Option<String> {
@@ -6676,7 +6698,18 @@ async fn run_discovery_publisher(
         retry_at: std::time::Instant,
     }
     let mut publications: HashMap<u64, Publication> = HashMap::new();
-    let mut announcer = Announcer::new(stamper);
+    struct CancelOnDrop(Arc<AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    // A blocking thread owns the announcer while it generates stamps.
+    let announcer = Announcer::new(stamper);
+    let cancel_generation = CancelOnDrop(announcer.stamp_control().cancel.clone());
+    let mut announcer = Some(announcer);
+    let mut preparing: Option<tokio::task::JoinHandle<(Announcer, Vec<PreparedAnnounce>)>> = None;
+    let mut deferred_commits: Vec<(PreparedAnnounce, f64)> = Vec::new();
     let mut registered: HashMap<u64, Option<String>> = HashMap::new();
     let mut next_prepare = std::time::Instant::now();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -6690,7 +6723,41 @@ async fn run_discovery_publisher(
             _ = tick.tick() => {}
         }
         let now = std::time::Instant::now();
+        if preparing.as_ref().is_some_and(|job| job.is_finished()) {
+            let job = preparing.take().expect("checked above");
+            match job.await {
+                Ok((mut returned, prepared)) => {
+                    // The job saw these as unsent; they must not go out again.
+                    let mut committed = Vec::new();
+                    for (prepared, at) in deferred_commits.drain(..) {
+                        if returned.commit(&prepared, at) {
+                            committed.push(prepared.request().interface_id);
+                        }
+                    }
+                    announcer = Some(returned);
+                    for prepared in prepared {
+                        let id = prepared.request().interface_id;
+                        if committed.contains(&id) {
+                            continue;
+                        }
+                        publications.entry(id).or_insert(Publication {
+                            prepared,
+                            pending: None,
+                            last_failure: None,
+                            retry_at: now,
+                        });
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "discovery announce preparation failed");
+                    break;
+                }
+            }
+        }
         for local in &locals {
+            let Some(announcer) = announcer.as_mut() else {
+                break;
+            };
             let online = local
                 .online
                 .as_ref()
@@ -6721,24 +6788,19 @@ async fn run_discovery_publisher(
                 }
             }
         }
-        if now >= next_prepare {
-            let encrypt = |plaintext: &[u8]| {
-                handle
-                    .network_identity
-                    .as_ref()
-                    .and_then(|identity| identity.encrypt(plaintext, None).ok())
-            };
-            let (prepared, _) = announcer.prepare(unix_now(), Some(&encrypt));
-            for prepared in prepared {
-                publications
-                    .entry(prepared.request().interface_id)
-                    .or_insert(Publication {
-                        prepared,
-                        pending: None,
-                        last_failure: None,
-                        retry_at: now,
-                    });
-            }
+        if now >= next_prepare
+            && let Some(mut owned) = announcer.take()
+        {
+            let network_identity = handle.network_identity.clone();
+            preparing = Some(tokio::task::spawn_blocking(move || {
+                let encrypt = |plaintext: &[u8]| {
+                    network_identity
+                        .as_ref()
+                        .and_then(|identity| identity.encrypt(plaintext, None).ok())
+                };
+                let (prepared, _) = owned.prepare(unix_now(), Some(&encrypt));
+                (owned, prepared)
+            }));
             next_prepare =
                 now + Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
         }
@@ -6754,7 +6816,14 @@ async fn run_discovery_publisher(
             if let Some(pending) = publication.pending.as_mut() {
                 match pending.try_recv() {
                     Ok(AnnounceDispatchResult::Admitted) => {
-                        announcer.commit(&publication.prepared, unix_now());
+                        match announcer.as_mut() {
+                            Some(announcer) => {
+                                announcer.commit(&publication.prepared, unix_now());
+                            }
+                            None => {
+                                deferred_commits.push((publication.prepared.clone(), unix_now()))
+                            }
+                        }
                         admitted.push(local.id);
                         continue;
                     }
@@ -6813,6 +6882,10 @@ async fn run_discovery_publisher(
         for id in admitted {
             publications.remove(&id);
         }
+    }
+    drop(cancel_generation);
+    if let Some(job) = preparing {
+        let _ = job.await;
     }
     // Stop unacknowledged dispatch before retiring its local destination.
     drop(publications);
@@ -12384,14 +12457,19 @@ loglevel = 7
 
     struct StaticStamper;
     impl DiscoveryStamper for StaticStamper {
-        fn generate(&self, _infohash: &[u8; 32], _target_value: u8) -> Option<Vec<u8>> {
+        fn generate(
+            &self,
+            _infohash: &[u8; 32],
+            _target_value: f64,
+            _ctl: &rns_identity::stamps::StampControl,
+        ) -> Option<Vec<u8>> {
             Some(vec![0xAB; 32])
         }
-        fn value(&self, _infohash: &[u8; 32], _stamp: &[u8]) -> u8 {
-            16
+        fn value(&self, _infohash: &[u8; 32], _stamp: &[u8]) -> f64 {
+            16.0
         }
-        fn valid(&self, _infohash: &[u8; 32], _stamp: &[u8], required_value: u8) -> bool {
-            required_value <= 16
+        fn valid(&self, _infohash: &[u8; 32], _stamp: &[u8], required_value: f64) -> bool {
+            required_value <= 16.0
         }
     }
 
@@ -12701,14 +12779,19 @@ loglevel = 7
     async fn discovery_publisher_recalls_pending_service_when_it_goes_offline() {
         struct CountedStamper(AtomicU64);
         impl DiscoveryStamper for CountedStamper {
-            fn generate(&self, hash: &[u8; 32], value: u8) -> Option<Vec<u8>> {
+            fn generate(
+                &self,
+                hash: &[u8; 32],
+                value: f64,
+                ctl: &rns_identity::stamps::StampControl,
+            ) -> Option<Vec<u8>> {
                 self.0.fetch_add(1, Ordering::Relaxed);
-                StaticStamper.generate(hash, value)
+                StaticStamper.generate(hash, value, ctl)
             }
-            fn value(&self, hash: &[u8; 32], stamp: &[u8]) -> u8 {
+            fn value(&self, hash: &[u8; 32], stamp: &[u8]) -> f64 {
                 StaticStamper.value(hash, stamp)
             }
-            fn valid(&self, hash: &[u8; 32], stamp: &[u8], value: u8) -> bool {
+            fn valid(&self, hash: &[u8; 32], stamp: &[u8], value: f64) -> bool {
                 StaticStamper.valid(hash, stamp, value)
             }
         }
@@ -12758,6 +12841,142 @@ loglevel = 7
             .await
             .unwrap();
         actor.await.unwrap();
+    }
+
+    /// Holds every search after the first `free` until released or cancelled.
+    struct GatedStamper {
+        free: u64,
+        calls: AtomicU64,
+        release: AtomicBool,
+        cancelled: AtomicBool,
+    }
+
+    impl GatedStamper {
+        fn new(free: u64) -> Arc<Self> {
+            Arc::new(Self {
+                free,
+                calls: AtomicU64::new(0),
+                release: AtomicBool::new(false),
+                cancelled: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl DiscoveryStamper for GatedStamper {
+        fn generate(
+            &self,
+            hash: &[u8; 32],
+            value: f64,
+            ctl: &rns_identity::stamps::StampControl,
+        ) -> Option<Vec<u8>> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) >= self.free {
+                while !self.release.load(Ordering::Relaxed) {
+                    if ctl.cancel.load(Ordering::Relaxed) {
+                        self.cancelled.store(true, Ordering::Relaxed);
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            StaticStamper.generate(hash, value, ctl)
+        }
+        fn value(&self, hash: &[u8; 32], stamp: &[u8]) -> f64 {
+            StaticStamper.value(hash, stamp)
+        }
+        fn valid(&self, hash: &[u8; 32], stamp: &[u8], value: f64) -> bool {
+            StaticStamper.valid(hash, stamp, value)
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_publisher_sends_once_when_admitted_during_generation() {
+        let (handle, actor) = discovery_actor();
+        let (tx, mut sink) =
+            discovery_egress(&handle, 1, rns_interface::traits::InterfaceMode::Full, 1).await;
+        tx.send(Bytes::from_static(b"busy")).await.unwrap();
+        let second_online = Arc::new(AtomicBool::new(false));
+        let mut second = advertised_service(43, false);
+        second.online = Some(second_online.clone());
+        let stamper = GatedStamper::new(1);
+        let publisher = tokio::spawn(run_discovery_announcer(
+            handle.clone(),
+            stamper.clone(),
+            vec![advertised_service(42, false), second],
+        ));
+        // The first service is prepared and waits behind the full egress.
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        second_online.store(true, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(stamper.calls.load(Ordering::Relaxed), 2);
+        // It is admitted while the second service's stamp is still generating.
+        assert_eq!(sink.recv().await.unwrap(), Bytes::from_static(b"busy"));
+        let raw = tokio::time::timeout(Duration::from_secs(3), sink.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_discovery_packet(&raw, &handle).name, "service-42");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        stamper.release.store(true, Ordering::Relaxed);
+        let raw = tokio::time::timeout(Duration::from_secs(4), sink.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_discovery_packet(&raw, &handle).name, "service-43");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(2200), sink.recv())
+                .await
+                .is_err(),
+            "an admitted service must not be sent again"
+        );
+        handle.shutdown.trigger();
+        tokio::time::timeout(Duration::from_secs(2), publisher)
+            .await
+            .unwrap()
+            .unwrap();
+        handle
+            .transport_tx
+            .send(TransportMessage::Shutdown)
+            .await
+            .unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_publisher_cancels_generation_when_it_stops() {
+        for abort in [false, true] {
+            let (handle, actor) = discovery_actor();
+            let stamper = GatedStamper::new(0);
+            let publisher = tokio::spawn(run_discovery_announcer(
+                handle.clone(),
+                stamper.clone(),
+                vec![advertised_service(42, false)],
+            ));
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            assert_eq!(stamper.calls.load(Ordering::Relaxed), 1);
+            if abort {
+                publisher.abort();
+                let _ = publisher.await;
+            } else {
+                handle.shutdown.trigger();
+                tokio::time::timeout(Duration::from_secs(2), publisher)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !stamper.cancelled.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the search is cancelled");
+            handle
+                .transport_tx
+                .send(TransportMessage::Shutdown)
+                .await
+                .unwrap();
+            actor.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -12835,7 +13054,14 @@ loglevel = 7
             let interfaces = synthesize_interfaces(&config, false).unwrap();
             let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
             assert!(
-                discovery_config_for_interface(&config, &interfaces[0], &post_init, true).is_none()
+                discovery_config_for_interface(
+                    &config,
+                    &interfaces[0],
+                    &post_init,
+                    true,
+                    &rns_transport::stamps::StampPolicy::default(),
+                )
+                .is_none()
             );
         }
     }
@@ -12852,7 +13078,13 @@ loglevel = 7
             .unwrap();
             let interfaces = synthesize_interfaces(&config, false).unwrap();
             let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
-            discovery_config_for_interface(&config, &interfaces[0], &post_init, true)
+            discovery_config_for_interface(
+                &config,
+                &interfaces[0],
+                &post_init,
+                true,
+                &rns_transport::stamps::StampPolicy::default(),
+            )
         };
         for server in [
             "type = TCPServerInterface\nlisten_ip = 192.0.2.10\nlisten_port = 4242\n",
@@ -12883,8 +13115,14 @@ loglevel = 7
             let config = Config::parse(&format!("[interfaces]\n[[relay]]\ntype = TCPServerInterface\nenabled = yes\nlisten_ip = 127.0.0.1\nlisten_port = 4242\ndiscoverable = yes\nreachable_on = relay.example.org\n{extra}")).unwrap();
             let interfaces = synthesize_interfaces(&config, false).unwrap();
             let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
-            let discovery =
-                discovery_config_for_interface(&config, &interfaces[0], &post_init, true).unwrap();
+            let discovery = discovery_config_for_interface(
+                &config,
+                &interfaces[0],
+                &post_init,
+                true,
+                &rns_transport::stamps::StampPolicy::default(),
+            )
+            .unwrap();
             assert_eq!(
                 [discovery.latitude, discovery.longitude, discovery.height],
                 expected
@@ -12899,8 +13137,14 @@ loglevel = 7
         let config = Config::parse("[interfaces]\n[[kiss tnc]]\ntype = TCPClientInterface\nenabled = yes\nkiss_framing = yes\ntarget_host = 10.0.0.2\ntarget_port = 8001\ndiscoverable = yes\ndiscovery_frequency = 433775000\ndiscovery_modulation = AFSK\n").unwrap();
         let interfaces = synthesize_interfaces(&config, false).unwrap();
         let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
-        let discovery =
-            discovery_config_for_interface(&config, &interfaces[0], &post_init, true).unwrap();
+        let discovery = discovery_config_for_interface(
+            &config,
+            &interfaces[0],
+            &post_init,
+            true,
+            &rns_transport::stamps::StampPolicy::default(),
+        )
+        .unwrap();
         assert_eq!(discovery.interface_type, "KISSInterface");
         assert_eq!((discovery.reachable_on, discovery.port), (None, None));
         assert_eq!(discovery.frequency, Some(433_775_000));
@@ -12983,7 +13227,7 @@ loglevel = 7
                 },
                 network_id: [0x51; 16],
                 hops: 1,
-                stamp_value: 16,
+                stamp_value: 16.0,
                 stamp: vec![0; 32],
                 discovered: 0,
                 last_heard: 0,
@@ -13055,7 +13299,7 @@ loglevel = 7
         let rc = ReticulumConfig::from_config(&config);
         assert!(rc.discover_interfaces);
         assert_eq!(rc.autoconnect_discovered_interfaces, 2);
-        assert_eq!(rc.discover_interfaces_required_value, 16);
+        assert_eq!(rc.discover_interfaces_required_value, 16.0);
         assert_eq!(rc.interface_discovery_sources.len(), 1);
         assert_eq!(rc.default_ar_target, Some(7200));
         assert_eq!(rc.default_ar_penalty, Some(30));
@@ -14953,7 +15197,7 @@ egress_control = Yes
         let config = Config::parse(input).unwrap();
         let rc = ReticulumConfig::from_config(&config);
         assert_eq!(rc.autoconnect_discovered_interfaces, 1);
-        assert_eq!(rc.discover_interfaces_required_value, 16);
+        assert_eq!(rc.discover_interfaces_required_value, 16.0);
     }
 
     #[test]
@@ -15009,11 +15253,36 @@ egress_control = Yes
     }
 
     #[test]
-    fn test_discover_required_value_clamped_to_u8() {
-        let input = "[reticulum]\ndiscover_interfaces_required_value = 999\n";
-        let config = Config::parse(input).unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-        assert_eq!(rc.discover_interfaces_required_value, 255);
+    fn required_discovery_value_is_fractional_and_not_positive_means_default() {
+        for (raw, expected) in [("14.5", 14.5), ("999", 999.0), ("0", 16.0), ("-1", 16.0)] {
+            let config =
+                Config::parse(&format!("[reticulum]\nrequired_discovery_value = {raw}\n")).unwrap();
+            let rc = ReticulumConfig::try_from_config(&config).unwrap();
+            assert_eq!(rc.discover_interfaces_required_value, expected, "{raw}");
+        }
+        let config = Config::parse("[reticulum]\nrequired_discovery_value = abc\n").unwrap();
+        assert!(ReticulumConfig::try_from_config(&config).is_err());
+    }
+
+    #[test]
+    fn discovery_stamp_value_is_fractional_and_zero_generates_at_default() {
+        for (line, expected) in [
+            ("discovery_stamp_value = 17.5", 17.5),
+            ("discovery_stamp_value = 0", 16.0),
+            ("", 16.0),
+            ("stamp_value = 18.25", 18.25),
+            ("discovery_stamp_value = 150", 150.0),
+        ] {
+            let mut section = ConfigSection::new();
+            if let Some((k, v)) = line.split_once(" = ") {
+                section.set(k, v);
+            }
+            let cfg = DiscoveryInterfaceConfig {
+                stamp_value: discovery_stamp_value(&section),
+                ..DiscoveryInterfaceConfig::backbone("x".into(), "127.0.0.1".into(), 1)
+            };
+            assert_eq!(cfg.effective_stamp_value(), expected, "{line}");
+        }
     }
 
     #[test]

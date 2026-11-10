@@ -56,8 +56,8 @@ pub struct DiscoveredInterface {
     pub network_id: [u8; 16],
     /// Hop count copied from the announce event; not a current path measurement.
     pub hops: u8,
-    /// Stamp value observed on the latest announce.
-    pub stamp_value: u8,
+    /// Fractional stamp value observed on the latest announce.
+    pub stamp_value: f64,
     /// The actual stamp bytes last observed (useful for diagnostics).
     pub stamp: Vec<u8>,
     /// Unix seconds — first time this interface was learned.
@@ -239,7 +239,7 @@ impl DiscoveryStore {
             let sa = a.status.map(DiscoveryStatus::code).unwrap_or(0);
             let sb = b.status.map(DiscoveryStatus::code).unwrap_or(0);
             sb.cmp(&sa)
-                .then(b.stamp_value.cmp(&a.stamp_value))
+                .then(b.stamp_value.total_cmp(&a.stamp_value))
                 .then(b.last_heard.cmp(&a.last_heard))
         });
 
@@ -287,7 +287,9 @@ fn encode_record(rec: &DiscoveredInterface) -> Result<Vec<u8>, StorageError> {
     map.push((s("transport_id"), Value::from(hex::encode(i.transport_id))));
     map.push((s("network_id"), Value::from(hex::encode(rec.network_id))));
     map.push((s("hops"), Value::from(rec.hops)));
-    map.push((s("value"), Value::from(rec.stamp_value)));
+    map.push((s("value"), Value::F64(rec.stamp_value)));
+    map.push((s("dst_cost"), i.dst_cost.map_or(Value::Nil, Value::F64)));
+    map.push((s("pr_cost"), i.pr_cost.map_or(Value::Nil, Value::F64)));
     map.push((s("stamp"), Value::Binary(rec.stamp.clone())));
     map.push((s("latitude"), i.latitude.map_or(Value::Nil, Value::F64)));
     map.push((s("longitude"), i.longitude.map_or(Value::Nil, Value::F64)));
@@ -355,6 +357,8 @@ fn decode_record(bytes: &[u8]) -> Result<DiscoveredInterface, StorageError> {
         interface_type: str_or_default(&lookup, "type"),
         impl_name: str_opt(&lookup, "impl_name"),
         impl_version: str_opt(&lookup, "version"),
+        dst_cost: f64_optional(&lookup, "dst_cost"),
+        pr_cost: f64_optional(&lookup, "pr_cost"),
         transport_enabled: bool_or_default(&lookup, "transport"),
         transport_id: hex16(&lookup, "transport_id").unwrap_or([0; 16]),
         name: str_or_default(&lookup, "name"),
@@ -385,10 +389,10 @@ fn decode_record(bytes: &[u8]) -> Result<DiscoveredInterface, StorageError> {
         info,
         network_id: hex16(&lookup, "network_id").unwrap_or([0; 16]),
         hops: u64_opt(&lookup, "hops").unwrap_or(0).min(u8::MAX as u64) as u8,
-        stamp_value: u64_opt(&lookup, "value").unwrap_or(0).min(u8::MAX as u64) as u8,
+        stamp_value: f64_optional(&lookup, "value").unwrap_or(0.0),
         stamp,
-        discovered: u64_opt(&lookup, "discovered").unwrap_or(0),
-        last_heard: u64_opt(&lookup, "last_heard").unwrap_or(0),
+        discovered: timestamp(&lookup, "discovered"),
+        last_heard: timestamp(&lookup, "last_heard"),
         heard_count: u64_opt(&lookup, "heard_count").unwrap_or(0),
         status: None,
     })
@@ -428,6 +432,13 @@ fn f64_optional(lookup: &HashMap<String, Value>, k: &str) -> Option<f64> {
         Some(Value::Integer(n)) => n.as_f64(),
         _ => None,
     }
+}
+
+/// Python stores `time.time()` floats; Rust writes whole seconds.
+fn timestamp(lookup: &HashMap<String, Value>, k: &str) -> u64 {
+    f64_optional(lookup, k)
+        .filter(|t| t.is_finite() && *t > 0.0)
+        .map_or(0, |t| t as u64)
 }
 
 fn u64_opt(lookup: &HashMap<String, Value>, k: &str) -> Option<u64> {
@@ -487,7 +498,7 @@ mod tests {
             },
             network_id: transport_id,
             hops: 2,
-            stamp_value: 14,
+            stamp_value: 14.0,
             stamp: vec![0xAA; STAMP_SIZE],
             discovered: 1_000_000,
             last_heard: 1_000_010,
@@ -529,6 +540,64 @@ mod tests {
             assert_eq!(read.heard_count, 2);
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn float_timestamps_and_fractional_value_decode() {
+        let original = record("floats", [4; 16]);
+        let encoded = encode_record(&original).unwrap();
+        let Value::Map(mut entries) = rmpv::decode::read_value(&mut &encoded[..]).unwrap() else {
+            panic!("map");
+        };
+        let now = unix_now() as f64 + 0.75;
+        for (k, v) in &mut entries {
+            match k.as_str() {
+                Some("discovered") | Some("last_heard") => *v = Value::F64(now),
+                Some("value") => *v = Value::F64(8.58203125),
+                _ => {}
+            }
+        }
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &Value::Map(entries)).unwrap();
+        let read = decode_record(&bytes).unwrap();
+        assert_eq!(read.last_heard, now as u64);
+        assert_eq!(read.discovered, now as u64);
+        assert_eq!(read.stamp_value, 8.58203125);
+
+        let dir = tmpdir("float_records");
+        let store = DiscoveryStore::open(&dir).unwrap();
+        let path = store.root().join(original.filename());
+        std::fs::write(&path, &bytes).unwrap();
+        let listed = store.list(None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].stamp_value, 8.58203125);
+        assert!(path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cost_fields_round_trip_and_integer_value_still_decodes() {
+        let mut original = record("costs", [5; 16]);
+        original.info.dst_cost = Some(23.5);
+        original.info.pr_cost = Some(15.80078125);
+        original.stamp_value = 16.5;
+        let read = decode_record(&encode_record(&original).unwrap()).unwrap();
+        assert_eq!(read.info.dst_cost, Some(23.5));
+        assert_eq!(read.info.pr_cost, Some(15.80078125));
+        assert_eq!(read.stamp_value, 16.5);
+
+        let encoded = encode_record(&record("int", [6; 16])).unwrap();
+        let Value::Map(mut entries) = rmpv::decode::read_value(&mut &encoded[..]).unwrap() else {
+            panic!("map");
+        };
+        for (k, v) in &mut entries {
+            if k.as_str() == Some("value") {
+                *v = Value::from(14u8);
+            }
+        }
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &Value::Map(entries)).unwrap();
+        assert_eq!(decode_record(&bytes).unwrap().stamp_value, 14.0);
     }
 
     #[test]
@@ -700,16 +769,16 @@ mod tests {
 
         // Available, low stamp value, old
         let mut a = record("a", [0x01; 16]);
-        a.stamp_value = 10;
+        a.stamp_value = 10.0;
         a.last_heard = now - 100;
         // Available, high stamp value, recent
         let mut b = record("b", [0x02; 16]);
-        b.stamp_value = 20;
+        b.stamp_value = 20.0;
         b.last_heard = now - 10;
         // Unknown (freshness bucket)
         let mut c = record("c", [0x03; 16]);
         c.last_heard = now - THRESHOLD_UNKNOWN_SECS - 1;
-        c.stamp_value = 30;
+        c.stamp_value = 30.0;
 
         store.upsert(a).unwrap();
         store.upsert(b).unwrap();

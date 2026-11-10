@@ -4,11 +4,13 @@
 //! when the caller's required admission condition is met. This module neither
 //! sends a packet nor verifies driver admission. The caller supplies the timer,
 //! outer signed announce and egress handling. Preparation may synchronously
-//! generate proof of work; unchanged info bytes reuse a cached stamp.
+//! generate proof of work; unchanged info bytes reuse a cached stamp. Run it
+//! off async workers, and cancel a search through [`Announcer::stamp_control`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use rns_identity::stamps::{STAMP_COST_CAP, StampControl};
 use tracing::{debug, trace};
 
 use crate::messages::InterfaceId;
@@ -34,10 +36,15 @@ pub struct DiscoveryInterfaceConfig {
     /// Minimum seconds after the last successful commit. The backbone helper
     /// uses [`ANNOUNCE_JOB_INTERVAL_SECS`]; zero permits immediate preparation.
     pub announce_interval_secs: u64,
-    /// Sender's generation target; receivers choose their own requirement.
-    /// The backbone helper uses [`DEFAULT_STAMP_VALUE`]. Raising this through
-    /// `reconfigure` alone does not invalidate an unchanged info map's stamp.
-    pub stamp_value: u8,
+    /// Sender's generation target (`discovery_stamp_value`); 0 means
+    /// [`DEFAULT_STAMP_VALUE`] (Discovery.py:134). A value outside `0..=100`
+    /// cannot be generated and the interface is not announced. Raising this
+    /// through `reconfigure` alone does not invalidate an unchanged stamp.
+    pub stamp_value: f64,
+    /// Announce and path-request costs required on this interface, advertised
+    /// as `DST_COST` / `PR_COST` (Discovery.py:171-172).
+    pub dst_cost: Option<f64>,
+    pub pr_cost: Option<f64>,
     /// Endpoint address (IP / host / I2P b32) — optional.
     pub reachable_on: Option<String>,
     /// Advertised TCP/Backbone port, if applicable.
@@ -79,6 +86,8 @@ impl DiscoveryInterfaceConfig {
             transport_enabled: true,
             announce_interval_secs: ANNOUNCE_JOB_INTERVAL_SECS,
             stamp_value: DEFAULT_STAMP_VALUE,
+            dst_cost: None,
+            pr_cost: None,
             reachable_on: Some(reachable_on),
             port: Some(port),
             ifac_netname: None,
@@ -103,6 +112,15 @@ impl DiscoveryInterfaceConfig {
         DISCOVERABLE_INTERFACE_TYPES
             .iter()
             .any(|t| *t == self.interface_type)
+    }
+
+    /// The value stamps are generated at (Discovery.py:134).
+    pub fn effective_stamp_value(&self) -> f64 {
+        if self.stamp_value == 0.0 {
+            DEFAULT_STAMP_VALUE
+        } else {
+            self.stamp_value
+        }
     }
 }
 
@@ -129,7 +147,7 @@ pub struct AnnounceRequest {
     /// encrypted body).
     pub app_data: Vec<u8>,
     /// Stamp value actually achieved — useful for logging.
-    pub stamp_value: u8,
+    pub stamp_value: f64,
 }
 
 /// One cached publication tied to its announcer instance and configuration
@@ -159,9 +177,12 @@ pub enum SkipReason {
     /// Too soon after the last successful commit; remaining seconds truncate
     /// the fractional part of the computed interval.
     RateLimited { remaining_secs: u64 },
-    /// Encoding failed, the stamper returned no result, or its stamp had
-    /// the wrong length. This variant does not identify a specific cause.
+    /// Encoding failed, the stamper returned no result (including a cancelled
+    /// search), or its stamp had the wrong length.
     StampGenerationFailed,
+    /// The effective stamp value is outside `0..=100` or not a number, which
+    /// upstream refuses to generate (Stamps.py:255).
+    StampValueOutOfRange,
     /// Encryption requested but no encryptor supplied to preparation.
     EncryptorMissing,
     /// Encryptor returned `None` for this payload.
@@ -178,6 +199,7 @@ pub type EncryptFn<'a> = &'a dyn Fn(&[u8]) -> Option<Vec<u8>>;
 pub struct Announcer {
     owner: Arc<()>,
     stamper: Arc<dyn DiscoveryStamper>,
+    stamp_control: StampControl,
     interfaces: HashMap<InterfaceId, InterfaceAnnounceState>,
     next_generation: u64,
 }
@@ -188,9 +210,16 @@ impl Announcer {
         Self {
             owner: Arc::new(()),
             stamper,
+            stamp_control: StampControl::default(),
             interfaces: HashMap::new(),
             next_generation: 0,
         }
+    }
+
+    /// Stop conditions passed to every stamp search. Setting its cancel flag
+    /// makes a running and every later search return no stamp.
+    pub fn stamp_control(&self) -> &StampControl {
+        &self.stamp_control
     }
 
     /// Register or replace an interface's metadata. `transport_id` is copied
@@ -320,6 +349,17 @@ impl Announcer {
                 continue;
             }
 
+            let target_value = state.config.effective_stamp_value();
+            if !(0.0..=STAMP_COST_CAP).contains(&target_value) {
+                tracing::warn!(
+                    interface_id = id,
+                    target_value,
+                    "discovery stamp value cannot be generated, not announcing"
+                );
+                skips.push((*id, SkipReason::StampValueOutOfRange));
+                continue;
+            }
+
             let info = config_to_info(&state.config, state.transport_id);
             let Ok(Encoded { packed, infohash }) = app_data::encode_info(&info) else {
                 skips.push((*id, SkipReason::StampGenerationFailed));
@@ -329,7 +369,10 @@ impl Announcer {
             // Reuse cached stamp if the infohash is unchanged.
             let stamp = match &state.stamp_cache {
                 Some((cached_ih, cached_stamp)) if cached_ih == &infohash => cached_stamp.clone(),
-                _ => match self.stamper.generate(&infohash, state.config.stamp_value) {
+                _ => match self
+                    .stamper
+                    .generate(&infohash, target_value, &self.stamp_control)
+                {
                     Some(s) if s.len() == STAMP_SIZE => s,
                     _ => {
                         skips.push((*id, SkipReason::StampGenerationFailed));
@@ -434,6 +477,8 @@ fn config_to_info(cfg: &DiscoveryInterfaceConfig, transport_id: [u8; 16]) -> Dis
         transport_id,
         impl_name: Some(IMPLEMENTATION_NAME.to_string()),
         impl_version: Some(IMPLEMENTATION_VERSION.to_string()),
+        dst_cost: cfg.dst_cost,
+        pr_cost: cfg.pr_cost,
         interface_type: cfg.interface_type.clone(),
         transport_enabled: cfg.transport_enabled,
         reachable_on: cfg.reachable_on.clone(),
@@ -456,33 +501,34 @@ fn config_to_info(cfg: &DiscoveryInterfaceConfig, transport_id: [u8; 16]) -> Dis
 mod tests {
     use super::*;
     use crate::discovery::constants::{FLAG_ENCRYPTED, FLAG_SIGNED};
+    use rns_identity::stamps::StampControl;
 
     struct StaticStamper {
         stamp: Vec<u8>,
-        value: u8,
+        value: f64,
     }
 
     impl DiscoveryStamper for StaticStamper {
-        fn generate(&self, _: &[u8; 32], _: u8) -> Option<Vec<u8>> {
+        fn generate(&self, _: &[u8; 32], _: f64, _: &StampControl) -> Option<Vec<u8>> {
             Some(self.stamp.clone())
         }
-        fn value(&self, _: &[u8; 32], _: &[u8]) -> u8 {
+        fn value(&self, _: &[u8; 32], _: &[u8]) -> f64 {
             self.value
         }
-        fn valid(&self, _: &[u8; 32], _: &[u8], required: u8) -> bool {
+        fn valid(&self, _: &[u8; 32], _: &[u8], required: f64) -> bool {
             self.value >= required
         }
     }
 
     struct RefusingStamper;
     impl DiscoveryStamper for RefusingStamper {
-        fn generate(&self, _: &[u8; 32], _: u8) -> Option<Vec<u8>> {
+        fn generate(&self, _: &[u8; 32], _: f64, _: &StampControl) -> Option<Vec<u8>> {
             None
         }
-        fn value(&self, _: &[u8; 32], _: &[u8]) -> u8 {
-            0
+        fn value(&self, _: &[u8; 32], _: &[u8]) -> f64 {
+            0.0
         }
-        fn valid(&self, _: &[u8; 32], _: &[u8], _: u8) -> bool {
+        fn valid(&self, _: &[u8; 32], _: &[u8], _: f64) -> bool {
             false
         }
     }
@@ -494,8 +540,65 @@ mod tests {
     fn static_stamper() -> Arc<dyn DiscoveryStamper> {
         Arc::new(StaticStamper {
             stamp: vec![0xBB; STAMP_SIZE],
-            value: 16,
+            value: 16.0,
         })
+    }
+
+    struct TargetRecorder(std::sync::Mutex<Vec<f64>>);
+    impl DiscoveryStamper for TargetRecorder {
+        fn generate(&self, _: &[u8; 32], target: f64, _: &StampControl) -> Option<Vec<u8>> {
+            self.0.lock().unwrap().push(target);
+            Some(vec![0; STAMP_SIZE])
+        }
+        fn value(&self, _: &[u8; 32], _: &[u8]) -> f64 {
+            0.0
+        }
+        fn valid(&self, _: &[u8; 32], _: &[u8], _: f64) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn zero_value_generates_at_default_and_fractional_value_is_kept() {
+        let recorder = Arc::new(TargetRecorder(Default::default()));
+        let mut a = Announcer::new(recorder.clone());
+        for (id, value) in [(1, 0.0), (2, 16.5)] {
+            let mut cfg = sample_backbone();
+            cfg.name = format!("relay-{id}");
+            cfg.stamp_value = value;
+            a.register(id, [0x11; 16], cfg);
+        }
+        a.prepare(0.0, None);
+        let mut targets = recorder.0.lock().unwrap().clone();
+        targets.sort_by(f64::total_cmp);
+        assert_eq!(targets, vec![16.0, 16.5]);
+    }
+
+    #[test]
+    fn value_above_the_cap_skips_the_interface_without_generating() {
+        let recorder = Arc::new(TargetRecorder(Default::default()));
+        let mut a = Announcer::new(recorder.clone());
+        let mut cfg = sample_backbone();
+        cfg.stamp_value = 150.0;
+        a.register(1, [0x11; 16], cfg);
+        let (prepared, skips) = a.prepare(0.0, None);
+        assert!(prepared.is_empty());
+        assert_eq!(skips, vec![(1, SkipReason::StampValueOutOfRange)]);
+        assert!(recorder.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancelled_control_skips_generation() {
+        let mut a = Announcer::new(Arc::new(crate::discovery::stamper::RnsDiscoveryStamper));
+        a.stamp_control()
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut cfg = sample_backbone();
+        cfg.stamp_value = 60.0;
+        a.register(1, [0x11; 16], cfg);
+        let (prepared, skips) = a.prepare(0.0, None);
+        assert!(prepared.is_empty());
+        assert_eq!(skips, vec![(1, SkipReason::StampGenerationFailed)]);
     }
 
     #[test]
@@ -555,7 +658,7 @@ mod tests {
         let (requests, skips) = a.tick(1000.0, None);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].interface_id, 1);
-        assert_eq!(requests[0].stamp_value, 16);
+        assert_eq!(requests[0].stamp_value, 16.0);
         assert!(skips.is_empty());
 
         // Verify the blob round-trips.
@@ -671,14 +774,14 @@ mod tests {
             stamp: Vec<u8>,
         }
         impl DiscoveryStamper for CountingStamper {
-            fn generate(&self, _: &[u8; 32], _: u8) -> Option<Vec<u8>> {
+            fn generate(&self, _: &[u8; 32], _: f64, _: &StampControl) -> Option<Vec<u8>> {
                 *self.count.lock().unwrap() += 1;
                 Some(self.stamp.clone())
             }
-            fn value(&self, _: &[u8; 32], _: &[u8]) -> u8 {
-                16
+            fn value(&self, _: &[u8; 32], _: &[u8]) -> f64 {
+                16.0
             }
-            fn valid(&self, _: &[u8; 32], _: &[u8], _: u8) -> bool {
+            fn valid(&self, _: &[u8; 32], _: &[u8], _: f64) -> bool {
                 true
             }
         }
@@ -716,14 +819,14 @@ mod tests {
             stamp: Vec<u8>,
         }
         impl DiscoveryStamper for CountingStamper {
-            fn generate(&self, _: &[u8; 32], _: u8) -> Option<Vec<u8>> {
+            fn generate(&self, _: &[u8; 32], _: f64, _: &StampControl) -> Option<Vec<u8>> {
                 *self.count.lock().unwrap() += 1;
                 Some(self.stamp.clone())
             }
-            fn value(&self, _: &[u8; 32], _: &[u8]) -> u8 {
-                16
+            fn value(&self, _: &[u8; 32], _: &[u8]) -> f64 {
+                16.0
             }
-            fn valid(&self, _: &[u8; 32], _: &[u8], _: u8) -> bool {
+            fn valid(&self, _: &[u8; 32], _: &[u8], _: f64) -> bool {
                 true
             }
         }

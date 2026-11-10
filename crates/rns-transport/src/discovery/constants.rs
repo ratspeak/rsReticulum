@@ -21,13 +21,14 @@ pub const BLACKHOLE_ASPECT_FILTER: &str = "rnstransport.info.blackhole";
 /// Default publication interval in seconds (60), used by the Backbone config helper.
 pub const ANNOUNCE_JOB_INTERVAL_SECS: u64 = 60;
 
-/// Default discovery work target/requirement (16 leading zero bits). Sender
-/// generation targets and receiver requirements are configured independently.
-pub const DEFAULT_STAMP_VALUE: u8 = 16;
+/// Default discovery stamp value (`InterfaceAnnouncer.DEFAULT_STAMP_VALUE`).
+/// Used for generation when an interface's value is unset or 0, and for
+/// validation when `required_discovery_value` is unset or not positive.
+pub const DEFAULT_STAMP_VALUE: f64 = 16.0;
 
 /// Discovery stamp-workblock expansion rounds (20). A custom stamper must use
 /// the compatible algorithm; the trait does not enforce this constant itself.
-pub const WORKBLOCK_EXPAND_ROUNDS: u32 = 20;
+pub const WORKBLOCK_EXPAND_ROUNDS: usize = 20;
 
 /// Fixed discovery stamp length in bytes (32).
 pub const STAMP_SIZE: usize = 32;
@@ -109,6 +110,8 @@ pub mod key {
     pub const TRANSPORT_ID: u8 = 0xFE;
     pub const TRANSPORT_IMPL: u8 = 0xFD;
     pub const TRANSPORT_VERS: u8 = 0xFC;
+    pub const DST_COST: u8 = 0xFB;
+    pub const PR_COST: u8 = 0xFA;
     pub const INTERFACE_TYPE: u8 = 0x00;
     pub const TRANSPORT: u8 = 0x01;
     pub const REACHABLE_ON: u8 = 0x02;

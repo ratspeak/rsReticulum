@@ -49,7 +49,7 @@ fn discovered(name: &str, host: &str, port: u16) -> DiscoveredInterface {
         },
         network_id: [0x5a; 16],
         hops: 1,
-        stamp_value: 16,
+        stamp_value: 16.0,
         stamp: Vec::new(),
         discovered: 0,
         last_heard: 0,

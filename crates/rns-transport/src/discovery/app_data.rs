@@ -39,6 +39,10 @@ pub struct DiscoveryInfo {
     /// names them as strings.
     pub impl_name: Option<String>,
     pub impl_version: Option<String>,
+    /// Required announce and path-request stamp costs on the advertised
+    /// interface (keys `0xFB` / `0xFA`), quantized to 1/256.
+    pub dst_cost: Option<f64>,
+    pub pr_cost: Option<f64>,
     /// Interface type string, e.g. `"BackboneInterface"` (key `0x00`).
     pub interface_type: String,
     /// Whether the announcer has transport (routing) enabled (key `0x01`).
@@ -168,9 +172,7 @@ pub fn encode_info(info: &DiscoveryInfo) -> Result<Encoded, AppDataError> {
 }
 
 fn info_to_map(info: &DiscoveryInfo) -> Vec<(Value, Value)> {
-    // Python-Discovery.py iteration order for required keys. Receivers do
-    // not depend on ordering; we keep it stable for testability against
-    // pinned vectors.
+    // Insertion order of Python's info dict, so the packed bytes match.
     let mut entries: Vec<(Value, Value)> = vec![
         (
             u8_key(key::INTERFACE_TYPE),
@@ -190,6 +192,11 @@ fn info_to_map(info: &DiscoveryInfo) -> Vec<(Value, Value)> {
             u8_key(key::TRANSPORT_VERS),
             Value::from(impl_version.clone()),
         ));
+    }
+    for (k, cost) in [(key::DST_COST, info.dst_cost), (key::PR_COST, info.pr_cost)] {
+        if let Some(cost) = cost.and_then(|c| rns_identity::stamps::quantize_cost(c).ok()) {
+            entries.push((u8_key(k), Value::F64(cost)));
+        }
     }
     entries.extend([
         (u8_key(key::NAME), Value::from(info.name.clone())),
@@ -212,12 +219,6 @@ fn info_to_map(info: &DiscoveryInfo) -> Vec<(Value, Value)> {
     }
     if let Some(port) = info.port {
         entries.push((u8_key(key::PORT), Value::from(port)));
-    }
-    if let Some(name) = &info.ifac_netname {
-        entries.push((u8_key(key::IFAC_NETNAME), Value::from(name.clone())));
-    }
-    if let Some(k) = &info.ifac_netkey {
-        entries.push((u8_key(key::IFAC_NETKEY), Value::from(k.clone())));
     }
     // Python always writes a radio type's parameters, unset ones as nil.
     let required: &[u8] = match info.interface_type.as_str() {
@@ -244,14 +245,20 @@ fn info_to_map(info: &DiscoveryInfo) -> Vec<(Value, Value)> {
             info.spreading_factor.map(Value::from),
         ),
         (key::CODING_RATE, info.coding_rate.map(Value::from)),
-        (key::MODULATION, info.modulation.clone().map(Value::from)),
         (key::CHANNEL, info.channel.map(Value::from)),
+        (key::MODULATION, info.modulation.clone().map(Value::from)),
     ];
     entries.extend(radio.into_iter().filter_map(|(k, value)| {
         value
             .or_else(|| required.contains(&k).then_some(Value::Nil))
             .map(|value| (u8_key(k), value))
     }));
+    if let Some(name) = &info.ifac_netname {
+        entries.push((u8_key(key::IFAC_NETNAME), Value::from(name.clone())));
+    }
+    if let Some(k) = &info.ifac_netkey {
+        entries.push((u8_key(key::IFAC_NETKEY), Value::from(k.clone())));
+    }
 
     entries
 }
@@ -314,7 +321,7 @@ pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
         };
         match kb {
             key::NAME => {
-                info.name = value_as_string(&v, kb)?;
+                info.name = unset_or(&v, |v| value_as_string(v, kb))?.unwrap_or_default();
             }
             key::TRANSPORT_ID => {
                 let bytes = value_as_bytes(&v, kb)?;
@@ -330,6 +337,8 @@ pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
             }
             key::TRANSPORT_IMPL => info.impl_name = v.as_str().map(str::to_string),
             key::TRANSPORT_VERS => info.impl_version = v.as_str().map(str::to_string),
+            key::DST_COST => info.dst_cost = Some(value_as_cost(&v, kb)?),
+            key::PR_COST => info.pr_cost = Some(value_as_cost(&v, kb)?),
             key::TRANSPORT => {
                 info.transport_enabled = value_as_bool(&v, kb)?;
             }
@@ -374,6 +383,9 @@ pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
         return Err(AppDataError::MissingKey(key::TRANSPORT_ID));
     }
     info.name = sanitize_name(&info.name);
+    if info.name.is_empty() {
+        info.name = format!("Discovered {}", info.interface_type);
+    }
     if !DISCOVERABLE_INTERFACE_TYPES.contains(&info.interface_type.as_str()) {
         return Err(AppDataError::UnsupportedInterfaceType(info.interface_type));
     }
@@ -471,6 +483,25 @@ fn value_as_f64(v: &Value, kb: u8) -> Result<Option<f64>, AppDataError> {
             expected: "float or nil",
         }),
     }
+}
+
+/// Python `RNS.Stamps.quantize_cost` on a received cost.
+fn value_as_cost(v: &Value, kb: u8) -> Result<f64, AppDataError> {
+    let mismatch = AppDataError::TypeMismatch {
+        key: kb,
+        expected: "number",
+    };
+    let cost = match v {
+        Value::F64(f) => *f,
+        Value::F32(f) => f64::from(*f),
+        Value::Integer(n) => n.as_f64().ok_or(mismatch)?,
+        Value::Boolean(b) => f64::from(u8::from(*b)),
+        _ => return Err(mismatch),
+    };
+    rns_identity::stamps::quantize_cost(cost).map_err(|_| AppDataError::TypeMismatch {
+        key: kb,
+        expected: "finite number",
+    })
 }
 
 /// A radio parameter Python leaves unset arrives as nil.
@@ -724,6 +755,7 @@ mod tests {
             ),
         ] {
             let info = DiscoveryInfo {
+                name: "radio".into(),
                 interface_type: interface_type.into(),
                 transport_id: [0x33; 16],
                 ..Default::default()
@@ -742,6 +774,85 @@ mod tests {
             }
             assert_eq!(decode_info(&packed).unwrap(), info, "{interface_type}");
         }
+    }
+
+    #[test]
+    fn nil_or_empty_name_gets_the_upstream_default() {
+        for name in [Value::Nil, Value::from("")] {
+            let map = Value::Map(vec![
+                (
+                    u8_key(key::INTERFACE_TYPE),
+                    Value::from("BackboneInterface"),
+                ),
+                (u8_key(key::TRANSPORT), Value::from(true)),
+                (u8_key(key::TRANSPORT_ID), Value::Binary(vec![0x11; 16])),
+                (u8_key(key::NAME), name),
+                (u8_key(key::LATITUDE), Value::Nil),
+                (u8_key(key::LONGITUDE), Value::Nil),
+                (u8_key(key::HEIGHT), Value::Nil),
+            ]);
+            let mut packed = Vec::new();
+            rmpv::encode::write_value(&mut packed, &map).unwrap();
+            assert_eq!(
+                decode_info(&packed).unwrap().name,
+                "Discovered BackboneInterface"
+            );
+        }
+    }
+
+    #[test]
+    fn cost_keys_follow_transport_version_as_quantized_floats() {
+        let mut info = sample_backbone();
+        info.impl_name = Some("RNS".into());
+        info.impl_version = Some("1.6.0".into());
+        info.dst_cost = Some(23.5);
+        info.pr_cost = Some(15.8);
+        let packed = encode_info(&info).unwrap().packed;
+        let Value::Map(map) = rmpv::decode::read_value(&mut Cursor::new(&packed)).unwrap() else {
+            panic!("info is a map");
+        };
+        let keys: Vec<u8> = map.iter().filter_map(|(k, _)| value_as_u8(k)).collect();
+        let at = |k| keys.iter().position(|x| *x == k).unwrap();
+        assert_eq!(at(key::DST_COST), at(key::TRANSPORT_VERS) + 1);
+        assert_eq!(at(key::PR_COST), at(key::DST_COST) + 1);
+        assert_eq!(at(key::NAME), at(key::PR_COST) + 1);
+        assert_eq!(map[at(key::DST_COST)].1, Value::F64(23.5));
+        assert_eq!(map[at(key::PR_COST)].1, Value::F64(4045.0 / 256.0));
+        let decoded = decode_info(&packed).unwrap();
+        assert_eq!(decoded.dst_cost, Some(23.5));
+        assert_eq!(decoded.pr_cost, Some(4045.0 / 256.0));
+    }
+
+    /// Key orders taken from upstream's `get_interface_announce_data`.
+    #[test]
+    fn radio_keys_precede_ifac_keys_in_upstream_order() {
+        let keys = |info: &DiscoveryInfo| -> Vec<u8> {
+            info_to_map(info)
+                .iter()
+                .filter_map(|(k, _)| value_as_u8(k))
+                .collect()
+        };
+        let mut rnode = sample_rnode();
+        rnode.ifac_netname = Some("mynet".into());
+        rnode.ifac_netkey = Some("hunter2".into());
+        assert_eq!(
+            keys(&rnode),
+            [
+                0x00, 0x01, 0xFE, 0xFF, 0x03, 0x04, 0x05, 0x09, 0x0A, 0x0B, 0x0C, 0x07, 0x08
+            ]
+        );
+        let weave = DiscoveryInfo {
+            interface_type: "WeaveInterface".into(),
+            channel: Some(6),
+            modulation: Some("OFDM".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            keys(&weave),
+            [
+                0x00, 0x01, 0xFE, 0xFF, 0x03, 0x04, 0x05, 0x09, 0x0A, 0x0E, 0x0D
+            ]
+        );
     }
 
     #[test]

@@ -1694,7 +1694,7 @@ mod tests {
             },
             network_id: [0; 16],
             hops: 0,
-            stamp_value: 14,
+            stamp_value: 14.0,
             stamp: vec![0; 32],
             discovered: 1,
             last_heard: 2,
