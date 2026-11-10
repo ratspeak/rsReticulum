@@ -42,6 +42,8 @@ pub enum IdentityError {
     VerificationFailed,
     #[error("decryption failed")]
     DecryptionFailed,
+    #[error("encryption failed")]
+    EncryptionFailed,
     #[error("ed25519 error: {0}")]
     Ed25519(#[from] Ed25519Error),
     #[error("io error: {0}")]
@@ -359,7 +361,9 @@ impl Identity {
             None => self.pub_key.clone(),
         };
 
-        let mut shared = ephemeral.exchange(&target);
+        let mut shared = ephemeral
+            .exchange(&target)
+            .map_err(|_| IdentityError::EncryptionFailed)?;
         let derived =
             derive_key_64(&shared, &self.hash).map_err(|_| IdentityError::DecryptionFailed);
         shared.zeroize();
@@ -408,7 +412,9 @@ impl Identity {
         if let Some(ratchets) = ratchets {
             for ratchet in ratchets {
                 let ratchet_prv = X25519PrivateKey::from_bytes(ratchet);
-                let mut shared = ratchet_prv.exchange(&peer_pub);
+                let Ok(mut shared) = ratchet_prv.exchange(&peer_pub) else {
+                    continue;
+                };
                 let derived_result = derive_key_64(&shared, &self.hash);
                 shared.zeroize();
                 if let Ok(derived) = derived_result
@@ -429,9 +435,11 @@ impl Identity {
         // Identity-key ECDH: in-memory key if present, else the hardware backend.
         let mut shared: [u8; 32] = if let Some(prv) = self.prv.as_ref() {
             prv.exchange(&peer_pub)
+                .map_err(|_| IdentityError::DecryptionFailed)?
         } else if let Some(backend) = self.backend.as_ref() {
             backend
                 .ecdh(&peer_pub_bytes)
+                .filter(|shared| shared.iter().any(|byte| *byte != 0))
                 .ok_or(IdentityError::DecryptionFailed)?
         } else {
             return Err(IdentityError::DecryptionFailed);
@@ -766,7 +774,7 @@ mod tests {
         }
         fn ecdh(&self, peer_pub: &[u8; 32]) -> Option<[u8; 32]> {
             let peer = rns_crypto::x25519::X25519PublicKey::from_bytes(peer_pub);
-            Some(self.x.exchange(&peer))
+            self.x.exchange(&peer).ok()
         }
     }
 

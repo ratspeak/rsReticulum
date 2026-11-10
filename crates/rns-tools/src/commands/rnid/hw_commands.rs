@@ -537,8 +537,8 @@ fn cmd_test(hwid_path: PathBuf, pin: Option<String>) {
             println!("   PASS: ECDH returned {} bytes", shared.len());
             let hw_pub_bytes = config.x25519_pub_bytes().unwrap();
             let hw_pub = rns_crypto::x25519::X25519PublicKey::from_bytes(&hw_pub_bytes);
-            let peer_shared = peer_prv.exchange(&hw_pub);
-            if shared == peer_shared {
+            let peer_shared = peer_prv.exchange(&hw_pub).ok();
+            if Some(shared) == peer_shared {
                 println!("   PASS: ECDH is symmetric");
             } else {
                 println!("   FAIL: ECDH shared secrets do not match");

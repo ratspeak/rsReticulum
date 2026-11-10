@@ -40,7 +40,7 @@ impl Drop for TempDir {
 fn derived_key(private: &[u8; 32], ephemeral_public: &[u8], salt: &[u8]) -> Zeroizing<Vec<u8>> {
     let private = X25519PrivateKey::from_bytes(private);
     let public = X25519PublicKey::from_bytes(ephemeral_public.try_into().unwrap());
-    let shared = Zeroizing::new(private.exchange(&public));
+    let shared = Zeroizing::new(private.exchange(&public).unwrap());
     hkdf_sha256(64, &*shared, Some(salt), None).unwrap()
 }
 

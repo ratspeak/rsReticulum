@@ -1015,6 +1015,19 @@ pub enum ReceiptError {
     TransportClosed,
 }
 
+/// Largest payload whose HEADER_1 packet fits the MTU for a destination type.
+fn max_header1_payload(dest_type: DestType) -> usize {
+    use rns_wire::constants::{AES128_BLOCKSIZE, HEADER_MINSIZE, KEYSIZE, MTU, TOKEN_OVERHEAD};
+    let room = MTU - HEADER_MINSIZE;
+    match dest_type {
+        DestType::Single => {
+            (room - KEYSIZE / 16 - TOKEN_OVERHEAD) / AES128_BLOCKSIZE * AES128_BLOCKSIZE - 1
+        }
+        DestType::Group => (room - TOKEN_OVERHEAD) / AES128_BLOCKSIZE * AES128_BLOCKSIZE - 1,
+        DestType::Plain | DestType::Link => room,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SendError {
     #[error("destination must be outbound")]
@@ -1023,7 +1036,7 @@ pub enum SendError {
     LinkDestination,
     #[error("no validated identity is known for destination {0}")]
     IdentityUnavailable(String),
-    #[error("payload is {actual} bytes; encrypted SINGLE-packet MDU is {max}")]
+    #[error("payload is {actual} bytes; the largest payload that fits the MTU is {max}")]
     PayloadTooLarge { actual: usize, max: usize },
     #[error("destination encryption failed: {0}")]
     Encryption(#[from] DestinationError),
@@ -1510,14 +1523,6 @@ impl ReticulumHandle {
         if destination.dest_type == DestType::Link {
             return Err(SendError::LinkDestination);
         }
-        if destination.dest_type == DestType::Single
-            && data.len() > rns_wire::constants::SINGLE_PACKET_ENCRYPTED_MDU
-        {
-            return Err(SendError::PayloadTooLarge {
-                actual: data.len(),
-                max: rns_wire::constants::SINGLE_PACKET_ENCRYPTED_MDU,
-            });
-        }
 
         // Python does not create receipts for PLAIN packets.
         let create_receipt = options.create_receipt && destination.dest_type != DestType::Plain;
@@ -1538,14 +1543,22 @@ impl ReticulumHandle {
             .remote_ratchet_pub
             .as_ref()
             .or_else(|| recalled.as_ref().and_then(|entry| entry.ratchet.as_ref()));
-        let packet = destination
-            .pack_packet(
-                data,
-                Some(encryption_identity),
-                ratchet,
-                DestinationPacketOptions::default(),
-            )?
-            .packet;
+        // Like the reference `Packet.pack`, only the packed size is limited.
+        let packet = match destination.pack_packet(
+            data,
+            Some(encryption_identity),
+            ratchet,
+            DestinationPacketOptions::default(),
+        ) {
+            Ok(packed) => packed.packet,
+            Err(DestinationPacketError::Packet(rns_wire::packet::PacketError::ExceedsMtu(_))) => {
+                return Err(SendError::PayloadTooLarge {
+                    actual: data.len(),
+                    max: max_header1_payload(destination.dest_type),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
         let packet_hash = packet.packet_hash;
         let truncated_hash = packet.truncated_hash;
 
@@ -6193,8 +6206,8 @@ fn derive_ifac_key_from_post_init(
 
 #[derive(Clone, Default)]
 /// Optional IFAC settings for runtime-spawned TCP/Backbone interfaces.
-/// `ifac_size` is bytes (1..=64), default 16 when active. Empty name and
-/// passphrase disable IFAC. IFAC restricts interface access; it does not
+/// `ifac_size` is bytes (1..=64), default 16 when active. An empty or "None" name or
+/// passphrase is ignored, as in config files. IFAC restricts interface access; it does not
 /// provide application end-to-end encryption. `Debug` redacts the passphrase,
 /// but the owned `String` is not itself a zeroizing container.
 pub struct RuntimeInterfaceIfacConfig {
@@ -6246,8 +6259,8 @@ fn runtime_ifac_post_init(
         return Err(format!("Invalid IFAC size {size}; expected 1..=64 bytes"));
     }
 
-    let network_name = ifac.network_name.filter(|s| !s.is_empty());
-    let passphrase = ifac.passphrase.filter(|s| !s.is_empty());
+    let network_name = ifac.network_name.filter(|s| !s.is_empty() && s != "None");
+    let passphrase = ifac.passphrase.filter(|s| !s.is_empty() && s != "None");
     if network_name.is_none() && passphrase.is_none() {
         return Ok(None);
     }
@@ -7129,6 +7142,14 @@ fn autoconnect_admits(record: &DiscoveredInterface, config: &ReticulumConfig) ->
     admitted
 }
 
+/// Older nodes published the literal "None"; like an empty value it sets no credential.
+fn discovered_ifac_value(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .filter(|v| !v.is_empty() && *v != "None")
+        .map(str::to_string)
+}
+
 async fn spawn_discovered_backbone_client(
     handle: &ReticulumHandle,
     record: &DiscoveredInterface,
@@ -7161,8 +7182,9 @@ async fn spawn_discovered_backbone_client(
             .expect("empty interface defaults are valid")
             .with_default_ifac_size(16);
     finalize_post_init(&mut post_init, &handle.config);
-    post_init.ifac_network_name = record.info.ifac_netname.clone();
-    post_init.ifac_passphrase = record.info.ifac_netkey.clone().map(zeroize::Zeroizing::new);
+    post_init.ifac_network_name = discovered_ifac_value(&record.info.ifac_netname);
+    post_init.ifac_passphrase =
+        discovered_ifac_value(&record.info.ifac_netkey).map(zeroize::Zeroizing::new);
     let ifac_key = derive_ifac_key_from_post_init(&post_init);
     register_interface_with_post_init_and_spawn_permit(
         &handle.transport_tx,
@@ -9625,6 +9647,47 @@ mod tests {
         .unwrap();
 
         assert!(post_init.is_none());
+    }
+
+    #[test]
+    fn discovered_ifac_values_drop_blank_and_none() {
+        for (value, expected) in [
+            (None, None),
+            (Some(""), None),
+            (Some("None"), None),
+            (Some("net"), Some("net")),
+        ] {
+            assert_eq!(
+                discovered_ifac_value(&value.map(str::to_string)).as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_ifac_post_init_ignores_none_fields() {
+        let post_init = runtime_ifac_post_init(
+            Some(RuntimeInterfaceIfacConfig {
+                network_name: Some("None".to_string()),
+                passphrase: Some("None".to_string()),
+                ifac_size: None,
+            }),
+            16,
+        )
+        .unwrap();
+        assert!(post_init.is_none());
+
+        let post_init = runtime_ifac_post_init(
+            Some(RuntimeInterfaceIfacConfig {
+                network_name: Some("None".to_string()),
+                passphrase: Some("pw".to_string()),
+                ifac_size: None,
+            }),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(post_init.ifac_network_name, None);
     }
 
     #[test]
@@ -12103,29 +12166,6 @@ loglevel = 7
             Err(LinkConnectError::Control(ControlError::ChannelClosed))
         ));
         responder.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn send_to_rejects_oversized_single_payload_before_transport_work() {
-        let destination_identity = Identity::new();
-        let destination = Destination::new(
-            Some(&destination_identity),
-            Direction::Out,
-            DestType::Single,
-            "send.large",
-        )
-        .unwrap();
-        let handle = dummy_handle();
-        let payload = vec![0u8; rns_wire::constants::SINGLE_PACKET_ENCRYPTED_MDU + 1];
-
-        assert!(matches!(
-            handle
-                .send_to(&destination, &payload, SendOptions::default())
-                .await,
-            Err(SendError::PayloadTooLarge { actual, max })
-                if actual == payload.len()
-                    && max == rns_wire::constants::SINGLE_PACKET_ENCRYPTED_MDU
-        ));
     }
 
     #[tokio::test]

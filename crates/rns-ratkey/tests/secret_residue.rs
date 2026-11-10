@@ -24,7 +24,11 @@ impl PivTransport for EcdhToken {
         let mut response = Vec::with_capacity(38);
         if apdu[1] == 0x87 {
             let peer: [u8; 32] = apdu[apdu.len() - 32..].try_into().unwrap();
-            let shared = Zeroizing::new(self.key.exchange(&X25519PublicKey::from_bytes(&peer)));
+            let shared = Zeroizing::new(
+                self.key
+                    .exchange(&X25519PublicKey::from_bytes(&peer))
+                    .unwrap(),
+            );
             response.extend_from_slice(&[0x7c, 0x22, 0x82, 0x20]);
             response.extend_from_slice(&*shared);
         }
@@ -55,7 +59,7 @@ fn piv_ecdh_frees_no_shared_secret() {
     let peer = X25519PrivateKey::from_bytes(&pseudo_random(41))
         .public_key()
         .to_bytes();
-    let expected = Zeroizing::new(key.exchange(&X25519PublicKey::from_bytes(&peer)));
+    let expected = Zeroizing::new(key.exchange(&X25519PublicKey::from_bytes(&peer)).unwrap());
     let mut session = session(key);
 
     let ((), freed) = freed_by(|| {
@@ -79,9 +83,13 @@ fn hardware_decrypt_frees_no_shared_secret_or_plaintext() {
         HardwareIdentity::from_keys(ed25519_public, x25519_public, Box::new(session(key))).unwrap();
     let plaintext: [u8; 100] = pseudo_random(44);
     let ciphertext = hardware.identity.encrypt(&plaintext, None).unwrap();
-    let shared = Zeroizing::new(X25519PrivateKey::from_bytes(&x25519).exchange(
-        &X25519PublicKey::from_bytes(ciphertext[..32].try_into().unwrap()),
-    ));
+    let shared = Zeroizing::new(
+        X25519PrivateKey::from_bytes(&x25519)
+            .exchange(&X25519PublicKey::from_bytes(
+                ciphertext[..32].try_into().unwrap(),
+            ))
+            .unwrap(),
+    );
     let derived = derive_key_64(&*shared, &hardware.identity.hash).unwrap();
 
     let ((), freed) = freed_by(|| {

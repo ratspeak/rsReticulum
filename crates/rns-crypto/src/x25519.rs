@@ -25,6 +25,14 @@ impl Drop for X25519PrivateKey {
     }
 }
 
+/// Errors surfaced by [`X25519PrivateKey::exchange`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum X25519Error {
+    /// The peer key is a low-order point, so the shared secret is all zero.
+    #[error("X25519 peer key is a low-order point")]
+    LowOrderPoint,
+}
+
 /// X25519 public key (32 bytes, u-coordinate).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct X25519PublicKey {
@@ -59,10 +67,14 @@ impl X25519PrivateKey {
     }
 
     /// Compute the shared secret with `peer` via X25519 Diffie-Hellman.
-    /// This primitive does not reject an all-zero result; a protocol requiring
-    /// a contributory-behavior check must validate the returned secret.
-    pub fn exchange(&self, peer: &X25519PublicKey) -> [u8; 32] {
-        self.secret.diffie_hellman(&peer.key).to_bytes()
+    /// An all-zero result (a low-order peer key) is rejected, as the
+    /// reference implementation's default backend does.
+    pub fn exchange(&self, peer: &X25519PublicKey) -> Result<[u8; 32], X25519Error> {
+        let shared = self.secret.diffie_hellman(&peer.key);
+        if !shared.was_contributory() {
+            return Err(X25519Error::LowOrderPoint);
+        }
+        Ok(shared.to_bytes())
     }
 }
 
@@ -107,8 +119,8 @@ mod tests {
         let bob_prv = X25519PrivateKey::generate();
         let bob_pub = bob_prv.public_key();
 
-        let alice_shared = alice_prv.exchange(&bob_pub);
-        let bob_shared = bob_prv.exchange(&alice_pub);
+        let alice_shared = alice_prv.exchange(&bob_pub).unwrap();
+        let bob_shared = bob_prv.exchange(&alice_pub).unwrap();
 
         assert_eq!(alice_shared, bob_shared);
     }

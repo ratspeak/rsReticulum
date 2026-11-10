@@ -24,7 +24,8 @@ impl LinkKeys {
     ///
     /// This primitive accepts AES-128-CBC and AES-256-CBC; endpoint admission
     /// is narrower (see [`crate::constants::ENABLED_MODES`]). It does not
-    /// authenticate the peer or reject an all-zero X25519 shared secret.
+    /// authenticate the peer. A low-order peer key fails with
+    /// [`LinkKeyError::LowOrderPoint`].
     pub fn derive(
         my_prv: &X25519PrivateKey,
         peer_pub: &X25519PublicKey,
@@ -37,7 +38,9 @@ impl LinkKeys {
             _ => return Err(LinkKeyError::UnsupportedMode(mode)),
         };
 
-        let mut shared_key = my_prv.exchange(peer_pub);
+        let mut shared_key = my_prv
+            .exchange(peer_pub)
+            .map_err(|_| LinkKeyError::LowOrderPoint)?;
 
         let derived_result =
             rns_crypto::hkdf::hkdf_sha256(derived_key_length, &shared_key, Some(link_id), None)
@@ -69,6 +72,8 @@ pub enum LinkKeyError {
     UnsupportedMode(u8),
     #[error("HKDF key derivation failed")]
     HkdfFailed,
+    #[error("peer X25519 key is a low-order point")]
+    LowOrderPoint,
 }
 
 #[cfg(test)]

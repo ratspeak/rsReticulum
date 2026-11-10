@@ -342,7 +342,7 @@ mod tests {
         let hw_shared = hw.ecdh(&peer_pub_bytes).unwrap();
 
         let hw_pub = X25519PublicKey::from_bytes(&x_pub);
-        let sw_shared = peer_prv.exchange(&hw_pub);
+        let sw_shared = peer_prv.exchange(&hw_pub).unwrap();
 
         assert_eq!(hw_shared, sw_shared, "ECDH must be symmetric");
     }

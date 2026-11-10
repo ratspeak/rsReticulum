@@ -393,7 +393,9 @@ impl MockPivSession {
             .ok_or(RatkeyError::EmptySlot { slot })?;
 
         let peer_pub = X25519PublicKey::from_bytes(peer_pub_bytes);
-        let shared = prv.exchange(&peer_pub);
+        let shared = prv
+            .exchange(&peer_pub)
+            .map_err(|e| RatkeyError::EcdhFailed(e.to_string()))?;
 
         self.operations.push(MockOperation::EcdhX25519 { slot });
         Ok(shared)
@@ -652,7 +654,7 @@ mod tests {
         let secret_hw = session.ecdh_x25519(SLOT_9D, &peer_pub_bytes).unwrap();
 
         let session_pub = X25519PublicKey::from_bytes(&session_x_pub);
-        let secret_sw = peer_prv.exchange(&session_pub);
+        let secret_sw = peer_prv.exchange(&session_pub).unwrap();
 
         assert_eq!(
             secret_hw, secret_sw,
@@ -670,7 +672,7 @@ mod tests {
 
         let software_key = X25519PrivateKey::from_bytes(&secret);
         let peer = X25519PublicKey::from_bytes(&peer_pub);
-        let sw_shared = software_key.exchange(&peer);
+        let sw_shared = software_key.exchange(&peer).unwrap();
 
         let hw_shared = session.ecdh_x25519(SLOT_9D, &peer_pub).unwrap();
 

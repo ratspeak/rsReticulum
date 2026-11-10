@@ -3,19 +3,23 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+const HASH_LEN: usize = 32;
 /// Per RFC 5869, HKDF-SHA256 can emit at most 255 * HashLen = 8160 bytes.
-const MAX_OUTPUT_LENGTH: usize = 255 * 32;
+const RFC_MAX_OUTPUT_LENGTH: usize = 255 * HASH_LEN;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Errors surfaced by [`hkdf_sha256`].
 #[derive(Debug, Error)]
 pub enum HkdfError {
-    /// Requested output length exceeds the RFC 5869 cap (8160 bytes).
-    #[error("requested length {0} exceeds maximum HKDF output of {MAX_OUTPUT_LENGTH} bytes")]
-    OutputTooLong(usize),
+    /// Requested output length is zero.
+    #[error("invalid HKDF output length 0")]
+    InvalidLength,
     /// Underlying HKDF expand call returned an error.
     #[error("HKDF expansion failed")]
     ExpansionFailed,
@@ -23,23 +27,42 @@ pub enum HkdfError {
 
 /// HKDF-SHA256 key derivation (RFC 5869).
 ///
-/// `length` is capped at 8160 bytes. `salt = None` uses 32 zero bytes as
-/// specified by the RFC; `info = None` uses an empty context string. The
-/// output is wiped when it is dropped.
+/// `salt = None` uses 32 zero bytes as specified by the RFC; `info = None`
+/// uses an empty context string. The output is wiped when it is dropped.
+/// Lengths above the RFC's 255-block bound are accepted: the reference
+/// implementation wraps its one-byte block counter, and IFAC masks for large
+/// frames depend on that.
 pub fn hkdf_sha256(
     length: usize,
     ikm: &[u8],
     salt: Option<&[u8]>,
     info: Option<&[u8]>,
 ) -> Result<Zeroizing<Vec<u8>>, HkdfError> {
-    if length > MAX_OUTPUT_LENGTH {
-        return Err(HkdfError::OutputTooLong(length));
+    if length == 0 {
+        return Err(HkdfError::InvalidLength);
+    }
+    let info = info.unwrap_or(b"");
+    let mut okm = Zeroizing::new(vec![0u8; length]);
+    if length <= RFC_MAX_OUTPUT_LENGTH {
+        Hkdf::<Sha256>::new(salt, ikm)
+            .expand(info, &mut okm)
+            .map_err(|_| HkdfError::ExpansionFailed)?;
+        return Ok(okm);
     }
 
-    let hk = Hkdf::<Sha256>::new(salt, ikm);
-    let mut okm = Zeroizing::new(vec![0u8; length]);
-    hk.expand(info.unwrap_or(b""), &mut okm)
-        .map_err(|_| HkdfError::ExpansionFailed)?;
+    let (prk, _) = Hkdf::<Sha256>::extract(salt, ikm);
+    let keyed = HmacSha256::new_from_slice(&prk).map_err(|_| HkdfError::ExpansionFailed)?;
+    let mut previous = Zeroizing::new([0u8; HASH_LEN]);
+    for (index, chunk) in okm.chunks_mut(HASH_LEN).enumerate() {
+        let mut mac = keyed.clone();
+        if index > 0 {
+            mac.update(&previous[..]);
+        }
+        mac.update(info);
+        mac.update(&[(index as u8).wrapping_add(1)]);
+        previous.copy_from_slice(&mac.finalize().into_bytes());
+        chunk.copy_from_slice(&previous[..chunk.len()]);
+    }
     Ok(okm)
 }
 
@@ -74,9 +97,11 @@ mod tests {
     }
 
     #[test]
-    fn test_hkdf_max_length_exceeded() {
-        let result = hkdf_sha256(MAX_OUTPUT_LENGTH + 1, b"test", None, None);
-        assert!(result.is_err());
+    fn test_hkdf_rejects_zero_length() {
+        assert!(matches!(
+            hkdf_sha256(0, b"test", None, None),
+            Err(HkdfError::InvalidLength)
+        ));
     }
 
     #[test]

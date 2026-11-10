@@ -48,8 +48,8 @@ pub struct PacketReceipt {
     pub callbacks: ReceiptCallbacks,
 }
 
-/// Optional callbacks consumed by delivery or failure methods.
-/// Culling does not invoke either callback.
+/// Optional callbacks consumed by delivery, failure or cull methods.
+/// Culling invokes the timeout callback.
 #[allow(missing_docs)]
 #[derive(Default)]
 pub struct ReceiptCallbacks {
@@ -117,10 +117,14 @@ impl PacketReceipt {
         }
     }
 
-    /// Transition to `Culled` without firing any callback.
+    /// Transition to `Culled` and fire the timeout callback, as the reference
+    /// `check_timeout` does for a culled receipt.
     pub fn cull(&mut self) {
         self.status = ReceiptStatus::Culled;
         self.concluded_at = Some(Instant::now());
+        if let Some(cb) = self.callbacks.timeout.take() {
+            cb(self);
+        }
     }
 
     /// Elapsed time from creation to conclusion, for any concluded status.

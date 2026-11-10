@@ -273,24 +273,22 @@ fn packet_capacity_authenticated_proof_obeys_request_ceiling_and_keeps_original_
 }
 
 #[test]
-fn packet_capacity_ifac_mask_frontier_is_checked_without_panicking() {
+fn packet_capacity_ifac_wire_budget_is_the_hardware_mtu() {
     let high = InterfacePacketCapacity::new(262144, 262144, true);
     assert_eq!(high.effective_clear_mtu(0).unwrap(), 262144);
     for tag in [1, 8, 16, 64] {
-        let clear = 8160 - tag;
+        let clear = 262144 - tag;
         assert_eq!(high.effective_clear_mtu(tag).unwrap() as usize, clear);
-        let wire = crate::ifac::try_ifac_sign(&vec![0; clear], &[9; 64], tag).unwrap();
-        assert_eq!(wire.len(), 8160);
-        assert_eq!(
-            crate::ifac::ifac_verify(&wire, &[9; 64], tag)
-                .unwrap()
-                .len(),
-            clear
-        );
-        assert_eq!(
-            crate::ifac::try_ifac_sign(&vec![0; clear + 1], &[9; 64], tag),
-            Err(crate::ifac::IfacSignError::PacketTooLarge)
-        );
+        for len in [8160 - tag, 8161 - tag, 20000] {
+            let wire = crate::ifac::try_ifac_sign(&vec![0; len], &[9; 64], tag).unwrap();
+            assert_eq!(wire.len(), len + tag);
+            assert_eq!(
+                crate::ifac::ifac_verify(&wire, &[9; 64], tag)
+                    .unwrap()
+                    .len(),
+                len
+            );
+        }
     }
     assert!(crate::ifac::try_ifac_sign(&[1, 2], &[0; 64], 0).is_err());
     assert!(crate::ifac::try_ifac_sign(&[1], &[0; 64], 1).is_err());

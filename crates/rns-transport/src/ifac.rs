@@ -19,17 +19,12 @@ use subtle::ConstantTimeEq;
 /// Bit 7 of byte 0 signals IFAC presence, regardless of `ifac_size`.
 const IFAC_FLAG: u8 = 0x80;
 
-/// RFC5869 SHA256 expansion bound, including the IFAC tag itself.
-pub const MAX_IFAC_WIRE_BYTES: usize = 255 * 32;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum IfacSignError {
     #[error("IFAC tag size must be 1..=64")]
     InvalidTagSize,
     #[error("packet is shorter than the two-byte header")]
     ShortPacket,
-    #[error("complete IFAC packet exceeds the 8160-byte mask expansion limit")]
-    PacketTooLarge,
 }
 
 /// Stamp a packet with its IFAC tag and XOR mask.
@@ -41,16 +36,16 @@ pub enum IfacSignError {
 ///
 /// # Panics
 ///
-/// Panics for a tag outside 1..=64, a packet shorter than two bytes, or a
-/// complete IFAC packet above 8160 bytes. Use [`try_ifac_sign`] when metadata
-/// or packet size is caller-provided. Transport egress uses the checked form.
+/// Panics for a tag outside 1..=64 or a packet shorter than two bytes. Use
+/// [`try_ifac_sign`] when metadata or packet size is caller-provided.
+/// Transport egress uses the checked form.
 pub fn ifac_sign(packet: &[u8], ifac_key: &[u8; 64], ifac_size: usize) -> Vec<u8> {
     try_ifac_sign(packet, ifac_key, ifac_size).expect("invalid IFAC signing arguments")
 }
 
 /// Sign and mask with checked tag size and byte length. Accepts tag sizes
-/// of 1..=64 bytes and inner packets of at least two bytes, provided packet
-/// plus tag is at most [`MAX_IFAC_WIRE_BYTES`]. This is not full packet validation: the
+/// of 1..=64 bytes and inner packets of at least two bytes, of any length.
+/// This is not full packet validation: the
 /// caller must supply an inner packet with the IFAC flag clear. A two-byte
 /// inner packet can be signed here but is rejected by [`ifac_verify`], which
 /// requires at least one additional byte after the two-byte header.
@@ -65,11 +60,7 @@ pub fn try_ifac_sign(
     if packet.len() < 2 {
         return Err(IfacSignError::ShortPacket);
     }
-    let mask_len = packet
-        .len()
-        .checked_add(ifac_size)
-        .filter(|len| *len <= MAX_IFAC_WIRE_BYTES)
-        .ok_or(IfacSignError::PacketTooLarge)?;
+    let mask_len = packet.len() + ifac_size;
 
     let signing_seed: &[u8; 32] = ifac_key[32..64]
         .try_into()
@@ -78,8 +69,7 @@ pub fn try_ifac_sign(
     let signature = ed_key.sign(packet);
     let tag = &signature[64 - ifac_size..];
 
-    let mask = hkdf_sha256(mask_len, tag, Some(ifac_key), None)
-        .map_err(|_| IfacSignError::PacketTooLarge)?;
+    let mask = hkdf_sha256(mask_len, tag, Some(ifac_key), None).expect("mask length is nonzero");
 
     let mut new_raw = Vec::with_capacity(2 + ifac_size + packet.len() - 2);
     new_raw.push(packet[0] | IFAC_FLAG);
@@ -107,7 +97,7 @@ pub fn try_ifac_sign(
 /// Unmask an IFAC packet and compare its tag against the supplied shared key.
 /// Return the inner packet bytes on a match; application payloads can still
 /// be encrypted. Reject missing flags, invalid tag sizes, packets with no
-/// byte after the two-byte header and tag, oversized masks, and mismatched
+/// byte after the two-byte header and tag, and mismatched
 /// tags. The comparison is constant-time; no inner packet parsing or replay
 /// check is performed. Callers must discard `None` results.
 pub fn ifac_verify(raw: &[u8], ifac_key: &[u8; 64], ifac_size: usize) -> Option<Vec<u8>> {

@@ -671,6 +671,28 @@ fn synthesize_tcp_client(
     Ok(config)
 }
 
+/// Reads an IFAC credential the way the reference config loader does: both
+/// spellings are evaluated in order, so the second wins, and `""` or `"None"`
+/// leaves the credential unset.
+fn ifac_credential(
+    section: &ConfigSection,
+    plain: &str,
+    underscore: &str,
+    what: &str,
+) -> Option<String> {
+    let mut credential = None;
+    for key in [plain, underscore] {
+        match section.get(key) {
+            Some("None") => warn!(
+                "Ambiguous IFAC {what} \"None\", this value is ignored and an IFAC {what} has NOT been set"
+            ),
+            Some(value) if !value.is_empty() => credential = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    credential
+}
+
 /// Validate explicit IFAC byte sizes and TCP client `fixed_mtu` before driver
 /// startup. A fixed MTU must be at least 500 and fit the driver wire budget
 /// after active IFAC overhead. This does not validate every interface field;
@@ -700,13 +722,7 @@ pub fn validate_config_capacity(
     } else {
         0
     };
-    // IFAC masking expands HKDF-SHA256 over the complete wire packet. Its
-    // 255-block limit is smaller than TCP's driver buffer when IFAC is active.
-    let wire_budget: usize = if active_ifac {
-        rns_transport::ifac::MAX_IFAC_WIRE_BYTES
-    } else {
-        262144
-    };
+    let wire_budget: usize = 262144;
     let maximum = wire_budget
         .checked_sub(tag)
         .filter(|_| !active_ifac || (1..=64).contains(&tag));
@@ -1813,14 +1829,14 @@ impl InterfacePostInit {
             announce_rate_penalty: section
                 .get_uint("announce_rate_penalty")
                 .or_else(|| announce_rate_target.map(|_| 0)),
-            ifac_network_name: section
-                .get("networkname")
-                .or_else(|| section.get("network_name"))
-                .map(|s| s.to_string()),
-            ifac_passphrase: section
-                .get("passphrase")
-                .or_else(|| section.get("pass_phrase"))
-                .map(|s| zeroize::Zeroizing::new(s.to_string())),
+            ifac_network_name: ifac_credential(
+                section,
+                "networkname",
+                "network_name",
+                "network name",
+            ),
+            ifac_passphrase: ifac_credential(section, "passphrase", "pass_phrase", "passphrase")
+                .map(zeroize::Zeroizing::new),
             ifac_size,
             default_ifac_size: 8,
             ingress_control,
@@ -2284,18 +2300,20 @@ mod tests {
         }
         client.set("fixed_mtu", "262144");
         assert!(synthesize_interface("tcp", &client).is_ok());
-        // All supported credential spellings activate the tag, including an
-        // explicitly empty credential (which differs from an absent field).
+        // Every credential spelling activates the tag; an empty one does not.
         for credential in ["networkname", "network_name", "passphrase", "pass_phrase"] {
+            let mut blank = client.clone();
+            blank.set(credential, "");
+            assert!(synthesize_interface("tcp", &blank).is_ok());
             let mut active = client.clone();
-            active.set(credential, "");
+            active.set(credential, "k");
             assert!(synthesize_interface("tcp", &active).is_err());
-            active.set("fixed_mtu", "8144");
+            active.set("fixed_mtu", "262128");
             assert!(synthesize_interface("tcp", &active).is_ok());
             active.set("ifac_size", "512");
             active.set("ifac_size_unit", "bits");
             assert!(synthesize_interface("tcp", &active).is_err());
-            active.set("fixed_mtu", "8096");
+            active.set("fixed_mtu", "262080");
             assert!(synthesize_interface("tcp", &active).is_ok());
         }
         client.set("ifac_size", "512");

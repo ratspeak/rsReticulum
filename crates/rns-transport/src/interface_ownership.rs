@@ -192,8 +192,7 @@ impl InterfacePacketCapacity {
         Self::new(mtu, mtu, false)
     }
     /// Return the smaller of the clear budget and the wire budget minus IFAC.
-    /// Zero IFAC bytes means inactive; 1..=64 is active and also limits wire
-    /// size to the 8160-byte mask bound. Reject invalid tag sizes, zero budgets
+    /// Zero IFAC bytes means inactive; 1..=64 is active. Reject invalid tag sizes, zero budgets
     /// and budgets with no room after the tag.
     pub fn effective_clear_mtu(
         self,
@@ -205,13 +204,8 @@ impl InterfacePacketCapacity {
         if active_ifac_bytes > 64 {
             return Err(InterfaceCapacityError::InvalidIfac);
         }
-        let wire_limit = if active_ifac_bytes > 0 {
-            self.max_wire_packet_bytes
-                .min(crate::ifac::MAX_IFAC_WIRE_BYTES as u32)
-        } else {
-            self.max_wire_packet_bytes
-        };
-        let wire = usize::try_from(wire_limit).map_err(|_| InterfaceCapacityError::Empty)?;
+        let wire = usize::try_from(self.max_wire_packet_bytes)
+            .map_err(|_| InterfaceCapacityError::Empty)?;
         let remaining =
             wire.checked_sub(active_ifac_bytes)
                 .ok_or(InterfaceCapacityError::IfacExceedsWire {
