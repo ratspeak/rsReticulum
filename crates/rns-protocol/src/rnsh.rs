@@ -41,7 +41,6 @@ pub const STREAM_ID_STDOUT: u16 = 1;
 pub const STREAM_ID_STDERR: u16 = 2;
 
 pub const STREAM_ID_MAX: u16 = 0x3FFF;
-pub const STREAM_DATA_OVERHEAD: usize = 8;
 
 pub const fn make_msg_type(val: u8) -> u16 {
     ((MSG_MAGIC as u16) << 8) | (val as u16)
@@ -262,7 +261,7 @@ impl RnshStreamDataMessage {
         let header_val = u16::from_be_bytes([raw[0], raw[1]]);
         let (stream_id, eof, compressed) = Self::parse_header(header_val);
         let payload = &raw[2..];
-        let data = if compressed && !payload.is_empty() {
+        let data = if compressed {
             compression::bz2_decompress(payload, crate::buffer::MAX_CHUNK_LEN)
                 .map_err(|_| RnshCodecError::StreamData)?
         } else {

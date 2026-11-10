@@ -102,15 +102,9 @@ impl DeferredRequestResponder {
             RequestOutcome::ReplyFile { metadata, .. } => {
                 Some(metadata.as_ref().map_or(0, Vec::capacity))
             }
-            RequestOutcome::ReplyWithResource {
-                ack,
-                data,
-                metadata,
-                ..
-            } => ack
+            RequestOutcome::ReplyWithResource { ack, metadata, .. } => ack
                 .capacity()
-                .checked_add(data.capacity())
-                .and_then(|n| n.checked_add(metadata.as_ref().map_or(0, Vec::capacity))),
+                .checked_add(metadata.as_ref().map_or(0, Vec::capacity)),
             RequestOutcome::Drop => Some(0),
         };
         if capacity.is_none_or(|n| n > self.state.limit) {

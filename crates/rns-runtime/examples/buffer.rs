@@ -2,8 +2,6 @@ mod support;
 
 use std::time::Duration;
 
-use rns_protocol::channel_message::{MessageBase, SMT_STREAM_DATA};
-use rns_protocol::stream_data::StreamDataMessage;
 use rns_runtime::prelude::*;
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -39,36 +37,30 @@ async fn server(args: ExampleArgs) -> ExampleResult {
     loop {
         tokio::select! {
             _ = runtime.shutdown.wait() => break,
-            message = destination.events.channel_messages.recv() => {
-                let Some(message) = message else { break };
-                if message.msg_type != SMT_STREAM_DATA {
-                    continue;
-                }
-                let mut frame = StreamDataMessage::new(0, Vec::new(), false);
-                frame.unpack(&message.payload)?;
-                if frame.eof {
-                    destination
-                        .handle
-                        .send_channel(
-                            message.link_id,
-                            SMT_STREAM_DATA,
-                            StreamDataMessage::new(frame.stream_id, Vec::new(), true).pack(),
-                        )
-                        .await?;
-                    continue;
-                }
-
-                let text = String::from_utf8_lossy(&frame.data);
-                println!("Received over Buffer: {text}");
-                let reply = StreamDataMessage::new(
-                    frame.stream_id,
-                    format!("Received: {text}").into_bytes(),
-                    false,
-                );
-                destination
+            link_id = destination.events.links_established.recv() => {
+                let Some(link_id) = link_id else { break };
+                // Open the stream as soon as the link is up, as a Python server would.
+                let mut buffer = destination
                     .handle
-                    .send_channel(message.link_id, SMT_STREAM_DATA, reply.pack())
+                    .create_bidirectional_buffer(link_id, STREAM_ID, STREAM_ID)
                     .await?;
+                tokio::spawn(async move {
+                    let mut data = vec![0; 4096];
+                    while let Ok(n) = buffer.read(&mut data).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let text = String::from_utf8_lossy(&data[..n]).into_owned();
+                        println!("Received over Buffer: {text}");
+                        let reply = format!("Received: {text}");
+                        if buffer.write_all(reply.as_bytes()).await.is_err()
+                            || buffer.flush().await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    let _ = buffer.shutdown().await;
+                });
             }
         }
     }

@@ -65,6 +65,7 @@ pub struct Envelope {
     pub tries: usize,
     pub state: MessageState,
     last_sent: Option<Instant>,
+    timeout: f64,
 }
 
 impl Envelope {
@@ -88,6 +89,7 @@ impl Envelope {
             tries: 0,
             state: MessageState::New,
             last_sent: None,
+            timeout: 0.0,
         }
     }
 
@@ -111,6 +113,7 @@ impl Envelope {
             tries: 0,
             state: MessageState::New,
             last_sent: None,
+            timeout: 0.0,
         })
     }
 
@@ -412,6 +415,12 @@ impl Channel {
 
         let raw = envelope.raw.clone();
         self.tx_ring.push_back(envelope);
+        // Python sizes the deadline with the new envelope already in the ring.
+        let timeout = self.compute_timeout(1);
+        if let Some(env) = self.tx_ring.back_mut() {
+            env.timeout = timeout;
+        }
+        self.raise_timeouts();
         Ok((seq, raw))
     }
 
@@ -444,10 +453,29 @@ impl Channel {
                 return Err(ChannelError::MaxRetriesExceeded);
             }
             env.last_sent = Some(Instant::now());
+            let tries = env.tries;
+            let raw = env.raw.clone();
             self.window.shrink();
-            return Ok(Some(env.raw.clone()));
+            let timeout = self.compute_timeout(tries);
+            if let Some(env) = self.tx_ring.iter_mut().find(|e| e.sequence == sequence) {
+                env.timeout = timeout;
+            }
+            self.raise_timeouts();
+            return Ok(Some(raw));
         }
         Ok(None)
+    }
+
+    /// Raise every running deadline to the current formula value, never lowering one.
+    fn raise_timeouts(&mut self) {
+        let raised: Vec<f64> = self
+            .tx_ring
+            .iter()
+            .map(|env| env.timeout.max(self.compute_timeout(env.tries)))
+            .collect();
+        for (env, timeout) in self.tx_ring.iter_mut().zip(raised) {
+            env.timeout = timeout;
+        }
     }
 
     /// Return the sequences whose delivery proof timers have expired.
@@ -458,7 +486,7 @@ impl Channel {
                 env.state != MessageState::Delivered
                     && env
                         .last_sent
-                        .is_some_and(|sent| sent.elapsed() >= self.timeout_duration(env.tries))
+                        .is_some_and(|sent| sent.elapsed() >= Self::timeout_duration(env.timeout))
             })
             .map(|env| env.sequence)
             .collect()
@@ -471,7 +499,7 @@ impl Channel {
             .filter(|env| env.state != MessageState::Delivered)
             .filter_map(|env| {
                 let sent = env.last_sent?;
-                let timeout = self.timeout_duration(env.tries);
+                let timeout = Self::timeout_duration(env.timeout);
                 Some(timeout.saturating_sub(sent.elapsed()))
             })
             .min()
@@ -482,6 +510,26 @@ impl Channel {
     /// legitimate. Out-of-range or duplicate sequence numbers are silently
     /// dropped; registered callbacks fire in order on each delivered message.
     pub fn receive(&mut self, raw: &[u8]) -> Result<Vec<(u16, Vec<u8>)>, ChannelError> {
+        Ok(self
+            .receive_tagged(raw)?
+            .into_iter()
+            .map(|(msg_type, payload, _)| (msg_type, payload))
+            .collect())
+    }
+
+    /// As [`Self::receive`], but return only the messages no handler consumed,
+    /// matching Python's callback chain, which stops at the first handler
+    /// returning true.
+    pub fn receive_unhandled(&mut self, raw: &[u8]) -> Result<Vec<(u16, Vec<u8>)>, ChannelError> {
+        Ok(self
+            .receive_tagged(raw)?
+            .into_iter()
+            .filter(|(_, _, consumed)| !consumed)
+            .map(|(msg_type, payload, _)| (msg_type, payload))
+            .collect())
+    }
+
+    fn receive_tagged(&mut self, raw: &[u8]) -> Result<Vec<(u16, Vec<u8>, bool)>, ChannelError> {
         if !self.active {
             return Err(ChannelError::ChannelClosed);
         }
@@ -507,9 +555,9 @@ impl Channel {
                 let env = self.rx_ring.remove(idx).unwrap();
                 let payload = env.payload().to_vec();
 
-                self.run_callbacks(env.msg_type, &payload);
+                let consumed = self.run_callbacks(env.msg_type, &payload);
 
-                delivered.push((env.msg_type, payload));
+                delivered.push((env.msg_type, payload, consumed));
                 self.next_rx_sequence = ((self.next_rx_sequence as u32 + 1) % SEQ_MODULUS) as u16;
             } else {
                 break;
@@ -517,6 +565,31 @@ impl Channel {
         }
 
         Ok(delivered)
+    }
+
+    /// Message types that [`Self::receive`] would release, in order, if handed
+    /// `raw` now. Empty when the envelope is invalid, unregistered or not the
+    /// next expected sequence. Does not change state.
+    pub fn deliverable_types(&self, raw: &[u8]) -> Vec<u16> {
+        let Ok(envelope) = Envelope::unpack(raw) else {
+            return Vec::new();
+        };
+        if !self.active
+            || !self.is_type_registered(envelope.msg_type)
+            || envelope.sequence != self.next_rx_sequence
+        {
+            return Vec::new();
+        }
+        let mut types = vec![envelope.msg_type];
+        let mut next = ((envelope.sequence as u32 + 1) % SEQ_MODULUS) as u16;
+        while let Some(env) = self.rx_ring.iter().find(|e| e.sequence == next) {
+            types.push(env.msg_type);
+            next = ((next as u32 + 1) % SEQ_MODULUS) as u16;
+            if types.len() > self.rx_ring.len() {
+                break;
+            }
+        }
+        types
     }
 
     /// Match Python RNS 1.4.2's receive guard: future sequence numbers are
@@ -575,12 +648,12 @@ impl Channel {
         backoff * base * outstanding
     }
 
-    fn timeout_duration(&self, tries: usize) -> Duration {
-        Duration::try_from_secs_f64(self.compute_timeout(tries).max(MIN_TIMEOUT_BASE))
-            .unwrap_or(Duration::from_secs(1))
+    fn timeout_duration(timeout: f64) -> Duration {
+        Duration::try_from_secs_f64(timeout.max(MIN_TIMEOUT_BASE)).unwrap_or(Duration::from_secs(1))
     }
 
-    /// Update the live Link RTT used by subsequent retransmit deadlines.
+    /// Update the Link RTT used for deadlines set from now on; running
+    /// deadlines are fixed at send or resend and only ever raised.
     pub fn update_rtt(&mut self, rtt: f64) {
         if rtt.is_finite() && rtt >= 0.0 {
             self.current_rtt = rtt.min(RTT_MAX);
@@ -718,13 +791,33 @@ impl LinkChannel {
     /// Decrypt if session keys are present, then hand the payload to the
     /// underlying channel and return any newly deliverable messages.
     pub fn receive_data(&mut self, raw: &[u8]) -> Result<Vec<(u16, Vec<u8>)>, ChannelError> {
-        let plaintext = if let Some(ref keys) = self.session_keys {
-            rns_link::encryption::link_decrypt(keys, raw)
-                .map_err(|_| ChannelError::ChannelClosed)?
-        } else {
-            raw.to_vec()
-        };
+        let plaintext = self.open(raw)?;
         self.channel.receive(&plaintext)
+    }
+
+    /// As [`Self::receive_data`], but return only the released messages that
+    /// no handler consumed.
+    pub fn receive_data_unhandled(
+        &mut self,
+        raw: &[u8],
+    ) -> Result<Vec<(u16, Vec<u8>)>, ChannelError> {
+        let plaintext = self.open(raw)?;
+        self.channel.receive_unhandled(&plaintext)
+    }
+
+    /// See [`Channel::deliverable_types`]; `raw` is a packet body as received.
+    pub fn deliverable_types(&self, raw: &[u8]) -> Vec<u16> {
+        self.open(raw)
+            .map(|plaintext| self.channel.deliverable_types(&plaintext))
+            .unwrap_or_default()
+    }
+
+    fn open(&self, raw: &[u8]) -> Result<Vec<u8>, ChannelError> {
+        if let Some(ref keys) = self.session_keys {
+            rns_link::encryption::link_decrypt(keys, raw).map_err(|_| ChannelError::ChannelClosed)
+        } else {
+            Ok(raw.to_vec())
+        }
     }
 
     pub fn delivered(&mut self, sequence: u16, rtt: f64) {
@@ -732,7 +825,11 @@ impl LinkChannel {
         self.channel.delivered(sequence, rtt);
     }
 
+    /// Map the latest transmission of `sequence` to its packet hash. A proof
+    /// for an earlier transmission of the same sequence no longer delivers it.
     pub fn track_outbound_packet_hash(&mut self, packet_hash: [u8; 32], sequence: u16) {
+        self.outbound_packet_hashes
+            .retain(|_, tracked_sequence| *tracked_sequence != sequence);
         self.outbound_packet_hashes.insert(packet_hash, sequence);
     }
 
@@ -1096,8 +1193,7 @@ mod tests {
             channel.update_rtt(rtt);
             assert_eq!(channel.current_rtt, 1.0);
             assert!(
-                channel
-                    .timeout_duration(usize::MAX)
+                Channel::timeout_duration(channel.compute_timeout(usize::MAX))
                     .as_secs_f64()
                     .is_finite()
             );

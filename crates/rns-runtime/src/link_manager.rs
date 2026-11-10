@@ -20,7 +20,9 @@ pub use crate::inbound_link_packet::{
     InboundLinkPacket, LinkPacketConfigurationError, LinkPacketReceipt, LinkPacketReceiptOutcome,
     LinkPacketRejection,
 };
-use crate::resource_source::{AutoCompress, PreparedResourceSource, ResourceSource};
+use crate::resource_source::{
+    AutoCompress, PreparedResourceSource, ResourceOptions, ResourceSource,
+};
 use bytes::Bytes;
 use rns_identity::destination::ProofStrategy;
 use tokio::sync::{mpsc, oneshot};
@@ -33,8 +35,8 @@ use rns_identity::ratchet::PersistentRatchetRing;
 use rns_link::link::{
     CloseReason, Link, LinkAction, LinkRole, LinkState, PacketProofError, ResourceStrategy,
 };
-use rns_protocol::channel::{ChannelError, LinkChannel};
-use rns_protocol::channel_message::{MessageBase, SYSTEM_MESSAGE_TYPE_MIN};
+use rns_protocol::channel::{ChannelError, HandlerId, LinkChannel, MessageCallback};
+use rns_protocol::channel_message::{MessageBase, SMT_STREAM_DATA, SYSTEM_MESSAGE_TYPE_MIN};
 use rns_protocol::resource::{
     InboundTransfer, MAX_EFFICIENT_SIZE, MAX_SEGMENTS, MultiSegmentInbound, MultiSegmentOutbound,
     OutboundTransfer, TransferAction,
@@ -340,6 +342,32 @@ pub enum LinkManagerCommand {
         message: Box<dyn MessageBase>,
         result_tx: Option<oneshot::Sender<Result<ChannelSendReceipt, ChannelSendError>>>,
     },
+    /// Open the Link's Channel for Buffer streams (Python `link.get_channel()`
+    /// plus the `StreamDataMessage` system type) and reply with its MDU.
+    OpenStreamChannel {
+        link_id: [u8; 16],
+        result_tx: oneshot::Sender<Result<usize, ChannelSendError>>,
+    },
+    AddChannelHandler {
+        link_id: [u8; 16],
+        handler: MessageCallback,
+        result_tx: oneshot::Sender<Result<HandlerId, ChannelSendError>>,
+    },
+    RemoveChannelHandler {
+        link_id: [u8; 16],
+        id: HandlerId,
+        result_tx: Option<oneshot::Sender<bool>>,
+    },
+    /// Payload budget of one Channel message on the Link (Python `channel.mdu`).
+    ChannelMdu {
+        link_id: [u8; 16],
+        result_tx: oneshot::Sender<Option<usize>>,
+    },
+    /// Channel readiness and the Python Buffer close wait, `link.rtt * len(tx_ring)`.
+    ChannelCloseWait {
+        link_id: [u8; 16],
+        result_tx: oneshot::Sender<Option<(bool, f64)>>,
+    },
     SendLinkPacket {
         link_id: [u8; 16],
         payload: Vec<u8>,
@@ -584,7 +612,8 @@ pub enum RequestOutcome {
     ReplyWithResource {
         /// One already-encoded MessagePack value sent as the response.
         ack: Vec<u8>,
-        data: Vec<u8>,
+        /// Resource contents, read one segment at a time.
+        source: Box<dyn ResourceSource>,
         /// Optional opaque Resource metadata. rncp expects a MessagePack map
         /// such as `{"name": "file.bin"}`; the manager does not validate it.
         metadata: Option<Vec<u8>>,
@@ -606,16 +635,15 @@ impl std::fmt::Debug for RequestOutcome {
                 .finish_non_exhaustive(),
             Self::ReplyWithResource {
                 ack,
-                data,
                 metadata,
                 auto_compress,
+                ..
             } => f
                 .debug_struct("ReplyWithResource")
                 .field("ack_len", &ack.len())
-                .field("data_len", &data.len())
                 .field("metadata_len", &metadata.as_ref().map(Vec::len))
                 .field("auto_compress", auto_compress)
-                .finish(),
+                .finish_non_exhaustive(),
             Self::Drop => f.write_str("Drop"),
         }
     }
@@ -1373,7 +1401,7 @@ impl LinkManager {
                 &link_id,
                 role,
                 &proof,
-                rns_wire::context::PacketContext::LinkProof,
+                rns_wire::context::PacketContext::None,
             )
         {
             active.link.record_tx(proof.len());
@@ -1537,11 +1565,7 @@ impl LinkManager {
                     hops: 0,
                     transport_id: None,
                     destination_hash: pending.link_id,
-                    context: if rejecting {
-                        rns_wire::context::PacketContext::None
-                    } else {
-                        rns_wire::context::PacketContext::LinkProof
-                    },
+                    context: rns_wire::context::PacketContext::None,
                 };
                 let mut raw = header.pack();
                 raw.extend_from_slice(&body);
@@ -1986,6 +2010,46 @@ impl LinkManager {
                 if let Some(tx) = result_tx {
                     let _ = tx.send(result);
                 }
+                true
+            }
+            LinkManagerCommand::OpenStreamChannel { link_id, result_tx } => {
+                let _ = result_tx.send(self.open_stream_channel(&link_id));
+                true
+            }
+            LinkManagerCommand::AddChannelHandler {
+                link_id,
+                handler,
+                result_tx,
+            } => {
+                let _ = result_tx.send(self.add_channel_message_handler(&link_id, handler));
+                true
+            }
+            LinkManagerCommand::RemoveChannelHandler {
+                link_id,
+                id,
+                result_tx,
+            } => {
+                let removed = self.remove_channel_message_handler(&link_id, id);
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(removed);
+                }
+                true
+            }
+            LinkManagerCommand::ChannelMdu { link_id, result_tx } => {
+                let mdu = self
+                    .active_links
+                    .get(&link_id)
+                    .map(|active| rns_protocol::channel::Channel::channel_mdu(active.link.mdu));
+                let _ = result_tx.send(mdu);
+                true
+            }
+            LinkManagerCommand::ChannelCloseWait { link_id, result_tx } => {
+                let status = self.active_links.get(&link_id).and_then(|active| {
+                    let channel = active.channel.as_ref()?;
+                    let wait = active.link.rtt_secs() * channel.outstanding_count() as f64;
+                    Some((channel.is_ready_to_send(), wait))
+                });
+                let _ = result_tx.send(status);
                 true
             }
             LinkManagerCommand::SendLinkPacket {
@@ -3294,6 +3358,28 @@ impl LinkManager {
                         return;
                     }
 
+                    // Python runs callbacks inline after the proof; withhold the
+                    // proof while the delivery queue cannot take every released
+                    // message, so the sender retransmits instead of losing it.
+                    if let (Some(tx), Some(channel)) =
+                        (self.channel_message_tx.as_ref(), active.channel.as_ref())
+                        && !tx.is_closed()
+                    {
+                        let releasable = channel
+                            .deliverable_types(data)
+                            .into_iter()
+                            .filter(|msg_type| *msg_type < SYSTEM_MESSAGE_TYPE_MIN)
+                            .count();
+                        if tx.capacity() < releasable.min(tx.max_capacity()) {
+                            tracing::debug!(
+                                link_id = hex::encode(link_id),
+                                releasable,
+                                "channel packet withheld until the delivery queue drains"
+                            );
+                            return;
+                        }
+                    }
+
                     let pkt_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
                     let proof_retained = Self::prove_received_link_packet(
                         active,
@@ -3337,10 +3423,13 @@ impl LinkManager {
                     }
 
                     if let Some(ref mut channel) = active.channel {
-                        match channel.receive_data(data) {
+                        match channel.receive_data_unhandled(data) {
                             Ok(messages) => {
                                 if let Some(ref tx) = self.channel_message_tx {
                                     for (msg_type, payload) in messages {
+                                        if msg_type >= SYSTEM_MESSAGE_TYPE_MIN {
+                                            continue;
+                                        }
                                         let _ = tx.try_send(LinkChannelMessage {
                                             link_id,
                                             msg_type,
@@ -4510,6 +4599,7 @@ impl LinkManager {
 
     fn on_tick(&mut self) {
         let mut to_remove = Vec::new();
+        let mut channel_timed_out = Vec::new();
 
         for (link_id, active) in &mut self.active_links {
             if let Some(channel) = active.channel.as_mut() {
@@ -4533,7 +4623,7 @@ impl LinkManager {
                                     sequence,
                                     "channel packet exceeded max retries"
                                 );
-                                to_remove.push((*link_id, false));
+                                channel_timed_out.push(*link_id);
                                 None
                             }
                             Err(error) => {
@@ -4782,6 +4872,18 @@ impl LinkManager {
             {
                 tracing::debug!(link_id = hex::encode(link_id), "link removed by tick");
             }
+        }
+        // Channel.py _packet_timeout -> outlet.timed_out() -> link.teardown().
+        channel_timed_out.dedup();
+        for link_id in channel_timed_out {
+            let Some(role) = self.active_links.get(&link_id).map(|a| a.link.role()) else {
+                continue;
+            };
+            let reason = match role {
+                LinkRole::Initiator => CloseReason::InitiatorClosed,
+                LinkRole::Responder => CloseReason::DestinationClosed,
+            };
+            self.close_active_link(link_id, reason, true);
         }
     }
 
@@ -5789,12 +5891,12 @@ impl LinkManager {
             }
             RequestOutcome::ReplyWithResource {
                 ack,
-                data,
+                source,
                 metadata,
                 auto_compress,
             } => (
                 Some(Link::pack_response(&request_id, &ack)),
-                Some((data, metadata, auto_compress)),
+                Some((source, metadata, auto_compress)),
             ),
             RequestOutcome::Drop => (None, None),
         };
@@ -5894,18 +5996,19 @@ impl LinkManager {
             );
         }
 
-        if let Some((data, metadata, auto_compress)) = fetch_spec {
-            if let Some(resource_id) = self.start_resource_transfer_inner(
-                &link_id,
-                ResourceTransferStart {
-                    data,
-                    metadata,
+        if let Some((source, metadata, auto_compress)) = fetch_spec {
+            let prepared = PreparedResourceSource::prepare(
+                source,
+                ResourceOptions {
                     auto_compress,
-                    request_id: None,
-                    is_response: false,
-                    allow_handshake: true,
+                    metadata,
                 },
-            ) {
+            )
+            .map_err(|error| tracing::warn!(%error, "request Resource source refused"))
+            .ok();
+            if let Some(resource_id) =
+                prepared.and_then(|prepared| self.start_prepared_resource(&link_id, prepared))
+            {
                 if let Some(lease) = lease {
                     self.deferred_resource_leases.push(DeferredResourceLease {
                         link_id,
@@ -5960,6 +6063,20 @@ impl LinkManager {
         metadata: Option<Vec<u8>>,
         auto_compress: AutoCompress,
     ) -> Option<[u8; 32]> {
+        let prepared =
+            PreparedResourceSource::prepare_response(source, request_id, metadata, auto_compress)
+                .map_err(|error| tracing::warn!(%error, "file response source refused"))
+                .ok()?;
+        self.start_prepared_resource(link_id, prepared)
+    }
+
+    /// Start the first segment of a prepared source; later segments are read
+    /// as earlier ones are proved.
+    fn start_prepared_resource(
+        &mut self,
+        link_id: &[u8; 16],
+        mut prepared: PreparedResourceSource,
+    ) -> Option<[u8; 32]> {
         let active = self.active_links.get_mut(link_id)?;
         if !matches!(active.link.state, LinkState::Active | LinkState::Stale) {
             return None;
@@ -5969,10 +6086,6 @@ impl LinkManager {
             .link
             .rtt
             .unwrap_or(std::time::Duration::from_millis(500));
-        let mut prepared =
-            PreparedResourceSource::prepare_response(source, request_id, metadata, auto_compress)
-                .map_err(|error| tracing::warn!(%error, "file response source refused"))
-                .ok()?;
         let first = prepared.next_segment(&keys, rtt).ok()??;
         let resource_key = first.logical_hash;
         let total_segments = first.total_segments;
@@ -6409,9 +6522,9 @@ impl LinkManager {
         self.outbound_resource_waits.clear();
     }
 
-    /// Receive decoded Channel messages through a best-effort bounded queue.
-    /// The manager can prove Channel packets before this application delivery;
-    /// a full receiver may lose a message despite the peer receiving a proof.
+    /// Receive decoded Channel messages through a bounded queue. A Channel
+    /// packet whose messages the queue cannot take is left unproved, so the
+    /// peer retransmits it once the receiver drains.
     pub fn set_channel_message_channel(&mut self, tx: mpsc::Sender<LinkChannelMessage>) {
         self.channel_message_tx = Some(tx);
     }
@@ -6544,6 +6657,42 @@ impl LinkManager {
         Self::ensure_link_channel(active, *link_id, &self.channel_message_types)
     }
 
+    /// Open the Link's Channel and accept Buffer stream frames on it, as
+    /// Python `RawChannelReader` does; returns the Channel MDU.
+    pub fn open_stream_channel(&mut self, link_id: &[u8; 16]) -> Result<usize, ChannelSendError> {
+        let active = self
+            .active_links
+            .get_mut(link_id)
+            .ok_or(ChannelSendError::LinkNotFound)?;
+        let channel = Self::ensure_link_channel(active, *link_id, &self.channel_message_types)
+            .ok_or(ChannelSendError::NoSessionKeys)?;
+        channel.register_system_type(SMT_STREAM_DATA);
+        Ok(channel.mdu())
+    }
+
+    /// Append a handler to the Link Channel's callback chain. Messages a
+    /// handler consumes are not forwarded to the Channel message queue.
+    pub fn add_channel_message_handler(
+        &mut self,
+        link_id: &[u8; 16],
+        handler: MessageCallback,
+    ) -> Result<HandlerId, ChannelSendError> {
+        let active = self
+            .active_links
+            .get_mut(link_id)
+            .ok_or(ChannelSendError::LinkNotFound)?;
+        let channel = Self::ensure_link_channel(active, *link_id, &self.channel_message_types)
+            .ok_or(ChannelSendError::NoSessionKeys)?;
+        Ok(channel.add_message_handler(handler))
+    }
+
+    pub fn remove_channel_message_handler(&mut self, link_id: &[u8; 16], id: HandlerId) -> bool {
+        self.active_links
+            .get_mut(link_id)
+            .and_then(|active| active.channel.as_mut())
+            .is_some_and(|channel| channel.remove_message_handler(id))
+    }
+
     /// Prepare and enqueue a Channel message. Success records local transport
     /// command admission, not driver dispatch or peer delivery. Continue driving
     /// the manager so the Channel can process proofs and retransmissions.
@@ -6556,7 +6705,8 @@ impl LinkManager {
             .active_links
             .get(link_id)
             .ok_or(ChannelSendError::LinkNotFound)?;
-        if !matches!(active.link.state, LinkState::Active | LinkState::Stale) {
+        // Channel.py LinkChannelOutlet.send transmits only on an ACTIVE link.
+        if active.link.state != LinkState::Active {
             return Err(ChannelSendError::LinkNotActive);
         }
 
@@ -11041,10 +11191,7 @@ mod tests {
             proof_header.flags.packet_type,
             rns_wire::flags::PacketType::Proof
         );
-        assert_eq!(
-            proof_header.context,
-            rns_wire::context::PacketContext::LinkProof
-        );
+        assert_eq!(proof_header.context, rns_wire::context::PacketContext::None);
         let proof_data = &request.raw[proof_offset..];
         assert_eq!(&proof_data[..32], &packet_hash);
         assert!(sender_link.validate_packet_proof(&packet_hash, proof_data));
@@ -11202,10 +11349,7 @@ mod tests {
             proof_header.flags.packet_type,
             rns_wire::flags::PacketType::Proof
         );
-        assert_eq!(
-            proof_header.context,
-            rns_wire::context::PacketContext::LinkProof
-        );
+        assert_eq!(proof_header.context, rns_wire::context::PacketContext::None);
         let proof_data = &request.raw[proof_offset..];
         assert_eq!(&proof_data[..32], &packet_hash);
         assert!(sender_link.validate_packet_proof(&packet_hash, proof_data));

@@ -23,6 +23,7 @@ use rns_crypto::ed25519::Ed25519PublicKey;
 use rns_identity::destination::{DestType, Destination, Direction};
 use rns_identity::identity::Identity;
 use rns_link::link::{CloseReason, Link};
+use rns_protocol::buffer::{MAX_CHUNK_LEN, StreamWriter};
 use rns_protocol::channel::{ChannelError, LinkChannel};
 use rns_protocol::channel_message::MessageBase;
 use rns_protocol::rnsh::{
@@ -43,7 +44,6 @@ use crate::link_manager::{
 
 pub const RNSH_APP_NAME: &str = "rnsh";
 pub const RNSH_SOFTWARE_VERSION: &str = "0.3.0";
-const CLIENT_CHUNK_LEN: usize = 240;
 const CHANNEL_SEND_RETRY: Duration = Duration::from_millis(20);
 const CLIENT_PRE_EOF_DRAIN_MIN: Duration = Duration::from_secs(3);
 const CLIENT_PRE_EOF_DRAIN_MAX: Duration = Duration::from_secs(3);
@@ -615,7 +615,7 @@ async fn run_client_io_loop(
         let (tx, rx) = mpsc::channel(16);
         let stdin_data = std::mem::take(&mut cfg.stdin_data);
         tokio::spawn(async move {
-            for chunk in stdin_data.chunks(CLIENT_CHUNK_LEN) {
+            for chunk in stdin_data.chunks(MAX_CHUNK_LEN) {
                 if tx.send(chunk.to_vec()).await.is_err() {
                     return;
                 }
@@ -682,9 +682,30 @@ async fn run_client_io_loop(
                 )));
             }
             maybe_chunk = recv_optional_stdin_chunk(&mut stdin_rx), if !stdin_eof_sent => {
+                let mut maybe_chunk = maybe_chunk;
+                let mut stdin_ended = false;
+                // Python rnsh frames from its whole pending stdin buffer, not per read.
+                if let (Some(data), Some(rx)) = (maybe_chunk.as_mut(), stdin_rx.as_mut()) {
+                    while !data.is_empty() && data.len() < MAX_CHUNK_LEN {
+                        match rx.try_recv() {
+                            Ok(more) if !more.is_empty() => data.extend_from_slice(&more),
+                            Ok(_) | Err(mpsc::error::TryRecvError::Disconnected) => {
+                                stdin_ended = true;
+                                break;
+                            }
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                        }
+                    }
+                }
+                if stdin_ended {
+                    // Replay the end of stdin so the EOF branch runs next.
+                    let (tx, rx) = mpsc::channel(1);
+                    let _ = tx.try_send(Vec::new());
+                    stdin_rx = Some(rx);
+                }
                 match maybe_chunk {
                     Some(data) if !data.is_empty() => {
-                        for chunk in data.chunks(CLIENT_CHUNK_LEN) {
+                        for frame in stream_frames(STREAM_ID_STDIN, &data, channel.mdu()) {
                             if pending_has_remote_terminal(pending_messages) {
                                 break;
                             }
@@ -694,7 +715,7 @@ async fn run_client_io_loop(
                                 link,
                                 channel,
                                 pending_messages,
-                                RnshStreamDataMessage::new(STREAM_ID_STDIN, chunk.to_vec(), false),
+                                frame,
                                 deadline,
                             ).await?;
                         }
@@ -1480,17 +1501,21 @@ async fn stream_reader_task<R>(
 ) where
     R: AsyncRead + Unpin,
 {
-    let mut buf = [0u8; CLIENT_CHUNK_LEN];
+    let Some(channel_mdu) = manager_channel_mdu(&command_tx, link_id).await else {
+        return;
+    };
+    let mut buf = vec![0u8; MAX_CHUNK_LEN];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
-                let msg = RnshStreamDataMessage::new(stream_id, buf[..n].to_vec(), false);
-                if send_manager_message(&command_tx, link_id, msg)
-                    .await
-                    .is_err()
-                {
-                    return;
+                for msg in stream_frames(stream_id, &buf[..n], channel_mdu) {
+                    if send_manager_message(&command_tx, link_id, msg)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
             Err(_) => break,
@@ -1502,6 +1527,34 @@ async fn stream_reader_task<R>(
         RnshStreamDataMessage::new(stream_id, Vec::new(), true),
     )
     .await;
+}
+
+/// Python rnsh `compress_adaptive`: frames of at most `channel.mdu - 2`
+/// bytes, bz2-compressed when that helps (session.py `pump`, initiator.py).
+fn stream_frames(stream_id: u16, data: &[u8], channel_mdu: usize) -> Vec<RnshStreamDataMessage> {
+    let max_data_len = channel_mdu.saturating_sub(2).max(1);
+    let mut writer = StreamWriter::new(stream_id, max_data_len);
+    let mut frames = Vec::new();
+    let mut offset = 0;
+    while let Ok(Some((frame, consumed))) = writer.write_once(&data[offset..]) {
+        let mut message = RnshStreamDataMessage::new(stream_id, frame.data, false);
+        message.compressed = frame.compressed;
+        frames.push(message);
+        offset += consumed;
+    }
+    frames
+}
+
+async fn manager_channel_mdu(
+    command_tx: &mpsc::Sender<LinkManagerCommand>,
+    link_id: [u8; 16],
+) -> Option<usize> {
+    let (result_tx, result_rx) = oneshot::channel();
+    command_tx
+        .send(LinkManagerCommand::ChannelMdu { link_id, result_tx })
+        .await
+        .ok()?;
+    result_rx.await.ok()?
 }
 
 async fn send_manager_message<M>(
@@ -2093,6 +2146,11 @@ mod tests {
                             }));
                             sequence = sequence.wrapping_add(1);
                         }
+                    }
+                    LinkManagerCommand::ChannelMdu { result_tx, .. } => {
+                        let _ = result_tx.send(Some(rns_protocol::channel::Channel::channel_mdu(
+                            rns_wire::constants::LINK_MDU,
+                        )));
                     }
                     LinkManagerCommand::Shutdown => break,
                     _ => {}

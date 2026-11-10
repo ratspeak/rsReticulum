@@ -82,8 +82,9 @@ impl MessageBase for StreamDataMessage {
         self.compressed = compressed;
 
         let payload = &raw[2..];
-        if compressed && !payload.is_empty() {
-            // Mirror Python `Buffer.py:96`: cap decompression at MAX_CHUNK_LEN
+        if compressed {
+            // Mirror Python `Buffer.py:94-98`, which also rejects an empty
+            // compressed payload: cap decompression at MAX_CHUNK_LEN
             // (16 KiB) so a malicious peer can't expand a tiny bz2 payload into
             // a large allocation. The streaming hard-cap in `bz2_decompress`
             // returns an error rather than completing the allocation.

@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 
-use crate::compression;
 use crate::stream_data::{STREAM_ID_MAX, StreamDataMessage};
 
 /// Upper bound on a single chunk before the writer splits (16 KiB).
@@ -142,6 +141,25 @@ impl StreamWriter {
         Ok(messages)
     }
 
+    /// Produce the single frame Python `RawChannelWriter.write` sends for
+    /// `data`, and how many input bytes it consumed. `None` for empty input.
+    pub fn write_once(
+        &mut self,
+        data: &[u8],
+    ) -> Result<Option<(StreamDataMessage, usize)>, BufferError> {
+        if self.closed {
+            return Err(BufferError::WriterClosed);
+        }
+        if data.is_empty() {
+            return Ok(None);
+        }
+        let chunk = &data[..data.len().min(MAX_CHUNK_LEN)];
+        let (msg_data, consumed, compressed) = self.try_compress_chunk(chunk);
+        let mut msg = StreamDataMessage::new(self.stream_id, msg_data, false);
+        msg.compressed = compressed;
+        Ok(Some((msg, consumed)))
+    }
+
     /// Compress `chunk` at progressively smaller prefixes (chunk/1, chunk/2, …)
     /// until the bzip2 output fits within `max_data_len` and is actually
     /// shorter than the source, returning the first match. Falls back to a raw
@@ -158,7 +176,7 @@ impl StreamWriter {
             if segment_len <= 32 {
                 break;
             }
-            if let Ok(compressed) = compression::bz2_compress(&chunk[..segment_len])
+            if let Ok(compressed) = bz2_compress_best(&chunk[..segment_len])
                 && compressed.len() < self.max_data_len
                 && compressed.len() < segment_len
             {
@@ -190,6 +208,14 @@ impl StreamWriter {
     pub fn is_closed(&self) -> bool {
         self.closed
     }
+}
+
+/// Python `bz2.compress` defaults to compresslevel 9.
+fn bz2_compress_best(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Write;
+    let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+    encoder.write_all(data)?;
+    encoder.finish()
 }
 
 /// EOF frame handed back by [`StreamWriter::close`]. Must be sent only after

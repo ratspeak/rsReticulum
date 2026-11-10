@@ -192,6 +192,10 @@ impl DestinationHandle {
         &self.app_name
     }
 
+    pub(crate) fn command_tx(&self) -> &mpsc::Sender<LinkManagerCommand> {
+        &self.command_tx
+    }
+
     pub async fn announce(
         &self,
         options: DestinationAnnounceOptions,
@@ -790,6 +794,7 @@ mod tests {
                     client_label: "test.same-actor-link".into(),
                     identify: true,
                     track_phy_stats: false,
+                    proof_strategy: rns_identity::destination::ProofStrategy::ProveNone,
                 },
             ),
         )

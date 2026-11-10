@@ -5,15 +5,14 @@
 //! * `rncp-rs -l [-s <dir>] [-a <hash>] [-F [-j <jail>]]` — listen (optionally serving fetch)
 //! * `rncp-rs -f <destination_hash> <remote_path> [-s <dir>]` — fetch
 //!
-//! Exit codes: 0 success, 1 generic failure, 2 identity unreadable,
-//! 3 output dir missing, 4 output dir not writable.
+//! Exit codes follow rncp: 0 success, an answered fetch failure or an
+//! interrupt; 1 generic failure; 2 identity unreadable; 3 output dir missing;
+//! 4 output dir not writable.
 //!
-//! The current listener checks `-a` and allow-list files when a peer identifies,
-//! but does not require identification before receiving a pushed file. Do not
-//! rely on the allow-list to exclude unidentified senders. Fetch requests require
-//! an allowed identity unless `-n` / `--no-auth` is used. `-F` also leaves push
-//! reception enabled. Use `-j <jail>` to constrain fetched paths to a directory
-//! under trusted local control; it is not an OS sandbox.
+//! The listener accepts pushed files and fetch requests only from identified
+//! peers in `-a` or the allowed_identities file, unless `-n` is given. `-F`
+//! also leaves push reception enabled. Use `-j <jail>` to constrain fetched
+//! paths to a directory under trusted local control; it is not an OS sandbox.
 
 use std::path::PathBuf;
 use std::process;
@@ -37,11 +36,13 @@ fn expand_tilde(p: &str) -> PathBuf {
 use rns_identity::identity::Identity;
 use rns_runtime::lifecycle::{ShutdownSignal, install_signal_handlers};
 use rns_runtime::platform::StoragePaths;
+use rns_runtime::reticulum::{InstanceMode, ReticulumHandle, SharedInstanceRpcEndpoint};
 use rns_runtime::rncp::{
     DEFAULT_RNCP_APP_NAME, RncpError, RncpEvent, RncpFetchOutcome, RncpFetchRequest,
     RncpListenerConfig, RncpOutcome, RncpSendRequest, default_rncp_app_name, rncp_fetch_file,
     rncp_send_file, spawn_rncp_listener,
 };
+use rns_runtime::rpc::{RpcRequest, RpcResponse};
 
 const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
 use rns_tools::RS_RETICULUM_VERSION;
@@ -87,7 +88,7 @@ struct Args {
     #[arg(short = 'f', long)]
     fetch: bool,
 
-    /// Restrict served fetch paths to this directory (-l -F only; ignored with -f).
+    /// Restrict fetch requests to this path (-l -F only; ignored with -f).
     /// Keep the directory under trusted local control; this is not an OS sandbox.
     #[arg(short = 'j', long, value_name = "path")]
     jail: Option<String>,
@@ -100,12 +101,11 @@ struct Args {
     #[arg(short = 'O', long)]
     overwrite: bool,
 
-    /// Listen-mode announce interval in seconds; -1 disables, 0 announces once at startup
+    /// Announce interval, 0 to only announce at startup
     #[arg(short = 'b', value_name = "seconds", default_value_t = -1)]
     announce_interval: i64,
 
-    /// Allowed identity hash (repeat for multiple). 32 hex chars each.
-    /// The listener does not require identification before accepting pushed files.
+    /// Allow this identity (or add in ~/.rncp/allowed_identities). 32 hex chars each.
     #[arg(short = 'a', value_name = "hash", action = clap::ArgAction::Append)]
     allowed: Vec<String>,
 
@@ -121,7 +121,8 @@ struct Args {
     #[arg(short = 'i', value_name = "identity")]
     identity_path: Option<String>,
 
-    /// Protocol wait budget in seconds (minimum 1); transport work and file I/O can add time
+    /// Sender timeout before giving up: the path wait, raised to the medium
+    /// path timeout; the transfer itself has no deadline
     #[arg(short = 'w', value_name = "seconds", default_value_t = DEFAULT_TIMEOUT_SECS)]
     timeout: f64,
 
@@ -231,8 +232,8 @@ pub(crate) async fn main() {
 
 async fn run_fetch(args: Args) -> ! {
     // Register before any slow init so an early SIGINT exits cleanly.
-    let shutdown = ShutdownSignal::new();
-    let _signal_rx = install_signal_handlers(shutdown.clone());
+    let interrupt = ShutdownSignal::new();
+    let _signal_rx = install_signal_handlers(interrupt.clone());
     // In fetch mode the positionals are `<destination_hash> <remote_path>`.
     let (Some(dest_arg), Some(path_arg)) = (args.file.as_ref(), args.destination.as_ref()) else {
         eprintln!("rncp-rs: fetch mode requires <destination_hash> <remote_path>");
@@ -269,7 +270,7 @@ async fn run_fetch(args: Args) -> ! {
         None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
 
-    let handle = start_reticulum(args.config.as_deref(), shutdown.clone()).await;
+    let handle = start_interruptible(args.config.as_deref(), &interrupt).await;
     let paths = StoragePaths::from_config_dir(&handle.config_dir);
     let identity = match load_or_create_identity(args.identity_path.as_deref(), &paths.identity_dir)
     {
@@ -284,8 +285,7 @@ async fn run_fetch(args: Args) -> ! {
         println!("Fetching \"{path_arg}\" from <{}>", hex::encode(dest_hash));
     }
 
-    let timeout = Duration::from_secs_f64(args.timeout.max(1.0));
-    let path_wait = timeout;
+    let path_timeout = path_timeout(&handle, args.timeout).await;
 
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<f32>(32);
     let silent = args.silent;
@@ -318,19 +318,42 @@ async fn run_fetch(args: Args) -> ! {
         remote_path: path_arg,
         save_dir: &save_dir,
         overwrite: args.overwrite,
-        overall_timeout: timeout,
-        path_wait,
+        path_timeout,
         progress_tx: Some(progress_tx),
+        shutdown: Some(interrupt.clone()),
     })
     .await;
 
     let _ = progress_task.await;
 
+    // rncp.py:543-567: every answered request failure exits 0.
     match result {
         Ok(outcome) => {
             if !args.silent {
                 print_fetch_summary(&outcome);
             }
+            process::exit(0);
+        }
+        Err(RncpError::Interrupted) => {
+            println!();
+            process::exit(0);
+        }
+        Err(RncpError::Denied) => {
+            println!(
+                "Fetch request failed, fetching the file {path_arg} was not allowed by the remote"
+            );
+            process::exit(0);
+        }
+        Err(RncpError::NotFound) => {
+            println!("Fetch request failed, the file {path_arg} was not found on the remote");
+            process::exit(0);
+        }
+        Err(RncpError::RemoteError) => {
+            println!("Fetch request failed due to an error on the remote system");
+            process::exit(0);
+        }
+        Err(RncpError::RequestFailed) => {
+            println!("Fetch request failed due to an unknown error (probably not authorised)");
             process::exit(0);
         }
         Err(RncpError::PathTimeout) => {
@@ -343,10 +366,6 @@ async fn run_fetch(args: Args) -> ! {
         }
         Err(RncpError::Timeout(what)) => {
             eprintln!("Timed out waiting for {what}");
-            process::exit(1);
-        }
-        Err(RncpError::Denied) => {
-            eprintln!("Remote denied the fetch (not in allow-list or outside jail).");
             process::exit(1);
         }
         Err(RncpError::ResourceFailed(reason)) => {
@@ -377,8 +396,8 @@ fn print_fetch_summary(outcome: &RncpFetchOutcome) {
 
 async fn run_send(args: Args) -> ! {
     // Register before any slow init so an early SIGINT exits cleanly.
-    let shutdown = ShutdownSignal::new();
-    let _signal_rx = install_signal_handlers(shutdown.clone());
+    let interrupt = ShutdownSignal::new();
+    let _signal_rx = install_signal_handlers(interrupt.clone());
     let (Some(file_arg), Some(dest_arg)) = (args.file.as_ref(), args.destination.as_ref()) else {
         // Bare `rncp` prints help and exits 0.
         let mut cmd = <Args as clap::CommandFactory>::command();
@@ -407,15 +426,16 @@ async fn run_send(args: Args) -> ! {
         .map(|s| s.to_string())
         .unwrap_or_else(|| "file".to_string());
 
-    let data = match tokio::fs::read(&file_path).await {
-        Ok(d) => d,
+    let file = match std::fs::File::open(&file_path) {
+        Ok(f) => f,
         Err(e) => {
-            eprintln!("Failed to read \"{}\": {e}", file_path.display());
+            println!("Could not start transfer: {e}");
             process::exit(1);
         }
     };
+    let bytes_total = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
 
-    let handle = start_reticulum(args.config.as_deref(), shutdown.clone()).await;
+    let handle = start_interruptible(args.config.as_deref(), &interrupt).await;
 
     let paths = StoragePaths::from_config_dir(&handle.config_dir);
     let identity = match load_or_create_identity(args.identity_path.as_deref(), &paths.identity_dir)
@@ -431,10 +451,8 @@ async fn run_send(args: Args) -> ! {
         println!("Sending \"{file_name}\" to <{}>", hex::encode(dest_hash));
     }
 
-    let timeout = Duration::from_secs_f64(args.timeout.max(1.0));
-    let path_wait = timeout;
+    let path_timeout = path_timeout(&handle, args.timeout).await;
     let auto_compress = !args.no_compress;
-    let bytes_total = data.len();
 
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<f32>(32);
     let silent = args.silent;
@@ -465,11 +483,11 @@ async fn run_send(args: Args) -> ! {
         identity,
         dest_hash,
         file_name: &file_name,
-        data,
+        source: Box::new(file),
         auto_compress,
-        overall_timeout: timeout,
-        path_wait,
+        path_timeout,
         progress_tx: Some(progress_tx),
+        shutdown: Some(interrupt.clone()),
     })
     .await;
 
@@ -480,6 +498,10 @@ async fn run_send(args: Args) -> ! {
             if !args.silent {
                 print_send_summary(&outcome, bytes_total);
             }
+            process::exit(0);
+        }
+        Err(RncpError::Interrupted) => {
+            println!();
             process::exit(0);
         }
         Err(RncpError::PathTimeout) => {
@@ -563,27 +585,6 @@ async fn run_listen(args: Args) -> ! {
         None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
 
-    let allowed: Vec<[u8; 16]> = {
-        let mut v = Vec::with_capacity(args.allowed.len());
-        for a in &args.allowed {
-            match parse_dest_hash(a) {
-                Ok(h) => v.push(h),
-                Err(e) => {
-                    eprintln!("{e}");
-                    process::exit(1);
-                }
-            }
-        }
-        extend_allowed_from_files(&mut v);
-        v
-    };
-    let allow_all = args.no_auth;
-    if allowed.is_empty() && !allow_all && !args.print_identity {
-        eprintln!(
-            "Warning: No allowed identities configured. This listener does not require identification before receiving pushed files; do not rely on the allow-list to exclude unidentified senders."
-        );
-    }
-
     let handle = start_reticulum(args.config.as_deref(), shutdown.clone()).await;
     let paths = StoragePaths::from_config_dir(&handle.config_dir);
     let identity = match load_or_create_identity(args.identity_path.as_deref(), &paths.identity_dir)
@@ -616,13 +617,24 @@ async fn run_listen(args: Args) -> ! {
         process::exit(0);
     }
 
-    let fetch_jail = args.jail.as_deref().map(expand_tilde);
-    if let Some(ref jail) = fetch_jail
-        && !jail.is_dir()
-    {
-        eprintln!("Fetch jail directory not found: {}", jail.display());
-        process::exit(3);
+    // rncp.py:118-170: -n skips the allowed_identities file and -a entirely.
+    let allow_all = args.no_auth;
+    let allowed = if allow_all {
+        Vec::new()
+    } else {
+        match allowed_identities(&args.allowed, &rncp_allowed_identity_file_candidates()) {
+            Ok(allowed) => allowed,
+            Err(e) => {
+                eprintln!("Could not apply allowed identity: {e}");
+                process::exit(1);
+            }
+        }
+    };
+    if allowed.is_empty() && !allow_all {
+        eprintln!("No allowed identities configured, rncp will not accept any files!");
     }
+
+    let fetch_jail = args.jail.as_deref().map(PathBuf::from);
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<RncpEvent>(64);
     let cfg = RncpListenerConfig {
@@ -729,9 +741,6 @@ fn spawn_listen_announcer(
     destination_hash: [u8; 16],
     interval_seconds: i64,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if interval_seconds < 0 {
-        return None;
-    }
     let Some(identity) = identity else {
         tracing::warn!("rncp-rs: listener identity has no private key; announce disabled");
         return None;
@@ -754,7 +763,8 @@ fn spawn_listen_announcer(
 
         loop {
             send_rncp_announce(&transport_tx, &mut destination, &identity, destination_hash).await;
-            if interval_seconds == 0 {
+            // rncp.py:86-87, 222-230: -1 and 0 both announce once.
+            if interval_seconds <= 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_secs(interval_seconds as u64)).await;
@@ -798,22 +808,44 @@ async fn send_rncp_announce(
     }
 }
 
-fn extend_allowed_from_files(allowed: &mut Vec<[u8; 16]>) {
-    for path in rncp_allowed_identity_file_candidates() {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        for line in text.lines() {
-            let value = line.trim();
-            if value.len() != 32 {
-                continue;
+/// The `-a` values plus the first existing allowed_identities file, each
+/// validated as a 16-byte hex hash (rncp.py:121-167).
+fn allowed_identities(cli: &[String], candidates: &[PathBuf]) -> Result<Vec<[u8; 16]>, String> {
+    let mut entries: Vec<String> = cli.to_vec();
+    if let Some(path) = candidates.iter().find(|p| p.is_file()) {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let lines: Vec<String> = text
+                    .replace('\r', "")
+                    .split('\n')
+                    .filter(|line| line.chars().count() == 32)
+                    .map(str::to_string)
+                    .collect();
+                tracing::info!(
+                    "Loaded {} allowed identit{} from {}",
+                    lines.len(),
+                    if lines.len() == 1 { "y" } else { "ies" },
+                    path.display()
+                );
+                entries.extend(lines);
             }
-            if let Ok(hash) = parse_dest_hash(value) {
-                allowed.push(hash);
-            }
+            Err(e) => tracing::error!(
+                "Error while parsing allowed_identities file. The contained exception was: {e}"
+            ),
         }
-        break;
     }
+    entries
+        .iter()
+        .map(|entry| {
+            if entry.chars().count() != 32 {
+                return Err("Allowed destination length is invalid, must be 32 hexadecimal characters (16 bytes).".to_string());
+            }
+            hex::decode(entry)
+                .ok()
+                .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok())
+                .ok_or_else(|| "Invalid destination entered. Check your input.".to_string())
+        })
+        .collect()
 }
 
 fn rncp_allowed_identity_file_candidates() -> Vec<PathBuf> {
@@ -824,6 +856,78 @@ fn rncp_allowed_identity_file_candidates() -> Vec<PathBuf> {
         paths.push(home.join(".rncp/allowed_identities"));
     }
     paths
+}
+
+/// Start Reticulum for a send or fetch. The runtime gets its own shutdown
+/// signal so the transport outlives an interrupt until rncp has closed its
+/// link; an interrupt during startup exits 0 as rncp does.
+async fn start_interruptible(
+    config_dir: Option<&str>,
+    interrupt: &ShutdownSignal,
+) -> ReticulumHandle {
+    tokio::select! {
+        biased;
+        _ = interrupt.wait() => {
+            println!();
+            process::exit(0);
+        }
+        handle = start_reticulum(config_dir, ShutdownSignal::new()) => handle,
+    }
+}
+
+/// `max(-w, reticulum.get_medium_path_timeout())` (rncp.py:405, 662).
+async fn path_timeout(handle: &ReticulumHandle, timeout: f64) -> Duration {
+    let medium = medium_path_timeout(handle).await;
+    let secs = if timeout.is_finite() {
+        timeout.max(medium)
+    } else {
+        medium
+    };
+    Duration::try_from_secs_f64(secs.max(0.0)).unwrap_or(Duration::MAX)
+}
+
+/// Reticulum.get_medium_path_timeout (Reticulum.py:2011-2029): ask the shared
+/// instance, or compute Transport.medium_path_timeout (Transport.py:3550-3553)
+/// from the lowest online interface bitrate. 0 when unknown or on error.
+async fn medium_path_timeout(handle: &ReticulumHandle) -> f64 {
+    if handle.instance_mode == InstanceMode::Client {
+        let Some(rpc_key) = handle.config.rpc_key.as_deref() else {
+            return 0.0;
+        };
+        let request = RpcRequest::GetMediumPathTimeout;
+        let timeout = Duration::from_secs(5);
+        let response = match handle.config.shared_rpc_endpoint(&handle.socket_base) {
+            SharedInstanceRpcEndpoint::Tcp(port) => {
+                rns_runtime::rpc::connect_and_request(port, rpc_key, &request, timeout).await
+            }
+            SharedInstanceRpcEndpoint::Unix(path) => {
+                rns_runtime::rpc::connect_unix_and_request(&path, rpc_key, &request, timeout).await
+            }
+        };
+        return match response {
+            Ok(RpcResponse::FloatResult(Some(v))) if v.is_finite() => v,
+            _ => 0.0,
+        };
+    }
+    let lowest = match handle
+        .query_transport(rns_transport::messages::TransportQuery::GetInterfaceStats)
+        .await
+    {
+        Some(rns_transport::messages::TransportQueryResponse::InterfaceStats(entries)) => entries
+            .iter()
+            .filter(|entry| entry.online && entry.bitrate > 0)
+            .map(|entry| entry.bitrate)
+            .min(),
+        _ => None,
+    };
+    match lowest {
+        Some(bitrate) => {
+            let bits = (rns_wire::constants::MTU * 8) as f64;
+            2.0 * (bits / bitrate.max(rns_runtime::constants::MINIMUM_BITRATE) as f64)
+                + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT
+        }
+        None => 0.0,
+    }
 }
 
 async fn start_reticulum(
@@ -837,5 +941,47 @@ async fn start_reticulum(
             eprintln!("failed to start reticulum: {e}");
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: &str = "00112233445566778899aabbccddeeff";
+    const B: &str = "ffeeddccbbaa99887766554433221100";
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rncp-allowed-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn allowed_identities_file_keeps_exact_32_char_lines_from_first_existing_file() {
+        let dir = scratch("parse");
+        let first = dir.join("first");
+        let second = dir.join("second");
+        std::fs::write(&first, format!("{A}\r\n {B}\n{B} \nshort\n")).unwrap();
+        std::fs::write(&second, format!("{B}\n")).unwrap();
+        let candidates = [dir.join("missing"), first, second];
+        let parsed = allowed_identities(&[B.to_string()], &candidates).unwrap();
+        let mut expected_b = [0u8; 16];
+        hex::decode_to_slice(B, &mut expected_b).unwrap();
+        let mut expected_a = [0u8; 16];
+        hex::decode_to_slice(A, &mut expected_a).unwrap();
+        assert_eq!(parsed, vec![expected_b, expected_a]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allowed_identities_reject_invalid_entries() {
+        let dir = scratch("invalid");
+        let file = dir.join("allowed");
+        std::fs::write(&file, format!("{}\n", "zz".repeat(16))).unwrap();
+        assert!(allowed_identities(&[], std::slice::from_ref(&file)).is_err());
+        assert!(allowed_identities(&["abcd".into()], &[]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

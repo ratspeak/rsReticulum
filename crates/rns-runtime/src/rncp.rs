@@ -1,7 +1,7 @@
 //! File transfer over Reticulum Links and Resources: send, receive and fetch.
 //! The default destination aspect is `rncp.receive`. See [`spawn_rncp_listener`]
-//! for its current authorization and shutdown limits; a Resource proof alone
-//! does not establish that the receiving application saved a file.
+//! for its authorization and shutdown behaviour; a Resource proof alone does
+//! not establish that the receiving application saved a file.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,14 +12,11 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use rns_crypto::ed25519::Ed25519PublicKey;
-use rns_crypto::sha::truncated_hash;
 use rns_identity::destination::{DestType, Destination, Direction};
 use rns_identity::identity::Identity;
-use rns_link::encryption::link_encrypt;
+use rns_link::link::LinkAction;
 use rns_link::link::{CloseReason, Link};
-use rns_protocol::resource::{
-    MAX_EFFICIENT_SIZE, MultiSegmentOutbound, OutboundResource, OutboundTransfer, TransferAction,
-};
+use rns_protocol::resource::{OutboundTransfer, TransferAction};
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
     AnnounceRpcEntry, InterfaceId, LinkEndpointLifecycleEvent, LinkEndpointRole, OutboundRequest,
@@ -27,13 +24,21 @@ use rns_transport::messages::{
 };
 use tokio::sync::oneshot;
 
-use crate::link_manager::{LinkManager, RequestOutcome, ResourceCompletion};
+use crate::lifecycle::ShutdownSignal;
+use crate::link_manager::{DestinationRequest, LinkManager, RequestOutcome, ResourceCompletion};
+use crate::resource_source::{PreparedResourceSource, ResourceOptions, ResourceSource};
+use rns_identity::destination::AllowPolicy;
+use rns_link::link::ResourceStrategy;
 
-/// Fetch-denial response byte (`0xF0`).
+/// Fetch-denial response value, the integer 240 (packed `cc f0`).
 pub const REQ_FETCH_NOT_ALLOWED: u8 = 0xF0;
 
-/// [`REQ_FETCH_NOT_ALLOWED`] as upstream packs it on the wire: a MessagePack uint 8.
-const REQ_FETCH_NOT_ALLOWED_PACKED: [u8; 2] = [0xCC, REQ_FETCH_NOT_ALLOWED];
+/// Python sleeps this long after tearing links down on SIGINT so the
+/// LINKCLOSE packets can leave (Transport.detach_interfaces).
+const RNCP_INTERRUPT_TEARDOWN_WINDOW: Duration = Duration::from_millis(150);
+
+/// Idle wake-up for the link watchdog and Resource timeouts.
+const RNCP_SERVICE_INTERVAL: Duration = Duration::from_secs(1);
 
 pub const FETCH_PATH_NAME: &str = "fetch_file";
 
@@ -86,8 +91,21 @@ pub enum RncpError {
     Io(String),
     #[error("local identity has no signing key")]
     NoSigningKey,
-    #[error("sender not in allow-list")]
+    /// The listener answered REQ_FETCH_NOT_ALLOWED.
+    #[error("fetch not allowed by the remote")]
     Denied,
+    /// The listener answered `False`: the file does not exist.
+    #[error("file not found on the remote")]
+    NotFound,
+    /// The listener answered `None`.
+    #[error("error on the remote system")]
+    RemoteError,
+    /// The fetch request got no answer before its timeout or the link closed.
+    #[error("fetch request failed")]
+    RequestFailed,
+    /// The caller's shutdown signal fired; any established link was closed.
+    #[error("interrupted")]
+    Interrupted,
 }
 
 #[derive(Debug, Clone)]
@@ -103,11 +121,16 @@ pub struct RncpSendRequest<'a> {
     pub identity: Identity,
     pub dest_hash: [u8; 16],
     pub file_name: &'a str,
-    pub data: Vec<u8>,
+    /// File contents, read one Resource segment at a time.
+    pub source: Box<dyn ResourceSource>,
     pub auto_compress: bool,
-    pub overall_timeout: Duration,
-    pub path_wait: Duration,
+    /// Path wait, rncp's `max(-w, medium path timeout)`. The link proof wait
+    /// ends at the later of this and the link establishment timeout; the
+    /// transfer itself has no deadline.
+    pub path_timeout: Duration,
     pub progress_tx: Option<mpsc::Sender<f32>>,
+    /// Stops the transfer and closes the link, as rncp does on SIGINT.
+    pub shutdown: Option<ShutdownSignal>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,35 +170,151 @@ pub enum RncpEvent {
     },
 }
 
-/// Resolves a fetch path under the jail root (Python rncp.py:177-183).
-/// Absolute paths replace the jail prefix; relatives join onto it; canonical
-/// result must stay inside `jail_canonical`.
-fn resolve_fetch_path(jail: Option<&Path>, data: &[u8]) -> Result<PathBuf, String> {
-    let path_str = std::str::from_utf8(data).map_err(|_| "non-utf8 path".to_string())?;
-    if path_str.is_empty() {
-        return Err("empty path".into());
-    }
-    match jail {
-        Some(jail_dir) => {
-            let jail_canonical =
-                std::fs::canonicalize(jail_dir).map_err(|e| format!("jail canonicalize: {e}"))?;
-            // canonicalize resolves symlinks (macOS `/var` → `/private/var`)
-            // before the containment check.
-            let requested = Path::new(path_str);
-            let combined = if requested.is_absolute() {
-                requested.to_path_buf()
-            } else {
-                jail_canonical.join(path_str)
-            };
-            let canonical =
-                std::fs::canonicalize(&combined).map_err(|e| format!("not found: {e}"))?;
-            if !canonical.starts_with(&jail_canonical) {
-                return Err("outside fetch jail".into());
-            }
-            Ok(canonical)
+/// The value a fetch handler answers with, and the status a fetch client
+/// derives from it (rncp.py:172-208, 463-474).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchReply {
+    Found,
+    NotFound,
+    RemoteError,
+    NotAllowed,
+}
+
+impl FetchReply {
+    /// The packed MessagePack value: `True`, `False` or the integer 240.
+    fn packed(self) -> Vec<u8> {
+        match self {
+            Self::Found => vec![0xC3],
+            Self::NotFound => vec![0xC2],
+            Self::RemoteError => vec![0xC0],
+            Self::NotAllowed => vec![0xCC, REQ_FETCH_NOT_ALLOWED],
         }
-        None => std::fs::canonicalize(path_str).map_err(|e| format!("not found: {e}")),
     }
+
+    /// Python compares with `==`, so `0` and `240.0` match too.
+    fn from_value(value: &rmpv::Value) -> Self {
+        let number = match value {
+            rmpv::Value::Nil => return Self::RemoteError,
+            rmpv::Value::Boolean(false) => return Self::NotFound,
+            rmpv::Value::Integer(i) => i.as_f64(),
+            rmpv::Value::F32(f) => Some(f64::from(*f)),
+            rmpv::Value::F64(f) => Some(*f),
+            _ => None,
+        };
+        match number {
+            Some(0.0) => Self::NotFound,
+            Some(n) if n == f64::from(REQ_FETCH_NOT_ALLOWED) => Self::NotAllowed,
+            // Older rncp-rs listeners sent the single byte 0xF0, fixint -16.
+            Some(-16.0) => Self::NotAllowed,
+            _ => Self::Found,
+        }
+    }
+}
+
+/// `posixpath.normpath`.
+fn normpath(path: &str) -> String {
+    if path.is_empty() {
+        return ".".into();
+    }
+    let initial_slashes = if path.starts_with("//") && !path.starts_with("///") {
+        2
+    } else if path.starts_with('/') {
+        1
+    } else {
+        0
+    };
+    let mut comps: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        if comp.is_empty() || comp == "." {
+            continue;
+        }
+        if comp != ".." || (initial_slashes == 0 && comps.is_empty()) || comps.last() == Some(&"..")
+        {
+            comps.push(comp);
+        } else {
+            comps.pop();
+        }
+    }
+    let normalized = format!("{}{}", "/".repeat(initial_slashes), comps.join("/"));
+    if normalized.is_empty() {
+        ".".into()
+    } else {
+        normalized
+    }
+}
+
+/// `os.path.expanduser` for `~` and `~/...`; `~user` is left unchanged.
+fn expanduser(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home else {
+        return path.to_string();
+    };
+    if path != "~" && !path.starts_with("~/") {
+        return path.to_string();
+    }
+    let expanded = format!("{}{}", home.trim_end_matches('/'), &path[1..]);
+    if expanded.is_empty() {
+        "/".into()
+    } else {
+        expanded
+    }
+}
+
+/// `os.path.abspath`, lexical only: symlinks are not resolved.
+fn abspath(path: &str, cwd: &str) -> String {
+    if path.starts_with('/') {
+        normpath(path)
+    } else if cwd.ends_with('/') {
+        normpath(&format!("{cwd}{path}"))
+    } else {
+        normpath(&format!("{cwd}/{path}"))
+    }
+}
+
+fn process_home() -> Option<String> {
+    std::env::var("HOME").ok()
+}
+
+fn process_cwd() -> String {
+    std::env::current_dir()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "/".into())
+}
+
+/// The path a fetch request names, or `None` when it falls outside the jail
+/// (rncp.py:177-185). `jail` is already absolute and normalised.
+fn fetch_request_path(
+    jail: Option<&str>,
+    data: &str,
+    home: Option<&str>,
+    cwd: &str,
+) -> Option<String> {
+    match jail {
+        Some(jail) => {
+            let prefix = format!("{jail}/");
+            let data = if data.starts_with(&prefix) {
+                data.replace(&prefix, "")
+            } else {
+                data.to_string()
+            };
+            let path = abspath(&expanduser(&format!("{jail}/{data}"), home), cwd);
+            path.starts_with(&prefix).then_some(path)
+        }
+        None => Some(abspath(&expanduser(data, home), cwd)),
+    }
+}
+
+/// Refuses a jailed file whose resolved location leaves the resolved jail,
+/// such as a symlink pointing outside it.
+fn escapes_jail(path: &str, jail: &str) -> bool {
+    match (std::fs::canonicalize(path), std::fs::canonicalize(jail)) {
+        (Ok(path), Ok(jail)) => !path.starts_with(jail),
+        _ => true,
+    }
+}
+
+/// `os.path.basename`.
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// Listener policy and file locations. Defaults generate a fresh identity,
@@ -192,17 +331,18 @@ pub struct RncpListenerConfig {
     pub identity: Identity,
     pub app_name: String,
     pub save_dir: PathBuf,
-    /// Bypass identity allow-list checks for push and fetch. This also allows
-    /// unidentified fetch requests; see the listener's push-authorization limit.
+    /// Bypass identity allow-list checks for push and fetch, including for
+    /// unidentified peers.
     pub allow_all: bool,
     /// Allowed identity hashes, ignored when `allow_all` is true.
     pub allowed: Vec<[u8; 16]>,
     pub overwrite: bool,
     /// Serve `fetch_file` requests as well as receiving pushed files.
     pub allow_fetch: bool,
-    /// Optional canonical-path containment check for fetched files. `None`
-    /// allows any readable path; this is not an OS sandbox or a race-free
-    /// filesystem boundary. Keep the jail tree under trusted local control.
+    /// Restrict fetched paths to this directory. Requests are resolved
+    /// lexically as rncp does; a path that then resolves outside the jail
+    /// (through a symlink) is also refused. `None` allows any readable path.
+    /// This is not an OS sandbox or a race-free filesystem boundary.
     pub fetch_jail: Option<PathBuf>,
     /// Try compression when serving fetched files; enabled by default.
     pub fetch_auto_compress: bool,
@@ -244,17 +384,15 @@ impl RncpListenerHandle {
 
 /// Register a file receiver and spawn its background tasks. This function
 /// does not announce the destination; the caller owns reachability/publication.
-/// Drain `events_tx` to avoid blocking completion processing. Fetch reads are
-/// synchronous and load the requested file into memory.
+/// Drain `events_tx` to avoid blocking completion processing. Fetched files
+/// are read one Resource segment at a time.
 ///
-/// # Authorization limit
+/// # Authorization
 ///
-/// The current push path checks peers when they identify, and discards
-/// completions from links recorded as denied. It does not require identification
-/// before accepting an ordinary Resource, so `allowed` is not a complete push
-/// authorization boundary. Do not expose this receiver as an allow-list-enforced
-/// file service. Fetch requests do check for an allowed identity unless
-/// `allow_all` is enabled.
+/// Unless `allow_all` is set, a pushed Resource is accepted only on a link
+/// whose peer identified with an allowed identity, and a peer identifying with
+/// any other identity has its link torn down. `fetch_file` is registered with
+/// ALLOW_LIST (or ALLOW_ALL), so requests from other peers get no answer.
 ///
 /// Keep the handle and read [`RncpListenerHandle::shutdown`] before embedding this
 /// listener in a longer-lived runtime.
@@ -278,7 +416,6 @@ pub async fn spawn_rncp_listener(
     let dest_hash = destination.hash;
 
     let (dest_tx, dest_rx) = mpsc::channel::<DestinationEvent>(256);
-    let link_control_tx = dest_tx.clone();
     transport_tx
         .send(TransportMessage::RegisterDestination {
             hash: dest_hash,
@@ -298,87 +435,60 @@ pub async fn spawn_rncp_listener(
     let (completion_tx, mut completion_rx) = mpsc::channel::<ResourceCompletion>(64);
     link_mgr.set_resource_completion_channel(completion_tx);
 
-    // Gate the allow-list before parts arrive.
+    let allowed_set: Arc<std::collections::HashSet<[u8; 16]>> =
+        Arc::new(cfg.allowed.iter().copied().collect());
+    let allow_all = cfg.allow_all;
+
+    // Every incoming link: ACCEPT_APP with the identity check (rncp.py:234-266).
     let (identified_tx, mut identified_rx) = mpsc::channel::<([u8; 16], [u8; 16])>(64);
     link_mgr.set_link_identified_channel(identified_tx);
-
-    if !cfg.allow_fetch && !cfg.allow_all {
-        let allowed_push: std::collections::HashSet<[u8; 16]> =
-            cfg.allowed.iter().copied().collect();
+    link_mgr.set_resource_strategy(ResourceStrategy::AcceptApp);
+    let link_identities = link_mgr.link_identities_handle();
+    let push_allowed = Arc::clone(&allowed_set);
+    link_mgr.set_resource_accept_handler(move |link_id, _adv| {
+        allow_all
+            || link_identities
+                .lock()
+                .ok()
+                .and_then(|ids| ids.get(&link_id).copied())
+                .is_some_and(|hash| push_allowed.contains(&hash))
+    });
+    if !allow_all {
+        let gate_allowed = Arc::clone(&allowed_set);
         link_mgr.set_link_identity_gate(move |_link_id, identity_hash| {
-            allowed_push.contains(&identity_hash)
+            gate_allowed.contains(&identity_hash)
         });
     }
 
     if cfg.allow_fetch {
-        let jail = cfg.fetch_jail.clone();
-        let auto_compress = cfg.fetch_auto_compress;
-        let allowed_fetch: Arc<std::collections::HashSet<[u8; 16]>> =
-            Arc::new(cfg.allowed.iter().copied().collect());
-        let allow_all_fetch = cfg.allow_all;
-        let link_identities = link_mgr.link_identities_handle();
-        let fetch_events = events_tx.clone();
-        let fetch_path_hash = truncated_hash(FETCH_PATH_NAME.as_bytes());
-        link_mgr.set_request_handler_ex(move |link_id, path_hash, data| {
-            if path_hash != fetch_path_hash {
-                return RequestOutcome::Drop;
-            }
-            // Allow-all bypasses ident check; else peer must have sent
-            // LinkIdentify with an identity in `allowed`.
-            if !allow_all_fetch {
-                let ident = link_identities
-                    .lock()
-                    .ok()
-                    .and_then(|m| m.get(&link_id).copied());
-                match ident {
-                    Some(h) if allowed_fetch.contains(&h) => {}
-                    _ => {
-                        let _ = fetch_events.try_send(RncpEvent::FetchDenied {
-                            link_id,
-                            reason: "not in allow-list".into(),
-                        });
-                        return RequestOutcome::ReplyValue(REQ_FETCH_NOT_ALLOWED_PACKED.to_vec());
-                    }
-                }
-            }
-            match resolve_fetch_path(jail.as_deref(), &data) {
-                Ok(file_path) => match std::fs::read(&file_path) {
-                    Ok(bytes) => {
-                        let basename = file_path
-                            .file_name()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        let metadata = pack_metadata(&basename);
-                        let _ = fetch_events.try_send(RncpEvent::FetchServing {
-                            link_id,
-                            file_name: basename,
-                            bytes: bytes.len(),
-                        });
-                        RequestOutcome::ReplyWithResource {
-                            ack: vec![0xC3], // msgpack `true`
-                            data: bytes,
-                            metadata: Some(metadata),
-                            auto_compress,
-                        }
-                    }
-                    Err(_) => RequestOutcome::ReplyValue(vec![0xC2]), // msgpack `false`
-                },
-                Err(reason) => {
-                    let _ = fetch_events.try_send(RncpEvent::FetchDenied { link_id, reason });
-                    RequestOutcome::ReplyValue(REQ_FETCH_NOT_ALLOWED_PACKED.to_vec())
-                }
-            }
+        let jail = cfg.fetch_jail.as_ref().map(|jail| {
+            abspath(
+                &expanduser(&jail.to_string_lossy(), process_home().as_deref()),
+                &process_cwd(),
+            )
         });
+        let auto_compress = cfg.fetch_auto_compress;
+        let fetch_events = events_tx.clone();
+        let (allow, allowed_list) = if allow_all {
+            (AllowPolicy::AllowAll, None)
+        } else {
+            (AllowPolicy::AllowList, Some(cfg.allowed.clone()))
+        };
+        link_mgr.register_request_handler(
+            FETCH_PATH_NAME,
+            allow,
+            allowed_list,
+            auto_compress,
+            move |request: DestinationRequest| {
+                serve_fetch(request, jail.as_deref(), auto_compress, &fetch_events)
+            },
+        );
     }
 
     let app_name = cfg.app_name.clone();
     let save_dir = cfg.save_dir.clone();
-    let allow_all = cfg.allow_all;
-    let allowed: std::collections::HashSet<[u8; 16]> = cfg.allowed.iter().copied().collect();
     let overwrite = cfg.overwrite;
-    let allow_fetch_outer = cfg.allow_fetch;
     let events_tx_cb = events_tx.clone();
-    let link_control_tx_cb = link_control_tx.clone();
 
     let task = tokio::spawn(async move {
         let lm_task = tokio::spawn(async move { link_mgr.run().await });
@@ -389,7 +499,7 @@ pub async fn spawn_rncp_listener(
             tokio::select! {
                 ident = identified_rx.recv() => {
                     let Some((link_id, ident_hash)) = ident else { break };
-                    if allow_all || allowed.contains(&ident_hash) {
+                    if allow_all || allowed_set.contains(&ident_hash) {
                         let _ = events_tx_cb
                             .send(RncpEvent::SenderIdentified {
                                 link_id,
@@ -397,6 +507,7 @@ pub async fn spawn_rncp_listener(
                             })
                             .await;
                     } else {
+                        // The identity gate has already torn this link down.
                         denied_links.insert(link_id);
                         let _ = events_tx_cb
                             .send(RncpEvent::SenderDenied {
@@ -404,13 +515,6 @@ pub async fn spawn_rncp_listener(
                                 identity_hash: ident_hash,
                             })
                             .await;
-                        // Keep the link open under fetch so the handler can
-                        // reply REQ_FETCH_NOT_ALLOWED rather than a generic close.
-                        if !allow_fetch_outer {
-                            let _ = link_control_tx_cb
-                                .send(DestinationEvent::LinkClosed { link_id })
-                                .await;
-                        }
                     }
                 }
                 completion = completion_rx.recv() => {
@@ -419,8 +523,13 @@ pub async fn spawn_rncp_listener(
                         continue;
                     }
 
-                    let file_name = extract_filename(evt.metadata.as_deref())
-                        .unwrap_or_else(|| default_file_name(&evt.resource_hash));
+                    let Some(file_name) = extract_filename(evt.metadata.as_deref()) else {
+                        tracing::warn!(
+                            link_id = hex::encode(evt.link_id),
+                            "Invalid data received, ignoring resource"
+                        );
+                        continue;
+                    };
 
                     match save_payload(&save_dir, &file_name, &evt.data, overwrite).await {
                         Ok(path) => {
@@ -462,6 +571,52 @@ pub async fn spawn_rncp_listener(
     })
 }
 
+/// Upstream's `fetch_request` (rncp.py:172-208). The LinkManager has already
+/// applied the ALLOW_ALL / ALLOW_LIST policy.
+fn serve_fetch(
+    request: DestinationRequest,
+    jail: Option<&str>,
+    auto_compress: bool,
+    events: &mpsc::Sender<RncpEvent>,
+) -> RequestOutcome {
+    let link_id = request.link_id;
+    let deny = |reason: String| {
+        let _ = events.try_send(RncpEvent::FetchDenied { link_id, reason });
+        RequestOutcome::ReplyValue(FetchReply::NotAllowed.packed())
+    };
+    let data = String::from_utf8_lossy(&request.data);
+    let Some(path) = fetch_request_path(jail, &data, process_home().as_deref(), &process_cwd())
+    else {
+        return deny("outside fetch jail".into());
+    };
+    if let Some(jail) = jail
+        && Path::new(&path).exists()
+        && escapes_jail(&path, jail)
+    {
+        return deny("resolves outside fetch jail".into());
+    }
+    if !Path::new(&path).is_file() {
+        return RequestOutcome::ReplyValue(FetchReply::NotFound.packed());
+    }
+    let Ok(file) = std::fs::File::open(&path) else {
+        return RequestOutcome::ReplyValue(FetchReply::NotFound.packed());
+    };
+    let bytes = file.metadata().map_or(0, |meta| meta.len() as usize);
+    let name = basename(&path).to_string();
+    let metadata = pack_metadata(&name);
+    let _ = events.try_send(RncpEvent::FetchServing {
+        link_id,
+        file_name: name,
+        bytes,
+    });
+    RequestOutcome::ReplyWithResource {
+        ack: FetchReply::Found.packed(),
+        source: Box::new(file),
+        metadata: Some(metadata),
+        auto_compress,
+    }
+}
+
 fn extract_filename(metadata: Option<&[u8]>) -> Option<String> {
     let meta = metadata?;
     // Envelope: msgpack({"name": b"filename"}).
@@ -488,23 +643,16 @@ fn extract_filename(metadata: Option<&[u8]>) -> Option<String> {
     None
 }
 
-fn default_file_name(resource_hash: &[u8; 32]) -> String {
-    format!("rncp_{}", hex::encode(&resource_hash[..8]))
-}
-
 async fn save_payload(
     save_dir: &Path,
     file_name: &str,
     data: &[u8],
     overwrite: bool,
 ) -> Result<PathBuf, String> {
-    // Strip path traversal components.
-    let basename = Path::new(file_name)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| file_name.to_string());
-    if basename.is_empty() {
-        return Err("empty filename".into());
+    // rncp.py:286-293: the basename must name an entry directly in save_dir.
+    let basename = basename(file_name).to_string();
+    if basename.is_empty() || basename == "." || basename == ".." {
+        return Err(format!("invalid save path for {file_name:?}"));
     }
 
     tokio::fs::create_dir_all(save_dir)
@@ -538,44 +686,205 @@ fn build_link_close(link: &mut Link) -> Option<Bytes> {
     ))
 }
 
-/// Send an in-memory file and its filename metadata, identifying the local
-/// identity on the Link. Success means all Resource segments received valid
-/// proofs, followed by a short settlement delay; it does not confirm a remote
-/// file write or durable storage.
+/// Send a file and its filename metadata, identifying the local identity on
+/// the Link. Large sources are read one Resource segment at a time. Success
+/// means every segment received a valid proof, followed by a short settlement
+/// delay; it does not confirm a remote file write.
 ///
-/// `overall_timeout` covers protocol waits. Transport lookup/admission,
-/// settlement and cleanup can extend beyond it; use an outer deadline when
-/// the whole call needs a time bound. Progress notifications may be dropped
-/// when their channel is full.
+/// Only the path and link waits are bounded; the transfer runs until the
+/// Resource concludes, its retry timeouts expire or the link closes, as
+/// rncp does. Progress notifications may be dropped when their channel is full.
 pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome, RncpError> {
     let RncpSendRequest {
         transport_tx,
         identity,
         dest_hash,
         file_name,
-        data,
+        source,
         auto_compress,
-        overall_timeout,
-        path_wait,
+        path_timeout,
         progress_tx,
+        shutdown,
     } = request;
-
+    let shutdown = shutdown.as_ref();
     let started = Instant::now();
-    let deadline = started + overall_timeout;
-    let byte_count = data.len();
 
-    let pubkey =
-        discover_pubkey(&transport_tx, dest_hash, path_wait.min(remaining(deadline))).await?;
+    let options = ResourceOptions {
+        auto_compress,
+        metadata: Some(pack_metadata(file_name)),
+    };
+    let prepared = interruptible(shutdown, async move {
+        tokio::task::spawn_blocking(move || PreparedResourceSource::prepare(source, options))
+            .await
+            .map_err(|_| RncpError::ResourceCreate("preparation task failed".into()))?
+            .map_err(|e| RncpError::ResourceCreate(e.to_string()))
+    })
+    .await?;
 
-    let (mut link, link_request_data) = Link::new_initiator(dest_hash, 1);
+    let mut rl = establish(
+        &transport_tx,
+        &identity,
+        dest_hash,
+        path_timeout,
+        "rncp.sender",
+        shutdown,
+    )
+    .await?;
+    let link_rtt = rl.link.rtt.unwrap_or(Duration::from_millis(500));
+
+    let transfer_result = interruptible(
+        shutdown,
+        send_segments(&transport_tx, &mut rl, prepared, progress_tx),
+    )
+    .await;
+    if transfer_result.is_ok() {
+        tokio::time::sleep(RNCP_POST_PROOF_SETTLE).await;
+    }
+    close_link(rl, &transport_tx, &transfer_result).await;
+    let byte_count = transfer_result?;
+
+    tracing::info!(
+        dest = hex::encode(dest_hash),
+        bytes = byte_count,
+        "rncp send complete"
+    );
+
+    Ok(RncpOutcome {
+        file_name: file_name.to_string(),
+        bytes: byte_count,
+        link_rtt,
+        duration: started.elapsed(),
+    })
+}
+
+async fn send_segments(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    rl: &mut RncpLink,
+    mut prepared: PreparedResourceSource,
+    progress_tx: Option<mpsc::Sender<f32>>,
+) -> Result<usize, RncpError> {
+    let keys = rl
+        .link
+        .session_keys()
+        .ok_or_else(|| RncpError::LinkCrypto("no session keys".into()))?;
+    let rtt = rl.link.rtt.unwrap_or(Duration::from_millis(500));
+    let mut data_size = 0;
+    loop {
+        let segment_keys = keys.clone();
+        let (returned, segment) = tokio::task::spawn_blocking(move || {
+            let segment = prepared.next_segment(&segment_keys, rtt);
+            (prepared, segment)
+        })
+        .await
+        .map_err(|_| RncpError::ResourceCreate("segment preparation task failed".into()))?;
+        prepared = returned;
+        let Some(segment) = segment.map_err(|e| RncpError::ResourceCreate(e.to_string()))? else {
+            return Ok(data_size);
+        };
+        data_size = segment.data_size;
+        let total = segment.total_segments.max(1) as f32;
+        drive_outbound(OutboundDrive {
+            transport_tx,
+            link: &mut rl.link,
+            link_id: rl.link_id,
+            transfer: segment.transfer,
+            lpkt_rx: &mut rl.lpkt_rx,
+            endpoint_lifecycle_rx: &mut rl.endpoint_lifecycle_rx,
+            attached_interface: rl.attached_interface,
+            interface_owner: rl.interface_owner,
+            progress_tx: progress_tx.clone(),
+            progress_base: (segment.segment_index - 1) as f32 / total,
+            progress_span: 1.0 / total,
+        })
+        .await?;
+        if segment.segment_index >= segment.total_segments {
+            return Ok(data_size);
+        }
+    }
+}
+
+/// An established, identified initiator Link owned by an rncp transfer.
+struct RncpLink {
+    link: Link,
+    link_id: [u8; 16],
+    lpkt_rx: mpsc::Receiver<DestinationEvent>,
+    endpoint_lifecycle_rx: mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
+    attached_interface: InterfaceId,
+    interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
+    registration: crate::link_endpoint::LinkEndpointCleanupGuard,
+}
+
+/// Run `fut` until it completes or `shutdown` fires.
+async fn interruptible<T>(
+    shutdown: Option<&ShutdownSignal>,
+    fut: impl std::future::Future<Output = Result<T, RncpError>>,
+) -> Result<T, RncpError> {
+    match shutdown {
+        Some(shutdown) => tokio::select! {
+            biased;
+            _ = shutdown.wait() => Err(RncpError::Interrupted),
+            result = fut => result,
+        },
+        None => fut.await,
+    }
+}
+
+async fn query(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    query: TransportQuery,
+) -> Result<TransportQueryResponse, RncpError> {
+    let (response_tx, response_rx) = oneshot::channel();
+    transport_tx
+        .send(TransportMessage::Rpc { query, response_tx })
+        .await
+        .map_err(|_| RncpError::TransportUnavailable)?;
+    response_rx
+        .await
+        .map_err(|_| RncpError::TransportUnavailable)
+}
+
+/// Path wait, link request and identification (rncp.py:394-450, 651-706).
+/// The path wait lasts `path_timeout`; the proof wait ends at the later of
+/// that deadline and the link establishment timeout.
+async fn establish(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    identity: &Identity,
+    dest_hash: [u8; 16],
+    path_timeout: Duration,
+    endpoint_name: &str,
+    shutdown: Option<&ShutdownSignal>,
+) -> Result<RncpLink, RncpError> {
+    let path_deadline = Instant::now() + path_timeout;
+    let pubkey = interruptible(
+        shutdown,
+        discover_pubkey(transport_tx, dest_hash, path_timeout),
+    )
+    .await?;
+
+    // Link.py:308-309: first_hop_timeout + ESTABLISHMENT_TIMEOUT_PER_HOP * max(1, hops).
+    let hops = match query(transport_tx, TransportQuery::HopsTo { dest: dest_hash }).await? {
+        TransportQueryResponse::IntResult(hops) => u8::try_from(hops.max(1)).unwrap_or(u8::MAX),
+        _ => 1,
+    };
+    let first_hop = match query(
+        transport_tx,
+        TransportQuery::FirstHopTimeout { dest: dest_hash },
+    )
+    .await?
+    {
+        TransportQueryResponse::FloatResult(Some(t)) if t.is_finite() && t >= 0.0 => t,
+        _ => rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT,
+    };
+    let (mut link, link_request_data) = Link::new_initiator(dest_hash, hops);
+    let _ = link.try_extend_establishment_timeout(first_hop);
     let link_id = link.link_id;
+    let deadline = path_deadline.max(Instant::now() + link.establishment_timeout);
 
-    // Route LRPROOF / link packets back to this task.
     let (lpkt_tx, mut lpkt_rx) = mpsc::channel::<DestinationEvent>(256);
     transport_tx
         .send(TransportMessage::RegisterDestination {
             hash: link_id,
-            app_name: "rncp.sender".to_string(),
+            app_name: endpoint_name.to_string(),
             delivery_tx: Some(lpkt_tx),
         })
         .await
@@ -587,24 +896,31 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
     );
 
     let link_req_pkt = build_link_request_packet(dest_hash, &link_request_data);
-    tokio::time::timeout(
-        remaining(deadline),
-        rns_transport::link_messages::dispatch_link_request(
-            &transport_tx,
-            OutboundRequest {
-                raw: link_req_pkt,
-                destination_hash: dest_hash,
-            },
-        ),
+    interruptible(shutdown, async {
+        tokio::time::timeout(
+            remaining(deadline),
+            rns_transport::link_messages::dispatch_link_request(
+                transport_tx,
+                OutboundRequest {
+                    raw: link_req_pkt,
+                    destination_hash: dest_hash,
+                },
+            ),
+        )
+        .await
+        .map_err(|_| RncpError::Timeout("link request admission"))?
+        .map_err(RncpError::from)
+    })
+    .await?;
+
+    let (rtt_data, attached_interface, interface_owner) = interruptible(
+        shutdown,
+        wait_for_valid_rncp_proof(&mut lpkt_rx, &mut link, &pubkey, deadline),
     )
-    .await
-    .map_err(|_| RncpError::Timeout("link request admission"))??;
+    .await?;
 
-    let (rtt_data, attached_interface, interface_owner) =
-        wait_for_valid_rncp_proof(&mut lpkt_rx, &mut link, &pubkey, deadline).await?;
-
-    let mut endpoint_lifecycle_rx = crate::link_endpoint::bind(
-        &transport_tx,
+    let endpoint_lifecycle_rx = crate::link_endpoint::bind(
+        transport_tx,
         link_id,
         attached_interface,
         interface_owner,
@@ -615,7 +931,7 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
     registration.endpoint_bound();
 
     let rtt_pkt = build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data);
-    send_endpoint_packet(&transport_tx, link_id, rtt_pkt).await?;
+    send_endpoint_packet(transport_tx, link_id, rtt_pkt).await?;
 
     let our_pub = identity.get_public_key();
     let our_priv = identity.get_signing_key().ok_or(RncpError::NoSigningKey)?;
@@ -627,84 +943,31 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
         rns_wire::context::PacketContext::LinkIdentify,
         &ident_data,
     );
-    send_endpoint_packet(&transport_tx, link_id, ident_pkt).await?;
+    send_endpoint_packet(transport_tx, link_id, ident_pkt).await?;
+    link.keepalive.record_outbound();
 
-    // Encrypt full payload BEFORE chunking (Resource.py:424).
-    let session_keys = link
-        .session_keys()
-        .ok_or_else(|| RncpError::LinkCrypto("no session keys".into()))?;
-    let session_keys_enc = session_keys.clone();
-    let encrypt_fn = move |plaintext: &[u8]| -> Vec<u8> {
-        link_encrypt(&session_keys_enc, plaintext).unwrap_or_default()
-    };
+    Ok(RncpLink {
+        link,
+        link_id,
+        lpkt_rx,
+        endpoint_lifecycle_rx,
+        attached_interface,
+        interface_owner,
+        registration,
+    })
+}
 
-    let metadata_bytes = pack_metadata(file_name);
-
-    let link_rtt = link.rtt.unwrap_or(Duration::from_millis(500));
-    let resources = if metadata_bytes.len() + 3 + data.len() <= MAX_EFFICIENT_SIZE {
-        vec![
-            OutboundResource::with_options(
-                data,
-                auto_compress,
-                Some(metadata_bytes),
-                None,
-                Some(&encrypt_fn),
-            )
-            .map_err(|e| RncpError::ResourceCreate(format!("{e:?}")))?,
-        ]
-    } else {
-        MultiSegmentOutbound::with_options(
-            data,
-            auto_compress,
-            Some(metadata_bytes),
-            None,
-            false,
-            Some(&encrypt_fn),
-        )
-        .map_err(|e| RncpError::ResourceCreate(format!("{e:?}")))?
-        .segments
-    };
-    let resource_hash = resources
-        .first()
-        .map(|r| r.original_hash.unwrap_or(r.resource_hash))
-        .unwrap_or([0u8; 32]);
-    let total_parts: usize = resources.iter().map(|r| r.parts.len()).sum();
-    let total_parts_nonzero = total_parts.max(1);
-
-    let proof_deadline = Instant::now() + overall_timeout.min(Duration::from_secs(120));
-    let mut transfer_result = Ok(());
-    let mut completed_parts = 0usize;
-    for resource in resources {
-        let segment_parts = resource.parts.len();
-        transfer_result = drive_outbound(OutboundDrive {
-            transport_tx: &transport_tx,
-            link: &mut link,
-            link_id,
-            resource,
-            lpkt_rx: &mut lpkt_rx,
-            endpoint_lifecycle_rx: &mut endpoint_lifecycle_rx,
-            attached_interface,
-            interface_owner,
-            progress_tx: progress_tx.clone(),
-            progress_base: completed_parts as f32 / total_parts_nonzero as f32,
-            progress_span: segment_parts as f32 / total_parts_nonzero as f32,
-            deadline: proof_deadline.min(deadline),
-        })
-        .await;
-        if transfer_result.is_err() {
-            break;
-        }
-        completed_parts += segment_parts;
-    }
-
-    if transfer_result.is_ok() {
-        tokio::time::sleep(RNCP_POST_PROOF_SETTLE).await;
-    }
-
-    let endpoint_closing = if let Some(close_pkt) = build_link_close(&mut link) {
+/// Tear the link down. After an interrupt, wait as Python's SIGINT handler
+/// does so the LINKCLOSE can leave.
+async fn close_link<T>(
+    mut rl: RncpLink,
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    result: &Result<T, RncpError>,
+) {
+    let endpoint_closing = if let Some(close_pkt) = build_link_close(&mut rl.link) {
         crate::link_endpoint::send_and_unbind(
-            &transport_tx,
-            link_id,
+            transport_tx,
+            rl.link_id,
             LinkEndpointRole::Initiator,
             close_pkt,
         )
@@ -714,28 +977,62 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
         false
     };
     if !endpoint_closing {
-        let _ = registration.cleanup().await;
+        let _ = rl.registration.cleanup().await;
     } else {
-        registration.disarm();
+        rl.registration.disarm();
     }
+    if matches!(result, Err(RncpError::Interrupted)) {
+        tokio::time::sleep(RNCP_INTERRUPT_TEARDOWN_WINDOW).await;
+    }
+}
 
-    transfer_result?;
+/// Run the initiator side of the link watchdog (Link.py:799-857): keepalives,
+/// stale detection and request timeouts.
+async fn service_link(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    link: &mut Link,
+    link_id: [u8; 16],
+) -> Result<(), RncpError> {
+    match link.tick() {
+        LinkAction::None => Ok(()),
+        LinkAction::SendKeepalive | LinkAction::TransitionedToStale => {
+            let raw = build_data_packet(
+                link_id,
+                rns_wire::context::PacketContext::Keepalive,
+                &[rns_link::constants::KEEPALIVE_REQUEST],
+            );
+            link.record_tx_keepalive(1);
+            send_endpoint_packet(transport_tx, link_id, raw).await
+        }
+        LinkAction::SendTeardownAndClose(teardown_data) => {
+            if !teardown_data.is_empty() {
+                let raw = build_data_packet(
+                    link_id,
+                    rns_wire::context::PacketContext::LinkClose,
+                    &teardown_data,
+                );
+                let _ = send_endpoint_packet(transport_tx, link_id, raw).await;
+            }
+            Err(RncpError::ResourceFailed("link timed out".into()))
+        }
+        LinkAction::Closed(reason) => Err(RncpError::ResourceFailed(format!(
+            "link closed: {reason:?}"
+        ))),
+    }
+}
 
-    tracing::info!(
-        dest = hex::encode(dest_hash),
-        link_id = hex::encode(link_id),
-        resource = hex::encode(&resource_hash[..8]),
-        bytes = byte_count,
-        parts = total_parts,
-        "rncp send complete"
-    );
-
-    Ok(RncpOutcome {
-        file_name: file_name.to_string(),
-        bytes: byte_count,
-        link_rtt,
-        duration: started.elapsed(),
-    })
+async fn next_link_event(
+    lpkt_rx: &mut mpsc::Receiver<DestinationEvent>,
+    endpoint_lifecycle_rx: &mut mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
+) -> Result<DestinationEvent, RncpError> {
+    tokio::select! {
+        event = lpkt_rx.recv() => event.ok_or_else(|| {
+            RncpError::ResourceFailed("link channel closed".into())
+        }),
+        terminal = endpoint_lifecycle_rx.recv() => Err(RncpError::ResourceFailed(
+            format!("link endpoint terminated: {terminal:?}")
+        )),
+    }
 }
 
 fn pack_metadata(file_name: &str) -> Vec<u8> {
@@ -752,7 +1049,7 @@ struct OutboundDrive<'a> {
     transport_tx: &'a mpsc::Sender<TransportMessage>,
     link: &'a mut Link,
     link_id: [u8; 16],
-    resource: OutboundResource,
+    transfer: OutboundTransfer,
     lpkt_rx: &'a mut mpsc::Receiver<DestinationEvent>,
     endpoint_lifecycle_rx: &'a mut mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
     attached_interface: InterfaceId,
@@ -760,7 +1057,6 @@ struct OutboundDrive<'a> {
     progress_tx: Option<mpsc::Sender<f32>>,
     progress_base: f32,
     progress_span: f32,
-    deadline: Instant,
 }
 
 async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
@@ -768,7 +1064,7 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
         transport_tx,
         link,
         link_id,
-        resource,
+        mut transfer,
         lpkt_rx,
         endpoint_lifecycle_rx,
         attached_interface,
@@ -776,11 +1072,8 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
         progress_tx,
         progress_base,
         progress_span,
-        deadline,
     } = request;
 
-    let rtt = link.rtt.unwrap_or(Duration::from_millis(500));
-    let mut transfer = OutboundTransfer::from_prebuilt(resource, rtt);
     let total = transfer.resource.parts.len();
     if let Some(ref tx) = progress_tx {
         let _ = tx.try_send(if total == 0 {
@@ -791,10 +1084,6 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
     }
 
     loop {
-        if Instant::now() >= deadline {
-            return Err(RncpError::Timeout("resource proof"));
-        }
-
         loop {
             match transfer.tick() {
                 TransferAction::None => break,
@@ -803,18 +1092,14 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
                 action => send_transfer_action(transport_tx, link, link_id, action).await?,
             }
         }
+        // An outgoing Resource keeps the link alive (Link.py watchdog).
+        link.record_inbound();
+        service_link(transport_tx, link, link_id).await?;
 
-        let recv_timeout = remaining(deadline).min(Duration::from_secs(5));
-        let ev = match tokio::time::timeout(recv_timeout, async {
-            tokio::select! {
-                event = lpkt_rx.recv() => event.ok_or_else(|| {
-                    RncpError::ResourceFailed("link channel closed".into())
-                }),
-                terminal = endpoint_lifecycle_rx.recv() => Err(RncpError::ResourceFailed(
-                    format!("link endpoint terminated: {terminal:?}")
-                )),
-            }
-        })
+        let ev = match tokio::time::timeout(
+            RNCP_SERVICE_INTERVAL,
+            next_link_event(lpkt_rx, endpoint_lifecycle_rx),
+        )
         .await
         {
             Ok(Ok(ev)) => ev,
@@ -992,20 +1277,18 @@ async fn discover_pubkey(
         })
         .await
         .map_err(|_| RncpError::TransportUnavailable)?;
-    let (await_tx, await_rx) = oneshot::channel();
-    transport_tx
-        .send(TransportMessage::AwaitPath {
-            dest: dest_hash,
-            reply: await_tx,
-        })
-        .await
-        .map_err(|_| RncpError::TransportUnavailable)?;
-    let found = timeout(path_wait, await_rx)
-        .await
-        .map_err(|_| RncpError::PathTimeout)?
-        .unwrap_or(false);
-    if !found {
-        return Err(RncpError::PathTimeout);
+    // rncp.py:394-406: one path request, then poll has_path until the deadline.
+    let deadline = Instant::now() + path_wait;
+    loop {
+        if let TransportQueryResponse::BoolResult(true) =
+            query(transport_tx, TransportQuery::HasPath { dest: dest_hash }).await?
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(RncpError::PathTimeout);
+        }
+        tokio::time::sleep(Duration::from_millis(100).min(remaining(deadline))).await;
     }
 
     lookup_pubkey(transport_tx, dest_hash)
@@ -1149,22 +1432,24 @@ pub struct RncpFetchRequest<'a> {
     pub remote_path: &'a str,
     pub save_dir: &'a Path,
     pub overwrite: bool,
-    pub overall_timeout: Duration,
-    pub path_wait: Duration,
+    /// Path wait, rncp's `max(-w, medium path timeout)`. The link proof wait
+    /// ends at the later of this and the link establishment timeout; the
+    /// request uses the Link's default timeout and the transfer has no deadline.
+    pub path_timeout: Duration,
     pub progress_tx: Option<mpsc::Sender<f32>>,
+    /// Stops the fetch and closes the link, as rncp does on SIGINT.
+    pub shutdown: Option<ShutdownSignal>,
 }
 
-/// Fetch a file over a Link, identify the local identity, and request
-/// `fetch_file`. Responses use `0xC3` (ready), `0xC2` (unavailable) or
-/// [`REQ_FETCH_NOT_ALLOWED`] (denied). A Resource advertisement can arrive
-/// before the ready response.
+/// Fetch a file over a Link: identify the local identity and request
+/// `fetch_file`. The listener answers `True` and sends the file as a Resource,
+/// or answers `False` ([`RncpError::NotFound`]), `None`
+/// ([`RncpError::RemoteError`]) or 240 ([`RncpError::Denied`]). No answer
+/// within the request timeout gives [`RncpError::RequestFailed`].
 ///
 /// Success means the assembled file was written under `save_dir`; the Resource
-/// proof is sent before this local write. Writes are not atomic or synced for
-/// crash durability. Filename collision handling follows [`RncpListenerConfig`].
-/// `overall_timeout` covers protocol waits, but not all transport admission,
-/// cleanup or file I/O. Use an outer deadline when the entire call must finish
-/// within a fixed time.
+/// proof is sent before this local write. Filename collision handling follows
+/// [`RncpListenerConfig`].
 pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchOutcome, RncpError> {
     use rns_protocol::resource::{
         InboundTransfer, MAX_SEGMENTS, MultiSegmentInbound, TransferAction,
@@ -1177,80 +1462,35 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
         remote_path,
         save_dir,
         overwrite,
-        overall_timeout,
-        path_wait,
+        path_timeout,
         progress_tx,
+        shutdown,
     } = request;
-
+    let shutdown = shutdown.as_ref();
     let started = Instant::now();
-    let deadline = started + overall_timeout;
 
-    let pubkey =
-        discover_pubkey(&transport_tx, dest_hash, path_wait.min(remaining(deadline))).await?;
-
-    let (mut link, link_request_data) = Link::new_initiator(dest_hash, 1);
-    let link_id = link.link_id;
-
-    let (lpkt_tx, mut lpkt_rx) = mpsc::channel::<DestinationEvent>(256);
-    transport_tx
-        .send(TransportMessage::RegisterDestination {
-            hash: link_id,
-            app_name: "rncp.fetch".to_string(),
-            delivery_tx: Some(lpkt_tx),
-        })
-        .await
-        .map_err(|_| RncpError::TransportUnavailable)?;
-    let mut registration = crate::link_endpoint::LinkEndpointCleanupGuard::new(
-        transport_tx.clone(),
-        link_id,
-        LinkEndpointRole::Initiator,
-    );
-
-    let link_req_pkt = build_link_request_packet(dest_hash, &link_request_data);
-    tokio::time::timeout(
-        remaining(deadline),
-        rns_transport::link_messages::dispatch_link_request(
-            &transport_tx,
-            OutboundRequest {
-                raw: link_req_pkt,
-                destination_hash: dest_hash,
-            },
-        ),
-    )
-    .await
-    .map_err(|_| RncpError::Timeout("link request admission"))??;
-
-    let (rtt_data, attached_interface, interface_owner) =
-        wait_for_valid_rncp_proof(&mut lpkt_rx, &mut link, &pubkey, deadline).await?;
-
-    let mut endpoint_lifecycle_rx = crate::link_endpoint::bind(
+    let rl = establish(
         &transport_tx,
+        &identity,
+        dest_hash,
+        path_timeout,
+        "rncp.fetch",
+        shutdown,
+    )
+    .await?;
+    let RncpLink {
+        mut link,
         link_id,
+        mut lpkt_rx,
+        mut endpoint_lifecycle_rx,
         attached_interface,
         interface_owner,
-        LinkEndpointRole::Initiator,
-    )
-    .await
-    .map_err(|_| RncpError::TransportUnavailable)?;
-    registration.endpoint_bound();
+        registration,
+    } = rl;
 
-    let rtt_pkt = build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data);
-    send_endpoint_packet(&transport_tx, link_id, rtt_pkt).await?;
-
-    let our_pub = identity.get_public_key();
-    let our_priv = identity.get_signing_key().ok_or(RncpError::NoSigningKey)?;
-    let ident_data = link
-        .identify(&our_pub, &our_priv)
-        .map_err(|e| RncpError::LinkCrypto(format!("identify: {e:?}")))?;
-    let ident_pkt = build_data_packet(
-        link_id,
-        rns_wire::context::PacketContext::LinkIdentify,
-        &ident_data,
-    );
-    send_endpoint_packet(&transport_tx, link_id, ident_pkt).await?;
-
+    let request_timeout = link.default_request_timeout();
     let (req_encrypted, _req_id) = link
-        .request_str(FETCH_PATH_NAME, remote_path, remaining(deadline))
+        .request_str(FETCH_PATH_NAME, remote_path, request_timeout)
         .map_err(|e| RncpError::LinkCrypto(format!("request: {e:?}")))?;
     let req_pkt = build_data_packet(
         link_id,
@@ -1261,6 +1501,8 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
         rns_wire::hash::truncated_packet_hash(&req_pkt, rns_wire::flags::HeaderType::Header1);
     link.update_pending_request_id(&_req_id, packet_request_id);
     send_endpoint_packet(&transport_tx, link_id, req_pkt).await?;
+    link.keepalive.record_outbound();
+    let request_deadline = Instant::now() + request_timeout;
 
     let session_keys = link
         .session_keys()
@@ -1281,301 +1523,340 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
     let mut segment_routes: std::collections::HashMap<[u8; 32], ([u8; 32], usize)> =
         std::collections::HashMap::new();
 
-    let result: Result<(String, Vec<u8>), RncpError> = loop {
-        if Instant::now() >= deadline {
-            break Err(RncpError::Timeout("fetch"));
-        }
-        let recv_timeout = remaining(deadline).min(Duration::from_secs(5));
-        let ev = match tokio::time::timeout(recv_timeout, async {
-            tokio::select! {
-                event = lpkt_rx.recv() => event.ok_or_else(|| {
-                    RncpError::ResourceFailed("link channel closed".into())
-                }),
-                terminal = endpoint_lifecycle_rx.recv() => Err(RncpError::ResourceFailed(
-                    format!("link endpoint terminated: {terminal:?}")
-                )),
+    let fetch_loop = async {
+        let result: Result<(String, Vec<u8>), RncpError> = loop {
+            if !ack_seen && Instant::now() >= request_deadline {
+                break Err(RncpError::RequestFailed);
             }
-        })
-        .await
-        {
-            Ok(Ok(ev)) => ev,
-            Ok(Err(error)) => break Err(error),
-            Err(_) => continue,
-        };
-
-        let DestinationEvent::InboundPacket {
-            raw,
-            interface_id,
-            interface_owner: event_owner,
-            ..
-        } = ev
-        else {
-            continue;
-        };
-        if interface_id != attached_interface || event_owner != interface_owner {
-            continue;
-        }
-        let (header, off) = match rns_wire::header::PacketHeader::unpack(&raw) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-        if header.destination_hash != link_id {
-            continue;
-        }
-        let body = &raw[off..];
-        match header.context {
-            rns_wire::context::PacketContext::Keepalive
-                if body.first() == Some(&rns_link::constants::KEEPALIVE_REQUEST) =>
-            {
-                send_keepalive_response(&transport_tx, link_id).await?;
+            if !transfers.is_empty() {
+                link.record_inbound();
             }
-            rns_wire::context::PacketContext::Response => {
-                let Ok((_req_id, resp)) = link.handle_response(body) else {
-                    continue;
-                };
-                match resp.as_slice() {
-                    [0xC3] => ack_seen = true,
-                    [0xC2] => break Err(RncpError::ResourceFailed("remote: not found".into())),
-                    r if r == REQ_FETCH_NOT_ALLOWED_PACKED => break Err(RncpError::Denied),
-                    _ => break Err(RncpError::ResourceFailed("unknown ack".into())),
-                }
-            }
-            rns_wire::context::PacketContext::ResourceAdv => {
-                if !ack_seen {
-                    // Some implementations race ADV with ack; treat ADV as implicit consent.
-                    ack_seen = true;
-                }
-                let Ok(plaintext) = link.decrypt(body) else {
-                    continue;
-                };
-                let Ok(adv) = rns_protocol::resource_adv::ResourceAdvertisement::unpack(&plaintext)
-                else {
-                    continue;
-                };
-                if adv.total_segments > 1 {
-                    if adv.total_segments > MAX_SEGMENTS
-                        || adv.segment_index == 0
-                        || adv.segment_index > adv.total_segments
-                    {
-                        break Err(RncpError::ResourceFailed(
-                            "invalid split-resource advertisement".into(),
-                        ));
-                    }
-                    let coord = split_resources.entry(adv.original_hash).or_insert_with(|| {
-                        MultiSegmentInbound::new(adv.total_segments, adv.original_hash)
-                    });
-                    if coord.total_segments != adv.total_segments {
-                        break Err(RncpError::ResourceFailed(
-                            "split-resource total_segments changed".into(),
-                        ));
-                    }
-                    segment_routes
-                        .insert(adv.resource_hash, (adv.original_hash, adv.segment_index));
-                }
-                let map_hashes = adv.get_map_hashes();
-                let mut transfer_flags = adv.flags;
-                if adv.total_segments > 1 && adv.segment_index > 1 {
-                    transfer_flags.has_metadata = false;
-                }
-                let mut rh = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
-                let copy_len = adv.random_hash.len().min(rh.len());
-                rh[..copy_len].copy_from_slice(&adv.random_hash[..copy_len]);
-                let Ok(mut t) = InboundTransfer::from_advertisement(
-                    adv.num_parts,
-                    adv.transfer_size,
-                    adv.data_size,
-                    rh,
-                    adv.resource_hash,
-                    transfer_flags,
-                    map_hashes,
-                    link_rtt,
-                ) else {
-                    continue;
-                };
-                if let TransferAction::SendRequest(req_data) = t.request_next()
-                    && let Ok(encrypted) = link.encrypt(&req_data)
-                {
-                    let req_raw = build_data_packet(
-                        link_id,
-                        rns_wire::context::PacketContext::ResourceReq,
-                        &encrypted,
-                    );
-                    send_endpoint_packet(&transport_tx, link_id, req_raw).await?;
-                }
-                transfers.insert(adv.resource_hash, t);
-            }
-            rns_wire::context::PacketContext::Resource => {
-                let mut resource_action_to_send = None;
-                let mut completed_rh = None;
-                for (rh, t) in &mut transfers {
-                    let action = t.receive_part(body.to_vec());
-                    if let Some(ref tx) = progress_tx {
-                        let _ = tx.try_send(t.resource.progress() as f32);
-                    }
-                    match action {
-                        TransferAction::SendHmu(_) | TransferAction::SendRequest(_) => {
-                            resource_action_to_send = Some(action);
+            let mut failed = None;
+            for t in transfers.values_mut() {
+                match t.check_timeout() {
+                    TransferAction::SendRequest(req) => {
+                        if let Ok(encrypted) = link.encrypt(&req) {
+                            let raw = build_data_packet(
+                                link_id,
+                                rns_wire::context::PacketContext::ResourceReq,
+                                &encrypted,
+                            );
+                            send_endpoint_packet(&transport_tx, link_id, raw).await?;
                         }
-                        TransferAction::Complete => {
+                    }
+                    TransferAction::Failed(reason) => failed = Some(reason),
+                    _ => {}
+                }
+            }
+            if let Some(reason) = failed {
+                break Err(RncpError::ResourceFailed(reason));
+            }
+            if let Err(error) = service_link(&transport_tx, &mut link, link_id).await {
+                break Err(if ack_seen {
+                    error
+                } else {
+                    RncpError::RequestFailed
+                });
+            }
+            let ev = match tokio::time::timeout(
+                RNCP_SERVICE_INTERVAL,
+                next_link_event(&mut lpkt_rx, &mut endpoint_lifecycle_rx),
+            )
+            .await
+            {
+                Ok(Ok(ev)) => ev,
+                Ok(Err(error)) => {
+                    break Err(if ack_seen {
+                        error
+                    } else {
+                        RncpError::RequestFailed
+                    });
+                }
+                Err(_) => continue,
+            };
+
+            let DestinationEvent::InboundPacket {
+                raw,
+                interface_id,
+                interface_owner: event_owner,
+                ..
+            } = ev
+            else {
+                continue;
+            };
+            if interface_id != attached_interface || event_owner != interface_owner {
+                continue;
+            }
+            let (header, off) = match rns_wire::header::PacketHeader::unpack(&raw) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            if header.destination_hash != link_id {
+                continue;
+            }
+            let body = &raw[off..];
+            match header.context {
+                rns_wire::context::PacketContext::Keepalive
+                    if body.first() == Some(&rns_link::constants::KEEPALIVE_REQUEST) =>
+                {
+                    send_keepalive_response(&transport_tx, link_id).await?;
+                }
+                rns_wire::context::PacketContext::Response => {
+                    let Ok(plaintext) = link.decrypt(body) else {
+                        continue;
+                    };
+                    let Ok((response_id, value)) = Link::parse_response_value(&plaintext) else {
+                        continue;
+                    };
+                    if response_id != packet_request_id {
+                        continue;
+                    }
+                    link.deliver_response_data(&response_id, Vec::new());
+                    match FetchReply::from_value(&value) {
+                        FetchReply::Found => ack_seen = true,
+                        FetchReply::NotFound => break Err(RncpError::NotFound),
+                        FetchReply::RemoteError => break Err(RncpError::RemoteError),
+                        FetchReply::NotAllowed => break Err(RncpError::Denied),
+                    }
+                }
+                rns_wire::context::PacketContext::ResourceAdv => {
+                    if !ack_seen {
+                        // Some implementations race ADV with ack; treat ADV as implicit consent.
+                        ack_seen = true;
+                    }
+                    let Ok(plaintext) = link.decrypt(body) else {
+                        continue;
+                    };
+                    let Ok(adv) =
+                        rns_protocol::resource_adv::ResourceAdvertisement::unpack(&plaintext)
+                    else {
+                        continue;
+                    };
+                    if adv.total_segments > 1 {
+                        if adv.total_segments > MAX_SEGMENTS
+                            || adv.segment_index == 0
+                            || adv.segment_index > adv.total_segments
+                        {
+                            break Err(RncpError::ResourceFailed(
+                                "invalid split-resource advertisement".into(),
+                            ));
+                        }
+                        let coord = split_resources.entry(adv.original_hash).or_insert_with(|| {
+                            MultiSegmentInbound::new(adv.total_segments, adv.original_hash)
+                        });
+                        if coord.total_segments != adv.total_segments {
+                            break Err(RncpError::ResourceFailed(
+                                "split-resource total_segments changed".into(),
+                            ));
+                        }
+                        segment_routes
+                            .insert(adv.resource_hash, (adv.original_hash, adv.segment_index));
+                    }
+                    let map_hashes = adv.get_map_hashes();
+                    let mut transfer_flags = adv.flags;
+                    if adv.total_segments > 1 && adv.segment_index > 1 {
+                        transfer_flags.has_metadata = false;
+                    }
+                    let mut rh = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
+                    let copy_len = adv.random_hash.len().min(rh.len());
+                    rh[..copy_len].copy_from_slice(&adv.random_hash[..copy_len]);
+                    let Ok(mut t) = InboundTransfer::from_advertisement(
+                        adv.num_parts,
+                        adv.transfer_size,
+                        adv.data_size,
+                        rh,
+                        adv.resource_hash,
+                        transfer_flags,
+                        map_hashes,
+                        link_rtt,
+                    ) else {
+                        continue;
+                    };
+                    if let TransferAction::SendRequest(req_data) = t.request_next()
+                        && let Ok(encrypted) = link.encrypt(&req_data)
+                    {
+                        let req_raw = build_data_packet(
+                            link_id,
+                            rns_wire::context::PacketContext::ResourceReq,
+                            &encrypted,
+                        );
+                        send_endpoint_packet(&transport_tx, link_id, req_raw).await?;
+                    }
+                    transfers.insert(adv.resource_hash, t);
+                }
+                rns_wire::context::PacketContext::Resource => {
+                    let mut resource_action_to_send = None;
+                    let mut completed_rh = None;
+                    for (rh, t) in &mut transfers {
+                        let action = t.receive_part(body.to_vec());
+                        if let Some(ref tx) = progress_tx {
+                            let _ = tx.try_send(t.resource.progress() as f32);
+                        }
+                        match action {
+                            TransferAction::SendHmu(_) | TransferAction::SendRequest(_) => {
+                                resource_action_to_send = Some(action);
+                            }
+                            TransferAction::Complete => {
+                                completed_rh = Some(*rh);
+                            }
+                            _ => {}
+                        }
+                        if completed_rh.is_none() && t.resource.is_complete() {
                             completed_rh = Some(*rh);
                         }
-                        _ => {}
-                    }
-                    if completed_rh.is_none() && t.resource.is_complete() {
-                        completed_rh = Some(*rh);
-                    }
-                    if resource_action_to_send.is_some() || completed_rh.is_some() {
-                        break;
-                    }
-                }
-
-                if let Some(action) = resource_action_to_send {
-                    let (context, payload) = match action {
-                        TransferAction::SendHmu(hmu) => {
-                            (rns_wire::context::PacketContext::ResourceHmu, hmu)
+                        if resource_action_to_send.is_some() || completed_rh.is_some() {
+                            break;
                         }
-                        TransferAction::SendRequest(req) => {
-                            (rns_wire::context::PacketContext::ResourceReq, req)
-                        }
-                        _ => unreachable!(),
-                    };
-                    if let Ok(encrypted) = link.encrypt(&payload) {
-                        let raw = build_data_packet(link_id, context, &encrypted);
-                        send_endpoint_packet(&transport_tx, link_id, raw).await?;
                     }
-                }
 
-                if let Some(rh) = completed_rh {
-                    let (payload, proof, metadata, resource_hash) = match transfers.get_mut(&rh) {
-                        Some(t) => match t.complete(Some(&decrypt_fn)) {
-                            Ok((payload, proof)) => (
-                                payload,
-                                proof,
-                                t.resource.metadata.clone(),
-                                t.resource.resource_hash,
-                            ),
-                            Err(e) => {
+                    if let Some(action) = resource_action_to_send {
+                        let (context, payload) = match action {
+                            TransferAction::SendHmu(hmu) => {
+                                (rns_wire::context::PacketContext::ResourceHmu, hmu)
+                            }
+                            TransferAction::SendRequest(req) => {
+                                (rns_wire::context::PacketContext::ResourceReq, req)
+                            }
+                            _ => unreachable!(),
+                        };
+                        if let Ok(encrypted) = link.encrypt(&payload) {
+                            let raw = build_data_packet(link_id, context, &encrypted);
+                            send_endpoint_packet(&transport_tx, link_id, raw).await?;
+                        }
+                    }
+
+                    if let Some(rh) = completed_rh {
+                        let (payload, proof, metadata) = match transfers.get_mut(&rh) {
+                            Some(t) => match t.complete(Some(&decrypt_fn)) {
+                                Ok((payload, proof)) => {
+                                    (payload, proof, t.resource.metadata.clone())
+                                }
+                                Err(e) => {
+                                    break Err(RncpError::ResourceFailed(format!(
+                                        "resource assemble/proof failed: {e:?}; parts={}/{} map_hashes={} total_size={} data_size={} flags={:?}",
+                                        t.resource.received_count(),
+                                        t.resource.total_parts,
+                                        t.resource.map_hashes.len(),
+                                        t.resource.total_size,
+                                        t.resource.data_size,
+                                        t.resource.flags,
+                                    )));
+                                }
+                            },
+                            None => {
+                                break Err(RncpError::ResourceFailed(
+                                    "resource assemble/proof failed: transfer missing".into(),
+                                ));
+                            }
+                        };
+                        let prf_raw = build_resource_proof_packet(link_id, &proof);
+                        // The received file is not locally concluded until its
+                        // Resource proof has been admitted on the exact Link
+                        // endpoint. Otherwise a stale or lost binding could make
+                        // the receiver publish success that the sender can never
+                        // observe.
+                        send_endpoint_packet(&transport_tx, link_id, prf_raw).await?;
+
+                        transfers.remove(&rh);
+
+                        if let Some((original_hash, segment_index)) = segment_routes.remove(&rh) {
+                            let Some(coord) = split_resources.get_mut(&original_hash) else {
+                                break Err(RncpError::ResourceFailed(
+                                    "split-resource coordinator missing".into(),
+                                ));
+                            };
+                            if let Some(meta) = metadata {
+                                coord.set_metadata(meta);
+                            }
+                            if let Err(e) = coord.set_segment_data(segment_index, payload) {
                                 break Err(RncpError::ResourceFailed(format!(
-                                    "resource assemble/proof failed: {e:?}; parts={}/{} map_hashes={} total_size={} data_size={} flags={:?}",
-                                    t.resource.received_count(),
-                                    t.resource.total_parts,
-                                    t.resource.map_hashes.len(),
-                                    t.resource.total_size,
-                                    t.resource.data_size,
-                                    t.resource.flags,
+                                    "split segment rejected: {e:?}"
                                 )));
                             }
-                        },
-                        None => {
-                            break Err(RncpError::ResourceFailed(
-                                "resource assemble/proof failed: transfer missing".into(),
-                            ));
-                        }
-                    };
-                    let prf_raw = build_resource_proof_packet(link_id, &proof);
-                    // The received file is not locally concluded until its
-                    // Resource proof has been admitted on the exact Link
-                    // endpoint. Otherwise a stale or lost binding could make
-                    // the receiver publish success that the sender can never
-                    // observe.
-                    send_endpoint_packet(&transport_tx, link_id, prf_raw).await?;
+                            if !coord.is_complete() {
+                                if let Some(ref tx) = progress_tx {
+                                    let _ = tx.try_send(coord.progress() as f32);
+                                }
+                                continue;
+                            }
 
-                    transfers.remove(&rh);
-
-                    if let Some((original_hash, segment_index)) = segment_routes.remove(&rh) {
-                        let Some(coord) = split_resources.get_mut(&original_hash) else {
-                            break Err(RncpError::ResourceFailed(
-                                "split-resource coordinator missing".into(),
-                            ));
-                        };
-                        if let Some(meta) = metadata {
-                            coord.set_metadata(meta);
-                        }
-                        if let Err(e) = coord.set_segment_data(segment_index, payload) {
-                            break Err(RncpError::ResourceFailed(format!(
-                                "split segment rejected: {e:?}"
-                            )));
-                        }
-                        if !coord.is_complete() {
+                            let payload = match coord.reassemble() {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    break Err(RncpError::ResourceFailed(format!(
+                                        "split reassemble: {e:?}"
+                                    )));
+                                }
+                            };
+                            let meta_bytes = coord.metadata.clone();
+                            let Some(file_name) = extract_filename(meta_bytes.as_deref()) else {
+                                break Err(RncpError::ResourceFailed(
+                                    "invalid data received".into(),
+                                ));
+                            };
+                            split_resources.remove(&original_hash);
                             if let Some(ref tx) = progress_tx {
-                                let _ = tx.try_send(coord.progress() as f32);
+                                let _ = tx.try_send(1.0);
                             }
-                            continue;
+                            break Ok((file_name, payload));
                         }
 
-                        let payload = match coord.reassemble() {
-                            Ok(p) => p,
-                            Err(e) => {
-                                break Err(RncpError::ResourceFailed(format!(
-                                    "split reassemble: {e:?}"
-                                )));
-                            }
+                        let Some(file_name) = extract_filename(metadata.as_deref()) else {
+                            break Err(RncpError::ResourceFailed("invalid data received".into()));
                         };
-                        let meta_bytes = coord.metadata.clone();
-                        let file_name = extract_filename(meta_bytes.as_deref())
-                            .unwrap_or_else(|| default_file_name(&original_hash));
-                        split_resources.remove(&original_hash);
                         if let Some(ref tx) = progress_tx {
                             let _ = tx.try_send(1.0);
                         }
                         break Ok((file_name, payload));
                     }
-
-                    let file_name = extract_filename(metadata.as_deref())
-                        .unwrap_or_else(|| default_file_name(&resource_hash));
-                    if let Some(ref tx) = progress_tx {
-                        let _ = tx.try_send(1.0);
+                }
+                rns_wire::context::PacketContext::ResourceHmu => {
+                    let Ok(plaintext) = link.decrypt(body) else {
+                        continue;
+                    };
+                    let Ok((rh, segment, hashmap)) =
+                        rns_protocol::resource::parse_hashmap_update(&plaintext)
+                    else {
+                        continue;
+                    };
+                    let Some(t) = transfers.get_mut(&rh) else {
+                        continue;
+                    };
+                    if let TransferAction::SendRequest(req) = t.hashmap_update(segment, &hashmap)
+                        && let Ok(encrypted) = link.encrypt(&req)
+                    {
+                        let req_raw = build_data_packet(
+                            link_id,
+                            rns_wire::context::PacketContext::ResourceReq,
+                            &encrypted,
+                        );
+                        send_endpoint_packet(&transport_tx, link_id, req_raw).await?;
                     }
-                    break Ok((file_name, payload));
                 }
-            }
-            rns_wire::context::PacketContext::ResourceHmu => {
-                let Ok(plaintext) = link.decrypt(body) else {
-                    continue;
-                };
-                let Ok((rh, segment, hashmap)) =
-                    rns_protocol::resource::parse_hashmap_update(&plaintext)
-                else {
-                    continue;
-                };
-                let Some(t) = transfers.get_mut(&rh) else {
-                    continue;
-                };
-                if let TransferAction::SendRequest(req) = t.hashmap_update(segment, &hashmap)
-                    && let Ok(encrypted) = link.encrypt(&req)
-                {
-                    let req_raw = build_data_packet(
-                        link_id,
-                        rns_wire::context::PacketContext::ResourceReq,
-                        &encrypted,
-                    );
-                    send_endpoint_packet(&transport_tx, link_id, req_raw).await?;
+                rns_wire::context::PacketContext::LinkClose if link.receive_teardown(body) => {
+                    break Err(if ack_seen {
+                        RncpError::ResourceFailed("link closed".into())
+                    } else {
+                        RncpError::RequestFailed
+                    });
                 }
+                _ => {}
             }
-            rns_wire::context::PacketContext::LinkClose if link.receive_teardown(body) => {
-                break Err(RncpError::ResourceFailed("link closed".into()));
-            }
-            _ => {}
-        }
+        };
+        result
     };
+    let result = interruptible(shutdown, fetch_loop).await;
 
-    let endpoint_closing = if let Some(close_pkt) = build_link_close(&mut link) {
-        crate::link_endpoint::send_and_unbind(
-            &transport_tx,
-            link_id,
-            LinkEndpointRole::Initiator,
-            close_pkt,
-        )
-        .await
-        .is_ok()
-    } else {
-        false
+    let rl = RncpLink {
+        link,
+        link_id,
+        lpkt_rx,
+        endpoint_lifecycle_rx,
+        attached_interface,
+        interface_owner,
+        registration,
     };
-    if !endpoint_closing {
-        let _ = registration.cleanup().await;
-    } else {
-        registration.disarm();
-    }
+    close_link(rl, &transport_tx, &result).await;
 
     let (file_name, payload) = result?;
     let bytes = payload.len();
@@ -1611,12 +1892,99 @@ mod tests {
         assert_eq!(parsed, "hello.txt");
     }
 
+    const FETCH_VECTORS: &str = include_str!("../tests/fixtures/rncp_fetch/rncp_fetch.tsv");
+
+    fn vector_rows(kind: &str) -> Vec<Vec<&'static str>> {
+        FETCH_VECTORS
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| line.split('\t').collect::<Vec<_>>())
+            .filter(|row| row[0] == kind)
+            .collect()
+    }
+
+    fn vector_header(key: &str) -> &'static str {
+        FETCH_VECTORS
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("# {key}\t")))
+            .expect("fixture header")
+    }
+
     #[test]
-    fn default_file_name_uses_resource_hash_prefix() {
-        let rh = [0xAB; 32];
-        let name = default_file_name(&rh);
-        assert!(name.starts_with("rncp_"));
-        assert_eq!(name.len(), "rncp_".len() + 16);
+    fn fetch_request_paths_match_upstream_rncp() {
+        let home = vector_header("home");
+        let rows = vector_rows("case");
+        assert!(!rows.is_empty());
+        for row in rows {
+            let (jail, request, expected) = (row[1], row[2], row[3]);
+            let jail = (jail != "<none>").then(|| abspath(&expanduser(jail, Some(home)), "/"));
+            let expected = (expected != "<none>").then(|| expected.to_string());
+            assert_eq!(
+                fetch_request_path(jail.as_deref(), request, Some(home), "/"),
+                expected,
+                "jail {jail:?}, request {request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_replies_pack_and_decode_as_upstream_rncp() {
+        let rows = vector_rows("reply");
+        assert!(!rows.is_empty());
+        let rid: [u8; 16] = core::array::from_fn(|i| i as u8);
+        for row in rows {
+            let (name, packed, status) = (row[1], hex::decode(row[2]).unwrap(), row[3]);
+            let (id, value) = Link::parse_response_value(&packed).unwrap();
+            assert_eq!(id, rid, "{name}");
+            let reply = FetchReply::from_value(&value);
+            let expected = match status {
+                "found" => FetchReply::Found,
+                "not_found" => FetchReply::NotFound,
+                "remote_error" => FetchReply::RemoteError,
+                "fetch_not_allowed" => FetchReply::NotAllowed,
+                other => panic!("unknown status {other}"),
+            };
+            // Rust keeps decoding its old single-byte denial as a denial.
+            if name == "legacy_fixint_f0" {
+                assert_eq!(reply, FetchReply::NotAllowed, "{name}");
+                continue;
+            }
+            assert_eq!(reply, expected, "{name}");
+            let sent = match name {
+                "not_allowed" => Some(FetchReply::NotAllowed),
+                "not_found" => Some(FetchReply::NotFound),
+                "found" => Some(FetchReply::Found),
+                "no_link" => Some(FetchReply::RemoteError),
+                _ => None,
+            };
+            if let Some(sent) = sent {
+                assert_eq!(
+                    Link::pack_response(&rid, &sent.packed()).unwrap(),
+                    packed,
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jailed_symlink_leading_outside_is_refused() {
+        let base = std::env::temp_dir().join(format!("rncp-jail-{}", std::process::id()));
+        let jail = base.join("jail");
+        std::fs::create_dir_all(&jail).unwrap();
+        std::fs::write(base.join("secret"), b"x").unwrap();
+        std::fs::write(jail.join("inside"), b"y").unwrap();
+        let link = jail.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(base.join("secret"), &link).unwrap();
+        let jail_str = jail.to_string_lossy();
+        assert!(escapes_jail(&link.to_string_lossy(), &jail_str));
+        assert!(!escapes_jail(
+            &jail.join("inside").to_string_lossy(),
+            &jail_str
+        ));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rns_crypto::ed25519::Ed25519PublicKey;
+use rns_identity::destination::ProofStrategy;
 use rns_identity::identity::Identity;
 use rns_link::link::{CloseReason, Link, LinkAction, LinkPhyStats, LinkState};
 use rns_protocol::channel::{
@@ -63,6 +64,10 @@ pub struct LinkSessionConfig {
     pub client_label: String,
     pub identify: bool,
     pub track_phy_stats: bool,
+    /// Proof policy for inbound plain Link data. An initiator's Link destination
+    /// is an OUT destination, which Python leaves at `PROVE_NONE`; `ProveApp`
+    /// has no callback here and proves nothing.
+    pub proof_strategy: ProofStrategy,
 }
 
 impl LinkSessionConfig {
@@ -79,6 +84,7 @@ impl LinkSessionConfig {
             client_label: client_label.into(),
             identify: true,
             track_phy_stats: false,
+            proof_strategy: ProofStrategy::ProveNone,
         }
     }
 }
@@ -582,6 +588,9 @@ enum LinkSessionChannelCommand {
     IsDrained {
         result_tx: oneshot::Sender<Result<bool, LinkSessionChannelError>>,
     },
+    CloseWait {
+        result_tx: oneshot::Sender<Result<(bool, Duration), LinkSessionChannelError>>,
+    },
     Shutdown {
         result_tx: oneshot::Sender<Result<(), LinkSessionChannelError>>,
     },
@@ -786,6 +795,9 @@ struct SessionActorState {
     packets: HashSet<[u8; 32]>,
     requests: HashMap<[u8; 16], PendingSessionRequest>,
     channel: LinkChannel,
+    /// Python `Link.get_channel()`: set by the first channel command.
+    channel_open: bool,
+    proof_strategy: ProofStrategy,
     resources: SessionResources,
 }
 
@@ -931,6 +943,12 @@ impl LinkSessionChannelHandle {
     /// not prove delivery or application consumption.
     pub async fn is_drained(&self) -> Result<bool, LinkSessionChannelError> {
         self.invoke(|result_tx| LinkSessionChannelCommand::IsDrained { result_tx })
+            .await
+    }
+
+    /// Channel readiness and the Python Buffer close wait, `link.rtt * len(tx_ring)`.
+    pub(crate) async fn close_wait(&self) -> Result<(bool, Duration), LinkSessionChannelError> {
+        self.invoke(|result_tx| LinkSessionChannelCommand::CloseWait { result_tx })
             .await
     }
 
@@ -1280,7 +1298,7 @@ impl LinkSession {
             phy_stats_rx,
         };
         tokio::spawn(run_session_actor(
-            (link, channel),
+            (link, channel, config.proof_strategy),
             attached_interface,
             interface_owner,
             delivery_rx,
@@ -1369,7 +1387,7 @@ pub async fn lookup_destination(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_session_actor(
-    link_and_channel: (Link, LinkChannel),
+    link_and_channel: (Link, LinkChannel, ProofStrategy),
     attached_interface: InterfaceId,
     interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
     mut delivery_rx: mpsc::Receiver<DestinationEvent>,
@@ -1387,12 +1405,14 @@ async fn run_session_actor(
         resource_offer_tx,
         phy_stats_tx,
     } = channels;
-    let (mut link, channel) = link_and_channel;
+    let (mut link, channel, proof_strategy) = link_and_channel;
     let link_id = link.link_id;
     let mut state = SessionActorState {
         packets: HashSet::new(),
         requests: HashMap::new(),
         channel,
+        channel_open: false,
+        proof_strategy,
         resources: SessionResources::default(),
     };
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -1486,6 +1506,7 @@ async fn run_session_actor(
                         );
                     }
                     Some(LinkSessionCommand::Channel(command)) => {
+                        state.channel_open = true;
                         let transport_failed = handle_channel_command(
                             &transport_tx,
                             attached_interface,
@@ -1717,6 +1738,11 @@ async fn handle_channel_command(
         }
         LinkSessionChannelCommand::IsDrained { result_tx } => {
             let _ = result_tx.send(Ok(channel.is_drained()));
+        }
+        LinkSessionChannelCommand::CloseWait { result_tx } => {
+            let wait = link.rtt_secs() * channel.outstanding_count() as f64;
+            let wait = Duration::try_from_secs_f64(wait).unwrap_or(Duration::from_secs(15));
+            let _ = result_tx.send(Ok((channel.is_ready_to_send(), wait)));
         }
         LinkSessionChannelCommand::Shutdown { result_tx } => {
             channel.shutdown();
@@ -3516,7 +3542,7 @@ async fn send_channel_message(
     channel: &mut LinkChannel,
     message: PackedChannelMessage,
 ) -> Result<LinkSessionChannelReceipt, LinkSessionChannelError> {
-    if !matches!(link.state, LinkState::Active | LinkState::Stale) {
+    if link.state != LinkState::Active {
         return Err(LinkSessionChannelError::LinkNotActive);
     }
     let prepared = channel.prepare_send_tracked(&message)?;
@@ -4165,7 +4191,10 @@ async fn process_destination_event(
                         return Ok(None);
                     };
                     let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
-                    send_packet_proof(transport_tx, attached_interface, link, &packet_hash).await?;
+                    if state.proof_strategy == ProofStrategy::ProveAll {
+                        send_packet_proof(transport_tx, attached_interface, link, &packet_hash)
+                            .await?;
+                    }
                     event_tx
                         .send(LinkSessionEvent::Packet {
                             data: plaintext,
@@ -4177,6 +4206,13 @@ async fn process_destination_event(
                 rns_wire::context::PacketContext::Channel => {
                     link.record_inbound();
                     link.record_rx(body.len());
+                    if !state.channel_open {
+                        tracing::debug!(
+                            link_id = hex::encode(link.link_id),
+                            "channel data received without open channel"
+                        );
+                        return Ok(None);
+                    }
                     let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
                     send_packet_proof(transport_tx, attached_interface, link, &packet_hash).await?;
                     let _ = state.channel.receive_data(body);
@@ -4293,11 +4329,8 @@ async fn send_packet_proof(
     let Ok(proof) = link.prove_packet_with_local_signer(packet_hash) else {
         return Ok(());
     };
-    let proof_raw = build_proof_packet(
-        link.link_id,
-        rns_wire::context::PacketContext::LinkProof,
-        &proof,
-    );
+    let proof_raw =
+        build_proof_packet(link.link_id, rns_wire::context::PacketContext::None, &proof);
     send_raw(transport_tx, attached_interface, link.link_id, proof_raw).await?;
     link.record_tx(proof.len());
     Ok(())
@@ -5007,7 +5040,7 @@ mod tests {
         registration.endpoint_bound();
 
         tokio::spawn(run_session_actor(
-            (initiator, channel),
+            (initiator, channel, ProofStrategy::ProveNone),
             7,
             None,
             delivery_rx,
@@ -5064,7 +5097,6 @@ mod tests {
             .await
             .unwrap();
 
-        let _inbound_proof = next_initiator_endpoint(&mut transport_rx).await;
         assert!(matches!(
             event_rx.recv().await,
             Some(LinkSessionEvent::Packet { ref data, .. }) if data == b"ping"
@@ -5123,6 +5155,7 @@ mod tests {
                 client_label: "capacity".into(),
                 identify: false,
                 track_phy_stats: false,
+                proof_strategy: ProofStrategy::ProveNone,
             },
         ));
         let link_id = match rx.recv().await.unwrap() {
@@ -5171,6 +5204,7 @@ mod tests {
                 client_label: "test.cancelled-link-session".into(),
                 identify: false,
                 track_phy_stats: false,
+                proof_strategy: ProofStrategy::ProveNone,
             },
         ));
 
@@ -5213,6 +5247,7 @@ mod tests {
                 client_label: "test.post-bind-failure".into(),
                 identify: false,
                 track_phy_stats: false,
+                proof_strategy: ProofStrategy::ProveNone,
             },
         ));
 
@@ -5319,6 +5354,7 @@ mod tests {
                 client_label: "test.hostile-lrrtt".into(),
                 identify: false,
                 track_phy_stats: false,
+                proof_strategy: ProofStrategy::ProveNone,
             },
         ));
         let delivery_tx = match transport_rx.recv().await.unwrap() {
@@ -5411,6 +5447,7 @@ mod tests {
                 client_label: "test.link-session".into(),
                 identify: true,
                 track_phy_stats: true,
+                proof_strategy: ProofStrategy::ProveAll,
             },
         ));
 
@@ -5853,6 +5890,7 @@ mod tests {
         responder_channel.delivered(inbound_stream_prepared.sequence, responder.rtt_secs());
 
         buffer.write_all(b"buffer outbound").await.unwrap();
+        buffer.flush().await.unwrap();
         let outbound_stream_packet = next_initiator_endpoint(&mut transport_rx).await;
         let (outbound_stream_header, outbound_stream_offset) =
             rns_wire::header::PacketHeader::unpack(&outbound_stream_packet.raw).unwrap();
@@ -5971,10 +6009,7 @@ mod tests {
             proof_header.flags.packet_type,
             rns_wire::flags::PacketType::Proof
         );
-        assert_eq!(
-            proof_header.context,
-            rns_wire::context::PacketContext::LinkProof
-        );
+        assert_eq!(proof_header.context, rns_wire::context::PacketContext::None);
         responder
             .validate_peer_packet_proof(&inbound_hash, &proof.raw[proof_offset..])
             .expect("initiator ordinary proof must use the LINKREQUEST transient key");

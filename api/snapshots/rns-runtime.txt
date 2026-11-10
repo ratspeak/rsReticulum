@@ -607,8 +607,8 @@ pub rns_runtime::link_manager::RequestOutcome::Reply(alloc::vec::Vec<u8>)
 pub rns_runtime::link_manager::RequestOutcome::ReplyWithResource
 pub rns_runtime::link_manager::RequestOutcome::ReplyWithResource::ack: alloc::vec::Vec<u8>
 pub rns_runtime::link_manager::RequestOutcome::ReplyWithResource::auto_compress: bool
-pub rns_runtime::link_manager::RequestOutcome::ReplyWithResource::data: alloc::vec::Vec<u8>
 pub rns_runtime::link_manager::RequestOutcome::ReplyWithResource::metadata: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_runtime::link_manager::RequestOutcome::ReplyWithResource::source: alloc::boxed::Box<dyn rns_runtime::resource_source::ResourceSource>
 pub struct rns_runtime::link_manager::ChannelSendReceipt
 pub rns_runtime::link_manager::ChannelSendReceipt::link_id: [u8; 16]
 pub rns_runtime::link_manager::ChannelSendReceipt::packet_hash: [u8; 32]
@@ -1116,8 +1116,8 @@ pub rns_runtime::prelude::RequestOutcome::Reply(alloc::vec::Vec<u8>)
 pub rns_runtime::prelude::RequestOutcome::ReplyWithResource
 pub rns_runtime::prelude::RequestOutcome::ReplyWithResource::ack: alloc::vec::Vec<u8>
 pub rns_runtime::prelude::RequestOutcome::ReplyWithResource::auto_compress: bool
-pub rns_runtime::prelude::RequestOutcome::ReplyWithResource::data: alloc::vec::Vec<u8>
 pub rns_runtime::prelude::RequestOutcome::ReplyWithResource::metadata: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_runtime::prelude::RequestOutcome::ReplyWithResource::source: alloc::boxed::Box<dyn rns_runtime::resource_source::ResourceSource>
 pub enum rns_runtime::prelude::ReticulumError
 pub rns_runtime::prelude::ReticulumError::AlreadyInitialized
 pub rns_runtime::prelude::ReticulumError::Config(rns_runtime::config::ConfigError)
@@ -1805,13 +1805,17 @@ pub mod rns_runtime::rncp
 pub enum rns_runtime::rncp::RncpError
 pub rns_runtime::rncp::RncpError::Denied
 pub rns_runtime::rncp::RncpError::HandshakeFailed(alloc::string::String)
+pub rns_runtime::rncp::RncpError::Interrupted
 pub rns_runtime::rncp::RncpError::Io(alloc::string::String)
 pub rns_runtime::rncp::RncpError::LinkCrypto(alloc::string::String)
 pub rns_runtime::rncp::RncpError::NoIdentity
 pub rns_runtime::rncp::RncpError::NoSigningKey
+pub rns_runtime::rncp::RncpError::NotFound
 pub rns_runtime::rncp::RncpError::PathTimeout
 pub rns_runtime::rncp::RncpError::ProofInvalid(alloc::string::String)
+pub rns_runtime::rncp::RncpError::RemoteError
 pub rns_runtime::rncp::RncpError::RequestDispatch(rns_transport::link_messages::LinkRequestDispatchError)
+pub rns_runtime::rncp::RncpError::RequestFailed
 pub rns_runtime::rncp::RncpError::ResourceCreate(alloc::string::String)
 pub rns_runtime::rncp::RncpError::ResourceFailed(alloc::string::String)
 pub rns_runtime::rncp::RncpError::Timeout(&'static str)
@@ -1850,12 +1854,12 @@ pub rns_runtime::rncp::RncpFetchOutcome::saved_path: std::path::PathBuf
 pub struct rns_runtime::rncp::RncpFetchRequest<'a>
 pub rns_runtime::rncp::RncpFetchRequest::dest_hash: [u8; 16]
 pub rns_runtime::rncp::RncpFetchRequest::identity: rns_identity::identity::Identity
-pub rns_runtime::rncp::RncpFetchRequest::overall_timeout: core::time::Duration
 pub rns_runtime::rncp::RncpFetchRequest::overwrite: bool
-pub rns_runtime::rncp::RncpFetchRequest::path_wait: core::time::Duration
+pub rns_runtime::rncp::RncpFetchRequest::path_timeout: core::time::Duration
 pub rns_runtime::rncp::RncpFetchRequest::progress_tx: core::option::Option<tokio::sync::mpsc::bounded::Sender<f32>>
 pub rns_runtime::rncp::RncpFetchRequest::remote_path: &'a str
 pub rns_runtime::rncp::RncpFetchRequest::save_dir: &'a std::path::Path
+pub rns_runtime::rncp::RncpFetchRequest::shutdown: core::option::Option<rns_runtime::lifecycle::ShutdownSignal>
 pub rns_runtime::rncp::RncpFetchRequest::transport_tx: tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>
 pub struct rns_runtime::rncp::RncpListenerConfig
 pub rns_runtime::rncp::RncpListenerConfig::allow_all: bool
@@ -1881,13 +1885,13 @@ pub rns_runtime::rncp::RncpOutcome::file_name: alloc::string::String
 pub rns_runtime::rncp::RncpOutcome::link_rtt: core::time::Duration
 pub struct rns_runtime::rncp::RncpSendRequest<'a>
 pub rns_runtime::rncp::RncpSendRequest::auto_compress: bool
-pub rns_runtime::rncp::RncpSendRequest::data: alloc::vec::Vec<u8>
 pub rns_runtime::rncp::RncpSendRequest::dest_hash: [u8; 16]
 pub rns_runtime::rncp::RncpSendRequest::file_name: &'a str
 pub rns_runtime::rncp::RncpSendRequest::identity: rns_identity::identity::Identity
-pub rns_runtime::rncp::RncpSendRequest::overall_timeout: core::time::Duration
-pub rns_runtime::rncp::RncpSendRequest::path_wait: core::time::Duration
+pub rns_runtime::rncp::RncpSendRequest::path_timeout: core::time::Duration
 pub rns_runtime::rncp::RncpSendRequest::progress_tx: core::option::Option<tokio::sync::mpsc::bounded::Sender<f32>>
+pub rns_runtime::rncp::RncpSendRequest::shutdown: core::option::Option<rns_runtime::lifecycle::ShutdownSignal>
+pub rns_runtime::rncp::RncpSendRequest::source: alloc::boxed::Box<dyn rns_runtime::resource_source::ResourceSource>
 pub rns_runtime::rncp::RncpSendRequest::transport_tx: tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>
 pub const rns_runtime::rncp::DEFAULT_RNCP_APP_NAME: &str
 pub const rns_runtime::rncp::FETCH_PATH_NAME: &str

@@ -1,0 +1,38 @@
+# generator	crates/rns-runtime/tests/fixtures/rncp_fetch/gen_rncp_fetch.py
+# rns_version	1.6.0
+# rns_commit	cb1260891d1b6da8f6e9b21542c4f0cc0725cac4
+# home	/home/rncp
+case	/srv/rncp	f.txt	/srv/rncp/f.txt
+case	/srv/rncp	/srv/rncp/f.txt	/srv/rncp/f.txt
+case	/srv/rncp	/etc/passwd	/srv/rncp/etc/passwd
+case	/srv/rncp	//etc/passwd	/srv/rncp/etc/passwd
+case	/srv/rncp	../x	<none>
+case	/srv/rncp	a/../b	/srv/rncp/b
+case	/srv/rncp	./a//b/	/srv/rncp/a/b
+case	/srv/rncp	/srv/rncp/../rncp/x	/srv/rncp/x
+case	/srv/rncp	../rncpx/f	<none>
+case	/srv/rncp	..	<none>
+case	/srv/rncp		<none>
+case	/srv/rncp	sub/..	<none>
+case	/srv/rncp	~/x	/srv/rncp/~/x
+case	/srv/rncp	/srv/rncp/a/srv/rncp/b	/srv/rncp/ab
+case	/srv/rncp	/srv/rncp/	<none>
+case	/srv/rncp/	f.txt	/srv/rncp/f.txt
+case	/srv/./rncp/../rncp	f.txt	/srv/rncp/f.txt
+case	/	etc/x	//etc/x
+case	/	/etc/x	<none>
+case	/	../x	//x
+case	<none>	/a/../b	/b
+case	<none>	~/x	/home/rncp/x
+case	<none>	~	/home/rncp
+case	<none>	//x	//x
+case	<none>	///x	/x
+reply	not_allowed	92c410000102030405060708090a0b0c0d0e0fccf0	fetch_not_allowed
+reply	not_found	92c410000102030405060708090a0b0c0d0e0fc2	not_found
+reply	found	92c410000102030405060708090a0b0c0d0e0fc3	found
+reply	no_link	92c410000102030405060708090a0b0c0d0e0fc0	remote_error
+reply	int_zero	92c410000102030405060708090a0b0c0d0e0f00	not_found
+reply	float_240	92c410000102030405060708090a0b0c0d0e0fcb406e000000000000	fetch_not_allowed
+reply	int_241	92c410000102030405060708090a0b0c0d0e0fccf1	found
+reply	legacy_fixint_f0	92c410000102030405060708090a0b0c0d0e0ff0	found
+reply	bytes_value	92c410000102030405060708090a0b0c0d0e0fc401f0	found
