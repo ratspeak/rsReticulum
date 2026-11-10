@@ -1828,6 +1828,9 @@ pub struct InterfacePostInit {
     /// for the selected interface class.
     pub default_ifac_size: usize,
     pub ingress_control: bool,
+    /// Serial, KISS, AX.25 KISS, RNode and RNodeMulti interfaces never hold
+    /// announces in Python; they override `should_ingress_limit`.
+    pub announce_ingress_exempt: bool,
     /// Per-interface ingress/egress overrides parsed from `ic_*`, `ec_pr_freq`
     /// and `egress_control` settings.
     pub ingress_overrides: rns_transport::ingress::IngressOverrides,
@@ -1917,6 +1920,16 @@ impl InterfacePostInit {
             ifac_size,
             default_ifac_size: 8,
             ingress_control,
+            announce_ingress_exempt: matches!(
+                section.get("type"),
+                Some(
+                    "SerialInterface"
+                        | "KISSInterface"
+                        | "AX25KISSInterface"
+                        | "RNodeInterface"
+                        | "RNodeMultiInterface"
+                )
+            ),
             ingress_overrides,
             recursive_prs,
             announces_from_internal,

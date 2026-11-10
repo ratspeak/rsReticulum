@@ -2,7 +2,6 @@
 use super::*;
 use crate::announce_dispatch::{AnnounceDispatchRequest, AnnounceDispatchResult};
 use crate::background_egress::BackgroundAnnounceReceiver;
-use std::sync::atomic::Ordering;
 
 fn limited() -> (InterfaceEntry, mpsc::Receiver<Bytes>) {
     let (mut entry, _) = make_test_interface("arbitrary name");
@@ -11,27 +10,27 @@ fn limited() -> (InterfaceEntry, mpsc::Receiver<Bytes>) {
     (entry, rx)
 }
 
+/// Python `process_announce_queue` consumes the entry and counts it sent
+/// whatever `Transport.transmit` did with it (Interface.py:436-443).
 #[test]
-fn announce_admission_full_does_not_charge_or_drop_background() {
+fn announce_queue_full_send_consumes_entry_and_counts_it() {
     let (mut actor, _) = TransportActor::new();
-    let (entry, mut rx) = limited();
+    let (mut entry, mut rx) = limited();
     entry.tx.try_send(Bytes::from_static(b"ordinary")).unwrap();
+    entry.announce_allowed_at = f64::MAX;
     actor.interfaces.insert(1, entry);
-    let (raw, dest) = make_valid_announce("admission.full", 0);
+    let (raw, dest) = make_valid_announce("admission.full", 1);
     actor.local_destinations.insert(dest);
     actor.broadcast_announce_on_interfaces(&raw, None);
-    let now = now_f64();
-    for _ in 0..1000 {
-        actor.process_announce_queues(now);
-    }
     assert_eq!(actor.interfaces[&1].announce_queue.len(), 1);
-    assert_eq!(actor.interfaces[&1].announce_allowed_at, 0.0);
-    assert_eq!(actor.interfaces[&1].tx_drops.load(Ordering::Relaxed), 0);
-    assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"ordinary"));
+    let now = now_f64();
+    actor.interfaces.get_mut(&1).unwrap().announce_allowed_at = 0.0;
     actor.process_announce_queues(now);
-    assert_eq!(rx.try_recv().unwrap(), raw);
     assert!(actor.interfaces[&1].announce_queue.is_empty());
+    assert_eq!(actor.interfaces[&1].ingress.announces_sent(), 1);
     assert!(actor.interfaces[&1].announce_allowed_at > now);
+    assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"ordinary"));
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test(start_paused = true)]
@@ -365,7 +364,7 @@ fn announce_admission_disable_transport_preserves_local_announcement_progress() 
     let (entry, mut rx) = limited();
     let lane = BackgroundAnnounceReceiver::register(&entry.tx).unwrap();
     actor.interfaces.insert(1, entry);
-    let (raw, dest) = make_valid_announce("admission.disable", 0);
+    let (raw, dest) = make_valid_announce("admission.disable", 1);
     actor.local_destinations.insert(dest);
     actor.broadcast_announce_on_interfaces(&raw, None);
     actor.process_announce_queues(now_f64());

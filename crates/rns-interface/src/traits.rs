@@ -306,8 +306,8 @@ pub const IC_BURST_PENALTY: f64 = 15.0;
 pub const IC_HELD_RELEASE_INTERVAL: f64 = 5.0;
 /// Minimum samples required before incoming frequency is considered defined.
 pub const IC_DEQUE_MIN_SAMPLE: usize = 2;
-/// Minimum samples required for burst clearing / PR egress limiting.
-pub const IC_BURST_MIN_SAMPLES: usize = 6;
+/// Minimum outgoing path-request samples before egress limiting applies.
+pub const EC_BURST_MIN_SAMPLES: usize = 2;
 /// Optional outgoing path-request limiter threshold (requests/sec).
 pub const EC_PR_FREQ: f64 = 5.0;
 /// Whether outgoing path-request limiting is active by default.
@@ -446,7 +446,7 @@ mod tests {
         assert_eq!(IC_NEW_TIME, 7200.0);
         assert_eq!(IC_HELD_RELEASE_INTERVAL, 5.0);
         assert_eq!(IC_DEQUE_MIN_SAMPLE, 2);
-        assert_eq!(IC_BURST_MIN_SAMPLES, 6);
+        assert_eq!(EC_BURST_MIN_SAMPLES, 2);
         assert_eq!(EC_PR_FREQ, 5.0);
         const { assert!(!EGRESS_CONTROL) };
     }

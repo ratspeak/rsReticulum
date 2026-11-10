@@ -118,6 +118,7 @@ pub struct TransportActor {
     pub tunnel_table: TunnelTable,
     pub packet_hashlist: PacketHashlist,
     pub rate_table: RateTable,
+    rate_table_retain: f64,
     pub blackhole_table: BlackholeTable,
     pub traffic: TrafficCounter,
     /// Python's interface traffic count and top-level stats counters.
@@ -493,6 +494,7 @@ impl TransportActor {
             tunnel_table: TunnelTable::new(),
             packet_hashlist: PacketHashlist::new_with_capacity(hashlist_cap),
             rate_table: RateTable::new(),
+            rate_table_retain: RATE_TABLE_RETAIN,
             blackhole_table: BlackholeTable::new(),
             traffic: TrafficCounter::new(),
             traffic_count: rpc::TrafficCount::default(),
@@ -1200,6 +1202,11 @@ impl TransportActor {
                     return;
                 }
                 debug!(id, name = %iface_name, outbound = is_outbound, role = role.as_str(), "registering interface");
+                if let Some(target) = entry.announce_rate_target
+                    && target > self.rate_table_retain
+                {
+                    self.rate_table_retain = target;
+                }
                 if let Some(existing) = self.interfaces.get(&id) {
                     if existing.owner.epoch() != entry.owner.epoch() {
                         existing.owner.retire();
@@ -2243,11 +2250,12 @@ impl TransportActor {
         accepted
     }
 
-    /// Enqueue an announce on every eligible outbound interface (except
-    /// optionally one). Eligibility mirrors Python's AP/roaming/boundary mode
-    /// gates. Enqueueing lets `process_announce_queues` apply ANNOUNCE_CAP
-    /// spacing and hop priority. Python retains at most one queued entry per
-    /// destination, replacing it only when a newer announce is emitted.
+    /// Python `Transport._outbound` for a broadcast announce (Transport.py:
+    /// 1676-1791): offline interfaces are skipped; Roaming, Boundary and
+    /// non-local Internal egress and hop-0 announces send at once, uncapped.
+    /// Otherwise an announce sends at once when the queue is empty, the cap
+    /// window is open and the bitrate is known; else it is queued, replacing a
+    /// queued copy only when newer, and refused when the queue is full.
     fn broadcast_announce_on_interfaces(&mut self, raw: &[u8], except: Option<InterfaceId>) {
         let destination_hash = rns_wire::header::PacketHeader::unpack(raw)
             .ok()
@@ -2255,6 +2263,7 @@ impl TransportActor {
             .unwrap_or([0u8; 16]);
         let hops = raw.get(1).copied().unwrap_or(0);
         let emitted = announce_emitted_from_raw(raw);
+        let local = self.local_destinations.contains(&destination_hash);
         let now = now_f64();
         // One copy at the boundary; per-interface queue entries clone the
         // shared Arc for free.
@@ -2271,6 +2280,33 @@ impl TransportActor {
             let Some(entry) = self.interfaces.get_mut(&id) else {
                 continue;
             };
+            if interface_marked_offline(entry) {
+                continue;
+            }
+            let capped = hops > 0
+                && match entry.mode {
+                    InterfaceMode::Roaming | InterfaceMode::Boundary => false,
+                    InterfaceMode::Internal => local,
+                    _ => true,
+                };
+            if !capped {
+                self.send_queued_announce(id, raw);
+                continue;
+            }
+            // A background lane must see every capped announce, so those queue
+            // and are offered on the next tick.
+            if entry.announce_queue.is_empty()
+                && now > entry.announce_allowed_at
+                && entry.bitrate != 0
+                && crate::background_egress::lookup(&entry.tx).is_none()
+            {
+                entry.announce_allowed_at = now + announce_wait_time(entry, raw.len());
+                self.send_queued_announce(id, raw);
+                continue;
+            }
+            if entry.announce_queue.len() >= MAX_QUEUED_ANNOUNCES {
+                continue;
+            }
             if let Some(existing) = entry
                 .announce_queue
                 .iter_mut()
@@ -2295,10 +2331,24 @@ impl TransportActor {
                 hops,
                 raw: shared.clone(),
             });
-            if entry.announce_queue.len() > MAX_QUEUED_ANNOUNCES {
-                let excess = entry.announce_queue.len() - MAX_QUEUED_ANNOUNCES;
-                entry.announce_queue.drain(..excess);
-            }
+        }
+    }
+
+    /// Python `Transport.transmit` then `sent_announce`: the announce counts
+    /// as sent whatever the interface does with it.
+    fn send_queued_announce(&mut self, id: InterfaceId, raw: &[u8]) {
+        let sent = |actor: &Self| {
+            actor
+                .interfaces
+                .get(&id)
+                .map(|entry| entry.ingress.announces_sent())
+        };
+        let before = sent(self);
+        self.send_to_interface(id, raw);
+        // A delivered announce is counted where it is transmitted.
+        if before.is_some() && sent(self) == before {
+            self.record_interface_event(id, InterfaceEvent::SentAnnounce, raw.len());
+            self.count_transport_event(InterfaceEvent::SentAnnounce);
         }
     }
 
@@ -2427,6 +2477,11 @@ impl TransportActor {
 /// Offline, and not a local client (whose offline state means a dead handle to reap).
 fn offline_for_send(entry: &InterfaceEntry) -> bool {
     entry.role != InterfaceRole::LocalClient && interface_marked_offline(entry)
+}
+
+/// Seconds until the next capped announce may leave (Interface.py:428-430).
+fn announce_wait_time(entry: &InterfaceEntry, len: usize) -> f64 {
+    (len as f64 * 8.0 / entry.bitrate as f64) / entry.announce_cap
 }
 
 fn interface_marked_offline(entry: &InterfaceEntry) -> bool {
@@ -2757,6 +2812,19 @@ mod tests {
         let mut raw = header.pack();
         raw.extend_from_slice(&[0xEF; 32]);
         Bytes::from(raw)
+    }
+
+    /// Announces an interface carried: sent at once or still queued.
+    fn carried(
+        actor: &TransportActor,
+        id: InterfaceId,
+        rx: &mut mpsc::Receiver<Bytes>,
+        sent: &mut usize,
+    ) -> usize {
+        while rx.try_recv().is_ok() {
+            *sent += 1;
+        }
+        *sent + actor.interfaces[&id].announce_queue.len()
     }
 
     fn make_test_interface(name: &str) -> (InterfaceEntry, mpsc::Receiver<Bytes>) {
@@ -5658,13 +5726,15 @@ mod tests {
 
         let dest_hash = [0x88; 16];
 
-        // Record multiple announces from the same destination
         for _ in 0..5 {
-            actor.rate_table.record(dest_hash);
+            actor
+                .rate_table
+                .check_interface_rate(dest_hash, 3600.0, 5, 0.0);
         }
 
-        let rate = actor.rate_table.get_rate(&dest_hash);
-        assert!(rate > 0.0, "rate should be tracked");
+        let entry = actor.rate_table.iter().next().expect("rate entry").1;
+        assert_eq!(entry.timestamps.len(), 5);
+        assert_eq!(entry.violations, 4);
     }
 
     #[test]
@@ -8310,66 +8380,41 @@ mod tests {
         );
     }
 
-    /// `broadcast_announce_on_interfaces` must enqueue rather than send
-    /// directly, and `process_announce_queues` must drain one entry per
-    /// gate-open while pushing `announce_allowed_at` forward by the
-    /// `tx_time / announce_cap` formula. This test exercises both halves.
+    /// Python `Transport._outbound` (Transport.py:1746-1791): a capped
+    /// rebroadcast leaves at once on an empty queue and opens the
+    /// `tx_time / announce_cap` window; the next one queues behind it and
+    /// `process_announce_queues` releases it only once the window passes.
     #[test]
-    fn test_broadcast_announce_queues_then_spaces_via_cap() {
+    fn test_broadcast_announce_sends_then_queues_behind_cap() {
         let (mut actor, _tx) = TransportActor::new();
         let (entry, mut rx) = make_test_interface("spaced_iface");
         actor.interfaces.insert(1, entry);
 
-        let (raw, dest) = make_valid_announce("test.cap", 0);
+        let (raw, dest) = make_valid_announce("test.cap", 1);
         let raw_len = raw.len();
-
-        // Two distinct announces back-to-back. The first call must just
-        // enqueue (nothing on the wire yet). Both destinations are local so
-        // the next-hop gate does not apply.
         actor.local_destinations.insert(dest);
+        let before = now_f64();
         actor.broadcast_announce_on_interfaces(&raw, None);
-        let (raw2, dest2) = make_valid_announce("test.cap.b", 0);
+        assert!(rx.try_recv().is_ok(), "empty queue sends at once");
+        let entry = actor.interfaces.get(&1).unwrap();
+        let expected_delay = (raw_len as f64 * 8.0) / entry.bitrate as f64 / entry.announce_cap;
+        assert!(entry.announce_allowed_at >= before + expected_delay);
+        let allowed_at = entry.announce_allowed_at;
+
+        let (raw2, dest2) = make_valid_announce("test.cap.b", 1);
         actor.local_destinations.insert(dest2);
         actor.broadcast_announce_on_interfaces(&raw2, None);
+        assert!(rx.try_recv().is_err(), "inside the window it queues");
+        assert_eq!(actor.interfaces[&1].announce_queue.len(), 1);
+
+        actor.process_announce_queues(allowed_at - 0.001);
         assert!(
             rx.try_recv().is_err(),
-            "broadcast_announce_on_interfaces must NOT send directly — it queues"
+            "drain before the window must not send"
         );
-        assert_eq!(
-            actor.interfaces.get(&1).unwrap().announce_queue.len(),
-            2,
-            "both announces must sit in the per-interface queue"
-        );
-
-        // Drain once: only the lowest-hops entry should send and the gate
-        // should slide forward by tx_time/announce_cap.
-        let now = now_f64();
-        actor.process_announce_queues(now);
-        assert!(
-            rx.try_recv().is_ok(),
-            "process_announce_queues must release one announce on the wire"
-        );
-
-        let entry = actor.interfaces.get(&1).expect("interface still present");
-        let expected_delay =
-            (raw_len as f64 * 8.0) / entry.bitrate.max(1) as f64 / entry.announce_cap.max(0.001);
-        let actual_delay = entry.announce_allowed_at - now;
-        assert!(
-            (actual_delay - expected_delay).abs() < 1e-6,
-            "announce_allowed_at must be pushed forward by tx_time/cap (expected {expected_delay}, got {actual_delay})"
-        );
-        assert_eq!(
-            entry.announce_queue.len(),
-            1,
-            "the second announce must remain queued behind the bandwidth gate"
-        );
-
-        // A second drain at the same `now` is gated — no further sends.
-        actor.process_announce_queues(now);
-        assert!(
-            rx.try_recv().is_err(),
-            "second drain before announce_allowed_at must not release the next entry"
-        );
+        actor.process_announce_queues(allowed_at);
+        assert!(rx.try_recv().is_ok());
+        assert!(actor.interfaces[&1].announce_queue.is_empty());
     }
 
     /// Python 1.3.8 Transport.py:1286-1308 keeps one queued announce per
@@ -8377,7 +8422,8 @@ mod tests {
     #[test]
     fn rebroadcast_queue_coalesces_destination_to_freshest_announce() {
         let (mut actor, _tx) = TransportActor::new();
-        let (entry, _rx) = make_test_interface("coalesced_iface");
+        let (mut entry, _rx) = make_test_interface("coalesced_iface");
+        entry.announce_allowed_at = f64::MAX;
         actor.interfaces.insert(1, entry);
 
         let identity = rns_identity::identity::Identity::new();
@@ -10125,13 +10171,13 @@ mod tests {
         let (mut via_roaming, _rx1) = make_test_interface("via_roaming");
         via_roaming.mode = InterfaceMode::Roaming;
         actor.interfaces.insert(1, via_roaming);
-        let (mut gateway, _rx2) = make_test_interface("gateway");
+        let (mut gateway, mut rx2) = make_test_interface("gateway");
         gateway.mode = InterfaceMode::Gateway;
         actor.interfaces.insert(2, gateway);
-        let (mut roaming, _rx3) = make_test_interface("roaming");
+        let (mut roaming, mut rx3) = make_test_interface("roaming");
         roaming.mode = InterfaceMode::Roaming;
         actor.interfaces.insert(3, roaming);
-        let (mut boundary, _rx4) = make_test_interface("boundary");
+        let (mut boundary, mut rx4) = make_test_interface("boundary");
         boundary.mode = InterfaceMode::Boundary;
         actor.interfaces.insert(4, boundary);
 
@@ -10140,21 +10186,22 @@ mod tests {
             dest,
             crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Roaming),
         );
+        let mut sent = [0usize; 5];
 
         actor.broadcast_announce_on_interfaces(&raw, None);
 
         assert_eq!(
-            actor.interfaces.get(&2).unwrap().announce_queue.len(),
+            carried(&actor, 2, &mut rx2, &mut sent[2]),
             1,
             "gateway should rebroadcast a path learned from roaming"
         );
         assert_eq!(
-            actor.interfaces.get(&3).unwrap().announce_queue.len(),
+            carried(&actor, 3, &mut rx3, &mut sent[3]),
             0,
             "roaming should not rebroadcast a path learned from roaming"
         );
         assert_eq!(
-            actor.interfaces.get(&4).unwrap().announce_queue.len(),
+            carried(&actor, 4, &mut rx4, &mut sent[4]),
             0,
             "boundary should not rebroadcast a path learned from roaming"
         );
@@ -10167,12 +10214,12 @@ mod tests {
         actor.broadcast_announce_on_interfaces(&raw2, None);
 
         assert_eq!(
-            actor.interfaces.get(&3).unwrap().announce_queue.len(),
+            carried(&actor, 3, &mut rx3, &mut sent[3]),
             1,
             "roaming may rebroadcast paths learned from gateway/full-style interfaces"
         );
         assert_eq!(
-            actor.interfaces.get(&4).unwrap().announce_queue.len(),
+            carried(&actor, 4, &mut rx4, &mut sent[4]),
             1,
             "boundary may rebroadcast paths learned from gateway/full-style interfaces"
         );
@@ -10744,14 +10791,15 @@ mod tests {
     fn announce_broadcast_blocked_without_next_hop_interface_unless_local() {
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
-        let (mut full, _rx) = make_test_interface("full");
+        let (mut full, mut rx1) = make_test_interface("full");
         full.mode = InterfaceMode::Full;
         actor.interfaces.insert(1, full);
+        let mut sent = [0usize; 5];
 
         let (raw, dest) = make_valid_announce("test.nexthop.gate", 1);
         actor.broadcast_announce_on_interfaces(&raw, None);
         assert_eq!(
-            actor.interfaces.get(&1).unwrap().announce_queue.len(),
+            carried(&actor, 1, &mut rx1, &mut sent[1]),
             0,
             "non-local announce without a known path must not be rebroadcast"
         );
@@ -10759,7 +10807,7 @@ mod tests {
         actor.local_destinations.insert(dest);
         actor.broadcast_announce_on_interfaces(&raw, None);
         assert_eq!(
-            actor.interfaces.get(&1).unwrap().announce_queue.len(),
+            carried(&actor, 1, &mut rx1, &mut sent[1]),
             1,
             "instance-local destinations are exempt from the next-hop gate"
         );
@@ -10775,12 +10823,13 @@ mod tests {
         let (mut boundary, _rx1) = make_test_interface("boundary");
         boundary.mode = InterfaceMode::Boundary;
         actor.interfaces.insert(1, boundary);
-        let (mut internal_egress, _rx2) = make_test_interface("internal_egress");
+        let (mut internal_egress, mut rx2) = make_test_interface("internal_egress");
         internal_egress.mode = InterfaceMode::Internal;
         actor.interfaces.insert(2, internal_egress);
-        let (mut full, _rx3) = make_test_interface("full");
+        let (mut full, mut rx3) = make_test_interface("full");
         full.mode = InterfaceMode::Full;
         actor.interfaces.insert(3, full);
+        let mut sent = [0usize; 5];
 
         // Boundary-origin announce: blocked on internal egress, allowed on full.
         let (raw_b, dest_b) = make_valid_announce("test.internal.from_boundary", 1);
@@ -10790,12 +10839,12 @@ mod tests {
         );
         actor.broadcast_announce_on_interfaces(&raw_b, None);
         assert_eq!(
-            actor.interfaces.get(&2).unwrap().announce_queue.len(),
+            carried(&actor, 2, &mut rx2, &mut sent[2]),
             0,
             "internal egress must block boundary-origin announces"
         );
         assert_eq!(
-            actor.interfaces.get(&3).unwrap().announce_queue.len(),
+            carried(&actor, 3, &mut rx3, &mut sent[3]),
             1,
             "full egress relays boundary-origin announces"
         );
@@ -10804,15 +10853,10 @@ mod tests {
         // set passes internal egress.
         actor.interfaces.get_mut(&1).unwrap().announces_to_internal = Some(true);
         actor.broadcast_announce_on_interfaces(&raw_b, None);
-        assert_eq!(actor.interfaces.get(&2).unwrap().announce_queue.len(), 1);
+        assert_eq!(carried(&actor, 2, &mut rx2, &mut sent[2]), 1);
         actor.interfaces.get_mut(&1).unwrap().announces_to_internal = None;
-        actor.interfaces.get_mut(&2).unwrap().announce_queue.clear();
-        actor
-            .interfaces
-            .get_mut(&3)
-            .unwrap()
-            .announce_queue
-            .truncate(1);
+        sent[2] = 0;
+        actor.interfaces.get_mut(&3).unwrap().announce_queue.clear();
 
         // Full-origin announce: allowed on internal egress.
         let (raw_f, dest_f) = make_valid_announce("test.internal.from_full", 1);
@@ -10822,7 +10866,7 @@ mod tests {
         );
         actor.broadcast_announce_on_interfaces(&raw_f, None);
         assert_eq!(
-            actor.interfaces.get(&2).unwrap().announce_queue.len(),
+            carried(&actor, 2, &mut rx2, &mut sent[2]),
             1,
             "internal egress relays full-origin announces"
         );
@@ -10836,12 +10880,12 @@ mod tests {
         );
         actor.broadcast_announce_on_interfaces(&raw_m, None);
         assert_eq!(
-            actor.interfaces.get(&2).unwrap().announce_queue.len(),
+            carried(&actor, 2, &mut rx2, &mut sent[2]),
             1,
             "internal egress must block announces from mode-less interfaces"
         );
         assert_eq!(
-            actor.interfaces.get(&3).unwrap().announce_queue.len(),
+            carried(&actor, 3, &mut rx3, &mut sent[3]),
             3,
             "full egress relays announces from mode-less interfaces"
         );
@@ -10851,7 +10895,7 @@ mod tests {
         actor.local_destinations.insert(dest_l);
         actor.broadcast_announce_on_interfaces(&raw_l, None);
         assert_eq!(
-            actor.interfaces.get(&2).unwrap().announce_queue.len(),
+            carried(&actor, 2, &mut rx2, &mut sent[2]),
             2,
             "instance-local announces pass internal egress gating"
         );
@@ -10868,13 +10912,14 @@ mod tests {
         let (mut internal_origin, _rx1) = make_test_interface("internal_origin");
         internal_origin.mode = InterfaceMode::Internal;
         actor.interfaces.insert(1, internal_origin);
-        let (mut opted_out, _rx2) = make_test_interface("opted_out");
+        let (mut opted_out, mut rx2) = make_test_interface("opted_out");
         opted_out.mode = InterfaceMode::Full;
         opted_out.announces_from_internal = false;
         actor.interfaces.insert(2, opted_out);
-        let (mut default_full, _rx3) = make_test_interface("default_full");
+        let (mut default_full, mut rx3) = make_test_interface("default_full");
         default_full.mode = InterfaceMode::Full;
         actor.interfaces.insert(3, default_full);
+        let mut sent = [0usize; 5];
 
         let (raw, dest) = make_valid_announce("test.afi.origin", 1);
         actor.path_table.insert(
@@ -10883,12 +10928,12 @@ mod tests {
         );
         actor.broadcast_announce_on_interfaces(&raw, None);
         assert_eq!(
-            actor.interfaces.get(&2).unwrap().announce_queue.len(),
+            carried(&actor, 2, &mut rx2, &mut sent[2]),
             0,
             "announces_from_internal=false must block internal-origin announces"
         );
         assert_eq!(
-            actor.interfaces.get(&3).unwrap().announce_queue.len(),
+            carried(&actor, 3, &mut rx3, &mut sent[3]),
             1,
             "default announces_from_internal=true relays internal-origin announces"
         );
@@ -10898,7 +10943,7 @@ mod tests {
         actor.local_destinations.insert(dest_l);
         actor.broadcast_announce_on_interfaces(&raw_l, None);
         assert_eq!(
-            actor.interfaces.get(&2).unwrap().announce_queue.len(),
+            carried(&actor, 2, &mut rx2, &mut sent[2]),
             1,
             "local announces bypass the announces_from_internal opt-out"
         );
@@ -11083,7 +11128,7 @@ mod tests {
             .get_mut(&interface_id)
             .expect("test interface should exist")
             .ingress;
-        for _ in 0..IC_BURST_MIN_SAMPLES {
+        for _ in 0..=IC_DEQUE_MIN_SAMPLE {
             ingress.received_path_request();
         }
     }
@@ -11101,7 +11146,7 @@ mod tests {
             },
         )
         .unwrap();
-        for _ in 0..IC_BURST_MIN_SAMPLES {
+        for _ in 0..EC_BURST_MIN_SAMPLES {
             ingress.sent_path_request();
         }
     }
@@ -11610,7 +11655,7 @@ mod tests {
         requestor.mode = InterfaceMode::Gateway;
         actor.interfaces.insert(1, requestor);
         let (mut outbound, mut outbound_rx) = make_test_interface("outbound");
-        for _ in 0..IC_BURST_MIN_SAMPLES {
+        for _ in 0..EC_BURST_MIN_SAMPLES {
             outbound.ingress.sent_path_request();
         }
         actor.interfaces.insert(2, outbound);
@@ -11682,10 +11727,10 @@ mod tests {
         assert!(
             direct
                 .interfaces
-                .get(&1)
+                .get_mut(&1)
                 .unwrap()
                 .ingress
-                .outgoing_pr_frequency()
+                .outgoing_pr_frequency(false)
                 > 0.0
         );
 
@@ -11702,10 +11747,10 @@ mod tests {
         assert!(
             forwarded
                 .interfaces
-                .get(&2)
+                .get_mut(&2)
                 .unwrap()
                 .ingress
-                .outgoing_pr_frequency()
+                .outgoing_pr_frequency(false)
                 > 0.0
         );
 
@@ -11728,10 +11773,10 @@ mod tests {
         assert!(
             recursive
                 .interfaces
-                .get(&2)
+                .get_mut(&2)
                 .unwrap()
                 .ingress
-                .outgoing_pr_frequency()
+                .outgoing_pr_frequency(false)
                 > 0.0
         );
     }

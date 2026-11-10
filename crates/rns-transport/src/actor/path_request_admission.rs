@@ -305,7 +305,15 @@ mod tests {
             actor.pending_path_request_admissions.len(),
             MAX_PENDING_ADMISSIONS - 1
         );
-        assert_eq!(actor.interfaces[&1].ingress.outgoing_pr_frequency(), 0.0);
+        assert_eq!(
+            actor
+                .interfaces
+                .get_mut(&1)
+                .unwrap()
+                .ingress
+                .outgoing_pr_frequency(false),
+            0.0
+        );
         actor.process_pending_path_request_admissions(due + DISCOVERY_PR_TX_THROTTLE);
         assert!(
             recovering.try_recv().is_err(),
@@ -342,7 +350,15 @@ mod tests {
                 actor.process_pending_path_request_admissions(now);
                 assert!(radio.try_recv().is_err());
                 assert!(actor.path_requests.is_empty());
-                assert_eq!(actor.interfaces[&1].ingress.outgoing_pr_frequency(), 0.0);
+                assert_eq!(
+                    actor
+                        .interfaces
+                        .get_mut(&1)
+                        .unwrap()
+                        .ingress
+                        .outgoing_pr_frequency(false),
+                    0.0
+                );
                 assert_eq!(actor.pending_path_request_admissions[0].raw, raw);
                 assert_eq!(actor.pending_path_request_admissions[0].deadline, deadline);
                 assert_eq!(actor.interfaces[&1].announce_allowed_at, deadline + 1.0);

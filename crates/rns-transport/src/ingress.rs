@@ -10,17 +10,20 @@
 //! Ingress and optional outgoing path-request control have separate switches;
 //! neither setting is a general packet bandwidth limit.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
 use crate::constants::{
-    AR_FREQ_DECAY, EC_PR_FREQ, EGRESS_CONTROL, IA_FREQ_SAMPLES, IC_BURST_FREQ, IC_BURST_FREQ_NEW,
-    IC_BURST_HOLD, IC_BURST_MIN_SAMPLES, IC_BURST_PENALTY, IC_DEQUE_MIN_SAMPLE,
+    AR_FREQ_DECAY, EC_BURST_MIN_SAMPLES, EC_PR_FREQ, EGRESS_CONTROL, IA_FREQ_SAMPLES,
+    IC_BURST_FREQ, IC_BURST_FREQ_NEW, IC_BURST_HOLD, IC_BURST_PENALTY, IC_DEQUE_MIN_SAMPLE,
     IC_HELD_RELEASE_INTERVAL, IC_NEW_TIME, IC_PR_BURST_FREQ, IC_PR_BURST_FREQ_NEW, IP_FREQ_SAMPLES,
     MAX_HELD_ANNOUNCES, OA_FREQ_SAMPLES, OP_FREQ_SAMPLES, PATHFINDER_M, PR_FREQ_DECAY,
 };
+
+/// Extra qualifying calls before a path-request burst clears (Interface.py).
+const PR_BURST_COOLDOWN: u8 = 3;
 
 /// Per-interface limiter settings. `None` keeps the controller default.
 /// Frequencies are events per second, durations are seconds, and `max_held`
@@ -112,9 +115,8 @@ pub struct HeldAnnounce {
 }
 
 /// Monotonic-clock samples and limiter state for one interface. Record events
-/// through the `received_*`/`sent_*` methods before consulting limiters. Status
-/// frequency getters ignore stale samples without mutation; limiter checks
-/// trim at most one stale sample and can therefore calculate a different rate.
+/// through the `received_*`/`sent_*` methods before consulting limiters. Every
+/// frequency read, status getters included, drops at most one stale sample.
 #[derive(Debug)]
 pub struct IngressController {
     created: Instant,
@@ -129,11 +131,17 @@ pub struct IngressController {
     op_freq_deque: VecDeque<Instant>,
     burst_active: bool,
     burst_activated: Instant,
+    burst_sustained: Instant,
     pr_burst_active: bool,
     pr_burst_activated: Instant,
+    pr_burst_sustained: Instant,
+    pr_burst_cooldown: u8,
+    /// Radio-class interfaces never hold announces; path requests still limit.
+    announce_limit: bool,
     /// Earliest instant at which the next held announce may be released.
     held_release: Instant,
-    held_announces: HashMap<[u8; 16], HeldAnnounce>,
+    /// One entry per destination, in insertion order.
+    held_announces: Vec<HeldAnnounce>,
     /// Python `arxc`/`atxc`/`prxc`/`ptxc`: every sample, unbounded.
     announces_received: u64,
     announces_sent: u64,
@@ -170,10 +178,14 @@ impl IngressController {
             op_freq_deque: VecDeque::with_capacity(OP_FREQ_SAMPLES),
             burst_active: false,
             burst_activated: now,
+            burst_sustained: now,
             pr_burst_active: false,
             pr_burst_activated: now,
+            pr_burst_sustained: now,
+            pr_burst_cooldown: 0,
+            announce_limit: true,
             held_release: now,
-            held_announces: HashMap::new(),
+            held_announces: Vec::new(),
             announces_received: 0,
             announces_sent: 0,
             path_requests_received: 0,
@@ -314,6 +326,16 @@ impl IngressController {
         self.enabled
     }
 
+    /// Stop announce ingress limiting, as Python's Serial, KISS, AX.25 KISS
+    /// and RNode interfaces do; path-request limiting is unaffected.
+    pub fn exempt_announce_limit(&mut self) {
+        self.announce_limit = false;
+    }
+
+    pub fn is_announce_limit_exempt(&self) -> bool {
+        !self.announce_limit
+    }
+
     pub fn age(&self) -> f64 {
         self.created.elapsed().as_secs_f64()
     }
@@ -403,45 +425,55 @@ impl IngressController {
         self.path_requests_sent
     }
 
-    pub fn incoming_announce_frequency(&self) -> f64 {
-        frequency_from_deque(
-            &self.ia_freq_deque,
+    pub fn incoming_announce_frequency(&mut self) -> f64 {
+        frequency_from_deque_mut(
+            &mut self.ia_freq_deque,
             IC_DEQUE_MIN_SAMPLE,
             Duration::from_secs_f64(AR_FREQ_DECAY),
+            false,
         )
     }
 
-    pub fn outgoing_announce_frequency(&self) -> f64 {
-        frequency_from_deque(
-            &self.oa_freq_deque,
+    pub fn outgoing_announce_frequency(&mut self) -> f64 {
+        frequency_from_deque_mut(
+            &mut self.oa_freq_deque,
             1,
             Duration::from_secs_f64(AR_FREQ_DECAY),
+            false,
         )
     }
 
-    pub fn incoming_pr_frequency(&self) -> f64 {
-        frequency_from_deque(
-            &self.ip_freq_deque,
+    pub fn incoming_pr_frequency(&mut self) -> f64 {
+        frequency_from_deque_mut(
+            &mut self.ip_freq_deque,
             IC_DEQUE_MIN_SAMPLE,
             Duration::from_secs_f64(PR_FREQ_DECAY),
+            false,
         )
     }
 
-    pub fn outgoing_pr_frequency(&self) -> f64 {
-        frequency_from_deque(
-            &self.op_freq_deque,
+    /// With `preemptive`, the next request is counted as already sent.
+    pub fn outgoing_pr_frequency(&mut self, preemptive: bool) -> f64 {
+        frequency_from_deque_mut(
+            &mut self.op_freq_deque,
             1,
             Duration::from_secs_f64(PR_FREQ_DECAY),
+            preemptive,
         )
+    }
+
+    fn hold(&self) -> Duration {
+        Duration::from_secs_f64(self.burst_hold)
     }
 
     /// Update announce burst state and return whether selected inbound announces
-    /// should be held. Clearing a burst requires frequency below threshold,
-    /// elapsed time greater than `burst_hold`, and at least six samples in the
-    /// trimmed deque. The call that clears the state still returns true; a later
-    /// call can return false. Disabled ingress always returns false.
+    /// should be held. While active, the burst clears once the frequency is
+    /// below threshold, both activation and the last above-threshold sample are
+    /// older than `burst_hold`, and at least `IC_DEQUE_MIN_SAMPLE` samples
+    /// remain. The clearing call still returns true. Disabled or exempt
+    /// controllers always return false.
     pub fn should_ingress_limit(&mut self) -> bool {
-        if !self.enabled {
+        if !self.enabled || !self.announce_limit {
             return false;
         }
 
@@ -450,26 +482,26 @@ impl IngressController {
         } else {
             self.burst_freq
         };
-
-        let ia_freq = frequency_from_deque_mut(
-            &mut self.ia_freq_deque,
-            IC_DEQUE_MIN_SAMPLE,
-            Duration::from_secs_f64(AR_FREQ_DECAY),
-        );
+        let ia_freq = self.incoming_announce_frequency();
         let now = Instant::now();
+        let hold = self.hold();
 
         if self.burst_active {
             if ia_freq < freq_threshold
-                && now.duration_since(self.burst_activated)
-                    > Duration::from_secs_f64(self.burst_hold)
-                && self.ia_freq_deque.len() >= IC_BURST_MIN_SAMPLES
+                && sample_age(now, self.burst_activated) > hold
+                && sample_age(now, self.burst_sustained) > hold
             {
-                self.burst_active = false;
+                if self.ia_freq_deque.len() >= IC_DEQUE_MIN_SAMPLE {
+                    self.burst_active = false;
+                }
+            } else if ia_freq >= freq_threshold {
+                self.burst_sustained = now;
             }
             true
         } else if ia_freq > freq_threshold {
             self.burst_active = true;
             self.burst_activated = now;
+            self.burst_sustained = now;
             self.held_release = now
                 .checked_add(Duration::from_secs_f64(self.burst_penalty))
                 .unwrap_or(now);
@@ -480,8 +512,8 @@ impl IngressController {
     }
 
     /// Update the separate path-request burst state for unknown recursive
-    /// discovery. Clearing requires frequency below threshold and elapsed
-    /// time greater than `burst_hold`; that clearing call still returns true.
+    /// discovery. Clearing needs the announce conditions plus three further
+    /// qualifying calls; any non-qualifying call restarts that cooldown.
     /// Disabled ingress always returns false.
     pub fn should_ingress_limit_pr(&mut self) -> bool {
         if !self.enabled {
@@ -493,45 +525,47 @@ impl IngressController {
         } else {
             self.pr_burst_freq
         };
-
-        let ip_freq = frequency_from_deque_mut(
-            &mut self.ip_freq_deque,
-            IC_DEQUE_MIN_SAMPLE,
-            Duration::from_secs_f64(PR_FREQ_DECAY),
-        );
+        let ip_freq = self.incoming_pr_frequency();
         let now = Instant::now();
+        let hold = self.hold();
 
         if self.pr_burst_active {
             if ip_freq < freq_threshold
-                && now.duration_since(self.pr_burst_activated)
-                    > Duration::from_secs_f64(self.burst_hold)
+                && sample_age(now, self.pr_burst_activated) > hold
+                && sample_age(now, self.pr_burst_sustained) > hold
             {
-                self.pr_burst_active = false;
+                if self.pr_burst_cooldown == 0 {
+                    self.pr_burst_active = false;
+                } else {
+                    self.pr_burst_cooldown -= 1;
+                }
+            } else {
+                self.pr_burst_cooldown = PR_BURST_COOLDOWN;
+                if ip_freq >= freq_threshold {
+                    self.pr_burst_sustained = now;
+                }
             }
             true
         } else if ip_freq > freq_threshold {
             self.pr_burst_active = true;
             self.pr_burst_activated = now;
+            self.pr_burst_sustained = now;
+            self.pr_burst_cooldown = PR_BURST_COOLDOWN;
             true
         } else {
             false
         }
     }
 
-    /// Whether outgoing path requests exceed `ec_pr_freq` with at least six
-    /// samples remaining. Controlled by `egress_control`, independently of
-    /// inbound `enabled`, and disabled by default in this implementation.
+    /// Whether sending one more path request would exceed `ec_pr_freq`, with
+    /// at least `EC_BURST_MIN_SAMPLES` recorded. Controlled by
+    /// `egress_control`, independently of inbound `enabled`; off by default.
     pub fn should_egress_limit_pr(&mut self) -> bool {
         if !self.egress_control {
             return false;
         }
-
-        let op_freq = frequency_from_deque_mut(
-            &mut self.op_freq_deque,
-            1,
-            Duration::from_secs_f64(PR_FREQ_DECAY),
-        );
-        op_freq > self.ec_pr_freq && self.op_freq_deque.len() >= IC_BURST_MIN_SAMPLES
+        self.outgoing_pr_frequency(true) > self.ec_pr_freq
+            && self.op_freq_deque.len() >= EC_BURST_MIN_SAMPLES
     }
 
     /// Store or replace an announce by destination hash, without validating
@@ -544,16 +578,19 @@ impl IngressController {
         if announce.hops >= PATHFINDER_M - 1 {
             return;
         }
-        if self.held_announces.contains_key(&announce.destination_hash)
-            || self.held_announces.len() < self.max_held
+        if let Some(held) = self
+            .held_announces
+            .iter_mut()
+            .find(|held| held.destination_hash == announce.destination_hash)
         {
-            self.held_announces
-                .insert(announce.destination_hash, announce);
+            *held = announce;
+        } else if self.held_announces.len() < self.max_held {
+            self.held_announces.push(announce);
         }
     }
 
     /// Release at most one held announce per call — the one with the lowest
-    /// hop count; ties have no defined order. Both the release time and a
+    /// hop count, the earliest held among ties. Both the release time and a
     /// frequency strictly below the current threshold are required. It does
     /// not consult `should_ingress_limit` or the enabled flag, and can release
     /// while burst state remains set. The returned entry is removed; the caller
@@ -574,22 +611,17 @@ impl IngressController {
             self.burst_freq
         };
 
-        let ia_freq = frequency_from_deque_mut(
-            &mut self.ia_freq_deque,
-            IC_DEQUE_MIN_SAMPLE,
-            Duration::from_secs_f64(AR_FREQ_DECAY),
-        );
-        if ia_freq >= freq_threshold {
+        if self.incoming_announce_frequency() >= freq_threshold {
             return None;
         }
 
-        let best_hash = self
-            .held_announces
-            .iter()
-            .min_by_key(|(_, a)| a.hops)
-            .map(|(hash, _)| *hash)?;
-
-        let announce = self.held_announces.remove(&best_hash)?;
+        let mut best: Option<usize> = None;
+        for (idx, held) in self.held_announces.iter().enumerate() {
+            if best.is_none_or(|b| held.hops < self.held_announces[b].hops) {
+                best = Some(idx);
+            }
+        }
+        let announce = self.held_announces.remove(best?);
         self.held_release = now
             .checked_add(Duration::from_secs_f64(self.held_release_interval))
             .unwrap_or(now);
@@ -630,48 +662,24 @@ fn push_sample(deque: &mut VecDeque<Instant>, cap: usize, now: Instant) {
     deque.push_back(now);
 }
 
-/// Snapshot frequency over a timestamp deque. Stale samples are ignored for
-/// observability without mutating the controller from read-only status paths.
-fn frequency_from_deque(deque: &VecDeque<Instant>, min_samples: usize, decay: Duration) -> f64 {
-    let now = Instant::now();
-    let oldest = deque
-        .iter()
-        .find(|sample| sample_age(now, **sample) <= decay);
-    let Some(oldest) = oldest else {
-        return 0.0;
-    };
-    let n = deque
-        .iter()
-        .filter(|sample| sample_age(now, **sample) <= decay)
-        .count();
-    frequency_from_parts(n, now, *oldest, min_samples)
-}
-
-/// Mutable limiter frequency. Mirrors upstream's decay side effect by dropping
-/// one stale oldest sample when the observed window is older than the decay
-/// horizon, then calculating from the current sample count and oldest span.
+/// Upstream's frequency: drop one stale oldest sample when the window is older
+/// than the decay horizon, then divide the pre-drop count by the oldest span.
 fn frequency_from_deque_mut(
     deque: &mut VecDeque<Instant>,
     min_samples: usize,
     decay: Duration,
+    preemptive: bool,
 ) -> f64 {
-    let n = deque.len();
-    if n <= min_samples {
+    if deque.len() <= min_samples {
         return 0.0;
     }
+    let n = deque.len() + usize::from(preemptive);
     let now = Instant::now();
     let Some(oldest) = deque.front().copied() else {
         return 0.0;
     };
     if sample_age(now, oldest) > decay {
         deque.pop_front();
-    }
-    frequency_from_parts(n, now, oldest, min_samples)
-}
-
-fn frequency_from_parts(n: usize, now: Instant, oldest: Instant, min_samples: usize) -> f64 {
-    if n <= min_samples {
-        return 0.0;
     }
     let span = sample_age(now, oldest).as_secs_f64();
     if span <= 0.0 { 0.0 } else { n as f64 / span }
@@ -731,7 +739,7 @@ mod tests {
         assert_eq!(AR_FREQ_DECAY, 10.0);
         assert_eq!(PR_FREQ_DECAY, 10.0);
         assert_eq!(IC_DEQUE_MIN_SAMPLE, 2);
-        assert_eq!(IC_BURST_MIN_SAMPLES, 6);
+        assert_eq!(EC_BURST_MIN_SAMPLES, 2);
         assert_eq!(IC_BURST_FREQ_NEW, 3.0);
         assert_eq!(IC_BURST_FREQ, 10.0);
         assert_eq!(IC_PR_BURST_FREQ_NEW, 3.0);
@@ -745,7 +753,7 @@ mod tests {
 
     #[test]
     fn ingress_controller_default_state() {
-        let ctrl = IngressController::new();
+        let mut ctrl = IngressController::new();
         assert!(ctrl.is_enabled());
         assert!(!ctrl.is_burst_active());
         assert!(!ctrl.is_pr_burst_active());
@@ -756,7 +764,7 @@ mod tests {
         assert_eq!(ctrl.held_count(), 0);
         assert_eq!(ctrl.incoming_announce_frequency(), 0.0);
         assert_eq!(ctrl.incoming_pr_frequency(), 0.0);
-        assert_eq!(ctrl.outgoing_pr_frequency(), 0.0);
+        assert_eq!(ctrl.outgoing_pr_frequency(false), 0.0);
     }
 
     #[test]
@@ -813,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn announce_frequency_ignores_decayed_samples_for_stats() {
+    fn stale_status_frequency_decays_one_sample_per_read() {
         let mut ctrl = IngressController::new();
         push_samples(
             &mut ctrl.ia_freq_deque,
@@ -822,54 +830,36 @@ mod tests {
             AR_FREQ_DECAY + 2.0,
             0.1,
         );
-
+        assert!(ctrl.incoming_announce_frequency() > 0.0);
+        assert_eq!(ctrl.ia_freq_deque.len(), IC_DEQUE_MIN_SAMPLE + 1);
+        assert!(ctrl.incoming_announce_frequency() > 0.0);
         assert_eq!(ctrl.incoming_announce_frequency(), 0.0);
     }
 
     #[test]
-    fn pr_frequency_ignores_decayed_samples_for_stats() {
-        let mut ctrl = IngressController::new();
-        push_samples(
-            &mut ctrl.ip_freq_deque,
-            IP_FREQ_SAMPLES,
-            IC_DEQUE_MIN_SAMPLE + 2,
-            PR_FREQ_DECAY + 2.0,
-            0.1,
-        );
-
-        assert_eq!(ctrl.incoming_pr_frequency(), 0.0);
-    }
-
-    #[test]
-    fn announce_burst_clears_only_with_minimum_remaining_samples() {
+    fn announce_burst_clear_waits_for_sustained_hold() {
         let mut ctrl = IngressController::new();
         push_samples(&mut ctrl.ia_freq_deque, IA_FREQ_SAMPLES, 4, 1.0, 0.1);
         assert!(ctrl.should_ingress_limit());
         assert!(ctrl.is_burst_active());
 
-        ctrl.burst_activated = Instant::now() - Duration::from_secs_f64(IC_BURST_HOLD + 1.0);
+        let past_hold = Instant::now() - Duration::from_secs_f64(IC_BURST_HOLD + 1.0);
+        ctrl.burst_activated = past_hold;
         ctrl.ia_freq_deque.clear();
         push_samples(
             &mut ctrl.ia_freq_deque,
             IA_FREQ_SAMPLES,
-            IC_BURST_MIN_SAMPLES,
+            IC_DEQUE_MIN_SAMPLE + 1,
             AR_FREQ_DECAY + 1.0,
             0.1,
         );
         assert!(ctrl.should_ingress_limit());
-        assert!(ctrl.is_burst_active());
+        assert!(ctrl.is_burst_active(), "sustained timestamp is recent");
 
-        ctrl.burst_activated = Instant::now() - Duration::from_secs_f64(IC_BURST_HOLD + 1.0);
-        ctrl.ia_freq_deque.clear();
-        push_samples(
-            &mut ctrl.ia_freq_deque,
-            IA_FREQ_SAMPLES,
-            IC_BURST_MIN_SAMPLES + 1,
-            AR_FREQ_DECAY + 1.0,
-            0.1,
-        );
+        ctrl.burst_sustained = past_hold;
         assert!(ctrl.should_ingress_limit());
         assert!(!ctrl.is_burst_active());
+        assert!(!ctrl.should_ingress_limit());
     }
 
     #[test]
@@ -882,18 +872,17 @@ mod tests {
     }
 
     #[test]
-    fn held_announces_release_even_if_burst_state_is_waiting_for_clear_samples() {
+    fn held_announces_release_while_burst_state_is_still_held() {
         let mut ctrl = IngressController::new();
         push_samples(&mut ctrl.ia_freq_deque, IA_FREQ_SAMPLES, 4, 1.0, 0.1);
         assert!(ctrl.should_ingress_limit());
         assert!(ctrl.is_burst_active());
 
-        ctrl.burst_activated = Instant::now() - Duration::from_secs_f64(IC_BURST_HOLD + 1.0);
         ctrl.ia_freq_deque.clear();
         push_samples(
             &mut ctrl.ia_freq_deque,
             IA_FREQ_SAMPLES,
-            IC_BURST_MIN_SAMPLES,
+            IC_DEQUE_MIN_SAMPLE + 1,
             AR_FREQ_DECAY + 1.0,
             0.1,
         );
@@ -921,57 +910,51 @@ mod tests {
         assert!(ctrl.should_ingress_limit_pr());
         assert!(ctrl.is_pr_burst_active());
 
-        ctrl.pr_burst_activated = Instant::now() - Duration::from_secs_f64(IC_BURST_HOLD + 1.0);
+        let past_hold = Instant::now() - Duration::from_secs_f64(IC_BURST_HOLD + 1.0);
+        ctrl.pr_burst_activated = past_hold;
+        ctrl.pr_burst_sustained = past_hold;
         ctrl.ip_freq_deque.clear();
-        push_samples(
-            &mut ctrl.ip_freq_deque,
-            IP_FREQ_SAMPLES,
-            IC_DEQUE_MIN_SAMPLE + 1,
-            PR_FREQ_DECAY + 1.0,
-            0.1,
-        );
 
+        for _ in 0..PR_BURST_COOLDOWN {
+            assert!(ctrl.should_ingress_limit_pr());
+            assert!(ctrl.is_pr_burst_active(), "cooldown still running");
+        }
         assert!(ctrl.should_ingress_limit_pr());
         assert!(!ctrl.is_pr_burst_active());
         assert!(!ctrl.should_ingress_limit_pr());
     }
 
     #[test]
-    fn pr_egress_limiting_is_optional_and_requires_six_samples() {
+    fn pr_egress_limiting_is_optional_and_counts_the_next_request() {
         let mut disabled = IngressController::new();
-        push_samples(
-            &mut disabled.op_freq_deque,
-            OP_FREQ_SAMPLES,
-            IC_BURST_MIN_SAMPLES + 2,
-            1.0,
-            0.1,
-        );
+        push_samples(&mut disabled.op_freq_deque, OP_FREQ_SAMPLES, 8, 1.0, 0.1);
         assert!(!disabled.should_egress_limit_pr());
 
         let mut ctrl = IngressController::try_with_overrides(&IngressOverrides {
             egress_control: Some(true),
-            ec_pr_freq: Some(EC_PR_FREQ),
             ..Default::default()
         })
         .unwrap();
-        push_samples(
-            &mut ctrl.op_freq_deque,
-            OP_FREQ_SAMPLES,
-            IC_BURST_MIN_SAMPLES - 1,
-            1.0,
-            0.1,
-        );
+        push_samples(&mut ctrl.op_freq_deque, OP_FREQ_SAMPLES, 1, 0.1, 0.0);
         assert!(!ctrl.should_egress_limit_pr());
 
+        // Two samples 0.5 s old: (2 + 1) / 0.5 = 6 Hz > 5 Hz only preemptively.
         ctrl.op_freq_deque.clear();
-        push_samples(
-            &mut ctrl.op_freq_deque,
-            OP_FREQ_SAMPLES,
-            IC_BURST_MIN_SAMPLES,
-            1.0,
-            0.1,
-        );
+        push_samples(&mut ctrl.op_freq_deque, OP_FREQ_SAMPLES, 2, 0.5, 0.0);
+        assert!(ctrl.outgoing_pr_frequency(false) < EC_PR_FREQ);
         assert!(ctrl.should_egress_limit_pr());
+    }
+
+    #[test]
+    fn exempt_controller_never_holds_announces_but_limits_path_requests() {
+        let mut ctrl = IngressController::new();
+        ctrl.exempt_announce_limit();
+        push_samples(&mut ctrl.ia_freq_deque, IA_FREQ_SAMPLES, 8, 1.0, 0.1);
+        push_samples(&mut ctrl.ip_freq_deque, IP_FREQ_SAMPLES, 8, 1.0, 0.1);
+        assert!(!ctrl.should_ingress_limit());
+        assert!(!ctrl.is_burst_active());
+        assert!(ctrl.should_ingress_limit_pr());
+        assert!(ctrl.incoming_announce_frequency() > 0.0);
     }
 
     #[test]

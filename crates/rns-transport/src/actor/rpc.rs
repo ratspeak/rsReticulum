@@ -53,8 +53,8 @@ impl TransportActor {
                 let mut stats: Vec<InterfaceStatRpcEntry> = self
                     .prioritized_interface_ids()
                     .into_iter()
-                    .map(|iface_id| (iface_id, &self.interfaces[&iface_id]))
-                    .map(|(iface_id, entry)| {
+                    .filter_map(|iface_id| {
+                        let entry = self.interfaces.get_mut(&iface_id)?;
                         let online = entry
                             .online
                             .as_ref()
@@ -94,7 +94,7 @@ impl TransportActor {
                             .get(&iface_id)
                             .copied()
                             .unwrap_or_default();
-                        InterfaceStatRpcEntry {
+                        Some(InterfaceStatRpcEntry {
                             id: iface_id,
                             name: entry.name.clone(),
                             rx_bytes,
@@ -115,7 +115,7 @@ impl TransportActor {
                                 .ingress
                                 .outgoing_announce_frequency(),
                             incoming_pr_frequency: entry.ingress.incoming_pr_frequency(),
-                            outgoing_pr_frequency: entry.ingress.outgoing_pr_frequency(),
+                            outgoing_pr_frequency: entry.ingress.outgoing_pr_frequency(false),
                             burst_active: entry.ingress.is_burst_active(),
                             burst_activated: activation_epoch(
                                 now,
@@ -168,7 +168,7 @@ impl TransportActor {
                             tx_stalled: inspection.tx_stalled,
                             tx_buffered: inspection.tx_buffered,
                             radio: inspection.radio,
-                        }
+                        })
                     })
                     .collect();
                 aggregate_backbone_bursts(&mut stats);
@@ -183,7 +183,7 @@ impl TransportActor {
                     .iter()
                     .map(|(hash, entry)| RateTableRpcEntry {
                         hash: hash.into_bytes(),
-                        rate: entry.rate,
+                        rate: entry.rate(),
                         last: entry.last,
                         rate_violations: entry.violations,
                         blocked_until: entry.blocked_until,
@@ -942,7 +942,7 @@ impl TransportActor {
         let mut speeds = [0f64; 6];
         let mut freqs = [0f64; 4];
         let mut measured = false;
-        for (&id, entry) in &self.interfaces {
+        for (&id, entry) in &mut self.interfaces {
             if entry.parent_id.is_some() || entry.role == InterfaceRole::SharedServer {
                 continue;
             }
@@ -966,7 +966,7 @@ impl TransportActor {
             freqs[0] += entry.ingress.incoming_announce_frequency();
             freqs[1] += entry.ingress.outgoing_announce_frequency();
             freqs[2] += entry.ingress.incoming_pr_frequency();
-            freqs[3] += entry.ingress.outgoing_pr_frequency();
+            freqs[3] += entry.ingress.outgoing_pr_frequency(false);
             measured = true;
         }
         let totals = &mut count.totals;

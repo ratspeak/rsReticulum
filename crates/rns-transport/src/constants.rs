@@ -46,6 +46,13 @@ pub const MAX_RECEIPTS: usize = 1024;
 /// Rate timestamps per destination.
 pub const MAX_RATE_TIMESTAMPS: usize = 16;
 
+/// Default announce rate table retention (seconds); raised to the largest
+/// interface `announce_rate_target` on registration.
+pub const RATE_TABLE_RETAIN: f64 = 3600.0;
+
+/// Announce rate table cull interval (seconds).
+pub const RATE_TABLE_CULL_INTERVAL: f64 = 5.0;
+
 /// Random blobs saved to disk per destination.
 pub const PERSIST_RANDOM_BLOBS: usize = 32;
 
@@ -207,8 +214,8 @@ pub const PR_FREQ_DECAY: f64 = 1.0 / PR_MINFREQ_HZ;
 /// Minimum samples required before frequency is considered defined.
 pub const IC_DEQUE_MIN_SAMPLE: usize = 2;
 
-/// Minimum samples required for burst state clearing / egress PR limiting.
-pub const IC_BURST_MIN_SAMPLES: usize = 6;
+/// Minimum outgoing path-request samples before egress limiting applies.
+pub const EC_BURST_MIN_SAMPLES: usize = 2;
 
 /// Duration interface is treated as "new" (seconds).
 pub const IC_NEW_TIME: f64 = 7200.0;
@@ -250,11 +257,15 @@ pub const ANNOUNCE_QUEUE_INTERVAL: f64 = 1.0;
 /// Maximum number of packet-metric cache entries retained by the actor.
 pub const LOCAL_CLIENT_CACHE_MAXSIZE: usize = 512;
 
-/// Maximum lifetime for queued announces (24 hours, in seconds).
-pub const QUEUED_ANNOUNCE_LIFE: f64 = 86_400.0;
+/// Maximum lifetime for queued announces (3 hours, in seconds).
+pub const QUEUED_ANNOUNCE_LIFE: f64 = 10_800.0;
 
 /// Maximum number of queued announces per interface.
-pub const MAX_QUEUED_ANNOUNCES: usize = 16_384;
+pub const MAX_QUEUED_ANNOUNCES: usize = 4096;
+
+/// Queued announces one interface may send in one maintenance tick; bounds
+/// actor work on fast links.
+pub const MAX_ANNOUNCE_DRAIN_PER_TICK: usize = 256;
 
 /// Grace period in seconds after the first interface registration before
 /// startup-gated in-memory cache cleanup becomes eligible.

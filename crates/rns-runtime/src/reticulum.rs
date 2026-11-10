@@ -5707,6 +5707,7 @@ fn clone_interface_post_init(
         ifac_size: post_init.ifac_size,
         default_ifac_size: post_init.default_ifac_size,
         ingress_control: post_init.ingress_control,
+        announce_ingress_exempt: post_init.announce_ingress_exempt,
         ingress_overrides: post_init.ingress_overrides.clone(),
         recursive_prs: post_init.recursive_prs,
         announces_from_internal: post_init.announces_from_internal,
@@ -5745,7 +5746,7 @@ async fn prepare_interface_with_post_init(
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
 ) -> Result<PreparedInterfaceRegistration, InterfaceRegistrationError> {
-    let ingress = if post_init.ingress_overrides.is_empty() {
+    let mut ingress = if post_init.ingress_overrides.is_empty() {
         rns_transport::ingress::IngressController::new()
     } else {
         match rns_transport::ingress::IngressController::try_with_overrides(
@@ -5758,6 +5759,10 @@ async fn prepare_interface_with_post_init(
             }
         }
     };
+    // RNodeMulti subinterfaces receive the traffic and keep the base limiter.
+    if post_init.announce_ingress_exempt && owned.interface.parent_id.is_none() {
+        ingress.exempt_announce_limit();
+    }
     if ifac_key.is_some()
         && !(1..=64).contains(&post_init.ifac_size.unwrap_or(post_init.default_ifac_size))
     {

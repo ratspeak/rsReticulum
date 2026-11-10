@@ -147,3 +147,31 @@ fn a_replayed_cached_announce_is_not_counted_as_received_traffic() {
         "a cached announce never crossed the wire"
     );
 }
+
+/// Python's 5 s interface job re-evaluates the limiter (Transport.py:1329-1337),
+/// so a burst clears on a quiet interface without another announce.
+#[test]
+fn interface_job_clears_a_burst_on_a_quiet_interface() {
+    let (mut actor, _) = TransportActor::new();
+    let (mut entry, _rx) = make_test_interface("quiet");
+    entry.ingress =
+        crate::ingress::IngressController::try_with_overrides(&crate::ingress::IngressOverrides {
+            burst_freq_new: Some(100.0),
+            burst_freq: Some(100.0),
+            burst_hold: Some(0.2),
+            ..Default::default()
+        })
+        .unwrap();
+    actor.interfaces.insert(1, entry);
+    let ingress = &mut actor.interfaces.get_mut(&1).unwrap().ingress;
+    for _ in 0..4 {
+        ingress.received_announce();
+    }
+    assert!(ingress.should_ingress_limit(), "precondition: a burst");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    actor.last_held_announce_check = 0.0;
+    actor.on_tick();
+
+    assert!(!actor.interfaces[&1].ingress.is_burst_active());
+}

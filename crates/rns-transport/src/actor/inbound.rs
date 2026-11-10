@@ -723,47 +723,6 @@ impl TransportActor {
             return;
         }
 
-        let mut rate_blocked = false;
-
-        // Per-interface rate limiting is opt-in and suppresses rebroadcast
-        // only; Python still learns the path, updates caches and dispatches
-        // handlers for blocked announces. Path responses bypass this gate.
-        let has_interface_rate_limit = header.context
-            != rns_wire::context::PacketContext::PathResponse
-            && self
-                .interfaces
-                .get(&interface_id)
-                .is_some_and(|entry| entry.announce_rate_target.is_some());
-        let interface_rate_blocked = if has_interface_rate_limit {
-            self.interfaces
-                .get(&interface_id)
-                .and_then(|entry| {
-                    entry.announce_rate_target.map(|target| {
-                        self.rate_table.check_interface_rate(
-                            header.destination_hash,
-                            target,
-                            entry.announce_rate_grace.unwrap_or(0),
-                            entry.announce_rate_penalty.unwrap_or(0.0),
-                        )
-                    })
-                })
-                .unwrap_or(false)
-        } else {
-            false
-        };
-        if interface_rate_blocked {
-            pathing!(
-                dest = hex::encode(header.destination_hash),
-                interface = interface_id,
-                "announce blocked by per-interface rate limit"
-            );
-            rate_blocked = true;
-        } else {
-            // Always record non-interface-limited announces for observability.
-            // `check_interface_rate` already stores its own timestamp state.
-            self.rate_table.record(header.destination_hash);
-        }
-
         let iface_mode = self
             .interfaces
             .get(&interface_id)
@@ -775,14 +734,17 @@ impl TransportActor {
         // Cancel our queued rebroadcast when a neighbor already carried it.
         // Same-hop neighbor rebroadcast counts toward the local cap;
         // strict hops+1 forward drops our queued copy outright.
+        // Only HEADER_2 copies come from a rebroadcasting transport node
+        // (Transport.py:2454); copies heard before our first send count too.
         if self.is_transport_enabled
+            && header.transport_id.is_some()
             && let Some(existing) = self.announce_table.get(&header.destination_hash)
         {
             let existing_hops = existing.hops;
             let existing_retries = existing.retries;
-            if header.hops > 0 && header.hops - 1 == existing_hops && existing_retries > 0 {
+            if header.hops > 0 && header.hops - 1 == existing_hops {
                 let existing_local_rebroadcasts = existing.local_rebroadcasts + 1;
-                if existing_local_rebroadcasts >= LOCAL_REBROADCASTS_MAX {
+                if existing_retries > 0 && existing_local_rebroadcasts >= LOCAL_REBROADCASTS_MAX {
                     trace!(
                         dest = hex::encode(header.destination_hash),
                         "announce dedup: local rebroadcast limit reached, removing from table"
@@ -845,6 +807,36 @@ impl TransportActor {
         };
 
         if should_add {
+            // Only path-updating announces on interfaces with a rate target
+            // touch the rate table (Transport.py:2578-2591).
+            let rate_limit = (header.context != rns_wire::context::PacketContext::PathResponse)
+                .then(|| self.interfaces.get(&interface_id))
+                .flatten()
+                .and_then(|entry| {
+                    entry.announce_rate_target.map(|target| {
+                        (
+                            target,
+                            entry.announce_rate_grace.unwrap_or(0),
+                            entry.announce_rate_penalty.unwrap_or(0.0),
+                        )
+                    })
+                });
+            let rate_blocked = rate_limit.is_some_and(|(target, grace, penalty)| {
+                self.rate_table.check_interface_rate(
+                    header.destination_hash,
+                    target,
+                    grace,
+                    penalty,
+                )
+            });
+            if rate_blocked {
+                pathing!(
+                    dest = hex::encode(header.destination_hash),
+                    interface = interface_id,
+                    "announce blocked by per-interface rate limit"
+                );
+            }
+
             // Announce-table update MUST precede path-table update — the dedup
             // check above compares against our own queued copy. Non-transport
             // nodes never queue (would amplify the announce per hub).
@@ -904,20 +896,36 @@ impl TransportActor {
             // destination can replay the exact announce bytes.
             let announce_packet_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
             entry.packet_hash = Some(announce_packet_hash);
-            let tunnel_path = crate::tunnel::TunnelPath {
-                timestamp: entry.timestamp,
-                next_hop: entry.next_hop,
-                hops: entry.hops,
-                expires: entry.expires,
-                random_blobs: entry.random_blobs.iter().copied().collect(),
-                packet_hash: entry.packet_hash,
-            };
-            self.path_table.insert(header.destination_hash, entry);
-            if let Some(tunnel) = self.tunnel_table.get_mut_by_interface(interface_id) {
-                tunnel
-                    .tunnel_paths
-                    .insert(header.destination_hash, tunnel_path);
-                tunnel.expires = now_f64() + TUNNEL_TIMEOUT as f64;
+            if rate_blocked {
+                // Rate-blocked announces update routing fields only, never
+                // liveness, and create no entry (Transport.py:2712-2724).
+                if let Some(existing) = self.path_table.get_mut(&header.destination_hash) {
+                    existing.next_hop = entry.next_hop;
+                    existing.hops = entry.hops;
+                    existing.random_blobs = entry.random_blobs;
+                    existing.interface_id = entry.interface_id;
+                    existing.packet_hash = entry.packet_hash;
+                    self.path_table.set_state(
+                        header.destination_hash,
+                        crate::constants::PathState::Unknown,
+                    );
+                }
+            } else {
+                let tunnel_path = crate::tunnel::TunnelPath {
+                    timestamp: entry.timestamp,
+                    next_hop: entry.next_hop,
+                    hops: entry.hops,
+                    expires: entry.expires,
+                    random_blobs: entry.random_blobs.iter().copied().collect(),
+                    packet_hash: entry.packet_hash,
+                };
+                self.path_table.insert(header.destination_hash, entry);
+                if let Some(tunnel) = self.tunnel_table.get_mut_by_interface(interface_id) {
+                    tunnel
+                        .tunnel_paths
+                        .insert(header.destination_hash, tunnel_path);
+                    tunnel.expires = now_f64() + TUNNEL_TIMEOUT as f64;
+                }
             }
             self.state_dirty = true;
             if self.path_requests.contains_key(&header.destination_hash) {
@@ -1139,10 +1147,9 @@ impl TransportActor {
                         self.state_dirty = true;
                         self.restore_tunnel_paths(&tunnel_id, interface_id);
                     }
-                    None => {
-                        debug!(interface_id, "invalid tunnel synthesis");
-                        self.protocol_violation(interface_id);
-                    }
+                    // Wrong length or a bad signature is a silent drop
+                    // (Transport.py:3067-3084).
+                    None => debug!(interface_id, "invalid tunnel synthesis"),
                 }
             }
             return;
@@ -1282,17 +1289,23 @@ impl TransportActor {
             let Some(egress) = self.interfaces.get(&target_interface) else {
                 return;
             };
-            let Ok((payload, requested_mode, accepted_mtu_ceiling)) =
-                crate::link_transit::attenuate_request(
+            let (payload, requested_mode, accepted_mtu_ceiling) =
+                match crate::link_transit::attenuate_request(
                     &raw[header.size()..],
                     interface_id,
                     ingress,
                     target_interface,
                     egress,
-                )
-            else {
-                return;
-            };
+                ) {
+                    Ok(attenuated) => attenuated,
+                    // Python cannot re-encode a clamped MTU for a disabled
+                    // mode and counts it (Transport.py:2354-2361).
+                    Err(crate::link_transit::LinkTransitError::UnsupportedTransitModeTransform) => {
+                        self.protocol_violation(interface_id);
+                        return;
+                    }
+                    Err(_) => return,
+                };
             let interface_owner = Some(egress.owner.clone());
             let receiving_owner = Some(ingress.owner.clone());
             let Ok((forwarded_header, _)) = rns_wire::header::PacketHeader::unpack(&forwarded)
