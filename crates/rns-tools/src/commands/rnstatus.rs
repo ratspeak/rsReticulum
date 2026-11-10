@@ -60,6 +60,10 @@ struct Args {
     #[arg(short, long)]
     totals: bool,
 
+    /// Display packets per second in totals.
+    #[arg(short = 'p', long = "pps")]
+    pps: bool,
+
     /// Sort interfaces by rate, traffic, rx, tx, rxs, txs, announces, arx, atx, arxc, atxc, prx,
     /// ptx, prxc, ptxc, held, pvs, ivs, flt, txdrp or txdrb.
     #[arg(short, long)]
@@ -230,26 +234,32 @@ async fn run_local_once(args: &Args) -> ExitCode {
     let timeout = Duration::from_secs(args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
     let endpoint = rc.shared_rpc_endpoint(&std::env::temp_dir());
 
-    let stats =
-        match local_rpc_request(&endpoint, &rpc_key, &RpcRequest::GetInterfaceStats, timeout).await
-        {
-            Ok(RpcResponse::InterfaceStats(v)) => v,
-            Ok(RpcResponse::Error(e)) => {
-                eprintln!("rnstatus-rs: {e}");
-                return ExitCode::from(1);
-            }
-            Ok(other) => {
-                eprintln!("rnstatus-rs: unexpected response: {other:?}");
-                return ExitCode::from(1);
-            }
-            Err(e) => {
-                eprintln!(
-                    "rnstatus-rs: {}",
-                    local_rpc_failure_message(&endpoint, &config_dir, &e)
-                );
-                return ExitCode::from(1);
-            }
-        };
+    let answer =
+        local_rpc_request_bytes(&endpoint, &rpc_key, &RpcRequest::GetInterfaceStats, timeout).await;
+    let totals = answer
+        .as_ref()
+        .ok()
+        .and_then(|bytes| rpc::decode_interface_stats_totals(bytes).ok());
+    let stats = match answer
+        .and_then(|bytes| rpc::decode_response_for_request(&bytes, &RpcRequest::GetInterfaceStats))
+    {
+        Ok(RpcResponse::InterfaceStats(v)) => v,
+        Ok(RpcResponse::Error(e)) => {
+            eprintln!("rnstatus-rs: {e}");
+            return ExitCode::from(1);
+        }
+        Ok(other) => {
+            eprintln!("rnstatus-rs: unexpected response: {other:?}");
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!(
+                "rnstatus-rs: {}",
+                local_rpc_failure_message(&endpoint, &config_dir, &e)
+            );
+            return ExitCode::from(1);
+        }
+    };
 
     let link_count = if args.link_stats {
         match local_rpc_request(&endpoint, &rpc_key, &RpcRequest::GetLinkCount, timeout).await {
@@ -263,7 +273,7 @@ async fn run_local_once(args: &Args) -> ExitCode {
     if args.json {
         print_local_json(&stats, link_count, args);
     } else {
-        print_local_human(&stats, link_count, args);
+        print_local_human(&stats, totals, link_count, args);
     }
 
     ExitCode::SUCCESS
@@ -281,6 +291,22 @@ async fn local_rpc_request(
         }
         SharedInstanceRpcEndpoint::Unix(socket_path) => {
             rpc::connect_unix_and_request(socket_path, rpc_key, request, timeout).await
+        }
+    }
+}
+
+async fn local_rpc_request_bytes(
+    endpoint: &SharedInstanceRpcEndpoint,
+    rpc_key: &[u8],
+    request: &RpcRequest,
+    timeout: Duration,
+) -> Result<Vec<u8>, rns_runtime::rpc::RpcError> {
+    match endpoint {
+        SharedInstanceRpcEndpoint::Tcp(port) => {
+            rpc::connect_and_request_bytes(*port, rpc_key, request, timeout).await
+        }
+        SharedInstanceRpcEndpoint::Unix(socket_path) => {
+            rpc::connect_unix_and_request_bytes(socket_path, rpc_key, request, timeout).await
         }
     }
 }
@@ -555,7 +581,12 @@ fn print_interface_heading(
     println!("    Status   : {}", if online { "Up" } else { "Down" });
 }
 
-fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, args: &Args) {
+fn print_local_human(
+    stats: &[rpc::InterfaceStatEntry],
+    totals: Option<rpc::InterfaceStatsTotals>,
+    link_count: Option<i64>,
+    args: &Args,
+) {
     println!(
         "Reticulum Status [rnstatus-rs {}]",
         env!("CARGO_PKG_VERSION")
@@ -659,17 +690,41 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
     }
 
     if args.totals {
-        let (rxb, txb) = stats
-            .iter()
-            .fold((0u64, 0u64), |(r, t), e| (r + e.rx_bytes, t + e.tx_bytes));
+        let totals = totals.unwrap_or_else(|| {
+            let (rxb, txb) = stats
+                .iter()
+                .fold((0u64, 0u64), |(r, t), e| (r + e.rx_bytes, t + e.tx_bytes));
+            rpc::InterfaceStatsTotals {
+                rxb,
+                txb,
+                ..Default::default()
+            }
+        });
         println!("  Totals:");
-        println!("    RX : {}", format::pretty_size(rxb));
-        println!("    TX : {}", format::pretty_size(txb));
+        println!(
+            "    RX : {}{}",
+            format::pretty_size(totals.rxb),
+            pps_suffix(args.pps, totals.rxpps)
+        );
+        println!(
+            "    TX : {}{}",
+            format::pretty_size(totals.txb),
+            pps_suffix(args.pps, totals.txpps)
+        );
         println!();
     }
 
     if let Some(n) = link_count {
         println!("  Active links: {n}");
+    }
+}
+
+/// Python `-p` appends `prettysize(pps, suffix="pps")` to the totals (rnstatus.py:792-796).
+fn pps_suffix(pps: bool, value: u64) -> String {
+    if pps {
+        format!(", {}", format::pretty_size(value).replace('B', "pps"))
+    } else {
+        String::new()
     }
 }
 
@@ -1370,6 +1425,14 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
         .find(|(k, _)| k.as_str() == Some("txb"))
         .and_then(|(_, v)| v.as_u64())
         .unwrap_or(0);
+    let stat_u64 = |key: &str| {
+        stats
+            .iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .and_then(|(_, v)| v.as_u64())
+            .unwrap_or(0)
+    };
+    let (rxpps, txpps) = (stat_u64("rxpps"), stat_u64("txpps"));
 
     let mut parsed_interfaces = interfaces
         .map(|ifs| {
@@ -1547,8 +1610,16 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
 
     if args.totals {
         println!("  Totals:");
-        println!("    RX : {}", format::pretty_size(total_rxb));
-        println!("    TX : {}", format::pretty_size(total_txb));
+        println!(
+            "    RX : {}{}",
+            format::pretty_size(total_rxb),
+            pps_suffix(args.pps, rxpps)
+        );
+        println!(
+            "    TX : {}{}",
+            format::pretty_size(total_txb),
+            pps_suffix(args.pps, txpps)
+        );
         println!();
     }
     if let Some(n) = link_count {
@@ -1866,6 +1937,7 @@ mod tests {
             link_stats: false,
             burst: false,
             totals: false,
+            pps: false,
             sort: None,
             reverse: false,
             json: false,

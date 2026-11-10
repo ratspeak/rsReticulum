@@ -549,12 +549,11 @@ impl TransportActor {
         }
         match self.try_send_to_interface(interface, raw) {
             InterfaceSendOutcome::Sent => {
-                if let Some(entry) = self.interfaces.get_mut(&interface) {
-                    entry.ingress.sent_path_request();
-                    if recursive {
-                        let tx_time = raw.len() as f64 * 8.0 / entry.bitrate.max(1) as f64;
-                        entry.announce_allowed_at = now + tx_time / entry.announce_cap.max(0.001);
-                    }
+                self.record_interface_event(interface, InterfaceEvent::SentPathRequest, raw.len());
+                self.count_transport_event(InterfaceEvent::SentPathRequest);
+                if recursive && let Some(entry) = self.interfaces.get_mut(&interface) {
+                    let tx_time = raw.len() as f64 * 8.0 / entry.bitrate.max(1) as f64;
+                    entry.announce_allowed_at = now + tx_time / entry.announce_cap.max(0.001);
                 }
                 self.path_requests.insert(destination, now);
                 Admission::Sent

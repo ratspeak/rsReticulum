@@ -15,9 +15,13 @@ use tokio::sync::mpsc;
 
 use crate::hdlc;
 use crate::traits::{
-    InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, handoff_accepted_interface,
+    ByteCounter, ClientCountGuard, InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode,
+    handoff_accepted_interface,
 };
-use rns_transport::messages::{InboundPacket, TransportMessage};
+use rns_transport::messages::{
+    InboundPacket, InterfaceIdentity, InterfaceInspectionSnapshot, InterfaceInspectionSource,
+    TransportMessage,
+};
 
 pub const LOCAL_MTU: u32 = 262_144;
 const LOCAL_HW_MTU: usize = LOCAL_MTU as usize;
@@ -163,6 +167,16 @@ impl LocalEndpoint {
         #[cfg(not(unix))]
         {
             Self::Tcp(format!("127.0.0.1:{FALLBACK_TCP_PORT}"))
+        }
+    }
+
+    /// What Python's local interfaces show in brackets: the socket path
+    /// without its abstract-namespace NUL, or the TCP port.
+    fn python_label(&self) -> String {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(path) => path.replace('\0', ""),
+            Self::Tcp(addr) => addr.rsplit(':').next().unwrap_or(addr).to_string(),
         }
     }
 
@@ -335,7 +349,7 @@ async fn accepted_read_loop(
     interface_id: InterfaceId,
     transport_tx: InterfaceTransportSender,
     online: Arc<AtomicBool>,
-    rxb: Arc<AtomicU64>,
+    rxb: ByteCounter,
     pause: Option<Arc<ClientSleepPause>>,
 ) {
     let mut buf = [0u8; 8192];
@@ -355,11 +369,11 @@ async fn accepted_read_loop(
                 if let Some(pause) = &pause {
                     pause.refresh();
                 }
-                rxb.fetch_add(n as u64, Ordering::Relaxed);
                 for frame in deframer.feed(&buf[..n]) {
                     if frame.is_empty() {
                         continue;
                     }
+                    rxb.add(frame.len());
                     let msg = TransportMessage::Inbound(InboundPacket {
                         raw: Bytes::from(frame),
                         interface_id,
@@ -387,7 +401,7 @@ async fn accepted_write_loop(
     mut writer: LocalWriter,
     mut rx: mpsc::Receiver<Bytes>,
     online: Arc<AtomicBool>,
-    txb: Arc<AtomicU64>,
+    txb: ByteCounter,
     pause: Option<Arc<ClientSleepPause>>,
     force_bitrate: Option<u64>,
 ) {
@@ -398,7 +412,7 @@ async fn accepted_write_loop(
         }
         match write_local_frame(&mut writer, &data, force_bitrate).await {
             Ok(written) => {
-                txb.fetch_add(written as u64, Ordering::Relaxed);
+                txb.add(written);
             }
             Err(e) => {
                 tracing::warn!(error = %e, "local write error");
@@ -459,11 +473,11 @@ async fn run_local_client_connection(
                         return LocalClientConnectionEnd::Disconnected;
                     }
                     Ok(n) => {
-                        io.rxb.fetch_add(n as u64, Ordering::Relaxed);
                         for frame in deframer.feed(&buf[..n]) {
                             if frame.is_empty() {
                                 continue;
                             }
+                            io.rxb.fetch_add(frame.len() as u64, Ordering::Relaxed);
                             let msg = TransportMessage::Inbound(InboundPacket {
                                 raw: Bytes::from(frame),
                                 interface_id,
@@ -516,10 +530,14 @@ async fn run_local_client_connection(
 
 /// Wire one accepted server-side client: write loop, read task, and its
 /// `InterfaceHandle`. Transport is told to drop it as soon as it disconnects.
+#[allow(clippy::too_many_arguments)]
 fn wire_accepted_stream(
     id: InterfaceId,
     name: String,
     parent_id: InterfaceId,
+    parent_counters: (Arc<AtomicU64>, Arc<AtomicU64>),
+    client_count: ClientCountGuard,
+    identity: InterfaceIdentity,
     reader: LocalReader,
     writer: LocalWriter,
     transport_tx: mpsc::Sender<TransportMessage>,
@@ -537,16 +555,17 @@ fn wire_accepted_stream(
         writer,
         rx,
         online.clone(),
-        txb.clone(),
+        ByteCounter::new(txb.clone(), Some(parent_counters.1)),
         pause.clone(),
         force_bitrate,
     ));
 
     let online_r = online.clone();
-    let rxb_r = rxb.clone();
+    let rxb_r = ByteCounter::new(rxb.clone(), Some(parent_counters.0));
     let task_name = name.clone();
     let dereg_tx = transport_tx.clone();
     let read_task = tokio::spawn(async move {
+        let _client_count = client_count;
         accepted_read_loop(reader, id, transport_tx, online_r, rxb_r, pause).await;
         tracing::info!(name = %task_name, "local client disconnected");
         // Proactively notify so transport drops immediately.
@@ -566,6 +585,7 @@ fn wire_accepted_stream(
         txb,
         tx,
         read_task,
+        InterfaceInspectionSource::identified(identity),
     )
 }
 
@@ -581,6 +601,7 @@ fn local_handle(
     txb: Arc<AtomicU64>,
     tx: mpsc::Sender<Bytes>,
     read_task: tokio::task::JoinHandle<()>,
+    inspection: InterfaceInspectionSource,
 ) -> InterfaceHandle {
     InterfaceHandle {
         id,
@@ -600,7 +621,7 @@ fn local_handle(
         online,
         rxb: Some(rxb),
         txb: Some(txb),
-        inspection: None,
+        inspection: Some(inspection),
         tx,
         read_task,
     }
@@ -628,6 +649,20 @@ pub async fn spawn_local_server(
     let online2 = online.clone();
     let name = config.name.clone();
     let (tx, _rx) = mpsc::channel::<Bytes>(1);
+    let parent_rxb = Arc::new(AtomicU64::new(0));
+    let parent_txb = Arc::new(AtomicU64::new(0));
+    let task_parent_counters = (parent_rxb.clone(), parent_txb.clone());
+    let clients = Arc::new(AtomicU64::new(0));
+    let task_clients = clients.clone();
+    let label = endpoint.python_label();
+    let unix_path =
+        (!matches!(endpoint, LocalEndpoint::Tcp(_))).then(|| config.socket_path.clone());
+    // LocalInterface.py:372, :485-487.
+    let server_identity = InterfaceIdentity::new(
+        format!("Shared Instance[{label}]"),
+        "Reticulum",
+        "LocalServerInterface",
+    );
 
     let read_task = tokio::spawn(async move {
         loop {
@@ -636,11 +671,30 @@ pub async fn spawn_local_server(
                     let client_id = id_gen.fetch_add(1, Ordering::SeqCst);
                     let client_name = format!("{}/client_{}", config.name, client_id);
                     tracing::info!(name = %client_name, %peer, "local client connected");
+                    // LocalInterface.py:351-353, :420-424 and :443.
+                    let identity = match &unix_path {
+                        Some(path) => InterfaceIdentity::new(
+                            format!("LocalInterface[{label}]"),
+                            format!("{}@{path}", task_clients.load(Ordering::Relaxed)),
+                            "LocalClientInterface",
+                        ),
+                        None => {
+                            let port = peer.rsplit(':').next().unwrap_or(&peer).to_string();
+                            InterfaceIdentity::new(
+                                format!("LocalInterface[{port}]"),
+                                port,
+                                "LocalClientInterface",
+                            )
+                        }
+                    };
 
                     let handle = wire_accepted_stream(
                         client_id,
                         client_name,
                         id,
+                        task_parent_counters.clone(),
+                        ClientCountGuard::new(task_clients.clone()),
+                        identity,
                         reader,
                         writer,
                         transport_tx.clone(),
@@ -670,10 +724,15 @@ pub async fn spawn_local_server(
         None,
         false,
         online,
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
+        parent_rxb,
+        parent_txb,
         tx,
         read_task,
+        InterfaceInspectionSource::new(move || InterfaceInspectionSnapshot {
+            active_clients: Some(clients.load(Ordering::Relaxed)),
+            ..InterfaceInspectionSnapshot::default()
+        })
+        .with_identity(server_identity),
     ))
 }
 
@@ -694,6 +753,12 @@ pub async fn spawn_local_client(
     let transport_tx = InterfaceTransportSender::new(id, transport_tx);
     let owner = transport_tx.owner();
     let endpoint = LocalEndpoint::parse(&config.socket_path);
+    // Reticulum.py:437-441: named "Local shared instance".
+    let identity = InterfaceIdentity::new(
+        format!("LocalInterface[{}]", endpoint.python_label()),
+        "Local shared instance",
+        "LocalClientInterface",
+    );
     let initial = endpoint.connect().await?;
     tracing::debug!(name = %config.name, endpoint = %endpoint.display(), "local client connected");
 
@@ -774,6 +839,7 @@ pub async fn spawn_local_client(
         txb,
         tx,
         read_task,
+        InterfaceInspectionSource::identified(identity),
     ))
 }
 

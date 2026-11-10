@@ -19,11 +19,12 @@ use tokio::sync::mpsc;
 use crate::hdlc;
 use crate::socket_tuning::{iface_addr_for, set_keepalive_tuned, set_socket_buffers};
 use crate::traits::{
-    InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, TunnelIdentity,
-    handoff_accepted_interface, open_client_connection, python_host,
+    ByteCounter, InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, TunnelIdentity,
+    handoff_accepted_interface, open_client_connection, python_address_name, python_host,
 };
 use rns_transport::messages::{
-    InboundPacket, InterfaceInspectionSnapshot, InterfaceInspectionSource, TransportMessage,
+    InboundPacket, InterfaceIdentity, InterfaceInspectionSnapshot, InterfaceInspectionSource,
+    TransportMessage,
 };
 
 /// 1 MiB ceiling for MTU selection and requested socket buffer size.
@@ -313,6 +314,7 @@ impl FastFlapRuntime {
         InterfaceInspectionSnapshot {
             active_clients: Some(active_clients.load(Ordering::Relaxed)),
             blocked_ips: Some(blocked_ips),
+            ..InterfaceInspectionSnapshot::default()
         }
     }
 }
@@ -397,7 +399,7 @@ async fn backbone_read_loop(
     interface_id: InterfaceId,
     transport_tx: InterfaceTransportSender,
     online: Arc<AtomicBool>,
-    rxb: Arc<AtomicU64>,
+    rxb: ByteCounter,
 ) {
     // Upstream bounds receive at its optimised HW_MTU (32768 at 100 Mbps); this
     // stays at the wire budget until a transit node clamps link MTU to that too.
@@ -416,11 +418,11 @@ async fn backbone_read_loop(
                 break;
             }
             Ok(n) => {
-                rxb.fetch_add(n as u64, Ordering::Relaxed);
                 for frame in deframer.feed(&buf[..n]) {
                     if frame.is_empty() {
                         continue;
                     }
+                    rxb.add(frame.len());
                     let msg = TransportMessage::Inbound(InboundPacket {
                         raw: Bytes::from(frame),
                         interface_id,
@@ -523,13 +525,31 @@ impl EgressControl {
     }
 }
 
+/// Python `tx_stalled` and `len(transmit_buffer)` of one connection, read by stats.
+#[derive(Debug, Default)]
+struct EgressState {
+    stalled: AtomicBool,
+    buffered: AtomicU64,
+}
+
+impl EgressState {
+    fn inspection(state: Arc<Self>) -> InterfaceInspectionSource {
+        InterfaceInspectionSource::new(move || InterfaceInspectionSnapshot {
+            tx_stalled: state.stalled.load(Ordering::Relaxed),
+            tx_buffered: state.buffered.load(Ordering::Relaxed),
+            ..InterfaceInspectionSnapshot::default()
+        })
+    }
+}
+
 /// HDLC-frames outbound packets into a byte-bounded transmit queue drained to
 /// the socket, applying egress control. Returns when the connection must close.
 async fn backbone_write_loop(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     rx: &mut mpsc::Receiver<Bytes>,
-    txb: &AtomicU64,
+    txb: &ByteCounter,
     name: &str,
+    state: &EgressState,
 ) {
     let started = tokio::time::Instant::now();
     let mut control = EgressControl::new(0.0);
@@ -544,7 +564,9 @@ async fn backbone_write_loop(
         tokio::select! {
             _ = tick.tick() => {
                 let now = started.elapsed().as_secs_f64();
-                if control.evaluate(sent, buffered, buffered, now) {
+                let teardown = control.evaluate(sent, buffered, buffered, now);
+                state.stalled.store(control.stalled(), Ordering::Relaxed);
+                if teardown {
                     rns_transport::notice!(
                         name = %name,
                         "No egress control drain progress for {}s on {}, tearing down",
@@ -561,7 +583,8 @@ async fn backbone_write_loop(
                         let written = n as u64;
                         sent += written;
                         buffered -= written;
-                        txb.fetch_add(written, Ordering::Relaxed);
+                        state.buffered.store(buffered, Ordering::Relaxed);
+                        txb.add(n);
                         if let Some(front) = queue.front_mut() {
                             if n >= front.len() {
                                 queue.pop_front();
@@ -590,6 +613,7 @@ async fn backbone_write_loop(
                     );
                 } else {
                     buffered += len;
+                    state.buffered.store(buffered, Ordering::Relaxed);
                     queue.push_back(frame);
                 }
             }
@@ -606,15 +630,17 @@ async fn backbone_connection(
     interface_id: InterfaceId,
     transport_tx: InterfaceTransportSender,
     online: Arc<AtomicBool>,
-    rxb: Arc<AtomicU64>,
-    txb: Arc<AtomicU64>,
+    rxb: ByteCounter,
+    txb: ByteCounter,
     name: &str,
+    state: &EgressState,
 ) {
     let (reader, mut writer) = stream.into_split();
     tokio::select! {
         _ = backbone_read_loop(reader, interface_id, transport_tx, online.clone(), rxb) => {}
-        _ = backbone_write_loop(&mut writer, rx, &txb, name) => {}
+        _ = backbone_write_loop(&mut writer, rx, &txb, name, state) => {}
     }
+    state.buffered.store(0, Ordering::Relaxed);
     online.store(false, Ordering::SeqCst);
 }
 
@@ -732,6 +758,20 @@ fn spawn_backbone_server_on_listener(
         inspection_runtime.inspection_snapshot(fast_flap_policy, inspection_active_clients.as_ref())
     });
     let task_active_clients = Arc::clone(&active_clients);
+    let parent_rxb = Arc::new(AtomicU64::new(0));
+    let parent_txb = Arc::new(AtomicU64::new(0));
+    let task_parent_rxb = parent_rxb.clone();
+    let task_parent_txb = parent_txb.clone();
+    let listener_identity = InterfaceIdentity::new(
+        python_address_name(
+            "BackboneInterface",
+            &config.name,
+            &local_addr.ip().to_string(),
+            local_addr.port(),
+        ),
+        &config.name,
+        "BackboneInterface",
+    );
 
     // Parent listener is inbound-only; drain task warns on stray writes.
     let (tx, mut listener_rx) = mpsc::channel::<Bytes>(1);
@@ -778,8 +818,8 @@ fn spawn_backbone_server_on_listener(
                     let (c_tx, mut c_rx) = mpsc::channel::<Bytes>(TX_CHANNEL_DEPTH);
 
                     let c_online_r = c_online.clone();
-                    let c_rxb_r = c_rxb.clone();
-                    let c_txb_w = c_txb.clone();
+                    let c_rxb_r = ByteCounter::new(c_rxb.clone(), Some(task_parent_rxb.clone()));
+                    let c_txb_w = ByteCounter::new(c_txb.clone(), Some(task_parent_txb.clone()));
                     let transport_tx2 =
                         InterfaceTransportSender::new(client_id, transport_tx.actor_sender());
                     let child_owner = transport_tx2.owner();
@@ -787,6 +827,8 @@ fn spawn_backbone_server_on_listener(
                     let cname = client_name.clone();
                     let active_client_guard =
                         ActiveClientGuard::new(Arc::clone(&task_active_clients));
+                    let egress = Arc::new(EgressState::default());
+                    let task_egress = egress.clone();
                     let read_handle = tokio::spawn(async move {
                         let _active_client_guard = active_client_guard;
                         backbone_connection(
@@ -798,6 +840,7 @@ fn spawn_backbone_server_on_listener(
                             c_rxb_r,
                             c_txb_w,
                             &cname,
+                            &task_egress,
                         )
                         .await;
                         fast_flap_connection.disconnected();
@@ -809,6 +852,17 @@ fn spawn_backbone_server_on_listener(
                     });
 
                     let (child_mtu, packet_capacity) = autoconfigured_mtu();
+                    let spawned_name = format!("Client on {}", config.name);
+                    let child_identity = InterfaceIdentity::new(
+                        python_address_name(
+                            "BackboneInterface",
+                            &spawned_name,
+                            &peer.ip().to_string(),
+                            peer.port(),
+                        ),
+                        spawned_name,
+                        "BackboneClientInterface",
+                    );
                     let handle = InterfaceHandle {
                         id: client_id,
                         owner: child_owner,
@@ -827,7 +881,9 @@ fn spawn_backbone_server_on_listener(
                         online: c_online,
                         rxb: Some(c_rxb),
                         txb: Some(c_txb),
-                        inspection: None,
+                        inspection: Some(
+                            EgressState::inspection(egress).with_identity(child_identity),
+                        ),
                         tx: c_tx,
                         read_task: read_handle,
                     };
@@ -865,9 +921,9 @@ fn spawn_backbone_server_on_listener(
         bitrate: BITRATE_GUESS,
         mtu,
         online,
-        rxb: Some(Arc::new(AtomicU64::new(0))),
-        txb: Some(Arc::new(AtomicU64::new(0))),
-        inspection: Some(inspection),
+        rxb: Some(parent_rxb),
+        txb: Some(parent_txb),
+        inspection: Some(inspection.with_identity(listener_identity)),
         tx,
         read_task,
     })
@@ -893,6 +949,9 @@ pub async fn spawn_backbone_client(
     let task_txb = shared_txb.clone();
 
     let python_name = config.python_name();
+    let identity = InterfaceIdentity::new(&python_name, &config.name, "BackboneClientInterface");
+    let egress = Arc::new(EgressState::default());
+    let task_egress = egress.clone();
     let read_task = tokio::spawn(async move {
         let max_tries = config.max_reconnect_tries;
         let mut tries: usize = 0;
@@ -993,9 +1052,10 @@ pub async fn spawn_backbone_client(
                     id,
                     transport_tx.clone(),
                     online2.clone(),
-                    task_rxb.clone(),
-                    task_txb.clone(),
+                    ByteCounter::new(task_rxb.clone(), None),
+                    ByteCounter::new(task_txb.clone(), None),
                     &python_name,
+                    &task_egress,
                 )
                 .await;
             }
@@ -1038,7 +1098,7 @@ pub async fn spawn_backbone_client(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        inspection: None,
+        inspection: Some(EgressState::inspection(egress).with_identity(identity)),
         tx,
         read_task,
     })
@@ -1488,6 +1548,7 @@ mod tests {
             InterfaceInspectionSnapshot {
                 active_clients: Some(0),
                 blocked_ips: Some(0),
+                ..Default::default()
             }
         );
     }
@@ -1507,6 +1568,7 @@ mod tests {
             InterfaceInspectionSnapshot {
                 active_clients: Some(3),
                 blocked_ips: Some(0),
+                ..Default::default()
             }
         );
 

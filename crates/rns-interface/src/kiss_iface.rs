@@ -139,6 +139,8 @@ async fn spawn_kiss_with_port(
     let (tx, mut rx) = mpsc::channel::<Bytes>(256);
     let background = crate::background_announce::register(&tx)?;
     let name = config.name.clone();
+    let python_identity =
+        rns_transport::messages::InterfaceIdentity::bracketed("KISSInterface", &name);
     let mode = config.mode;
     let flow_control = config.flow_control;
 
@@ -255,11 +257,12 @@ async fn spawn_kiss_with_port(
             if flow_control {
                 flow_control_locked = tokio::time::Instant::now();
             }
-            txb_w.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let framed = kiss::frame(&data);
             match crate::serial_io::blocking_write_all(port_w, framed).await {
                 Ok(p) => {
                     port_w = p;
+                    // Python counts the unframed payload here (KISSInterface.py:275).
+                    txb_w.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "KISS write error");
@@ -297,10 +300,13 @@ async fn spawn_kiss_with_port(
                         }
                     } else {
                         last_read = std::time::Instant::now();
-                        rxb_r.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                         for event in deframer.feed(&buf[..n]) {
                             match event {
                                 kiss::KissEvent::Data(frame) => {
+                                    rxb_r.fetch_add(
+                                        frame.len() as u64,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
                                     let msg = TransportMessage::Inbound(InboundPacket {
                                         raw: Bytes::from(frame),
                                         interface_id: id,
@@ -349,7 +355,9 @@ async fn spawn_kiss_with_port(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        inspection: None,
+        inspection: Some(
+            rns_transport::messages::InterfaceInspectionSource::identified(python_identity),
+        ),
         tx,
         read_task,
     })

@@ -28,6 +28,51 @@ pub struct InterfaceHandle {
     pub read_task: tokio::task::JoinHandle<()>,
 }
 
+/// A byte counter that also adds to a parent's counter, as Python's spawned
+/// interfaces add their traffic to `parent_interface.rxb`/`txb`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ByteCounter {
+    own: Arc<AtomicU64>,
+    parent: Option<Arc<AtomicU64>>,
+}
+
+impl ByteCounter {
+    pub(crate) fn new(own: Arc<AtomicU64>, parent: Option<Arc<AtomicU64>>) -> Self {
+        Self { own, parent }
+    }
+
+    pub(crate) fn add(&self, bytes: usize) {
+        let bytes = bytes as u64;
+        self.own
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        if let Some(parent) = &self.parent {
+            parent.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Counts a listener's live clients, as Python's `clients` does, for as long
+/// as the client task holds it.
+pub(crate) struct ClientCountGuard(Arc<AtomicU64>);
+
+impl ClientCountGuard {
+    pub(crate) fn new(count: Arc<AtomicU64>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(count)
+    }
+}
+
+impl Drop for ClientCountGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Python `str(interface)` for the address-bearing interfaces: `Class[name/host:port]`.
+pub(crate) fn python_address_name(class: &str, name: &str, host: &str, port: u16) -> String {
+    format!("{class}[{name}/{}:{port}]", python_host(host))
+}
+
 /// Deliver a dynamically accepted interface to its owner.
 ///
 /// A failed handoff returns the handle to this producer. The producer must

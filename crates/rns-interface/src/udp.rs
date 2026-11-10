@@ -91,6 +91,12 @@ pub async fn spawn_udp_interface(
     let online2 = online.clone();
     let (tx, mut rx) = mpsc::channel::<Bytes>(256);
     let name = config.name.clone();
+    // UDPInterface.py:141-142 renders the bind address as configured.
+    let python_identity = rns_transport::messages::InterfaceIdentity::new(
+        format!("UDPInterface[{}/{}:{}]", name, listen_ip, local_addr.port()),
+        &name,
+        "UDPInterface",
+    );
     let mode = config.mode;
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
@@ -185,7 +191,9 @@ pub async fn spawn_udp_interface(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        inspection: None,
+        inspection: Some(
+            rns_transport::messages::InterfaceInspectionSource::identified(python_identity),
+        ),
         tx,
         read_task,
     })

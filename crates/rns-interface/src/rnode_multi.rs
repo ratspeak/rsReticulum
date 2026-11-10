@@ -750,6 +750,7 @@ struct SubRuntime {
     rxb: Arc<AtomicU64>,
     txb: Arc<AtomicU64>,
     transport: InterfaceTransportSender,
+    radio: Arc<std::sync::Mutex<rnode::RNodeRadioStats>>,
 }
 
 enum ReaderEvent {
@@ -925,6 +926,7 @@ pub async fn spawn_rnode_multi_interface_observed(
         let retired = Arc::new(AtomicBool::new(false));
         let rxb = Arc::new(AtomicU64::new(0));
         let txb = Arc::new(AtomicU64::new(0));
+        let radio = Arc::new(std::sync::Mutex::new(rnode::RNodeRadioStats::default()));
         let transport = InterfaceTransportSender::new(id, transport_tx.clone());
 
         let (sub_tx, mut sub_rx) = mpsc::channel::<Bytes>(256);
@@ -972,7 +974,15 @@ pub async fn spawn_rnode_multi_interface_observed(
             online: online.clone(),
             rxb: Some(rxb.clone()),
             txb: Some(txb.clone()),
-            inspection: None,
+            // RNodeMultiInterface.py:1164-1165.
+            inspection: Some(
+                rnode::RNodeRadioStats::inspection(radio.clone(), rnode::RNodeRadioKind::Sub)
+                    .with_identity(rns_transport::messages::InterfaceIdentity::new(
+                        format!("{}[{}]", config.name, sub_cfg.name),
+                        &sub_cfg.name,
+                        "RNodeSubInterface",
+                    )),
+            ),
             tx: sub_tx,
             read_task: spawn_retire_watch(retired.clone(), None),
         });
@@ -986,6 +996,7 @@ pub async fn spawn_rnode_multi_interface_observed(
             rxb,
             txb,
             transport,
+            radio,
         });
     }
     drop(write_tx);
@@ -1012,12 +1023,18 @@ pub async fn spawn_rnode_multi_interface_observed(
         online: parent_online.clone(),
         rxb: Some(Arc::new(AtomicU64::new(0))),
         txb: Some(parent_txb.clone()),
-        inspection: Some(rns_transport::messages::InterfaceInspectionSource::new(
-            move || rns_transport::messages::InterfaceInspectionSnapshot {
-                active_clients: Some(clients.load(Ordering::SeqCst)),
-                blocked_ips: None,
-            },
-        )),
+        inspection: Some(
+            rns_transport::messages::InterfaceInspectionSource::new(move || {
+                rns_transport::messages::InterfaceInspectionSnapshot {
+                    active_clients: Some(clients.load(Ordering::SeqCst)),
+                    ..rns_transport::messages::InterfaceInspectionSnapshot::default()
+                }
+            })
+            .with_identity(rns_transport::messages::InterfaceIdentity::bracketed(
+                "RNodeMultiInterface",
+                &config.name,
+            )),
+        ),
         tx: parent_tx,
         read_task: spawn_retire_watch(parent_retired.clone(), Some(device.clone())),
     };
@@ -1280,8 +1297,9 @@ impl MultiDriver {
         }
         let sub = &self.subs[local];
         sub.txb.fetch_add(data.len() as u64, Ordering::Relaxed);
+        // Python's parent counts the KISS-escaped payload (RNodeMultiInterface.py:540-544).
         self.parent_txb
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
+            .fetch_add(kiss::escape(&data).len() as u64, Ordering::Relaxed);
         let frame = build_subinterface_data_frame(sub.vport, &data);
         let Some(current) = port.take() else {
             return Err(());
@@ -1403,6 +1421,15 @@ async fn read_rnode_multi(
         port_r = p;
         buf = b;
         for (command, frame) in deframer.feed(&buf[..n]) {
+            if command != kiss::CMD_DATA
+                && let Some(local) = selected_local(selected_vport)
+            {
+                subs[local]
+                    .radio
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .observe(rnode::RNodeRadioKind::Sub, command, &frame);
+            }
             match command {
                 kiss::CMD_DATA => {
                     if frame.is_empty() {

@@ -119,6 +119,8 @@ pub async fn spawn_serial_interface(
     let (tx, mut rx) = mpsc::channel::<Bytes>(256);
     let background = crate::background_announce::register(&tx)?;
     let name = config.name.clone();
+    let python_identity =
+        rns_transport::messages::InterfaceIdentity::bracketed("SerialInterface", &name);
     let mode = config.mode;
 
     let port_write = port
@@ -147,11 +149,12 @@ pub async fn spawn_serial_interface(
                     Err(_) => continue,
                 }
             };
-            txb_w.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let framed = hdlc::frame(&data);
+            let framed_len = framed.len() as u64;
             match crate::serial_io::blocking_write_all(port_w, framed).await {
                 Ok(p) => {
                     port_w = p;
+                    txb_w.fetch_add(framed_len, std::sync::atomic::Ordering::Relaxed);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "serial write error");
@@ -186,8 +189,14 @@ pub async fn spawn_serial_interface(
                         }
                     } else {
                         last_read = std::time::Instant::now();
-                        rxb_r.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                         for frame in deframer.feed(&buf[..n]) {
+                            if frame.is_empty() {
+                                continue;
+                            }
+                            rxb_r.fetch_add(
+                                frame.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                             let msg = TransportMessage::Inbound(InboundPacket {
                                 raw: Bytes::from(frame),
                                 interface_id: id,
@@ -230,7 +239,9 @@ pub async fn spawn_serial_interface(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        inspection: None,
+        inspection: Some(
+            rns_transport::messages::InterfaceInspectionSource::identified(python_identity),
+        ),
         tx,
         read_task,
     })

@@ -55,6 +55,10 @@ pub(super) struct Core {
 }
 
 impl Core {
+    pub fn peer_count(&self) -> usize {
+        self.peers.len()
+    }
+
     /// `link_local` is the selected address; `all` lists every link-local
     /// address of the interface (`link_local_addresses`).
     pub fn adopt(&mut self, ifname: &str, link_local: Ipv6Addr, all: &[Ipv6Addr], now: Instant) {

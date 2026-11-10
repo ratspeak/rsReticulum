@@ -313,9 +313,9 @@ impl TransportActor {
             return false;
         }
         if outcome == InterfaceSendOutcome::Sent {
-            if let Some(entry) = self.interfaces.get_mut(&id) {
-                entry.ingress.sent_announce();
-            }
+            self.count_tx_packet();
+            self.record_interface_event(id, InterfaceEvent::SentAnnounce, raw.len());
+            self.count_transport_event(InterfaceEvent::SentAnnounce);
             Self::complete_announce_reply(&reply, AnnounceDispatchResult::Admitted);
             self.finish_cached_response(cached, &raw, id);
             return true;
@@ -525,9 +525,13 @@ impl TransportActor {
             }
             match Self::try_prepared_announce(&self.interfaces[&pending.interface], &pending.wire) {
                 InterfaceSendOutcome::Sent => {
-                    if let Some(entry) = self.interfaces.get_mut(&pending.interface) {
-                        entry.ingress.sent_announce();
-                    }
+                    self.count_tx_packet();
+                    self.record_interface_event(
+                        pending.interface,
+                        InterfaceEvent::SentAnnounce,
+                        pending.raw.len(),
+                    );
+                    self.count_transport_event(InterfaceEvent::SentAnnounce);
                     Self::complete_announce_reply(&pending.reply, AnnounceDispatchResult::Admitted);
                     self.finish_cached_response(pending.cached, &pending.raw, pending.interface);
                 }
@@ -558,6 +562,7 @@ impl TransportActor {
             match offered.receipt.started.try_recv() {
                 Ok(started) => {
                     self.announce_pressure.started += 1;
+                    let mut sent = false;
                     if let Some(entry) = self
                         .interfaces
                         .get_mut(&id)
@@ -570,7 +575,16 @@ impl TransportActor {
                         entry
                             .announce_queue
                             .retain(|queued| queued.raw != offered.raw);
-                        entry.ingress.sent_announce();
+                        sent = true;
+                    }
+                    if sent {
+                        self.count_tx_packet();
+                        self.record_interface_event(
+                            id,
+                            InterfaceEvent::SentAnnounce,
+                            offered.raw.len(),
+                        );
+                        self.count_transport_event(InterfaceEvent::SentAnnounce);
                     }
                 }
                 Err(oneshot::error::TryRecvError::Empty) => {

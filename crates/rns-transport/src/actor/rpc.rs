@@ -50,7 +50,7 @@ impl TransportActor {
             TransportQuery::GetInterfaceStats => {
                 let now = now_f64();
                 // Reticulum.py:1620: stats follow Transport.interfaces, bitrate order.
-                let stats: Vec<InterfaceStatRpcEntry> = self
+                let mut stats: Vec<InterfaceStatRpcEntry> = self
                     .prioritized_interface_ids()
                     .into_iter()
                     .map(|iface_id| (iface_id, &self.interfaces[&iface_id]))
@@ -85,6 +85,14 @@ impl TransportActor {
                                     InterfaceInspectionSnapshot::default()
                                 })
                             })
+                            .unwrap_or_default();
+                        let (arxb, atxb, prxb, ptxb) =
+                            entry.ingress.announce_and_path_request_bytes();
+                        let signal = self
+                            .traffic_count
+                            .signal
+                            .get(&iface_id)
+                            .copied()
                             .unwrap_or_default();
                         InterfaceStatRpcEntry {
                             id: iface_id,
@@ -139,10 +147,35 @@ impl TransportActor {
                             gravity: entry.gravity,
                             announces_to_internal: entry.announces_to_internal,
                             parent_id: entry.parent_id,
+                            identity: entry
+                                .inspection
+                                .as_ref()
+                                .and_then(|source| source.identity().cloned()),
+                            speeds: self.traffic_count.speeds.get(&iface_id).copied(),
+                            announce_rx_bytes: arxb,
+                            announce_tx_bytes: atxb,
+                            path_request_rx_bytes: prxb,
+                            path_request_tx_bytes: ptxb,
+                            burst_count: None,
+                            pr_burst_count: None,
+                            rssi: signal.rssi.map(f64::from),
+                            snr: signal.snr.map(f64::from),
+                            signal_quality: signal.q.map(f64::from),
+                            peers: inspection.peers,
+                            i2p_connectable: inspection.i2p_connectable,
+                            i2p_b32: inspection.i2p_b32,
+                            i2p_tunnel_state: inspection.i2p_tunnel_state,
+                            tx_stalled: inspection.tx_stalled,
+                            tx_buffered: inspection.tx_buffered,
+                            radio: inspection.radio,
                         }
                     })
                     .collect();
+                aggregate_backbone_bursts(&mut stats);
                 TransportQueryResponse::InterfaceStats(stats)
+            }
+            TransportQuery::GetTrafficTotals => {
+                TransportQueryResponse::TrafficTotals(self.traffic_totals())
             }
             TransportQuery::GetRateTable => {
                 let entries: Vec<RateTableRpcEntry> = self
@@ -267,7 +300,14 @@ impl TransportActor {
                     .get_live(&dest)
                     .map(|e| e.interface_id)
                     .or_else(|| self.local_destination_interface_id(&dest))
-                    .and_then(|id| self.interfaces.get(&id).map(|i| i.name.clone()));
+                    .and_then(|id| self.interfaces.get(&id))
+                    .map(|i| {
+                        // Python answers `str(interface)` (Reticulum.py:1960), as stats name it.
+                        i.inspection
+                            .as_ref()
+                            .and_then(|source| source.identity())
+                            .map_or_else(|| i.name.clone(), |identity| identity.name.clone())
+                    });
                 TransportQueryResponse::StringResult(name)
             }
             TransportQuery::GetPacketRssi { packet_hash } => TransportQueryResponse::FloatResult(
@@ -761,6 +801,262 @@ impl TransportActor {
             .iter()
             .find(|(_, e)| e.role == crate::messages::InterfaceRole::SharedServer)
             .map(|(&id, _)| id)
+    }
+}
+
+/// An announce or path request an interface received or sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InterfaceEvent {
+    ReceivedAnnounce,
+    SentAnnounce,
+    ReceivedPathRequest,
+    SentPathRequest,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrafficSample {
+    at: std::time::Instant,
+    bytes: [u64; 6],
+}
+
+/// Python `Transport.count_traffic_loop` state and the packet counters it
+/// reports (Transport.py:736-814).
+#[derive(Debug)]
+pub(super) struct TrafficCount {
+    started: std::time::Instant,
+    totals: TrafficTotalsRpcEntry,
+    samples: HashMap<InterfaceId, TrafficSample>,
+    speeds: HashMap<InterfaceId, [f64; 6]>,
+    /// Python `r_stat_rssi`, `r_stat_snr` and `r_stat_q` per interface.
+    signal: HashMap<InterfaceId, PacketMetrics>,
+    last_pps: Option<(std::time::Instant, u64, u64)>,
+    last_count: f64,
+}
+
+impl Default for TrafficCount {
+    fn default() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            totals: TrafficTotalsRpcEntry::default(),
+            samples: HashMap::new(),
+            speeds: HashMap::new(),
+            signal: HashMap::new(),
+            last_pps: None,
+            last_count: 0.0,
+        }
+    }
+}
+
+use crate::messages::TrafficTotalsRpcEntry;
+
+impl TransportActor {
+    /// Python `Interface.received_announce` and siblings: count on the
+    /// interface, then the bytes and a frequency sample on its parent
+    /// (Interface.py:307-329, TCPInterface.py:655-673).
+    pub(super) fn record_interface_event(
+        &mut self,
+        id: InterfaceId,
+        event: InterfaceEvent,
+        size: usize,
+    ) {
+        let Some(entry) = self.interfaces.get_mut(&id) else {
+            return;
+        };
+        match event {
+            InterfaceEvent::ReceivedAnnounce => entry.ingress.received_announce_bytes(size),
+            InterfaceEvent::SentAnnounce => entry.ingress.sent_announce_bytes(size),
+            InterfaceEvent::ReceivedPathRequest => entry.ingress.received_path_request_bytes(size),
+            InterfaceEvent::SentPathRequest => entry.ingress.sent_path_request_bytes(size),
+        }
+        let Some(parent) = entry
+            .parent_id
+            .and_then(|parent| self.interfaces.get_mut(&parent))
+        else {
+            return;
+        };
+        match event {
+            InterfaceEvent::ReceivedAnnounce => parent.ingress.spawned_received_announce(size),
+            InterfaceEvent::SentAnnounce => parent.ingress.spawned_sent_announce(size),
+            InterfaceEvent::ReceivedPathRequest => {
+                parent.ingress.spawned_received_path_request(size)
+            }
+            InterfaceEvent::SentPathRequest => parent.ingress.spawned_sent_path_request(size),
+        }
+    }
+
+    /// Python `Transport.rx_packets += 1` once a packet passes the packet
+    /// filter (Transport.py:2026).
+    pub(super) fn count_rx_packet(&mut self) {
+        self.traffic_count.totals.rx_packets += 1;
+    }
+
+    /// Python `Transport.tx_packets += 1` per `Transport.transmit` (Transport.py:1557).
+    pub(super) fn count_tx_packet(&mut self) {
+        self.traffic_count.totals.tx_packets += 1;
+    }
+
+    /// Python `Transport.announce_rxc`, `announce_txc`, `pr_rxc` and `pr_txc`.
+    pub(super) fn count_transport_event(&mut self, event: InterfaceEvent) {
+        let totals = &mut self.traffic_count.totals;
+        match event {
+            InterfaceEvent::ReceivedAnnounce => totals.announce_rx_packets += 1,
+            InterfaceEvent::SentAnnounce => totals.announce_tx_packets += 1,
+            InterfaceEvent::ReceivedPathRequest => totals.pr_rx_packets += 1,
+            InterfaceEvent::SentPathRequest => totals.pr_tx_packets += 1,
+        }
+    }
+
+    pub(super) fn record_interface_signal(&mut self, id: InterfaceId, metrics: PacketMetrics) {
+        if metrics.rssi.is_some() || metrics.snr.is_some() || metrics.q.is_some() {
+            let signal = self.traffic_count.signal.entry(id).or_default();
+            signal.rssi = metrics.rssi.or(signal.rssi);
+            signal.snr = metrics.snr.or(signal.snr);
+            signal.q = metrics.q.or(signal.q);
+        }
+    }
+
+    /// One pass of Python's once-a-second traffic count over top-level
+    /// interfaces other than the shared-instance server.
+    pub(super) fn count_traffic(&mut self, now: f64) {
+        if now - self.traffic_count.last_count < 1.0 {
+            return;
+        }
+        self.traffic_count.last_count = now;
+        let at = std::time::Instant::now();
+        let load = |counter: &Option<Arc<AtomicU64>>| {
+            counter
+                .as_ref()
+                .map_or(0, |c| c.load(std::sync::atomic::Ordering::Relaxed))
+        };
+        let count = &mut self.traffic_count;
+        count
+            .samples
+            .retain(|id, _| self.interfaces.contains_key(id));
+        count
+            .speeds
+            .retain(|id, _| self.interfaces.contains_key(id));
+        count
+            .signal
+            .retain(|id, _| self.interfaces.contains_key(id));
+        let mut deltas = [0u64; 6];
+        let mut speeds = [0f64; 6];
+        let mut freqs = [0f64; 4];
+        let mut measured = false;
+        for (&id, entry) in &self.interfaces {
+            if entry.parent_id.is_some() || entry.role == InterfaceRole::SharedServer {
+                continue;
+            }
+            let (arxb, atxb, prxb, ptxb) = entry.ingress.announce_and_path_request_bytes();
+            let bytes = [load(&entry.rxb), load(&entry.txb), arxb, atxb, prxb, ptxb];
+            let Some(previous) = count.samples.insert(id, TrafficSample { at, bytes }) else {
+                continue;
+            };
+            let elapsed = at.duration_since(previous.at).as_secs_f64();
+            if elapsed <= 0.0 {
+                continue;
+            }
+            let mut interface_speeds = [0f64; 6];
+            for i in 0..6 {
+                let delta = bytes[i].saturating_sub(previous.bytes[i]);
+                deltas[i] += delta;
+                interface_speeds[i] = (delta as f64 * 8.0) / elapsed;
+                speeds[i] += interface_speeds[i];
+            }
+            count.speeds.insert(id, interface_speeds);
+            freqs[0] += entry.ingress.incoming_announce_frequency();
+            freqs[1] += entry.ingress.outgoing_announce_frequency();
+            freqs[2] += entry.ingress.incoming_pr_frequency();
+            freqs[3] += entry.ingress.outgoing_pr_frequency();
+            measured = true;
+        }
+        let totals = &mut count.totals;
+        let (since, rxp, txp) = count.last_pps.unwrap_or((count.started, 0, 0));
+        let elapsed = at.duration_since(since).as_secs_f64();
+        if elapsed > 0.0 {
+            totals.rxpps =
+                ((totals.rx_packets.saturating_sub(rxp)) as f64 / elapsed).round() as u64;
+            totals.txpps =
+                ((totals.tx_packets.saturating_sub(txp)) as f64 / elapsed).round() as u64;
+        }
+        count.last_pps = Some((at, totals.rx_packets, totals.tx_packets));
+        totals.measured = measured;
+        totals.rxb += deltas[0];
+        totals.txb += deltas[1];
+        totals.arxb += deltas[2];
+        totals.atxb += deltas[3];
+        totals.prxb += deltas[4];
+        totals.ptxb += deltas[5];
+        [
+            totals.rxs,
+            totals.txs,
+            totals.arxs,
+            totals.atxs,
+            totals.prxs,
+            totals.ptxs,
+        ] = speeds;
+        [totals.arxf, totals.atxf, totals.prxf, totals.ptxf] = freqs;
+    }
+
+    fn traffic_totals(&self) -> TrafficTotalsRpcEntry {
+        let link_count = self.link_table.len() as u64;
+        let path_count = self.path_table.len() as u64;
+        TrafficTotalsRpcEntry {
+            link_count,
+            active_link_count: self
+                .link_table
+                .iter()
+                .filter(|(_, entry)| entry.validated)
+                .count() as u64,
+            path_count,
+            // Path use is not recorded, so every path reads as never used.
+            unused_path_count: path_count,
+            ..self.traffic_count.totals
+        }
+    }
+}
+
+/// A Backbone listener reports its children's bursts: whether any is active,
+/// the earliest activation, and how many (BackboneInterface.py:185-259).
+fn aggregate_backbone_bursts(stats: &mut [crate::messages::InterfaceStatRpcEntry]) {
+    let listeners: Vec<InterfaceId> = stats
+        .iter()
+        .filter(|entry| {
+            entry.parent_id.is_none()
+                && entry
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.class_name == "BackboneInterface")
+        })
+        .map(|entry| entry.id)
+        .collect();
+    for listener in listeners {
+        let children = stats
+            .iter()
+            .filter(|entry| entry.parent_id == Some(listener));
+        let (mut count, mut activated, mut pr_count, mut pr_activated) =
+            (0u64, None::<f64>, 0u64, None::<f64>);
+        for child in children {
+            if child.burst_active {
+                count += 1;
+                activated = Some(
+                    activated.map_or(child.burst_activated, |a: f64| a.min(child.burst_activated)),
+                );
+            }
+            if child.pr_burst_active {
+                pr_count += 1;
+                pr_activated = Some(pr_activated.map_or(child.pr_burst_activated, |a: f64| {
+                    a.min(child.pr_burst_activated)
+                }));
+            }
+        }
+        if let Some(entry) = stats.iter_mut().find(|entry| entry.id == listener) {
+            entry.burst_count = Some(count);
+            entry.burst_active = count > 0;
+            entry.burst_activated = activated.unwrap_or(0.0);
+            entry.pr_burst_count = Some(pr_count);
+            entry.pr_burst_active = pr_count > 0;
+            entry.pr_burst_activated = pr_activated.unwrap_or(0.0);
+        }
     }
 }
 

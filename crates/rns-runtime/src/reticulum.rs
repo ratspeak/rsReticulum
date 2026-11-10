@@ -2672,6 +2672,13 @@ fn rpc_response_to_transport_response(
                     gravity: entry.gravity,
                     announces_to_internal: entry.announces_to_internal,
                     parent_id: None,
+                    announce_rx_bytes: entry.announce_rx_bytes,
+                    announce_tx_bytes: entry.announce_tx_bytes,
+                    path_request_rx_bytes: entry.path_request_rx_bytes,
+                    path_request_tx_bytes: entry.path_request_tx_bytes,
+                    burst_count: entry.burst_count,
+                    pr_burst_count: entry.pr_burst_count,
+                    ..Default::default()
                 })
                 .collect();
             TransportQueryResponse::InterfaceStats(entries)
@@ -13725,6 +13732,9 @@ loglevel = 7
                     TransportQuery::GetInterfaceStats => {
                         TransportQueryResponse::InterfaceStats(master_interfaces.clone())
                     }
+                    TransportQuery::GetTrafficTotals => {
+                        TransportQueryResponse::TrafficTotals(Default::default())
+                    }
                     other => panic!("unexpected authoritative query: {other:?}"),
                 };
                 response_tx
@@ -17635,13 +17645,13 @@ enabled = yes
         assert!(
             shared_control_roles
                 .iter()
-                .any(|role| role == "shared_server"),
+                .any(|role| role == "LocalServerInterface"),
             "client control queries must proxy to the authoritative shared instance"
         );
         assert!(
             shared_control_roles
                 .iter()
-                .filter(|role| *role == "local_client")
+                .filter(|role| *role == "LocalClientInterface")
                 .count()
                 >= 2,
             "proxied shared control stats must include accepted local clients"
@@ -17718,7 +17728,7 @@ enabled = yes
         };
         let post_forward_local_clients: Vec<_> = post_forward_entries
             .iter()
-            .filter(|entry| entry.role == "local_client")
+            .filter(|entry| entry.role == "LocalClientInterface")
             .collect();
         assert_eq!(
             post_forward_local_clients.len(),
@@ -17798,7 +17808,9 @@ enabled = yes
             panic!("unexpected interface stats response: {response:?}");
         };
         assert!(
-            stats.iter().any(|entry| entry.role == "shared_server"),
+            stats
+                .iter()
+                .any(|entry| entry.role == "LocalServerInterface"),
             "rnstatus-style local RPC should see the shared server interface"
         );
 

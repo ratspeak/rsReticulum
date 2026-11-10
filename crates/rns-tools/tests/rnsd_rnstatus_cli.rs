@@ -376,9 +376,9 @@ fn rnsd_rnstatus_cli_survives_stale_python_destination_table() {
         Duration::from_secs(5),
         "1",
         |interfaces| {
-            interfaces
-                .iter()
-                .any(|entry| entry.get("role").and_then(|v| v.as_str()) == Some("shared_server"))
+            interfaces.iter().any(|entry| {
+                entry.get("role").and_then(|v| v.as_str()) == Some("LocalServerInterface")
+            })
         },
     ) {
         panic_with_daemon_output(message, daemon);

@@ -282,6 +282,47 @@ pub struct InterfaceStatEntry {
     /// interface (Python `autoconnect_source`).
     #[serde(default)]
     pub autoconnect_source: Option<String>,
+    /// Python `interface.name` and `type(interface).__name__`, when known.
+    #[serde(default)]
+    pub short_name: Option<String>,
+    #[serde(default)]
+    pub class_name: Option<String>,
+    /// Python `rxs`, `txs`, `arxs`, `atxs`, `prxs` and `ptxs` in bits per
+    /// second; `None` before the interface's first traffic count.
+    #[serde(default)]
+    pub speeds: Option<[f64; 6]>,
+    #[serde(default)]
+    pub announce_rx_bytes: u64,
+    #[serde(default)]
+    pub announce_tx_bytes: u64,
+    #[serde(default)]
+    pub path_request_rx_bytes: u64,
+    #[serde(default)]
+    pub path_request_tx_bytes: u64,
+    #[serde(default)]
+    pub burst_count: Option<u64>,
+    #[serde(default)]
+    pub pr_burst_count: Option<u64>,
+    #[serde(default)]
+    pub rssi: Option<f64>,
+    #[serde(default)]
+    pub snr: Option<f64>,
+    #[serde(default)]
+    pub signal_quality: Option<f64>,
+    #[serde(default)]
+    pub peers: Option<u64>,
+    #[serde(default)]
+    pub i2p_connectable: Option<bool>,
+    /// Python `i2p_b32` with its `.b32.i2p` suffix.
+    #[serde(default)]
+    pub i2p_b32: Option<String>,
+    /// Python `tunnelstate`.
+    #[serde(default)]
+    pub tunnel_state: Option<String>,
+    #[serde(default)]
+    pub tx_stalled: bool,
+    #[serde(default)]
+    pub tx_buffered: u64,
 }
 
 /// What a transport instance adds to its interface stats
@@ -293,6 +334,10 @@ pub(crate) struct TransportStats {
     pub(crate) uptime: f64,
     pub(crate) probe_responder: Option<[u8; 16]>,
 }
+
+/// Python's top-level traffic, packet, link and path counters
+/// (Reticulum.py:1806-1852).
+pub(crate) type TrafficTotals = rns_transport::messages::TrafficTotalsRpcEntry;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateTableEntry {
@@ -776,7 +821,7 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                 })
                 .collect(),
         ),
-        RpcResponse::InterfaceStats(entries) => interface_stats_value(entries, None, None),
+        RpcResponse::InterfaceStats(entries) => interface_stats_value(entries, None, None, None),
         RpcResponse::RateTable(entries) => PyValue::List(
             entries
                 .iter()
@@ -844,9 +889,10 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
 pub(crate) fn encode_interface_stats(
     entries: &[InterfaceStatEntry],
     transport: Option<&TransportStats>,
+    traffic: Option<&TrafficTotals>,
     queues: Option<&InboundQueueSnapshot>,
 ) -> Result<Vec<u8>, RpcError> {
-    encode_umsgpack(&interface_stats_value(entries, transport, queues))
+    encode_umsgpack(&interface_stats_value(entries, transport, traffic, queues))
 }
 
 /// Remote management's `/status` answer: `[stats]`, then the link count and
@@ -854,11 +900,12 @@ pub(crate) fn encode_interface_stats(
 pub(crate) fn encode_remote_status(
     entries: &[InterfaceStatEntry],
     transport: Option<&TransportStats>,
+    traffic: Option<&TrafficTotals>,
     queues: Option<&InboundQueueSnapshot>,
     link_count: Option<u64>,
     profiling: bool,
 ) -> Result<Vec<u8>, RpcError> {
-    let mut response = vec![interface_stats_value(entries, transport, queues)];
+    let mut response = vec![interface_stats_value(entries, transport, traffic, queues)];
     if let Some(link_count) = link_count {
         response.push(PyValue::Int(i128::from(link_count)));
     }
@@ -902,36 +949,101 @@ fn queue_stats(q: &InboundQueueSnapshot) -> Vec<(&'static str, PyValue)> {
     ]
 }
 
-/// Python 1.5.5 `Reticulum.get_interface_stats()` (Reticulum.py:1494-1716)
-/// for the control port and remote management alike. Rust keeps no packet
-/// rates, announce or path request byte counters or transmit buffer, so
-/// those keys carry Python's idle values.
+/// `Reticulum.get_interface_stats()` (Reticulum.py:1619-1852@1.6.0) for the
+/// control port and remote management alike.
 fn interface_stats_value(
     entries: &[InterfaceStatEntry],
     transport: Option<&TransportStats>,
+    traffic: Option<&TrafficTotals>,
     queues: Option<&InboundQueueSnapshot>,
 ) -> PyValue {
-    let sum = |select: fn(&InterfaceStatEntry) -> u64| {
-        entries.iter().map(select).fold(0u64, u64::saturating_add)
-    };
-    let mut stats = vec![
-        (
-            "interfaces",
-            PyValue::List(entries.iter().map(interface_stat_value).collect()),
-        ),
-        ("rxb", PyValue::Int(i128::from(sum(|e| e.rx_bytes)))),
-        ("txb", PyValue::Int(i128::from(sum(|e| e.tx_bytes)))),
-        ("rxs", PyValue::Int(i128::from(sum(|e| e.rx_rate)))),
-        ("txs", PyValue::Int(i128::from(sum(|e| e.tx_rate)))),
-    ];
-    for key in [
-        "arxb", "atxb", "arxs", "atxs", "arxf", "atxf", "prxb", "ptxb", "prxs", "ptxs", "prxf",
-        "ptxf", "rxpps", "txpps",
-    ] {
-        stats.push((key, PyValue::Int(0)));
+    let mut stats = vec![(
+        "interfaces",
+        PyValue::List(entries.iter().map(interface_stat_value).collect()),
+    )];
+    match traffic {
+        Some(t) => {
+            let int = |value: u64| PyValue::Int(i128::from(value));
+            // Python's speeds become floats once an interface is measured, and
+            // its frequency sums once a frequency is (Transport.py:746-813).
+            let speed = |value: f64| {
+                if t.measured {
+                    PyValue::Float(value)
+                } else {
+                    PyValue::Int(0)
+                }
+            };
+            let frequency = |value: f64| {
+                if value != 0.0 {
+                    PyValue::Float(value)
+                } else {
+                    PyValue::Int(0)
+                }
+            };
+            stats.extend([
+                ("rxb", int(t.rxb)),
+                ("txb", int(t.txb)),
+                ("rxs", speed(t.rxs)),
+                ("txs", speed(t.txs)),
+                ("arxb", int(t.arxb)),
+                ("atxb", int(t.atxb)),
+                ("arxs", speed(t.arxs)),
+                ("atxs", speed(t.atxs)),
+                ("arxf", frequency(t.arxf)),
+                ("atxf", frequency(t.atxf)),
+                ("prxb", int(t.prxb)),
+                ("ptxb", int(t.ptxb)),
+                ("prxs", speed(t.prxs)),
+                ("ptxs", speed(t.ptxs)),
+                ("prxf", frequency(t.prxf)),
+                ("ptxf", frequency(t.ptxf)),
+                ("rxpps", int(t.rxpps)),
+                ("txpps", int(t.txpps)),
+                ("rxpkts", int(t.rx_packets)),
+                ("txpkts", int(t.tx_packets)),
+                ("arxpkts", int(t.announce_rx_packets)),
+                ("atxpkts", int(t.announce_tx_packets)),
+                ("prxpkts", int(t.pr_rx_packets)),
+                ("ptxpkts", int(t.pr_tx_packets)),
+            ]);
+        }
+        None => {
+            let sum = |select: fn(&InterfaceStatEntry) -> u64| {
+                entries.iter().map(select).fold(0u64, u64::saturating_add)
+            };
+            stats.extend([
+                ("rxb", PyValue::Int(i128::from(sum(|e| e.rx_bytes)))),
+                ("txb", PyValue::Int(i128::from(sum(|e| e.tx_bytes)))),
+                ("rxs", PyValue::Int(i128::from(sum(|e| e.rx_rate)))),
+                ("txs", PyValue::Int(i128::from(sum(|e| e.tx_rate)))),
+            ]);
+            for key in [
+                "arxb", "atxb", "arxs", "atxs", "arxf", "atxf", "prxb", "ptxb", "prxs", "ptxs",
+                "prxf", "ptxf", "rxpps", "txpps", "rxpkts", "txpkts", "arxpkts", "atxpkts",
+                "prxpkts", "ptxpkts",
+            ] {
+                stats.push((key, PyValue::Int(0)));
+            }
+        }
     }
     stats.extend(queue_stats(&queues.copied().unwrap_or_default()));
     stats.push(("txq", PyValue::None));
+    let t = traffic.copied().unwrap_or_default();
+    let int = |value: u64| PyValue::Int(i128::from(value));
+    stats.extend([
+        ("tlinks", int(t.link_count)),
+        ("alinks", int(t.active_link_count)),
+        (
+            "plinks",
+            int(t.link_count.saturating_sub(t.active_link_count)),
+        ),
+        ("tpcount", int(t.path_count)),
+        ("unupcount", int(t.unused_path_count)),
+        (
+            "actpcount",
+            int(t.path_count.saturating_sub(t.unused_path_count)),
+        ),
+    ]);
     if let Some(transport) = transport {
         let hash = |hash: Option<[u8; 16]>| {
             hash.map(|hash| PyValue::Bytes(hash.to_vec()))
@@ -952,27 +1064,45 @@ fn interface_stats_value(
 fn interface_stat_value(e: &InterfaceStatEntry) -> PyValue {
     let int = |value: u64| PyValue::Int(i128::from(value));
     let optional = |value: Option<PyValue>| value.unwrap_or(PyValue::None);
+    // Python's `current_*_speed` are unset (reported as 0) until the first
+    // traffic count, and floats after it (Reticulum.py:1696-1724).
+    let speed = |index: usize, fallback: u64| match e.speeds {
+        Some(speeds) => PyValue::Float(speeds[index]),
+        None => int(fallback),
+    };
     let mut fields = vec![
         ("id", int(e.id)),
         ("name", PyValue::String(e.name.clone())),
-        ("short_name", PyValue::String(e.name.clone())),
+        (
+            "short_name",
+            PyValue::String(e.short_name.clone().unwrap_or_else(|| e.name.clone())),
+        ),
         (
             "hash",
             PyValue::Bytes(rns_crypto::sha::sha256(e.name.as_bytes()).to_vec()),
         ),
-        ("type", PyValue::String(e.role.clone())),
+        (
+            "type",
+            PyValue::String(e.class_name.clone().unwrap_or_else(|| e.role.clone())),
+        ),
         ("rxb", int(e.rx_bytes)),
         ("txb", int(e.tx_bytes)),
-        ("rxs", int(e.rx_rate)),
-        ("txs", int(e.tx_rate)),
-        ("arxb", int(0)),
-        ("atxb", int(0)),
-        ("arxs", int(0)),
-        ("atxs", int(0)),
-        ("prxb", int(0)),
-        ("ptxb", int(0)),
-        ("prxs", int(0)),
-        ("ptxs", int(0)),
+        ("rxs", speed(0, e.rx_rate)),
+        ("txs", speed(1, e.tx_rate)),
+        ("arxb", int(e.announce_rx_bytes)),
+        ("atxb", int(e.announce_tx_bytes)),
+        ("arxs", speed(2, 0)),
+        ("atxs", speed(3, 0)),
+        ("prxb", int(e.path_request_rx_bytes)),
+        ("ptxb", int(e.path_request_tx_bytes)),
+        ("prxs", speed(4, 0)),
+        ("ptxs", speed(5, 0)),
+        ("rssi", optional(e.rssi.map(PyValue::Float))),
+        ("snr", optional(e.snr.map(PyValue::Float))),
+        (
+            "signal_quality",
+            optional(e.signal_quality.map(PyValue::Float)),
+        ),
         ("arxc", int(e.announces_received)),
         ("atxc", int(e.announces_sent)),
         ("prxc", int(e.path_requests_received)),
@@ -1032,15 +1162,15 @@ fn interface_stat_value(e: &InterfaceStatEntry) -> PyValue {
         ),
         ("burst_active", PyValue::Bool(e.burst_active)),
         ("burst_activated", PyValue::Float(e.burst_activated)),
-        ("burst_count", PyValue::None),
+        ("burst_count", optional(e.burst_count.map(int))),
         ("pr_burst_active", PyValue::Bool(e.pr_burst_active)),
         ("pr_burst_activated", PyValue::Float(e.pr_burst_activated)),
-        ("pr_burst_count", PyValue::None),
+        ("pr_burst_count", optional(e.pr_burst_count.map(int))),
         ("clients", optional(e.clients.map(int))),
         ("txdrp", int(e.tx_drops)),
         ("txdrb", int(e.tx_dropped_bytes)),
-        ("txstalled", PyValue::Bool(false)),
-        ("txbuffered", int(0)),
+        ("txstalled", PyValue::Bool(e.tx_stalled)),
+        ("txbuffered", int(e.tx_buffered)),
         ("tx_drops", int(e.tx_drops)),
         ("gravity", PyValue::Int(i128::from(e.gravity))),
         (
@@ -1060,6 +1190,16 @@ fn interface_stat_value(e: &InterfaceStatEntry) -> PyValue {
     }
     if let Some(blocked_ips) = e.blocked_ips {
         fields.push(("blocked_ips", int(blocked_ips)));
+    }
+    if let Some(peers) = e.peers {
+        fields.push(("peers", int(peers)));
+    }
+    if let Some(connectable) = e.i2p_connectable {
+        fields.push(("i2p_connectable", PyValue::Bool(connectable)));
+        fields.push(("i2p_b32", optional(e.i2p_b32.clone().map(PyValue::String))));
+    }
+    if let Some(state) = &e.tunnel_state {
+        fields.push(("tunnelstate", PyValue::String(state.clone())));
     }
     py_dict(fields)
 }
@@ -1348,6 +1488,34 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, Rpc
                 },
                 parent_interface_name: dict_get(m, "parent_interface_name").and_then(py_string),
                 autoconnect_source: dict_get(m, "autoconnect_source").and_then(py_string),
+                short_name: dict_get(m, "short_name").and_then(py_string),
+                class_name: dict_get(m, "type").and_then(py_string),
+                speeds: {
+                    let speeds: Vec<f64> = ["rxs", "txs", "arxs", "atxs", "prxs", "ptxs"]
+                        .iter()
+                        .map(|key| dict_get(m, key).and_then(py_f64).unwrap_or(0.0))
+                        .collect();
+                    matches!(dict_get(m, "rxs"), Some(PyValue::Float(_))).then(|| {
+                        [
+                            speeds[0], speeds[1], speeds[2], speeds[3], speeds[4], speeds[5],
+                        ]
+                    })
+                },
+                announce_rx_bytes: dict_get(m, "arxb").and_then(py_u64).unwrap_or(0),
+                announce_tx_bytes: dict_get(m, "atxb").and_then(py_u64).unwrap_or(0),
+                path_request_rx_bytes: dict_get(m, "prxb").and_then(py_u64).unwrap_or(0),
+                path_request_tx_bytes: dict_get(m, "ptxb").and_then(py_u64).unwrap_or(0),
+                burst_count: dict_get(m, "burst_count").and_then(py_u64),
+                pr_burst_count: dict_get(m, "pr_burst_count").and_then(py_u64),
+                rssi: dict_get(m, "rssi").and_then(py_f64),
+                snr: dict_get(m, "snr").and_then(py_f64),
+                signal_quality: dict_get(m, "signal_quality").and_then(py_f64),
+                peers: dict_get(m, "peers").and_then(py_u64),
+                i2p_connectable: dict_get(m, "i2p_connectable").and_then(py_bool),
+                i2p_b32: dict_get(m, "i2p_b32").and_then(py_string),
+                tunnel_state: dict_get(m, "tunnelstate").and_then(py_string),
+                tx_stalled: dict_get(m, "txstalled").and_then(py_bool).unwrap_or(false),
+                tx_buffered: dict_get(m, "txbuffered").and_then(py_u64).unwrap_or(0),
             })
         })
         .collect()
@@ -2084,11 +2252,105 @@ pub async fn connect_unix_and_request(
 }
 
 async fn request_over_stream<S>(
-    mut stream: &mut S,
+    stream: &mut S,
     rpc_key: &[u8],
     request: &RpcRequest,
     timeout: std::time::Duration,
 ) -> Result<RpcResponse, RpcError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let resp_buf = request_bytes_over_stream(stream, rpc_key, request, timeout).await?;
+    decode_response_for_request(&resp_buf, request)
+}
+
+/// Like [`connect_and_request`], returning the undecoded response.
+pub async fn connect_and_request_bytes(
+    port: u16,
+    rpc_key: &[u8],
+    request: &RpcRequest,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, RpcError> {
+    let addr = format!("127.0.0.1:{port}");
+    let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr))
+        .await
+        .map_err(|_| {
+            RpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "connect timeout",
+            ))
+        })?
+        .map_err(RpcError::Io)?;
+    request_bytes_over_stream(&mut stream, rpc_key, request, timeout).await
+}
+
+/// Like [`connect_unix_and_request`], returning the undecoded response.
+#[cfg(unix)]
+pub async fn connect_unix_and_request_bytes(
+    socket_path: &str,
+    rpc_key: &[u8],
+    request: &RpcRequest,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, RpcError> {
+    let mut stream = tokio::time::timeout(timeout, connect_unix_stream(socket_path))
+        .await
+        .map_err(|_| {
+            RpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "connect timeout",
+            ))
+        })?
+        .map_err(RpcError::Io)?;
+    request_bytes_over_stream(&mut stream, rpc_key, request, timeout).await
+}
+
+#[cfg(not(unix))]
+pub async fn connect_unix_and_request_bytes(
+    _socket_path: &str,
+    _rpc_key: &[u8],
+    _request: &RpcRequest,
+    _timeout: std::time::Duration,
+) -> Result<Vec<u8>, RpcError> {
+    Err(RpcError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Unix shared-instance RPC is not supported on this platform",
+    )))
+}
+
+/// Python's top-level byte totals and packet rates in an `interface_stats`
+/// answer (Reticulum.py:1806-1825).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InterfaceStatsTotals {
+    pub rxb: u64,
+    pub txb: u64,
+    pub rxpps: u64,
+    pub txpps: u64,
+}
+
+/// Read [`InterfaceStatsTotals`] from an `interface_stats` answer; keys a peer
+/// leaves out read as zero.
+pub fn decode_interface_stats_totals(data: &[u8]) -> Result<InterfaceStatsTotals, RpcError> {
+    let value = decode_umsgpack(data)?;
+    let PyValue::Dict(entries) = &value else {
+        return Err(RpcError::Deserialize(
+            "expected interface stats dictionary".to_string(),
+        ));
+    };
+    let get = |key: &str| dict_get(entries, key).and_then(py_u64).unwrap_or(0);
+    Ok(InterfaceStatsTotals {
+        rxb: get("rxb"),
+        txb: get("txb"),
+        rxpps: get("rxpps"),
+        txpps: get("txpps"),
+    })
+}
+
+async fn request_bytes_over_stream<S>(
+    mut stream: &mut S,
+    rpc_key: &[u8],
+    request: &RpcRequest,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, RpcError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -2186,7 +2448,7 @@ where
             ))
         })??;
 
-    decode_response_for_request(&resp_buf, request)
+    Ok(resp_buf)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2607,7 +2869,7 @@ mod tests {
             dropped: [0, 7, 1, 3],
             lengths: [1024, 128, 128, 8],
         };
-        let stats = stats_dict(&encode_interface_stats(&[], None, Some(&queues)).unwrap());
+        let stats = stats_dict(&encode_interface_stats(&[], None, None, Some(&queues)).unwrap());
         let get = |k| dict_get(&stats, k).cloned().unwrap();
         assert_eq!(get("rxqt"), PyValue::Int(290));
         assert_eq!(get("rxqil"), PyValue::Int(2));
@@ -2628,7 +2890,8 @@ mod tests {
             probe_responder: Some([0x33; 16]),
         };
         let encoded =
-            encode_interface_stats(&[interface_stat_entry()], Some(&transport), None).unwrap();
+            encode_interface_stats(&[interface_stat_entry()], Some(&transport), None, None)
+                .unwrap();
         let stats = stats_dict(&encoded);
         assert_eq!(
             dict_get(&stats, "transport_id"),
@@ -2652,7 +2915,7 @@ mod tests {
             probe_responder: None,
             ..transport
         };
-        let stats = stats_dict(&encode_interface_stats(&[], Some(&bare), None).unwrap());
+        let stats = stats_dict(&encode_interface_stats(&[], Some(&bare), None, None).unwrap());
         assert_eq!(dict_get(&stats, "network_id"), Some(&PyValue::None));
         assert_eq!(dict_get(&stats, "probe_responder"), Some(&PyValue::None));
     }

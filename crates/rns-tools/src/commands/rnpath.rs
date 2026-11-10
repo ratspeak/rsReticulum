@@ -1,137 +1,150 @@
-//! rnpath-rs — path and routing management.
+//! rnpath-rs — path and routing management, following `RNS/Utilities/rnpath.py`.
 //!
-//! Local mode supports the full table/rate/blackhole surface via HMAC RPC
-//! (TCP or shared Unix socket).
-//! Remote mode (`-R <hash> -i <identity>`) is read-only (`--table` / `--rates`);
-//! `-p <hash>` fetches a remote transport's published blackhole list.
+//! Local actions query the shared instance over its RPC control port. `-R`
+//! manages a remote transport through `rnstransport.remote.management`, and
+//! `-p` fetches a remote transport's published blackhole list.
 
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 
+use rns_identity::destination::Destination;
+use rns_identity::identity::Identity;
 use rns_runtime::config::Config;
 use rns_runtime::lifecycle::ShutdownSignal;
 use rns_runtime::link_client::{LinkClient, LinkClientError};
 use rns_runtime::platform::resolve_config_dir;
 use rns_runtime::reticulum::{
-    InitOptions, InstanceMode, ReticulumConfig, SharedInstanceRpcEndpoint, init, init_with_options,
+    InitOptions, InstanceMode, ReticulumConfig, ReticulumHandle, SharedInstanceRpcEndpoint, init,
+    init_with_options,
 };
 use rns_runtime::rpc::{self, RpcRequest, RpcResponse};
-use rns_tools::{format, hash};
+use rns_tools::RS_RETICULUM_VERSION;
+use rns_tools::format::pretty_hex_rep;
+use rns_transport::constants::PATH_REQUEST_TIMEOUT;
 use rns_transport::messages::PathRequestOptions;
 
-const DEFAULT_TIMEOUT_SECS: u64 = 5;
-const REMOTE_TIMEOUT_SECS: u64 = 30;
+const LOCAL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// Budget for link establishment and the request once a remote path is known.
+const REMOTE_LINK_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_HOPS: u8 = 8;
 const MGMT_APP: &str = "rnstransport.remote.management";
 const BLACKHOLE_APP: &str = "rnstransport.info.blackhole";
-use rns_tools::RS_RETICULUM_VERSION;
+const SPINNER: [char; 7] = ['⢄', '⢂', '⢁', '⡁', '⡈', '⡐', '⡠'];
+/// rnpath.py:42.
+const OUTPUT_RST: &str = "\r                                                          \r";
+/// rnpath.py:478,489.
+const LOOKUP_RST: &str = "\r                                                       \r";
+const DEST_LENGTH_INVALID: &str =
+    "Destination length is invalid, must be 32 hexadecimal characters (16 bytes).";
+const DEST_INVALID: &str = "Invalid destination entered. Check your input.";
+const HASH_LENGTH_INVALID: &str =
+    "Hash length is invalid, must be 32 hexadecimal characters (16 bytes).";
+const HASH_INVALID: &str = "Invalid hash entered. Check your input.";
+/// Python's `len(None)` error, printed when a flag needs the missing destination.
+const NO_DESTINATION: &str = "object of type 'NoneType' has no len()";
 
 #[derive(Parser)]
 #[command(
     name = "rnpath-rs",
-    about = "Reticulum path management",
+    about = "Reticulum Path Management Utility",
     disable_version_flag = true
 )]
 struct Args {
-    /// Destination hash for a path request or table/rate filter; with -p, the remote transport hash.
-    destination: Option<String>,
-
-    /// Show the full path table.
-    #[arg(short, long)]
-    table: bool,
-
-    /// Show announce rate-limiting table.
-    #[arg(short, long)]
-    rates: bool,
-
-    /// Sort the path table by last use, most recent first.
-    #[arg(short = 'u', long)]
-    usage: bool,
-
-    /// Drop the path to a specific destination.
-    #[arg(short, long)]
-    drop: Option<String>,
-
-    /// Drop all queued announces on all interfaces.
-    #[arg(short = 'D', long)]
-    drop_announces: bool,
-
-    /// Drop all paths routed via a specific transport identity.
-    #[arg(short = 'x', long)]
-    drop_via: Option<String>,
-
-    /// Filter path table by maximum hops.
-    #[arg(short, long)]
-    max: Option<u8>,
-
-    /// List blackholed identities.
-    #[arg(short, long)]
-    blackholed: bool,
-
-    /// View a remote transport's published blackhole list; supply its hash as DESTINATION or with -R.
-    #[arg(short = 'p', long = "blackholed-list")]
-    blackholed_list: bool,
-
-    /// Blackhole an identity (pass its hash).
-    #[arg(short = 'B', long)]
-    blackhole: Option<String>,
-
-    /// Remove the blackhole on an identity.
-    #[arg(short = 'U', long)]
-    unblackhole: Option<String>,
-
-    /// Blackhole duration (hours, float).
-    #[arg(long)]
-    duration: Option<f64>,
-
-    /// Reason to record on the blackhole entry.
-    #[arg(long)]
-    reason: Option<String>,
-
-    /// Print table and list results as JSON.
-    /// Known limitation: interface names and blackhole reasons are not fully JSON-escaped.
-    #[arg(short, long)]
-    json: bool,
-
-    /// Alternative config directory.
+    /// Path to alternative Reticulum config directory
     #[arg(short = 'c', long)]
     config: Option<String>,
 
-    /// Remote transport hash (32 hex chars). Query that node over Reticulum.
-    /// Remote management supports --table and --rates; -p queries the published
-    /// blackhole list instead. Mutations are local-only.
-    #[arg(short = 'R', long = "remote")]
-    remote: Option<String>,
-
-    /// Identity for remote authentication (required for -R management; optional with -p).
-    #[arg(short = 'i', long)]
-    identity: Option<PathBuf>,
-
-    /// Local RPC wait in seconds; also sets path-request wait and the remote-query fallback.
-    /// Defaults without this option: 5 seconds for local RPC, 15 for path requests, 30 remote.
-    #[arg(short = 'w', long)]
-    timeout: Option<u64>,
-
-    /// Remote query protocol budget in seconds; overrides -w. Transport work can add time.
-    #[arg(short = 'W', long = "remote-timeout")]
-    remote_timeout: Option<u64>,
-
-    /// Print version and exit.
+    /// Show program's version number and exit
     #[arg(long)]
     version: bool,
 
-    /// Increase verbosity.
-    #[arg(short, action = clap::ArgAction::Count)]
-    verbose: u8,
+    /// Show all known paths
+    #[arg(short, long)]
+    table: bool,
 
-    /// Case-sensitive substring in identity, reason or source for the remote blackhole list.
+    /// Sort the path table by last use, most recent first
+    #[arg(short = 'u', long)]
+    usage: bool,
+
+    /// Maximum hops to filter path table by
+    #[arg(short = 'm', long, value_name = "hops", allow_negative_numbers = true)]
+    max: Option<i64>,
+
+    /// Show announce rate info
+    #[arg(short, long)]
+    rates: bool,
+
+    /// Remove the path to a destination
+    #[arg(short, long)]
+    drop: bool,
+
+    /// Drop all queued announces
+    #[arg(short = 'D', long)]
+    drop_announces: bool,
+
+    /// Drop all paths via specified transport instance
+    #[arg(short = 'x', long)]
+    drop_via: bool,
+
+    /// Timeout before giving up
+    #[arg(short = 'w', long = "timeout", value_name = "seconds", default_value_t = PATH_REQUEST_TIMEOUT)]
+    timeout: f64,
+
+    /// Transport identity hash of remote instance to manage
+    #[arg(short = 'R', long = "remote", value_name = "hash")]
+    remote: Option<String>,
+
+    /// Path to identity used for remote management
+    #[arg(short = 'i', long = "identity", value_name = "path")]
+    identity: Option<PathBuf>,
+
+    /// Timeout before giving up on remote queries
+    #[arg(short = 'W', long = "remote-timeout", value_name = "seconds", default_value_t = PATH_REQUEST_TIMEOUT)]
+    remote_timeout: f64,
+
+    /// List blackholed identities
+    #[arg(short, long)]
+    blackholed: bool,
+
+    /// Blackhole identity
+    #[arg(short = 'B', long)]
+    blackhole: bool,
+
+    /// Unblackhole identity
+    #[arg(short = 'U', long)]
+    unblackhole: bool,
+
+    /// Duration of blackhole enforcement in hours
+    #[arg(long)]
+    duration: Option<f64>,
+
+    /// Reason for blackholing identity
+    #[arg(long)]
+    reason: Option<String>,
+
+    /// View published blackhole list for remote transport instance
+    #[arg(short = 'p', long = "blackholed-list")]
+    blackholed_list: bool,
+
+    /// Output in JSON format
+    #[arg(short, long)]
+    json: bool,
+
+    /// Hexadecimal hash of the destination
+    destination: Option<String>,
+
+    /// Filter for remote blackhole list view
     list_filter: Option<String>,
+
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -144,7 +157,7 @@ pub(crate) async fn main() -> ExitCode {
     }
 
     let level = rns_tools::Utility::Rnpath.loglevel(None, args.verbose, 0, false);
-    let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
+    let config_dir = resolve_config_dir(args.config.as_deref());
     rns_tools::init_tracing(
         level,
         rns_tools::config_log_timestamps(&config_dir),
@@ -152,159 +165,156 @@ pub(crate) async fn main() -> ExitCode {
         std::io::stdout,
     );
 
-    if args.blackholed_list {
-        return run_remote_blackhole_list(args).await;
-    }
-
-    if args.remote.is_some() {
-        return run_remote(args).await;
-    }
-
-    if !local_action_requested(&args) {
-        eprintln!("rnpath-rs: no action specified (use --help)");
-        return ExitCode::from(2);
-    }
-    if let Err(e) = validate_local_hash_args(&args) {
-        eprintln!("rnpath-rs: {e}");
-        return ExitCode::from(2);
-    }
-
-    let config_dir = resolve_config_dir(args.config.as_deref());
-    let config_path = config_dir.join("config");
-    let config = match Config::from_file(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "rnpath-rs: could not read config at {}: {e}",
-                config_path.display()
-            );
-            return ExitCode::from(1);
+    let destination = args.destination.as_deref().filter(|d| !d.is_empty());
+    // rnpath.py:525-528.
+    if !(args.drop_announces
+        || args.table
+        || args.rates
+        || destination.is_some()
+        || args.drop_via
+        || args.blackholed)
+    {
+        let help = <Args as clap::CommandFactory>::command()
+            .render_help()
+            .to_string();
+        println!();
+        print!("{help}");
+        if !help.ends_with('\n') {
+            println!();
         }
-    };
-    let rc = ReticulumConfig::from_config(&config);
+        println!();
+        return ExitCode::SUCCESS;
+    }
 
-    let rpc_key = match local_rpc_key(&config_dir, &rc) {
-        Some(k) => k,
-        None => {
-            eprintln!(
-                "rnpath-rs: no rpc_key configured and no transport identity at {} — cannot query rnsd.",
-                config_path.display()
-            );
-            return ExitCode::from(1);
-        }
-    };
+    if args.blackholed_list && !args.blackholed {
+        return run_remote_blackhole_list(&args).await;
+    }
+    if let Some(remote) = args.remote.as_deref() {
+        return run_remote(&args, remote).await;
+    }
 
-    let ctx = ClientCtx {
-        endpoint: rc.shared_rpc_endpoint(&std::env::temp_dir()),
-        config_dir,
-        rpc_key,
-        timeout: std::time::Duration::from_secs(args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS)),
-        explicit_timeout: args.timeout.map(std::time::Duration::from_secs),
+    let ctx = match ClientCtx::load(&config_dir) {
+        Ok(ctx) => ctx,
+        Err(code) => return code,
     };
-
-    // First matching branch wins when multiple action flags are passed.
+    // Dispatch order of rnpath.py:132-490.
+    if args.blackholed {
+        return show_blackholed(&ctx, destination).await;
+    }
+    if args.blackhole {
+        return do_blackhole(&ctx, destination, args.duration, args.reason.clone()).await;
+    }
+    if args.unblackhole {
+        return do_unblackhole(&ctx, destination).await;
+    }
     if args.table {
-        return show_path_table(
-            &ctx,
-            args.max,
-            args.json,
-            args.usage,
-            args.destination.as_deref(),
-        )
-        .await;
+        return show_path_table(&ctx, destination, args.max, args.json, args.usage).await;
     }
     if args.rates {
-        return show_rate_table(&ctx, args.json, args.destination.as_deref()).await;
-    }
-    if args.blackholed {
-        return show_blackholed(&ctx, args.json).await;
-    }
-    if let Some(dest_hex) = args.drop.as_deref() {
-        return drop_path(&ctx, dest_hex).await;
+        return show_rate_table(&ctx, destination, args.json).await;
     }
     if args.drop_announces {
         return drop_announces(&ctx).await;
     }
-    if let Some(via_hex) = args.drop_via.as_deref() {
-        return drop_all_via(&ctx, via_hex).await;
+    if args.drop {
+        return drop_path(&ctx, destination).await;
     }
-    if let Some(h) = args.blackhole.as_deref() {
-        return do_blackhole(&ctx, h, args.duration, args.reason).await;
+    if args.drop_via {
+        return drop_all_via(&ctx, destination).await;
     }
-    if let Some(h) = args.unblackhole.as_deref() {
-        return do_unblackhole(&ctx, h).await;
-    }
-    if let Some(dest) = args.destination.as_deref() {
-        return query_path(&ctx, dest).await;
-    }
-
-    unreachable!("local action was validated before config load")
+    query_path(&ctx, destination, args.timeout).await
 }
 
-fn local_action_requested(args: &Args) -> bool {
-    args.table
-        || args.rates
-        || args.blackholed
-        || args.drop.is_some()
-        || args.drop_announces
-        || args.drop_via.is_some()
-        || args.blackhole.is_some()
-        || args.unblackhole.is_some()
-        || args.destination.is_some()
+/// rnpath.py:249-255 and its copies: a 32-character hex destination.
+fn parse_destination(input: Option<&str>) -> Result<[u8; 16], &'static str> {
+    parse_hex16(input, DEST_LENGTH_INVALID, DEST_INVALID)
 }
 
-fn validate_hash_arg(value: Option<&str>) -> Result<(), String> {
-    if let Some(value) = value {
-        hash::parse_dest_hash(value)?;
+/// rnpath.py:94-100.
+fn parse_hash(input: Option<&str>) -> Result<[u8; 16], &'static str> {
+    parse_hex16(input, HASH_LENGTH_INVALID, HASH_INVALID)
+}
+
+fn parse_hex16(
+    input: Option<&str>,
+    length_msg: &'static str,
+    invalid_msg: &'static str,
+) -> Result<[u8; 16], &'static str> {
+    let input = input.ok_or(NO_DESTINATION)?;
+    if input.chars().count() != 32 {
+        return Err(length_msg);
     }
-    Ok(())
-}
-
-fn validate_local_hash_args(args: &Args) -> Result<(), String> {
-    validate_hash_arg(args.destination.as_deref())?;
-    validate_hash_arg(args.drop.as_deref())?;
-    validate_hash_arg(args.drop_via.as_deref())?;
-    validate_hash_arg(args.blackhole.as_deref())?;
-    validate_hash_arg(args.unblackhole.as_deref())?;
-    Ok(())
+    let bytes = hex::decode(input).map_err(|_| invalid_msg)?;
+    bytes.try_into().map_err(|_| invalid_msg)
 }
 
 fn local_rpc_key(config_dir: &Path, rc: &ReticulumConfig) -> Option<Vec<u8>> {
     if let Some(key) = rc.rpc_key.as_ref() {
         return Some(key.clone());
     }
-    let paths = rns_runtime::platform::StoragePaths::from_config_dir(config_dir);
-    let identity =
-        rns_identity::identity::Identity::from_file(&paths.storage_dir.join("transport_identity"))
-            .ok()?;
+    let identity = Identity::from_file(&transport_identity_path(config_dir)).ok()?;
     let private_key = identity.get_private_key()?;
     Some(rpc::derive_rpc_key(&*private_key).to_vec())
+}
+
+fn transport_identity_path(config_dir: &Path) -> PathBuf {
+    rns_runtime::platform::StoragePaths::from_config_dir(config_dir)
+        .storage_dir
+        .join("transport_identity")
 }
 
 struct ClientCtx {
     endpoint: SharedInstanceRpcEndpoint,
     config_dir: PathBuf,
     rpc_key: Vec<u8>,
-    timeout: std::time::Duration,
-    /// `-w` as given; `None` means path requests wait `PATH_REQUEST_TIMEOUT`.
-    explicit_timeout: Option<std::time::Duration>,
+    static_transport_identity: bool,
+}
+
+impl ClientCtx {
+    fn load(config_dir: &Path) -> Result<Self, ExitCode> {
+        let config_path = config_dir.join("config");
+        let config = Config::from_file(&config_path).map_err(|e| {
+            eprintln!(
+                "rnpath-rs: could not read config at {}: {e}",
+                config_path.display()
+            );
+            ExitCode::from(1)
+        })?;
+        let rc = ReticulumConfig::from_config(&config);
+        let Some(rpc_key) = local_rpc_key(config_dir, &rc) else {
+            eprintln!(
+                "rnpath-rs: no rpc_key configured and no transport identity at {} — cannot query rnsd.",
+                config_path.display()
+            );
+            return Err(ExitCode::from(1));
+        };
+        Ok(Self {
+            endpoint: rc.shared_rpc_endpoint(&std::env::temp_dir()),
+            config_dir: config_dir.to_path_buf(),
+            rpc_key,
+            static_transport_identity: rc.static_transport_identity,
+        })
+    }
+
+    /// `RNS.Transport.identity` of a shared-instance client: ephemeral unless
+    /// `static_transport_identity` is set (Transport.py:440-445).
+    fn local_transport_identity(&self) -> Option<[u8; 16]> {
+        if !self.static_transport_identity {
+            return None;
+        }
+        Identity::from_file(&transport_identity_path(&self.config_dir))
+            .ok()
+            .map(|identity| identity.hash)
+    }
 }
 
 async fn request(ctx: &ClientCtx, req: &RpcRequest) -> Result<RpcResponse, LocalRpcFailure> {
-    request_with_timeout(ctx, req, ctx.timeout).await
-}
-
-async fn request_with_timeout(
-    ctx: &ClientCtx,
-    req: &RpcRequest,
-    timeout: std::time::Duration,
-) -> Result<RpcResponse, LocalRpcFailure> {
     let result = match &ctx.endpoint {
         SharedInstanceRpcEndpoint::Tcp(port) => {
-            rpc::connect_and_request(*port, &ctx.rpc_key, req, timeout).await
+            rpc::connect_and_request(*port, &ctx.rpc_key, req, LOCAL_RPC_TIMEOUT).await
         }
         SharedInstanceRpcEndpoint::Unix(socket_path) => {
-            rpc::connect_unix_and_request(socket_path, &ctx.rpc_key, req, timeout).await
+            rpc::connect_unix_and_request(socket_path, &ctx.rpc_key, req, LOCAL_RPC_TIMEOUT).await
         }
     };
     result.map_err(|source| LocalRpcFailure {
@@ -312,6 +322,16 @@ async fn request_with_timeout(
         config_dir: ctx.config_dir.clone(),
         source,
     })
+}
+
+fn rpc_failed(e: LocalRpcFailure) -> ExitCode {
+    eprintln!("rnpath-rs: {e}");
+    ExitCode::from(1)
+}
+
+fn unexpected(response: RpcResponse) -> ExitCode {
+    eprintln!("rnpath-rs: unexpected response: {response:?}");
+    ExitCode::from(1)
 }
 
 #[derive(Debug)]
@@ -386,71 +406,259 @@ fn local_rpc_failure_message(
     }
 }
 
-fn optional_dest_filter(value: Option<&str>) -> Result<Option<[u8; 16]>, String> {
-    value.map(hash::parse_dest_hash).transpose()
+/// rnpath.py:132-206: `-b` lists the shared instance's blackhole list.
+async fn show_blackholed(ctx: &ClientCtx, filter: Option<&str>) -> ExitCode {
+    let entries = match request(ctx, &RpcRequest::GetBlackholedIdentities).await {
+        Ok(RpcResponse::BlackholeList(entries)) => entries,
+        Ok(RpcResponse::Error(e)) => {
+            println!("Could not get blackholed identities from RNS instance: {e}");
+            return ExitCode::from(20);
+        }
+        Ok(other) => return unexpected(other),
+        Err(e) => {
+            println!("Could not get blackholed identities from RNS instance: {e}");
+            return ExitCode::from(20);
+        }
+    };
+    let entries: Vec<BlackholeLine> = entries
+        .into_iter()
+        .map(|e| BlackholeLine {
+            identity: e.identity_hash,
+            until: e.until,
+            reason: e.reason.unwrap_or_default(),
+            source: e.source,
+        })
+        .collect();
+    print_blackhole_list(
+        &entries,
+        filter,
+        ctx.local_transport_identity(),
+        now_epoch(),
+    )
 }
 
+struct BlackholeLine {
+    identity: Vec<u8>,
+    until: Option<f64>,
+    reason: String,
+    source: Option<Vec<u8>>,
+}
+
+/// rnpath.py:176-206, shared by `-b` and `-p`.
+fn print_blackhole_list(
+    entries: &[BlackholeLine],
+    filter: Option<&str>,
+    own_transport_id: Option<[u8; 16]>,
+    now: f64,
+) -> ExitCode {
+    if entries.is_empty() {
+        println!("No blackholed identity data available");
+        return ExitCode::from(20);
+    }
+    for line in blackhole_lines(entries, filter, own_transport_id, now) {
+        println!("{line}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn blackhole_lines(
+    entries: &[BlackholeLine],
+    filter: Option<&str>,
+    own_transport_id: Option<[u8; 16]>,
+    now: f64,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for entry in entries {
+        let identity = pretty_hex_rep(&entry.identity);
+        let until = match entry.until {
+            Some(until) if until != 0.0 => {
+                format!("for {}", py_prettytime((until - now).max(0.0), false))
+            }
+            _ => "indefinitely".to_string(),
+        };
+        let reason = if entry.reason.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", truncate_reason(&entry.reason))
+        };
+        let by = match entry.source.as_deref() {
+            Some(source) if Some(source) != own_transport_id.as_ref().map(|id| &id[..]) => {
+                format!(" by {}", pretty_hex_rep(source))
+            }
+            _ => String::new(),
+        };
+        let filter_str = format!("{identity} {until} {reason} {by}");
+        if filter.is_some_and(|needle| !filter_str.contains(needle)) {
+            continue;
+        }
+        lines.push(format!("{identity} blackholed {until}{reason}{by}"));
+    }
+    lines
+}
+
+/// rnpath.py:181-184: at most 64 characters, the last one an ellipsis.
+fn truncate_reason(reason: &str) -> String {
+    const RMLEN: usize = 64;
+    if reason.chars().count() <= RMLEN {
+        reason.to_string()
+    } else {
+        let mut out: String = reason.chars().take(RMLEN - 1).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// rnpath.py:208-225.
+async fn do_blackhole(
+    ctx: &ClientCtx,
+    destination: Option<&str>,
+    duration_hours: Option<f64>,
+    reason: Option<String>,
+) -> ExitCode {
+    let id = match parse_hash(destination) {
+        Ok(id) => id,
+        Err(e) => {
+            println!("Could not blackhole identity: {e}");
+            return ExitCode::from(20);
+        }
+    };
+    let typed = destination.unwrap_or_default();
+    let until = duration_hours
+        .filter(|h| *h != 0.0)
+        .map(|h| now_epoch() + h * 3600.0);
+    let req = RpcRequest::BlackholeIdentity {
+        identity_hash: id.to_vec(),
+        until,
+        reason,
+    };
+    match request(ctx, &req).await {
+        Ok(RpcResponse::OptBoolResult(Some(true))) => println!("Blackholed identity {typed}"),
+        Ok(RpcResponse::OptBoolResult(None)) => println!("Identity {typed} already blackholed"),
+        Ok(RpcResponse::OptBoolResult(Some(false))) => {
+            println!("Could not blackhole identity {typed}")
+        }
+        Ok(RpcResponse::Error(e)) => {
+            println!("Could not blackhole identity: {e}");
+            return ExitCode::from(20);
+        }
+        Ok(other) => return unexpected(other),
+        Err(e) => {
+            println!("Could not blackhole identity: {e}");
+            return ExitCode::from(20);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// rnpath.py:227-243.
+async fn do_unblackhole(ctx: &ClientCtx, destination: Option<&str>) -> ExitCode {
+    let id = match parse_hash(destination) {
+        Ok(id) => id,
+        Err(e) => {
+            println!("Could not unblackhole identity: {e}");
+            return ExitCode::from(20);
+        }
+    };
+    let typed = destination.unwrap_or_default();
+    let req = RpcRequest::UnblackholeIdentity {
+        identity_hash: id.to_vec(),
+    };
+    match request(ctx, &req).await {
+        Ok(RpcResponse::OptBoolResult(Some(true))) => {
+            println!("Lifted blackhole for identity {typed}")
+        }
+        Ok(RpcResponse::OptBoolResult(None)) => println!("Identity {typed} not blackholed"),
+        Ok(RpcResponse::OptBoolResult(Some(false))) => {
+            println!("Could not unblackhole identity {typed}")
+        }
+        Ok(RpcResponse::Error(e)) => {
+            println!("Could not unblackhole identity: {e}");
+            return ExitCode::from(20);
+        }
+        Ok(other) => return unexpected(other),
+        Err(e) => {
+            println!("Could not unblackhole identity: {e}");
+            return ExitCode::from(20);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// The `-t`/`-r` destination filter; an invalid one prints and exits 1.
+fn table_filter(destination: Option<&str>) -> Result<Option<[u8; 16]>, ExitCode> {
+    match destination {
+        None => Ok(None),
+        Some(_) => parse_destination(destination).map(Some).map_err(|e| {
+            println!("{e}");
+            ExitCode::from(1)
+        }),
+    }
+}
+
+/// rnpath.py:245-306, local shared instance.
 async fn show_path_table(
     ctx: &ClientCtx,
-    max_hops: Option<u8>,
+    destination: Option<&str>,
+    max_hops: Option<i64>,
     json: bool,
     usage: bool,
-    destination_filter: Option<&str>,
 ) -> ExitCode {
-    let destination_filter = match optional_dest_filter(destination_filter) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("rnpath-rs: {e}");
-            return ExitCode::from(2);
-        }
+    let filter = match table_filter(destination) {
+        Ok(filter) => filter,
+        Err(code) => return code,
     };
-    let mut resp = match request(ctx, &RpcRequest::GetPathTable { max_hops }).await {
-        Ok(RpcResponse::PathTable(v)) => v,
-        Ok(other) => {
-            eprintln!("rnpath-rs: unexpected response: {other:?}");
-            return ExitCode::from(1);
-        }
-        Err(e) => {
-            eprintln!("rnpath-rs: {e}");
-            return ExitCode::from(1);
-        }
+    let mut table = match request(ctx, &RpcRequest::GetPathTable { max_hops: None }).await {
+        Ok(RpcResponse::PathTable(table)) => table,
+        Ok(other) => return unexpected(other),
+        Err(e) => return rpc_failed(e),
     };
-    if let Some(dest) = destination_filter {
-        resp.retain(|entry| entry.hash.as_slice() == dest);
+    if let Some(max) = max_hops {
+        table.retain(|e| i64::from(e.hops) <= max);
     }
+    table.sort_by(|a, b| (&a.interface, a.hops).cmp(&(&b.interface, b.hops)));
+    print_path_table(table, filter, json, usage, now_epoch())
+}
 
+fn print_path_table(
+    mut table: Vec<rpc::PathTableEntry>,
+    filter: Option<[u8; 16]>,
+    json: bool,
+    usage: bool,
+    now: f64,
+) -> ExitCode {
+    // rnpath.py:276-283 dumps the whole table, filter or not.
     if json {
-        println!("{}", path_table_json(&resp));
-        return ExitCode::SUCCESS;
-    }
-
-    if resp.is_empty() {
-        println!("Path table is empty.");
+        println!("{}", path_table_json(&table));
         return ExitCode::SUCCESS;
     }
     if usage {
-        sort_by_usage(&mut resp);
+        sort_by_usage(&mut table);
     }
-    println!(
-        "{:<36} {:>5} {:<36} Interface",
-        "Destination", "Hops", "Via"
-    );
-    for e in &resp {
-        let via = e
-            .via
-            .as_ref()
-            .map(hex::encode)
-            .unwrap_or_else(|| "-".to_string());
-        println!(
-            "{:<36} {:>5} {:<36} {} {}",
-            hex::encode(&e.hash),
-            e.hops,
-            via,
-            e.interface,
-            cost_suffix(e.value, e.lr_cost)
-        );
+    let mut displayed = 0;
+    for entry in &table {
+        if filter.is_none_or(|f| entry.hash == f) {
+            displayed += 1;
+            println!("{}", path_table_line(entry, now));
+        }
+    }
+    if filter.is_some() && displayed == 0 {
+        println!("No path known");
+        return ExitCode::from(1);
     }
     ExitCode::SUCCESS
+}
+
+/// rnpath.py:302.
+fn path_table_line(entry: &rpc::PathTableEntry, now: f64) -> String {
+    format!(
+        "{} {:>3}h via {} on {} expires in {} {}",
+        pretty_hex_rep(&entry.hash),
+        entry.hops,
+        pretty_hex_rep(entry.via.as_deref().unwrap_or_default()),
+        entry.interface,
+        py_prettytime(entry.expires - now, true),
+        cost_suffix(entry.value, entry.lr_cost)
+    )
 }
 
 /// rnpath.py:287-288: most recently used first.
@@ -471,345 +679,262 @@ fn pretty_cost(value: Option<f64>) -> String {
     }
 }
 
-fn json_opt_f64(value: Option<f64>) -> String {
-    value
-        .filter(|v| v.is_finite())
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "null".to_string())
-}
-
-async fn show_rate_table(
-    ctx: &ClientCtx,
-    json: bool,
-    destination_filter: Option<&str>,
-) -> ExitCode {
-    let destination_filter = match optional_dest_filter(destination_filter) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("rnpath-rs: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let mut resp = match request(ctx, &RpcRequest::GetRateTable).await {
-        Ok(RpcResponse::RateTable(v)) => v,
-        Ok(other) => {
-            eprintln!("rnpath-rs: unexpected response: {other:?}");
-            return ExitCode::from(1);
-        }
-        Err(e) => {
-            eprintln!("rnpath-rs: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    if let Some(dest) = destination_filter {
-        resp.retain(|entry| entry.hash.as_slice() == dest);
-    }
-    print_rate_table(&resp, json)
-}
-
-fn print_rate_table(resp: &[rpc::RateTableEntry], json: bool) -> ExitCode {
-    if json {
-        print!("[");
-        for (i, e) in resp.iter().enumerate() {
-            if i > 0 {
-                print!(",");
-            }
-            print!(
-                "{{\"hash\":\"{}\",\"violations\":{},\"blocked_until\":{}}}",
-                hex::encode(&e.hash),
-                e.rate_violations,
-                e.blocked_until
-            );
-        }
-        println!("]");
-        return ExitCode::SUCCESS;
-    }
-
-    if resp.is_empty() {
-        println!("Rate table is empty.");
-        return ExitCode::SUCCESS;
-    }
-    println!(
-        "{:<36} {:>10} {:>12}",
-        "Destination", "Violations", "Blocked"
-    );
-    for e in resp {
-        let blocked = if e.blocked_until > 0.0 {
-            format::pretty_time(e.blocked_until - now_epoch())
-        } else {
-            "-".to_string()
-        };
-        println!(
-            "{:<36} {:>10} {:>12}",
-            hex::encode(&e.hash),
-            e.rate_violations,
-            blocked
-        );
-    }
-    ExitCode::SUCCESS
-}
-
-async fn show_blackholed(ctx: &ClientCtx, json: bool) -> ExitCode {
-    let resp = match request(ctx, &RpcRequest::GetBlackholedIdentities).await {
-        Ok(RpcResponse::BlackholeList(v)) => v,
-        Ok(other) => {
-            eprintln!("rnpath-rs: unexpected response: {other:?}");
-            return ExitCode::from(1);
-        }
-        Err(e) => {
-            eprintln!("rnpath-rs: {e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    if json {
-        print!("[");
-        for (i, e) in resp.iter().enumerate() {
-            if i > 0 {
-                print!(",");
-            }
-            let reason = e.reason.as_deref().unwrap_or("manual");
-            let until = e
-                .until
-                .map(|u| format!("{u}"))
+/// `json.dumps` of the path table rows with bytes as hex (rnpath.py:276-282).
+/// Upstream sends `value` and `used` as int 0 when unset, and floats otherwise.
+fn path_table_json(entries: &[rpc::PathTableEntry]) -> String {
+    let rows: Vec<String> = entries
+        .iter()
+        .map(|e| {
+            let via = e
+                .via
+                .as_ref()
+                .map(|v| py_json_str(&hex::encode(v)))
                 .unwrap_or_else(|| "null".to_string());
-            print!(
-                "{{\"identity\":\"{}\",\"reason\":\"{}\",\"until\":{}}}",
-                hex::encode(&e.identity_hash),
-                reason,
-                until
-            );
-        }
-        println!("]");
-        return ExitCode::SUCCESS;
-    }
+            format!(
+                "{{\"hash\": {}, \"timestamp\": {}, \"via\": {via}, \"hops\": {}, \"expires\": {}, \"value\": {}, \"used\": {}, \"lr_cost\": {}, \"interface\": {}}}",
+                py_json_str(&hex::encode(&e.hash)),
+                py_float_repr(e.timestamp),
+                e.hops,
+                py_float_repr(e.expires),
+                e.value.map(py_int_or_float).unwrap_or_else(|| "null".to_string()),
+                py_int_or_float(e.used),
+                e.lr_cost.map(py_float_repr).unwrap_or_else(|| "null".to_string()),
+                py_json_str(&e.interface)
+            )
+        })
+        .collect();
+    format!("[{}]", rows.join(", "))
+}
 
-    if resp.is_empty() {
-        println!("No identities are blackholed.");
+fn py_int_or_float(value: f64) -> String {
+    if value == 0.0 {
+        "0".to_string()
+    } else {
+        py_float_repr(value)
+    }
+}
+
+/// rnpath.py:308-390, local shared instance.
+async fn show_rate_table(ctx: &ClientCtx, destination: Option<&str>, json: bool) -> ExitCode {
+    let filter = match table_filter(destination) {
+        Ok(filter) => filter,
+        Err(code) => return code,
+    };
+    let table = match request(ctx, &RpcRequest::GetRateTable).await {
+        Ok(RpcResponse::RateTable(table)) => table,
+        Ok(other) => return unexpected(other),
+        Err(e) => return rpc_failed(e),
+    };
+    print_rate_table(table, filter, json, now_epoch())
+}
+
+fn print_rate_table(
+    mut table: Vec<rpc::RateTableEntry>,
+    filter: Option<[u8; 16]>,
+    json: bool,
+    now: f64,
+) -> ExitCode {
+    table.sort_by(|a, b| a.last.total_cmp(&b.last));
+    if json {
+        println!("{}", rate_table_json(&table));
         return ExitCode::SUCCESS;
     }
-    println!("Blackholed identities:");
-    println!("  {:<32}  {:<18}  {:<10}", "identity", "reason", "expires");
-    for e in &resp {
-        let reason = e.reason.as_deref().unwrap_or("manual");
-        let expires = match e.until {
-            Some(u) => {
-                let now = now_epoch();
-                let secs = (u - now) as i64;
-                if secs <= 0 {
-                    "expired".to_string()
-                } else if secs >= 3600 {
-                    format!("{}h", secs / 3600)
-                } else if secs >= 60 {
-                    format!("{}m", secs / 60)
-                } else {
-                    format!("{}s", secs)
-                }
+    if table.is_empty() {
+        println!("No information available");
+        return ExitCode::SUCCESS;
+    }
+    let mut displayed = 0;
+    for entry in &table {
+        if filter.is_none_or(|f| entry.hash == f) {
+            displayed += 1;
+            for line in rate_table_lines(entry, now) {
+                println!("{line}");
             }
-            None => "never".to_string(),
-        };
-        println!(
-            "  {:<32}  {:<18}  {:<10}",
-            hex::encode(&e.identity_hash),
-            reason,
-            expires
-        );
+        }
+    }
+    if filter.is_some() && displayed == 0 {
+        println!("No information available");
+        return ExitCode::from(1);
     }
     ExitCode::SUCCESS
 }
 
-async fn drop_path(ctx: &ClientCtx, dest_hex: &str) -> ExitCode {
-    let dest = match hash::parse_dest_hash(dest_hex) {
-        Ok(h) => h,
-        Err(e) => {
+/// rnpath.py:355-386.
+fn rate_table_lines(entry: &rpc::RateTableEntry, now: f64) -> Vec<String> {
+    let hash = pretty_hex_rep(&entry.hash);
+    let Some(&start_ts) = entry.timestamps.first() else {
+        return vec![
+            format!("Error while processing entry for {hash}"),
+            "list index out of range".to_string(),
+        ];
+    };
+    let last_str = pretty_date(entry.last.trunc(), now);
+    let span_hours = (now - start_ts).max(3600.0) / 3600.0;
+    let span_str = pretty_date(start_ts.trunc(), now);
+    let hour_rate = py_round(entry.timestamps.len() as f64 / span_hours, 3);
+    let hour_rate = if hour_rate.fract() == 0.0 {
+        format!("{}", hour_rate as i64)
+    } else {
+        py_float_repr(hour_rate)
+    };
+    let rv_str = match entry.rate_violations {
+        0 => String::new(),
+        1 => ", 1 active rate violation".to_string(),
+        n => format!(", {n} active rate violations"),
+    };
+    let bl_str = if entry.blocked_until > now {
+        let bli = now - (entry.blocked_until.trunc() - now);
+        format!(
+            ", new announces allowed in {}",
+            pretty_date(bli.trunc(), now)
+        )
+    } else {
+        String::new()
+    };
+    vec![format!(
+        "{hash} last heard {last_str} ago, {hour_rate} announces/hour in the last {span_str}{rv_str}{bl_str}"
+    )]
+}
+
+/// `json.dumps` of the rate table rows, in upstream key order (Storage.py:162-163,
+/// Reticulum.py:1911).
+fn rate_table_json(entries: &[rpc::RateTableEntry]) -> String {
+    let rows: Vec<String> = entries
+        .iter()
+        .map(|e| {
+            let timestamps: Vec<String> = e.timestamps.iter().copied().map(py_float_repr).collect();
+            format!(
+                "{{\"last\": {}, \"rate_violations\": {}, \"blocked_until\": {}, \"timestamps\": [{}], \"hash\": {}}}",
+                py_float_repr(e.last),
+                e.rate_violations,
+                py_float_repr(e.blocked_until),
+                timestamps.join(", "),
+                py_json_str(&hex::encode(&e.hash))
+            )
+        })
+        .collect();
+    format!("[{}]", rows.join(", "))
+}
+
+/// rnpath.py:392-400.
+async fn drop_announces(ctx: &ClientCtx) -> ExitCode {
+    println!("Dropping announce queues on all interfaces...");
+    match request(ctx, &RpcRequest::DropAnnounceQueues).await {
+        Ok(RpcResponse::Error(e)) => {
             eprintln!("rnpath-rs: {e}");
-            return ExitCode::from(2);
+            ExitCode::from(1)
+        }
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => rpc_failed(e),
+    }
+}
+
+/// rnpath.py:402-421.
+async fn drop_path(ctx: &ClientCtx, destination: Option<&str>) -> ExitCode {
+    let dest = match parse_destination(destination) {
+        Ok(dest) => dest,
+        Err(e) => {
+            println!("{e}");
+            return ExitCode::from(1);
         }
     };
-    match request(
-        ctx,
-        &RpcRequest::DropPath {
-            destination_hash: dest.to_vec(),
-        },
-    )
-    .await
-    {
-        // rnpath.py:418-421: a falsy reply means no such path.
+    let req = RpcRequest::DropPath {
+        destination_hash: dest.to_vec(),
+    };
+    match request(ctx, &req).await {
         Ok(RpcResponse::BoolResult(true)) => {
-            println!("Dropped path to {}", format::pretty_hex_rep(&dest));
+            println!("Dropped path to {}", pretty_hex_rep(&dest));
             ExitCode::SUCCESS
         }
         Ok(RpcResponse::BoolResult(false)) => {
             println!(
                 "Unable to drop path to {}. Does it exist?",
-                format::pretty_hex_rep(&dest)
+                pretty_hex_rep(&dest)
             );
             ExitCode::from(1)
         }
-        Ok(other) => {
-            eprintln!("rnpath-rs: unexpected response: {other:?}");
-            ExitCode::from(1)
-        }
-        Err(e) => {
-            eprintln!("rnpath-rs: {e}");
-            ExitCode::from(1)
-        }
+        Ok(other) => unexpected(other),
+        Err(e) => rpc_failed(e),
     }
 }
 
-async fn drop_announces(ctx: &ClientCtx) -> ExitCode {
-    match request(ctx, &RpcRequest::DropAnnounceQueues).await {
-        Ok(RpcResponse::Ok) => {
-            println!("All announce queues cleared.");
-            ExitCode::SUCCESS
-        }
-        Ok(other) => {
-            eprintln!("rnpath-rs: unexpected response: {other:?}");
-            ExitCode::from(1)
-        }
+/// rnpath.py:423-442.
+async fn drop_all_via(ctx: &ClientCtx, destination: Option<&str>) -> ExitCode {
+    let via = match parse_destination(destination) {
+        Ok(via) => via,
         Err(e) => {
-            eprintln!("rnpath-rs: {e}");
-            ExitCode::from(1)
-        }
-    }
-}
-
-async fn drop_all_via(ctx: &ClientCtx, via_hex: &str) -> ExitCode {
-    let via = match hash::parse_dest_hash(via_hex) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("rnpath-rs: {e}");
-            return ExitCode::from(2);
+            println!("{e}");
+            return ExitCode::from(1);
         }
     };
-    match request(
-        ctx,
-        &RpcRequest::DropAllVia {
-            transport_hash: via.to_vec(),
-        },
-    )
-    .await
-    {
-        Ok(RpcResponse::IntResult(n)) => {
+    let req = RpcRequest::DropAllVia {
+        transport_hash: via.to_vec(),
+    };
+    match request(ctx, &req).await {
+        Ok(RpcResponse::IntResult(n)) if n != 0 => {
+            println!("Dropped all paths via {}", pretty_hex_rep(&via));
+            ExitCode::SUCCESS
+        }
+        Ok(RpcResponse::IntResult(_)) => {
             println!(
-                "Dropped {n} path{} via {}",
-                if n == 1 { "" } else { "s" },
-                hex::encode(via)
+                "Unable to drop paths via {}. Does the transport instance exist?",
+                pretty_hex_rep(&via)
             );
-            ExitCode::SUCCESS
-        }
-        Ok(RpcResponse::Ok) => {
-            println!("Dropped all paths via {}", hex::encode(via));
-            ExitCode::SUCCESS
-        }
-        Ok(other) => {
-            eprintln!("rnpath-rs: unexpected response: {other:?}");
             ExitCode::from(1)
         }
-        Err(e) => {
-            eprintln!("rnpath-rs: {e}");
-            ExitCode::from(1)
-        }
+        Ok(other) => unexpected(other),
+        Err(e) => rpc_failed(e),
     }
 }
 
-async fn do_blackhole(
+/// rnpath.py:444-490: request a path through the shared instance and wait
+/// `max(-w, medium_path_timeout)` with the spinner.
+async fn query_path(ctx: &ClientCtx, destination: Option<&str>, timeout: f64) -> ExitCode {
+    let dest = match parse_destination(destination) {
+        Ok(dest) => dest,
+        Err(e) => {
+            println!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let handle = match attach_client(ctx).await {
+        Ok(handle) => handle,
+        Err(e) => {
+            eprintln!("rnpath-rs: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let code = query_path_attached(ctx, &handle, dest, timeout).await;
+    handle.shutdown.trigger();
+    handle.shutdown_and_wait().await;
+    code
+}
+
+async fn query_path_attached(
     ctx: &ClientCtx,
-    identity_hex: &str,
-    duration_hours: Option<f64>,
-    reason: Option<String>,
+    handle: &ReticulumHandle,
+    dest: [u8; 16],
+    timeout: f64,
 ) -> ExitCode {
-    let id = match hash::parse_dest_hash(identity_hex) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("rnpath-rs: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let until = duration_hours.map(|h| now_epoch() + h * 3600.0);
-    match request(
-        ctx,
-        &RpcRequest::BlackholeIdentity {
-            identity_hash: id.to_vec(),
-            until,
-            reason,
-        },
-    )
-    .await
+    // A client's own path table starts empty, so upstream always requests.
+    if let Err(e) = handle
+        .request_path(dest, PathRequestOptions::default())
+        .await
     {
-        // rnpath.py:217-221 echoes the hash as given.
-        Ok(RpcResponse::OptBoolResult(Some(true))) => {
-            println!("Blackholed identity {identity_hex}");
-            ExitCode::SUCCESS
-        }
-        Ok(RpcResponse::OptBoolResult(None)) => {
-            println!("Identity {identity_hex} already blackholed");
-            ExitCode::SUCCESS
-        }
-        Ok(RpcResponse::OptBoolResult(Some(false))) => {
-            println!("Could not blackhole identity {identity_hex}");
-            ExitCode::SUCCESS
-        }
-        Ok(other) => {
-            eprintln!("rnpath-rs: unexpected response: {other:?}");
-            ExitCode::from(1)
-        }
-        Err(e) => {
-            eprintln!("rnpath-rs: {e}");
-            ExitCode::from(1)
-        }
+        eprintln!("rnpath-rs: path request failed: {e}");
+        return ExitCode::from(1);
     }
-}
+    print!("Path to {} requested   ", pretty_hex_rep(&dest));
+    flush();
+    let medium = medium_path_timeout(ctx).await;
+    let deadline = deadline_after(timeout.max(medium));
+    let found = spin_until(deadline, || async { has_path(ctx, dest).await }).await;
 
-async fn do_unblackhole(ctx: &ClientCtx, identity_hex: &str) -> ExitCode {
-    let id = match hash::parse_dest_hash(identity_hex) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("rnpath-rs: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    match request(
-        ctx,
-        &RpcRequest::UnblackholeIdentity {
-            identity_hash: id.to_vec(),
-        },
-    )
-    .await
-    {
-        // rnpath.py:235-239.
-        Ok(RpcResponse::OptBoolResult(Some(true))) => {
-            println!("Lifted blackhole for identity {identity_hex}");
-            ExitCode::SUCCESS
-        }
-        Ok(RpcResponse::OptBoolResult(None)) => {
-            println!("Identity {identity_hex} not blackholed");
-            ExitCode::SUCCESS
-        }
-        Ok(RpcResponse::OptBoolResult(Some(false))) => {
-            println!("Could not unblackhole identity {identity_hex}");
-            ExitCode::SUCCESS
-        }
-        Ok(other) => {
-            eprintln!("rnpath-rs: unexpected response: {other:?}");
-            ExitCode::from(1)
-        }
-        Err(e) => {
-            eprintln!("rnpath-rs: {e}");
-            ExitCode::from(1)
-        }
+    if !found {
+        println!("{LOOKUP_RST}Path not found");
+        return ExitCode::from(1);
     }
-}
-
-async fn query_path(ctx: &ClientCtx, dest_hex: &str) -> ExitCode {
-    let dest = match hash::parse_dest_hash(dest_hex) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("rnpath-rs: {e}");
-            return ExitCode::from(2);
-        }
-    };
-
+    let hops = path_hops(ctx, dest).await;
     let next_hop = match request(
         ctx,
         &RpcRequest::GetNextHop {
@@ -818,19 +943,15 @@ async fn query_path(ctx: &ClientCtx, dest_hex: &str) -> ExitCode {
     )
     .await
     {
-        Ok(RpcResponse::HashResult(Some(h))) => Some(h),
-        Ok(RpcResponse::HashResult(None)) => None,
-        Ok(other) => {
-            eprintln!("rnpath-rs: unexpected response: {other:?}");
-            return ExitCode::from(1);
-        }
-        Err(e) => {
-            eprintln!("rnpath-rs: {e}");
-            return ExitCode::from(1);
-        }
+        Ok(RpcResponse::HashResult(next_hop)) => next_hop,
+        Ok(other) => return unexpected(other),
+        Err(e) => return rpc_failed(e),
     };
-
-    let iface = match request(
+    let Some(next_hop) = next_hop else {
+        println!("{LOOKUP_RST}Error: Invalid path data returned");
+        return ExitCode::from(1);
+    };
+    let interface = match request(
         ctx,
         &RpcRequest::GetNextHopIfName {
             destination_hash: dest.to_vec(),
@@ -838,111 +959,87 @@ async fn query_path(ctx: &ClientCtx, dest_hex: &str) -> ExitCode {
     )
     .await
     {
-        Ok(RpcResponse::StringResult(s)) => s,
-        _ => None,
+        Ok(RpcResponse::StringResult(name)) => name.unwrap_or_else(|| "None".to_string()),
+        Ok(other) => return unexpected(other),
+        Err(e) => return rpc_failed(e),
     };
+    println!(
+        "\rPath found, destination {} is {hops} hop{} away via {} on {interface}",
+        pretty_hex_rep(&dest),
+        if hops == 1 { "" } else { "s" },
+        pretty_hex_rep(&next_hop)
+    );
+    ExitCode::SUCCESS
+}
 
-    let mut path_entry = match request(ctx, &RpcRequest::GetPathTable { max_hops: None }).await {
-        Ok(RpcResponse::PathTable(entries)) => entries
-            .into_iter()
-            .find(|entry| entry.hash.as_slice() == dest),
-        _ => None,
-    };
-
-    let mut next_hop = next_hop;
-    let mut iface = iface;
-    if next_hop.is_none() && path_entry.is_none() {
-        // rnpath.py:460-470: as a shared-instance client, send the path request
-        // over the local interface and wait max(-w, medium path timeout).
-        let timeout_secs = ctx
-            .explicit_timeout
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(rns_transport::constants::PATH_REQUEST_TIMEOUT);
-        let medium = match request(ctx, &RpcRequest::GetMediumPathTimeout).await {
-            Ok(RpcResponse::FloatResult(Some(v))) if v.is_finite() => v,
-            _ => 0.0,
-        };
-        let found = match request_path_as_client(ctx, dest, timeout_secs.max(medium)).await {
-            Ok(found) => found,
-            Err(e) => {
-                eprintln!("rnpath-rs: {e}");
-                return ExitCode::from(1);
-            }
-        };
-
-        if found {
-            next_hop = match request(
-                ctx,
-                &RpcRequest::GetNextHop {
-                    destination_hash: dest.to_vec(),
-                },
-            )
-            .await
-            {
-                Ok(RpcResponse::HashResult(h)) => h,
-                Ok(other) => {
-                    eprintln!("rnpath-rs: unexpected response: {other:?}");
-                    return ExitCode::from(1);
-                }
-                Err(e) => {
-                    eprintln!("rnpath-rs: {e}");
-                    return ExitCode::from(1);
-                }
-            };
-            iface = match request(
-                ctx,
-                &RpcRequest::GetNextHopIfName {
-                    destination_hash: dest.to_vec(),
-                },
-            )
-            .await
-            {
-                Ok(RpcResponse::StringResult(s)) => s,
-                _ => None,
-            };
-            path_entry = match request(ctx, &RpcRequest::GetPathTable { max_hops: None }).await {
-                Ok(RpcResponse::PathTable(entries)) => entries
-                    .into_iter()
-                    .find(|entry| entry.hash.as_slice() == dest),
-                _ => None,
-            };
+/// Print one spinner frame every 100 ms until `done` or the deadline
+/// (rnpath.py:465-472, rnprobe.py:85-91). Returns whether `done` held.
+async fn spin_until<F, Fut>(deadline: Option<Instant>, mut done: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut i = 0;
+    loop {
+        if done().await {
+            return true;
         }
-    }
-
-    println!("Destination: {}", hex::encode(dest));
-    match next_hop.as_ref() {
-        Some(h) => println!("  Next hop : {}", hex::encode(h)),
-        None if path_entry.is_some() => println!("  Next hop : (direct)"),
-        None => println!("  Next hop : (no known path)"),
-    }
-    if let Some(entry) = path_entry.as_ref() {
-        println!("  Hops     : {}", entry.hops);
-    }
-    if let Some(i) = iface {
-        println!("  Interface: {i}");
-    }
-
-    if next_hop.is_none() && path_entry.is_none() {
-        println!("  Note     : path request timed out or no path was found");
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        print!("\u{8}\u{8}{} ", SPINNER[i]);
+        flush();
+        i = (i + 1) % SPINNER.len();
     }
 }
 
-/// Attach to the shared instance as a client, request the path through it and
-/// poll for it every 100 ms until `wait_secs` pass.
-async fn request_path_as_client(
-    ctx: &ClientCtx,
-    dest: [u8; 16],
-    wait_secs: f64,
-) -> Result<bool, String> {
-    let shutdown = ShutdownSignal::new();
+/// `None` when the wait cannot end (Python's `time.time() + inf`).
+fn deadline_after(secs: f64) -> Option<Instant> {
+    if secs.is_nan() || secs <= 0.0 {
+        return Some(Instant::now());
+    }
+    Duration::try_from_secs_f64(secs)
+        .ok()
+        .and_then(|d| Instant::now().checked_add(d))
+}
+
+fn flush() {
+    let _ = std::io::stdout().flush();
+}
+
+async fn has_path(ctx: &ClientCtx, dest: [u8; 16]) -> bool {
+    path_entry(ctx, dest).await.is_some()
+}
+
+async fn path_hops(ctx: &ClientCtx, dest: [u8; 16]) -> u8 {
+    path_entry(ctx, dest)
+        .await
+        .map(|e| e.hops)
+        .unwrap_or(rns_transport::constants::PATHFINDER_M)
+}
+
+async fn path_entry(ctx: &ClientCtx, dest: [u8; 16]) -> Option<rpc::PathTableEntry> {
+    match request(ctx, &RpcRequest::GetPathTable { max_hops: None }).await {
+        Ok(RpcResponse::PathTable(entries)) => entries.into_iter().find(|e| e.hash == dest),
+        _ => None,
+    }
+}
+
+async fn medium_path_timeout(ctx: &ClientCtx) -> f64 {
+    match request(ctx, &RpcRequest::GetMediumPathTimeout).await {
+        Ok(RpcResponse::FloatResult(Some(v))) if v.is_finite() => v,
+        _ => 0.0,
+    }
+}
+
+/// Attach to the shared instance as a client, as `RNS.Reticulum()` does in rnpath.
+async fn attach_client(ctx: &ClientCtx) -> Result<ReticulumHandle, String> {
     let config_dir = ctx.config_dir.to_string_lossy().into_owned();
     let handle = init_with_options(
         Some(&config_dir),
         None,
-        shutdown.clone(),
+        ShutdownSignal::new(),
         Arc::new(AtomicBool::new(true)),
         InitOptions {
             require_shared_instance: true,
@@ -951,59 +1048,12 @@ async fn request_path_as_client(
     )
     .await
     .map_err(|e| format!("could not attach to the shared instance: {e}"))?;
-    let result = async {
-        // A standalone fallback would request the path over its own interfaces.
-        if handle.instance_mode != InstanceMode::Client {
-            return Err("could not attach to the shared instance".to_string());
-        }
-        if handle.has_path(dest).await.unwrap_or(false) {
-            return Ok(true);
-        }
-        handle
-            .request_path(dest, PathRequestOptions::default())
-            .await
-            .map_err(|e| format!("path request failed: {e}"))?;
-        let started = tokio::time::Instant::now();
-        while started.elapsed().as_secs_f64() < wait_secs.max(0.1) {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if handle.has_path(dest).await.unwrap_or(false) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+    if handle.instance_mode != InstanceMode::Client {
+        handle.shutdown.trigger();
+        handle.shutdown_and_wait().await;
+        return Err("could not attach to the shared instance".to_string());
     }
-    .await;
-    shutdown.trigger();
-    handle.shutdown_and_wait().await;
-    result
-}
-
-fn path_table_json(entries: &[rpc::PathTableEntry]) -> String {
-    let mut out = String::from("[");
-    for (i, e) in entries.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        let via = e
-            .via
-            .as_ref()
-            .map(|v| format!("\"{}\"", hex::encode(v)))
-            .unwrap_or_else(|| "null".to_string());
-        out.push_str(&format!(
-            "{{\"hash\":\"{}\",\"hops\":{},\"via\":{},\"timestamp\":{},\"expires\":{},\"value\":{},\"used\":{},\"lr_cost\":{},\"interface\":{:?}}}",
-            hex::encode(&e.hash),
-            e.hops,
-            via,
-            e.timestamp,
-            e.expires,
-            json_opt_f64(e.value),
-            e.used,
-            json_opt_f64(e.lr_cost),
-            e.interface
-        ));
-    }
-    out.push(']');
-    out
+    Ok(handle)
 }
 
 fn now_epoch() -> f64 {
@@ -1013,438 +1063,472 @@ fn now_epoch() -> f64 {
         .unwrap_or(0.0)
 }
 
-async fn run_remote_blackhole_list(args: Args) -> ExitCode {
-    let remote_hex = args.remote.as_deref().or(args.destination.as_deref());
-    let Some(remote_hex) = remote_hex else {
-        eprintln!("rnpath-rs: -p requires a remote transport identity hash.");
-        return ExitCode::from(2);
-    };
-    let remote_hash = match hash::parse_dest_hash(remote_hex) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("rnpath-rs: remote blackhole source: {e}");
-            return ExitCode::from(2);
-        }
-    };
+/// Start the runtime used for `-R` and `-p`, as rnpath.py:108 does.
+async fn start_runtime(args: &Args) -> Result<ReticulumHandle, ExitCode> {
+    init(
+        args.config.as_deref(),
+        None,
+        ShutdownSignal::new(),
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await
+    .map_err(|e| {
+        eprintln!("rnpath-rs: failed to initialize Reticulum runtime: {e:?}");
+        ExitCode::from(1)
+    })
+}
 
-    let identity = match args.identity.as_ref() {
-        Some(path) => match rns_identity::identity::Identity::from_file(path) {
-            Ok(id) => id,
-            Err(e) => {
-                eprintln!(
-                    "rnpath-rs: could not load identity from {}: {e:?}",
-                    path.display()
-                );
-                return ExitCode::from(1);
-            }
-        },
-        None => rns_identity::identity::Identity::new(),
-    };
+async fn stop_runtime(handle: ReticulumHandle, code: ExitCode) -> ExitCode {
+    handle.shutdown.trigger();
+    handle.shutdown_and_wait().await;
+    code
+}
 
-    let shutdown = ShutdownSignal::new();
-    let foreground = Arc::new(AtomicBool::new(true));
-    let handle = match init(args.config.as_deref(), None, shutdown.clone(), foreground).await {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("rnpath-rs: failed to initialize Reticulum runtime: {e:?}");
-            return ExitCode::from(1);
-        }
-    };
-
-    let timeout = Duration::from_secs(
-        args.remote_timeout
-            .or(args.timeout)
-            .unwrap_or(REMOTE_TIMEOUT_SECS),
-    );
-    let client = LinkClient::new(handle.transport_tx.clone(), identity);
-    let response_bytes = match client
-        .query(
-            remote_hash,
-            BLACKHOLE_APP,
-            "/list",
-            Vec::new(),
-            REMOTE_HOPS,
-            timeout,
-        )
+/// rnpath.py:43-58: wait for a path to the remote destination, printing the
+/// request line when one is needed. Exit 12 on timeout.
+async fn await_remote_path(
+    handle: &ReticulumHandle,
+    dest: [u8; 16],
+    timeout: f64,
+) -> Result<(), ExitCode> {
+    let medium = match handle
+        .query_control(rns_transport::messages::TransportQuery::GetInterfaceStats)
         .await
     {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!(
-                "rnpath-rs: remote blackhole query failed: {}",
-                remote_err(&e)
-            );
-            shutdown.trigger();
-            return match e {
-                LinkClientError::Timeout(_) => ExitCode::from(124),
-                _ => ExitCode::from(1),
-            };
-        }
+        Some(rns_transport::messages::TransportQueryResponse::InterfaceStats(ifs)) => ifs
+            .iter()
+            .filter(|i| i.online && i.bitrate > 0)
+            .map(|i| i.bitrate)
+            .min()
+            .map(medium_path_timeout_for_bitrate)
+            .unwrap_or(0.0),
+        _ => 0.0,
     };
-
-    let list_filter = args.list_filter.as_deref().or_else(|| {
-        if args.remote.is_some() {
-            args.destination.as_deref()
-        } else {
-            None
-        }
-    });
-    let exit = print_remote_blackhole_list(&response_bytes, args.json, list_filter, remote_hash);
-    shutdown.trigger();
-    exit
-}
-
-fn print_remote_blackhole_list(
-    bytes: &[u8],
-    json: bool,
-    filter: Option<&str>,
-    publisher: [u8; 16],
-) -> ExitCode {
-    let entries = match rns_transport::discovery::decode_manifest(bytes) {
-        Ok(entries) => entries,
-        Err(e) => {
-            eprintln!("rnpath-rs: malformed blackhole manifest: {e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    let filter_match = |identity: &[u8; 16], reason: &str, source: &[u8; 16]| {
-        filter.is_none_or(|needle| {
-            let haystack = format!(
-                "{} {} {}",
-                hex::encode(identity),
-                reason,
-                hex::encode(source)
-            );
-            haystack.contains(needle)
-        })
-    };
-    let entries: Vec<_> = entries
-        .into_iter()
-        .filter(|(identity, entry)| filter_match(identity, &entry.reason, entry.source.as_bytes()))
-        .collect();
-
-    if json {
-        print!("[");
-        for (i, (identity, entry)) in entries.iter().enumerate() {
-            if i > 0 {
-                print!(",");
-            }
-            let until = entry
-                .until
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "null".to_string());
-            print!(
-                "{{\"identity\":\"{}\",\"until\":{},\"reason\":{:?},\"source\":\"{}\"}}",
-                hex::encode(identity),
-                until,
-                entry.reason,
-                hex::encode(entry.source.as_bytes())
-            );
-        }
-        println!("]");
-        return ExitCode::SUCCESS;
+    if handle.has_path(dest).await.unwrap_or(false) {
+        return Ok(());
     }
-
-    if entries.is_empty() {
-        println!("No blackholed identity data available.");
-        return ExitCode::SUCCESS;
-    }
-
-    let now = now_epoch();
-    for (identity, entry) in entries {
-        let until = match entry.until {
-            Some(u) => format!("for {}", format::pretty_time((u - now).max(0.0))),
-            None => "indefinitely".to_string(),
-        };
-        let reason = if entry.reason.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", entry.reason)
-        };
-        let by = if entry.source.as_bytes() == &publisher {
-            String::new()
-        } else {
-            format!(" by {}", hex::encode(entry.source.as_bytes()))
-        };
-        println!("{} blackholed {until}{reason}{by}", hex::encode(identity));
-    }
-    ExitCode::SUCCESS
-}
-
-fn remote_mutation_flag(args: &Args) -> Option<&'static str> {
-    if args.drop.is_some() {
-        Some("--drop")
-    } else if args.drop_announces {
-        Some("--drop-announces")
-    } else if args.drop_via.is_some() {
-        Some("--drop-via")
-    } else if args.blackhole.is_some() {
-        Some("--blackhole")
-    } else if args.unblackhole.is_some() {
-        Some("--unblackhole")
-    } else {
-        None
+    print!("Path to {} requested ", pretty_hex_rep(&dest));
+    flush();
+    let _ = handle
+        .request_path(dest, PathRequestOptions::default())
+        .await;
+    let deadline = deadline_after(timeout.max(medium));
+    loop {
+        if handle.has_path(dest).await.unwrap_or(false) {
+            return Ok(());
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            println!("{OUTPUT_RST}Path request timed out");
+            return Err(ExitCode::from(12));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-async fn run_remote(args: Args) -> ExitCode {
-    let remote_hex = args.remote.as_deref().expect("checked in main");
-    let remote_hash = match hash::parse_dest_hash(remote_hex) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("rnpath-rs: --remote: {e}");
-            return ExitCode::from(2);
-        }
-    };
+/// `Transport.medium_path_timeout()` (Transport.py:3550-3553).
+fn medium_path_timeout_for_bitrate(lowest_bitrate: u64) -> f64 {
+    let bits = (rns_wire::constants::MTU * 8) as f64;
+    2.0 * (bits / lowest_bitrate.max(rns_runtime::constants::MINIMUM_BITRATE) as f64)
+        + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT
+}
 
-    // Remote management protocol is read-only — reject any mutation flag.
-    if let Some(flag) = remote_mutation_flag(&args) {
-        eprintln!("rnpath-rs: {flag} is local-only in remote mode.");
-        eprintln!(
-            "        Remote mode supports read-only --table and --rates queries; \
-             path mutations and blackhole management are local-only \
-             (no remote endpoint exists in the Reticulum management protocol)."
-        );
-        return ExitCode::from(255);
-    }
-    if args.blackholed {
-        eprintln!("rnpath-rs: --blackholed is local-only (no remote endpoint).");
-        return ExitCode::from(255);
-    }
-    if !args.table && !args.rates {
-        if args.destination.is_some() {
-            eprintln!(
-                "rnpath-rs: remote destination path requests are not implemented; use --table or --rates with the destination as a filter, or run the path request locally."
-            );
-        } else {
-            eprintln!("rnpath-rs: remote mode requires --table or --rates.");
-        }
-        return ExitCode::from(255);
-    }
-
-    let identity_path = match args.identity.as_ref() {
-        Some(p) => p.clone(),
-        None => {
-            eprintln!("rnpath-rs: --remote requires --identity <path>.");
-            return ExitCode::from(2);
-        }
-    };
-    let identity = match rns_identity::identity::Identity::from_file(&identity_path) {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!(
-                "rnpath-rs: could not load identity from {}: {e:?}",
-                identity_path.display()
-            );
-            return ExitCode::from(1);
-        }
-    };
-
-    let shutdown = ShutdownSignal::new();
-    let foreground = Arc::new(AtomicBool::new(true));
-    let handle = match init(args.config.as_deref(), None, shutdown.clone(), foreground).await {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("rnpath-rs: failed to initialize Reticulum runtime: {e:?}");
-            return ExitCode::from(1);
-        }
-    };
-
-    let timeout = Duration::from_secs(
-        args.remote_timeout
-            .or(args.timeout)
-            .unwrap_or(REMOTE_TIMEOUT_SECS),
-    );
-
-    // Wire payload: [command, destination, max_hops]. Destination filter not
-    // exposed by all older peers; max_hops is table-only.
-    let command = if args.table { "table" } else { "rates" };
-    let mut req_args: Vec<rmpv::Value> = vec![rmpv::Value::from(command)];
-    if let Some(dest_hex) = args.destination.as_deref() {
-        let dest = match hash::parse_dest_hash(dest_hex) {
-            Ok(dest) => dest,
-            Err(e) => {
-                eprintln!("rnpath-rs: destination filter: {e}");
-                shutdown.trigger();
-                return ExitCode::from(2);
-            }
-        };
-        req_args.push(rmpv::Value::Binary(dest.to_vec()));
-    }
-    if args.table
-        && let Some(m) = args.max
-    {
-        if args.destination.is_none() {
-            req_args.push(rmpv::Value::Nil);
-        }
-        req_args.push(rmpv::Value::from(m));
-    }
-    let req_value = rmpv::Value::Array(req_args);
-    let mut payload = Vec::new();
-    if let Err(e) = rmpv::encode::write_value(&mut payload, &req_value) {
-        eprintln!("rnpath-rs: msgpack encode failed: {e}");
-        shutdown.trigger();
-        return ExitCode::from(1);
-    }
-
+/// rnpath.py:59-92 and the request: one link query, with upstream's
+/// progress lines and link failure messages (exit 10).
+async fn remote_query(
+    handle: &ReticulumHandle,
+    identity: Identity,
+    transport_hash: [u8; 16],
+    app: &str,
+    path: &str,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, ExitCode> {
+    print!("{OUTPUT_RST}Establishing link with remote transport instance... ");
+    flush();
+    print!("{OUTPUT_RST}Sending request... ");
+    flush();
     let client = LinkClient::new(handle.transport_tx.clone(), identity);
-    let response_bytes = match client
+    client
         .query(
-            remote_hash,
-            MGMT_APP,
-            "/path",
+            transport_hash,
+            app,
+            path,
             payload,
             REMOTE_HOPS,
-            timeout,
+            REMOTE_LINK_TIMEOUT,
         )
         .await
+        .map_err(|e| {
+            print!("{OUTPUT_RST}");
+            match e {
+                LinkClientError::Timeout(_) => println!("The link timed out, exiting now"),
+                _ => println!("Link closed unexpectedly, exiting now"),
+            }
+            ExitCode::from(10)
+        })
+}
+
+/// rnpath.py:146-206: `-p` fetches `/list` from the transport whose identity
+/// hash is the destination argument, filtered by `list_filter`.
+async fn run_remote_blackhole_list(args: &Args) -> ExitCode {
+    let identity_hash = match parse_hash(args.destination.as_deref()) {
+        Ok(h) => h,
+        Err(e) => {
+            println!("{e}");
+            return ExitCode::from(20);
+        }
+    };
+    let handle = match start_runtime(args).await {
+        Ok(handle) => handle,
+        Err(code) => return code,
+    };
+    let code = remote_blackhole_list(args, &handle, identity_hash).await;
+    stop_runtime(handle, code).await
+}
+
+async fn remote_blackhole_list(
+    args: &Args,
+    handle: &ReticulumHandle,
+    identity_hash: [u8; 16],
+) -> ExitCode {
+    let dest = Destination::hash_from_name_and_identity(BLACKHOLE_APP, Some(&identity_hash));
+    if let Err(code) = await_remote_path(handle, dest, args.remote_timeout).await {
+        return code;
+    }
+    let bytes = match remote_query(
+        handle,
+        Identity::new(),
+        identity_hash,
+        BLACKHOLE_APP,
+        "/list",
+        Vec::new(),
+    )
+    .await
     {
-        Ok(b) => b,
+        Ok(bytes) => bytes,
+        Err(code) => return code,
+    };
+    let Ok(entries) = rns_transport::discovery::decode_manifest(&bytes) else {
+        println!("{OUTPUT_RST}The remote request failed.");
+        return ExitCode::from(10);
+    };
+    print!("{OUTPUT_RST}");
+    let entries: Vec<BlackholeLine> = entries
+        .into_iter()
+        .map(|(identity, entry)| BlackholeLine {
+            identity: identity.to_vec(),
+            until: entry.until,
+            reason: entry.reason,
+            source: Some(entry.source.as_bytes().to_vec()),
+        })
+        .collect();
+    print_blackhole_list(
+        &entries,
+        args.list_filter.as_deref(),
+        Some(handle.transport_identity.hash),
+        now_epoch(),
+    )
+}
+
+/// rnpath.py:111-130 and the remote branches: `-t` and `-r` over
+/// `rnstransport.remote.management`; other actions are not implemented upstream.
+async fn run_remote(args: &Args, remote: &str) -> ExitCode {
+    let remote_hash = match parse_destination(Some(remote)) {
+        Ok(h) => h,
         Err(e) => {
-            eprintln!("rnpath-rs: remote query failed: {}", remote_err(&e));
-            shutdown.trigger();
-            return match e {
-                LinkClientError::Timeout(_) => ExitCode::from(124),
-                _ => ExitCode::from(1),
-            };
+            println!("{e}");
+            return ExitCode::from(20);
         }
     };
+    let identity = match args.identity.as_ref() {
+        None => {
+            println!("expected str, bytes or os.PathLike object, not NoneType");
+            return ExitCode::from(20);
+        }
+        Some(path) => match Identity::from_file(path) {
+            Ok(identity) => identity,
+            Err(_) => {
+                println!("Could not load management identity from {}", path.display());
+                return ExitCode::from(20);
+            }
+        },
+    };
+    let handle = match start_runtime(args).await {
+        Ok(handle) => handle,
+        Err(code) => return code,
+    };
+    let dest = Destination::hash_from_name_and_identity(MGMT_APP, Some(&remote_hash));
+    if let Err(code) = await_remote_path(&handle, dest, args.remote_timeout).await {
+        return stop_runtime(handle, code).await;
+    }
+    if let Some(message) = remote_unimplemented(args) {
+        println!("{OUTPUT_RST}{message}");
+        return stop_runtime(handle, ExitCode::from(255)).await;
+    }
+    let destination = args.destination.as_deref().filter(|d| !d.is_empty());
+    let filter = match table_filter(destination) {
+        Ok(filter) => filter,
+        Err(code) => return stop_runtime(handle, code).await,
+    };
+    let code = remote_management(args, &handle, identity, remote_hash, filter).await;
+    stop_runtime(handle, code).await
+}
 
-    let exit = if args.table {
-        print_remote_path_table(&response_bytes, args.json, args.usage)
+/// The remote branches that print "not implemented" and exit 255 (rnpath.py:135-449).
+fn remote_unimplemented(args: &Args) -> Option<&'static str> {
+    if args.blackholed {
+        Some("Listing blackholed identities on remote instances not yet implemented")
+    } else if args.blackhole || args.unblackhole {
+        Some("Blackholing identity on remote instances not yet implemented")
+    } else if args.table || args.rates {
+        None
+    } else if args.drop_announces {
+        Some("Dropping announce queues on remote instances not yet implemented")
+    } else if args.drop {
+        Some("Dropping path on remote instances not yet implemented")
+    } else if args.drop_via {
+        Some(
+            "Dropping all paths via specific transport instance on remote instances yet not implemented",
+        )
     } else {
-        print_remote_rate_table(&response_bytes, args.json)
+        Some("Requesting paths on remote instances not implemented")
+    }
+}
+
+async fn remote_management(
+    args: &Args,
+    handle: &ReticulumHandle,
+    identity: Identity,
+    remote_hash: [u8; 16],
+    filter: Option<[u8; 16]>,
+) -> ExitCode {
+    let dest_value = filter
+        .map(|f| rmpv::Value::Binary(f.to_vec()))
+        .unwrap_or(rmpv::Value::Nil);
+    // rnpath.py:263,326.
+    let request = if args.table {
+        let max = args.max.map(rmpv::Value::from).unwrap_or(rmpv::Value::Nil);
+        vec![rmpv::Value::from("table"), dest_value, max]
+    } else {
+        vec![rmpv::Value::from("rates"), dest_value]
     };
-    shutdown.trigger();
-    exit
-}
-
-fn print_remote_path_table(bytes: &[u8], json: bool, usage: bool) -> ExitCode {
-    let mut entries =
-        match rpc::decode_response_for_request(bytes, &RpcRequest::GetPathTable { max_hops: None })
+    let mut payload = Vec::new();
+    if let Err(e) = rmpv::encode::write_value(&mut payload, &rmpv::Value::Array(request)) {
+        eprintln!("rnpath-rs: msgpack encode failed: {e}");
+        return ExitCode::from(1);
+    }
+    let bytes = match remote_query(handle, identity, remote_hash, MGMT_APP, "/path", payload).await
+    {
+        Ok(bytes) => bytes,
+        Err(code) => return code,
+    };
+    let now = now_epoch();
+    // A falsy reply, including an empty table, is reported as a failure (rnpath.py:266-273).
+    if args.table {
+        match rpc::decode_response_for_request(&bytes, &RpcRequest::GetPathTable { max_hops: None })
         {
-            Ok(RpcResponse::PathTable(entries)) => entries,
-            Ok(other) => {
-                eprintln!("rnpath-rs: unexpected response: {other:?}");
-                return ExitCode::from(1);
+            Ok(RpcResponse::PathTable(table)) if !table.is_empty() => {
+                print!("{OUTPUT_RST}");
+                print_path_table(table, filter, args.json, args.usage, now)
             }
-            Err(e) => {
-                eprintln!("rnpath-rs: malformed response: {e}");
-                return ExitCode::from(1);
+            _ => remote_request_failed(),
+        }
+    } else {
+        match rpc::decode_response_for_request(&bytes, &RpcRequest::GetRateTable) {
+            Ok(RpcResponse::RateTable(table)) if !table.is_empty() => {
+                print!("{OUTPUT_RST}");
+                print_rate_table(table, filter, args.json, now)
             }
+            _ => remote_request_failed(),
+        }
+    }
+}
+
+fn remote_request_failed() -> ExitCode {
+    println!("{OUTPUT_RST}The remote request failed. Likely authentication failure.");
+    ExitCode::from(10)
+}
+
+/// `RNS.prettytime` (RNS/__init__.py:239-290), not verbose.
+fn py_prettytime(time: f64, compact: bool) -> String {
+    let neg = time < 0.0;
+    let mut time = time.abs();
+    let days = (time / 86400.0).floor();
+    time %= 86400.0;
+    let hours = (time / 3600.0).floor();
+    time %= 3600.0;
+    let minutes = (time / 60.0).floor();
+    time %= 60.0;
+    let seconds = if compact {
+        time.trunc()
+    } else {
+        py_round(time, 2)
+    };
+
+    let mut components = Vec::new();
+    for (value, unit) in [(days, "d"), (hours, "h"), (minutes, "m")] {
+        if value > 0.0 && (!compact || components.len() < 2) {
+            components.push(format!("{}{unit}", value as i64));
+        }
+    }
+    if seconds > 0.0 && (!compact || components.len() < 2) {
+        let seconds = if compact {
+            format!("{}", seconds as i64)
+        } else {
+            py_float_repr(seconds)
         };
-
-    if json {
-        println!("{}", path_table_json(&entries));
-        return ExitCode::SUCCESS;
+        components.push(format!("{seconds}s"));
     }
-
-    if entries.is_empty() {
-        println!("Remote path table is empty.");
-        return ExitCode::SUCCESS;
-    }
-    if usage {
-        sort_by_usage(&mut entries);
-    }
-    println!(
-        "{:<36} {:>5} {:<36} Interface",
-        "Destination", "Hops", "Via"
-    );
-    for e in &entries {
-        let via = e
-            .via
-            .as_ref()
-            .map(hex::encode)
-            .unwrap_or_else(|| "-".to_string());
-        println!(
-            "{:<36} {:>5} {:<36} {} {}",
-            hex::encode(&e.hash),
-            e.hops,
-            via,
-            e.interface,
-            cost_suffix(e.value, e.lr_cost)
-        );
-    }
-    ExitCode::SUCCESS
-}
-
-/// Remote rates are the control port's rate table entries (Transport.py:3364-3369).
-fn print_remote_rate_table(bytes: &[u8], json: bool) -> ExitCode {
-    match rpc::decode_response_for_request(bytes, &RpcRequest::GetRateTable) {
-        Ok(RpcResponse::RateTable(entries)) => print_rate_table(&entries, json),
-        Ok(other) => {
-            eprintln!("rnpath-rs: unexpected response: {other:?}");
-            ExitCode::from(1)
+    let mut out = String::new();
+    let count = components.len();
+    for (i, c) in components.iter().enumerate() {
+        if i > 0 {
+            out.push_str(if i + 1 < count { ", " } else { " and " });
         }
-        Err(e) => {
-            eprintln!("rnpath-rs: malformed response: {e}");
-            ExitCode::from(1)
-        }
+        out.push_str(c);
+    }
+    if out.is_empty() {
+        "0s".to_string()
+    } else if neg {
+        format!("-{out}")
+    } else {
+        out
     }
 }
 
-fn remote_err(e: &LinkClientError) -> String {
-    match e {
-        LinkClientError::PubkeyNotDiscovered => {
-            "remote node not discovered (no announce received). \
-             Verify the transport hash and that the local rnsd has connectivity."
-                .to_string()
-        }
-        LinkClientError::Timeout(stage) => format!("timeout while waiting for {stage}"),
-        other => other.to_string(),
+/// rnpath.py:542-561 for an integer timestamp, from `datetime` differences.
+fn pretty_date(time: f64, now: f64) -> String {
+    let diff = now - time;
+    let day_diff = (diff / 86400.0).floor() as i64;
+    let second_diff = (diff - day_diff as f64 * 86400.0).floor() as i64;
+    if day_diff < 0 {
+        return String::new();
     }
+    if day_diff == 0 {
+        if second_diff < 60 {
+            return format!("{second_diff} seconds");
+        }
+        if second_diff < 70 {
+            return "1 minute".to_string();
+        }
+        if second_diff < 7200 {
+            return format!("{} minutes", second_diff / 60);
+        }
+        return format!("{} hours", second_diff / 3600);
+    }
+    if day_diff == 1 {
+        return "1 day".to_string();
+    }
+    if day_diff < 7 {
+        return format!("{day_diff} days");
+    }
+    if day_diff < 31 {
+        return format!("{} weeks", day_diff / 7);
+    }
+    if day_diff < 365 {
+        return format!("{} months", day_diff / 30);
+    }
+    format!("{} years", day_diff / 365)
+}
+
+/// Python `round(x, n)` for a float.
+fn py_round(value: f64, digits: usize) -> f64 {
+    format!("{value:.digits$}").parse().unwrap_or(value)
+}
+
+/// Python `repr(float)`: shortest round-trip digits, scientific notation
+/// outside `1e-4 <= |x| < 1e16`.
+fn py_float_repr(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    let sci = format!("{value:e}");
+    let (mantissa, exponent) = sci
+        .split_once('e')
+        .expect("scientific format has an exponent");
+    let exponent: i32 = exponent.parse().expect("integer exponent");
+    if value == 0.0 || (-4..16).contains(&exponent) {
+        let fixed = format!("{value}");
+        if fixed.contains('.') {
+            fixed
+        } else {
+            format!("{fixed}.0")
+        }
+    } else {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exponent.abs())
+    }
+}
+
+/// A `json.dumps` string with the default `ensure_ascii`.
+fn py_json_str(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if c.is_ascii() && !c.is_ascii_control() => out.push(c),
+            c => {
+                let mut units = [0u16; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
-    /// Python's remote rates carry no `rate` key (Reticulum.py:1757-1763).
-    #[test]
-    fn remote_rates_read_python_rate_entries() {
-        let entry = rmpv::Value::Map(vec![
-            (
-                rmpv::Value::from("hash"),
-                rmpv::Value::Binary(vec![0x44; 16]),
-            ),
-            (rmpv::Value::from("last"), rmpv::Value::F64(1_700_000_000.0)),
-            (
-                rmpv::Value::from("rate_violations"),
-                rmpv::Value::from(2u64),
-            ),
-            (rmpv::Value::from("blocked_until"), rmpv::Value::F64(0.0)),
-            (
-                rmpv::Value::from("timestamps"),
-                rmpv::Value::Array(vec![rmpv::Value::F64(1_700_000_000.0)]),
-            ),
-        ]);
-        let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &rmpv::Value::Array(vec![entry])).unwrap();
-        let Ok(RpcResponse::RateTable(entries)) =
-            rpc::decode_response_for_request(&bytes, &RpcRequest::GetRateTable)
-        else {
-            panic!("remote rates decode as a rate table");
-        };
-        assert_eq!(entries[0].hash, vec![0x44; 16]);
-        assert_eq!(entries[0].rate_violations, 2);
-        assert_eq!(print_remote_rate_table(&bytes, true), ExitCode::SUCCESS);
+    fn fixture() -> Value {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/python_formatting/python_formatting.json");
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn cases(name: &str) -> Vec<Value> {
+        fixture()[name].as_array().unwrap().clone()
     }
 
     #[test]
-    fn local_rpc_auth_failure_explains_config_mismatch_and_port_owner() {
-        let endpoint = SharedInstanceRpcEndpoint::Tcp(37429);
-        let msg = local_rpc_failure_message(
-            &endpoint,
-            Path::new("/tmp/rns-auth-test"),
-            &rns_runtime::rpc::RpcError::AuthFailed,
-        );
-
-        assert!(msg.contains("config mismatch"));
-        assert!(msg.contains("another app is owning the control port"));
-        assert!(msg.contains("rpc_key"));
-        assert!(msg.contains("transport_identity"));
-        assert!(msg.contains("37430/37431"));
+    fn formatting_matches_upstream_helpers() {
+        for case in cases("prettytime_compact") {
+            let t = case[0].as_f64().unwrap();
+            assert_eq!(py_prettytime(t, true), case[1].as_str().unwrap(), "{t}");
+        }
+        for case in cases("prettytime") {
+            let t = case[0].as_f64().unwrap();
+            assert_eq!(py_prettytime(t, false), case[1].as_str().unwrap(), "{t}");
+        }
+        let now = fixture()["pretty_date_now"].as_f64().unwrap();
+        for case in cases("pretty_date") {
+            let t = case[0].as_f64().unwrap();
+            assert_eq!(pretty_date(t, now), case[1].as_str().unwrap(), "{t}");
+        }
+        for case in cases("float_repr") {
+            let x = case[0].as_f64().unwrap();
+            assert_eq!(py_float_repr(x), case[1].as_str().unwrap(), "{x}");
+        }
+        for case in cases("round_repr") {
+            let (x, n) = (case[0].as_f64().unwrap(), case[1].as_u64().unwrap());
+            assert_eq!(
+                py_float_repr(py_round(x, n as usize)),
+                case[2].as_str().unwrap(),
+                "round({x}, {n})"
+            );
+        }
     }
 
     // Expected strings are RNS 1.6.0 `prettycost` output for the same values.
@@ -1485,5 +1569,62 @@ mod tests {
         sort_by_usage(&mut entries);
         let order: Vec<u8> = entries.iter().map(|e| e.hash[0]).collect();
         assert_eq!(order, [4, 2, 1, 3]);
+    }
+
+    /// rnpath.py:181-202: reason truncation, the `by` suffix and the filter string.
+    #[test]
+    fn blackhole_lines_truncate_reason_and_filter_on_rendered_text() {
+        let own = [0xdd; 16];
+        let entries = [
+            BlackholeLine {
+                identity: vec![0xee; 16],
+                until: None,
+                reason: format!("spam source {}", "x".repeat(80)),
+                source: Some(own.to_vec()),
+            },
+            BlackholeLine {
+                identity: vec![0xff; 16],
+                until: Some(1000.0 + 3.0 * 3600.0 + 900.0),
+                reason: String::new(),
+                source: Some(vec![0x11; 16]),
+            },
+        ];
+        let lines = blackhole_lines(&entries, None, Some(own), 1000.0);
+        assert_eq!(
+            lines[0],
+            format!(
+                "<{}> blackholed indefinitely (spam source {}…)",
+                "ee".repeat(16),
+                "x".repeat(51)
+            )
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "<{}> blackholed for 3h and 15m by <{}>",
+                "ff".repeat(16),
+                "11".repeat(16)
+            )
+        );
+        assert_eq!(
+            blackhole_lines(&entries, Some("for 3h"), Some(own), 1000.0).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn local_rpc_auth_failure_explains_config_mismatch_and_port_owner() {
+        let endpoint = SharedInstanceRpcEndpoint::Tcp(37429);
+        let msg = local_rpc_failure_message(
+            &endpoint,
+            Path::new("/tmp/rns-auth-test"),
+            &rns_runtime::rpc::RpcError::AuthFailed,
+        );
+
+        assert!(msg.contains("config mismatch"));
+        assert!(msg.contains("another app is owning the control port"));
+        assert!(msg.contains("rpc_key"));
+        assert!(msg.contains("transport_identity"));
+        assert!(msg.contains("37430/37431"));
     }
 }

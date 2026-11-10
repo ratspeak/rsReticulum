@@ -14,10 +14,13 @@ use tokio::sync::mpsc;
 
 use crate::hdlc;
 use crate::traits::{
-    InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, TunnelIdentity,
+    ByteCounter, InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, TunnelIdentity,
     handoff_accepted_interface, open_client_connection,
 };
-use rns_transport::messages::{InboundPacket, TransportMessage};
+use rns_transport::messages::{
+    InboundPacket, InterfaceIdentity, InterfaceInspectionSnapshot, InterfaceInspectionSource,
+    TransportMessage,
+};
 
 pub const DEFAULT_SAM_ADDRESS: &str = "127.0.0.1";
 pub const DEFAULT_SAM_PORT: u16 = 7656;
@@ -566,6 +569,9 @@ pub async fn spawn_i2p_client(
     let task_txb = shared_txb.clone();
 
     let python_name = config.python_name();
+    let tunnel_state = Arc::new(std::sync::atomic::AtomicU8::new(TUNNEL_STATE_INIT));
+    let task_tunnel_state = tunnel_state.clone();
+    let identity = InterfaceIdentity::new(&python_name, &config.name, "I2PInterfacePeer");
     let read_task = tokio::spawn(async move {
         let mut pacer = ReconnectPacer::new(config.reconnect_delay, config.max_reconnect_tries);
         // Every attempt after the first follows a failure or an outage.
@@ -744,9 +750,10 @@ pub async fn spawn_i2p_client(
                     id,
                     &transport_tx,
                     &online_task,
-                    &task_rxb,
-                    &task_txb,
+                    &ByteCounter::new(task_rxb.clone(), None),
+                    &ByteCounter::new(task_txb.clone(), None),
                     &python_name,
+                    &task_tunnel_state,
                 )
                 .await;
             }
@@ -786,7 +793,7 @@ pub async fn spawn_i2p_client(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        inspection: None,
+        inspection: Some(tunnel_inspection(tunnel_state).with_identity(identity)),
         tx,
         read_task,
     })
@@ -810,6 +817,12 @@ pub async fn spawn_i2p_server(
 
     // Server handle tx is unused; per-peer handles carry traffic.
     let (tx, _rx) = mpsc::channel::<Bytes>(1);
+    let server_rxb = Arc::new(AtomicU64::new(0));
+    let server_txb = Arc::new(AtomicU64::new(0));
+    let parent_rxb = server_rxb.clone();
+    let parent_txb = server_txb.clone();
+    let server_identity = InterfaceIdentity::bracketed("I2PInterface", &name);
+    let b32 = config.b32.as_ref().map(|b32| b32.subscribe());
 
     let online_task = online.clone();
 
@@ -967,12 +980,16 @@ pub async fn spawn_i2p_server(
                 let (c_tx, mut c_rx) = mpsc::channel::<Bytes>(256);
 
                 let c_online_r = c_online.clone();
-                let c_rxb_r = c_rxb.clone();
-                let c_txb_w = c_txb.clone();
+                let c_rxb_r = ByteCounter::new(c_rxb.clone(), Some(parent_rxb.clone()));
+                let c_txb_w = ByteCounter::new(c_txb.clone(), Some(parent_txb.clone()));
                 let transport_tx2 =
                     InterfaceTransportSender::new(client_id, transport_tx.actor_sender());
                 let child_owner = transport_tx2.owner();
                 let peer_name = format!("I2PInterfacePeer[{client_name}]");
+                let c_tunnel_state = Arc::new(std::sync::atomic::AtomicU8::new(TUNNEL_STATE_INIT));
+                let task_c_tunnel_state = c_tunnel_state.clone();
+                let child_identity =
+                    InterfaceIdentity::new(&peer_name, &client_name, "I2PInterfacePeer");
                 let c_read_task = tokio::spawn(async move {
                     i2p_connection(
                         raw_reader,
@@ -985,6 +1002,7 @@ pub async fn spawn_i2p_server(
                         &c_rxb_r,
                         &c_txb_w,
                         &peer_name,
+                        &task_c_tunnel_state,
                     )
                     .await;
                     tracing::info!(name = %peer_name, "I2P server: peer disconnected");
@@ -1011,7 +1029,9 @@ pub async fn spawn_i2p_server(
                     online: c_online,
                     rxb: Some(c_rxb),
                     txb: Some(c_txb),
-                    inspection: None,
+                    inspection: Some(
+                        tunnel_inspection(c_tunnel_state).with_identity(child_identity),
+                    ),
                     tx: c_tx,
                     read_task: c_read_task,
                 };
@@ -1052,9 +1072,17 @@ pub async fn spawn_i2p_server(
         bitrate: BITRATE_GUESS,
         mtu: HW_MTU,
         online,
-        rxb: Some(Arc::new(AtomicU64::new(0))),
-        txb: Some(Arc::new(AtomicU64::new(0))),
-        inspection: None,
+        rxb: Some(server_rxb),
+        txb: Some(server_txb),
+        // Rust runs the listener only when `connectable` is set.
+        inspection: Some(
+            InterfaceInspectionSource::new(move || InterfaceInspectionSnapshot {
+                i2p_connectable: Some(true),
+                i2p_b32: b32.as_ref().and_then(|b32| b32.borrow().clone()),
+                ..InterfaceInspectionSnapshot::default()
+            })
+            .with_identity(server_identity),
+        ),
         tx,
         read_task,
     })
@@ -1070,18 +1098,18 @@ async fn i2p_read_loop(
     interface_id: InterfaceId,
     transport_tx: &InterfaceTransportSender,
     online: &AtomicBool,
-    rxb: &AtomicU64,
+    rxb: &ByteCounter,
     last_read: &std::sync::Mutex<tokio::time::Instant>,
 ) {
     let mut deframer = hdlc::HdlcByteDeframer::new(HW_MTU as usize);
     let mut buf = [0u8; 4096];
 
     if !initial_data.is_empty() {
-        rxb.fetch_add(initial_data.len() as u64, Ordering::Relaxed);
         for frame in deframer.feed(initial_data) {
             if frame.is_empty() {
                 continue;
             }
+            rxb.add(frame.len());
             let msg = TransportMessage::Inbound(InboundPacket {
                 raw: Bytes::from(frame),
                 interface_id,
@@ -1105,11 +1133,11 @@ async fn i2p_read_loop(
             }
             Ok(n) => {
                 *last_read.lock().unwrap_or_else(|e| e.into_inner()) = tokio::time::Instant::now();
-                rxb.fetch_add(n as u64, Ordering::Relaxed);
                 for frame in deframer.feed(&buf[..n]) {
                     if frame.is_empty() {
                         continue;
                     }
+                    rxb.add(frame.len());
                     let msg = TransportMessage::Inbound(InboundPacket {
                         raw: Bytes::from(frame),
                         interface_id,
@@ -1140,9 +1168,10 @@ async fn i2p_read_loop(
 async fn i2p_write_loop(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     rx: &mut mpsc::Receiver<Bytes>,
-    txb: &AtomicU64,
+    txb: &ByteCounter,
     last_read: &std::sync::Mutex<tokio::time::Instant>,
     name: &str,
+    shown_state: &std::sync::atomic::AtomicU8,
 ) {
     let probe_after = std::time::Duration::from_secs(I2P_PROBE_AFTER);
     let read_timeout = std::time::Duration::from_secs(I2P_READ_TIMEOUT);
@@ -1160,7 +1189,7 @@ async fn i2p_write_loop(
                     tracing::warn!(name = %name, error = %e, "I2P: write error");
                     return;
                 }
-                txb.fetch_add(framed.len() as u64, Ordering::Relaxed);
+                txb.add(framed.len());
                 last_write = tokio::time::Instant::now();
             }
             _ = tick.tick() => {
@@ -1173,6 +1202,7 @@ async fn i2p_write_loop(
                 } else {
                     tunnel_state = TUNNEL_STATE_ACTIVE;
                 }
+                shown_state.store(tunnel_state, Ordering::Relaxed);
                 // Keepalives do not count as writes, as upstream: they repeat every tick.
                 if last_write.elapsed() > probe_after
                     && let Err(e) = writer.write_all(&[hdlc::FLAG, hdlc::FLAG]).await
@@ -1189,6 +1219,14 @@ async fn i2p_write_loop(
     }
 }
 
+/// Reports Python's `i2p_tunnel_state` for an I2P peer.
+fn tunnel_inspection(state: Arc<std::sync::atomic::AtomicU8>) -> InterfaceInspectionSource {
+    InterfaceInspectionSource::new(move || InterfaceInspectionSnapshot {
+        i2p_tunnel_state: Some(state.load(Ordering::Relaxed)),
+        ..InterfaceInspectionSnapshot::default()
+    })
+}
+
 /// Run one I2P stream; the reader, writer and watchdog share a task, so either
 /// side ending, or the task being aborted, closes the stream.
 #[allow(clippy::too_many_arguments)]
@@ -1200,14 +1238,15 @@ async fn i2p_connection(
     interface_id: InterfaceId,
     transport_tx: &InterfaceTransportSender,
     online: &AtomicBool,
-    rxb: &AtomicU64,
-    txb: &AtomicU64,
+    rxb: &ByteCounter,
+    txb: &ByteCounter,
     name: &str,
+    tunnel_state: &std::sync::atomic::AtomicU8,
 ) {
     let last_read = std::sync::Mutex::new(tokio::time::Instant::now());
     tokio::select! {
         _ = i2p_read_loop(reader, initial_data, interface_id, transport_tx, online, rxb, &last_read) => {}
-        _ = i2p_write_loop(writer, rx, txb, &last_read, name) => {}
+        _ = i2p_write_loop(writer, rx, txb, &last_read, name, tunnel_state) => {}
     }
     online.store(false, Ordering::SeqCst);
 }

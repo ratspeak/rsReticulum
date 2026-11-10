@@ -165,9 +165,14 @@ fn handle_status(
         None
     };
 
+    let traffic = match blocking_query(tx, TransportQuery::GetTrafficTotals) {
+        Some(TransportQueryResponse::TrafficTotals(totals)) => Some(totals),
+        _ => None,
+    };
     rpc::encode_remote_status(
         &stat_entries(iface_stats, ifac),
         transport.map(TransportStatsSource::snapshot).as_ref(),
+        traffic.as_ref(),
         inbound_queues.map(|q| q.snapshot()).as_ref(),
         link_count,
         request.profiling,

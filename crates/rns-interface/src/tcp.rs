@@ -10,10 +10,14 @@ use tokio::sync::mpsc;
 use crate::hdlc;
 use crate::kiss;
 use crate::traits::{
-    InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, TunnelIdentity,
-    handoff_accepted_interface, open_client_connection, python_host,
+    ClientCountGuard, InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode,
+    TunnelIdentity, handoff_accepted_interface, open_client_connection, python_address_name,
+    python_host,
 };
-use rns_transport::messages::{InboundPacket, TransportMessage};
+use rns_transport::messages::{
+    InboundPacket, InterfaceIdentity, InterfaceInspectionSnapshot, InterfaceInspectionSource,
+    TransportMessage,
+};
 
 pub const RECONNECT_WAIT_INITIAL: u64 = 5;
 pub const RECONNECT_WAIT_MAX: u64 = 300;
@@ -174,6 +178,9 @@ pub struct TcpInterfaceState {
     /// Aggregate counters that persist across reconnections.
     pub shared_rxb: Option<Arc<AtomicU64>>,
     pub shared_txb: Option<Arc<AtomicU64>>,
+    /// The listener's counters, for a connection a TCP server accepted.
+    pub parent_rxb: Option<Arc<AtomicU64>>,
+    pub parent_txb: Option<Arc<AtomicU64>>,
 }
 
 impl TcpInterfaceState {
@@ -195,6 +202,9 @@ impl TcpInterfaceState {
         if let Some(shared) = &self.shared_rxb {
             shared.fetch_add(bytes as u64, Ordering::Relaxed);
         }
+        if let Some(parent) = &self.parent_rxb {
+            parent.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
     }
 
     pub fn record_tx(&self, bytes: usize) {
@@ -202,6 +212,9 @@ impl TcpInterfaceState {
         self.tx_packets.fetch_add(1, Ordering::Relaxed);
         if let Some(shared) = &self.shared_txb {
             shared.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+        if let Some(parent) = &self.parent_txb {
+            parent.fetch_add(bytes as u64, Ordering::Relaxed);
         }
     }
 }
@@ -217,6 +230,8 @@ impl Default for TcpInterfaceState {
             tx_packets: AtomicU64::new(0),
             shared_rxb: None,
             shared_txb: None,
+            parent_rxb: None,
+            parent_txb: None,
         }
     }
 }
@@ -336,11 +351,11 @@ async fn tcp_write_loop(
             first_byte = format!("0x{:02x}", data.first().copied().unwrap_or(0)),
             "TCP write: sending frame"
         );
-        state.record_tx(data.len());
         if let Err(e) = writer.write_all(&framed).await {
             tracing::warn!(error = %e, "TCP write error");
             break;
         }
+        state.record_tx(framed.len());
     }
     state.online.store(false, Ordering::SeqCst);
 }
@@ -376,6 +391,7 @@ pub async fn spawn_tcp_client(
     let task_txb = shared_txb.clone();
 
     let python_name = config.python_name();
+    let identity = InterfaceIdentity::new(&python_name, &config.name, "TCPClientInterface");
     let read_task = tokio::spawn(async move {
         let max_tries = config.max_reconnect_tries;
         let mut tries: usize = 0;
@@ -520,7 +536,7 @@ pub async fn spawn_tcp_client(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        inspection: None,
+        inspection: Some(InterfaceInspectionSource::identified(identity)),
         tx,
         read_task,
     })
@@ -533,10 +549,14 @@ pub async fn spawn_tcp_client(
     skip_all,
     fields(client_id = id, name = %name),
 )]
+#[allow(clippy::too_many_arguments)]
 async fn spawn_tcp_accepted(
     stream: TcpStream,
     id: InterfaceId,
     parent_id: InterfaceId,
+    parent_counters: (Arc<AtomicU64>, Arc<AtomicU64>),
+    client_count: ClientCountGuard,
+    identity: InterfaceIdentity,
     name: String,
     transport_tx: mpsc::Sender<TransportMessage>,
     kiss_framing: bool,
@@ -550,7 +570,13 @@ async fn spawn_tcp_accepted(
 
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
-    let state = TcpInterfaceState::with_shared_counters(shared_rxb.clone(), shared_txb.clone());
+    let state = Arc::new(TcpInterfaceState {
+        shared_rxb: Some(shared_rxb.clone()),
+        shared_txb: Some(shared_txb.clone()),
+        parent_rxb: Some(parent_counters.0),
+        parent_txb: Some(parent_counters.1),
+        ..TcpInterfaceState::default()
+    });
     state.online.store(true, Ordering::SeqCst);
 
     set_tcp_keepalive_tuned(&stream, false);
@@ -565,6 +591,7 @@ async fn spawn_tcp_accepted(
     let handle_name = name.clone();
     let dereg_tx = transport_tx.clone();
     let read_task = tokio::spawn(async move {
+        let _client_count = client_count;
         tcp_read_loop(
             reader,
             id,
@@ -601,7 +628,7 @@ async fn spawn_tcp_accepted(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        inspection: None,
+        inspection: Some(InterfaceInspectionSource::identified(identity)),
         tx,
         read_task,
     }
@@ -641,6 +668,21 @@ pub async fn spawn_tcp_server(
 
     // Server handle tx is unused; only accepted connections send.
     let (tx, _rx) = mpsc::channel::<Bytes>(1);
+    let parent_rxb = Arc::new(AtomicU64::new(0));
+    let parent_txb = Arc::new(AtomicU64::new(0));
+    let task_parent_counters = (parent_rxb.clone(), parent_txb.clone());
+    let clients = Arc::new(AtomicU64::new(0));
+    let task_clients = clients.clone();
+    let server_identity = InterfaceIdentity::new(
+        python_address_name(
+            "TCPServerInterface",
+            &config.name,
+            &local_addr.ip().to_string(),
+            config.listen_port,
+        ),
+        &config.name,
+        "TCPServerInterface",
+    );
 
     let read_task = tokio::spawn(async move {
         loop {
@@ -649,10 +691,24 @@ pub async fn spawn_tcp_server(
                     let client_id = id_gen.fetch_add(1, Ordering::SeqCst);
                     let client_name = format!("{}/client_{}", config.name, client_id);
                     tracing::info!(name = %client_name, peer = %peer, "accepted TCP connection");
+                    let spawned_name = format!("Client on {}", config.name);
+                    let identity = InterfaceIdentity::new(
+                        python_address_name(
+                            "TCPInterface",
+                            &spawned_name,
+                            &peer.ip().to_string(),
+                            peer.port(),
+                        ),
+                        spawned_name,
+                        "TCPClientInterface",
+                    );
                     let handle = spawn_tcp_accepted(
                         stream,
                         client_id,
                         id,
+                        task_parent_counters.clone(),
+                        ClientCountGuard::new(task_clients.clone()),
+                        identity,
                         client_name,
                         transport_tx.actor_sender(),
                         kiss_framing,
@@ -693,9 +749,15 @@ pub async fn spawn_tcp_server(
         bitrate: BITRATE_GUESS,
         mtu,
         online,
-        rxb: Some(Arc::new(AtomicU64::new(0))),
-        txb: Some(Arc::new(AtomicU64::new(0))),
-        inspection: None,
+        rxb: Some(parent_rxb),
+        txb: Some(parent_txb),
+        inspection: Some(
+            InterfaceInspectionSource::new(move || InterfaceInspectionSnapshot {
+                active_clients: Some(clients.load(Ordering::Relaxed)),
+                ..InterfaceInspectionSnapshot::default()
+            })
+            .with_identity(server_identity),
+        ),
         tx,
         read_task,
     })

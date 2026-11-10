@@ -146,6 +146,8 @@ impl TransportActor {
             self.last_rate_cull = now;
         }
 
+        self.count_traffic(now);
+
         if now - self.last_links_check >= LINKS_CHECK_INTERVAL {
             self.traffic.update_speeds();
             self.last_links_check = now;
@@ -538,7 +540,6 @@ impl TransportActor {
                     let packet_time = (raw.len() as f64 * 8.0) / bitrate;
                     let announce_delay = packet_time / entry.announce_cap.max(0.001);
                     entry.announce_allowed_at = now + announce_delay;
-                    entry.ingress.sent_announce();
 
                     if idx < entry.announce_queue.len() {
                         entry.announce_queue.remove(idx);

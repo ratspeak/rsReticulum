@@ -105,18 +105,59 @@ pub(crate) fn stat_entries(
 ) -> Vec<rpc::InterfaceStatEntry> {
     let names: std::collections::HashMap<u64, String> = entries
         .iter()
-        .map(|entry| (entry.id, entry.name.clone()))
+        .map(|entry| {
+            let name = entry
+                .identity
+                .as_ref()
+                .map_or_else(|| entry.name.clone(), |identity| identity.name.clone());
+            (entry.id, name)
+        })
         .collect();
     entries
         .into_iter()
         .map(|e| {
             let autoconnect_source = ifac.and_then(|records| records.autoconnect_source(e.id));
             let ifac = ifac.map(|ifac| ifac.lookup(e.id)).unwrap_or_default();
+            let (name, short_name, class_name) = match e.identity {
+                Some(identity) => (
+                    identity.name,
+                    Some(identity.short_name),
+                    Some(identity.class_name),
+                ),
+                None => (e.name, None, None),
+            };
             rpc::InterfaceStatEntry {
                 autoconnect_source,
                 parent_interface_name: e.parent_id.and_then(|id| names.get(&id).cloned()),
                 id: e.id,
-                name: e.name,
+                name,
+                short_name,
+                class_name,
+                speeds: e.speeds,
+                announce_rx_bytes: e.announce_rx_bytes,
+                announce_tx_bytes: e.announce_tx_bytes,
+                path_request_rx_bytes: e.path_request_rx_bytes,
+                path_request_tx_bytes: e.path_request_tx_bytes,
+                burst_count: e.burst_count,
+                pr_burst_count: e.pr_burst_count,
+                rssi: e.rssi,
+                snr: e.snr,
+                signal_quality: e.signal_quality,
+                peers: e.peers,
+                i2p_connectable: e.i2p_connectable,
+                i2p_b32: e.i2p_b32.map(|b32| format!("{b32}.b32.i2p")),
+                tunnel_state: e.i2p_tunnel_state.map(|state| {
+                    // I2PInterfacePeer.TUNNEL_STATE_* (Reticulum.py:1638-1647).
+                    match state {
+                        0x01 => "Tunnel Active",
+                        0x00 => "Creating Tunnel",
+                        0x02 => "Tunnel Unresponsive",
+                        _ => "Unknown State",
+                    }
+                    .to_string()
+                }),
+                tx_stalled: e.tx_stalled,
+                tx_buffered: e.tx_buffered,
                 rx_bytes: e.rx_bytes,
                 tx_bytes: e.tx_bytes,
                 rx_rate: e.rx_rate,
@@ -443,19 +484,23 @@ async fn respond(request: RpcRequest, backend: &RpcBackend) -> Result<Vec<u8>, R
         _ => {}
     }
     match process_rpc_request(request, &backend.transport_tx, backend.ifac.as_ref()).await {
-        RpcResponse::InterfaceStats(entries) => rpc::encode_interface_stats(
-            &entries,
-            backend
-                .transport
-                .as_ref()
-                .map(TransportStatsSource::snapshot)
-                .as_ref(),
-            backend
-                .inbound_queues
-                .as_ref()
-                .map(|q| q.snapshot())
-                .as_ref(),
-        ),
+        RpcResponse::InterfaceStats(entries) => {
+            let traffic = traffic_totals(&backend.transport_tx).await;
+            rpc::encode_interface_stats(
+                &entries,
+                backend
+                    .transport
+                    .as_ref()
+                    .map(TransportStatsSource::snapshot)
+                    .as_ref(),
+                traffic.as_ref(),
+                backend
+                    .inbound_queues
+                    .as_ref()
+                    .map(|q| q.snapshot())
+                    .as_ref(),
+            )
+        }
         response => rpc::encode_response(&response),
     }
 }
@@ -542,6 +587,21 @@ fn invalid_request_hash(kind: &'static str) -> RpcResponse {
 }
 
 /// 5 s cap so a wedged actor can't hold a client open indefinitely.
+/// The transport's top-level stats counters, or `None` if it cannot answer.
+pub(crate) async fn traffic_totals(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+) -> Option<rpc::TrafficTotals> {
+    match query_transport(
+        transport_tx,
+        rns_transport::messages::TransportQuery::GetTrafficTotals,
+    )
+    .await
+    {
+        Ok(rns_transport::messages::TransportQueryResponse::TrafficTotals(totals)) => Some(totals),
+        _ => None,
+    }
+}
+
 async fn query_transport(
     transport_tx: &mpsc::Sender<TransportMessage>,
     query: rns_transport::messages::TransportQuery,

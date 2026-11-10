@@ -36,6 +36,7 @@ mod path_request_admission;
 mod persistence;
 mod recursive_discovery;
 mod rpc;
+use rpc::InterfaceEvent;
 
 // In-process Links need two distinguishable ingress edges even though both
 // endpoints are owned by this actor. Real interface ids are allocated upward
@@ -119,6 +120,8 @@ pub struct TransportActor {
     pub rate_table: RateTable,
     pub blackhole_table: BlackholeTable,
     pub traffic: TrafficCounter,
+    /// Python's interface traffic count and top-level stats counters.
+    traffic_count: rpc::TrafficCount,
     /// Optional driver observations keyed by packet hash. Actor insertion keeps
     /// at most 512 entries; metrics are not normalized or independently validated.
     pub packet_metrics: HashMap<[u8; 32], PacketMetrics>,
@@ -492,6 +495,7 @@ impl TransportActor {
             rate_table: RateTable::new(),
             blackhole_table: BlackholeTable::new(),
             traffic: TrafficCounter::new(),
+            traffic_count: rpc::TrafficCount::default(),
             packet_metrics: HashMap::new(),
             packet_metrics_order: VecDeque::new(),
             receipt_table: HashMap::new(),
@@ -1966,6 +1970,14 @@ impl TransportActor {
         };
         match entry.tx.try_send(data) {
             Ok(()) => {
+                self.count_tx_packet();
+                // Python counts every transmitted announce (Transport.py:1827).
+                if rns_wire::header::PacketHeader::unpack(raw).is_ok_and(|(header, _)| {
+                    header.flags.packet_type == rns_wire::flags::PacketType::Announce
+                }) {
+                    self.record_interface_event(id, InterfaceEvent::SentAnnounce, raw.len());
+                    self.count_transport_event(InterfaceEvent::SentAnnounce);
+                }
                 if let Some((link_id, _)) = request_owner {
                     self.pending_local_link_requests
                         .entry(link_id)
@@ -7973,6 +7985,7 @@ mod tests {
             InterfaceInspectionSnapshot {
                 active_clients: Some(7),
                 blocked_ips: Some(2),
+                ..Default::default()
             }
         }));
         actor.interfaces.insert(1, entry);

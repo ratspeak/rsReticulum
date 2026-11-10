@@ -600,7 +600,19 @@ impl TransportActor {
     /// Local destination -> fire waiters so the owner re-announces.
     /// Known path + transport enabled -> replay the cached announce.
     /// Otherwise, on a transport node, forward the request on other interfaces.
+    #[cfg(test)]
     pub(super) fn handle_inbound_path_request(&mut self, data: &[u8], interface_id: InterfaceId) {
+        let raw_len = data.len() + rns_wire::constants::HEADER_MINSIZE;
+        self.handle_inbound_path_request_sized(data, interface_id, raw_len);
+    }
+
+    /// `raw_len` is the whole packet's size, which Python counts in `prxb`.
+    pub(super) fn handle_inbound_path_request_sized(
+        &mut self,
+        data: &[u8],
+        interface_id: InterfaceId,
+        raw_len: usize,
+    ) {
         if data.len() < 16 {
             return;
         }
@@ -677,9 +689,8 @@ impl TransportActor {
         }
         // Python counts a path request once its tag and stamp pass these gates
         // (Transport.py:2088-2131).
-        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
-            entry.ingress.received_path_request();
-        }
+        self.record_interface_event(interface_id, InterfaceEvent::ReceivedPathRequest, raw_len);
+        self.count_transport_event(InterfaceEvent::ReceivedPathRequest);
 
         if self.local_destinations.contains(&requested_dest) {
             pathing!(

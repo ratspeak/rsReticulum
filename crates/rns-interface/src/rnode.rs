@@ -3350,6 +3350,166 @@ pub struct RNodeSignalStats {
     pub q: Option<f32>,
 }
 
+/// What an RNode last reported about its radio, kept as Python keeps the
+/// `r_*` attributes that `get_interface_stats()` reads (Reticulum.py:1651-1690).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RNodeRadioStats {
+    pub frequency: Option<u32>,
+    pub bandwidth: Option<u32>,
+    pub txpower: Option<i64>,
+    pub sf: Option<u8>,
+    pub cr: Option<u8>,
+    pub rssi: Option<i64>,
+    pub snr: Option<f64>,
+    pub q: Option<f64>,
+    pub airtime_short: f64,
+    pub airtime_long: f64,
+    pub channel_load_short: f64,
+    pub channel_load_long: f64,
+    pub noise_floor: Option<i64>,
+    pub interference: Option<i64>,
+    pub interference_last: Option<(f64, i64)>,
+    pub cpu_temp: Option<i64>,
+    pub battery_state: u8,
+    pub battery_percent: u8,
+}
+
+/// Which upstream class the report belongs to: their attributes differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RNodeRadioKind {
+    /// `RNodeInterface` (RNodeInterface.py:785-1070).
+    Single,
+    /// `RNodeSubInterface`: its own radio settings and signal, airtime fixed
+    /// at 0.0 because the parent keeps channel time (RNodeMultiInterface.py:625-800, 998-1001).
+    Sub,
+}
+
+impl RNodeRadioStats {
+    /// Apply one deframed report from the device.
+    pub fn observe(&mut self, kind: RNodeRadioKind, command: u8, frame: &[u8]) {
+        let u32_at =
+            |f: &[u8]| (f.len() >= 4).then(|| u32::from_be_bytes([f[0], f[1], f[2], f[3]]));
+        let u16_at = |f: &[u8], i: usize| f64::from(u16::from_be_bytes([f[i], f[i + 1]]));
+        let offset = |byte: u8| i64::from(byte) - i64::from(RSSI_OFFSET);
+        match command {
+            CMD_FREQUENCY => self.frequency = u32_at(frame).or(self.frequency),
+            CMD_BANDWIDTH => self.bandwidth = u32_at(frame).or(self.bandwidth),
+            CMD_TXPOWER => {
+                if let Some(&byte) = frame.first() {
+                    // The multi-radio parent reads it signed (RNodeMultiInterface.py:655).
+                    self.txpower = Some(match kind {
+                        RNodeRadioKind::Single => i64::from(byte),
+                        RNodeRadioKind::Sub => i64::from(byte as i8),
+                    });
+                }
+            }
+            CMD_SF => self.sf = frame.first().copied().or(self.sf),
+            CMD_CR => self.cr = frame.first().copied().or(self.cr),
+            CMD_STAT_RSSI => {
+                if let Some(&byte) = frame.first() {
+                    self.rssi = Some(offset(byte));
+                }
+            }
+            CMD_STAT_SNR => {
+                if let Some(&byte) = frame.first() {
+                    let snr = f64::from(byte as i8) * 0.25;
+                    self.snr = Some(snr);
+                    if let Some(sf) = self.sf {
+                        // Python rounds the quality to one decimal in f64.
+                        let q = f64::from(signal_quality(snr as f32, sf));
+                        self.q = Some((q * 10.0).round() / 10.0);
+                    }
+                }
+            }
+            CMD_STAT_CHTM if kind == RNodeRadioKind::Single && frame.len() >= 11 => {
+                self.airtime_short = u16_at(frame, 0) / 100.0;
+                self.airtime_long = u16_at(frame, 2) / 100.0;
+                self.channel_load_short = u16_at(frame, 4) / 100.0;
+                self.channel_load_long = u16_at(frame, 6) / 100.0;
+                self.noise_floor = Some(offset(frame[9]));
+                if frame[10] == 0xFF {
+                    self.interference = None;
+                } else {
+                    let dbm = offset(frame[10]);
+                    self.interference = Some(dbm);
+                    self.interference_last = Some((rns_transport::now_f64(), dbm));
+                }
+            }
+            CMD_STAT_BAT if kind == RNodeRadioKind::Single => {
+                if let Some((state, percent)) = decode_battery_status(frame) {
+                    self.battery_state = state;
+                    self.battery_percent = percent;
+                }
+            }
+            CMD_STAT_TEMP if kind == RNodeRadioKind::Single => {
+                if let Some(&byte) = frame.first() {
+                    self.cpu_temp = decode_temperature_byte(byte).map(i64::from);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The keys Python's `get_interface_stats()` gives this interface.
+    pub fn stat_keys(
+        &self,
+        kind: RNodeRadioKind,
+    ) -> Vec<(&'static str, rns_transport::messages::InterfaceStatValue)> {
+        use rns_transport::messages::InterfaceStatValue as V;
+        let int = |v: Option<i64>| v.map_or(V::None, V::Int);
+        let float = |v: Option<f64>| v.map_or(V::None, V::Float);
+        let mut keys = vec![
+            ("rssi", int(self.rssi)),
+            ("snr", float(self.snr)),
+            ("signal_quality", float(self.q)),
+            ("frequency", int(self.frequency.map(i64::from))),
+            ("bandwidth", int(self.bandwidth.map(i64::from))),
+            ("txpower", int(self.txpower)),
+            ("sf", int(self.sf.map(i64::from))),
+            ("cr", int(self.cr.map(i64::from))),
+            ("airtime_short", V::Float(self.airtime_short)),
+            ("airtime_long", V::Float(self.airtime_long)),
+            ("channel_load_short", V::Float(self.channel_load_short)),
+            ("channel_load_long", V::Float(self.channel_load_long)),
+        ];
+        if kind == RNodeRadioKind::Single {
+            keys.push(("noise_floor", int(self.noise_floor)));
+            keys.push(("interference", int(self.interference)));
+            keys.push(("cpu_temp", int(self.cpu_temp)));
+            if let Some((ts, dbm)) = self.interference_last {
+                keys.push(("interference_last_ts", V::Float(ts)));
+                keys.push(("interference_last_dbm", V::Int(dbm)));
+            }
+            // RNodeInterface.get_battery_state_string (RNodeInterface.py:1218-1226).
+            match self.battery_state {
+                0x00 => {}
+                0x01 => keys.push(("battery_state", V::Str("discharging".into()))),
+                0x02 => keys.push(("battery_state", V::Str("charging".into()))),
+                0x03 => keys.push(("battery_state", V::Str("charged".into()))),
+                _ => keys.push(("battery_state", V::Str("unknown".into()))),
+            }
+            keys.push(("battery_percent", V::Int(i64::from(self.battery_percent))));
+        }
+        keys
+    }
+
+    /// An inspection callback reporting the shared radio state.
+    pub fn inspection(
+        stats: Arc<std::sync::Mutex<Self>>,
+        kind: RNodeRadioKind,
+    ) -> rns_transport::messages::InterfaceInspectionSource {
+        rns_transport::messages::InterfaceInspectionSource::new(move || {
+            rns_transport::messages::InterfaceInspectionSnapshot {
+                radio: stats
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .stat_keys(kind),
+                ..Default::default()
+            }
+        })
+    }
+}
+
 /// Python: raw unsigned RSSI byte minus `RSSI_OFFSET` (157) → dBm.
 pub fn decode_rssi_byte(byte: u8) -> f32 {
     byte as f32 - RSSI_OFFSET as f32
@@ -3625,6 +3785,10 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
     let background = crate::background_announce::register(&tx)?;
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
     let name = config.name.clone();
+    let python_identity =
+        rns_transport::messages::InterfaceIdentity::bracketed("RNodeInterface", &name);
+    let radio_stats = Arc::new(std::sync::Mutex::new(RNodeRadioStats::default()));
+    let task_radio_stats = radio_stats.clone();
     let mode = config.mode;
     // Python RNodeInterface.py:333-343: oversized callsigns disable beaconing.
     let beacon: Option<(Duration, Bytes)> = config
@@ -4143,6 +4307,10 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                                 // packet gate reflect the same reducer state.
                                 sync_rnode_interface_online(&online_r, &protocol_state);
                                 snapshot_publisher.protocol_effect(&protocol_state, effect);
+                                task_radio_stats
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .observe(RNodeRadioKind::Single, cmd, &frame);
                                 match process_rnode_response(
                                     cmd,
                                     &frame,
@@ -4258,7 +4426,10 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        inspection: None,
+        inspection: Some(
+            RNodeRadioStats::inspection(radio_stats, RNodeRadioKind::Single)
+                .with_identity(python_identity),
+        ),
         tx,
         read_task,
     };

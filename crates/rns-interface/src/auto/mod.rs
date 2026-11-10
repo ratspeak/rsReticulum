@@ -20,7 +20,8 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use rns_transport::messages::{
-    InboundPacket, InterfacePacketCapacity, InterfaceTransportSender, TransportMessage,
+    InboundPacket, InterfaceIdentity, InterfaceInspectionSnapshot, InterfaceInspectionSource,
+    InterfacePacketCapacity, InterfaceTransportSender, TransportMessage,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, mpsc};
@@ -829,7 +830,7 @@ impl Shared {
             owner,
             packet_capacity: InterfacePacketCapacity::new(HW_MTU, HW_MTU, FIXED_MTU),
             parent_id: Some(self.id),
-            name,
+            name: name.clone(),
             mode: self.mode,
             direction: InterfaceDirection {
                 inbound: true,
@@ -842,7 +843,10 @@ impl Shared {
             online: online.clone(),
             rxb: Some(rxb.clone()),
             txb: Some(txb),
-            inspection: None,
+            // AutoInterfacePeer never sets `name` (AutoInterface.py:636-650).
+            inspection: Some(InterfaceInspectionSource::identified(
+                InterfaceIdentity::new(name, "None", "AutoInterfacePeer"),
+            )),
             tx,
             read_task,
         };
@@ -1182,10 +1186,33 @@ pub async fn spawn_auto_interface(
         online: shared.online.clone(),
         rxb: Some(shared.rxb.clone()),
         txb: Some(shared.txb.clone()),
-        inspection: None,
+        inspection: Some(auto_inspection(&shared)),
         tx,
         read_task,
     })
+}
+
+/// `peers` and the `AutoInterface[name]` identity for interface stats (Reticulum.py:1726-1728).
+fn auto_inspection(shared: &Arc<Shared>) -> InterfaceInspectionSource {
+    let shared = Arc::downgrade(shared);
+    let last = Arc::new(AtomicU64::new(0));
+    let name = shared.upgrade().map(|s| s.name.clone()).unwrap_or_default();
+    InterfaceInspectionSource::new(move || {
+        // The callback runs on the transport actor, so it never waits for the lock.
+        let peers = match shared.upgrade().as_ref().map(|s| s.core.try_lock()) {
+            Some(Ok(core)) => {
+                let count = core.peer_count() as u64;
+                last.store(count, Ordering::Relaxed);
+                count
+            }
+            _ => last.load(Ordering::Relaxed),
+        };
+        InterfaceInspectionSnapshot {
+            peers: Some(peers),
+            ..Default::default()
+        }
+    })
+    .with_identity(InterfaceIdentity::bracketed("AutoInterface", &name))
 }
 
 #[cfg(test)]

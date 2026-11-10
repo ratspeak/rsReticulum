@@ -24,15 +24,65 @@ pub use crate::interface_ownership::{
     InterfaceTransportSender,
 };
 
-/// Optional aggregate counts supplied by an interface driver.
-///
-/// This record contains no endpoint, address, name or free-form field. That
-/// restriction applies to this record, not to the surrounding interface stats,
-/// which include names and other configuration metadata.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// A driver-reported interface stat value, as Python puts it in the dict.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum InterfaceStatValue {
+    None,
+    Int(i64),
+    Float(f64),
+    Str(String),
+}
+
+/// Optional live state supplied by an interface driver for interface stats.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct InterfaceInspectionSnapshot {
+    /// Radio keys Python emits only for interfaces that have them
+    /// (Reticulum.py:1651-1690), e.g. `frequency` or `noise_floor`.
+    pub radio: Vec<(&'static str, InterfaceStatValue)>,
     pub active_clients: Option<u64>,
     pub blocked_ips: Option<u64>,
+    /// Python `len(interface.peers)` (AutoInterface).
+    pub peers: Option<u64>,
+    /// Set for an I2P listener: Python `i2p_connectable` and the b32 address.
+    pub i2p_connectable: Option<bool>,
+    pub i2p_b32: Option<String>,
+    /// Python `I2PInterfacePeer.i2p_tunnel_state`.
+    pub i2p_tunnel_state: Option<u8>,
+    /// Python `tx_stalled` and `len(transmit_buffer)` in bytes.
+    pub tx_stalled: bool,
+    pub tx_buffered: u64,
+}
+
+/// How Python names an interface: `str(interface)`, `interface.name` and
+/// `type(interface).__name__`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InterfaceIdentity {
+    pub name: String,
+    pub short_name: String,
+    pub class_name: String,
+}
+
+impl InterfaceIdentity {
+    pub fn new(
+        name: impl Into<String>,
+        short_name: impl Into<String>,
+        class_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            short_name: short_name.into(),
+            class_name: class_name.into(),
+        }
+    }
+
+    /// The common `Class[name]` form.
+    pub fn bracketed(class_name: &str, short_name: &str) -> Self {
+        Self::new(
+            format!("{class_name}[{short_name}]"),
+            short_name,
+            class_name,
+        )
+    }
 }
 
 /// A driver-owned callback for live aggregate interface counts.
@@ -42,7 +92,8 @@ pub struct InterfaceInspectionSnapshot {
 /// I/O: the callback executes on the actor task.
 #[derive(Clone)]
 pub struct InterfaceInspectionSource {
-    snapshot: Arc<dyn Fn() -> InterfaceInspectionSnapshot + Send + Sync>,
+    snapshot: Option<Arc<dyn Fn() -> InterfaceInspectionSnapshot + Send + Sync>>,
+    identity: Option<InterfaceIdentity>,
 }
 
 impl InterfaceInspectionSource {
@@ -52,20 +103,42 @@ impl InterfaceInspectionSource {
         F: Fn() -> InterfaceInspectionSnapshot + Send + Sync + 'static,
     {
         Self {
-            snapshot: Arc::new(snapshot),
+            snapshot: Some(Arc::new(snapshot)),
+            identity: None,
         }
+    }
+
+    /// A source that only names the interface the way Python does.
+    pub fn identified(identity: InterfaceIdentity) -> Self {
+        Self {
+            snapshot: None,
+            identity: Some(identity),
+        }
+    }
+
+    pub fn with_identity(mut self, identity: InterfaceIdentity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    pub fn identity(&self) -> Option<&InterfaceIdentity> {
+        self.identity.as_ref()
     }
 
     /// Call the callback synchronously. Unlike `GetInterfaceStats`, this method
     /// does not catch callback panics.
     pub fn snapshot(&self) -> InterfaceInspectionSnapshot {
-        (self.snapshot)()
+        self.snapshot
+            .as_ref()
+            .map(|snapshot| snapshot())
+            .unwrap_or_default()
     }
 }
 
 impl std::fmt::Debug for InterfaceInspectionSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InterfaceInspectionSource")
+            .field("identity", &self.identity)
             .finish_non_exhaustive()
     }
 }
@@ -886,6 +959,9 @@ pub enum TransportQuery {
     GetLinkCount,
     /// Python's `Transport.active_link_count()`, answered as `IntResult`.
     GetActiveLinkCount,
+    /// The top-level traffic, packet, link and path counts of Python's
+    /// `get_interface_stats()`, answered as `TrafficTotals`.
+    GetTrafficTotals,
     GetRecentAnnounces,
     /// Return cached identity metadata without updating `last_used`. Locally
     /// restored cache metadata is trusted; this query performs no fresh signature
@@ -1106,6 +1182,7 @@ pub enum TransportQuery {
 pub enum TransportQueryResponse {
     PathTable(Vec<PathTableRpcEntry>),
     InterfaceStats(Vec<InterfaceStatRpcEntry>),
+    TrafficTotals(TrafficTotalsRpcEntry),
     RateTable(Vec<RateTableRpcEntry>),
     Announces(Vec<AnnounceRpcEntry>),
     RecalledDestination(Option<RecalledDestinationRpcEntry>),
@@ -1201,6 +1278,70 @@ pub struct InterfaceStatRpcEntry {
     pub announces_to_internal: Option<bool>,
     /// The listener that accepted this interface.
     pub parent_id: Option<InterfaceId>,
+    /// How Python names the interface, when the driver says.
+    pub identity: Option<InterfaceIdentity>,
+    /// Python `current_rx/tx/arx/atx/prx/ptx_speed` in bits per second, set by
+    /// the traffic count on top-level interfaces after their first second.
+    pub speeds: Option<[f64; 6]>,
+    /// Python `arxb`, `atxb`, `prxb` and `ptxb`.
+    pub announce_rx_bytes: u64,
+    pub announce_tx_bytes: u64,
+    pub path_request_rx_bytes: u64,
+    pub path_request_tx_bytes: u64,
+    /// Children of a Backbone listener in an announce or path request burst.
+    pub burst_count: Option<u64>,
+    pub pr_burst_count: Option<u64>,
+    /// Python `r_stat_rssi`, `r_stat_snr` and `r_stat_q`: the last reported.
+    pub rssi: Option<f64>,
+    pub snr: Option<f64>,
+    pub signal_quality: Option<f64>,
+    pub peers: Option<u64>,
+    pub i2p_connectable: Option<bool>,
+    pub i2p_b32: Option<String>,
+    pub i2p_tunnel_state: Option<u8>,
+    pub tx_stalled: bool,
+    pub tx_buffered: u64,
+    /// Driver radio keys; these replace the generic `rssi`/`snr`/`signal_quality`.
+    pub radio: Vec<(&'static str, InterfaceStatValue)>,
+}
+
+/// Python's top-level `get_interface_stats()` counters (Reticulum.py:1806-1852,
+/// Transport.py:736-814). Byte totals are cumulative over top-level,
+/// non-shared-instance interfaces; speeds are bits per second and frequencies
+/// per second over the last second.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TrafficTotalsRpcEntry {
+    /// False until a traffic count has measured an interface; Python then
+    /// still reports its integer zero speeds.
+    pub measured: bool,
+    pub rxb: u64,
+    pub txb: u64,
+    pub rxs: f64,
+    pub txs: f64,
+    pub arxb: u64,
+    pub atxb: u64,
+    pub arxs: f64,
+    pub atxs: f64,
+    pub arxf: f64,
+    pub atxf: f64,
+    pub prxb: u64,
+    pub ptxb: u64,
+    pub prxs: f64,
+    pub ptxs: f64,
+    pub prxf: f64,
+    pub ptxf: f64,
+    pub rxpps: u64,
+    pub txpps: u64,
+    pub rx_packets: u64,
+    pub tx_packets: u64,
+    pub announce_rx_packets: u64,
+    pub announce_tx_packets: u64,
+    pub pr_rx_packets: u64,
+    pub pr_tx_packets: u64,
+    pub link_count: u64,
+    pub active_link_count: u64,
+    pub path_count: u64,
+    pub unused_path_count: u64,
 }
 
 /// Announce-rate state: rate is announces per second; timestamps, `last` and

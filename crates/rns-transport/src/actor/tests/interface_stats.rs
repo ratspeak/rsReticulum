@@ -374,3 +374,70 @@ fn an_accepted_client_names_its_listener() {
     assert_eq!(stats(&mut actor, 2).parent_id, Some(1));
     assert_eq!(stats(&mut actor, 1).parent_id, None);
 }
+
+fn totals(actor: &mut TransportActor) -> crate::messages::TrafficTotalsRpcEntry {
+    let TransportQueryResponse::TrafficTotals(totals) =
+        actor.handle_query(TransportQuery::GetTrafficTotals)
+    else {
+        panic!("unexpected traffic totals response");
+    };
+    totals
+}
+
+/// Spawned children add their announce bytes and samples, not counts, to the
+/// parent (Interface.py:307-311, TCPInterface.py:655-658).
+#[test]
+fn a_parent_takes_its_childrens_announce_bytes_but_not_their_counts() {
+    let mut actor = hub();
+    let _parent = attach(&mut actor, 1);
+    for id in [2, 3] {
+        let (mut child, _rx) = make_test_interface(&format!("stats_1/client_{id}"));
+        child.parent_id = Some(1);
+        actor.interfaces.insert(id, child);
+    }
+    let mut sizes = 0;
+    for (id, name) in [(2, "stats.rollup.a"), (3, "stats.rollup.b")] {
+        let (announce, _) = make_valid_announce(name, 0);
+        sizes += announce.len() as u64;
+        inbound(&mut actor, announce, id);
+    }
+    let parent = stats(&mut actor, 1);
+    assert_eq!(parent.announce_rx_bytes, sizes, "arxb");
+    assert_eq!(parent.announces_received, 0, "arxc");
+    assert_eq!(stats(&mut actor, 2).announces_received, 1);
+}
+
+/// Totals sum top-level interfaces other than the shared-instance server and
+/// keep what they counted when an interface leaves (Transport.py:736-814).
+#[test]
+fn traffic_totals_are_cumulative_over_top_level_interfaces() {
+    let mut actor = hub();
+    let counters: Vec<Arc<AtomicU64>> = (0..3).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    for (id, role) in [
+        (1, InterfaceRole::Normal),
+        (2, InterfaceRole::Normal),
+        (3, InterfaceRole::SharedServer),
+    ] {
+        let (mut entry, _rx) = make_test_interface(&format!("totals_{id}"));
+        entry.role = role;
+        entry.rxb = Some(counters[id as usize - 1].clone());
+        if id == 2 {
+            entry.parent_id = Some(1);
+        }
+        actor.interfaces.insert(id, entry);
+    }
+    actor.count_traffic(1_000.0);
+    for counter in &counters {
+        counter.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+    }
+    std::thread::sleep(Duration::from_millis(5));
+    actor.count_traffic(1_001.0);
+    let measured = totals(&mut actor);
+    assert!(measured.measured);
+    assert_eq!(measured.rxb, 100, "only the top-level non-shared interface");
+    assert!(measured.rxs > 0.0);
+
+    actor.deregister_interface(1);
+    actor.count_traffic(1_002.0);
+    assert_eq!(totals(&mut actor).rxb, 100, "totals survive deregistration");
+}

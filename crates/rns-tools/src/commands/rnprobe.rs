@@ -1,17 +1,34 @@
-//! rnprobe-rs — send PROBE packets, measure RTT.
+//! rnprobe-rs — send probe packets and measure round-trip time, following
+//! `RNS/Utilities/rnprobe.py`.
 //!
 //! Exit codes: 0 all delivered, 1 path timeout, 2 packet loss, 3 size > MTU.
 
+use std::io::Write;
 use std::process;
+use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use clap::Parser;
+use tokio::sync::mpsc;
 
-use rns_runtime::probe::{
-    ProbeError, ProbeOutcome, default_probe_app_name, parse_dest_hash, probe_once,
+use rns_identity::destination::{
+    DestType, Destination, DestinationPacketError, DestinationPacketOptions, Direction,
 };
+use rns_runtime::reticulum::{InstanceMode, ReticulumHandle};
+use rns_tools::RS_RETICULUM_VERSION;
+use rns_tools::format::pretty_hex_rep;
+use rns_transport::link_messages::{DestinationEvent, PacketMetrics};
+use rns_transport::messages::{
+    OutboundRequest, PathRequestOptions, TransportMessage, TransportQuery, TransportQueryResponse,
+};
+use rns_wire::constants::{DEFAULT_PER_HOP_TIMEOUT, MTU};
+use rns_wire::receipt::PacketReceipt;
 
 const DEFAULT_PROBE_SIZE: usize = 16;
-use rns_tools::RS_RETICULUM_VERSION;
+const DEFAULT_TIMEOUT: f64 = 12.0;
+const SPINNER: [char; 7] = ['⢄', '⢂', '⢁', '⡁', '⡈', '⡐', '⡠'];
+const RST_58: &str = "\r                                                          \r";
+const RST_64: &str = "\r                                                                \r";
 
 #[derive(Parser)]
 #[command(
@@ -24,7 +41,7 @@ struct Args {
     #[arg(long)]
     config: Option<String>,
 
-    /// Plaintext probe payload size in bytes (default: 16)
+    /// Size of probe packet payload in bytes
     #[arg(short = 's', long)]
     size: Option<usize>,
 
@@ -32,32 +49,29 @@ struct Args {
     #[arg(short = 'n', long, default_value_t = 1)]
     probes: u32,
 
-    /// Seconds to wait separately for a path and each probe proof.
-    /// Default: 12 seconds plus the first-hop timeout; transport work can add time.
+    /// Timeout before giving up
     #[arg(short = 't', long, value_name = "seconds")]
     timeout: Option<f64>,
 
-    /// Delay after one probe completes before starting the next (seconds)
+    /// Time between each probe
     #[arg(short = 'w', long, default_value_t = 0.0, value_name = "seconds")]
     wait: f64,
 
     /// Print probe results as JSON; some fatal errors are reported only on stderr.
-    /// Known limitation: destination and interface names are not JSON-escaped.
     #[arg(long)]
     json: bool,
 
-    /// Increase verbosity
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Print version and exit.
+    /// Show program's version number and exit
     #[arg(long)]
     version: bool,
 
-    /// Full destination name in dotted notation (e.g. `rnstransport.probe`)
+    /// Full destination name in dotted notation
     full_name: Option<String>,
 
-    /// Hexadecimal hash of the destination (32 hex chars)
+    /// Hexadecimal hash of the destination
     destination_hash: Option<String>,
 }
 
@@ -68,13 +82,39 @@ pub(crate) async fn main() {
         println!("rnprobe-rs {RS_RETICULUM_VERSION}");
         return;
     }
+    exit_silently_on_signal();
 
-    let Some(dest_hex) = args.destination_hash.clone() else {
-        // Print help on missing args (don't error).
-        let mut cmd = <Args as clap::CommandFactory>::command();
-        cmd.print_help().ok();
+    let Some(dest_hex) = args.destination_hash.clone().filter(|d| !d.is_empty()) else {
+        let help = <Args as clap::CommandFactory>::command()
+            .render_help()
+            .to_string();
+        println!();
+        print!("{help}");
+        if !help.ends_with('\n') {
+            println!();
+        }
         println!();
         return;
+    };
+    // The single positional fills full_name, so this is unreachable from the CLI.
+    let Some(full_name) = args.full_name.clone() else {
+        println!(
+            "The full destination name including application name aspects must be specified for the destination"
+        );
+        return;
+    };
+    // rnprobe.py:57-67: input errors print to stdout and exit 0.
+    let dest_hash: [u8; 16] = if dest_hex.chars().count() != 32 {
+        println!("Destination length is invalid, must be 32 hexadecimal characters (16 bytes).");
+        return;
+    } else {
+        match hex::decode(&dest_hex).ok().and_then(|b| b.try_into().ok()) {
+            Some(hash) => hash,
+            None => {
+                println!("Invalid destination entered. Check your input.");
+                return;
+            }
+        }
     };
 
     let level = rns_tools::Utility::Rnprobe.loglevel(None, args.verbose, 0, false);
@@ -86,44 +126,7 @@ pub(crate) async fn main() {
         std::io::stderr,
     );
 
-    let full_name = args
-        .full_name
-        .clone()
-        .unwrap_or_else(|| default_probe_app_name().to_string());
-
-    let dest_hash = match parse_dest_hash(&dest_hex) {
-        Ok(h) => h,
-        Err(_) => {
-            eprintln!(
-                "Destination length is invalid, must be 32 hexadecimal characters (16 bytes)."
-            );
-            process::exit(1);
-        }
-    };
-
-    let size = args.size.unwrap_or(DEFAULT_PROBE_SIZE);
-    // None = Python default: 12 s + first-hop timeout, resolved per wait.
-    let timeout = match args
-        .timeout
-        .map(rns_runtime::probe::checked_probe_timeout)
-        .transpose()
-    {
-        Ok(timeout) => timeout,
-        Err(error) => {
-            eprintln!("rnprobe-rs: invalid --timeout: {error}");
-            process::exit(1);
-        }
-    };
-    let wait = match rns_runtime::probe::checked_probe_timeout(args.wait) {
-        Ok(wait) => wait,
-        Err(error) => {
-            eprintln!("rnprobe-rs: invalid --wait: {error}");
-            process::exit(1);
-        }
-    };
-
     let shutdown = rns_runtime::lifecycle::ShutdownSignal::new();
-    let _signal_rx = rns_runtime::lifecycle::install_signal_handlers(shutdown.clone());
     let is_foreground = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let handle = match rns_runtime::reticulum::init(
         args.config.as_deref(),
@@ -139,131 +142,553 @@ pub(crate) async fn main() {
             process::exit(1);
         }
     };
+    let code = run(&args, &handle, dest_hash, &full_name).await;
+    shutdown.trigger();
+    handle.shutdown_and_wait().await;
+    process::exit(code);
+}
 
+/// Python's `Reticulum.sigint_handler`/`sigterm_handler` end in `os._exit(0)`.
+fn exit_silently_on_signal() {
+    tokio::spawn(async {
+        let _ = tokio::signal::ctrl_c().await;
+        process::exit(0);
+    });
+    #[cfg(unix)]
+    if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        tokio::spawn(async move {
+            term.recv().await;
+            process::exit(0);
+        });
+    }
+}
+
+async fn run(args: &Args, handle: &ReticulumHandle, dest_hash: [u8; 16], full_name: &str) -> i32 {
+    let json = args.json;
+    let size = args.size.unwrap_or(DEFAULT_PROBE_SIZE);
+    let timeout = args.timeout.filter(|t| *t != 0.0);
+
+    // rnprobe.py:79-95.
+    if !local_has_path(handle, dest_hash).await {
+        let _ = handle
+            .request_path(dest_hash, PathRequestOptions::default())
+            .await;
+        if !json {
+            print!("Path to {} requested   ", pretty_hex_rep(&dest_hash));
+            flush();
+        }
+    }
+    let path_deadline = deadline_after(probe_timeout(handle, dest_hash, timeout).await);
+    let mut i = 0;
+    while !local_has_path(handle, dest_hash).await && !passed(path_deadline) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !json {
+            print!("\u{8}\u{8}{} ", SPINNER[i]);
+            flush();
+        }
+        i = (i + 1) % SPINNER.len();
+    }
+    if passed(path_deadline) {
+        if json {
+            print_json(1, size, dest_hash, full_name, None, Some("path_timeout"));
+        } else {
+            println!("{RST_58}Path request timed out");
+        }
+        return 1;
+    }
+
+    let recalled = match handle.recall(dest_hash).await {
+        Ok(Some(recalled)) => recalled,
+        _ => {
+            if json {
+                print_json(1, size, dest_hash, full_name, None, Some("no_identity"));
+            } else {
+                eprintln!(
+                    "Destination's identity is not known — wait for an announce or use rnstatus to verify the destination has been seen."
+                );
+            }
+            return 1;
+        }
+    };
+    let destination = match Destination::new(
+        Some(&recalled.identity),
+        Direction::Out,
+        DestType::Single,
+        full_name,
+    ) {
+        Ok(destination) => destination,
+        Err(e) => {
+            eprintln!("probe error: {e}");
+            return 1;
+        }
+    };
+
+    let wait = Duration::try_from_secs_f64(args.wait.max(0.0)).unwrap_or(Duration::ZERO);
     let mut sent: u32 = 0;
     let mut replies: u32 = 0;
-    let mut first = true;
-    let mut remaining = args.probes;
-
-    while remaining > 0 {
-        if !first {
+    for _ in 0..args.probes {
+        if sent > 0 {
             tokio::time::sleep(wait).await;
         }
-        first = false;
+        // rnprobe.py:114-119: the packed length is reported.
+        let payload = rns_crypto::random::random_bytes(size);
+        let packet = match destination.pack_packet(
+            &payload,
+            Some(&recalled.identity),
+            recalled.ratchet.as_ref(),
+            DestinationPacketOptions::default(),
+        ) {
+            Ok(packed) => packed.packet,
+            Err(DestinationPacketError::Packet(rns_wire::packet::PacketError::ExceedsMtu(len))) => {
+                println!("Error: Probe packet size of {len} bytes exceed MTU of {MTU} bytes");
+                return 3;
+            }
+            Err(e) => {
+                eprintln!("probe error: {e}");
+                return 1;
+            }
+        };
 
+        let probe = match send_probe(handle, &packet, &recalled.identity, dest_hash).await {
+            Some(probe) => probe,
+            None => {
+                eprintln!("probe error: transport channel closed");
+                return 1;
+            }
+        };
         sent += 1;
-        let result = probe_once(
-            handle.transport_tx.clone(),
-            dest_hash,
-            &full_name,
-            size,
-            timeout,
-            timeout,
-            handle.should_use_implicit_proof(),
-        )
-        .await;
 
-        match result {
-            Ok(outcome) => {
-                replies += 1;
-                if args.json {
-                    print_json(sent, size, dest_hash, &full_name, Some(&outcome), None);
+        let (via, interface) = next_hop_info(handle, dest_hash).await;
+        if !json {
+            let more = if args.verbose > 0 {
+                let via_str = via
+                    .map(|v| format!(" via {}", pretty_hex_rep(&v)))
+                    .unwrap_or_default();
+                let if_str = if interface != "None" {
+                    format!(" on {interface}")
                 } else {
-                    let via = outcome
-                        .via
-                        .map(|v| format!(" via <{}>", hex::encode(v)))
-                        .unwrap_or_default();
-                    let iface = outcome
-                        .interface
-                        .as_deref()
-                        .filter(|n| !n.is_empty())
-                        .map(|n| format!(" on {n}"))
-                        .unwrap_or_default();
-                    println!(
-                        "Sent probe {sent} ({size} bytes) to <{}>{via}{iface}",
-                        hex::encode(dest_hash)
-                    );
-                    let ms = if outcome.hops == 1 { "" } else { "s" };
-                    let rttstring = if outcome.rtt.as_secs_f64() >= 1.0 {
-                        format!("{:.3} seconds", outcome.rtt.as_secs_f64())
-                    } else {
-                        format!("{:.3} milliseconds", outcome.rtt.as_secs_f64() * 1000.0)
-                    };
-                    println!(
-                        "Valid reply from <{}>\nRound-trip time is {} over {} hop{}\n",
-                        hex::encode(dest_hash),
-                        rttstring,
-                        outcome.hops,
-                        ms
-                    );
-                }
-            }
-            Err(ProbeError::MtuExceeded(s, mtu)) => {
-                eprintln!("Error: Probe packet size of {s} bytes exceed MTU of {mtu} bytes");
-                process::exit(3);
-            }
-            Err(ProbeError::PathTimeout) => {
-                if args.json {
+                    String::new()
+                };
+                format!("{via_str}{if_str}")
+            } else {
+                String::new()
+            };
+            print!(
+                "\rSent probe {sent} ({size} bytes) to {}{more}   ",
+                pretty_hex_rep(&dest_hash)
+            );
+            flush();
+        }
+
+        // rnprobe.py:134-143, and the receipt's own timeout (Packet.py:432-433).
+        let probe_deadline = deadline_after(probe_timeout(handle, dest_hash, timeout).await);
+        let outcome = probe.wait(probe_deadline, json).await;
+        match outcome {
+            ProbeResult::TimedOut => {
+                if json {
                     print_json(
                         sent,
                         size,
                         dest_hash,
-                        &full_name,
-                        None,
-                        Some("path_timeout"),
-                    );
-                } else {
-                    println!("Path request timed out");
-                }
-                process::exit(1);
-            }
-            Err(ProbeError::NoIdentity) => {
-                if args.json {
-                    print_json(sent, size, dest_hash, &full_name, None, Some("no_identity"));
-                } else {
-                    eprintln!(
-                        "Destination's identity is not known — wait for an announce or use rnstatus to verify the destination has been seen."
-                    );
-                }
-                process::exit(1);
-            }
-            Err(ProbeError::PacketTimeout) => {
-                if args.json {
-                    print_json(
-                        sent,
-                        size,
-                        dest_hash,
-                        &full_name,
+                        full_name,
                         None,
                         Some("packet_timeout"),
                     );
                 } else {
-                    println!("Probe timed out");
+                    println!("{RST_64}Probe timed out");
                 }
             }
-            Err(e) => {
-                eprintln!("probe error: {e}");
-                process::exit(1);
+            ProbeResult::Failed => {
+                if json {
+                    print_json(
+                        sent,
+                        size,
+                        dest_hash,
+                        full_name,
+                        None,
+                        Some("packet_timeout"),
+                    );
+                } else {
+                    println!("\u{8}\u{8} ");
+                    println!("{RST_58}Probe timed out");
+                }
+            }
+            ProbeResult::Delivered {
+                rtt,
+                proof_hash,
+                metrics,
+            } => {
+                replies += 1;
+                let hops = local_hops(handle, dest_hash).await;
+                if json {
+                    let ok = JsonOk {
+                        rtt,
+                        hops,
+                        via,
+                        interface: &interface,
+                    };
+                    print_json(sent, size, dest_hash, full_name, Some(&ok), None);
+                } else {
+                    println!("\u{8}\u{8} ");
+                    let stats = reception_stats(handle, proof_hash, metrics).await;
+                    println!(
+                        "Valid reply from {}\nRound-trip time is {} over {hops} hop{}{stats}\n",
+                        pretty_hex_rep(&dest_hash),
+                        rtt_string(rtt),
+                        if hops == 1 { "" } else { "s" }
+                    );
+                }
             }
         }
-
-        remaining -= 1;
     }
 
-    let loss_pct = if sent > 0 {
-        (1.0 - (replies as f64 / sent as f64)) * 100.0
-    } else {
-        0.0
+    if sent == 0 {
+        return 0;
+    }
+    let loss = py_round((1.0 - f64::from(replies) / f64::from(sent)) * 100.0, 2);
+    if !json {
+        println!(
+            "Sent {sent}, received {replies}, packet loss {}%",
+            py_float_repr(loss)
+        );
+    }
+    if loss > 0.0 { 2 } else { 0 }
+}
+
+enum ProbeResult {
+    Delivered {
+        rtt: Duration,
+        proof_hash: [u8; 32],
+        metrics: PacketMetrics,
+    },
+    /// The receipt's own timeout concluded it (PacketReceipt FAILED).
+    Failed,
+    /// The probe timeout passed first.
+    TimedOut,
+}
+
+/// One sent probe awaiting its proof. The proof is collected on a channel at
+/// the probe's truncated hash and validated against the destination identity,
+/// which keeps the proof packet's hash and reception metrics.
+struct PendingProbe {
+    receipt: PacketReceipt,
+    rx: mpsc::Receiver<DestinationEvent>,
+    sent_at: Instant,
+    receipt_deadline: Option<Instant>,
+    transport_tx: mpsc::Sender<TransportMessage>,
+}
+
+impl Drop for PendingProbe {
+    fn drop(&mut self) {
+        let _ = self
+            .transport_tx
+            .try_send(TransportMessage::DeregisterDestination {
+                hash: self.receipt.truncated_hash,
+            });
+    }
+}
+
+async fn send_probe(
+    handle: &ReticulumHandle,
+    packet: &rns_wire::packet::Packet,
+    identity: &rns_identity::identity::Identity,
+    dest_hash: [u8; 16],
+) -> Option<PendingProbe> {
+    let first_hop = handle
+        .first_hop_timeout(dest_hash)
+        .await
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(DEFAULT_PER_HOP_TIMEOUT);
+    let hops = local_hops(handle, dest_hash).await;
+    let receipt_timeout = first_hop + DEFAULT_PER_HOP_TIMEOUT * f64::from(hops);
+
+    let mut receipt = PacketReceipt::new(packet.packet_hash, packet.truncated_hash, None);
+    receipt.set_destination_identity(dest_hash, Some(identity.get_public_key()));
+    let (tx, rx) = mpsc::channel(16);
+    handle
+        .transport_tx
+        .send(TransportMessage::RegisterDestination {
+            hash: packet.truncated_hash,
+            app_name: "rnprobe.proof".to_string(),
+            delivery_tx: Some(tx),
+        })
+        .await
+        .ok()?;
+    let pending = PendingProbe {
+        receipt,
+        rx,
+        sent_at: Instant::now(),
+        receipt_deadline: deadline_after(receipt_timeout),
+        transport_tx: handle.transport_tx.clone(),
     };
-    let loss_rounded = (loss_pct * 100.0).round() / 100.0;
-    if !args.json {
-        println!("Sent {sent}, received {replies}, packet loss {loss_rounded}%");
-    }
+    // No transport receipt, so the proof reaches the channel above.
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    handle
+        .transport_tx
+        .send(TransportMessage::SendPacket {
+            request: OutboundRequest {
+                raw: Bytes::from(packet.raw.clone()),
+                destination_hash: dest_hash,
+            },
+            attached_interface: None,
+            receipt: None,
+            result_tx,
+        })
+        .await
+        .ok()?;
+    result_rx.await.ok()?;
+    Some(pending)
+}
 
-    if loss_rounded > 0.0 {
-        process::exit(2);
+impl PendingProbe {
+    async fn wait(mut self, probe_deadline: Option<Instant>, quiet: bool) -> ProbeResult {
+        let mut i = 0;
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                event = self.rx.recv() => {
+                    let Some(DestinationEvent::InboundPacket { raw, metrics, .. }) = event else {
+                        if event.is_none() {
+                            return ProbeResult::Failed;
+                        }
+                        continue;
+                    };
+                    let Ok((header, offset)) = rns_wire::header::PacketHeader::unpack(&raw) else {
+                        continue;
+                    };
+                    if header.flags.packet_type != rns_wire::flags::PacketType::Proof {
+                        continue;
+                    }
+                    if self.receipt.validate_proof_from_destination(&raw[offset..]) {
+                        return ProbeResult::Delivered {
+                            rtt: self.sent_at.elapsed(),
+                            proof_hash: rns_wire::hash::packet_hash(&raw, header.flags.header_type),
+                            metrics,
+                        };
+                    }
+                }
+                _ = tick.tick() => {
+                    if passed(probe_deadline) {
+                        return ProbeResult::TimedOut;
+                    }
+                    if passed(self.receipt_deadline) {
+                        return ProbeResult::Failed;
+                    }
+                    if !quiet {
+                        print!("\u{8}\u{8}{} ", SPINNER[i]);
+                        flush();
+                    }
+                    i = (i + 1) % SPINNER.len();
+                }
+            }
+        }
     }
-    process::exit(0);
+}
+
+/// rnprobe.py:165-186: over RPC on a shared-instance client, else from the proof packet.
+async fn reception_stats(
+    handle: &ReticulumHandle,
+    proof_hash: [u8; 32],
+    metrics: PacketMetrics,
+) -> String {
+    let (rssi, snr, q) = if handle.instance_mode == InstanceMode::Client {
+        let get = |query| async move {
+            match handle.query_control(query).await {
+                Some(TransportQueryResponse::FloatResult(v)) => v,
+                _ => None,
+            }
+        };
+        (
+            get(TransportQuery::GetPacketRssi {
+                packet_hash: proof_hash,
+            })
+            .await,
+            get(TransportQuery::GetPacketSnr {
+                packet_hash: proof_hash,
+            })
+            .await,
+            get(TransportQuery::GetPacketQ {
+                packet_hash: proof_hash,
+            })
+            .await,
+        )
+    } else {
+        (
+            metrics.rssi.map(f32_to_f64),
+            metrics.snr.map(f32_to_f64),
+            None,
+        )
+    };
+    format_reception_stats(rssi, snr, q)
+}
+
+/// Upstream interfaces report RSSI as an int and SNR/Q as floats; the RPC
+/// decoder carries all three as floats, so an integral RSSI prints as an int.
+fn format_reception_stats(rssi: Option<f64>, snr: Option<f64>, q: Option<f64>) -> String {
+    let mut out = String::new();
+    if let Some(rssi) = rssi {
+        let rssi = if rssi.fract() == 0.0 && rssi.abs() < 1e15 {
+            format!("{}", rssi as i64)
+        } else {
+            py_float_repr(rssi)
+        };
+        out.push_str(&format!(" [RSSI {rssi} dBm]"));
+    }
+    if let Some(snr) = snr {
+        out.push_str(&format!(" [SNR {} dB]", py_float_repr(snr)));
+    }
+    if let Some(q) = q {
+        out.push_str(&format!(" [Link Quality {}%]", py_float_repr(q)));
+    }
+    out
+}
+
+/// The shortest decimal of an `f32`, as the interface reported it.
+fn f32_to_f64(value: f32) -> f64 {
+    format!("{value}").parse().unwrap_or(f64::from(value))
+}
+
+/// rnprobe.py:157-163.
+fn rtt_string(rtt: Duration) -> String {
+    let rtt = rtt.as_secs_f64();
+    if rtt >= 1.0 {
+        format!("{} seconds", py_float_repr(py_round(rtt, 3)))
+    } else {
+        format!("{} milliseconds", py_float_repr(py_round(rtt * 1000.0, 3)))
+    }
+}
+
+/// `timeout or max(DEFAULT_TIMEOUT + first_hop_timeout, medium_path_timeout)`.
+async fn probe_timeout(handle: &ReticulumHandle, dest: [u8; 16], timeout: Option<f64>) -> f64 {
+    if let Some(timeout) = timeout {
+        return timeout;
+    }
+    let first_hop = handle
+        .first_hop_timeout(dest)
+        .await
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(DEFAULT_PER_HOP_TIMEOUT);
+    (DEFAULT_TIMEOUT + first_hop).max(medium_path_timeout(handle).await)
+}
+
+/// `Reticulum.get_medium_path_timeout()`: the slowest online interface of
+/// this instance, or of the shared instance for a client.
+async fn medium_path_timeout(handle: &ReticulumHandle) -> f64 {
+    let Ok(stats) = handle.interface_stats().await else {
+        return 0.0;
+    };
+    stats
+        .interfaces
+        .iter()
+        .filter(|i| i.online && i.bitrate > 0)
+        .map(|i| i.bitrate)
+        .min()
+        .map(|bitrate| {
+            2.0 * ((MTU * 8) as f64 / bitrate.max(rns_runtime::constants::MINIMUM_BITRATE) as f64)
+                + DEFAULT_PER_HOP_TIMEOUT
+        })
+        .unwrap_or(0.0)
+}
+
+/// `RNS.Transport.has_path`: this process's own path table.
+async fn local_has_path(handle: &ReticulumHandle, dest: [u8; 16]) -> bool {
+    matches!(
+        handle
+            .query_transport(TransportQuery::HasPath { dest })
+            .await,
+        Some(TransportQueryResponse::BoolResult(true))
+    )
+}
+
+/// `RNS.Transport.hops_to`: this process's own path table.
+async fn local_hops(handle: &ReticulumHandle, dest: [u8; 16]) -> u8 {
+    match handle
+        .query_transport(TransportQuery::HopsTo { dest })
+        .await
+    {
+        Some(TransportQueryResponse::IntResult(hops)) => {
+            u8::try_from(hops).unwrap_or(rns_transport::constants::PATHFINDER_M)
+        }
+        _ => rns_transport::constants::PATHFINDER_M,
+    }
+}
+
+/// `get_next_hop` and `get_next_hop_if_name`, from the shared instance for a client.
+async fn next_hop_info(handle: &ReticulumHandle, dest: [u8; 16]) -> (Option<[u8; 16]>, String) {
+    let via = match handle
+        .query_control(TransportQuery::GetNextHop { dest })
+        .await
+    {
+        Some(TransportQueryResponse::HashResult(via)) => via,
+        _ => None,
+    };
+    let interface = match handle
+        .query_control(TransportQuery::GetNextHopIfName { dest })
+        .await
+    {
+        Some(TransportQueryResponse::StringResult(Some(name))) => name,
+        _ => "None".to_string(),
+    };
+    (via, interface)
+}
+
+/// `None` when the wait cannot end (Python's `time.time() + inf`).
+fn deadline_after(secs: f64) -> Option<Instant> {
+    if secs.is_nan() || secs <= 0.0 {
+        return Some(Instant::now());
+    }
+    Duration::try_from_secs_f64(secs)
+        .ok()
+        .and_then(|d| Instant::now().checked_add(d))
+}
+
+fn passed(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|d| Instant::now() > d)
+}
+
+fn flush() {
+    let _ = std::io::stdout().flush();
+}
+
+/// Python `round(x, n)` for a float.
+fn py_round(value: f64, digits: usize) -> f64 {
+    format!("{value:.digits$}").parse().unwrap_or(value)
+}
+
+/// Python `repr(float)`: shortest round-trip digits, scientific notation
+/// outside `1e-4 <= |x| < 1e16`.
+fn py_float_repr(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    let sci = format!("{value:e}");
+    let (mantissa, exponent) = sci
+        .split_once('e')
+        .expect("scientific format has an exponent");
+    let exponent: i32 = exponent.parse().expect("integer exponent");
+    if value == 0.0 || (-4..16).contains(&exponent) {
+        let fixed = format!("{value}");
+        if fixed.contains('.') {
+            fixed
+        } else {
+            format!("{fixed}.0")
+        }
+    } else {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exponent.abs())
+    }
+}
+
+struct JsonOk<'a> {
+    rtt: Duration,
+    hops: u8,
+    via: Option<[u8; 16]>,
+    interface: &'a str,
 }
 
 fn print_json(
@@ -271,35 +696,57 @@ fn print_json(
     size: usize,
     dest_hash: [u8; 16],
     full_name: &str,
-    outcome: Option<&ProbeOutcome>,
+    outcome: Option<&JsonOk<'_>>,
     error: Option<&str>,
 ) {
-    use std::fmt::Write;
-    let mut out = String::new();
-    write!(
-        out,
-        "{{\"probe\":{probe_num},\"size\":{size},\"destination\":\"{}\",\"name\":\"{}\"",
-        hex::encode(dest_hash),
-        full_name
-    )
-    .ok();
+    let mut out = serde_json::json!({
+        "probe": probe_num,
+        "size": size,
+        "destination": hex::encode(dest_hash),
+        "name": full_name,
+    });
     if let Some(o) = outcome {
-        write!(
-            out,
-            ",\"status\":\"ok\",\"rtt_ms\":{:.3},\"hops\":{}",
-            o.rtt.as_secs_f64() * 1000.0,
-            o.hops
-        )
-        .ok();
+        out["status"] = "ok".into();
+        out["rtt_ms"] = (o.rtt.as_secs_f64() * 1000.0).into();
+        out["hops"] = o.hops.into();
         if let Some(via) = o.via {
-            write!(out, ",\"via\":\"{}\"", hex::encode(via)).ok();
+            out["via"] = hex::encode(via).into();
         }
-        if let Some(ref iface) = o.interface {
-            write!(out, ",\"interface\":\"{iface}\"").ok();
+        if o.interface != "None" {
+            out["interface"] = o.interface.into();
         }
     } else if let Some(err) = error {
-        write!(out, ",\"status\":\"error\",\"error\":\"{err}\"").ok();
+        out["status"] = "error".into();
+        out["error"] = err.into();
     }
-    out.push('}');
     println!("{out}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Expected strings are Python `str(round(x, 3))` and `str()` output.
+    #[test]
+    fn rtt_and_reception_stats_print_python_number_forms() {
+        assert_eq!(
+            rtt_string(Duration::from_secs_f64(0.00099)),
+            "0.99 milliseconds"
+        );
+        assert_eq!(
+            rtt_string(Duration::from_secs_f64(0.1278714)),
+            "127.871 milliseconds"
+        );
+        assert_eq!(rtt_string(Duration::from_secs(1)), "1.0 seconds");
+        assert_eq!(format_reception_stats(None, None, None), "");
+        assert_eq!(
+            format_reception_stats(Some(-87.0), Some(9.25), Some(88.0)),
+            " [RSSI -87 dBm] [SNR 9.25 dB] [Link Quality 88.0%]"
+        );
+        assert_eq!(
+            format_reception_stats(None, Some(-3.0), None),
+            " [SNR -3.0 dB]"
+        );
+        assert_eq!(f32_to_f64(0.1), 0.1);
+    }
 }

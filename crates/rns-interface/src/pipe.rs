@@ -163,6 +163,8 @@ pub async fn spawn_pipe_interface(
     let shared_txb = Arc::new(AtomicU64::new(0));
     let (tx, mut rx) = mpsc::channel::<Bytes>(256);
     let name = config.name.clone();
+    let python_identity =
+        rns_transport::messages::InterfaceIdentity::bracketed("PipeInterface", &name);
     let mode = config.mode;
     let respawn_delay = Duration::from_secs_f64(config.respawn_delay);
 
@@ -183,11 +185,11 @@ pub async fn spawn_pipe_interface(
                             break;
                         }
                         Ok(n) => {
-                            rxb_task.fetch_add(n as u64, Ordering::Relaxed);
                             for frame in deframer.feed(&buf[..n]) {
                                 if frame.is_empty() {
                                     continue;
                                 }
+                                rxb_task.fetch_add(frame.len() as u64, Ordering::Relaxed);
                                 let msg = TransportMessage::Inbound(InboundPacket {
                                     raw: Bytes::from(frame),
                                     interface_id: id,
@@ -282,7 +284,9 @@ pub async fn spawn_pipe_interface(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        inspection: None,
+        inspection: Some(
+            rns_transport::messages::InterfaceInspectionSource::identified(python_identity),
+        ),
         tx,
         read_task,
     })

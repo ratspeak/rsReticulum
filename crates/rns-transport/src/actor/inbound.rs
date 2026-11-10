@@ -347,6 +347,7 @@ impl TransportActor {
             q: packet.q,
         };
         self.record_packet_metrics(pkt_hash, packet_metrics);
+        self.record_interface_signal(packet.interface_id, packet_metrics);
 
         // On shared media (e.g. LoRa) we overhear our own forwards and link
         // traffic; if we dedup against that, legitimate copies disappear.
@@ -371,6 +372,10 @@ impl TransportActor {
                 self.packet_filter_hit(packet.interface_id);
                 return;
             }
+        }
+
+        if origin != InboundOrigin::CachedAnnounce {
+            self.count_rx_packet();
         }
 
         // Destination-type filtering runs after the packet filter and before
@@ -606,26 +611,26 @@ impl TransportActor {
                 .discovery_path_requests
                 .get(&header.destination_hash)
                 .is_some_and(|request| now_f64() < request.timeout);
-        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
-            entry.ingress.received_announce();
-            if !is_from_local_client
-                && !announced_destination_known
-                && !answers_path_request
-                && entry.ingress.should_ingress_limit()
-            {
-                entry.ingress.hold_announce(crate::ingress::HeldAnnounce {
-                    raw: bytes::Bytes::copy_from_slice(raw),
-                    destination_hash: header.destination_hash,
-                    hops: header.hops,
-                    receiving_interface_id: interface_id,
-                });
-                debug!(
-                    dest = hex::encode(header.destination_hash),
-                    interface = interface_id,
-                    "announce held by ingress controller (burst active)"
-                );
-                return;
-            }
+        self.record_interface_event(interface_id, InterfaceEvent::ReceivedAnnounce, raw.len());
+        self.count_transport_event(InterfaceEvent::ReceivedAnnounce);
+        if let Some(entry) = self.interfaces.get_mut(&interface_id)
+            && !is_from_local_client
+            && !announced_destination_known
+            && !answers_path_request
+            && entry.ingress.should_ingress_limit()
+        {
+            entry.ingress.hold_announce(crate::ingress::HeldAnnounce {
+                raw: bytes::Bytes::copy_from_slice(raw),
+                destination_hash: header.destination_hash,
+                hops: header.hops,
+                receiving_interface_id: interface_id,
+            });
+            debug!(
+                dest = hex::encode(header.destination_hash),
+                interface = interface_id,
+                "announce held by ingress controller (burst active)"
+            );
+            return;
         }
 
         if let Some(validated_identity) = validated_identity.as_ref() {
@@ -1108,7 +1113,7 @@ impl TransportActor {
         if header.destination_hash == path_request_dest {
             if let Some(payload_start) = self.data_payload_offset(raw, header) {
                 let payload = &raw[payload_start..];
-                self.handle_inbound_path_request(payload, interface_id);
+                self.handle_inbound_path_request_sized(payload, interface_id, raw.len());
             }
             return;
         }

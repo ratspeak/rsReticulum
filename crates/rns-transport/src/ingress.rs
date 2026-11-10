@@ -139,6 +139,11 @@ pub struct IngressController {
     announces_sent: u64,
     path_requests_received: u64,
     path_requests_sent: u64,
+    /// Python `arxb`/`atxb`/`prxb`/`ptxb`, including spawned children's.
+    announce_rx_bytes: u64,
+    announce_tx_bytes: u64,
+    path_request_rx_bytes: u64,
+    path_request_tx_bytes: u64,
 
     burst_freq_new: f64,
     burst_freq: f64,
@@ -173,6 +178,10 @@ impl IngressController {
             announces_sent: 0,
             path_requests_received: 0,
             path_requests_sent: 0,
+            announce_rx_bytes: 0,
+            announce_tx_bytes: 0,
+            path_request_rx_bytes: 0,
+            path_request_tx_bytes: 0,
             burst_freq_new: IC_BURST_FREQ_NEW,
             burst_freq: IC_BURST_FREQ,
             pr_burst_freq_new: IC_PR_BURST_FREQ_NEW,
@@ -310,23 +319,72 @@ impl IngressController {
     }
 
     pub fn received_announce(&mut self) {
-        self.announces_received = self.announces_received.saturating_add(1);
-        push_sample(&mut self.ia_freq_deque, IA_FREQ_SAMPLES, Instant::now());
+        self.received_announce_bytes(0);
     }
 
     pub fn sent_announce(&mut self) {
-        self.announces_sent = self.announces_sent.saturating_add(1);
-        push_sample(&mut self.oa_freq_deque, OA_FREQ_SAMPLES, Instant::now());
+        self.sent_announce_bytes(0);
     }
 
     pub fn received_path_request(&mut self) {
-        self.path_requests_received = self.path_requests_received.saturating_add(1);
-        push_sample(&mut self.ip_freq_deque, IP_FREQ_SAMPLES, Instant::now());
+        self.received_path_request_bytes(0);
     }
 
     pub fn sent_path_request(&mut self) {
+        self.sent_path_request_bytes(0);
+    }
+
+    /// Python `received_announce(size)` (Interface.py:307-311).
+    pub fn received_announce_bytes(&mut self, size: usize) {
+        self.announces_received = self.announces_received.saturating_add(1);
+        self.spawned_received_announce(size);
+    }
+
+    pub fn sent_announce_bytes(&mut self, size: usize) {
+        self.announces_sent = self.announces_sent.saturating_add(1);
+        self.spawned_sent_announce(size);
+    }
+
+    pub fn received_path_request_bytes(&mut self, size: usize) {
+        self.path_requests_received = self.path_requests_received.saturating_add(1);
+        self.spawned_received_path_request(size);
+    }
+
+    pub fn sent_path_request_bytes(&mut self, size: usize) {
         self.path_requests_sent = self.path_requests_sent.saturating_add(1);
+        self.spawned_sent_path_request(size);
+    }
+
+    /// A spawned child's announce on its parent: a frequency sample and the
+    /// bytes, but no count (`from_spawned=True`, TCPInterface.py:655-673).
+    pub fn spawned_received_announce(&mut self, size: usize) {
+        self.announce_rx_bytes = self.announce_rx_bytes.saturating_add(size as u64);
+        push_sample(&mut self.ia_freq_deque, IA_FREQ_SAMPLES, Instant::now());
+    }
+
+    pub fn spawned_sent_announce(&mut self, size: usize) {
+        self.announce_tx_bytes = self.announce_tx_bytes.saturating_add(size as u64);
+        push_sample(&mut self.oa_freq_deque, OA_FREQ_SAMPLES, Instant::now());
+    }
+
+    pub fn spawned_received_path_request(&mut self, size: usize) {
+        self.path_request_rx_bytes = self.path_request_rx_bytes.saturating_add(size as u64);
+        push_sample(&mut self.ip_freq_deque, IP_FREQ_SAMPLES, Instant::now());
+    }
+
+    pub fn spawned_sent_path_request(&mut self, size: usize) {
+        self.path_request_tx_bytes = self.path_request_tx_bytes.saturating_add(size as u64);
         push_sample(&mut self.op_freq_deque, OP_FREQ_SAMPLES, Instant::now());
+    }
+
+    /// Python `arxb`, `atxb`, `prxb` and `ptxb`.
+    pub fn announce_and_path_request_bytes(&self) -> (u64, u64, u64, u64) {
+        (
+            self.announce_rx_bytes,
+            self.announce_tx_bytes,
+            self.path_request_rx_bytes,
+            self.path_request_tx_bytes,
+        )
     }
 
     pub fn announces_received(&self) -> u64 {

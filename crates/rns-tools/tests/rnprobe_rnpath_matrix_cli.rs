@@ -199,7 +199,7 @@ fn poll_shared_server(
                 .and_then(|v| v.as_array())
                 .is_some_and(|interfaces| {
                     interfaces.iter().any(|entry| {
-                        entry.get("role").and_then(|v| v.as_str()) == Some("shared_server")
+                        entry.get("role").and_then(|v| v.as_str()) == Some("LocalServerInterface")
                     })
                 });
             if ready {
@@ -425,12 +425,8 @@ fn rust_probe_destination_supports_active_path_and_probe_matrix() {
     };
     let (rnpath_stdout, _rnpath_stderr) = output_text(&rnpath);
     assert!(
-        rnpath_stdout.contains(&format!("Destination: {probe_hash_hex}")),
-        "rnpath-rs output did not include the requested destination\n{rnpath_stdout}"
-    );
-    assert!(
-        !rnpath_stdout.contains("(no known path)"),
-        "rnpath-rs reported no known path after active request\n{rnpath_stdout}"
+        rnpath_stdout.contains(&format!("Path found, destination <{probe_hash_hex}>")),
+        "rnpath-rs did not report the requested path\n{rnpath_stdout}"
     );
 
     let known_path_probe = poll_command_success(

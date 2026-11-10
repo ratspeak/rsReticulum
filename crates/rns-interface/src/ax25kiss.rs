@@ -271,6 +271,8 @@ pub async fn spawn_ax25kiss_interface(
     let (tx, mut rx) = mpsc::channel::<Bytes>(256);
     let background = crate::background_announce::register(&tx)?;
     let name = config.name.clone();
+    let python_identity =
+        rns_transport::messages::InterfaceIdentity::bracketed("AX25KISSInterface", &name);
     let mode = config.mode;
     let flow_control = config.flow_control;
 
@@ -337,8 +339,6 @@ pub async fn spawn_ax25kiss_interface(
                     Err(_) => continue,
                 }
             };
-            txb_w.fetch_add(data.len() as u64, Ordering::Relaxed);
-
             if flow_control && background_packet.is_none() {
                 while !take_permit(flow_control_locked) {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -357,6 +357,8 @@ pub async fn spawn_ax25kiss_interface(
             match crate::serial_io::blocking_write_all(port_w, framed).await {
                 Ok(p) => {
                     port_w = p;
+                    // Python counts the payload without AX.25 header or framing.
+                    txb_w.fetch_add(data.len() as u64, Ordering::Relaxed);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "AX.25 KISS write error");
@@ -392,7 +394,6 @@ pub async fn spawn_ax25kiss_interface(
                         }
                     } else {
                         last_read = std::time::Instant::now();
-                        rxb_r.fetch_add(n as u64, Ordering::Relaxed);
                         for event in deframer.feed(&buf[..n]) {
                             match event {
                                 kiss::KissEvent::Data(frame) => {
@@ -400,6 +401,8 @@ pub async fn spawn_ax25kiss_interface(
                                         Some(p) if !p.is_empty() => p.to_vec(),
                                         _ => continue,
                                     };
+                                    // Python counts the frame with its AX.25 header.
+                                    rxb_r.fetch_add(frame.len() as u64, Ordering::Relaxed);
                                     let msg = TransportMessage::Inbound(InboundPacket {
                                         raw: Bytes::from(payload),
                                         interface_id: id,
@@ -448,7 +451,9 @@ pub async fn spawn_ax25kiss_interface(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        inspection: None,
+        inspection: Some(
+            rns_transport::messages::InterfaceInspectionSource::identified(python_identity),
+        ),
         tx,
         read_task,
     })
