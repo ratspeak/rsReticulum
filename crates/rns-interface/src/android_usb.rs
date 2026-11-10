@@ -2255,20 +2255,19 @@ mod tests {
         kiss::frame_with_command_into(rnode::CMD_ROM_READ, &[0x10, 0x20], &mut wire);
         kiss::frame_with_command_into(kiss::CMD_DATA, &data_payload, &mut wire);
 
-        let mut last_rssi = None;
-        let mut last_snr = None;
+        let mut signal = rnode::RNodeSignalStats::default();
         let mut control_commands = Vec::new();
         let mut packet_count = 0;
         let mut packet_bytes = 0;
 
         for (command, frame) in fragmented_decode(&wire) {
-            match rnode::process_rnode_response(command, &frame, 7, &mut last_rssi, &mut last_snr) {
+            match rnode::process_rnode_response(command, &frame, 7, &mut signal, None) {
                 rnode::RNodeResponse::Packet(_) => {
                     assert_eq!(command, kiss::CMD_DATA);
                     packet_count += 1;
                     packet_bytes += frame.len();
                 }
-                rnode::RNodeResponse::Ready(_) | rnode::RNodeResponse::None => {
+                rnode::RNodeResponse::Ready | rnode::RNodeResponse::None => {
                     if command != kiss::CMD_DATA {
                         control_commands.push(command);
                     }

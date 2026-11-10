@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::kiss;
 use crate::rnode;
@@ -790,6 +790,34 @@ async fn start_rnode_multi_generation(
         .map_err(|error| StartupFailure::Retry(format!("startup worker failed: {error}")))?
 }
 
+/// Running sessions of one RNodeMulti device that ended in a read-loop
+/// failure, which Python answers with `RNS.panic()` under
+/// `panic_on_interface_error`.
+#[derive(Clone)]
+pub struct RNodeMultiFailures {
+    total: watch::Receiver<u64>,
+}
+
+impl RNodeMultiFailures {
+    pub fn total(&self) -> u64 {
+        *self.total.borrow()
+    }
+
+    /// Wait for the next failure. `None` means the driver has ended.
+    pub async fn changed(&mut self) -> Option<u64> {
+        self.total.changed().await.ok()?;
+        Some(self.total())
+    }
+}
+
+/// RNodeMulti handles paired with the device's failure count.
+#[non_exhaustive]
+pub struct SpawnedRNodeMultiInterface {
+    /// The parent handle, then one handle per configured subinterface.
+    pub handles: Vec<InterfaceHandle>,
+    pub failures: RNodeMultiFailures,
+}
+
 /// Spawn one RNodeMulti over a single serial port.
 ///
 /// Returns the parent handle first, then one handle per configured
@@ -803,6 +831,19 @@ pub async fn spawn_rnode_multi_interface(
     ids: &[InterfaceId],
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<Vec<InterfaceHandle>, InterfaceError> {
+    Ok(
+        spawn_rnode_multi_interface_observed(config, ids, transport_tx)
+            .await?
+            .handles,
+    )
+}
+
+/// [`spawn_rnode_multi_interface`], also returning the device's failure count.
+pub async fn spawn_rnode_multi_interface_observed(
+    config: RNodeMultiConfig,
+    ids: &[InterfaceId],
+    transport_tx: mpsc::Sender<TransportMessage>,
+) -> Result<SpawnedRNodeMultiInterface, InterfaceError> {
     if config.subinterfaces.is_empty() {
         return Err(InterfaceError::SendFailed(
             "RNodeMulti: no sub-interfaces configured".to_string(),
@@ -1000,9 +1041,11 @@ pub async fn spawn_rnode_multi_interface(
         })
         .map(|(interval, callsign)| (Duration::from_secs(interval), Bytes::from(callsign)));
 
+    let (failures_tx, failures) = watch::channel(0);
     let driver = MultiDriver {
         config,
         device,
+        failures: failures_tx,
         parent_online,
         parent_retired,
         parent_txb,
@@ -1017,12 +1060,16 @@ pub async fn spawn_rnode_multi_interface(
     };
     tokio::spawn(driver.run(initial));
 
-    Ok(handles)
+    Ok(SpawnedRNodeMultiInterface {
+        handles,
+        failures: RNodeMultiFailures { total: failures },
+    })
 }
 
 struct MultiDriver {
     config: RNodeMultiConfig,
     device: Arc<DeviceShared>,
+    failures: watch::Sender<u64>,
     parent_online: Arc<AtomicBool>,
     parent_retired: Arc<AtomicBool>,
     parent_txb: Arc<AtomicU64>,
@@ -1184,9 +1231,12 @@ impl MultiDriver {
             }
         };
 
-        if matches!(end, GenerationEnd::Teardown) {
-            drop(port_w);
-            self.device.detach();
+        match end {
+            GenerationEnd::Teardown => {
+                drop(port_w);
+                self.device.detach();
+            }
+            GenerationEnd::Failed => self.failures.send_modify(|total| *total += 1),
         }
         stop.store(true, Ordering::SeqCst);
         let _ = reader.await;
@@ -1867,6 +1917,76 @@ mod tests {
         let mut mismatch = state.radios[0];
         mismatch.coding_rate = Some(config.coding_rate + 1);
         assert!(mismatch.validate(&config).is_err());
+    }
+
+    // macOS pseudo terminals refuse the baud-rate ioctl the driver's open issues.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_running_session_is_counted() {
+        use serialport::SerialPort;
+        use std::io::Read;
+
+        let (mut master, slave) = serialport::TTYPort::pair().unwrap();
+        let mut config = RNodeMultiConfig::new("multi", &slave.name().unwrap());
+        config
+            .subinterfaces
+            .push(SubInterfaceConfig::new("a", 0, 868_000_000));
+        master.set_timeout(Duration::from_millis(50)).unwrap();
+        let (reset_tx, reset_rx) = std::sync::mpsc::channel::<()>();
+        // Device role: answer discovery, echo radio settings, then reset on request.
+        let device = std::thread::spawn(move || {
+            let mut deframer = kiss::RawKissDeframer::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                if reset_rx.try_recv().is_ok() {
+                    let reset = kiss::frame_with_command(rnode::CMD_RESET, &[0xF8]);
+                    master.write_all(&reset).unwrap();
+                    return;
+                }
+                let Ok(read) = master.read(&mut buf) else {
+                    continue;
+                };
+                let mut out = Vec::new();
+                for (command, payload) in deframer.feed(&buf[..read]) {
+                    let reply: &[u8] = match command {
+                        rnode::CMD_DETECT => &[rnode::DETECT_RESP],
+                        rnode::CMD_FW_VERSION => &[REQUIRED_FW_VER_MAJ, REQUIRED_FW_VER_MIN],
+                        rnode::CMD_PLATFORM => &[rnode::PLATFORM_ESP32],
+                        rnode::CMD_MCU => &[0x81],
+                        CMD_INTERFACES => &[0, RadioType::SX1262 as u8],
+                        rnode::CMD_LEAVE | rnode::CMD_FB_EXT => continue,
+                        _ => &payload,
+                    };
+                    kiss::frame_with_command_into(command, reply, &mut out);
+                }
+                master.write_all(&out).unwrap();
+            }
+        });
+
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
+        tokio::spawn(async move { while transport_rx.recv().await.is_some() {} });
+        let spawned = spawn_rnode_multi_interface_observed(config, &[1, 2], transport_tx)
+            .await
+            .unwrap();
+        let mut failures = spawned.failures.clone();
+        let parent_online = spawned.handles[0].online.clone();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !parent_online.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the device did not come up");
+        assert_eq!(failures.total(), 0);
+
+        reset_tx.send(()).unwrap();
+        let total = tokio::time::timeout(Duration::from_secs(5), failures.changed())
+            .await
+            .expect("an ESP32 reset must end the running session");
+        assert_eq!(total, Some(1));
+        device.join().unwrap();
+        drop(spawned);
+        drop(slave);
     }
 
     #[tokio::test]

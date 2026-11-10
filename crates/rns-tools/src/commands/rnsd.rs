@@ -741,6 +741,13 @@ pub(crate) async fn main() {
 
             shutdown.wait().await;
             handle.shutdown_and_wait().await;
+            if let Some(interface) = handle.interface_panic() {
+                tracing::error!(
+                    "interface {interface} failed and panic_on_interface_error is set, exiting"
+                );
+                // Python `RNS.panic()` exits with status 255.
+                std::process::exit(255);
+            }
             tracing::info!("rnsd-rs shutting down");
         }
         Err(e) => {

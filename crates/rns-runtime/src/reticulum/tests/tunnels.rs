@@ -41,22 +41,14 @@ async fn start(dir: &Path) -> ReticulumHandle {
     .unwrap()
 }
 
-#[cfg(unix)]
-async fn start_unix_owner(dir: &Path) -> ReticulumHandle {
-    let socket_dir = std::env::temp_dir().join(format!("tuns{}", nonce() % 1_000_000));
-    std::fs::create_dir_all(&socket_dir).unwrap();
-    init_with_options(
-        Some(dir.to_str().unwrap()),
-        Some(socket_dir),
-        ShutdownSignal::new(),
-        Arc::new(AtomicBool::new(true)),
-        InitOptions {
-            shared_instance_type: Some(SharedInstanceType::Unix),
-            ..InitOptions::default()
-        },
+/// `[reticulum]` keys for a shared instance of its own: a unique name where
+/// Unix sockets carry it, unused ports where TCP does.
+async fn own_shared_instance(tag: &str) -> String {
+    let (port, control_port) = free_tcp_port_pair().await;
+    format!(
+        "share_instance = Yes\n  shared_instance_type = unix\n  instance_name = {tag}{}\n  shared_instance_port = {port}\n  instance_control_port = {control_port}",
+        nonce() % 1_000_000
     )
-    .await
-    .unwrap()
 }
 
 async fn unused_port() -> u16 {
@@ -181,19 +173,17 @@ async fn fake_sam(
     (port, rx)
 }
 
-// Off Unix the shared listener binds a fixed TCP port.
-#[cfg(unix)]
 #[tokio::test]
-async fn the_unix_shared_listener_and_a_connectable_i2p_interface_both_register() {
+async fn the_shared_listener_and_a_connectable_i2p_interface_both_register() {
     let sam_port = unused_port().await;
     let dir = config_dir(
-        "unix-i2p",
+        "shared-i2p",
         &format!(
-            "[reticulum]\n  share_instance = Yes\n  shared_instance_type = unix\n  instance_name = tunu{}\n  enable_transport = No\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n",
-            nonce() % 1_000_000
+            "[reticulum]\n  {}\n  enable_transport = No\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n",
+            own_shared_instance("tunu").await
         ),
     );
-    let handle = start_unix_owner(&dir).await;
+    let handle = start(&dir).await;
     assert_eq!(handle.instance_mode, InstanceMode::Shared);
     assert!(
         handle.startup_interface_failures().is_empty(),
@@ -533,18 +523,17 @@ async fn configured_i2p_peers_take_only_ifac_from_their_interface() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn i2p_server_peers_register_under_their_server() {
     let (sam_port, mut streams) = fake_sam(1).await;
     let dir = config_dir(
         "i2p-peers",
         &format!(
-            "[reticulum]\n  share_instance = Yes\n  shared_instance_type = unix\n  instance_name = tunp{}\n  enable_transport = No\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    network_name = tunnelnet\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n",
-            nonce() % 1_000_000
+            "[reticulum]\n  {}\n  enable_transport = No\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    network_name = tunnelnet\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n",
+            own_shared_instance("tunp").await
         ),
     );
-    let handle = start_unix_owner(&dir).await;
+    let handle = start(&dir).await;
 
     let (command, _stream) = tokio::time::timeout(Duration::from_secs(10), streams.recv())
         .await

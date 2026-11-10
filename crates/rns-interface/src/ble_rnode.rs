@@ -270,9 +270,9 @@ where
 
 /// Claim the generation-local one-packet RNode transmit permit.
 ///
-/// A valid positive `CMD_READY` replenishes the boolean permit and every data
-/// packet, including a station-ID packet, must atomically consume it.  Merely
-/// observing `true` lets multiple queued packets pass on one READY response.
+/// Any `CMD_READY` replenishes the boolean permit, as in Python, and every
+/// data packet, including a station-ID packet, must atomically consume it.
+/// Merely observing `true` lets multiple queued packets pass on one READY.
 fn claim_ble_packet_permit(flow_control: bool, ready: &AtomicBool) -> bool {
     !flow_control
         || ready
@@ -2793,6 +2793,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
 
     let read_task = tokio::spawn(async move {
         let mut snapshot_publisher = snapshot_publisher;
+        let mut signal = rnode::RNodeSignalStats::default();
         let mut tries: usize = 0;
         let mut backoff = RECONNECT_WAIT;
         let mut initial_attempt = true;
@@ -3452,8 +3453,6 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             background.retire_generation();
             let ready = AtomicBool::new(true);
 
-            let mut last_rssi: Option<f32> = None;
-            let mut last_snr: Option<f32> = None;
             let mut transport_closed = false;
 
             enum GenerationEvent {
@@ -3510,8 +3509,8 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                                 cmd,
                                 &frame,
                                 id,
-                                &mut last_rssi,
-                                &mut last_snr,
+                                &mut signal,
+                                protocol_state.evidence().spreading_factor,
                             ) {
                                 RNodeResponse::Packet(msg) => {
                                     if data_allowed {
@@ -3530,9 +3529,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                                         }
                                     }
                                 }
-                                RNodeResponse::Ready(is_ready) => {
-                                    ready.store(is_ready, Ordering::SeqCst);
-                                }
+                                RNodeResponse::Ready => ready.store(true, Ordering::SeqCst),
                                 RNodeResponse::None => {}
                             }
                         }
@@ -3835,6 +3832,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
 
     let read_task = tokio::spawn(async move {
         let mut snapshot_publisher = snapshot_publisher;
+        let mut signal = rnode::RNodeSignalStats::default();
         let mut tries: usize = 0;
         let mut backoff = RECONNECT_WAIT;
         let mut initial_attempt = true;
@@ -4321,8 +4319,6 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
             // that point therefore began after the exact Ready boundary and
             // belongs to this active TCP generation.
             let mut deframer = startup_deframer;
-            let mut last_rssi: Option<f32> = None;
-            let mut last_snr: Option<f32> = None;
             let mut buf = [0u8; 4096];
             let mut transport_closed = false;
             let mut bridge_acknowledged = 0u64;
@@ -4345,8 +4341,8 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                     command,
                     &frame,
                     id,
-                    &mut last_rssi,
-                    &mut last_snr,
+                    &mut signal,
+                    protocol_state.evidence().spreading_factor,
                 ) {
                     RNodeResponse::Packet(msg) => {
                         if data_allowed {
@@ -4357,9 +4353,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                             }
                         }
                     }
-                    RNodeResponse::Ready(is_ready) => {
-                        ready.store(is_ready, Ordering::SeqCst);
-                    }
+                    RNodeResponse::Ready => ready.store(true, Ordering::SeqCst),
                     RNodeResponse::None => {}
                 }
             }
@@ -4464,8 +4458,8 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                                 command,
                                 &frame,
                                 id,
-                                &mut last_rssi,
-                                &mut last_snr,
+                                &mut signal,
+                                protocol_state.evidence().spreading_factor,
                             ) {
                                 RNodeResponse::Packet(msg) => {
                                     if data_allowed {
@@ -4477,9 +4471,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                                         }
                                     }
                                 }
-                                RNodeResponse::Ready(is_ready) => {
-                                    ready.store(is_ready, Ordering::SeqCst);
-                                }
+                                RNodeResponse::Ready => ready.store(true, Ordering::SeqCst),
                                 RNodeResponse::None => {}
                             }
                         }
@@ -5792,10 +5784,9 @@ mod tests {
 
         // The startup data was packet-shaped and would have entered the
         // legacy forwarding path if the drain had called it.
-        let mut rssi = None;
-        let mut snr = None;
+        let mut signal = rnode::RNodeSignalStats::default();
         assert!(matches!(
-            rnode::process_rnode_response(kiss::CMD_DATA, &packet, 7, &mut rssi, &mut snr),
+            rnode::process_rnode_response(kiss::CMD_DATA, &packet, 7, &mut signal, None),
             RNodeResponse::Packet(_)
         ));
 
@@ -6612,6 +6603,137 @@ mod tests {
         server.await.expect("native reliability bridge task");
     }
 
+    /// Python's `RNodeInterface` also drives BLE: any READY releases the queue
+    /// (RNodeInterface.py:1099-1100), and the last RSSI, SNR and quality stay
+    /// on the interface across packets (:881-896).
+    #[tokio::test]
+    async fn native_ble_any_ready_releases_the_queue_and_signal_stats_persist() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn acknowledge(stream: &mut tokio::net::TcpStream, count: u64) {
+            let mut acknowledgement = RNODE_NATIVE_BRIDGE_ACK_MAGIC.to_vec();
+            acknowledgement.extend_from_slice(&count.to_be_bytes());
+            stream
+                .write_all(&kiss::frame_with_command(
+                    RNODE_NATIVE_BRIDGE_ACK_COMMAND,
+                    &acknowledgement,
+                ))
+                .await
+                .expect("write bridge acknowledgement");
+        }
+
+        async fn read_data(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+            native_test_read_through_command(stream, kiss::CMD_DATA)
+                .await
+                .into_iter()
+                .find_map(|(command, frame)| (command == kiss::CMD_DATA).then_some(frame))
+                .expect("data frame")
+        }
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind flow-control bridge");
+        let port = listener.local_addr().expect("bridge address").port();
+        let mut config = BleRNodeConfig::new("native-flow", "ble://RNode 0544");
+        config.flow_control = true;
+        let server_config = config.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept bridge");
+            native_test_attach(&mut stream).await;
+            native_test_read_through_command(&mut stream, rnode::CMD_MCU).await;
+            let mut handshake = kiss::frame_with_command(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
+            handshake.extend(kiss::frame_with_command(
+                rnode::CMD_FW_VERSION,
+                &[rnode::REQUIRED_FW_VER_MAJ, rnode::REQUIRED_FW_VER_MIN],
+            ));
+            stream.write_all(&handshake).await.expect("write handshake");
+            native_test_read_through_command(&mut stream, rnode::CMD_MCU).await;
+
+            let mut ready = native_ready_response(&server_config);
+            ready.extend(kiss::frame_with_command(rnode::CMD_STAT_RSSI, &[92]));
+            ready.extend(kiss::frame_with_command(rnode::CMD_STAT_SNR, &[0xF4]));
+            ready.extend(kiss::frame(b"first inbound"));
+            ready.extend(kiss::frame(b"second inbound"));
+            stream
+                .write_all(&ready)
+                .await
+                .expect("write Ready evidence");
+
+            assert_eq!(read_data(&mut stream).await, b"first outbound");
+            acknowledge(&mut stream, 1).await;
+            let mut early = [0u8; 64];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), stream.read(&mut early))
+                    .await
+                    .is_err(),
+                "the second packet must wait for READY"
+            );
+            stream
+                .write_all(&kiss::frame_with_command(rnode::CMD_READY, &[0x00]))
+                .await
+                .expect("write READY");
+            assert_eq!(read_data(&mut stream).await, b"second outbound");
+            acknowledge(&mut stream, 2).await;
+            let mut detach = [0u8; 64];
+            let _ = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut detach)).await;
+        });
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(8);
+        let spawned = spawn_ble_rnode_interface_native_with_driver_and_options(
+            config,
+            0xB1E0_F10C,
+            transport_tx,
+            port,
+            RNodeStartupOptions::default(),
+        )
+        .await
+        .expect("spawn flow-control interface");
+        spawned.interface.owner.mark_registered();
+
+        for expected in [&b"first inbound"[..], b"second inbound"] {
+            let message = tokio::time::timeout(Duration::from_secs(10), transport_rx.recv())
+                .await
+                .expect("inbound packet timeout")
+                .expect("inbound transport message");
+            let TransportMessage::Inbound(packet) =
+                crate::traits::test_event_for_handle(message, &spawned.interface)
+            else {
+                panic!("expected an inbound packet");
+            };
+            assert_eq!(packet.raw.as_ref(), expected);
+            // SF 7: ((-3.0 - -9) / 15) * 100.
+            assert_eq!(
+                (packet.rssi, packet.snr, packet.q),
+                (Some(-65.0), Some(-3.0), Some(40.0))
+            );
+        }
+
+        let tx = spawned.interface.tx.clone();
+        tx.send(Bytes::from_static(b"first outbound"))
+            .await
+            .unwrap();
+        tx.send(Bytes::from_static(b"second outbound"))
+            .await
+            .unwrap();
+        let txb = spawned.interface.txb.as_ref().expect("TXB counter").clone();
+        let sent = (b"first outbound".len() + b"second outbound".len()) as u64;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while txb.load(Ordering::Relaxed) != sent {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("READY 0x00 must release the queued packet");
+
+        spawned.driver.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(3), spawned.interface.read_task)
+            .await
+            .expect("shutdown timeout")
+            .expect("task join");
+        server.await.expect("bridge task");
+    }
+
     /// A cold radio echoes the requested transmit power, then the amplifier
     /// floor once it is on. The effective echo must decide, once, without a
     /// reconnect loop or RADIO_OFF.
@@ -6920,8 +7042,7 @@ mod tests {
         notification.extend(kiss::frame_with_command(rnode::CMD_STAT_RSSI, &[67]));
 
         let mut deframer = kiss::RawKissDeframer::new();
-        let mut last_rssi = None;
-        let mut last_snr = None;
+        let mut signal = rnode::RNodeSignalStats::default();
         let mut packets = 0usize;
         let mut flow_ready = false;
         let mut packet_admission = ActiveBlePacketAdmission::for_startup_policy(true);
@@ -6934,9 +7055,9 @@ mod tests {
                 command,
                 &frame,
             );
-            match rnode::process_rnode_response(command, &frame, 1, &mut last_rssi, &mut last_snr) {
+            match rnode::process_rnode_response(command, &frame, 1, &mut signal, None) {
                 RNodeResponse::Packet(_) if data_allowed => packets += 1,
-                RNodeResponse::Ready(value) => flow_ready = value,
+                RNodeResponse::Ready => flow_ready = true,
                 RNodeResponse::Packet(_) | RNodeResponse::None => {}
             }
         }
@@ -6944,7 +7065,7 @@ mod tests {
         assert_eq!(packets, 1, "fresh post-Ready DATA must not be drained");
         assert!(flow_ready, "same-notification READY must be applied");
         assert_eq!(
-            last_rssi,
+            signal.rssi,
             Some(-90.0),
             "same-notification RSSI must be retained"
         );
@@ -7514,170 +7635,113 @@ mod tests {
 
     // ── process_rnode_response tests ──
 
+    fn respond(
+        command: u8,
+        frame: &[u8],
+        signal: &mut rnode::RNodeSignalStats,
+    ) -> rnode::RNodeResponse {
+        rnode::process_rnode_response(command, frame, 42, signal, Some(7))
+    }
+
     #[test]
-    fn test_response_data_packet() {
+    fn test_response_data_packet_carries_the_last_signal_report() {
         let data = vec![0x01, 0x02, 0x03];
-        let mut rssi = Some(-65.0_f32);
-        let mut snr = Some(8.0_f32);
-        match rnode::process_rnode_response(kiss::CMD_DATA, &data, 42, &mut rssi, &mut snr) {
-            rnode::RNodeResponse::Packet(msg) => {
-                if let rns_transport::messages::TransportMessage::Inbound(pkt) = msg {
-                    assert_eq!(pkt.raw, data);
-                    assert_eq!(pkt.interface_id, 42);
-                    assert_eq!(pkt.rssi, Some(-65.0));
-                    assert_eq!(pkt.snr, Some(8.0));
-                } else {
-                    panic!("Expected Inbound packet");
-                }
-            }
-            _ => panic!("Expected Packet response"),
+        let mut signal = rnode::RNodeSignalStats {
+            rssi: Some(-65.0),
+            snr: Some(8.0),
+            q: Some(100.0),
+        };
+        let before = signal;
+        // Python keeps r_stat_rssi/snr/q after a packet (RNodeInterface.py:707-710).
+        for _ in 0..2 {
+            let rnode::RNodeResponse::Packet(rns_transport::messages::TransportMessage::Inbound(
+                packet,
+            )) = respond(kiss::CMD_DATA, &data, &mut signal)
+            else {
+                panic!("expected an inbound packet");
+            };
+            assert_eq!(packet.raw, data);
+            assert_eq!(packet.interface_id, 42);
+            assert_eq!(
+                (packet.rssi, packet.snr, packet.q),
+                (before.rssi, before.snr, before.q)
+            );
         }
-        assert!(rssi.is_none());
-        assert!(snr.is_none());
+        assert_eq!(signal, before);
     }
 
     #[test]
     fn test_response_empty_data_ignored() {
-        let mut rssi = None;
-        let mut snr = None;
-        match rnode::process_rnode_response(kiss::CMD_DATA, &[], 1, &mut rssi, &mut snr) {
-            rnode::RNodeResponse::None => {}
-            _ => panic!("Expected None for empty data"),
-        }
+        let mut signal = rnode::RNodeSignalStats::default();
+        assert!(matches!(
+            respond(kiss::CMD_DATA, &[], &mut signal),
+            rnode::RNodeResponse::None
+        ));
     }
 
     #[test]
     fn test_response_rssi_updates() {
-        let mut rssi = None;
-        let mut snr = None;
-        rnode::process_rnode_response(rnode::CMD_STAT_RSSI, &[92], 1, &mut rssi, &mut snr);
-        assert_eq!(rssi, Some(-65.0));
+        let mut signal = rnode::RNodeSignalStats::default();
+        respond(rnode::CMD_STAT_RSSI, &[92], &mut signal);
+        assert_eq!(signal.rssi, Some(-65.0));
     }
 
+    /// Python RNodeInterface.py:883-894: each SNR report also sets the quality
+    /// for the reported spreading factor; without one the old value stays.
     #[test]
-    fn test_response_snr_updates() {
-        let mut rssi = None;
-        let mut snr = None;
-        rnode::process_rnode_response(rnode::CMD_STAT_SNR, &[32], 1, &mut rssi, &mut snr);
-        assert_eq!(snr, Some(8.0));
-    }
-
-    #[test]
-    fn test_response_rssi_snr_reset_after_data() {
-        let mut rssi = Some(-70.0_f32);
-        let mut snr = Some(6.0_f32);
-        rnode::process_rnode_response(kiss::CMD_DATA, &[0xFF], 1, &mut rssi, &mut snr);
-        assert!(rssi.is_none());
-        assert!(snr.is_none());
-    }
-
-    #[test]
-    fn test_response_ready_true() {
-        let mut rssi = None;
-        let mut snr = None;
-        match rnode::process_rnode_response(rnode::CMD_READY, &[0x01], 1, &mut rssi, &mut snr) {
-            rnode::RNodeResponse::Ready(true) => {}
-            _ => panic!("Expected Ready(true)"),
+    fn test_response_snr_updates_quality_for_the_reported_spreading_factor() {
+        let mut signal = rnode::RNodeSignalStats::default();
+        rnode::process_rnode_response(rnode::CMD_STAT_SNR, &[0xF4], 1, &mut signal, None);
+        assert_eq!((signal.snr, signal.q), (Some(-3.0), None));
+        for (spreading_factor, quality) in [(7, 40.0), (9, 52.6)] {
+            rnode::process_rnode_response(
+                rnode::CMD_STAT_SNR,
+                &[0xF4],
+                1,
+                &mut signal,
+                Some(spreading_factor),
+            );
+            assert_eq!((signal.snr, signal.q), (Some(-3.0), Some(quality)));
         }
+        rnode::process_rnode_response(rnode::CMD_STAT_SNR, &[32], 1, &mut signal, None);
+        assert_eq!((signal.snr, signal.q), (Some(8.0), Some(52.6)));
+    }
+
+    /// Python RNodeInterface.py:1099-1100 runs `process_queue` for each READY
+    /// payload byte, whatever its value.
+    #[test]
+    fn test_response_ready_ignores_the_payload_value() {
+        let mut signal = rnode::RNodeSignalStats::default();
+        for payload in [&[0x01][..], &[0x00], &[0x01, 0x00]] {
+            assert!(matches!(
+                respond(rnode::CMD_READY, payload, &mut signal),
+                rnode::RNodeResponse::Ready
+            ));
+        }
+        assert!(matches!(
+            respond(rnode::CMD_READY, &[], &mut signal),
+            rnode::RNodeResponse::None
+        ));
     }
 
     #[test]
-    fn test_response_ready_false() {
-        let mut rssi = None;
-        let mut snr = None;
-        match rnode::process_rnode_response(rnode::CMD_READY, &[0x00], 1, &mut rssi, &mut snr) {
-            rnode::RNodeResponse::Ready(false) => {}
-            _ => panic!("Expected Ready(false)"),
+    fn test_response_other_commands_have_no_effect() {
+        let mut signal = rnode::RNodeSignalStats::default();
+        for (command, frame) in [
+            (rnode::CMD_DETECT, &[rnode::DETECT_RESP][..]),
+            (rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_ON]),
+            (rnode::CMD_FW_VERSION, &[2, 10]),
+            (rnode::CMD_STAT_BAT, &[0x0E, 0x74]),
+            (rnode::CMD_STAT_TEMP, &[25]),
+            (rnode::CMD_ERROR, &[0x01]),
+            (0xFE, &[0x01, 0x02]),
+        ] {
+            assert!(matches!(
+                respond(command, frame, &mut signal),
+                rnode::RNodeResponse::None
+            ));
         }
-    }
-
-    #[test]
-    fn test_response_detect() {
-        let mut rssi = None;
-        let mut snr = None;
-        match rnode::process_rnode_response(
-            rnode::CMD_DETECT,
-            &[rnode::DETECT_RESP],
-            1,
-            &mut rssi,
-            &mut snr,
-        ) {
-            rnode::RNodeResponse::None => {}
-            _ => panic!("Expected None"),
-        }
-    }
-
-    #[test]
-    fn test_response_radio_state_on() {
-        let mut rssi = None;
-        let mut snr = None;
-        match rnode::process_rnode_response(
-            rnode::CMD_RADIO_STATE,
-            &[rnode::RADIO_STATE_ON],
-            1,
-            &mut rssi,
-            &mut snr,
-        ) {
-            rnode::RNodeResponse::None => {}
-            _ => panic!("Expected None"),
-        }
-    }
-
-    #[test]
-    fn test_response_firmware_version() {
-        let mut rssi = None;
-        let mut snr = None;
-        match rnode::process_rnode_response(rnode::CMD_FW_VERSION, &[2, 10], 1, &mut rssi, &mut snr)
-        {
-            rnode::RNodeResponse::None => {}
-            _ => panic!("Expected None"),
-        }
-    }
-
-    #[test]
-    fn test_response_battery_status() {
-        let mut rssi = None;
-        let mut snr = None;
-        match rnode::process_rnode_response(
-            rnode::CMD_STAT_BAT,
-            &[0x0E, 0x74],
-            1,
-            &mut rssi,
-            &mut snr,
-        ) {
-            rnode::RNodeResponse::None => {}
-            _ => panic!("Expected None"),
-        }
-    }
-
-    #[test]
-    fn test_response_temperature() {
-        let mut rssi = None;
-        let mut snr = None;
-        match rnode::process_rnode_response(rnode::CMD_STAT_TEMP, &[25], 1, &mut rssi, &mut snr) {
-            rnode::RNodeResponse::None => {}
-            _ => panic!("Expected None"),
-        }
-    }
-
-    #[test]
-    fn test_response_error() {
-        let mut rssi = None;
-        let mut snr = None;
-        match rnode::process_rnode_response(rnode::CMD_ERROR, &[0x01], 1, &mut rssi, &mut snr) {
-            rnode::RNodeResponse::None => {}
-            _ => panic!("Expected None"),
-        }
-    }
-
-    #[test]
-    fn test_response_unknown_command() {
-        let mut rssi = None;
-        let mut snr = None;
-        match rnode::process_rnode_response(0xFE, &[0x01, 0x02], 1, &mut rssi, &mut snr) {
-            rnode::RNodeResponse::None => {}
-            _ => panic!("Expected None for unknown command"),
-        }
+        assert_eq!(signal, rnode::RNodeSignalStats::default());
     }
 
     // ── Write chunking tests ──

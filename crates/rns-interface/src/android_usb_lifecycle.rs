@@ -488,13 +488,17 @@ impl UsbTxGate {
             state.permit = false;
         }
         state.ready = ready;
-        // Decode every valid READY, including an identical repeated positive
-        // response: the diagnostic reducer may call it NoChange after we used
-        // the prior permit. Malformed widths never grant or revoke permission.
-        match RNodeProtocolFrame::decode(command, frame) {
-            Ok(RNodeProtocolFrame::FlowPermission(permitted)) => state.permit = permitted,
-            Ok(RNodeProtocolFrame::Reset) => state.permit = false,
-            _ => {}
+        // Python runs process_queue for any READY, whatever its payload. The
+        // diagnostic reducer may call a repeated READY NoChange, so decide here.
+        if command == rnode::CMD_READY {
+            if !frame.is_empty() {
+                state.permit = true;
+            }
+        } else if matches!(
+            RNodeProtocolFrame::decode(command, frame),
+            Ok(RNodeProtocolFrame::Reset)
+        ) {
+            state.permit = false;
         }
         self.online.store(state.ready, Ordering::Release);
         drop(state);
@@ -806,8 +810,7 @@ pub(crate) enum UsbIoEvent {
 
 pub(crate) struct UsbInboundState {
     deframer: kiss::RawKissDeframer,
-    last_rssi: Option<f32>,
-    last_snr: Option<f32>,
+    signal: rnode::RNodeSignalStats,
     projection: Option<UsbRNodeProjection>,
     tx_gate: Option<Arc<UsbTxGate>>,
 }
@@ -821,8 +824,7 @@ impl UsbInboundState {
     pub(crate) fn new() -> Self {
         Self {
             deframer: kiss::RawKissDeframer::new(),
-            last_rssi: None,
-            last_snr: None,
+            signal: rnode::RNodeSignalStats::default(),
             projection: None,
             tx_gate: None,
         }
@@ -969,12 +971,16 @@ async fn forward_usb_read_chunk_inner(
     }
     for (command, frame) in state.deframer.feed(bytes) {
         state.project_frame(command, &frame);
+        let spreading_factor = state
+            .projection
+            .as_ref()
+            .and_then(|projection| projection.protocol.evidence().spreading_factor);
         match rnode::process_rnode_response(
             command,
             &frame,
             id,
-            &mut state.last_rssi,
-            &mut state.last_snr,
+            &mut state.signal,
+            spreading_factor,
         ) {
             rnode::RNodeResponse::Packet(message) => {
                 // Preserve legacy Android USB/BLE accounting: a recognized
@@ -1004,7 +1010,7 @@ async fn forward_usb_read_chunk_inner(
                     return UsbInboundOutcome::TransportClosed;
                 }
             }
-            rnode::RNodeResponse::Ready(_) | rnode::RNodeResponse::None => {}
+            rnode::RNodeResponse::Ready | rnode::RNodeResponse::None => {}
         }
     }
     UsbInboundOutcome::Complete
@@ -2609,7 +2615,6 @@ mod tests {
                 "CMD_READY alone is not protocol Ready"
             );
 
-            inbound.project_frame(rnode::CMD_READY, &[0]);
             let (_stop_tx, mut inbound_stop) = mpsc::channel(1);
             let (transport, _transport_rx) = mpsc::channel(1);
             let mut evidence = required_protocol_frames(USB_TEST_TARGET);
@@ -2636,20 +2641,15 @@ mod tests {
             );
             assert!(online.load(Ordering::Acquire));
             if flow_control {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                assert_eq!(counter.load(Ordering::Relaxed), 0);
-                inbound.project_frame(rnode::CMD_READY, &[1]);
                 wait_for_count(&counter, 2).await;
-                inbound.project_frame(rnode::CMD_READY, &[1, 1]);
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 assert_eq!(
                     counter.load(Ordering::Relaxed),
                     2,
-                    "malformed grant must not release packet two"
+                    "one permit must not release packet two"
                 );
-                // Repeated valid READY=1 must replenish a consumed permit even
-                // when the diagnostic reducer classifies it as NoChange.
-                inbound.project_frame(rnode::CMD_READY, &[1]);
+                // Like Python, a READY carrying 0x00 still releases the queue.
+                inbound.project_frame(rnode::CMD_READY, &[0]);
             }
             wait_for_count(&counter, 5).await;
             assert_eq!(
@@ -2717,7 +2717,7 @@ mod tests {
         let gate = UsbTxGate::new(true, online.clone());
         let (mut inbound, _driver) = projected_inbound();
         inbound.attach_tx_gate(gate.clone());
-        inbound.project_frame(rnode::CMD_READY, &[0]);
+        inbound.project_frame(rnode::CMD_RESET, &[0xF8]);
         let counter = Arc::new(AtomicU64::new(0));
         let (stop_tx, stop_rx) = oneshot::channel();
         let mut pump = Box::pin(run_usb_tx_pump(
@@ -4226,6 +4226,48 @@ mod tests {
         assert_eq!(received.load(Ordering::Relaxed), 0);
     }
 
+    /// Python RNodeInterface.py:881-896: the last RSSI, SNR and quality stay
+    /// on the interface, so every later packet carries them.
+    #[tokio::test]
+    async fn usb_packets_carry_the_last_signal_report() {
+        let (mut inbound, _driver) = projected_inbound();
+        let mut frames = required_protocol_frames(USB_TEST_TARGET).to_vec();
+        frames.extend([
+            (rnode::CMD_STAT_RSSI, vec![92]),
+            (rnode::CMD_STAT_SNR, vec![0xF4]),
+            (kiss::CMD_DATA, b"first".to_vec()),
+            (kiss::CMD_DATA, b"second".to_vec()),
+        ]);
+        let (_stop_tx, mut stop_rx) = mpsc::channel(1);
+        let (transport_tx, mut transport_rx) = mpsc::channel(2);
+
+        assert_eq!(
+            forward_usb_read_chunk(
+                &mut inbound,
+                &framed_protocol_frames(frames),
+                7,
+                &AtomicU64::new(0),
+                &crate::traits::test_registered_sender(7, transport_tx.clone()),
+                &mut stop_rx,
+            )
+            .await,
+            UsbInboundOutcome::Complete
+        );
+        for expected in [&b"first"[..], b"second"] {
+            let TransportMessage::Inbound(packet) =
+                crate::traits::test_event_body(transport_rx.try_recv().unwrap())
+            else {
+                panic!("expected an inbound packet");
+            };
+            assert_eq!(packet.raw.as_ref(), expected);
+            // SF 7: ((-3.0 - -9) / 15) * 100.
+            assert_eq!(
+                (packet.rssi, packet.snr, packet.q),
+                (Some(-65.0), Some(-3.0), Some(40.0))
+            );
+        }
+    }
+
     #[tokio::test]
     async fn cmd_ready_diagnostics_do_not_substitute_for_protocol_readiness() {
         let (mut inbound, driver) = projected_inbound();
@@ -5655,10 +5697,10 @@ mod tests {
         let (mut inbound, _driver) = projected_inbound();
         let gate = UsbTxGate::new(true, Arc::new(AtomicBool::new(false)));
         inbound.attach_tx_gate(gate.clone());
+        inbound.project_frame(rnode::CMD_RESET, &[0xF8]);
         for (command, frame) in required_protocol_frames(USB_TEST_TARGET) {
             inbound.project_frame(command, &frame);
         }
-        inbound.project_frame(rnode::CMD_READY, &[0]);
         let transmitted = Arc::new(AtomicU64::new(0));
         let (stop, stopped) = oneshot::channel();
         let pump = tokio::spawn(run_usb_tx_pump(

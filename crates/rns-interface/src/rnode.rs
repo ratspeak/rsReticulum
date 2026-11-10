@@ -545,6 +545,9 @@ pub struct RNodeRuntimeSnapshot {
     pub reconnect_total: u64,
     /// Unplanned active-session losses that entered retry.
     pub disconnect_total: u64,
+    /// Session losses that Python's read loop treats as unrecoverable: a
+    /// device-reported hardware error or reset, or a failed serial port.
+    pub hardware_failure_total: u64,
     pub detection: RNodeDetectionState,
     pub firmware_compatibility: RNodeFirmwareCompatibility,
     pub configuration: RNodeConfigurationState,
@@ -579,6 +582,7 @@ impl RNodeRuntimeSnapshot {
             reconnect_attempt: 0,
             reconnect_total: 0,
             disconnect_total: 0,
+            hardware_failure_total: 0,
             detection: RNodeDetectionState::Unknown,
             firmware_compatibility: RNodeFirmwareCompatibility::Unknown,
             configuration: RNodeConfigurationState::Unknown,
@@ -1071,10 +1075,28 @@ impl RNodeSnapshotPublisher {
         target_os = "android"
     ))]
     pub(crate) fn connection_lost(&self) {
+        self.session_lost(false);
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    pub(crate) fn connection_failed(&self) {
+        self.session_lost(true);
+    }
+
+    #[cfg(any(
+        feature = "serial",
+        feature = "rnode-tcp",
+        feature = "ble",
+        target_os = "android"
+    ))]
+    fn session_lost(&self, hardware_failure: bool) {
         self.update(|snapshot| {
             snapshot.phase = RNodeRuntimePhase::ReconnectBackoff;
             snapshot.connection_generation = 0;
             snapshot.disconnect_total = snapshot.disconnect_total.saturating_add(1);
+            if hardware_failure {
+                snapshot.hardware_failure_total = snapshot.hardware_failure_total.saturating_add(1);
+            }
             snapshot.reason = Some(RNodeRuntimeReason::ConnectionLost);
             snapshot.port_failure = None;
             snapshot.reset_protocol_observations();
@@ -1319,7 +1341,7 @@ const RNODE_DETACH_DEADLINE: Duration = Duration::from_millis(500);
 const RNODE_STARTUP_SETTLE: Duration = Duration::from_secs(2);
 /// Python serial startup waits 0.2 s for detect and 0.25 s for validation;
 /// the margin covers this driver's queued writes and polled reads.
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(feature = "serial")]
 const RNODE_SERIAL_READINESS_DEADLINE: Duration = Duration::from_millis(1_500);
 /// Python TCP startup: 5 s detect timeout, then a 1.5 s validation wait.
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -1556,14 +1578,6 @@ struct RNodeGenerationWriter {
 impl RNodeGenerationWriter {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
-    }
-}
-
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-fn apply_rnode_ready_permit(ready: &AtomicBool, frame: &[u8]) {
-    // Python runs process_queue for any READY, whatever its payload value.
-    if !frame.is_empty() {
-        ready.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1989,7 +2003,7 @@ fn spawn_rnode_generation_writer(
             id: options.id,
             flow_control: config.flow_control,
             // Upstream flow control starts with one permissive packet token;
-            // exact-width CMD_READY frames replenish or revoke that token.
+            // any CMD_READY frame replenishes that token.
             // This token is independent of the exact protocol-readiness gate.
             ready: Arc::new(AtomicBool::new(true)),
             carrier_online: options.carrier_online,
@@ -2051,6 +2065,18 @@ async fn finish_rnode_writer(writer: RNodeGenerationWriter) -> RNodeWriterFinish
             RNodeWriterFinish::NonQuiesced
         }
     }
+}
+
+/// Whether a session ended the way Python's `readLoop` raises: a hardware
+/// error or reset reported by the device, or a failed serial port. A dropped
+/// TCP connection only makes Python's loop exit.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn rnode_session_hardware_failure(
+    transport: RNodeTransportClass,
+    device_fault: bool,
+    io_failed: bool,
+) -> bool {
+    device_fault || (io_failed && transport == RNodeTransportClass::Serial)
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -3309,8 +3335,19 @@ pub fn rnode_hardware_failure(code: u8) -> Option<&'static str> {
 #[allow(clippy::large_enum_variant)]
 pub enum RNodeResponse {
     Packet(TransportMessage),
-    Ready(bool),
+    /// Python runs `process_queue` for a READY frame, whatever its payload.
+    Ready,
     None,
+}
+
+/// The last signal report of an RNode. Python keeps `r_stat_rssi`,
+/// `r_stat_snr` and `r_stat_q` on the interface, so they outlive packets and
+/// reconnects.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RNodeSignalStats {
+    pub rssi: Option<f32>,
+    pub snr: Option<f32>,
+    pub q: Option<f32>,
 }
 
 /// Python: raw unsigned RSSI byte minus `RSSI_OFFSET` (157) → dBm.
@@ -3336,46 +3373,51 @@ pub fn decode_temperature_byte(byte: u8) -> Option<i8> {
         .then_some(temperature_c as i8)
 }
 
-/// Dispatch decoded KISS frame; shared by serial and BLE transports.
+/// Dispatch one decoded KISS frame; shared by the serial, TCP, BLE and Android
+/// USB transports. `spreading_factor` is the one the device last reported.
 pub fn process_rnode_response(
     cmd: u8,
     frame: &[u8],
     id: InterfaceId,
-    last_rssi: &mut Option<f32>,
-    last_snr: &mut Option<f32>,
+    signal: &mut RNodeSignalStats,
+    spreading_factor: Option<u8>,
 ) -> RNodeResponse {
     match cmd {
         kiss::CMD_DATA => {
             if frame.is_empty() {
                 return RNodeResponse::None;
             }
-            let msg = TransportMessage::Inbound(InboundPacket {
+            RNodeResponse::Packet(TransportMessage::Inbound(InboundPacket {
                 raw: Bytes::copy_from_slice(frame),
                 interface_id: id,
-                rssi: *last_rssi,
-                snr: *last_snr,
-                q: None,
-            });
-            // RSSI/SNR stats attach to the next data frame; clear once consumed.
-            *last_rssi = None;
-            *last_snr = None;
-            RNodeResponse::Packet(msg)
+                rssi: signal.rssi,
+                snr: signal.snr,
+                q: signal.q,
+            }))
         }
         CMD_STAT_RSSI => {
-            if !frame.is_empty() {
-                *last_rssi = Some(decode_rssi_byte(frame[0]));
+            if let Some(&byte) = frame.first() {
+                signal.rssi = Some(decode_rssi_byte(byte));
             }
             RNodeResponse::None
         }
         CMD_STAT_SNR => {
-            if !frame.is_empty() {
-                *last_snr = Some(decode_snr_byte(frame[0]));
+            if let Some(&byte) = frame.first() {
+                let snr = decode_snr_byte(byte);
+                signal.snr = Some(snr);
+                // Python keeps the old quality until the device has reported its SF.
+                if let Some(spreading_factor) = spreading_factor {
+                    signal.q = Some(signal_quality(snr, spreading_factor));
+                }
             }
             RNodeResponse::None
         }
         CMD_READY => {
-            let is_ready = frame.first().copied().unwrap_or(0) != 0;
-            RNodeResponse::Ready(is_ready)
+            if frame.is_empty() {
+                RNodeResponse::None
+            } else {
+                RNodeResponse::Ready
+            }
         }
         CMD_DETECT => {
             if frame.first().copied() == Some(DETECT_RESP) {
@@ -3705,10 +3747,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
         let mut snapshot_publisher = initial_snapshot_publisher;
         let _stop_guard = stop_guard;
         let mut next_generation = initial_generation;
-        // Python keeps r_stat_rssi/snr/q on the interface across frames and reconnects.
-        let mut last_rssi: Option<f32> = None;
-        let mut last_snr: Option<f32> = None;
-        let mut last_q: Option<f32> = None;
+        let mut signal = RNodeSignalStats::default();
         if next_generation.is_none() {
             tokio::select! {
                 _ = stop_rx.recv() => {
@@ -4033,6 +4072,8 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
             let mut transport_closed = false;
             let mut stop_requested = false;
             let mut read_task_failed = false;
+            let mut hardware_failure = false;
+            let mut io_failed = false;
             let mut configuration_rejected = None;
 
             loop {
@@ -4046,6 +4087,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                 }
                 if generation_writer.task.is_finished() || !carrier_online_r.load(Ordering::SeqCst)
                 {
+                    io_failed = true;
                     break;
                 }
                 became_ready |= online_r.load(Ordering::SeqCst);
@@ -4065,7 +4107,6 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                         port_r = p;
                         buf = b;
                         if n > 0 {
-                            let mut hardware_failure = false;
                             for (cmd, frame) in deframer.feed(&buf[..n]) {
                                 match (cmd, frame.as_slice()) {
                                     (CMD_PLATFORM, [value]) => platform = Some(*value),
@@ -4102,26 +4143,14 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                                 // packet gate reflect the same reducer state.
                                 sync_rnode_interface_online(&online_r, &protocol_state);
                                 snapshot_publisher.protocol_effect(&protocol_state, effect);
-                                // Python keeps the last RSSI/SNR across packets, so the
-                                // decoder's per-packet clearing is not written back.
-                                let mut frame_rssi = last_rssi;
-                                let mut frame_snr = last_snr;
-                                let response = process_rnode_response(
+                                match process_rnode_response(
                                     cmd,
                                     &frame,
                                     id,
-                                    &mut frame_rssi,
-                                    &mut frame_snr,
-                                );
-                                if cmd != kiss::CMD_DATA {
-                                    last_rssi = frame_rssi;
-                                    last_snr = frame_snr;
-                                }
-                                match response {
-                                    RNodeResponse::Packet(mut msg) => {
-                                        if let TransportMessage::Inbound(packet) = &mut msg {
-                                            packet.q = last_q;
-                                        }
+                                    &mut signal,
+                                    protocol_state.evidence().spreading_factor,
+                                ) {
+                                    RNodeResponse::Packet(msg) => {
                                         rxb_r.fetch_add(
                                             frame.len() as u64,
                                             std::sync::atomic::Ordering::Relaxed,
@@ -4132,20 +4161,8 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                                             break;
                                         }
                                     }
-                                    RNodeResponse::Ready(_) => {
-                                        apply_rnode_ready_permit(&ready, &frame);
-                                    }
-                                    RNodeResponse::None => {
-                                        if cmd == CMD_STAT_SNR
-                                            && let Some(snr) = last_snr
-                                        {
-                                            let sf = protocol_state
-                                                .evidence()
-                                                .spreading_factor
-                                                .unwrap_or(task_config.spreading_factor);
-                                            last_q = Some(signal_quality(snr, sf));
-                                        }
-                                    }
+                                    RNodeResponse::Ready => ready.store(true, Ordering::SeqCst),
+                                    RNodeResponse::None => {}
                                 }
                             }
                             if transport_closed || hardware_failure {
@@ -4168,6 +4185,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                     }
                     Ok(Err((_port, e))) => {
                         tracing::warn!(error = %e, "RNode read error");
+                        io_failed = true;
                         break;
                     }
                     Err(e) => {
@@ -4204,7 +4222,11 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                 return;
             }
 
-            snapshot_publisher.connection_lost();
+            if rnode_session_hardware_failure(transport, hardware_failure, io_failed) {
+                snapshot_publisher.connection_failed();
+            } else {
+                snapshot_publisher.connection_lost();
+            }
             tracing::info!(name = %task_name, "RNode reconnecting");
             tokio::select! {
                 _ = stop_rx.recv() => {
@@ -4622,14 +4644,12 @@ mod tests {
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     fn apply_scripted_ready_frame(ready: &AtomicBool, frame: &[u8]) {
-        let mut last_rssi = None;
-        let mut last_snr = None;
-        let RNodeResponse::Ready(_) =
-            process_rnode_response(CMD_READY, frame, 0x5C71, &mut last_rssi, &mut last_snr)
-        else {
-            panic!("CMD_READY must produce a readiness response");
-        };
-        apply_rnode_ready_permit(ready, frame);
+        let mut signal = RNodeSignalStats::default();
+        if let RNodeResponse::Ready =
+            process_rnode_response(CMD_READY, frame, 0x5C71, &mut signal, None)
+        {
+            ready.store(true, Ordering::SeqCst);
+        }
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -4910,11 +4930,10 @@ mod tests {
         assert_eq!(decode_snr_byte(20), 5.0);
         assert_eq!(decode_snr_byte(0xF6), -2.5); // -10 as i8
 
-        let mut rssi = None;
-        let mut snr = None;
-        let resp = process_rnode_response(CMD_STAT_RSSI, &[67], 0, &mut rssi, &mut snr);
+        let mut signal = RNodeSignalStats::default();
+        let resp = process_rnode_response(CMD_STAT_RSSI, &[67], 0, &mut signal, None);
         assert!(matches!(resp, RNodeResponse::None));
-        assert_eq!(rssi, Some(-90.0));
+        assert_eq!(signal.rssi, Some(-90.0));
     }
 
     #[test]
@@ -8591,6 +8610,8 @@ mod tests {
             disconnected.reason,
             Some(RNodeRuntimeReason::ConnectionLost)
         );
+        // Python's loop only exits when the TCP connection drops.
+        assert_eq!(disconnected.hardware_failure_total, 0);
         assert_protocol_observations_unknown(&disconnected);
 
         assert_eq!(
@@ -8615,6 +8636,158 @@ mod tests {
         let _ = spawned.interface.read_task.await;
         release_second_tx.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[test]
+    fn hardware_failures_are_device_faults_and_failed_serial_ports() {
+        use RNodeTransportClass::{Serial, Tcp};
+        for transport in [Serial, Tcp] {
+            assert!(rnode_session_hardware_failure(transport, true, false));
+            assert!(!rnode_session_hardware_failure(transport, false, false));
+        }
+        assert!(rnode_session_hardware_failure(Serial, false, true));
+        assert!(!rnode_session_hardware_failure(Tcp, false, true));
+    }
+
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test]
+    async fn test_rnode_driver_counts_a_reported_hardware_error_and_reconnects() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = RNodeConfig::new("rnode-hardware-error", &format!("tcp://{addr}"));
+        let target = RNodeProtocolTarget::new(
+            config.frequency,
+            config.bandwidth,
+            config.spreading_factor,
+            config.coding_rate,
+            config.tx_power,
+        );
+        let expected_startup = tcp_startup_bytes(&config);
+        let (fault_tx, fault_rx) = std::sync::mpsc::channel();
+        let (reconnected_tx, mut reconnected_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            first
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            assert_eq!(
+                read_exact_tcp(&mut first, expected_startup.len()),
+                expected_startup
+            );
+            let mut ready_frames = Vec::new();
+            for (command, payload) in protocol_required_frames(target)
+                .into_iter()
+                .chain(post_radio_on_echoes(target))
+            {
+                kiss::frame_with_command_into(command, &payload, &mut ready_frames);
+            }
+            std::io::Write::write_all(&mut first, &ready_frames).unwrap();
+            fault_rx.recv_timeout(Duration::from_secs(6)).unwrap();
+            std::io::Write::write_all(
+                &mut first,
+                &kiss::frame_with_command(CMD_ERROR, &[ERROR_TXFAILED]),
+            )
+            .unwrap();
+
+            let (mut second, _) = listener.accept().unwrap();
+            second
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            assert_eq!(
+                read_exact_tcp(&mut second, expected_startup.len()),
+                expected_startup
+            );
+            reconnected_tx.send(()).unwrap();
+        });
+
+        let id = 0xE0F2;
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let spawned = spawn_rnode_interface_with_driver(config, id, transport_tx)
+            .await
+            .unwrap();
+        spawned.interface.owner.mark_registered();
+        let mut state = spawned.driver.watch();
+        let ready = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.phase == RNodeRuntimePhase::Ready
+        })
+        .await;
+        assert_eq!(ready.hardware_failure_total, 0);
+
+        fault_tx.send(()).unwrap();
+        let failed = wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.phase == RNodeRuntimePhase::ReconnectBackoff
+        })
+        .await;
+        assert_eq!(failed.hardware_failure_total, 1);
+        assert_eq!(failed.disconnect_total, 1);
+
+        tokio::time::timeout(Duration::from_secs(10), reconnected_rx.recv())
+            .await
+            .expect("the driver must keep reconnecting after a hardware error")
+            .unwrap();
+        stop_rnode_interface(id);
+        let _ = spawned.interface.read_task.await;
+        server.join().unwrap();
+    }
+
+    // macOS pseudo terminals refuse the baud-rate ioctl the driver's open issues.
+    #[cfg(all(feature = "serial", target_os = "linux"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_rnode_driver_counts_a_failed_serial_port() {
+        use serialport::SerialPort;
+        use std::io::{Read, Write};
+
+        let (mut master, slave) = serialport::TTYPort::pair().unwrap();
+        let config = RNodeConfig::new("rnode-serial-failure", &slave.name().unwrap());
+        let target = RNodeProtocolTarget::new(
+            config.frequency,
+            config.bandwidth,
+            config.spreading_factor,
+            config.coding_rate,
+            config.tx_power,
+        );
+        let expected_startup = tcp_startup_bytes(&config);
+        let (unplug_tx, unplug_rx) = std::sync::mpsc::channel::<()>();
+        let device = std::thread::spawn(move || {
+            master.set_timeout(Duration::from_secs(8)).unwrap();
+            let mut startup = vec![0; expected_startup.len()];
+            master.read_exact(&mut startup).unwrap();
+            assert_eq!(startup, expected_startup);
+            let mut ready_frames = Vec::new();
+            for (command, payload) in protocol_required_frames(target)
+                .into_iter()
+                .chain(post_radio_on_echoes(target))
+            {
+                kiss::frame_with_command_into(command, &payload, &mut ready_frames);
+            }
+            master.write_all(&ready_frames).unwrap();
+            unplug_rx.recv_timeout(Duration::from_secs(8)).unwrap();
+        });
+
+        let id = 0xE0F3;
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let spawned = spawn_rnode_interface_with_driver(config, id, transport_tx)
+            .await
+            .unwrap();
+        spawned.interface.owner.mark_registered();
+        let mut state = spawned.driver.watch();
+        wait_for_rnode_snapshot(&mut state, |snapshot| {
+            snapshot.phase == RNodeRuntimePhase::Ready
+        })
+        .await;
+
+        // The thread drops the master end: the port is gone, as when unplugged.
+        unplug_tx.send(()).unwrap();
+        device.join().unwrap();
+        let failed =
+            wait_for_rnode_snapshot(&mut state, |snapshot| snapshot.disconnect_total == 1).await;
+        assert_eq!(failed.hardware_failure_total, 1);
+
+        stop_rnode_interface(id);
+        let _ = spawned.interface.read_task.await;
+        drop(slave);
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]

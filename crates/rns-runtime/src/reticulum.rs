@@ -159,6 +159,7 @@ struct RuntimeShutdownInner {
     interface_registry: InterfaceRegistry,
     accepted_child_pump: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     owned_control_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    interface_panic: Arc<std::sync::OnceLock<String>>,
 }
 
 impl RuntimeShutdownCoordinator {
@@ -181,6 +182,7 @@ impl RuntimeShutdownCoordinator {
                 interface_registry,
                 accepted_child_pump: std::sync::Mutex::new(None),
                 owned_control_task: std::sync::Mutex::new(None),
+                interface_panic: Arc::default(),
             }),
         }
     }
@@ -1340,6 +1342,16 @@ impl ReticulumHandle {
         self.shutdown_coordinator.start_and_wait().await;
     }
 
+    /// The interface whose hardware failure shut this runtime down under
+    /// `panic_on_interface_error`, where Python calls `RNS.panic()`.
+    pub fn interface_panic(&self) -> Option<&str> {
+        self.shutdown_coordinator
+            .inner
+            .interface_panic
+            .get()
+            .map(String::as_str)
+    }
+
     /// Wait for the local actor to confirm a current path, requesting one if
     /// needed. One deadline covers mailbox admission and reply waiting. Success
     /// is a routing observation, not proof that the destination application
@@ -2411,21 +2423,27 @@ pub enum InstanceMode {
     Standalone,
 }
 
-/// Shared-instance transport. The default is AF_UNIX on Linux/Android and
-/// TCP loopback elsewhere. Explicit Unix selection uses filesystem sockets
-/// on other supported Unix hosts; abstract names are Linux/Android-specific.
+/// Shared-instance transport. As in Python, it is AF_UNIX on Linux/Android
+/// unless TCP is requested, and TCP loopback everywhere else, where a Unix
+/// request is served over TCP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharedInstanceType {
     /// TCP loopback on [`ReticulumConfig::shared_instance_port`].
     Tcp,
-    /// AF_UNIX socket; Linux/Android use Python-compatible abstract names.
+    /// AF_UNIX socket with Python-compatible abstract names.
     Unix,
 }
 
 impl SharedInstanceType {
     fn platform_default() -> Self {
-        if cfg!(any(target_os = "linux", target_os = "android")) {
-            Self::Unix
+        Self::Unix.on_this_platform()
+    }
+
+    /// Python forces TCP wherever `platformutils.use_af_unix()` is false
+    /// (Reticulum.py:815-820): only Linux and Android have abstract sockets.
+    fn on_this_platform(self) -> Self {
+        if cfg!(target_os = "linux") || rns_interface::local::is_android() {
+            self
         } else {
             Self::Tcp
         }
@@ -2438,6 +2456,7 @@ pub struct InitOptions {
     /// Python `require_shared_instance`: fail startup rather than become the shared instance.
     pub require_shared_instance: bool,
     /// Override the configured shared-instance transport for this process.
+    /// A Unix request still becomes TCP off Linux/Android.
     pub shared_instance_type: Option<SharedInstanceType>,
     /// Python `Reticulum(enable_stamping=True)`: stamp emitted announces, path
     /// requests and link requests. `false` never clears a configured switch.
@@ -2944,7 +2963,9 @@ impl ReticulumConfig {
             if let Some(kind) = sec.get("shared_instance_type") {
                 match kind.trim().to_lowercase().as_str() {
                     "tcp" => rc.shared_instance_type = SharedInstanceType::Tcp,
-                    "unix" => rc.shared_instance_type = SharedInstanceType::Unix,
+                    "unix" => {
+                        rc.shared_instance_type = SharedInstanceType::Unix.on_this_platform();
+                    }
                     _ => {}
                 }
             }
@@ -3089,7 +3110,7 @@ impl ReticulumConfig {
             self.stamps.enforce();
         }
         if let Some(shared_instance_type) = options.shared_instance_type {
-            self.shared_instance_type = shared_instance_type;
+            self.shared_instance_type = shared_instance_type.on_this_platform();
         }
     }
 
@@ -3871,6 +3892,11 @@ pub async fn init_with_policy(
                 Ok(iface_handles) => {
                     let pending_rnode =
                         pending_configured_rnode_runtime(iface_config, &iface_handles);
+                    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+                    let hardware_failures: Vec<_> = iface_handles
+                        .iter()
+                        .filter_map(|owned| owned.hardware_failures.clone())
+                        .collect();
                     let discovery_online: HashMap<_, _> = iface_handles
                         .iter()
                         .map(|owned| (owned.interface.id, owned.interface.online.clone()))
@@ -3898,6 +3924,16 @@ pub async fn init_with_policy(
                                 pending_rnode.and_then(|pending| pending.commit(&registered_ids))
                             {
                                 startup_rnode_runtimes.push(runtime);
+                            }
+                            #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+                            if rc.panic_on_interface_error {
+                                for failures in hardware_failures {
+                                    spawn_interface_panic_monitor(
+                                        interface_config_name(iface_config).to_string(),
+                                        failures,
+                                        &shutdown_coordinator,
+                                    );
+                                }
                             }
                             if let Some((host, port)) = configured_client_target(iface_config) {
                                 for &registered_id in &registered_ids {
@@ -4320,6 +4356,68 @@ struct OwnedInterfaceHandle {
     configured_peer: Option<rns_transport::ingress::IngressOverrides>,
     /// The address a discoverable interface learns at runtime (I2P b32).
     discovery_address: Option<tokio::sync::watch::Receiver<Option<String>>>,
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    hardware_failures: Option<HardwareFailureWatch>,
+}
+
+/// A hardware driver's count of the failures Python answers with
+/// `RNS.panic()` when `panic_on_interface_error` is set.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[derive(Clone)]
+enum HardwareFailureWatch {
+    RNode(rns_interface::rnode::RNodeDriverSubscription),
+    #[cfg(feature = "serial")]
+    RNodeMulti(rns_interface::rnode_multi::RNodeMultiFailures),
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+impl HardwareFailureWatch {
+    /// True at the first failure, false if the driver ends without one.
+    async fn failed(&mut self) -> bool {
+        loop {
+            let total = match self {
+                Self::RNode(state) => state.snapshot().hardware_failure_total,
+                #[cfg(feature = "serial")]
+                Self::RNodeMulti(failures) => failures.total(),
+            };
+            if total > 0 {
+                return true;
+            }
+            let running = match self {
+                Self::RNode(state) => state.changed().await.is_some(),
+                #[cfg(feature = "serial")]
+                Self::RNodeMulti(failures) => failures.changed().await.is_some(),
+            };
+            if !running {
+                return false;
+            }
+        }
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn spawn_interface_panic_monitor(
+    name: String,
+    mut failures: HardwareFailureWatch,
+    coordinator: &RuntimeShutdownCoordinator,
+) {
+    let shutdown = coordinator.inner.shutdown.clone();
+    let interface_panic = coordinator.inner.interface_panic.clone();
+    tokio::spawn(async move {
+        let failed = tokio::select! {
+            biased;
+            _ = shutdown.wait() => false,
+            failed = failures.failed() => failed,
+        };
+        if failed {
+            tracing::error!(
+                interface = %name,
+                "interface failed and panic_on_interface_error is set, shutting down"
+            );
+            let _ = interface_panic.set(name);
+            shutdown.trigger();
+        }
+    });
 }
 
 /// Startup-only observation captured before ownership moves into the
@@ -4403,6 +4501,8 @@ impl From<rns_interface::traits::InterfaceHandle> for OwnedInterfaceHandle {
             driver: None,
             configured_peer: None,
             discovery_address: None,
+            #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+            hardware_failures: None,
         }
     }
 }
@@ -4414,6 +4514,8 @@ impl From<rns_interface::rnode::SpawnedRNodeInterface> for OwnedInterfaceHandle 
             driver: Some(spawned.driver),
             configured_peer: None,
             discovery_address: None,
+            #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+            hardware_failures: None,
         }
     }
 }
@@ -7988,6 +8090,13 @@ pub async fn spawn_rnode_runtime_observed_with_options(
     .map_err(|error| {
         RNodeRuntimeSpawnError::Registration(format!("RNode registration failed: {error}"))
     })?;
+    if handle.config.panic_on_interface_error {
+        spawn_interface_panic_monitor(
+            name.to_string(),
+            HardwareFailureWatch::RNode(state.clone()),
+            &handle.shutdown_coordinator,
+        );
+    }
     tracing::info!(name = %name, id, "runtime RNode interface spawned");
     Ok(SpawnedRNodeRuntime {
         interface_id: id,
@@ -8779,7 +8888,13 @@ async fn spawn_interface_with_rnode_startup_options(
                     rnode_startup_options,
                 )
                 .await
-                .map(|spawned| vec![spawned.into()])
+                .map(|spawned| {
+                    let failures = HardwareFailureWatch::RNode(spawned.driver.watch());
+                    vec![OwnedInterfaceHandle {
+                        hardware_failures: Some(failures),
+                        ..spawned.into()
+                    }]
+                })
                 .map_err(|e| format!("RNode: {e}"))
             }
 
@@ -8918,13 +9033,19 @@ async fn spawn_interface_with_rnode_startup_options(
             for _ in 0..multi_config.subinterfaces.len() {
                 sub_ids.push(id_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
             }
-            rns_interface::rnode_multi::spawn_rnode_multi_interface(
+            rns_interface::rnode_multi::spawn_rnode_multi_interface_observed(
                 multi_config,
                 &sub_ids,
                 transport_tx,
             )
             .await
-            .map(|handles| handles.into_iter().map(Into::into).collect())
+            .map(|spawned| {
+                let mut handles: Vec<OwnedInterfaceHandle> =
+                    spawned.handles.into_iter().map(Into::into).collect();
+                handles[0].hardware_failures =
+                    Some(HardwareFailureWatch::RNodeMulti(spawned.failures));
+                handles
+            })
             .map_err(|e| format!("RNodeMulti: {e}"))
         }
         #[cfg(feature = "serial")]
@@ -9189,7 +9310,8 @@ mod tests {
     mod tunnels;
 
     async fn wait_for_registry_len(registry: &InterfaceRegistry, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        // An RNode registers only after its 2 s post-open settle.
+        tokio::time::timeout(Duration::from_secs(5), async {
             while registry.len() != expected {
                 tokio::task::yield_now().await;
             }
@@ -11283,12 +11405,40 @@ loglevel = 7
         assert_eq!(rc.shared_instance_type, SharedInstanceType::Tcp);
     }
 
+    /// Python Reticulum.py:815-820: Unix sockets serve the shared instance
+    /// only where `platformutils.use_af_unix()` holds, whatever was requested.
+    fn python_unix_request() -> SharedInstanceType {
+        if cfg!(target_os = "linux") || rns_interface::local::is_android() {
+            SharedInstanceType::Unix
+        } else {
+            SharedInstanceType::Tcp
+        }
+    }
+
     #[test]
     fn test_shared_instance_type_explicit_unix() {
         let input = "[reticulum]\nshared_instance_type = Unix\n";
         let config = Config::parse(input).unwrap();
         let rc = ReticulumConfig::from_config(&config);
-        assert_eq!(rc.shared_instance_type, SharedInstanceType::Unix);
+        assert_eq!(rc.shared_instance_type, python_unix_request());
+    }
+
+    #[test]
+    fn test_shared_instance_type_absent_is_the_platform_carrier() {
+        let config = Config::parse("[reticulum]\ninstance_name = other\n").unwrap();
+        let rc = ReticulumConfig::from_config(&config);
+        assert_eq!(rc.shared_instance_type, python_unix_request());
+    }
+
+    #[test]
+    fn test_shared_instance_type_option_follows_the_platform_rule() {
+        let config = Config::parse("[reticulum]\nshared_instance_type = tcp\n").unwrap();
+        let mut rc = ReticulumConfig::from_config(&config);
+        rc.apply_init_options(&InitOptions {
+            shared_instance_type: Some(SharedInstanceType::Unix),
+            ..InitOptions::default()
+        });
+        assert_eq!(rc.shared_instance_type, python_unix_request());
     }
 
     #[test]
@@ -15742,6 +15892,90 @@ enabled = yes
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Start a runtime on one RNode that reports a radio fault once it is up.
+    #[cfg(feature = "rnode-tcp")]
+    async fn init_with_faulting_rnode(
+        panic_on_interface_error: &str,
+    ) -> (ReticulumHandle, ShutdownSignal, PathBuf) {
+        use rns_interface::{kiss, rnode};
+
+        let template = rnode::RNodeConfig::new("Faulting RNode", "tcp://127.0.0.1:1");
+        let settings = rnode::RNodeRadioSettings::from(&template);
+        let mut responses = test_ready_rnode_tcp_responses(settings);
+        kiss::frame_with_command_into(rnode::CMD_ERROR, &[rnode::ERROR_INITRADIO], &mut responses);
+        let (port, _closed_rx, _peer) = test_rnode_tcp_peer_with_responses(responses);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("reticulum_rs_faulting_rnode_{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config"),
+            format!(
+                "[reticulum]\nshare_instance = No\nenable_transport = No\npanic_on_interface_error = {panic_on_interface_error}\n\n[interfaces]\n\n[[Faulting RNode]]\ntype = RNodeInterface\nenabled = Yes\nport = {port}\nfrequency = {}\nbandwidth = {}\nspreadingfactor = {}\ncodingrate = {}\ntxpower = {}\n",
+                template.frequency,
+                template.bandwidth,
+                template.spreading_factor,
+                template.coding_rate,
+                template.tx_power,
+            ),
+        )
+        .unwrap();
+
+        let shutdown = ShutdownSignal::new();
+        let handle = init(
+            Some(dir.to_str().unwrap()),
+            None,
+            shutdown.clone(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .expect("faulting RNode init");
+        (handle, shutdown, dir)
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn rnode_hardware_failure_stops_the_runtime_when_panic_on_interface_error_is_set() {
+        let (handle, shutdown, dir) = init_with_faulting_rnode("Yes").await;
+
+        tokio::time::timeout(Duration::from_secs(5), shutdown.wait())
+            .await
+            .expect("an RNode hardware failure must take the runtime down");
+        handle.shutdown_and_wait().await;
+        assert_eq!(handle.interface_panic(), Some("Faulting RNode"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    #[tokio::test]
+    async fn rnode_hardware_failure_only_reconnects_without_panic_on_interface_error() {
+        use rns_interface::rnode::RNodeRuntimePhase;
+
+        let (handle, shutdown, dir) = init_with_faulting_rnode("No").await;
+        let mut observer = handle.startup_rnode_runtimes().remove(0).observer;
+
+        let failed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = observer.snapshot();
+                if snapshot.hardware_failure_total == 1 {
+                    return snapshot;
+                }
+                observer.changed().await.expect("RNode driver ended");
+            }
+        })
+        .await
+        .expect("the RNode hardware failure was not observed");
+        assert_eq!(failed.phase, RNodeRuntimePhase::ReconnectBackoff);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!shutdown.is_triggered());
+        assert_eq!(handle.interface_panic(), None);
+
+        handle.shutdown_and_wait().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn configured_rnode_results_exclude_non_rnode() {
         let handle = dummy_handle();
@@ -15903,6 +16137,79 @@ enabled = yes
         owner.shutdown_and_wait().await;
         let _ = std::fs::remove_dir_all(&owner_dir);
         let _ = std::fs::remove_dir_all(&client_dir);
+    }
+
+    #[tokio::test]
+    async fn unix_shared_instance_request_uses_the_platform_carrier() {
+        use crate::rpc::{RpcRequest, RpcResponse};
+
+        let (port, control_port) = free_tcp_port_pair().await;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir_a = std::env::temp_dir().join(format!("reticulum_rs_unix_request_a_{nonce}"));
+        let dir_b = std::env::temp_dir().join(format!("reticulum_rs_unix_request_b_{nonce}"));
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let rpc_key = [0x42u8; 32];
+        let cfg = format!(
+            "[reticulum]\nshare_instance = Yes\ninstance_name = unixreq{nonce}\nshared_instance_type = unix\nshared_instance_port = {port}\ninstance_control_port = {control_port}\nrpc_key = {}\nenable_transport = No\n\n[interfaces]\n",
+            hex::encode(rpc_key)
+        );
+        std::fs::write(dir_a.join("config"), &cfg).unwrap();
+        std::fs::write(dir_b.join("config"), &cfg).unwrap();
+
+        let owner = init(
+            Some(dir_a.to_str().unwrap()),
+            None,
+            ShutdownSignal::new(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(owner.instance_mode, InstanceMode::Shared);
+        assert_eq!(owner.config.shared_instance_type, python_unix_request());
+
+        let client = init(
+            Some(dir_b.to_str().unwrap()),
+            None,
+            ShutdownSignal::new(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.instance_mode, InstanceMode::Client);
+
+        // A tool reading the same file must reach the owner's control socket.
+        let tool = ReticulumConfig::from_config(&Config::parse(&cfg).unwrap());
+        let request = RpcRequest::GetInterfaceStats;
+        let timeout = Duration::from_secs(3);
+        let on_tcp = python_unix_request() == SharedInstanceType::Tcp;
+        let response = match tool.shared_rpc_endpoint(&std::env::temp_dir()) {
+            SharedInstanceRpcEndpoint::Tcp(tool_port) => {
+                assert!(on_tcp);
+                assert_eq!(tool_port, control_port);
+                crate::rpc::connect_and_request(tool_port, &rpc_key, &request, timeout).await
+            }
+            SharedInstanceRpcEndpoint::Unix(path) => {
+                assert!(!on_tcp);
+                crate::rpc::connect_unix_and_request(&path, &rpc_key, &request, timeout).await
+            }
+        };
+        assert!(matches!(response, Ok(RpcResponse::InterfaceStats(_))));
+        assert_eq!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok(),
+            on_tcp,
+            "the packet socket is TCP exactly where Python's is"
+        );
+
+        client.shutdown_and_wait().await;
+        owner.shutdown_and_wait().await;
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     #[tokio::test]
