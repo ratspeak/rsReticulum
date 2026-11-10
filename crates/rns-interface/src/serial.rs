@@ -16,6 +16,7 @@ use rns_transport::messages::{InboundPacket, TransportMessage};
 pub const DEFAULT_BAUD: u32 = 9600;
 
 const SERIAL_READ_TIMEOUT_MS: u64 = 100;
+const HW_MTU: usize = 564;
 
 /// Open with DTR and RTS asserted, as POSIX `open()` and pyserial do. Windows
 /// otherwise leaves both low, and TinyUSB CDC (nRF52 RNodes) sends nothing
@@ -165,8 +166,9 @@ pub async fn spawn_serial_interface(
     let rxb_r = shared_rxb.clone();
     let read_task = tokio::spawn(async move {
         let mut port_r = port;
-        let mut deframer = hdlc::HdlcDeframer::new();
+        let mut deframer = hdlc::HdlcByteDeframer::new(HW_MTU);
         let mut buf = [0u8; 1024];
+        let mut last_read = std::time::Instant::now();
 
         loop {
             if !online_r.load(Ordering::SeqCst) {
@@ -176,12 +178,16 @@ pub async fn spawn_serial_interface(
                 Ok((p, b, n)) => {
                     port_r = p;
                     buf = b;
-                    if n > 0 {
+                    if n == 0 {
+                        if deframer.buffered() > 0
+                            && last_read.elapsed() > Duration::from_millis(SERIAL_READ_TIMEOUT_MS)
+                        {
+                            deframer.reset();
+                        }
+                    } else {
+                        last_read = std::time::Instant::now();
                         rxb_r.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                         for frame in deframer.feed(&buf[..n]) {
-                            if frame.is_empty() {
-                                continue;
-                            }
                             let msg = TransportMessage::Inbound(InboundPacket {
                                 raw: Bytes::from(frame),
                                 interface_id: id,

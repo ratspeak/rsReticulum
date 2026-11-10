@@ -173,7 +173,7 @@ pub async fn spawn_pipe_interface(
     let read_task = tokio::spawn(async move {
         let (mut child, mut stdin, mut stdout) = first;
         loop {
-            let mut deframer = hdlc::HdlcDeframer::new();
+            let mut deframer = hdlc::HdlcByteDeframer::new(HW_MTU as usize);
             let mut buf = [0u8; 2048];
             loop {
                 tokio::select! {

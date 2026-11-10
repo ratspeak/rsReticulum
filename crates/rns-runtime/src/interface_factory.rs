@@ -316,7 +316,7 @@ pub struct BackboneInterfaceConfig {
 fn parse_interface_mode(s: &str) -> Option<InterfaceMode> {
     match s.to_lowercase().as_str() {
         "full" => Some(InterfaceMode::Full),
-        "pointtopoint" | "point_to_point" => Some(InterfaceMode::PointToPoint),
+        "pointtopoint" | "ptp" | "point_to_point" => Some(InterfaceMode::PointToPoint),
         "access_point" | "accesspoint" | "ap" => Some(InterfaceMode::AccessPoint),
         "roaming" => Some(InterfaceMode::Roaming),
         "boundary" => Some(InterfaceMode::Boundary),
@@ -487,6 +487,96 @@ fn parse_duration_strict(
     })
 }
 
+/// Python `int()` on a config scalar: surrounding whitespace, a sign and
+/// single underscores between digits are accepted.
+fn python_int(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+    if digits.is_empty()
+        || digits.starts_with('_')
+        || digits.ends_with('_')
+        || digits.contains("__")
+        || !digits.bytes().all(|b| b.is_ascii_digit() || b == b'_')
+    {
+        return None;
+    }
+    let value: i64 = digits.replace('_', "").parse().ok()?;
+    Some(if s.starts_with('-') { -value } else { value })
+}
+
+fn invalid_scalar(field: &str, expected: &str) -> InterfaceFactoryError {
+    InterfaceFactoryError::InvalidValue {
+        field: field.into(),
+        message: format!("expected {expected}"),
+    }
+}
+
+/// ConfigObj `as_int`: a present key that is not an integer is an error.
+fn config_int(section: &ConfigSection, field: &str) -> Result<Option<i64>, InterfaceFactoryError> {
+    if !section.has(field) {
+        return Ok(None);
+    }
+    section
+        .get(field)
+        .and_then(python_int)
+        .map(Some)
+        .ok_or_else(|| invalid_scalar(field, "an integer"))
+}
+
+/// ConfigObj `as_float`: a present key that is not a number is an error.
+fn config_float(
+    section: &ConfigSection,
+    field: &str,
+) -> Result<Option<f64>, InterfaceFactoryError> {
+    if !section.has(field) {
+        return Ok(None);
+    }
+    section
+        .get_float(field)
+        .map(Some)
+        .ok_or_else(|| invalid_scalar(field, "a numeric scalar"))
+}
+
+/// ConfigObj `as_bool`: a present key that is not a boolean is an error.
+fn config_bool(
+    section: &ConfigSection,
+    field: &str,
+) -> Result<Option<bool>, InterfaceFactoryError> {
+    if !section.has(field) {
+        return Ok(None);
+    }
+    section
+        .get_bool(field)
+        .map(Some)
+        .ok_or_else(|| invalid_scalar(field, "a boolean value"))
+}
+
+/// A per-interface ingress duration in seconds. Upstream only adds it to the
+/// current time, so a negative value acts exactly as zero.
+fn config_ingress_duration(
+    section: &ConfigSection,
+    field: &str,
+) -> Result<Option<f64>, InterfaceFactoryError> {
+    Ok(config_float(section, field)?.map(|v| v.max(0.0)))
+}
+
+/// IFAC size in bytes. A plain `ifac_size` is bits as in Python: values of at
+/// least 8 are floor-divided by 8, smaller values select the class default.
+/// `ifac_size_unit` and `ifac_size_bytes` keep their stricter parser.
+fn parse_ifac_size(section: &ConfigSection) -> Result<Option<usize>, InterfaceFactoryError> {
+    if section.has("ifac_size") && !section.has("ifac_size_unit") && !section.has("ifac_size_bytes")
+    {
+        let bits = config_int(section, "ifac_size")?.expect("present key");
+        return Ok((bits >= 8).then(|| usize::try_from(bits / 8).unwrap_or(usize::MAX)));
+    }
+    crate::config::ifac::parse_ifac_size(section).map_err(|error| {
+        InterfaceFactoryError::InvalidValue {
+            field: "ifac_size".into(),
+            message: error.to_string(),
+        }
+    })
+}
+
 /// Parse an enabled interface section into a built-in driver configuration.
 /// No device, socket or subprocess is opened here. Performs IFAC-size and
 /// ingress-override validation; callers starting a driver must also apply
@@ -515,13 +605,24 @@ pub fn synthesize_interface(
 
     // Validate every explicit size even when credentials are currently absent.
     // A fully disabled section retains its existing skipped behavior above.
-    crate::config::ifac::parse_ifac_size(section).map_err(|error| {
-        InterfaceFactoryError::InvalidValue {
-            field: format!("{name}.ifac_size"),
-            message: error.to_string(),
+    parse_ifac_size(section).map_err(|error| match error {
+        InterfaceFactoryError::InvalidValue { message, .. } => {
+            InterfaceFactoryError::InvalidValue {
+                field: format!("{name}.ifac_size"),
+                message,
+            }
         }
+        other => other,
     })?;
     InterfacePostInit::try_from_section(section)?;
+    if !section.has("ifac_size_unit")
+        && section
+            .get("ifac_size")
+            .and_then(python_int)
+            .is_some_and(|bits| (1..=64).contains(&bits))
+    {
+        warn!(interface = %name, "ifac_size is read as bits, as in Python");
+    }
     if section.has("ifac_size_bytes") {
         warn!(interface = %name, "legacy ifac_size_bytes; migrate to explicit bits");
     }
@@ -658,7 +759,8 @@ fn synthesize_tcp_client(
                 field: format!("{name}.fixed_mtu"),
                 message: "must be a representable nonnegative integer".into(),
             })?;
-        config.fixed_mtu = Some(mtu);
+        // Python's `if fixed_mtu:` leaves zero unset (TCPInterface.py:110).
+        config.fixed_mtu = (mtu != 0).then_some(mtu);
     }
     if let Some(retries) = section.get_uint("max_reconnect_tries") {
         config.max_reconnect_tries = Some(retries as usize);
@@ -694,9 +796,9 @@ fn ifac_credential(
 }
 
 /// Validate explicit IFAC byte sizes and TCP client `fixed_mtu` before driver
-/// startup. A fixed MTU must be at least 500 and fit the driver wire budget
-/// after active IFAC overhead. This does not validate every interface field;
-/// automatic capacity selection happens during runtime registration.
+/// startup. A fixed MTU must be at least 500 (TCPInterface.py:110-116). This
+/// does not validate every interface field; automatic capacity selection
+/// happens during runtime registration.
 pub fn validate_config_capacity(
     config: &InterfaceConfig,
     post_init: &InterfacePostInit,
@@ -713,25 +815,10 @@ pub fn validate_config_capacity(
     let InterfaceConfig::TcpClient(tcp) = config else {
         return Ok(());
     };
-    let Some(fixed) = tcp.fixed_mtu else {
-        return Ok(());
-    };
-    let active_ifac = post_init.ifac_network_name.is_some() || post_init.ifac_passphrase.is_some();
-    let tag = if active_ifac {
-        post_init.ifac_size.unwrap_or(post_init.default_ifac_size)
-    } else {
-        0
-    };
-    let wire_budget: usize = 262144;
-    let maximum = wire_budget
-        .checked_sub(tag)
-        .filter(|_| !active_ifac || (1..=64).contains(&tag));
-    if fixed < 500 || maximum.is_none_or(|maximum| fixed as u64 > maximum as u64) {
+    if tcp.fixed_mtu.is_some_and(|fixed| fixed < 500) {
         return Err(InterfaceFactoryError::InvalidValue {
             field: format!("{}.fixed_mtu", tcp.name),
-            message: format!(
-                "must be at least 500 and fit the {wire_budget}-byte wire budget with {tag} active IFAC bytes"
-            ),
+            message: "must be at least 500".into(),
         });
     }
     Ok(())
@@ -1765,49 +1852,37 @@ pub struct InterfacePostInit {
 
 impl InterfacePostInit {
     pub fn try_from_section(section: &ConfigSection) -> Result<Self, InterfaceFactoryError> {
-        let ifac_size = crate::config::ifac::parse_ifac_size(section).map_err(|error| {
-            InterfaceFactoryError::InvalidValue {
-                field: "ifac_size".into(),
-                message: error.to_string(),
-            }
-        })?;
-        for field in [
-            "ic_burst_freq_new",
-            "ic_burst_freq",
-            "ic_pr_burst_freq_new",
-            "ic_pr_burst_freq",
-            "ic_new_time",
-            "ic_burst_hold",
-            "ic_burst_penalty",
-            "ic_held_release_interval",
-            "ec_pr_freq",
-            "destination_cost",
-            "pr_cost",
-        ] {
-            if section.has(field) && section.get_float(field).is_none() {
-                return Err(InterfaceFactoryError::InvalidValue {
-                    field: field.into(),
-                    message: "expected a numeric scalar".into(),
-                });
-            }
+        let ifac_size = parse_ifac_size(section)?;
+        for field in ["destination_cost", "pr_cost"] {
+            config_float(section, field)?;
         }
-        let ingress_control = section.get_bool("ingress_control").unwrap_or(true);
-        let announce_rate_target = section.get_uint("announce_rate_target");
+        let ingress_control = config_bool(section, "ingress_control")?.unwrap_or(true);
+        let announce_rate_target = config_int(section, "announce_rate_target")?
+            .filter(|v| *v > 0)
+            .map(|v| v as u64);
+        let announce_rate_grace = config_int(section, "announce_rate_grace")?
+            .filter(|v| *v >= 0)
+            .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+            .or_else(|| announce_rate_target.map(|_| 0));
+        let announce_rate_penalty = config_int(section, "announce_rate_penalty")?
+            .filter(|v| *v >= 0)
+            .map(|v| v as u64)
+            .or_else(|| announce_rate_target.map(|_| 0));
         let ingress_overrides = rns_transport::ingress::IngressOverrides {
             enabled: if ingress_control { None } else { Some(false) },
-            burst_freq_new: section.get_float("ic_burst_freq_new"),
-            burst_freq: section.get_float("ic_burst_freq"),
-            pr_burst_freq_new: section.get_float("ic_pr_burst_freq_new"),
-            pr_burst_freq: section.get_float("ic_pr_burst_freq"),
-            new_time: section.get_float("ic_new_time"),
-            burst_hold: section.get_float("ic_burst_hold"),
-            burst_penalty: section.get_float("ic_burst_penalty"),
-            max_held: section
-                .get_uint("ic_max_held_announces")
-                .map(|v| v as usize),
-            held_release_interval: section.get_float("ic_held_release_interval"),
-            ec_pr_freq: section.get_float("ec_pr_freq"),
-            egress_control: section.get_bool("egress_control"),
+            burst_freq_new: config_float(section, "ic_burst_freq_new")?,
+            burst_freq: config_float(section, "ic_burst_freq")?,
+            pr_burst_freq_new: config_float(section, "ic_pr_burst_freq_new")?,
+            pr_burst_freq: config_float(section, "ic_pr_burst_freq")?,
+            new_time: config_ingress_duration(section, "ic_new_time")?,
+            burst_hold: config_ingress_duration(section, "ic_burst_hold")?,
+            burst_penalty: config_ingress_duration(section, "ic_burst_penalty")?,
+            // A negative limit never holds, as in Python.
+            max_held: config_int(section, "ic_max_held_announces")?
+                .map(|v| usize::try_from(v).unwrap_or(0)),
+            held_release_interval: config_ingress_duration(section, "ic_held_release_interval")?,
+            ec_pr_freq: config_float(section, "ec_pr_freq")?,
+            egress_control: config_bool(section, "egress_control")?,
         };
         ingress_overrides
             .validate()
@@ -1815,20 +1890,21 @@ impl InterfacePostInit {
                 field: error.field.into(),
                 message: error.to_string(),
             })?;
+        let bitrate = config_int(section, "bitrate")?
+            .filter(|v| *v >= MINIMUM_BITRATE)
+            .map(|v| v as u64);
+        let announce_cap = config_float(section, "announce_cap")?;
+        let outgoing = config_bool(section, "outgoing")?.unwrap_or(true);
+        let recursive_prs = config_bool(section, "recursive_prs")?.unwrap_or(false);
+        let announces_from_internal =
+            config_bool(section, "announces_from_internal")?.unwrap_or(true);
         Ok(Self {
-            outgoing: section.get_bool("outgoing").unwrap_or(true),
-            bitrate: section.get_uint("bitrate"),
-            announce_cap: section
-                .get_float("announce_cap")
-                .and_then(normalize_announce_cap_percent),
+            outgoing,
+            bitrate,
+            announce_cap: announce_cap.and_then(normalize_announce_cap_percent),
             announce_rate_target,
-            announce_rate_grace: section
-                .get_uint("announce_rate_grace")
-                .map(|v| v as u32)
-                .or_else(|| announce_rate_target.map(|_| 0)),
-            announce_rate_penalty: section
-                .get_uint("announce_rate_penalty")
-                .or_else(|| announce_rate_target.map(|_| 0)),
+            announce_rate_grace,
+            announce_rate_penalty,
             ifac_network_name: ifac_credential(
                 section,
                 "networkname",
@@ -1841,8 +1917,8 @@ impl InterfacePostInit {
             default_ifac_size: 8,
             ingress_control,
             ingress_overrides,
-            recursive_prs: section.get_bool("recursive_prs").unwrap_or(false),
-            announces_from_internal: section.get_bool("announces_from_internal").unwrap_or(true),
+            recursive_prs,
+            announces_from_internal,
             destination_cost: section
                 .get_float("destination_cost")
                 .map(rns_transport::stamps::StampPolicy::clamp_cost),
@@ -1857,6 +1933,9 @@ impl InterfacePostInit {
         self
     }
 }
+
+/// `Reticulum.MINIMUM_BITRATE`: smaller configured bitrates are ignored.
+const MINIMUM_BITRATE: i64 = 5;
 
 fn normalize_announce_cap_percent(value: f64) -> Option<f64> {
     if value > 0.0 && value <= 100.0 {
@@ -2049,22 +2128,32 @@ mod tests {
         }
     }
 
-    /// T1-11: ifac_size outside 1..=64 used to panic the transport actor on
-    /// first egress; it must be a parse-time config error.
+    /// A plain `ifac_size` is bits floor-divided by 8 as in Python; values
+    /// below 8 select the class default and non-integers are config errors.
     #[test]
-    fn test_ifac_size_out_of_range_rejected() {
-        for bad in ["0", "65", "4096"] {
+    fn test_ifac_size_bits_parse_like_python() {
+        for (bits, bytes) in [
+            ("0", None),
+            ("7", None),
+            ("12", Some(1)),
+            ("65", Some(8)),
+            ("4096", Some(512)),
+        ] {
             let mut section = enabled_section();
-            section.set("type", "TCPClientInterface");
-            section.set("target_host", "127.0.0.1");
-            section.set("target_port", "4242");
-            section.set("ifac_size", bad);
-            match synthesize_interface("tcp_ifac", &section) {
-                Err(InterfaceFactoryError::InvalidValue { field, .. }) => {
-                    assert_eq!(field, "tcp_ifac.ifac_size");
-                }
-                other => panic!("expected InvalidValue for ifac_size={bad}, got {other:?}"),
+            section.set("ifac_size", bits);
+            let post = InterfacePostInit::try_from_section(&section).unwrap();
+            assert_eq!(post.ifac_size, bytes, "ifac_size = {bits}");
+        }
+        let mut section = enabled_section();
+        section.set("type", "TCPClientInterface");
+        section.set("target_host", "127.0.0.1");
+        section.set("target_port", "4242");
+        section.set("ifac_size", "abc");
+        match synthesize_interface("tcp_ifac", &section) {
+            Err(InterfaceFactoryError::InvalidValue { field, .. }) => {
+                assert_eq!(field, "tcp_ifac.ifac_size");
             }
+            other => panic!("expected InvalidValue for ifac_size=abc, got {other:?}"),
         }
 
         // In-range sizes still parse.
@@ -2280,48 +2369,30 @@ mod tests {
     }
 
     #[test]
-    fn fixed_mtu_checks_exact_integer_and_active_ifac_before_spawn() {
+    fn fixed_mtu_needs_an_integer_of_at_least_500_with_or_without_ifac() {
         let mut client = enabled_section();
         client.set("type", "TCPClientInterface");
         client.set("target_host", "example.com");
         client.set("target_port", "4242");
-        for invalid in [
-            "",
-            "NaN",
-            "1.5",
-            "-1",
-            "499",
-            "262145",
-            "4294967296",
-            "18446744073709551615",
-        ] {
+        for invalid in ["", "NaN", "1.5", "-1", "499", "4294967296"] {
             client.set("fixed_mtu", invalid);
             assert!(synthesize_interface("tcp", &client).is_err(), "{invalid}");
         }
-        client.set("fixed_mtu", "262144");
-        assert!(synthesize_interface("tcp", &client).is_ok());
-        // Every credential spelling activates the tag; an empty one does not.
-        for credential in ["networkname", "network_name", "passphrase", "pass_phrase"] {
-            let mut blank = client.clone();
-            blank.set(credential, "");
-            assert!(synthesize_interface("tcp", &blank).is_ok());
-            let mut active = client.clone();
-            active.set(credential, "k");
-            assert!(synthesize_interface("tcp", &active).is_err());
-            active.set("fixed_mtu", "262128");
-            assert!(synthesize_interface("tcp", &active).is_ok());
-            active.set("ifac_size", "512");
-            active.set("ifac_size_unit", "bits");
-            assert!(synthesize_interface("tcp", &active).is_err());
-            active.set("fixed_mtu", "262080");
-            assert!(synthesize_interface("tcp", &active).is_ok());
+        client.set("fixed_mtu", "0");
+        match synthesize_interface("tcp", &client).unwrap() {
+            InterfaceConfig::TcpClient(c) => assert_eq!(c.fixed_mtu, None),
+            _ => panic!("expected TcpClient"),
         }
-        client.set("ifac_size", "512");
-        client.set("ifac_size_unit", "bits");
-        assert!(
-            synthesize_interface("tcp", &client).is_ok(),
-            "inactive credentials do not consume wire capacity"
-        );
+        for valid in ["500", "16384", "400000"] {
+            client.set("fixed_mtu", valid);
+            assert!(synthesize_interface("tcp", &client).is_ok(), "{valid}");
+            let mut active = client.clone();
+            active.set("network_name", "net");
+            assert!(
+                synthesize_interface("tcp", &active).is_ok(),
+                "{valid} with IFAC"
+            );
+        }
     }
 
     #[cfg(feature = "serial")]

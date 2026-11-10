@@ -477,12 +477,10 @@ async fn an_unreadable_i2p_key_file_is_never_replaced() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Python's configured peers keep MODE_FULL, no announce-rate settings and
-/// the `[reticulum]` ingress defaults (Interface.py:140-150), and take only
-/// IFAC from their interface (I2PInterface.py:359-381); the interface's own
-/// settings apply to it alone (Reticulum.py:1030, :1059).
+/// Python's configured peers take their interface's mode, announce and
+/// ingress settings as well as its IFAC (I2PInterface.py:814-857).
 #[tokio::test]
-async fn configured_i2p_peers_take_only_ifac_from_their_interface() {
+async fn configured_i2p_peers_inherit_their_interface_settings() {
     let (sam_port, _streams) = fake_sam(0).await;
     let peer = "peeraaaaaaaaaaaa.b32.i2p";
     let dir = config_dir(
@@ -506,9 +504,10 @@ async fn configured_i2p_peers_take_only_ifac_from_their_interface() {
     );
     assert_eq!(
         (peer.mode.as_str(), peer.announce_rate_target),
-        ("Full", None)
+        ("Gateway", Some(3600.0))
     );
-    assert_eq!(peer.announce_cap, ANNOUNCE_CAP);
+    assert_eq!(peer.announce_cap, 0.05);
+    assert_eq!(peer.bitrate, server.bitrate);
     assert!(server.ifac_size > 0);
     assert_eq!(peer.ifac_size, server.ifac_size);
     let ingress = |id: u64| {
@@ -517,7 +516,7 @@ async fn configured_i2p_peers_take_only_ifac_from_their_interface() {
         (overrides.burst_freq_new, overrides.new_time)
     };
     assert_eq!(ingress(server.id), (Some(2.5), Some(1234.0)));
-    assert_eq!(ingress(peer.id), (Some(7.5), None));
+    assert_eq!(ingress(peer.id), (Some(2.5), Some(1234.0)));
 
     handle.shutdown_and_wait().await;
     let _ = std::fs::remove_dir_all(dir);
@@ -529,7 +528,7 @@ async fn i2p_server_peers_register_under_their_server() {
     let dir = config_dir(
         "i2p-peers",
         &format!(
-            "[reticulum]\n  {}\n  enable_transport = No\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    network_name = tunnelnet\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n",
+            "[reticulum]\n  {}\n  enable_transport = No\n\n[interfaces]\n  [[Golden I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    network_name = tunnelnet\n    mode = gateway\n    announce_rate_target = 600\n    announce_cap = 5\n    i2p_sam_host = 127.0.0.1\n    i2p_sam_port = {sam_port}\n",
             own_shared_instance("tunp").await
         ),
     );
@@ -559,6 +558,16 @@ async fn i2p_server_peers_register_under_their_server() {
         peer.ifac_size, server.ifac_size,
         "the peer inherits its server's IFAC"
     );
+    assert_eq!(
+        (
+            peer.mode.as_str(),
+            peer.announce_rate_target,
+            peer.announce_cap
+        ),
+        ("Gateway", Some(600.0), 0.05),
+        "the peer inherits its server's mode and announce settings"
+    );
+    assert_eq!((peer.bitrate, peer.mtu), (server.bitrate, server.mtu));
 
     handle.shutdown_and_wait().await;
     let _ = std::fs::remove_dir_all(dir);

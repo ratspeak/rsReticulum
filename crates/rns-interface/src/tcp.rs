@@ -20,7 +20,24 @@ pub const RECONNECT_WAIT_MAX: u64 = 300;
 pub const DEFAULT_CONNECT_TIMEOUT: u64 = 5;
 pub const DEFAULT_TCP_USER_TIMEOUT: u32 = 24;
 
+/// Python `TCPInterface.HW_MTU`. Also the largest packet the drivers carry:
+/// its worst-case HDLC escaping fills the shared deframer.
 pub const TCP_HW_MTU: u32 = 262144;
+
+/// Python `TCPClientInterface.BITRATE_GUESS` and `TCPServerInterface.BITRATE_GUESS`.
+pub const BITRATE_GUESS: u64 = 10_000_000;
+
+fn autoconfigured_mtu() -> (u32, InterfacePacketCapacity) {
+    crate::traits::hardware_mtu_capacity(crate::traits::optimise_mtu(BITRATE_GUESS), TCP_HW_MTU)
+}
+
+/// Receive bound. Upstream's is its `HW_MTU` after `optimise_mtu()` (16384 at
+/// the 10 Mbps guess); this stays at the wire budget until a transit node
+/// clamps link MTU to the optimised value too.
+const TCP_RECEIVE_HW_MTU: usize = TCP_HW_MTU as usize;
+
+/// Largest IFAC tag a frame can carry on top of the hardware MTU.
+const MAX_IFAC_SIZE: usize = 64;
 
 // Python TCPClientInterface: TCP_PROBE_AFTER / TCP_PROBE_INTERVAL / TCP_PROBES.
 // Dead-peer detection: 5s idle + 12 probes × 2s ≈ 29s.
@@ -66,8 +83,8 @@ pub struct TcpClientConfig {
     pub connect_timeout_secs: u64,
     pub max_reconnect_tries: Option<usize>,
     pub mode: InterfaceMode,
-    /// Override the MTU used for link MTU discovery. Accepted values are
-    /// 500 through 262,144 bytes, inclusive.
+    /// Fixed hardware MTU instead of the bitrate-derived one; at least 500.
+    /// Packets stay within the 262,144-byte driver budget.
     pub fixed_mtu: Option<u32>,
     /// Identity used to request a signed tunnel synthesis for each non-KISS
     /// connection. `None`, or an identity without signing material, sends none.
@@ -220,11 +237,12 @@ async fn tcp_read_loop(
     transport_tx: InterfaceTransportSender,
     state: Arc<TcpInterfaceState>,
     kiss_framing: bool,
+    hw_mtu: usize,
 ) {
     let mut buf = [0u8; 32768];
 
     if kiss_framing {
-        let mut deframer = kiss::KissDeframer::new();
+        let mut deframer = kiss::KissByteDeframer::new(hw_mtu);
         loop {
             match reader.read(&mut buf).await {
                 Ok(0) => {
@@ -232,10 +250,10 @@ async fn tcp_read_loop(
                     break;
                 }
                 Ok(n) => {
-                    for (_cmd, frame) in deframer.feed(&buf[..n]) {
-                        if frame.is_empty() {
+                    for event in deframer.feed(&buf[..n]) {
+                        let kiss::KissEvent::Data(frame) = event else {
                             continue;
-                        }
+                        };
                         state.record_rx(frame.len());
                         let msg = TransportMessage::Inbound(InboundPacket {
                             raw: Bytes::from(frame),
@@ -257,7 +275,12 @@ async fn tcp_read_loop(
             }
         }
     } else {
-        let mut deframer = hdlc::HdlcDeframer::new();
+        // The IFAC size is applied by transport, so allow the largest tag.
+        let mut deframer = hdlc::HdlcDeframer::with_limits(
+            hw_mtu,
+            rns_wire::constants::HEADER_MINSIZE,
+            Some(hw_mtu + MAX_IFAC_SIZE),
+        );
         loop {
             match reader.read(&mut buf).await {
                 Ok(0) => {
@@ -331,12 +354,9 @@ pub async fn spawn_tcp_client(
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
     let transport_tx = InterfaceTransportSender::new(id, transport_tx);
     let owner = transport_tx.owner();
-    if config
-        .fixed_mtu
-        .is_some_and(|mtu| !(500..=262144).contains(&mtu))
-    {
+    if config.fixed_mtu.is_some_and(|mtu| mtu < 500) {
         return Err(crate::traits::InterfaceError::SendFailed(
-            "fixed_mtu must be between 500 and 262144 clear packet bytes".into(),
+            "fixed_mtu must be at least 500 bytes".into(),
         ));
     }
     let online = Arc::new(AtomicBool::new(false));
@@ -450,6 +470,7 @@ pub async fn spawn_tcp_client(
                 transport_tx.clone(),
                 state.clone(),
                 kiss_framing,
+                fixed_mtu.map_or(TCP_RECEIVE_HW_MTU, |mtu| mtu as usize),
             )
             .await;
 
@@ -477,17 +498,14 @@ pub async fn spawn_tcp_client(
         }
     });
 
-    let bitrate: u64 = 10_000_000;
+    let (mtu, packet_capacity) = match fixed_mtu {
+        Some(mtu) => crate::traits::hardware_mtu_capacity(Some(mtu), TCP_HW_MTU),
+        None => autoconfigured_mtu(),
+    };
     Ok(InterfaceHandle {
         id,
         owner,
-        packet_capacity: InterfacePacketCapacity::new(
-            fixed_mtu
-                .unwrap_or_else(|| crate::traits::optimise_mtu(bitrate).unwrap_or(TCP_HW_MTU))
-                .min(262144),
-            262144,
-            fixed_mtu.is_some() || crate::traits::optimise_mtu(bitrate).is_some(),
-        ),
+        packet_capacity,
         parent_id: None,
         name,
         mode,
@@ -497,9 +515,8 @@ pub async fn spawn_tcp_client(
             forward: false,
             repeat: false,
         },
-        bitrate,
-        mtu: fixed_mtu
-            .unwrap_or_else(|| crate::traits::optimise_mtu(bitrate).unwrap_or(TCP_HW_MTU)),
+        bitrate: BITRATE_GUESS,
+        mtu,
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
@@ -548,7 +565,15 @@ async fn spawn_tcp_accepted(
     let handle_name = name.clone();
     let dereg_tx = transport_tx.clone();
     let read_task = tokio::spawn(async move {
-        tcp_read_loop(reader, id, transport_tx, state, kiss_framing).await;
+        tcp_read_loop(
+            reader,
+            id,
+            transport_tx,
+            state,
+            kiss_framing,
+            TCP_RECEIVE_HW_MTU,
+        )
+        .await;
         online2.store(false, Ordering::SeqCst);
         tracing::info!(name = %handle_name, "accepted TCP client disconnected");
         // Proactively notify transport so broadcasts stop targeting this dead tx.
@@ -557,17 +582,11 @@ async fn spawn_tcp_accepted(
             .await;
     });
 
-    let bitrate: u64 = 10_000_000;
+    let (mtu, packet_capacity) = autoconfigured_mtu();
     InterfaceHandle {
         id,
         owner,
-        packet_capacity: InterfacePacketCapacity::new(
-            crate::traits::optimise_mtu(bitrate)
-                .unwrap_or(TCP_HW_MTU)
-                .min(262144),
-            262144,
-            crate::traits::optimise_mtu(bitrate).is_some(),
-        ),
+        packet_capacity,
         parent_id: Some(parent_id),
         name,
         mode,
@@ -577,8 +596,8 @@ async fn spawn_tcp_accepted(
             forward: false,
             repeat: false,
         },
-        bitrate,
-        mtu: crate::traits::optimise_mtu(bitrate).unwrap_or(TCP_HW_MTU),
+        bitrate: BITRATE_GUESS,
+        mtu,
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
@@ -657,17 +676,11 @@ pub async fn spawn_tcp_server(
         online2.store(false, Ordering::SeqCst);
     });
 
-    let bitrate: u64 = 10_000_000;
+    let (mtu, packet_capacity) = autoconfigured_mtu();
     Ok(InterfaceHandle {
         id,
         owner,
-        packet_capacity: InterfacePacketCapacity::new(
-            crate::traits::optimise_mtu(bitrate)
-                .unwrap_or(TCP_HW_MTU)
-                .min(262144),
-            262144,
-            crate::traits::optimise_mtu(bitrate).is_some(),
-        ),
+        packet_capacity,
         parent_id: None,
         name,
         mode,
@@ -677,8 +690,8 @@ pub async fn spawn_tcp_server(
             forward: false,
             repeat: false,
         },
-        bitrate,
-        mtu: crate::traits::optimise_mtu(bitrate).unwrap_or(TCP_HW_MTU),
+        bitrate: BITRATE_GUESS,
+        mtu,
         online,
         rxb: Some(Arc::new(AtomicU64::new(0))),
         txb: Some(Arc::new(AtomicU64::new(0))),
@@ -893,7 +906,7 @@ mod tests {
         assert_ne!(accepted.owner, server_handle.owner);
         assert_ne!(accepted.owner, client_handle.owner);
         assert_eq!(accepted.packet_capacity.max_wire_packet_bytes, 262144);
-        let payload = Bytes::from_static(b"hello from client");
+        let payload = Bytes::from_static(b"hello from client packet payload");
         client_handle.tx.send(payload.clone()).await.unwrap();
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(20), transport_rx.recv())
@@ -916,7 +929,7 @@ mod tests {
             other => panic!("unexpected message: {:?}", other),
         }
 
-        let reply = Bytes::from_static(b"hello from server");
+        let reply = Bytes::from_static(b"hello from server packet payload");
         accepted.tx.send(reply.clone()).await.unwrap();
 
         let msg2 = tokio::time::timeout(std::time::Duration::from_secs(3), transport_rx.recv())

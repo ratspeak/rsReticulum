@@ -416,7 +416,8 @@ async fn packet_loop(
 ) -> std::io::Result<()> {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut buf = [0; 8192];
-    let mut deframer = HdlcDeframer::new();
+    let mut deframer =
+        HdlcDeframer::with_limits(262144, rns_wire::constants::HEADER_MINSIZE, Some(262144));
     loop {
         tokio::select! {
             read = reader.read(&mut buf) => {

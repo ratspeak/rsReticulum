@@ -20,6 +20,7 @@ use crate::traits::{
 use rns_transport::messages::{InboundPacket, TransportMessage};
 
 pub const LOCAL_MTU: u32 = 262_144;
+const LOCAL_HW_MTU: usize = LOCAL_MTU as usize;
 pub const LOCAL_BITRATE: u64 = 1_000_000_000;
 pub const RECONNECT_WAIT: Duration = Duration::from_secs(8);
 pub const CLIENT_SLEEP_PAUSE_TIMEOUT: Duration = Duration::from_secs(12);
@@ -338,7 +339,11 @@ async fn accepted_read_loop(
     pause: Option<Arc<ClientSleepPause>>,
 ) {
     let mut buf = [0u8; 8192];
-    let mut deframer = hdlc::HdlcDeframer::new();
+    let mut deframer = hdlc::HdlcDeframer::with_limits(
+        LOCAL_HW_MTU,
+        rns_wire::constants::HEADER_MINSIZE,
+        Some(LOCAL_HW_MTU),
+    );
 
     loop {
         match reader.read(&mut buf).await {
@@ -431,7 +436,11 @@ async fn run_local_client_connection(
 ) -> LocalClientConnectionEnd {
     let interface_id = io.interface_id;
     let mut buf = [0u8; 8192];
-    let mut deframer = hdlc::HdlcDeframer::new();
+    let mut deframer = hdlc::HdlcDeframer::with_limits(
+        LOCAL_HW_MTU,
+        rns_wire::constants::HEADER_MINSIZE,
+        Some(LOCAL_HW_MTU),
+    );
     let mut keepalive = phy_keepalive.then(|| {
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now() + KEEPALIVE_INTERVAL,
@@ -938,7 +947,7 @@ mod tests {
             accepted.packet_capacity,
             InterfacePacketCapacity::new(262144, 262144, true)
         );
-        let payload = Bytes::from_static(b"local ipc test");
+        let payload = Bytes::from_static(b"local ipc test packet payload");
         client_handle.tx.send(payload.clone()).await.unwrap();
 
         let msg = tokio::time::timeout(std::time::Duration::from_secs(3), transport_rx.recv())
@@ -954,7 +963,7 @@ mod tests {
             other => panic!("unexpected: {:?}", other),
         }
 
-        let reply = Bytes::from_static(b"local ipc reply");
+        let reply = Bytes::from_static(b"local ipc reply packet payload");
         accepted.tx.send(reply.clone()).await.unwrap();
 
         let msg2 = tokio::time::timeout(std::time::Duration::from_secs(3), transport_rx.recv())
@@ -1214,7 +1223,7 @@ mod tests {
         second_accepted.owner.mark_registered();
         // Online is published only after the offline queue is dropped.
         wait_until_online(&client_handle.online).await;
-        let after = Bytes::from_static(b"after reconnect");
+        let after = Bytes::from_static(b"after reconnect packet payload");
         client_handle.tx.send(after.clone()).await.unwrap();
 
         let first_frame = tokio::time::timeout(std::time::Duration::from_secs(3), async {

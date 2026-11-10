@@ -167,32 +167,67 @@ pub struct InterfaceDirection {
     pub repeat: bool,
 }
 
-/// Select an MTU for the given bitrate in bits per second. Returns `None`
-/// for rates at or below 62,500 bps.
+/// Select an MTU for the given bitrate in bits per second, as Python's
+/// `Interface.optimise_mtu`. Returns `None` below 62,500 bps.
 pub fn optimise_mtu(bitrate: u64) -> Option<u32> {
     if bitrate >= 1_000_000_000 {
         Some(524_288)
-    } else if bitrate > 750_000_000 {
+    } else if bitrate >= 750_000_000 {
         Some(262_144)
-    } else if bitrate > 400_000_000 {
+    } else if bitrate >= 400_000_000 {
         Some(131_072)
-    } else if bitrate > 200_000_000 {
+    } else if bitrate >= 200_000_000 {
         Some(65_536)
-    } else if bitrate > 100_000_000 {
+    } else if bitrate >= 100_000_000 {
         Some(32_768)
-    } else if bitrate > 10_000_000 {
+    } else if bitrate >= 10_000_000 {
         Some(16_384)
-    } else if bitrate > 5_000_000 {
+    } else if bitrate >= 5_000_000 {
         Some(8_192)
-    } else if bitrate > 2_000_000 {
+    } else if bitrate >= 2_000_000 {
         Some(4_096)
-    } else if bitrate > 1_000_000 {
+    } else if bitrate >= 1_000_000 {
         Some(2_048)
-    } else if bitrate > 62_500 {
+    } else if bitrate >= 62_500 {
         Some(1_024)
     } else {
         None
     }
+}
+
+/// The reported MTU and packet capacity of an interface with a known
+/// hardware MTU, within the driver's wire budget. `None` is Python's
+/// `HW_MTU = None`: base-size packets and no Link MTU upgrade.
+pub fn hardware_mtu_capacity(
+    hw_mtu: Option<u32>,
+    wire_budget: u32,
+) -> (u32, rns_transport::messages::InterfacePacketCapacity) {
+    use rns_transport::messages::InterfacePacketCapacity;
+    match hw_mtu {
+        Some(mtu) => (
+            mtu,
+            InterfacePacketCapacity::new(mtu.min(wire_budget), wire_budget, true),
+        ),
+        None => {
+            let base = rns_wire::constants::MTU as u32;
+            (
+                base,
+                InterfacePacketCapacity::new(base.min(wire_budget), wire_budget, false),
+            )
+        }
+    }
+}
+
+/// Python `Interface.optimise_mtu` on an `AUTOCONFIGURE_MTU` interface:
+/// set the bitrate and derive the MTU and packet capacity from it.
+pub fn apply_autoconfigured_mtu(handle: &mut InterfaceHandle, bitrate: u64) {
+    let (mtu, capacity) = hardware_mtu_capacity(
+        optimise_mtu(bitrate),
+        handle.packet_capacity.max_wire_packet_bytes,
+    );
+    handle.bitrate = bitrate;
+    handle.mtu = mtu;
+    handle.packet_capacity = capacity;
 }
 
 /// Length of interface name hash (80 bits / 10 bytes).
@@ -299,15 +334,6 @@ mod tests {
                 let _ = exited.send(());
             }
         }
-    }
-
-    #[test]
-    fn test_optimise_mtu() {
-        assert_eq!(optimise_mtu(1_000_000_000), Some(524_288));
-        assert_eq!(optimise_mtu(100_000_001), Some(32_768));
-        assert_eq!(optimise_mtu(10_000_001), Some(16_384));
-        assert_eq!(optimise_mtu(62_500), None);
-        assert_eq!(optimise_mtu(62_501), Some(1_024));
     }
 
     #[test]

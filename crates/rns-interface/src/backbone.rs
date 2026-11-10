@@ -31,12 +31,11 @@ use rns_transport::messages::{
 /// the interface wire budget; the kernel may clamp the socket buffer request.
 pub const HW_MTU: u32 = 1_048_576;
 
-/// Listener-side bitrate guess advertised on the parent handle.
-pub const BITRATE_GUESS: u64 = 1_000_000_000;
+/// Python `BackboneInterface.BITRATE_GUESS` and `BackboneClientInterface.BITRATE_GUESS`.
+pub const BITRATE_GUESS: u64 = 100_000_000;
 
-/// Per-peer bitrate guess (100 Mbps), selecting a 16 KiB MTU through
-/// [`crate::traits::optimise_mtu`].
-pub const CHILD_BITRATE_GUESS: u64 = 100_000_000;
+/// Largest packet a Backbone peer carries (the shared HDLC deframer bound).
+const WIRE_BUDGET: u32 = crate::tcp::TCP_HW_MTU;
 
 pub const RECONNECT_WAIT: u64 = 5;
 pub const INITIAL_CONNECT_TIMEOUT: u64 = 5;
@@ -389,10 +388,8 @@ fn tune_accepted_stream(stream: &TcpStream) {
     let _ = socket2::SockRef::from(stream).set_recv_buffer_size(DP_IC_RCVBUF);
 }
 
-fn child_mtu() -> u32 {
-    crate::traits::optimise_mtu(CHILD_BITRATE_GUESS)
-        .map(|m| m.min(HW_MTU))
-        .unwrap_or(rns_wire::constants::MTU as u32)
+fn autoconfigured_mtu() -> (u32, InterfacePacketCapacity) {
+    crate::traits::hardware_mtu_capacity(crate::traits::optimise_mtu(BITRATE_GUESS), WIRE_BUDGET)
 }
 
 async fn backbone_read_loop(
@@ -402,8 +399,15 @@ async fn backbone_read_loop(
     online: Arc<AtomicBool>,
     rxb: Arc<AtomicU64>,
 ) {
-    let mut deframer = hdlc::HdlcDeframer::new();
-    // Large buffer to amortise syscalls; inbound capped by HdlcDeframer::MAX_FRAME_SIZE.
+    // Upstream bounds receive at its optimised HW_MTU (32768 at 100 Mbps); this
+    // stays at the wire budget until a transit node clamps link MTU to that too.
+    // Transport applies IFAC, so allow the largest tag.
+    let mut deframer = hdlc::HdlcDeframer::with_limits(
+        WIRE_BUDGET as usize,
+        rns_wire::constants::HEADER_MINSIZE,
+        Some(WIRE_BUDGET as usize + 64),
+    );
+    // Large buffer to amortise syscalls.
     let mut buf = vec![0u8; 65536];
     loop {
         match reader.read(&mut buf).await {
@@ -804,14 +808,11 @@ fn spawn_backbone_server_on_listener(
                             .await;
                     });
 
+                    let (child_mtu, packet_capacity) = autoconfigured_mtu();
                     let handle = InterfaceHandle {
                         id: client_id,
                         owner: child_owner,
-                        packet_capacity: InterfacePacketCapacity::new(
-                            child_mtu().min(262144),
-                            262144,
-                            true,
-                        ),
+                        packet_capacity,
                         parent_id: Some(id),
                         name: client_name,
                         mode,
@@ -821,8 +822,8 @@ fn spawn_backbone_server_on_listener(
                             forward: false,
                             repeat: false,
                         },
-                        bitrate: CHILD_BITRATE_GUESS,
-                        mtu: child_mtu(),
+                        bitrate: BITRATE_GUESS,
+                        mtu: child_mtu,
                         online: c_online,
                         rxb: Some(c_rxb),
                         txb: Some(c_txb),
@@ -847,10 +848,11 @@ fn spawn_backbone_server_on_listener(
         online2.store(false, Ordering::SeqCst);
     });
 
+    let (mtu, packet_capacity) = autoconfigured_mtu();
     Ok(InterfaceHandle {
         id,
         owner,
-        packet_capacity: InterfacePacketCapacity::base(500),
+        packet_capacity,
         parent_id: None,
         name,
         mode,
@@ -861,7 +863,7 @@ fn spawn_backbone_server_on_listener(
             repeat: false,
         },
         bitrate: BITRATE_GUESS,
-        mtu: rns_wire::constants::MTU as u32,
+        mtu,
         online,
         rxb: Some(Arc::new(AtomicU64::new(0))),
         txb: Some(Arc::new(AtomicU64::new(0))),
@@ -1017,10 +1019,11 @@ pub async fn spawn_backbone_client(
         }
     });
 
+    let (mtu, packet_capacity) = autoconfigured_mtu();
     Ok(InterfaceHandle {
         id,
         owner,
-        packet_capacity: InterfacePacketCapacity::new(child_mtu().min(262144), 262144, true),
+        packet_capacity,
         parent_id: None,
         name,
         mode,
@@ -1030,8 +1033,8 @@ pub async fn spawn_backbone_client(
             forward: false,
             repeat: false,
         },
-        bitrate: CHILD_BITRATE_GUESS,
-        mtu: child_mtu(),
+        bitrate: BITRATE_GUESS,
+        mtu,
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
@@ -1364,8 +1367,7 @@ mod tests {
     #[test]
     fn test_constants() {
         assert_eq!(HW_MTU, 1_048_576);
-        assert_eq!(BITRATE_GUESS, 1_000_000_000);
-        assert_eq!(CHILD_BITRATE_GUESS, 100_000_000);
+        assert_eq!(BITRATE_GUESS, 100_000_000);
         assert_eq!(RECONNECT_WAIT, 5);
     }
 
@@ -1393,15 +1395,6 @@ mod tests {
         let mut cfg = cfg;
         cfg.prefer_ipv6 = true;
         assert!(cfg.prefer_ipv6);
-    }
-
-    #[test]
-    fn test_child_mtu_uses_100mbps_curve() {
-        // optimise_mtu(100 Mbps) is one of the step values; verify the
-        // result lands inside the HW_MTU ceiling.
-        let mtu = child_mtu();
-        assert!(mtu <= HW_MTU);
-        assert!(mtu >= rns_wire::constants::MTU as u32 / 2);
     }
 
     #[test]

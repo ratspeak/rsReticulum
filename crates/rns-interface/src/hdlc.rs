@@ -11,8 +11,8 @@ pub const ESC: u8 = 0x7D;
 /// XOR mask applied to escaped bytes.
 pub const ESC_MASK: u8 = 0x20;
 
-/// Upper bound on a single HDLC frame (sized for full resource transfers on TCP/Local MTUs).
-const MAX_FRAME_SIZE: usize = 524288;
+/// Default MTU of [`HdlcDeframer::new`]; partial frames are bounded at twice this.
+const DEFAULT_MTU: usize = 262144;
 
 /// Pre-allocated capacity for the deframer accumulator. Covers typical HW_MTUs
 /// with headroom; larger frames grow the Vec normally.
@@ -39,39 +39,44 @@ pub fn escape_into(data: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// Append the unescaped form of `data` to `out`. Unknown escape sequences and a
-/// trailing lone ESC byte are passed through unchanged — matching the previous
-/// implementation so any consumer relying on length/CRC rejection still sees
-/// the same bytes.
+/// Append the unescaped form of `data` to `out` as two global replacements,
+/// `ESC 5E` to FLAG and then `ESC 5D` to ESC, so malformed sequences decode as
+/// upstream `HDLC.unescape` does.
 pub fn unescape_into(data: &[u8], out: &mut Vec<u8>) {
+    let start = out.len();
     let mut i = 0;
     while i < data.len() {
         match data[i..].iter().position(|&b| b == ESC) {
             Some(rel) => {
                 let hit = i + rel;
                 out.extend_from_slice(&data[i..hit]);
-                if hit + 1 < data.len() {
-                    let next = data[hit + 1];
-                    if next == (FLAG ^ ESC_MASK) {
-                        out.push(FLAG);
-                    } else if next == (ESC ^ ESC_MASK) {
-                        out.push(ESC);
-                    } else {
-                        out.push(ESC);
-                        out.push(next);
-                    }
+                if data.get(hit + 1) == Some(&(FLAG ^ ESC_MASK)) {
+                    out.push(FLAG);
                     i = hit + 2;
                 } else {
                     out.push(ESC);
-                    return;
+                    i = hit + 1;
                 }
             }
             None => {
                 out.extend_from_slice(&data[i..]);
-                return;
+                break;
             }
         }
     }
+    let end = out.len();
+    let (mut r, mut w) = (start, start);
+    while r < end {
+        let b = out[r];
+        out[w] = b;
+        w += 1;
+        r += if b == ESC && r + 1 < end && out[r + 1] == (ESC ^ ESC_MASK) {
+            2
+        } else {
+            1
+        };
+    }
+    out.truncate(w);
 }
 
 /// Append a complete HDLC frame for `data` to `out`.
@@ -99,20 +104,44 @@ pub fn frame(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Stream deframer with upstream `HDLC.ReceiveBuffer` semantics: a flag closes
+/// one frame and opens the next, a frame is delivered only when its unescaped
+/// length is above `min_frame_len` and at most `max_frame_len`, and an
+/// unterminated partial frame longer than twice the MTU is dropped.
 pub struct HdlcDeframer {
     buffer: Vec<u8>,
     in_frame: bool,
     /// Reusable scratch for unescape output to avoid per-frame allocation.
     unescape_scratch: Vec<u8>,
+    /// Bytes before the opening flag that upstream keeps in its buffer.
+    lead: usize,
+    mtu: usize,
+    min_frame_len: usize,
+    max_frame_len: Option<usize>,
 }
 
 impl HdlcDeframer {
+    /// Equivalent to `ReceiveBuffer(262144, 0, None)`: every non-empty frame is delivered.
     pub fn new() -> Self {
+        Self::with_limits(DEFAULT_MTU, 0, None)
+    }
+
+    /// Equivalent to `ReceiveBuffer(mtu, min_frame_len, max_frame_len)`.
+    pub fn with_limits(mtu: usize, min_frame_len: usize, max_frame_len: Option<usize>) -> Self {
         Self {
             buffer: Vec::with_capacity(DEFRAME_BUF_CAPACITY),
             in_frame: false,
             unescape_scratch: Vec::with_capacity(DEFRAME_BUF_CAPACITY),
+            lead: 0,
+            mtu,
+            min_frame_len,
+            max_frame_len,
         }
+    }
+
+    /// Update the delivery bound, for example after the interface IFAC size changes.
+    pub fn set_max_frame_len(&mut self, max_frame_len: Option<usize>) {
+        self.max_frame_len = max_frame_len;
     }
 
     pub fn feed(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
@@ -123,24 +152,21 @@ impl HdlcDeframer {
                 Some(rel) => {
                     let hit = i + rel;
                     if self.in_frame {
-                        self.append_in_frame(&data[i..hit]);
-                        if !self.buffer.is_empty() {
-                            self.unescape_scratch.clear();
-                            unescape_into(&self.buffer, &mut self.unescape_scratch);
-                            if !self.unescape_scratch.is_empty() {
-                                frames.push(std::mem::take(&mut self.unescape_scratch));
-                                // Restore capacity for the next frame.
-                                self.unescape_scratch = Vec::with_capacity(DEFRAME_BUF_CAPACITY);
-                            }
-                        }
-                        self.buffer.clear();
+                        self.buffer.extend_from_slice(&data[i..hit]);
+                        self.finish_frame(&mut frames);
+                        self.lead = 0;
+                    } else {
+                        self.lead = hit - i;
                     }
                     self.in_frame = true;
                     i = hit + 1;
                 }
                 None => {
                     if self.in_frame {
-                        self.append_in_frame(&data[i..]);
+                        self.buffer.extend_from_slice(&data[i..]);
+                        if self.lead + 1 + self.buffer.len() > self.mtu.saturating_mul(2) {
+                            self.reset();
+                        }
                     }
                     return frames;
                 }
@@ -149,27 +175,111 @@ impl HdlcDeframer {
         frames
     }
 
-    /// Append `chunk` to `self.buffer` while enforcing `MAX_FRAME_SIZE`. On
-    /// overflow the in-progress frame is dropped and we wait for the next FLAG
-    /// to resync — matching the previous byte-loop behavior.
-    fn append_in_frame(&mut self, chunk: &[u8]) {
-        if self.buffer.len() + chunk.len() > MAX_FRAME_SIZE {
-            self.buffer.clear();
-            self.in_frame = false;
-            return;
+    fn finish_frame(&mut self, frames: &mut Vec<Vec<u8>>) {
+        if !self.buffer.is_empty() {
+            self.unescape_scratch.clear();
+            unescape_into(&self.buffer, &mut self.unescape_scratch);
+            let len = self.unescape_scratch.len();
+            if len > self.min_frame_len && self.max_frame_len.is_none_or(|max| len <= max) {
+                frames.push(std::mem::replace(
+                    &mut self.unescape_scratch,
+                    Vec::with_capacity(DEFRAME_BUF_CAPACITY),
+                ));
+            } else if len > 0 {
+                tracing::debug!(
+                    frame_len = len,
+                    "invalid HDLC frame received, dropping frame"
+                );
+            }
         }
-        self.buffer.extend_from_slice(chunk);
+        self.buffer.clear();
     }
 
     pub fn reset(&mut self) {
         self.buffer.clear();
         self.in_frame = false;
+        self.lead = 0;
     }
 }
 
 impl Default for HdlcDeframer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Per-byte deframer of the upstream serial, pipe and I2P read loops. Bytes past
+/// `hw_mtu` are dropped but the frame is still delivered, an unknown escape keeps
+/// only the escaped byte, the escape state carries across frames, and the flag
+/// that closes a frame does not open the next one.
+pub struct HdlcByteDeframer {
+    buffer: Vec<u8>,
+    in_frame: bool,
+    escape: bool,
+    /// Length of the last delivered frame, which upstream keeps buffered.
+    held: usize,
+    hw_mtu: usize,
+}
+
+impl HdlcByteDeframer {
+    pub fn new(hw_mtu: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(DEFRAME_BUF_CAPACITY.min(hw_mtu)),
+            in_frame: false,
+            escape: false,
+            held: 0,
+            hw_mtu,
+        }
+    }
+
+    pub fn feed(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        for &byte in data {
+            if self.in_frame && byte == FLAG {
+                self.in_frame = false;
+                self.held = self.buffer.len();
+                if !self.buffer.is_empty() {
+                    frames.push(std::mem::take(&mut self.buffer));
+                }
+            } else if byte == FLAG {
+                self.in_frame = true;
+                self.buffer.clear();
+                self.held = 0;
+            } else if self.in_frame && self.buffer.len() < self.hw_mtu {
+                if byte == ESC {
+                    self.escape = true;
+                } else {
+                    let mut byte = byte;
+                    if self.escape {
+                        if byte == FLAG ^ ESC_MASK {
+                            byte = FLAG;
+                        } else if byte == ESC ^ ESC_MASK {
+                            byte = ESC;
+                        }
+                        self.escape = false;
+                    }
+                    self.buffer.push(byte);
+                }
+            }
+        }
+        frames
+    }
+
+    /// Bytes upstream holds in its data buffer. Upstream drivers reset after an
+    /// idle read timeout only while this is non-zero.
+    pub fn buffered(&self) -> usize {
+        if self.in_frame {
+            self.buffer.len()
+        } else {
+            self.held
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.buffer.clear();
+        self.held = 0;
+        self.in_frame = false;
+        self.escape = false;
     }
 }
 
@@ -282,19 +392,15 @@ mod tests {
     }
 
     #[test]
-    fn test_deframer_oversized_drops_then_resyncs() {
-        // A frame body larger than MAX_FRAME_SIZE must drop and resync on the
-        // next FLAG, exactly like the per-byte implementation.
-        let mut deframer = HdlcDeframer::new();
-        let mut oversized = vec![FLAG];
-        oversized.extend(std::iter::repeat_n(0x55, MAX_FRAME_SIZE + 100));
-        oversized.push(FLAG);
-        let frames = deframer.feed(&oversized);
-        assert!(frames.is_empty());
+    fn test_deframer_partial_over_twice_mtu_drops_then_resyncs() {
+        let mut deframer = HdlcDeframer::with_limits(64, 0, None);
+        let mut partial = vec![FLAG];
+        partial.extend(std::iter::repeat_n(0x55, 128));
+        assert!(deframer.feed(&partial).is_empty());
 
-        let small = frame(b"after-overflow");
-        let frames = deframer.feed(&small);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0], b"after-overflow");
+        let mut rest = vec![0x55, FLAG];
+        rest.extend(frame(b"after-overflow"));
+        let frames = deframer.feed(&rest);
+        assert_eq!(frames, vec![b"after-overflow".to_vec()]);
     }
 }

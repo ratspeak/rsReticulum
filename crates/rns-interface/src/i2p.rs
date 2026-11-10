@@ -1073,7 +1073,7 @@ async fn i2p_read_loop(
     rxb: &AtomicU64,
     last_read: &std::sync::Mutex<tokio::time::Instant>,
 ) {
-    let mut deframer = hdlc::HdlcDeframer::new();
+    let mut deframer = hdlc::HdlcByteDeframer::new(HW_MTU as usize);
     let mut buf = [0u8; 4096];
 
     if !initial_data.is_empty() {

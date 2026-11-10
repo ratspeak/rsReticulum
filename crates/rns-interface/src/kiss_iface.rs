@@ -13,6 +13,7 @@ use crate::traits::{InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceM
 use rns_transport::messages::{InboundPacket, TransportMessage};
 
 const KISS_READ_TIMEOUT_MS: u64 = 100;
+const HW_MTU: usize = 564;
 
 /// Python `KISSInterface.BITRATE_GUESS`; `speed` is only the serial baud rate.
 pub const BITRATE_GUESS: u64 = 1200;
@@ -276,8 +277,9 @@ async fn spawn_kiss_with_port(
         // The writer lives and dies with the read task that teardown aborts.
         let _writer = AbortOnDrop(writer);
         let mut port_r = port;
-        let mut deframer = kiss::KissDeframer::new();
+        let mut deframer = kiss::KissByteDeframer::new(HW_MTU);
         let mut buf = [0u8; 1024];
+        let mut last_read = std::time::Instant::now();
 
         loop {
             if !online_r.load(Ordering::SeqCst) {
@@ -287,14 +289,18 @@ async fn spawn_kiss_with_port(
                 Ok((p, b, n)) => {
                     port_r = p;
                     buf = b;
-                    if n > 0 {
+                    if n == 0 {
+                        if deframer.buffered() > 0
+                            && last_read.elapsed() > Duration::from_millis(KISS_READ_TIMEOUT_MS)
+                        {
+                            deframer.reset();
+                        }
+                    } else {
+                        last_read = std::time::Instant::now();
                         rxb_r.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-                        for (cmd, frame) in deframer.feed(&buf[..n]) {
-                            match cmd {
-                                kiss::CMD_DATA => {
-                                    if frame.is_empty() {
-                                        continue;
-                                    }
+                        for event in deframer.feed(&buf[..n]) {
+                            match event {
+                                kiss::KissEvent::Data(frame) => {
                                     let msg = TransportMessage::Inbound(InboundPacket {
                                         raw: Bytes::from(frame),
                                         interface_id: id,
@@ -308,13 +314,9 @@ async fn spawn_kiss_with_port(
                                         return;
                                     }
                                 }
-                                kiss::CMD_READY => {
-                                    // Python process_queue ignores the READY payload.
+                                kiss::KissEvent::Ready => {
                                     ready_r.store(true, Ordering::SeqCst);
                                     tracing::debug!(id, "KISS flow control: ready");
-                                }
-                                _ => {
-                                    tracing::debug!(id, cmd, "ignoring KISS command");
                                 }
                             }
                         }

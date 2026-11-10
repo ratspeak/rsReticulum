@@ -48,9 +48,8 @@ pub fn escape_into(data: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// Append the unescaped form of `data` to `out`. Unknown escape sequences and
-/// a trailing lone FESC byte are passed through unchanged — matching the
-/// previous implementation byte-for-byte.
+/// Append the unescaped form of `data` to `out`. As in the upstream read loops,
+/// an unknown escape keeps only the escaped byte and a trailing FESC is dropped.
 pub fn unescape_into(data: &[u8], out: &mut Vec<u8>) {
     let mut i = 0;
     while i < data.len() {
@@ -58,20 +57,13 @@ pub fn unescape_into(data: &[u8], out: &mut Vec<u8>) {
             Some(rel) => {
                 let hit = i + rel;
                 out.extend_from_slice(&data[i..hit]);
-                if hit + 1 < data.len() {
-                    match data[hit + 1] {
-                        TFEND => out.push(FEND),
-                        TFESC => out.push(FESC),
-                        other => {
-                            out.push(FESC);
-                            out.push(other);
-                        }
-                    }
-                    i = hit + 2;
-                } else {
-                    out.push(FESC);
-                    return;
+                match data.get(hit + 1) {
+                    Some(&TFEND) => out.push(FEND),
+                    Some(&TFESC) => out.push(FESC),
+                    Some(&other) => out.push(other),
+                    None => return,
                 }
+                i = hit + 2;
             }
             None => {
                 out.extend_from_slice(&data[i..]);
@@ -250,6 +242,101 @@ impl RawKissDeframer {
 impl Default for RawKissDeframer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Output of [`KissByteDeframer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KissEvent {
+    /// A completed `CMD_DATA` frame.
+    Data(Vec<u8>),
+    /// One payload byte of a `CMD_READY` frame; upstream runs `process_queue` per byte.
+    Ready,
+}
+
+/// Per-byte deframer of the upstream KISS, AX.25-KISS and TCP `kiss_framing`
+/// read loops. The port nibble is stripped, only `CMD_DATA` frames are
+/// collected and delivered, bytes past `hw_mtu` are dropped but the frame is
+/// still delivered, an unknown escape keeps only the escaped byte, and the
+/// FEND closing a data frame does not open the next one.
+pub struct KissByteDeframer {
+    buffer: Vec<u8>,
+    in_frame: bool,
+    escape: bool,
+    command: u8,
+    /// Length of the last delivered frame, which upstream keeps buffered.
+    held: usize,
+    hw_mtu: usize,
+}
+
+impl KissByteDeframer {
+    pub fn new(hw_mtu: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(DEFRAME_BUF_CAPACITY.min(hw_mtu)),
+            in_frame: false,
+            escape: false,
+            command: CMD_UNKNOWN,
+            held: 0,
+            hw_mtu,
+        }
+    }
+
+    pub fn feed(&mut self, data: &[u8]) -> Vec<KissEvent> {
+        let mut events = Vec::new();
+        for &byte in data {
+            if self.in_frame && byte == FEND && self.command == CMD_DATA {
+                self.in_frame = false;
+                self.held = self.buffer.len();
+                if !self.buffer.is_empty() {
+                    events.push(KissEvent::Data(std::mem::take(&mut self.buffer)));
+                }
+            } else if byte == FEND {
+                self.in_frame = true;
+                self.command = CMD_UNKNOWN;
+                self.buffer.clear();
+                self.held = 0;
+            } else if self.in_frame && self.buffer.len() < self.hw_mtu {
+                if self.buffer.is_empty() && self.command == CMD_UNKNOWN {
+                    self.command = byte & CMD_MASK;
+                } else if self.command == CMD_DATA {
+                    if byte == FESC {
+                        self.escape = true;
+                    } else {
+                        let mut byte = byte;
+                        if self.escape {
+                            if byte == TFEND {
+                                byte = FEND;
+                            } else if byte == TFESC {
+                                byte = FESC;
+                            }
+                            self.escape = false;
+                        }
+                        self.buffer.push(byte);
+                    }
+                } else if self.command == CMD_READY {
+                    events.push(KissEvent::Ready);
+                }
+            }
+        }
+        events
+    }
+
+    /// Bytes upstream holds in its data buffer. Upstream drivers reset after an
+    /// idle read timeout only while this is non-zero.
+    pub fn buffered(&self) -> usize {
+        if self.in_frame {
+            self.buffer.len()
+        } else {
+            self.held
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.buffer.clear();
+        self.held = 0;
+        self.in_frame = false;
+        self.escape = false;
+        self.command = CMD_UNKNOWN;
     }
 }
 

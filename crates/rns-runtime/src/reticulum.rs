@@ -81,6 +81,35 @@ struct InterfaceControlMetadata {
     // Per-interface stamp costs, copied raw to spawned children (TCPInterface.py:608-609).
     destination_cost: Option<f64>,
     pr_cost: Option<f64>,
+    /// What a connection this interface accepts takes from it.
+    spawn: Option<SpawnInheritance>,
+}
+
+/// The listener settings Python copies to each accepted connection
+/// (TCPInterface.py:588-646, BackboneInterface.py:706-757, I2PInterface.py:861-912).
+#[derive(Clone)]
+struct SpawnInheritance {
+    mode: rns_interface::traits::InterfaceMode,
+    outgoing: bool,
+    bitrate: u64,
+    mtu: u32,
+    packet_capacity: rns_transport::messages::InterfacePacketCapacity,
+    announce_cap: f64,
+    announce_rate_target: Option<f64>,
+    announce_rate_grace: Option<u32>,
+    announce_rate_penalty: Option<f64>,
+    recursive_prs: bool,
+    announces_from_internal: bool,
+}
+
+impl SpawnInheritance {
+    fn apply(&self, child: &mut rns_interface::traits::InterfaceHandle) {
+        child.mode = self.mode;
+        child.bitrate = self.bitrate;
+        child.mtu = self.mtu;
+        child.packet_capacity = self.packet_capacity;
+        child.direction.outbound &= self.outgoing;
+    }
 }
 
 type InterfaceControlMap = Arc<std::sync::Mutex<HashMap<u64, InterfaceControlMetadata>>>;
@@ -3058,22 +3087,27 @@ fn config_u16(
     Ok(Some(value))
 }
 
-fn parse_ingress_overrides(
-    section_name: &str,
+/// `[reticulum]` ingress defaults: zero or negative values leave the class default.
+fn parse_global_ingress_overrides(
     section: &ConfigSection,
 ) -> Result<rns_transport::ingress::IngressOverrides, ConfigError> {
+    let positive = |key| -> Result<Option<f64>, ConfigError> {
+        Ok(config_float("reticulum", section, key)?.filter(|v| *v > 0.0))
+    };
     Ok(rns_transport::ingress::IngressOverrides {
-        burst_freq_new: config_float(section_name, section, "ic_burst_freq_new")?,
-        burst_freq: config_float(section_name, section, "ic_burst_freq")?,
-        pr_burst_freq_new: config_float(section_name, section, "ic_pr_burst_freq_new")?,
-        pr_burst_freq: config_float(section_name, section, "ic_pr_burst_freq")?,
-        new_time: config_float(section_name, section, "ic_new_time")?,
-        burst_hold: config_float(section_name, section, "ic_burst_hold")?,
-        burst_penalty: config_float(section_name, section, "ic_burst_penalty")?,
-        max_held: config_uint(section_name, section, "ic_max_held_announces")?.map(|v| v as usize),
-        held_release_interval: config_float(section_name, section, "ic_held_release_interval")?,
-        ec_pr_freq: config_float(section_name, section, "ec_pr_freq")?,
-        egress_control: config_bool(section_name, section, "egress_control")?,
+        burst_freq_new: positive("ic_burst_freq_new")?,
+        burst_freq: positive("ic_burst_freq")?,
+        pr_burst_freq_new: positive("ic_pr_burst_freq_new")?,
+        pr_burst_freq: positive("ic_pr_burst_freq")?,
+        new_time: positive("ic_new_time")?,
+        burst_hold: positive("ic_burst_hold")?,
+        burst_penalty: positive("ic_burst_penalty")?,
+        max_held: config_int("reticulum", section, "ic_max_held_announces")?
+            .filter(|v| *v > 0)
+            .map(|v| usize::try_from(v).unwrap_or(usize::MAX)),
+        held_release_interval: positive("ic_held_release_interval")?,
+        ec_pr_freq: positive("ec_pr_freq")?,
+        egress_control: config_bool("reticulum", section, "egress_control")?.filter(|v| *v),
         ..Default::default()
     })
 }
@@ -3218,16 +3252,17 @@ impl ReticulumConfig {
             }
             rc.force_shared_instance_bitrate =
                 config_uint("reticulum", sec, "force_shared_instance_bitrate")?;
-            if let Some(v) = config_uint("reticulum", sec, "default_ar_target")? {
-                rc.default_ar_target = (v > 0).then_some(v);
-            }
-            if let Some(v) = config_uint("reticulum", sec, "default_ar_penalty")? {
-                rc.default_ar_penalty = Some(v);
-            }
-            if let Some(v) = config_uint("reticulum", sec, "default_ar_grace")? {
-                rc.default_ar_grace = Some(v.min(u32::MAX as u64) as u32);
-            }
-            rc.ingress_overrides = parse_ingress_overrides("reticulum", sec)?;
+            // Zero or negative falls back to the interface class default, as upstream's getters do.
+            let positive = |key| -> Result<Option<u64>, ConfigError> {
+                Ok(config_int("reticulum", sec, key)?
+                    .filter(|v| *v > 0)
+                    .map(|v| v as u64))
+            };
+            rc.default_ar_target = positive("default_ar_target")?;
+            rc.default_ar_penalty = positive("default_ar_penalty")?;
+            rc.default_ar_grace =
+                positive("default_ar_grace")?.map(|v| u32::try_from(v).unwrap_or(u32::MAX));
+            rc.ingress_overrides = parse_global_ingress_overrides(sec)?;
             let queues = &mut rc.inbound_queue_lengths;
             for (key, length) in [
                 ("qlen_in_data", &mut queues.data),
@@ -4109,14 +4144,14 @@ pub async fn init_with_policy(
                 handle_tx.clone(),
                 &socket_base,
                 &paths.storage_dir,
-                &rc.ingress_overrides,
                 is_foreground.clone(),
                 rnode_startup_options,
                 &tunnel_identity,
             )
             .await
             {
-                Ok(iface_handles) => {
+                Ok(mut iface_handles) => {
+                    apply_configured_bitrate_mtu(iface_config, &post_init, &mut iface_handles);
                     let pending_rnode =
                         pending_configured_rnode_runtime(iface_config, &iface_handles);
                     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -4578,9 +4613,6 @@ fn interface_kind_for_config(config: &interface_factory::InterfaceConfig) -> Int
 struct OwnedInterfaceHandle {
     interface: rns_interface::traits::InterfaceHandle,
     driver: Option<rns_interface::rnode::RNodeDriverHandle>,
-    /// An I2P peer that Python's `I2PInterface` creates for a configured peer,
-    /// with the `[reticulum]` ingress settings it takes.
-    configured_peer: Option<rns_transport::ingress::IngressOverrides>,
     /// The address a discoverable interface learns at runtime (I2P b32).
     discovery_address: Option<tokio::sync::watch::Receiver<Option<String>>>,
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -4726,7 +4758,6 @@ impl From<rns_interface::traits::InterfaceHandle> for OwnedInterfaceHandle {
         Self {
             interface,
             driver: None,
-            configured_peer: None,
             discovery_address: None,
             #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
             hardware_failures: None,
@@ -4739,7 +4770,6 @@ impl From<rns_interface::rnode::SpawnedRNodeInterface> for OwnedInterfaceHandle 
         Self {
             interface: spawned.interface,
             driver: Some(spawned.driver),
-            configured_peer: None,
             discovery_address: None,
             #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
             hardware_failures: None,
@@ -5198,7 +5228,7 @@ async fn register_owned_interface_handle_with_role_and_overrides(
 
 #[allow(clippy::too_many_arguments)]
 async fn prepare_interface_with_role_and_overrides(
-    owned: OwnedInterfaceHandle,
+    mut owned: OwnedInterfaceHandle,
     role: rns_transport::messages::InterfaceRole,
     ingress_overrides: rns_transport::ingress::IngressOverrides,
     ifac_key: Option<IfacKey>,
@@ -5208,6 +5238,16 @@ async fn prepare_interface_with_role_and_overrides(
     kind: InterfaceKind,
     multipoint: bool,
 ) -> Result<PreparedInterfaceRegistration, InterfaceRegistrationError> {
+    let inherited = owned.interface.parent_id.and_then(|parent| {
+        interface_controls
+            .lock()
+            .expect("interface_controls mutex poisoned")
+            .get(&parent)
+            .and_then(|parent| parent.spawn.clone())
+    });
+    if let Some(parent) = &inherited {
+        parent.apply(&mut owned.interface);
+    }
     let ingress = match ingress_for_role(role, &ingress_overrides) {
         Ok(ingress) => ingress,
         Err(error) => {
@@ -5304,6 +5344,7 @@ async fn prepare_interface_with_role_and_overrides(
                 autoconnect_source: None,
                 destination_cost,
                 pr_cost,
+                spawn: None,
             },
         );
     }
@@ -5324,11 +5365,19 @@ async fn prepare_interface_with_role_and_overrides(
         tx: handle.tx,
         ifac_key,
         ifac_size,
-        announce_cap: ANNOUNCE_CAP,
+        announce_cap: inherited
+            .as_ref()
+            .map_or(ANNOUNCE_CAP, |parent| parent.announce_cap),
         announce_allowed_at: 0.0,
-        announce_rate_target: None,
-        announce_rate_grace: None,
-        announce_rate_penalty: None,
+        announce_rate_target: inherited
+            .as_ref()
+            .and_then(|parent| parent.announce_rate_target),
+        announce_rate_grace: inherited
+            .as_ref()
+            .and_then(|parent| parent.announce_rate_grace),
+        announce_rate_penalty: inherited
+            .as_ref()
+            .and_then(|parent| parent.announce_rate_penalty),
         online: Some(online.clone()),
         rxb: handle.rxb,
         txb: handle.txb,
@@ -5341,10 +5390,12 @@ async fn prepare_interface_with_role_and_overrides(
         ingress,
         announce_queue: Vec::new(),
         multipoint,
-        // Interface.py class defaults; Python spawned sub-interfaces do not
-        // inherit recursive_prs/announces_from_internal (TCPInterface.py:579+).
-        recursive_prs: false,
-        announces_from_internal: true,
+        recursive_prs: inherited
+            .as_ref()
+            .is_some_and(|parent| parent.recursive_prs),
+        announces_from_internal: inherited
+            .as_ref()
+            .is_none_or(|parent| parent.announces_from_internal),
         destination_cost: child_stamp_costs.0,
         pr_cost: child_stamp_costs.1,
     };
@@ -5435,6 +5486,34 @@ async fn register_owned_interface_with_post_init(
     .map(|_| ())
 }
 
+/// Python's configured `bitrate`, which counts from `MINIMUM_BITRATE` (Reticulum.py:1018-1020).
+fn configured_bitrate(post_init: &interface_factory::InterfacePostInit) -> Option<u64> {
+    post_init
+        .bitrate
+        .filter(|bitrate| *bitrate >= MINIMUM_BITRATE)
+}
+
+/// Python's post-init `optimise_mtu` after a configured bitrate (Reticulum.py:1127-1128),
+/// for the interface classes with `AUTOCONFIGURE_MTU`.
+fn apply_configured_bitrate_mtu(
+    iface_config: &interface_factory::InterfaceConfig,
+    post_init: &interface_factory::InterfacePostInit,
+    handles: &mut [OwnedInterfaceHandle],
+) {
+    let autoconfigures = match iface_config {
+        interface_factory::InterfaceConfig::TcpClient(c) => c.fixed_mtu.is_none(),
+        interface_factory::InterfaceConfig::TcpServer(_)
+        | interface_factory::InterfaceConfig::Backbone(_) => true,
+        _ => false,
+    };
+    let Some(bitrate) = configured_bitrate(post_init).filter(|_| autoconfigures) else {
+        return;
+    };
+    for owned in handles {
+        rns_interface::traits::apply_autoconfigured_mtu(&mut owned.interface, bitrate);
+    }
+}
+
 fn clone_interface_post_init(
     post_init: &interface_factory::InterfacePostInit,
 ) -> interface_factory::InterfacePostInit {
@@ -5478,34 +5557,6 @@ fn i2p_key_path(storage_dir: &Path, name: &str, transport_identity_hash: &[u8; 1
     ))
 }
 
-/// Python's configured I2P peers take IFAC from their interface and every
-/// other default (I2PInterface.py:359-381), the `[reticulum]` ingress settings
-/// included (Interface.py:140-150).
-fn configured_peer_post_init(
-    post_init: &interface_factory::InterfacePostInit,
-    ingress_overrides: &rns_transport::ingress::IngressOverrides,
-) -> interface_factory::InterfacePostInit {
-    interface_factory::InterfacePostInit {
-        outgoing: true,
-        bitrate: None,
-        announce_cap: None,
-        announce_rate_target: None,
-        announce_rate_grace: None,
-        announce_rate_penalty: None,
-        ifac_network_name: post_init.ifac_network_name.clone(),
-        ifac_passphrase: post_init.ifac_passphrase.clone(),
-        ifac_size: post_init.ifac_size,
-        default_ifac_size: post_init.default_ifac_size,
-        ingress_control: true,
-        ingress_overrides: ingress_overrides.clone(),
-        recursive_prs: false,
-        announces_from_internal: true,
-        // I2PInterface.py:854-855 copies these to configured peers.
-        destination_cost: post_init.destination_cost,
-        pr_cost: post_init.pr_cost,
-    }
-}
-
 async fn prepare_interface_with_post_init(
     owned: OwnedInterfaceHandle,
     post_init: &interface_factory::InterfacePostInit,
@@ -5514,14 +5565,6 @@ async fn prepare_interface_with_post_init(
     interface_registry: &InterfaceRegistry,
     kind: InterfaceKind,
 ) -> Result<PreparedInterfaceRegistration, InterfaceRegistrationError> {
-    let peer_post_init;
-    let post_init = match &owned.configured_peer {
-        Some(ingress_overrides) => {
-            peer_post_init = configured_peer_post_init(post_init, ingress_overrides);
-            &peer_post_init
-        }
-        None => post_init,
-    };
     let ingress = if post_init.ingress_overrides.is_empty() {
         rns_transport::ingress::IngressController::new()
     } else {
@@ -5615,6 +5658,10 @@ async fn prepare_interface_with_post_init(
         }
     };
     let registry_owner = registration.owner();
+    let bitrate = configured_bitrate(post_init).unwrap_or(handle.bitrate);
+    let announce_cap = post_init.announce_cap.unwrap_or(ANNOUNCE_CAP);
+    let announce_rate_target = post_init.announce_rate_target.map(|v| v as f64);
+    let announce_rate_penalty = post_init.announce_rate_penalty.map(|v| v as f64);
     interface_controls
         .lock()
         .expect("interface_controls mutex poisoned")
@@ -5632,6 +5679,19 @@ async fn prepare_interface_with_post_init(
                 autoconnect_source: None,
                 destination_cost: post_init.destination_cost,
                 pr_cost: post_init.pr_cost,
+                spawn: Some(SpawnInheritance {
+                    mode: handle.mode,
+                    outgoing: post_init.outgoing,
+                    bitrate,
+                    mtu: handle.mtu,
+                    packet_capacity: handle.packet_capacity,
+                    announce_cap,
+                    announce_rate_target,
+                    announce_rate_grace: post_init.announce_rate_grace,
+                    announce_rate_penalty,
+                    recursive_prs: post_init.recursive_prs,
+                    announces_from_internal: post_init.announces_from_internal,
+                }),
             },
         );
     let entry = rns_transport::messages::InterfaceEntry {
@@ -5643,16 +5703,16 @@ async fn prepare_interface_with_post_init(
         parent_id: handle.parent_id,
         accepted: false,
         direction,
-        bitrate: post_init.bitrate.unwrap_or(handle.bitrate),
+        bitrate,
         mtu: handle.mtu,
         tx: handle.tx,
         ifac_key,
         ifac_size: post_init.ifac_size.unwrap_or(post_init.default_ifac_size),
-        announce_cap: post_init.announce_cap.unwrap_or(ANNOUNCE_CAP),
+        announce_cap,
         announce_allowed_at: 0.0,
-        announce_rate_target: post_init.announce_rate_target.map(|v| v as f64),
+        announce_rate_target,
         announce_rate_grace: post_init.announce_rate_grace,
-        announce_rate_penalty: post_init.announce_rate_penalty.map(|v| v as f64),
+        announce_rate_penalty,
         online: Some(online.clone()),
         rxb: handle.rxb,
         txb: handle.txb,
@@ -8972,7 +9032,6 @@ async fn spawn_interface_with_rnode_startup_options(
     handle_tx: mpsc::Sender<rns_interface::traits::InterfaceHandle>,
     socket_base: &Path,
     storage_dir: &Path,
-    global_ingress_overrides: &rns_transport::ingress::IngressOverrides,
     is_foreground: Arc<AtomicBool>,
     rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
     tunnel_identity: &rns_interface::traits::TunnelIdentity,
@@ -9193,6 +9252,7 @@ async fn spawn_interface_with_rnode_startup_options(
                 );
                 client_config.sam_host = c.i2p_sam_host.clone();
                 client_config.sam_port = c.i2p_sam_port;
+                client_config.mode = c.mode;
                 client_config.tunnel_identity = Some(tunnel_identity.clone());
                 let peer_id = next.take().unwrap_or_else(|| next_id(&id_gen));
                 match rns_interface::i2p::spawn_i2p_client(
@@ -9202,10 +9262,7 @@ async fn spawn_interface_with_rnode_startup_options(
                 )
                 .await
                 {
-                    Ok(client) => handles.push(OwnedInterfaceHandle {
-                        configured_peer: Some(global_ingress_overrides.clone()),
-                        ..client.into()
-                    }),
+                    Ok(client) => handles.push(client.into()),
                     Err(e) => {
                         for spawned in handles {
                             rollback_unreserved_interface(spawned, InterfaceKind::Standard).await;
@@ -9627,6 +9684,7 @@ mod tests {
                 autoconnect_source: None,
                 destination_cost: None,
                 pr_cost: None,
+                spawn: None,
             },
         );
 
@@ -9776,6 +9834,7 @@ mod tests {
                 autoconnect_source: None,
                 destination_cost: None,
                 pr_cost: None,
+                spawn: None,
             },
         );
         drop(registration);
@@ -15371,6 +15430,7 @@ egress_control = Yes
                     autoconnect_source: None,
                     destination_cost: None,
                     pr_cost: None,
+                    spawn: None,
                 },
             );
 

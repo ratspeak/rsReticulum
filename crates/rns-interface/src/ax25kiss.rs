@@ -372,8 +372,9 @@ pub async fn spawn_ax25kiss_interface(
     let rxb_r = shared_rxb.clone();
     let read_task = tokio::spawn(async move {
         let mut port_r = port;
-        let mut deframer = kiss::KissDeframer::new();
+        let mut deframer = kiss::KissByteDeframer::new(HW_MTU as usize + AX25_HEADER_SIZE);
         let mut buf = [0u8; 1024];
+        let mut last_read = std::time::Instant::now();
 
         loop {
             if !online_r.load(Ordering::SeqCst) {
@@ -383,11 +384,18 @@ pub async fn spawn_ax25kiss_interface(
                 Ok((p, b, n)) => {
                     port_r = p;
                     buf = b;
-                    if n > 0 {
+                    if n == 0 {
+                        if deframer.buffered() > 0
+                            && last_read.elapsed() > Duration::from_millis(AX25_READ_TIMEOUT_MS)
+                        {
+                            deframer.reset();
+                        }
+                    } else {
+                        last_read = std::time::Instant::now();
                         rxb_r.fetch_add(n as u64, Ordering::Relaxed);
-                        for (cmd, frame) in deframer.feed(&buf[..n]) {
-                            match cmd {
-                                kiss::CMD_DATA => {
+                        for event in deframer.feed(&buf[..n]) {
+                            match event {
+                                kiss::KissEvent::Data(frame) => {
                                     let payload = match strip_ax25_header(&frame) {
                                         Some(p) if !p.is_empty() => p.to_vec(),
                                         _ => continue,
@@ -405,12 +413,9 @@ pub async fn spawn_ax25kiss_interface(
                                         return;
                                     }
                                 }
-                                kiss::CMD_READY => {
+                                kiss::KissEvent::Ready => {
                                     ready_r.store(true, Ordering::SeqCst);
                                     tracing::debug!(id, "AX.25 KISS flow control: ready");
-                                }
-                                _ => {
-                                    tracing::debug!(id, cmd, "ignoring KISS command");
                                 }
                             }
                         }
