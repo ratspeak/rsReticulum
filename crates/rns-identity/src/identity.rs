@@ -8,6 +8,7 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::persistence::{self, SecretBytes};
+use crate::stamps::{self, StampControl, StampError};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -141,6 +142,33 @@ impl Identity {
             hash,
             backend: None,
         }
+    }
+
+    /// Generate a software identity whose X25519 key stamps its Ed25519
+    /// public key with at least `value` (Python `Identity(value=...)`).
+    /// Returns `None` when the search is cancelled or passes its deadline.
+    pub fn new_with_value(value: f64, ctl: &StampControl) -> Result<Option<Self>, StampError> {
+        let sig_prv = Ed25519PrivateKey::generate();
+        let sig_pub = sig_prv.public_key();
+        let Some(key) = stamps::generate_stamped_key(&sig_pub.to_bytes(), value, ctl)? else {
+            return Ok(None);
+        };
+        let pub_key = key.private.public_key();
+        let hash = Self::compute_hash(&pub_key, &sig_pub);
+        Ok(Some(Self {
+            prv: Some(key.private),
+            sig_prv: Some(sig_prv),
+            pub_key,
+            sig_pub,
+            hash,
+            backend: None,
+        }))
+    }
+
+    /// Stamp value of the X25519 public key over the Ed25519 public key
+    /// (Python `Identity.get_value`).
+    pub fn get_value(&self) -> f64 {
+        stamps::stamp_value(&self.sig_pub.to_bytes(), &self.pub_key.to_bytes())
     }
 
     /// Load exactly 64 bytes: an X25519 private key followed by an Ed25519 seed.

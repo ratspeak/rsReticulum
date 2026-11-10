@@ -11,3 +11,4 @@ pub mod known_destinations;
 pub mod name_hash;
 pub mod persistence;
 pub mod ratchet;
+pub mod stamps;
