@@ -2488,8 +2488,15 @@ pub fn shared_instance_rpc_socket_path(instance_name: &str, socket_base: &Path) 
     shared_unix_rpc_socket_path(instance_name, socket_base)
 }
 
-fn shared_tcp_client_config(port: u16) -> rns_interface::tcp::TcpClientConfig {
-    rns_interface::tcp::TcpClientConfig::new("SharedInstanceClient", "127.0.0.1", port)
+fn shared_tcp_client_config(
+    port: u16,
+    force_bitrate: Option<u64>,
+) -> rns_interface::local::LocalClientConfig {
+    rns_interface::local::LocalClientConfig {
+        socket_path: rns_interface::local::tcp_socket_path(port),
+        name: "SharedInstanceClient".to_string(),
+        force_bitrate,
+    }
 }
 
 async fn detect_shared_tcp_server(port: u16) -> bool {
@@ -3362,32 +3369,23 @@ pub async fn init_with_policy(
                 return Ok(mode);
             }
             let control = BoundControlListener::bind(&rc, &socket_base).await?;
-            let mut server = if rc.shared_instance_type == SharedInstanceType::Tcp {
-                rns_interface::tcp::spawn_tcp_server(
-                    rns_interface::tcp::TcpServerConfig::new(
-                        "SharedInstanceServer",
-                        "127.0.0.1",
-                        rc.shared_instance_port,
-                    ),
-                    next_id(&id_gen),
-                    id_gen.clone(),
-                    transport_tx.clone(),
-                    handle_tx.clone(),
-                )
-                .await
+            let socket_path = if rc.shared_instance_type == SharedInstanceType::Tcp {
+                rns_interface::local::tcp_socket_path(rc.shared_instance_port)
             } else {
-                rns_interface::local::spawn_local_server(
-                    rns_interface::local::LocalServerConfig {
-                        socket_path: shared_unix_socket_path(&rc.instance_name, &socket_base),
-                        name: "SharedInstanceServer".to_string(),
-                    },
-                    next_id(&id_gen),
-                    id_gen.clone(),
-                    transport_tx.clone(),
-                    handle_tx.clone(),
-                )
-                .await
-            }
+                shared_unix_socket_path(&rc.instance_name, &socket_base)
+            };
+            let mut server = rns_interface::local::spawn_local_server(
+                rns_interface::local::LocalServerConfig {
+                    socket_path,
+                    name: "SharedInstanceServer".to_string(),
+                    force_bitrate: rc.force_shared_instance_bitrate,
+                },
+                next_id(&id_gen),
+                id_gen.clone(),
+                transport_tx.clone(),
+                handle_tx.clone(),
+            )
+            .await
             .map_err(|_| SharedInstanceError::PacketBindFailed)?;
             apply_forced_shared_instance_bitrate(&mut server, rc.force_shared_instance_bitrate);
             register_interface_handle_with_role_and_spawn_permit(
@@ -3429,9 +3427,12 @@ pub async fn init_with_policy(
             let live_server_detected = detect_shared_tcp_server(rc.shared_instance_port).await;
 
             if live_server_detected {
-                let client_config = shared_tcp_client_config(rc.shared_instance_port);
+                let client_config = shared_tcp_client_config(
+                    rc.shared_instance_port,
+                    rc.force_shared_instance_bitrate,
+                );
                 let client_id = next_id(&id_gen);
-                match rns_interface::tcp::spawn_tcp_client(
+                match rns_interface::local::spawn_local_client(
                     client_config,
                     client_id,
                     transport_tx.clone(),
@@ -3455,13 +3456,13 @@ pub async fn init_with_policy(
             } else if options.require_shared_instance {
                 InstanceMode::Standalone
             } else {
-                let server_config = rns_interface::tcp::TcpServerConfig::new(
-                    "SharedInstanceServer",
-                    "127.0.0.1",
-                    rc.shared_instance_port,
-                );
+                let server_config = rns_interface::local::LocalServerConfig {
+                    socket_path: rns_interface::local::tcp_socket_path(rc.shared_instance_port),
+                    name: "SharedInstanceServer".to_string(),
+                    force_bitrate: rc.force_shared_instance_bitrate,
+                };
                 let server_id = next_id(&id_gen);
-                match rns_interface::tcp::spawn_tcp_server(
+                match rns_interface::local::spawn_local_server(
                     server_config,
                     server_id,
                     id_gen.clone(),
@@ -3498,9 +3499,12 @@ pub async fn init_with_policy(
                     }
                     Err(_) => {
                         if detect_shared_tcp_server(rc.shared_instance_port).await {
-                            let client_config = shared_tcp_client_config(rc.shared_instance_port);
+                            let client_config = shared_tcp_client_config(
+                                rc.shared_instance_port,
+                                rc.force_shared_instance_bitrate,
+                            );
                             let client_id = next_id(&id_gen);
-                            match rns_interface::tcp::spawn_tcp_client(
+                            match rns_interface::local::spawn_local_client(
                                 client_config,
                                 client_id,
                                 transport_tx.clone(),
@@ -3564,6 +3568,7 @@ pub async fn init_with_policy(
                 let client_config = rns_interface::local::LocalClientConfig {
                     socket_path,
                     name: "SharedInstanceClient".to_string(),
+                    force_bitrate: rc.force_shared_instance_bitrate,
                 };
                 let client_id = next_id(&id_gen);
                 match rns_interface::local::spawn_local_client(
@@ -3593,6 +3598,7 @@ pub async fn init_with_policy(
                 let server_config = rns_interface::local::LocalServerConfig {
                     socket_path: socket_path.clone(),
                     name: "SharedInstanceServer".to_string(),
+                    force_bitrate: rc.force_shared_instance_bitrate,
                 };
                 match rns_interface::local::spawn_local_server(
                     server_config,
@@ -3633,6 +3639,7 @@ pub async fn init_with_policy(
                         let client_config = rns_interface::local::LocalClientConfig {
                             socket_path,
                             name: "SharedInstanceClient".to_string(),
+                            force_bitrate: rc.force_shared_instance_bitrate,
                         };
                         let client_id = next_id(&id_gen);
                         match rns_interface::local::spawn_local_client(
@@ -8683,6 +8690,7 @@ async fn spawn_interface_with_rnode_startup_options(
                     .to_string_lossy()
                     .to_string(),
                 name: c.name.clone(),
+                force_bitrate: None,
             };
             rns_interface::local::spawn_local_client(local_config, id, transport_tx)
                 .await
@@ -8758,7 +8766,7 @@ async fn spawn_interface_with_rnode_startup_options(
             let pipe_config = rns_interface::pipe::PipeInterfaceConfig {
                 name: c.name.clone(),
                 command: c.command.clone(),
-                respawn_delay: c.respawn_delay as f64,
+                respawn_delay: c.respawn_delay,
                 mode: c.mode,
             };
             rns_interface::pipe::spawn_pipe_interface(pipe_config, id, transport_tx)
@@ -11187,12 +11195,10 @@ loglevel = 7
     }
 
     #[test]
-    fn test_shared_tcp_client_config_has_no_reconnect_cap() {
-        let config = shared_tcp_client_config(12345);
+    fn test_shared_tcp_client_config_uses_local_interface() {
+        let config = shared_tcp_client_config(12345, None);
         assert_eq!(config.name, "SharedInstanceClient");
-        assert_eq!(config.target_host, "127.0.0.1");
-        assert_eq!(config.target_port, 12345);
-        assert_eq!(config.max_reconnect_tries, None);
+        assert_eq!(config.socket_path, "tcp://127.0.0.1:12345");
     }
 
     #[test]

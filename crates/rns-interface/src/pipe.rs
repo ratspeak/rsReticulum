@@ -1,15 +1,18 @@
-//! HDLC-framed data over a subprocess's stdin/stdout. The task retries failed
-//! spawns and respawns after stdout EOF or a read error. The command is split
-//! on whitespace and executed directly: shell quoting, expansion, and
-//! pipelines are not interpreted.
+//! HDLC-framed data over a subprocess's stdin/stdout, matching upstream
+//! `PipeInterface`. The command is split like Python `shlex.split` and run
+//! directly, without a shell. The first spawn happens while the interface is
+//! created and its failure fails creation; after the child exits the
+//! interface is offline, drops outbound traffic, and respawns every
+//! `respawn_delay` seconds until a spawn succeeds.
 
 use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 
 use crate::hdlc;
@@ -24,8 +27,7 @@ pub const DEFAULT_RESPAWN_DELAY: f64 = 5.0;
 pub struct PipeInterfaceConfig {
     pub name: String,
     pub command: String,
-    /// Seconds before respawning. Must be finite, non-negative, and representable
-    /// as a `Duration`; this field is not validated before the task starts.
+    /// Seconds before each respawn attempt; must be finite and non-negative.
     pub respawn_delay: f64,
     pub mode: InterfaceMode,
 }
@@ -41,156 +43,224 @@ impl PipeInterfaceConfig {
     }
 }
 
+/// Split `command` like Python `shlex.split(command)` (POSIX mode, no
+/// comments). Returns `None` for an unterminated quote or trailing escape.
+pub fn split_command(command: &str) -> Option<Vec<String>> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        Space,
+        Word,
+        Quote(char),
+        Escape(Option<char>),
+    }
+    let mut words = Vec::new();
+    let mut token = String::new();
+    let mut quoted = false;
+    let mut state = State::Space;
+    for c in command.chars() {
+        let whitespace = matches!(c, ' ' | '\t' | '\r' | '\n');
+        match state {
+            State::Space | State::Word => {
+                if whitespace {
+                    if state == State::Word || quoted {
+                        words.push(std::mem::take(&mut token));
+                        quoted = false;
+                    }
+                    state = State::Space;
+                } else if c == '\\' {
+                    state = State::Escape(None);
+                } else if c == '\'' || c == '"' {
+                    state = State::Quote(c);
+                } else {
+                    token.push(c);
+                    state = State::Word;
+                }
+            }
+            State::Quote(q) => {
+                quoted = true;
+                if c == q {
+                    state = State::Word;
+                } else if c == '\\' && q == '"' {
+                    state = State::Escape(Some(q));
+                } else {
+                    token.push(c);
+                }
+            }
+            State::Escape(inside) => {
+                // Inside double quotes only the quote and backslash are escapable.
+                if inside.is_some_and(|q| c != '\\' && c != q) {
+                    token.push('\\');
+                }
+                token.push(c);
+                state = inside.map_or(State::Word, State::Quote);
+            }
+        }
+    }
+    match state {
+        State::Quote(_) | State::Escape(_) => None,
+        State::Word => {
+            words.push(token);
+            Some(words)
+        }
+        State::Space => {
+            if quoted {
+                words.push(token);
+            }
+            Some(words)
+        }
+    }
+}
+
+fn spawn_child(argv: &[String]) -> std::io::Result<(Child, ChildStdin, ChildStdout)> {
+    let Some((program, args)) = argv.split_first() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty PipeInterface command",
+        ));
+    };
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let stdin = child.stdin.take().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "subprocess has no stdin")
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "subprocess has no stdout")
+    })?;
+    Ok((child, stdin, stdout))
+}
+
 pub async fn spawn_pipe_interface(
     config: PipeInterfaceConfig,
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    if !config.respawn_delay.is_finite() || config.respawn_delay < 0.0 {
+        return Err(crate::traits::InterfaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "invalid PipeInterface respawn_delay {}",
+                config.respawn_delay
+            ),
+        )));
+    }
+    let argv = split_command(&config.command).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "PipeInterface command has an unterminated quote or escape",
+        )
+    })?;
+    let first = spawn_child(&argv)?;
+    tracing::info!(name = %config.name, cmd = %config.command, "PipeInterface: subprocess spawned");
+
     let transport_tx = InterfaceTransportSender::new(id, transport_tx);
     let owner = transport_tx.owner();
     let online = Arc::new(AtomicBool::new(true));
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
-    let (tx, rx) = mpsc::channel::<Bytes>(256);
+    let (tx, mut rx) = mpsc::channel::<Bytes>(256);
     let name = config.name.clone();
     let mode = config.mode;
-
-    // Outbound rx must survive respawns; share across write loops.
-    let rx = Arc::new(tokio::sync::Mutex::new(rx));
+    let respawn_delay = Duration::from_secs_f64(config.respawn_delay);
 
     let online_task = online.clone();
     let rxb_task = shared_rxb.clone();
     let txb_task = shared_txb.clone();
 
     let read_task = tokio::spawn(async move {
+        let (mut child, mut stdin, mut stdout) = first;
         loop {
-            if !online_task.load(Ordering::SeqCst) {
-                break;
-            }
-
-            let parts: Vec<&str> = config.command.split_whitespace().collect();
-            if parts.is_empty() {
-                tracing::error!("PipeInterface: empty command");
-                break;
-            }
-
-            let child = Command::new(parts[0])
-                .args(&parts[1..])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn();
-
-            let mut child = match child {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(error = %e, "PipeInterface: failed to spawn subprocess");
-                    tokio::time::sleep(std::time::Duration::from_secs_f64(config.respawn_delay))
-                        .await;
-                    continue;
-                }
-            };
-
-            tracing::info!(name = %config.name, cmd = %config.command, "PipeInterface: subprocess spawned");
-
-            let mut stdout = match child.stdout.take() {
-                Some(s) => s,
-                None => {
-                    tracing::error!("PipeInterface: no stdout from subprocess");
-                    break;
-                }
-            };
-            let mut stdin = match child.stdin.take() {
-                Some(s) => s,
-                None => {
-                    tracing::error!("PipeInterface: no stdin for subprocess");
-                    break;
-                }
-            };
-
-            // Per-subprocess writer channel; outer rx forwards into conn_tx.
-            let (conn_tx, mut conn_rx) = mpsc::channel::<Bytes>(256);
-            let online_w = online_task.clone();
-            let txb_w = txb_task.clone();
-            let write_handle = tokio::spawn(async move {
-                while let Some(data) = conn_rx.recv().await {
-                    if !online_w.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let framed = hdlc::frame(&data);
-                    txb_w.fetch_add(framed.len() as u64, Ordering::Relaxed);
-                    if let Err(e) = stdin.write_all(&framed).await {
-                        tracing::warn!(error = %e, "PipeInterface: write error");
-                        break;
-                    }
-                    if let Err(e) = stdin.flush().await {
-                        tracing::warn!(error = %e, "PipeInterface: flush error");
-                        break;
-                    }
-                }
-            });
-
-            let rx_ref = rx.clone();
-            let fwd_handle = tokio::spawn(async move {
-                let mut guard = rx_ref.lock().await;
-                while let Some(data) = guard.recv().await {
-                    if conn_tx.send(data).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
             let mut deframer = hdlc::HdlcDeframer::new();
             let mut buf = [0u8; 2048];
             loop {
-                match stdout.read(&mut buf).await {
-                    Ok(0) => {
-                        tracing::info!("PipeInterface: subprocess stdout EOF");
-                        break;
-                    }
-                    Ok(n) => {
-                        rxb_task.fetch_add(n as u64, Ordering::Relaxed);
-                        for frame in deframer.feed(&buf[..n]) {
-                            if frame.is_empty() {
-                                continue;
+                tokio::select! {
+                    read = stdout.read(&mut buf) => match read {
+                        Ok(0) => {
+                            tracing::info!(name = %config.name, "PipeInterface: subprocess terminated");
+                            break;
+                        }
+                        Ok(n) => {
+                            rxb_task.fetch_add(n as u64, Ordering::Relaxed);
+                            for frame in deframer.feed(&buf[..n]) {
+                                if frame.is_empty() {
+                                    continue;
+                                }
+                                let msg = TransportMessage::Inbound(InboundPacket {
+                                    raw: Bytes::from(frame),
+                                    interface_id: id,
+                                    rssi: None,
+                                    snr: None,
+                                    q: None,
+                                });
+                                if transport_tx.send(msg).await.is_err() {
+                                    tracing::warn!(id, "transport channel closed");
+                                    online_task.store(false, Ordering::SeqCst);
+                                    return;
+                                }
                             }
-                            let msg = TransportMessage::Inbound(InboundPacket {
-                                raw: Bytes::from(frame),
-                                interface_id: id,
-                                rssi: None,
-                                snr: None,
-                                q: None,
-                            });
-                            if transport_tx.send(msg).await.is_err() {
-                                tracing::warn!(id, "transport channel closed");
-                                online_task.store(false, Ordering::SeqCst);
+                        }
+                        Err(e) => {
+                            tracing::error!(name = %config.name, error = %e, "PipeInterface: pipe error");
+                            break;
+                        }
+                    },
+                    outbound = rx.recv() => {
+                        let Some(data) = outbound else {
+                            online_task.store(false, Ordering::SeqCst);
+                            return;
+                        };
+                        let framed = hdlc::frame(&data);
+                        let written = async {
+                            stdin.write_all(&framed).await?;
+                            stdin.flush().await
+                        }
+                        .await;
+                        match written {
+                            Ok(()) => {
+                                txb_task.fetch_add(framed.len() as u64, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                tracing::warn!(name = %config.name, error = %e, "PipeInterface: write error");
+                            }
+                        }
+                    }
+                }
+            }
+
+            online_task.store(false, Ordering::SeqCst);
+            let _ = child.kill().await;
+
+            // Offline until a respawn succeeds; outbound traffic is dropped.
+            loop {
+                let wake = tokio::time::sleep(respawn_delay);
+                tokio::pin!(wake);
+                loop {
+                    tokio::select! {
+                        _ = &mut wake => break,
+                        outbound = rx.recv() => {
+                            if outbound.is_none() {
                                 return;
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "PipeInterface: read error");
+                }
+                tracing::debug!(name = %config.name, "PipeInterface: attempting to respawn subprocess");
+                match spawn_child(&argv) {
+                    Ok(spawned) => {
+                        (child, stdin, stdout) = spawned;
+                        while rx.try_recv().is_ok() {}
+                        online_task.store(true, Ordering::SeqCst);
+                        tracing::info!(name = %config.name, "PipeInterface: reconnected pipe");
                         break;
+                    }
+                    Err(e) => {
+                        tracing::error!(name = %config.name, error = %e, "PipeInterface: error while spawning subprocess");
                     }
                 }
             }
-
-            fwd_handle.abort();
-            let _ = fwd_handle.await;
-            write_handle.abort();
-            let _ = write_handle.await;
-
-            let _ = child.kill().await;
-
-            if !online_task.load(Ordering::SeqCst) {
-                break;
-            }
-
-            tracing::info!(
-                name = %config.name,
-                delay = config.respawn_delay,
-                "PipeInterface: respawning subprocess"
-            );
-            tokio::time::sleep(std::time::Duration::from_secs_f64(config.respawn_delay)).await;
         }
     });
 

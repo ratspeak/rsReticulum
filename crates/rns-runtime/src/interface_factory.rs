@@ -217,15 +217,15 @@ pub struct I2PInterfaceConfig {
 }
 
 /// Subprocess interface carrying HDLC-framed packets over stdin/stdout.
-/// The driver splits `command` on whitespace into executable and arguments;
-/// it does not interpret shell quoting, expansion or redirection.
+/// The driver splits `command` like Python `shlex.split` and runs it without
+/// a shell, so quoting works but expansion and redirection do not.
 #[derive(Debug, Clone)]
 pub struct PipeInterfaceConfig {
     pub name: String,
     pub command: String,
-    /// Delay in seconds before retrying after spawn failure, stdout EOF or
-    /// read failure. Parser default: 5.
-    pub respawn_delay: u64,
+    /// Seconds between respawn attempts after the subprocess exits. Parsed
+    /// like Python `as_float`; default 5.
+    pub respawn_delay: f64,
     pub mode: InterfaceMode,
 }
 
@@ -1346,7 +1346,16 @@ fn synthesize_pipe(
         })?
         .to_string();
 
-    let respawn_delay = section.get_uint("respawn_delay").unwrap_or(5);
+    let respawn_delay = match section.get("respawn_delay") {
+        None => rns_interface::pipe::DEFAULT_RESPAWN_DELAY,
+        Some(_) => section
+            .get_float("respawn_delay")
+            .filter(|delay| delay.is_finite() && *delay >= 0.0)
+            .ok_or_else(|| InterfaceFactoryError::InvalidValue {
+                field: format!("{name}.respawn_delay"),
+                message: "must be a non-negative number of seconds".into(),
+            })?,
+    };
 
     Ok(InterfaceConfig::Pipe(PipeInterfaceConfig {
         name: name.to_string(),
@@ -3206,7 +3215,7 @@ mod tests {
             InterfaceConfig::Pipe(c) => {
                 assert_eq!(c.name, "test_pipe");
                 assert_eq!(c.command, "netcat -l 5757");
-                assert_eq!(c.respawn_delay, 10);
+                assert_eq!(c.respawn_delay, 10.0);
             }
             _ => panic!("expected Pipe"),
         }
@@ -3221,7 +3230,7 @@ mod tests {
         let config = synthesize_interface("pipe_defaults", &section).unwrap();
         match config {
             InterfaceConfig::Pipe(c) => {
-                assert_eq!(c.respawn_delay, 5);
+                assert_eq!(c.respawn_delay, 5.0);
             }
             _ => panic!("expected Pipe"),
         }

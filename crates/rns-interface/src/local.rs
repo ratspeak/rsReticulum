@@ -1,13 +1,16 @@
-//! Shared-instance IPC with HDLC framing. Uses Unix domain sockets on Unix
-//! and TCP on non-Unix platforms. TCP defaults to loopback; a `tcp://` value
-//! in `socket_path` overrides that endpoint.
+//! Shared-instance IPC with HDLC framing, matching upstream
+//! `LocalServerInterface`/`LocalClientInterface`. A `socket_path` of the form
+//! `tcp://host:port` selects a loopback TCP socket on every platform; any
+//! other value is a Unix socket path (abstract when it starts with NUL). On
+//! non-Unix platforms non-TCP values fall back to the loopback default.
 
 use rns_transport::messages::{InterfaceOwner, InterfacePacketCapacity, InterfaceTransportSender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::hdlc;
@@ -17,6 +20,13 @@ use crate::traits::{
 use rns_transport::messages::{InboundPacket, TransportMessage};
 
 pub const LOCAL_MTU: u32 = 262_144;
+pub const LOCAL_BITRATE: u64 = 1_000_000_000;
+pub const RECONNECT_WAIT: Duration = Duration::from_secs(8);
+pub const CLIENT_SLEEP_PAUSE_TIMEOUT: Duration = Duration::from_secs(12);
+/// Upstream sends keepalives from the transport interface jobs, every 5 s.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+const TCP_SCHEME: &str = "tcp://";
 
 /// Default filesystem socket path for local IPC.
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/rns_reticulum.sock";
@@ -34,8 +44,6 @@ pub fn socket_path(data_dir: Option<&std::path::Path>) -> std::path::PathBuf {
 }
 
 pub const FALLBACK_TCP_PORT: u16 = 37428;
-#[cfg(unix)]
-const LOCAL_RECONNECT_WAIT_SECS: u64 = 8;
 
 pub fn socket_path_for(instance_name: &str) -> String {
     format!("/tmp/rns_{}.sock", instance_name)
@@ -49,15 +57,43 @@ pub fn python_shared_socket_name(instance_name: &str) -> String {
     }
 }
 
-#[cfg(unix)]
-fn is_abstract_socket_path(path: &str) -> bool {
-    path.as_bytes().first() == Some(&0)
+/// `socket_path` value for a loopback TCP shared instance on `port`.
+pub fn tcp_socket_path(port: u16) -> String {
+    format!("{TCP_SCHEME}127.0.0.1:{port}")
+}
+
+/// Upstream `platformutils.is_android()`: an Android build, or a process
+/// started with Android's runtime environment.
+pub fn is_android() -> bool {
+    cfg!(target_os = "android")
+        || std::env::var_os("ANDROID_ARGUMENT").is_some()
+        || std::env::var_os("ANDROID_ROOT").is_some()
+}
+
+/// Upstream `platformutils.use_epoll()`; the forced-bitrate send delay only
+/// exists on the other (thread-per-socket) backend.
+fn uses_epoll_backend() -> bool {
+    cfg!(any(target_os = "linux", target_os = "android")) || is_android()
+}
+
+/// Simulated transmission time for `len` payload bytes at `bitrate`.
+pub fn forced_bitrate_delay(len: usize, bitrate: u64) -> Duration {
+    Duration::from_secs_f64(len as f64 * 8.0 / bitrate as f64)
+}
+
+fn send_delay(len: usize, force_bitrate: Option<u64>) -> Option<Duration> {
+    if uses_epoll_backend() {
+        return None;
+    }
+    force_bitrate
+        .filter(|bitrate| *bitrate > 0)
+        .map(|bitrate| forced_bitrate_delay(len, bitrate))
 }
 
 #[cfg(unix)]
 fn display_socket_path(path: &str) -> String {
-    if is_abstract_socket_path(path) {
-        format!("\\0{}", &path[1..])
+    if let Some(name) = path.strip_prefix('\0') {
+        format!("\\0{name}")
     } else {
         path.to_string()
     }
@@ -65,10 +101,11 @@ fn display_socket_path(path: &str) -> String {
 
 #[derive(Debug, Clone)]
 pub struct LocalServerConfig {
-    /// Unix socket path. On non-Unix platforms, a nonempty `tcp://host:port`
-    /// value selects the TCP endpoint; other values use the loopback default.
+    /// Unix socket path, or `tcp://host:port` for a TCP listener.
     pub socket_path: String,
     pub name: String,
+    /// `force_shared_instance_bitrate`; accepted clients inherit it.
+    pub force_bitrate: Option<u64>,
 }
 
 impl Default for LocalServerConfig {
@@ -76,14 +113,18 @@ impl Default for LocalServerConfig {
         Self {
             socket_path: DEFAULT_SOCKET_PATH.to_string(),
             name: "LocalServer".to_string(),
+            force_bitrate: None,
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct LocalClientConfig {
+    /// Unix socket path, or `tcp://host:port` for a TCP shared instance.
     pub socket_path: String,
     pub name: String,
+    /// `force_shared_instance_bitrate`.
+    pub force_bitrate: Option<u64>,
 }
 
 impl Default for LocalClientConfig {
@@ -91,16 +132,210 @@ impl Default for LocalClientConfig {
         Self {
             socket_path: DEFAULT_SOCKET_PATH.to_string(),
             name: "LocalClient".to_string(),
+            force_bitrate: None,
         }
     }
 }
 
-async fn local_read_loop<R: AsyncReadExt + Unpin>(
-    mut reader: R,
+type LocalReader = Box<dyn AsyncRead + Unpin + Send>;
+type LocalWriter = Box<dyn AsyncWrite + Unpin + Send>;
+
+#[derive(Debug, Clone)]
+enum LocalEndpoint {
+    #[cfg(unix)]
+    Unix(String),
+    Tcp(String),
+}
+
+impl LocalEndpoint {
+    fn parse(socket_path: &str) -> Self {
+        if let Some(addr) = socket_path
+            .strip_prefix(TCP_SCHEME)
+            .filter(|addr| !addr.is_empty())
+        {
+            return Self::Tcp(addr.to_string());
+        }
+        #[cfg(unix)]
+        {
+            Self::Unix(socket_path.to_string())
+        }
+        #[cfg(not(unix))]
+        {
+            Self::Tcp(format!("127.0.0.1:{FALLBACK_TCP_PORT}"))
+        }
+    }
+
+    fn display(&self) -> String {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(path) => display_socket_path(path),
+            Self::Tcp(addr) => format!("{TCP_SCHEME}{addr}"),
+        }
+    }
+
+    async fn connect(&self) -> std::io::Result<(LocalReader, LocalWriter)> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(path) => {
+                let (reader, writer) = unix::connect(path).await?.into_split();
+                Ok((Box::new(reader), Box::new(writer)))
+            }
+            Self::Tcp(addr) => {
+                let stream = tokio::net::TcpStream::connect(addr).await?;
+                let _ = stream.set_nodelay(true);
+                let (reader, writer) = stream.into_split();
+                Ok((Box::new(reader), Box::new(writer)))
+            }
+        }
+    }
+
+    async fn bind(&self) -> std::io::Result<LocalListener> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(path) => Ok(LocalListener::Unix(unix::bind(path)?)),
+            Self::Tcp(addr) => Ok(LocalListener::Tcp(
+                tokio::net::TcpListener::bind(addr).await?,
+            )),
+        }
+    }
+}
+
+enum LocalListener {
+    #[cfg(unix)]
+    Unix(tokio::net::UnixListener),
+    Tcp(tokio::net::TcpListener),
+}
+
+impl LocalListener {
+    async fn accept(&self) -> std::io::Result<(LocalReader, LocalWriter, String)> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(listener) => {
+                let (stream, _) = listener.accept().await?;
+                let (reader, writer) = stream.into_split();
+                Ok((Box::new(reader), Box::new(writer), "unix".to_string()))
+            }
+            Self::Tcp(listener) => {
+                let (stream, peer) = listener.accept().await?;
+                let _ = stream.set_nodelay(true);
+                let (reader, writer) = stream.into_split();
+                Ok((Box::new(reader), Box::new(writer), peer.to_string()))
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+mod unix {
+    use tokio::net::{UnixListener, UnixStream};
+
+    pub(super) fn bind(socket_path: &str) -> std::io::Result<UnixListener> {
+        if let Some(abstract_name) = socket_path.strip_prefix('\0') {
+            return bind_abstract(abstract_name);
+        }
+        let _ = std::fs::remove_file(socket_path);
+        UnixListener::bind(socket_path)
+    }
+
+    pub(super) async fn connect(socket_path: &str) -> std::io::Result<UnixStream> {
+        if let Some(abstract_name) = socket_path.strip_prefix('\0') {
+            return connect_abstract(abstract_name);
+        }
+        UnixStream::connect(socket_path).await
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn bind_abstract(name: &str) -> std::io::Result<UnixListener> {
+        use std::os::unix::net::{SocketAddr, UnixListener as StdUnixListener};
+
+        #[cfg(target_os = "android")]
+        use std::os::android::net::SocketAddrExt as _;
+        #[cfg(target_os = "linux")]
+        use std::os::linux::net::SocketAddrExt as _;
+
+        let addr = SocketAddr::from_abstract_name(name.as_bytes())?;
+        let listener = StdUnixListener::bind_addr(&addr)?;
+        listener.set_nonblocking(true)?;
+        UnixListener::from_std(listener)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn bind_abstract(_name: &str) -> std::io::Result<UnixListener> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "abstract Unix sockets are only available on Linux/Android",
+        ))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn connect_abstract(name: &str) -> std::io::Result<UnixStream> {
+        use std::os::unix::net::{SocketAddr, UnixStream as StdUnixStream};
+
+        #[cfg(target_os = "android")]
+        use std::os::android::net::SocketAddrExt as _;
+        #[cfg(target_os = "linux")]
+        use std::os::linux::net::SocketAddrExt as _;
+
+        let addr = SocketAddr::from_abstract_name(name.as_bytes())?;
+        let stream = StdUnixStream::connect_addr(&addr)?;
+        stream.set_nonblocking(true)?;
+        UnixStream::from_std(stream)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn connect_abstract(_name: &str) -> std::io::Result<UnixStream> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "abstract Unix sockets are only available on Linux/Android",
+        ))
+    }
+}
+
+/// Upstream Android owners stop sending to an accepted client that has been
+/// silent for [`CLIENT_SLEEP_PAUSE_TIMEOUT`]; any received data re-arms it.
+struct ClientSleepPause {
+    deadline: std::sync::Mutex<tokio::time::Instant>,
+}
+
+impl ClientSleepPause {
+    fn new() -> Self {
+        Self {
+            deadline: std::sync::Mutex::new(
+                tokio::time::Instant::now() + CLIENT_SLEEP_PAUSE_TIMEOUT,
+            ),
+        }
+    }
+
+    fn refresh(&self) {
+        *self.deadline.lock().expect("pause mutex poisoned") =
+            tokio::time::Instant::now() + CLIENT_SLEEP_PAUSE_TIMEOUT;
+    }
+
+    fn paused(&self) -> bool {
+        tokio::time::Instant::now() > *self.deadline.lock().expect("pause mutex poisoned")
+    }
+}
+
+async fn write_local_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+    force_bitrate: Option<u64>,
+) -> std::io::Result<usize> {
+    if let Some(delay) = send_delay(data.len(), force_bitrate) {
+        tokio::time::sleep(delay).await;
+    }
+    let framed = hdlc::frame(data);
+    writer.write_all(&framed).await?;
+    Ok(framed.len())
+}
+
+async fn accepted_read_loop(
+    mut reader: LocalReader,
     interface_id: InterfaceId,
     transport_tx: InterfaceTransportSender,
     online: Arc<AtomicBool>,
     rxb: Arc<AtomicU64>,
+    pause: Option<Arc<ClientSleepPause>>,
 ) {
     let mut buf = [0u8; 8192];
     let mut deframer = hdlc::HdlcDeframer::new();
@@ -112,6 +347,9 @@ async fn local_read_loop<R: AsyncReadExt + Unpin>(
                 break;
             }
             Ok(n) => {
+                if let Some(pause) = &pause {
+                    pause.refresh();
+                }
                 rxb.fetch_add(n as u64, Ordering::Relaxed);
                 for frame in deframer.feed(&buf[..n]) {
                     if frame.is_empty() {
@@ -140,49 +378,68 @@ async fn local_read_loop<R: AsyncReadExt + Unpin>(
     online.store(false, Ordering::SeqCst);
 }
 
-async fn local_write_loop<W: AsyncWriteExt + Unpin>(
-    mut writer: W,
+async fn accepted_write_loop(
+    mut writer: LocalWriter,
     mut rx: mpsc::Receiver<Bytes>,
     online: Arc<AtomicBool>,
     txb: Arc<AtomicU64>,
+    pause: Option<Arc<ClientSleepPause>>,
+    force_bitrate: Option<u64>,
 ) {
     while let Some(data) = rx.recv().await {
-        let framed = hdlc::frame(&data);
-        if let Err(e) = writer.write_all(&framed).await {
-            tracing::warn!(error = %e, "local write error");
-            break;
+        if pause.as_ref().is_some_and(|pause| pause.paused()) {
+            tracing::debug!("TX paused for local client, dropping outbound packet");
+            continue;
         }
-        txb.fetch_add(framed.len() as u64, Ordering::Relaxed);
+        match write_local_frame(&mut writer, &data, force_bitrate).await {
+            Ok(written) => {
+                txb.fetch_add(written as u64, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "local write error");
+                break;
+            }
+        }
     }
     online.store(false, Ordering::SeqCst);
 }
 
-#[cfg(unix)]
 enum LocalClientConnectionEnd {
+    /// EOF or a socket error: the client reconnects.
     Disconnected,
     Detached,
 }
 
-/// Drive both halves of one initiating local-client connection in a single
-/// task. Keeping the persistent outbound receiver here lets the Unix client
-/// retain one stable `InterfaceHandle` while replacing only the socket after a
-/// shared-instance restart.
-#[cfg(unix)]
-async fn run_local_client_connection<R, W>(
-    mut reader: R,
-    mut writer: W,
-    rx: &mut mpsc::Receiver<Bytes>,
+struct LocalClientIo<'a> {
     interface_id: InterfaceId,
-    transport_tx: &InterfaceTransportSender,
-    rxb: &AtomicU64,
-    txb: &AtomicU64,
-) -> LocalClientConnectionEnd
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
+    transport_tx: &'a InterfaceTransportSender,
+    rxb: &'a AtomicU64,
+    txb: &'a AtomicU64,
+    force_bitrate: Option<u64>,
+}
+
+/// Drive both halves of one initiating local-client connection in a single
+/// task. Keeping the persistent outbound receiver here lets the client retain
+/// one stable `InterfaceHandle` while replacing only the socket after a
+/// shared-instance restart.
+async fn run_local_client_connection(
+    mut reader: LocalReader,
+    mut writer: LocalWriter,
+    rx: &mut mpsc::Receiver<Bytes>,
+    io: &LocalClientIo<'_>,
+    phy_keepalive: bool,
+) -> LocalClientConnectionEnd {
+    let interface_id = io.interface_id;
     let mut buf = [0u8; 8192];
     let mut deframer = hdlc::HdlcDeframer::new();
+    let mut keepalive = phy_keepalive.then(|| {
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + KEEPALIVE_INTERVAL,
+            KEEPALIVE_INTERVAL,
+        );
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval
+    });
 
     loop {
         tokio::select! {
@@ -193,7 +450,7 @@ where
                         return LocalClientConnectionEnd::Disconnected;
                     }
                     Ok(n) => {
-                        rxb.fetch_add(n as u64, Ordering::Relaxed);
+                        io.rxb.fetch_add(n as u64, Ordering::Relaxed);
                         for frame in deframer.feed(&buf[..n]) {
                             if frame.is_empty() {
                                 continue;
@@ -205,7 +462,7 @@ where
                                 snr: None,
                                 q: None,
                             });
-                            if transport_tx.send(msg).await.is_err() {
+                            if io.transport_tx.send(msg).await.is_err() {
                                 tracing::warn!(interface_id, "transport channel closed");
                                 return LocalClientConnectionEnd::Detached;
                             }
@@ -221,438 +478,122 @@ where
                 let Some(data) = outbound else {
                     return LocalClientConnectionEnd::Detached;
                 };
-                let framed = hdlc::frame(&data);
-                if let Err(error) = writer.write_all(&framed).await {
-                    tracing::warn!(interface_id, %error, "local client write error");
-                    return LocalClientConnectionEnd::Disconnected;
+                match write_local_frame(&mut writer, &data, io.force_bitrate).await {
+                    Ok(written) => {
+                        io.txb.fetch_add(written as u64, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        tracing::warn!(interface_id, %error, "local client write error");
+                        return LocalClientConnectionEnd::Disconnected;
+                    }
                 }
-                txb.fetch_add(framed.len() as u64, Ordering::Relaxed);
+            }
+            _ = async {
+                match keepalive.as_mut() {
+                    Some(interval) => {
+                        interval.tick().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                // Upstream only logs keepalive send failures.
+                if let Err(error) = writer.write_all(&[hdlc::FLAG, hdlc::FLAG]).await {
+                    tracing::error!(interface_id, %error, "local client keepalive error");
+                }
             }
         }
     }
 }
 
-/// Per-stream wiring shared by both platform variants: write loop, read task,
-/// and the connection's `InterfaceHandle`. `dereg_on_disconnect` is set for
-/// accepted server-side clients so transport drops them immediately on EOF.
-fn wire_local_stream<R, W>(
+/// Wire one accepted server-side client: write loop, read task, and its
+/// `InterfaceHandle`. Transport is told to drop it as soon as it disconnects.
+fn wire_accepted_stream(
     id: InterfaceId,
     name: String,
-    parent_id: Option<InterfaceId>,
-    reader: R,
-    writer: W,
+    parent_id: InterfaceId,
+    reader: LocalReader,
+    writer: LocalWriter,
     transport_tx: mpsc::Sender<TransportMessage>,
-    dereg_on_disconnect: bool,
-) -> InterfaceHandle
-where
-    R: AsyncReadExt + Unpin + Send + 'static,
-    W: AsyncWriteExt + Unpin + Send + 'static,
-{
+    force_bitrate: Option<u64>,
+) -> InterfaceHandle {
     let transport_tx = InterfaceTransportSender::new(id, transport_tx);
     let owner = transport_tx.owner();
     let online = Arc::new(AtomicBool::new(true));
     let rxb = Arc::new(AtomicU64::new(0));
     let txb = Arc::new(AtomicU64::new(0));
     let (tx, rx) = mpsc::channel::<Bytes>(256);
+    let pause = is_android().then(|| Arc::new(ClientSleepPause::new()));
 
-    tokio::spawn(local_write_loop(writer, rx, online.clone(), txb.clone()));
+    tokio::spawn(accepted_write_loop(
+        writer,
+        rx,
+        online.clone(),
+        txb.clone(),
+        pause.clone(),
+        force_bitrate,
+    ));
 
     let online_r = online.clone();
     let rxb_r = rxb.clone();
     let task_name = name.clone();
     let dereg_tx = transport_tx.clone();
     let read_task = tokio::spawn(async move {
-        local_read_loop(reader, id, transport_tx, online_r, rxb_r).await;
-        if dereg_on_disconnect {
-            tracing::info!(name = %task_name, "local client disconnected");
-            // Proactively notify so transport drops immediately.
-            let _ = dereg_tx
-                .send(TransportMessage::DeregisterInterface { id })
-                .await;
-        }
+        accepted_read_loop(reader, id, transport_tx, online_r, rxb_r, pause).await;
+        tracing::info!(name = %task_name, "local client disconnected");
+        // Proactively notify so transport drops immediately.
+        let _ = dereg_tx
+            .send(TransportMessage::DeregisterInterface { id })
+            .await;
     });
 
+    local_handle(
+        id,
+        owner,
+        name,
+        Some(parent_id),
+        true,
+        online,
+        rxb,
+        txb,
+        tx,
+        read_task,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn local_handle(
+    id: InterfaceId,
+    owner: InterfaceOwner,
+    name: String,
+    parent_id: Option<InterfaceId>,
+    outbound: bool,
+    online: Arc<AtomicBool>,
+    rxb: Arc<AtomicU64>,
+    txb: Arc<AtomicU64>,
+    tx: mpsc::Sender<Bytes>,
+    read_task: tokio::task::JoinHandle<()>,
+) -> InterfaceHandle {
     InterfaceHandle {
         id,
         owner,
-        packet_capacity: InterfacePacketCapacity::new(262144, 262144, true),
+        packet_capacity: InterfacePacketCapacity::new(LOCAL_MTU, LOCAL_MTU, true),
         parent_id,
         name,
         mode: InterfaceMode::Full,
         direction: InterfaceDirection {
             inbound: true,
-            outbound: true,
+            outbound,
             forward: false,
             repeat: false,
         },
-        bitrate: 1_000_000_000,
-        mtu: crate::traits::optimise_mtu(1_000_000_000).unwrap_or(LOCAL_MTU),
+        bitrate: LOCAL_BITRATE,
+        mtu: LOCAL_MTU,
         online,
         rxb: Some(rxb),
         txb: Some(txb),
         inspection: None,
         tx,
         read_task,
-    }
-}
-
-/// Handle for the listener pseudo-interface: inbound-only, no per-byte
-/// counters of its own.
-fn server_listener_handle(
-    id: InterfaceId,
-    name: String,
-    online: Arc<AtomicBool>,
-    tx: mpsc::Sender<Bytes>,
-    read_task: tokio::task::JoinHandle<()>,
-    owner: InterfaceOwner,
-) -> InterfaceHandle {
-    InterfaceHandle {
-        id,
-        owner,
-        packet_capacity: InterfacePacketCapacity::new(262144, 262144, true),
-        parent_id: None,
-        name,
-        mode: InterfaceMode::Full,
-        direction: InterfaceDirection {
-            inbound: true,
-            outbound: false,
-            forward: false,
-            repeat: false,
-        },
-        bitrate: 1_000_000_000,
-        mtu: crate::traits::optimise_mtu(1_000_000_000).unwrap_or(LOCAL_MTU),
-        online,
-        rxb: Some(Arc::new(AtomicU64::new(0))),
-        txb: Some(Arc::new(AtomicU64::new(0))),
-        inspection: None,
-        tx,
-        read_task,
-    }
-}
-
-#[cfg(unix)]
-mod platform {
-    use super::*;
-    use tokio::net::{UnixListener, UnixStream};
-
-    fn bind_unix_listener(socket_path: &str) -> std::io::Result<UnixListener> {
-        if let Some(abstract_name) = socket_path.strip_prefix('\0') {
-            return bind_abstract_unix_listener(abstract_name);
-        }
-
-        let _ = std::fs::remove_file(socket_path);
-        UnixListener::bind(socket_path)
-    }
-
-    async fn connect_unix_stream(socket_path: &str) -> std::io::Result<UnixStream> {
-        if let Some(abstract_name) = socket_path.strip_prefix('\0') {
-            return connect_abstract_unix_stream(abstract_name);
-        }
-
-        UnixStream::connect(socket_path).await
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn bind_abstract_unix_listener(name: &str) -> std::io::Result<UnixListener> {
-        use std::os::unix::net::{SocketAddr, UnixListener as StdUnixListener};
-
-        #[cfg(target_os = "android")]
-        use std::os::android::net::SocketAddrExt as _;
-        #[cfg(target_os = "linux")]
-        use std::os::linux::net::SocketAddrExt as _;
-
-        let addr = SocketAddr::from_abstract_name(name.as_bytes())?;
-        let listener = StdUnixListener::bind_addr(&addr)?;
-        listener.set_nonblocking(true)?;
-        UnixListener::from_std(listener)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    fn bind_abstract_unix_listener(_name: &str) -> std::io::Result<UnixListener> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "abstract Unix sockets are only available on Linux/Android",
-        ))
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn connect_abstract_unix_stream(name: &str) -> std::io::Result<UnixStream> {
-        use std::os::unix::net::{SocketAddr, UnixStream as StdUnixStream};
-
-        #[cfg(target_os = "android")]
-        use std::os::android::net::SocketAddrExt as _;
-        #[cfg(target_os = "linux")]
-        use std::os::linux::net::SocketAddrExt as _;
-
-        let addr = SocketAddr::from_abstract_name(name.as_bytes())?;
-        let stream = StdUnixStream::connect_addr(&addr)?;
-        stream.set_nonblocking(true)?;
-        UnixStream::from_std(stream)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    fn connect_abstract_unix_stream(_name: &str) -> std::io::Result<UnixStream> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "abstract Unix sockets are only available on Linux/Android",
-        ))
-    }
-
-    pub async fn spawn_local_server_impl(
-        config: LocalServerConfig,
-        id: InterfaceId,
-        id_gen: Arc<AtomicU64>,
-        transport_tx: mpsc::Sender<TransportMessage>,
-        handle_tx: mpsc::Sender<InterfaceHandle>,
-    ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-        let owner = InterfaceOwner::new();
-        let listener = bind_unix_listener(&config.socket_path)?;
-        tracing::info!(name = %config.name, path = %display_socket_path(&config.socket_path), "local server listening");
-
-        let online = Arc::new(AtomicBool::new(true));
-        let online2 = online.clone();
-        let name = config.name.clone();
-        let (tx, _rx) = mpsc::channel::<Bytes>(1);
-
-        let read_task = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _addr)) => {
-                        let client_id = id_gen.fetch_add(1, Ordering::SeqCst);
-                        let client_name = format!("{}/client_{}", config.name, client_id);
-                        tracing::info!(name = %client_name, "local client connected");
-
-                        let (reader, writer) = stream.into_split();
-                        let handle = wire_local_stream(
-                            client_id,
-                            client_name,
-                            Some(id),
-                            reader,
-                            writer,
-                            transport_tx.clone(),
-                            true,
-                        );
-                        if handoff_accepted_interface(&handle_tx, handle)
-                            .await
-                            .is_err()
-                        {
-                            tracing::warn!("local handle registry closed");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "local accept error");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
-            }
-            online2.store(false, Ordering::SeqCst);
-        });
-
-        Ok(server_listener_handle(
-            id, name, online, tx, read_task, owner,
-        ))
-    }
-
-    pub async fn spawn_local_client_impl(
-        config: LocalClientConfig,
-        id: InterfaceId,
-        transport_tx: mpsc::Sender<TransportMessage>,
-    ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-        let transport_tx = InterfaceTransportSender::new(id, transport_tx);
-        let owner = transport_tx.owner();
-        let initial_stream = connect_unix_stream(&config.socket_path).await?;
-        tracing::info!(name = %config.name, path = %display_socket_path(&config.socket_path), "local client connected");
-
-        let online = Arc::new(AtomicBool::new(true));
-        let rxb = Arc::new(AtomicU64::new(0));
-        let txb = Arc::new(AtomicU64::new(0));
-        let (tx, mut rx) = mpsc::channel::<Bytes>(256);
-
-        let task_online = online.clone();
-        let task_rxb = rxb.clone();
-        let task_txb = txb.clone();
-        let task_name = config.name.clone();
-        let task_socket_path = config.socket_path.clone();
-        let read_task = tokio::spawn(async move {
-            let mut stream = initial_stream;
-            loop {
-                let (reader, writer) = stream.into_split();
-                let end = run_local_client_connection(
-                    reader,
-                    writer,
-                    &mut rx,
-                    id,
-                    &transport_tx,
-                    &task_rxb,
-                    &task_txb,
-                )
-                .await;
-                task_online.store(false, Ordering::SeqCst);
-
-                if matches!(end, LocalClientConnectionEnd::Detached)
-                    || transport_tx.is_closed()
-                    || rx.is_closed()
-                {
-                    return;
-                }
-
-                tracing::warn!(
-                    name = %task_name,
-                    path = %display_socket_path(&task_socket_path),
-                    wait_seconds = LOCAL_RECONNECT_WAIT_SECS,
-                    "local shared-instance connection lost; reconnecting"
-                );
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(LOCAL_RECONNECT_WAIT_SECS))
-                        .await;
-                    if transport_tx.is_closed() || rx.is_closed() {
-                        return;
-                    }
-                    match connect_unix_stream(&task_socket_path).await {
-                        Ok(connected) => {
-                            stream = connected;
-                            // Python drops traffic while offline (LocalInterface.py:218).
-                            while rx.try_recv().is_ok() {}
-                            task_online.store(true, Ordering::SeqCst);
-                            tracing::info!(
-                                name = %task_name,
-                                path = %display_socket_path(&task_socket_path),
-                                "local shared-instance client reconnected"
-                            );
-                            break;
-                        }
-                        Err(error) => {
-                            tracing::debug!(
-                                name = %task_name,
-                                path = %display_socket_path(&task_socket_path),
-                                %error,
-                                "local shared-instance reconnect failed"
-                            );
-                        }
-                    }
-                }
-            }
-        });
-
-        Ok(InterfaceHandle {
-            id,
-            owner,
-            packet_capacity: InterfacePacketCapacity::new(262144, 262144, true),
-            parent_id: None,
-            name: config.name,
-            mode: InterfaceMode::Full,
-            direction: InterfaceDirection {
-                inbound: true,
-                outbound: true,
-                forward: false,
-                repeat: false,
-            },
-            bitrate: 1_000_000_000,
-            mtu: crate::traits::optimise_mtu(1_000_000_000).unwrap_or(LOCAL_MTU),
-            online,
-            rxb: Some(rxb),
-            txb: Some(txb),
-            inspection: None,
-            tx,
-            read_task,
-        })
-    }
-}
-
-#[cfg(not(unix))]
-mod platform {
-    use super::*;
-    use tokio::net::{TcpListener, TcpStream};
-
-    fn fallback_tcp_addr(socket_path: &str) -> String {
-        if let Some(addr) = socket_path
-            .strip_prefix("tcp://")
-            .filter(|addr| !addr.is_empty())
-        {
-            addr.to_string()
-        } else {
-            format!("127.0.0.1:{FALLBACK_TCP_PORT}")
-        }
-    }
-
-    pub async fn spawn_local_server_impl(
-        config: LocalServerConfig,
-        id: InterfaceId,
-        id_gen: Arc<AtomicU64>,
-        transport_tx: mpsc::Sender<TransportMessage>,
-        handle_tx: mpsc::Sender<InterfaceHandle>,
-    ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-        let addr = fallback_tcp_addr(&config.socket_path);
-        let owner = InterfaceOwner::new();
-        let listener = TcpListener::bind(&addr).await?;
-        let local_addr = listener.local_addr()?;
-        tracing::info!(name = %config.name, addr = %local_addr, "local server (TCP fallback) listening");
-
-        let online = Arc::new(AtomicBool::new(true));
-        let online2 = online.clone();
-        let name = config.name.clone();
-        let (tx, _rx) = mpsc::channel::<Bytes>(1);
-
-        let read_task = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, peer)) => {
-                        let client_id = id_gen.fetch_add(1, Ordering::SeqCst);
-                        let client_name = format!("{}/client_{}", config.name, client_id);
-                        tracing::info!(name = %client_name, peer = %peer, "local client connected (TCP)");
-
-                        let (reader, writer) = stream.into_split();
-                        let handle = wire_local_stream(
-                            client_id,
-                            client_name,
-                            Some(id),
-                            reader,
-                            writer,
-                            transport_tx.clone(),
-                            true,
-                        );
-                        if handoff_accepted_interface(&handle_tx, handle)
-                            .await
-                            .is_err()
-                        {
-                            tracing::warn!("local handle registry closed");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "local accept error");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
-            }
-            online2.store(false, Ordering::SeqCst);
-        });
-
-        Ok(server_listener_handle(
-            id, name, online, tx, read_task, owner,
-        ))
-    }
-
-    pub async fn spawn_local_client_impl(
-        config: LocalClientConfig,
-        id: InterfaceId,
-        transport_tx: mpsc::Sender<TransportMessage>,
-    ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-        let addr = fallback_tcp_addr(&config.socket_path);
-        let stream = TcpStream::connect(&addr).await?;
-        tracing::info!(name = %config.name, addr = %addr, "local client connected (TCP fallback)");
-
-        let (reader, writer) = stream.into_split();
-        Ok(wire_local_stream(
-            id,
-            config.name.clone(),
-            None,
-            reader,
-            writer,
-            transport_tx,
-            false,
-        ))
     }
 }
 
@@ -669,9 +610,67 @@ pub async fn spawn_local_server(
     transport_tx: mpsc::Sender<TransportMessage>,
     handle_tx: mpsc::Sender<InterfaceHandle>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-    platform::spawn_local_server_impl(config, id, id_gen, transport_tx, handle_tx).await
+    let endpoint = LocalEndpoint::parse(&config.socket_path);
+    let listener = endpoint.bind().await?;
+    tracing::info!(name = %config.name, endpoint = %endpoint.display(), "local server listening");
+
+    let owner = InterfaceOwner::new();
+    let online = Arc::new(AtomicBool::new(true));
+    let online2 = online.clone();
+    let name = config.name.clone();
+    let (tx, _rx) = mpsc::channel::<Bytes>(1);
+
+    let read_task = tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((reader, writer, peer)) => {
+                    let client_id = id_gen.fetch_add(1, Ordering::SeqCst);
+                    let client_name = format!("{}/client_{}", config.name, client_id);
+                    tracing::info!(name = %client_name, %peer, "local client connected");
+
+                    let handle = wire_accepted_stream(
+                        client_id,
+                        client_name,
+                        id,
+                        reader,
+                        writer,
+                        transport_tx.clone(),
+                        config.force_bitrate,
+                    );
+                    if handoff_accepted_interface(&handle_tx, handle)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("local handle registry closed");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "local accept error");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+        online2.store(false, Ordering::SeqCst);
+    });
+
+    Ok(local_handle(
+        id,
+        owner,
+        name,
+        None,
+        false,
+        online,
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        tx,
+        read_task,
+    ))
 }
 
+/// Connect to a shared instance. The returned handle survives owner restarts:
+/// after a disconnect the client retries every [`RECONNECT_WAIT`], forever,
+/// dropping traffic queued while offline.
 #[tracing::instrument(
     level = "debug",
     name = "local.client.connect",
@@ -683,7 +682,90 @@ pub async fn spawn_local_client(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-    platform::spawn_local_client_impl(config, id, transport_tx).await
+    let transport_tx = InterfaceTransportSender::new(id, transport_tx);
+    let owner = transport_tx.owner();
+    let endpoint = LocalEndpoint::parse(&config.socket_path);
+    let initial = endpoint.connect().await?;
+    tracing::info!(name = %config.name, endpoint = %endpoint.display(), "local client connected");
+
+    let online = Arc::new(AtomicBool::new(true));
+    let rxb = Arc::new(AtomicU64::new(0));
+    let txb = Arc::new(AtomicU64::new(0));
+    let (tx, mut rx) = mpsc::channel::<Bytes>(256);
+
+    let task_online = online.clone();
+    let task_rxb = rxb.clone();
+    let task_txb = txb.clone();
+    let task_name = config.name.clone();
+    let force_bitrate = config.force_bitrate;
+    let read_task = tokio::spawn(async move {
+        let io = LocalClientIo {
+            interface_id: id,
+            transport_tx: &transport_tx,
+            rxb: &task_rxb,
+            txb: &task_txb,
+            force_bitrate,
+        };
+        let (mut reader, mut writer) = initial;
+        loop {
+            let end = run_local_client_connection(reader, writer, &mut rx, &io, is_android()).await;
+            task_online.store(false, Ordering::SeqCst);
+
+            if matches!(end, LocalClientConnectionEnd::Detached)
+                || transport_tx.is_closed()
+                || rx.is_closed()
+            {
+                return;
+            }
+            tracing::warn!(
+                name = %task_name,
+                endpoint = %endpoint.display(),
+                wait_seconds = RECONNECT_WAIT.as_secs(),
+                "local shared-instance connection lost; reconnecting"
+            );
+            loop {
+                tokio::time::sleep(RECONNECT_WAIT).await;
+                if transport_tx.is_closed() || rx.is_closed() {
+                    return;
+                }
+                match endpoint.connect().await {
+                    Ok(connected) => {
+                        (reader, writer) = connected;
+                        // Upstream drops traffic while offline.
+                        while rx.try_recv().is_ok() {}
+                        task_online.store(true, Ordering::SeqCst);
+                        tracing::info!(
+                            name = %task_name,
+                            endpoint = %endpoint.display(),
+                            "local shared-instance client reconnected"
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            name = %task_name,
+                            endpoint = %endpoint.display(),
+                            %error,
+                            "local shared-instance reconnect failed"
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(local_handle(
+        id,
+        owner,
+        config.name,
+        None,
+        true,
+        online,
+        rxb,
+        txb,
+        tx,
+        read_task,
+    ))
 }
 
 #[cfg(test)]
@@ -717,7 +799,7 @@ mod tests {
     /// The client's real reconnect wait, plus one missed attempt on a loaded host.
     #[cfg(unix)]
     const RECONNECT_DEADLINE: std::time::Duration =
-        std::time::Duration::from_secs(2 * LOCAL_RECONNECT_WAIT_SECS);
+        std::time::Duration::from_secs(2 * RECONNECT_WAIT.as_secs());
 
     /// The server hands off an accepted client before that client has
     /// necessarily published itself online, so wait for the flag itself.
@@ -733,6 +815,56 @@ mod tests {
     }
 
     #[test]
+    fn forced_bitrate_delay_is_payload_airtime() {
+        // Upstream sleeps len / bitrate * 8 (LocalInterface.py:228-236).
+        assert_eq!(forced_bitrate_delay(400, 1000), Duration::from_millis(3200));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_sleep_pause_trips_after_timeout_and_rearms_on_receive() {
+        let pause = ClientSleepPause::new();
+        assert!(!pause.paused());
+        tokio::time::advance(CLIENT_SLEEP_PAUSE_TIMEOUT + Duration::from_millis(1)).await;
+        assert!(pause.paused());
+        pause.refresh();
+        assert!(!pause.paused());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn phy_keepalive_writes_two_flags_every_interval() {
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let transport_tx = crate::traits::test_registered_sender(7, transport_tx);
+        let (client, mut server) = tokio::io::duplex(64);
+        let (reader, writer) = tokio::io::split(client);
+        let (_tx, mut rx) = mpsc::channel::<Bytes>(1);
+        let (rxb, txb) = (AtomicU64::new(0), AtomicU64::new(0));
+        let task = async {
+            let io = LocalClientIo {
+                interface_id: 7,
+                transport_tx: &transport_tx,
+                rxb: &rxb,
+                txb: &txb,
+                force_bitrate: None,
+            };
+            run_local_client_connection(Box::new(reader), Box::new(writer), &mut rx, &io, true)
+                .await
+        };
+        let check = async {
+            let mut buf = [0u8; 4];
+            let started = tokio::time::Instant::now();
+            server.read_exact(&mut buf[..2]).await.unwrap();
+            assert_eq!(&buf[..2], &[hdlc::FLAG, hdlc::FLAG]);
+            assert_eq!(started.elapsed(), KEEPALIVE_INTERVAL);
+            server.read_exact(&mut buf[..2]).await.unwrap();
+            assert_eq!(started.elapsed(), 2 * KEEPALIVE_INTERVAL);
+        };
+        tokio::select! {
+            _ = task => panic!("connection ended"),
+            _ = check => {}
+        }
+    }
+
+    #[test]
     fn test_local_mtu() {
         assert_eq!(LOCAL_MTU, 262_144);
     }
@@ -742,6 +874,7 @@ mod tests {
         let cfg = LocalServerConfig {
             socket_path: "/tmp/test_rns.sock".to_string(),
             name: "TestServer".to_string(),
+            force_bitrate: None,
         };
         assert_eq!(cfg.socket_path, "/tmp/test_rns.sock");
         assert_eq!(cfg.name, "TestServer");
@@ -752,6 +885,7 @@ mod tests {
         let cfg = LocalClientConfig {
             socket_path: "/tmp/test_rns.sock".to_string(),
             name: "TestClient".to_string(),
+            force_bitrate: None,
         };
         assert_eq!(cfg.socket_path, "/tmp/test_rns.sock");
         assert_eq!(cfg.name, "TestClient");
@@ -768,6 +902,7 @@ mod tests {
         let server_cfg = LocalServerConfig {
             socket_path: socket_path.clone(),
             name: "test-local-server".to_string(),
+            force_bitrate: None,
         };
 
         let server_handle =
@@ -782,6 +917,7 @@ mod tests {
         let client_cfg = LocalClientConfig {
             socket_path: socket_path.clone(),
             name: "test-local-client".to_string(),
+            force_bitrate: None,
         };
 
         let client_handle = spawn_local_client(client_cfg, 42, transport_tx.clone())
@@ -852,6 +988,7 @@ mod tests {
         let server_cfg = LocalServerConfig {
             socket_path: socket_path.clone(),
             name: "dereg-server".to_string(),
+            force_bitrate: None,
         };
         let server_handle =
             spawn_local_server(server_cfg, 599, id_gen, transport_tx.clone(), handle_tx)
@@ -864,6 +1001,7 @@ mod tests {
         let client_cfg = LocalClientConfig {
             socket_path: socket_path.clone(),
             name: "dereg-client".to_string(),
+            force_bitrate: None,
         };
         let client_handle = spawn_local_client(client_cfg, 77, transport_tx.clone())
             .await
@@ -921,6 +1059,7 @@ mod tests {
         let server_config = || LocalServerConfig {
             socket_path: socket_path.clone(),
             name: "restartable-local-server".to_string(),
+            force_bitrate: None,
         };
         let server_handle = spawn_local_server(
             server_config(),
@@ -936,6 +1075,7 @@ mod tests {
             LocalClientConfig {
                 socket_path: socket_path.clone(),
                 name: "persistent-local-client".to_string(),
+                force_bitrate: None,
             },
             88,
             transport_tx.clone(),
@@ -1012,6 +1152,7 @@ mod tests {
         let server_config = || LocalServerConfig {
             socket_path: socket_path.clone(),
             name: "restartable-local-server".to_string(),
+            force_bitrate: None,
         };
         let server_handle = spawn_local_server(
             server_config(),
@@ -1027,6 +1168,7 @@ mod tests {
             LocalClientConfig {
                 socket_path: socket_path.clone(),
                 name: "offline-local-client".to_string(),
+                force_bitrate: None,
             },
             89,
             transport_tx.clone(),

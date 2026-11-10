@@ -1034,9 +1034,11 @@ async fn a_backbone_client_drops_traffic_queued_while_its_first_attempts_fail() 
 
 #[test]
 fn the_shared_instance_client_never_synthesizes() {
-    assert!(
-        shared_tcp_client_config(37428).tunnel_identity.is_none(),
-        "Python's LocalInterface never synthesizes"
+    // Python's LocalInterface never synthesizes; the shared TCP client is a
+    // local interface, which carries no tunnel identity.
+    assert_eq!(
+        shared_tcp_client_config(37428, None).socket_path,
+        "tcp://127.0.0.1:37428"
     );
 }
 
