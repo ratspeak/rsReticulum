@@ -420,7 +420,10 @@ pub async fn rnsh_client_execute(
     let pubkey = discover_pubkey(&transport_tx, destination_hash, cfg.timeout).await?;
 
     let link_deadline = Some(Instant::now() + cfg.timeout);
-    let (mut link, request_data) = Link::new_initiator(destination_hash, 1);
+    let (mut link, request_data) =
+        crate::link_endpoint::new_initiator_link(&transport_tx, destination_hash)
+            .await
+            .map_err(|_| RnshError::TransportUnavailable)?;
     let link_id = link.link_id;
     let (lpkt_tx, mut lpkt_rx) = mpsc::channel::<DestinationEvent>(256);
     transport_tx
@@ -2060,6 +2063,7 @@ async fn receive_client_messages(
     }
     service_client_link(transport_tx, link, channel).await?;
     let wait = wait
+        .min(Duration::from_secs(1))
         .min(channel.next_timeout_duration().unwrap_or(wait))
         .min(remaining(deadline));
     let event = match tokio::time::timeout(wait, async {
@@ -2122,14 +2126,18 @@ async fn process_client_destination_event(
     if header.destination_hash != *channel.link_id() {
         return Ok(false);
     }
+    crate::link_endpoint::record_initiator_inbound(link, &raw);
     let body = &raw[data_offset..];
-    link.record_inbound();
     match header.flags.packet_type {
         rns_wire::flags::PacketType::Proof if body.len() >= 96 => {
             let mut packet_hash = [0u8; 32];
             packet_hash.copy_from_slice(&body[..32]);
-            if link.validate_peer_packet_proof(&packet_hash, body).is_ok() {
-                channel.delivered_by_packet_hash(&packet_hash, link.rtt_secs());
+            if link.validate_peer_packet_proof(&packet_hash, body).is_ok()
+                && channel
+                    .delivered_by_packet_hash(&packet_hash, link.rtt_secs())
+                    .is_some()
+            {
+                link.keepalive.record_proof();
             }
         }
         rns_wire::flags::PacketType::Data => match header.context {
@@ -2142,7 +2150,6 @@ async fn process_client_destination_event(
                 return Err(RnshError::HandshakeFailed("link closed by remote".into()));
             }
             rns_wire::context::PacketContext::Channel => {
-                link.record_inbound();
                 let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
                 if let Ok(proof_data) = link.prove_packet_with_local_signer(&packet_hash) {
                     send_link_packet_proof(

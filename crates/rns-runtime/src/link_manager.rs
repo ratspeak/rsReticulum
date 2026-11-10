@@ -306,6 +306,39 @@ enum EndpointCleanupKind {
     Atomic { accepted: bool },
 }
 
+/// A verified LINKIDENTIFY waiting for the blackhole answer; later packets on
+/// the Link wait with it so they see the identity Link.py would have set.
+struct PendingIdentityCheck {
+    remote_pub: [u8; 64],
+    result_rx: oneshot::Receiver<rns_transport::messages::TransportQueryResponse>,
+    blackholed: Option<bool>,
+    buffered: VecDeque<DestinationEvent>,
+}
+
+async fn wait_identity_checks(pending: &mut HashMap<[u8; 16], PendingIdentityCheck>) {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::Poll;
+    std::future::poll_fn(|cx| {
+        for check in pending.values_mut() {
+            if check.blackholed.is_some() {
+                return Poll::Ready(());
+            }
+            if let Poll::Ready(result) = Pin::new(&mut check.result_rx).poll(cx) {
+                check.blackholed = Some(matches!(
+                    result,
+                    Ok(rns_transport::messages::TransportQueryResponse::BoolResult(
+                        true
+                    ))
+                ));
+                return Poll::Ready(());
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 struct ResponderEndpointTombstone {
     ownership: ResponderEndpointOwnership,
     kind: EndpointCleanupKind,
@@ -988,6 +1021,7 @@ pub struct LinkManager {
     backchannel_links: HashMap<[u8; 16], [u8; 16]>,
     /// Shared reverse map so sync request handlers can look up the authenticated peer.
     link_identities: Arc<Mutex<HashMap<[u8; 16], [u8; 16]>>>,
+    pending_identity_checks: HashMap<[u8; 16], PendingIdentityCheck>,
 }
 
 impl LinkManager {
@@ -1079,6 +1113,7 @@ impl LinkManager {
             data_inactivity_timeout: None,
             backchannel_links: HashMap::new(),
             link_identities: Arc::new(Mutex::new(HashMap::new())),
+            pending_identity_checks: HashMap::new(),
         }
     }
 
@@ -1182,6 +1217,7 @@ impl LinkManager {
             data_inactivity_timeout: None,
             backchannel_links: HashMap::new(),
             link_identities: Arc::new(Mutex::new(HashMap::new())),
+            pending_identity_checks: HashMap::new(),
         }
     }
 
@@ -1310,6 +1346,7 @@ impl LinkManager {
             _ = self.deferred_request_notify.notified() => { self.poll_deferred_requests(); true }
             _ = self.inbound_packet_notify.notified() => { self.poll_inbound_packet_receipts(); true }
             _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => { self.poll_inbound_packet_receipts(); true }
+            _ = wait_identity_checks(&mut self.pending_identity_checks) => { self.poll_identity_checks(); true }
             _ = tokio::time::sleep_until(inbound_deadline.into()) => { self.poll_inbound_packet_receipts(); true }
             event = self.event_rx.recv() => {
                 let Some(event) = event else { return false; };
@@ -1381,6 +1418,7 @@ impl LinkManager {
                 _ = self.deferred_request_notify.notified() => { self.poll_deferred_requests(); }
             _ = self.inbound_packet_notify.notified() => { self.poll_inbound_packet_receipts(); }
                 _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => { self.poll_inbound_packet_receipts(); }
+                _ = wait_identity_checks(&mut self.pending_identity_checks) => { self.poll_identity_checks(); }
                 _ = tokio::time::sleep_until(inbound_deadline.into()) => { self.poll_inbound_packet_receipts(); }
                 event = self.event_rx.recv() => {
                     match event {
@@ -1449,6 +1487,7 @@ impl LinkManager {
                 _ = self.deferred_request_notify.notified() => { self.poll_deferred_requests(); }
                 _ = self.inbound_packet_notify.notified() => {},
                 _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => {},
+                _ = wait_identity_checks(&mut self.pending_identity_checks) => {},
                 command = command_rx.recv() => {
                     if let Some(command) = command
                         && !self.handle_command(command)
@@ -1479,6 +1518,7 @@ impl LinkManager {
             || !self.pending_endpoint_cleanups.is_empty()
             || !self.pending_inbound_packets.is_empty()
             || !self.pending_deferred_requests.is_empty()
+            || !self.pending_identity_checks.is_empty()
             || self
                 .endpoint_tombstones
                 .values()
@@ -1861,8 +1901,105 @@ impl LinkManager {
         progressed
     }
 
+    /// Ask transport whether a verified LINKIDENTIFY came from a blackholed
+    /// identity before accepting it (Link.py:1067-1070).
+    fn check_identity_blackhole(&mut self, link_id: [u8; 16], remote_pub: [u8; 64]) {
+        let (response_tx, result_rx) = oneshot::channel();
+        let staged = Self::stage_required_link_control(
+            &self.transport_tx,
+            &mut self.pending_link_control,
+            TransportMessage::Rpc {
+                query: TransportQuery::IsBlackholed {
+                    hash: truncated_hash(&remote_pub),
+                },
+                response_tx,
+            },
+        );
+        if !staged {
+            self.accept_link_identity(link_id, remote_pub);
+            return;
+        }
+        self.pending_identity_checks.insert(
+            link_id,
+            PendingIdentityCheck {
+                remote_pub,
+                result_rx,
+                blackholed: None,
+                buffered: VecDeque::new(),
+            },
+        );
+    }
+
+    fn poll_identity_checks(&mut self) -> bool {
+        let mut resolved = Vec::new();
+        for (link_id, pending) in &mut self.pending_identity_checks {
+            if pending.blackholed.is_none() {
+                pending.blackholed = match pending.result_rx.try_recv() {
+                    Ok(response) => Some(matches!(
+                        response,
+                        rns_transport::messages::TransportQueryResponse::BoolResult(true)
+                    )),
+                    Err(oneshot::error::TryRecvError::Closed) => Some(false),
+                    Err(oneshot::error::TryRecvError::Empty) => None,
+                };
+            }
+            if pending.blackholed.is_some() {
+                resolved.push(*link_id);
+            }
+        }
+        for link_id in &resolved {
+            let Some(pending) = self.pending_identity_checks.remove(link_id) else {
+                continue;
+            };
+            if pending.blackholed == Some(true) {
+                tracing::debug!(
+                    link_id = hex::encode(link_id),
+                    "terminating incoming link from blackholed identity"
+                );
+                self.close_active_link(*link_id, CloseReason::DestinationClosed, true);
+                continue;
+            }
+            self.accept_link_identity(*link_id, pending.remote_pub);
+            for event in pending.buffered {
+                self.handle_event(event);
+            }
+        }
+        !resolved.is_empty()
+    }
+
+    fn accept_link_identity(&mut self, link_id: [u8; 16], remote_pub: [u8; 64]) {
+        let identity_hash = truncated_hash(&remote_pub);
+        let accepted = self
+            .link_identity_gate
+            .as_ref()
+            .map(|gate| gate(link_id, identity_hash))
+            .unwrap_or(true);
+        self.backchannel_links.insert(identity_hash, link_id);
+        if let Ok(mut ids) = self.link_identities.lock() {
+            ids.insert(link_id, identity_hash);
+        }
+        if let Some(ref tx) = self.link_identified_tx {
+            let _ = tx.try_send((link_id, identity_hash));
+        }
+        tracing::info!(
+            link_id = hex::encode(link_id),
+            remote_pub = hex::encode(&remote_pub[..8]),
+            identity_hash = hex::encode(identity_hash),
+            "remote peer identified on link — backchannel tracked"
+        );
+        if let Some(active) = self.active_links.get(&link_id)
+            && let Some(ref cb) = active.link.remote_identified_callback
+        {
+            cb(&active.link, &remote_pub);
+        }
+        if !accepted {
+            let _ = self.close_active_link(link_id, CloseReason::DestinationClosed, true);
+        }
+    }
+
     fn poll_link_endpoints(&mut self) -> bool {
-        let mut progressed = self.poll_deferred_requests()
+        let mut progressed = self.poll_identity_checks()
+            | self.poll_deferred_requests()
             | self.poll_inbound_packet_receipts()
             | self.poll_packet_dispatches();
         let mut completed_binds = Vec::new();
@@ -2434,6 +2571,15 @@ impl LinkManager {
     }
 
     fn handle_event(&mut self, event: DestinationEvent) {
+        if let DestinationEvent::InboundPacket { raw, .. } = &event
+            && let Ok((header, _)) = rns_wire::header::PacketHeader::unpack(raw)
+            && let Some(pending) = self
+                .pending_identity_checks
+                .get_mut(&header.destination_hash)
+        {
+            pending.buffered.push_back(event);
+            return;
+        }
         match event {
             DestinationEvent::LinkRequest {
                 raw,
@@ -3082,7 +3228,9 @@ impl LinkManager {
         }
         let request_data = &raw[data_offset..];
 
-        let hops = header.hops;
+        // Link.py:214 reads packet.hops after Transport.py:2028 increments it;
+        // the delivered raw is unadjusted.
+        let hops = header.hops.saturating_add(1);
 
         if let Some(ref dest) = self.destination
             && !dest.accept_link_requests
@@ -3380,6 +3528,7 @@ impl LinkManager {
 
         match header.context {
             rns_wire::context::PacketContext::Lrrtt => {
+                let mut teardown_malformed_rtt = false;
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_rx(data.len());
                     if active.link.state == LinkState::Handshake {
@@ -3405,6 +3554,14 @@ impl LinkManager {
                                     let _ = tx.try_send(link_id);
                                 }
                             }
+                            Err(rns_link::handshake::HandshakeError::MalformedRtt) => {
+                                // Link.py:622-624 tears the link down.
+                                tracing::warn!(
+                                    link_id = hex::encode(link_id),
+                                    "malformed LRRTT, tearing down link"
+                                );
+                                teardown_malformed_rtt = true;
+                            }
                             Err(e) => {
                                 tracing::warn!(
                                     link_id = hex::encode(link_id),
@@ -3415,9 +3572,12 @@ impl LinkManager {
                         }
                     }
                 }
+                if teardown_malformed_rtt {
+                    let _ = self.close_active_link(link_id, CloseReason::DestinationClosed, true);
+                }
             }
             rns_wire::context::PacketContext::LinkIdentify => {
-                let mut close_rejected_link = false;
+                let mut identified = None;
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_rx(data.len());
                     // First-identity-wins (1.3.9): capture prior state so a repeat
@@ -3432,31 +3592,7 @@ impl LinkManager {
                             );
                         }
                         Ok(remote_pub) => {
-                            let identity_hash = rns_crypto::sha::truncated_hash(&remote_pub);
-                            let accepted = self
-                                .link_identity_gate
-                                .as_ref()
-                                .map(|gate| gate(link_id, identity_hash))
-                                .unwrap_or(true);
-                            self.backchannel_links.insert(identity_hash, link_id);
-                            if let Ok(mut ids) = self.link_identities.lock() {
-                                ids.insert(link_id, identity_hash);
-                            }
-                            if let Some(ref tx) = self.link_identified_tx {
-                                let _ = tx.try_send((link_id, identity_hash));
-                            }
-                            tracing::info!(
-                                link_id = hex::encode(link_id),
-                                remote_pub = hex::encode(&remote_pub[..8]),
-                                identity_hash = hex::encode(identity_hash),
-                                "remote peer identified on link — backchannel tracked"
-                            );
-                            if let Some(ref cb) = active.link.remote_identified_callback {
-                                cb(&active.link, &remote_pub);
-                            }
-                            if !accepted {
-                                close_rejected_link = true;
-                            }
+                            identified = Some(remote_pub);
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -3467,8 +3603,8 @@ impl LinkManager {
                         }
                     }
                 }
-                if close_rejected_link {
-                    let _ = self.close_active_link(link_id, CloseReason::InitiatorClosed, true);
+                if let Some(remote_pub) = identified {
+                    self.check_identity_blackhole(link_id, remote_pub);
                 }
             }
             rns_wire::context::PacketContext::Keepalive => {
@@ -5119,10 +5255,11 @@ impl LinkManager {
                 }
             }
 
-            if !active.inbound_resources.is_empty() || !active.outbound_resources.is_empty() {
-                active.link.record_inbound();
-            }
+            let was_active = active.link.state == LinkState::Active;
             let action = active.link.tick();
+            if was_active && active.link.state == LinkState::Stale {
+                tracing::debug!(link_id = hex::encode(link_id), "link transitioned to stale");
+            }
             match action {
                 LinkAction::SendKeepalive => {
                     Self::send_keepalive_packet(
@@ -5134,17 +5271,13 @@ impl LinkManager {
                     active.link.record_tx_keepalive(1);
                 }
                 LinkAction::TransitionedToStale => {
-                    // Python double-sends on stale transition (Link.py:797-802, initiator only).
-                    if active.link.is_initiator {
-                        Self::send_keepalive_packet(
-                            &self.transport_tx,
-                            &mut self.pending_endpoint_sends,
-                            link_id,
-                            active.link.role(),
-                        );
-                        active.link.record_tx_keepalive(1);
-                    }
-                    tracing::debug!(link_id = hex::encode(link_id), "link transitioned to stale");
+                    Self::send_keepalive_packet(
+                        &self.transport_tx,
+                        &mut self.pending_endpoint_sends,
+                        link_id,
+                        active.link.role(),
+                    );
+                    active.link.record_tx_keepalive(1);
                 }
                 LinkAction::SendTeardownAndClose(ref teardown_data) => {
                     let endpoint_closing = if !teardown_data.is_empty() {
@@ -5250,6 +5383,7 @@ impl LinkManager {
         let Some(mut active) = self.active_links.remove(&link_id) else {
             return false;
         };
+        self.pending_identity_checks.remove(&link_id);
         if let Some(epoch) = self.inbound_packet_epochs.remove(&link_id) {
             epoch
                 .alive
@@ -9591,11 +9725,7 @@ mod tests {
             let active = &lm.active_links[&link_id];
             assert_eq!(active.link.state, LinkState::Active, "{peer_rtt}");
             let rtt = active.link.rtt.unwrap();
-            assert!(
-                rtt <= std::time::Duration::from_secs(720),
-                "{peer_rtt}: {rtt:?}"
-            );
-            assert!(LinkManager::inbound_split_wait_timeout(active) > rtt);
+            assert!(LinkManager::inbound_split_wait_timeout(active) >= rtt);
 
             lm.on_tick();
             assert!(lm.active_links.contains_key(&link_id), "{peer_rtt}");
@@ -11248,7 +11378,7 @@ mod tests {
             .identify(&client.get_public_key(), &client.get_signing_key().unwrap())
             .unwrap();
 
-        let (transport_tx, _transport_rx) = mpsc::channel(16);
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
         let (_event_tx, event_rx) = mpsc::channel(16);
         let mut manager = LinkManager::new(transport_tx, event_rx, dest_hash, None);
         manager.active_links.insert(
@@ -11290,6 +11420,20 @@ mod tests {
             &link_packet(rns_wire::context::PacketContext::LinkIdentify, &identify),
             1,
         );
+        let Ok(TransportMessage::Rpc {
+            query: TransportQuery::IsBlackholed { hash },
+            response_tx,
+        }) = transport_rx.try_recv()
+        else {
+            panic!("identification must ask transport about the blackhole");
+        };
+        assert_eq!(hash, client.hash);
+        response_tx
+            .send(rns_transport::messages::TransportQueryResponse::BoolResult(
+                false,
+            ))
+            .unwrap();
+        assert!(manager.poll_identity_checks());
         assert_eq!(
             manager.link_identities.lock().unwrap().get(&link_id),
             Some(&client.hash)

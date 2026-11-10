@@ -307,6 +307,8 @@ pub enum HandshakeError {
     KeyDerivation(#[from] LinkKeyError),
     #[error("unsupported encryption mode: {0}")]
     UnsupportedMode(u8),
+    #[error("RTT packet does not carry a msgpack number")]
+    MalformedRtt,
 }
 
 #[cfg(test)]

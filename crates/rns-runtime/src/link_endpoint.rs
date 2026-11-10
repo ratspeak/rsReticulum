@@ -7,7 +7,7 @@ use rns_transport::link_messages::{DestinationEvent, PacketMetrics};
 use rns_transport::messages::{
     InterfaceId, LinkEndpointBindResult, LinkEndpointBinding, LinkEndpointLifecycleEvent,
     LinkEndpointRole, LinkEndpointSendResult, LinkEndpointUnbindResult, OutboundRequest,
-    TransportMessage,
+    TransportMessage, TransportQuery, TransportQueryResponse,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -176,7 +176,8 @@ pub(crate) struct ValidatedLinkProof {
 
 /// Wait for the first cryptographically valid LRPROOF while the Link remains
 /// pending. Invalid candidates are unauthenticated input and cannot terminate
-/// establishment or select the endpoint interface.
+/// establishment or select the endpoint interface. A signed proof that closes
+/// the Link (a low-order key, as Link.py:533-536) ends the wait.
 pub(crate) async fn wait_for_valid_proof(
     delivery_rx: &mut mpsc::Receiver<DestinationEvent>,
     link: &mut Link,
@@ -217,6 +218,9 @@ pub(crate) async fn wait_for_valid_proof(
                             metrics,
                         });
                     }
+                    Err(_) if link.state == rns_link::link::LinkState::Closed => {
+                        return Err(LinkProofWaitError::LinkClosed);
+                    }
                     Err(error) => {
                         tracing::debug!(
                             link_id = %hex::encode(link_id),
@@ -231,6 +235,76 @@ pub(crate) async fn wait_for_valid_proof(
         }
     }
     Err(LinkProofWaitError::DeliveryClosed)
+}
+
+/// Create an initiator Link the way Link.py does (Link.py:304-309): hops from
+/// the path table and an establishment timeout of the first-hop timeout plus
+/// `ESTABLISHMENT_TIMEOUT_PER_HOP` per hop.
+pub(crate) async fn new_initiator_link(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    destination_hash: [u8; 16],
+) -> Result<(Link, Vec<u8>), LinkEndpointError> {
+    let hops = match query(
+        transport_tx,
+        TransportQuery::HopsTo {
+            dest: destination_hash,
+        },
+    )
+    .await?
+    {
+        TransportQueryResponse::IntResult(hops) => u8::try_from(hops).unwrap_or(u8::MAX),
+        _ => rns_transport::constants::PATHFINDER_M,
+    };
+    let first_hop_timeout = match query(
+        transport_tx,
+        TransportQuery::FirstHopTimeout {
+            dest: destination_hash,
+        },
+    )
+    .await?
+    {
+        TransportQueryResponse::FloatResult(Some(seconds)) => seconds,
+        _ => rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT,
+    };
+    let (mut link, request_data) = Link::new_initiator(destination_hash, hops);
+    let _ = link.try_extend_establishment_timeout(first_hop_timeout);
+    Ok((link, request_data))
+}
+
+async fn query(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    query: TransportQuery,
+) -> Result<TransportQueryResponse, LinkEndpointError> {
+    let (response_tx, response_rx) = oneshot::channel();
+    transport_tx
+        .send(TransportMessage::Rpc { query, response_tx })
+        .await
+        .map_err(|_| LinkEndpointError::TransportUnavailable)?;
+    response_rx
+        .await
+        .map_err(|_| LinkEndpointError::TransportUnavailable)
+}
+
+/// Record an inbound packet on an initiator Link as Link.py's `__receive`
+/// does (Link.py:1024-1032): a keepalive refreshes liveness but not data,
+/// and the responder-only 0xFF request is ignored.
+pub(crate) fn record_initiator_inbound(link: &mut Link, raw: &[u8]) {
+    let Ok((header, offset)) = rns_wire::header::PacketHeader::unpack(raw) else {
+        return;
+    };
+    if header.flags.packet_type == rns_wire::flags::PacketType::Proof
+        && header.context != rns_wire::context::PacketContext::ResourcePrf
+    {
+        return;
+    }
+    if header.context == rns_wire::context::PacketContext::Keepalive {
+        if raw.get(offset) != Some(&rns_link::constants::KEEPALIVE_REQUEST) {
+            link.record_inbound();
+        }
+    } else {
+        link.record_inbound();
+        link.record_inbound_data();
+    }
 }
 
 pub(crate) async fn bind(

@@ -19,17 +19,10 @@ pub struct KeepaliveState {
     pub last_outbound: Option<Instant>,
     pub last_proof: Option<Instant>,
     pub activated_at: Option<Instant>,
-    /// Per-link ±10% random jitter so neighbouring links don't all fire at the same
-    /// phase and cause synchronised bursts on shared media.
-    jitter_offset: Duration,
-    jitter_negative: bool,
 }
 
 impl KeepaliveState {
     pub fn new(is_initiator: bool) -> Self {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let jitter_frac: f64 = rng.gen_range(-0.1..0.1);
         let now = Instant::now();
         Self {
             keepalive_interval: Duration::from_secs_f64(KEEPALIVE_DEFAULT),
@@ -41,8 +34,6 @@ impl KeepaliveState {
             last_outbound: None,
             last_proof: None,
             activated_at: None,
-            jitter_offset: Duration::from_secs_f64(jitter_frac.abs() * KEEPALIVE_DEFAULT),
-            jitter_negative: jitter_frac < 0.0,
         }
     }
 
@@ -50,61 +41,50 @@ impl KeepaliveState {
     ///
     /// Interval scales linearly with RTT, clamped to `KEEPALIVE_MIN` through
     /// `KEEPALIVE_MAX`; it reaches the upper limit at `KEEPALIVE_MAX_RTT`.
-    /// Jitter is re-rolled so the ±10% spread is relative to the new interval.
     pub fn update_from_rtt(&mut self, rtt: Duration) {
         let rtt_secs = rtt.as_secs_f64();
         let scale_factor = KEEPALIVE_MAX / KEEPALIVE_MAX_RTT;
         let interval = (rtt_secs * scale_factor).clamp(KEEPALIVE_MIN, KEEPALIVE_MAX);
         self.keepalive_interval = Duration::from_secs_f64(interval);
         self.stale_time = Duration::from_secs_f64(interval * STALE_FACTOR);
-
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let jitter_frac: f64 = rng.gen_range(-0.1..0.1);
-        self.jitter_offset = Duration::from_secs_f64(jitter_frac.abs() * interval);
-        self.jitter_negative = jitter_frac < 0.0;
     }
 
+    /// Record an inbound keepalive; it does not count as data.
     pub fn record_inbound(&mut self) {
         self.last_inbound = Instant::now();
     }
 
-    /// Record an inbound data packet (distinct from a keepalive beat).
+    /// Record an inbound packet other than a keepalive.
     pub fn record_data(&mut self) {
         let now = Instant::now();
         self.last_data = now;
         self.last_inbound = now;
     }
 
+    /// Record an outbound packet other than a keepalive.
     pub fn record_outbound(&mut self) {
-        self.last_outbound = Some(Instant::now());
+        let now = Instant::now();
+        self.last_outbound = Some(now);
+        self.last_data = now;
     }
 
+    /// Record a validated proof for a packet sent on the link.
     pub fn record_proof(&mut self) {
-        let now = Instant::now();
-        self.last_proof = Some(now);
-        self.last_inbound = now;
+        self.last_proof = Some(Instant::now());
     }
 
     pub fn mark_activated(&mut self) {
         self.activated_at = Some(Instant::now());
     }
 
-    /// Whether the initiator should emit a keepalive now (jitter applied).
+    /// Whether the initiator should emit a keepalive now.
     pub fn should_send_keepalive(&self) -> bool {
         self.should_send_keepalive_at(Instant::now())
     }
 
     pub(crate) fn should_send_keepalive_at(&self, now: Instant) -> bool {
-        let jittered = if self.jitter_negative {
-            self.keepalive_interval
-                .saturating_sub(self.jitter_offset)
-                .max(Duration::from_secs_f64(KEEPALIVE_MIN))
-        } else {
-            self.keepalive_interval + self.jitter_offset
-        };
-
-        let inbound_elapsed = now.saturating_duration_since(self.last_inbound);
+        let interval = self.keepalive_interval;
+        let inbound_elapsed = now.saturating_duration_since(self.peer_evidence());
         let outbound_elapsed = self
             .last_outbound
             .or(self.activated_at)
@@ -116,8 +96,8 @@ impl KeepaliveState {
             .unwrap_or(Duration::MAX);
 
         self.is_initiator
-            && (inbound_elapsed >= jittered || outbound_elapsed >= jittered)
-            && keepalive_elapsed >= jittered
+            && (inbound_elapsed >= interval || outbound_elapsed >= interval)
+            && keepalive_elapsed >= interval
     }
 
     pub(crate) fn should_respond_to_keepalive_at(&self, now: Instant) -> bool {
@@ -139,6 +119,11 @@ impl KeepaliveState {
     }
 
     pub(crate) fn is_stale_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.peer_evidence()) >= self.stale_time
+    }
+
+    /// Latest of inbound traffic, packet proof and activation (Link.py watchdog).
+    fn peer_evidence(&self) -> Instant {
         let mut latest = self.last_inbound;
         if let Some(proof) = self.last_proof
             && proof > latest
@@ -150,13 +135,16 @@ impl KeepaliveState {
         {
             latest = activated;
         }
-        now.saturating_duration_since(latest) >= self.stale_time
+        latest
     }
 
-    /// How long to wait in STALE before tearing the link down.
+    /// How long to wait in STALE before tearing the link down: Link.py's
+    /// `rtt * KEEPALIVE_TIMEOUT_FACTOR + STALE_GRACE`, clamped like every
+    /// watchdog sleep to `WATCHDOG_MAX_SLEEP`.
     pub fn stale_grace_timeout(&self, rtt: Duration) -> Duration {
         rtt.saturating_mul(KEEPALIVE_TIMEOUT_FACTOR as u32)
             .saturating_add(Duration::from_secs_f64(STALE_GRACE))
+            .min(Duration::from_secs_f64(WATCHDOG_MAX_SLEEP))
     }
 
     pub fn mark_keepalive_sent(&mut self) {
@@ -182,17 +170,6 @@ impl KeepaliveState {
 mod tests {
     use super::*;
     use std::thread;
-
-    fn instant_before_now(elapsed: Duration) -> Instant {
-        if let Some(instant) = Instant::now().checked_sub(elapsed) {
-            instant
-        } else {
-            thread::sleep(elapsed);
-            Instant::now()
-                .checked_sub(elapsed)
-                .expect("elapsed duration should be representable after waiting")
-        }
-    }
 
     #[test]
     fn test_rtt_scaling() {
@@ -238,8 +215,6 @@ mod tests {
     fn test_should_send_keepalive_timing() {
         let mut ks = KeepaliveState::new(true);
         ks.keepalive_interval = Duration::from_millis(50);
-        ks.jitter_offset = Duration::ZERO;
-        ks.jitter_negative = false;
 
         assert!(!ks.should_send_keepalive());
 
@@ -249,7 +224,6 @@ mod tests {
         // Non-initiator side never emits keepalives.
         let mut ks2 = KeepaliveState::new(false);
         ks2.keepalive_interval = Duration::from_millis(1);
-        ks2.jitter_offset = Duration::ZERO;
         thread::sleep(Duration::from_millis(5));
         assert!(!ks2.should_send_keepalive());
     }
@@ -259,8 +233,6 @@ mod tests {
         let now = Instant::now();
         let mut state = KeepaliveState::new(true);
         state.keepalive_interval = Duration::from_secs(5);
-        state.jitter_offset = Duration::ZERO;
-        state.jitter_negative = false;
         state.last_inbound = now;
         state.last_outbound = None;
         state.activated_at = Some(now - Duration::from_secs(6));
@@ -274,8 +246,6 @@ mod tests {
         let now = Instant::now();
         let mut state = KeepaliveState::new(true);
         state.keepalive_interval = Duration::from_secs(5);
-        state.jitter_offset = Duration::ZERO;
-        state.jitter_negative = false;
         state.last_inbound = now - Duration::from_secs(6);
         state.last_outbound = Some(now - Duration::from_secs(6));
         state.last_keepalive_sent = Some(now - Duration::from_secs(4));
@@ -322,59 +292,18 @@ mod tests {
     }
 
     #[test]
-    fn test_jitter_desynchronizes_keepalives() {
-        let links: Vec<KeepaliveState> = (0usize..20)
-            .map(|i| {
-                let mut ks = KeepaliveState::new(true);
-                ks.keepalive_interval = Duration::from_secs_f64(KEEPALIVE_MIN);
-                ks.jitter_offset = Duration::from_millis(500);
-                ks.jitter_negative = i.is_multiple_of(2);
-                // Push last_inbound just past the interval boundary.
-                ks.last_inbound = instant_before_now(ks.keepalive_interval);
-                ks
-            })
-            .collect();
+    fn keepalive_fires_at_the_exact_interval() {
+        let now = Instant::now();
+        let mut state = KeepaliveState::new(true);
+        state.update_from_rtt(Duration::from_millis(500));
+        let interval = state.keepalive_interval;
+        state.last_inbound = now;
+        state.activated_at = Some(now);
+        state.last_outbound = Some(now);
+        state.last_keepalive_sent = Some(now);
 
-        let firing: usize = links.iter().filter(|ks| ks.should_send_keepalive()).count();
-
-        let links_past: Vec<KeepaliveState> = (0usize..20)
-            .map(|i| {
-                let mut ks = KeepaliveState::new(true);
-                ks.keepalive_interval = Duration::from_secs_f64(KEEPALIVE_MIN);
-                ks.jitter_offset = Duration::from_millis(500);
-                ks.jitter_negative = i.is_multiple_of(2);
-                ks.last_inbound = instant_before_now(Duration::from_secs(6));
-                ks
-            })
-            .collect();
-        let firing_past: usize = links_past
-            .iter()
-            .filter(|ks| ks.should_send_keepalive())
-            .count();
-
-        assert!(
-            firing < 20,
-            "jitter should prevent all links firing simultaneously"
-        );
-        assert_eq!(
-            firing_past, 20,
-            "all links should fire well past the interval"
-        );
-    }
-
-    #[test]
-    fn test_jitter_bounded() {
-        for _ in 0..100 {
-            let mut ks = KeepaliveState::new(true);
-            ks.update_from_rtt(Duration::from_millis(500));
-            let max_jitter = ks.keepalive_interval.as_secs_f64() * 0.1;
-            assert!(
-                ks.jitter_offset.as_secs_f64() <= max_jitter + 0.001,
-                "jitter {:?} exceeds ±10% of interval {:?}",
-                ks.jitter_offset,
-                ks.keepalive_interval
-            );
-        }
+        assert!(!state.should_send_keepalive_at(now + interval - Duration::from_millis(1)));
+        assert!(state.should_send_keepalive_at(now + interval));
     }
 
     #[test]

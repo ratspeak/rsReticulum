@@ -1687,12 +1687,11 @@ async fn run_session_actor(
                 ).await {
                     break LinkSessionCloseReason::TransportUnavailable;
                 }
-                if state.resources.outbound.is_some() || !state.resources.inbound.is_empty() {
-                    // Resource watchdogs own liveness while a transfer is in
-                    // flight, matching the responder Link manager.
-                    link.record_inbound();
-                }
+                let was_active = link.state == LinkState::Active;
                 let action = link.tick();
+                if was_active && link.state == LinkState::Stale {
+                    let _ = event_tx.send(LinkSessionEvent::Stale).await;
+                }
                 reap_concluded_requests(&link, &mut state.requests, &event_tx);
                 match action {
                     LinkAction::SendKeepalive => {
@@ -1704,7 +1703,6 @@ async fn run_session_actor(
                         }
                     }
                     LinkAction::TransitionedToStale => {
-                        let _ = event_tx.send(LinkSessionEvent::Stale).await;
                         if send_keepalive(&transport_tx, attached_interface, &mut link)
                             .await
                             .is_err()
@@ -5771,7 +5769,6 @@ mod tests {
                 .unwrap(),
             Some(LinkSessionEvent::Stale)
         );
-        let _stale_keepalive = next_initiator_endpoint(&mut transport_rx).await;
 
         let inbound_ciphertext = responder.encrypt(b"ping").unwrap();
         let inbound_packet = build_data_packet(

@@ -143,18 +143,23 @@ pub fn value_bytes_view(value: &rmpv::Value) -> Result<Vec<u8>, LinkCryptoError>
     }
 }
 
-/// Ceiling for peer-reported RTTs: Link.py's keepalive and stale time already
-/// saturate above `KEEPALIVE_MAX_RTT`, and no idle Link outlives a round trip
-/// longer than its stale window.
-const PEER_RTT_MAX_SECS: f64 = STALE_TIME_DEFAULT;
+/// Saturation point for peer-reported RTTs. Link.py has no cap; this bound
+/// only keeps RTT-derived timers representable as `Duration`.
+const PEER_RTT_MAX_SECS: f64 = 1e9;
 
 /// Peer RTT as Link.py's `max(measured, peer)` would use it: NaN and negative
-/// values never win, larger ones saturate so derived timers stay finite.
+/// values never win; larger ones saturate at `PEER_RTT_MAX_SECS`.
 fn peer_reported_rtt(secs: f64) -> Option<Duration> {
     if secs.is_nan() || secs < 0.0 {
         return None;
     }
     Duration::try_from_secs_f64(secs.min(PEER_RTT_MAX_SECS)).ok()
+}
+
+/// Length of a handshake packet as Link.py counts it in `establishment_cost`:
+/// the HEADER_1 packet carrying `payload` (Link.py:215, :401, :459, :496).
+fn packet_len(payload: &[u8]) -> usize {
+    rns_wire::constants::HEADER_MINSIZE + payload.len()
 }
 
 /// An encrypted bidirectional tunnel between two peers.
@@ -296,7 +301,7 @@ impl Link {
         let timeout_secs = ESTABLISHMENT_TIMEOUT_PER_HOP * (hops.max(1) as f64);
         let now = Instant::now();
 
-        let establishment_cost = request_data.len();
+        let establishment_cost = packet_len(&request_data);
 
         let link = Self {
             link_id,
@@ -420,12 +425,20 @@ impl Link {
             .ephemeral_keys
             .as_ref()
             .ok_or(HandshakeError::InvalidSignature)?;
-        let keys = perform_handshake(
+        let keys = match perform_handshake(
             &ephemeral.x25519_prv,
             &proof.responder_x25519_pub,
             &self.link_id,
             checked.mode,
-        )?;
+        ) {
+            Ok(keys) => keys,
+            Err(error) => {
+                // Link.py closes the link when the key exchange raises (Link.py:533-536).
+                self.state = LinkState::Closed;
+                self.purge_keys();
+                return Err(error.into());
+            }
+        };
         let rtt = self.request_time.elapsed();
         let mut rtt_bytes = Vec::new();
         rmpv::encode::write_value(&mut rtt_bytes, &rmpv::Value::F64(rtt.as_secs_f64()))
@@ -434,7 +447,9 @@ impl Link {
             link_encrypt(&keys, &rtt_bytes).map_err(|_| HandshakeError::InvalidSignature)?;
         // All fallible validation/crypto work completes before pending state,
         // key ownership, timing or accounting is changed.
-        self.establishment_cost = self.establishment_cost.saturating_add(proof_data.len());
+        self.establishment_cost = self
+            .establishment_cost
+            .saturating_add(packet_len(proof_data));
         self.peer_x25519_pub = Some(proof.responder_x25519_pub);
         self.peer_packet_proof_key = Some(*identity_ed25519_pub_bytes);
         self.session_keys = Some(keys);
@@ -558,7 +573,7 @@ impl Link {
         let timeout_secs = ESTABLISHMENT_TIMEOUT_PER_HOP * (hops.max(1) as f64) + KEEPALIVE_DEFAULT;
         let now = Instant::now();
 
-        let establishment_cost = request_data.len() + proof_data.len();
+        let establishment_cost = packet_len(request_data) + packet_len(&proof_data);
 
         let link = Self {
             link_id,
@@ -616,27 +631,33 @@ impl Link {
     }
 
     /// Handle the RTT packet (Message 3) and activate the link.
+    ///
+    /// An undecryptable packet is ignored. A decrypted payload that is not a
+    /// msgpack number returns [`HandshakeError::MalformedRtt`] and leaves the
+    /// link in HANDSHAKE; Link.py tears the link down in that case
+    /// (Link.py:622-624), which the owner must do.
     pub fn receive_rtt_packet(&mut self, encrypted_data: &[u8]) -> Result<(), HandshakeError> {
         if self.state != LinkState::Handshake {
             return Err(HandshakeError::InvalidSignature);
         }
 
         let mdu = LinkMtu::try_from_signal(Some(self.mtu))?.checked_mdu()?;
-        self.establishment_cost += encrypted_data.len();
 
         let plaintext = self
             .decrypt(encrypted_data)
             .map_err(|_| HandshakeError::InvalidSignature)?;
 
-        // RTT is a msgpack f64 — see matching encode in validate_proof().
-        if let Ok(value) = rmpv::decode::read_value(&mut &plaintext[..])
-            && let Some(peer_rtt) = value.as_f64()
-        {
-            let local_rtt = self.request_time.elapsed();
-            let rtt = peer_reported_rtt(peer_rtt).map_or(local_rtt, |peer| peer.max(local_rtt));
-            self.rtt = Some(rtt);
-            self.keepalive.update_from_rtt(rtt);
-        }
+        let peer_rtt = rmpv::decode::read_value(&mut &plaintext[..])
+            .ok()
+            .and_then(|value| match value {
+                rmpv::Value::Boolean(flag) => Some(f64::from(u8::from(flag))),
+                value => value.as_f64(),
+            })
+            .ok_or(HandshakeError::MalformedRtt)?;
+        let local_rtt = self.request_time.elapsed();
+        let rtt = peer_reported_rtt(peer_rtt).map_or(local_rtt, |peer| peer.max(local_rtt));
+        self.rtt = Some(rtt);
+        self.keepalive.update_from_rtt(rtt);
 
         self.state = LinkState::Active;
         self.activated_at = Some(Instant::now());
@@ -1440,8 +1461,6 @@ impl Link {
         self.tx_bytes += bytes as u64;
         self.tx_count += 1;
         self.keepalive.record_outbound();
-        // Link.had_outbound: non-keepalive traffic refreshes `no_data_for`.
-        self.keepalive.last_data = std::time::Instant::now();
     }
 
     /// Count an outbound keepalive beat and retain its send time.
@@ -1590,17 +1609,23 @@ impl Link {
                 LinkAction::None
             }
             LinkState::Active => {
-                // Emit any pending keepalive before checking staleness so a final
-                // beat goes out on the same tick the link transitions to STALE.
-                if self.keepalive.should_send_keepalive_at(now) {
+                // One Link.py watchdog pass (Link.py:831-845): the keepalive
+                // and the STALE transition can happen together.
+                let send_keepalive = self.keepalive.should_send_keepalive_at(now);
+                if send_keepalive {
                     self.keepalive.mark_keepalive_sent_at(now);
-                    return LinkAction::SendKeepalive;
                 }
                 if self.keepalive.is_stale_at(now) {
                     self.state = LinkState::Stale;
                     self.stale_since = Some(now);
                     tracing::debug!(link_id = ?self.link_id, "link state -> Stale");
-                    return LinkAction::TransitionedToStale;
+                    if send_keepalive {
+                        return LinkAction::TransitionedToStale;
+                    }
+                    return LinkAction::None;
+                }
+                if send_keepalive {
+                    return LinkAction::SendKeepalive;
                 }
                 LinkAction::None
             }
@@ -1638,7 +1663,19 @@ impl Link {
         self.keepalive.last_data = std::time::Instant::now();
     }
 
+    /// Close reason Link.py records for a close started on this side:
+    /// `InitiatorClosed` on the initiator, `DestinationClosed` on the
+    /// responder (Link.py:756-757). `Timeout` is kept.
+    fn local_close_reason(&self, reason: CloseReason) -> CloseReason {
+        match reason {
+            CloseReason::Timeout => CloseReason::Timeout,
+            _ if self.is_initiator => CloseReason::InitiatorClosed,
+            _ => CloseReason::DestinationClosed,
+        }
+    }
+
     /// Initiate link teardown and return the encrypted teardown payload to send.
+    /// Any reason other than `Timeout` is recorded by role, as Link.py does.
     pub fn teardown(&mut self, reason: CloseReason) -> Option<Vec<u8>> {
         if self.state == LinkState::Closed {
             return None;
@@ -1647,16 +1684,22 @@ impl Link {
         // Teardown payload is the link ID sealed with the session key — the peer
         // can verify authenticity of the teardown without a separate signature.
         let teardown_data = self.encrypt(&self.link_id).ok();
-        self.close(reason);
+        self.close(self.local_close_reason(reason));
         teardown_data
     }
 
-    /// Handle a received teardown packet and close the link on success.
+    /// Handle a received teardown packet and close the link on success. The
+    /// reason names the peer's role (Link.py:764-765).
     pub fn receive_teardown(&mut self, encrypted_data: &[u8]) -> bool {
         match self.decrypt(encrypted_data) {
             Ok(plaintext) => {
                 if plaintext.len() >= 16 && plaintext[..16] == self.link_id {
-                    self.close(CloseReason::DestinationClosed);
+                    let reason = if self.is_initiator {
+                        CloseReason::DestinationClosed
+                    } else {
+                        CloseReason::InitiatorClosed
+                    };
+                    self.close(reason);
                     true
                 } else {
                     false
@@ -1932,7 +1975,9 @@ pub enum LinkAction {
     None,
     /// Initiator should send a keepalive frame.
     SendKeepalive,
-    /// Link just entered STALE; initiator should flush a final keepalive.
+    /// The initiator's link entered STALE in the same pass that sends its
+    /// keepalive: send exactly one keepalive. Entering STALE with no
+    /// keepalive due returns [`LinkAction::None`] and shows only in `state`.
     TransitionedToStale,
     /// Send the wrapped (already encrypted) teardown payload, then drop the link.
     SendTeardownAndClose(Vec<u8>),
@@ -2055,7 +2100,7 @@ mod tests {
         assert_eq!(responder.state, LinkState::Closed);
         assert_eq!(
             responder.teardown_reason,
-            Some(CloseReason::DestinationClosed)
+            Some(CloseReason::InitiatorClosed)
         );
     }
 
@@ -3398,6 +3443,11 @@ mod tests {
         ]
     }
 
+    /// The peer RTT Link.py adopts, saturated at `PEER_RTT_MAX_SECS`.
+    fn adopted_peer_rtt(value: &rmpv::Value) -> Duration {
+        peer_reported_rtt(value.as_f64().unwrap()).unwrap_or_default()
+    }
+
     fn encrypted_rtt(sender: &Link, value: &rmpv::Value) -> Vec<u8> {
         let mut encoded = Vec::new();
         rmpv::encode::write_value(&mut encoded, value).unwrap();
@@ -3457,8 +3507,8 @@ mod tests {
 
     #[test]
     fn lrrtt_activation_bounds_hostile_peer_rtt_like_link_py() {
-        let ceiling = Duration::from_secs_f64(PEER_RTT_MAX_SECS);
         for (value, expected) in hostile_peer_rtts() {
+            let ceiling = adopted_peer_rtt(&value);
             let (initiator, mut responder) = lrrtt_pair();
             responder
                 .receive_rtt_packet(&encrypted_rtt(&initiator, &value))
@@ -3487,16 +3537,19 @@ mod tests {
             let peer = value.as_f64().unwrap();
             assert_link_py_keepalive(&responder, link_py_rtt(measured, peer), &value);
             assert!(responder.establishment_rate.is_none_or(f64::is_finite));
-            assert!(responder.default_request_timeout() > rtt);
-            assert!(responder.keepalive.stale_grace_timeout(rtt) > rtt);
+            assert!(responder.default_request_timeout() >= rtt);
+            assert!(
+                responder.keepalive.stale_grace_timeout(rtt)
+                    <= Duration::from_secs_f64(WATCHDOG_MAX_SLEEP)
+            );
         }
     }
 
     #[test]
     fn rtt_update_bounds_hostile_peer_rtt_with_and_without_prior_measurement() {
-        let ceiling = Duration::from_secs_f64(PEER_RTT_MAX_SECS);
         let prior = Duration::from_millis(200);
         for (value, expected) in hostile_peer_rtts() {
+            let ceiling = adopted_peer_rtt(&value);
             let (initiator, mut responder, _) = make_active_link();
             let payload = encrypted_rtt(&initiator, &value);
             let peer = value.as_f64().unwrap();
@@ -3539,7 +3592,7 @@ mod tests {
                 .receive_rtt_packet(&encrypted_rtt(&initiator, &rmpv::Value::F64(peer_rtt)))
                 .unwrap();
             let rtt = responder.rtt.unwrap();
-            assert_eq!(rtt, Duration::from_secs_f64(PEER_RTT_MAX_SECS));
+            assert_eq!(rtt, adopted_peer_rtt(&rmpv::Value::F64(peer_rtt)));
             let keepalive = responder.keepalive.keepalive_interval;
             assert_eq!(keepalive, Duration::from_secs_f64(KEEPALIVE_MAX));
 
@@ -3563,11 +3616,11 @@ mod tests {
                 responder.tick_at(stale_at - Duration::from_secs(1)),
                 LinkAction::None
             );
-            assert_eq!(responder.tick_at(stale_at), LinkAction::TransitionedToStale);
+            assert_eq!(responder.tick_at(stale_at), LinkAction::None);
             assert_eq!(responder.state, LinkState::Stale);
 
             let grace = responder.keepalive.stale_grace_timeout(rtt);
-            assert_eq!(grace, rtt * 4 + Duration::from_secs(5));
+            assert_eq!(grace, Duration::from_secs_f64(WATCHDOG_MAX_SLEEP));
             assert_eq!(
                 responder.tick_at(stale_at + grace - Duration::from_secs(1)),
                 LinkAction::None
@@ -3589,7 +3642,7 @@ mod tests {
         assert_eq!(link.packet_proof_timeout(), Duration::MAX);
         assert_eq!(
             link.keepalive.stale_grace_timeout(Duration::MAX),
-            Duration::MAX
+            Duration::from_secs_f64(WATCHDOG_MAX_SLEEP)
         );
         link.keepalive.update_from_rtt(Duration::MAX);
         assert_eq!(

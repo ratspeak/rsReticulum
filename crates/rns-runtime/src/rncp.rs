@@ -1095,8 +1095,6 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
                 action => send_transfer_action(transport_tx, link, link_id, action).await?,
             }
         }
-        // An outgoing Resource keeps the link alive (Link.py watchdog).
-        link.record_inbound();
         service_link(transport_tx, link, link_id).await?;
 
         let ev = match tokio::time::timeout(
@@ -1129,6 +1127,7 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
         if header.destination_hash != link_id {
             continue;
         }
+        crate::link_endpoint::record_initiator_inbound(link, &raw);
         let body = &raw[off..];
         match header.context {
             rns_wire::context::PacketContext::Keepalive
@@ -1529,9 +1528,6 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
             if !ack_seen && Instant::now() >= request_deadline {
                 break Err(RncpError::RequestFailed);
             }
-            if !transfers.is_empty() {
-                link.record_inbound();
-            }
             let mut failed = None;
             for t in transfers.values_mut() {
                 match t.check_timeout() {
@@ -1595,6 +1591,7 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
             if header.destination_hash != link_id {
                 continue;
             }
+            crate::link_endpoint::record_initiator_inbound(&mut link, &raw);
             let body = &raw[off..];
             match header.context {
                 rns_wire::context::PacketContext::Keepalive
