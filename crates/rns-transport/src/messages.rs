@@ -272,8 +272,11 @@ pub struct InterfaceEntry {
     pub name: String,
     pub mode: InterfaceMode,
     pub role: InterfaceRole,
-    /// The listener that accepted this interface; `None` for configured ones.
+    /// The interface this one belongs to: a listener, or a multi-radio device.
     pub parent_id: Option<InterfaceId>,
+    /// Accepted by a listener at runtime, so its name can recur for another
+    /// peer after a restart and is not used to rebind persisted state.
+    pub accepted: bool,
     pub direction: InterfaceDirection,
     /// Declared bitrate in bits per second, used for timing estimates.
     pub bitrate: u64,
@@ -351,6 +354,7 @@ impl InterfaceEntry {
             mode,
             role: InterfaceRole::Normal,
             parent_id: None,
+            accepted: false,
             direction,
             bitrate,
             mtu,
@@ -481,6 +485,7 @@ impl std::fmt::Debug for InterfaceEntry {
             .field("mode", &self.mode)
             .field("role", &self.role)
             .field("parent_id", &self.parent_id)
+            .field("accepted", &self.accepted)
             .field("direction", &self.direction)
             .field("bitrate", &self.bitrate)
             .field("mtu", &self.mtu)

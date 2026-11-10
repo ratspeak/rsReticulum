@@ -4936,6 +4936,7 @@ async fn prepare_interface_with_role_and_overrides(
         mode: convert_mode(handle.mode),
         role,
         parent_id: handle.parent_id,
+        accepted: handle.parent_id.is_some(),
         direction: rns_transport::constants::InterfaceDirection {
             inbound: handle.direction.inbound,
             outbound: handle.direction.outbound,
@@ -5182,10 +5183,21 @@ async fn prepare_interface_with_post_init(
         interface, driver, ..
     } = owned;
     let handle = interface;
-    // Outbound = physical capability AND `outgoing` config flag.
+    // Outbound = physical capability AND `outgoing` config flag. An
+    // RNodeMulti section's `outgoing` applies to its parent only.
+    let rnode_multi_child = {
+        #[cfg(feature = "serial")]
+        {
+            kind == InterfaceKind::RNodeMulti && handle.parent_id.is_some()
+        }
+        #[cfg(not(feature = "serial"))]
+        {
+            false
+        }
+    };
     let direction = rns_transport::constants::InterfaceDirection {
         inbound: handle.direction.inbound,
-        outbound: handle.direction.outbound && post_init.outgoing,
+        outbound: handle.direction.outbound && (post_init.outgoing || rnode_multi_child),
     };
     let name = handle.name.clone();
     let id = handle.id;
@@ -5251,6 +5263,7 @@ async fn prepare_interface_with_post_init(
         mode: convert_mode(handle.mode),
         role: rns_transport::messages::InterfaceRole::Normal,
         parent_id: handle.parent_id,
+        accepted: false,
         direction,
         bitrate: post_init.bitrate.unwrap_or(handle.bitrate),
         mtu: handle.mtu,
@@ -8758,7 +8771,7 @@ async fn spawn_interface_with_rnode_startup_options(
             let mut multi_config =
                 rns_interface::rnode_multi::RNodeMultiConfig::new(&c.name, &c.port);
             multi_config.baud_rate = c.baud_rate;
-            multi_config.flow_control = c.flow_control;
+            multi_config.mode = c.mode;
             multi_config.id_interval = c.id_interval;
             multi_config.id_callsign = c.id_callsign.as_ref().map(|s| s.as_bytes().to_vec());
             for sub in &c.subinterfaces {
@@ -8771,7 +8784,6 @@ async fn spawn_interface_with_rnode_startup_options(
                 sub_config.spreading_factor = sub.spreading_factor;
                 sub_config.coding_rate = sub.coding_rate;
                 sub_config.tx_power = sub.tx_power;
-                sub_config.mode = sub.mode;
                 sub_config.flow_control = sub.flow_control;
                 sub_config.outgoing = sub.outgoing;
                 sub_config.st_alock = sub.st_alock;
@@ -8784,9 +8796,10 @@ async fn spawn_interface_with_rnode_startup_options(
                     c.name
                 ));
             }
-            let mut sub_ids = Vec::with_capacity(multi_config.subinterfaces.len());
+            // The parent takes `id`, then one ID per subinterface.
+            let mut sub_ids = Vec::with_capacity(multi_config.subinterfaces.len() + 1);
             sub_ids.push(id);
-            for _ in 1..multi_config.subinterfaces.len() {
+            for _ in 0..multi_config.subinterfaces.len() {
                 sub_ids.push(id_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
             }
             rns_interface::rnode_multi::spawn_rnode_multi_interface(

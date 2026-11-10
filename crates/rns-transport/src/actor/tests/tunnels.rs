@@ -264,6 +264,7 @@ fn a_cache_request_never_replays_on_an_accepted_client() {
     actor.storage_dir = Some(dir.clone());
     let (mut entry, _rx) = make_test_interface("hub/client_3");
     entry.parent_id = Some(2);
+    entry.accepted = true;
     actor.interfaces.insert(3, entry);
     let (announce, dest) = make_valid_announce("cache.child", 1);
     let packet_hash = cache_announce(&dir, &announce, Some("hub/client_3"));

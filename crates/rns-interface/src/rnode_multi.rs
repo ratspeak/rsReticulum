@@ -6,8 +6,8 @@
 use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
 use std::collections::HashSet;
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -97,8 +97,8 @@ pub struct SubInterfaceConfig {
     pub bandwidth: u32,
     pub spreading_factor: u8,
     pub coding_rate: u8,
-    pub tx_power: u8,
-    pub mode: InterfaceMode,
+    /// dBm, -9..=37; sent as a signed byte like Python `setTXPower`.
+    pub tx_power: i8,
     pub flow_control: bool,
     pub outgoing: bool,
     /// Short-term airtime cap, percent of duty cycle.
@@ -117,7 +117,6 @@ impl SubInterfaceConfig {
             spreading_factor: 7,
             coding_rate: 5,
             tx_power: 14,
-            mode: InterfaceMode::Full,
             flow_control: false,
             outgoing: true,
             st_alock: None,
@@ -126,7 +125,7 @@ impl SubInterfaceConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.tx_power > 37 {
+        if !(-9..=37).contains(&self.tx_power) {
             return Err(format!(
                 "Invalid TX power {} for sub-interface {}",
                 self.tx_power, self.name
@@ -183,7 +182,8 @@ pub struct RNodeMultiConfig {
     pub name: String,
     pub port: String,
     pub baud_rate: u32,
-    pub flow_control: bool,
+    /// Interface mode of the parent; Python gives every subinterface this mode.
+    pub mode: InterfaceMode,
     /// Up to `MAX_SUBINTERFACES` radios on this device.
     pub subinterfaces: Vec<SubInterfaceConfig>,
     /// Station-ID beacon, parent-level: when due, the callsign is sent on
@@ -198,7 +198,7 @@ impl RNodeMultiConfig {
             name: name.to_string(),
             port: port.to_string(),
             baud_rate: 115200,
-            flow_control: false,
+            mode: InterfaceMode::Full,
             subinterfaces: Vec::new(),
             id_interval: None,
             id_callsign: None,
@@ -225,7 +225,7 @@ pub fn build_subinterface_init(index: u8, config: &SubInterfaceConfig) -> Vec<u8
     );
     kiss::frame_with_command_into(rnode::CMD_SF, &[config.spreading_factor], &mut out);
     kiss::frame_with_command_into(rnode::CMD_CR, &[config.coding_rate], &mut out);
-    kiss::frame_with_command_into(rnode::CMD_TXPOWER, &[config.tx_power], &mut out);
+    kiss::frame_with_command_into(rnode::CMD_TXPOWER, &[config.tx_power as u8], &mut out);
     if let Some(st) = config.st_alock {
         let at = (st * 100.0) as u16;
         let c1 = (at >> 8) as u8;
@@ -249,7 +249,7 @@ pub fn build_subinterface_init(index: u8, config: &SubInterfaceConfig) -> Vec<u8
         &config.bandwidth.to_be_bytes(),
         &mut out,
     );
-    kiss::frame_with_command_into(rnode::CMD_TXPOWER, &[config.tx_power], &mut out);
+    kiss::frame_with_command_into(rnode::CMD_TXPOWER, &[config.tx_power as u8], &mut out);
 
     out
 }
@@ -302,7 +302,7 @@ struct RadioEvidence {
     bandwidth: Option<u32>,
     spreading_factor: Option<u8>,
     coding_rate: Option<u8>,
-    tx_power: Option<u8>,
+    tx_power: Option<i8>,
     radio_state: Option<u8>,
     /// A TX power echo arrived while the radio was on, so the evidence holds
     /// the effective values.
@@ -352,6 +352,7 @@ impl RadioEvidence {
 #[derive(Debug)]
 struct StartupEvidence {
     detected: bool,
+    platform: Option<u8>,
     firmware: Option<(u8, u8)>,
     interfaces: [Option<RadioType>; MAX_SUBINTERFACES],
     selected_vport: Option<u8>,
@@ -362,6 +363,7 @@ impl Default for StartupEvidence {
     fn default() -> Self {
         Self {
             detected: false,
+            platform: None,
             firmware: None,
             interfaces: [None; MAX_SUBINTERFACES],
             selected_vport: None,
@@ -455,7 +457,7 @@ impl StartupEvidence {
                 }
             }
             rnode::CMD_TXPOWER => {
-                let value = one_byte(payload, "TX power")?;
+                let value = one_byte(payload, "TX power")? as i8;
                 if let Some(radio) = self.selected_radio_mut() {
                     radio.tx_power = Some(value);
                     radio.effective |= radio.radio_state == Some(rnode::RADIO_STATE_ON);
@@ -468,17 +470,11 @@ impl StartupEvidence {
                     radio.effective &= value == rnode::RADIO_STATE_ON;
                 }
             }
-            CMD_ERROR => {
-                let class = match payload.first().copied() {
-                    Some(ERROR_INITRADIO) => "radio initialisation",
-                    Some(ERROR_TXFAILED) => "radio transmission",
-                    _ => "unknown hardware",
-                };
-                return Err(format!("RNodeMulti reported a {class} error"));
+            rnode::CMD_PLATFORM => {
+                self.platform = Some(one_byte(payload, "platform")?);
             }
-            rnode::CMD_RESET if payload.first().copied() == Some(0xF8) => {
-                return Err("RNodeMulti reset during startup".into());
-            }
+            // 0x90 (CMD_ERROR) is also CMD_INT5_DATA; Python decodes it as data,
+            // and ignores a reset before the device is online.
             _ => {}
         }
         Ok(())
@@ -576,48 +572,71 @@ fn read_startup_until(
 fn initialise_rnode_multi(
     mut port: Box<dyn serialport::SerialPort>,
     config: &RNodeMultiConfig,
-) -> Result<Box<dyn serialport::SerialPort>, String> {
+) -> Result<StartedDevice, StartupFailure> {
+    use StartupFailure::{Fatal, Retry};
     std::thread::sleep(RNODE_OPEN_SETTLE);
     let mut deframer = kiss::RawKissDeframer::new();
     let mut evidence = StartupEvidence::default();
 
     port.write_all(&build_detect_sequence())
-        .map_err(|error| format!("RNodeMulti detect write failed: {error}"))?;
-    port.flush()
-        .map_err(|error| format!("RNodeMulti detect flush failed: {error}"))?;
-    read_startup_until(
+        .and_then(|()| port.flush())
+        .map_err(|error| Retry(format!("RNodeMulti detect write failed: {error}")))?;
+    let discovered = read_startup_until(
         port.as_mut(),
         &mut deframer,
         &mut evidence,
         Instant::now() + RNODE_DISCOVERY_DEADLINE,
         |state| state.discovery_complete(config),
-    )?;
-    evidence.validate_discovery(config)?;
+    );
+    if let Some((major, minor)) = evidence.firmware
+        && (major, minor) < (REQUIRED_FW_VER_MAJ, REQUIRED_FW_VER_MIN)
+    {
+        return Err(Fatal(format!(
+            "RNodeMulti firmware {major}.{minor} is below required {}.{}",
+            REQUIRED_FW_VER_MAJ, REQUIRED_FW_VER_MIN
+        )));
+    }
+    discovered.map_err(Retry)?;
+    evidence.validate_discovery(config).map_err(Retry)?;
 
+    let mut configured = Vec::with_capacity(config.subinterfaces.len());
     for sub in &config.subinterfaces {
-        // RNode firmware configures one physical radio at a time. Match the
-        // established RNodeMulti startup cadence and let the selected radio
-        // settle before sending its reset/init sequence.
+        // Python RNodeSubInterface.configure_device sleeps 2 s before initRadio.
         std::thread::sleep(RNODE_SUBINTERFACE_SETTLE);
         evidence.reset_radio(sub.vport);
         port.write_all(&build_subinterface_init(sub.vport, sub))
-            .map_err(|error| format!("RNodeMulti {} init write failed: {error}", sub.name))?;
-        port.flush()
-            .map_err(|error| format!("RNodeMulti {} init flush failed: {error}", sub.name))?;
-        read_startup_until(
+            .and_then(|()| port.flush())
+            .map_err(|error| {
+                Retry(format!(
+                    "RNodeMulti {} init write failed: {error}",
+                    sub.name
+                ))
+            })?;
+        let validated = read_startup_until(
             port.as_mut(),
             &mut deframer,
             &mut evidence,
             Instant::now() + RNODE_CONFIGURATION_DEADLINE,
             |state| state.radio_complete(sub.vport),
-        )?;
-        evidence.radios[sub.vport as usize].validate(sub)?;
-        // Match upstream's brief post-validation pause before exposing this
-        // radio or beginning configuration of the next physical radio.
+        )
+        .and_then(|()| evidence.radios[sub.vport as usize].validate(sub));
+        // A mismatching radio stays offline; the others still come up.
+        if let Err(error) = &validated {
+            tracing::error!(
+                name = %sub.name,
+                error = %error,
+                "RNodeMulti subinterface radio parameters did not match, aborting its startup"
+            );
+        }
+        configured.push(validated.is_ok());
         std::thread::sleep(RNODE_SUBINTERFACE_READY_SETTLE);
     }
 
-    Ok(port)
+    Ok(StartedDevice {
+        port,
+        platform: evidence.platform,
+        configured,
+    })
 }
 
 fn selected_data_target(
@@ -634,53 +653,151 @@ fn selected_data_target(
         .flatten()
 }
 
-struct WriteRequest {
-    index: u8,
-    /// Raw payload, not yet KISS-escaped.
-    data: Bytes,
-    flow_control: bool,
-}
-
+/// Python keeps `r_stat_rssi/snr/q` on each subinterface across packets.
 #[derive(Default)]
 struct SubInterfaceSignal {
     last_rssi: Option<f32>,
     last_snr: Option<f32>,
+    last_q: Option<f32>,
 }
 
-/// Device-level + per-sub online state shared by the writer and reader tasks.
-#[derive(Clone)]
-struct OnlineFlags {
-    device: Arc<AtomicBool>,
-    subs: Arc<Vec<Arc<AtomicBool>>>,
-}
-
-impl OnlineFlags {
-    /// Device failure takes every sub-interface down with it.
-    fn trip_device(&self) {
-        self.device.store(false, Ordering::SeqCst);
-        for sub in self.subs.iter() {
-            sub.store(false, Ordering::SeqCst);
-        }
-    }
-
-    /// True while the device is up and at least one sub remains registered —
-    /// once false the shared reader exits and releases the serial port.
-    fn device_running(&self) -> bool {
-        self.device.load(Ordering::SeqCst) && self.subs.iter().any(|sub| sub.load(Ordering::SeqCst))
-    }
+struct WriteRequest {
+    /// Index into the configured subinterfaces.
+    local: usize,
+    /// Raw payload, not yet KISS-escaped.
+    data: Bytes,
 }
 
 const RNODE_READ_TIMEOUT_MS: u64 = 100;
+const RNODE_WRITER_POLL: Duration = Duration::from_millis(100);
+
+/// Device state reachable from teardown, which may run outside the driver task.
+struct DeviceShared {
+    detached: AtomicBool,
+    detach_port: Mutex<Option<Box<dyn serialport::SerialPort>>>,
+    platform: Mutex<Option<u8>>,
+    spawned_vports: Mutex<Vec<u8>>,
+}
+
+impl DeviceShared {
+    /// Python `RNodeMultiInterface.detach()`; runs at most once.
+    fn detach(&self) {
+        if self.detached.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let port = self.detach_port.lock().unwrap().take();
+        if let Some(mut port) = port {
+            let bytes = build_multi_detach_sequence(
+                *self.platform.lock().unwrap(),
+                &self.spawned_vports.lock().unwrap(),
+            );
+            let _ = port.write_all(&bytes);
+            let _ = port.flush();
+        }
+    }
+}
+
+/// Upstream `detach()`: framebuffer off on display platforms, radio off for
+/// each spawned subinterface, then leave host-controlled mode.
+pub fn build_multi_detach_sequence(platform: Option<u8>, vports: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + vports.len() * 8);
+    if matches!(
+        platform,
+        Some(rnode::PLATFORM_ESP32 | rnode::PLATFORM_NRF52)
+    ) {
+        kiss::frame_with_command_into(rnode::CMD_FB_EXT, &[0x00], &mut out);
+    }
+    for &vport in vports {
+        kiss::frame_with_command_into(CMD_SEL_INT, &[vport], &mut out);
+        kiss::frame_with_command_into(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_OFF], &mut out);
+    }
+    kiss::frame_with_command_into(rnode::CMD_LEAVE, &[0xFF], &mut out);
+    out
+}
+
+/// Marks a handle retired when the registry aborts or drops its task.
+struct RetireOnDrop {
+    retired: Arc<AtomicBool>,
+    detach: Option<Arc<DeviceShared>>,
+}
+
+impl Drop for RetireOnDrop {
+    fn drop(&mut self) {
+        self.retired.store(true, Ordering::SeqCst);
+        if let Some(device) = &self.detach {
+            device.detach();
+        }
+    }
+}
+
+fn spawn_retire_watch(
+    retired: Arc<AtomicBool>,
+    detach: Option<Arc<DeviceShared>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let _guard = RetireOnDrop { retired, detach };
+        std::future::pending::<()>().await
+    })
+}
+
+struct SubRuntime {
+    id: InterfaceId,
+    vport: u8,
+    spreading_factor: u8,
+    flow_control: bool,
+    online: Arc<AtomicBool>,
+    retired: Arc<AtomicBool>,
+    rxb: Arc<AtomicU64>,
+    txb: Arc<AtomicU64>,
+    transport: InterfaceTransportSender,
+}
+
+enum ReaderEvent {
+    Ready,
+    Failed(String),
+}
+
+enum StartupFailure {
+    /// Python panics here; only this interface stops.
+    Fatal(String),
+    Retry(String),
+}
+
+struct StartedDevice {
+    port: Box<dyn serialport::SerialPort>,
+    platform: Option<u8>,
+    /// Per configured subinterface: radio validated after configuration.
+    configured: Vec<bool>,
+}
+
+fn open_rnode_multi_port(
+    config: &RNodeMultiConfig,
+) -> Result<Box<dyn serialport::SerialPort>, String> {
+    crate::serial::open_port(
+        serialport::new(&config.port, config.baud_rate)
+            .timeout(Duration::from_millis(RNODE_READ_TIMEOUT_MS)),
+    )
+    .map_err(|e| format!("RNodeMulti open: {e}"))
+}
+
+async fn start_rnode_multi_generation(
+    config: &RNodeMultiConfig,
+) -> Result<StartedDevice, StartupFailure> {
+    let port = open_rnode_multi_port(config).map_err(StartupFailure::Retry)?;
+    let startup_config = config.clone();
+    tokio::task::spawn_blocking(move || initialise_rnode_multi(port, &startup_config))
+        .await
+        .map_err(|error| StartupFailure::Retry(format!("startup worker failed: {error}")))?
+}
 
 /// Spawn one RNodeMulti over a single serial port.
 ///
-/// Returns one `InterfaceHandle` per configured sub-interface. Each handle has
-/// its own tx channel, `InterfaceId`, and online flag; all of them share one
-/// serial connection. Tearing down one sub leaves the others running; the
-/// shared reader exits (releasing the port) when the device fails or every
-/// sub has been deregistered.
-///
-/// `ids.len()` must equal `config.subinterfaces.len()`.
+/// Returns the parent handle first, then one handle per configured
+/// subinterface, matching `ids` (`config.subinterfaces.len() + 1` IDs, parent
+/// first). The parent never carries traffic, like Python's parent interface;
+/// it reports the spawned subinterface count as `clients`. A failed device
+/// is retried every `RECONNECT_WAIT` seconds, toggling the subinterfaces'
+/// online flags. Tearing down the parent sends the detach sequence.
 pub async fn spawn_rnode_multi_interface(
     config: RNodeMultiConfig,
     ids: &[InterfaceId],
@@ -691,9 +808,9 @@ pub async fn spawn_rnode_multi_interface(
             "RNodeMulti: no sub-interfaces configured".to_string(),
         ));
     }
-    if ids.len() != config.subinterfaces.len() {
+    if ids.len() != config.subinterfaces.len() + 1 {
         return Err(InterfaceError::SendFailed(format!(
-            "RNodeMulti: {} IDs provided but {} sub-interfaces configured",
+            "RNodeMulti: {} IDs provided but {} sub-interfaces plus the parent configured",
             ids.len(),
             config.subinterfaces.len()
         )));
@@ -705,7 +822,6 @@ pub async fn spawn_rnode_multi_interface(
             MAX_SUBINTERFACES
         )));
     }
-
     for sub in &config.subinterfaces {
         sub.validate()
             .map_err(|e| InterfaceError::SendFailed(format!("RNodeMulti config: {}", e)))?;
@@ -720,94 +836,63 @@ pub async fn spawn_rnode_multi_interface(
         }
     }
 
-    let port = crate::serial::open_port(
-        serialport::new(&config.port, config.baud_rate)
-            .timeout(Duration::from_millis(RNODE_READ_TIMEOUT_MS)),
-    )
-    .map_err(|e| InterfaceError::SendFailed(format!("RNodeMulti open: {}", e)))?;
-
-    tracing::info!(
-        name = %config.name,
-        port = %config.port,
-        subinterfaces = config.subinterfaces.len(),
-        "RNodeMulti interface opened"
-    );
-
-    let startup_config = config.clone();
-    let port = tokio::task::spawn_blocking(move || initialise_rnode_multi(port, &startup_config))
-        .await
-        .map_err(|error| {
-            InterfaceError::SendFailed(format!("RNodeMulti startup worker failed: {error}"))
-        })?
-        .map_err(|error| InterfaceError::SendFailed(format!("RNodeMulti startup: {error}")))?;
-
-    let online = Arc::new(AtomicBool::new(true));
-
-    let num_subs = config.subinterfaces.len();
-
-    // Per-sub online flags: deregistering one sub must not kill the shared
-    // device, but the reader must release the serial port once ALL subs are
-    // gone; device-level failure trips every sub flag.
-    let sub_onlines: Arc<Vec<Arc<AtomicBool>>> = Arc::new(
-        (0..num_subs)
-            .map(|_| Arc::new(AtomicBool::new(true)))
-            .collect(),
-    );
-    let flags = OnlineFlags {
-        device: online.clone(),
-        subs: sub_onlines.clone(),
+    // Like Python's start(), the first attempt runs inline; a device that is
+    // missing or fails to start is retried periodically.
+    let initial = match start_rnode_multi_generation(&config).await {
+        Ok(started) => Some(started),
+        Err(StartupFailure::Fatal(error)) => {
+            return Err(InterfaceError::SendFailed(format!(
+                "RNodeMulti startup: {error}"
+            )));
+        }
+        Err(StartupFailure::Retry(error)) => {
+            tracing::warn!(
+                name = %config.name,
+                error = %error,
+                "RNodeMulti startup failed, retrying periodically"
+            );
+            None
+        }
     };
 
-    // All sub-interface handles funnel into one writer so CMD_SEL_INT framing
-    // stays ordered relative to each data frame.
-    let (write_tx, mut write_rx) = mpsc::channel::<WriteRequest>(256);
+    let parent_id = ids[0];
+    let parent_transport = InterfaceTransportSender::new(parent_id, transport_tx.clone());
+    let parent_online = Arc::new(AtomicBool::new(false));
+    let parent_retired = Arc::new(AtomicBool::new(false));
+    let parent_txb = Arc::new(AtomicU64::new(0));
+    let spawned_count = Arc::new(AtomicU64::new(0));
+    let device = Arc::new(DeviceShared {
+        detached: AtomicBool::new(false),
+        detach_port: Mutex::new(None),
+        platform: Mutex::new(None),
+        spawned_vports: Mutex::new(Vec::new()),
+    });
 
-    let transport_senders: Vec<_> = ids
-        .iter()
-        .map(|id| InterfaceTransportSender::new(*id, transport_tx.clone()))
-        .collect();
-    let mut background_lanes = Vec::with_capacity(num_subs);
-    let mut handles = Vec::with_capacity(num_subs);
-    let mut sub_txb: Vec<Arc<AtomicU64>> = Vec::with_capacity(num_subs);
-    let mut sub_rxb: Vec<Arc<AtomicU64>> = Vec::with_capacity(num_subs);
+    let (write_tx, write_rx) = mpsc::channel::<WriteRequest>(256);
+    let mut subs = Vec::with_capacity(config.subinterfaces.len());
+    let mut lanes = Vec::with_capacity(config.subinterfaces.len());
+    let mut handles = Vec::with_capacity(config.subinterfaces.len() + 1);
 
-    for (i, sub_cfg) in config.subinterfaces.iter().enumerate() {
+    for (local, sub_cfg) in config.subinterfaces.iter().enumerate() {
+        let id = ids[local + 1];
         let bitrate = rnode::calculate_bitrate(
             sub_cfg.spreading_factor,
             sub_cfg.coding_rate,
             sub_cfg.bandwidth,
         );
-
+        let online = Arc::new(AtomicBool::new(false));
+        let retired = Arc::new(AtomicBool::new(false));
         let rxb = Arc::new(AtomicU64::new(0));
         let txb = Arc::new(AtomicU64::new(0));
-        sub_rxb.push(rxb.clone());
-        sub_txb.push(txb.clone());
+        let transport = InterfaceTransportSender::new(id, transport_tx.clone());
 
-        // Adapt the per-handle `Vec<u8>` channel into the shared WriteRequest
-        // channel so the handle type stays symmetric with other interfaces.
         let (sub_tx, mut sub_rx) = mpsc::channel::<Bytes>(256);
-        let background = crate::background_announce::register(&sub_tx)?;
-        background_lanes.push((
-            sub_cfg.vport,
-            background,
-            config.flow_control || sub_cfg.flow_control,
-            txb.clone(),
-            sub_onlines[i].clone(),
-        ));
+        lanes.push(crate::background_announce::register(&sub_tx)?);
         let write_tx_clone = write_tx.clone();
-        let vport = sub_cfg.vport;
-        let sub_flow_control = config.flow_control || sub_cfg.flow_control;
-        let txb_fwd = txb.clone();
-
         tokio::spawn(async move {
             while let Some(data) = sub_rx.recv().await {
-                txb_fwd.fetch_add(data.len() as u64, Ordering::Relaxed);
                 if write_tx_clone
-                    .send(WriteRequest {
-                        index: vport,
-                        data,
-                        flow_control: sub_flow_control,
-                    })
+                    .send(WriteRequest { local, data })
                     .await
                     .is_err()
                 {
@@ -817,10 +902,9 @@ pub async fn spawn_rnode_multi_interface(
         });
 
         let sub_name = format!("{}[{}]", config.name, sub_cfg.name);
-
         tracing::info!(
             name = %sub_name,
-            vport = vport,
+            vport = sub_cfg.vport,
             freq = sub_cfg.frequency,
             bw = sub_cfg.bandwidth,
             sf = sub_cfg.spreading_factor,
@@ -829,26 +913,13 @@ pub async fn spawn_rnode_multi_interface(
             "RNodeMulti sub-interface configured"
         );
 
-        // The real read loop is shared by all sub-interfaces; each handle just
-        // needs a JoinHandle that exits when its sub or the device goes offline.
-        let online_sub = sub_onlines[i].clone();
-        let device_sub = online.clone();
-        let sub_read_task = tokio::spawn(async move {
-            loop {
-                if !online_sub.load(Ordering::SeqCst) || !device_sub.load(Ordering::SeqCst) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        });
-
         handles.push(InterfaceHandle {
-            id: ids[i],
-            owner: transport_senders[i].owner(),
+            id,
+            owner: transport.owner(),
             packet_capacity: InterfacePacketCapacity::new(500, 508, false),
-            parent_id: None,
+            parent_id: Some(ids[0]),
             name: sub_name,
-            mode: sub_cfg.mode,
+            mode: config.mode,
             direction: InterfaceDirection {
                 inbound: true,
                 outbound: sub_cfg.outgoing,
@@ -857,28 +928,61 @@ pub async fn spawn_rnode_multi_interface(
             },
             bitrate,
             mtu: RNODE_HW_MTU,
-            online: sub_onlines[i].clone(),
-            rxb: Some(rxb),
-            txb: Some(txb),
+            online: online.clone(),
+            rxb: Some(rxb.clone()),
+            txb: Some(txb.clone()),
             inspection: None,
             tx: sub_tx,
-            read_task: sub_read_task,
+            read_task: spawn_retire_watch(retired.clone(), None),
+        });
+        subs.push(SubRuntime {
+            id,
+            vport: sub_cfg.vport,
+            spreading_factor: sub_cfg.spreading_factor,
+            flow_control: sub_cfg.flow_control,
+            online,
+            retired,
+            rxb,
+            txb,
+            transport,
         });
     }
-
-    // Drop our clone so the writer exits once every sub-interface handle drops.
     drop(write_tx);
 
-    let port_write = port
-        .try_clone()
-        .map_err(|e| InterfaceError::SendFailed(format!("RNodeMulti clone: {}", e)))?;
-    let online_w = online.clone();
-    let flags_w = flags.clone();
-    let ready = Arc::new(AtomicBool::new(true));
-    let ready_w = ready.clone();
+    // Python's parent is registered with Transport but never transmits.
+    let (parent_tx, mut parent_rx) = mpsc::channel::<Bytes>(16);
+    tokio::spawn(async move { while parent_rx.recv().await.is_some() {} });
+    let clients = spawned_count.clone();
+    let parent = InterfaceHandle {
+        id: parent_id,
+        owner: parent_transport.owner(),
+        packet_capacity: InterfacePacketCapacity::new(500, 508, false),
+        parent_id: None,
+        name: config.name.clone(),
+        mode: config.mode,
+        direction: InterfaceDirection {
+            inbound: false,
+            outbound: false,
+            forward: false,
+            repeat: false,
+        },
+        bitrate: 0,
+        mtu: RNODE_HW_MTU,
+        online: parent_online.clone(),
+        rxb: Some(Arc::new(AtomicU64::new(0))),
+        txb: Some(parent_txb.clone()),
+        inspection: Some(rns_transport::messages::InterfaceInspectionSource::new(
+            move || rns_transport::messages::InterfaceInspectionSnapshot {
+                active_clients: Some(clients.load(Ordering::SeqCst)),
+                blocked_ips: None,
+            },
+        )),
+        tx: parent_tx,
+        read_task: spawn_retire_watch(parent_retired.clone(), Some(device.clone())),
+    };
+    handles.insert(0, parent);
 
-    // Python RNodeMultiInterface.py:281-291 — oversized callsigns disable
-    // beaconing; when due, the callsign goes out on all subinterfaces.
+    // Python RNodeMultiInterface.py:281-291 — oversized callsigns disable beaconing.
     let beacon: Option<(Duration, Bytes)> = config
         .id_interval
         .zip(config.id_callsign.clone())
@@ -895,480 +999,440 @@ pub async fn spawn_rnode_multi_interface(
             ok
         })
         .map(|(interval, callsign)| (Duration::from_secs(interval), Bytes::from(callsign)));
-    let beacon_vports: Vec<_> = config
-        .subinterfaces
-        .iter()
-        .map(|sub| (sub.vport, config.flow_control || sub.flow_control))
-        .collect();
 
-    tokio::spawn(async move {
-        let mut port_w = port_write;
-        let mut background_cursor = 0usize;
-        let mut pending_beacons = std::collections::VecDeque::<WriteRequest>::new();
-        let mut first_tx: Option<tokio::time::Instant> = None;
-        loop {
-            let mut background_packet = None;
-            let mut background_request = None;
-            if write_rx.is_empty() && pending_beacons.is_empty() && online_w.load(Ordering::SeqCst)
-            {
-                for offset in 0..background_lanes.len() {
-                    let index = (background_cursor + offset) % background_lanes.len();
-                    let (vport, lane, flow_control, txb, online) = &background_lanes[index];
-                    if online.load(Ordering::SeqCst)
-                        && lane.ordinary_is_empty()
-                        && let Some(packet) = lane.try_start_when(rns_transport::now_f64(), || {
-                            !*flow_control
-                                || ready_w
-                                    .compare_exchange(
-                                        true,
-                                        false,
-                                        Ordering::SeqCst,
-                                        Ordering::SeqCst,
-                                    )
-                                    .is_ok()
-                        })
-                    {
-                        txb.fetch_add(packet.raw().len() as u64, Ordering::Relaxed);
-                        background_request = Some(WriteRequest {
-                            index: *vport,
-                            data: packet.raw().clone(),
-                            flow_control: *flow_control,
-                        });
-                        background_packet = Some(packet);
-                        background_cursor = (index + 1) % background_lanes.len();
-                        break;
-                    }
-                }
-            }
-            let req = if let Some(request) = pending_beacons.pop_front() {
-                request
-            } else if let Some(request) = background_request {
-                request
-            } else if let Some((interval, ref callsign)) = beacon {
-                match tokio::time::timeout(Duration::from_secs(1), write_rx.recv()).await {
-                    Ok(Some(req)) => req,
-                    Ok(None) => break,
-                    Err(_) => {
-                        if first_tx.is_none_or(|t| t.elapsed() < interval)
-                            || !online_w.load(Ordering::SeqCst)
-                        {
-                            continue;
-                        }
-                        tracing::debug!(
-                            "RNodeMulti transmitting station-ID beacon on all subinterfaces"
-                        );
-                        first_tx = None;
-                        // Each beacon is a complete radio packet and consumes
-                        // its own READY permit in the common writer below.
-                        for &(vport, flow_control) in &beacon_vports {
-                            pending_beacons.push_back(WriteRequest {
-                                index: vport,
-                                data: callsign.clone(),
-                                flow_control,
-                            });
-                        }
-                        continue;
-                    }
-                }
-            } else {
-                match tokio::time::timeout(Duration::from_millis(100), write_rx.recv()).await {
-                    Ok(Some(req)) => req,
-                    Ok(None) => break,
-                    Err(_) => continue,
-                }
-            };
-            if !online_w.load(Ordering::SeqCst) {
-                break;
-            }
-            if let Some((_, ref callsign)) = beacon {
-                if req.data == *callsign {
-                    first_tx = None;
-                } else if first_tx.is_none() {
-                    first_tx = Some(tokio::time::Instant::now());
-                }
-            }
-
-            if req.flow_control && background_packet.is_none() {
-                while ready_w
-                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_err()
-                {
-                    if !online_w.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            }
-
-            let frame = build_subinterface_data_frame(req.index, &req.data);
-            match crate::serial_io::blocking_write_all(port_w, frame).await {
-                Ok(p) => {
-                    port_w = p;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "RNodeMulti write error");
-                    flags_w.trip_device();
-                    break;
-                }
-            }
-        }
-    });
-
-    let flags_r = flags;
-    let ready_r = ready;
-    let parent_name = config.name.clone();
-
-    // `vport_map[vport] -> Some(local_index)` for configured sub-interfaces.
-    let mut vport_map: [Option<usize>; MAX_SUBINTERFACES] = [None; MAX_SUBINTERFACES];
-    let mut sub_ids: Vec<InterfaceId> = Vec::with_capacity(num_subs);
-    for (i, sub_cfg) in config.subinterfaces.iter().enumerate() {
-        let vp = sub_cfg.vport as usize;
-        vport_map[vp] = Some(i);
-        sub_ids.push(ids[i]);
-    }
-
-    tokio::spawn(async move {
-        let mut port_r = port;
-        let mut deframer = kiss::RawKissDeframer::new();
-        let mut buf = [0u8; 1024];
-
-        let mut signals: Vec<SubInterfaceSignal> = (0..num_subs)
-            .map(|_| SubInterfaceSignal::default())
-            .collect();
-
-        // Which sub-interface the device is currently addressing via
-        // CMD_SEL_INT; status and canonical CMD_DATA frames target this vport.
-        let mut selected_vport: Option<u8> = Some(0);
-
-        loop {
-            if !flags_r.device_running() {
-                break;
-            }
-
-            match crate::serial_io::poll_read(port_r, buf).await {
-                Ok((p, b, n)) => {
-                    port_r = p;
-                    buf = b;
-                    if n == 0 {
-                        continue;
-                    }
-
-                    for (raw_cmd, frame) in deframer.feed(&buf[..n]) {
-                        if raw_cmd == kiss::CMD_DATA {
-                            if frame.is_empty() {
-                                continue;
-                            }
-                            if let Some(local_idx) =
-                                selected_data_target(raw_cmd, selected_vport, &vport_map)
-                            {
-                                sub_rxb[local_idx].fetch_add(frame.len() as u64, Ordering::Relaxed);
-
-                                let rssi = signals[local_idx].last_rssi.take();
-                                let snr = signals[local_idx].last_snr.take();
-
-                                let msg = TransportMessage::Inbound(InboundPacket {
-                                    raw: Bytes::from(frame),
-                                    interface_id: sub_ids[local_idx],
-                                    rssi,
-                                    snr,
-                                    q: None,
-                                });
-                                if transport_senders[local_idx].send(msg).await.is_err() {
-                                    tracing::warn!(
-                                        parent = %parent_name,
-                                        "transport channel closed"
-                                    );
-                                    flags_r.trip_device();
-                                    return;
-                                }
-                            } else {
-                                tracing::debug!(
-                                    parent = %parent_name,
-                                    vport = ?selected_vport,
-                                    "data for unconfigured sub-interface, dropping"
-                                );
-                            }
-                            continue;
-                        }
-
-                        match raw_cmd {
-                            CMD_SEL_INT => {
-                                // Device echoes selection before emitting any
-                                // status/config responses for that sub-interface.
-                                if let Some(&idx) = frame.first() {
-                                    selected_vport =
-                                        ((idx as usize) < MAX_SUBINTERFACES).then_some(idx);
-                                    if selected_vport.is_none() {
-                                        tracing::warn!(
-                                            parent = %parent_name,
-                                            vport = idx,
-                                            "RNodeMulti selected an invalid virtual port"
-                                        );
-                                    }
-                                }
-                            }
-
-                            rnode::CMD_STAT_RSSI => {
-                                if !frame.is_empty() {
-                                    let rssi = rnode::decode_rssi_byte(frame[0]);
-                                    if let Some(local_idx) =
-                                        selected_vport.and_then(|vport| vport_map[vport as usize])
-                                    {
-                                        signals[local_idx].last_rssi = Some(rssi);
-                                    }
-                                }
-                            }
-                            rnode::CMD_STAT_SNR => {
-                                if !frame.is_empty() {
-                                    let snr = rnode::decode_snr_byte(frame[0]);
-                                    if let Some(local_idx) =
-                                        selected_vport.and_then(|vport| vport_map[vport as usize])
-                                    {
-                                        signals[local_idx].last_snr = Some(snr);
-                                    }
-                                }
-                            }
-
-                            rnode::CMD_READY => {
-                                if frame.len() == 1 {
-                                    ready_r.store(frame[0] != 0, Ordering::SeqCst);
-                                }
-                            }
-
-                            rnode::CMD_DETECT => {
-                                if frame.first().copied() == Some(rnode::DETECT_RESP) {
-                                    tracing::info!(
-                                        parent = %parent_name,
-                                        "RNodeMulti device detected"
-                                    );
-                                }
-                            }
-
-                            rnode::CMD_FW_VERSION => {
-                                if frame.len() >= 2 {
-                                    let major = frame[0];
-                                    let minor = frame[1];
-                                    tracing::info!(
-                                        parent = %parent_name,
-                                        major, minor,
-                                        "RNodeMulti firmware version {}.{}",
-                                        major, minor,
-                                    );
-                                    if major < REQUIRED_FW_VER_MAJ
-                                        || (major == REQUIRED_FW_VER_MAJ
-                                            && minor < REQUIRED_FW_VER_MIN)
-                                    {
-                                        tracing::warn!(
-                                            parent = %parent_name,
-                                            "RNodeMulti firmware {}.{} below required {}.{}",
-                                            major, minor,
-                                            REQUIRED_FW_VER_MAJ, REQUIRED_FW_VER_MIN,
-                                        );
-                                    }
-                                }
-                            }
-
-                            rnode::CMD_RADIO_STATE => {
-                                if let Some(local_idx) =
-                                    selected_vport.and_then(|vport| vport_map[vport as usize])
-                                {
-                                    if frame.first().copied() == Some(rnode::RADIO_STATE_ON) {
-                                        tracing::info!(
-                                            parent = %parent_name,
-                                            subinterface = local_idx,
-                                            vport = ?selected_vport,
-                                            "RNodeMulti sub-interface radio online"
-                                        );
-                                    } else {
-                                        tracing::warn!(
-                                            parent = %parent_name,
-                                            subinterface = local_idx,
-                                            vport = ?selected_vport,
-                                            "RNodeMulti sub-interface radio offline"
-                                        );
-                                    }
-                                }
-                            }
-
-                            rnode::CMD_FREQUENCY => {
-                                if frame.len() >= 4 {
-                                    let freq = u32::from_be_bytes([
-                                        frame[0], frame[1], frame[2], frame[3],
-                                    ]);
-                                    tracing::debug!(
-                                        parent = %parent_name,
-                                        vport = ?selected_vport,
-                                        freq_mhz = format!("{:.3}", freq as f64 / 1_000_000.0),
-                                        "Radio reporting frequency"
-                                    );
-                                }
-                            }
-
-                            rnode::CMD_BANDWIDTH => {
-                                if frame.len() >= 4 {
-                                    let bw = u32::from_be_bytes([
-                                        frame[0], frame[1], frame[2], frame[3],
-                                    ]);
-                                    tracing::debug!(
-                                        parent = %parent_name,
-                                        vport = ?selected_vport,
-                                        bw_khz = format!("{:.1}", bw as f64 / 1000.0),
-                                        "Radio reporting bandwidth"
-                                    );
-                                }
-                            }
-
-                            rnode::CMD_SF => {
-                                if !frame.is_empty() {
-                                    tracing::debug!(
-                                        parent = %parent_name,
-                                        vport = ?selected_vport,
-                                        sf = frame[0],
-                                        "Radio reporting spreading factor"
-                                    );
-                                }
-                            }
-
-                            rnode::CMD_CR => {
-                                if !frame.is_empty() {
-                                    tracing::debug!(
-                                        parent = %parent_name,
-                                        vport = ?selected_vport,
-                                        cr = frame[0],
-                                        "Radio reporting coding rate"
-                                    );
-                                }
-                            }
-
-                            rnode::CMD_TXPOWER => {
-                                if !frame.is_empty() {
-                                    let txp = frame[0] as i8;
-                                    tracing::debug!(
-                                        parent = %parent_name,
-                                        vport = ?selected_vport,
-                                        txpower_dbm = txp,
-                                        "Radio reporting TX power"
-                                    );
-                                }
-                            }
-
-                            rnode::CMD_ST_ALOCK => {
-                                if frame.len() >= 2 {
-                                    let at = ((frame[0] as u16) << 8) | frame[1] as u16;
-                                    let pct = at as f32 / 100.0;
-                                    tracing::debug!(
-                                        parent = %parent_name,
-                                        vport = ?selected_vport,
-                                        "RNodeMulti short-term airtime limit: {:.2}%", pct,
-                                    );
-                                }
-                            }
-
-                            rnode::CMD_LT_ALOCK => {
-                                if frame.len() >= 2 {
-                                    let at = ((frame[0] as u16) << 8) | frame[1] as u16;
-                                    let pct = at as f32 / 100.0;
-                                    tracing::debug!(
-                                        parent = %parent_name,
-                                        vport = ?selected_vport,
-                                        "RNodeMulti long-term airtime limit: {:.2}%", pct,
-                                    );
-                                }
-                            }
-
-                            rnode::CMD_PLATFORM => {
-                                if !frame.is_empty() {
-                                    tracing::debug!(
-                                        parent = %parent_name,
-                                        platform = format!("0x{:02X}", frame[0]),
-                                        "RNodeMulti platform"
-                                    );
-                                }
-                            }
-
-                            rnode::CMD_MCU => {
-                                if !frame.is_empty() {
-                                    tracing::debug!(
-                                        parent = %parent_name,
-                                        mcu = format!("0x{:02X}", frame[0]),
-                                        "RNodeMulti MCU"
-                                    );
-                                }
-                            }
-
-                            CMD_INTERFACES => {
-                                // Reply is one or more `[vport, radio_type]` pairs.
-                                for pair in frame.as_chunks::<2>().0 {
-                                    let vp = pair[0];
-                                    let rt = pair[1];
-                                    let rtype = RadioType::from_u8(rt)
-                                        .map(|r| r.family_name().to_string())
-                                        .unwrap_or_else(|| format!("unknown(0x{:02X})", rt));
-                                    tracing::info!(
-                                        parent = %parent_name,
-                                        vport = vp,
-                                        radio_type = %rtype,
-                                        "RNodeMulti radio module reported"
-                                    );
-                                }
-                                if !frame.len().is_multiple_of(2) {
-                                    tracing::warn!(
-                                        parent = %parent_name,
-                                        "RNodeMulti returned a malformed interface list"
-                                    );
-                                }
-                            }
-
-                            CMD_ERROR => {
-                                let class = match frame.first().copied() {
-                                    Some(ERROR_INITRADIO) => "radio initialisation",
-                                    Some(ERROR_TXFAILED) => "radio transmission",
-                                    _ => "unknown hardware",
-                                };
-                                tracing::error!(
-                                    parent = %parent_name,
-                                    class,
-                                    "RNodeMulti hardware error"
-                                );
-                                flags_r.trip_device();
-                                return;
-                            }
-
-                            rnode::CMD_RESET => {
-                                if frame.first().copied() == Some(0xF8) {
-                                    tracing::error!(
-                                        parent = %parent_name,
-                                        "RNodeMulti device reset detected"
-                                    );
-                                    flags_r.trip_device();
-                                    return;
-                                }
-                            }
-
-                            _ => {
-                                tracing::debug!(
-                                    parent = %parent_name,
-                                    cmd = format!("0x{:02X}", raw_cmd),
-                                    "RNodeMulti: ignoring KISS command"
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        parent = %parent_name,
-                        error = %e,
-                        "RNodeMulti read error"
-                    );
-                    flags_r.trip_device();
-                    return;
-                }
-            }
-        }
-    });
+    let driver = MultiDriver {
+        config,
+        device,
+        parent_online,
+        parent_retired,
+        parent_txb,
+        spawned_count,
+        subs: Arc::new(subs),
+        lanes,
+        beacon,
+        write_rx,
+        ready: [false; MAX_SUBINTERFACES],
+        queues: Default::default(),
+        first_tx: None,
+    };
+    tokio::spawn(driver.run(initial));
 
     Ok(handles)
+}
+
+struct MultiDriver {
+    config: RNodeMultiConfig,
+    device: Arc<DeviceShared>,
+    parent_online: Arc<AtomicBool>,
+    parent_retired: Arc<AtomicBool>,
+    parent_txb: Arc<AtomicU64>,
+    spawned_count: Arc<AtomicU64>,
+    subs: Arc<Vec<SubRuntime>>,
+    lanes: Vec<crate::background_announce::BackgroundAnnounceReceiver>,
+    beacon: Option<(Duration, Bytes)>,
+    write_rx: mpsc::Receiver<WriteRequest>,
+    /// Python per-subinterface `interface_ready` and `packet_queue`.
+    ready: [bool; MAX_SUBINTERFACES],
+    queues: [std::collections::VecDeque<Bytes>; MAX_SUBINTERFACES],
+    first_tx: Option<tokio::time::Instant>,
+}
+
+enum GenerationEnd {
+    Failed,
+    Teardown,
+}
+
+impl MultiDriver {
+    fn teardown_requested(&self) -> bool {
+        self.device.detached.load(Ordering::SeqCst)
+            || self.parent_retired.load(Ordering::SeqCst)
+            || self
+                .subs
+                .iter()
+                .all(|sub| sub.retired.load(Ordering::SeqCst))
+    }
+
+    async fn run(mut self, mut next: Option<StartedDevice>) {
+        loop {
+            let started = match next.take() {
+                Some(started) => started,
+                None => {
+                    if self
+                        .idle_wait(Duration::from_secs(rnode::RECONNECT_WAIT))
+                        .await
+                    {
+                        break;
+                    }
+                    tracing::info!(name = %self.config.name, "attempting to reconnect RNodeMulti");
+                    match start_rnode_multi_generation(&self.config).await {
+                        Ok(started) => started,
+                        Err(StartupFailure::Fatal(error)) => {
+                            tracing::error!(name = %self.config.name, error = %error, "RNodeMulti stopped");
+                            break;
+                        }
+                        Err(StartupFailure::Retry(error)) => {
+                            tracing::warn!(name = %self.config.name, error = %error, "RNodeMulti reconnect failed");
+                            continue;
+                        }
+                    }
+                }
+            };
+            match self.run_generation(started).await {
+                GenerationEnd::Teardown => break,
+                GenerationEnd::Failed => {
+                    tracing::error!(
+                        name = %self.config.name,
+                        "RNodeMulti is offline, reconnecting periodically"
+                    );
+                }
+            }
+        }
+        self.device.detach();
+        self.end_generation();
+    }
+
+    /// Wait while offline; writes are dropped like Python's offline subinterfaces.
+    async fn idle_wait(&mut self, duration: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + duration;
+        loop {
+            if self.teardown_requested() {
+                return true;
+            }
+            tokio::select! {
+                request = self.write_rx.recv() => {
+                    if request.is_none() {
+                        return true;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => return false,
+                _ = tokio::time::sleep(RNODE_WRITER_POLL) => {}
+            }
+        }
+    }
+
+    fn end_generation(&mut self) {
+        for sub in self.subs.iter() {
+            sub.online.store(false, Ordering::SeqCst);
+        }
+        self.parent_online.store(false, Ordering::SeqCst);
+        self.spawned_count.store(0, Ordering::SeqCst);
+        self.device.spawned_vports.lock().unwrap().clear();
+        self.device.detach_port.lock().unwrap().take();
+    }
+
+    async fn run_generation(&mut self, started: StartedDevice) -> GenerationEnd {
+        let StartedDevice {
+            port,
+            platform,
+            configured,
+        } = started;
+        let (Ok(write_port), Ok(detach_port)) = (port.try_clone(), port.try_clone()) else {
+            return GenerationEnd::Failed;
+        };
+        *self.device.platform.lock().unwrap() = platform;
+        *self.device.detach_port.lock().unwrap() = Some(detach_port);
+        *self.device.spawned_vports.lock().unwrap() =
+            self.subs.iter().map(|sub| sub.vport).collect();
+        self.spawned_count
+            .store(self.subs.len() as u64, Ordering::SeqCst);
+        for (local, sub) in self.subs.iter().enumerate() {
+            let up = configured[local] && !sub.retired.load(Ordering::SeqCst);
+            self.ready[local] = configured[local];
+            self.queues[local].clear();
+            sub.online.store(up, Ordering::SeqCst);
+        }
+        self.parent_online.store(true, Ordering::SeqCst);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let reader = tokio::spawn(read_rnode_multi(
+            port,
+            self.subs.clone(),
+            self.device.clone(),
+            self.parent_online.clone(),
+            stop.clone(),
+            event_tx,
+            self.config.name.clone(),
+        ));
+        let mut port_w = Some(write_port);
+
+        let end = loop {
+            if self.teardown_requested() {
+                break GenerationEnd::Teardown;
+            }
+            if self.write_background(&mut port_w).await.is_err() {
+                break GenerationEnd::Failed;
+            }
+            let result = tokio::select! {
+                biased;
+                event = events.recv() => match event {
+                    Some(ReaderEvent::Ready) => self.process_queues(&mut port_w).await,
+                    Some(ReaderEvent::Failed(reason)) => {
+                        tracing::error!(name = %self.config.name, reason = %reason, "RNodeMulti device error");
+                        Err(())
+                    }
+                    None => Err(()),
+                },
+                request = self.write_rx.recv() => match request {
+                    Some(request) => self.submit(&mut port_w, request.local, request.data).await,
+                    None => break GenerationEnd::Teardown,
+                },
+                _ = tokio::time::sleep(RNODE_WRITER_POLL) => self.beacon_tick(&mut port_w).await,
+            };
+            if result.is_err() {
+                break GenerationEnd::Failed;
+            }
+        };
+
+        if matches!(end, GenerationEnd::Teardown) {
+            drop(port_w);
+            self.device.detach();
+        }
+        stop.store(true, Ordering::SeqCst);
+        let _ = reader.await;
+        self.end_generation();
+        end
+    }
+
+    /// Python `RNodeSubInterface.process_outgoing` for one subinterface.
+    async fn submit(
+        &mut self,
+        port: &mut Option<Box<dyn serialport::SerialPort>>,
+        local: usize,
+        data: Bytes,
+    ) -> Result<(), ()> {
+        let sub = &self.subs[local];
+        if !sub.online.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if sub.flow_control {
+            if !self.ready[local] {
+                self.queues[local].push_back(data);
+                return Ok(());
+            }
+            self.ready[local] = false;
+        }
+        self.write(port, local, data).await
+    }
+
+    async fn write(
+        &mut self,
+        port: &mut Option<Box<dyn serialport::SerialPort>>,
+        local: usize,
+        data: Bytes,
+    ) -> Result<(), ()> {
+        if let Some((_, callsign)) = &self.beacon {
+            if data == *callsign {
+                self.first_tx = None;
+            } else if self.first_tx.is_none() {
+                self.first_tx = Some(tokio::time::Instant::now());
+            }
+        }
+        let sub = &self.subs[local];
+        sub.txb.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.parent_txb
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        let frame = build_subinterface_data_frame(sub.vport, &data);
+        let Some(current) = port.take() else {
+            return Err(());
+        };
+        match crate::serial_io::blocking_write_all(current, frame).await {
+            Ok(p) => {
+                *port = Some(p);
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "RNodeMulti write error");
+                Err(())
+            }
+        }
+    }
+
+    /// Python `process_queue`: any READY lets every subinterface send one
+    /// queued packet or become ready.
+    async fn process_queues(
+        &mut self,
+        port: &mut Option<Box<dyn serialport::SerialPort>>,
+    ) -> Result<(), ()> {
+        for local in 0..self.subs.len() {
+            self.ready[local] = true;
+            if let Some(data) = self.queues[local].pop_front() {
+                self.submit(port, local, data).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn write_background(
+        &mut self,
+        port: &mut Option<Box<dyn serialport::SerialPort>>,
+    ) -> Result<(), ()> {
+        if !self.write_rx.is_empty() {
+            return Ok(());
+        }
+        for local in 0..self.subs.len() {
+            let sub = &self.subs[local];
+            if !sub.online.load(Ordering::SeqCst) || !self.queues[local].is_empty() {
+                continue;
+            }
+            let lane = &self.lanes[local];
+            if !lane.ordinary_is_empty() {
+                continue;
+            }
+            let flow_control = sub.flow_control;
+            let ready = &mut self.ready[local];
+            let Some(packet) = lane.try_start_when(rns_transport::now_f64(), || {
+                if !flow_control {
+                    return true;
+                }
+                std::mem::replace(ready, false)
+            }) else {
+                continue;
+            };
+            let data = packet.raw().clone();
+            let result = self.write(port, local, data).await;
+            drop(packet);
+            result?;
+        }
+        Ok(())
+    }
+
+    async fn beacon_tick(
+        &mut self,
+        port: &mut Option<Box<dyn serialport::SerialPort>>,
+    ) -> Result<(), ()> {
+        let Some((interval, callsign)) = self.beacon.clone() else {
+            return Ok(());
+        };
+        if self.first_tx.is_none_or(|t| t.elapsed() < interval) {
+            return Ok(());
+        }
+        tracing::debug!("RNodeMulti transmitting station-ID beacon on all subinterfaces");
+        self.first_tx = None;
+        for local in 0..self.subs.len() {
+            if self.subs[local].online.load(Ordering::SeqCst) {
+                self.submit(port, local, callsign.clone()).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn read_rnode_multi(
+    port: Box<dyn serialport::SerialPort>,
+    subs: Arc<Vec<SubRuntime>>,
+    device: Arc<DeviceShared>,
+    parent_online: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    events: mpsc::UnboundedSender<ReaderEvent>,
+    parent_name: String,
+) {
+    let mut vport_map: [Option<usize>; MAX_SUBINTERFACES] = [None; MAX_SUBINTERFACES];
+    for (local, sub) in subs.iter().enumerate() {
+        vport_map[sub.vport as usize] = Some(local);
+    }
+    let mut signals: Vec<SubInterfaceSignal> = (0..subs.len())
+        .map(|_| SubInterfaceSignal::default())
+        .collect();
+    let mut port_r = port;
+    let mut deframer = kiss::RawKissDeframer::new();
+    let mut buf = [0u8; 1024];
+    let mut selected_vport: Option<u8> = Some(0);
+    let selected_local = |selected: Option<u8>| {
+        selected.and_then(|vport| vport_map.get(vport as usize).copied().flatten())
+    };
+
+    while !stop.load(Ordering::SeqCst) {
+        let (p, b, n) = match crate::serial_io::poll_read(port_r, buf).await {
+            Ok(read) => read,
+            Err(e) => {
+                let _ = events.send(ReaderEvent::Failed(format!("read error: {e}")));
+                return;
+            }
+        };
+        port_r = p;
+        buf = b;
+        for (command, frame) in deframer.feed(&buf[..n]) {
+            match command {
+                kiss::CMD_DATA => {
+                    if frame.is_empty() {
+                        continue;
+                    }
+                    let Some(local) = selected_data_target(command, selected_vport, &vport_map)
+                    else {
+                        tracing::debug!(
+                            parent = %parent_name,
+                            vport = ?selected_vport,
+                            "data for unconfigured sub-interface, dropping"
+                        );
+                        continue;
+                    };
+                    let sub = &subs[local];
+                    sub.rxb.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                    let msg = TransportMessage::Inbound(InboundPacket {
+                        raw: Bytes::from(frame),
+                        interface_id: sub.id,
+                        rssi: signals[local].last_rssi,
+                        snr: signals[local].last_snr,
+                        q: signals[local].last_q,
+                    });
+                    if sub.transport.send(msg).await.is_err() {
+                        let _ = events.send(ReaderEvent::Failed("transport channel closed".into()));
+                        return;
+                    }
+                }
+                CMD_SEL_INT => {
+                    if let Some(&index) = frame.first() {
+                        selected_vport = ((index as usize) < MAX_SUBINTERFACES).then_some(index);
+                    }
+                }
+                rnode::CMD_STAT_RSSI => {
+                    if let (Some(&byte), Some(local)) =
+                        (frame.first(), selected_local(selected_vport))
+                    {
+                        signals[local].last_rssi = Some(rnode::decode_rssi_byte(byte));
+                    }
+                }
+                rnode::CMD_STAT_SNR => {
+                    if let (Some(&byte), Some(local)) =
+                        (frame.first(), selected_local(selected_vport))
+                    {
+                        let snr = rnode::decode_snr_byte(byte);
+                        signals[local].last_snr = Some(snr);
+                        signals[local].last_q =
+                            Some(rnode::signal_quality(snr, subs[local].spreading_factor));
+                    }
+                }
+                rnode::CMD_READY => {
+                    let _ = events.send(ReaderEvent::Ready);
+                }
+                rnode::CMD_PLATFORM => {
+                    if let Some(&platform) = frame.first() {
+                        *device.platform.lock().unwrap() = Some(platform);
+                    }
+                }
+                rnode::CMD_RESET => {
+                    // Python acts on a reset only from an online ESP32.
+                    if frame.first() == Some(&0xF8)
+                        && *device.platform.lock().unwrap() == Some(rnode::PLATFORM_ESP32)
+                        && parent_online.load(Ordering::SeqCst)
+                    {
+                        let _ = events.send(ReaderEvent::Failed("ESP32 reset".into()));
+                        return;
+                    }
+                }
+                // 0x90 is CMD_INT5_DATA as well as CMD_ERROR; Python's read loop
+                // takes the data branch first, so these frames are dropped.
+                _ => {
+                    tracing::debug!(
+                        parent = %parent_name,
+                        cmd = format!("0x{:02X}", command),
+                        "RNodeMulti: ignoring KISS command"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1379,7 +1443,7 @@ mod tests {
     fn test_rnode_multi_config() {
         let mut cfg = RNodeMultiConfig::new("multi0", "/dev/ttyACM0");
         assert_eq!(cfg.baud_rate, 115200);
-        assert!(!cfg.flow_control);
+        assert_eq!(cfg.mode, InterfaceMode::Full);
         assert!(cfg.subinterfaces.is_empty());
 
         cfg.subinterfaces
@@ -1391,38 +1455,23 @@ mod tests {
         assert!(cfg.subinterfaces.iter().all(|sub| !sub.flow_control));
     }
 
-    /// T1-3: the shared serial reader runs while the device is up and at
-    /// least one sub-interface remains registered. Deregistering one sub
-    /// must NOT stop the device; deregistering all must (port release);
-    /// device failure trips every sub flag.
     #[test]
-    fn test_online_flags_reader_exit_semantics() {
-        let flags = OnlineFlags {
-            device: Arc::new(AtomicBool::new(true)),
-            subs: Arc::new(vec![
-                Arc::new(AtomicBool::new(true)),
-                Arc::new(AtomicBool::new(true)),
-            ]),
-        };
-        assert!(flags.device_running());
-
-        // One sub deregistered (actor flips its flag): device keeps serving.
-        flags.subs[0].store(false, Ordering::SeqCst);
-        assert!(flags.device_running());
-
-        // Last sub deregistered: reader must exit and release the port.
-        flags.subs[1].store(false, Ordering::SeqCst);
-        assert!(!flags.device_running());
-
-        // Device failure path: every sub flag goes down with the device.
-        let flags2 = OnlineFlags {
-            device: Arc::new(AtomicBool::new(true)),
-            subs: Arc::new(vec![Arc::new(AtomicBool::new(true))]),
-        };
-        flags2.trip_device();
-        assert!(!flags2.device.load(Ordering::SeqCst));
-        assert!(!flags2.subs[0].load(Ordering::SeqCst));
-        assert!(!flags2.device_running());
+    fn detach_sequence_follows_upstream_order() {
+        let mut expected = Vec::new();
+        kiss::frame_with_command_into(rnode::CMD_FB_EXT, &[0x00], &mut expected);
+        for vport in [0u8, 2] {
+            kiss::frame_with_command_into(CMD_SEL_INT, &[vport], &mut expected);
+            kiss::frame_with_command_into(rnode::CMD_RADIO_STATE, &[0x00], &mut expected);
+        }
+        kiss::frame_with_command_into(rnode::CMD_LEAVE, &[0xFF], &mut expected);
+        assert_eq!(
+            build_multi_detach_sequence(Some(rnode::PLATFORM_ESP32), &[0, 2]),
+            expected
+        );
+        assert_eq!(
+            build_multi_detach_sequence(Some(rnode::PLATFORM_AVR), &[0, 2]),
+            expected[4..]
+        );
     }
 
     /// The multi reader decodes STAT_RSSI/STAT_SNR via the shared rnode
@@ -1772,7 +1821,8 @@ mod tests {
                 .apply_frame(CMD_INTERFACES, &[MAX_SUBINTERFACES as u8, 0x00])
                 .is_err()
         );
-        assert!(state.apply_frame(CMD_ERROR, &[ERROR_INITRADIO]).is_err());
+        // 0x90 doubles as CMD_INT5_DATA, which Python's read loop decodes first.
+        assert!(state.apply_frame(CMD_ERROR, &[ERROR_INITRADIO]).is_ok());
     }
 
     #[test]
@@ -1793,7 +1843,7 @@ mod tests {
             .apply_frame(rnode::CMD_CR, &[config.coding_rate])
             .unwrap();
         state
-            .apply_frame(rnode::CMD_TXPOWER, &[config.tx_power])
+            .apply_frame(rnode::CMD_TXPOWER, &[config.tx_power as u8])
             .unwrap();
         assert!(!state.radio_complete(0));
         state
@@ -1802,7 +1852,7 @@ mod tests {
         // Pre-RADIO_ON echoes are the request, not what the radio will use.
         assert!(!state.radio_complete(0));
         state
-            .apply_frame(rnode::CMD_TXPOWER, &[config.tx_power])
+            .apply_frame(rnode::CMD_TXPOWER, &[config.tx_power as u8])
             .unwrap();
 
         assert!(state.radio_complete(0));
@@ -1810,7 +1860,7 @@ mod tests {
 
         // An amplifier floor reported once on is a mismatch.
         state
-            .apply_frame(rnode::CMD_TXPOWER, &[config.tx_power + 3])
+            .apply_frame(rnode::CMD_TXPOWER, &[(config.tx_power + 3) as u8])
             .unwrap();
         assert!(state.radios[0].validate(&config).is_err());
 
@@ -1829,7 +1879,7 @@ mod tests {
             .subinterfaces
             .push(SubInterfaceConfig::new("second", 0, 915_000_000));
         let (transport_tx, _transport_rx) = mpsc::channel(1);
-        let result = spawn_rnode_multi_interface(config, &[1, 2], transport_tx).await;
+        let result = spawn_rnode_multi_interface(config, &[1, 2, 3], transport_tx).await;
         let error = match result {
             Ok(_) => panic!("duplicate vports must fail before serial open"),
             Err(error) => error,

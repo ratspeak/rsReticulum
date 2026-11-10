@@ -14,6 +14,12 @@ use rns_transport::messages::{InboundPacket, TransportMessage};
 
 const KISS_READ_TIMEOUT_MS: u64 = 100;
 
+/// Python `KISSInterface.BITRATE_GUESS`; `speed` is only the serial baud rate.
+pub const BITRATE_GUESS: u64 = 1200;
+
+/// Python `KISSInterface.flow_control_timeout`.
+pub const FLOW_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone)]
 pub struct KissInterfaceConfig {
     pub name: String,
@@ -32,11 +38,9 @@ pub struct KissInterfaceConfig {
     /// Station-ID delay in seconds, armed by data transmission. Both this field
     /// and `id_callsign` must be set to enable automatic beacons.
     ///
-    /// In this implementation, callsigns shorter than 15 bytes are padded for
-    /// transmission but compared with the unpadded value when resetting the timer.
-    /// After becoming due, such a beacon can repeat on each one-second idle poll,
-    /// subject to flow control and successful writes. Set either option to `None`
-    /// to disable automatic beaconing.
+    /// As in Python, a callsign shorter than 15 bytes is padded for transmission
+    /// and so re-arms the timer: beacons then repeat every `id_interval`. A
+    /// callsign of 15 bytes or more stops beaconing until the next data frame.
     pub id_interval: Option<u64>,
     pub id_callsign: Option<Vec<u8>>,
 }
@@ -60,6 +64,30 @@ impl KissInterfaceConfig {
             id_callsign: None,
         }
     }
+}
+
+/// KISS TNC configuration frames in Python `configure_device` order:
+/// TXDELAY, TXTAIL, P, SLOTTIME, then the flow-control enable `READY 0x01`,
+/// which Python sends whether or not flow control is configured.
+pub fn build_kiss_init(
+    txdelay: Option<u8>,
+    txtail: Option<u8>,
+    persistence: Option<u8>,
+    slottime: Option<u8>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20);
+    for (cmd, value) in [
+        (kiss::CMD_TXDELAY, txdelay),
+        (kiss::CMD_TXTAIL, txtail),
+        (kiss::CMD_P, persistence),
+        (kiss::CMD_SLOTTIME, slottime),
+    ] {
+        if let Some(v) = value {
+            kiss::frame_with_command_into(cmd, &[v], &mut out);
+        }
+    }
+    kiss::frame_with_command_into(kiss::CMD_READY, &[0x01], &mut out);
+    out
 }
 
 /// Beacon frame payload: callsign zero-padded to the 15-byte minimum
@@ -122,24 +150,19 @@ async fn spawn_kiss_with_port(
         let mut init_port = port_write.try_clone().map_err(|e| {
             crate::traits::InterfaceError::SendFailed(format!("kiss init clone: {}", e))
         })?;
-        let mut init_frames = Vec::with_capacity(16);
-        if let Some(v) = config.txdelay {
-            kiss::frame_with_command_into(kiss::CMD_TXDELAY, &[v], &mut init_frames);
-        }
-        if let Some(v) = config.persistence {
-            kiss::frame_with_command_into(kiss::CMD_P, &[v], &mut init_frames);
-        }
-        if let Some(v) = config.slottime {
-            kiss::frame_with_command_into(kiss::CMD_SLOTTIME, &[v], &mut init_frames);
-        }
-        if let Some(v) = config.txtail {
-            kiss::frame_with_command_into(kiss::CMD_TXTAIL, &[v], &mut init_frames);
-        }
-        if !init_frames.is_empty() {
-            use std::io::Write;
-            let _ = init_port.write_all(&init_frames);
-            let _ = init_port.flush();
-        }
+        let init_frames = build_kiss_init(
+            config.txdelay,
+            config.txtail,
+            config.persistence,
+            config.slottime,
+        );
+        use std::io::Write;
+        init_port
+            .write_all(&init_frames)
+            .and_then(|()| init_port.flush())
+            .map_err(|e| {
+                crate::traits::InterfaceError::SendFailed(format!("kiss configure: {}", e))
+            })?;
     }
 
     let ready = Arc::new(AtomicBool::new(true));
@@ -151,18 +174,34 @@ async fn spawn_kiss_with_port(
         .id_interval
         .zip(config.id_callsign.clone())
         .map(|(interval, callsign)| (Duration::from_secs(interval), Bytes::from(callsign)));
-    tokio::spawn(async move {
+    let writer = tokio::spawn(async move {
         let mut port_w = port_write;
         // Python first_tx semantics: armed by the first data TX after a
         // beacon; cleared when the beacon goes out.
         let mut first_tx: Option<tokio::time::Instant> = None;
+        let mut flow_control_locked = tokio::time::Instant::now();
+        let take_permit = |locked: tokio::time::Instant| {
+            if ready_w
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return true;
+            }
+            if locked.elapsed() > FLOW_CONTROL_TIMEOUT {
+                tracing::warn!(
+                    "KISS interface is unlocking flow control due to time-out. This should not happen. Your hardware might have missed a flow-control READY command, or maybe it does not support flow-control."
+                );
+                return true;
+            }
+            false
+        };
         loop {
-            let background_packet = if rx.is_empty() && online_w.load(Ordering::SeqCst) {
+            if !online_w.load(Ordering::SeqCst) {
+                break;
+            }
+            let background_packet = if rx.is_empty() {
                 background.try_start_when(rns_transport::now_f64(), || {
-                    !flow_control
-                        || ready_w
-                            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                            .is_ok()
+                    !flow_control || take_permit(flow_control_locked)
                 })
             } else {
                 None
@@ -179,6 +218,7 @@ async fn spawn_kiss_with_port(
                             continue;
                         }
                         tracing::debug!("KISS transmitting station-ID beacon");
+                        first_tx = None;
                         Bytes::from(beacon_frame_payload(callsign))
                     }
                 }
@@ -190,10 +230,7 @@ async fn spawn_kiss_with_port(
                 }
             };
 
-            // Python KISSInterface.py:267-271 compares the unpadded callsign,
-            // so a padded (<15 byte) beacon re-arms the timer and beacons
-            // repeat every id_interval once anything has been sent. Kept
-            // bug-for-bug for parity.
+            // Python compares against the unpadded callsign, so a padded beacon re-arms.
             let is_beacon = beacon
                 .as_ref()
                 .is_some_and(|(_, callsign)| data == *callsign);
@@ -203,19 +240,21 @@ async fn spawn_kiss_with_port(
                 first_tx = Some(tokio::time::Instant::now());
             }
 
-            txb_w.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            // READY is one packet permit. A timeout must never synthesize it.
             if flow_control && background_packet.is_none() {
-                while ready_w
-                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_err()
-                {
+                while !take_permit(flow_control_locked) {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     if !online_w.load(Ordering::SeqCst) {
                         return;
                     }
                 }
             }
+            if !online_w.load(Ordering::SeqCst) {
+                break;
+            }
+            if flow_control {
+                flow_control_locked = tokio::time::Instant::now();
+            }
+            txb_w.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let framed = kiss::frame(&data);
             match crate::serial_io::blocking_write_all(port_w, framed).await {
                 Ok(p) => {
@@ -234,6 +273,8 @@ async fn spawn_kiss_with_port(
     let ready_r = ready;
     let rxb_r = shared_rxb.clone();
     let read_task = tokio::spawn(async move {
+        // The writer lives and dies with the read task that teardown aborts.
+        let _writer = AbortOnDrop(writer);
         let mut port_r = port;
         let mut deframer = kiss::KissDeframer::new();
         let mut buf = [0u8; 1024];
@@ -268,10 +309,9 @@ async fn spawn_kiss_with_port(
                                     }
                                 }
                                 kiss::CMD_READY => {
-                                    // Nonzero = TNC ready to accept data.
-                                    let is_ready = frame.first().copied().unwrap_or(0) != 0;
-                                    ready_r.store(is_ready, Ordering::SeqCst);
-                                    tracing::debug!(id, ready = is_ready, "KISS flow control");
+                                    // Python process_queue ignores the READY payload.
+                                    ready_r.store(true, Ordering::SeqCst);
+                                    tracing::debug!(id, "KISS flow control: ready");
                                 }
                                 _ => {
                                     tracing::debug!(id, cmd, "ignoring KISS command");
@@ -302,7 +342,7 @@ async fn spawn_kiss_with_port(
             forward: false,
             repeat: false,
         },
-        bitrate: config.baud_rate as u64,
+        bitrate: BITRATE_GUESS,
         mtu: 564,
         online,
         rxb: Some(shared_rxb),
@@ -311,6 +351,14 @@ async fn spawn_kiss_with_port(
         tx,
         read_task,
     })
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[cfg(test)]
@@ -382,16 +430,24 @@ mod tests {
             .await
             .unwrap();
         driver.owner.mark_registered();
-        let mut revoke = kiss::frame_with_command(kiss::CMD_READY, &[0]);
-        revoke.extend(kiss::frame(b"read barrier"));
-        master.write_all(&revoke).unwrap();
+        let init = build_kiss_init(None, None, None, None);
+        let mut actual_init = vec![0; init.len()];
+        master.read_exact(&mut actual_init).unwrap();
+        assert_eq!(actual_init, init);
+        // The initial permit goes to the first packet; later ones wait for READY.
+        driver.tx.send(Bytes::from_static(b"first")).await.unwrap();
+        let expected = kiss::frame(b"first");
+        let mut actual = vec![0; expected.len()];
+        master.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        master.write_all(&kiss::frame(b"read barrier")).unwrap();
         received.recv().await.unwrap();
         let (actor, control, raw) = crate::background_announce::scheduled_actor(driver.tx.clone());
         tokio::time::sleep(Duration::from_millis(300)).await;
         let mut probe = [0; 2048];
         assert!(
             master.read(&mut probe).is_err(),
-            "no timeout may synthesize READY"
+            "no packet may go out before READY or the flow-control timeout"
         );
         driver
             .tx

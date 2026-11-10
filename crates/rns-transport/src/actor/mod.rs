@@ -1064,7 +1064,7 @@ impl TransportActor {
                 let is_outbound = entry.direction.outbound;
                 let iface_name = entry.name.clone();
                 let role = entry.role;
-                let accepted_child = entry.parent_id.is_some();
+                let accepted_child = entry.accepted;
                 if role == InterfaceRole::LocalClient && interface_marked_offline(&entry) {
                     tracing::info!(
                         id,
@@ -1276,7 +1276,7 @@ impl TransportActor {
     fn replay_interface(&self, name: &str) -> Option<InterfaceId> {
         self.interfaces
             .iter()
-            .find(|(_, entry)| entry.parent_id.is_none() && entry.name == name)
+            .find(|(_, entry)| !entry.accepted && entry.name == name)
             .map(|(&id, _)| id)
     }
 
@@ -2594,6 +2594,7 @@ mod tests {
             mode: InterfaceMode::Gateway,
             role: InterfaceRole::Normal,
             parent_id: None,
+            accepted: false,
             direction: InterfaceDirection::bidirectional(),
             bitrate: 115200,
             mtu: 500,

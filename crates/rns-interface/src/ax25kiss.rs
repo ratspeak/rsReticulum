@@ -301,16 +301,29 @@ pub async fn spawn_ax25kiss_interface(
     let txb_w = shared_txb.clone();
     tokio::spawn(async move {
         let mut port_w = port_write;
+        let mut flow_control_locked = tokio::time::Instant::now();
+        let take_permit = |locked: tokio::time::Instant| {
+            if ready_w
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return true;
+            }
+            if locked.elapsed() > crate::kiss_iface::FLOW_CONTROL_TIMEOUT {
+                tracing::warn!(
+                    "AX.25 KISS interface is unlocking flow control due to time-out. This should not happen. Your hardware might have missed a flow-control READY command, or maybe it does not support flow-control."
+                );
+                return true;
+            }
+            false
+        };
         loop {
             if !online_w.load(Ordering::SeqCst) {
                 break;
             }
             let background_packet = if rx.is_empty() {
                 background.try_start_when(rns_transport::now_f64(), || {
-                    !flow_control
-                        || ready_w
-                            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                            .is_ok()
+                    !flow_control || take_permit(flow_control_locked)
                 })
             } else {
                 None
@@ -327,15 +340,15 @@ pub async fn spawn_ax25kiss_interface(
             txb_w.fetch_add(data.len() as u64, Ordering::Relaxed);
 
             if flow_control && background_packet.is_none() {
-                while ready_w
-                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_err()
-                {
+                while !take_permit(flow_control_locked) {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     if !online_w.load(Ordering::SeqCst) {
                         return;
                     }
                 }
+            }
+            if flow_control {
+                flow_control_locked = tokio::time::Instant::now();
             }
 
             let framed =

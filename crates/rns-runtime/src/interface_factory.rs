@@ -78,9 +78,9 @@ pub struct KissSerialConfig {
     pub persistence: u8,
     pub slottime_ms: u32,
     pub flow_control: bool,
-    /// Station-ID interval in seconds after data TX. Current KISS beacons
-    /// with callsigns shorter than 15 bytes can repeat on each one-second
-    /// idle poll. Omit either this option or `id_callsign` to disable beacons.
+    /// Station-ID interval in seconds after data TX; beacons repeat every
+    /// interval while idle when the callsign is shorter than 15 bytes.
+    /// Omit either this option or `id_callsign` to disable beacons.
     pub id_interval: Option<u64>,
     pub id_callsign: Option<String>,
 }
@@ -236,7 +236,6 @@ pub struct RNodeMultiInterfaceConfig {
     pub name: String,
     pub port: String,
     pub baud_rate: u32,
-    pub flow_control: bool,
     pub subinterfaces: Vec<RNodeSubInterfaceConfig>,
     pub mode: InterfaceMode,
     /// Parent-level station-ID interval in seconds. Due beacons target all
@@ -253,14 +252,15 @@ pub struct RNodeSubInterfaceConfig {
     pub bandwidth: u32,
     pub spreading_factor: u8,
     pub coding_rate: u8,
-    pub tx_power: u8,
+    /// dBm, -9..=37 (Python `RNodeSubInterface`).
+    pub tx_power: i8,
     pub vport: u8,
     pub enabled: bool,
+    /// The subsection's own key only; Python has no parent fallback.
     pub flow_control: bool,
     pub outgoing: bool,
     pub st_alock: Option<f32>,
     pub lt_alock: Option<f32>,
-    pub mode: InterfaceMode,
 }
 
 /// AX.25-framed packets carried over a KISS serial TNC, with a configured
@@ -385,6 +385,59 @@ fn parse_uint_strict(
             field: format!("{name}.{field}"),
             message: format!("'{raw}' is not a non-negative integer"),
         })
+}
+
+/// Python `int(c[field])`: a non-integer is a config error (Python raises).
+#[cfg(feature = "serial")]
+fn parse_int_strict(
+    name: &str,
+    field: &str,
+    section: &ConfigSection,
+    default: i64,
+) -> Result<i64, InterfaceFactoryError> {
+    if !section.has(field) {
+        return Ok(default);
+    }
+    let raw = section
+        .get(field)
+        .ok_or_else(|| InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: "expected an integer".to_string(),
+        })?;
+    raw.trim()
+        .parse::<i64>()
+        .map_err(|_| InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.{field}"),
+            message: format!("'{raw}' is not an integer"),
+        })
+}
+
+/// KISS TNC timing/persistence keys parsed like Python `KISSInterface` and
+/// `AX25KISSInterface`. Python sends `clamp(int(ms / 10), 0, 255)` for the
+/// timings and `clamp(p, 0, 255)` for persistence, so negative values become
+/// zero and the ms values are clamped to a range that keeps every wire byte.
+#[cfg(feature = "serial")]
+struct KissTncParams {
+    preamble_ms: u16,
+    txtail_ms: u16,
+    persistence: u8,
+    slottime_ms: u16,
+}
+
+#[cfg(feature = "serial")]
+fn parse_kiss_tnc_params(
+    name: &str,
+    section: &ConfigSection,
+) -> Result<KissTncParams, InterfaceFactoryError> {
+    let ms = |field: &str, default: i64| -> Result<u16, InterfaceFactoryError> {
+        Ok(parse_int_strict(name, field, section, default)?.clamp(0, i64::from(u16::MAX)) as u16)
+    };
+    Ok(KissTncParams {
+        preamble_ms: ms("preamble", 350)?,
+        txtail_ms: ms("txtail", 20)?,
+        persistence: parse_int_strict(name, "persistence", section, 64)?.clamp(0, 255) as u8,
+        slottime_ms: ms("slottime", 20)?,
+    })
 }
 
 fn parse_duration_strict(
@@ -788,6 +841,7 @@ fn synthesize_kiss_serial(
 
     // Python KISSInterface.py:86-97 — TNC timing defaults 350/20/64/20,
     // serial 8N1, flow_control off, optional station-ID beacon.
+    let tnc = parse_kiss_tnc_params(name, section)?;
     Ok(InterfaceConfig::KissSerial(KissSerialConfig {
         name: name.to_string(),
         port,
@@ -796,10 +850,10 @@ fn synthesize_kiss_serial(
         parity: section.get("parity").unwrap_or("N").to_string(),
         stop_bits: section.get_uint("stopbits").unwrap_or(1) as u8,
         mode,
-        preamble_ms: section.get_uint("preamble").unwrap_or(350) as u32,
-        txtail_ms: section.get_uint("txtail").unwrap_or(20) as u32,
-        persistence: section.get_uint("persistence").unwrap_or(64) as u8,
-        slottime_ms: section.get_uint("slottime").unwrap_or(20) as u32,
+        preamble_ms: u32::from(tnc.preamble_ms),
+        txtail_ms: u32::from(tnc.txtail_ms),
+        persistence: tnc.persistence,
+        slottime_ms: u32::from(tnc.slottime_ms),
         flow_control: section.get_bool("flow_control").unwrap_or(false),
         id_interval: section.get_uint("id_interval"),
         id_callsign: section.get("id_callsign").map(|s| s.to_string()),
@@ -1154,7 +1208,11 @@ fn require_rnode_radio_params(
     let tx_power = section
         .get_int("txpower")
         .or_else(|| section.get_int("tx_power"))
-        .ok_or_else(|| missing("txpower"))? as i8;
+        .ok_or_else(|| missing("txpower"))?;
+    let tx_power = i8::try_from(tx_power).map_err(|_| InterfaceFactoryError::InvalidValue {
+        field: format!("{name}.txpower"),
+        message: format!("{tx_power} dBm is out of range"),
+    })?;
     Ok((
         frequency,
         bandwidth,
@@ -1316,7 +1374,6 @@ fn synthesize_rnode_multi(
         .get_uint("speed")
         .or_else(|| section.get_uint("baud_rate"))
         .unwrap_or(115200) as u32;
-    let parent_flow_control = section.get_bool("flow_control").unwrap_or(false);
 
     let mut subinterfaces = Vec::new();
     let mut seen_vports = std::collections::HashSet::new();
@@ -1366,10 +1423,7 @@ fn synthesize_rnode_multi(
         let sub_full_name = format!("{name}/{sub_name}");
         let (frequency, bandwidth, spreading_factor, coding_rate, tx_power) =
             require_rnode_radio_params(&sub_full_name, sub_section)?;
-        let tx_power = tx_power as u8;
-        let flow_control = sub_section
-            .get_bool("flow_control")
-            .unwrap_or(parent_flow_control);
+        let flow_control = sub_section.get_bool("flow_control").unwrap_or(false);
         let outgoing = sub_section.get_bool("outgoing").unwrap_or(true);
         let st_alock = sub_section
             .get_float("airtime_limit_short")
@@ -1379,11 +1433,6 @@ fn synthesize_rnode_multi(
             .get_float("airtime_limit_long")
             .or_else(|| sub_section.get_float("lt_alock"))
             .map(|v| v as f32);
-        let sub_mode = sub_section
-            .get("interface_mode")
-            .or_else(|| sub_section.get("mode"))
-            .and_then(parse_interface_mode)
-            .unwrap_or(mode);
 
         let parsed = RNodeSubInterfaceConfig {
             name: sub_name.clone(),
@@ -1398,7 +1447,6 @@ fn synthesize_rnode_multi(
             outgoing,
             st_alock,
             lt_alock,
-            mode: sub_mode,
         };
         validate_rnode_multi_subinterface(name, &parsed)?;
         subinterfaces.push(parsed);
@@ -1427,7 +1475,6 @@ fn synthesize_rnode_multi(
         name: name.to_string(),
         port,
         baud_rate,
-        flow_control: parent_flow_control,
         subinterfaces,
         mode,
         id_interval: section.get_uint("id_interval"),
@@ -1440,10 +1487,10 @@ fn validate_rnode_multi_subinterface(
     parent: &str,
     sub: &RNodeSubInterfaceConfig,
 ) -> Result<(), InterfaceFactoryError> {
-    if sub.tx_power > 37 {
+    if !(-9..=37).contains(&sub.tx_power) {
         return Err(InterfaceFactoryError::InvalidValue {
             field: format!("{}.txpower", sub.name),
-            message: format!("{} exceeds max 37 dBm", sub.tx_power),
+            message: format!("{} is outside -9..=37 dBm", sub.tx_power),
         });
     }
     if !(7_800..=1_625_000).contains(&sub.bandwidth) {
@@ -1535,10 +1582,11 @@ fn synthesize_ax25kiss(
     let ssid = ssid_raw as u8;
 
     // Python defaults: 350/20/64/20 (AX25KISSInterface.py:141-144).
-    let preamble = section.get_uint("preamble").unwrap_or(350) as u32;
-    let txtail = section.get_uint("txtail").unwrap_or(20) as u32;
-    let persistence = section.get_uint("persistence").unwrap_or(64) as u32;
-    let slottime = section.get_uint("slottime").unwrap_or(20) as u32;
+    let tnc = parse_kiss_tnc_params(name, section)?;
+    let preamble = u32::from(tnc.preamble_ms);
+    let txtail = u32::from(tnc.txtail_ms);
+    let persistence = u32::from(tnc.persistence);
+    let slottime = u32::from(tnc.slottime_ms);
     let flow_control = section.get_bool("flow_control").unwrap_or(false);
 
     Ok(InterfaceConfig::AX25KISS(AX25KISSInterfaceConfig {
@@ -3568,7 +3616,6 @@ mod tests {
                 assert_eq!(c.name, "test_rnodemulti");
                 assert_eq!(c.port, "/dev/ttyACM0");
                 assert_eq!(c.baud_rate, 230400);
-                assert!(c.flow_control);
                 assert_eq!(c.subinterfaces.len(), 2);
 
                 let low = &c.subinterfaces[0];
@@ -3579,7 +3626,7 @@ mod tests {
                 assert_eq!(low.spreading_factor, 7);
                 assert_eq!(low.coding_rate, 5);
                 assert_eq!(low.tx_power, 14);
-                assert!(low.flow_control, "parent flow_control is inherited");
+                assert!(!low.flow_control, "parent flow_control is not inherited");
                 assert!(low.outgoing);
 
                 let high = &c.subinterfaces[1];
@@ -3590,10 +3637,7 @@ mod tests {
                 assert_eq!(high.spreading_factor, 5);
                 assert_eq!(high.coding_rate, 5);
                 assert_eq!(high.tx_power, 0);
-                assert!(
-                    !high.flow_control,
-                    "subinterface can override parent flow_control"
-                );
+                assert!(!high.flow_control);
                 assert!(!high.outgoing);
                 assert_eq!(high.st_alock, Some(33.5));
                 assert_eq!(high.lt_alock, Some(88.0));

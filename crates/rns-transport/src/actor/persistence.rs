@@ -270,7 +270,7 @@ impl TransportActor {
             interface_names: self
                 .interfaces
                 .iter()
-                .filter(|(_, entry)| entry.parent_id.is_none())
+                .filter(|(_, entry)| !entry.accepted)
                 .map(|(&id, entry)| (id, entry.name.clone()))
                 .collect(),
             transport_identity_hash: self.transport_identity_hash,

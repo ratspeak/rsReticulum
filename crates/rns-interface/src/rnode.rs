@@ -122,6 +122,21 @@ pub const REQUIRED_FW_VER_MIN: u8 = 52;
 
 pub const RSSI_OFFSET: i32 = 157;
 
+pub const PLATFORM_AVR: u8 = 0x90;
+pub const PLATFORM_ESP32: u8 = 0x80;
+pub const PLATFORM_NRF52: u8 = 0x70;
+
+pub const ERROR_INITRADIO: u8 = 0x01;
+pub const ERROR_TXFAILED: u8 = 0x02;
+pub const ERROR_EEPROM_LOCKED: u8 = 0x03;
+pub const ERROR_QUEUE_FULL: u8 = 0x04;
+pub const ERROR_MEMORY_LOW: u8 = 0x05;
+pub const ERROR_MODEM_TIMEOUT: u8 = 0x06;
+
+pub const Q_SNR_MIN_BASE: f32 = -9.0;
+pub const Q_SNR_MAX: f32 = 6.0;
+pub const Q_SNR_STEP: f32 = 2.0;
+
 pub const RECONNECT_WAIT: u64 = 5;
 
 pub const RADIO_STATE_ON: u8 = 0x01;
@@ -1299,6 +1314,16 @@ const RNODE_TCP_IDLE_PROBE_INTERVAL: Duration = Duration::from_millis(3_500);
 const RNODE_STARTUP_STAGE_DEADLINE: Duration = Duration::from_secs(5);
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_DETACH_DEADLINE: Duration = Duration::from_millis(500);
+/// Python `configure_device` sleeps 2 s after opening, for boards reset by DTR.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+const RNODE_STARTUP_SETTLE: Duration = Duration::from_secs(2);
+/// Python serial startup waits 0.2 s for detect and 0.25 s for validation;
+/// the margin covers this driver's queued writes and polled reads.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+const RNODE_SERIAL_READINESS_DEADLINE: Duration = Duration::from_millis(1_500);
+/// Python TCP startup: 5 s detect timeout, then a 1.5 s validation wait.
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+const RNODE_TCP_READINESS_DEADLINE: Duration = Duration::from_millis(6_500);
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_WRITER_JOIN_DEADLINE: Duration = Duration::from_millis(500);
 
@@ -1535,11 +1560,10 @@ impl RNodeGenerationWriter {
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-fn apply_rnode_ready_permit(ready: &AtomicBool, frame: &[u8], is_ready: bool) {
-    // Keep the shared response decoder (also used by BLE) unchanged while the
-    // serial/TCP writer accepts operational grants only at the exact width.
-    if frame.len() == 1 {
-        ready.store(is_ready, Ordering::SeqCst);
+fn apply_rnode_ready_permit(ready: &AtomicBool, frame: &[u8]) {
+    // Python runs process_queue for any READY, whatever its payload value.
+    if !frame.is_empty() {
+        ready.store(true, Ordering::SeqCst);
     }
 }
 
@@ -2165,12 +2189,13 @@ async fn initialise_reconnecting_rnode_writer(
 async fn send_detach_request(
     control_tx: &mpsc::Sender<RNodeControlWriteRequest>,
     id: InterfaceId,
+    platform: Option<u8>,
 ) -> Result<(), RNodeWriteFailure> {
     let deadline = tokio::time::Instant::now() + RNODE_DETACH_DEADLINE;
     let result = request_rnode_control_write_before(
         control_tx,
         RNodeWritePhase::Detach,
-        build_detach_sequence(),
+        build_detach_sequence_for_platform(platform),
         deadline,
     )
     .await;
@@ -3242,13 +3267,41 @@ pub fn build_radio_off_sequence() -> Vec<u8> {
     out
 }
 
-/// KISS sequence matching upstream RNodeInterface.detach(): radio off, then
-/// leave host-controlled mode so device UI state is reset before disconnect.
+/// KISS sequence matching upstream RNodeInterface.detach() for a device
+/// without a display: radio off, then leave host-controlled mode.
 pub fn build_detach_sequence() -> Vec<u8> {
-    let mut out = Vec::with_capacity(8);
+    build_detach_sequence_for_platform(None)
+}
+
+/// Upstream detach() for the detected platform: ESP32 and NRF52 devices have
+/// a display, so the external framebuffer is disabled first.
+pub fn build_detach_sequence_for_platform(platform: Option<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    if matches!(platform, Some(PLATFORM_ESP32 | PLATFORM_NRF52)) {
+        kiss::frame_with_command_into(CMD_FB_EXT, &[0x00], &mut out);
+    }
     kiss::frame_with_command_into(CMD_RADIO_STATE, &[RADIO_STATE_OFF], &mut out);
     kiss::frame_with_command_into(CMD_LEAVE, &[0xFF], &mut out);
     out
+}
+
+/// Python signal quality: SNR mapped onto the spreading factor's usable range,
+/// as a percentage rounded to one decimal and clamped to 0..=100.
+pub fn signal_quality(snr: f32, spreading_factor: u8) -> f32 {
+    let q_snr_min = Q_SNR_MIN_BASE - (f32::from(spreading_factor) - 7.0) * Q_SNR_STEP;
+    let quality = ((snr - q_snr_min) / (Q_SNR_MAX - q_snr_min) * 1000.0).round() / 10.0;
+    quality.clamp(0.0, 100.0)
+}
+
+/// Python readLoop's CMD_ERROR handling: the failure that takes the interface
+/// down, or `None` for the codes it only records.
+pub fn rnode_hardware_failure(code: u8) -> Option<&'static str> {
+    match code {
+        ERROR_INITRADIO => Some("Radio initialisation failure"),
+        ERROR_TXFAILED => Some("Hardware transmit failure"),
+        ERROR_MEMORY_LOW | ERROR_MODEM_TIMEOUT => None,
+        _ => Some("Unknown hardware failure"),
+    }
 }
 
 // Hot-path interface adapters pass this enum around directly; boxing the
@@ -3553,6 +3606,9 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
     // bounded capability admission after detect and before any init bytes.
     // Only a deterministic capability rejection fails spawn; transient startup
     // failures join the same periodic retry as an unavailable port.
+    if opened.is_some() {
+        tokio::time::sleep(RNODE_STARTUP_SETTLE).await;
+    }
     let initial_generation = match opened {
         Some(port) if options.requires_capability_admission() => {
             match start_strict_rnode_generation(
@@ -3575,7 +3631,11 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                     },
                 )),
                 Err(RNodeSpawnError::CapabilityAdmission(error))
-                    if !matches!(error, RNodeCapabilityAdmissionError::ResponseTimedOut) =>
+                    if !matches!(
+                        error,
+                        RNodeCapabilityAdmissionError::ResponseTimedOut
+                            | RNodeCapabilityAdmissionError::DeviceError
+                    ) =>
                 {
                     return Err(RNodeSpawnError::CapabilityAdmission(error));
                 }
@@ -3636,10 +3696,19 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
     let task_config = config.clone();
     let task_port_cfg = port_cfg.clone();
     let task_name = config.name.clone();
+    let readiness_deadline = match &port_cfg {
+        #[cfg(feature = "serial")]
+        PortConfig::Serial { .. } => RNODE_SERIAL_READINESS_DEADLINE,
+        PortConfig::Tcp { .. } => RNODE_TCP_READINESS_DEADLINE,
+    };
     let read_task = tokio::spawn(async move {
         let mut snapshot_publisher = initial_snapshot_publisher;
         let _stop_guard = stop_guard;
         let mut next_generation = initial_generation;
+        // Python keeps r_stat_rssi/snr/q on the interface across frames and reconnects.
+        let mut last_rssi: Option<f32> = None;
+        let mut last_snr: Option<f32> = None;
+        let mut last_q: Option<f32> = None;
         if next_generation.is_none() {
             tokio::select! {
                 _ = stop_rx.recv() => {
@@ -3697,6 +3766,16 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                         }
                     };
 
+                    tokio::select! {
+                        biased;
+                        _ = stop_rx.recv() => {
+                            tracing::info!(name = %task_name, "RNode stop requested during reconnect settle");
+                            snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
+                            snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
+                            return;
+                        }
+                        _ = tokio::time::sleep(RNODE_STARTUP_SETTLE) => {}
+                    }
                     let reconnect_writer = match spawn_rnode_generation_writer(
                         &opened,
                         &task_config,
@@ -3766,14 +3845,16 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                                     "RNode stop requested during admitted reconnect init"
                                 );
                                 snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                                let _ = send_detach_request(&reconnect_writer.control_tx, id).await;
+                                let _ = send_detach_request(&reconnect_writer.control_tx, id, None)
+                                    .await;
                                 reconnect_writer.cancel();
                                 let _ = finish_rnode_writer(reconnect_writer).await;
                                 snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
                                 return;
                             }
                             Err(RNodeStrictPreflightError::Capability(
-                                RNodeCapabilityAdmissionError::ResponseTimedOut,
+                                RNodeCapabilityAdmissionError::ResponseTimedOut
+                                | RNodeCapabilityAdmissionError::DeviceError,
                             )) => {
                                 carrier_online_r.store(false, Ordering::SeqCst);
                                 online_r.store(false, Ordering::SeqCst);
@@ -3867,7 +3948,8 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                                     "RNode stop requested during reconnect startup"
                                 );
                                 snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                                let _ = send_detach_request(&reconnect_writer.control_tx, id).await;
+                                let _ = send_detach_request(&reconnect_writer.control_tx, id, None)
+                                    .await;
                                 reconnect_writer.cancel();
                                 let _ = finish_rnode_writer(reconnect_writer).await;
                                 snapshot_publisher.stopped(RNodeRuntimeReason::StopRequested);
@@ -3907,6 +3989,8 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
 
             carrier_online_r.store(true, Ordering::SeqCst);
             online_r.store(false, Ordering::SeqCst);
+            let readiness_by = matches!(protocol_seed, RNodeGenerationProtocolSeed::Legacy)
+                .then(|| tokio::time::Instant::now() + readiness_deadline);
             let mut protocol_state = match protocol_seed {
                 RNodeGenerationProtocolSeed::Legacy => {
                     let state = RNodeProtocolState::with_effective_settings(protocol_target);
@@ -3944,8 +4028,8 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
 
             let mut deframer = kiss::RawKissDeframer::new();
             let mut buf = [0u8; 1024];
-            let mut last_rssi: Option<f32> = None;
-            let mut last_snr: Option<f32> = None;
+            let mut platform: Option<u8> = None;
+            let mut became_ready = false;
             let mut transport_closed = false;
             let mut stop_requested = false;
             let mut read_task_failed = false;
@@ -3956,12 +4040,21 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                     tracing::info!(name = %task_name, "RNode stop requested");
                     online_r.store(false, Ordering::SeqCst);
                     snapshot_publisher.shutting_down(RNodeRuntimeReason::StopRequested);
-                    let _ = send_detach_request(&control_tx, id).await;
+                    let _ = send_detach_request(&control_tx, id, platform).await;
                     stop_requested = true;
                     break;
                 }
                 if generation_writer.task.is_finished() || !carrier_online_r.load(Ordering::SeqCst)
                 {
+                    break;
+                }
+                became_ready |= online_r.load(Ordering::SeqCst);
+                if !became_ready && readiness_by.is_some_and(|by| tokio::time::Instant::now() >= by)
+                {
+                    tracing::warn!(
+                        name = %task_name,
+                        "Could not detect and configure RNode, reconnecting"
+                    );
                     break;
                 }
                 let result =
@@ -3972,20 +4065,63 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                         port_r = p;
                         buf = b;
                         if n > 0 {
+                            let mut hardware_failure = false;
                             for (cmd, frame) in deframer.feed(&buf[..n]) {
+                                match (cmd, frame.as_slice()) {
+                                    (CMD_PLATFORM, [value]) => platform = Some(*value),
+                                    (CMD_RESET, _) => {
+                                        // Python acts on a reset only from an online ESP32.
+                                        if frame.as_slice() == [0xF8]
+                                            && platform == Some(PLATFORM_ESP32)
+                                            && online_r.load(Ordering::SeqCst)
+                                        {
+                                            tracing::error!(
+                                                name = %task_name,
+                                                "Detected reset while device was online, reinitialising device"
+                                            );
+                                            hardware_failure = true;
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    (CMD_ERROR, [code, ..]) => {
+                                        if let Some(failure) = rnode_hardware_failure(*code) {
+                                            tracing::error!(
+                                                name = %task_name,
+                                                error_code = *code,
+                                                "RNode hardware error: {failure}"
+                                            );
+                                            hardware_failure = true;
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
                                 let effect = protocol_state.apply_frame(cmd, &frame);
                                 // Publish Ready only after the public handle and
                                 // packet gate reflect the same reducer state.
                                 sync_rnode_interface_online(&online_r, &protocol_state);
                                 snapshot_publisher.protocol_effect(&protocol_state, effect);
-                                match process_rnode_response(
+                                // Python keeps the last RSSI/SNR across packets, so the
+                                // decoder's per-packet clearing is not written back.
+                                let mut frame_rssi = last_rssi;
+                                let mut frame_snr = last_snr;
+                                let response = process_rnode_response(
                                     cmd,
                                     &frame,
                                     id,
-                                    &mut last_rssi,
-                                    &mut last_snr,
-                                ) {
-                                    RNodeResponse::Packet(msg) => {
+                                    &mut frame_rssi,
+                                    &mut frame_snr,
+                                );
+                                if cmd != kiss::CMD_DATA {
+                                    last_rssi = frame_rssi;
+                                    last_snr = frame_snr;
+                                }
+                                match response {
+                                    RNodeResponse::Packet(mut msg) => {
+                                        if let TransportMessage::Inbound(packet) = &mut msg {
+                                            packet.q = last_q;
+                                        }
                                         rxb_r.fetch_add(
                                             frame.len() as u64,
                                             std::sync::atomic::Ordering::Relaxed,
@@ -3996,13 +4132,23 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                                             break;
                                         }
                                     }
-                                    RNodeResponse::Ready(is_ready) => {
-                                        apply_rnode_ready_permit(&ready, &frame, is_ready);
+                                    RNodeResponse::Ready(_) => {
+                                        apply_rnode_ready_permit(&ready, &frame);
                                     }
-                                    RNodeResponse::None => {}
+                                    RNodeResponse::None => {
+                                        if cmd == CMD_STAT_SNR
+                                            && let Some(snr) = last_snr
+                                        {
+                                            let sf = protocol_state
+                                                .evidence()
+                                                .spreading_factor
+                                                .unwrap_or(task_config.spreading_factor);
+                                            last_q = Some(signal_quality(snr, sf));
+                                        }
+                                    }
                                 }
                             }
-                            if transport_closed {
+                            if transport_closed || hardware_failure {
                                 break;
                             }
                             // Settings the radio cannot use only fail again, and
@@ -4014,7 +4160,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
                                     "RNode rejected the configured settings"
                                 );
                                 online_r.store(false, Ordering::SeqCst);
-                                let _ = send_detach_request(&control_tx, id).await;
+                                let _ = send_detach_request(&control_tx, id, platform).await;
                                 configuration_rejected = Some(rejected);
                                 break;
                             }
@@ -4478,12 +4624,12 @@ mod tests {
     fn apply_scripted_ready_frame(ready: &AtomicBool, frame: &[u8]) {
         let mut last_rssi = None;
         let mut last_snr = None;
-        let RNodeResponse::Ready(is_ready) =
+        let RNodeResponse::Ready(_) =
             process_rnode_response(CMD_READY, frame, 0x5C71, &mut last_rssi, &mut last_snr)
         else {
             panic!("CMD_READY must produce a readiness response");
         };
-        apply_rnode_ready_permit(ready, frame, is_ready);
+        apply_rnode_ready_permit(ready, frame);
     }
 
     #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -5240,7 +5386,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             release.release_flush();
         });
-        send_detach_request(&writer.control_tx, 0x5C71)
+        send_detach_request(&writer.control_tx, 0x5C71, None)
             .await
             .expect("retained reconnect writer must detach");
         assert_eq!(
@@ -5634,6 +5780,7 @@ mod tests {
                     .writes()
                     .iter()
                     .any(|write| write == &framed_payload)
+                    && txb.load(Ordering::Relaxed) == payload.len() as u64
             },
             "permitted flow-stalled payload did not complete",
         )
@@ -5834,11 +5981,8 @@ mod tests {
             (first.len() + second.len()) as u64
         );
 
-        // Malformed frames have no operational effect, while an exact-width
-        // zero frame explicitly retains the blocked state.
+        // An empty READY has no operational effect.
         apply_scripted_ready_frame(&ready, &[]);
-        apply_scripted_ready_frame(&ready, &[0x01, 0x00]);
-        apply_scripted_ready_frame(&ready, &[0x00]);
         tokio::time::sleep(RNODE_FLOW_POLL_INTERVAL * 3).await;
         assert_eq!(
             scripted.writes(),
@@ -5849,7 +5993,8 @@ mod tests {
             (first.len() + second.len()) as u64
         );
 
-        apply_scripted_ready_frame(&ready, &[0x01]);
+        // Like Python, a READY carrying 0x00 still releases the queue.
+        apply_scripted_ready_frame(&ready, &[0x00]);
         wait_for_scripted_writer(&scripted, |state| state.flush_calls == 4).await;
         assert_eq!(
             scripted.writes(),
@@ -5866,7 +6011,7 @@ mod tests {
         );
         assert!(!ready.load(Ordering::SeqCst));
 
-        send_detach_request(&writer.control_tx, 0x5C71)
+        send_detach_request(&writer.control_tx, 0x5C71, None)
             .await
             .expect("flow-bypass writer must detach");
         assert_eq!(
@@ -5928,7 +6073,7 @@ mod tests {
         assert_eq!(scripted.writes(), vec![kiss::frame(&payload)]);
         assert_eq!(txb.load(Ordering::Relaxed), payload.len() as u64);
         assert!(ready.load(Ordering::SeqCst));
-        apply_scripted_ready_frame(&ready, &[0x00]);
+        ready.store(false, Ordering::SeqCst);
 
         tokio::time::sleep(beacon_interval).await;
         let control = vec![0xD1, 0xD2];
@@ -5965,7 +6110,7 @@ mod tests {
         );
         assert!(!ready.load(Ordering::SeqCst));
 
-        send_detach_request(&writer.control_tx, 0x5C71)
+        send_detach_request(&writer.control_tx, 0x5C71, None)
             .await
             .expect("flow/beacon writer must detach");
         finish_rnode_writer(writer).await;
@@ -6016,7 +6161,7 @@ mod tests {
                 + (callsign.len() * packets.len()) as u64
         );
 
-        send_detach_request(&writer.control_tx, 0x5C71)
+        send_detach_request(&writer.control_tx, 0x5C71, None)
             .await
             .expect("continuous-lane writer must detach");
         finish_rnode_writer(writer).await;
@@ -6038,7 +6183,7 @@ mod tests {
             ),
         );
 
-        send_detach_request(&writer.control_tx, 0x5C71)
+        send_detach_request(&writer.control_tx, 0x5C71, None)
             .await
             .expect("detach must be acknowledged after flush");
         assert_eq!(scripted.flush_calls(), 1);
@@ -6108,7 +6253,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let failure = tokio::time::timeout(
             Duration::from_secs(2),
-            send_detach_request(&writer.control_tx, 0x5C71),
+            send_detach_request(&writer.control_tx, 0x5C71, None),
         )
         .await
         .expect("outer detach test timeout elapsed")
@@ -6238,7 +6383,7 @@ mod tests {
             vec![kiss::frame(&old_first), kiss::frame(&new_packet)]
         );
 
-        send_detach_request(&new_writer.control_tx, 0x5C71)
+        send_detach_request(&new_writer.control_tx, 0x5C71, None)
             .await
             .expect("new generation writer must detach");
         finish_rnode_writer(new_writer).await;
@@ -6318,7 +6463,7 @@ mod tests {
             "only the new generation's attempted payload may account"
         );
 
-        send_detach_request(&next_writer.control_tx, 0x5C71)
+        send_detach_request(&next_writer.control_tx, 0x5C71, None)
             .await
             .expect("next generation writer must detach");
         finish_rnode_writer(next_writer).await;
@@ -6363,7 +6508,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(scripted.writes().len(), 2, "beacon must disarm itself");
 
-        send_detach_request(&writer.control_tx, 0x5C71)
+        send_detach_request(&writer.control_tx, 0x5C71, None)
             .await
             .expect("beacon writer must detach");
         assert_eq!(
@@ -6631,7 +6776,7 @@ mod tests {
 
             assert_eq!(read_exact_tcp(&mut stream, init.len()), init);
             init_tx.send(()).unwrap();
-            if echo_rx.recv_timeout(Duration::from_secs(3)).is_err() {
+            if echo_rx.recv_timeout(Duration::from_secs(6)).is_err() {
                 return;
             }
             let mut active = strict_radio_echoes(&server_config);
@@ -6701,7 +6846,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             assert_eq!(read_exact_tcp(&mut stream, detect.len()), detect);
             assert_eq!(
@@ -6761,7 +6906,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             assert_eq!(read_exact_tcp(&mut stream, detect.len()), detect);
             assert_eq!(
@@ -6784,7 +6929,7 @@ mod tests {
             // As upstream, a silent radio is retried rather than abandoned.
             let (mut retry, _) = listener.accept().unwrap();
             retry
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             assert_eq!(read_exact_tcp(&mut retry, detect.len()), detect);
             retried_tx.send(()).unwrap();
@@ -6837,7 +6982,7 @@ mod tests {
             std::io::Write::write_all(&mut first, &strict_capability_responses(0xB8)).unwrap();
             assert_eq!(read_exact_tcp(&mut first, init.len()), init);
             first_tx.send(()).unwrap();
-            close_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            close_rx.recv_timeout(Duration::from_secs(6)).unwrap();
             drop(first);
 
             let (mut second, _) = listener.accept().unwrap();
@@ -6946,7 +7091,7 @@ mod tests {
             std::io::Write::write_all(&mut first, &strict_capability_responses(0xB8)).unwrap();
             assert_eq!(read_exact_tcp(&mut first, init.len()), init);
             first_tx.send(()).unwrap();
-            close_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            close_rx.recv_timeout(Duration::from_secs(6)).unwrap();
             drop(first);
 
             // This failed connection receives one ROM request and no init
@@ -7006,7 +7151,7 @@ mod tests {
         let mut state = spawned.driver.watch();
         wait_for_rnode_snapshot(&mut state, |snapshot| snapshot.connection_generation == 1).await;
         close_tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), third_rx.recv())
+        tokio::time::timeout(Duration::from_secs(15), third_rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -7070,7 +7215,7 @@ mod tests {
             std::io::Write::write_all(&mut first, &strict_capability_responses(0xB8)).unwrap();
             assert_eq!(read_exact_tcp(&mut first, init.len()), init);
             first_tx.send(()).unwrap();
-            close_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            close_rx.recv_timeout(Duration::from_secs(6)).unwrap();
             drop(first);
 
             let (mut second, _) = listener.accept().unwrap();
@@ -7138,7 +7283,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             std::io::Write::write_all(&mut stream, &responses).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            let _ = release_rx.recv_timeout(Duration::from_secs(6));
         });
 
         let port = RNodeStream::connect_tcp(&addr.to_string()).unwrap();
@@ -7173,7 +7318,7 @@ mod tests {
         ));
 
         scripted.release_flush();
-        send_detach_request(&writer.control_tx, 0xCA95)
+        send_detach_request(&writer.control_tx, 0xCA95, None)
             .await
             .expect("detach must follow an init that may have reached the radio");
         assert_eq!(
@@ -7683,7 +7828,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             assert_eq!(
                 read_exact_tcp(&mut stream, expected_startup.len()),
@@ -7781,7 +7926,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             assert_eq!(
                 read_exact_tcp(&mut stream, expected_startup.len()),
@@ -7867,7 +8012,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             assert_eq!(
                 read_exact_tcp(&mut stream, expected_startup.len()),
@@ -7940,7 +8085,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             assert_eq!(
                 read_exact_tcp(&mut stream, expected_startup.len()),
@@ -7971,7 +8116,7 @@ mod tests {
             }
             std::io::Write::write_all(&mut stream, &readiness).unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             packet_tx
                 .send(read_exact_tcp(&mut stream, server_expected_packet.len()))
@@ -8080,12 +8225,12 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             let startup = read_exact_tcp(&mut stream, server_expected_startup.len());
             accepted_tx.send(startup).unwrap();
             if send_responses_rx
-                .recv_timeout(Duration::from_secs(3))
+                .recv_timeout(Duration::from_secs(6))
                 .is_err()
             {
                 return;
@@ -8102,7 +8247,7 @@ mod tests {
             kiss::frame_with_command_into(CMD_READY, &[1], &mut responses);
             kiss::frame_with_command_into(kiss::CMD_DATA, b"snapshot-barrier", &mut responses);
             std::io::Write::write_all(&mut stream, &responses).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            let _ = release_rx.recv_timeout(Duration::from_secs(6));
         });
 
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
@@ -8208,14 +8353,14 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             stream.set_nodelay(true).unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             assert_eq!(
                 read_exact_tcp(&mut stream, expected_startup.len()),
                 expected_startup
             );
             accepted_tx.send(()).unwrap();
-            if start_rx.recv_timeout(Duration::from_secs(3)).is_err() {
+            if start_rx.recv_timeout(Duration::from_secs(6)).is_err() {
                 return;
             }
 
@@ -8231,11 +8376,10 @@ mod tests {
             kiss::frame_with_command_into(CMD_RADIO_STATE, &[2], &mut malformed);
             kiss::frame_with_command_into(CMD_READY, &[0, 1], &mut malformed);
             kiss::frame_with_command_into(CMD_RESET, &[0], &mut malformed);
-            kiss::frame_with_command_into(CMD_ERROR, &[0x7F], &mut malformed);
             kiss::frame_with_command_into(kiss::CMD_DATA, &server_first_packet, &mut malformed);
             write_fragmented_tcp(&mut stream, &malformed);
 
-            if continue_rx.recv_timeout(Duration::from_secs(3)).is_err() {
+            if continue_rx.recv_timeout(Duration::from_secs(6)).is_err() {
                 return;
             }
             let mut valid = Vec::new();
@@ -8267,7 +8411,7 @@ mod tests {
             }
             kiss::frame_with_command_into(kiss::CMD_DATA, &server_final_packet, &mut valid);
             write_fragmented_tcp(&mut stream, &valid);
-            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            let _ = release_rx.recv_timeout(Duration::from_secs(6));
         });
 
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
@@ -8365,7 +8509,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut first, _) = listener.accept().unwrap();
             first
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             assert_eq!(
                 read_exact_tcp(&mut first, expected_startup.len()),
@@ -8381,13 +8525,13 @@ mod tests {
             kiss::frame_with_command_into(kiss::CMD_DATA, &server_ready_barrier, &mut ready_frames);
             std::io::Write::write_all(&mut first, &ready_frames).unwrap();
             accepted_tx.send(1).unwrap();
-            if close_first_rx.recv_timeout(Duration::from_secs(3)).is_err() {
+            if close_first_rx.recv_timeout(Duration::from_secs(6)).is_err() {
                 return;
             }
             first.shutdown(std::net::Shutdown::Both).unwrap();
 
             listener.set_nonblocking(true).unwrap();
-            let accept_deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let accept_deadline = std::time::Instant::now() + Duration::from_secs(6);
             let (mut second, _) = loop {
                 match listener.accept() {
                     Ok(connection) => break connection,
@@ -8402,14 +8546,14 @@ mod tests {
             };
             second.set_nonblocking(false).unwrap();
             second
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             assert_eq!(
                 read_exact_tcp(&mut second, expected_startup.len()),
                 expected_startup
             );
             accepted_tx.send(2).unwrap();
-            let _ = release_second_rx.recv_timeout(Duration::from_secs(3));
+            let _ = release_second_rx.recv_timeout(Duration::from_secs(6));
         });
 
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
@@ -8486,7 +8630,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             assert_eq!(
                 read_exact_tcp(&mut stream, expected_startup.len()),
@@ -8549,7 +8693,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             assert_eq!(
                 read_exact_tcp(&mut stream, expected_startup.len()),
@@ -8601,7 +8745,7 @@ mod tests {
         let peer = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             let mut byte = [0u8; 1];
             match std::io::Read::read(&mut stream, &mut byte) {
@@ -8685,7 +8829,7 @@ mod tests {
             for attempt in 1..=2 {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
 
                 let mut buf = [0u8; 512];
