@@ -17,7 +17,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use crate::hdlc;
-use crate::socket_tuning::{iface_addr_for, set_keepalive_tuned, set_socket_buffers};
+use crate::socket_tuning::{set_keepalive_tuned, set_socket_buffers};
 use crate::traits::{
     ByteCounter, InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, TunnelIdentity,
     handoff_accepted_interface, open_client_connection, python_address_name, python_host,
@@ -78,11 +78,13 @@ const MAX_TRACKED_FAST_FLAP_IPS: usize = 4096;
 #[derive(Debug, Clone)]
 pub struct BackboneServerConfig {
     pub name: String,
-    pub listen_ip: String,
+    /// Host to bind; required unless `device` is set (BackboneInterface.py:162-168).
+    pub listen_ip: Option<String>,
     pub listen_port: u16,
     pub prefer_ipv6: bool,
     pub mode: InterfaceMode,
-    /// Optional kernel ifname; binds to its current IP (falls back to `listen_ip`).
+    /// Optional kernel ifname; binds to its current IP. A device without an
+    /// address is an error, as upstream.
     pub device: Option<String>,
     /// Reject a tracked IP after more than `fast_flapping_grace` short connections.
     /// The process-wide tracking table is bounded; a new IP is not tracked when
@@ -100,7 +102,7 @@ impl BackboneServerConfig {
     pub fn new(name: &str, ip: &str, port: u16) -> Self {
         Self {
             name: name.to_string(),
-            listen_ip: ip.to_string(),
+            listen_ip: Some(ip.to_string()),
             listen_port: port,
             prefer_ipv6: false,
             mode: InterfaceMode::Full,
@@ -119,7 +121,10 @@ pub struct BackboneClientConfig {
     pub target_host: String,
     pub target_port: u16,
     pub prefer_ipv6: bool,
+    /// Parsed like Python, which stores it but connects with
+    /// [`INITIAL_CONNECT_TIMEOUT`] (BackboneInterface.py:979).
     pub connect_timeout_secs: u64,
+    /// Retries allowed within one outage; `None` retries forever.
     pub max_reconnect_tries: Option<usize>,
     pub mode: InterfaceMode,
     /// Identity used to request a signed tunnel synthesis for each connection.
@@ -644,45 +649,13 @@ async fn backbone_connection(
     online.store(false, Ordering::SeqCst);
 }
 
-/// `device` takes precedence over `listen_ip` when its lookup succeeds.
-fn resolve_listen_addr(config: &BackboneServerConfig) -> String {
-    if let Some(name) = config.device.as_deref() {
-        match iface_addr_for(name, config.prefer_ipv6) {
-            Some(IpAddr::V4(v4)) => return v4.to_string(),
-            Some(IpAddr::V6(v6)) => return format!("[{}]", v6),
-            None => {
-                tracing::warn!(
-                    device = %name,
-                    listen_ip = %config.listen_ip,
-                    "backbone: device lookup failed, falling back to listen_ip",
-                );
-            }
-        }
-    }
-    config.listen_ip.clone()
-}
-
 /// Resolve `host:port` preferring the configured address family.
 async fn resolve_target(
     host: &str,
     port: u16,
     prefer_ipv6: bool,
 ) -> std::io::Result<std::net::SocketAddr> {
-    let mut addrs: Vec<std::net::SocketAddr> =
-        tokio::net::lookup_host((host, port)).await?.collect();
-    if addrs.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            format!("no addresses resolved for {host}:{port}"),
-        ));
-    }
-    // Prefer the requested family; else first resolved.
-    let preferred = if prefer_ipv6 {
-        addrs.iter().find(|a| a.is_ipv6()).copied()
-    } else {
-        addrs.iter().find(|a| a.is_ipv4()).copied()
-    };
-    Ok(preferred.unwrap_or_else(|| addrs.remove(0)))
+    crate::tcp::resolve_host(host, port, prefer_ipv6).await
 }
 
 /// Spawn a backbone server; each accepted connection becomes an `InterfaceHandle`.
@@ -712,14 +685,13 @@ async fn spawn_backbone_server_with_runtime(
     handle_tx: mpsc::Sender<InterfaceHandle>,
     fast_flap_runtime: FastFlapRuntime,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-    let listen_ip = resolve_listen_addr(&config);
-    let bind_addr = if listen_ip.starts_with('[') {
-        format!("{}:{}", listen_ip, config.listen_port)
-    } else if listen_ip.contains(':') && !listen_ip.contains('.') {
-        format!("[{}]:{}", listen_ip, config.listen_port)
-    } else {
-        format!("{}:{}", listen_ip, config.listen_port)
-    };
+    let bind_addr = crate::tcp::resolve_bind_address(
+        config.listen_ip.as_deref(),
+        config.device.as_deref(),
+        config.listen_port,
+        config.prefer_ipv6,
+    )
+    .await?;
     let listener = TcpListener::bind(&bind_addr).await?;
     spawn_backbone_server_on_listener(
         config,
@@ -929,11 +901,38 @@ fn spawn_backbone_server_on_listener(
     })
 }
 
+/// Resolve and connect, each step bounded by `timeout`.
+async fn connect_backbone_target(
+    config: &BackboneClientConfig,
+    timeout: Duration,
+) -> std::io::Result<TcpStream> {
+    let target = tokio::time::timeout(
+        timeout,
+        resolve_target(&config.target_host, config.target_port, config.prefer_ipv6),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "resolve timed out"))??;
+    tokio::time::timeout(timeout, TcpStream::connect(target))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"))?
+}
+
 pub async fn spawn_backbone_client(
     config: BackboneClientConfig,
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    spawn_backbone_client_observed(config, id, transport_tx)
+        .await
+        .map(|spawned| spawned.interface)
+}
+
+/// [`spawn_backbone_client`], also returning the client's teardown signal.
+pub async fn spawn_backbone_client_observed(
+    config: BackboneClientConfig,
+    id: InterfaceId,
+    transport_tx: mpsc::Sender<TransportMessage>,
+) -> Result<crate::tcp::SpawnedClientInterface, crate::traits::InterfaceError> {
     let transport_tx = InterfaceTransportSender::new(id, transport_tx);
     let owner = transport_tx.owner();
     let online = Arc::new(AtomicBool::new(false));
@@ -952,90 +951,53 @@ pub async fn spawn_backbone_client(
     let identity = InterfaceIdentity::new(&python_name, &config.name, "BackboneClientInterface");
     let egress = Arc::new(EgressState::default());
     let task_egress = egress.clone();
+    let (teardown_tx, teardown) = crate::tcp::ClientTeardown::channel();
+    // Python connects once, synchronously, before the interface is handed to
+    // transport (BackboneInterface.py:921-922, :979).
+    let initial_timeout = Duration::from_secs(INITIAL_CONNECT_TIMEOUT);
+    let mut initial_attempt = Some(
+        tokio::time::timeout(
+            initial_timeout,
+            connect_backbone_target(&config, initial_timeout),
+        )
+        .await
+        .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into())),
+    );
+    if matches!(initial_attempt, Some(Ok(_))) {
+        online.store(true, Ordering::SeqCst);
+    }
     let read_task = tokio::spawn(async move {
         let max_tries = config.max_reconnect_tries;
-        let mut tries: usize = 0;
         // Every attempt after the first follows a failure or an outage.
         let mut attempted = false;
+        // Retries within the current outage (BackboneInterface.py:1007-1023).
+        let mut attempts: usize = 0;
 
         loop {
+            if attempted {
+                tokio::time::sleep(Duration::from_secs(RECONNECT_WAIT)).await;
+                attempts += 1;
+                if max_tries.is_some_and(|max| attempts > max) {
+                    tracing::warn!("Max reconnection attempts reached for {python_name}");
+                    crate::tcp::hold_torn_down(&rx, &python_name, &teardown_tx).await;
+                    return;
+                }
+            }
             let after_outage = std::mem::replace(&mut attempted, true);
-            let target = match tokio::time::timeout(
-                Duration::from_secs(config.connect_timeout_secs),
-                resolve_target(&config.target_host, config.target_port, config.prefer_ipv6),
-            )
-            .await
-            {
-                Ok(Ok(addr)) => addr,
-                Ok(Err(e)) => {
-                    tracing::warn!(name = %config.name, error = %e, "backbone resolve failed");
-                    if let Some(max) = max_tries {
-                        tries += 1;
-                        if tries >= max {
-                            let _ = transport_tx
-                                .send(TransportMessage::DeregisterInterface { id })
-                                .await;
-                            return;
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_secs(RECONNECT_WAIT)).await;
-                    continue;
-                }
-                Err(_) => {
-                    tracing::warn!(name = %config.name, "backbone resolve timed out");
-                    if let Some(max) = max_tries {
-                        tries += 1;
-                        if tries >= max {
-                            let _ = transport_tx
-                                .send(TransportMessage::DeregisterInterface { id })
-                                .await;
-                            return;
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_secs(RECONNECT_WAIT)).await;
-                    continue;
-                }
+            let attempt = match initial_attempt.take() {
+                Some(attempt) => attempt,
+                None => connect_backbone_target(&config, initial_timeout).await,
             };
-
-            let stream = match tokio::time::timeout(
-                Duration::from_secs(config.connect_timeout_secs),
-                TcpStream::connect(target),
-            )
-            .await
-            {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
+            let stream = match attempt {
+                Ok(s) => s,
+                Err(e) => {
                     tracing::warn!(name = %config.name, error = %e, "backbone connect failed");
-                    if let Some(max) = max_tries {
-                        tries += 1;
-                        if tries >= max {
-                            let _ = transport_tx
-                                .send(TransportMessage::DeregisterInterface { id })
-                                .await;
-                            return;
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_secs(RECONNECT_WAIT)).await;
-                    continue;
-                }
-                Err(_) => {
-                    tracing::warn!(name = %config.name, "backbone connect timed out");
-                    if let Some(max) = max_tries {
-                        tries += 1;
-                        if tries >= max {
-                            let _ = transport_tx
-                                .send(TransportMessage::DeregisterInterface { id })
-                                .await;
-                            return;
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_secs(RECONNECT_WAIT)).await;
                     continue;
                 }
             };
 
             tune_stream(&stream);
-            tries = 0;
+            attempts = 0;
             // Python synthesizes on every connection (BackboneInterface.py:922,
             // :1019).
             let synthesis = config
@@ -1061,46 +1023,39 @@ pub async fn spawn_backbone_client(
             }
             online2.store(false, Ordering::SeqCst);
 
-            if let Some(max) = max_tries {
-                tries += 1;
-                if tries >= max {
-                    let _ = transport_tx
-                        .send(TransportMessage::DeregisterInterface { id })
-                        .await;
-                    return;
-                }
-            }
             tracing::info!(
                 name = %config.name,
                 "backbone: reconnecting in {}s",
                 RECONNECT_WAIT,
             );
-            tokio::time::sleep(Duration::from_secs(RECONNECT_WAIT)).await;
         }
     });
 
     let (mtu, packet_capacity) = autoconfigured_mtu();
-    Ok(InterfaceHandle {
-        id,
-        owner,
-        packet_capacity,
-        parent_id: None,
-        name,
-        mode,
-        direction: InterfaceDirection {
-            inbound: true,
-            outbound: true,
-            forward: false,
-            repeat: false,
+    Ok(crate::tcp::SpawnedClientInterface {
+        interface: InterfaceHandle {
+            id,
+            owner,
+            packet_capacity,
+            parent_id: None,
+            name,
+            mode,
+            direction: InterfaceDirection {
+                inbound: true,
+                outbound: true,
+                forward: false,
+                repeat: false,
+            },
+            bitrate: BITRATE_GUESS,
+            mtu,
+            online,
+            rxb: Some(shared_rxb),
+            txb: Some(shared_txb),
+            inspection: Some(EgressState::inspection(egress).with_identity(identity)),
+            tx,
+            read_task,
         },
-        bitrate: BITRATE_GUESS,
-        mtu,
-        online,
-        rxb: Some(shared_rxb),
-        txb: Some(shared_txb),
-        inspection: Some(EgressState::inspection(egress).with_identity(identity)),
-        tx,
-        read_task,
+        teardown,
     })
 }
 
@@ -1228,6 +1183,22 @@ mod tests {
             closed.is_ok(),
             "socket stayed open after the interface task was aborted"
         );
+    }
+
+    #[tokio::test]
+    async fn client_is_online_when_spawn_returns_against_a_listening_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, _rx) = mpsc::channel(64);
+        let handle = spawn_backbone_client(
+            BackboneClientConfig::new("initial", "127.0.0.1", port),
+            4,
+            tx,
+        )
+        .await
+        .unwrap();
+        assert!(handle.online.load(Ordering::SeqCst));
+        handle.read_task.abort();
     }
 
     #[tokio::test]
@@ -1435,7 +1406,7 @@ mod tests {
     fn test_backbone_server_config_mode() {
         let cfg = BackboneServerConfig::new("bb-srv", "0.0.0.0", 4243);
         assert_eq!(cfg.mode, InterfaceMode::Full);
-        assert_eq!(cfg.listen_ip, "0.0.0.0");
+        assert_eq!(cfg.listen_ip.as_deref(), Some("0.0.0.0"));
         assert_eq!(cfg.name, "bb-srv");
     }
 
@@ -1772,39 +1743,21 @@ mod tests {
         parent.read_task.abort();
     }
 
+    /// Spending the retry budget tears the client down like Python's
+    /// initiator: registered, offline, never deregistered.
     #[tokio::test]
-    async fn test_backbone_max_reconnect_dereg() {
-        // Connect attempts to a port nobody is listening on; with
-        // max_reconnect_tries = Some(1) we get one connect attempt, one
-        // failure, then DeregisterInterface and exit.
-        let mut cfg = BackboneClientConfig::new("bb-dereg", "127.0.0.1", 1);
-        cfg.connect_timeout_secs = 1;
-        cfg.max_reconnect_tries = Some(1);
+    async fn give_up_keeps_interface_registered_and_offline() {
+        let mut cfg = BackboneClientConfig::new("bb-giveup", "127.0.0.1", 1);
+        cfg.max_reconnect_tries = Some(0);
 
         let (tx, mut rx) = mpsc::channel::<TransportMessage>(8);
         let handle = spawn_backbone_client(cfg, 99, tx).await.unwrap();
         handle.owner.mark_registered();
-        // Wait for the read_task to finish — guarded by a generous timeout
-        // to absorb the one RECONNECT_WAIT sleep + connect attempt.
-        let dereg = tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                match rx
-                    .recv()
-                    .await
-                    .map(|event| crate::traits::test_event_for_handle(event, &handle))
-                {
-                    Some(TransportMessage::DeregisterInterface { id }) => return Some(id),
-                    Some(_) => continue,
-                    None => return None,
-                }
-            }
-        })
-        .await
-        .ok()
-        .flatten();
-        assert_eq!(dereg, Some(99));
-        // Drop the handle (aborts read_task if still alive).
-        drop(handle);
+        let early = tokio::time::timeout(Duration::from_secs(RECONNECT_WAIT + 3), rx.recv()).await;
+        assert!(early.is_err(), "no message expected, got {early:?}");
+        assert!(!handle.read_task.is_finished());
+        assert!(!handle.online.load(Ordering::SeqCst));
+        handle.read_task.abort();
     }
 
     #[tokio::test]

@@ -49,6 +49,20 @@ impl UdpInterfaceConfig {
     }
 }
 
+/// Python `get_broadcast_for_if`: the network broadcast of the device's first
+/// IPv4 address, computed from its prefix (UDPInterface.py:50-54, netinfo.py:66-70).
+fn broadcast_for_device(device: &str) -> Option<std::net::Ipv4Addr> {
+    if_addrs::get_if_addrs()
+        .ok()?
+        .into_iter()
+        .find_map(|i| match i.addr {
+            if_addrs::IfAddr::V4(v4) if i.name == device => {
+                Some((u32::from(v4.ip) | !u32::from(v4.netmask)).into())
+            }
+            _ => None,
+        })
+}
+
 /// Spawn a UDP interface — datagrams are unframed (1 send/recv = 1 packet).
 pub async fn spawn_udp_interface(
     config: UdpInterfaceConfig,
@@ -65,7 +79,7 @@ pub async fn spawn_udp_interface(
     if let Some(device) = config.device.as_deref()
         && (listen_ip_cfg.is_none() || forward_ip_cfg.is_none())
     {
-        let bcast = crate::socket_tuning::iface_broadcast_for(device).ok_or_else(|| {
+        let bcast = broadcast_for_device(device).ok_or_else(|| {
             crate::traits::InterfaceError::SendFailed(format!(
                 "UDP device '{device}' not found or has no IPv4 broadcast address"
             ))
@@ -78,22 +92,34 @@ pub async fn spawn_udp_interface(
         }
     }
 
-    let listen_ip = listen_ip_cfg.as_deref().unwrap_or("0.0.0.0");
-    let listen_port = config.listen_port.unwrap_or(0);
-    let bind_addr = format!("{}:{}", listen_ip, listen_port);
-    let socket = Arc::new(UdpSocket::bind(&bind_addr).await?);
-    // Needed for directed broadcasts (255.255.255.255).
-    socket.set_broadcast(true)?;
-    let local_addr = socket.local_addr()?;
-    tracing::info!(name = %config.name, addr = %local_addr, "UDP interface bound");
+    // Python listens only when both the address and the port are known, and
+    // otherwise stays offline, so transport never sends on it (UDPInterface.py:90-108).
+    let socket = match (listen_ip_cfg.as_deref(), config.listen_port) {
+        (Some(ip), Some(port)) => {
+            let socket = UdpSocket::bind((ip, port)).await?;
+            tracing::info!(name = %config.name, addr = %socket.local_addr()?, "UDP interface bound");
+            Some(socket)
+        }
+        _ => None,
+    };
+    let listening = socket.is_some();
 
-    let online = Arc::new(AtomicBool::new(true));
+    let online = Arc::new(AtomicBool::new(listening));
     let online2 = online.clone();
     let (tx, mut rx) = mpsc::channel::<Bytes>(256);
     let name = config.name.clone();
     // UDPInterface.py:141-142 renders the bind address as configured.
+    let shown_port = match &socket {
+        Some(socket) => socket.local_addr()?.port(),
+        None => config.listen_port.unwrap_or(0),
+    };
     let python_identity = rns_transport::messages::InterfaceIdentity::new(
-        format!("UDPInterface[{}/{}:{}]", name, listen_ip, local_addr.port()),
+        format!(
+            "UDPInterface[{}/{}:{}]",
+            name,
+            listen_ip_cfg.as_deref().unwrap_or(""),
+            shown_port
+        ),
         &name,
         "UDPInterface",
     );
@@ -120,13 +146,27 @@ pub async fn spawn_udp_interface(
         _ => None,
     };
 
-    let socket_w = socket.clone();
+    // Sends use their own broadcast socket, as Python's per-send socket does,
+    // so send errors never reach the listener (UDPInterface.py:131-140).
+    // Transport skips an offline interface (Transport.py:1676), so a
+    // forward-only interface never transmits either.
+    let send_socket = match forward_addr {
+        Some(_) if listening => {
+            let send_socket = UdpSocket::bind("0.0.0.0:0").await?;
+            send_socket.set_broadcast(true)?;
+            Some(send_socket)
+        }
+        _ => None,
+    };
+    let send_name = config.name.clone();
     tokio::spawn(async move {
         while let Some(data) = rx.recv().await {
-            if let Some(addr) = forward_addr {
+            if let (Some(socket), Some(addr)) = (&send_socket, forward_addr) {
                 let len = data.len();
-                if let Err(e) = socket_w.send_to(&data, addr).await {
-                    tracing::warn!(error = %e, "UDP send_to failed");
+                if let Err(e) = socket.send_to(&data, addr).await {
+                    tracing::error!(
+                        "Could not transmit on UDPInterface[{send_name}]. The contained exception was: {e}"
+                    );
                 } else {
                     task_txb.fetch_add(len as u64, Ordering::Relaxed);
                 }
@@ -137,6 +177,9 @@ pub async fn spawn_udp_interface(
     });
 
     let read_task = tokio::spawn(async move {
+        let Some(socket) = socket else {
+            return;
+        };
         let mut buf = [0u8; 2048];
         loop {
             match socket.recv_from(&mut buf).await {
@@ -164,9 +207,10 @@ pub async fn spawn_udp_interface(
                         break;
                     }
                 }
+                // Python's serve_forever survives a failed recvfrom.
                 Err(e) => {
                     tracing::warn!(error = %e, "UDP recv_from error");
-                    break;
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }
         }
@@ -181,7 +225,7 @@ pub async fn spawn_udp_interface(
         name,
         mode,
         direction: InterfaceDirection {
-            inbound: true,
+            inbound: listening,
             outbound: true,
             forward: false,
             repeat: false,

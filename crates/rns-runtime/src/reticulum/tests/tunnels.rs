@@ -139,6 +139,11 @@ async fn fake_sam(
                     return;
                 }
                 let command = line.trim().to_string();
+                if let Some(name) = command.strip_prefix("NAMING LOOKUP NAME=") {
+                    let reply = format!("NAMING REPLY RESULT=OK NAME={name} VALUE={name}\n");
+                    let _ = reader.get_mut().write_all(reply.as_bytes()).await;
+                    return;
+                }
                 let accepted = command.starts_with("STREAM ACCEPT")
                     && remaining
                         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))

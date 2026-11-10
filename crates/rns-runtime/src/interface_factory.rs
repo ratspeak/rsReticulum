@@ -289,6 +289,7 @@ pub struct AX25KISSInterfaceConfig {
 #[derive(Debug, Clone)]
 pub struct BackboneInterfaceConfig {
     pub name: String,
+    /// Listener bind host: `listen_ip`, or its alias `listen_on`.
     pub listen_on: Option<String>,
     pub target_host: Option<String>,
     pub port: u16,
@@ -713,7 +714,9 @@ pub fn synthesize_interface(
         "RNodeMultiInterface" => synthesize_rnode_multi(name, section, mode),
         #[cfg(feature = "serial")]
         "AX25KISSInterface" => synthesize_ax25kiss(name, section, mode),
-        "BackboneInterface" => synthesize_backbone(name, section, mode),
+        "BackboneInterface" | "BackboneClientInterface" => {
+            synthesize_backbone(name, section, mode, iface_type == "BackboneClientInterface")
+        }
         other => Err(InterfaceFactoryError::UnknownType(other.to_string())),
     }
 }
@@ -829,21 +832,28 @@ fn synthesize_tcp_server(
     section: &ConfigSection,
     mode: InterfaceMode,
 ) -> Result<InterfaceConfig, InterfaceFactoryError> {
-    let ip = section.get("listen_ip").unwrap_or("0.0.0.0");
-
-    let port = parse_port(
-        name,
-        "listen_port",
-        section
-            .get_uint("listen_port")
-            .ok_or_else(|| InterfaceFactoryError::MissingField {
+    // `port` wins over `listen_port`; `listen_ip` or `device` is required
+    // (TCPInterface.py:523-524, :541-550).
+    let port = match parse_port_opt(name, "port", section)? {
+        Some(port) => port,
+        None => parse_port_opt(name, "listen_port", section)?.ok_or_else(|| {
+            InterfaceFactoryError::MissingField {
                 name: name.to_string(),
                 field: "listen_port".to_string(),
-            })?,
-    )?;
+            }
+        })?,
+    };
+    if !section.has("listen_ip") && !section.has("device") {
+        return Err(InterfaceFactoryError::MissingField {
+            name: name.to_string(),
+            field: "listen_ip".to_string(),
+        });
+    }
 
-    let mut config = TcpServerConfig::new(name, ip, port);
+    let mut config = TcpServerConfig::new(name, "", port);
+    config.listen_ip = section.get("listen_ip").map(str::to_string);
     config.mode = mode;
+    config.i2p_tunneled = parse_bool_strict(name, "i2p_tunneled", section, false)?;
 
     if let Some(kiss) = section.get_bool("kiss_framing") {
         config.kiss_framing = kiss;
@@ -874,6 +884,10 @@ fn synthesize_udp(
         config.forward_ip = Some(ip.to_string());
     }
     config.forward_port = parse_port_opt(name, "forward_port", section)?;
+    // `port` defaults both ports (UDPInterface.py:68-72).
+    let port = parse_port_opt(name, "port", section)?;
+    config.listen_port = config.listen_port.or(port);
+    config.forward_port = config.forward_port.or(port);
     if let Some(device) = section.get("device") {
         config.device = Some(device.to_string());
     }
@@ -1417,11 +1431,27 @@ fn synthesize_i2p(
     let connectable = section.get_bool("connectable").unwrap_or(false);
     // Python `as_list`: each item is a peer (I2PInterface.py:731, :812-813).
     let peers = section.get_list("peers").unwrap_or_default();
+    // Python has neither key and runs the interface idle; nothing to register.
+    if !connectable && peers.is_empty() {
+        warn!(interface = %name, "I2PInterface has neither connectable nor peers; nothing to do");
+        return Err(InterfaceFactoryError::Disabled(name.to_string()));
+    }
+    // Rust-only keys first, then i2plib's `I2P_SAM_ADDRESS` (i2plib/utils.py:29-35).
+    let env_address = std::env::var("I2P_SAM_ADDRESS").ok().and_then(|value| {
+        let (host, port) = value.split_once(':')?;
+        Some((
+            host.to_string(),
+            port.split(':').next()?.parse::<u16>().ok()?,
+        ))
+    });
     let i2p_sam_host = section
         .get("i2p_sam_host")
-        .unwrap_or("127.0.0.1")
-        .to_string();
-    let i2p_sam_port = parse_port_opt(name, "i2p_sam_port", section)?.unwrap_or(7656);
+        .map(str::to_string)
+        .or_else(|| env_address.as_ref().map(|(host, _)| host.clone()))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let i2p_sam_port = parse_port_opt(name, "i2p_sam_port", section)?
+        .or(env_address.map(|(_, port)| port))
+        .unwrap_or(7656);
 
     Ok(InterfaceConfig::I2P(I2PInterfaceConfig {
         name: name.to_string(),
@@ -1721,25 +1751,42 @@ fn synthesize_backbone(
     name: &str,
     section: &ConfigSection,
     mode: InterfaceMode,
+    client_type: bool,
 ) -> Result<InterfaceConfig, InterfaceFactoryError> {
-    let listen_on = section.get("listen_on").map(|s| s.to_string());
-    let target_host = section
-        .get("target_host")
-        .or_else(|| section.get("remote"))
+    // Reticulum.py:1210-1222: `listen_on`, `remote` and `port` overwrite
+    // `listen_ip`, `target_host` and both ports; `target_host` or the client
+    // type selects a client.
+    let listen_ip = section
+        .get("listen_on")
+        .or_else(|| section.get("listen_ip"))
         .map(|s| s.to_string());
-    // Python BackboneInterface.py:133-134 errors without an explicit port.
-    let port = parse_port(
-        name,
-        "port",
-        section
-            .get_uint("port")
-            .or_else(|| section.get_uint("listen_port"))
-            .or_else(|| section.get_uint("target_port"))
-            .ok_or_else(|| InterfaceFactoryError::MissingField {
+    let target_host = section
+        .get("remote")
+        .or_else(|| section.get("target_host"))
+        .map(|s| s.to_string());
+    let client = client_type || target_host.is_some();
+    if client && target_host.is_none() {
+        return Err(InterfaceFactoryError::MissingField {
+            name: name.to_string(),
+            field: "target_host".to_string(),
+        });
+    }
+    let port_field = if client { "target_port" } else { "listen_port" };
+    let port = match parse_port_opt(name, "port", section)? {
+        Some(port) => port,
+        None => parse_port_opt(name, port_field, section)?.ok_or_else(|| {
+            InterfaceFactoryError::MissingField {
                 name: name.to_string(),
                 field: "port".to_string(),
-            })?,
-    )?;
+            }
+        })?,
+    };
+    if !client && listen_ip.is_none() && !section.has("device") {
+        return Err(InterfaceFactoryError::MissingField {
+            name: name.to_string(),
+            field: "listen_ip".to_string(),
+        });
+    }
     let device = section.get("device").map(|s| s.to_string());
     let prefer_ipv6 = section.get_bool("prefer_ipv6").unwrap_or(false);
     let connect_timeout = section.get_uint("connect_timeout").unwrap_or(5);
@@ -1774,7 +1821,7 @@ fn synthesize_backbone(
 
     Ok(InterfaceConfig::Backbone(BackboneInterfaceConfig {
         name: name.to_string(),
-        listen_on,
+        listen_on: listen_ip,
         target_host,
         port,
         device,
@@ -2051,11 +2098,17 @@ mod tests {
         let mut section = enabled_section();
         section.set("type", "TCPServerInterface");
         section.set("listen_port", "4242");
+        // Upstream requires `listen_ip` or `device` (TCPInterface.py:550).
+        assert!(matches!(
+            synthesize_interface("test_srv", &section),
+            Err(InterfaceFactoryError::MissingField { field, .. }) if field == "listen_ip"
+        ));
+        section.set("listen_ip", "0.0.0.0");
 
         let config = synthesize_interface("test_srv", &section).unwrap();
         match config {
             InterfaceConfig::TcpServer(c) => {
-                assert_eq!(c.listen_ip, "0.0.0.0");
+                assert_eq!(c.listen_ip.as_deref(), Some("0.0.0.0"));
                 assert_eq!(c.listen_port, 4242);
             }
             _ => panic!("expected TcpServer"),
@@ -3236,7 +3289,7 @@ mod tests {
     fn i2p_peers_read_like_python_as_list() {
         let peers = |value: &str| {
             let text = format!(
-                "[interfaces]\n  [[I2P]]\n    type = I2PInterface\n    enabled = yes\n    peers = {value}\n"
+                "[interfaces]\n  [[I2P]]\n    type = I2PInterface\n    enabled = yes\n    connectable = yes\n    peers = {value}\n"
             );
             let config = crate::config::Config::parse(&text).unwrap();
             let section = config.subsection("interfaces", "I2P").unwrap();
@@ -3295,11 +3348,17 @@ mod tests {
     fn test_synthesize_i2p_defaults() {
         let mut section = enabled_section();
         section.set("type", "I2PInterface");
+        // Neither key: upstream runs it idle, so there is nothing to start.
+        assert!(matches!(
+            synthesize_interface("i2p_defaults", &section),
+            Err(InterfaceFactoryError::Disabled(_))
+        ));
+        section.set("connectable", "yes");
 
         let config = synthesize_interface("i2p_defaults", &section).unwrap();
         match config {
             InterfaceConfig::I2P(c) => {
-                assert!(!c.connectable);
+                assert!(c.connectable);
                 assert!(c.peers.is_empty());
                 assert_eq!(c.i2p_sam_host, "127.0.0.1");
                 assert_eq!(c.i2p_sam_port, 7656);
@@ -3425,6 +3484,12 @@ mod tests {
         ));
 
         section.set("port", "4242");
+        // A listener needs `listen_ip` or `device` (BackboneInterface.py:162-168).
+        assert!(matches!(
+            synthesize_interface("backbone_defaults", &section),
+            Err(InterfaceFactoryError::MissingField { field, .. }) if field == "listen_ip"
+        ));
+        section.set("device", "eth0");
         let config = synthesize_interface("backbone_defaults", &section).unwrap();
         match config {
             InterfaceConfig::Backbone(c) => {
@@ -3432,7 +3497,7 @@ mod tests {
                 assert!(!c.prefer_ipv6);
                 assert!(c.listen_on.is_none());
                 assert!(c.target_host.is_none());
-                assert!(c.device.is_none());
+                assert_eq!(c.device.as_deref(), Some("eth0"));
                 assert_eq!(c.connect_timeout, 5);
                 assert!(c.max_reconnect_tries.is_none());
                 assert!(!c.i2p_tunneled);
@@ -3845,5 +3910,117 @@ mod tests {
             }
             other => panic!("expected MissingField, got {other:?}"),
         }
+    }
+
+    fn standalone_tcp_client_config(port: u16) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config"),
+            format!(
+                "[reticulum]\nshare_instance = No\nenable_transport = No\n\n[interfaces]\n\n\
+                 [[Uplink]]\ntype = TCPClientInterface\nenabled = yes\n\
+                 target_host = 127.0.0.1\ntarget_port = {port}\n"
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    async fn start_standalone(
+        dir: &tempfile::TempDir,
+    ) -> (
+        crate::reticulum::ReticulumHandle,
+        crate::lifecycle::ShutdownSignal,
+    ) {
+        let shutdown = crate::lifecycle::ShutdownSignal::new();
+        let handle = crate::reticulum::init(
+            Some(dir.path().to_str().unwrap()),
+            Some(dir.path().join("sockets")),
+            shutdown.clone(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .await
+        .unwrap();
+        (handle, shutdown)
+    }
+
+    #[tokio::test]
+    async fn tcp_client_path_request_issued_at_startup_reaches_listening_server() {
+        // A full accept queue drops the client's first SYN, so its connect
+        // completes on the retransmit about a second later.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(0).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _filler = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let accepting = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let filler = listener.accept().await.unwrap();
+            let client = listener.accept().await.unwrap().0;
+            (filler, client)
+        });
+        let dir = standalone_tcp_client_config(addr.port());
+        let (handle, shutdown) = start_standalone(&dir).await;
+        let destination = [0x5a; 16];
+        handle
+            .request_path(destination, Default::default())
+            .await
+            .unwrap();
+
+        let (_filler, mut socket) = tokio::time::timeout(Duration::from_secs(8), accepting)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut received = Vec::new();
+        let found = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                    .await
+                    .unwrap();
+                assert!(n > 0, "client closed before the path request arrived");
+                received.extend_from_slice(&buf[..n]);
+                if rns_interface::hdlc::unescape(&received)
+                    .windows(16)
+                    .any(|w| w == destination)
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        shutdown.trigger();
+        assert!(found.is_ok(), "path request never reached the server");
+    }
+
+    #[tokio::test]
+    async fn startup_with_unreachable_tcp_client_returns_within_initial_connect_timeout() {
+        // An address that never answers makes the attempt run to its timeout.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config"),
+            "[reticulum]\nshare_instance = No\nenable_transport = No\n\n[interfaces]\n\n\
+             [[Uplink]]\ntype = TCPClientInterface\nenabled = yes\n\
+             target_host = 192.0.2.1\ntarget_port = 4242\n",
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let (handle, shutdown) = start_standalone(&dir).await;
+        let elapsed = started.elapsed();
+        let stats = handle.interface_stats().await.unwrap();
+        shutdown.trigger();
+        let bound = rns_interface::tcp::INITIAL_CONNECT_TIMEOUT + 3;
+        assert!(
+            elapsed < Duration::from_secs(bound),
+            "start-up took {elapsed:?}"
+        );
+        assert!(
+            stats
+                .interfaces
+                .iter()
+                .any(|entry| entry.name.contains("Uplink") && !entry.online),
+            "unreachable client must register offline: {:?}",
+            stats.interfaces
+        );
     }
 }

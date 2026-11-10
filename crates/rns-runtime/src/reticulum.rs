@@ -4291,7 +4291,6 @@ pub async fn init_with_policy(
                     apply_configured_bitrate_mtu(iface_config, &post_init, &mut iface_handles);
                     let pending_rnode =
                         pending_configured_rnode_runtime(iface_config, &iface_handles);
-                    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
                     let hardware_failures: Vec<_> = iface_handles
                         .iter()
                         .filter_map(|owned| owned.hardware_failures.clone())
@@ -4324,7 +4323,6 @@ pub async fn init_with_policy(
                             {
                                 startup_rnode_runtimes.push(runtime);
                             }
-                            #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
                             if rc.panic_on_interface_error {
                                 for failures in hardware_failures {
                                     spawn_interface_panic_monitor(
@@ -4789,46 +4787,57 @@ struct OwnedInterfaceHandle {
     driver: Option<rns_interface::rnode::RNodeDriverHandle>,
     /// The address a discoverable interface learns at runtime (I2P b32).
     discovery_address: Option<tokio::sync::watch::Receiver<Option<String>>>,
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     hardware_failures: Option<HardwareFailureWatch>,
 }
 
-/// A hardware driver's count of the failures Python answers with
-/// `RNS.panic()` when `panic_on_interface_error` is set.
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+/// A driver's failures Python answers with `RNS.panic()` when
+/// `panic_on_interface_error` is set.
 #[derive(Clone)]
 enum HardwareFailureWatch {
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
     RNode(rns_interface::rnode::RNodeDriverSubscription),
     #[cfg(feature = "serial")]
     RNodeMulti(rns_interface::rnode_multi::RNodeMultiFailures),
+    /// TCP or Backbone client teardown (TCPInterface.py:437-442).
+    ClientTeardown(rns_interface::tcp::ClientTeardown),
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 impl HardwareFailureWatch {
     /// True at the first failure, false if the driver ends without one.
     async fn failed(&mut self) -> bool {
-        loop {
-            let total = match self {
-                Self::RNode(state) => state.snapshot().hardware_failure_total,
-                #[cfg(feature = "serial")]
-                Self::RNodeMulti(failures) => failures.total(),
-            };
-            if total > 0 {
-                return true;
-            }
-            let running = match self {
-                Self::RNode(state) => state.changed().await.is_some(),
-                #[cfg(feature = "serial")]
-                Self::RNodeMulti(failures) => failures.changed().await.is_some(),
-            };
-            if !running {
-                return false;
-            }
+        match self {
+            #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+            Self::RNode(state) => loop {
+                if state.snapshot().hardware_failure_total > 0 {
+                    return true;
+                }
+                if state.changed().await.is_none() {
+                    return false;
+                }
+            },
+            #[cfg(feature = "serial")]
+            Self::RNodeMulti(failures) => loop {
+                if failures.total() > 0 {
+                    return true;
+                }
+                if failures.changed().await.is_none() {
+                    return false;
+                }
+            },
+            Self::ClientTeardown(teardown) => teardown.torn_down().await,
         }
     }
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+fn client_with_teardown(
+    spawned: rns_interface::tcp::SpawnedClientInterface,
+) -> Vec<OwnedInterfaceHandle> {
+    vec![OwnedInterfaceHandle {
+        hardware_failures: Some(HardwareFailureWatch::ClientTeardown(spawned.teardown)),
+        ..spawned.interface.into()
+    }]
+}
+
 fn spawn_interface_panic_monitor(
     name: String,
     mut failures: HardwareFailureWatch,
@@ -4933,7 +4942,6 @@ impl From<rns_interface::traits::InterfaceHandle> for OwnedInterfaceHandle {
             interface,
             driver: None,
             discovery_address: None,
-            #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
             hardware_failures: None,
         }
     }
@@ -4945,7 +4953,6 @@ impl From<rns_interface::rnode::SpawnedRNodeInterface> for OwnedInterfaceHandle 
             interface: spawned.interface,
             driver: Some(spawned.driver),
             discovery_address: None,
-            #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
             hardware_failures: None,
         }
     }
@@ -7429,6 +7436,9 @@ async fn run_discovery_publisher(
             let job = preparing.take().expect("checked above");
             match job.await {
                 Ok((mut returned, prepared)) => {
+                    // Python sleeps a full job interval after each pass's work.
+                    next_prepare = now
+                        + Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
                     // The job saw these as unsent; they must not go out again.
                     let mut committed = Vec::new();
                     for (prepared, at) in deferred_commits.drain(..) {
@@ -7523,6 +7533,8 @@ async fn run_discovery_publisher(
                     _ = handle.shutdown.wait() => break,
                     resolved = resolve_discovery_inputs(config, local.location_cmd.as_deref()) => resolved,
                 };
+                next_prepare = tokio::time::Instant::now()
+                    + Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
                 if let (Some(mut config), Some(mut owned)) = (resolved, announcer.take()) {
                     for other in &locals {
                         if other.id != local.id && registered.contains_key(&other.id) {
@@ -9938,9 +9950,9 @@ async fn spawn_interface_with_rnode_startup_options(
         interface_factory::InterfaceConfig::TcpClient(c) => {
             let mut config = c.clone();
             config.tunnel_identity = Some(tunnel_identity.clone());
-            rns_interface::tcp::spawn_tcp_client(config, id, transport_tx)
+            rns_interface::tcp::spawn_tcp_client_observed(config, id, transport_tx)
                 .await
-                .map(|h| vec![h.into()])
+                .map(client_with_teardown)
                 .map_err(|e| format!("TCP client: {e}"))
         }
         interface_factory::InterfaceConfig::TcpServer(c) => {
@@ -10287,14 +10299,14 @@ async fn spawn_interface_with_rnode_startup_options(
                 config.connect_timeout_secs = c.connect_timeout;
                 config.max_reconnect_tries = c.max_reconnect_tries;
                 config.tunnel_identity = Some(tunnel_identity.clone());
-                rns_interface::backbone::spawn_backbone_client(config, id, transport_tx)
+                rns_interface::backbone::spawn_backbone_client_observed(config, id, transport_tx)
                     .await
-                    .map(|h| vec![h.into()])
+                    .map(client_with_teardown)
                     .map_err(|e| format!("Backbone client: {e}"))
             } else {
-                let listen_ip = c.listen_on.as_deref().unwrap_or("0.0.0.0");
                 let mut config =
-                    rns_interface::backbone::BackboneServerConfig::new(&c.name, listen_ip, c.port);
+                    rns_interface::backbone::BackboneServerConfig::new(&c.name, "", c.port);
+                config.listen_ip = c.listen_on.clone();
                 config.mode = c.mode;
                 config.prefer_ipv6 = c.prefer_ipv6;
                 config.device = c.device.clone();
@@ -13936,6 +13948,18 @@ loglevel = 7
         }
     }
 
+    /// The link manager paces its tick on the std clock and spins under a
+    /// paused clock, so the runtime never idles into auto-advance; step it.
+    fn drive_paused_clock() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async {
+            loop {
+                tokio::time::advance(Duration::from_millis(250)).await;
+                // Lets blocking stamp jobs finish within a step of tokio time.
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    }
+
     fn read_discovery_packet(
         raw: &[u8],
         handle: &ReticulumHandle,
@@ -13971,8 +13995,9 @@ loglevel = 7
         info
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn discovery_publisher_registers_selected_signer_and_multiple_services() {
+        let _clock = drive_paused_clock();
         use rns_interface::traits::InterfaceMode;
         let mut runs = Vec::new();
         for (mode, network, encrypted) in [
@@ -14047,8 +14072,9 @@ loglevel = 7
     /// An interface announces the address it learns at runtime
     /// (Discovery.py:215-216); a later change waits for the interval instead
     /// of announcing at once, so a flapping address cannot flood announces.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn discovery_publisher_announces_a_learned_address_on_its_interval() {
+        let _clock = drive_paused_clock();
         use rns_interface::traits::InterfaceMode;
         let (handle, actor) = discovery_actor();
         let (_, mut sink) = discovery_egress(&handle, 1, InterfaceMode::Full, 8).await;
@@ -14091,8 +14117,9 @@ loglevel = 7
         actor.await.unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn discovery_publisher_recovers_eligibility_fifo_and_services_attached_path_requests() {
+        let _clock = drive_paused_clock();
         use rns_interface::traits::InterfaceMode;
         let (mut handle, actor) = discovery_actor();
         handle.network_identity = Some(Arc::new(Identity::new()));
@@ -14208,8 +14235,9 @@ loglevel = 7
         actor.await.unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn discovery_publisher_recalls_pending_service_when_it_goes_offline() {
+        let _clock = drive_paused_clock();
         struct CountedStamper(AtomicU64);
         impl DiscoveryStamper for CountedStamper {
             fn generate(
@@ -14321,8 +14349,9 @@ loglevel = 7
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn discovery_publisher_sends_once_when_admitted_during_generation() {
+        let _clock = drive_paused_clock();
         let (handle, actor) = discovery_actor();
         let (tx, mut sink) =
             discovery_egress(&handle, 1, rns_interface::traits::InterfaceMode::Full, 1).await;
@@ -14349,7 +14378,8 @@ loglevel = 7
             .unwrap()
             .unwrap();
         assert_eq!(read_discovery_packet(&raw, &handle).name, "service-42");
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        // Generation outlasts the job interval; Python sleeps a full interval after it.
+        tokio::time::sleep(Duration::from_secs(70)).await;
         stamper.release.store(true, Ordering::Relaxed);
         let raw = tokio::time::timeout(Duration::from_secs(4), sink.recv())
             .await
@@ -14357,7 +14387,7 @@ loglevel = 7
             .unwrap();
         assert_eq!(read_discovery_packet(&raw, &handle).name, "service-43");
         assert!(
-            tokio::time::timeout(Duration::from_millis(2200), sink.recv())
+            tokio::time::timeout(Duration::from_secs(55), sink.recv())
                 .await
                 .is_err(),
             "an admitted service must not be sent again"
@@ -14375,8 +14405,9 @@ loglevel = 7
         actor.await.unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn discovery_publisher_cancels_generation_when_it_stops() {
+        let _clock = drive_paused_clock();
         for abort in [false, true] {
             let (handle, actor) = discovery_actor();
             let stamper = GatedStamper::new(0);
@@ -14413,8 +14444,9 @@ loglevel = 7
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn discovery_enable_is_single_owner_and_clients_do_not_publish() {
+        let _clock = drive_paused_clock();
         use rns_interface::traits::InterfaceMode;
         let (mut handle, actor) = discovery_actor();
         let (_, mut sink) = discovery_egress(&handle, 1, InterfaceMode::Full, 8).await;
@@ -17278,6 +17310,41 @@ enabled = yes
 
         handle.shutdown_and_wait().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TCPInterface.py:437-442: a client that spends its retry budget panics
+    /// the instance when `panic_on_interface_error` is set.
+    #[tokio::test]
+    async fn tcp_client_teardown_stops_the_runtime_when_panic_on_interface_error_is_set() {
+        let refused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = refused.local_addr().unwrap().port();
+        drop(refused);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config"),
+            format!(
+                "[reticulum]\nshare_instance = No\nenable_transport = No\npanic_on_interface_error = Yes\n\n[interfaces]\n\n[[Unreachable]]\ntype = TCPClientInterface\nenabled = Yes\ntarget_host = 127.0.0.1\ntarget_port = {port}\nmax_reconnect_tries = 0\n"
+            ),
+        )
+        .unwrap();
+        let shutdown = ShutdownSignal::new();
+        let handle = init(
+            Some(dir.path().to_str().unwrap()),
+            None,
+            shutdown.clone(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .expect("TCP client init");
+
+        tokio::time::timeout(
+            Duration::from_secs(rns_interface::tcp::RECONNECT_WAIT + 5),
+            shutdown.wait(),
+        )
+        .await
+        .expect("a torn-down TCP client must take the runtime down");
+        handle.shutdown_and_wait().await;
+        assert_eq!(handle.interface_panic(), Some("Unreachable"));
     }
 
     #[tokio::test]

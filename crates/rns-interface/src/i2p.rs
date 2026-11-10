@@ -266,6 +266,40 @@ async fn sam_session_create<R: AsyncRead + Unpin>(
     }
 }
 
+/// i2plib `stream_connect` resolves a destination ending in `.i2p` with
+/// `NAMING LOOKUP` on its own SAM connection and connects to the full key
+/// (RNS/vendor/i2plib/aiosam.py:34-50, :120-121).
+async fn sam_resolve_destination(
+    sam_host: &str,
+    sam_port: u16,
+    destination: &str,
+) -> Result<String, SamError> {
+    if !destination.ends_with(".i2p") {
+        return Ok(destination.to_string());
+    }
+    let (mut reader, mut writer) = connect_to_sam(sam_host, sam_port).await?.into_split();
+    sam_hello(&mut writer, &mut reader).await?;
+    writer
+        .write_all(format!("NAMING LOOKUP NAME={destination}\n").as_bytes())
+        .await?;
+    writer.flush().await?;
+    let reply = read_sam_reply(&mut reader).await?;
+    let pairs = parse_sam_reply(&reply);
+    if !sam_reply_has_token(&pairs, "NAMING") || !sam_reply_has_token(&pairs, "REPLY") {
+        return Err(SamError::UnexpectedReply(reply.to_string()));
+    }
+    match (
+        sam_reply_get(&pairs, "RESULT"),
+        sam_reply_get(&pairs, "VALUE"),
+    ) {
+        (Some("OK"), Some(value)) => Ok(value.to_string()),
+        (result, _) => Err(SamError::StreamFailed(format!(
+            "NAMING LOOKUP RESULT={}",
+            result.unwrap_or("none")
+        ))),
+    }
+}
+
 /// SAM STREAM CONNECT — needs its own TCP connection (SAM forbids sharing
 /// the session control socket). On OK the socket becomes the data stream.
 async fn sam_stream_connect(
@@ -354,14 +388,8 @@ async fn connect_to_sam(sam_host: &str, sam_port: u16) -> Result<TcpStream, SamE
     let addr = format!("{}:{}", sam_host, sam_port);
     let stream = TcpStream::connect(&addr).await.map_err(SamError::Io)?;
     let _ = stream.set_nodelay(true);
-    // Python i2p_tunneled tuning: longer probes/timeout to absorb I2P latency.
-    crate::socket_tuning::set_keepalive_tuned(
-        &stream,
-        std::time::Duration::from_secs(I2P_PROBE_AFTER),
-        std::time::Duration::from_secs(I2P_PROBE_INTERVAL),
-        I2P_PROBES as u32,
-        std::time::Duration::from_secs(I2P_TCP_USER_TIMEOUT as u64),
-    );
+    // Python's per-platform I2P peer timeouts (I2PInterface.py:443-455).
+    crate::tcp::set_tcp_keepalive_tuned(&stream, true);
     Ok(stream)
 }
 
@@ -626,7 +654,7 @@ pub async fn spawn_i2p_client(
                 &mut session_reader,
                 &session_id,
                 None,
-                None,
+                Some(NEW_DESTINATION_SIGNATURE_TYPE),
             )
             .await
             {
@@ -652,6 +680,33 @@ pub async fn spawn_i2p_client(
                         return;
                     }
                     pacer.wait_tunnel().await;
+                    continue;
+                }
+            };
+
+            let peer_destination = match sam_resolve_destination(
+                &config.sam_host,
+                config.sam_port,
+                &config.peer_destination,
+            )
+            .await
+            {
+                Ok(destination) => destination,
+                Err(e) => {
+                    tracing::warn!(
+                        name = %config.name,
+                        peer = %config.peer_destination,
+                        error = %e,
+                        "I2P client: NAMING LOOKUP failed"
+                    );
+                    if pacer.give_up() {
+                        tracing::warn!(name = %config.name, "I2P client: max reconnect tries reached");
+                        let _ = transport_tx
+                            .send(TransportMessage::DeregisterInterface { id })
+                            .await;
+                        return;
+                    }
+                    pacer.wait().await;
                     continue;
                 }
             };
@@ -701,7 +756,7 @@ pub async fn spawn_i2p_client(
                 &mut stream_writer,
                 &mut stream_buf_reader,
                 &session_id,
-                &config.peer_destination,
+                &peer_destination,
             )
             .await
             {

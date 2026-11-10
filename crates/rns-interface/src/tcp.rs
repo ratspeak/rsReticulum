@@ -19,9 +19,11 @@ use rns_transport::messages::{
     TransportMessage,
 };
 
-pub const RECONNECT_WAIT_INITIAL: u64 = 5;
-pub const RECONNECT_WAIT_MAX: u64 = 300;
-pub const DEFAULT_CONNECT_TIMEOUT: u64 = 5;
+/// Python `TCPClientInterface.RECONNECT_WAIT`: fixed wait before every retry.
+pub const RECONNECT_WAIT: u64 = 5;
+/// Python `TCPClientInterface.INITIAL_CONNECT_TIMEOUT`, used for every connect.
+pub const INITIAL_CONNECT_TIMEOUT: u64 = 5;
+pub const DEFAULT_CONNECT_TIMEOUT: u64 = INITIAL_CONNECT_TIMEOUT;
 pub const DEFAULT_TCP_USER_TIMEOUT: u32 = 24;
 
 /// Python `TCPInterface.HW_MTU`. Also the largest packet the drivers carry:
@@ -49,8 +51,9 @@ pub const TCP_KEEPIDLE: u32 = 5;
 pub const TCP_KEEPINTVL: u32 = 2;
 pub const TCP_KEEPCNT: u32 = 12;
 
-/// Python's ordinary TCP or I2P Linux timeout values through the shared Rust
-/// socket tuner. Accepted sockets use ordinary TCP tuning.
+/// Python's per-platform TCP timeouts (TCPInterface.py:181-207): the full
+/// set on Linux (and Android), keepalive with the idle time on Apple
+/// platforms, nothing elsewhere. `i2p_tunneled` selects the longer I2P values.
 pub(crate) fn set_tcp_keepalive_tuned(stream: &TcpStream, i2p_tunneled: bool) {
     let (idle, interval, count, user_timeout) = if i2p_tunneled {
         (
@@ -67,6 +70,7 @@ pub(crate) fn set_tcp_keepalive_tuned(stream: &TcpStream, i2p_tunneled: bool) {
             DEFAULT_TCP_USER_TIMEOUT,
         )
     };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     crate::socket_tuning::set_keepalive_tuned(
         stream,
         std::time::Duration::from_secs(idle),
@@ -74,6 +78,91 @@ pub(crate) fn set_tcp_keepalive_tuned(stream: &TcpStream, i2p_tunneled: bool) {
         count,
         std::time::Duration::from_secs(user_timeout as u64),
     );
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let _ = (interval, count, user_timeout);
+        let keepalive =
+            socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(idle));
+        if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+            tracing::warn!(error = %e, "set_tcp_keepalive failed");
+        }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    let _ = (stream, idle, interval, count, user_timeout);
+}
+
+/// Python `get_address_for_if` / `get_address_for_host` of the TCP and
+/// Backbone listeners (TCPInterface.py:469-504): `device` wins over
+/// `listen_ip`, neither is an error, and nothing falls back to a wildcard.
+pub async fn resolve_bind_address(
+    listen_ip: Option<&str>,
+    device: Option<&str>,
+    port: u16,
+    prefer_ipv6: bool,
+) -> std::io::Result<std::net::SocketAddr> {
+    use std::io::{Error, ErrorKind};
+    use std::net::{IpAddr, SocketAddr, SocketAddrV6};
+    if let Some(device) = device {
+        let no_address = || {
+            Error::new(
+                ErrorKind::AddrNotAvailable,
+                format!("No addresses available on specified kernel interface \"{device}\""),
+            )
+        };
+        let on_device: Vec<if_addrs::Interface> = if_addrs::get_if_addrs()?
+            .into_iter()
+            .filter(|a| a.name == device)
+            .collect();
+        let v4 = on_device.iter().find(|a| a.ip().is_ipv4());
+        let v6 = on_device.iter().find(|a| a.ip().is_ipv6());
+        return match (v4, v6) {
+            (v4, Some(v6)) if prefer_ipv6 || v4.is_none() => {
+                let IpAddr::V6(ip) = v6.ip() else {
+                    unreachable!()
+                };
+                if (ip.segments()[0] & 0xffc0) == 0xfe80 {
+                    let scope = v6.index.ok_or_else(no_address)?;
+                    Ok(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, scope)))
+                } else {
+                    resolve_host(&ip.to_string(), port, prefer_ipv6).await
+                }
+            }
+            (Some(v4), _) => Ok(SocketAddr::new(v4.ip(), port)),
+            _ => Err(no_address()),
+        };
+    }
+    match listen_ip {
+        Some(host) => resolve_host(host, port, prefer_ipv6).await,
+        None => Err(Error::new(
+            ErrorKind::InvalidInput,
+            "No TCP bind IP configured",
+        )),
+    }
+}
+
+/// First resolved address of the preferred family, else the first one.
+pub(crate) async fn resolve_host(
+    host: &str,
+    port: u16,
+    prefer_ipv6: bool,
+) -> std::io::Result<std::net::SocketAddr> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+    addrs
+        .iter()
+        .find(|a| a.is_ipv6() == prefer_ipv6)
+        .or_else(|| addrs.first())
+        .copied()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("no addresses resolved for {host}:{port}"),
+            )
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +173,8 @@ pub struct TcpClientConfig {
     pub kiss_framing: bool,
     /// Use the longer socket timeouts for a TCP connection tunneled over I2P.
     pub i2p_tunneled: bool,
+    /// Parsed like Python, which stores it but connects with
+    /// [`INITIAL_CONNECT_TIMEOUT`] (TCPInterface.py:241).
     pub connect_timeout_secs: u64,
     pub max_reconnect_tries: Option<usize>,
     pub mode: InterfaceMode,
@@ -125,7 +216,8 @@ impl TcpClientConfig {
 #[derive(Debug, Clone)]
 pub struct TcpServerConfig {
     pub name: String,
-    pub listen_ip: String,
+    /// Host to bind; required unless `device` is set (TCPInterface.py:550).
+    pub listen_ip: Option<String>,
     pub listen_port: u16,
     pub kiss_framing: bool,
     pub prefer_ipv6: bool,
@@ -133,39 +225,23 @@ pub struct TcpServerConfig {
     /// Bind to this network device's address instead of `listen_ip`
     /// (Python `device =` option).
     pub device: Option<String>,
+    /// Accepted clients take the I2P socket timeouts (TCPInterface.py:589).
+    pub i2p_tunneled: bool,
 }
 
 impl TcpServerConfig {
     pub fn new(name: &str, ip: &str, port: u16) -> Self {
         Self {
             name: name.to_string(),
-            listen_ip: ip.to_string(),
+            listen_ip: Some(ip.to_string()),
             listen_port: port,
             kiss_framing: false,
             prefer_ipv6: false,
             mode: InterfaceMode::Full,
             device: None,
+            i2p_tunneled: false,
         }
     }
-}
-
-/// First usable address on `device`, honouring `prefer_ipv6`. Python
-/// `TCPServerInterface.get_address_for_if` equivalent.
-fn address_for_device(device: &str, prefer_ipv6: bool) -> Option<std::net::IpAddr> {
-    let addrs = if_addrs::get_if_addrs().ok()?;
-    let on_dev: Vec<std::net::IpAddr> = addrs
-        .iter()
-        .filter(|a| a.name == device)
-        .map(|a| a.ip())
-        .collect();
-    if prefer_ipv6 && let Some(v6) = on_dev.iter().find(|ip| ip.is_ipv6()) {
-        return Some(*v6);
-    }
-    on_dev
-        .iter()
-        .find(|ip| ip.is_ipv4())
-        .or_else(|| on_dev.first())
-        .copied()
 }
 
 pub struct TcpInterfaceState {
@@ -360,13 +436,64 @@ async fn tcp_write_loop(
     state.online.store(false, Ordering::SeqCst);
 }
 
-/// Spawn an auto-reconnecting TCP client interface. IFAC masking, when
+/// Python's initiator `teardown()` (TCPInterface.py:437-455): the interface
+/// stays registered and offline, and queued outbound packets are discarded
+/// until the runtime stops it.
+pub(crate) async fn hold_torn_down(
+    outbound: &tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
+    name: &str,
+    teardown: &tokio::sync::watch::Sender<bool>,
+) {
+    tracing::error!(
+        "The interface {name} experienced an unrecoverable error and is being torn down. Restart Reticulum to attempt to open this interface again."
+    );
+    teardown.send_replace(true);
+    let mut queued = outbound.lock().await;
+    while queued.recv().await.is_some() {}
+}
+
+/// Resolves when a client spends its retry budget and is torn down.
+#[derive(Clone, Debug)]
+pub struct ClientTeardown(tokio::sync::watch::Receiver<bool>);
+
+impl ClientTeardown {
+    pub(crate) fn channel() -> (tokio::sync::watch::Sender<bool>, Self) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        (tx, Self(rx))
+    }
+
+    /// True at teardown, false if the driver ends without one.
+    pub async fn torn_down(&mut self) -> bool {
+        self.0.wait_for(|torn_down| *torn_down).await.is_ok()
+    }
+}
+
+/// A reconnecting client handle paired with its teardown signal.
+#[non_exhaustive]
+pub struct SpawnedClientInterface {
+    pub interface: InterfaceHandle,
+    pub teardown: ClientTeardown,
+}
+
+/// Spawn an auto-reconnecting TCP client interface. `max_reconnect_tries`
+/// bounds the retries of each outage. IFAC masking, when
 /// configured, is applied by the transport actor, not the driver.
 pub async fn spawn_tcp_client(
     config: TcpClientConfig,
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    spawn_tcp_client_observed(config, id, transport_tx)
+        .await
+        .map(|spawned| spawned.interface)
+}
+
+/// [`spawn_tcp_client`], also returning the client's teardown signal.
+pub async fn spawn_tcp_client_observed(
+    config: TcpClientConfig,
+    id: InterfaceId,
+    transport_tx: mpsc::Sender<TransportMessage>,
+) -> Result<SpawnedClientInterface, crate::traits::InterfaceError> {
     let transport_tx = InterfaceTransportSender::new(id, transport_tx);
     let owner = transport_tx.owner();
     if config.fixed_mtu.is_some_and(|mtu| mtu < 500) {
@@ -392,55 +519,56 @@ pub async fn spawn_tcp_client(
 
     let python_name = config.python_name();
     let identity = InterfaceIdentity::new(&python_name, &config.name, "TCPClientInterface");
+    let (teardown_tx, teardown) = ClientTeardown::channel();
+    // Python connects once, synchronously, before the interface is handed to
+    // transport (TCPInterface.py:162-163, :241).
+    let mut initial_attempt = Some(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(INITIAL_CONNECT_TIMEOUT),
+            TcpStream::connect(format!("{}:{}", config.target_host, config.target_port)),
+        )
+        .await,
+    );
+    if matches!(initial_attempt, Some(Ok(Ok(_)))) {
+        online.store(true, Ordering::SeqCst);
+    }
     let read_task = tokio::spawn(async move {
         let max_tries = config.max_reconnect_tries;
-        let mut tries: usize = 0;
-        let mut backoff = RECONNECT_WAIT_INITIAL;
+        let addr = format!("{}:{}", config.target_host, config.target_port);
         // Every attempt after the first follows a failure or an outage.
         let mut attempted = false;
+        // Retries within the current outage (TCPInterface.py:271-290).
+        let mut attempts: usize = 0;
 
         loop {
+            if attempted {
+                tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_WAIT)).await;
+                attempts += 1;
+                if max_tries.is_some_and(|max| attempts > max) {
+                    tracing::error!("Max reconnection attempts reached for {python_name}");
+                    hold_torn_down(&rx, &python_name, &teardown_tx).await;
+                    return;
+                }
+            }
             let after_outage = std::mem::replace(&mut attempted, true);
-            let addr = format!("{}:{}", config.target_host, config.target_port);
-            let stream = match tokio::time::timeout(
-                std::time::Duration::from_secs(config.connect_timeout_secs),
-                TcpStream::connect(&addr),
-            )
-            .await
-            {
+            let attempt = match initial_attempt.take() {
+                Some(attempt) => attempt,
+                None => {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(INITIAL_CONNECT_TIMEOUT),
+                        TcpStream::connect(&addr),
+                    )
+                    .await
+                }
+            };
+            let stream = match attempt {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
                     tracing::warn!(name = %config.name, error = %e, "TCP connect failed");
-                    if let Some(max) = max_tries {
-                        tries += 1;
-                        if tries >= max {
-                            tracing::warn!(name = %config.name, "max reconnect tries reached");
-                            // Same dereg as the post-connect give-up below —
-                            // otherwise the actor keeps a zombie entry.
-                            let _ = transport_tx
-                                .send(TransportMessage::DeregisterInterface { id })
-                                .await;
-                            return;
-                        }
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
                     continue;
                 }
                 Err(_) => {
                     tracing::warn!(name = %config.name, "TCP connect timed out");
-                    if let Some(max) = max_tries {
-                        tries += 1;
-                        if tries >= max {
-                            tracing::warn!(name = %config.name, "max reconnect tries reached");
-                            let _ = transport_tx
-                                .send(TransportMessage::DeregisterInterface { id })
-                                .await;
-                            return;
-                        }
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                    backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
                     continue;
                 }
             };
@@ -453,8 +581,7 @@ pub async fn spawn_tcp_client(
 
             let state = TcpInterfaceState::with_shared_counters(task_rxb.clone(), task_txb.clone());
             state.online.store(true, Ordering::SeqCst);
-            tries = 0;
-            backoff = RECONNECT_WAIT_INITIAL;
+            attempts = 0;
             // Python synthesizes on every non-KISS connection
             // (TCPInterface.py:178-179, :298-299).
             let synthesis = config
@@ -497,20 +624,7 @@ pub async fn spawn_tcp_client(
             write_handle.abort();
             let _ = write_handle.await;
 
-            if let Some(max) = max_tries {
-                tries += 1;
-                if tries >= max {
-                    tracing::warn!(name = %config.name, "max reconnect tries reached");
-                    // Notify transport immediately rather than waiting for auto-drop.
-                    let _ = transport_tx
-                        .send(TransportMessage::DeregisterInterface { id })
-                        .await;
-                    return;
-                }
-            }
-            tracing::info!(name = %config.name, "reconnecting in {}s", backoff);
-            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-            backoff = (backoff * 2).min(RECONNECT_WAIT_MAX);
+            tracing::info!(name = %config.name, "reconnecting in {}s", RECONNECT_WAIT);
         }
     });
 
@@ -518,38 +632,41 @@ pub async fn spawn_tcp_client(
         Some(mtu) => crate::traits::hardware_mtu_capacity(Some(mtu), TCP_HW_MTU),
         None => autoconfigured_mtu(),
     };
-    Ok(InterfaceHandle {
-        id,
-        owner,
-        packet_capacity,
-        parent_id: None,
-        name,
-        mode,
-        direction: InterfaceDirection {
-            inbound: true,
-            outbound: true,
-            forward: false,
-            repeat: false,
+    Ok(SpawnedClientInterface {
+        interface: InterfaceHandle {
+            id,
+            owner,
+            packet_capacity,
+            parent_id: None,
+            name,
+            mode,
+            direction: InterfaceDirection {
+                inbound: true,
+                outbound: true,
+                forward: false,
+                repeat: false,
+            },
+            bitrate: BITRATE_GUESS,
+            mtu,
+            online,
+            rxb: Some(shared_rxb),
+            txb: Some(shared_txb),
+            inspection: Some(InterfaceInspectionSource::identified(identity)),
+            tx,
+            read_task,
         },
-        bitrate: BITRATE_GUESS,
-        mtu,
-        online,
-        rxb: Some(shared_rxb),
-        txb: Some(shared_txb),
-        inspection: Some(InterfaceInspectionSource::identified(identity)),
-        tx,
-        read_task,
+        teardown,
     })
 }
 
 /// Wrap an accepted TCP stream as an interface; no reconnect on disconnect.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     level = "debug",
     name = "tcp.server.accept",
     skip_all,
     fields(client_id = id, name = %name),
 )]
-#[allow(clippy::too_many_arguments)]
 async fn spawn_tcp_accepted(
     stream: TcpStream,
     id: InterfaceId,
@@ -560,6 +677,7 @@ async fn spawn_tcp_accepted(
     name: String,
     transport_tx: mpsc::Sender<TransportMessage>,
     kiss_framing: bool,
+    i2p_tunneled: bool,
     mode: InterfaceMode,
 ) -> InterfaceHandle {
     let transport_tx = InterfaceTransportSender::new(id, transport_tx);
@@ -579,7 +697,7 @@ async fn spawn_tcp_accepted(
     });
     state.online.store(true, Ordering::SeqCst);
 
-    set_tcp_keepalive_tuned(&stream, false);
+    set_tcp_keepalive_tuned(&stream, i2p_tunneled);
     let _ = stream.set_nodelay(true);
     set_socket_buffers(&stream, 131072);
 
@@ -645,17 +763,13 @@ pub async fn spawn_tcp_server(
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
     let transport_tx = InterfaceTransportSender::new(id, transport_tx);
     let owner = transport_tx.owner();
-    let addr = match config.device.as_deref() {
-        Some(device) => {
-            let ip = address_for_device(device, config.prefer_ipv6).ok_or_else(|| {
-                crate::traits::InterfaceError::SendFailed(format!(
-                    "no usable address on device '{device}'"
-                ))
-            })?;
-            std::net::SocketAddr::new(ip, config.listen_port).to_string()
-        }
-        None => format!("{}:{}", config.listen_ip, config.listen_port),
-    };
+    let addr = resolve_bind_address(
+        config.listen_ip.as_deref(),
+        config.device.as_deref(),
+        config.listen_port,
+        config.prefer_ipv6,
+    )
+    .await?;
     let listener = TcpListener::bind(&addr).await?;
     let local_addr = listener.local_addr()?;
     tracing::info!(name = %config.name, addr = %local_addr, "TCP server listening");
@@ -712,6 +826,7 @@ pub async fn spawn_tcp_server(
                         client_name,
                         transport_tx.actor_sender(),
                         kiss_framing,
+                        config.i2p_tunneled,
                         mode,
                     )
                     .await;
@@ -841,8 +956,10 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 let idle = get_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPALIVE);
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
+                assert_eq!(idle, _expected[0]);
+                // Darwin sets only the idle time, as upstream's set_timeouts_osx does.
+                #[cfg(target_os = "linux")]
                 {
-                    assert_eq!(idle, _expected[0]);
                     assert_eq!(
                         get_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL),
                         _expected[1]
@@ -861,11 +978,10 @@ mod tests {
         }
     }
 
-    /// T1-11: exhausting max_reconnect_tries before the FIRST successful
-    /// connect must send DeregisterInterface, same as the post-connect path —
-    /// otherwise the actor keeps a zombie entry forever.
+    /// Python's initiator teardown keeps the interface registered and
+    /// offline after the retry budget is spent (TCPInterface.py:437-455).
     #[tokio::test]
-    async fn test_initial_connect_give_up_sends_deregister() {
+    async fn give_up_keeps_interface_registered_and_offline() {
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
 
         // Bind-then-drop: the port refuses connections immediately.
@@ -874,20 +990,25 @@ mod tests {
         drop(listener);
 
         let mut config = TcpClientConfig::new("tcp-giveup", &addr.ip().to_string(), addr.port());
-        config.max_reconnect_tries = Some(1);
-        config.connect_timeout_secs = 2;
+        config.max_reconnect_tries = Some(0);
 
         let handle = spawn_tcp_client(config, 77, transport_tx).await.unwrap();
         handle.owner.mark_registered();
 
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), transport_rx.recv())
+        // One attempt, one RECONNECT_WAIT, then teardown.
+        let early = tokio::time::timeout(
+            std::time::Duration::from_secs(RECONNECT_WAIT + 3),
+            transport_rx.recv(),
+        )
+        .await;
+        assert!(early.is_err(), "no message expected, got {early:?}");
+        assert!(!handle.read_task.is_finished());
+        assert!(!handle.online.load(Ordering::SeqCst));
+        handle
+            .tx
+            .send(Bytes::from_static(b"dropped"))
             .await
-            .expect("expected DeregisterInterface before timeout")
-            .expect("transport channel closed");
-        match crate::traits::test_event_for_handle(msg, &handle) {
-            TransportMessage::DeregisterInterface { id } => assert_eq!(id, 77),
-            other => panic!("expected DeregisterInterface, got {other:?}"),
-        }
+            .unwrap();
         handle.read_task.abort();
     }
 
@@ -1033,35 +1154,6 @@ mod tests {
         assert_eq!(all_frames.len(), 2);
         assert_eq!(all_frames[0], data1);
         assert_eq!(all_frames[1], data2);
-    }
-
-    /// TCP reconnection: client retries after connection failure.
-    #[tokio::test]
-    async fn test_tcp_client_reconnection_max_tries() {
-        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
-
-        // Port 1 is closed, forcing every connect to fail.
-        let config = TcpClientConfig {
-            name: "reconnect-test".into(),
-            target_host: "127.0.0.1".into(),
-            target_port: 1,
-            kiss_framing: false,
-            i2p_tunneled: false,
-            connect_timeout_secs: 1,
-            max_reconnect_tries: Some(2),
-            mode: InterfaceMode::Full,
-            fixed_mtu: None,
-            tunnel_identity: None,
-        };
-
-        let handle = spawn_tcp_client(config, 99, transport_tx).await.unwrap();
-        handle.owner.mark_registered();
-
-        // Two failed tries with 5s waits each; 20s headroom.
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(20), handle.read_task).await;
-
-        assert!(result.is_ok(), "task should have finished within timeout");
     }
 
     /// Server's per-client read_task must DeregisterInterface on EOF
